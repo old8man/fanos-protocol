@@ -1,45 +1,51 @@
-# Coherent Cybernetics — the theory of self-observing coherent networks
+# Coherence Cybernetics in FANOS — the theory of self-observing networks
 
-> The meta-theory beneath FANOS. **Coherent Cybernetics** is cybernetics (feedback, control,
-> homeostasis) unified with **coherence** (the UHM density `ρ`, its integration `Φ`, its spectral gap
-> `Δ`): a system that regulates itself *through its own coherence*, where the regulator and the
-> regulated are one mathematical object. From it, network architectures fall out **derived, not
-> designed** — and the derived architectures are, in a precise sense, **Unitary**: a single coherent
-> whole. This document works out the theory in depth, its **three-level organismic model**, and why
-> UHM's mathematical elegance lets it *discover* optimal architectures rather than merely describe one.
+> The meta-theory beneath FANOS is **Coherence Cybernetics (CC)** — "the only complete cybernetics
+> strictly derivable from Unitary Holonomic Monism (UHM)" (CC corpus, `introduction.md`), in which a
+> system's *dynamics*, *structural integrity*, and *interiority* are "different projections of one and
+> the same object — the coherence matrix `Γ`." A system regulates itself *through its own coherence*:
+> the regulator and the regulated are one object. This document instantiates CC for anonymous networks
+> — its **three-level organismic model**, and why UHM's elegance lets it *discover* optimal
+> architectures rather than merely describe one — and is **reconciled to the canonical CC corpus in §9**,
+> with FANOS-original extensions marked as such.
 
 Companion to [`design.md`](design.md) (invariants), [`design-platform.md`](design-platform.md)
-(architecture), [`roadmap.md`](roadmap.md) (phases). Where those engineer the network, this names the
-*discipline* the engineering instantiates.
+(architecture), [`design-telemetry.md`](design-telemetry.md) (the minimal-overhead observation theorem),
+[`roadmap.md`](roadmap.md) (phases). Where those engineer the network, this names the *discipline* the
+engineering instantiates. **Notation.** FANOS writes the coherence density `ρ`/`Γ_net`; the canon writes
+`Γ` and reserves `ρ*` for the *self-model target* `φ(Γ)`. Read them as the same object (§9).
 
 ---
 
 ## 0. The herald — one sentence
 
 **A network should not be *managed*; it should *metabolize* — sense its own coherence and relax back to
-health by the same dynamics that make it work.** Coherent Cybernetics is the study of systems for which
+health by the same dynamics that make it work.** Coherence Cybernetics is the study of systems for which
 "operate," "observe," "heal," "price," "grow," and "evolve" are not separate machineries bolted together
 but **one dissipative dynamics read at different time-scales.** FANOS is its first full instantiation.
 
 ---
 
-## 1. From cybernetics to Coherent Cybernetics
+## 1. From cybernetics to Coherence Cybernetics
 
-Classical cybernetics (Wiener, Ashby, von Foerster) gave three load-bearing ideas; Coherent Cybernetics
-promotes each from a *principle* to a *theorem* by giving it a coherence carrier.
+Classical cybernetics (Wiener, Ashby, von Foerster) gave load-bearing *principles*; CC promotes each to
+a *theorem* by giving it a coherence carrier. The canon positions CC as a **metatheory** "from which all
+particular cybernetics … are derived as projections onto a subset of dimensions" (`cybernetics-history.md`).
 
-| Cybernetics (classical) | Coherent Cybernetics (UHM carrier) | In FANOS |
+| Cybernetics (classical) | CC carrier (canonical) | In FANOS |
 |---|---|---|
-| **Negative feedback / homeostasis** — a system holds a variable near a set-point | **Dissipative relaxation** — the Lindbladian's jump terms relax the density `ρ` to its steady state `ρ*` at the spectral gap `Δ` | DIAKRISIS heals a cell back to `ρ*`; `τ = 1/Δ` is the recovery time (T-226(v)) |
-| **The Good Regulator theorem** (Conant–Ashby): *every good regulator of a system must be a model of that system* | **Requisite coherence:** a system can regulate only what it can *coherently model* — and the self-model costs a fixed fraction of capacity | `R = 1/(N·P) ≥ 1/3` (spec §6.8): a node must spend **≥ ⅓ of its cycles on self-observation** or it *provably* cannot hold a faithful self-model. The Good Regulator theorem, made a numeric threshold. |
-| **Requisite variety** (Ashby): a regulator needs at least as much variety as the disturbances it faces | **Spectral requisite variety:** the regulator's response bandwidth is its spectral gap `Δ`; disturbances faster than `Δ` cannot be regulated | the Lindblad admission controller relaxes at exactly `Δ` (now *derived* from the cell's gap, not tuned — `stabilize::from_line_rates`), so it out-paces exactly the floods `Δ` can damp |
-| **Reflexivity / second-order cybernetics** (von Foerster): the observer is part of the system | **The reflexive plane is a tier of the same operator:** observation *is* a coherence measurement of `ρ`, so observing does not sit outside the dynamics — it is the diagonal of the same `ρ` | DIAKRISIS reads `Γ_net` (a density) and its verdict *is* a healing input — observer and observed share one `ρ` |
+| **Negative feedback / homeostasis** | **Regeneration, not decay.** The generator has *three* terms, `dΓ/dτ = −i[H,Γ] + 𝒟[Γ] + ℛ[Γ,E]` (T-258): unitary *work*, the dissipator 𝒟 (*heat* — drains order toward `I/7`, i.e. death), and the **regenerator ℛ** (*matter* — the only term that imports order, relaxing toward the self-model `ρ* = φ(Γ)`). **Healing is ℛ, not 𝒟.** | DIAKRISIS heals a cell back to `ρ*` via regeneration `κ = κ_bootstrap + κ₀·Coh_E`; `τ = 1/λ_gap` is the recovery time (FANOS's `Δ` is the equicorrelated instance of `λ_gap`, `stabilize::from_line_rates`) |
+| **Second-order / the observer is in the system** (von Foerster) — *asserted* | **Necessity of Self-Reference (T-7.1) — *proved*:** a viable open system *must* contain `φ` with `‖Γ − φ(Γ)‖ < ε` ("part of `Γ` must model the whole"). Sharpened by **No-Zombie (T-8.1):** `Coh_E ≥ Coh_min > 1/7`, a *derived* minimum self-observation signal that grows with environmental noise. | DIAKRISIS reads `Γ_net` and its verdict *is* a healing input — observer and observed share one `Γ`; a node that stops self-observing stops being viable (T-8.1) |
+| **Requisite variety** (Ashby) | **Dimensional:** requisite variety ↔ `dim ℋ = 7` (the minimum for autopoiesis + phenomenology + a quantum base, from `G₂` minimality). *Separately*, the regulation **bandwidth** is the spectral gap `λ_gap` (relaxation `τ = 1/λ_gap`; critical slowing `λ_min → 0 ⇒ τ → ∞`). | the cell is `N = 7`; the admission controller relaxes at the *derived* gap so it out-paces exactly the floods that gap can damp — a FANOS *bandwidth* reading of `λ_gap`, distinct from requisite variety proper |
+| **The Good Regulator theorem** (Conant–Ashby) — *"every good regulator must be a model"* | The canon proves this as **T-7.1 + T-113** (learning needs a replacement channel with `R > 0`, else `n* = ∞`); "Good Regulator/Conant–Ashby" is FANOS's *naming* for the CC self-reference results. | `R = 1/(7P) ≥ 1/3` is the readiness gate; equivalently `P ≤ 3/7` — a reflexivity **ceiling** on purity ("dissipation protects reflexivity against an over-rigid ideal"), the *dual* of "afford to know yourself" |
 
-The decisive upgrade is the **Good Regulator theorem becoming `R ≥ 1/3`**. Ashby proved a regulator must
-model its system but gave no *cost*; UHM proves the model costs at least a third of the reflection budget
-and pins the number. This is why FANOS's monitoring is not an add-on: a node that stops self-observing
-*stops being a regulator of itself* by theorem, and readiness is defined as `Φ ≥ 1 ∧ R ≥ 1/3` — "an
-integrated subject that can afford to know itself."
+The decisive upgrade is that **von Foerster's and Ashby's intuitions become theorems.** Where classical
+cybernetics *asserted* the observer belongs in the system, CC *proves* a viable system must model itself
+(T-7.1) and must carry a minimum interiority signal (T-8.1, `Coh_E > 1/7`). The FANOS readiness gate
+`Φ ≥ 1 ∧ R ≥ 1/3` is the canon's **L2 viability gate** (which also asks `P > 2/7` and `D_diff ≥ 2`);
+`R ≥ 1/3 ⟺ P ∈ (2/7, 3/7]` is the **Goldilocks window** — integrated enough to be a subject, dissipative
+enough to stay adaptable. "An integrated subject that can afford to know itself — and not so rigid it
+cannot revise itself."
 
 ---
 
@@ -56,9 +62,13 @@ The unit is the projective cell of `N = q²+q+1` nodes (the Fano cell at `q=2`, 
 
 - **Density (state):** the coherence matrix `Γ_net = C/N` (`Tr Γ = 1`) — a bona-fide density built from
   the nodes' behavioural correlations (`fanos-diakrisis::coherence`).
-- **Dynamics:** the Lindblad master equation `dρ/dt = −i[H,ρ] + D[ρ]`. The **unitary** part `−i[H,ρ]` is
-  the cell's normal, reversible operation (routing, storage, rendezvous). The **dissipative** part `D` is
-  healing — relaxation to `ρ*` at the gap `Δ = (G − max_k T_k)/6`.
+- **Dynamics:** the CC master equation `dΓ/dτ = −i[H,Γ] + 𝒟[Γ] + ℛ[Γ,E]` (three terms, T-258). The
+  **unitary** `−i[H,Γ]` is normal reversible operation (routing, storage, rendezvous — *work*); the
+  **dissipator** `𝒟` is entropy-producing decay toward `I/7` (*heat* — the death the cell resists); the
+  **regenerator** `ℛ` is **healing** — the only term that imports order, relaxing toward the self-model
+  `ρ* = φ(Γ)` at rate `κ = κ_bootstrap + κ₀·Coh_E`, with recovery time `τ = 1/λ_gap` (FANOS's
+  `Δ = (G − max_k T_k)/6` is the equicorrelated instance of `λ_gap`). *DIAKRISIS is `ℛ`, not `𝒟`* — it
+  opposes decay, it is not decay.
 - **Vital signs:** integration `Φ` (cross-node binding, threshold 1), structure `P = Tr(Γ²)` (purity),
   reflection `R = 1/(N·P)` (self-model), mean correlation `r`, and the recovery time `τ = 1/Δ`.
 - **Homeostasis (the immune/metabolic reflex):** DIAKRISIS *sense → act* — reroute (project around a dead
@@ -137,15 +147,63 @@ evolution, unitary + dissipative). State, rate, law — three, and only three, b
 
 ---
 
+## 2A. The self-modeling node — monism at the architecture level
+
+The canon proves (T-7.1) that a viable system **must** contain a self-model `φ` with `‖Γ − φ(Γ)‖ < ε`.
+FANOS realizes this not with an *approximate* model bolted on, but with an exact one that falls out of an
+architectural fact already true: **`fanos-sim` runs the byte-for-byte same sans-I/O engine as production**
+(the determinism contract, `architecture.md`). So a node can embed an instance of *its own engine* as its
+self-model — the map is literally a copy of the territory's code. This is **monism at the architecture and
+implementation level**: the model and the modeled are one object, so the self-model has **zero structural
+mismatch** — `φ(Γ)` is exact, and the Good-Regulator requirement is met not approximately but *with
+equality* (the regulator is an *instance* of the system, not a sketch of it). Classical control fights
+model-mismatch; here there is none to fight.
+
+Made scalable and provable by **two fidelities** — a pragmatic digital-twin + model-predictive design:
+
+- **The exact twin (deep, occasional).** The node runs its own engine forward on a hypothesis — *what if I
+  decouple? what if node k dies? what if this line is flooded?* — a literal deterministic what-if. Zero
+  mismatch, reproducible (so a plan is *verifiable*), but `O(engine-step)`, so it drives deliberation, not
+  the hot loop. Bounded: one cell, `N = 7`.
+- **The reduced-order predictor (cheap, per-tick).** The hot loop forecasts via the *coherence dynamics*
+  alone — the linearized CC relaxation of `Γ` in `(Φ, P, R, r)` around the operating point (`τ = 1/λ_gap`).
+  `O(1)` per window, error bounded by the linearization near `ρ*`; this is the `forecast_cascade` the
+  observatory already computes.
+
+Together they close a **model-predictive sensorimotor loop** — and this is where the sensorimotor idea
+grounds *maturely*, not speculatively:
+
+1. **Sense** — read coherence (the 3-bit syndrome + scalars; minimal, `design-telemetry.md`).
+2. **Predict** — the reduced model forecasts the trajectory; the exact twin scores candidate actions.
+3. **Plan** — choose the action minimizing the stress `‖σ_sys‖_∞` (the canonical minimax, T-11.2 — a
+   *ready-made objective with no engineered reward*): decouple / reroute / raise admission `Δ` / escalate.
+4. **Act** — the motor outputs are the node's syscalls (emit, reroute, decouple, adjust difficulty).
+5. **Learn** — tune only the model's *parameters* (operating point, gap estimate) from prediction error —
+   active-inference / free-energy in the CC sense (minimize surprise between model and observation). The
+   *structure* stays exact (the engine); only the parameters adapt.
+
+A **SYNARC / neural module** plugs in here as an *optional* planner (step 3) that learns a policy over the
+same sense/act interface (sense = coherence feed; motor = datagram/broadcast/reroute; proprioception = the
+node's own `Γ`) — sandboxed as a capability-scoped `Protocol`, never a core dependency. The default planner
+is the provable MPC minimax; SYNARC is the innovative option on a mature core (the pragmatic split the
+architecture demands). This makes each node a small **anticipatory agent** — it does not merely react to
+damage, it *foresees* it (leading indicator `{P<2/N}⊂{Φ<1}`, a regime before failure) and acts on a
+verifiable plan — and it is the substrate on which many such agents compose into the larger organism
+(§2, §12): cells that model themselves, forming an organism that models itself.
+
+---
+
 ## 3. Unitary architectures
 
 Why call the derived architectures **Unitary**? Two senses, and they are the same sense.
 
-1. **Operator-theoretic.** The Lindbladian splits into a **unitary** generator `−i[H,ρ]` (reversible,
-   coherence-preserving — the network *working*) and a **dissipative** generator `D` (irreversible —
-   the network *healing*). A *Unitary architecture* is one whose normal operation is the unitary part and
-   whose only irreversibility is the deliberate return to coherence. Nothing leaks entropy except the act
-   of healing; there is no ad-hoc, off-model machinery. The architecture evolves as **one operator**.
+1. **Operator-theoretic.** The CC generator is **metriplectic** (T-262): "one frictionless rotation plus
+   two slides downhill" — the **unitary** `−i[H,Γ]` is a reversible isometry (the network *working*), the
+   **dissipator** `𝒟` slides down to `I/7` (*heat*), and the **regenerator** `ℛ` slides toward the
+   self-model `ρ*` (*matter* — the network *healing*). A *Unitary architecture* is one whose normal
+   operation is the unitary rotation and whose only irreversibility is the deliberate `ℛ`-climb that
+   opposes the `𝒟`-decay — no ad-hoc, off-model machinery leaks entropy. The architecture evolves as
+   **one operator** with exactly these three channels (a fourth is impossible, T-11.3).
 2. **Compositional.** *Unitary* = *a single coherent whole*, not a federation of modules that negotiate.
    Every component is derived from the same three primitives — the coherence quantity `(Φ,P,R,Δ)`, the
    commitment move `H(label‖id‖…)`, and the reflexive cell — so the transport, the privacy composition,
@@ -158,7 +216,7 @@ into a whole. A Unitary architecture is one that maximizes its own `Φ` — an i
 precisely the readiness condition `Φ ≥ 1`. *The architecture is Unitary iff it is an integrated subject of
 its own coherence.*
 
-This is the sense in which Coherent-Cybernetic architectures "lead to a Cyberpunk epoch" not by aesthetic
+This is the sense in which Coherence-Cybernetic architectures "lead to a Cyberpunk epoch" not by aesthetic
 but by capability: a self-owning, self-healing, self-observing, censorship-resistant substrate that no
 authority operates is the material precondition of that world.
 
@@ -266,7 +324,7 @@ architecture, read the winners, and let disagreements with UHM surface new mathe
 
 ---
 
-## 7. Deployment reality — Coherent Cybernetics on real servers
+## 7. Deployment reality — Coherence Cybernetics on real servers
 
 The theory is not ornamental; it is what makes tomorrow's real-server launch *operable*:
 
@@ -290,7 +348,7 @@ DevEx implementation phase.
 
 ## 8. Positioning — the herald of a Cyberpunk epoch
 
-Coherent Cybernetics is the banner because it names what makes the substrate *unlike everything before it*:
+Coherence Cybernetics is the banner because it names what makes the substrate *unlike everything before it*:
 a network that is a self-owning, self-observing, self-healing, censorship-resistant coherent subject —
 operated by no authority, understood through one quantity, and evolvable like life. Its architectures are
 **Unitary** because they are one dissipative dynamics; its platform hosts an ecology of anonymous overlays
@@ -298,5 +356,45 @@ as symbionts; its math is expressive enough to *derive* the optimal and to *reco
 material substrate of a Cyberpunk epoch — not the aesthetic, the infrastructure: **coherence as the
 currency of a networked world that governs itself.**
 
-*Engineering maturity, viability, and the most advanced solutions are the drivers; Coherent Cybernetics is
+*Engineering maturity, viability, and the most advanced solutions are the drivers; Coherence Cybernetics is
 the theory that keeps them one thing.*
+
+---
+
+## 9. Canonical alignment (the CC corpus)
+
+This document instantiates the canonical **Coherence Cybernetics** corpus (`.../applied/coherence-cybernetics/`)
+for anonymous networks. Fidelity notes, so FANOS-original synthesis is never mistaken for canonical result:
+
+**Faithful (direct instances of the canon).** The measures `Φ` (int., `Φ_th=1`), `P = Tr(Γ²)` (`P_crit=2/7`),
+`R = 1/(7P)` (`R_th=1/3`); the readiness gate `Φ≥1 ∧ R≥1/3` = the canon's **L2 viability gate**; fractal
+self-similarity (**T-9.1/9.2**, "a cell is a holon, an organ is a holon…", invariants preserved under scale
+aggregation); the metatheory-as-projection stance (**T-82** `G₂`-rigidity uniqueness); the Fano/Hamming
+syndrome decoder (`gap-algebra §3.5`) that FANOS's telemetry theorem uses.
+
+**Corrections applied here (were wrong in an earlier draft).** (a) The generator is **three-term**
+`−i[H,Γ] + 𝒟 + ℛ` (T-258), and **DIAKRISIS healing is the regenerator `ℛ` (matter), not the dissipator `𝒟`
+(heat, → `I/7` = death)** — the single most important fix. (b) "Good Regulator / Conant–Ashby" is *absent*
+from the canon; the self-model requirement is **T-7.1** (Necessity of Self-Reference) + **T-113** (learning
+needs `R>0`), and `R≥1/3 ⟺ P∈(2/7,3/7]` is a reflexivity **ceiling/Goldilocks window**, not a duty-cycle
+floor. (c) Requisite variety is **`dim ℋ=7`** (dimensional); `Δ` carries the *bandwidth/relaxation rate*
+`λ_gap`, a separate role.
+
+**Glossary delta to adopt going forward.** the regenerator `ℛ` + rate `κ=κ_bootstrap+κ₀·Coh_E`; **E-coherence
+`Coh_E`** + the **No-Zombie floor `Coh_E>1/7`** (T-8.1) — a *derived* minimum self-observation signal that
+grows with environmental noise; the **stress tensor `σ_sys∈ℝ⁷`**, viability `‖σ_sys‖_∞<1` (T-92) — a richer
+diagnostic than one scalar, mapping onto per-node syndromes; **effective temperature `T_eff=(Γ₂/κ₀)k_BT`** —
+the fever quantity; **stability radius `r_stab=√(P−2/7)`** + Lyapunov contraction (T-104), with T-69 "sudden
+death is impossible for small perturbations" underwriting the leading indicator; the **learning/observation
+bounds** T-109 (info), T-111 (measurement back-action `ε≤r_stab`), T-113, and the **`Γ`-tomography sample
+bound `N ≥ (2c²/Δ²)·ln(1/δ)`** — the canonical "cost of scanning yourself" that grounds `design-telemetry.md`;
+**`G₂`-Noether**: 14 charges / 14 Ward identities / 14 sum-rules on the 21 pairwise rates, gauge torus
+`U(1)⁷⋊PSL(2,7)` (order 168) — the same `Aut(PG(2,2))` FANOS already uses; the **metriplectic** structure
+(T-262) "one rotation + two slides"; the attractor hierarchy `I/7 → ρ*_Ω → Γ*_coh`.
+
+**FANOS-original extensions (consistent with, but not stated in, the canon).** The projective-network results
+— `O(1)` cross-product rendezvous, quorum-by-line-intersection, the cascade line `r*=1/√(N−1)`, the healing
+locality `1/9`, the `K₇` Fano-blindness of pairwise monitoring, and the **Minimal Self-Observation Overhead
+theorem** (`design-telemetry.md`) — are FANOS's own projective-geometry contributions, grounded in the
+canon's Fano/`PG(2,2)`/Hamming machinery and its measurement bounds, and presented as extensions, not as
+canonical theorems.
