@@ -56,12 +56,14 @@ node code are implemented and verified:
 | `fanos-nyx` | L5 | threshold-sheaf onion: geometric flag paths, `t`-of-`q+1` hops, holonomic ratchet, mixing | ✅ verified |
 | `fanos-pqcrypto` | L6 | **real** hybrid post-quantum crypto: Ed25519+ML-DSA-65 signatures, X25519+ML-KEM-768 KEM, node identity | ✅ verified |
 | `fanos-vrf` | L6 | **real** verifiable random function (ristretto255 ECVRF) → self-certifying epoch coordinates, **Feldman VSS**, and **interactive multi-dealer DKG** (a joint key no party holds) | ✅ verified |
+| `fanos-incentives` | L7 | **anonymous relay credits** — a ristretto255 VOPRF (blind tokens + DLEQ proof) so payment can't deanonymise (Privacy-Pass class) | ✅ verified |
+| `fanos-keygen` | L6 | **distributed key generation as a running engine** — a cell runs a `t`-of-`n` DKG over the overlay and agrees on a joint key | ✅ verified |
 | `fanos-aphantos` | L5 | KEM-sealed onion + the `NyxNode` routing engine, with **Poisson mixing** and **cover traffic** | ✅ verified |
 | `fanos-calypso` | services | self-certifying `.fanos` addresses, epoch-rotating rendezvous, hashcash PoW, threshold hosting — plus the running hidden-service flow over the overlay | ✅ verified |
 | `fanos-proteus` | XIII | polymorphic transport: beacon-rotating shape, moving-target bridges, morphs, and the `ProteusShaper` driver wrapper | ✅ verified |
 | `fanos-runtime` | — | the node as a **sans-I/O** state machine (`OverlayNode`) — witness-corroborated liveness, rendezvous, the **sense→act** healing loop, **L4 storage**, reliable **streams**, and **membership/JOIN + epoch beacon** (flooded key distribution, adopt-max consensus) | ✅ verified |
 | `fanos-sim` | — | deterministic in-process **simulator** driving the real engines (faults, traces, metrics) + the **coherence observatory** that forecasts cascades | ✅ verified |
-| `fanos-quic` | L2 | the **second sans-I/O driver** — the *same* engine over real UDP + QUIC (TLS 1.3), optionally PROTEUS-shaped, with **cert-bound self-certifying identity** (mutual TLS) | ✅ verified |
+| `fanos-quic` | L2 | the **second sans-I/O driver** — the *same* engine over real UDP + QUIC (TLS 1.3), optionally PROTEUS-shaped, with **cert-bound self-certifying identity** (mutual TLS), **persistent credentials** (durable coordinate), keep-alive/idle tuning, and `tracing` | ✅ verified |
 | `fanos-cli` / `fanos-bench` | — | `fanos-verify` reproduces V1–V22; `fanos-bench` benchmarks the hot paths (rendezvous ≈ 5 ns) | ✅ verified |
 
 The node logic is written **sans-I/O** (see [`docs/architecture.md`](docs/architecture.md)): it
@@ -98,7 +100,7 @@ $ cargo run -p fanos-sim --bin fanos-sim-demo     # drive a real cell: crash, pa
 $ cargo run -p fanos-sim --example forecast       # forecast a cascade before it collapses
 $ cargo run -p fanos-sim --example catastrophe    # loss/churn/scale robustness probe
 $ cargo bench -p fanos-bench                       # hot-path micro-benchmarks
-$ cargo test --workspace                          # 340 tests
+$ cargo test --workspace                          # 349 tests
 ```
 
 The verifier reproduces the specification's headline numbers exactly, e.g. the NYX endpoint

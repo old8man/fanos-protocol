@@ -1,0 +1,25 @@
+# fanos-keygen — distributed key generation as a running node engine.
+#
+# Drives the verified multi-dealer DKG (fanos-vrf::dkg) over the overlay: a cell runs a t-of-n DKG
+# by exchanging Feldman dealings as DkgDeal frames and converges on a joint public key no node holds.
+[package]
+name = "fanos-keygen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS distributed key generation as a sans-I/O node engine (networked multi-dealer DKG)"
+keywords = ["dkg", "threshold", "sans-io", "overlay", "fanos"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+fanos-field = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-wire = { workspace = true, features = ["std"] }
+fanos-runtime = { workspace = true, features = ["std"] }
+fanos-vrf = { path = "../fanos-vrf", version = "0.1.0" }
+
+[lints]
+workspace = true

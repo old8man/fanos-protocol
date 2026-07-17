@@ -1,0 +1,24 @@
+# fanos-incentives — L7 anonymous relay credits (VOPRF blind tokens).
+#
+# Payment that cannot deanonymise: a relay earns/redeems blind-signed credits whose issuance is
+# unlinkable to their redemption (Privacy Pass class, RFC 9497/9578), over the same ristretto255
+# group the rest of FANOS's verifiable crypto uses.
+[package]
+name = "fanos-incentives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS L7 incentives: VOPRF anonymous relay credits (unlinkable blind tokens)"
+keywords = ["voprf", "privacy-pass", "anonymous-credentials", "incentives", "fanos"]
+categories = ["cryptography"]
+
+[dependencies]
+fanos-crypto = { workspace = true, features = ["alloc"] }
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+rand_core = { version = "0.6", default-features = false }
+
+[lints]
+workspace = true

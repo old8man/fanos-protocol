@@ -62,6 +62,7 @@ fn note_desc(note: &Notification) -> String {
         ),
         Notification::MemberJoined { coord, .. } => format!("MemberJoined {}", fmt_coord(*coord)),
         Notification::EpochAdvanced(e) => format!("EpochAdvanced {e}"),
+        Notification::DkgComplete(y) => format!("DkgComplete {}", short_digest(y)),
     }
 }
 

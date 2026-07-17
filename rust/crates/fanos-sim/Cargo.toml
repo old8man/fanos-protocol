@@ -34,6 +34,8 @@ fanos-core = { workspace = true, features = ["std"] }
 fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
 # For the NYX mixnet scenarios (anonymity-set entropy math).
 fanos-nyx = { workspace = true, features = ["std"] }
+# For the networked DKG scenario (DkgNode engine driven over the sim).
+fanos-keygen = { path = "../fanos-keygen", version = "0.1.0" }
 
 [lints]
 workspace = true

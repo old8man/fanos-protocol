@@ -99,6 +99,18 @@ impl Participant {
         true
     }
 
+    /// Ingest a single (share, commitment) addressed to this participant — the networked form,
+    /// where a dealer sends each holder only *its* share plus the public commitment. Verifies the
+    /// share and folds it in; a mismatched index or a failed Feldman check is rejected.
+    pub fn ingest_share(&mut self, share: &VssShare, commitment: &VssCommitment) -> bool {
+        if share.index() != self.index || !vss::verify_share(share, commitment) {
+            return false;
+        }
+        self.accumulator += share.value();
+        self.accepted += 1;
+        true
+    }
+
     /// How many dealings this participant accepted.
     #[must_use]
     pub fn accepted(&self) -> usize {
@@ -115,9 +127,16 @@ impl Participant {
 /// The joint public key `Y = Σ C_0` over the qualified dealings.
 #[must_use]
 pub fn joint_public_key(qualified: &[&Dealing]) -> [u8; 32] {
+    joint_public_from_commitments(&qualified.iter().map(|d| d.commitment()).collect::<Vec<_>>())
+}
+
+/// The joint public key `Y = Σ C_0` from just the qualified dealers' commitments — the form a
+/// networked participant computes from the commitments it collected (it never sees others' shares).
+#[must_use]
+pub fn joint_public_from_commitments(commitments: &[&VssCommitment]) -> [u8; 32] {
     let mut y = RistrettoPoint::identity();
-    for dealing in qualified {
-        y += dealing.commitment().commitment_point();
+    for commitment in commitments {
+        y += commitment.commitment_point();
     }
     y.compress().to_bytes()
 }

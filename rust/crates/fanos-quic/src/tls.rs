@@ -83,20 +83,70 @@ pub(crate) fn node_configs() -> Result<(ServerConfig, ClientConfig), TlsError> {
     Ok((server, client))
 }
 
-/// Build a **mutual-TLS** `(server, client, cert)` triple for a self-certifying node. Both ends
-/// present the node's certificate and require the peer's, so each can derive the peer's overlay
-/// coordinate `MapToPoint(H(cert))` from the authenticated handshake — no directory-trust, no
-/// HELLO. Returns the node's own certificate DER (its identity), used to derive its coordinate.
+/// A node's long-term TLS identity — its certificate and private key. Persist these bytes
+/// ([`to_bytes`](NodeCredentials::to_bytes)) and reload them ([`from_bytes`](NodeCredentials::from_bytes))
+/// to keep the same self-certifying coordinate `MapToPoint(H(cert))` across restarts.
+#[derive(Clone, Debug)]
+pub struct NodeCredentials {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+}
+
+impl NodeCredentials {
+    /// Mint fresh credentials (a self-signed certificate + key).
+    pub fn generate() -> Result<Self, TlsError> {
+        let certified = rcgen::generate_simple_self_signed(vec!["fanos.node".to_owned()])
+            .map_err(|_| TlsError::Cert)?;
+        Ok(Self {
+            cert_der: certified.cert.der().to_vec(),
+            key_der: certified.signing_key.serialize_der(),
+        })
+    }
+
+    /// The certificate DER — the node's identity (its coordinate is `MapToPoint(H(cert))`).
+    #[must_use]
+    pub fn cert_der(&self) -> &[u8] {
+        &self.cert_der
+    }
+
+    /// Serialize as `certlen(4) ‖ cert ‖ key` for persistence.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.cert_der.len() + self.key_der.len());
+        out.extend_from_slice(&(self.cert_der.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.cert_der);
+        out.extend_from_slice(&self.key_der);
+        out
+    }
+
+    /// Reload persisted credentials, or `None` if the bytes are malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let len = u32::from_be_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+        let cert_der = bytes.get(4..4 + len)?.to_vec();
+        let key_der = bytes.get(4 + len..)?.to_vec();
+        Some(Self { cert_der, key_der })
+    }
+}
+
+/// Build a **mutual-TLS** `(server, client, cert)` triple with fresh credentials.
 pub(crate) fn node_configs_mutual()
 -> Result<(ServerConfig, ClientConfig, CertificateDer<'static>), TlsError> {
+    node_configs_mutual_from(&NodeCredentials::generate()?)
+}
+
+/// Build a **mutual-TLS** `(server, client, cert)` triple from given credentials. Both ends present
+/// the node's certificate and require the peer's, so each derives the peer's overlay coordinate
+/// `MapToPoint(H(cert))` from the authenticated handshake — no directory-trust, no HELLO. Returns
+/// the node's own certificate DER (its identity), used to derive its coordinate.
+pub(crate) fn node_configs_mutual_from(
+    creds: &NodeCredentials,
+) -> Result<(ServerConfig, ClientConfig, CertificateDer<'static>), TlsError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-    let certified = rcgen::generate_simple_self_signed(vec!["fanos.node".to_owned()])
-        .map_err(|_| TlsError::Cert)?;
-    let cert_der: CertificateDer<'static> = certified.cert.der().clone();
-    let key_bytes = certified.signing_key.serialize_der();
-    let server_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_bytes.clone()));
-    let client_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_bytes));
+    let cert_der: CertificateDer<'static> = CertificateDer::from(creds.cert_der.clone());
+    let server_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(creds.key_der.clone()));
+    let client_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(creds.key_der.clone()));
 
     // Server: require and accept any client certificate (identity is the key, not a CA).
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())

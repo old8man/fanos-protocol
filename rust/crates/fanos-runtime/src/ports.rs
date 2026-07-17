@@ -185,6 +185,9 @@ pub enum Notification {
     },
     /// The epoch beacon advanced to this value (spec §L3).
     EpochAdvanced(u32),
+    /// A distributed key generation completed (spec §L6): the 32-byte joint public key the cell
+    /// agreed on, whose secret no single node holds.
+    DkgComplete([u8; 32]),
 }
 
 /// The sans-I/O node engine: a pure state machine over virtual time.

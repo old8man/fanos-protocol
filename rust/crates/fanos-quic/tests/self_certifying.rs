@@ -9,7 +9,9 @@ use std::time::Duration as StdDuration;
 
 use fanos_field::F7;
 use fanos_geometry::Point;
-use fanos_quic::{Directory, spawn_self_certifying};
+use fanos_quic::{
+    Directory, NodeCredentials, spawn_self_certifying, spawn_self_certifying_persistent,
+};
 use fanos_runtime::{Command, Config, Engine, Notification, OverlayNode};
 
 fn make_node(coord: Point<F7>) -> Box<dyn Engine + Send> {
@@ -79,4 +81,24 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
         "an impostor whose cert does not certify the dialed coordinate must be rejected"
     );
     let _ = c; // keep C alive for the duration
+}
+
+#[tokio::test]
+async fn persistent_credentials_keep_the_same_coordinate_across_restarts() {
+    // Mint an identity, persist it to bytes, and reload it (as an app would across a restart).
+    let creds = NodeCredentials::generate().expect("generate credentials");
+    let reloaded = NodeCredentials::from_bytes(&creds.to_bytes()).expect("reload credentials");
+
+    let a = spawn_self_certifying_persistent::<F7>(&creds, make_node, Directory::new())
+        .await
+        .expect("spawn with credentials");
+    let coord = a.address();
+    a.shutdown();
+
+    // A fresh node from the *same* persisted credentials occupies the *same* coordinate — a durable
+    // overlay identity, not a new one each boot.
+    let b = spawn_self_certifying_persistent::<F7>(&reloaded, make_node, Directory::new())
+        .await
+        .expect("spawn from reloaded credentials");
+    assert_eq!(b.address(), coord, "coordinate is stable across restarts");
 }

@@ -15,6 +15,7 @@
 use alloc::vec::Vec;
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::traits::Identity;
 use curve25519_dalek::{RistrettoPoint, Scalar};
 use rand_core::{CryptoRng, RngCore};
@@ -102,6 +103,24 @@ impl VssShare {
         Self { index, value }
     }
 
+    /// The `index(1) ‖ value(32)` wire encoding (33 bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 33] {
+        let mut out = [0u8; 33];
+        out[0] = self.index;
+        out[1..].copy_from_slice(&self.value.to_bytes());
+        out
+    }
+
+    /// Decode a share from its 33-byte encoding, or `None` if the value is not canonical.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let index = *bytes.first()?;
+        let value_bytes: [u8; 32] = bytes.get(1..33)?.try_into().ok()?;
+        let value = Option::from(Scalar::from_canonical_bytes(value_bytes))?;
+        Some(Self { index, value })
+    }
+
     /// Tamper with the share value (test-only, to model a cheating dealer).
     #[cfg(test)]
     pub(crate) fn corrupt(&mut self) {
@@ -128,6 +147,31 @@ impl VssCommitment {
             .first()
             .copied()
             .unwrap_or_else(RistrettoPoint::identity)
+    }
+
+    /// The `t(1) ‖ C_0 ‖ … ‖ C_{t-1}` wire encoding (`1 + 32t` bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 32 * self.coeffs.len());
+        out.push(self.coeffs.len() as u8);
+        for c in &self.coeffs {
+            out.extend_from_slice(c.compress().as_bytes());
+        }
+        out
+    }
+
+    /// Decode a commitment, or `None` if a coefficient is not a valid group element.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let t = *bytes.first()? as usize;
+        let mut coeffs = Vec::with_capacity(t);
+        for i in 0..t {
+            let start = 1 + i * 32;
+            let chunk = bytes.get(start..start + 32)?;
+            let point = CompressedRistretto::from_slice(chunk).ok()?.decompress()?;
+            coeffs.push(point);
+        }
+        Some(Self { coeffs })
     }
 }
 

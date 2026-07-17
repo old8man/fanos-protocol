@@ -30,7 +30,20 @@ use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
 use crate::identity::{coordinate_from_cert, peer_cert_der};
-use crate::tls::{TlsError, node_configs, node_configs_mutual};
+use crate::tls::{
+    NodeCredentials, TlsError, node_configs, node_configs_mutual, node_configs_mutual_from,
+};
+
+/// Production transport tuning: a keep-alive so idle overlay links survive NAT/firewall timeouts,
+/// and a bounded idle timeout so a dead peer's connection is reaped rather than lingering.
+fn tuned_transport() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+        tc.max_idle_timeout(Some(idle));
+    }
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    Arc::new(tc)
+}
 
 /// An optional PROTEUS transport shaper, shared across a node's connections. When present, every
 /// frame (including the identity HELLO) is polymorph-obfuscated on the wire (spec §13.2).
@@ -174,6 +187,30 @@ pub async fn spawn_self_certifying<F: Field + 'static>(
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, cert) = node_configs_mutual()?;
+    self_certifying_inner::<F, _>(server, client, &cert, make_engine, directory)
+}
+
+/// Like [`spawn_self_certifying`], but reuses persisted [`NodeCredentials`] so the node keeps the
+/// **same coordinate across restarts** — a durable overlay identity.
+pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
+    credentials: &NodeCredentials,
+    make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
+    directory: Directory,
+) -> Result<NodeHandle, QuicError> {
+    let (server, client, cert) = node_configs_mutual_from(credentials)?;
+    self_certifying_inner::<F, _>(server, client, &cert, make_engine, directory)
+}
+
+fn self_certifying_inner<F: Field + 'static, M>(
+    server: ServerConfig,
+    client: ClientConfig,
+    cert: &rustls::pki_types::CertificateDer<'static>,
+    make_engine: M,
+    directory: Directory,
+) -> Result<NodeHandle, QuicError>
+where
+    M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
+{
     let engine = make_engine(coordinate_from_cert::<F>(cert.as_ref()));
     let derive: Identity = Some(Arc::new(|der: &[u8]| {
         Some(coordinate_from_cert::<F>(der).coords())
@@ -203,16 +240,21 @@ fn spawn_inner(
     directory: Directory,
     shaper: Shaper,
     identity: Identity,
-    server_cfg: ServerConfig,
-    client_cfg: ClientConfig,
+    mut server_cfg: ServerConfig,
+    mut client_cfg: ClientConfig,
 ) -> Result<NodeHandle, QuicError> {
     let addr = engine.address();
+
+    // Apply production transport tuning (keep-alive + idle timeout) to both directions.
+    server_cfg.transport_config(tuned_transport());
+    client_cfg.transport_config(tuned_transport());
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut endpoint = Endpoint::server(server_cfg, bind)?;
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;
     directory.insert(addr, local_addr);
+    tracing::debug!(?addr, %local_addr, self_certifying = identity.is_some(), "fanos-quic node up");
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<Input>();
     let (send_tx, send_rx) = mpsc::unbounded_channel::<SendRequest>();
@@ -337,7 +379,13 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
         // Self-certifying mode: the peer's certificate must certify the coordinate we dialed —
         // otherwise the address resolved to an impostor and we drop the connection.
         Some(derive) => {
-            if peer_cert_der(&conn).and_then(|der| derive(&der)) != Some(to) {
+            let peer = peer_cert_der(&conn).and_then(|der| derive(&der));
+            if peer != Some(to) {
+                tracing::warn!(
+                    ?to,
+                    ?peer,
+                    "peer certificate does not certify the dialed coordinate; rejecting"
+                );
                 return None;
             }
         }
@@ -385,15 +433,17 @@ async fn accept_loop(
                 return;
             };
             // Learn the peer's coordinate: from its certificate (self-certifying) or its HELLO.
-            let from = match &identity {
-                Some(derive) => match peer_cert_der(&conn).and_then(|der| derive(&der)) {
-                    Some(coord) => coord,
-                    None => return,
-                },
-                None => match read_hello(&conn, &shaper).await {
-                    Some(coord) => coord,
-                    None => return,
-                },
+            let from = if let Some(derive) = &identity {
+                let Some(coord) = peer_cert_der(&conn).and_then(|der| derive(&der)) else {
+                    tracing::debug!("inbound peer presented no certifiable identity; dropping");
+                    return;
+                };
+                coord
+            } else {
+                let Some(coord) = read_hello(&conn, &shaper).await else {
+                    return;
+                };
+                coord
             };
             if let Ok(mut map) = conns.lock() {
                 map.insert(from, conn.clone());

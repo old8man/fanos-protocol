@@ -23,6 +23,8 @@ members = [
     "crates/fanos-quic",
     "crates/fanos-runtime",
     "crates/fanos-vrf",
+    "crates/fanos-incentives",
+    "crates/fanos-keygen",
     "crates/fanos-sim",
     "crates/fanos-cli",
     "crates/fanos-bench",

@@ -34,6 +34,9 @@ mod identity;
 mod tls;
 
 pub use directory::Directory;
-pub use driver::{NodeHandle, QuicError, spawn, spawn_self_certifying, spawn_shaped};
+pub use driver::{
+    NodeHandle, QuicError, spawn, spawn_self_certifying, spawn_self_certifying_persistent,
+    spawn_shaped,
+};
 pub use identity::coordinate_from_cert;
-pub use tls::TlsError;
+pub use tls::{NodeCredentials, TlsError};

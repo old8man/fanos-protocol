@@ -35,6 +35,8 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+# Structured, level-filtered observability (no-op unless the app installs a subscriber).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 fanos-field = { workspace = true, features = ["std"] }
