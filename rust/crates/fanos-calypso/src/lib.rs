@@ -23,6 +23,7 @@ pub mod balance;
 pub mod hosting;
 pub mod pow;
 pub mod rendezvous;
+pub mod stabilize;
 
 use alloc::vec::Vec;
 
