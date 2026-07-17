@@ -168,6 +168,189 @@ impl ThresholdSealed {
         let key32: [u8; 32] = key.try_into().map_err(|_| ThresholdError::Malformed)?;
         aead_open(&key32, &self.nonce, &self.ciphertext)
     }
+
+    /// Canonically serialize the layer: `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖
+    /// [sealed_share]*` (each sealed share is fixed-size).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&(self.sealed_shares.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        for slot in &self.sealed_shares {
+            out.extend_from_slice(slot);
+        }
+        out
+    }
+
+    /// Decode a layer from [`to_bytes`](Self::to_bytes), or `None` if malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let nonce: [u8; NONCE_LEN] = bytes.get(..NONCE_LEN)?.try_into().ok()?;
+        let members =
+            u16::from_be_bytes(bytes.get(NONCE_LEN..NONCE_LEN + 2)?.try_into().ok()?) as usize;
+        let ct_len =
+            u32::from_be_bytes(bytes.get(NONCE_LEN + 2..NONCE_LEN + 6)?.try_into().ok()?) as usize;
+        let mut pos = NONCE_LEN + 6;
+        let ciphertext = bytes.get(pos..pos.checked_add(ct_len)?)?.to_vec();
+        pos += ct_len;
+        let mut sealed_shares = Vec::with_capacity(members.min(4096));
+        for _ in 0..members {
+            let slot = bytes.get(pos..pos.checked_add(SEALED_SHARE_LEN)?)?.to_vec();
+            pos += SEALED_SHARE_LEN;
+            sealed_shares.push(slot);
+        }
+        Some(Self {
+            nonce,
+            ciphertext,
+            sealed_shares,
+        })
+    }
+}
+
+// --- Nested threshold onion over a circuit of hop LINES (the "hop is a line" onion) ---
+
+const CMD_DELIVER: u8 = 0;
+const CMD_NEXT: u8 = 1;
+
+/// One hop of a threshold circuit: the hop line's coordinate (where the packet is routed) and the
+/// KEM public keys of its `q+1` members, in member order.
+pub struct HopLine<'a> {
+    /// The hop line's coordinate (the next-hop address a peeling hop learns).
+    pub line: fanos_geometry::Triple,
+    /// The line members' hybrid KEM public keys, in order.
+    pub members: &'a [&'a HybridKemPublic],
+}
+
+/// The outcome of peeling one threshold hop.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ThresholdPeel {
+    /// Forward the inner onion to the next hop line at `next`.
+    Forward {
+        /// The next hop line's coordinate.
+        next: fanos_geometry::Triple,
+        /// The inner onion bytes.
+        onion: Vec<u8>,
+    },
+    /// The payload reached its destination.
+    Deliver {
+        /// The delivered payload.
+        payload: Vec<u8>,
+    },
+}
+
+fn coord_to_bytes(coord: fanos_geometry::Triple) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    let (chunks, _) = out.as_chunks_mut::<4>();
+    for (chunk, w) in chunks.iter_mut().zip(coord) {
+        *chunk = w.to_be_bytes();
+    }
+    out
+}
+
+fn coord_from_bytes(b: &[u8]) -> Option<fanos_geometry::Triple> {
+    Some([
+        u32::from_be_bytes(b.get(0..4)?.try_into().ok()?),
+        u32::from_be_bytes(b.get(4..8)?.try_into().ok()?),
+        u32::from_be_bytes(b.get(8..12)?.try_into().ok()?),
+    ])
+}
+
+/// Build a **nested threshold onion** over `hops`: each layer is a [`ThresholdSealed`] to that hop
+/// line's members, so a hop is peeled only by a threshold `t` of its `q+1` members — the "a hop is a
+/// line" property (spec §5.2). A peeling hop learns only the *next* hop line, never the whole path.
+/// All per-hop keys, nonces, sharing randomness, and KEM randomness derive from `seed` (a real
+/// CSPRNG in production; a fixed seed under the deterministic simulator).
+pub fn seal_onion(
+    hops: &[HopLine<'_>],
+    threshold: u8,
+    payload: &[u8],
+    seed: &[u8],
+) -> Result<Vec<u8>, ThresholdError> {
+    if hops.is_empty() {
+        return Err(ThresholdError::Malformed);
+    }
+    let mut inner = payload.to_vec();
+    let last = hops.len() - 1;
+    for (k, hop) in hops.iter().enumerate().rev() {
+        // Routing command: forward to the next line, or deliver.
+        let mut cmd = Vec::with_capacity(1 + 12 + inner.len());
+        if k == last {
+            cmd.push(CMD_DELIVER);
+        } else if let Some(next) = hops.get(k + 1) {
+            cmd.push(CMD_NEXT);
+            cmd.extend_from_slice(&coord_to_bytes(next.line));
+        }
+        cmd.extend_from_slice(&inner);
+
+        // Per-hop key material from the seed (labelled by hop index for separation).
+        let tag = |label: &str| {
+            let mut s = seed.to_vec();
+            s.extend_from_slice(label.as_bytes());
+            s.extend_from_slice(&(k as u32).to_be_bytes());
+            s
+        };
+        let key = hash_labeled("FANOS-v1/threshold-onion-key", &tag("k"));
+        let nonce_full = hash_labeled("FANOS-v1/threshold-onion-nonce", &tag("n"));
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(
+            nonce_full
+                .get(..NONCE_LEN)
+                .ok_or(ThresholdError::Malformed)?,
+        );
+        let key_rnd = sharing_randomness(&tag("r"), threshold);
+        let kem_seed = tag("kem");
+
+        let sealed = ThresholdSealed::seal(
+            &cmd,
+            &key,
+            &nonce,
+            threshold,
+            hop.members,
+            &key_rnd,
+            &kem_seed,
+        )?;
+        inner = sealed.to_bytes();
+    }
+    Ok(inner)
+}
+
+/// `(threshold − 1) · 32` bytes of deterministic sharing randomness from a seed.
+fn sharing_randomness(seed: &[u8], threshold: u8) -> Vec<u8> {
+    let n = usize::from(threshold.saturating_sub(1)) * 32;
+    let mut out = alloc::vec![0u8; n];
+    fanos_crypto::hash::hash_xof("FANOS-v1/threshold-onion-sharing", seed, &mut out);
+    out
+}
+
+/// Peel one threshold hop: given `members` — at least `threshold` `(index, secret)` pairs of the
+/// current hop line — reconstruct the layer key and reveal the routing command. Returns whether to
+/// forward the inner onion to the next line or deliver the payload. Fewer than `threshold` members
+/// (or wrong secrets) fail with [`ThresholdError::Aead`].
+pub fn peel_onion(
+    onion: &[u8],
+    members: &[(usize, &HybridKemSecret)],
+) -> Result<ThresholdPeel, ThresholdError> {
+    let sealed = ThresholdSealed::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
+    let shares: Vec<Share> = members
+        .iter()
+        .filter_map(|(i, sk)| sealed.member_share(*i, sk))
+        .collect();
+    let cmd = sealed.open(&shares)?;
+    let (&tag, rest) = cmd.split_first().ok_or(ThresholdError::Malformed)?;
+    match tag {
+        CMD_DELIVER => Ok(ThresholdPeel::Deliver {
+            payload: rest.to_vec(),
+        }),
+        CMD_NEXT => {
+            let next = coord_from_bytes(rest.get(..12).ok_or(ThresholdError::Malformed)?)
+                .ok_or(ThresholdError::Malformed)?;
+            let onion = rest.get(12..).ok_or(ThresholdError::Malformed)?.to_vec();
+            Ok(ThresholdPeel::Forward { next, onion })
+        }
+        _ => Err(ThresholdError::Malformed),
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +413,88 @@ mod tests {
         .unwrap();
         // Member 0's slot cannot be opened with member 1's secret.
         assert!(layer.member_share(0, &members[1].0).is_none());
+    }
+
+    #[test]
+    fn a_threshold_circuit_routes_hop_by_hop_and_delivers() {
+        use fanos_geometry::Point;
+        // A 3-hop circuit; each hop is a line of 5 members with threshold 3.
+        let t = 3u8;
+        let lines: Vec<Vec<(HybridKemSecret, HybridKemPublic)>> =
+            (0..3).map(|h| line(5, 20 + h as u8)).collect();
+        // Borrow the public keys per hop (outlives the HopLine slice below).
+        let pubs: Vec<Vec<&HybridKemPublic>> = lines
+            .iter()
+            .map(|kps| kps.iter().map(|(_, p)| p).collect())
+            .collect();
+        let hops: Vec<HopLine<'_>> = pubs
+            .iter()
+            .enumerate()
+            .map(|(h, members)| HopLine {
+                line: Point::<fanos_field::F2>::at(h).coords(),
+                members,
+            })
+            .collect();
+
+        let payload = b"threshold-routed anonymous hello";
+        let mut onion = seal_onion(&hops, t, payload, b"circuit-seed").unwrap();
+
+        // Route through each hop: a threshold subset of the line's members cooperate to peel.
+        for kps in &lines {
+            let members: Vec<(usize, &HybridKemSecret)> = kps
+                .iter()
+                .take(usize::from(t))
+                .enumerate()
+                .map(|(i, (sk, _))| (i, sk))
+                .collect();
+            match peel_onion(&onion, &members).unwrap() {
+                ThresholdPeel::Forward { onion: inner, .. } => onion = inner,
+                ThresholdPeel::Deliver { payload: got } => {
+                    assert_eq!(got, payload, "the payload arrives intact");
+                    return;
+                }
+            }
+        }
+        panic!("onion never delivered");
+    }
+
+    #[test]
+    fn below_threshold_members_cannot_peel_a_hop() {
+        use fanos_geometry::Point;
+        let t = 4u8;
+        let kps = line(6, 30);
+        let members_pub: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
+        let hop = HopLine {
+            line: Point::<fanos_field::F2>::at(0).coords(),
+            members: &members_pub,
+        };
+        let onion = seal_onion(&[hop], t, b"secret", b"s").unwrap();
+        // Only t-1 members try — the reconstructed key is wrong and AEAD auth fails.
+        let too_few: Vec<(usize, &HybridKemSecret)> = kps
+            .iter()
+            .take(usize::from(t) - 1)
+            .enumerate()
+            .map(|(i, (sk, _))| (i, sk))
+            .collect();
+        assert_eq!(peel_onion(&onion, &too_few), Err(ThresholdError::Aead));
+    }
+
+    #[test]
+    fn a_threshold_layer_round_trips_through_bytes() {
+        let members = line(5, 40);
+        let pubs: Vec<&HybridKemPublic> = members.iter().map(|(_, p)| p).collect();
+        let layer = ThresholdSealed::seal(
+            b"cmd",
+            &[1u8; 32],
+            &[2u8; 12],
+            3,
+            &pubs,
+            &randomness(2 * 32),
+            b"s",
+        )
+        .unwrap();
+        let decoded = ThresholdSealed::from_bytes(&layer.to_bytes()).unwrap();
+        assert_eq!(decoded, layer);
     }
 
     #[test]
