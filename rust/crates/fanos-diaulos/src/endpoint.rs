@@ -218,4 +218,111 @@ mod tests {
         service_got.extend_from_slice(&service.read());
         assert_eq!(service_got, up, "recovered despite round-0 tampering");
     }
+
+    #[test]
+    fn empty_streams_complete_cleanly() {
+        // Both sides close without writing a byte. `finish()` still seals one empty FIN-bearing
+        // segment, so each receiver observes the close and the connection converges rather than hanging.
+        let (mut client, mut service) = endpoints();
+        client.finish();
+        service.finish();
+        let (client_got, service_got) = run(&mut client, &mut service, |_, _| false, |_, _| false);
+        assert!(client_got.is_empty() && service_got.is_empty(), "no bytes either way");
+        assert!(client.is_done() && service.is_done(), "an empty exchange still completes");
+    }
+
+    #[test]
+    fn boundary_payload_sizes_round_trip_exactly() {
+        // Sizes straddling the MAX_SEGMENT (1024) and window (32 segments = 32768 bytes) boundaries —
+        // the off-by-one cases where segmentation or the sliding window is most likely to misbehave.
+        for size in [0usize, 1, 1023, 1024, 1025, 2047, 2048, 32767, 32768, 32769, 40960] {
+            let (mut client, mut service) = endpoints();
+            let up: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+            client.write(&up);
+            client.finish();
+            service.finish();
+            let (_c, service_got) = run(&mut client, &mut service, |_, _| false, |_, _| false);
+            assert_eq!(service_got, up, "payload of {size} bytes round-trips exactly");
+        }
+    }
+
+    #[test]
+    fn converges_under_sustained_alternating_loss() {
+        // Loss on *every* round (not just round 0): position k is dropped on rounds of one parity and
+        // delivered on the other, so every cell eventually gets through and selective repeat converges.
+        let (mut client, mut service) = endpoints();
+        let up: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(11)) as u8).collect();
+        let down: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(13)) as u8).collect();
+        client.write(&up);
+        client.finish();
+        service.write(&down);
+        service.finish();
+        let (client_got, service_got) = run(
+            &mut client,
+            &mut service,
+            |round, k| (round + k).is_multiple_of(2),
+            |round, k| !(round + k).is_multiple_of(2),
+        );
+        assert_eq!(service_got, up);
+        assert_eq!(client_got, down);
+    }
+
+    #[test]
+    fn converges_under_heavy_two_thirds_loss() {
+        // Drop two of every three cells in *both* directions, every round. Recovery is slow but must
+        // still terminate; a dedicated loop grants more rounds than the strict happy-path `run`.
+        let (mut client, mut service) = endpoints();
+        let up: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(29)) as u8).collect();
+        client.write(&up);
+        client.finish();
+        service.finish();
+        let mut service_got = Vec::new();
+        let mut round = 0usize;
+        while !(client.is_done() && service.is_done()) {
+            for (k, cell) in client.outbound().into_iter().enumerate() {
+                if (round + k).is_multiple_of(3) {
+                    service.on_cell(&cell);
+                }
+            }
+            service_got.extend_from_slice(&service.read());
+            for (k, cell) in service.outbound().into_iter().enumerate() {
+                if (round + k).is_multiple_of(3) {
+                    client.on_cell(&cell);
+                }
+            }
+            round += 1;
+            assert!(round < 400, "heavy loss must still converge");
+        }
+        service_got.extend_from_slice(&service.read());
+        assert_eq!(service_got, up, "recovered under sustained 2/3 loss");
+    }
+
+    #[test]
+    fn a_late_duplicate_data_cell_is_harmless() {
+        // A stale/replayed DATA cell arriving after its sequence was already delivered must be absorbed
+        // idempotently — no duplicate bytes surface to the application, no panic.
+        let (mut client, mut service) = endpoints();
+        client.write(b"exactly once");
+        client.finish();
+        service.finish();
+
+        // Capture the client's first-round cells, deliver them, then deliver them AGAIN next round.
+        let first = client.outbound();
+        for cell in &first {
+            service.on_cell(cell);
+        }
+        let once = service.read();
+        for cell in &first {
+            service.on_cell(cell); // replay
+        }
+        let after_replay = service.read();
+        assert_eq!(once, b"exactly once", "delivered once");
+        assert!(after_replay.is_empty(), "the replay surfaced no additional bytes");
+
+        // And the exchange still completes normally afterward.
+        let (_c, mut service_got) = run(&mut client, &mut service, |_, _| false, |_, _| false);
+        let mut all = once;
+        all.append(&mut service_got);
+        assert_eq!(all, b"exactly once");
+    }
 }

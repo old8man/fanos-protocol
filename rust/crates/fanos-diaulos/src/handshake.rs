@@ -233,6 +233,10 @@ mod tests {
         );
         // A truncated bundle is rejected.
         assert!(service_public_from_bundle(&bundle[..100]).is_none());
+        // Exact boundary: the full bundle parses; one byte short does not.
+        let exact = ED25519_PK_LEN + MLDSA65_PK_LEN + PUBLIC_LEN;
+        assert_eq!(bundle.len(), exact);
+        assert!(service_public_from_bundle(&bundle[..exact - 1]).is_none());
     }
 
     #[test]
@@ -307,5 +311,75 @@ mod tests {
         assert!(ServerHandshake::respond(&service, &[0u8; 10], &mut rng).is_none());
         let (client_hs, _) = ClientHandshake::start(&service.public, &mut rng);
         assert!(client_hs.finish(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn hellos_one_byte_off_the_exact_length_are_rejected() {
+        // The length gates are exact equality, so both the short and long neighbours must be refused.
+        let mut rng = SeedRng::from_seed(b"diaulos-hs-len");
+        let service = StaticKeypair::generate(&mut rng);
+        assert!(ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN - 1], &mut rng).is_none());
+        assert!(ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN + 1], &mut rng).is_none());
+        let (hs_short, _) = ClientHandshake::start(&service.public, &mut rng);
+        assert!(hs_short.finish(&vec![0u8; SERVER_HELLO_LEN - 1]).is_none());
+        let (hs_long, _) = ClientHandshake::start(&service.public, &mut rng);
+        assert!(hs_long.finish(&vec![0u8; SERVER_HELLO_LEN + 1]).is_none());
+    }
+
+    #[test]
+    fn a_tampered_client_hello_prevents_a_shared_key() {
+        // A network attacker that flips a byte of the ClientHello's ciphertext-to-static cannot force
+        // agreement: the service decapsulates a different ss_static (and its transcript differs from
+        // the client's), so the two sides never land on the same key. Fail-closed.
+        let mut rng = SeedRng::from_seed(b"diaulos-hs-tamper-ch");
+        let service = StaticKeypair::generate(&mut rng);
+        let (client_hs, mut client_hello) = ClientHandshake::start(&service.public, &mut rng);
+        client_hello[PUBLIC_LEN + 5] ^= 0xFF;
+        let (server_keys, server_hello) =
+            ServerHandshake::respond(&service, &client_hello, &mut rng).unwrap();
+        let client_keys = client_hs.finish(&server_hello).unwrap();
+        assert_ne!(
+            client_keys, server_keys,
+            "tampering the ClientHello prevents a shared session key"
+        );
+    }
+
+    #[test]
+    fn a_tampered_server_hello_prevents_a_shared_key() {
+        // Symmetrically, flipping a byte of the ServerHello makes the client decapsulate a different
+        // ss_ephemeral, so it cannot match the service's keys.
+        let mut rng = SeedRng::from_seed(b"diaulos-hs-tamper-sh");
+        let service = StaticKeypair::generate(&mut rng);
+        let (client_hs, client_hello) = ClientHandshake::start(&service.public, &mut rng);
+        let (server_keys, mut server_hello) =
+            ServerHandshake::respond(&service, &client_hello, &mut rng).unwrap();
+        server_hello[3] ^= 0xFF;
+        let client_keys = client_hs.finish(&server_hello).expect("still the right length");
+        assert_ne!(
+            client_keys, server_keys,
+            "tampering the ServerHello prevents a shared session key"
+        );
+    }
+
+    #[test]
+    fn two_sessions_to_the_same_service_derive_distinct_keys() {
+        // Each session draws a fresh ephemeral, so no two sessions to the same static identity share a
+        // key — the forward-secrecy contribution of the ephemeral encapsulation.
+        let mut srng = SeedRng::from_seed(b"diaulos-hs-distinct-svc");
+        let service = StaticKeypair::generate(&mut srng);
+        let mut rng = SeedRng::from_seed(b"diaulos-hs-distinct");
+
+        let (hs1, ch1) = ClientHandshake::start(&service.public, &mut rng);
+        let (k1, sh1) = ServerHandshake::respond(&service, &ch1, &mut rng).unwrap();
+        let ck1 = hs1.finish(&sh1).unwrap();
+
+        let (hs2, ch2) = ClientHandshake::start(&service.public, &mut rng);
+        let (k2, sh2) = ServerHandshake::respond(&service, &ch2, &mut rng).unwrap();
+        let ck2 = hs2.finish(&sh2).unwrap();
+
+        assert_eq!(ck1, k1, "session 1 agrees");
+        assert_eq!(ck2, k2, "session 2 agrees");
+        assert_ne!(ck1, ck2, "fresh ephemerals give each session distinct keys");
+        assert_ne!(ch1, ch2, "and distinct client hellos");
     }
 }
