@@ -33,6 +33,25 @@
 //! violate the line's free polar sum-rules and are localized and quarantined (spec §6.2, T-226) —
 //! the same mechanism that catches a Byzantine liar. This controller governs *valid-but-excessive*
 //! demand, where the only fair response is to price it.
+//!
+//! **`Δ` is derived, not tuned.** [`LindbladLoadController::from_line_rates`] computes the relaxation
+//! rate from the cell's own dissipative **spectral gap** `Δ = (G − max_k T_k)/6` (T-226(v), the exact
+//! gap `fanos_diakrisis::regeneration::spectral_gap` reads from the seven line rates), so admission
+//! relaxation and the DIAKRISIS reintegration time `τ = 1/Δ` are two observables of **one** spectral
+//! gap — the *derive-don't-tune* invariant, closed. [`Self::new`] with an explicit `Δ` remains for
+//! tests and analytic sizing.
+
+use fanos_diakrisis::regeneration::spectral_gap;
+use fanos_geometry::fano;
+
+/// The per-window dissipation derived from a cell's dissipative spectral gap `Δ_cont` over a window
+/// of `dt_window` (in the same time unit as the line rates): the small-step discretization
+/// `Δ_cont · dt_window` (the linearization of `1 − e^{−Δ_cont·dt}`), clamped to `(0, 1]`. Exposed for
+/// transparency and testing; [`LindbladLoadController::from_line_rates`] uses it.
+#[must_use]
+pub fn dissipation_from_gap(line_rates: &[f64; fano::N], dt_window: f64) -> f64 {
+    (spectral_gap(line_rates).max(0.0) * dt_window.max(0.0)).clamp(1e-3, 1.0)
+}
 
 /// A Lindbladian (leaky-integrator) admission controller: excitation relaxes at rate `Δ` while load
 /// drives it up, and admission difficulty is a super-linear function of the excitation. Pure state
@@ -68,6 +87,29 @@ impl LindbladLoadController {
             ceil,
             over_ceil: DEFAULT_OVER_CEIL,
         }
+    }
+
+    /// A controller whose relaxation rate is **derived from the cell's own dissipative spectral gap**
+    /// (T-226(v)) rather than tuned: `Δ = (G − max_k T_k)/6` from the line's seven `line_rates`,
+    /// discretized over `dt_window` (see [`dissipation_from_gap`]). This is the network-grounded
+    /// constructor — the admission relaxation and the healing time `τ = 1/Δ` then share one gap. A
+    /// cell whose flux concentrates on one axis (`max_k T_k` large relative to the total `G`) has a
+    /// smaller `Δ`, slower relaxation, and a *larger* steady-state excitation, so a structurally
+    /// stressed cell prices admission more conservatively — automatically, with no hand-tuning.
+    #[must_use]
+    pub fn from_line_rates(
+        line_rates: &[f64; fano::N],
+        dt_window: f64,
+        target: f64,
+        floor: u32,
+        ceil: u32,
+    ) -> Self {
+        Self::new(
+            dissipation_from_gap(line_rates, dt_window),
+            target,
+            floor,
+            ceil,
+        )
     }
 
     /// Fold in a completed window's `arrived` intro count: relax the excitation by the dissipation
@@ -190,5 +232,31 @@ mod tests {
             d3 > 3.5 * d2 && d3 < 4.5 * d2,
             "3× overload costs ~4× the excess of 2× overload: {d2} → {d3}"
         );
+    }
+
+    #[test]
+    fn dissipation_is_derived_from_the_cell_spectral_gap_not_tuned() {
+        // T-226(v): uniform line rates γ̄ ⇒ Δ = (2/3)·γ̄. Over a unit window the derived dissipation
+        // is that exact gap (clamped) — the controller's relaxation is the CELL's own, not tuned.
+        let gamma_bar = 0.9;
+        let rates = [gamma_bar; fano::N];
+        let d = dissipation_from_gap(&rates, 1.0);
+        assert!(
+            (d - (2.0 / 3.0) * gamma_bar).abs() < 1e-9,
+            "Δ = (2/3)·γ̄, got {d}"
+        );
+
+        let c = LindbladLoadController::from_line_rates(&rates, 1.0, 100.0, 4, 24);
+        // Steady state under a 2× flood uses the DERIVED Δ: x* = (2−1)·target/Δ = 100/Δ.
+        assert!((c.steady_state_excitation(2.0) - 100.0 / d).abs() < 1e-6);
+
+        // A cell with a SMALLER gap (slower dissipative dynamics) prices admission more
+        // conservatively — larger steady-state excitation — automatically, no hand-tuning.
+        let fast = LindbladLoadController::from_line_rates(&[0.9; fano::N], 1.0, 100.0, 4, 24); // Δ=0.6
+        let slow = LindbladLoadController::from_line_rates(&[0.3; fano::N], 1.0, 100.0, 4, 24); // Δ=0.2
+        assert!(slow.steady_state_excitation(2.0) > fast.steady_state_excitation(2.0));
+
+        // A large gap saturates the discretized dissipation at 1.0 (immediate relaxation).
+        assert!((dissipation_from_gap(&[2.0; fano::N], 1.0) - 1.0).abs() < 1e-12);
     }
 }

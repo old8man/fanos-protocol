@@ -616,6 +616,7 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "fanos-crypto",
+ "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
  "fanos-onoma",
