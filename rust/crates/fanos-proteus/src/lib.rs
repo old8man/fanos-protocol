@@ -48,10 +48,10 @@ mod tests {
         let env = Environment::DeepCensorship;
         assert_eq!(env.preferred_morph(), Morph::Polymorph);
 
-        // It derives this epoch's shape and obfuscates a transport packet.
+        // It derives this epoch's shape and obfuscates a transport packet with a per-packet nonce.
         let shape = epoch_shape(secret, epoch);
         let packet = b"encrypted FANOS transport frame";
-        let wire = obfuscate(&shape, packet);
+        let wire = obfuscate(&shape, packet, &[0u8; obfuscate::NONCE_LEN]);
 
         // The bridge (holding the same secret) derives the same shape and strips it.
         let bridge_shape = epoch_shape(secret, epoch);

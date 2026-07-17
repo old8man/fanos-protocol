@@ -110,9 +110,14 @@ silent-replica timeout, so any survivor answers even when the primary recovered 
 The networked **DKG completes on a timed qualified subset** — a node finalizes as soon as every
 member qualifies, or, once a collection deadline elapses, on whatever qualified set reached the
 threshold, so an offline dealer no longer stalls the honest majority. Documented as known
-limitations with a fix path (see the module docs): the onion still shrinks one layer per hop
-(constant-size Tessera padding is a separate change), PROTEUS junk is per-epoch rather than
-per-packet, and DKG's qualified-set agreement is robust to crash/offline dealers but not yet to a
+The APHANTOS onion is **constant-size on the wire** — every hop's packet is
+padded to a fixed bucket with the real layer length carried in an *encrypted* field, so a passive
+observer cannot link entry to exit by the shrinking size a naive nested onion leaks. PROTEUS junk
+is now **per-packet**: a random-looking nonce seeds each packet's junk/padding keystream, so even
+two sends of the identical frame shape to different bytes (no fixed intra-epoch prefix, cf.
+AmneziaWG). Documented as known limitations with a fix path (see the module docs): the processing
+relay still learns its own onion layer length (full position-hiding is the Sphinx filler
+construction), and DKG's qualified-set agreement is robust to crash/offline dealers but not yet to a
 Byzantine *equivocating* dealer (the classic complaint round).
 
 ### Build, verify, and simulate
