@@ -7,6 +7,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use fanos_crypto::hash::hash_xof;
 use fanos_crypto::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
@@ -115,6 +116,14 @@ impl<F: Field> NyxNode<F> {
         out
     }
 
+    /// Per-cover-cell keystream material: the node seed diversified by the mix counter, so every
+    /// cover cell is a fresh random-looking block (no two identical, and unlinkable to the seed).
+    fn cover_material(&self) -> Vec<u8> {
+        let mut data = self.seed.to_vec();
+        data.extend_from_slice(&self.delay_seq.to_be_bytes());
+        data
+    }
+
     /// A uniform sample in `[0, 1)` from the node seed and a domain-separating counter.
     fn prf_unit(&self, tag: &str, counter: u64) -> f64 {
         let mut data = self.seed.to_vec();
@@ -160,14 +169,17 @@ impl<F: Field> NyxNode<F> {
             let idx = (self.prf_unit("FANOS-v1/nyx-cover-dst", self.delay_seq) * peers.len() as f64)
                 as usize;
             if let Some(&dst) = peers.get(idx.min(peers.len() - 1)) {
-                // A cover cell carries indistinguishable junk; the recipient fails to peel it and
-                // drops it. (Typed here for measurement; production shapes it as a Tessera cell.)
-                let mut junk = [0u8; 32];
-                let d = hash_labeled("FANOS-v1/nyx-cover-body", &self.delay_seq.to_be_bytes());
-                junk.copy_from_slice(&d);
-                let mut frame = Vec::new();
-                encode_frame(FrameType::Cover.code(), &junk, &mut frame);
-                effects.push(Effect::Send { to: dst, frame });
+                // A cover cell is byte-indistinguishable from a real onion: the *same* Tessera frame
+                // type carrying a full constant-size ([`sealed::ONION_LEN`]) block of keystream that
+                // looks exactly like ciphertext (spec §5.5/V8). The recipient tries to peel it, the
+                // KEM/AEAD fails on the random bytes, and it is dropped — the identical code path a
+                // real onion addressed to the wrong relay takes, so cover and real are unobservable.
+                let mut cell = alloc::vec![0u8; sealed::ONION_LEN];
+                hash_xof("FANOS-v1/nyx-cover-body", &self.cover_material(), &mut cell);
+                effects.push(Effect::Send {
+                    to: dst,
+                    frame: Self::nyx_frame(&cell),
+                });
             }
         }
         if self.covering && self.cover_interval.as_nanos() > 0 {
@@ -289,5 +301,61 @@ impl<F: Field> Engine for NyxNode<F> {
 
     fn address(&self) -> Triple {
         self.coord.coords()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use fanos_field::F31;
+    use fanos_pqcrypto::SeedRng;
+
+    use super::*;
+
+    /// A cover cell must be byte-indistinguishable from a real onion: the same `Tessera` frame type,
+    /// the same constant [`sealed::ONION_LEN`] size, and it must simply fail to peel (the drop path a
+    /// wrong-relay real onion takes) — never a give-away short `Cover`-typed frame (spec §5.5/V8).
+    #[test]
+    fn a_cover_cell_is_indistinguishable_from_a_real_onion() {
+        // A node with one directory peer and cover enabled.
+        let mut rng = SeedRng::from_seed(b"nyx-cover-node");
+        let (secret, _public) = HybridKemSecret::generate(&mut rng);
+        let (peer_secret, peer_public) = HybridKemSecret::generate(&mut rng);
+        let mut directory = Directory::new();
+        let peer_coord = Point::<F31>::at(9).coords();
+        directory.insert(peer_coord, peer_public);
+
+        let mut node = NyxNode::new(Point::<F31>::at(0), secret, directory, [7u8; 32], 2)
+            .with_mixing(Duration(0), Duration::from_millis(200));
+
+        // Start cover, then fire the cover timer to emit one cell.
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let effects = node.step(Instant(1), Input::Timer(COVER_TIMER));
+
+        let frame = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { frame, .. } => Some(frame.clone()),
+                _ => None,
+            })
+            .unwrap(); // a cover cell was emitted
+
+        // Same frame type and same constant size as a real onion.
+        let (decoded, _) = decode_frame(&frame).unwrap();
+        assert_eq!(
+            decoded.frame_type(),
+            Some(FrameType::Tessera),
+            "cover rides the real onion frame type, not a distinguishable Cover type"
+        );
+        assert_eq!(
+            decoded.body.len(),
+            sealed::ONION_LEN,
+            "cover cell is the constant onion size"
+        );
+        // And it behaves like a wrong-relay onion: peeling fails and it is dropped.
+        assert!(
+            sealed::peel(decoded.body, &peer_secret).is_err(),
+            "a cover cell does not peel — the same drop path a real onion takes"
+        );
     }
 }

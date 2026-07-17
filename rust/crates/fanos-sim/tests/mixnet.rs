@@ -96,9 +96,13 @@ fn without_mixing_no_delay_timers_are_used() {
 }
 
 #[test]
-fn cover_traffic_emits_a_steady_stream_of_cover_cells() {
-    // Every node runs cover traffic; over a window the network carries many cover cells, so an
-    // observer cannot tell an idle node from a busy one (spec §L5, V8).
+fn cover_traffic_emits_a_steady_stream_indistinguishable_from_real_onions() {
+    // Every node runs cover traffic; over a window the network carries many cover cells. Crucially,
+    // a cover cell is emitted as the *same* `Tessera` frame type as a real onion (and, in bytes, the
+    // same constant size) — so an observer cannot tell an idle node from a busy one, nor a cover
+    // cell from a real onion (spec §L5, V8). With no real traffic in this run, every Tessera frame
+    // on the wire is a cover cell; that they trace as `Tessera` (not a give-away `Cover` type) is
+    // the indistinguishability.
     let mut sim = Sim::new(7);
     sim.enable_trace(true);
     let _cell = spawn_nyx_cell(
@@ -109,10 +113,16 @@ fn cover_traffic_emits_a_steady_stream_of_cover_cells() {
     sim.inject_all(&Command::StartHeartbeat); // begin cover emission
     sim.run_for(Duration::from_millis(6000));
 
-    let cover_cells = sim.trace().grep("Cover").len();
+    let cover_cells = sim.trace().grep("Tessera").len();
     assert!(
         cover_cells > 20,
         "cover traffic should produce a steady stream, got {cover_cells}"
+    );
+    // No give-away cover-typed frames exist anymore — cover rides the real onion frame type.
+    assert_eq!(
+        sim.trace().grep("Cover").len(),
+        0,
+        "cover cells must not use a distinguishable frame type"
     );
 }
 

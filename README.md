@@ -115,7 +115,9 @@ padded to a fixed bucket with the real layer length carried in an *encrypted* fi
 observer cannot link entry to exit by the shrinking size a naive nested onion leaks. PROTEUS junk
 is now **per-packet**: a random-looking nonce seeds each packet's junk/padding keystream, so even
 two sends of the identical frame shape to different bytes (no fixed intra-epoch prefix, cf.
-AmneziaWG). Documented as known limitations with a fix path (see the module docs): the processing
+AmneziaWG). NYX **cover traffic is now byte-indistinguishable from real onions** — a cover cell is
+the same `Tessera` frame type and the same constant onion size, and it simply fails to peel (the
+drop path a wrong-relay onion takes), so an observer cannot tell an idle node from a busy one. Documented as known limitations with a fix path (see the module docs): the processing
 relay still learns its own onion layer length (full position-hiding is the Sphinx filler
 construction), and DKG's qualified-set agreement is robust to crash/offline dealers but not yet to a
 Byzantine *equivocating* dealer (the classic complaint round).
