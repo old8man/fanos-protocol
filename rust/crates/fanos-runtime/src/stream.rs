@@ -1,23 +1,33 @@
-//! Reliable, ordered, multiplexed streams over the overlay (spec §7.2 `Stream*`).
+//! Reliable, ordered, multiplexed, **incremental** byte streams over the overlay (spec §7.2
+//! `Stream*`).
 //!
 //! The overlay delivers single, possibly-dropped datagrams; an application often wants a reliable
-//! ordered byte-stream. This module is the sans-I/O protocol logic for one: a payload is cut into
-//! [`Segment`]s (`STREAM_DATA`), the receiver buffers out-of-order arrivals and delivers them in
-//! order. Acknowledgement is **selective (SACK)**: the receiver returns the cumulative next-needed
-//! sequence *and* a bitmap of the out-of-order segments it already holds, so the sender does
-//! **selective repeat** — it retransmits only the genuinely missing segments, never the ones already
-//! received past a gap (unlike Go-Back-N, which re-sends everything past the cumulative ack). Sends
-//! are bounded by a **sliding window** for flow control. It is a pure state machine — a driver
-//! performs the sends and the retransmit timer — so it composes with either transport (over QUIC,
-//! native streams subsume it; over the lossy simulator or UDP, this provides the reliability).
+//! ordered byte-stream — a socket. This module is the sans-I/O protocol logic for one: bytes are
+//! appended to a [`StreamSender`] as they are produced ([`push`](StreamSender::push)), cut into
+//! [`Segment`]s (`STREAM_DATA`), and the [`StreamReceiver`] buffers out-of-order arrivals and
+//! releases the in-order prefix incrementally ([`take`](StreamReceiver::take)). It is a socket, not a
+//! one-shot message: you do not need the whole payload up front, and the reader gets bytes as they
+//! arrive rather than only at FIN.
 //!
-//! Multiplexing is by `stream_id`: many independent streams share one peer link, each with its own
-//! sender/receiver state.
+//! * **Selective repeat (SACK).** The receiver returns the cumulative next-needed sequence *and* a
+//!   bitmap of the out-of-order segments it already holds, so the sender retransmits only the
+//!   genuinely missing segments (not the whole tail past a gap, as Go-Back-N would).
+//! * **Two-level flow control.** A sender-side sliding **window** bounds lookahead; the receiver
+//!   **advertises its remaining credit** (`rwnd`) in every ack, and the sender never sends beyond it —
+//!   so a slow reader throttles a fast writer (backpressure) and the receiver's buffer is bounded.
+//! * **Incremental both ways.** [`StreamSender::push`]/[`finish`](StreamSender::finish) append and
+//!   close; [`StreamReceiver::take`] drains the contiguous delivered prefix, freeing buffer and
+//!   credit. The one-shot [`StreamSender::new`] and [`StreamReceiver::deliver`] remain for
+//!   whole-message use.
+//!
+//! It is a pure state machine — a driver performs the sends and the retransmit timer — so it composes
+//! with either transport. Multiplexing is by `stream_id`: many independent streams share one peer
+//! link, each with its own sender/receiver state, so a loss on one stream never stalls another.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-/// Maximum payload bytes per segment (keeps a segment within a typical datagram).
+/// Maximum payload bytes per segment (keeps a segment within a typical datagram / onion cell).
 pub const MAX_SEGMENT: usize = 1024;
 
 /// The SACK bitmap width: the receiver reports out-of-order receipt of the 64 sequences immediately
@@ -28,15 +38,19 @@ pub const SACK_WIDTH: u32 = 64;
 /// The default sliding-window size (max in-flight / lookahead segments). Bounded by [`SACK_WIDTH`].
 pub const DEFAULT_WINDOW: u32 = 32;
 
-/// A selective acknowledgement: `cumulative` is the next sequence the receiver still needs (all
-/// below it are in order), and `sack` is a bitmap where bit `i` set means sequence `cumulative + i`
-/// has already been received out of order (bit `0` is always clear — `cumulative` is the gap).
+/// A selective acknowledgement plus a receive-window credit. `cumulative` is the next sequence the
+/// receiver still needs (all below it are in order); `sack` is a bitmap where bit `i` set means
+/// sequence `cumulative + i` has already been received out of order (bit `0` is always clear —
+/// `cumulative` is the gap); `rwnd` is the number of further segments the receiver will buffer beyond
+/// `cumulative` right now (its free credit — flow control).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Ack {
     /// The next in-order sequence the receiver needs (cumulative ack).
     pub cumulative: u32,
     /// Bitmap of out-of-order sequences held beyond `cumulative` (bit `i` ⇒ `cumulative + i`).
     pub sack: u64,
+    /// The receiver's remaining buffer credit, in segments (flow control / backpressure).
+    pub rwnd: u32,
 }
 
 /// One stream segment: `stream_id ‖ seq ‖ fin ‖ data` (spec §7.2 `STREAM_DATA`/`STREAM_FIN`).
@@ -80,37 +94,52 @@ impl Segment {
     }
 }
 
-/// The sender half: segments a payload and **selectively repeats** only the missing segments within
-/// a sliding window, until the stream drains.
+/// The sender half: an append-only byte buffer, segmented lazily, that **selectively repeats** only
+/// the missing segments within `min(window, peer_rwnd)`, until the stream drains.
 #[derive(Clone, Debug)]
 pub struct StreamSender {
     stream_id: u32,
+    /// Sealed (immutable, sendable) segments.
     segments: Vec<Vec<u8>>,
+    /// The unsealed tail — bytes pushed but not yet formed into a full segment.
+    pending: Vec<u8>,
+    /// Set once [`finish`](Self::finish) has sealed the final (FIN-bearing) segment.
+    finished: bool,
     /// Cumulative ack: every sequence below this is acknowledged.
     acked: u32,
-    /// Individually acknowledged sequences at or above `acked` (from SACK bitmaps) — these are NOT
-    /// retransmitted (the selective-repeat property).
+    /// Individually acknowledged sequences at or above `acked` (from SACK bitmaps) — NOT retransmitted.
     sacked: BTreeSet<u32>,
-    /// Max in-flight / lookahead segments (flow control).
+    /// Local lookahead cap (flow control).
     window: u32,
+    /// The receiver's last-advertised credit (flow control); the effective window is `min` of the two.
+    peer_rwnd: u32,
 }
 
 impl StreamSender {
-    /// Open a stream carrying `payload`, cut into `MAX_SEGMENT`-sized segments.
+    /// Open an empty, incremental stream. Append with [`push`](Self::push), close with
+    /// [`finish`](Self::finish).
     #[must_use]
-    pub fn new(stream_id: u32, payload: &[u8]) -> Self {
-        let segments: Vec<Vec<u8>> = if payload.is_empty() {
-            alloc::vec![Vec::new()] // an empty stream is still one (FIN) segment
-        } else {
-            payload.chunks(MAX_SEGMENT).map(<[u8]>::to_vec).collect()
-        };
+    pub fn open(stream_id: u32) -> Self {
         Self {
             stream_id,
-            segments,
+            segments: Vec::new(),
+            pending: Vec::new(),
+            finished: false,
             acked: 0,
             sacked: BTreeSet::new(),
             window: DEFAULT_WINDOW,
+            peer_rwnd: SACK_WIDTH,
         }
+    }
+
+    /// Open a stream carrying a complete `payload` (one-shot / whole-message convenience): equivalent
+    /// to [`open`](Self::open) + [`push`](Self::push) + [`finish`](Self::finish).
+    #[must_use]
+    pub fn new(stream_id: u32, payload: &[u8]) -> Self {
+        let mut s = Self::open(stream_id);
+        s.push(payload);
+        s.finish();
+        s
     }
 
     /// Set the sliding-window size (clamped to `1..=SACK_WIDTH`).
@@ -120,30 +149,74 @@ impl StreamSender {
         self
     }
 
-    /// The segments to (re)send now — call on open and on each retransmit tick. Only the **missing**
-    /// segments within the window `[acked, acked + window)` are emitted: any sequence already
-    /// selectively acked is skipped, so a single loss costs a single retransmit (selective repeat),
-    /// not a re-send of the whole tail. The stream's last segment carries `fin`.
+    fn seal_full(&mut self) {
+        while self.pending.len() >= MAX_SEGMENT {
+            let rest = self.pending.split_off(MAX_SEGMENT);
+            let seg = core::mem::replace(&mut self.pending, rest);
+            self.segments.push(seg);
+        }
+    }
+
+    /// Append `more` bytes to the send stream, sealing full segments as they form. A no-op once the
+    /// stream is [`finish`](Self::finish)ed.
+    pub fn push(&mut self, more: &[u8]) {
+        if self.finished {
+            return;
+        }
+        self.pending.extend_from_slice(more);
+        self.seal_full();
+    }
+
+    /// Seal the current partial tail into a (non-final) segment so it is sent promptly, without
+    /// closing the stream — the explicit-flush counterpart to a batching write. No-op if the tail is
+    /// empty or the stream is finished.
+    pub fn flush(&mut self) {
+        if self.finished || self.pending.is_empty() {
+            return;
+        }
+        let seg = core::mem::take(&mut self.pending);
+        self.segments.push(seg);
+    }
+
+    /// Close the send side: seal the remaining tail as the final **FIN-bearing** segment (an empty one
+    /// if the tail is empty, so the FIN always rides a freshly-sealed segment the peer will receive)
+    /// and mark the stream finished. Idempotent.
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        let seg = core::mem::take(&mut self.pending);
+        self.segments.push(seg);
+        self.finished = true;
+    }
+
+    /// The segments to (re)send now — call on open/push and on each retransmit tick. Only the
+    /// **missing** segments within the effective window `[acked, acked + min(window, peer_rwnd))` are
+    /// emitted: any sequence already selectively acked is skipped (selective repeat), and the final
+    /// segment carries `fin` once the stream is finished.
     #[must_use]
     pub fn outbound(&self) -> Vec<Segment> {
-        let last = self.segments.len().saturating_sub(1) as u32;
-        let end = (self.acked + self.window).min(self.segments.len() as u32);
+        let len = self.segments.len() as u32;
+        let last = len.saturating_sub(1);
+        let win = self.window.min(self.peer_rwnd.max(1)); // at least 1: a zero-window probe
+        let end = (self.acked + win).min(len);
         (self.acked..end)
             .filter(|seq| !self.sacked.contains(seq))
             .filter_map(|seq| {
                 self.segments.get(seq as usize).map(|data| Segment {
                     stream_id: self.stream_id,
                     seq,
-                    fin: seq == last,
+                    fin: self.finished && seq == last,
                     data: data.clone(),
                 })
             })
             .collect()
     }
 
-    /// Apply a selective ack: advance the cumulative point and record the individually-acked
-    /// sequences from the SACK bitmap, so they are not retransmitted.
+    /// Apply a selective ack: adopt the receiver's advertised credit, advance the cumulative point,
+    /// and record the individually-acked sequences from the SACK bitmap so they are not retransmitted.
     pub fn on_ack(&mut self, ack: Ack) {
+        self.peer_rwnd = ack.rwnd;
         let len = self.segments.len() as u32;
         self.acked = self.acked.max(ack.cumulative).min(len);
         for i in 1..SACK_WIDTH {
@@ -159,20 +232,27 @@ impl StreamSender {
         self.sacked = self.sacked.split_off(&self.acked);
     }
 
-    /// Whether every segment has been acknowledged.
+    /// Whether the stream is finished and every segment has been acknowledged.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.acked as usize >= self.segments.len()
+        self.finished && self.acked as usize >= self.segments.len()
     }
 }
 
-/// The receiver half: buffers out-of-order segments, delivers in order, acks the contiguous run.
+/// The receiver half: buffers in-window out-of-order segments, releases the in-order prefix on
+/// [`take`](Self::take), and advertises its remaining credit for backpressure.
 #[derive(Clone, Debug)]
 pub struct StreamReceiver {
     stream_id: u32,
+    /// Segments held but not yet taken (both the contiguous run awaiting `take` and out-of-order holds).
     received: BTreeMap<u32, Vec<u8>>,
+    /// The next in-order sequence needed (the contiguous frontier).
     next: u32,
+    /// The next sequence not yet handed to the application via `take` (`delivered ≤ next`).
+    delivered: u32,
     fin_seq: Option<u32>,
+    /// Max segments buffered beyond `next` (bounds memory; advertised as `rwnd` credit).
+    recv_window: u32,
 }
 
 impl StreamReceiver {
@@ -183,30 +263,46 @@ impl StreamReceiver {
             stream_id,
             received: BTreeMap::new(),
             next: 0,
+            delivered: 0,
             fin_seq: None,
+            recv_window: DEFAULT_WINDOW,
         }
     }
 
-    /// Ingest a segment (ignoring foreign stream ids). Returns the **selective** ack to send back:
-    /// the next in-order sequence needed plus a bitmap of the out-of-order segments already held, so
-    /// the sender retransmits only the true gaps.
+    /// Set the receive-window size (clamped to `1..=SACK_WIDTH`) — the buffer/credit bound.
+    #[must_use]
+    pub fn with_recv_window(mut self, window: u32) -> Self {
+        self.recv_window = window.clamp(1, SACK_WIDTH);
+        self
+    }
+
+    /// Ingest a segment (ignoring foreign stream ids and out-of-window/already-taken sequences).
+    /// Returns the **selective** ack to send back: the next in-order sequence needed, a bitmap of the
+    /// out-of-order segments already held, and the remaining buffer credit.
     pub fn on_segment(&mut self, segment: &Segment) -> Ack {
         if segment.stream_id != self.stream_id {
             return self.ack();
         }
-        if segment.fin {
-            self.fin_seq = Some(segment.seq);
-        }
-        self.received
-            .entry(segment.seq)
-            .or_insert_with(|| segment.data.clone());
-        while self.received.contains_key(&self.next) {
-            self.next += 1;
+        // Accept only sequences in the current window: not already taken, not beyond the advertised
+        // credit. Dropping out-of-window segments is what bounds the receive buffer.
+        let in_window = segment.seq >= self.delivered
+            && segment.seq < self.next.saturating_add(self.recv_window);
+        if in_window {
+            if segment.fin {
+                self.fin_seq = Some(segment.seq);
+            }
+            self.received
+                .entry(segment.seq)
+                .or_insert_with(|| segment.data.clone());
+            while self.received.contains_key(&self.next) {
+                self.next += 1;
+            }
         }
         self.ack()
     }
 
-    /// The current selective ack: cumulative next-needed sequence + a bitmap of out-of-order holds.
+    /// The current selective ack: cumulative next-needed sequence, out-of-order bitmap, and remaining
+    /// credit `rwnd = recv_window − held`.
     #[must_use]
     pub fn ack(&self) -> Ack {
         let mut sack = 0u64;
@@ -215,13 +311,30 @@ impl StreamReceiver {
                 sack |= 1u64 << i;
             }
         }
+        let held = self.received.len() as u32;
         Ack {
             cumulative: self.next,
             sack,
+            rwnd: self.recv_window.saturating_sub(held),
         }
     }
 
-    /// The reassembled payload, once the FIN segment and every segment before it have arrived.
+    /// Release the contiguous in-order bytes delivered since the last call, draining them from the
+    /// buffer (freeing credit). Returns an empty vector if nothing new is in order. This is the
+    /// socket read; use [`deliver`](Self::deliver) instead for whole-message reassembly (do not mix).
+    pub fn take(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        while self.delivered < self.next {
+            if let Some(seg) = self.received.remove(&self.delivered) {
+                out.extend_from_slice(&seg);
+            }
+            self.delivered += 1;
+        }
+        out
+    }
+
+    /// The whole reassembled payload, once the FIN segment and every segment before it have arrived.
+    /// For whole-message use; do not mix with [`take`](Self::take) (which drains the buffer).
     #[must_use]
     pub fn deliver(&self) -> Option<Vec<u8>> {
         let fin = self.fin_seq?;
@@ -233,6 +346,12 @@ impl StreamReceiver {
             payload.extend_from_slice(self.received.get(&seq)?);
         }
         Some(payload)
+    }
+
+    /// Whether the stream is fully received (FIN and every prior segment in order).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.fin_seq.is_some_and(|fin| self.next > fin)
     }
 }
 
@@ -260,18 +379,15 @@ mod tests {
             receiver.on_segment(&seg);
         }
         assert_eq!(receiver.deliver().as_deref(), Some(&b"short"[..]));
-        // The sender learns it is drained once it applies the ack.
         sender.on_ack(receiver.on_segment(&sender.outbound()[0]));
         assert!(sender.is_complete());
     }
 
     #[test]
     fn selective_repeat_resends_only_the_lost_segment() {
-        // Ten segments; the third (seq 2) is lost on the first pass. Under selective repeat the
-        // sender must resend ONLY seq 2 next tick — not the whole tail (that would be Go-Back-N).
         let payload: Vec<u8> = (0..10 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
         let mut sender = StreamSender::new(3, &payload).with_window(64);
-        let mut receiver = StreamReceiver::new(3);
+        let mut receiver = StreamReceiver::new(3).with_recv_window(64);
 
         let mut last_ack = receiver.ack();
         for seg in sender.outbound() {
@@ -282,13 +398,11 @@ mod tests {
         }
         sender.on_ack(last_ack);
 
-        // The cumulative ack is stuck at 2 (the gap), but every later segment was SACKed.
         assert_eq!(last_ack.cumulative, 2);
         let resend = sender.outbound();
         assert_eq!(resend.len(), 1, "only the lost segment is retransmitted");
         assert_eq!(resend[0].seq, 2);
 
-        // Deliver it and the stream completes.
         sender.on_ack(receiver.on_segment(&resend[0]));
         assert!(sender.is_complete());
         assert_eq!(receiver.deliver(), Some(payload));
@@ -314,7 +428,6 @@ mod tests {
             "5000 bytes spans several segments"
         );
         let mut receiver = StreamReceiver::new(9);
-        // Deliver segments out of order.
         let mut segs = sender.outbound();
         segs.reverse();
         for seg in &segs {
@@ -325,8 +438,6 @@ mod tests {
 
     #[test]
     fn reliable_under_loss_via_retransmission() {
-        // A lossy channel drops every third segment on the first pass; the sender retransmits past
-        // the cumulative ack until the receiver has the whole stream.
         let payload: Vec<u8> = (0..8000u32).map(|i| (i * 7) as u8).collect();
         let mut sender = StreamSender::new(2, &payload);
         let mut receiver = StreamReceiver::new(2);
@@ -335,7 +446,6 @@ mod tests {
         while !sender.is_complete() {
             let mut ack = receiver.ack();
             for (k, seg) in sender.outbound().iter().enumerate() {
-                // Drop one in three on the first pass only — later passes are clean.
                 if pass == 0 && k % 3 == 1 {
                     continue;
                 }
@@ -346,5 +456,99 @@ mod tests {
             assert!(pass < 10, "should converge quickly");
         }
         assert_eq!(receiver.deliver(), Some(payload));
+    }
+
+    // ---- incremental socket behaviour ----
+
+    #[test]
+    fn incremental_push_and_take_streams_bytes() {
+        // A socket: push bytes as produced, close, and read the in-order prefix incrementally.
+        let mut sender = StreamSender::open(5);
+        sender.push(b"hello ");
+        sender.flush(); // seal "hello " as a (non-fin) segment so it goes out now
+        sender.push(b"world");
+        sender.finish(); // seals "world" as the fin segment
+
+        let mut receiver = StreamReceiver::new(5);
+        let mut got = Vec::new();
+        // deliver out of order to exercise reassembly, then take the contiguous prefix.
+        let mut segs = sender.outbound();
+        segs.reverse();
+        for seg in &segs {
+            receiver.on_segment(seg);
+            got.extend_from_slice(&receiver.take());
+        }
+        got.extend_from_slice(&receiver.take());
+        assert_eq!(got, b"hello world");
+        assert!(receiver.is_finished());
+    }
+
+    #[test]
+    fn a_finish_without_data_still_delivers_a_fin() {
+        // finish() on an empty stream produces one empty FIN segment.
+        let sender = StreamSender::new(6, b"");
+        let mut receiver = StreamReceiver::new(6);
+        for seg in sender.outbound() {
+            receiver.on_segment(&seg);
+        }
+        assert!(receiver.is_finished());
+        assert_eq!(receiver.deliver(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn receiver_advertises_shrinking_then_recovering_credit() {
+        // With a small window, out-of-order holds consume credit; taking the in-order prefix frees it.
+        let payload: Vec<u8> = (0..3 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let sender = StreamSender::new(7, &payload); // 4 segments (3 data + empty fin)
+        let mut receiver = StreamReceiver::new(7).with_recv_window(4);
+
+        // Deliver seq 1,2 (out of order) — held, credit drops; seq 0 still missing.
+        let segs = sender.outbound();
+        receiver.on_segment(&segs[1]);
+        let a = receiver.on_segment(&segs[2]);
+        assert_eq!(a.cumulative, 0, "still waiting on seq 0");
+        assert_eq!(
+            a.rwnd, 2,
+            "two of four credits consumed by out-of-order holds"
+        );
+
+        // Fill the gap: everything becomes in order; take() drains and frees credit.
+        receiver.on_segment(&segs[0]);
+        let drained = receiver.take();
+        assert!(!drained.is_empty());
+        assert_eq!(receiver.ack().rwnd, 4, "credit fully recovered after take");
+    }
+
+    #[test]
+    fn out_of_window_segments_are_dropped() {
+        // A segment beyond the advertised window is not buffered (memory-exhaustion guard).
+        let mut receiver = StreamReceiver::new(8).with_recv_window(4);
+        let far = Segment {
+            stream_id: 8,
+            seq: 100,
+            fin: false,
+            data: b"x".to_vec(),
+        };
+        let a = receiver.on_segment(&far);
+        assert_eq!(a.cumulative, 0);
+        assert_eq!(a.rwnd, 4, "far-future segment was dropped, not buffered");
+    }
+
+    #[test]
+    fn backpressure_caps_the_effective_window() {
+        // The sender never sends beyond the receiver's advertised credit.
+        let payload: Vec<u8> = (0..50 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut sender = StreamSender::new(9, &payload).with_window(64);
+        // Receiver advertises only 3 credits.
+        sender.on_ack(Ack {
+            cumulative: 0,
+            sack: 0,
+            rwnd: 3,
+        });
+        assert_eq!(
+            sender.outbound().len(),
+            3,
+            "effective window = min(window, peer_rwnd)"
+        );
     }
 }
