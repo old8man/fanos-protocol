@@ -10,24 +10,29 @@
 //!
 //! * client → service: an onion whose last hop is the service's meeting line;
 //! * service → client: an onion whose last hop is a *client-chosen* reply rendezvous line, which the
-//!   client names (with an ephemeral reply key) inside its first message.
+//!   client names (as a [`Request`]'s `reply_circuit`) inside its first message.
 //!
-//! So neither party learns the other's location — each is reachable only at a rotating rendezvous
-//! line, through `t`-of-`(q+1)` threshold hops no single node can peel. This crate is the sealing and
-//! meeting-line core; wiring it under a DIAULOS session's payload API is a thin layer above.
+//! DIAULOS already encrypts the inner bytes end-to-end, so the reply route travels in the clear at
+//! the meeting point without weakening confidentiality — the onion hides *where*, DIAULOS hides
+//! *what*. So neither party learns the other's location: each is reachable only at a rotating
+//! rendezvous line, through `t`-of-`(q+1)` threshold hops no single node can peel. This crate is the
+//! sealing, meeting-line, and request-wrapper core; wiring it under a DIAULOS session is a thin layer.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 
 use fanos_aphantos::threshold::{HopLine, seal_onion};
-use fanos_aphantos::threshold_router::{combiner_for, launch_frame, line_member_coords};
+use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
 use fanos_field::Field;
 use fanos_geometry::{Line, Triple};
 use fanos_pqcrypto::kem::HybridKemPublic;
 
 /// The anonymous-source sentinel a threshold delivery carries (`from` in `Notification::Delivered`).
 pub use fanos_aphantos::threshold_router::ANONYMOUS;
+/// The combiner coordinate where an onion bound for `line` is finally delivered — the point a party
+/// listens at to receive its rendezvous traffic.
+pub use fanos_aphantos::threshold_router::combiner_for;
 
 /// The rendezvous **meeting line** for a service: the client and the service each derive the *same*
 /// line from the service's public key and the `epoch`, with no lookup or published record (CALYPSO).
@@ -75,6 +80,66 @@ impl MixDirectory {
     }
 }
 
+/// The client's rendezvous **request wrapper**, the plaintext delivered at the service's meeting
+/// line: the *reply circuit* the service routes responses back through (hop lines ending at the
+/// client's own reply rendezvous line) and the inner DIAULOS bytes (a `ClientHello` or a cell). The
+/// service seals its responses to `reply_circuit` (via [`seal_forward`]); the client listens at that
+/// circuit's destination combiner. The onion already hides the path, and DIAULOS already encrypts the
+/// inner bytes end-to-end, so this wrapper carries the return route in the clear at the meeting point
+/// without weakening either property.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Request {
+    /// Hop lines to the client's reply rendezvous (the last is where the client listens).
+    pub reply_circuit: Vec<Triple>,
+    /// The inner payload (a DIAULOS `ClientHello` or cell).
+    pub payload: Vec<u8>,
+}
+
+fn coord_bytes(c: Triple, out: &mut Vec<u8>) {
+    for w in c {
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+}
+
+fn coord_from(b: &[u8; 12]) -> Triple {
+    let mut c = [0u32; 3];
+    let (chunks, _) = b.as_chunks::<4>();
+    for (slot, chunk) in c.iter_mut().zip(chunks) {
+        *slot = u32::from_be_bytes(*chunk);
+    }
+    c
+}
+
+impl Request {
+    /// Encode as `hop_count(1) ‖ hop_line×12 … ‖ payload`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.reply_circuit.len() * 12 + self.payload.len());
+        out.push(u8::try_from(self.reply_circuit.len()).unwrap_or(u8::MAX));
+        for &line in &self.reply_circuit {
+            coord_bytes(line, &mut out);
+        }
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    /// Decode a request wrapper; `None` if truncated.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&n, mut rest) = bytes.split_first()?;
+        let mut reply_circuit = Vec::with_capacity(usize::from(n));
+        for _ in 0..n {
+            let (head, tail) = rest.split_at_checked(12)?;
+            rest = tail;
+            reply_circuit.push(coord_from(head.try_into().ok()?));
+        }
+        Some(Self {
+            reply_circuit,
+            payload: rest.to_vec(),
+        })
+    }
+}
+
 /// A sealed forward onion ready to launch: the coordinate to send it to and the wire frame.
 pub struct Forward {
     /// The combiner coordinate of the first hop line — where the launch frame is sent.
@@ -117,4 +182,22 @@ pub fn seal_forward<F: Field>(
         combiner: combiner_for::<F>(first)?,
         frame: launch_frame(first, &onion),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_wrapper_round_trips() {
+        let req = Request {
+            reply_circuit: vec![[1, 2, 3], [4, 5, 6]],
+            payload: b"inner diaulos bytes".to_vec(),
+        };
+        let wire = req.encode();
+        assert_eq!(Request::decode(&wire), Some(req));
+        assert!(Request::decode(&[]).is_none());
+        // A truncated hop-line is rejected.
+        assert!(Request::decode(&[2, 0, 0, 0, 1]).is_none());
+    }
 }
