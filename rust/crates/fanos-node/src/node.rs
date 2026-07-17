@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_onoma::{Address, lookup_key};
-use fanos_quic::{Directory, NodeHandle, spawn_self_certifying_persistent_on};
+use fanos_quic::{Client, Directory, NodeHandle, spawn_self_certifying_persistent_on};
 use fanos_runtime::{Command, Config as OverlayConfig, Notification, OverlayNode};
 
 use crate::config::{NodeConfig, RoleSet};
@@ -129,20 +129,25 @@ impl Node {
         self.handle.shutdown();
     }
 
+    /// A cloneable, concurrency-safe [`Client`] for this node — issue `get`/`put`/commands and await
+    /// correlated replies from many tasks at once (the surface a proxy or resolver builds on).
+    #[must_use]
+    pub fn client(&self) -> Client {
+        self.handle.client()
+    }
+
     /// Resolve a `.fanos` `name` to its authenticated service descriptor at `epoch`, requiring at
     /// least `min_pow` proof-of-work on the published descriptor.
     ///
-    /// This fetches the descriptor from the rotating epoch slot and verifies it **client-side**
-    /// (`H(bundle) == addr`), so a malicious store can never induce impersonation. It is a
-    /// one-shot request that consumes engine notifications until its `Get` answers — intended for
-    /// the `fanos resolve` command and tests, not for interleaving with other traffic on the same
-    /// node handle.
+    /// Fetches the descriptor from the rotating epoch slot via a **correlated** `get` (so many
+    /// resolves run concurrently without stealing each other's replies) and verifies it
+    /// **client-side** (`H(bundle) == addr`), so a malicious store can never induce impersonation.
     ///
     /// # Errors
     /// [`NodeError::Resolve`] if the name is malformed, no descriptor is published, or the fetched
     /// descriptor fails verification.
     pub async fn resolve(
-        &mut self,
+        &self,
         name: &str,
         epoch: u64,
         min_pow: u32,
@@ -150,27 +155,12 @@ impl Node {
         let address = Address::parse(name)
             .map_err(|e| NodeError::Resolve(format!("invalid .fanos name '{name}': {e}")))?;
         let slot = lookup_key(&address, epoch).to_vec();
-        if !self.command(Command::Get { key: slot }) {
-            return Err(NodeError::Resolve("node has shut down".to_string()));
-        }
-        loop {
-            match self.next_notification().await {
-                Some(Notification::Retrieved { value, .. }) => {
-                    let value = value.ok_or_else(|| {
-                        NodeError::Resolve(format!(
-                            "no descriptor published for '{name}' at epoch {epoch}"
-                        ))
-                    })?;
-                    return verify_descriptor(&address, epoch, &value, min_pow);
-                }
-                Some(_) => {}
-                None => {
-                    return Err(NodeError::Resolve(
-                        "node stopped before resolution".to_string(),
-                    ));
-                }
-            }
-        }
+        let value = self.client().get(slot).await.ok_or_else(|| {
+            NodeError::Resolve(format!(
+                "no descriptor published for '{name}' at epoch {epoch}"
+            ))
+        })?;
+        verify_descriptor(&address, epoch, &value, min_pow)
     }
 }
 
@@ -186,16 +176,20 @@ mod tests {
         // A name that is not a valid `.fanos` address fails at parse time, before any Get — so the
         // happy path (which needs a full cell) is covered by the resolve unit tests and the sim
         // `onoma_resolve` scenario, while this stays fast and deterministic.
-        let mut node = Node::start::<F2>(NodeConfig {
+        let node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             ..NodeConfig::default()
         })
         .await
         .unwrap();
-        assert!(matches!(
-            node.resolve("definitely not a .fanos name", 0, 0).await,
-            Err(NodeError::Resolve(_))
-        ));
+        // Concurrency-safe: two resolves run at once without stealing each other's replies (both
+        // fail at parse here, before any network I/O — deterministic).
+        let (a, b) = tokio::join!(
+            node.resolve("definitely not a .fanos name", 0, 0),
+            node.resolve("also-not-valid", 7, 0),
+        );
+        assert!(matches!(a, Err(NodeError::Resolve(_))));
+        assert!(matches!(b, Err(NodeError::Resolve(_))));
         node.shutdown();
     }
 

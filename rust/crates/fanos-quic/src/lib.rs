@@ -35,7 +35,7 @@ mod tls;
 
 pub use directory::Directory;
 pub use driver::{
-    NodeHandle, QuicError, spawn, spawn_self_certifying, spawn_self_certifying_persistent,
+    Client, NodeHandle, QuicError, spawn, spawn_self_certifying, spawn_self_certifying_persistent,
     spawn_self_certifying_persistent_on, spawn_shaped,
 };
 pub use identity::coordinate_from_cert;

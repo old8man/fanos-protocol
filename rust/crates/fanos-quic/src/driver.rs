@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant as StdInstant;
 
 use quinn::{Connection, Endpoint};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
+use fanos_crypto::{hash_labeled, label};
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
 use fanos_proteus::ProteusShaper;
@@ -101,7 +102,9 @@ pub struct NodeHandle {
     addr: Triple,
     local_addr: SocketAddr,
     input_tx: mpsc::UnboundedSender<Input>,
-    notify_rx: mpsc::UnboundedReceiver<Notification>,
+    ctrl_tx: mpsc::UnboundedSender<Control>,
+    events_tx: broadcast::Sender<Notification>,
+    events_rx: broadcast::Receiver<Notification>,
     endpoint: Endpoint,
 }
 
@@ -124,14 +127,172 @@ impl NodeHandle {
         self.input_tx.send(Input::Command(cmd)).is_ok()
     }
 
-    /// Await the next application notification the engine emits, or `None` once it stops.
+    /// Await the next application notification the engine emits, or `None` once it stops. Backed by a
+    /// broadcast fan-out, so many observers can each read the full stream; a reader that falls behind
+    /// skips the missed items rather than blocking the engine.
     pub async fn next_notification(&mut self) -> Option<Notification> {
-        self.notify_rx.recv().await
+        loop {
+            match self.events_rx.recv().await {
+                Ok(note) => return Some(note),
+                Err(broadcast::error::RecvError::Lagged(_)) => {} // skip missed items, keep reading
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// A cloneable, **correlated** client for this node — the concurrency-safe surface. Many tasks
+    /// share it to issue `get`/`put` and await *only their own* replies (correlated by the storage
+    /// digest the engine echoes), send fire-and-forget commands, or `subscribe` to the event stream —
+    /// none stealing another's notifications. A proxy or resolver uses this instead of the single
+    /// `next_notification` stream.
+    #[must_use]
+    pub fn client(&self) -> Client {
+        Client {
+            addr: self.addr,
+            input_tx: self.input_tx.clone(),
+            ctrl_tx: self.ctrl_tx.clone(),
+            events_tx: self.events_tx.clone(),
+        }
     }
 
     /// Close the QUIC endpoint and stop serving. Idempotent.
     pub fn shutdown(&self) {
         self.endpoint.close(0u32.into(), b"shutdown");
+    }
+}
+
+/// Pending `get` waiters, keyed by the storage digest the engine echoes (a Vec coalesces concurrent
+/// gets of the same key onto one reply).
+type GetWaiters = HashMap<[u8; 32], Vec<oneshot::Sender<Option<Vec<u8>>>>>;
+/// Pending `put` waiters, keyed by the storage digest.
+type PutWaiters = HashMap<[u8; 32], Vec<oneshot::Sender<()>>>;
+
+/// A control message from a [`Client`] to the router: register a waiter for a content-addressed
+/// reply, keyed by the storage digest the engine will echo back.
+enum Control {
+    Get {
+        digest: [u8; 32],
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
+    Put {
+        digest: [u8; 32],
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// A cloneable, correlated client for a node. Many tasks share it to issue content-addressed
+/// requests (`get`/`put`) that await *only their own* answer — correlated by the storage digest the
+/// engine echoes, so concurrent requests never cross — send fire-and-forget commands, or subscribe to
+/// the notification stream. This is the concurrency-safe surface a SOCKS5 proxy or a `.fanos` resolver
+/// builds on: the single-consumer `next_notification` bottleneck is gone.
+#[derive(Clone)]
+pub struct Client {
+    addr: Triple,
+    input_tx: mpsc::UnboundedSender<Input>,
+    ctrl_tx: mpsc::UnboundedSender<Control>,
+    events_tx: broadcast::Sender<Notification>,
+}
+
+impl Client {
+    /// This node's overlay coordinate.
+    #[must_use]
+    pub fn address(&self) -> Triple {
+        self.addr
+    }
+
+    /// Inject a fire-and-forget command (`Input::Command`). `false` once the engine has stopped.
+    pub fn command(&self, cmd: Command) -> bool {
+        self.input_tx.send(Input::Command(cmd)).is_ok()
+    }
+
+    /// Retrieve `key` from the L4 store, awaiting *this* request's answer (correlated by the storage
+    /// digest, so concurrent `get`s never cross). `None` if no value is stored or the node stopped.
+    pub async fn get(&self, key: Vec<u8>) -> Option<Vec<u8>> {
+        let digest = hash_labeled(label::STORAGE, &key);
+        let (reply, rx) = oneshot::channel();
+        // Register the waiter BEFORE issuing the Get, so a fast reply can never be missed.
+        if self.ctrl_tx.send(Control::Get { digest, reply }).is_err() {
+            return None;
+        }
+        if self
+            .input_tx
+            .send(Input::Command(Command::Get { key }))
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
+    /// Store `value` under `key`, awaiting the responsible node's acknowledgement. `false` if the
+    /// node stopped before acking.
+    pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let digest = hash_labeled(label::STORAGE, &key);
+        let (reply, rx) = oneshot::channel();
+        if self.ctrl_tx.send(Control::Put { digest, reply }).is_err() {
+            return false;
+        }
+        if self
+            .input_tx
+            .send(Input::Command(Command::Put { key, value }))
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.is_ok()
+    }
+
+    /// Subscribe to the full notification stream (Delivered, PeerDown, Verdict, healing events, …).
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<Notification> {
+        self.events_tx.subscribe()
+    }
+}
+
+/// The router actor: sole owner of the engine's notification stream. It resolves content-addressed
+/// request/response correlation (many concurrent `get`/`put` each awaiting their own digest) and fans
+/// every notification out to subscribers — so the single-consumer bottleneck is gone and no observer
+/// steals another's reply. Single-writer-by-message: it alone touches the registry, mutated only via
+/// `Control` (mirroring the engine actor's lock-free discipline).
+async fn router_loop(
+    mut notify_rx: mpsc::UnboundedReceiver<Notification>,
+    mut ctrl_rx: mpsc::UnboundedReceiver<Control>,
+    events_tx: broadcast::Sender<Notification>,
+) {
+    let mut gets: GetWaiters = HashMap::new();
+    let mut puts: PutWaiters = HashMap::new();
+    loop {
+        tokio::select! {
+            note = notify_rx.recv() => {
+                let Some(note) = note else { break };
+                match &note {
+                    Notification::Retrieved { key, value } => {
+                        if let Some(waiters) = gets.remove(key) {
+                            for w in waiters {
+                                let _ = w.send(value.clone());
+                            }
+                        }
+                    }
+                    Notification::Stored(key) => {
+                        if let Some(waiters) = puts.remove(key) {
+                            for w in waiters {
+                                let _ = w.send(());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Fan every notification out to subscribers (Err only if no receivers — ignored).
+                let _ = events_tx.send(note);
+            }
+            ctrl = ctrl_rx.recv() => {
+                let Some(ctrl) = ctrl else { break };
+                match ctrl {
+                    Control::Get { digest, reply } => gets.entry(digest).or_default().push(reply),
+                    Control::Put { digest, reply } => puts.entry(digest).or_default().push(reply),
+                }
+            }
+        }
     }
 }
 
@@ -308,6 +469,8 @@ fn spawn_inner(
     let (input_tx, input_rx) = mpsc::unbounded_channel::<Input>();
     let (send_tx, send_rx) = mpsc::unbounded_channel::<SendRequest>();
     let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Notification>();
+    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Control>();
+    let (events_tx, events_rx) = broadcast::channel::<Notification>(4096);
     let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(accept_loop(
@@ -333,12 +496,16 @@ fn spawn_inner(
         send_tx,
         notify_tx,
     ));
+    // The router owns the notification stream: it correlates get/put replies and fans events out.
+    tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone()));
 
     Ok(NodeHandle {
         addr,
         local_addr,
         input_tx,
-        notify_rx,
+        ctrl_tx,
+        events_tx,
+        events_rx,
         endpoint,
     })
 }

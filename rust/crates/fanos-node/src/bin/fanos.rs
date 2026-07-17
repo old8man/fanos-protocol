@@ -147,7 +147,7 @@ async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
         bootstrap,
         ..NodeConfig::default()
     };
-    let mut node = Node::start::<F2>(config).await?;
+    let node = Node::start::<F2>(config).await?;
     let resolved = node.resolve(name, epoch, min_pow).await?;
     println!("resolved {name}");
     println!("  address:  {}", resolved.address);
