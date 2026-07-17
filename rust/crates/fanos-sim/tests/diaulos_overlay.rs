@@ -17,6 +17,7 @@ use fanos_sim::{NetworkModel, Sim, spawn_cell};
 type Coord = [u32; 3];
 
 /// Route every not-yet-seen overlay delivery to the client or service session it belongs to.
+#[allow(clippy::too_many_arguments)] // a test pump helper; the args are all distinct and clear
 fn dispatch(
     sim: &Sim,
     seen: &mut usize,

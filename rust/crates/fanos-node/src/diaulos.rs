@@ -4,17 +4,20 @@
 //! module rides a reliable, encrypted, hybrid-PQ [DIAULOS](fanos_diaulos) session on top, exposing it
 //! as an async byte stream. [`NodeTransport`] adapts a node [`Client`] to the
 //! [`OverlayTransport`](fanos_session::OverlayTransport) the async stream driver expects;
-//! [`dial_service`] is the client side (what a SOCKS5 proxy calls); [`serve_one`] is a minimal
-//! single-client service accept loop. This is the **Direct** profile — the anonymous rendezvous is a
-//! different transport under the identical stream.
+//! [`dial_service`] / [`FanosDialer`] are the client side (what a SOCKS5 proxy calls); [`serve`] is
+//! the multi-client service accept loop. This is the **Direct** profile — the anonymous rendezvous is
+//! a different transport under the identical stream.
 
 use fanos_diaulos::{ClientSession, Coord, ServerSession, StaticKeypair};
 use fanos_pqcrypto::kem::HybridKemPublic;
+use fanos_pqcrypto::rng::SeedRng;
+use fanos_proxy::{DialError, Dialer, Target};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
 use fanos_session::{OverlayTransport, dial_over_transport};
 use rand_core::CryptoRng;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
@@ -68,10 +71,6 @@ pub fn dial_service<R: CryptoRng>(
     dial_over_transport(session, NodeTransport::new(client))
 }
 
-/// Serve a **single** client request/response over DIAULOS on `client`'s node, answering with
-/// `handler(request)`. Spawns a background task bound to the first client that connects; returns
-/// immediately. (A full multi-client hidden service is a follow-up — it needs the service identity
-/// shared across sessions by reference rather than owned here.)
 /// One in-flight client session at the service, plus its primary stream and whether it was answered.
 #[derive(Default)]
 struct ClientState {
@@ -133,4 +132,85 @@ where
             }
         }
     });
+}
+
+/// Resolves a `.fanos` host to the service's overlay coordinate and static KEM public key — the two
+/// facts [`FanosDialer`] needs to dial it. A production impl reads the ONOMA descriptor (bundle +
+/// coordinate) from the overlay; [`StaticResolver`] is a fixed map for simple deployments and tests.
+pub trait ServiceResolver: Send + Sync {
+    /// Resolve `host` (the full `.fanos` name), or `None` if it is unknown.
+    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send;
+}
+
+/// A fixed `host → (coordinate, key)` map.
+#[derive(Default)]
+pub struct StaticResolver {
+    map: BTreeMap<String, (Coord, HybridKemPublic)>,
+}
+
+impl StaticResolver {
+    /// An empty resolver.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a service (builder style).
+    #[must_use]
+    pub fn with(mut self, host: impl Into<String>, coord: Coord, public: HybridKemPublic) -> Self {
+        self.map.insert(host.into(), (coord, public));
+        self
+    }
+}
+
+impl ServiceResolver for StaticResolver {
+    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send {
+        std::future::ready(self.map.get(host).cloned())
+    }
+}
+
+/// A SOCKS5 [`Dialer`] that reaches `.fanos` services over DIAULOS: resolve the name to a coordinate
+/// and static key, then dial a reliable, encrypted, hybrid-PQ session (an async byte stream) to it.
+/// Each dial seeds a fresh CSPRNG from OS entropy for its ephemeral handshake keys, so forward
+/// secrecy holds per connection. Non-`.fanos` targets are `Unsupported`.
+pub struct FanosDialer<R: ServiceResolver> {
+    client: Client,
+    resolver: R,
+}
+
+impl<R: ServiceResolver> FanosDialer<R> {
+    /// A dialer on `client`'s node resolving names through `resolver`.
+    #[must_use]
+    pub fn new(client: Client, resolver: R) -> Self {
+        Self { client, resolver }
+    }
+}
+
+impl<R: ServiceResolver> Dialer for FanosDialer<R> {
+    type Stream = DuplexStream;
+
+    async fn dial(&self, target: &Target) -> Result<DuplexStream, DialError> {
+        if !target.is_fanos() {
+            return Err(DialError::Unsupported(
+                "the FANOS dialer reaches only .fanos targets".to_owned(),
+            ));
+        }
+        let host = target.host();
+        let (coord, service_public) = self
+            .resolver
+            .resolve(&host)
+            .await
+            .ok_or(DialError::Unreachable)?;
+        // A fresh CSPRNG seeded from OS entropy for this dial's ephemeral keys.
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed)
+            .map_err(|e| DialError::Io(std::io::Error::other(format!("OS entropy failed: {e}"))))?;
+        let mut rng = SeedRng::from_seed(&seed);
+        Ok(dial_service(
+            self.client.clone(),
+            coord,
+            &service_public,
+            &mut rng,
+        ))
+    }
 }

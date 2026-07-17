@@ -26,7 +26,12 @@ fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
 fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
 fanos-session = { path = "../fanos-session", version = "0.1.0" }
 fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+# The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
+# is the integration point that provides a Dialer).
+fanos-proxy = { path = "../fanos-proxy", version = "0.1.0" }
 rand_core = { version = "0.10", default-features = false }
+# OS entropy to seed each dial's ephemeral handshake keys (a fresh CSPRNG per dial).
+getrandom = "0.3"
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",

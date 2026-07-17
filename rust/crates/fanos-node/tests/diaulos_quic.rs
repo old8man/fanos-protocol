@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
-use fanos_node::{Node, NodeConfig, Peer, dial_service, serve};
+use fanos_node::{FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_service, serve};
 use fanos_pqcrypto::rng::SeedRng;
+use fanos_proxy::{DialError, Dialer, Target};
 use fanos_runtime::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -155,4 +156,55 @@ async fn diaulos_serves_two_clients_concurrently() {
     s.shutdown();
     c1.shutdown();
     c2.shutdown();
+}
+
+#[tokio::test]
+async fn fanos_dialer_reaches_a_service_by_name() {
+    // The full SOCKS5→.fanos seam: a FanosDialer resolves a name to the service's coordinate + key
+    // (here a StaticResolver) and returns a connected DIAULOS stream through the Dialer trait.
+    let a = start(vec![]).await; // service
+    let (a_addr, a_net) = (a.address(), a.local_addr());
+    let b = start_distinct(
+        vec![Peer {
+            coord: a_addr,
+            addr: a_net,
+        }],
+        &[a_addr],
+    )
+    .await; // client
+    a.directory().insert(b.address(), b.local_addr());
+    warm(&a, &b);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut krng = SeedRng::from_seed(b"fd-key");
+    let keypair = StaticKeypair::generate(&mut krng);
+    let service_public = keypair.public.clone();
+    serve(
+        a.client(),
+        keypair,
+        SeedRng::from_seed(b"fd-svc"),
+        <[u8]>::to_ascii_uppercase,
+    );
+
+    let resolver = StaticResolver::new().with("svc.fanos", a_addr, service_public);
+    let dialer = FanosDialer::new(b.client(), resolver);
+
+    let mut stream = dialer
+        .dial(&Target::Name("svc.fanos".to_owned(), 80))
+        .await
+        .expect("dial by name");
+    let response = exchange(&mut stream, b"via dialer").await;
+    assert_eq!(
+        response, b"VIA DIALER",
+        "reached the service through the SOCKS5 Dialer"
+    );
+
+    // A non-.fanos target is refused as unsupported.
+    let clear = dialer
+        .dial(&Target::Name("example.com".to_owned(), 443))
+        .await;
+    assert!(matches!(clear, Err(DialError::Unsupported(_))));
+
+    a.shutdown();
+    b.shutdown();
 }

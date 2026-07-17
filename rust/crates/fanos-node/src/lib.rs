@@ -24,7 +24,9 @@ pub mod node;
 pub mod resolve;
 
 pub use config::{NodeConfig, Peer, RoleSet};
-pub use diaulos::{NodeTransport, dial_service, serve};
+pub use diaulos::{
+    FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service, serve,
+};
 pub use error::NodeError;
 pub use node::{Health, Node};
 pub use resolve::ResolvedService;
