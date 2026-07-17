@@ -17,10 +17,17 @@ const FT_ACK: u8 = 0x02;
 /// A DIAULOS frame carried inside one cell.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Frame {
-    /// A reliability segment (stream data).
+    /// A reliability segment (stream data). The `stream_id` inside routes it in a multiplexed
+    /// connection.
     Data(Segment),
-    /// A selective acknowledgement with receive credit.
-    Ack(Ack),
+    /// A selective acknowledgement with receive credit, tagged with the stream it acknowledges (so
+    /// acks route independently over one connection).
+    Ack {
+        /// The stream this ack is for.
+        stream_id: u32,
+        /// The selective ack + receive credit.
+        ack: Ack,
+    },
     /// A cover cell — no payload.
     Padding,
 }
@@ -64,12 +71,13 @@ impl Frame {
                 out.extend_from_slice(s.data.get(..len).unwrap_or(&[]));
                 out
             }
-            Self::Ack(a) => {
-                let mut out = Vec::with_capacity(17);
+            Self::Ack { stream_id, ack } => {
+                let mut out = Vec::with_capacity(21);
                 out.push(FT_ACK);
-                out.extend_from_slice(&a.cumulative.to_be_bytes());
-                out.extend_from_slice(&a.sack.to_be_bytes());
-                out.extend_from_slice(&a.rwnd.to_be_bytes());
+                out.extend_from_slice(&stream_id.to_be_bytes());
+                out.extend_from_slice(&ack.cumulative.to_be_bytes());
+                out.extend_from_slice(&ack.sack.to_be_bytes());
+                out.extend_from_slice(&ack.rwnd.to_be_bytes());
                 out
             }
             Self::Padding => vec![FT_PADDING],
@@ -99,14 +107,18 @@ impl Frame {
                 }))
             }
             FT_ACK => {
+                let stream_id = read_u32(&mut cur)?;
                 let cumulative = read_u32(&mut cur)?;
                 let sack = read_u64(&mut cur)?;
                 let rwnd = read_u32(&mut cur)?;
-                Some(Self::Ack(Ack {
-                    cumulative,
-                    sack,
-                    rwnd,
-                }))
+                Some(Self::Ack {
+                    stream_id,
+                    ack: Ack {
+                        cumulative,
+                        sack,
+                        rwnd,
+                    },
+                })
             }
             _ => None,
         }
@@ -133,11 +145,14 @@ mod tests {
 
     #[test]
     fn ack_frame_round_trips() {
-        let f = Frame::Ack(Ack {
-            cumulative: 12,
-            sack: 0b1010,
-            rwnd: 30,
-        });
+        let f = Frame::Ack {
+            stream_id: 4,
+            ack: Ack {
+                cumulative: 12,
+                sack: 0b1010,
+                rwnd: 30,
+            },
+        };
         let mut wire = f.encode();
         wire.extend_from_slice(&[0u8; 64]);
         assert_eq!(Frame::decode(&wire), Some(f));

@@ -23,9 +23,11 @@
 #![forbid(unsafe_code)]
 
 pub mod cell;
+pub mod conn;
 pub mod endpoint;
 pub mod frame;
 
 pub use cell::{CELL_LEN, Key, open, seal};
+pub use conn::Connection;
 pub use endpoint::StreamEndpoint;
 pub use frame::Frame;

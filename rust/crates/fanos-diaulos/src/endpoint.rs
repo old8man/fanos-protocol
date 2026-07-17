@@ -15,6 +15,7 @@ use crate::frame::Frame;
 /// One end of a DIAULOS stream. Write bytes, drain received bytes, and exchange [`cells`](Self::outbound)
 /// with the peer until [`is_done`](Self::is_done).
 pub struct StreamEndpoint {
+    stream_id: u32,
     sender: StreamSender,
     receiver: StreamReceiver,
     key_tx: Key,
@@ -28,6 +29,7 @@ impl StreamEndpoint {
     #[must_use]
     pub fn new(stream_id: u32, key_tx: Key, key_rx: Key) -> Self {
         Self {
+            stream_id,
             sender: StreamSender::open(stream_id),
             receiver: StreamReceiver::new(stream_id),
             key_tx,
@@ -74,7 +76,11 @@ impl StreamEndpoint {
                 cells.push(cell);
             }
         }
-        let ack = Frame::Ack(self.receiver.ack()).encode();
+        let ack = Frame::Ack {
+            stream_id: self.stream_id,
+            ack: self.receiver.ack(),
+        }
+        .encode();
         let nonce = self.next_nonce();
         if let Some(cell) = seal(&self.key_tx, nonce, &ack) {
             cells.push(cell);
@@ -92,10 +98,10 @@ impl StreamEndpoint {
             Some(Frame::Data(seg)) => {
                 self.receiver.on_segment(&seg);
             }
-            Some(Frame::Ack(ack)) => {
+            Some(Frame::Ack { stream_id, ack }) if stream_id == self.stream_id => {
                 self.sender.on_ack(ack);
             }
-            Some(Frame::Padding) | None => {}
+            _ => {}
         }
     }
 }
