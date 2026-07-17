@@ -288,9 +288,10 @@ impl<F: Field> Engine for NyxNode<F> {
             Input::Command(Command::Send { to, payload }) => self.originate(to, &payload),
             Input::Timer(token) => self.on_timer(token),
             Input::Message { frame, .. } => self.on_frame(&frame),
-            // A NYX node ignores the overlay's diagnose/storage/membership commands.
+            // A NYX node ignores the overlay's diagnose/observe/storage/membership commands.
             Input::Command(
                 Command::Diagnose
+                | Command::Observe
                 | Command::Put { .. }
                 | Command::Get { .. }
                 | Command::Join { .. }

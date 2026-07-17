@@ -72,6 +72,10 @@ pub enum Command {
     },
     /// Run one round of local self-diagnosis and report the verdict (spec §6.9).
     Diagnose,
+    /// Emit the cell's current coherence self-observation **without acting** — a sense-only read for
+    /// a passive monitor (`fanos_telemetry`), which must not trigger the healing side-effects a full
+    /// `Diagnose` does. Produces a `Notification::Observed` (docs/design-telemetry.md §4).
+    Observe,
     /// Store `value` in the cell's DHT under `key` (spec §L4). The responsible node is
     /// `MapToPoint(H(key))`; the value is replicated across the cell for LRC availability.
     Put {

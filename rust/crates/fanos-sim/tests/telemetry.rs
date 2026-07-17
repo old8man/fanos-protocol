@@ -60,6 +60,44 @@ fn a_healthy_cell_observes_itself_with_no_fault() {
 }
 
 #[test]
+fn observe_is_sense_only_no_verdict_no_healing() {
+    let mut sim = Sim::new(11);
+    let cell = spawn_cell::<F2>(&mut sim, cfg());
+    sim.inject_all(&Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(2000));
+    sim.crash(cell[3]); // a real fault is present...
+    sim.run_for(Duration::from_millis(3000));
+    // ...but a passive monitor only *observes* — it must not diagnose or heal.
+    sim.inject_all(&Command::Observe);
+    sim.settle();
+
+    assert!(
+        sim.report().metrics.observations >= 1,
+        "frames were emitted"
+    );
+    assert_eq!(
+        sim.report().verdicts().count(),
+        0,
+        "Observe emits no verdict"
+    );
+    let m = &sim.report().metrics;
+    assert_eq!(
+        (
+            m.reroutes,
+            m.repairs,
+            m.quarantines,
+            m.escalations,
+            m.decouples
+        ),
+        (0, 0, 0, 0, 0),
+        "Observe triggers no healing action"
+    );
+    // The observation still carries the true syndrome (the crash is visible, just not acted on).
+    let frames = observed_frames(&sim);
+    assert!(frames.iter().any(CoherenceFrame::is_faulted));
+}
+
+#[test]
 fn a_crash_is_localized_in_the_coherence_frame() {
     let mut sim = Sim::new(3);
     let cell = spawn_cell::<F2>(&mut sim, cfg());

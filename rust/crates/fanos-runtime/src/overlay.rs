@@ -642,18 +642,17 @@ impl<F: Field> OverlayNode<F> {
         self.epoch
     }
 
-    fn on_diagnose(&mut self, now: Instant) -> Vec<Effect> {
-        // DIAKRISIS runs at cell scale. On the base Fano cell (N=7) a node sees the whole cell
-        // through its lines, so it can build the full degraded mask locally (spec §6.3).
-        let Some(self_index) = self.self_index else {
-            return Vec::new();
-        };
+    /// This node's cell-liveness view (base Fano cell only): `(self_index, degraded_mask,
+    /// alive_count)`. Bit `i` of the mask is set when point `i` is not corroborated-alive. `None`
+    /// off the base `N = 7` cell, where the index-addressed syndrome geometry does not apply.
+    fn cell_liveness(&self, now: Instant) -> Option<(usize, u8, usize)> {
+        let self_index = self.self_index?;
         let mut degraded = 0u8;
         let mut alive_count = 1usize; // self is alive
         for i in 0..7usize {
             let point = Point::<F>::at(i);
             if point == self.coord {
-                continue; // self is alive
+                continue;
             }
             if self.coord_alive(point.coords(), now) {
                 alive_count += 1;
@@ -661,6 +660,41 @@ impl<F: Field> OverlayNode<F> {
                 degraded |= 1 << i;
             }
         }
+        Some((self_index, degraded, alive_count))
+    }
+
+    /// Fold this window's cell health into a `CoherenceFrame`, record it in local history, and return
+    /// the effect that publishes its wire bytes. The exact 3-bit syndrome comes from `degraded`; the
+    /// coherence scalars from the equicorrelated liveness model (docs/design-telemetry.md §2).
+    fn emit_observation(&mut self, now: Instant, alive_count: usize, degraded: u8) -> Effect {
+        let frame = self.observer.observe_liveness(
+            now.as_nanos(),
+            alive_count,
+            self.config.healthy_correlation,
+            degraded,
+            0.0, // spectral gap Δ: not tracked from liveness alone; 0 = unknown this window
+            -1,  // cascade forecast: none from liveness alone
+        );
+        Effect::Notify(Notification::Observed(frame.encode().to_vec()))
+    }
+
+    /// Sense-only self-observation (`Command::Observe`): emit the cell's coherence frame **without**
+    /// running the verdict or any healing — the passive monitor read (docs/design-telemetry.md §4).
+    fn on_observe(&mut self, now: Instant) -> Vec<Effect> {
+        match self.cell_liveness(now) {
+            Some((_, degraded, alive_count)) => {
+                alloc::vec![self.emit_observation(now, alive_count, degraded)]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn on_diagnose(&mut self, now: Instant) -> Vec<Effect> {
+        // DIAKRISIS runs at cell scale. On the base Fano cell (N=7) a node sees the whole cell
+        // through its lines, so it can build the full degraded mask locally (spec §6.3).
+        let Some((self_index, degraded, alive_count)) = self.cell_liveness(now) else {
+            return Vec::new();
+        };
         // The base node senses only liveness, so it feeds the degraded mask; partition and
         // cascade verdicts require the global coherence view (the simulator's observatory / a
         // real deployment's cross-attestation), not this local liveness alone (spec §6.5).
@@ -680,21 +714,8 @@ impl<F: Field> OverlayNode<F> {
             }
             effects.extend(self.apply_healing_plan(&plan));
         }
-        // Mandatory self-observation (docs/design-telemetry.md): fold this window's cell health into
-        // a CoherenceFrame — the exact 3-bit syndrome from the degraded mask, the coherence scalars
-        // from the equicorrelated liveness model — record it in local history, and emit its wire
-        // bytes. Diagnosis cannot happen without observing.
-        let frame = self.observer.observe_liveness(
-            now.as_nanos(),
-            alive_count,
-            self.config.healthy_correlation,
-            degraded,
-            0.0, // spectral gap Δ: not tracked from liveness alone; 0 = unknown this window
-            -1,  // cascade forecast: none from liveness alone
-        );
-        effects.push(Effect::Notify(Notification::Observed(
-            frame.encode().to_vec(),
-        )));
+        // Mandatory self-observation: diagnosis cannot happen without observing.
+        effects.push(self.emit_observation(now, alive_count, degraded));
         effects
     }
 
@@ -756,6 +777,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             }
             Input::Command(Command::Send { to, payload }) => self.on_send(to, &payload),
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
+            Input::Command(Command::Observe) => self.on_observe(now),
             Input::Command(Command::Put { key, value }) => self.on_put(&key, value),
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
