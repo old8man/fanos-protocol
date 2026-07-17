@@ -1,0 +1,28 @@
+[package]
+name = "fanos-aphantos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "APHANTOS integration: a KEM-sealed NYX onion and a sans-I/O NyxNode engine that routes it (spec §L5)."
+keywords = ["onion-routing", "anonymity", "post-quantum", "sans-io", "fanos"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+fanos-field = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-crypto = { workspace = true, features = ["std"] }
+fanos-wire = { workspace = true, features = ["std"] }
+fanos-nyx = { workspace = true, features = ["std"] }
+fanos-runtime = { workspace = true, features = ["std"] }
+fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+chacha20poly1305 = { workspace = true }
+rand_core = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

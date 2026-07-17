@@ -1,0 +1,35 @@
+[package]
+name = "fanos-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS overlay core: coordinates, O(1) rendezvous, Maekawa quorums, projective storage, cell hierarchy."
+keywords = ["overlay", "p2p", "rendezvous", "quorum", "fanos"]
+categories = ["network-programming"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-code.workspace = true
+fanos-crypto.workspace = true
+fanos-diakrisis.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "fanos-geometry/std",
+    "fanos-code/std",
+    "fanos-crypto/std",
+    "fanos-diakrisis/std",
+]
+# For no_std targets: supply DIAKRISIS's float backend (used by the stratified healing budget).
+libm = ["fanos-diakrisis/libm"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

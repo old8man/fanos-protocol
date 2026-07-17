@@ -1,0 +1,39 @@
+[package]
+name = "fanos-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic in-process network simulator that drives the real FANOS node engines (swaps environment + transport)."
+keywords = ["simulation", "discrete-event", "p2p", "deterministic", "fanos"]
+categories = ["simulation", "network-programming"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-diakrisis.workspace = true
+fanos-wire.workspace = true
+fanos-runtime = { workspace = true, features = ["std"] }
+
+[[bin]]
+name = "fanos-sim-demo"
+path = "src/bin/demo.rs"
+
+[dev-dependencies]
+proptest.workspace = true
+# For the NYX anonymity-routing scenario (real onion over the simulated network).
+fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
+fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+# For the L4 storage scenarios (computing a key's responsible node, MapToPoint).
+fanos-crypto = { workspace = true, features = ["std"] }
+# For the hierarchy scenario (feeding a child cell's escalation to the parent tier).
+fanos-core = { workspace = true, features = ["std"] }
+# For the CALYPSO hidden-service flow (address, per-epoch rendezvous, PoW) over the overlay.
+fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+# For the NYX mixnet scenarios (anonymity-set entropy math).
+fanos-nyx = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

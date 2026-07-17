@@ -1,0 +1,118 @@
+# FANOS — reference implementation (Rust).
+#
+# A Cargo virtual workspace whose crates mirror the protocol's module structure
+# (spec Part XI): the layers L0–L7 plus the cross-cutting DIAKRISIS plane, each a
+# separate crate with a clean interface, so a build selects exactly what it needs
+# ("DHT only", "DHT+VPN", or the full mixnet+services stack) and stays wire-compatible
+# with the others via the canonical encoding (spec Part VII §7.9).
+[workspace]
+resolver = "3"
+members = [
+    "crates/fanos-field",
+    "crates/fanos-geometry",
+    "crates/fanos-code",
+    "crates/fanos-diakrisis",
+    "crates/fanos-wire",
+    "crates/fanos-crypto",
+    "crates/fanos-aphantos",
+    "crates/fanos-calypso",
+    "crates/fanos-core",
+    "crates/fanos-nyx",
+    "crates/fanos-pqcrypto",
+    "crates/fanos-proteus",
+    "crates/fanos-quic",
+    "crates/fanos-runtime",
+    "crates/fanos-vrf",
+    "crates/fanos-sim",
+    "crates/fanos-cli",
+    "crates/fanos-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/old8man/fanos-protocol"
+authors = ["FANOS contributors"]
+description = "FANOS — a projective-plane-addressed overlay network (reference implementation)"
+keywords = ["p2p", "overlay", "anonymity", "post-quantum", "projective-plane"]
+categories = ["network-programming", "cryptography"]
+
+# ----------------------------------------------------------------------------
+# Strictest-standard lint policy, shared by every crate via `[lints] workspace = true`.
+# CI runs `cargo clippy --all-targets -- -D warnings`, so each of these is a hard gate.
+# ----------------------------------------------------------------------------
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"                  # math crates further tighten this to `forbid`
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Correctness/robustness lints escalated to hard errors.
+unwrap_used = "warn"
+expect_used = "warn"
+panic_in_result_fn = "warn"
+indexing_slicing = "warn"
+# Pragmatic allowances: FANOS deliberately truncates in field reduction and carries
+# domain terminology that trips a few stylistic pedantic lints.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"   # small counts (n ≤ cell size) cast to f64; no real loss
+cast_possible_wrap = "allow"    # bounded small indices/exponents
+similar_names = "allow"
+doc_markdown = "allow"
+inline_always = "allow"
+many_single_char_names = "allow" # dense numerical kernels use math-style names
+missing_errors_doc = "allow"     # error types (WireError etc.) are self-documenting enums
+
+[workspace.dependencies]
+# Foundational math crates are zero-dependency; only fanos-crypto and above pull externals.
+fanos-field = { path = "crates/fanos-field", version = "0.1.0", default-features = false }
+fanos-geometry = { path = "crates/fanos-geometry", version = "0.1.0", default-features = false }
+fanos-code = { path = "crates/fanos-code", version = "0.1.0", default-features = false }
+fanos-diakrisis = { path = "crates/fanos-diakrisis", version = "0.1.0", default-features = false }
+fanos-wire = { path = "crates/fanos-wire", version = "0.1.0", default-features = false }
+fanos-crypto = { path = "crates/fanos-crypto", version = "0.1.0", default-features = false }
+fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }
+fanos-runtime = { path = "crates/fanos-runtime", version = "0.1.0", default-features = false }
+
+# External dependencies (isolated to the crypto/privacy layers and above).
+blake3 = { version = "1", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+
+# Test-only: property-based testing across all crates.
+proptest = "1"
+
+# Privacy and simulation crates (added as they land).
+fanos-nyx = { path = "crates/fanos-nyx", version = "0.1.0", default-features = false }
+fanos-sim = { path = "crates/fanos-sim", version = "0.1.0", default-features = false }
+
+# ----------------------------------------------------------------------------
+# Build profiles. FANOS targets "extreme performance"; the default release build
+# stays fast to compile, and `maxperf` is the ship profile (whole-program LTO).
+# ----------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = false
+
+# Ship / benchmark profile: whole-program optimization, single codegen unit.
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

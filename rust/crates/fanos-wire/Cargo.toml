@@ -1,0 +1,26 @@
+[package]
+name = "fanos-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS canonical wire encoding: varints, projective points/lines, frames, Tessera layout (spec Part VII)."
+keywords = ["encoding", "wire-format", "canonical", "protocol", "fanos"]
+categories = ["encoding", "no-std"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc", "fanos-geometry/std"]
+alloc = ["fanos-geometry/alloc"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

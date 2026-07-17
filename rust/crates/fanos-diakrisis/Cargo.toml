@@ -1,0 +1,30 @@
+[package]
+name = "fanos-diakrisis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "DIAKRISIS — the FANOS self-diagnosis plane: coherence matrix, Φ/P/R, polar sum-rules, partition, self-healing."
+keywords = ["diagnosis", "coherence-matrix", "self-healing", "fano", "fanos"]
+categories = ["mathematics", "algorithms"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-code.workspace = true
+# Float math for no_std builds (std uses hardware intrinsics instead).
+libm = { version = "0.2", default-features = false, optional = true }
+
+[features]
+default = ["std"]
+std = ["fanos-geometry/std", "fanos-code/std"]
+# Enable on no_std targets to supply sqrt via libm.
+libm = ["dep:libm"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

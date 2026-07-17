@@ -1,0 +1,13 @@
+# FANOS reference implementation pins the nightly toolchain.
+#
+# Rationale (recorded in the project README): the math core is `#![no_std]` and the
+# performance-critical layers use nightly-only features — `portable_simd` for the
+# DIAKRISIS coherence-matrix kernels and advanced const generics for the projective
+# geometry. Edition 2024 is the latest *stable* edition; the experimental `future`
+# edition is intentionally NOT used because it is unstable across nightlies.
+[toolchain]
+# Pinned to a specific nightly for reproducible builds (an industrial-standard practice);
+# bump deliberately, not implicitly. This is the nightly the CI gates run against.
+channel = "nightly-2026-07-15"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["aarch64-apple-darwin", "wasm32-unknown-unknown"]

@@ -1,0 +1,27 @@
+[package]
+name = "fanos-proteus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PROTEUS — polymorphic transport and censorship resistance for FANOS: beacon-rotating shape, moving-target bridges (spec Part XIII)."
+keywords = ["censorship-resistance", "obfuscation", "pluggable-transport", "anti-dpi", "fanos"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-crypto.workspace = true
+
+[features]
+default = ["std"]
+std = ["fanos-geometry/std", "fanos-crypto/std"]
+alloc = ["fanos-geometry/alloc", "fanos-crypto/alloc"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

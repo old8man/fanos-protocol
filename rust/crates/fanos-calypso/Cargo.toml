@@ -1,0 +1,27 @@
+[package]
+name = "fanos-calypso"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CALYPSO — anonymous hidden services for FANOS: self-certifying .fanos addresses, computed rendezvous, threshold hosting (spec Part XII)."
+keywords = ["hidden-service", "onion-service", "anonymity", "threshold", "fanos"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-crypto.workspace = true
+
+[features]
+default = ["std"]
+std = ["fanos-geometry/std", "fanos-crypto/std"]
+alloc = ["fanos-geometry/alloc", "fanos-crypto/alloc"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

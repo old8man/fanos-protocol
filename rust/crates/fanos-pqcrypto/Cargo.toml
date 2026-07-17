@@ -1,0 +1,29 @@
+[package]
+name = "fanos-pqcrypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Real post-quantum hybrid primitives for FANOS: Ed25519+ML-DSA-65 signatures, X25519+ML-KEM-768 KEM (spec §L6)."
+keywords = ["post-quantum", "ml-kem", "ml-dsa", "hybrid", "fanos"]
+categories = ["cryptography"]
+
+[dependencies]
+# `rand_core` on ed25519-dalek enables seedable keygen; ml-dsa's default `getrandom` brings
+# the `Generate` trait; ml-kem's `Kem::generate_keypair_from_rng` needs no extra feature.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+ml-kem = { version = "0.3" }
+ml-dsa = { version = "0.1" }
+sha3 = { version = "0.11", default-features = false }
+# rand_core 0.10 matches the RustCrypto crates above (via crypto-common 0.2).
+rand_core = { version = "0.10", default-features = false }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

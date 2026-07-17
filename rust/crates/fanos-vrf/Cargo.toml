@@ -1,0 +1,27 @@
+# fanos-vrf — a real verifiable random function (RFC 9381-style, ristretto255).
+#
+# Replaces the hash-only reference derivation: the beacon and rendezvous are now *verifiable* —
+# a node proves its per-epoch coordinate was derived correctly from its key, without revealing it.
+[package]
+name = "fanos-vrf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS verifiable random function (ristretto255 ECVRF) for beacon/rendezvous derivation"
+keywords = ["vrf", "ristretto255", "beacon", "rendezvous", "fanos"]
+categories = ["cryptography"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-crypto = { workspace = true, features = ["alloc"] }
+vrf-r255 = "0.1"
+# Feldman VSS shares the ristretto255 group vrf-r255 already pulls in (same version).
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+rand_core = { version = "0.6", default-features = false }
+
+[lints]
+workspace = true

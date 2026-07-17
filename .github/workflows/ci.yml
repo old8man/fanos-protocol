@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  # The nightly toolchain, components, and targets are pinned by rust/rust-toolchain.toml,
+  # so every job installs exactly the same compiler.
+  gate:
+    name: format · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show   # rust-toolchain.toml drives the install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Reference verifier (V1–V22)
+        run: cargo run -p fanos-cli
+      - name: Simulator demo (real engines, substituted transport)
+        run: cargo run -p fanos-sim --bin fanos-sim-demo
+      - name: Cascade forecast (leading indicator, before collapse)
+        run: cargo run -p fanos-sim --example forecast
+      - name: Catastrophe probe (loss · churn · scale)
+        run: cargo run -p fanos-sim --example catastrophe
+      - name: Benchmarks compile (hot paths)
+        run: cargo bench -p fanos-bench --no-run
+
+  portability:
+    name: no_std · wasm cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build math core for wasm32 (no_std)
+        run: |
+          cargo build -p fanos-field    --target wasm32-unknown-unknown --no-default-features
+          cargo build -p fanos-geometry --target wasm32-unknown-unknown --no-default-features
+          cargo build -p fanos-code     --target wasm32-unknown-unknown --no-default-features
+          cargo build -p fanos-wire     --target wasm32-unknown-unknown --no-default-features
+          cargo build -p fanos-crypto   --target wasm32-unknown-unknown --no-default-features --features alloc
+          cargo build -p fanos-diakrisis --target wasm32-unknown-unknown --no-default-features --features libm
+          cargo build -p fanos-nyx      --target wasm32-unknown-unknown --no-default-features --features "alloc libm"
+          cargo build -p fanos-runtime  --target wasm32-unknown-unknown --no-default-features --features libm
+          cargo build -p fanos-calypso  --target wasm32-unknown-unknown --no-default-features --features alloc
+          cargo build -p fanos-proteus  --target wasm32-unknown-unknown --no-default-features --features alloc
+
+  miri:
+    name: miri (undefined-behavior check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain + miri
+        run: |
+          rustup show
+          rustup component add miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # The math crates forbid unsafe, so Miri mostly guards the SIMD/threshold paths.
+      - name: Miri
+        run: cargo miri test -p fanos-diakrisis -p fanos-crypto -p fanos-field

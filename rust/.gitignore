@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+*.profraw
+/flamegraph.svg
+/perf.data*

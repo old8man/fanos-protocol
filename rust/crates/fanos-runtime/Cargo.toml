@@ -1,0 +1,36 @@
+[package]
+name = "fanos-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The FANOS node as a sans-I/O state machine: environment ports + the OverlayNode engine (the code that ships)."
+keywords = ["sans-io", "state-machine", "overlay", "p2p", "fanos"]
+categories = ["network-programming", "no-std"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-code.workspace = true
+fanos-diakrisis.workspace = true
+fanos-crypto.workspace = true
+fanos-core.workspace = true
+fanos-wire.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "fanos-geometry/std",
+    "fanos-code/std",
+    "fanos-diakrisis/std",
+    "fanos-crypto/std",
+    "fanos-core/std",
+    "fanos-wire/std",
+]
+# For no_std targets: supply DIAKRISIS's float backend.
+libm = ["fanos-diakrisis/libm"]
+
+[lints]
+workspace = true

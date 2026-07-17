@@ -1,0 +1,469 @@
+//! The QUIC driver: the second realization of the sans-I/O environment ports.
+//!
+//! [`spawn`] wires one [`Engine`] to a real [`quinn`] endpoint. It never touches engine internals
+//! — it only feeds the engine [`Input`]s and performs the [`Effect`]s it returns, the same
+//! contract the simulator honours. Three cheap actors serialize the work:
+//!
+//! * the **engine actor** owns the `Box<dyn Engine>` and is the *only* task that touches it, so no
+//!   locks are needed around engine state; it drains one input at a time and dispatches effects;
+//! * the **transport loop** turns [`Effect::Send`] into a QUIC uni-stream, dialing and caching one
+//!   connection per peer;
+//! * the **accept loop** receives inbound connections and streams, tagging each frame with the
+//!   peer coordinate learned from the connection HELLO.
+//!
+//! The clock is the one real-time seam: a driver *may* read the wall clock (the engine never can),
+//! so virtual [`Instant`]s here are elapsed nanoseconds since the node started.
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Instant as StdInstant;
+
+use quinn::{Connection, Endpoint};
+use tokio::sync::mpsc;
+
+use fanos_field::Field;
+use fanos_geometry::{Point, Triple};
+use fanos_proteus::ProteusShaper;
+use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
+use quinn::{ClientConfig, ServerConfig};
+
+use crate::directory::Directory;
+use crate::identity::{coordinate_from_cert, peer_cert_der};
+use crate::tls::{TlsError, node_configs, node_configs_mutual};
+
+/// An optional PROTEUS transport shaper, shared across a node's connections. When present, every
+/// frame (including the identity HELLO) is polymorph-obfuscated on the wire (spec §13.2).
+type Shaper = Option<Arc<ProteusShaper>>;
+
+/// The identity mode. `None` ⇒ HELLO + directory-trust; `Some(f)` ⇒ self-certifying, where `f`
+/// derives a peer's authenticated coordinate from its presented certificate DER.
+type Identity = Option<Arc<dyn Fn(&[u8]) -> Option<Triple> + Send + Sync>>;
+
+/// Shape an outbound frame for the wire (identity when no shaper is configured).
+fn shape_out(shaper: &Shaper, frame: &[u8]) -> Vec<u8> {
+    shaper
+        .as_ref()
+        .map_or_else(|| frame.to_vec(), |s| s.outbound(frame))
+}
+
+/// Recover an inbound frame from the wire, or `None` if it wasn't shaped by our secret+epoch.
+fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
+    match shaper {
+        Some(s) => s.inbound(&wire),
+        None => Some(wire),
+    }
+}
+
+/// Bytes of a HELLO: three little-endian `u32`s (a projective coordinate).
+const HELLO_LEN: usize = 12;
+/// Per-frame receive cap. Onion/Tessera frames are far smaller; this only bounds abuse.
+const MAX_FRAME: usize = 1 << 20;
+
+/// A coordinate → live connection cache. A `Connection` is a cheap handle (an `Arc` inside).
+type ConnMap = Arc<Mutex<HashMap<Triple, Connection>>>;
+
+/// An internal request from the engine actor to the transport loop.
+struct SendRequest {
+    to: Triple,
+    frame: Vec<u8>,
+}
+
+/// The transport's shared context: everything the send path needs besides the destination.
+#[derive(Clone)]
+struct Transport {
+    endpoint: Endpoint,
+    conns: ConnMap,
+    input_tx: mpsc::UnboundedSender<Input>,
+    shaper: Shaper,
+    identity: Identity,
+    me: Triple,
+}
+
+/// A running QUIC-backed node: the handle an application uses to drive it and hear from it.
+///
+/// Dropping the handle (or calling [`NodeHandle::shutdown`]) closes the endpoint and lets the
+/// actors wind down.
+pub struct NodeHandle {
+    addr: Triple,
+    local_addr: SocketAddr,
+    input_tx: mpsc::UnboundedSender<Input>,
+    notify_rx: mpsc::UnboundedReceiver<Notification>,
+    endpoint: Endpoint,
+}
+
+impl NodeHandle {
+    /// This node's overlay coordinate.
+    #[must_use]
+    pub fn address(&self) -> Triple {
+        self.addr
+    }
+
+    /// The UDP socket address the node is actually bound to (its directory entry).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Inject an application command (delivered to the engine as `Input::Command`). Returns
+    /// `false` if the engine actor has stopped.
+    pub fn command(&self, cmd: Command) -> bool {
+        self.input_tx.send(Input::Command(cmd)).is_ok()
+    }
+
+    /// Await the next application notification the engine emits, or `None` once it stops.
+    pub async fn next_notification(&mut self) -> Option<Notification> {
+        self.notify_rx.recv().await
+    }
+
+    /// Close the QUIC endpoint and stop serving. Idempotent.
+    pub fn shutdown(&self) {
+        self.endpoint.close(0u32.into(), b"shutdown");
+    }
+}
+
+/// Errors that can occur bringing a node up.
+#[derive(Debug)]
+pub enum QuicError {
+    /// TLS/QUIC configuration failed.
+    Tls(TlsError),
+    /// Binding the UDP socket or reading its address failed.
+    Io(std::io::Error),
+}
+
+impl core::fmt::Display for QuicError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Tls(e) => write!(f, "TLS setup: {e}"),
+            Self::Io(e) => write!(f, "I/O: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for QuicError {}
+
+impl From<TlsError> for QuicError {
+    fn from(e: TlsError) -> Self {
+        Self::Tls(e)
+    }
+}
+impl From<std::io::Error> for QuicError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Bring up a node: bind a QUIC endpoint on loopback, register it in `directory`, and spawn the
+/// three driver actors around `engine`. Returns a handle to command it and read its notifications.
+///
+/// The engine is moved in and thereafter touched only by its own actor task.
+pub async fn spawn(
+    engine: Box<dyn Engine + Send>,
+    directory: Directory,
+) -> Result<NodeHandle, QuicError> {
+    let (server, client) = node_configs()?;
+    spawn_inner(engine, directory, None, None, server, client)
+}
+
+/// Bring up a **self-certifying** node: its overlay coordinate is `MapToPoint(H(cert))`, bound to
+/// its mutual-TLS certificate, so a peer authenticates the coordinate from the handshake — no HELLO
+/// and no directory-trust for identity (the directory serves only address resolution). The engine
+/// is built at the cert-derived coordinate by `make_engine`.
+pub async fn spawn_self_certifying<F: Field + 'static>(
+    make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
+    directory: Directory,
+) -> Result<NodeHandle, QuicError> {
+    let (server, client, cert) = node_configs_mutual()?;
+    let engine = make_engine(coordinate_from_cert::<F>(cert.as_ref()));
+    let derive: Identity = Some(Arc::new(|der: &[u8]| {
+        Some(coordinate_from_cert::<F>(der).coords())
+    }));
+    spawn_inner(engine, directory, None, derive, server, client)
+}
+
+/// Like [`spawn`], but every frame on the wire is PROTEUS-shaped with the shared `community_secret`
+/// for `epoch` (spec §13.2): the transport carries no static FANOS signature, and a peer without
+/// the secret cannot produce frames this node will accept. The engine is unchanged — shaping lives
+/// entirely in the driver, below the sans-I/O boundary.
+pub async fn spawn_shaped(
+    engine: Box<dyn Engine + Send>,
+    directory: Directory,
+    community_secret: Vec<u8>,
+    epoch: u32,
+) -> Result<NodeHandle, QuicError> {
+    let shaper = Arc::new(ProteusShaper::new(community_secret, epoch));
+    let (server, client) = node_configs()?;
+    spawn_inner(engine, directory, Some(shaper), None, server, client)
+}
+
+/// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
+/// `tokio::spawn`s tasks); the public wrappers stay `async` for API stability.
+fn spawn_inner(
+    engine: Box<dyn Engine + Send>,
+    directory: Directory,
+    shaper: Shaper,
+    identity: Identity,
+    server_cfg: ServerConfig,
+    client_cfg: ClientConfig,
+) -> Result<NodeHandle, QuicError> {
+    let addr = engine.address();
+
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut endpoint = Endpoint::server(server_cfg, bind)?;
+    endpoint.set_default_client_config(client_cfg);
+    let local_addr = endpoint.local_addr()?;
+    directory.insert(addr, local_addr);
+
+    let (input_tx, input_rx) = mpsc::unbounded_channel::<Input>();
+    let (send_tx, send_rx) = mpsc::unbounded_channel::<SendRequest>();
+    let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Notification>();
+    let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+
+    tokio::spawn(accept_loop(
+        endpoint.clone(),
+        conns.clone(),
+        input_tx.clone(),
+        shaper.clone(),
+        identity.clone(),
+    ));
+    let transport = Transport {
+        endpoint: endpoint.clone(),
+        conns,
+        input_tx: input_tx.clone(),
+        shaper,
+        identity,
+        me: addr,
+    };
+    tokio::spawn(transport_loop(transport, directory, send_rx));
+    tokio::spawn(engine_loop(
+        engine,
+        input_rx,
+        input_tx.clone(),
+        send_tx,
+        notify_tx,
+    ));
+
+    Ok(NodeHandle {
+        addr,
+        local_addr,
+        input_tx,
+        notify_rx,
+        endpoint,
+    })
+}
+
+/// The engine actor: the sole owner of the engine, dispatching its effects.
+async fn engine_loop(
+    mut engine: Box<dyn Engine + Send>,
+    mut input_rx: mpsc::UnboundedReceiver<Input>,
+    input_tx: mpsc::UnboundedSender<Input>,
+    send_tx: mpsc::UnboundedSender<SendRequest>,
+    notify_tx: mpsc::UnboundedSender<Notification>,
+) {
+    let origin = StdInstant::now();
+    while let Some(input) = input_rx.recv().await {
+        let now = Instant(origin.elapsed().as_nanos() as u64);
+        for effect in engine.step(now, input) {
+            match effect {
+                Effect::Send { to, frame } => {
+                    let _ = send_tx.send(SendRequest { to, frame });
+                }
+                Effect::ArmTimer { token, after } => {
+                    let tx = input_tx.clone();
+                    let delay = std::time::Duration::from_nanos(after.as_nanos());
+                    tokio::spawn(fire_timer(tx, token, delay));
+                }
+                Effect::Notify(note) => {
+                    let _ = notify_tx.send(note);
+                }
+            }
+        }
+    }
+}
+
+/// Sleep for `delay`, then hand the engine its `Timer` input.
+async fn fire_timer(
+    tx: mpsc::UnboundedSender<Input>,
+    token: TimerToken,
+    delay: std::time::Duration,
+) {
+    tokio::time::sleep(delay).await;
+    let _ = tx.send(Input::Timer(token));
+}
+
+/// The transport loop: performs `Effect::Send` by writing one QUIC uni-stream per frame.
+async fn transport_loop(
+    t: Transport,
+    directory: Directory,
+    mut send_rx: mpsc::UnboundedReceiver<SendRequest>,
+) {
+    while let Some(SendRequest { to, frame }) = send_rx.recv().await {
+        // Unresolved coordinate → drop, exactly as the simulator drops to an unknown node.
+        let Some(addr) = directory.resolve(to) else {
+            continue;
+        };
+        let Some(conn) = get_or_connect(&t, to, addr).await else {
+            continue;
+        };
+        if let Ok(mut stream) = conn.open_uni().await
+            && stream
+                .write_all(&shape_out(&t.shaper, &frame))
+                .await
+                .is_ok()
+        {
+            let _ = stream.finish();
+        }
+    }
+}
+
+/// Reuse a cached connection to `to`, or dial one, establish identity (HELLO or self-certifying
+/// cert check), and start reading frames the peer sends back on it.
+async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<Connection> {
+    if let Some(conn) = cached(&t.conns, to) {
+        return Some(conn);
+    }
+    let conn = t.endpoint.connect(addr, "fanos.node").ok()?.await.ok()?;
+
+    match &t.identity {
+        // HELLO mode: announce our coordinate as the first uni-stream.
+        None => {
+            if let Ok(mut hello) = conn.open_uni().await {
+                let _ = hello
+                    .write_all(&shape_out(&t.shaper, &encode_triple(t.me)))
+                    .await;
+                let _ = hello.finish();
+            }
+        }
+        // Self-certifying mode: the peer's certificate must certify the coordinate we dialed —
+        // otherwise the address resolved to an impostor and we drop the connection.
+        Some(derive) => {
+            if peer_cert_der(&conn).and_then(|der| derive(&der)) != Some(to) {
+                return None;
+            }
+        }
+    }
+    // The dialer knows the peer identity intrinsically (it chose `to`): tag replies with it.
+    tokio::spawn(read_frames(
+        conn.clone(),
+        to,
+        t.input_tx.clone(),
+        t.shaper.clone(),
+    ));
+    if let Ok(mut map) = t.conns.lock() {
+        map.insert(to, conn.clone());
+    }
+    Some(conn)
+}
+
+/// A cached, still-open connection to `peer`, if any.
+fn cached(conns: &ConnMap, peer: Triple) -> Option<Connection> {
+    let map = conns.lock().ok()?;
+    let conn = map.get(&peer)?;
+    if conn.close_reason().is_none() {
+        Some(conn.clone())
+    } else {
+        None
+    }
+}
+
+/// The accept loop: for each inbound connection, learn the peer identity from its HELLO and then
+/// serve its frames.
+async fn accept_loop(
+    endpoint: Endpoint,
+    conns: ConnMap,
+    input_tx: mpsc::UnboundedSender<Input>,
+    shaper: Shaper,
+    identity: Identity,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let conns = conns.clone();
+        let input_tx = input_tx.clone();
+        let shaper = shaper.clone();
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            let Ok(conn) = incoming.await else {
+                return;
+            };
+            // Learn the peer's coordinate: from its certificate (self-certifying) or its HELLO.
+            let from = match &identity {
+                Some(derive) => match peer_cert_der(&conn).and_then(|der| derive(&der)) {
+                    Some(coord) => coord,
+                    None => return,
+                },
+                None => match read_hello(&conn, &shaper).await {
+                    Some(coord) => coord,
+                    None => return,
+                },
+            };
+            if let Ok(mut map) = conns.lock() {
+                map.insert(from, conn.clone());
+            }
+            // Subsequent uni-streams are this peer's frames.
+            read_frames(conn, from, input_tx, shaper).await;
+        });
+    }
+}
+
+/// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.
+async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
+    let mut stream = conn.accept_uni().await.ok()?;
+    let raw = stream.read_to_end(MAX_FRAME).await.ok()?;
+    let bytes = shape_in(shaper, raw)?;
+    decode_triple(bytes.get(..HELLO_LEN)?)
+}
+
+/// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
+async fn read_frames(
+    conn: Connection,
+    from: Triple,
+    input_tx: mpsc::UnboundedSender<Input>,
+    shaper: Shaper,
+) {
+    // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
+    // wrongly-shaped stream is skipped without sinking the connection.
+    while let Ok(mut stream) = conn.accept_uni().await {
+        let Ok(raw) = stream.read_to_end(MAX_FRAME).await else {
+            continue;
+        };
+        let Some(frame) = shape_in(&shaper, raw) else {
+            continue;
+        };
+        if input_tx.send(Input::Message { from, frame }).is_err() {
+            break; // engine actor gone
+        }
+    }
+}
+
+/// Encode a coordinate as 12 little-endian bytes.
+fn encode_triple(t: Triple) -> [u8; HELLO_LEN] {
+    let mut out = [0u8; HELLO_LEN];
+    out[0..4].copy_from_slice(&t[0].to_le_bytes());
+    out[4..8].copy_from_slice(&t[1].to_le_bytes());
+    out[8..12].copy_from_slice(&t[2].to_le_bytes());
+    out
+}
+
+/// Decode a coordinate from exactly 12 little-endian bytes.
+fn decode_triple(b: &[u8]) -> Option<Triple> {
+    let bytes: [u8; HELLO_LEN] = b.try_into().ok()?;
+    let x = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let y = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let z = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    Some([x, y, z])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triple_codec_round_trips() {
+        let t = [7u32, 0, 1];
+        assert_eq!(decode_triple(&encode_triple(t)), Some(t));
+    }
+
+    #[test]
+    fn short_hello_is_rejected() {
+        assert_eq!(decode_triple(&[0u8; 4]), None);
+    }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "fanos-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Innate error-correcting codes of PG(2,q): Hamming(7,4) syndrome localization and projective LRC (FANOS)."
+keywords = ["hamming", "syndrome", "lrc", "erasure-code", "fanos"]
+categories = ["mathematics", "no-std"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc", "fanos-geometry/std"]
+alloc = ["fanos-geometry/alloc"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+# fanos-bench — criterion micro-benchmarks for the FANOS hot paths.
+#
+# Isolates the (heavy) criterion dev-dependency in one crate. Run: `cargo bench -p fanos-bench`.
+[package]
+name = "fanos-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Criterion micro-benchmarks for the FANOS hot paths (rendezvous, addressing, coherence)"
+publish = false
+
+[dependencies]
+fanos-field = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-crypto = { workspace = true, features = ["std"] }
+fanos-diakrisis = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[lints]
+workspace = true

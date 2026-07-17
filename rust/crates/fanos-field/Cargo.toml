@@ -1,0 +1,22 @@
+[package]
+name = "fanos-field"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Finite-field arithmetic (GF(2^m) and GF(p)) for FANOS — zero-dependency, no_std."
+keywords = ["finite-field", "galois", "gf2", "no-std", "fanos"]
+categories = ["mathematics", "no-std"]
+
+[features]
+default = ["std"]
+# `std` only enables convenience impls; the arithmetic itself is no_std + no alloc.
+std = []
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

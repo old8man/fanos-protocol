@@ -1,0 +1,46 @@
+{
+  "description": "FANOS services & transport known-answer tests: L4 storage addressing, CALYPSO self-certifying addresses, and PROTEUS epoch shaping (spec §L4, Part XII, §13). Any implementation must reproduce these exactly to interoperate. Pinned by the Rust reference test suite.",
+  "storage_addressing": {
+    "comment": "The L4 storage address of a key: digest = BLAKE3-keyed(H_label, key) with label 'FANOS-v1/storage'; the responsible node is MapToPoint(label, key) over the deployment field. Digest is lower-case hex; point is the canonical projective coordinate over GF(7).",
+    "label": "FANOS-v1/storage",
+    "vectors": [
+      {
+        "key": "greeting",
+        "key_hex": "6772656574696e67",
+        "digest": "d507bd1e95611996b1f83b8c60576ad7d707ed37b9a07321aa68736e7e5779d5",
+        "field": 7,
+        "responsible_point": [1, 0, 0]
+      }
+    ]
+  },
+  "calypso_address": {
+    "comment": "A self-certifying .fanos address is base32(BLAKE3(pubkey)) in the lower-case RFC 4648 alphabet 'abcdefghijklmnopqrstuvwxyz234567' (no padding), suffixed '.fanos'. The address certifies a public key iff it equals this derivation.",
+    "base32_alphabet": "abcdefghijklmnopqrstuvwxyz234567",
+    "vectors": [
+      {
+        "pubkey": "fanos-conformance-service",
+        "pubkey_hex": "66616e6f732d636f6e666f726d616e63652d73657276696365",
+        "address": "j4jleh2q7q6pxyufkfdf2efgpeq5evnyqx6srlcdctgqmuiwxfoq.fanos"
+      }
+    ]
+  },
+  "proteus_shape": {
+    "comment": "The PROTEUS per-epoch transport shape is derived from a community secret and epoch. junk_len = junk_count * junk_size. All values are deterministic; the wire signature rotates every epoch. scramble_seed_prefix is the first 4 bytes of the 32-byte XOF-derived scramble seed.",
+    "vectors": [
+      {
+        "secret": "conformance-secret",
+        "epoch": 42,
+        "junk_count": 5,
+        "junk_size": 44,
+        "padding_multiple": 155,
+        "junk_len": 220,
+        "scramble_seed_prefix": [228, 92, 91, 113]
+      }
+    ]
+  },
+  "health_view_gossip": {
+    "comment": "The DIAKRISIS health-view gossip (DiagGossip frame body) is 7 little-endian u16 values: age-in-milliseconds since the sender last directly observed each Fano point (0 = self / just seen, 65535 = never/stale). A peer is live iff some witness reports it within the liveness window (spec §6.4).",
+    "layout": "7 x u16 little-endian (14 bytes)",
+    "sentinel_never_ms": 65535
+  }
+}

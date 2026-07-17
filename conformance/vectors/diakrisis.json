@@ -1,0 +1,55 @@
+{
+  "description": "DIAKRISIS coherence-measure constants and monitor thresholds (spec §2.7, §6). All for the base 7-cell unless noted.",
+  "coherence_measures": {
+    "comment": "Gamma_net = C/N (C = correlation matrix, unit diagonal). Phi = sum_{i!=j}|g_ij|^2 / sum_i g_ii^2; P = Tr(Gamma^2); R = 1/(N*P).",
+    "thresholds": {
+      "phi_th": 1.0,
+      "p_crit_7": 0.2857142857142857,
+      "r_th": 0.3333333333333333,
+      "systemic_correlation_r_star_7": 0.4082482904638631
+    },
+    "general_forms": {
+      "p_crit": "2 / N",
+      "r_star": "1 / sqrt(N - 1)"
+    }
+  },
+  "equicorrelated_stratum": {
+    "comment": "All off-diagonal correlations equal to r. These closed forms are verified against the matrix measures (V15).",
+    "phi": "(N - 1) * r^2",
+    "purity": "(1 + (N - 1) * r^2) / N",
+    "identity": "Phi = N * P - 1",
+    "critical_point": {
+      "r": 0.4082482904638631,
+      "phi": 1.0,
+      "purity": 0.2857142857142857,
+      "reflection": 0.5
+    }
+  },
+  "leading_indicator": {
+    "comment": "V17: on the physical domain (Gamma PSD, Tr=1) the failure region {P < 2/N} is contained in {Phi < 1}. The integration alarm fires no later than the structure alarm.",
+    "theorem": "{P < 2/N} subset {Phi < 1}"
+  },
+  "collective_subject_window": {
+    "comment": "V19: a 7-agent cell is a candidate unified subject iff its mean inter-agent correlation lies in this half-open interval.",
+    "n": 7,
+    "lower_exclusive": 0.4082482904638631,
+    "upper_inclusive": 0.5773502691896257
+  },
+  "first_order_blindness": {
+    "comment": "V11: the sum of the seven Fano line-adjacency matrices equals J - I (the complete graph K7). Its spectrum makes pairwise monitoring structure-blind.",
+    "sum_equals": "J - I",
+    "spectrum": { "6": 1, "-1": 6 }
+  },
+  "partition_fiedler": {
+    "comment": "V14: algebraic connectivity (second-smallest Laplacian eigenvalue) of the health-weighted collinearity graph.",
+    "full_cell_lambda2": 7.0,
+    "one_line_down_lambda2": 4.0
+  },
+  "self_healing": {
+    "comment": "V16, §6.7-6.8. Each coarse cross-segment hop contracts coherences by 1/3, hence integration Phi by 1/9. Diagnosis has a floor at one third of cycles.",
+    "coherence_contraction_per_hop": 0.3333333333333333,
+    "phi_contraction_per_hop": 0.1111111111111111,
+    "self_observation_floor_r_th": 0.3333333333333333,
+    "kappa_bootstrap": 0.14285714285714285
+  }
+}

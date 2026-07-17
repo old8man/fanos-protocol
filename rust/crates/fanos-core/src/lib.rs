@@ -1,0 +1,140 @@
+//! # fanos-core — the overlay core and public API
+//!
+//! This crate integrates the layers into the surface an application uses (spec §11.2). It is
+//! the *computational* core — addressing, rendezvous, quorums, storage placement, hierarchy,
+//! and self-diagnosis — everything that is algebra rather than I/O. The transport (QUIC),
+//! privacy (NYX), and service (CALYPSO) layers plug in above it; here every operation is
+//! deterministic and testable without a network.
+//!
+//! * [`routing`] — O(1) rendezvous, bridges, multipath, content addressing (§L1/§L4).
+//! * [`quorum`] — Maekawa quorums with guaranteed intersection (§L4).
+//! * [`membership`] — coordinates and the structural centrality cap (§L0/§L3, V3).
+//! * [`hierarchy`] — scale by a recursion of cells (§L1, V4).
+//!
+//! [`Node`] ties them together: an identity, its epoch coordinate, its quorums, and a
+//! [`diagnose`](fanos_diakrisis::diagnose) health hook.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
+
+pub mod hierarchy;
+pub mod membership;
+pub mod quorum;
+pub mod routing;
+pub mod stratum;
+
+// Re-export the stack's core types so an application depends on `fanos-core` alone.
+pub use fanos_crypto::{HybridPublicKey, NodeId};
+pub use fanos_diakrisis::{Observation, Verdict, diagnose};
+pub use fanos_field::Field;
+pub use fanos_geometry::{Line, Plane, Point};
+
+pub use hierarchy::Hierarchy;
+pub use membership::Member;
+pub use quorum::Quorum;
+pub use stratum::{ChildSummary, ParentCell};
+
+use fanos_geometry::fano;
+
+/// A FANOS participant in a cell `PG(2, q)`: an identity, its epoch coordinate, and the
+/// derived overlay structure (spec §3.1, §11.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Node<F: Field> {
+    member: Member<F>,
+}
+
+impl<F: Field> Node<F> {
+    /// Join the cell: derive this node's coordinate for `epoch` from its identity (spec §7.8
+    /// JOIN, steps 3–4).
+    #[must_use]
+    pub fn open(id: NodeId, epoch: u32) -> Self {
+        Self {
+            member: Member::assign(id, epoch),
+        }
+    }
+
+    /// This node's projective coordinate (its overlay address).
+    #[must_use]
+    pub fn coordinate(&self) -> Point<F> {
+        self.member.coord
+    }
+
+    /// This node's identity.
+    #[must_use]
+    pub fn id(&self) -> NodeId {
+        self.member.id
+    }
+
+    /// The rendezvous line to reach `peer` — a single field operation (spec §L1).
+    #[must_use]
+    pub fn rendezvous_with(&self, peer: &Point<F>) -> Option<Line<F>> {
+        routing::rendezvous(&self.coordinate(), peer)
+    }
+
+    /// This node's `q + 1` quorums (the lines it belongs to).
+    pub fn quorums(&self) -> impl Iterator<Item = Quorum<F>> + Clone {
+        self.member.lines().map(Quorum::new)
+    }
+}
+
+impl Node<fanos_field::F2> {
+    /// Run one DIAKRISIS diagnostic round on this node's Fano cell (spec §6.9). Available on
+    /// the base cell, where the self-diagnosis plane operates.
+    #[must_use]
+    pub fn health(observation: &Observation) -> Verdict {
+        diagnose(observation)
+    }
+
+    /// The mediator (deterministic reroute target) for a failed link to another cell node
+    /// (spec §6.7): the third point of their common line.
+    #[must_use]
+    pub fn reroute_via(from: usize, to: usize) -> Option<usize> {
+        fano::mediator(from, to)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use fanos_field::{F2, F31};
+
+    #[test]
+    fn two_nodes_share_a_rendezvous_line() {
+        // The end-to-end overlay flow: two identities → coordinates → a shared meeting line.
+        let alice = Node::<F31>::open(NodeId([1u8; 32]), 5);
+        let bob = Node::<F31>::open(NodeId([2u8; 32]), 5);
+        let line = alice.rendezvous_with(&bob.coordinate()).unwrap();
+        assert!(alice.coordinate().is_on(&line));
+        assert!(bob.coordinate().is_on(&line));
+        // Bob computes the same line to Alice — no coordination needed.
+        assert_eq!(line, bob.rendezvous_with(&alice.coordinate()).unwrap());
+    }
+
+    #[test]
+    fn a_node_has_q_plus_one_quorums_that_all_intersect() {
+        let node = Node::<F31>::open(NodeId([3u8; 32]), 0);
+        let quorums: Vec<_> = node.quorums().collect();
+        assert_eq!(quorums.len(), 32);
+        // Every pair of the node's quorums intersects (Maekawa); the node itself is common.
+        for q in &quorums {
+            assert!(q.members().any(|p| p == node.coordinate()));
+        }
+    }
+
+    #[test]
+    fn base_cell_node_can_self_diagnose_and_reroute() {
+        // A single crash is localized, and the reroute target is the mediator.
+        let obs = Observation {
+            degraded: 1 << 4,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Node::<F2>::health(&obs),
+            Verdict::Localized(fanos_diakrisis::Fault::Single(4))
+        ));
+        assert!(Node::<F2>::reroute_via(4, 0).is_some());
+    }
+}

@@ -1,0 +1,27 @@
+[package]
+name = "fanos-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS cryptographic surface: domain-separated BLAKE3, MapToPoint addressing, Shamir threshold sharing, hybrid keys."
+keywords = ["cryptography", "blake3", "threshold", "post-quantum", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+blake3 = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["alloc", "blake3/std", "fanos-geometry/std"]
+alloc = ["fanos-geometry/alloc"]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

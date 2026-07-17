@@ -1,0 +1,90 @@
+{
+  "description": "FANOS canonical wire KATs (spec §7.1–§7.5). Byte strings are lower-case hex.",
+  "varint": {
+    "comment": "QUIC variable-length integers, minimal-length. The top two bits of the first byte select the length (1/2/4/8 bytes); the value is big-endian in the remaining bits.",
+    "encode": [
+      { "value": 0, "hex": "00" },
+      { "value": 37, "hex": "25" },
+      { "value": 63, "hex": "3f" },
+      { "value": 64, "hex": "4040" },
+      { "value": 15293, "hex": "7bbd" },
+      { "value": 16383, "hex": "7fff" },
+      { "value": 16384, "hex": "80004000" },
+      { "value": 494878333, "hex": "9d7f3e7d" }
+    ]
+  },
+  "field_element_width": {
+    "comment": "Bytes per GF(q) element = ceil(log2 q / 8). Elements are big-endian, high bits zero.",
+    "widths": [
+      { "q": 2, "bytes": 1 },
+      { "q": 7, "bytes": 1 },
+      { "q": 127, "bytes": 1 },
+      { "q": 256, "bytes": 1 },
+      { "q": 65536, "bytes": 2 }
+    ]
+  },
+  "point_encoding": {
+    "comment": "A projective point/line is three canonical field elements concatenated. GF(7) uses one byte each.",
+    "field": 7,
+    "points": [
+      { "coords": [1, 0, 0], "hex": "010000" },
+      { "coords": [1, 2, 3], "hex": "010203" },
+      { "coords": [1, 0, 5], "hex": "010005" }
+    ]
+  },
+  "byte_string": {
+    "comment": "varint length prefix followed by the bytes.",
+    "examples": [
+      { "utf8": "FANOS", "hex": "0546414e4f53" }
+    ]
+  },
+  "frame": {
+    "comment": "frame = type:varint || length:varint || body[length]. Types are grouped by high nibble.",
+    "type_registry": [
+      { "name": "HELLO", "code": "0x00", "group": 0 },
+      { "name": "ERROR", "code": "0x05", "group": 0 },
+      { "name": "BEACON", "code": "0x13", "group": 1 },
+      { "name": "PUBLISH", "code": "0x22", "group": 2 },
+      { "name": "ROUTE", "code": "0x30", "group": 3 },
+      { "name": "TESSERA", "code": "0x40", "group": 4 },
+      { "name": "RDV_INTRO", "code": "0x50", "group": 5 },
+      { "name": "DIAG_VERDICT", "code": "0x62", "group": 6 }
+    ],
+    "examples": [
+      { "type": "0x22", "body_utf8": "payload", "hex": "22077061796c6f6164" }
+    ]
+  },
+  "tessera_layout": {
+    "comment": "Fixed-size Sphinx-derived packet (§7.7); constant total for length-indistinguishability.",
+    "version": 1,
+    "fields": [
+      { "name": "version", "bytes": 1 },
+      { "name": "epoch", "bytes": 4 },
+      { "name": "group_element", "bytes": 1120, "note": "X25519(32) || ML-KEM-768 ct(1088)" },
+      { "name": "routing_cmd", "bytes": 32 },
+      { "name": "header_mac", "bytes": 16 },
+      { "name": "holonomy_tag", "bytes": 32 },
+      { "name": "payload", "bytes": 2048 }
+    ],
+    "total_bytes": 4096
+  },
+  "reject": {
+    "comment": "A conformant decoder MUST reject every one of these as non-canonical.",
+    "cases": [
+      { "kind": "varint", "hex": "4000", "why": "value 0 in non-minimal 2-byte form" },
+      { "kind": "field_element", "field": 7, "hex": "07", "why": "value 7 is out of range in GF(7)" },
+      { "kind": "point", "field": 7, "hex": "020000", "why": "[2:0:0] leading coordinate is not 1" },
+      { "kind": "point", "field": 7, "hex": "000000", "why": "the zero vector is not a projective point" }
+    ]
+  },
+  "error_taxonomy": {
+    "comment": "Protocol error codes (§7.5), grouped by class digit.",
+    "codes": [
+      { "name": "UNSUPPORTED", "code": 100, "class": 1 },
+      { "name": "BAD_COORD", "code": 200, "class": 2 },
+      { "name": "NO_ROUTE", "code": 300, "class": 3 },
+      { "name": "PATH_BROKEN", "code": 400, "class": 4 },
+      { "name": "RDV_EXPIRED", "code": 501, "class": 5 }
+    ]
+  }
+}

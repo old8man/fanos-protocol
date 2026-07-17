@@ -1,0 +1,41 @@
+# fanos-quic — the production transport driver.
+#
+# The SECOND driver behind the sans-I/O node engine (the first is `fanos-sim`). It
+# realizes the three environment ports over real I/O: a monotonic clock, a `quinn`
+# QUIC endpoint (UDP + TLS 1.3), and `tokio` timers. The engine code is byte-for-byte
+# the same one the simulator runs — this crate performs its `Effect`s against a socket
+# instead of a virtual network. It is std-only and never on the no_std/wasm path.
+[package]
+name = "fanos-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS QUIC transport driver — runs the sans-I/O node engine over a real socket"
+keywords = ["quic", "p2p", "overlay", "transport", "sans-io"]
+categories = ["network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+fanos-runtime = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-field = { workspace = true, features = ["std"] }
+# For self-certifying identity: coordinate = MapToPoint(H(cert)).
+fanos-crypto = { workspace = true, features = ["std"] }
+# Optional PROTEUS transport shaping (polymorph obfuscation below the sans-I/O boundary).
+fanos-proteus = { path = "../fanos-proteus", version = "0.1.0", features = ["std"] }
+
+# Real transport stack. Pinned to the ring crypto provider for portability (no
+# aws-lc-rs C toolchain requirement) and reproducible cross-platform builds.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+fanos-field = { workspace = true, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"] }

@@ -1,0 +1,25 @@
+[package]
+name = "fanos-geometry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Finite projective plane PG(2,q): points, lines, cross-product rendezvous, incidence (FANOS)."
+keywords = ["projective-plane", "fano", "steiner", "geometry", "fanos"]
+categories = ["mathematics", "no-std"]
+
+[dependencies]
+fanos-field.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc", "fanos-field/std"]
+alloc = []
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

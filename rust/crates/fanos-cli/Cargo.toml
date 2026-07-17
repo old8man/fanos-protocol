@@ -1,0 +1,26 @@
+[package]
+name = "fanos-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS reference verifier and demo — reproduces the specification's V1–V22 numeric claims."
+
+[[bin]]
+name = "fanos-verify"
+path = "src/main.rs"
+
+[dependencies]
+# A binary always runs on std; enable it explicitly since the workspace deps default it off
+# (the library crates stay no_std-composable, and enable std through their own feature chains).
+fanos-field = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-code = { workspace = true, features = ["std"] }
+fanos-diakrisis = { workspace = true, features = ["std"] }
+fanos-crypto = { workspace = true, features = ["std"] }
+fanos-core = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
