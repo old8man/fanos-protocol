@@ -1,0 +1,35 @@
+[package]
+name = "fanos-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS SOCKS5 proxy front-end: a correct SOCKS5 CONNECT server over a pluggable Dialer, with DNS-leak-free .fanos target handling."
+keywords = ["socks5", "proxy", "anonymity", "dns", "fanos"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "net",
+    "io-util",
+    "rt",
+    "macros",
+    "time",
+    "sync",
+] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "net",
+    "io-util",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+] }
+
+[lints]
+workspace = true

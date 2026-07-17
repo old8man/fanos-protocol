@@ -28,6 +28,7 @@ members = [
     "crates/fanos-keygen",
     "crates/fanos-sim",
     "crates/fanos-node",
+    "crates/fanos-proxy",
     "crates/fanos-cli",
     "crates/fanos-bench",
 ]

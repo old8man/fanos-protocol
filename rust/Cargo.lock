@@ -776,6 +776,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-proxy"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fanos-quic"
 version = "0.1.0"
 dependencies = [
@@ -1946,6 +1954,7 @@ version = "1.52.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "317fafbbe3f02fc663dad00ea6186197de963cd4190e86a26d8d0fae095539af"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
