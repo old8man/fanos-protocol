@@ -45,12 +45,23 @@ const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
 /// carries a small request id). No real request id reaches `2^63`.
 const MIX_FLAG: u64 = 1 << 63;
 
-/// A combiner's in-flight peel: the layer being gathered, its line, and the partials collected.
+/// Cap on distinct candidate shares a combiner will hold for one pending peel. A line has only `q + 1`
+/// real members, so honest operation never approaches this; the cap bounds memory (and the peel search
+/// below) against an attacker flooding forged `TAG_REP` replies.
+const MAX_CANDIDATES: usize = 64;
+
+/// Cap on the number of `t`-subsets tried while searching for a set of shares that peels. Honest
+/// operation succeeds on the first (all-honest) subset; this bounds the CPU cost when up to `t − 1`
+/// forged shares are mixed in and several subsets must be tried.
+const MAX_PEEL_ATTEMPTS: usize = 256;
+
+/// A combiner's in-flight peel: the layer being gathered, its line, its member count (the valid share
+/// index bound), and the candidate partials collected so far.
 struct Pending {
     line: Triple,
     onion: Vec<u8>,
     shares: Vec<Share>,
-    contributors: Vec<usize>,
+    member_count: usize,
 }
 
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
@@ -160,21 +171,21 @@ impl<F: Field> ThresholdRouter<F> {
         let req_id = self.seq;
         self.seq += 1;
 
+        let members = Self::line_members(line);
+        let member_count = members.len();
         let mut shares = Vec::new();
-        let mut contributors = Vec::new();
         if let Some(i) = self.my_index(line)
             && let Some(share) = threshold::member_partial(&onion, i, &self.kem_secret)
         {
-            contributors.push(usize::from(share.x)); // dedup by Shamir x-coordinate, as replies do
             shares.push(share);
         }
 
         let mut effects = Vec::new();
         let me = self.coord.coords();
-        for member in Self::line_members(line) {
-            if member != me {
+        for member in &members {
+            if *member != me {
                 effects.push(Effect::Send {
-                    to: member,
+                    to: *member,
                     frame: encode_req(req_id, me, line, &onion),
                 });
             }
@@ -185,7 +196,7 @@ impl<F: Field> ThresholdRouter<F> {
                 line,
                 onion,
                 shares,
-                contributors,
+                member_count,
             },
         );
         // If we already have a threshold (e.g. t = 1), peel now; else await replies until deadline.
@@ -214,37 +225,57 @@ impl<F: Field> ThresholdRouter<F> {
         }]
     }
 
-    /// Handle a partial-decryption reply: fold it in and peel if we now have a threshold.
+    /// Handle a partial-decryption reply: fold it in (if it is a plausible member share) and try to
+    /// peel. A reply is only a *candidate* — it is not trusted until a subset of shares actually peels.
     fn on_reply(&mut self, req_id: u64, share: Share) -> Vec<Effect> {
         let Some(pending) = self.pending.get_mut(&req_id) else {
             return Vec::new(); // unknown / already-peeled request
         };
-        // De-duplicate by share index so one member cannot be counted twice.
-        if pending.contributors.contains(&usize::from(share.x)) {
+        // Reject any share whose index is not a real member of this line (valid Shamir x is
+        // `1..=member_count`). This caps distinct pollution to the true membership and drops
+        // garbage-index forgeries outright, so an attacker cannot balloon the candidate set with
+        // arbitrary `x` values.
+        if share.x == 0 || usize::from(share.x) > pending.member_count {
             return Vec::new();
         }
-        pending.contributors.push(usize::from(share.x));
+        // De-duplicate only *exact* (x, y) repeats. Crucially we do NOT drop a differing `y` at an
+        // already-seen `x`: a forged share must not be able to evict or pre-empt the honest member's
+        // real reply — both are kept as candidates and the peel search below picks the set that works.
+        if pending
+            .shares
+            .iter()
+            .any(|s| s.x == share.x && s.y == share.y)
+        {
+            return Vec::new();
+        }
+        if pending.shares.len() >= MAX_CANDIDATES {
+            return Vec::new(); // flood cap — a real line never needs this many candidates
+        }
         pending.shares.push(share);
         self.try_peel(req_id).unwrap_or_default()
     }
 
-    /// If a pending peel has reached the threshold, peel it and act on the outcome.
+    /// If a pending peel can be satisfied, peel it and act on the outcome. The pending state is removed
+    /// **only** when a subset of shares actually peels (or when its gather deadline fires) — a single
+    /// poisoned share can therefore neither reconstruct a wrong key that discards the peel nor destroy
+    /// the in-flight state, so honest replies still complete the hop (liveness under up to `t − 1`
+    /// malicious members).
     fn try_peel(&mut self, req_id: u64) -> Option<Vec<Effect>> {
         let pending = self.pending.get(&req_id)?;
         if pending.shares.len() < self.threshold {
             return None;
         }
-        let outcome = threshold::peel_onion_with_shares(&pending.onion, &pending.shares);
+        let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
         let pending = self.pending.remove(&req_id)?;
         let _ = pending.line;
-        Some(match outcome {
-            Ok(ThresholdPeel::Deliver { payload }) => {
+        Some(match peel {
+            ThresholdPeel::Deliver { payload } => {
                 alloc::vec![Effect::Notify(Notification::Delivered {
                     from: ANONYMOUS,
                     payload,
                 })]
             }
-            Ok(ThresholdPeel::Forward { next, onion }) => match Self::combiner_of(next) {
+            ThresholdPeel::Forward { next, onion } => match Self::combiner_of(next) {
                 Some(c) => {
                     // Re-pad the inner onion to the constant bucket so the forwarded packet is the
                     // same size as the one we received — no cross-hop size correlation.
@@ -253,9 +284,59 @@ impl<F: Field> ThresholdRouter<F> {
                 }
                 None => Vec::new(),
             },
-            Err(_) => Vec::new(), // malformed / below threshold → drop
         })
     }
+}
+
+/// Search for a set of `threshold` shares with distinct indices that peels `onion`, returning the
+/// first successful outcome. Honest operation succeeds on the first (all-honest) subset; when up to
+/// `t − 1` forged shares are interleaved, other subsets are tried, bounded by [`MAX_PEEL_ATTEMPTS`] so
+/// the search can never be turned into a CPU-exhaustion vector.
+fn peel_best_subset(onion: &[u8], shares: &[Share], threshold: usize) -> Option<ThresholdPeel> {
+    if threshold == 0 || shares.len() < threshold {
+        return None;
+    }
+    let mut chosen: Vec<usize> = Vec::with_capacity(threshold);
+    let mut attempts = 0usize;
+    peel_search(onion, shares, threshold, 0, &mut chosen, &mut attempts)
+}
+
+/// Recursive helper for [`peel_best_subset`]: extend `chosen` with distinct-`x` share indices until it
+/// reaches `threshold`, trying a peel at each complete subset.
+fn peel_search(
+    onion: &[u8],
+    shares: &[Share],
+    threshold: usize,
+    start: usize,
+    chosen: &mut Vec<usize>,
+    attempts: &mut usize,
+) -> Option<ThresholdPeel> {
+    if chosen.len() == threshold {
+        *attempts += 1;
+        let subset: Vec<Share> = chosen.iter().filter_map(|&i| shares.get(i).cloned()).collect();
+        return threshold::peel_onion_with_shares(onion, &subset).ok();
+    }
+    for i in start..shares.len() {
+        if *attempts >= MAX_PEEL_ATTEMPTS {
+            break;
+        }
+        // Keep share indices distinct: a valid Shamir reconstruction needs distinct x-coordinates.
+        let Some(candidate) = shares.get(i) else {
+            continue;
+        };
+        if chosen
+            .iter()
+            .any(|&j| shares.get(j).is_some_and(|s| s.x == candidate.x))
+        {
+            continue;
+        }
+        chosen.push(i);
+        if let Some(peel) = peel_search(onion, shares, threshold, i + 1, chosen, attempts) {
+            return Some(peel);
+        }
+        chosen.pop();
+    }
+    None
 }
 
 impl<F: Field> Engine for ThresholdRouter<F> {
@@ -382,4 +463,136 @@ fn decode_rep(body: &[u8]) -> Option<(u64, Share)> {
     let x = *body.get(8)?;
     let y = body.get(9..)?.to_vec();
     Some((req_id, Share { x, y }))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::threshold::{HopLine, member_partial, seal_onion};
+    use fanos_field::F2;
+    use fanos_pqcrypto::SeedRng;
+
+    fn has_delivery(effects: &[Effect], payload: &[u8]) -> bool {
+        effects.iter().any(|e| {
+            matches!(e, Effect::Notify(Notification::Delivered { from, payload: p })
+                if *from == ANONYMOUS && p == payload)
+        })
+    }
+
+    #[test]
+    fn a_forged_reply_neither_blocks_nor_kills_a_hop() {
+        // A Fano line (3 members), threshold 2. An attacker who knows the request id (a counter, and
+        // in any case broadcast to the line) injects a forged partial at an honest member's index with
+        // garbage `y`. Before the fix this poisoned the share set → wrong reconstruction → the pending
+        // peel was destroyed → the hop died. It must now be inert: the honest member's real reply still
+        // completes the hop.
+        let line_coord = Line::<F2>::at(1).coords();
+        let members = ThresholdRouter::<F2>::line_members(line_coord);
+        assert_eq!(members.len(), 3);
+        let t = 2usize;
+
+        // KEM keypair per member, in points_on (seal) order.
+        let (sec0, pub0) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A, 0]));
+        let (sec1, pub1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A, 1]));
+        let (_sec2, pub2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A, 2]));
+        let pubs = [&pub0, &pub1, &pub2];
+        let hop = HopLine {
+            line: line_coord,
+            members: &pubs,
+        };
+        let payload = b"anon-payload";
+        let onion = seal_onion(&[hop], t as u8, payload, b"seed-router").unwrap();
+
+        // The combiner is member 0.
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let mut router = ThresholdRouter::<F2>::new(combiner, sec0, t);
+
+        // Deliver the onion: the combiner seeds its own share and fans out requests — no peel yet.
+        let onion_frame = launch_frame(line_coord, &onion);
+        let e0 = router.step(
+            Instant(0),
+            Input::Message {
+                from: [9, 9, 9],
+                frame: onion_frame,
+            },
+        );
+        assert!(!has_delivery(&e0, payload), "one share (t=2) cannot deliver");
+
+        // The honest member-1 reply (the real partial) and a forgery at the same index with mangled y.
+        let honest1 = member_partial(&onion, 1, &sec1).unwrap();
+        let forged = Share {
+            x: honest1.x,
+            y: honest1.y.iter().map(|b| b ^ 0xFF).collect(),
+        };
+        assert_ne!(forged.y, honest1.y, "the forgery differs from the real share");
+
+        // Inject the forgery first: it reaches the threshold count but cannot peel, and must NOT be
+        // allowed to force a (wrong) delivery or discard the pending peel.
+        let e1 = router.step(
+            Instant(1),
+            Input::Message {
+                from: [8, 8, 8],
+                frame: encode_rep(0, &forged),
+            },
+        );
+        assert!(!has_delivery(&e1, payload), "a forged share does not complete the hop");
+
+        // The honest reply now arrives: a valid subset (combiner + honest member 1) exists, so the hop
+        // completes despite the forged candidate still sitting in the set.
+        let e2 = router.step(
+            Instant(2),
+            Input::Message {
+                from: members[1],
+                frame: encode_rep(0, &honest1),
+            },
+        );
+        assert!(
+            has_delivery(&e2, payload),
+            "the honest share completes the hop despite the forged one"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_an_out_of_range_index_is_rejected() {
+        // A share whose x is not a real member index (here x = 200, far beyond the 3 members) must be
+        // dropped outright — it can never join the candidate set, so it cannot flood or poison it.
+        let line_coord = Line::<F2>::at(2).coords();
+        let members = ThresholdRouter::<F2>::line_members(line_coord);
+        let t = 2usize;
+        let (sec0, pub0) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x7C, 0]));
+        let (_s1, pub1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x7C, 1]));
+        let (_s2, pub2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x7C, 2]));
+        let pubs = [&pub0, &pub1, &pub2];
+        let onion = seal_onion(
+            &[HopLine {
+                line: line_coord,
+                members: &pubs,
+            }],
+            t as u8,
+            b"payload-2",
+            b"seed-2",
+        )
+        .unwrap();
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let mut router = ThresholdRouter::<F2>::new(combiner, sec0, t);
+        router.step(
+            Instant(0),
+            Input::Message {
+                from: [1, 1, 1],
+                frame: launch_frame(line_coord, &onion),
+            },
+        );
+        // Two out-of-range forgeries (x = 0 and x = 200) and one that would exceed the member count.
+        for bad_x in [0u8, 200, 4] {
+            let e = router.step(
+                Instant(1),
+                Input::Message {
+                    from: [2, 2, 2],
+                    frame: encode_rep(0, &Share { x: bad_x, y: alloc::vec![0u8; 8] }),
+                },
+            );
+            assert!(e.is_empty(), "an out-of-range share index (x={bad_x}) is dropped");
+        }
+    }
 }
