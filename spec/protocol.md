@@ -1039,7 +1039,18 @@ Both ends stay anonymous (the client never learns the service's hosts; the servi
 
 Introduction flooding is the classic hidden-service DoS (Tor bolted on onion-service PoW in 2023). CALYPSO attaches a small **memory-hard PoW** or an **anonymous credit** (L7 VOPRF) to each `RDV_INTRO`; the service-line only threshold-decrypts intros above a difficulty it broadcasts and **raises adaptively under load**. Because the rendezvous line rotates each epoch and admission is throttled *at the line* (not a single node), there is no fixed target to flood — the DoS surface is itself distributed and moving.
 
-## 12.6 Why this beats Tor onion services / I2P {#calypso-comparison}
+## 12.6 CALYPSO-Balance — high-availability, load-balanced services [С] {#calypso-balance}
+
+A high-traffic service must be served by a **fleet**, not a single host. Tor bolts this on with *OnionBalance* — a tool that manually assembles one master descriptor out of several backends' introduction points. That inherits Tor's constraints: a hard cap on backends (introduction points per descriptor), a master key that must periodically re-sign a fresh descriptor, a single HSDir location per period, and clients that pick a backend at random (hotspots). CALYPSO-Balance is designed from FANOS's substrate instead, so none of those apply:
+
+- **No backend cap.** The master descriptor is an ordinary L4 object, replicated across its responsible cell by the projective LRC (§L4). The fleet size is bounded by the store, not a protocol constant, and the *fetch is fault-tolerant* — any surviving replica answers.
+- **Offline root, bounded online key.** The identity the `.fanos` address certifies is an **offline root**. It signs, once, a short-lived certificate authorising an **epoch signing key**; that online key signs the per-epoch descriptor and each backend delegation. A compromised signing key is confined to its certified epoch window and revoked by simply not re-issuing the certificate — the root secret never touches the serving path. (This is the identity/signing-key split of a Tor v3 descriptor, made explicit and post-quantum.)
+- **Delegated, time-bound backends.** Each backend carries a delegation signed by the signing key over `(root, epoch, backend_pubkey, coordinate, weight)`. Authority therefore expires with the epoch and cannot be replayed; a compromised backend cannot mint new delegations, add or drop instances, or alter the descriptor — all bound by the descriptor signature.
+- **Consistent, capacity-aware load balancing.** A client maps each request to a backend by **weighted rendezvous hashing (HRW)**: `score = weight · H(cookie ‖ backend_pubkey)`, highest wins. Load spreads in proportion to `weight` (a `0` drains a backend for maintenance), and — unlike a modulo assignment that reshuffles *everyone* when the fleet changes — adding or removing a backend remaps only that backend's ~`1/N` share. Failover walks down the ranking, one step per unreachable backend; and because a backend's coordinate may itself be a **threshold-hosted line** (§12.3), an individual backend is likewise unraidable.
+
+The trust chain is self-certifying end to end — **address → root → signing key → backend** — with no directory and nothing forgeable without the offline root secret. Backends may themselves rotate coordinates per epoch (§12.2), so there is no static fleet map to seize. Status: [С] — vetted primitives (hybrid PQ signatures, BLAKE3 rendezvous hashing) composed; the health-aware selection that consults DIAKRISIS liveness (§6) to skip a known-down backend before the request is sent is the natural extension.
+
+## 12.7 Why this beats Tor onion services / I2P {#calypso-comparison}
 
 | Property | Tor onion v3 | I2P eepsite | **CALYPSO** |
 |---|:-:|:-:|:-:|
@@ -1051,7 +1062,7 @@ Introduction flooding is the classic hidden-service DoS (Tor bolted on onion-ser
 | Below-threshold seizure | fatal | fatal | **0 knowledge** |
 | Self-diagnosis of hosts | ✗ | ✗ | **DIAKRISIS (§6)** |
 
-## 12.7 Honest status and human-readable naming {#calypso-status}
+## 12.8 Honest status and human-readable naming {#calypso-status}
 
 The rendezvous derivation is [Т]-structure + [С] on the beacon; threshold hosting is [С] (relies on line DKG and fewer than `t` corrupt members); every primitive is vetted — the novelty is architectural composition, as everywhere in FANOS. Self-certifying addresses are unmemorable; a **petname / naming-mapping layer** (à la Tor onion-names or ENS) can sit on top, deliberately **[P] and out of protocol scope** so that CALYPSO itself needs no naming authority.
 
