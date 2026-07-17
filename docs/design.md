@@ -9,8 +9,9 @@ This document is the **HOW and WHY** behind [`roadmap.md`](roadmap.md) (the what
 incident analysis they answer, and the evolvability model — so every future decision is traceable to a
 principle, and the platform can grow without losing coherence.
 
-> **Naming note.** The working name is FANOS (Φανός, "beacon"). A three-letter successor is proposed in
-> §8 to sit in the `tor` / `i2p` / `nym` lineage; the architecture below is name-independent.
+> **Naming note.** The name is **FANOS** (Φανός, "beacon"), retained for now. A three-letter successor
+> in the `tor` / `i2p` / `nym` lineage is catalogued in §8 as a future brand option; the architecture
+> below is name-independent and can be re-prefixed mechanically if ever renamed.
 
 ---
 
@@ -178,10 +179,11 @@ answers neither, it is scope creep.
 
 ---
 
-## 8. The name — a three-letter successor (proposal)
+## 8. The name — a three-letter successor (catalogued, deferred)
 
-To sit in the `tor` / `i2p` / `nym` lineage and carry the project's essence — a network that *knows and
-heals itself* — the recommended successor is:
+**FANOS is retained for now.** Should a three-letter successor in the `tor` / `i2p` / `nym` lineage be
+wanted later — to carry the project's essence, a network that *knows and heals itself* — the candidates
+are catalogued here. The leading option:
 
 - **`NOS`** — from Greek **νόος / νοῦς** ("mind, intellect, self-awareness"): *the network that observes
   itself*. It is literally the tail of FANOS (heritage preserved), three letters, pronounceable, and
@@ -197,3 +199,101 @@ Alternatives, if a fresher root is preferred:
 The subsystem names (NYX, APHANTOS, CALYPSO, PROTEUS, DIAKRISIS) already form a coherent mythic register
 and can stay regardless of the top-level rename. **This is a brand decision — the architecture above is
 name-independent** and every crate can be re-prefixed mechanically once chosen.
+
+---
+
+## 9. Component design — censorship-resistant bootstrap
+
+The hardest problem a real deployment faces is not routing but **entry**: a new node must reach *one*
+live peer, and that is exactly the choke a censor attacks (the GFW blocks known entry IPs and probes
+suspected bridges). Tor answers with directory authorities plus a bridge database — both enumerable and
+blockable. FANOS bootstraps by **derivation, not enumeration**, over three composable paths:
+
+1. **Open path** — a shipped seed set of well-known nodes, for the un-censored network. Simplest, blockable.
+2. **Moving-target bridges** — the censored path. A community shares a `bridge_secret` out of band (a
+   contact, a QR, a mesh); the current entry is `bridge = f(bridge_secret, epoch)` (built:
+   `fanos-proteus::bridge_line`), rotating every epoch. A user with the secret computes *today's* bridge;
+   a censor **without** the secret cannot enumerate the space, and yesterday's bridge is already stale.
+   There is no static list to block. The connection rides a PROTEUS morph, so the wire looks like nothing.
+3. **Peer exchange** — once inside, a node learns more peers by gossip (spec §L3 membership flood), so a
+   single successful entry seeds a full view. Bootstrap fragility decays to zero after the first contact.
+
+`fanos node --bridge <secret>` selects path 2. **Design invariants honoured:** no authority (2), nothing
+static to block (6), reflexive recovery if a bridge dies (4, the node re-derives and retries).
+**Open residual `[P]`:** the *first* out-of-band `bridge_secret` distribution is a human/social channel,
+not a protocol one — the universal bootstrap-trust problem, which no network solves purely in-band.
+
+---
+
+## 10. Component design — the exit / clearnet gateway
+
+Exits are where deanonymization and legal liability concentrate: an exit sees the cleartext destination
+(inherently — *someone* must speak to the clearnet), can sniff or inject, and its operator bears abuse
+complaints. The design contains, not eliminates, this:
+
+- **Exit is an opt-in role** advertised as a capability, with an **exit policy** (allowed
+  ports/host-patterns) negotiated like any other. Most nodes are not exits.
+- **What an exit learns and doesn't.** It learns the *destination* (must, to connect) and the *content*
+  if unencrypted (use TLS end-to-end — the exit is untrusted, exactly as a Tor exit). It does **not**
+  learn the *origin*: the stream arrives onion-routed, so the exit sees only the last hop. Origin↔exit
+  unlinkability is the whole point and is preserved.
+- **DNS through the exit** (see §11) so the client never resolves locally.
+- **Accountability without linkability.** The exit's cert-bound identity makes it accountable for policy
+  and reputation (DIAKRISIS coherence + abuse signals), while clients stay unlinkable — the two
+  properties do not conflict because identity binds the *exit*, not the *stream's origin*.
+- **`[P]` frontier — threshold exit.** A genuinely FANOS-native improvement is to make the *line*, not a
+  node, the exit: `t`-of-`(q+1)` members jointly authorize (and rate-limit) the clearnet connection, so no
+  single exit operator sees all a client's destinations and none can unilaterally inject. The connection
+  itself is still made by one member (TCP is point-to-point), but *authorization and logging are
+  threshold-shared* — spreading liability and trust the way threshold hosting does for services. Deferred
+  as research; the single-exit design ships first.
+
+---
+
+## 11. Component design — DNS without leaks
+
+DNS is the most common real-world deanonymizer: even a perfect tunnel is defeated if the browser resolves
+`example.com` via the local ISP resolver. The rule is absolute — **resolution never escapes the tunnel**:
+
+- **`.fanos` names** resolve locally with *no DNS at all*: the address self-certifies the service key, and
+  CALYPSO computes the rendezvous (built). Zero network resolution, zero leak.
+- **Clearnet names** are resolved **at the exit, over the circuit**: the client hands the *name* (not an
+  IP) into the onion; the exit resolves it (its resolver, or DoH for integrity) and connects. SOCKS5's
+  domain-address mode makes this native — the proxy forwards names, never pre-resolving.
+- **VPN / UDP mode** captures port-53 traffic at the TUN and tunnels it the same way, so even apps that
+  bypass SOCKS cannot leak.
+- **Caching is a fingerprint** and is therefore bound to the *session/circuit* (evicted on rotation),
+  trading a little circuit load for unlinkability — an explicit, honest trade (invariant 7).
+
+**Design invariant honoured:** close every side channel by construction (the incident-2 family). DNS is a
+first-class network feature here, not a proxy afterthought.
+
+---
+
+## 12. Component design — capability negotiation, the evolvability genome
+
+This is the mechanism that makes invariant 6 real: the protocol must *evolve continuously* (new morphs,
+ciphers, cell sizes, roles) without a hard fork, because censorship is a perpetual arms race and a
+network that cannot change is a network that will be blocked.
+
+- **Advertisement.** Each node's `HELLO`/`JOIN` carries a monotone `version` and a `capability` bitfield
+  (profiles `{Direct,Lite,Full}`, morphs, cipher suites, cell size `q`, roles `{relay,storage,exit,service}`),
+  spec §7.4. Old bits keep their meaning forever; new features are new bits.
+- **Negotiation.** Two peers operate at `min(version)` and the **intersection** of capabilities. A
+  minimal DHT-only node interoperates with a full mixnet+service node — the full node simply does not
+  offer it NYX/CALYPSO frames. Unknown bits are ignored (forward-compatible).
+- **Extension = mutation; interoperation = selection.** A new capability propagates only if nodes adopt
+  it *and* it reproduces the canonical KAT vectors (§7.9); one that cannot interoperate never spreads.
+  This is literally natural selection over the capability space — the "genome" (the KAT-pinned wire)
+  expresses variable "traits" (capabilities), and the network keeps what survives contact.
+- **Deprecation** is passive: nodes stop advertising a capability, and the intersection drops it — no
+  coordinated flag day.
+- **Security — no silent downgrade.** The capability set is bound to the node's identity in the signed
+  `HELLO`, and each side enforces a *policy floor* (e.g. "refuse below Lite for this stream"), so an
+  active attacker cannot strip a peer down to a weaker profile or cipher. Downgrade resistance is part of
+  the negotiation, not an add-on.
+
+This is the slow, structural counterpart to DIAKRISIS's fast, behavioural adaptation (§4): together they
+are why the platform can *keep evolving as part of its architecture* — homeostasis within a release,
+selection across releases — the living-organism property the project is built to have.
+
