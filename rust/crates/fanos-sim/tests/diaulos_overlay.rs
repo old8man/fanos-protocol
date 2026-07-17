@@ -39,10 +39,10 @@ fn dispatch(
     *seen = notes.len();
 }
 
-/// Establish a Fano cell on `sim`, then run one DIAULOS request/response (`ping` → `pong:ping`)
-/// between two of its nodes over the real engine's datagram transport, allowing `rounds` pump
-/// half-cycles. Returns `(handshake_completed, response_bytes)`.
-fn run_request_response(mut sim: Sim, rounds: usize) -> (bool, Vec<u8>) {
+/// Establish a Fano cell on `sim`, then run one DIAULOS request/response between two of its nodes
+/// over the real engine's datagram transport: the client sends `request`, the service replies
+/// `pong:` ++ `request`. Allows `rounds` pump half-cycles. Returns `(handshake_completed, response)`.
+fn run_request_response(mut sim: Sim, rounds: usize, request: &[u8]) -> (bool, Vec<u8>) {
     let cell = spawn_cell::<F2>(&mut sim, Config::default());
     sim.inject_all(&Command::StartHeartbeat);
     sim.run_for(Duration::from_millis(2500)); // establish liveness (generous, tolerates loss)
@@ -58,7 +58,6 @@ fn run_request_response(mut sim: Sim, rounds: usize) -> (bool, Vec<u8>) {
     let mut server = ServerSession::new(keypair);
     let mut srng = SeedRng::from_seed(b"overlay-server");
 
-    let request = b"ping".to_vec();
     let (mut wrote, mut answered) = (false, false);
     let mut seen = 0usize;
 
@@ -67,7 +66,7 @@ fn run_request_response(mut sim: Sim, rounds: usize) -> (bool, Vec<u8>) {
             sim.inject(client_node, cmd);
         }
         if client.is_live() && !wrote {
-            client.write(&request);
+            client.write(request);
             client.finish();
             wrote = true;
         }
@@ -114,12 +113,20 @@ fn run_request_response(mut sim: Sim, rounds: usize) -> (bool, Vec<u8>) {
     (client.is_live(), client.read())
 }
 
+/// The service's reply for `request`: `pong:` ++ `request`.
+fn expected(request: &[u8]) -> Vec<u8> {
+    let mut e = b"pong:".to_vec();
+    e.extend_from_slice(request);
+    e
+}
+
 #[test]
 fn diaulos_request_response_over_the_real_overlay() {
-    let (live, response) = run_request_response(Sim::new(42), 30);
+    let (live, response) = run_request_response(Sim::new(42), 30, b"ping");
     assert!(live, "the 1-RTT handshake completed over the real overlay");
     assert_eq!(
-        response, b"pong:ping",
+        response,
+        expected(b"ping"),
         "the encrypted response arrived end-to-end"
     );
 }
@@ -129,10 +136,29 @@ fn diaulos_recovers_under_heavy_packet_loss() {
     // A quarter of every datagram is dropped; DIAULOS's selective repeat must still deliver the
     // whole request and response (given enough retransmit rounds).
     let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), 0.25);
-    let (live, response) = run_request_response(Sim::with_network(7, net), 120);
+    let (live, response) = run_request_response(Sim::with_network(7, net), 120, b"ping");
     assert!(live, "the handshake completed despite 25% loss");
     assert_eq!(
-        response, b"pong:ping",
+        response,
+        expected(b"ping"),
         "selective repeat recovered the full exchange under loss"
+    );
+}
+
+#[test]
+fn diaulos_carries_a_large_multi_cell_payload_under_loss() {
+    // ~8 KiB fragments into many constant-size cells in both directions; with 15% loss this stresses
+    // multi-cell selective repeat, windowing, and reassembly over the real engine — an edge case well
+    // beyond the single-cell "ping".
+    let request: Vec<u8> = (0..8192u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), 0.15);
+    let (live, response) = run_request_response(Sim::with_network(99, net), 200, &request);
+    assert!(live, "handshake completed");
+    assert_eq!(
+        response,
+        expected(&request),
+        "the full 8 KiB round-tripped intact under loss"
     );
 }
