@@ -20,6 +20,7 @@ extern crate alloc;
 
 pub mod address;
 pub mod balance;
+pub mod descriptor;
 pub mod hosting;
 pub mod pow;
 pub mod rendezvous;

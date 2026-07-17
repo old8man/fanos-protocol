@@ -614,9 +614,11 @@ dependencies = [
 name = "fanos-calypso"
 version = "0.1.0"
 dependencies = [
+ "chacha20poly1305",
  "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
+ "fanos-onoma",
  "proptest",
 ]
 
