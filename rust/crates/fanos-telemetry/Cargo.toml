@@ -22,6 +22,10 @@ sysinfo = { version = "0.39", default-features = false, features = [
     "network",
 ], optional = true }
 
+[dev-dependencies]
+# Fuzz the untrusted-input decoders (frame / snapshot) — they must reject, never panic.
+proptest.workspace = true
+
 [features]
 default = ["std"]
 # std uses hardware float intrinsics; a no_std monitor supplies them via libm.
