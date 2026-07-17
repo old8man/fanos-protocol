@@ -61,6 +61,66 @@ fn a_cell_runs_a_networked_dkg_and_agrees_on_the_joint_key() {
 }
 
 #[test]
+fn an_offline_dealer_does_not_stall_the_honest_majority() {
+    // Liveness (spec §6.4): one dealer never deals. The other six must still complete on the
+    // qualified subset once the collection deadline passes — not hang forever waiting for all seven.
+    let mut sim = Sim::new(0xD47);
+    let cell = spawn_dkg_cell(&mut sim, 4); // 4-of-7 threshold
+
+    // Every node except the last begins dealing; node 6 stays silent (offline dealer).
+    for &node in &cell[..6] {
+        sim.inject(node, Command::StartHeartbeat);
+    }
+    // Run past the 2 s default deadline so the qualified-subset finalizer fires.
+    sim.run_for(Duration::from_millis(3000));
+
+    let joint: Vec<(Triple, [u8; 32])> = sim
+        .report()
+        .notifications
+        .iter()
+        .filter_map(|o| match &o.note {
+            Notification::DkgComplete(y) => Some((o.node, *y)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        joint.len(),
+        6,
+        "the six online dealers complete despite the offline seventh"
+    );
+    let first = joint[0].1;
+    assert!(
+        joint.iter().all(|(_, y)| *y == first),
+        "all honest nodes agree on the joint key over the qualified subset"
+    );
+    assert_ne!(first, [0u8; 32]);
+}
+
+#[test]
+fn below_threshold_participation_does_not_finalize() {
+    // Safety boundary: with only three dealers and a threshold of four, no qualified subset reaches
+    // the threshold, so no node finalizes a key (a genuine participation failure, not a stall to fix).
+    let mut sim = Sim::new(0xD48);
+    let cell = spawn_dkg_cell(&mut sim, 4);
+    for &node in &cell[..3] {
+        sim.inject(node, Command::StartHeartbeat);
+    }
+    sim.run_for(Duration::from_millis(3000));
+
+    let completions = sim
+        .report()
+        .notifications
+        .iter()
+        .filter(|o| matches!(o.note, Notification::DkgComplete(_)))
+        .count();
+    assert_eq!(
+        completions, 0,
+        "three dealers cannot form a 4-threshold key"
+    );
+}
+
+#[test]
 fn dkg_is_reproducible_per_seed() {
     // Determinism: the same seeds yield the same joint key (the dealings are seeded).
     let run = || {

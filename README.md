@@ -107,9 +107,13 @@ canonical hashing rule; and a VRF key derives from *any* seed (a hash-to-scalar,
 canonical-bytes gate). L4 reads now **repair across the replica line** — a `Get`
 queries the responsible primary, then falls back through the co-linear replicas on a miss or a
 silent-replica timeout, so any survivor answers even when the primary recovered empty after churn.
-Documented as known limitations with a fix path (see the module docs): the onion still shrinks one
-layer per hop (constant-size Tessera padding is a separate change), PROTEUS junk is per-epoch rather
-than per-packet, and DKG completes on the full `n` (not yet a timed qualified subset).
+The networked **DKG completes on a timed qualified subset** — a node finalizes as soon as every
+member qualifies, or, once a collection deadline elapses, on whatever qualified set reached the
+threshold, so an offline dealer no longer stalls the honest majority. Documented as known
+limitations with a fix path (see the module docs): the onion still shrinks one layer per hop
+(constant-size Tessera padding is a separate change), PROTEUS junk is per-epoch rather than
+per-packet, and DKG's qualified-set agreement is robust to crash/offline dealers but not yet to a
+Byzantine *equivocating* dealer (the classic complaint round).
 
 ### Build, verify, and simulate
 
