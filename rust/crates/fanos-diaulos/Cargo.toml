@@ -14,6 +14,11 @@ categories = ["network-programming", "cryptography"]
 # The reliability core (selective-repeat + SACK) DIAULOS carries end-to-end, verbatim.
 fanos-runtime = { workspace = true, features = ["std"] }
 chacha20poly1305 = { workspace = true }
+# The 1-RTT handshake: hybrid X25519+ML-KEM-768 KEM (encaps/decaps) and the labeled KDF.
+fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+fanos-crypto = { workspace = true }
+# The `CryptoRng` bound the KEM keygen/encapsulation are generic over (0.10 matches fanos-pqcrypto).
+rand_core = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true

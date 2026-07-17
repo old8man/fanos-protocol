@@ -31,6 +31,10 @@ pub mod label {
     pub const ONOMA_LOOKUP: &str = "FANOS-v1/onoma-lookup";
     /// ONOMA per-epoch descriptor **encryption** key (address-gated confidentiality).
     pub const ONOMA_ENC: &str = "FANOS-v1/onoma-enc";
+    /// DIAULOS handshake **transcript** hash (binds both hellos + the service static key).
+    pub const DIAULOS_TH: &str = "FANOS-v1/diaulos-th";
+    /// DIAULOS handshake session-key **expansion** (`key_c2s ‖ key_s2c`).
+    pub const DIAULOS_KEY: &str = "FANOS-v1/diaulos-key";
 }
 
 /// A domain-separated BLAKE3 hasher. The label and a unit separator are absorbed first, so

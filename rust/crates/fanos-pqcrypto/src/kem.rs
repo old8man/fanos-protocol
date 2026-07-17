@@ -4,7 +4,8 @@
 //! shared secrets combined with SHAKE256, so the session key is secure if *either* primitive
 //! is (classical hedge + post-quantum). This is the per-hop key establishment NYX needs.
 
-use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, MlKem768};
+use ml_kem::array::Array;
+use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, KeySizeUser, MlKem768};
 use rand_core::CryptoRng;
 use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
@@ -40,6 +41,12 @@ pub type SessionKey = [u8; 32];
 
 /// Serialized hybrid-ciphertext length: `X25519 ephemeral (32) ‖ ML-KEM-768 ciphertext (1088)`.
 pub const CIPHERTEXT_LEN: usize = 32 + 1088;
+
+/// ML-KEM-768 encapsulation-key length (FIPS 203).
+const MLKEM768_EK_LEN: usize = 1184;
+
+/// Serialized hybrid public-key length: `X25519 (32) ‖ ML-KEM-768 encapsulation key (1184)`.
+pub const PUBLIC_LEN: usize = 32 + MLKEM768_EK_LEN;
 
 impl HybridCiphertext {
     /// Serialize to `CIPHERTEXT_LEN` bytes (for the wire).
@@ -117,6 +124,22 @@ impl HybridKemPublic {
         out
     }
 
+    /// Parse a public key from its [`encode`](Self::encode) bytes (`PUBLIC_LEN` long). Returns `None`
+    /// on the wrong length or an ML-KEM key that fails validation.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != PUBLIC_LEN {
+            return None;
+        }
+        let mut x = [0u8; 32];
+        x.copy_from_slice(bytes.get(..32)?);
+        let x25519 = PublicKey::from(x);
+        let encoded =
+            Array::<u8, <MlEncapKey as KeySizeUser>::KeySize>::try_from(bytes.get(32..)?).ok()?;
+        let mlkem = MlEncapKey::new(&encoded).ok()?;
+        Some(Self { x25519, mlkem })
+    }
+
     /// Encapsulate to this public key, returning the ciphertext and the session key.
     #[must_use]
     pub fn encapsulate<R: CryptoRng>(&self, rng: &mut R) -> (HybridCiphertext, SessionKey) {
@@ -172,6 +195,19 @@ mod tests {
         // A different secret derives a different (wrong) session key.
         let (other, _) = HybridKemSecret::generate(&mut rng);
         assert_ne!(other.decapsulate(&ciphertext), sender_key);
+    }
+
+    #[test]
+    fn public_key_encodes_and_decodes_and_still_encapsulates() {
+        let mut rng = SeedRng::from_seed(b"kem-public-roundtrip");
+        let (secret, public) = HybridKemSecret::generate(&mut rng);
+        let bytes = public.encode();
+        assert_eq!(bytes.len(), PUBLIC_LEN);
+        let parsed = HybridKemPublic::decode(&bytes).expect("round-trips");
+        // A ciphertext encapsulated to the *decoded* key decapsulates under the original secret.
+        let (ciphertext, key) = parsed.encapsulate(&mut rng);
+        assert_eq!(secret.decapsulate(&ciphertext), key);
+        assert!(HybridKemPublic::decode(&bytes[..10]).is_none());
     }
 
     #[test]
