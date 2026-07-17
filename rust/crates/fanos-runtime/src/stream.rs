@@ -307,7 +307,9 @@ impl StreamReceiver {
     pub fn ack(&self) -> Ack {
         let mut sack = 0u64;
         for i in 1..SACK_WIDTH {
-            if self.received.contains_key(&(self.next + i)) {
+            // saturating: near u32::MAX (a ~4 TB stream) the add must not wrap/panic; such a key can
+            // never be present anyway, so saturating to u32::MAX simply reads as "not held".
+            if self.received.contains_key(&self.next.saturating_add(i)) {
                 sack |= 1u64 << i;
             }
         }
@@ -549,6 +551,123 @@ mod tests {
             sender.outbound().len(),
             3,
             "effective window = min(window, peer_rwnd)"
+        );
+    }
+
+    #[test]
+    fn the_receive_window_edge_is_exact() {
+        let mut rx = StreamReceiver::new(0).with_recv_window(4);
+        let seg = |seq| Segment {
+            stream_id: 0,
+            seq,
+            fin: false,
+            data: alloc::vec![seq as u8],
+        };
+        // next = 0, window = 4 ⇒ acceptable seqs are [0, 4). seq == next + recv_window (4) is dropped.
+        rx.on_segment(&seg(4));
+        assert_eq!(rx.ack().sack, 0, "a seq exactly at next+recv_window is dropped");
+        // seq == next + recv_window - 1 (3) is the last accepted slot.
+        rx.on_segment(&seg(3));
+        assert_ne!(rx.ack().sack & (1u64 << 3), 0, "next+recv_window-1 is accepted");
+    }
+
+    #[test]
+    fn the_sack_bitmap_marks_the_top_window_slot() {
+        let mut rx = StreamReceiver::new(0).with_recv_window(SACK_WIDTH);
+        // The highest representable out-of-order slot is next + (SACK_WIDTH - 1) = 63.
+        rx.on_segment(&Segment {
+            stream_id: 0,
+            seq: SACK_WIDTH - 1,
+            fin: false,
+            data: alloc::vec![9],
+        });
+        assert_ne!(
+            rx.ack().sack & (1u64 << (SACK_WIDTH - 1)),
+            0,
+            "the top SACK slot is representable without overflow"
+        );
+    }
+
+    #[test]
+    fn a_zero_receive_window_still_sends_a_one_segment_probe() {
+        let payload: Vec<u8> = (0..3 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut tx = StreamSender::new(0, &payload); // several segments
+        tx.on_ack(Ack {
+            cumulative: 0,
+            sack: 0,
+            rwnd: 0,
+        });
+        // A zero window would otherwise deadlock the stream; the max(1) floor keeps one probe in flight.
+        assert_eq!(
+            tx.outbound().len(),
+            1,
+            "zero credit still emits exactly one probe segment"
+        );
+    }
+
+    #[test]
+    fn on_ack_is_robust_to_stale_and_hostile_cumulative() {
+        let payload = alloc::vec![7u8; 2 * MAX_SEGMENT]; // segments 0,1 (+ empty FIN 2) ⇒ len 3
+        let mut tx = StreamSender::new(0, &payload);
+        tx.on_ack(Ack {
+            cumulative: 1,
+            sack: 0,
+            rwnd: 64,
+        });
+        // A stale, lower cumulative must not rewind the acknowledged frontier.
+        tx.on_ack(Ack {
+            cumulative: 0,
+            sack: 0,
+            rwnd: 64,
+        });
+        assert!(
+            tx.outbound().iter().all(|s| s.seq >= 1),
+            "a stale lower cumulative does not resurrect already-acked segments"
+        );
+        // A cumulative past the end clamps to len — no overflow, no acked beyond the segment count.
+        tx.on_ack(Ack {
+            cumulative: u32::MAX,
+            sack: 0,
+            rwnd: 64,
+        });
+        assert!(tx.is_complete(), "an over-large cumulative clamps to len and completes");
+        assert!(tx.outbound().is_empty(), "nothing remains to send once complete");
+    }
+
+    #[test]
+    fn a_replay_cannot_alter_already_delivered_or_buffered_bytes() {
+        let mut rx = StreamReceiver::new(0);
+        let seg = |seq, byte| Segment {
+            stream_id: 0,
+            seq,
+            fin: false,
+            data: alloc::vec![byte],
+        };
+        rx.on_segment(&seg(0, b'A'));
+        assert_eq!(rx.take(), b"A"); // delivered advances past 0
+        // A replay of an already-taken sequence is out of window ⇒ dropped, surfacing nothing.
+        rx.on_segment(&seg(0, b'Z'));
+        assert!(rx.take().is_empty(), "a replay below the delivered frontier yields nothing");
+        // The first bytes seen at a held seq win; a replay with altered payload cannot overwrite them.
+        rx.on_segment(&seg(2, b'C'));
+        rx.on_segment(&seg(2, b'X')); // replay, mangled
+        rx.on_segment(&seg(1, b'B')); // fills the gap
+        assert_eq!(rx.take(), b"BC", "a replay cannot corrupt buffered out-of-order bytes");
+    }
+
+    #[test]
+    fn segment_decode_length_boundary() {
+        // One byte short of the 9-byte header ⇒ rejected.
+        assert!(Segment::decode(&[0u8; 8]).is_none());
+        // Exactly the 9-byte header ⇒ a segment with empty data (the len-0 / FIN-only case).
+        assert_eq!(
+            Segment::decode(&[0, 0, 0, 1, 0, 0, 0, 2, 1]),
+            Some(Segment {
+                stream_id: 1,
+                seq: 2,
+                fin: true,
+                data: alloc::vec![],
+            })
         );
     }
 }
