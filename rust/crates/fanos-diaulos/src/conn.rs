@@ -140,6 +140,23 @@ impl Connection {
             .collect()
     }
 
+    /// Like [`outbound`](Self::outbound) but tops the batch up to at least `min_cells` by minting
+    /// indistinguishable `PADDING` cover cells (same key, same size, same monotone nonce space). This
+    /// is the mechanism a constant-rate traffic shaper needs: only the connection may mint valid
+    /// cells — it alone owns the send key and nonce counter — so padding cannot be added from outside.
+    /// The peer's [`on_cell`](Self::on_cell) silently ignores padding.
+    pub fn outbound_padded(&mut self, min_cells: usize) -> Vec<Vec<u8>> {
+        let mut cells = self.outbound();
+        while cells.len() < min_cells {
+            let nonce = self.next_nonce();
+            match seal(&self.key_tx, nonce, &Frame::Padding.encode()) {
+                Some(cell) => cells.push(cell),
+                None => break,
+            }
+        }
+        cells
+    }
+
     /// Ingest one cell: route the frame to its stream. A `DATA` for an unknown id implicitly opens an
     /// inbound stream (queued for [`accept`](Self::accept)). Cells that fail to open are dropped.
     pub fn on_cell(&mut self, cell: &[u8]) {
@@ -175,7 +192,7 @@ impl Connection {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::cell::CELL_LEN;
@@ -252,6 +269,44 @@ mod tests {
         assert_eq!(client.open_stream(), 2); // initiator: even
         assert_eq!(service.open_stream(), 1);
         assert_eq!(service.open_stream(), 3); // responder: odd
+    }
+
+    #[test]
+    fn padding_holds_a_constant_cell_rate_without_disturbing_streams() {
+        let (c2s, s2c) = ([5u8; 32], [6u8; 32]);
+        let mut client = Connection::new(c2s, s2c, true);
+        let mut service = Connection::new(s2c, c2s, false);
+        let id = client.open_stream();
+        client.write(id, b"hello");
+        client.finish(id);
+
+        // Ask for at least 8 cells this tick; the real DATA+ACK are topped up with cover.
+        let cells = client.outbound_padded(8);
+        assert!(cells.len() >= 8, "topped up to the target rate");
+        for cell in &cells {
+            assert_eq!(
+                cell.len(),
+                CELL_LEN,
+                "cover is byte-indistinguishable from data"
+            );
+        }
+        for cell in &cells {
+            service.on_cell(cell);
+        }
+        let sid = service.accept().expect("the real stream still opened");
+        assert_eq!(
+            service.read(sid),
+            b"hello",
+            "padding did not disturb the stream"
+        );
+
+        // An idle connection with no streams can still emit pure cover to hold the rate.
+        let mut idle = Connection::new(c2s, s2c, true);
+        let cover = idle.outbound_padded(5);
+        assert_eq!(cover.len(), 5);
+        for cell in &cover {
+            assert_eq!(cell.len(), CELL_LEN);
+        }
     }
 
     /// A small deterministic LCG so a proptest seed reproduces the exact loss pattern.
