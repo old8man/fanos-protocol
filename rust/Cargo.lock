@@ -793,6 +793,7 @@ dependencies = [
  "fanos-nyx",
  "fanos-pqcrypto",
  "fanos-runtime",
+ "fanos-vrf",
  "fanos-wire",
  "proptest",
  "rand_core 0.6.4",

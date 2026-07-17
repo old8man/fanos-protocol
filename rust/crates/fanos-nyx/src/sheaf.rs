@@ -7,7 +7,13 @@
 //! peel a hop alone; that is the property that drops endpoint linkage to `P_hop²` (spec §5.2,
 //! and [`crate::security`]).
 //!
-//! The AEAD and the secret sharing are real and audited primitives; the FANOS novelty is
+//! This module is the `no_std` **transparent form**: the shares are carried in the clear, so its
+//! below-threshold guarantee holds only when each share is delivered privately to its member. The
+//! **production form binds every share to its member cryptographically** — each Shamir share is
+//! hybrid-KEM-sealed to that member's public key, so an adversary holding the whole packet learns
+//! nothing below threshold and each hop is forward-secret — see
+//! `fanos_aphantos::threshold::ThresholdSealed` (which needs the post-quantum KEM and so lives above
+//! this `no_std` crate). AEAD and secret sharing are vetted primitives; the FANOS novelty is
 //! composing them so a *line* — not a node — is the unit of trust.
 
 use alloc::vec::Vec;
@@ -36,7 +42,8 @@ impl From<ShamirError> for NyxError {
 }
 
 /// A sealed threshold layer: the AEAD ciphertext, its nonce, and the `q+1` key shares (each
-/// distributed to a line member — encrypted to that member's key in production).
+/// distributed to a line member privately — cryptographically KEM-sealed per member in the
+/// production form, `fanos_aphantos::threshold::ThresholdSealed`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ThresholdLayer {
     ciphertext: Vec<u8>,

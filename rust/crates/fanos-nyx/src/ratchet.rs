@@ -1,14 +1,16 @@
-//! The holonomic ratchet — forward secrecy and a path authenticator (spec §5.4).
+//! The holonomic ratchet — a **path authenticator** over a geometric circuit (spec §5.4).
 //!
 //! On the incidence bundle a connection `A` is defined over each incident pair; the hop factor
-//! is `β_k = KDF(state ‖ A(p_{k-1}, p_k))`, and the ordered composition along the path is the
-//! **holonomy** `Hol = state_L`. Two consequences (spec §5.4):
+//! is `β_k = KDF(state ‖ A(p_{k-1}, p_k))`, a one-way KDF chain whose ordered composition along the
+//! path is the **holonomy** `Hol = state_L`. Both endpoints, knowing the algebraic path, compute the
+//! same `Hol`; inserting or substituting any hop changes an `A_k` and so breaks it, exactly as a
+//! nontrivial holonomy signals an incorrect contour in gap theory. The onion carries `Hol` as a
+//! compact tamper-evident tag — encrypted end-to-end in the innermost layer, so it is not a cleartext
+//! cross-hop correlator (see `fanos_aphantos::sealed`).
 //!
-//! * **Forward secrecy** — the chain is one-way (a KDF chain), so compromising the current hop
-//!   reveals nothing about past ones.
-//! * **A compact path authenticator** — both endpoints, knowing the algebraic path, compute
-//!   the same `Hol`; inserting or substituting any hop changes an `A_k` and so breaks it,
-//!   exactly as a nontrivial holonomy signals an incorrect contour in gap theory.
+//! *Forward secrecy* of the routed onion comes from the per-hop **hybrid KEM** to the relay/line —
+//! recovering a hop key needs a relay's long-term secret, so the sender's build state does not — not
+//! from this ratchet (whose chain is entirely sender-derived). The ratchet's role is authentication.
 
 use alloc::vec::Vec;
 

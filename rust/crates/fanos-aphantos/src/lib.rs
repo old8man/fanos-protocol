@@ -12,6 +12,8 @@ extern crate alloc;
 
 pub mod node;
 pub mod sealed;
+pub mod threshold;
 
 pub use node::{Directory, NyxNode};
 pub use sealed::{PeelOutcome, SealedError};
+pub use threshold::{ThresholdError, ThresholdSealed};
