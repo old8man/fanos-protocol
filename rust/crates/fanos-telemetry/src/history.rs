@@ -403,6 +403,9 @@ impl MetricStore {
 /// Snapshot magic (`FTS1` — Fanos Telemetry Series v1) and version, so the format is self-describing.
 const SNAPSHOT_MAGIC: [u8; 4] = *b"FTS1";
 const SNAPSHOT_VERSION: u8 = 1;
+/// The minimum on-wire size of one serialized [`Bucket`] (`start_nanos` u64 + `count` u32 + four f64s),
+/// used to bound speculative allocation when reading an untrusted finalized-bucket count.
+const BUCKET_BYTES: usize = 8 + 4 + 4 * 8;
 
 fn write_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());
@@ -470,7 +473,13 @@ impl Tier {
         let resolution_nanos = u64::from_be_bytes(take::<8>(cur)?);
         let capacity = read_u32(cur)? as usize;
         let n = read_u32(cur)? as usize;
-        let mut finalized = VecDeque::with_capacity(n);
+        // Never speculatively allocate on an untrusted count: a crafted snapshot can claim ~4.29B
+        // finalized buckets and force a multi-hundred-GB `VecDeque` allocation before a single bucket
+        // is validated. Cap the reservation to what the remaining bytes could actually supply (each
+        // bucket occupies at least `BUCKET_BYTES`); if `n` overstates it, `Bucket::read` returns `None`
+        // mid-loop and the whole restore fails cleanly. Mirrors the `members.min(..)` cap in the
+        // threshold-onion parser.
+        let mut finalized = VecDeque::with_capacity(n.min(cur.len() / BUCKET_BYTES));
         for _ in 0..n {
             finalized.push_back(Bucket::read(cur)?);
         }
@@ -639,6 +648,51 @@ mod tests {
         assert!(
             MetricStore::restore(&bytes[..3]).is_none(),
             "truncation rejected"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_an_oversized_finalized_count_without_allocating() {
+        // A crafted snapshot with a valid header whose single tier claims u32::MAX finalized buckets
+        // but supplies none. The reader must not reserve for the claimed count (that would demand
+        // hundreds of GB); it returns None cleanly once the promised buckets fail to materialize. The
+        // random-bytes proptest never reaches this path — arbitrary bytes almost never carry the FTS1
+        // magic — so this hand-crafted vector is the only cover for the untrusted-length allocation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SNAPSHOT_MAGIC);
+        bytes.push(SNAPSHOT_VERSION);
+        write_u16(&mut bytes, 0); // config: no tier specs
+        write_u32(&mut bytes, 1); // one series follows
+        write_u16(&mut bytes, 0); // series id (u16)
+        write_u16(&mut bytes, 1); // the series carries one tier
+        bytes.extend_from_slice(&1u64.to_be_bytes()); // tier resolution
+        write_u32(&mut bytes, 1); // tier capacity
+        write_u32(&mut bytes, u32::MAX); // finalized count — hostile, with no buckets following
+        assert!(
+            MetricStore::restore(&bytes).is_none(),
+            "an impossible finalized-bucket count is rejected, not speculatively allocated"
+        );
+
+        // And a truthful-but-large count with one real bucket still parses only the bytes present.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&SNAPSHOT_MAGIC);
+        ok.push(SNAPSHOT_VERSION);
+        write_u16(&mut ok, 0);
+        write_u32(&mut ok, 1);
+        write_u16(&mut ok, 0);
+        write_u16(&mut ok, 1);
+        ok.extend_from_slice(&1u64.to_be_bytes());
+        write_u32(&mut ok, 4);
+        write_u32(&mut ok, 2); // claims two finalized buckets but supplies one → still rejected
+        // one bucket: start_nanos u64, count u32, four f64s
+        ok.extend_from_slice(&0u64.to_be_bytes());
+        write_u32(&mut ok, 1);
+        for _ in 0..4 {
+            ok.extend_from_slice(&0f64.to_be_bytes());
+        }
+        assert!(
+            MetricStore::restore(&ok).is_none(),
+            "a count exceeding the supplied buckets fails cleanly mid-parse"
         );
     }
 }
