@@ -11,6 +11,8 @@ pub enum NodeError {
     Identity,
     /// A configuration value was invalid (bad address, coordinate, or role).
     Config(String),
+    /// A `.fanos` name could not be resolved (not published, malformed, or failed verification).
+    Resolve(String),
 }
 
 impl core::fmt::Display for NodeError {
@@ -20,6 +22,7 @@ impl core::fmt::Display for NodeError {
             Self::Quic(e) => write!(f, "transport error: {e}"),
             Self::Identity => f.write_str("node identity could not be loaded or generated"),
             Self::Config(msg) => write!(f, "invalid configuration: {msg}"),
+            Self::Resolve(msg) => write!(f, "name resolution failed: {msg}"),
         }
     }
 }

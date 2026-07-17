@@ -10,12 +10,14 @@ use std::net::SocketAddr;
 
 use fanos_field::Field;
 use fanos_geometry::Triple;
+use fanos_onoma::{Address, lookup_key};
 use fanos_quic::{Directory, NodeHandle, spawn_self_certifying_persistent_on};
 use fanos_runtime::{Command, Config as OverlayConfig, Notification, OverlayNode};
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::error::NodeError;
 use crate::identity;
+use crate::resolve::{ResolvedService, verify_descriptor};
 
 /// A running FANOS node.
 pub struct Node {
@@ -126,6 +128,50 @@ impl Node {
     pub fn shutdown(&self) {
         self.handle.shutdown();
     }
+
+    /// Resolve a `.fanos` `name` to its authenticated service descriptor at `epoch`, requiring at
+    /// least `min_pow` proof-of-work on the published descriptor.
+    ///
+    /// This fetches the descriptor from the rotating epoch slot and verifies it **client-side**
+    /// (`H(bundle) == addr`), so a malicious store can never induce impersonation. It is a
+    /// one-shot request that consumes engine notifications until its `Get` answers — intended for
+    /// the `fanos resolve` command and tests, not for interleaving with other traffic on the same
+    /// node handle.
+    ///
+    /// # Errors
+    /// [`NodeError::Resolve`] if the name is malformed, no descriptor is published, or the fetched
+    /// descriptor fails verification.
+    pub async fn resolve(
+        &mut self,
+        name: &str,
+        epoch: u64,
+        min_pow: u32,
+    ) -> Result<ResolvedService, NodeError> {
+        let address = Address::parse(name)
+            .map_err(|e| NodeError::Resolve(format!("invalid .fanos name '{name}': {e}")))?;
+        let slot = lookup_key(&address, epoch).to_vec();
+        if !self.command(Command::Get { key: slot }) {
+            return Err(NodeError::Resolve("node has shut down".to_string()));
+        }
+        loop {
+            match self.next_notification().await {
+                Some(Notification::Retrieved { value, .. }) => {
+                    let value = value.ok_or_else(|| {
+                        NodeError::Resolve(format!(
+                            "no descriptor published for '{name}' at epoch {epoch}"
+                        ))
+                    })?;
+                    return verify_descriptor(&address, epoch, &value, min_pow);
+                }
+                Some(_) => {}
+                None => {
+                    return Err(NodeError::Resolve(
+                        "node stopped before resolution".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +180,24 @@ mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use fanos_field::F2;
+
+    #[tokio::test]
+    async fn resolve_rejects_a_malformed_name_without_touching_the_network() {
+        // A name that is not a valid `.fanos` address fails at parse time, before any Get — so the
+        // happy path (which needs a full cell) is covered by the resolve unit tests and the sim
+        // `onoma_resolve` scenario, while this stays fast and deterministic.
+        let mut node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ..NodeConfig::default()
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            node.resolve("definitely not a .fanos name", 0, 0).await,
+            Err(NodeError::Resolve(_))
+        ));
+        node.shutdown();
+    }
 
     #[tokio::test]
     async fn a_node_starts_and_reports_health() {

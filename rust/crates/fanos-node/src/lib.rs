@@ -20,7 +20,9 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod node;
+pub mod resolve;
 
 pub use config::{NodeConfig, Peer, RoleSet};
 pub use error::NodeError;
 pub use node::{Health, Node};
+pub use resolve::ResolvedService;

@@ -30,6 +30,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
     match args.get(1).map(String::as_str) {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
+        Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
             print_help();
             Ok(())
@@ -114,6 +115,54 @@ fn cmd_id(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Resolve a `.fanos` name against the network and print the authenticated result.
+async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
+    init_tracing();
+
+    let name = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .ok_or_else(|| NodeError::Config("`fanos resolve` needs a .fanos name".to_string()))?;
+    let epoch = match flag(args, "--epoch") {
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
+        None => 0,
+    };
+    let min_pow = match flag(args, "--min-pow") {
+        Some(s) => s
+            .parse::<u32>()
+            .map_err(|_| NodeError::Config(format!("bad --min-pow '{s}'")))?,
+        None => 0,
+    };
+    let mut bootstrap = Vec::new();
+    for value in flag_all(args, "--bootstrap") {
+        for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            bootstrap.push(Peer::parse(part)?);
+        }
+    }
+
+    let config = NodeConfig {
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        bootstrap,
+        ..NodeConfig::default()
+    };
+    let mut node = Node::start::<F2>(config).await?;
+    let resolved = node.resolve(name, epoch, min_pow).await?;
+    println!("resolved {name}");
+    println!("  address:  {}", resolved.address);
+    println!("  epoch:    {}", resolved.epoch);
+    println!(
+        "  bundle:   {} bytes (self-certified: H(bundle) == address)",
+        resolved.bundle.len()
+    );
+    if !resolved.metadata.is_empty() {
+        println!("  metadata: {} bytes", resolved.metadata.len());
+    }
+    node.shutdown();
+    Ok(())
+}
+
 fn log_notification(note: &Notification) {
     match note {
         Notification::Delivered { from, payload } => {
@@ -173,6 +222,7 @@ fn print_help() {
          \x20 fanos node [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20            [--role relay,storage,service,exit] [--no-heartbeat]\n\
          \x20 fanos id   [--identity PATH]\n\
+         \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos help\n\
          \n\
          EXAMPLES:\n\

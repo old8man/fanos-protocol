@@ -19,6 +19,9 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-runtime = { workspace = true, features = ["std"] }
 fanos-quic = { path = "../fanos-quic", version = "0.1.0" }
+# For `.fanos` name resolution: ONOMA addresses/derivations + CALYPSO descriptors.
+fanos-onoma = { path = "../fanos-onoma", version = "0.1.0", features = ["std"] }
+fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
