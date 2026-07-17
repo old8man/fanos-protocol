@@ -630,6 +630,7 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "serde_json",
 ]
 
 [[package]]
@@ -728,6 +729,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
+ "fanos-crypto",
  "ml-dsa",
  "ml-kem",
  "proptest",
@@ -786,12 +788,14 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-incentives",
  "fanos-keygen",
  "fanos-nyx",
  "fanos-pqcrypto",
  "fanos-runtime",
  "fanos-wire",
  "proptest",
+ "rand_core 0.6.4",
 ]
 
 [[package]]

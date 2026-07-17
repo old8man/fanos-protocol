@@ -39,6 +39,17 @@ pub const R_TH: f64 = 1.0 / 3.0;
 /// The integration threshold `Φ_th = 1` (spec §2.7).
 pub const PHI_TH: f64 = 1.0;
 
+/// The three coherence measures read together in one pass (see [`CoherenceMatrix::measures`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Measures {
+    /// Integration `Φ` (threshold `1`).
+    pub phi: f64,
+    /// Structuredness `P = Tr(Γ²)` (threshold `2/N`).
+    pub purity: f64,
+    /// Reflection `R = 1/(N·P)` (threshold `1/3`).
+    pub reflection: f64,
+}
+
 /// Sum of squares of all entries of a slice (the Frobenius norm squared), via `portable_simd`.
 #[must_use]
 pub fn frobenius_sq(values: &[f64]) -> f64 {
@@ -150,41 +161,51 @@ impl CoherenceMatrix {
         self.n
     }
 
-    /// The coherence-energy `y = Σ_{i≠j} |γ_ij|²` and diagonal-weight `x = Σ_i γ_ii²` used by
-    /// the measures. Both are computed once from the Frobenius sum of `C`.
-    fn energies(&self) -> (f64, f64) {
+    /// All three scalar measures (`Φ`, `P`, `R`) from a **single** Frobenius pass over `C`.
+    ///
+    /// Because `Γ = C/n` with unit-diagonal `C`, every measure reduces to `frob = Σ C_ij²`:
+    /// `P = frob/n²`, `Φ = (frob − n)/n` (`= Σ_{i≠j}γ_ij² ÷ Σ_i γ_ii²`), and `R = 1/(N·P) = n/frob`.
+    /// Prefer this to calling [`phi`](Self::phi)/[`purity`](Self::purity)/[`reflection`](Self::reflection)
+    /// separately — each of those repeats the same O(n²) SIMD pass.
+    #[must_use]
+    pub fn measures(&self) -> Measures {
         let nf = self.n as f64;
-        let frob = frobenius_sq(&self.c); // Σ C_ij²
-        // Γ = C/n, diagonal of C is all ones (n entries), off-diagonal energy = frob − n.
-        let off_c = frob - nf; // Σ_{i≠j} C_ij²
-        let x = nf / (nf * nf); // Σ γ_ii² = n · (1/n²) = 1/n
-        let y = off_c / (nf * nf); // Σ_{i≠j} (C_ij/n)²
-        (y, x)
+        if nf <= 0.0 {
+            return Measures {
+                phi: 0.0,
+                purity: 0.0,
+                reflection: 0.0,
+            };
+        }
+        let frob = frobenius_sq(&self.c); // Σ C_ij², computed once
+        let purity = frob / (nf * nf); // Tr(Γ²)
+        Measures {
+            phi: (frob - nf) / nf, // Σ_{i≠j}γ_ij² / Σ_i γ_ii²
+            purity,
+            reflection: if purity > 0.0 {
+                1.0 / (nf * purity)
+            } else {
+                0.0
+            },
+        }
     }
 
     /// Integration `Φ = Σ_{i≠j}|γ_ij|² / Σ_i γ_ii²` (spec §2.7). `Φ ≥ 1` ⇒ integrated.
     #[must_use]
     pub fn phi(&self) -> f64 {
-        let (y, x) = self.energies();
-        if x <= 0.0 { 0.0 } else { y / x }
+        self.measures().phi
     }
 
     /// Structuredness `P = Tr(Γ²)` (purity). `P > 2/N` ⇒ structured (spec §2.7).
     #[must_use]
     pub fn purity(&self) -> f64 {
-        let nf = self.n as f64;
-        frobenius_sq(&self.c) / (nf * nf) // Tr(Γ²) = Σ (C_ij/n)²
+        self.measures().purity
     }
 
     /// Reflection `R = 1/(N·P)` (spec §2.7, §6.8). `R ≥ 1/3` ⇒ self-modelling.
     #[must_use]
     pub fn reflection(&self) -> f64 {
-        let p = self.purity();
-        if p <= 0.0 {
-            0.0
-        } else {
-            1.0 / (self.n as f64 * p)
-        }
+        self.measures().reflection
     }
 
     /// The mean off-diagonal correlation `r` (used for the cascade early-warning, §2.7).
@@ -210,10 +231,26 @@ impl CoherenceMatrix {
     }
 
     /// Whether the cell is in the systemic / cascade regime (`r > r*`), detectable a regime
-    /// ahead of any liveness alarm (spec §2.7, §6.5).
+    /// ahead of any liveness alarm (spec §2.7, §6.5). This is the **early-warning monitor**
+    /// (the leading indicator the observatory forecasts on) — it is *not* itself a healing
+    /// trigger, because the band `(r*, 1/√3]` is a healthy collective subject (see
+    /// [`is_overcoupled`](Self::is_overcoupled)).
     #[must_use]
     pub fn is_systemic(&self) -> bool {
         self.mean_correlation() > systemic_correlation(self.n) + 1e-12
+    }
+
+    /// Whether the cell is **over-coupled** (`r > √(2/(N−1))`, equivalently `R < 1/3`):
+    /// integration has climbed past the collective-subject band and the cell is losing its
+    /// self-model (spec §18.2, §6.8). This — not the mere early-warning [`is_systemic`](Self::is_systemic)
+    /// — is the actionable *decouple* trigger: shedding correlation is warranted only once the
+    /// cell leaves the healthy band, never while it is a legitimately integrated subject.
+    #[must_use]
+    pub fn is_overcoupled(&self) -> bool {
+        matches!(
+            self.collective_state(),
+            crate::window::CollectiveState::OverCoupled
+        )
     }
 
     /// Which leading-indicator alarm this cell trips (spec §6.6, V17): `Healthy`, `Integration`
@@ -221,8 +258,9 @@ impl CoherenceMatrix {
     /// `P < 2/N`). By the leading-indicator theorem `Structure` never fires without `Integration`.
     #[must_use]
     pub fn alarm(&self) -> crate::window::Alarm {
-        let phi_low = self.phi() < PHI_TH - 1e-12;
-        let p_low = self.purity() < p_crit(self.n) - 1e-12;
+        let m = self.measures(); // one Frobenius pass for both thresholds
+        let phi_low = m.phi < PHI_TH - 1e-12;
+        let p_low = m.purity < p_crit(self.n) - 1e-12;
         match (phi_low, p_low) {
             (false, _) => crate::window::Alarm::Healthy,
             (true, false) => crate::window::Alarm::Integration,

@@ -51,11 +51,20 @@ pub struct VrfPublic(PublicKey);
 pub struct VrfProof(Proof);
 
 impl VrfSecret {
-    /// Derive a secret key from a 32-byte seed. Returns `None` if the seed is not a canonical
-    /// scalar (negligible probability for random seeds).
+    /// Derive a secret key from any 32-byte seed.
+    ///
+    /// The seed is hashed **uniformly into the scalar field** (a wide reduction of a
+    /// domain-separated XOF), so every seed yields a key. A raw `SecretKey::from_bytes` would
+    /// instead demand an already-canonical scalar (`< ℓ ≈ 2²⁵²`) and reject ~15/16 of random
+    /// seeds — a trap for any caller deriving a VRF key deterministically from a node seed. The
+    /// reduced scalar's canonical bytes are always accepted, so this only returns `None` on the
+    /// (unreachable) event that the reduction is non-canonical.
     #[must_use]
     pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
-        Option::from(SecretKey::from_bytes(seed)).map(Self)
+        let mut wide = [0u8; 64];
+        fanos_crypto::hash::hash_xof("FANOS-v1/vrf-seed", &seed, &mut wide);
+        let scalar = curve25519_dalek::Scalar::from_bytes_mod_order_wide(&wide);
+        Option::from(SecretKey::from_bytes(scalar.to_bytes())).map(Self)
     }
 
     /// The 32-byte canonical encoding of this secret key.
@@ -165,6 +174,22 @@ mod tests {
 
     fn secret(seed: u8) -> VrfSecret {
         VrfSecret::from_seed([seed; 32]).unwrap()
+    }
+
+    #[test]
+    fn every_seed_yields_a_working_key_including_non_canonical_ones() {
+        // Seeds whose raw bytes are NOT a canonical scalar (top bytes 0xFF ⇒ ≥ 2²⁵⁵ > ℓ) would be
+        // rejected by a raw `from_bytes`; hashing into the field accepts them and the key works.
+        for seed in [[0xFFu8; 32], [0x80; 32], [0xEE; 32], [0x00; 32]] {
+            let sk = VrfSecret::from_seed(seed).unwrap(); // hashed seed is always a valid key
+            let (proof, output) = sk.prove(b"alpha");
+            assert_eq!(sk.public().verify(b"alpha", &proof), Some(output));
+        }
+        // Distinct seeds give distinct keys (the hash is injective in practice).
+        assert_ne!(
+            VrfSecret::from_seed([0xFF; 32]).unwrap().to_bytes(),
+            VrfSecret::from_seed([0xEE; 32]).unwrap().to_bytes()
+        );
     }
 
     #[test]

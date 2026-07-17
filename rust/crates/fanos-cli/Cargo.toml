@@ -22,5 +22,10 @@ fanos-diakrisis = { workspace = true, features = ["std"] }
 fanos-crypto = { workspace = true, features = ["std"] }
 fanos-core = { workspace = true, features = ["std"] }
 
+[dev-dependencies]
+# Parse the language-agnostic conformance vectors so the Rust impl is pinned to them directly
+# (the interop contract cannot silently drift from the code).
+serde_json = "1"
+
 [lints]
 workspace = true

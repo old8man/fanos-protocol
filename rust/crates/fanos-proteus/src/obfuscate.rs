@@ -4,6 +4,16 @@
 //! no static signature and looks different every epoch. Two peers sharing the community secret
 //! derive the same `θ` and so can strip it. The payload is already encrypted by the transport;
 //! this layer only removes the *shape* signature.
+//!
+//! **Known limitation (spec §13.3–§13.4, deliberate scope).** The junk and padding are derived
+//! from `θ` alone, so within one epoch every packet carries the *same* junk prefix and identical
+//! plaintext frames shape to identical bytes. This defeats a naive static-signature classifier and
+//! rotates per epoch, but it is weaker than AmneziaWG's *per-packet* junk: an intra-epoch DPI/ML
+//! classifier still sees a fixed prefix, and equal frames are linkable within the epoch. The
+//! fundamental fix is to mix a per-packet nonce (prepended so the peer can strip it) into the
+//! junk/padding keystream. That requires the driver to supply a unique nonce per send; the current
+//! QUIC driver shares one `Arc<ProteusShaper>` immutably across a connection's sends, so wiring the
+//! nonce through is a transport-layer change tracked separately rather than a local edit here.
 
 use alloc::vec;
 use alloc::vec::Vec;

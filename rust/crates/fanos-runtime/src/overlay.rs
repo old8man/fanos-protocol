@@ -43,6 +43,10 @@ pub struct Config {
     /// Whether the node acts on its diagnosis (reroute / repair / escalate). On by default; the
     /// reflexive loop *senses and acts* (spec §6.9). Set `false` for a sense-only node.
     pub self_healing: bool,
+    /// How many *distinct* witnesses must corroborate a peer's liveness before it is believed on
+    /// gossip alone (own direct observation is always trusted). Tolerates up to `quorum − 1`
+    /// Byzantine liars falsely vouching for a dead node (spec §6.4). Default `2`.
+    pub corroboration_quorum: usize,
 }
 
 impl Default for Config {
@@ -52,6 +56,7 @@ impl Default for Config {
             liveness_timeout: Duration::from_millis(1600),
             healthy_correlation: 0.45,
             self_healing: true,
+            corroboration_quorum: 2,
         }
     }
 }
@@ -81,11 +86,12 @@ pub struct OverlayNode<F: Field> {
     /// Members locally distrusted after a polar-rule violation (spec §6.2); their frames are
     /// dropped pending parental re-provisioning.
     quarantined: BTreeSet<Triple>,
-    /// Witness-corroborated liveness: the freshest time *any* cell member directly observed each
-    /// peer, learned from health-view gossip (`DiagGossip`). A peer is down only when it lapses
-    /// from every one of its `q+1` line-witnesses at once, so a single lossy link cannot forge a
-    /// false PeerDown — the projective LRC availability property applied to liveness (spec §6.4).
-    witnessed: BTreeMap<Triple, Instant>,
+    /// Witness-corroborated liveness (spec §6.4): for each peer, the freshest time *each distinct
+    /// witness* directly observed it, learned from health-view gossip (`DiagGossip`). A lossy link
+    /// cannot forge a false PeerDown (any honest witness rescues liveness), and a *Byzantine* liar
+    /// cannot forge a false liveness either — a peer is believed alive on gossip only when a
+    /// **quorum** of distinct witnesses vouch for it, so `quorum − 1` liars are outvoted.
+    witnessed: BTreeMap<Triple, BTreeMap<Triple, Instant>>,
     /// This node's slice of the cell's distributed store (spec §L4): key digest → value. A value
     /// lives on its responsible point `MapToPoint(H(key))` and is replicated across the cell for
     /// LRC availability, so any survivor answers a lookup — and a lookup to a *down* primary
@@ -143,22 +149,31 @@ impl<F: Field> OverlayNode<F> {
         self.peers.keys().copied()
     }
 
-    /// The freshest time *any* witness (self or a gossiping peer) directly observed `coord`.
-    fn effective_last_seen(&self, coord: Triple) -> Option<Instant> {
-        let own = self.peers.get(&coord).and_then(|p| p.last_seen);
-        let witnessed = self.witnessed.get(&coord).copied();
-        match (own, witnessed) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
-        }
-    }
-
-    /// Whether `coord` is live, corroborated across its `q+1` line-witnesses (spec §6.4): live iff
-    /// *some* witness observed it within the liveness window, so one lossy link cannot fail it.
+    /// Whether `coord` is live, corroborated across its line-witnesses (spec §6.4). Our own direct
+    /// observation is fully trusted; otherwise a **quorum** of distinct fresh witnesses is required,
+    /// so a lossy link cannot forge a PeerDown *and* a lone Byzantine liar cannot forge liveness.
     fn coord_alive(&self, coord: Triple, now: Instant) -> bool {
-        let reference = self.effective_last_seen(coord).unwrap_or(self.started_at);
-        now.since(reference) <= self.config.liveness_timeout
+        let timeout = self.config.liveness_timeout;
+        // Trust our own eyes first.
+        if let Some(seen) = self.peers.get(&coord).and_then(|p| p.last_seen)
+            && now.since(seen) <= timeout
+        {
+            return true;
+        }
+        // Otherwise: a quorum of distinct witnesses must vouch for it within the window.
+        let fresh = self.witnessed.get(&coord).map_or(0, |witnesses| {
+            witnesses
+                .values()
+                .filter(|&&seen| now.since(seen) <= timeout)
+                .count()
+        });
+        if fresh >= self.config.corroboration_quorum {
+            return true;
+        }
+        // Startup grace: if nothing has been observed about this peer yet, assume alive briefly.
+        let unobserved = self.peers.get(&coord).and_then(|p| p.last_seen).is_none()
+            && self.witnessed.get(&coord).is_none_or(BTreeMap::is_empty);
+        unobserved && now.since(self.started_at) <= timeout
     }
 
     fn on_heartbeat(&mut self, now: Instant) -> Vec<Effect> {
@@ -219,9 +234,11 @@ impl<F: Field> OverlayNode<F> {
         body
     }
 
-    /// Fold a peer's health-view into the corroborated `witnessed` map: for each cell point the
-    /// gossip reports a fresh direct observation of, remember the freshest such time.
-    fn apply_health_view(&mut self, now: Instant, body: &[u8]) {
+    /// Fold witness `from`'s health-view into the corroborated `witnessed` map: for each cell point
+    /// the gossip reports a fresh direct observation of, remember the freshest time *this witness*
+    /// vouched for it. Keeping witnesses distinct is what makes the quorum Byzantine-robust — a lone
+    /// liar is one entry, not a majority.
+    fn apply_health_view(&mut self, now: Instant, from: Triple, body: &[u8]) {
         for i in 0..7usize {
             let (Some(&lo), Some(&hi)) = (body.get(i * 2), body.get(i * 2 + 1)) else {
                 break;
@@ -232,7 +249,12 @@ impl<F: Field> OverlayNode<F> {
             }
             let observed = Instant(now.as_nanos().saturating_sub(u64::from(age_ms) * 1_000_000));
             let coord = Point::<F>::at(i).coords();
-            let slot = self.witnessed.entry(coord).or_insert(observed);
+            let slot = self
+                .witnessed
+                .entry(coord)
+                .or_default()
+                .entry(from)
+                .or_insert(observed);
             if observed > *slot {
                 *slot = observed;
             }
@@ -275,7 +297,7 @@ impl<F: Field> OverlayNode<F> {
                 }
                 self.reroute.remove(&from);
                 self.repaired.remove(&from);
-                self.apply_health_view(now, frame.body);
+                self.apply_health_view(now, from, frame.body);
                 Vec::new()
             }
             Some(FrameType::Publish) => self.on_publish(from, frame.body),
@@ -331,7 +353,17 @@ impl<F: Field> OverlayNode<F> {
     }
 
     /// `Command::Get` — answer from the local replica if present, else look up the responsible
-    /// node (rerouted to a replica if that node is down).
+    /// node (rerouted to a replica if that node is *down*, spec §6.7).
+    ///
+    /// Known limitation (spec §7.8, tracked): the read consults the responsible node (or its
+    /// reroute target), not the full quorum-line of replicas. If the primary is *up but has lost
+    /// its shard* — e.g. it crashed after a value was published, then recovered empty while the
+    /// value still lives on other cell replicas — this returns `Retrieved(None)` even though a
+    /// survivor holds it. A complete fix fans the lookup across the responsible point's line and
+    /// concludes "absent" only after the replicas are exhausted, which needs per-request pending
+    /// state + a timeout (the primary's single authoritative answer is what the stateless path
+    /// relies on today). The write path already replicates to every member, so the data is present;
+    /// only this read path underuses it.
     fn on_get(&mut self, key: &[u8]) -> Vec<Effect> {
         let (digest, primary) = Self::address_of(key);
         if let Some(value) = self.store.get(&digest) {
@@ -434,9 +466,20 @@ impl<F: Field> OverlayNode<F> {
         let Some((coord, info)) = parse_announce(body) else {
             return Vec::new();
         };
-        if self.members.insert(coord, info.clone()).is_some() {
-            return Vec::new(); // already known — do not re-flood
+        // Validate: a member coordinate must be a real, canonical projective point of this plane.
+        // Rejecting the zero vector and out-of-range triples both prevents state poisoning and
+        // bounds `members` by the plane size `N` — a peer cannot grow it without limit with forged
+        // coordinates (spec §7.8 membership).
+        let Some(coord) = Point::<F>::new(coord).map(|p| p.coords()) else {
+            return Vec::new();
+        };
+        // First sight only. A repeat must NOT overwrite the stored key bundle — otherwise any peer
+        // could silently replace a member's advertised keys in our local view (and suppress the
+        // re-flood, diverging the cell). Ignore repeats entirely; the monotone guard ends the flood.
+        if self.members.contains_key(&coord) {
+            return Vec::new();
         }
+        self.members.insert(coord, info.clone());
         let mut effects = self.flood(&encode(FrameType::Announce, &announce_body(coord, &info)));
         effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
         effects
@@ -714,5 +757,59 @@ mod tests {
                 .any(|e| matches!(e, Effect::Notify(Notification::RendezvousLine(_))))
         );
         assert!(effects.iter().any(|e| matches!(e, Effect::Send { .. })));
+    }
+
+    #[test]
+    fn announce_validates_coords_and_never_overwrites_a_member() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let peer = Point::<F2>::at(3).coords();
+        let from = Point::<F2>::at(1).coords();
+        let info_of = |c: Triple, n: &OverlayNode<F2>| {
+            n.members().find(|(m, _)| *m == c).map(|(_, i)| i.to_vec())
+        };
+
+        // Honest first announce → recorded and MemberJoined notified.
+        let honest = encode(FrameType::Announce, &announce_body(peer, b"HONEST"));
+        let e1 = node.step(
+            Instant(1),
+            Input::Message {
+                from,
+                frame: honest,
+            },
+        );
+        assert!(
+            e1.iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::MemberJoined { .. })))
+        );
+        assert_eq!(info_of(peer, &node), Some(b"HONEST".to_vec()));
+
+        // A repeat for the same coord with attacker keys must NOT overwrite or re-notify.
+        let forged = encode(FrameType::Announce, &announce_body(peer, b"ATTACKER"));
+        let e2 = node.step(
+            Instant(2),
+            Input::Message {
+                from,
+                frame: forged,
+            },
+        );
+        assert!(
+            !e2.iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::MemberJoined { .. })))
+        );
+        assert_eq!(
+            info_of(peer, &node),
+            Some(b"HONEST".to_vec()),
+            "a repeat announce cannot silently replace a member's keys"
+        );
+
+        // The zero vector is not a projective point → rejected, never stored.
+        let count_before = node.members().count();
+        let zero = encode(FrameType::Announce, &announce_body([0, 0, 0], b"ZERO"));
+        node.step(Instant(3), Input::Message { from, frame: zero });
+        assert_eq!(
+            node.members().count(),
+            count_before,
+            "an invalid coordinate is not accepted as a member"
+        );
     }
 }

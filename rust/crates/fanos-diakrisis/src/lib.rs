@@ -79,8 +79,11 @@ pub enum Verdict {
     /// No single-node syndrome, but the cell has fragmented (`Φ < 1`) — a partition /
     /// systemic event (spec §6.5).
     Partition,
-    /// Mean correlation has crossed `r*`: an incipient cascade, a full regime ahead of any
-    /// liveness alarm (spec §2.7, §6.5).
+    /// Mean correlation has crossed the **over-coupling** bound `√(2/(N−1))` (`= 1/√3` for
+    /// `N = 7`), so `R < 1/3`: the cell is over-integrated and losing self-observation. The
+    /// response is to *shed* correlation back into the healthy collective-subject band (spec
+    /// §18.2, §6.8). The earlier `r > r*` crossing is only a monitor alarm, not this verdict —
+    /// the band `(r*, 1/√3]` is a desirable integrated subject, not a fault.
     Systemic,
 }
 
@@ -103,13 +106,14 @@ pub fn diagnose(obs: &Observation) -> Verdict {
     // Localize: the 21 → 7 → 3 → 1 pyramid on the binarized health vector.
     match locate(obs.degraded) {
         Fault::Healthy => {
-            // No single-node fault. Consult the global monitors (spec §6.5). The cascade
-            // early-warning (mean correlation crossing r*) fires a regime before any liveness
-            // alarm; a partition is a genuine connectivity loss, not weak correlation.
+            // No single-node fault. Consult the global monitors (spec §6.5). Only *over-coupling*
+            // (r > 1/√3, R < 1/3) is an actionable systemic fault — the band (r*, 1/√3] is a
+            // healthy, self-modelling collective subject that must NOT be decoupled (spec §18.2).
+            // A partition is a genuine connectivity loss, not weak correlation.
             if obs
                 .coherence
                 .as_ref()
-                .is_some_and(CoherenceMatrix::is_systemic)
+                .is_some_and(CoherenceMatrix::is_overcoupled)
             {
                 return Verdict::Systemic;
             }
@@ -173,14 +177,24 @@ mod tests {
     }
 
     #[test]
-    fn systemic_regime_warns_before_any_node_fails() {
-        // No node degraded, but mean correlation is above r* → cascade early-warning.
-        let obs = Observation {
+    fn over_coupling_decouples_but_a_healthy_collective_subject_does_not() {
+        // In the collective-subject band (1/√6, 1/√3] the cell is integrated AND still
+        // self-modelling (R ≥ 1/3) — a *desired* state, not a fault: diagnose leaves it Healthy
+        // (spec §18.2). Decoupling a legitimately integrated subject would be self-defeating.
+        let in_band = Observation {
             degraded: 0,
             coherence: Some(CoherenceMatrix::equicorrelated(7, 0.5)),
+            healthy_lines: Some(0x7F),
             ..Default::default()
         };
-        assert_eq!(diagnose(&obs), Verdict::Systemic);
+        assert_eq!(diagnose(&in_band), Verdict::Healthy);
+        // Only when over-coupled (r > 1/√3, R < 1/3) is shedding correlation warranted.
+        let over_coupled = Observation {
+            degraded: 0,
+            coherence: Some(CoherenceMatrix::equicorrelated(7, 0.7)),
+            ..Default::default()
+        };
+        assert_eq!(diagnose(&over_coupled), Verdict::Systemic);
     }
 
     #[test]

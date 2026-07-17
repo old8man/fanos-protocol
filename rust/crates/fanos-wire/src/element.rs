@@ -103,9 +103,12 @@ pub fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 /// Decode a length-prefixed byte string, returning `(slice, bytes_consumed)`.
 pub fn decode_bytes(buf: &[u8]) -> Result<(&[u8], usize), WireError> {
     let (len, head) = varint::decode(buf)?;
-    let len = len as usize;
-    let body = buf.get(head..head + len).ok_or(WireError::UnexpectedEnd)?;
-    Ok((body, head + len))
+    // `usize::try_from`, not `as usize`: a 64-bit length must not truncate on a 32-bit target
+    // (wasm32) — that would desynchronise the byte-string stream between node widths.
+    let len = usize::try_from(len).map_err(|_| WireError::ValueTooLarge)?;
+    let end = head.checked_add(len).ok_or(WireError::ValueTooLarge)?;
+    let body = buf.get(head..end).ok_or(WireError::UnexpectedEnd)?;
+    Ok((body, end))
 }
 
 #[cfg(test)]

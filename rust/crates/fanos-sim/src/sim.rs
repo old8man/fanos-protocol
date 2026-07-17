@@ -236,6 +236,20 @@ impl Sim {
             .is_some_and(|s| s.status == Status::Alive)
     }
 
+    /// A ground-truth liveness snapshot of `nodes` (`1.0` alive, `0.0` crashed), for feeding the
+    /// coherence observatory from a *live* run. Sampled over time it yields one behavioural signal
+    /// per node whose correlation the observatory reads: a synchronized (correlated) collapse pushes
+    /// the mean correlation across `r*`, while independent churn stays diversified below it — so the
+    /// observatory discriminates a genuine cascade from incidental churn on real data, not just the
+    /// synthetic [`HealthField`](crate::HealthField).
+    #[must_use]
+    pub fn liveness_snapshot(&self, nodes: &[Triple]) -> Vec<f64> {
+        nodes
+            .iter()
+            .map(|&n| f64::from(u8::from(self.is_alive(n))))
+            .collect()
+    }
+
     /// Inject an application command into `node` at the current time.
     pub fn inject(&mut self, node: Triple, cmd: Command) {
         self.schedule(self.clock, Event::Command { node, cmd });
@@ -246,6 +260,13 @@ impl Sim {
         for node in self.nodes.keys().copied().collect::<Vec<_>>() {
             self.inject(node, cmd.clone());
         }
+    }
+
+    /// Deliver a raw wire `frame` to `to` as if sent by `from` — the Byzantine / adversary hook.
+    /// Models a malicious node crafting an arbitrary (possibly forged or malformed) frame; the
+    /// transport authenticates `from`, so this stands in for that node genuinely emitting it.
+    pub fn inject_frame(&mut self, from: Triple, to: Triple, frame: Vec<u8>) {
+        self.schedule(self.clock, Event::Deliver { to, from, frame });
     }
 
     fn schedule(&mut self, time: Instant, event: Event) {

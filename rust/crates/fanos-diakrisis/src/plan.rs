@@ -15,12 +15,13 @@
 //!   on some line; iterate. It recovers any `≤ 3` losses and every non-hyperoval `4`-set.
 //! * **Escalate** fires exactly on the stopping set (a hyperoval, V20) or when the reroute would
 //!   exceed the `Φ → Φ/9` per-coarse-hop budget (spec §6.7, V16) — [`max_reroute_depth`].
-//! * **Decouple** is the forecast-driven early-warning action. On the equicorrelated stratum
-//!   `Φ_net = 6r²` is *monotone increasing* in the mean correlation `r` (spec §2.7, V15), so the
-//!   cascade-failure regime is exactly the high-`Φ` regime `r > 1/√6`. The corpus prescribes an
-//!   early-warning monitor plus **band-keeping**: hold `r` inside the collective-subject band
-//!   `(1/√6, 1/√3]` (V19). Shedding correlation therefore *lowers* `Φ` back toward the band and
-//!   restores the self-observation budget `R ≥ 1/3` when over-coupled — it does **not** raise `Φ`.
+//! * **Decouple** is the over-coupling response, distinct from the mere early-warning. On the
+//!   equicorrelated stratum `Φ_net = 6r²` is *monotone increasing* in `r` (spec §2.7, V15); the
+//!   corpus prescribes **band-keeping**: the collective-subject band `(1/√6, 1/√3]` is the healthy,
+//!   self-modelling regime (V19), so nothing is shed while `r` stays inside it. Only once the cell
+//!   crosses `1/√3` (`R < 1/3`, over-coupled / groupthink, §18.2) is correlation shed — this
+//!   *lowers* `Φ` back into the band and restores `R ≥ 1/3`. The earlier `r > 1/√6` crossing is a
+//!   monitor alarm (the observatory's cascade forecast), not a decouple action.
 //! * **Quarantine + Escalate** is the corpus Byzantine response (spec §6.2, §6.4, §6.3): the
 //!   violated polar class *localizes* the liar (the free sum-rules `r_ij = ρ_{π(i,j)}` hold iff
 //!   the wiring is Fano, T-226(vi)); the cell locally distrusts that member and hands it to the
@@ -61,9 +62,10 @@ pub enum HealingAction {
         /// The implicated polar-class / mediator index.
         node: usize,
     },
-    /// Shed excess inter-node correlation while every node is still live: the cascade
-    /// early-warning fired (`r > 1/√6`, spec §2.7). Band-keeping toward `(1/√6, 1/√3]` — this
-    /// *lowers* `Φ = 6r²` (V15) out of the cascade regime and restores `R ≥ 1/3`, not raises it.
+    /// Shed excess inter-node correlation while every node is still live: the cell is
+    /// **over-coupled** (`r > 1/√3`, `R < 1/3`, spec §18.2). Band-keeping back toward `(1/√6, 1/√3]`
+    /// — this *lowers* `Φ = 6r²` (V15) out of the over-coupled regime and restores `R ≥ 1/3`, not
+    /// raises it. (A cell merely inside the band is a healthy subject and is left untouched.)
     Decouple,
     /// Hand the residue to the parent cell: the listed nodes are an irrecoverable stopping set
     /// (a hyperoval, V20) or lie beyond the `Φ`-budget (spec §6.3 stratification, §6.7).
@@ -169,8 +171,8 @@ pub fn plan_healing(verdict: &Verdict, self_index: usize, degraded: u8, phi: f64
             });
         }
         Verdict::Systemic => {
-            // Cascade early-warning (r > 1/√6), a full regime ahead of any liveness alarm. The
-            // corpus response is band-keeping: shed correlation to hold r in (1/√6, 1/√3] (V15/V19).
+            // Over-coupled (r > 1/√3, R < 1/3): the cell has climbed past the collective-subject
+            // band. Shed correlation to bring r back into (1/√6, 1/√3] and restore R ≥ 1/3 (§18.2).
             actions.push(HealingAction::Decouple);
         }
     }

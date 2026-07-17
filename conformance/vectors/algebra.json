@@ -32,7 +32,7 @@
     "mediator_examples": {
       "comment": "k*(i,j) = third point of the line through i,j = XOR of their coordinates.",
       "pairs": [
-        { "i": 0, "j": 4, "mediator": 5 },
+        { "i": 0, "j": 4, "mediator": 2 },
         { "i": 0, "j": 1, "mediator": 6 },
         { "i": 1, "j": 3, "mediator": 4 }
       ]

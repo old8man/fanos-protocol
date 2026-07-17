@@ -47,10 +47,11 @@ pub struct CoherenceReading {
 #[must_use]
 pub fn read(signals: &[Vec<f64>]) -> Option<CoherenceReading> {
     let g = CoherenceMatrix::from_signals(signals)?;
+    let m = g.measures(); // Φ, P, R from a single Frobenius pass rather than three
     Some(CoherenceReading {
-        phi: g.phi(),
-        purity: g.purity(),
-        reflection: g.reflection(),
+        phi: m.phi,
+        purity: m.purity,
+        reflection: m.reflection,
         mean_correlation: g.mean_correlation(),
         alarm: g.alarm(),
         collective: g.collective_state(),

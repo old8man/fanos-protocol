@@ -116,6 +116,14 @@ impl<F: Field> DkgNode<F> {
     }
 
     /// When a dealing has been accepted from every member, publish the joint public key.
+    ///
+    /// Known limitation (liveness, tracked): completion requires a valid dealing from **all** `n`
+    /// members (`== self.n`). A single offline dealer, or one whose Feldman share is disqualified,
+    /// means the count never reaches `n` and `DkgComplete` never fires — the honest majority stalls.
+    /// A production DKG completes on an agreed **qualified set** of size `≥ threshold` after a
+    /// collection deadline (Gennaro et al.), which needs a timeout + an agreement round this
+    /// sans-I/O engine does not yet drive. Safety is unaffected (every node that completes uses the
+    /// identical full set and agrees on the key); only liveness under a faulty dealer is.
     fn check_done(&mut self, effects: &mut Vec<Effect>) {
         if !self.done && self.commitments.len() == self.n {
             self.done = true;

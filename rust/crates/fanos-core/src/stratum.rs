@@ -102,9 +102,36 @@ impl ParentCell {
 
     /// The coarse healing plan: reroute around / regenerate failed child cells, bounded by the
     /// parent's integration budget `phi` (each coarse reroute costs `Φ → Φ/9`, spec §6.7).
+    ///
+    /// The budget is **enforced** here (not merely reported): at the parent tier every reroute is a
+    /// coarse boundary, so when `Φ` cannot afford even one hop (`Φ < 9` ⇒ [`coarse_budget`] `= 0`,
+    /// spec §6.7/V16), the parent does not install an unaffordable reroute — that would itself drive
+    /// `Φ → Φ/9 < 1` and disintegrate it — but escalates the coarse residue to the grandparent.
     #[must_use]
     pub fn heal(&self, phi: f64) -> HealingPlan {
-        plan_healing(&self.diagnose(), self.self_index, self.degraded_mask(), phi)
+        let coarse = self.degraded_mask();
+        let mut plan = plan_healing(&self.diagnose(), self.self_index, coarse, phi);
+        if coarse != 0 && Self::coarse_budget(phi) == 0 && !plan.escalates() {
+            plan.actions.clear();
+            plan.actions.push(HealingAction::Escalate {
+                unrecoverable: coarse,
+            });
+        }
+        plan
+    }
+
+    /// The fine-grained failure footprint (blast radius) below this parent: the total leaf-node
+    /// weight of every escalating child's residue (its internal stopping set). Where
+    /// [`degraded_mask`](Self::degraded_mask) says *which* child cells failed, this says *how many
+    /// leaf nodes* those failures cost — the detail a parent reports upward alongside a coarse
+    /// escalation, which the coarse mask alone would discard (spec §6.3).
+    #[must_use]
+    pub fn residue_weight(&self) -> u32 {
+        self.children
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .map(|s| s.residue.count_ones())
+            .sum()
     }
 
     /// How many coarse child-cell reroutes the parent can afford at integration `phi`
@@ -204,6 +231,34 @@ mod tests {
         // V16: Φ=100 affords 2 coarse child-cell reroutes; Φ=1 affords none.
         assert_eq!(ParentCell::coarse_budget(100.0), 2);
         assert_eq!(ParentCell::coarse_budget(1.0), 0);
+    }
+
+    #[test]
+    fn a_parent_that_cannot_afford_a_coarse_hop_escalates_instead_of_rerouting() {
+        // The budget is enforced, not just reported: the same single escalating child the parent
+        // reroutes at Φ=100 must instead escalate at Φ=1, where a coarse hop (Φ→Φ/9) is unaffordable.
+        let mut parent = ParentCell::new(0);
+        parent.observe(5, ChildSummary::escalated(0b0001_0110));
+        assert!(parent.contains_escalation(100.0), "affordable at Φ=100");
+        assert!(
+            !parent.contains_escalation(1.0),
+            "unaffordable at Φ=1 → escalates upward"
+        );
+        assert!(parent.heal(1.0).escalates());
+        assert!(
+            parent.coarse_reroutes(1.0).is_empty(),
+            "no unaffordable reroute is installed"
+        );
+    }
+
+    #[test]
+    fn residue_weight_reports_the_fine_grained_blast_radius() {
+        // The coarse mask says children 1 and 4 failed; the fine residue says 3+1 = 4 leaf nodes.
+        let mut parent = ParentCell::new(0);
+        parent.observe(1, ChildSummary::escalated(0b0000_0111));
+        parent.observe(4, ChildSummary::escalated(0b0001_0000));
+        assert_eq!(parent.degraded_mask(), (1 << 1) | (1 << 4));
+        assert_eq!(parent.residue_weight(), 4);
     }
 
     fn is_hyperoval(mask: u8) -> bool {

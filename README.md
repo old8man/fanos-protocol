@@ -85,22 +85,40 @@ signals and calls a cascade a full regime **before any node fails** (spec §2.7,
 correlation crosses `r* = 1/√6` with a measurable lead time ahead of the first liveness failure.
 Run `cargo run -p fanos-sim --example forecast` to watch it.
 
-A simulation-driven investigation also produced a protocol improvement: naive per-link liveness
-times out spuriously under packet loss (5→84 false positives as loss climbs 10→50%), so liveness
-is now **corroborated across a node's `q+1` line-witnesses** (spec §6.4) — a peer is down only
-when *all* its witnesses lose it, which drives the false-positive rate to **zero through 50% loss**
-with true-death detection preserved.
+Two simulation-driven investigations produced protocol improvements. (1) Naive per-link liveness
+times out spuriously under packet loss (5→84 false positives as loss climbs 10→50%), so liveness is
+**corroborated across a node's line-witnesses** (spec §6.4). (2) That fix, taken as "any witness
+rescues liveness", is then vulnerable to a *single Byzantine liar* vouching for a dead node — so
+corroboration is **quorum-based**: own observation is trusted, otherwise `≥ quorum` distinct
+witnesses must agree, outvoting up to `quorum − 1` liars. The Byzantine-safe default (quorum 2)
+holds the false-positive rate at **zero through ~40% loss** with true-death detection preserved; a
+loss-optimized deployment can set quorum 1 (zero through 50%, but fooled by one liar). Both regimes,
+and the garbage-flood drop path, are pinned by adversary scenarios (`tests/byzantine.rs`).
+
+A deep audit pass hardened several layers and, in the spirit of the status tags below, documents
+what remains a deliberate simplification. Fixed: the APHANTOS onion no longer carries a
+**circuit-constant holonomy tag** in cleartext (it was a perfect cross-hop correlator) — the
+authenticator now rides *inside* the innermost encrypted layer (`tests/`-pinned); the DIAKRISIS
+controller now **decouples only when over-coupled** (`r > 1/√3`, `R < 1/3`), never inside the
+healthy collective-subject band; wire length fields are `usize::try_from`-checked so a 64-bit and a
+`wasm32` node cannot disagree; membership rejects non-canonical/zero coordinates and never lets a
+repeat announce overwrite a member's keys; the hybrid node-ID is pinned byte-for-byte to the
+canonical hashing rule; and a VRF key derives from *any* seed (a hash-to-scalar, not a 1-in-16
+canonical-bytes gate). Documented as known limitations with a fix path (see the module docs): the
+onion still shrinks one layer per hop (constant-size Tessera padding is a separate change), PROTEUS
+junk is per-epoch rather than per-packet, DKG completes on the full `n` (not a timed qualified
+subset), and L4 reads consult the primary rather than fanning across the full replica line.
 
 ### Build, verify, and simulate
 
 ```console
 $ cd rust
-$ cargo run -p fanos-cli                          # the reference verifier — reproduces V1–V22
+$ cargo run -p fanos-cli                          # reference verifier — 18 headline claims (V1–V21, T-226)
 $ cargo run -p fanos-sim --bin fanos-sim-demo     # drive a real cell: crash, partition, rendezvous
 $ cargo run -p fanos-sim --example forecast       # forecast a cascade before it collapses
 $ cargo run -p fanos-sim --example catastrophe    # loss/churn/scale robustness probe
 $ cargo bench -p fanos-bench                       # hot-path micro-benchmarks
-$ cargo test --workspace                          # 349 tests
+$ cargo test --workspace                          # 368 tests
 ```
 
 The verifier reproduces the specification's headline numbers exactly, e.g. the NYX endpoint

@@ -2,15 +2,23 @@
 //!
 //! Each hop's layer key is established by a **hybrid KEM encapsulation to that relay's public
 //! key** (`X25519 ‖ ML-KEM-768`), not carried in the packet, so only the intended relay can
-//! peel its layer. Layers are nested AEAD (ChaCha20-Poly1305), the holonomy travels as the
-//! path authenticator, and the whole onion is a byte string on the wire — the same code the
-//! simulator routes and a real transport would carry.
+//! peel its layer. Layers are nested AEAD (ChaCha20-Poly1305) and the whole onion is a byte
+//! string on the wire — the same code the simulator routes and a real transport would carry.
+//!
+//! The path-authenticator **holonomy travels inside the innermost (DELIVER) layer**, encrypted
+//! end-to-end, so it is visible only to the endpoint. It is deliberately *not* a cleartext
+//! header: a constant per-circuit tag at a fixed offset would be a perfect cross-hop correlator
+//! (any two relays, or any observer of an un-encrypted hop, could link entry to exit by matching
+//! it), collapsing the threshold `P_hop^L` endpoint-unlinkability to `1` (spec §5.4).
 //!
 //! ```text
-//! onion = VERSION(1) ‖ HOLONOMY(32) ‖ hop
+//! onion = VERSION(1) ‖ hop
 //! hop   = kem_ciphertext(1120) ‖ nonce(12) ‖ AEAD(key, nonce, cmd ‖ inner)
-//! cmd   = DELIVER | NEXT ‖ next_coord(12)
+//! cmd   = (DELIVER ‖ holonomy(32)) | (NEXT ‖ next_coord(12))
 //! ```
+//!
+//! (The onion still *shrinks* one layer per hop; length-indistinguishability via the fixed-size
+//! [`fanos_wire::tessera`] padding is a separate, larger change — see the crate README.)
 
 use alloc::vec::Vec;
 
@@ -29,7 +37,9 @@ const CMD_DELIVER: u8 = 0;
 const CMD_NEXT: u8 = 1;
 const NONCE_LEN: usize = 12;
 const HOLONOMY_LEN: usize = 32;
-const HEADER_LEN: usize = 1 + HOLONOMY_LEN;
+/// The cleartext onion header is just the version byte — the holonomy is no longer carried here
+/// (it moved into the innermost encrypted layer to defeat cross-hop correlation).
+const HEADER_LEN: usize = 1;
 
 /// Errors from sealing or peeling an onion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,10 +139,12 @@ pub fn build<F: Field>(
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(nonce_full.get(..NONCE_LEN).ok_or(SealedError::Malformed)?);
 
-        // Routing command: forward to the next relay, or deliver.
+        // Routing command: forward to the next relay, or deliver. The holonomy authenticator rides
+        // inside the innermost DELIVER layer (encrypted end-to-end), never as a cleartext header.
         let mut plaintext = Vec::new();
         if k == hops {
             plaintext.push(CMD_DELIVER);
+            plaintext.extend_from_slice(&holonomy);
         } else {
             plaintext.push(CMD_NEXT);
             let next = relays.get(k + 1).ok_or(SealedError::Malformed)?;
@@ -149,10 +161,9 @@ pub fn build<F: Field>(
         inner = hop;
     }
 
-    // onion = VERSION ‖ HOLONOMY ‖ hop
+    // onion = VERSION ‖ hop  (the holonomy is sealed inside the innermost layer, not here)
     let mut onion = Vec::with_capacity(HEADER_LEN + inner.len());
     onion.push(VERSION);
-    onion.extend_from_slice(&holonomy);
     onion.extend_from_slice(&inner);
     Ok(onion)
 }
@@ -162,9 +173,6 @@ pub fn peel(onion: &[u8], kem_secret: &HybridKemSecret) -> Result<PeelOutcome, S
     if onion.first().copied() != Some(VERSION) {
         return Err(SealedError::Malformed);
     }
-    let holonomy_bytes = onion.get(1..HEADER_LEN).ok_or(SealedError::Malformed)?;
-    let mut holonomy = [0u8; 32];
-    holonomy.copy_from_slice(holonomy_bytes);
     let hop = onion.get(HEADER_LEN..).ok_or(SealedError::Malformed)?;
 
     let kem_ct_bytes = hop.get(..CIPHERTEXT_LEN).ok_or(SealedError::Malformed)?;
@@ -184,17 +192,23 @@ pub fn peel(onion: &[u8], kem_secret: &HybridKemSecret) -> Result<PeelOutcome, S
     let plaintext = aead_open(&key, &nonce, layer_ct)?;
     let (&cmd, rest) = plaintext.split_first().ok_or(SealedError::Malformed)?;
     match cmd {
-        CMD_DELIVER => Ok(PeelOutcome::Deliver {
-            payload: rest.to_vec(),
-            holonomy,
-        }),
+        CMD_DELIVER => {
+            // Innermost layer: holonomy(32) ‖ payload — only the endpoint ever sees the tag.
+            let holonomy_bytes = rest.get(..HOLONOMY_LEN).ok_or(SealedError::Malformed)?;
+            let mut holonomy = [0u8; 32];
+            holonomy.copy_from_slice(holonomy_bytes);
+            let payload = rest
+                .get(HOLONOMY_LEN..)
+                .ok_or(SealedError::Malformed)?
+                .to_vec();
+            Ok(PeelOutcome::Deliver { payload, holonomy })
+        }
         CMD_NEXT => {
             let next = coord_from_bytes(rest).ok_or(SealedError::Malformed)?;
             let inner = rest.get(12..).ok_or(SealedError::Malformed)?;
-            // Re-head the inner onion for the next relay.
+            // Re-head the inner onion for the next relay — version byte only, no shared tag.
             let mut forwarded = Vec::with_capacity(HEADER_LEN + inner.len());
             forwarded.push(VERSION);
-            forwarded.extend_from_slice(&holonomy);
             forwarded.extend_from_slice(inner);
             Ok(PeelOutcome::Forward {
                 next,
@@ -244,6 +258,40 @@ mod tests {
             }
         }
         panic!("onion never delivered");
+    }
+
+    #[test]
+    fn the_holonomy_is_not_a_cleartext_cross_hop_correlator() {
+        // Capture the on-wire bytes at every hop and confirm the path-authenticator holonomy
+        // appears verbatim in NONE of them — it travels encrypted end-to-end, so colluding relays
+        // (or an observer of an un-encrypted hop) cannot link entry to exit by matching a fixed tag.
+        let circuit =
+            build_circuit(Point::<F31>::at(3), Point::<F31>::at(700), 3, b"corr").unwrap();
+        let keypairs = relays(circuit.hop_count(), 7);
+        let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
+        let mut onion = build(&circuit, &pubkeys, b"secret payload", b"corr-seed").unwrap();
+
+        let mut snapshots = alloc::vec![onion.clone()];
+        let mut delivered = None;
+        for (secret, _) in &keypairs {
+            match peel(&onion, secret).unwrap() {
+                PeelOutcome::Forward { onion: inner, .. } => {
+                    onion = inner;
+                    snapshots.push(onion.clone());
+                }
+                PeelOutcome::Deliver { holonomy, .. } => {
+                    delivered = Some(holonomy);
+                    break;
+                }
+            }
+        }
+        let holo = delivered.unwrap(); // onion delivered
+        for (hop, snap) in snapshots.iter().enumerate() {
+            assert!(
+                !snap.windows(HOLONOMY_LEN).any(|w| w == holo),
+                "holonomy tag leaks in cleartext at hop {hop}"
+            );
+        }
     }
 
     #[test]

@@ -32,11 +32,16 @@ pub struct PublicIdentity {
 }
 
 impl PublicIdentity {
-    /// The long-term node identifier: `BLAKE3` of the canonical public-key bundle (spec §L0).
+    /// The long-term node identifier: domain-separated `BLAKE3` of the canonical public-key
+    /// bundle (spec §L0). This reproduces `fanos_crypto::hash_labeled(NODE_ID, sig ‖ kem)`
+    /// **byte-for-byte** — including the `0x1f` unit separator after the label — so the placeholder
+    /// identity in `fanos-crypto` and this real hybrid one agree on the same node ID (a
+    /// cross-crate test in `tests/node_id_parity.rs` pins the two together).
     #[must_use]
     pub fn node_id(&self) -> NodeId {
         let mut hasher = blake3::Hasher::new();
         hasher.update(NODE_ID_LABEL);
+        hasher.update(&[0x1f]); // canonical unit separator — matches `hash_labeled`
         hasher.update(&self.signature.encode());
         hasher.update(&self.kem.encode());
         NodeId(*hasher.finalize().as_bytes())
@@ -98,5 +103,18 @@ mod tests {
         let proof_input = b"coord-proof:epoch=42";
         let signature = node.signing.sign(proof_input);
         assert!(node.public.signature.verify(proof_input, &signature));
+    }
+
+    #[test]
+    fn node_id_matches_the_canonical_fanos_crypto_rule() {
+        // The real hybrid identity and the `fanos-crypto` placeholder must agree on the node ID,
+        // or the two impls disagree on addressing (spec §L0). Pin them: the pqcrypto node_id equals
+        // `hash_labeled(NODE_ID, sig ‖ kem)` byte-for-byte (this catches a missing/extra separator).
+        let mut rng = SeedRng::from_seed(b"id-parity");
+        let node = Identity::generate(&mut rng);
+        let mut bundle = node.public.signature.encode();
+        bundle.extend_from_slice(&node.public.kem.encode());
+        let canonical = fanos_crypto::hash_labeled(fanos_crypto::label::NODE_ID, &bundle);
+        assert_eq!(node.node_id().0, canonical);
     }
 }

@@ -136,12 +136,18 @@ pub fn decode_frame(buf: &[u8]) -> Result<(Frame<'_>, usize), WireError> {
     let (type_code, n0) = varint::decode(buf)?;
     let rest = buf.get(n0..).ok_or(WireError::UnexpectedEnd)?;
     let (len, n1) = varint::decode(rest)?;
-    let len = len as usize;
+    // Convert through `usize::try_from` (not `as usize`): on a 32-bit target (wasm32 is a declared
+    // build target) a 64-bit length would silently truncate, so a 64-bit and a 32-bit node would
+    // disagree on the same bytes — a canonical-encoding violation. Reject instead.
+    let len = usize::try_from(len).map_err(|_| WireError::FrameLengthOverflow)?;
     let body_start = n0 + n1;
-    let body = buf
-        .get(body_start..body_start + len)
+    let end = body_start
+        .checked_add(len)
         .ok_or(WireError::FrameLengthOverflow)?;
-    Ok((Frame { type_code, body }, body_start + len))
+    let body = buf
+        .get(body_start..end)
+        .ok_or(WireError::FrameLengthOverflow)?;
+    Ok((Frame { type_code, body }, end))
 }
 
 #[cfg(test)]
@@ -164,6 +170,20 @@ mod tests {
             assert_eq!(ft.code(), code);
         }
         assert_eq!(FrameType::from_code(0xFF), None);
+    }
+
+    #[test]
+    fn an_absurd_length_is_rejected_not_wrapped() {
+        // A length that overflows the address space (or a 32-bit `usize`) must be rejected, never
+        // truncated or wrapped into a valid-looking slice (canonical-encoding safety on wasm32).
+        let mut buf = Vec::new();
+        varint::encode(FrameType::Publish.code(), &mut buf);
+        varint::encode(1u64 << 40, &mut buf); // ~1 TB body length — exceeds a 32-bit usize
+        buf.extend_from_slice(b"short");
+        assert!(matches!(
+            decode_frame(&buf),
+            Err(WireError::FrameLengthOverflow)
+        ));
     }
 
     #[test]

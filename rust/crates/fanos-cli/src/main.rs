@@ -289,7 +289,9 @@ fn run_all_checks() -> Report {
 }
 
 fn main() {
-    println!("\nFANOS reference verifier — reproducing spec V1–V22\n");
+    println!(
+        "\nFANOS reference verifier — reproducing the spec's headline claims (V1–V21, T-226)\n"
+    );
     let r = run_all_checks();
     demo();
     println!("\n  Summary: {} passed, {} failed\n", r.passed, r.failed);

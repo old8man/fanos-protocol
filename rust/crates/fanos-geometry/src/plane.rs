@@ -228,9 +228,34 @@ impl<F: Field> Plane<F> {
     }
 
     /// Iterate the `q + 1` points incident to `line`.
+    ///
+    /// Enumerated **directly** in `Θ(q)` from the line's null space — not by filtering all
+    /// `N = Θ(q²)` points. A line `[a:b:c]` is the null space of that row vector; two independent
+    /// points `p₀, p₁` spanning it are read straight off the coordinates (the skew-matrix rows
+    /// `L × eᵢ`), and the `q+1` incident points are `p₀` together with `t·p₀ + p₁` for `t ∈ GF(q)`.
+    /// This is the projective line `PG(1, q)` through `p₀, p₁`.
     #[inline]
     pub fn points_on(line: Line<F>) -> impl Iterator<Item = Point<F>> + Clone {
-        Self::points().filter(move |p| p.is_on(&line))
+        let [a, b, c] = line.coords();
+        // Two independent points spanning the line's 2-D null space, selected by which coordinate
+        // of L is non-zero (a line is never the zero vector, so this always yields a valid basis).
+        let neg = |x| F::sub(0, x);
+        let (p0, p1) = if a != 0 {
+            ([neg(c), 0, a], [b, neg(a), 0]) // L×e₁, L×e₂
+        } else if b != 0 {
+            ([0, c, neg(b)], [b, 0, 0]) // L×e₀, L×e₂ (a = 0)
+        } else {
+            ([0, c, 0], [neg(c), 0, 0]) // L×e₀, L×e₁ (a = b = 0, c ≠ 0)
+        };
+        core::iter::once(p0)
+            .chain((0..F::Q).map(move |t| {
+                [
+                    F::add(F::mul(t, p0[0]), p1[0]),
+                    F::add(F::mul(t, p0[1]), p1[1]),
+                    F::add(F::mul(t, p0[2]), p1[2]),
+                ]
+            }))
+            .filter_map(|tri| canonicalize::<F>(tri).map(Point::wrap))
     }
 
     /// Iterate the `q + 1` lines through `point`.
@@ -246,9 +271,64 @@ impl<F: Field> Plane<F> {
 
 /// The order of the collineation group `PGL(3, q)` (spec §2.3): the count of symmetries of
 /// the plane. `|PGL(3,q)| = (q³−1)(q³−q)(q³−q²)/(q−1)`. For `q = 2` this is `168`.
+///
+/// # Panics
+/// If `q < 2`. A projective plane requires a field order `q ≥ 2`; the closed form divides by
+/// `q − 1`, so `q = 1` has no meaning here and `q = 0` is not a field order.
 #[must_use]
 pub fn pgl3_order(q: u32) -> u128 {
+    assert!(q >= 2, "PG(2,q) requires a field order q ≥ 2, got {q}");
     let q = u128::from(q);
     let q3 = q * q * q;
     (q3 - 1) * (q3 - q) * (q3 - q * q) / (q - 1)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    extern crate alloc;
+    use alloc::vec::Vec;
+
+    use fanos_field::{F2, F7, F13, F31};
+
+    use super::*;
+
+    /// Brute-force reference: the points on a line are those `p` with `p · L = 0`, found by
+    /// scanning the whole plane. The fast `points_on` must reproduce this set exactly.
+    fn brute_force_points_on<F: Field>(line: Line<F>) -> Vec<Triple> {
+        let mut v: Vec<Triple> = Plane::<F>::points()
+            .filter(|p| p.is_on(&line))
+            .map(|p| p.coords())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn check_points_on_matches_brute_force<F: Field>() {
+        let q = F::Q;
+        for l in 0..Plane::<F>::N as usize {
+            let line = Line::<F>::at(l);
+            let mut fast: Vec<Triple> = Plane::<F>::points_on(line).map(|p| p.coords()).collect();
+            fast.sort_unstable();
+            // Every enumerated point is canonical, distinct, and genuinely on the line.
+            assert_eq!(fast.len(), (q + 1) as usize, "q+1 points on line {l}");
+            fast.dedup();
+            assert_eq!(fast.len(), (q + 1) as usize, "no duplicates on line {l}");
+            assert_eq!(fast, brute_force_points_on(line), "line {l} point set");
+        }
+    }
+
+    #[test]
+    fn points_on_matches_brute_force_across_fields() {
+        check_points_on_matches_brute_force::<F2>();
+        check_points_on_matches_brute_force::<F7>();
+        check_points_on_matches_brute_force::<F13>();
+        check_points_on_matches_brute_force::<F31>();
+    }
+
+    #[test]
+    #[should_panic(expected = "q ≥ 2")]
+    fn pgl3_order_rejects_degenerate_q() {
+        let _ = pgl3_order(1);
+    }
 }
