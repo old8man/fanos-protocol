@@ -253,4 +253,79 @@ mod tests {
         assert_eq!(service.open_stream(), 1);
         assert_eq!(service.open_stream(), 3); // responder: odd
     }
+
+    /// A small deterministic LCG so a proptest seed reproduces the exact loss pattern.
+    fn lcg_next(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as u32
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Many streams multiplexed over one connection, each with a distinct payload, all arrive
+        /// intact and correctly separated (no cross-stream contamination) despite early loss in both
+        /// directions and arbitrary payload sizes. This is the multiplex-correctness property: the
+        /// stream_id inside each frame — not cell order — decides routing.
+        #[test]
+        fn multiplexed_streams_arrive_intact_and_separated(
+            payloads in proptest::collection::vec(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2500usize),
+                1..=4usize,
+            ),
+            loss_seed in proptest::prelude::any::<u64>(),
+        ) {
+            let (c2s, s2c) = ([11u8; 32], [22u8; 32]);
+            let mut client = Connection::new(c2s, s2c, true);
+            let mut service = Connection::new(s2c, c2s, false);
+
+            let n = payloads.len();
+            let mut ids = Vec::with_capacity(n);
+            for p in &payloads {
+                let id = client.open_stream();
+                client.write(id, p);
+                client.finish(id);
+                ids.push(id);
+            }
+
+            let mut state = loss_seed | 1;
+            let mut got: Vec<Vec<u8>> = vec![Vec::new(); n];
+            let mut round = 0;
+            loop {
+                // client → service: drop ~40% of cells for the first few rounds, then a clean channel
+                // guarantees convergence.
+                for cell in client.outbound() {
+                    if round >= 4 || lcg_next(&mut state) % 100 >= 40 {
+                        service.on_cell(&cell);
+                    }
+                }
+                while service.accept().is_some() {}
+                for (i, &id) in ids.iter().enumerate() {
+                    got[i].extend_from_slice(&service.read(id));
+                }
+                // service → client: only ACKs flow back; drop ~30% early.
+                for cell in service.outbound() {
+                    if round >= 4 || lcg_next(&mut state) % 100 >= 30 {
+                        client.on_cell(&cell);
+                    }
+                }
+                if ids
+                    .iter()
+                    .all(|&id| client.sender_complete(id) && service.receiver_finished(id))
+                {
+                    break;
+                }
+                round += 1;
+                proptest::prop_assert!(round < 300, "must converge");
+            }
+            for (i, &id) in ids.iter().enumerate() {
+                got[i].extend_from_slice(&service.read(id));
+            }
+            for i in 0..n {
+                proptest::prop_assert_eq!(&got[i], &payloads[i]);
+            }
+        }
+    }
 }
