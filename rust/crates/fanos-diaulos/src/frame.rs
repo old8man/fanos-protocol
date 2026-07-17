@@ -98,6 +98,13 @@ impl Frame {
                 let (&fin, r) = cur.split_first()?;
                 cur = r;
                 let len = read_u16(&mut cur)? as usize;
+                // Enforce the segment-size invariant on the parse side too: `encode` clamps to
+                // `MAX_SEGMENT`, so a frame claiming more is malformed. Without this, a crafted DATA
+                // frame could set `len` past `MAX_SEGMENT` and pull the cell's trailing zero-pad in as
+                // payload — injecting bytes the sender never wrote.
+                if len > MAX_SEGMENT {
+                    return None;
+                }
                 let data = cur.get(..len)?.to_vec();
                 Some(Self::Data(Segment {
                     stream_id,
@@ -170,5 +177,52 @@ mod tests {
     fn empty_or_unknown_is_rejected() {
         assert_eq!(Frame::decode(&[]), None);
         assert_eq!(Frame::decode(&[0xFF]), None);
+    }
+
+    fn data_header(stream_id: u32, seq: u32, fin: bool, len: u16) -> Vec<u8> {
+        let mut v = vec![FT_DATA];
+        v.extend_from_slice(&stream_id.to_be_bytes());
+        v.extend_from_slice(&seq.to_be_bytes());
+        v.push(u8::from(fin));
+        v.extend_from_slice(&len.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn a_data_frame_claiming_more_than_max_segment_is_rejected() {
+        // len = MAX_SEGMENT + 1 with that many bytes present — inside the cell but past the invariant.
+        let mut over = data_header(7, 0, false, (MAX_SEGMENT + 1) as u16);
+        over.extend_from_slice(&vec![0u8; MAX_SEGMENT + 1]);
+        assert_eq!(Frame::decode(&over), None, "len past MAX_SEGMENT is rejected");
+
+        // Exactly MAX_SEGMENT is accepted (the boundary).
+        let mut ok = data_header(7, 0, false, MAX_SEGMENT as u16);
+        ok.extend_from_slice(&vec![0xAB; MAX_SEGMENT]);
+        match Frame::decode(&ok) {
+            Some(Frame::Data(seg)) => assert_eq!(seg.data.len(), MAX_SEGMENT),
+            other => panic!("expected a MAX_SEGMENT data frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_and_boundary_frames() {
+        // A DATA header cut mid-field (stream_id needs 4 bytes).
+        assert_eq!(Frame::decode(&[FT_DATA, 0, 0, 0]), None);
+        // A DATA len exceeding the bytes actually present.
+        let mut short = data_header(0, 0, false, 10);
+        short.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(Frame::decode(&short), None, "len exceeding available bytes is rejected");
+        // An ACK cut mid-field.
+        assert_eq!(Frame::decode(&[FT_ACK, 0, 0, 0]), None);
+        // A DATA frame with exactly the header and len 0 → an empty-data segment (the FIN-only case).
+        assert_eq!(
+            Frame::decode(&data_header(1, 2, true, 0)),
+            Some(Frame::Data(Segment {
+                stream_id: 1,
+                seq: 2,
+                fin: true,
+                data: vec![],
+            }))
+        );
     }
 }

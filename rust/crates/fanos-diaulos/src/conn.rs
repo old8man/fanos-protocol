@@ -37,6 +37,9 @@ pub struct Connection {
     key_rx: Key,
     nonce_tx: u64,
     next_local_id: u32,
+    /// The low-bit parity an id must have for the *peer* to have opened it: the initiator (local even)
+    /// accepts implicit opens only on odd ids, the responder only on even. Guards our own id space.
+    peer_id_parity: u32,
     streams: BTreeMap<u32, Stream>,
     accept_queue: VecDeque<u32>,
 }
@@ -51,6 +54,7 @@ impl Connection {
             key_rx,
             nonce_tx: 0,
             next_local_id: u32::from(!initiator),
+            peer_id_parity: u32::from(initiator),
             streams: BTreeMap::new(),
             accept_queue: VecDeque::new(),
         }
@@ -166,19 +170,21 @@ impl Connection {
         match Frame::decode(&frame_bytes) {
             Some(Frame::Data(seg)) => {
                 let id = seg.stream_id;
-                // A DATA for an id we never opened ⇒ the peer opened it (implicit OPEN).
-                let fresh = match self.streams.entry(id) {
+                // A DATA for an id we never opened ⇒ the peer opened it (implicit OPEN) — but only in
+                // the peer's own id space. A DATA for an unopened id of *our* parity is a hostile (or
+                // buggy) attempt to seize a stream id we will later hand out from `open_stream`, which
+                // would clobber the local stream; drop it.
+                match self.streams.entry(id) {
                     Entry::Occupied(mut e) => {
                         e.get_mut().receiver.on_segment(&seg);
-                        false
                     }
                     Entry::Vacant(e) => {
-                        e.insert(Stream::new(id)).receiver.on_segment(&seg);
-                        true
+                        if id & 1 == self.peer_id_parity {
+                            e.insert(Stream::new(id)).receiver.on_segment(&seg);
+                            self.accept_queue.push_back(id);
+                        }
+                        // else: wrong-parity implicit open — dropped.
                     }
-                };
-                if fresh {
-                    self.accept_queue.push_back(id);
                 }
             }
             Some(Frame::Ack { stream_id, ack }) => {
@@ -269,6 +275,40 @@ mod tests {
         assert_eq!(client.open_stream(), 2); // initiator: even
         assert_eq!(service.open_stream(), 1);
         assert_eq!(service.open_stream(), 3); // responder: odd
+    }
+
+    #[test]
+    fn a_wrong_parity_implicit_open_cannot_seize_a_local_id() {
+        use fanos_runtime::stream::Segment;
+        let (c2s, s2c) = ([3u8; 32], [4u8; 32]);
+        // The initiator's local ids are even; only odd (peer) ids may be implicitly opened.
+        let mut initiator = Connection::new(c2s, s2c, true);
+
+        // A hostile DATA for an EVEN id — the initiator's own id space — must be dropped, not accepted.
+        let even = Frame::Data(Segment {
+            stream_id: 0,
+            seq: 0,
+            fin: false,
+            data: vec![9, 9, 9],
+        })
+        .encode();
+        initiator.on_cell(&seal(&s2c, 0, &even).unwrap());
+        assert!(initiator.accept().is_none(), "a wrong-parity (even) implicit open is refused");
+        assert!(initiator.read(0).is_empty(), "no stream state was injected at id 0");
+
+        // open_stream still hands out id 0 as a fresh local stream, uncorrupted by the injection.
+        assert_eq!(initiator.open_stream(), 0);
+
+        // A DATA for an ODD id — the peer's space — is a legitimate implicit open and is accepted.
+        let odd = Frame::Data(Segment {
+            stream_id: 1,
+            seq: 0,
+            fin: false,
+            data: vec![7],
+        })
+        .encode();
+        initiator.on_cell(&seal(&s2c, 1, &odd).unwrap());
+        assert_eq!(initiator.accept(), Some(1), "a correct-parity implicit open is accepted");
     }
 
     #[test]
