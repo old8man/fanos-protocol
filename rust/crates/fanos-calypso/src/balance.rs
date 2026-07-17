@@ -252,7 +252,7 @@ impl MasterDescriptor {
     where
         V: Fn(&[u8], &[u8], &[u8]) -> bool,
     {
-        if !address.certifies(&self.root_pubkey) {
+        if !address.verifies(&self.root_pubkey) {
             return false;
         }
         if !self
@@ -409,7 +409,7 @@ mod tests {
     fn setup(epoch: u32, weights: &[u16]) -> Setup {
         let root_sk = b"root-offline-secret".to_vec();
         let root_pk = toy_pub(&root_sk);
-        let address = ServiceAddress::from_pubkey(&root_pk);
+        let address = ServiceAddress::from_bundle(&root_pk);
         let signing_sk = b"epoch-signing-secret".to_vec();
         let signing_pk = toy_pub(&signing_sk);
 

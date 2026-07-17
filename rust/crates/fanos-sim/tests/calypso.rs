@@ -38,7 +38,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
     sim.run_for(Duration::from_millis(2000));
 
     let service = HiddenService::new(b"my-service-hybrid-pubkey".to_vec());
-    let address = service.address().clone();
+    let address = *service.address();
     let epoch = 7;
     let service_node = cell[0];
     let client_node = cell[3];
@@ -107,7 +107,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
 fn a_client_with_only_the_address_cannot_forge_the_rendezvous() {
     // Only a public key the address certifies yields the rendezvous key (self-certifying, §12.2).
     let service = HiddenService::new(b"another-service".to_vec());
-    let address = service.address().clone();
+    let address = *service.address();
     assert!(client_descriptor_key(&address, service.pubkey(), 3).is_some());
     assert!(client_descriptor_key(&address, b"impostor", 3).is_none());
 }

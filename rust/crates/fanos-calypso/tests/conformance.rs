@@ -1,6 +1,7 @@
 //! Cross-language conformance KATs for CALYPSO addressing and L4 storage addressing, pinned to
 //! `conformance/vectors/services.json`. Any implementation reproduces these exactly or it does not
 //! interoperate.
+#![allow(clippy::unwrap_used)]
 
 use fanos_calypso::ServiceAddress;
 use fanos_crypto::{hash::label, hash_labeled, map_to_point};
@@ -30,15 +31,15 @@ fn l4_storage_addressing_matches_the_vector() {
 }
 
 #[test]
-fn calypso_self_certifying_address_matches_the_vector() {
-    // services.json → calypso_address, pubkey "fanos-conformance-service".
-    let addr = ServiceAddress::from_pubkey(b"fanos-conformance-service");
-    assert_eq!(
-        addr.label(),
-        "j4jleh2q7q6pxyufkfdf2efgpeq5evnyqx6srlcdctgqmuiwxfoq"
-    );
-    assert!(format!("{addr}").ends_with(".fanos"));
-    // The address self-certifies the key it was derived from, and no other.
-    assert!(addr.certifies(b"fanos-conformance-service"));
-    assert!(!addr.certifies(b"a-different-service"));
+fn calypso_service_address_is_a_self_certifying_onoma_address() {
+    // A CALYPSO service address is an ONOMA address (the canonical pinned address/mnemonic/
+    // derivation vectors live in conformance/vectors/names.json + fanos-onoma/tests/conformance.rs).
+    // Here we pin the *services-layer* property: the address self-certifies its bundle and no other.
+    let bundle = b"fanos-conformance-service";
+    let addr = ServiceAddress::from_bundle(bundle);
+    assert!(addr.to_name().strip_suffix(".fanos").is_some());
+    assert!(addr.verifies(bundle));
+    assert!(!addr.verifies(b"a-different-service"));
+    // Round-trips through the human-readable `.fanos` name.
+    assert_eq!(ServiceAddress::parse(&addr.to_name()).unwrap(), addr);
 }

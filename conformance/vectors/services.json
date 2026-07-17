@@ -14,15 +14,8 @@
     ]
   },
   "calypso_address": {
-    "comment": "A self-certifying .fanos address is base32(BLAKE3(pubkey)) in the lower-case RFC 4648 alphabet 'abcdefghijklmnopqrstuvwxyz234567' (no padding), suffixed '.fanos'. The address certifies a public key iff it equals this derivation.",
-    "base32_alphabet": "abcdefghijklmnopqrstuvwxyz234567",
-    "vectors": [
-      {
-        "pubkey": "fanos-conformance-service",
-        "pubkey_hex": "66616e6f732d636f6e666f726d616e63652d73657276696365",
-        "address": "j4jleh2q7q6pxyufkfdf2efgpeq5evnyqx6srlcdctgqmuiwxfoq.fanos"
-      }
-    ]
+    "comment": "CALYPSO service addresses are now ONOMA addresses (post-quantum commitment, bech32m, version-agile) — strictly superseding the earlier base32(BLAKE3(pubkey)) scheme. The canonical address / mnemonic / per-epoch derivation known-answer vectors live in conformance/vectors/names.json (pinned by fanos-onoma/tests/conformance.rs).",
+    "superseded_by": "names.json"
   },
   "proteus_shape": {
     "comment": "The PROTEUS per-epoch transport shape is derived from a community secret and epoch. junk_len = junk_count * junk_size. All values are deterministic; the wire signature rotates every epoch. scramble_seed_prefix is the first 4 bytes of the 32-byte XOF-derived scramble seed.",

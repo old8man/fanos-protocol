@@ -115,7 +115,7 @@ fn an_anonymous_credit_pays_for_a_calypso_introduction_exactly_once() {
 
     // The service publishes its contact descriptor at the per-epoch rendezvous key.
     let service = HiddenService::new(b"paid-service-pubkey".to_vec());
-    let address = service.address().clone();
+    let address = *service.address();
     let epoch = 5;
     let service_node = cell[0];
     let client_node = cell[3];

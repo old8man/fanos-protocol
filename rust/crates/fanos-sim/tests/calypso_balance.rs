@@ -95,7 +95,7 @@ fn a_master_domain_load_balances_across_verified_backends_over_the_overlay() {
     let root_pubkey = root_vk.encode();
     let (signing, signing_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"epoch-signer"));
     let signing_pubkey = signing_vk.encode();
-    let address = ServiceAddress::from_pubkey(&root_pubkey);
+    let address = ServiceAddress::from_bundle(&root_pubkey);
     let epoch = 12;
 
     // Three backend instances at distinct cell coordinates, one with double weight.

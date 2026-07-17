@@ -18,7 +18,6 @@
 
 extern crate alloc;
 
-pub mod address;
 pub mod balance;
 pub mod descriptor;
 pub mod hosting;
@@ -31,9 +30,14 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::Line;
 
-pub use address::ServiceAddress;
 pub use balance::{InstanceRef, MasterDescriptor, master_descriptor_key};
 pub use rendezvous::rendezvous_line;
+
+// A CALYPSO service address *is* an ONOMA address (the self-certifying `.fanos` name system):
+// the post-quantum, bech32m, version-agile L-key. `ServiceAddress` is retained as the
+// domain-meaningful alias used across the services code.
+pub use fanos_onoma::Address;
+pub use fanos_onoma::Address as ServiceAddress;
 
 /// A hidden service — its public key and self-certifying address (spec Part XII).
 pub struct HiddenService {
@@ -45,7 +49,7 @@ impl HiddenService {
     /// Publish a service under its public-key bytes; the address is derived (self-certifying).
     #[must_use]
     pub fn new(pubkey: Vec<u8>) -> Self {
-        let address = ServiceAddress::from_pubkey(&pubkey);
+        let address = ServiceAddress::from_bundle(&pubkey);
         Self { pubkey, address }
     }
 
@@ -78,7 +82,7 @@ pub fn client_meeting_line<F: Field>(
     epoch: u32,
 ) -> Option<Line<F>> {
     address
-        .certifies(service_pubkey)
+        .verifies(service_pubkey)
         .then(|| rendezvous_line::<F>(service_pubkey, epoch))
 }
 
@@ -104,7 +108,7 @@ pub fn client_descriptor_key(
     epoch: u32,
 ) -> Option<Vec<u8>> {
     address
-        .certifies(service_pubkey)
+        .verifies(service_pubkey)
         .then(|| descriptor_key(service_pubkey, epoch))
 }
 
@@ -119,7 +123,7 @@ mod tests {
     fn client_and_service_meet_with_no_directory() {
         // The service publishes a self-certifying address.
         let service = HiddenService::new(b"service-hybrid-pubkey".to_vec());
-        let address = service.address().clone();
+        let address = *service.address();
 
         // A client that learns (address, pubkey) verifies the binding and computes the SAME
         // rendezvous line the service listens on — no HSDir lookup anywhere.

@@ -15,10 +15,10 @@ proptest! {
         pubkey in proptest::collection::vec(any::<u8>(), 1..64),
         other in proptest::collection::vec(any::<u8>(), 1..64),
     ) {
-        let address = ServiceAddress::from_pubkey(&pubkey);
-        prop_assert!(address.certifies(&pubkey));
+        let address = ServiceAddress::from_bundle(&pubkey);
+        prop_assert!(address.verifies(&pubkey));
         if pubkey != other {
-            prop_assert!(!address.certifies(&other));
+            prop_assert!(!address.verifies(&other));
         }
     }
 
