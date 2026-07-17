@@ -351,10 +351,169 @@ impl MetricStore {
     pub fn metrics(&self) -> impl Iterator<Item = MetricId> + '_ {
         self.series.keys().copied()
     }
+
+    /// Serialize the whole store — config and every series — to a versioned, self-describing byte
+    /// snapshot, so history survives a restart. Append-only structure makes this cheap and lossless.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SNAPSHOT_MAGIC);
+        out.push(SNAPSHOT_VERSION);
+        // Config: the tier specs new series will use.
+        write_u16(&mut out, self.config.tiers.len() as u16);
+        for &(res, cap) in &self.config.tiers {
+            out.extend_from_slice(&res.to_be_bytes());
+            write_u32(&mut out, cap as u32);
+        }
+        // Series.
+        write_u32(&mut out, self.series.len() as u32);
+        for (id, series) in &self.series {
+            out.extend_from_slice(&id.0.to_be_bytes());
+            series.write(&mut out);
+        }
+        out
+    }
+
+    /// Restore a store from a [`snapshot`](Self::snapshot). `None` on a bad magic, version, or
+    /// truncation.
+    #[must_use]
+    pub fn restore(bytes: &[u8]) -> Option<Self> {
+        let mut cur = bytes;
+        if take::<4>(&mut cur)? != SNAPSHOT_MAGIC || take::<1>(&mut cur)?[0] != SNAPSHOT_VERSION {
+            return None;
+        }
+        let tier_count = read_u16(&mut cur)? as usize;
+        let mut tiers = Vec::with_capacity(tier_count);
+        for _ in 0..tier_count {
+            let res = u64::from_be_bytes(take::<8>(&mut cur)?);
+            let cap = read_u32(&mut cur)? as usize;
+            tiers.push((res, cap));
+        }
+        let config = HistoryConfig { tiers };
+        let series_count = read_u32(&mut cur)?;
+        let mut series = BTreeMap::new();
+        for _ in 0..series_count {
+            let id = MetricId(u16::from_be_bytes(take::<2>(&mut cur)?));
+            series.insert(id, Series::read(&mut cur)?);
+        }
+        Some(Self { config, series })
+    }
+}
+
+/// Snapshot magic (`FTS1` — Fanos Telemetry Series v1) and version, so the format is self-describing.
+const SNAPSHOT_MAGIC: [u8; 4] = *b"FTS1";
+const SNAPSHOT_VERSION: u8 = 1;
+
+fn write_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn write_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn write_f64(out: &mut Vec<u8>, v: f64) {
+    out.extend_from_slice(&v.to_bits().to_be_bytes());
+}
+
+fn take<const M: usize>(cur: &mut &[u8]) -> Option<[u8; M]> {
+    let (head, tail) = cur.split_at_checked(M)?;
+    *cur = tail;
+    head.try_into().ok()
+}
+fn read_u16(cur: &mut &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(take::<2>(cur)?))
+}
+fn read_u32(cur: &mut &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(take::<4>(cur)?))
+}
+fn read_f64(cur: &mut &[u8]) -> Option<f64> {
+    Some(f64::from_bits(u64::from_be_bytes(take::<8>(cur)?)))
+}
+
+impl Bucket {
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.start_nanos.to_be_bytes());
+        write_u32(out, self.count);
+        write_f64(out, self.min);
+        write_f64(out, self.max);
+        write_f64(out, self.mean);
+        write_f64(out, self.last);
+    }
+    fn read(cur: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            start_nanos: u64::from_be_bytes(take::<8>(cur)?),
+            count: read_u32(cur)?,
+            min: read_f64(cur)?,
+            max: read_f64(cur)?,
+            mean: read_f64(cur)?,
+            last: read_f64(cur)?,
+        })
+    }
+}
+
+impl Tier {
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.resolution_nanos.to_be_bytes());
+        write_u32(out, self.capacity as u32);
+        write_u32(out, self.finalized.len() as u32);
+        for b in &self.finalized {
+            b.write(out);
+        }
+        match &self.current {
+            Some(b) => {
+                out.push(1);
+                b.write(out);
+            }
+            None => out.push(0),
+        }
+    }
+    fn read(cur: &mut &[u8]) -> Option<Self> {
+        let resolution_nanos = u64::from_be_bytes(take::<8>(cur)?);
+        let capacity = read_u32(cur)? as usize;
+        let n = read_u32(cur)? as usize;
+        let mut finalized = VecDeque::with_capacity(n);
+        for _ in 0..n {
+            finalized.push_back(Bucket::read(cur)?);
+        }
+        let current = match take::<1>(cur)?[0] {
+            0 => None,
+            _ => Some(Bucket::read(cur)?),
+        };
+        Some(Self {
+            resolution_nanos: resolution_nanos.max(1),
+            capacity: capacity.max(1),
+            finalized,
+            current,
+        })
+    }
+}
+
+impl Series {
+    fn write(&self, out: &mut Vec<u8>) {
+        write_u16(out, self.tiers.len() as u16);
+        for t in &self.tiers {
+            t.write(out);
+        }
+    }
+    fn read(cur: &mut &[u8]) -> Option<Self> {
+        let n = read_u16(cur)? as usize;
+        let mut tiers = Vec::with_capacity(n);
+        for _ in 0..n {
+            tiers.push(Tier::read(cur)?);
+        }
+        if tiers.is_empty() {
+            return None;
+        }
+        Some(Self { tiers })
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::float_cmp)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::float_cmp,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -448,5 +607,38 @@ mod tests {
         assert!(store.series(MetricId::PHI).unwrap().latest().unwrap().last > 1.0);
         // The 7 system metrics (cpu..disk_write) plus the 5 coherence scalars (phi..gap).
         assert_eq!(store.metrics().count(), 12);
+    }
+
+    #[test]
+    fn snapshot_round_trips_the_store() {
+        let mut store = MetricStore::new(HistoryConfig::compact());
+        for i in 0..50u64 {
+            store.record(
+                MetricId::CPU,
+                i * S,
+                f64::from(u32::try_from(i % 10).unwrap()) / 10.0,
+            );
+        }
+        store.record(MetricId::PHI, 5 * S, 1.5);
+        let bytes = store.snapshot();
+        let back = MetricStore::restore(&bytes).expect("restores");
+        assert_eq!(back.metrics().count(), store.metrics().count());
+        assert_eq!(
+            back.series(MetricId::CPU).unwrap().latest(),
+            store.series(MetricId::CPU).unwrap().latest()
+        );
+        assert_eq!(
+            back.range(MetricId::CPU, 0, 100 * S),
+            store.range(MetricId::CPU, 0, 100 * S),
+            "history restored losslessly"
+        );
+        assert!(
+            MetricStore::restore(b"xxxx").is_none(),
+            "bad magic rejected"
+        );
+        assert!(
+            MetricStore::restore(&bytes[..3]).is_none(),
+            "truncation rejected"
+        );
     }
 }
