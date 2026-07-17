@@ -25,6 +25,8 @@ path = "src/bin/demo.rs"
 proptest.workspace = true
 # For decoding the mandatory CoherenceFrames nodes emit each diagnosis (telemetry e2e scenario).
 fanos-telemetry = { workspace = true, features = ["std"] }
+# For the DIAULOS-over-overlay scenario (a reliable encrypted session over the datagram transport).
+fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
 # For the NYX anonymity-routing scenario (real onion over the simulated network).
 fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
 fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }

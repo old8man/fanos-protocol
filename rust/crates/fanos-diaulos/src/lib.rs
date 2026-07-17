@@ -32,6 +32,7 @@ pub mod conn;
 pub mod endpoint;
 pub mod frame;
 pub mod handshake;
+pub mod overlay;
 pub mod session;
 
 pub use cell::{CELL_LEN, Key, open, seal};
@@ -41,4 +42,5 @@ pub use frame::Frame;
 pub use handshake::{
     ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, service_public_from_bundle,
 };
+pub use overlay::{ClientSession, Coord, ServerSession};
 pub use session::{Dialed, PendingDial, accept, dial, dial_bundle};

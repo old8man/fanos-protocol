@@ -835,6 +835,7 @@ dependencies = [
  "fanos-core",
  "fanos-crypto",
  "fanos-diakrisis",
+ "fanos-diaulos",
  "fanos-field",
  "fanos-geometry",
  "fanos-incentives",
