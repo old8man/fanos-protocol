@@ -183,4 +183,36 @@ mod tests {
         );
         assert_eq!(reconstruct(&[]), Err(ShamirError::BadShares));
     }
+
+    #[test]
+    fn reconstruct_rejects_malformed_share_sets() {
+        // x = 0 is the secret slot, never a valid share index.
+        assert_eq!(
+            reconstruct(&[
+                Share { x: 0, y: [1].to_vec() },
+                Share { x: 2, y: [3].to_vec() },
+            ]),
+            Err(ShamirError::BadShares),
+            "a share at x = 0 is rejected"
+        );
+        // Duplicate x-coordinates (a replayed / forged share index) must be rejected rather than
+        // dividing by zero in the Lagrange denominator (add(x_m, x_j) = 0 when x_m == x_j).
+        assert_eq!(
+            reconstruct(&[
+                Share { x: 1, y: [5].to_vec() },
+                Share { x: 1, y: [6].to_vec() },
+            ]),
+            Err(ShamirError::BadShares),
+            "duplicate share indices are rejected, not a divide-by-zero"
+        );
+        // Shares of differing y-length cannot come from one split.
+        assert_eq!(
+            reconstruct(&[
+                Share { x: 1, y: [1, 2].to_vec() },
+                Share { x: 2, y: [3].to_vec() },
+            ]),
+            Err(ShamirError::BadShares),
+            "mismatched share lengths are rejected"
+        );
+    }
 }
