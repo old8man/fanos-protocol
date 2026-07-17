@@ -208,6 +208,29 @@ mod tests {
     }
 
     #[test]
+    fn reduce_canonicalizes_out_of_range_inputs() {
+        // MapToPoint feeds hash values (typically ≥ Q) through `reduce`, so its behavior past the
+        // field order is load-bearing, and it differs by field kind:
+        // prime field GF(p): reduction modulo p.
+        assert_eq!(F7::reduce(7), 0);
+        assert_eq!(F7::reduce(8), 1);
+        assert_eq!(F7::reduce(100), (100 % 7) as u32);
+        assert_eq!(F7::reduce(u64::MAX), (u64::MAX % 7) as u32);
+        // binary extension field GF(2^m): truncation to the low m bits (not polynomial reduction).
+        assert_eq!(F4::reduce(4), 0, "GF(4) keeps the low 2 bits");
+        assert_eq!(F4::reduce(5), 1);
+        assert_eq!(F4::reduce(0xFF), 3);
+        assert_eq!(F16::reduce(0xFFFF), 0xF, "GF(16) keeps the low 4 bits");
+        // In both kinds an already-canonical element is unchanged.
+        for a in 0..F7::Q {
+            assert_eq!(F7::reduce(u64::from(a)), a);
+        }
+        for a in 0..F4::Q {
+            assert_eq!(F4::reduce(u64::from(a)), a);
+        }
+    }
+
+    #[test]
     fn field_orders_match_spec() {
         assert_eq!(F2::Q, 2);
         assert_eq!(F256::Q, 256);

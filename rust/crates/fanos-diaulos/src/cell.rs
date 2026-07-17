@@ -114,4 +114,25 @@ mod tests {
     fn an_oversized_frame_is_rejected() {
         assert!(seal(&[0u8; 32], 0, &vec![0u8; CELL_PLAINTEXT + 1]).is_none());
     }
+
+    #[test]
+    fn a_frame_exactly_filling_the_cell_seals() {
+        // The `> CELL_PLAINTEXT` size guard's boundary: exactly CELL_PLAINTEXT bytes must still seal.
+        let key = [6u8; 32];
+        let frame = vec![0xABu8; CELL_PLAINTEXT];
+        let cell = seal(&key, 0, &frame).unwrap();
+        assert_eq!(cell.len(), CELL_LEN);
+        assert_eq!(open(&key, &cell).unwrap(), frame, "a max-size frame round-trips");
+    }
+
+    #[test]
+    fn tampering_the_cnonce_prefix_fails_to_open() {
+        // The explicit 8-byte counter prefix is the AEAD nonce. Flipping a bit there makes `open`
+        // derive a different nonce than the tag was sealed under, so authentication fails — the nonce
+        // is bound, not merely advisory.
+        let key = [5u8; 32];
+        let mut cell = seal(&key, 100, b"bind the nonce").unwrap();
+        cell[0] ^= 0x01;
+        assert!(open(&key, &cell).is_none(), "a tampered cnonce prefix is rejected");
+    }
 }

@@ -319,6 +319,30 @@ mod tests {
     }
 
     #[test]
+    fn point_new_validates_off_wire_coordinates() {
+        // The zero vector is not a projective point.
+        assert!(Point::<F7>::new([0, 0, 0]).is_none());
+        assert!(Line::<F7>::new([0, 0, 0]).is_none());
+        // A coordinate at or beyond the field order Q is out of range.
+        assert!(Point::<F7>::new([7, 0, 0]).is_none());
+        assert!(Point::<F7>::new([1, 0, 9]).is_none());
+        // A valid in-range triple is accepted and canonicalizes to a member of the enumeration.
+        let p = Point::<F7>::new([2, 4, 6]).unwrap();
+        assert_eq!(Point::<F7>::at(p.index()), p, "new ∘ index is the canonical point");
+    }
+
+    #[test]
+    fn a_line_does_not_meet_itself_and_a_point_does_not_join_itself() {
+        // The degenerate duals of the incidence operations: identical operands have no unique result.
+        for i in 0..Plane::<F7>::N as usize {
+            let l = Line::<F7>::at(i);
+            assert!(l.meet(&l).is_none(), "a line does not meet itself in one point");
+            let p = Point::<F7>::at(i);
+            assert!(p.join(&p).is_none(), "a point does not join itself into one line");
+        }
+    }
+
+    #[test]
     fn points_on_matches_brute_force_across_fields() {
         check_points_on_matches_brute_force::<F2>();
         check_points_on_matches_brute_force::<F7>();
