@@ -8,9 +8,9 @@
 use std::time::Duration as StdDuration;
 
 use fanos_field::F7;
-use fanos_geometry::Point;
+use fanos_geometry::{Point, Triple};
 use fanos_quic::{
-    Directory, NodeCredentials, spawn_self_certifying, spawn_self_certifying_persistent,
+    Directory, NodeCredentials, NodeHandle, spawn_self_certifying, spawn_self_certifying_persistent,
 };
 use fanos_runtime::{Command, Config, Engine, Notification, OverlayNode};
 
@@ -18,18 +18,28 @@ fn make_node(coord: Point<F7>) -> Box<dyn Engine + Send> {
     Box::new(OverlayNode::<F7>::new(coord, Config::default()))
 }
 
+/// Spawn a self-certifying node whose cert-derived coordinate (`MapToPoint(H(cert))`) differs from
+/// every one already in `taken`. A cell's members occupy **distinct** points, but two fresh
+/// identities collide on the same point `1/N` of the time — retry until distinct, otherwise the
+/// coordinate→node mapping is ambiguous and routing between the colliding pair breaks.
+async fn spawn_distinct(dir: &Directory, taken: &[Triple]) -> NodeHandle {
+    loop {
+        let node = spawn_self_certifying::<F7>(make_node, dir.clone())
+            .await
+            .expect("spawn");
+        if !taken.contains(&node.address()) {
+            return node;
+        }
+        node.shutdown();
+    }
+}
+
 #[tokio::test]
 async fn cert_bound_identity_delivers_and_authenticates_the_sender() {
     let dir = Directory::new();
-    let a = spawn_self_certifying::<F7>(make_node, dir.clone())
-        .await
-        .expect("spawn A");
-    let mut b = spawn_self_certifying::<F7>(make_node, dir.clone())
-        .await
-        .expect("spawn B");
-
-    // A and B sit at their cert-derived coordinates (no coordinate was assigned).
-    assert_ne!(a.address(), b.address());
+    // A and B sit at their cert-derived coordinates (none was assigned), at distinct points.
+    let a = spawn_distinct(&dir, &[]).await;
+    let mut b = spawn_distinct(&dir, &[a.address()]).await;
 
     let payload = b"authenticated by my certificate".to_vec();
     a.command(Command::Send {
@@ -56,15 +66,9 @@ async fn cert_bound_identity_delivers_and_authenticates_the_sender() {
 #[tokio::test]
 async fn an_impostor_at_the_resolved_address_is_rejected() {
     let dir = Directory::new();
-    let a = spawn_self_certifying::<F7>(make_node, dir.clone())
-        .await
-        .expect("spawn A");
-    let mut b = spawn_self_certifying::<F7>(make_node, dir.clone())
-        .await
-        .expect("spawn B");
-    let c = spawn_self_certifying::<F7>(make_node, dir.clone())
-        .await
-        .expect("spawn C");
+    let a = spawn_distinct(&dir, &[]).await;
+    let mut b = spawn_distinct(&dir, &[a.address()]).await;
+    let c = spawn_distinct(&dir, &[a.address(), b.address()]).await;
 
     // Poison the address book: B's coordinate now resolves to C's socket (a MITM / stale entry).
     dir.insert(b.address(), c.local_addr());

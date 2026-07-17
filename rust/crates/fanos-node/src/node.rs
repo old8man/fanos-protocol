@@ -221,16 +221,25 @@ mod tests {
         let a_addr = a.address();
         let a_net = a.local_addr();
 
-        let b = Node::start::<F2>(NodeConfig {
-            listen: loopback,
-            bootstrap: vec![crate::config::Peer {
-                coord: a_addr,
-                addr: a_net,
-            }],
-            ..NodeConfig::default()
-        })
-        .await
-        .unwrap();
+        // A node's coordinate is derived from its (fresh, random) identity, so two nodes collide on
+        // the same Fano point 1/7 of the time — which would make the coordinate→node mapping
+        // ambiguous and break routing. Start B until it lands on a point distinct from A (the cell
+        // invariant that members occupy distinct points).
+        let make_b = || {
+            Node::start::<F2>(NodeConfig {
+                listen: loopback,
+                bootstrap: vec![crate::config::Peer {
+                    coord: a_addr,
+                    addr: a_net,
+                }],
+                ..NodeConfig::default()
+            })
+        };
+        let mut b = make_b().await.unwrap();
+        while b.address() == a_addr {
+            b.shutdown();
+            b = make_b().await.unwrap();
+        }
         // b learned a via bootstrap; a learns b's address when b dials (the driver registers it).
         a.directory().insert(b.address(), b.local_addr());
 
