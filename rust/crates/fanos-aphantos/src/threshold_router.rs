@@ -41,6 +41,10 @@ pub const ANONYMOUS: Triple = [0, 0, 0];
 /// Default deadline for a combiner to gather `t` partials before abandoning a hop.
 const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// High bit marking a *mixing* timer token, distinguishing it from a gather-deadline token (which
+/// carries a small request id). No real request id reaches `2^63`.
+const MIX_FLAG: u64 = 1 << 63;
+
 /// A combiner's in-flight peel: the layer being gathered, its line, and the partials collected.
 struct Pending {
     line: Triple,
@@ -58,6 +62,13 @@ pub struct ThresholdRouter<F: Field> {
     gather_timeout: Duration,
     pending: BTreeMap<u64, Pending>,
     seq: u64,
+    /// Mean Poisson mixing delay before forwarding a peeled hop (0 ⇒ forward immediately). Holding
+    /// each forward for an independent exponential delay reorders a batch, breaking the timing
+    /// correlation an observer could otherwise use to link a hop's in- and out-flows (spec §L5/V7).
+    mean_delay: Duration,
+    /// Forwards held for their sampled mix delay, keyed by mix id (timer token = `MIX_FLAG | id`).
+    mix_pending: BTreeMap<u64, (Triple, Vec<u8>)>,
+    mix_seq: u64,
 }
 
 impl<F: Field> ThresholdRouter<F> {
@@ -71,6 +82,9 @@ impl<F: Field> ThresholdRouter<F> {
             gather_timeout: DEFAULT_GATHER_TIMEOUT,
             pending: BTreeMap::new(),
             seq: 0,
+            mean_delay: Duration(0),
+            mix_pending: BTreeMap::new(),
+            mix_seq: 0,
         }
     }
 
@@ -79,6 +93,46 @@ impl<F: Field> ThresholdRouter<F> {
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
         self.gather_timeout = timeout;
         self
+    }
+
+    /// Enable Poisson mixing: hold each forwarded hop for an exponential delay of mean `mean_delay`
+    /// before sending, so a batch of onions leaves reordered (spec §L5, V7). Zero disables it.
+    #[must_use]
+    pub fn with_mixing(mut self, mean_delay: Duration) -> Self {
+        self.mean_delay = mean_delay;
+        self
+    }
+
+    /// Forward `frame` to `to` — immediately, or (when mixing is on) held for a sampled exponential
+    /// mix delay so a batch of forwards leaves reordered.
+    fn forward_send(&mut self, to: Triple, frame: Vec<u8>) -> Vec<Effect> {
+        if self.mean_delay.as_nanos() == 0 {
+            return alloc::vec![Effect::Send { to, frame }];
+        }
+        self.mix_seq += 1;
+        let id = self.mix_seq;
+        let after = self.sample_delay(id);
+        self.mix_pending.insert(id, (to, frame));
+        alloc::vec![Effect::ArmTimer {
+            token: TimerToken(MIX_FLAG | id),
+            after,
+        }]
+    }
+
+    /// Sample an exponential mixing delay with the configured mean (`−mean·ln u`), seeded per node.
+    fn sample_delay(&self, id: u64) -> Duration {
+        let mut data = self
+            .coord
+            .coords()
+            .iter()
+            .flat_map(|w| w.to_be_bytes())
+            .collect::<Vec<u8>>();
+        data.extend_from_slice(&id.to_be_bytes());
+        let digest = fanos_crypto::hash_labeled("FANOS-v1/threshold-mix", &data);
+        let bits = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
+        let u = ((bits as f64) / (u64::MAX as f64 + 1.0)).max(1e-12);
+        let ns = (-(self.mean_delay.as_nanos() as f64) * u.ln()) as u64;
+        Duration(ns.max(1))
     }
 
     /// The canonical member coordinates of a hop line, in `points_on` order (the order a layer is
@@ -190,17 +244,15 @@ impl<F: Field> ThresholdRouter<F> {
                     payload,
                 })]
             }
-            Ok(ThresholdPeel::Forward { next, onion }) => Self::combiner_of(next)
-                .map(|c| {
+            Ok(ThresholdPeel::Forward { next, onion }) => match Self::combiner_of(next) {
+                Some(c) => {
                     // Re-pad the inner onion to the constant bucket so the forwarded packet is the
                     // same size as the one we received — no cross-hop size correlation.
                     let padded = threshold::pad_onion(&onion).unwrap_or(onion);
-                    alloc::vec![Effect::Send {
-                        to: c,
-                        frame: encode_onion(next, &padded),
-                    }]
-                })
-                .unwrap_or_default(),
+                    self.forward_send(c, encode_onion(next, &padded))
+                }
+                None => Vec::new(),
+            },
             Err(_) => Vec::new(), // malformed / below threshold → drop
         })
     }
@@ -226,10 +278,18 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                 },
                 _ => Vec::new(),
             },
-            // The gather deadline fired: drop an incomplete pending peel.
-            Input::Timer(TimerToken(req_id)) => {
-                self.pending.remove(&req_id);
-                Vec::new()
+            Input::Timer(TimerToken(token)) => {
+                if token & MIX_FLAG != 0 {
+                    // A held mix delay elapsed: release the forward now.
+                    match self.mix_pending.remove(&(token & !MIX_FLAG)) {
+                        Some((to, frame)) => alloc::vec![Effect::Send { to, frame }],
+                        None => Vec::new(),
+                    }
+                } else {
+                    // The gather deadline fired: drop an incomplete pending peel.
+                    self.pending.remove(&token);
+                    Vec::new()
+                }
             }
             Input::Command(_) => Vec::new(),
         }

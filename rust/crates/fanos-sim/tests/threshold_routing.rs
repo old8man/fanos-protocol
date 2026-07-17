@@ -21,13 +21,24 @@ use fanos_sim::Sim;
 /// Spawn a `ThresholdRouter` at every Fano point (threshold `t`), returning the public-key directory
 /// so the test can seal onions to the line members.
 fn spawn_routers(sim: &mut Sim, t: usize) -> BTreeMap<Triple, HybridKemPublic> {
+    spawn_routers_with(sim, t, Duration::from_millis(0))
+}
+
+/// As [`spawn_routers`], with a Poisson mixing mean delay on each router.
+fn spawn_routers_with(
+    sim: &mut Sim,
+    t: usize,
+    mean_delay: Duration,
+) -> BTreeMap<Triple, HybridKemPublic> {
     let mut pubs = BTreeMap::new();
     for i in 0..7 {
         let point = Point::<F2>::at(i);
         let mut rng = SeedRng::from_seed(&[0xA0, i as u8]);
         let (secret, public) = HybridKemSecret::generate(&mut rng);
         pubs.insert(point.coords(), public);
-        sim.add(Box::new(ThresholdRouter::<F2>::new(point, secret, t)));
+        sim.add(Box::new(
+            ThresholdRouter::<F2>::new(point, secret, t).with_mixing(mean_delay),
+        ));
     }
     pubs
 }
@@ -82,6 +93,34 @@ fn a_threshold_onion_routes_autonomously_and_delivers() {
     assert!(
         delivered.is_some(),
         "the threshold onion routes through both line-hops and delivers the payload"
+    );
+}
+
+#[test]
+fn a_threshold_onion_still_delivers_with_poisson_mixing() {
+    // With per-hop mixing enabled the onion is held for a sampled delay at each forward, reordering
+    // the flow — but it still reaches the destination once the delays elapse.
+    let mut sim = Sim::new(0x7A4);
+    let t = 2u8;
+    let pubs = spawn_routers_with(&mut sim, usize::from(t), Duration::from_millis(50));
+
+    let hop_lines = vec![Line::<F2>::at(0).coords(), Line::<F2>::at(3).coords()];
+    let payload = b"mixed threshold hello";
+    let onion = build_onion(&hop_lines, t, payload, &pubs);
+
+    let combiner = combiner_for::<F2>(hop_lines[0]).unwrap();
+    sim.inject_frame(
+        Point::<F2>::at(6).coords(),
+        combiner,
+        launch_frame(hop_lines[0], &onion),
+    );
+    sim.run_for(Duration::from_millis(4000)); // room for the sampled mix delays
+
+    assert!(
+        sim.report()
+            .deliveries()
+            .any(|(_, from, bytes)| from == ANONYMOUS && bytes == payload),
+        "the mixed threshold onion still delivers once the mix delays elapse"
     );
 }
 
