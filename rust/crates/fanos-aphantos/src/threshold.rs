@@ -51,10 +51,11 @@ pub enum ThresholdError {
 
 /// The fixed on-the-wire size of a threshold onion. Every hop's packet is padded to this constant
 /// bucket, so a passive observer cannot link hops by the shrinking layer size a naive nested onion
-/// leaks (spec §5.7). Sized to hold a Fano threshold circuit of several hops. (Residual, documented:
-/// the per-layer `ct_len` in the layer header is cleartext — needed by every line member to parse
-/// its share slot — so an observer that *parses* the packet still sees the layer size; full
-/// field-level hiding is the flat-header Sphinx construction. Packet **size** is fully constant.)
+/// leaks (spec §5.7). Sized to hold a Fano threshold circuit of several hops. Packet **size** is
+/// fully constant on the wire. (Residual, documented: the per-layer `ct_len` in the header is
+/// cleartext, so a party holding the *decrypted* packet — an on-path relay, or an observer of an
+/// un-encrypted hop — can read the layer size; the encrypting transport hides it from a passive
+/// network observer, and full defence-in-depth field hiding is the flat-header Sphinx construction.)
 /// It is a network-wide parameter — every node must agree on it — sized for the deepest supported
 /// threshold circuit (each hop costs `≈ line_size × 1169` bytes of KEM-sealed shares).
 pub const THRESHOLD_ONION_LEN: usize = 20480;
