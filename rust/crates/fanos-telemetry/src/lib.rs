@@ -13,13 +13,18 @@
 //! * [`frame`] — the [`CoherenceFrame`](frame::CoherenceFrame): the minimal sufficient statistic for
 //!   a cell's health at a window (3-bit syndrome + coherence scalars), with a canonical KAT-pinned
 //!   encoding. The load-bearing signal is 3 bits; the fold *is* the anonymization.
+//! * [`sysmetrics`] — platform-optimal acquisition of a node's raw vitals (CPU/memory/disk/network),
+//!   the sensory input whose [`pressure`](sysmetrics::SystemSample::pressure) becomes each node's
+//!   scalar in the cell correlation. Pure, tested parsers plus a cached-handle Linux `/proc` probe.
 //!
-//! Subsequent modules (system-metric acquisition, the local time-series history, the mandatory
-//! per-node observer loop, distributed collection, and the monitor WebSocket) build on this atom.
+//! Subsequent modules (the local time-series history, the mandatory per-node observer loop,
+//! distributed collection, and the monitor WebSocket) build on these.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
 pub mod frame;
+pub mod sysmetrics;
 
 pub use frame::{AlarmLevel, CellId, CoherenceFrame, FRAME_LEN, Regime};
+pub use sysmetrics::{CpuTimes, NullProbe, SystemProbe, SystemSample};
