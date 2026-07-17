@@ -104,10 +104,12 @@ healthy collective-subject band; wire length fields are `usize::try_from`-checke
 `wasm32` node cannot disagree; membership rejects non-canonical/zero coordinates and never lets a
 repeat announce overwrite a member's keys; the hybrid node-ID is pinned byte-for-byte to the
 canonical hashing rule; and a VRF key derives from *any* seed (a hash-to-scalar, not a 1-in-16
-canonical-bytes gate). Documented as known limitations with a fix path (see the module docs): the
-onion still shrinks one layer per hop (constant-size Tessera padding is a separate change), PROTEUS
-junk is per-epoch rather than per-packet, DKG completes on the full `n` (not a timed qualified
-subset), and L4 reads consult the primary rather than fanning across the full replica line.
+canonical-bytes gate). L4 reads now **repair across the replica line** — a `Get`
+queries the responsible primary, then falls back through the co-linear replicas on a miss or a
+silent-replica timeout, so any survivor answers even when the primary recovered empty after churn.
+Documented as known limitations with a fix path (see the module docs): the onion still shrinks one
+layer per hop (constant-size Tessera padding is a separate change), PROTEUS junk is per-epoch rather
+than per-packet, and DKG completes on the full `n` (not yet a timed qualified subset).
 
 ### Build, verify, and simulate
 

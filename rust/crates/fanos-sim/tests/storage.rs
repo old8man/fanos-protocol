@@ -96,6 +96,61 @@ fn the_value_is_replicated_across_the_cell() {
 }
 
 #[test]
+fn a_read_is_repaired_across_the_replica_line_when_the_primary_is_empty() {
+    // The subtle case the single-primary read misses: the responsible node is *up* but has lost its
+    // shard (it was down when the value was published, then recovered empty), while replicas still
+    // hold it. Read repair must fall back across the line and still find the value.
+    let (mut sim, cell) = established(11);
+    let (primary_idx, primary) = responsible(b"repair-key", &cell);
+    let putter = cell[(primary_idx + 1) % 7];
+    let querier = cell[(primary_idx + 3) % 7];
+
+    // The primary and the querier are both offline. The putter first detects the primary down and
+    // installs its reroute, so the Put lands on a co-linear survivor (which replicates to the live
+    // members) — the primary and querier never receive it.
+    sim.crash(primary);
+    sim.crash(querier);
+    sim.run_for(Duration::from_millis(3000)); // putter detects the primary down
+    sim.inject(putter, Command::Diagnose); // installs putter.reroute[primary] → survivor
+    sim.settle();
+    sim.inject(
+        putter,
+        Command::Put {
+            key: b"repair-key".to_vec(),
+            value: b"survived".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(1500));
+
+    // Both rejoin. The primary is now UP but empty (it missed the Put); the querier has no replica.
+    sim.recover(primary);
+    sim.recover(querier);
+    sim.inject(primary, Command::StartHeartbeat);
+    sim.inject(querier, Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(3000));
+
+    sim.inject(
+        querier,
+        Command::Get {
+            key: b"repair-key".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(3000));
+
+    let got = sim
+        .report()
+        .retrievals()
+        .filter(|(who, _, _)| *who == querier)
+        .last()
+        .map(|(_, _, v)| v.map(<[u8]>::to_vec));
+    assert_eq!(
+        got,
+        Some(Some(b"survived".to_vec())),
+        "read repair: an empty primary falls back to a replica that still holds the value"
+    );
+}
+
+#[test]
 fn a_get_through_a_crashed_primary_reroutes_to_a_replica() {
     // The headline compose: a querier that missed the replica looks up the responsible node while
     // it is DOWN, and the self-healing reroute serves the value from a co-linear survivor.

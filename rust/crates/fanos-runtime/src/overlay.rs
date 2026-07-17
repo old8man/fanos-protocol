@@ -47,6 +47,10 @@ pub struct Config {
     /// gossip alone (own direct observation is always trusted). Tolerates up to `quorum − 1`
     /// Byzantine liars falsely vouching for a dead node (spec §6.4). Default `2`.
     pub corroboration_quorum: usize,
+    /// How long a `Get` waits for a replica's `Value` answer before falling back to the next
+    /// replica on the responsible point's line (spec §L4 read repair). Only bounds the latency of
+    /// the *silent-replica* case — a `found=false` answer advances immediately. Default `1600 ms`.
+    pub read_timeout: Duration,
 }
 
 impl Default for Config {
@@ -57,8 +61,18 @@ impl Default for Config {
             healthy_correlation: 0.45,
             self_healing: true,
             corroboration_quorum: 2,
+            read_timeout: Duration::from_millis(1600),
         }
     }
+}
+
+/// An in-flight `Get` awaiting a replica's answer: the replica candidates not yet tried (the
+/// primary is queried first, these are the LRC fallbacks) and when the current query was issued
+/// (for the silent-replica timeout). Read repair across the responsible line (spec §L4).
+#[derive(Clone, Debug)]
+struct PendingGet {
+    issued: Instant,
+    remaining: Vec<Triple>,
 }
 
 /// What we know about a cell neighbour.
@@ -97,6 +111,11 @@ pub struct OverlayNode<F: Field> {
     /// LRC availability, so any survivor answers a lookup — and a lookup to a *down* primary
     /// reroutes to a replica through the same self-healing table (§6.7).
     store: BTreeMap<[u8; DIGEST], Vec<u8>>,
+    /// In-flight `Get`s awaiting a `Value` answer, keyed by digest (spec §L4 read repair). A read
+    /// consults the primary, then falls back through the replica line on a `found=false` or a
+    /// silent-replica timeout, concluding "absent" only once the replicas are exhausted — so any
+    /// surviving replica answers even when the primary recovered empty after churn.
+    pending_gets: BTreeMap<[u8; DIGEST], PendingGet>,
     /// The membership view: cell coordinate → announced info (public keys, capabilities), learned
     /// by flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
     members: BTreeMap<Triple, Vec<u8>>,
@@ -139,6 +158,7 @@ impl<F: Field> OverlayNode<F> {
             quarantined: BTreeSet::new(),
             witnessed: BTreeMap::new(),
             store: BTreeMap::new(),
+            pending_gets: BTreeMap::new(),
             members: BTreeMap::new(),
             epoch: 0,
         }
@@ -206,11 +226,29 @@ impl<F: Field> OverlayNode<F> {
                 });
             }
         }
+        // Read repair: advance any Get whose current replica has gone silent past the read timeout.
+        self.sweep_pending_gets(now, &mut effects);
         effects.push(Effect::ArmTimer {
             token: HEARTBEAT,
             after: self.config.heartbeat,
         });
         effects
+    }
+
+    /// Advance reads whose outstanding replica has not answered within `read_timeout`: try the next
+    /// replica on the line, or conclude `Retrieved(None)` once they are exhausted (spec §L4). This
+    /// is the backstop for a *crashed* replica (a live one answers `found=false` immediately).
+    fn sweep_pending_gets(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+        let timeout = self.config.read_timeout;
+        let stale: Vec<[u8; DIGEST]> = self
+            .pending_gets
+            .iter()
+            .filter(|(_, p)| now.since(p.issued) > timeout)
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in stale {
+            self.advance_pending_get(now, digest, effects);
+        }
     }
 
     /// Encode this node's direct-observation ages over the Fano cell: `7 × u16` little-endian
@@ -302,7 +340,7 @@ impl<F: Field> OverlayNode<F> {
             }
             Some(FrameType::Publish) => self.on_publish(from, frame.body),
             Some(FrameType::Lookup) => self.on_lookup(from, frame.body),
-            Some(FrameType::Value) => Self::on_value(frame.body),
+            Some(FrameType::Value) => self.on_value(now, frame.body),
             Some(FrameType::Ack) => Self::on_ack(frame.body),
             Some(FrameType::Announce) => self.on_announce(frame.body),
             Some(FrameType::Beacon) => self.on_beacon(frame.body),
@@ -352,19 +390,17 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
-    /// `Command::Get` — answer from the local replica if present, else look up the responsible
-    /// node (rerouted to a replica if that node is *down*, spec §6.7).
+    /// `Command::Get` — answer from the local replica if present, else read-repair across the
+    /// responsible point's replica line (spec §L4).
     ///
-    /// Known limitation (spec §7.8, tracked): the read consults the responsible node (or its
-    /// reroute target), not the full quorum-line of replicas. If the primary is *up but has lost
-    /// its shard* — e.g. it crashed after a value was published, then recovered empty while the
-    /// value still lives on other cell replicas — this returns `Retrieved(None)` even though a
-    /// survivor holds it. A complete fix fans the lookup across the responsible point's line and
-    /// concludes "absent" only after the replicas are exhausted, which needs per-request pending
-    /// state + a timeout (the primary's single authoritative answer is what the stateless path
-    /// relies on today). The write path already replicates to every member, so the data is present;
-    /// only this read path underuses it.
-    fn on_get(&mut self, key: &[u8]) -> Vec<Effect> {
+    /// A `Put` replicates to every cell member, so any survivor holds the value. The read queries
+    /// the responsible primary first (rerouted to a co-linear survivor if it is *down*, §6.7) and,
+    /// on a `found=false` reply or a silent-replica timeout, falls back through the remaining
+    /// replicas — concluding `Retrieved(None)` only once they are exhausted. This makes the LRC
+    /// availability guarantee hold on *read* too: a value is found even when the primary recovered
+    /// empty after churn while replicas still hold it. The in-flight query is tracked in
+    /// [`pending_gets`](Self::pending_gets); [`on_value`](Self::on_value) and the heartbeat sweep drive it.
+    fn on_get(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
         let (digest, primary) = Self::address_of(key);
         if let Some(value) = self.store.get(&digest) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
@@ -372,6 +408,21 @@ impl<F: Field> OverlayNode<F> {
                 value: Some(value.clone()),
             })];
         }
+        // Fallback replicas: every other cell member could hold a replica; query the primary now
+        // and keep the rest (live ones first) for read repair. A repeat Get simply refreshes them.
+        let remaining: Vec<Triple> = self
+            .peers
+            .keys()
+            .copied()
+            .filter(|&c| c != primary)
+            .collect();
+        self.pending_gets.insert(
+            digest,
+            PendingGet {
+                issued: now,
+                remaining,
+            },
+        );
         alloc::vec![self.routed_send(primary, encode_lookup(&digest))]
     }
 
@@ -422,16 +473,58 @@ impl<F: Field> OverlayNode<F> {
         }]
     }
 
-    fn on_value(body: &[u8]) -> Vec<Effect> {
+    /// A `Value` reply to one of our lookups (spec §L4). `found=true` resolves the pending read
+    /// with the value; `found=false` advances to the next replica on the line, or concludes
+    /// `Retrieved(None)` once the replicas are exhausted (read repair).
+    fn on_value(&mut self, now: Instant, body: &[u8]) -> Vec<Effect> {
         let Some(digest) = parse_digest(body.get(..DIGEST)) else {
             return Vec::new();
         };
         let found = body.get(DIGEST).copied().unwrap_or(0) != 0;
-        let value = found.then(|| body.get(DIGEST + 1..).unwrap_or(&[]).to_vec());
-        alloc::vec![Effect::Notify(Notification::Retrieved {
-            key: digest,
-            value
-        })]
+        if found {
+            // A survivor has it. Deliver once and retire the pending read (later dup replies are
+            // ignored because the entry is gone).
+            self.pending_gets.remove(&digest);
+            let value = Some(body.get(DIGEST + 1..).unwrap_or(&[]).to_vec());
+            return alloc::vec![Effect::Notify(Notification::Retrieved {
+                key: digest,
+                value
+            })];
+        }
+        // A negative reply: advance the pending read to the next replica, or conclude it absent.
+        // (No pending entry ⇒ already resolved / stale reply ⇒ nothing to do.)
+        let mut effects = Vec::new();
+        if self.pending_gets.contains_key(&digest) {
+            self.advance_pending_get(now, digest, &mut effects);
+        }
+        effects
+    }
+
+    /// Advance one pending `Get` after its outstanding replica declined or went silent: query the
+    /// next replica on the responsible line, or — once they are exhausted — conclude `Retrieved(None)`
+    /// and retire the read. The single seam shared by the negative-reply and timeout-sweep paths.
+    fn advance_pending_get(
+        &mut self,
+        now: Instant,
+        digest: [u8; DIGEST],
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(pending) = self.pending_gets.get_mut(&digest) else {
+            return;
+        };
+        if let Some(next) = pending.remaining.pop() {
+            pending.issued = now;
+            effects.push(Effect::Send {
+                to: next,
+                frame: encode_lookup(&digest),
+            });
+        } else {
+            self.pending_gets.remove(&digest);
+            effects.push(Effect::Notify(Notification::Retrieved {
+                key: digest,
+                value: None,
+            }));
+        }
     }
 
     fn on_ack(body: &[u8]) -> Vec<Effect> {
@@ -616,7 +709,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Send { to, payload }) => self.on_send(to, &payload),
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Put { key, value }) => self.on_put(&key, value),
-            Input::Command(Command::Get { key }) => self.on_get(&key),
+            Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
             Input::Timer(HEARTBEAT) if self.heartbeating => self.on_heartbeat(now),
