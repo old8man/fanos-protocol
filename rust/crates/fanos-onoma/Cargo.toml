@@ -1,0 +1,28 @@
+[package]
+name = "fanos-onoma"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ONOMA — the FANOS self-certifying name system (.fanos): post-quantum commitment addresses, bech32m codec, unenumerable epoch derivations, readable names & subdomains."
+keywords = ["naming", "self-certifying", "bech32m", "post-quantum", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-crypto.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc", "fanos-crypto/std", "fanos-geometry/std"]
+alloc = ["fanos-crypto/alloc", "fanos-geometry/alloc"]
+
+[dev-dependencies]
+proptest.workspace = true
+fanos-field = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

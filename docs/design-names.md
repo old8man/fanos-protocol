@@ -217,25 +217,40 @@ who need unlinkability use L-key/L-pet, which leak nothing.
 
 ---
 
-## 10. Mapping to the built substrate & what Phase 2 adds
+## 10. Implementation status & what remains
 
-**Already built and reused:** self-certifying identity (`coord = MapToPoint(H(cert))`), the
-offline-root→epoch `SigningKeyCert` hierarchy (CALYPSO-Balance), the projective **LRC descriptor store**
-with L4 read-repair, geometry routing (`points_on` / `MapToPoint`), CALYPSO intro/rendezvous, adaptive
-PoW, Lindbladian rate limiting, hybrid PQ keys, BLAKE3.
+**Reused substrate:** self-certifying identity (`coord = MapToPoint(H(cert))`), the offline-root→epoch
+`SigningKeyCert` hierarchy (CALYPSO-Balance), the projective **LRC descriptor store** with L4 read-repair,
+geometry routing (`points_on` / `MapToPoint`), CALYPSO intro/rendezvous, adaptive PoW, Lindbladian rate
+limiting, hybrid PQ keys, BLAKE3.
 
-**Phase 2 adds (small, well-scoped):**
+**Built now — the `fanos-onoma` crate (`no_std` + alloc, 30 tests, KAT-pinned):**
 
-1. `fanos-onoma` crate (no_std core): the bech32m address codec (`encode`/`decode`/checksum), the
-   version registry, the `L`/`K` epoch-key derivations, and the word-list renderer — all pure, KAT-pinned
-   in `conformance/vectors/` so every implementation produces byte-identical addresses.
-2. A `Resolver` engine (sans-I/O): address → descriptor fetch → client-side verify+select → keys+intro
-   points, plus the L-pet zone walk.
-3. Integration into `fanos proxy`/`fanos vpn` (design.md §5/§11): `.fanos` short-circuits to the resolver;
-   clearnet names go over the exit.
-4. Sim tests: self-certification (tamper a byte → rejected), unenumerability (store cannot derive addr),
-   squat-DoS (junk blobs ignored, PoW throttles), rotation (epoch key change, address stable), migration
-   (dual-version dual-publish resolves), petname delegation chains.
+- **L-key** — `address` (the versioned PQ-commitment `Address`, `verifies`, `.fanos` display + parse,
+  version dispatch), `bech32` (a from-scratch BIP-350 codec, pinned against BIP-350 vectors incl. the
+  bech32-vs-bech32m discriminator), `mnemonic` (dictionary-free proquint rendering).
+- **Derivations** — `derive` (`lookup_key` / `descriptor_key` / `lookup_point`): the rotating,
+  unenumerable, address-gated per-epoch material.
+- **L-pet readable names & subdomains** — `name` (strict LDH, homograph-safe), `zone` (signed
+  `Zone`/`Record`/`Target`, apex `@`, signature-agnostic `verify`, and `resolve` walking delegations for
+  subdomains), `registry` (`Registry` trait, `LocalRegistry`, and `MemoryNamespace` implementing
+  `ZoneSource` for a complete in-memory readable-name + subdomain resolver).
+- **L-global issuance seam** — `registry::Registration` (a signed, canonical, verifiable claim binding a
+  top-level label to a target) behind the `Registry` trait, so a chain backend drops in without touching
+  resolution.
+- KAT-pinned in `conformance/vectors/names.json` so every implementation produces byte-identical
+  addresses, mnemonics, and derivations.
 
-L-global (the coherent-chain global registry) is deferred to Phase 6 with the blockchain, kept strictly
-optional so the base name system never depends on consensus.
+**Remaining (integration, next):**
+
+1. A sans-I/O `Resolver` engine binding `derive` + the descriptor store: address → epoch lookup → fetch →
+   client-side verify+select → keys+intro points (client-is-the-authority), with a local `MemoryNamespace`
+   cache for readable names.
+2. Integration into `fanos proxy` / `fanos vpn` (design.md §5/§11): `.fanos` short-circuits to the
+   resolver; clearnet names go over the exit.
+3. Sim tests over the network: unenumerability (store cannot derive addr), squat-DoS (junk blobs ignored,
+   PoW throttles), rotation (epoch key change, address stable), migration (dual-version dual-publish),
+   multi-hop delegation chains.
+4. **L-global settlement backend** (Phase 6): a coherent-chain `Registry` implementation with
+   commit-reveal issuance — the only piece needing consensus, kept strictly optional so the base name
+   system never depends on it.

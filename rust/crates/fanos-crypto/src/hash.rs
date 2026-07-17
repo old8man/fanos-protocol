@@ -25,6 +25,12 @@ pub mod label {
     pub const NODE_ID: &str = "FANOS-v1/node-id";
     /// L4 storage key → responsible point / key digest (`MapToPoint`, spec §L4).
     pub const STORAGE: &str = "FANOS-v1/storage";
+    /// ONOMA address commitment: `BLAKE3` of the canonical hybrid key bundle (name system).
+    pub const ONOMA_ADDR: &str = "FANOS-v1/onoma-addr";
+    /// ONOMA per-epoch descriptor **lookup** key / coordinate (unenumerable rendezvous).
+    pub const ONOMA_LOOKUP: &str = "FANOS-v1/onoma-lookup";
+    /// ONOMA per-epoch descriptor **encryption** key (address-gated confidentiality).
+    pub const ONOMA_ENC: &str = "FANOS-v1/onoma-enc";
 }
 
 /// A domain-separated BLAKE3 hasher. The label and a unit separator are absorbed first, so

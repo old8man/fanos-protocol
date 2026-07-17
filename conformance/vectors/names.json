@@ -1,0 +1,41 @@
+{
+  "description": "ONOMA name-system known-answer tests (design: docs/design-names.md). Any implementation must reproduce these byte-for-byte to interoperate. An address is a post-quantum commitment to a key bundle, bech32m-encoded; per-epoch derivations make descriptors unenumerable. Pinned by the Rust reference suite (fanos-onoma/tests/conformance.rs).",
+  "address": {
+    "comment": "payload = version(0x01) || commitment(32); commitment = BLAKE3-256 under domain label 'FANOS-v1/onoma-addr' of the key bundle. Encoded bech32m (BIP-350) under the stable HRP 'onoma'; the canonical display name strips the 'onoma1' prefix and appends '.<tld>' (default '.fanos'). The mnemonic is the proquint rendering of the 32-byte commitment (16 groups), consonants 'bdfghjklmnprstvz', vowels 'aiou'.",
+    "hrp": "onoma",
+    "default_tld": "fanos",
+    "version": 1,
+    "commit_label": "FANOS-v1/onoma-addr",
+    "vectors": [
+      {
+        "bundle_utf8": "fanos-onoma-conformance-service",
+        "bundle_hex": "66616e6f732d6f6e6f6d612d636f6e666f726d616e63652d73657276696365",
+        "commitment_hex": "02659bc321a2475eec776ea6a3be81fb3b649d3328eb930353177c93833ce0d1",
+        "name": "qypxtx7ryx3ywhhvwah2dga7s8ankeyaxv5whycr2vtheyur8nsdzwqysun.fanos",
+        "bech32m": "onoma1qypxtx7ryx3ywhhvwah2dga7s8ankeyaxv5whycr2vtheyur8nsdzwqysun",
+        "mnemonic": "v1-banoj-nozag-fakof-hitiv-vudul-kupok-pavuv-malur-gotoh-nuhug-fogor-nasag-jasil-lufig-masus-vagid"
+      }
+    ]
+  },
+  "derivations": {
+    "comment": "Per-epoch descriptor derivations. input = payload(version||commitment) || epoch as little-endian u64. lookup_key = BLAKE3 under 'FANOS-v1/onoma-lookup'; descriptor_key = BLAKE3 under 'FANOS-v1/onoma-enc'; lookup_point = MapToPoint('FANOS-v1/onoma-lookup', input) over the deployment field (canonical projective coordinate).",
+    "vectors": [
+      {
+        "bundle_utf8": "fanos-onoma-conformance-service",
+        "epoch": 42,
+        "lookup_key_hex": "3936a45cef80a5c80bc7a1c137d0255082e65f32fa13265550b223627b98f689",
+        "descriptor_key_hex": "54b6eb245c20efeae57d43aa59d89925fa99e63984c8188baf111788acf632f1",
+        "field": 7,
+        "lookup_point": [1, 5, 3]
+      }
+    ]
+  },
+  "readable_names": {
+    "comment": "Readable names & subdomains (L-pet). A registry maps a top-level label to a Target (Delegate to a zone key, or a terminal Address). Subdomains resolve by walking delegated zones; a name terminating on a zone follows its apex '@' record. Names are strict lower-case ASCII LDH (letters/digits/hyphen).",
+    "label_rules": {
+      "charset": "abcdefghijklmnopqrstuvwxyz0123456789-",
+      "max_label_len": 63,
+      "no_leading_or_trailing_hyphen": true
+    }
+  }
+}

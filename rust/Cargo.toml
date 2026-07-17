@@ -23,6 +23,7 @@ members = [
     "crates/fanos-quic",
     "crates/fanos-runtime",
     "crates/fanos-vrf",
+    "crates/fanos-onoma",
     "crates/fanos-incentives",
     "crates/fanos-keygen",
     "crates/fanos-sim",
@@ -83,6 +84,7 @@ fanos-code = { path = "crates/fanos-code", version = "0.1.0", default-features =
 fanos-diakrisis = { path = "crates/fanos-diakrisis", version = "0.1.0", default-features = false }
 fanos-wire = { path = "crates/fanos-wire", version = "0.1.0", default-features = false }
 fanos-crypto = { path = "crates/fanos-crypto", version = "0.1.0", default-features = false }
+fanos-onoma = { path = "crates/fanos-onoma", version = "0.1.0", default-features = false }
 fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }
 fanos-runtime = { path = "crates/fanos-runtime", version = "0.1.0", default-features = false }
 

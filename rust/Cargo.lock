@@ -724,6 +724,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-onoma"
+version = "0.1.0"
+dependencies = [
+ "fanos-crypto",
+ "fanos-field",
+ "fanos-geometry",
+ "proptest",
+]
+
+[[package]]
 name = "fanos-pqcrypto"
 version = "0.1.0"
 dependencies = [
