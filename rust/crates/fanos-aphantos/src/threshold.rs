@@ -337,7 +337,25 @@ pub fn peel_onion(
         .iter()
         .filter_map(|(i, sk)| sealed.member_share(*i, sk))
         .collect();
-    let cmd = sealed.open(&shares)?;
+    peel_command(&sealed, &shares)
+}
+
+/// Peel one threshold hop from **already-gathered member shares** (the form an autonomous combiner
+/// uses: it collects `≥ threshold` `PartialDec` replies, then peels). Fewer than `threshold` shares
+/// fail with [`ThresholdError::Aead`].
+pub fn peel_onion_with_shares(
+    onion: &[u8],
+    shares: &[Share],
+) -> Result<ThresholdPeel, ThresholdError> {
+    let sealed = ThresholdSealed::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
+    peel_command(&sealed, shares)
+}
+
+fn peel_command(
+    sealed: &ThresholdSealed,
+    shares: &[Share],
+) -> Result<ThresholdPeel, ThresholdError> {
+    let cmd = sealed.open(shares)?;
     let (&tag, rest) = cmd.split_first().ok_or(ThresholdError::Malformed)?;
     match tag {
         CMD_DELIVER => Ok(ThresholdPeel::Deliver {
@@ -351,6 +369,19 @@ pub fn peel_onion(
         }
         _ => Err(ThresholdError::Malformed),
     }
+}
+
+/// Compute a single member's Shamir share of a threshold onion layer — the `PartialDec` a line
+/// member returns to the combiner (spec §5.2). `member_index` is the member's position in the line's
+/// canonical `points_on` ordering (the order the layer was sealed in). Returns `None` if the slot is
+/// not this member's or is tampered.
+#[must_use]
+pub fn member_partial(
+    onion: &[u8],
+    member_index: usize,
+    secret: &HybridKemSecret,
+) -> Option<Share> {
+    ThresholdSealed::from_bytes(onion)?.member_share(member_index, secret)
 }
 
 #[cfg(test)]
@@ -369,6 +400,34 @@ mod tests {
 
     fn randomness(n: usize) -> Vec<u8> {
         (0..n).map(|i| ((i * 131 + 7) % 251) as u8).collect()
+    }
+
+    #[test]
+    fn the_combiner_path_gathers_partials_and_peels() {
+        use fanos_geometry::Point;
+        // The autonomous-combiner form: each line member computes its `member_partial`, a combiner
+        // collects >= t of them and peels via `peel_onion_with_shares`.
+        let t = 3u8;
+        let kps = line(5, 55);
+        let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
+        let hop = HopLine {
+            line: Point::<fanos_field::F2>::at(1).coords(),
+            members: &pubs,
+        };
+        let onion = seal_onion(&[hop], t, b"deliver me", b"seed").unwrap();
+
+        // Members 0,2,4 each independently produce their partial share.
+        let partials: Vec<Share> = [0usize, 2, 4]
+            .iter()
+            .map(|&i| member_partial(&onion, i, &kps[i].0).unwrap())
+            .collect();
+        // A combiner with those t partials peels the hop.
+        match peel_onion_with_shares(&onion, &partials).unwrap() {
+            ThresholdPeel::Deliver { payload } => assert_eq!(payload, b"deliver me"),
+            ThresholdPeel::Forward { .. } => panic!("single hop should deliver"),
+        }
+        // A member decapsulating the wrong slot gets nothing (index 0 with member 2's secret).
+        assert!(member_partial(&onion, 0, &kps[2].0).is_none());
     }
 
     #[test]
