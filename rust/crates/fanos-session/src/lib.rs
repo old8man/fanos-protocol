@@ -15,11 +15,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::future::Future;
 use std::time::Duration;
 
-use fanos_diaulos::ClientSession;
+use fanos_diaulos::{ClientSession, Coord};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// The internal duplex buffer between the app and the driver.
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -47,6 +48,64 @@ pub fn stream_over_channels(session: ClientSession, transport: ChannelTransport)
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
     tokio::spawn(drive(session, driver_side, transport));
     app_side
+}
+
+/// A coordinate-addressed datagram transport — the base overlay as the async stream sees it: send a
+/// framed payload to a coordinate (like `Command::Send`), and await `(from, payload)` deliveries. A
+/// production impl wraps the node's client; a test impl uses channels. The anonymous rendezvous is a
+/// different impl of the same trait.
+pub trait OverlayTransport: Send + 'static {
+    /// Send `payload` to coordinate `to` (fire-and-forget).
+    fn send(&self, to: Coord, payload: Vec<u8>);
+    /// Await the next delivery `(from, payload)`; `None` once the transport closes.
+    fn recv(&mut self) -> impl Future<Output = Option<(Coord, Vec<u8>)>> + Send;
+}
+
+/// Dial a `ClientSession` over a coordinate-addressed [`OverlayTransport`], returning the async byte
+/// stream. Outbound payloads are `send`-t to the session's peer coordinate; deliveries *from* that
+/// coordinate feed the session (others are ignored). Must run inside a tokio runtime.
+#[must_use]
+pub fn dial_over_transport<T: OverlayTransport>(
+    session: ClientSession,
+    transport: T,
+) -> DuplexStream {
+    let peer = session.peer();
+    let (out_tx, out_rx) = unbounded_channel();
+    let (in_tx, in_rx) = unbounded_channel();
+    tokio::spawn(bridge(transport, peer, out_rx, in_tx));
+    stream_over_channels(
+        session,
+        ChannelTransport {
+            outbound: out_tx,
+            inbound: in_rx,
+        },
+    )
+}
+
+/// Bridge the channel transport to a coordinate-addressed overlay: outbound payloads go to `peer`;
+/// deliveries from `peer` come back in.
+async fn bridge<T: OverlayTransport>(
+    mut transport: T,
+    peer: Coord,
+    mut out_rx: UnboundedReceiver<Vec<u8>>,
+    in_tx: UnboundedSender<Vec<u8>>,
+) {
+    loop {
+        tokio::select! {
+            payload = out_rx.recv() => match payload {
+                Some(p) => transport.send(peer, p),
+                None => return,
+            },
+            delivery = transport.recv() => match delivery {
+                Some((from, payload)) => {
+                    if from == peer && in_tx.send(payload).is_err() {
+                        return;
+                    }
+                }
+                None => return,
+            },
+        }
+    }
 }
 
 async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport: ChannelTransport) {
@@ -117,7 +176,6 @@ mod tests {
     use super::*;
     use fanos_diaulos::{ServerSession, StaticKeypair};
     use fanos_pqcrypto::rng::SeedRng;
-    use tokio::sync::mpsc;
 
     /// A minimal async service loop: drive a `ServerSession` over the mirror channels and answer the
     /// request (uppercased) once fully received — the loopback peer for the async-stream test.
@@ -164,8 +222,8 @@ mod tests {
         // The coordinate is unused by the channel transport (it addresses the single peer).
         let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
 
-        let (c2s_tx, c2s_rx) = mpsc::unbounded_channel();
-        let (s2c_tx, s2c_rx) = mpsc::unbounded_channel();
+        let (c2s_tx, c2s_rx) = unbounded_channel();
+        let (s2c_tx, s2c_rx) = unbounded_channel();
         let mut stream = stream_over_channels(
             client,
             ChannelTransport {
@@ -189,5 +247,94 @@ mod tests {
             result, b"HELLO ASYNC",
             "response arrived through the async DIAULOS stream"
         );
+    }
+
+    const CLIENT: Coord = [1, 0, 0];
+    const SERVICE: Coord = [0, 1, 0];
+
+    /// A channel-backed [`OverlayTransport`] for the test: sends go to the mock network; deliveries
+    /// come back from it.
+    struct MockTransport {
+        to_net: UnboundedSender<(Coord, Vec<u8>)>,
+        from_net: UnboundedReceiver<(Coord, Vec<u8>)>,
+    }
+
+    impl OverlayTransport for MockTransport {
+        fn send(&self, to: Coord, payload: Vec<u8>) {
+            let _ = self.to_net.send((to, payload));
+        }
+        async fn recv(&mut self) -> Option<(Coord, Vec<u8>)> {
+            self.from_net.recv().await
+        }
+    }
+
+    /// The mock service: drive a `ServerSession` over the network channels, tagging replies with the
+    /// service coordinate so the client's transport accepts them, and answer the request uppercased.
+    async fn mock_service(
+        keypair: StaticKeypair,
+        mut inbound: UnboundedReceiver<(Coord, Vec<u8>)>,
+        outbound: UnboundedSender<(Coord, Vec<u8>)>,
+    ) {
+        let mut server = ServerSession::new(keypair);
+        let mut rng = SeedRng::from_seed(b"mock-svc");
+        let mut ticker = tokio::time::interval(TICK);
+        let mut answered = false;
+        loop {
+            for payload in server.poll_payloads() {
+                if outbound.send((SERVICE, payload)).is_err() {
+                    return;
+                }
+            }
+            if let Some(sid) = server.primary()
+                && !answered
+                && server.receiver_finished(sid)
+            {
+                let req = server.read(sid);
+                let resp: Vec<u8> = req.iter().map(u8::to_ascii_uppercase).collect();
+                server.write(sid, &resp);
+                server.finish(sid);
+                answered = true;
+            }
+            tokio::select! {
+                msg = inbound.recv() => match msg {
+                    Some((_from, payload)) => server.handle_payload(&payload, &mut rng),
+                    None => return,
+                },
+                _ = ticker.tick() => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_over_a_coordinate_addressed_transport() {
+        let mut rng = SeedRng::from_seed(b"mock-key");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut crng = SeedRng::from_seed(b"mock-client");
+        let session = ClientSession::dial(SERVICE, &keypair.public, &mut crng);
+        assert_eq!(session.peer(), SERVICE);
+
+        let (c2s_tx, c2s_rx) = unbounded_channel();
+        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let transport = MockTransport {
+            to_net: c2s_tx,
+            from_net: s2c_rx,
+        };
+        tokio::spawn(mock_service(keypair, c2s_rx, s2c_tx));
+
+        let mut stream = dial_over_transport(session, transport);
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            stream.write_all(b"dial me").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.unwrap();
+            resp
+        })
+        .await
+        .expect("the dial completed in time");
+        assert_eq!(
+            result, b"DIAL ME",
+            "the response arrived over the coordinate transport"
+        );
+        let _ = CLIENT; // documents the client coordinate in this scenario
     }
 }

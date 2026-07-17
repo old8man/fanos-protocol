@@ -174,6 +174,12 @@ impl ClientSession {
         }
     }
 
+    /// The service coordinate this session dials (its datagram destination).
+    #[must_use]
+    pub fn peer(&self) -> Coord {
+        self.service
+    }
+
     /// Whether the handshake has completed.
     #[must_use]
     pub fn is_live(&self) -> bool {
