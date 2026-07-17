@@ -1,0 +1,41 @@
+{
+  "description": "DIAULOS connection-layer wire formats (fanos-diaulos): frame encodings, the constant-size AEAD cell, and the 1-RTT hybrid-KEM handshake derivation. Small formats are full hex; large ones are a labeled BLAKE3-256 digest under label 'FANOS-v1/diaulos-kat'. Pinned in fanos-diaulos/tests/conformance.rs.",
+  "frame": {
+    "layout": "ftype(1) then a per-type body, big-endian; the cell zero-pads after the frame",
+    "data": {
+      "input": { "ftype": 1, "stream_id": 5, "seq": 9, "fin": true, "len": 7, "data": "payload" },
+      "encoded_hex": "0100000005000000090100077061796c6f6164"
+    },
+    "ack": {
+      "input": { "ftype": 2, "stream_id": 4, "cumulative": 12, "sack": "0b1010", "rwnd": 30 },
+      "encoded_hex": "02000000040000000c000000000000000a0000001e"
+    },
+    "padding": { "input": { "ftype": 0 }, "encoded_hex": "00" }
+  },
+  "cell": {
+    "cell_len_bytes": 1064,
+    "layout": "cnonce(8 LE) then ChaCha20-Poly1305(key, nonce = 4 zero bytes ++ 8-byte LE counter, frame ++ zero-pad to 1040)",
+    "kat": {
+      "input": { "key": "07 x32", "cnonce": 42, "frame": "Frame::Padding (0x00)" },
+      "sealed_digest_label": "FANOS-v1/diaulos-kat",
+      "sealed_digest_hex": "ec6633641bdd52afc8edf11cdf2c37df78831cb01275752657277cfbbf6bdfbf"
+    }
+  },
+  "handshake": {
+    "pattern": "KEMTLS / IK-KEM over hybrid X25519+ML-KEM-768; ClientHello = ephemeral_pk(1216) ++ ct_to_static(1120); ServerHello = ct_to_ephemeral(1120); session key = KDF(ss_static ++ ss_ephemeral ++ H(transcript))",
+    "client_hello_len_bytes": 2336,
+    "server_hello_len_bytes": 1120,
+    "kat": {
+      "seeds": {
+        "service": "diaulos-kat-service",
+        "client": "diaulos-kat-client",
+        "respond": "diaulos-kat-respond"
+      },
+      "note": "deterministic via fanos_pqcrypto::rng::SeedRng; pins the ML-KEM/X25519 primitive versions",
+      "digest_label": "FANOS-v1/diaulos-kat",
+      "client_hello_digest_hex": "d60be806263bd220429d9b2571f72a13c3cee6c5e7c58ad33e0dc2c338d94f59",
+      "server_hello_digest_hex": "54c0b5dc34de55a6134d8a2e4bb932c8265a51c91cfff86cb69ae6b9fb0037cb",
+      "session_keys_digest_hex": "3d6e24ffa7ac40b29a86c8ded9afda33b5e9f02a6c6d46f9d92d11fa8ba90451"
+    }
+  }
+}
