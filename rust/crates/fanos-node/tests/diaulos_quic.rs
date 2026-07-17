@@ -17,13 +17,12 @@ use fanos_pqcrypto::rng::SeedRng;
 use fanos_runtime::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// Demonstrates the Direct-profile DIAULOS path on the production QUIC driver. Ignored in CI: over a
-// two-node loopback cell the base overlay's Send/Delivered is not perfectly reliable, and DIAULOS's
-// many round trips occasionally hang under that (the same reason the bootstrap test can flake). The
-// *deterministic* proof of the identical path over the real node engine is the sim e2e
-// (fanos-sim/tests/diaulos_overlay.rs); run this manually with `--ignored` to see it on real sockets.
+// The Direct-profile DIAULOS path on the production QUIC driver: a full encrypted request/response
+// over real sockets between two live nodes at *distinct* cell coordinates. (An earlier version was
+// flaky until the root cause was found: two fresh identities collide on the same Fano point 1/7 of
+// the time, making the coordinate→node mapping ambiguous and breaking routing — the node setup below
+// now enforces distinct coordinates, the real cell invariant.)
 #[tokio::test]
-#[ignore = "real-QUIC 2-node demonstration; flaky transport, deterministic proof is the sim e2e"]
 async fn diaulos_request_response_over_quic() {
     let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
 
@@ -37,7 +36,12 @@ async fn diaulos_request_response_over_quic() {
     let a_addr = a.address();
     let a_net = a.local_addr();
 
-    let b = Node::start::<F2>(NodeConfig {
+    // A cell's members must occupy *distinct* projective points. A node's coordinate is derived from
+    // its identity, so two fresh identities collide on the same Fano point with probability 1/7 —
+    // start the client until it lands on a point different from the service's (modelling the
+    // real invariant that cell slots are assigned distinctly; a collision otherwise makes the
+    // coordinate→node mapping ambiguous and routing between them breaks).
+    let mut b = Node::start::<F2>(NodeConfig {
         listen: loopback,
         bootstrap: vec![Peer {
             coord: a_addr,
@@ -47,6 +51,19 @@ async fn diaulos_request_response_over_quic() {
     })
     .await
     .unwrap();
+    while b.address() == a_addr {
+        b.shutdown();
+        b = Node::start::<F2>(NodeConfig {
+            listen: loopback,
+            bootstrap: vec![Peer {
+                coord: a_addr,
+                addr: a_net,
+            }],
+            ..NodeConfig::default()
+        })
+        .await
+        .unwrap();
+    }
     // A learns how to reach B (so it can send the DIAULOS reply path).
     a.directory().insert(b.address(), b.local_addr());
 
