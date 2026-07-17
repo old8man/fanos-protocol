@@ -827,6 +827,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-session"
+version = "0.1.0"
+dependencies = [
+ "fanos-diaulos",
+ "fanos-pqcrypto",
+ "tokio",
+]
+
+[[package]]
 name = "fanos-sim"
 version = "0.1.0"
 dependencies = [

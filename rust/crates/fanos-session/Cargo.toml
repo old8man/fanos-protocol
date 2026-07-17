@@ -1,0 +1,36 @@
+[package]
+name = "fanos-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Async DIAULOS byte streams: drive a sans-I/O ClientSession as a tokio AsyncRead+AsyncWrite over a datagram channel transport (the bridge a SOCKS5 proxy or overlay driver uses)."
+keywords = ["stream", "async", "tokio", "diaulos", "fanos"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# The sans-I/O session state machine this crate drives asynchronously.
+fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "rt",
+    "time",
+    "sync",
+    "macros",
+] }
+
+[dev-dependencies]
+# The service half + a seeded RNG for the loopback e2e test.
+fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "macros",
+] }
+
+[lints]
+workspace = true

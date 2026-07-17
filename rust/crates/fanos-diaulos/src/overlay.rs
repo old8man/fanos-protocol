@@ -88,30 +88,36 @@ impl ClientSession {
         })
     }
 
-    /// The overlay commands to send now: the (retransmitted) `ClientHello` while handshaking, then
-    /// one `Send` per outbound cell once live.
-    pub fn poll_transmit(&mut self) -> Vec<Command> {
+    /// The framed payloads to send to the peer now (transport-agnostic): the (retransmitted)
+    /// `ClientHello` while handshaking, then one framed cell each once live. A transport turns each
+    /// into a datagram — a `Command::Send` to a coordinate (Direct), an onion to the rendezvous line
+    /// (anonymous), or a channel write (an async stream driver).
+    pub fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
         match &mut self.state {
-            ClientState::Handshaking { hello, .. } => alloc_send(self.service, TAG_HELLO, hello),
+            ClientState::Handshaking { hello, .. } => vec![framed(TAG_HELLO, hello)],
             ClientState::Live { dialed } => dialed
                 .conn
                 .outbound()
                 .iter()
-                .map(|cell| Command::Send {
-                    to: self.service,
-                    payload: framed(TAG_CELL, cell),
-                })
+                .map(|cell| framed(TAG_CELL, cell))
                 .collect(),
             ClientState::Failed => Vec::new(),
         }
     }
 
-    /// Ingest an overlay delivery. A `ServerHello` from the service completes the handshake; a cell
-    /// feeds the live connection. Deliveries from any other coordinate are ignored.
-    pub fn handle_delivery(&mut self, from: Coord, payload: &[u8]) {
-        if from != self.service {
-            return;
-        }
+    /// The overlay commands to send now — [`poll_payloads`](Self::poll_payloads) addressed to the
+    /// service coordinate (the Direct-profile transport).
+    pub fn poll_transmit(&mut self) -> Vec<Command> {
+        let to = self.service;
+        self.poll_payloads()
+            .into_iter()
+            .map(|payload| Command::Send { to, payload })
+            .collect()
+    }
+
+    /// Ingest a payload from the peer (the transport has already resolved addressing). A `ServerHello`
+    /// completes the handshake; a cell feeds the live connection.
+    pub fn handle_payload(&mut self, payload: &[u8]) {
         let Some((tag, body)) = unframe(payload) else {
             return;
         };
@@ -130,6 +136,14 @@ impl ClientSession {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Ingest an overlay delivery — [`handle_payload`](Self::handle_payload) gated on the sender being
+    /// the dialed service coordinate (deliveries from elsewhere are ignored).
+    pub fn handle_delivery(&mut self, from: Coord, payload: &[u8]) {
+        if from == self.service {
+            self.handle_payload(payload);
         }
     }
 
@@ -203,46 +217,47 @@ impl ServerSession {
         }
     }
 
-    /// The commands to send now: the (re)sent `ServerHello` if a `ClientHello` just arrived, plus one
-    /// `Send` per outbound cell once a connection exists.
-    pub fn poll_transmit(&mut self) -> Vec<Command> {
-        let Some(client) = self.client else {
-            return Vec::new();
-        };
-        let mut cmds = Vec::new();
+    /// The framed payloads to send to the client now (transport-agnostic): the (re)sent `ServerHello`
+    /// if a `ClientHello` just arrived, plus one framed cell each once a connection exists.
+    pub fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
         if self.resend_hello {
             if let Some(hello) = &self.server_hello {
-                cmds.push(Command::Send {
-                    to: client,
-                    payload: framed(TAG_HELLO, hello),
-                });
+                out.push(framed(TAG_HELLO, hello));
             }
             self.resend_hello = false;
         }
         if let Some(conn) = &mut self.conn {
             for cell in conn.outbound() {
-                cmds.push(Command::Send {
-                    to: client,
-                    payload: framed(TAG_CELL, &cell),
-                });
+                out.push(framed(TAG_CELL, &cell));
             }
         }
-        cmds
+        out
     }
 
-    /// Ingest an overlay delivery. The first `ClientHello` binds the client and derives the session
-    /// (`accept`); a repeat `ClientHello` just re-arms the `ServerHello` resend; a cell feeds the
-    /// connection.
-    pub fn handle_delivery<R: CryptoRng>(&mut self, from: Coord, payload: &[u8], rng: &mut R) {
+    /// The overlay commands to send now — [`poll_payloads`](Self::poll_payloads) addressed to the
+    /// bound client coordinate (the Direct-profile transport). Empty until a client has hello'd.
+    pub fn poll_transmit(&mut self) -> Vec<Command> {
+        match self.client {
+            Some(client) => self
+                .poll_payloads()
+                .into_iter()
+                .map(|payload| Command::Send {
+                    to: client,
+                    payload,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Ingest a payload from the client (the transport has resolved addressing). The first
+    /// `ClientHello` derives the session (`accept`); a repeat re-arms the `ServerHello` resend
+    /// (never re-accepting); a cell feeds the connection.
+    pub fn handle_payload<R: CryptoRng>(&mut self, payload: &[u8], rng: &mut R) {
         let Some((tag, body)) = unframe(payload) else {
             return;
         };
-        // Once bound to a client, ignore other coordinates.
-        if let Some(client) = self.client
-            && from != client
-        {
-            return;
-        }
         match tag {
             TAG_HELLO => {
                 if self.conn.is_none()
@@ -250,11 +265,8 @@ impl ServerSession {
                 {
                     self.conn = Some(conn);
                     self.server_hello = Some(hello);
-                    self.client = Some(from);
                 }
-                // Whether freshly accepted or a retransmit, (re)send the ServerHello.
                 if self.server_hello.is_some() {
-                    self.client.get_or_insert(from);
                     self.resend_hello = true;
                 }
             }
@@ -267,6 +279,20 @@ impl ServerSession {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Ingest an overlay delivery. Binds the client coordinate on the first accepted `ClientHello`;
+    /// once bound, deliveries from any other coordinate are ignored.
+    pub fn handle_delivery<R: CryptoRng>(&mut self, from: Coord, payload: &[u8], rng: &mut R) {
+        if let Some(client) = self.client
+            && from != client
+        {
+            return;
+        }
+        self.handle_payload(payload, rng);
+        if self.client.is_none() && self.conn.is_some() {
+            self.client = Some(from);
         }
     }
 
@@ -304,13 +330,6 @@ impl ServerSession {
             .as_ref()
             .is_some_and(|c| c.receiver_finished(stream_id))
     }
-}
-
-fn alloc_send(to: Coord, tag: u8, body: &[u8]) -> Vec<Command> {
-    vec![Command::Send {
-        to,
-        payload: framed(tag, body),
-    }]
 }
 
 #[cfg(test)]

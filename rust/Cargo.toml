@@ -29,6 +29,7 @@ members = [
     "crates/fanos-sim",
     "crates/fanos-diaulos",
     "crates/fanos-telemetry",
+    "crates/fanos-session",
     "crates/fanos-node",
     "crates/fanos-proxy",
     "crates/fanos-cli",
