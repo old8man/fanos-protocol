@@ -1,0 +1,22 @@
+[package]
+name = "fanos-diaulos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "DIAULOS — the FANOS connection & stream layer: reliable, multiplexed, end-to-end-encrypted byte streams over constant-size cells (docs/design-platform.md §3)."
+keywords = ["stream", "connection", "reliable", "aead", "fanos"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+# The reliability core (selective-repeat + SACK) DIAULOS carries end-to-end, verbatim.
+fanos-runtime = { workspace = true, features = ["std"] }
+chacha20poly1305 = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

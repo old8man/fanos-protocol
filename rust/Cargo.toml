@@ -27,6 +27,7 @@ members = [
     "crates/fanos-incentives",
     "crates/fanos-keygen",
     "crates/fanos-sim",
+    "crates/fanos-diaulos",
     "crates/fanos-node",
     "crates/fanos-proxy",
     "crates/fanos-cli",

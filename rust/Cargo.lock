@@ -679,6 +679,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-diaulos"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "fanos-runtime",
+ "proptest",
+]
+
+[[package]]
 name = "fanos-field"
 version = "0.1.0"
 dependencies = [
