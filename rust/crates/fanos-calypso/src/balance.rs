@@ -285,11 +285,30 @@ impl MasterDescriptor {
     /// at `attempt`.
     #[must_use]
     pub fn select_instance(&self, selector: &[u8], attempt: usize) -> Option<&InstanceRef> {
+        self.select_instance_where(selector, attempt, |_| true)
+    }
+
+    /// **Health-aware** HRW selection: like [`select_instance`](Self::select_instance) but only
+    /// backends for which `is_healthy` returns `true` are considered — so a client (or the overlay,
+    /// which already tracks liveness via DIAKRISIS §6.4) sends the *primary* request straight to a
+    /// live backend instead of discovering a dead one by timeout. Removing an unhealthy backend from
+    /// the ranking is HRW-consistent: the requests it would have served redistribute across the
+    /// remaining healthy backends by their scores, and every other request is unaffected.
+    #[must_use]
+    pub fn select_instance_where<H>(
+        &self,
+        selector: &[u8],
+        attempt: usize,
+        is_healthy: H,
+    ) -> Option<&InstanceRef>
+    where
+        H: Fn(&InstanceRef) -> bool,
+    {
         let mut ranked: Vec<(u128, usize)> = self
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, inst)| inst.weight > 0)
+            .filter(|(_, inst)| inst.weight > 0 && is_healthy(inst))
             .map(|(i, inst)| (hrw_score(selector, inst), i))
             .collect();
         // Highest score first; the instance index breaks ties deterministically.
@@ -580,5 +599,30 @@ mod tests {
                 "a zero-weight backend is never selected"
             );
         }
+    }
+
+    #[test]
+    fn health_aware_selection_skips_a_down_backend() {
+        let s = setup(9, &[1, 1, 1]);
+        let down = s.desc.instances[1].coordinate;
+        // With backend 1 marked unhealthy, no request — for any selector — picks it as primary.
+        let mut survivors = alloc::collections::BTreeSet::new();
+        for i in 0..100u32 {
+            let picked = s
+                .desc
+                .select_instance_where(&i.to_be_bytes(), 0, |inst| inst.coordinate != down)
+                .unwrap();
+            assert_ne!(
+                picked.coordinate, down,
+                "a down backend is never the primary"
+            );
+            survivors.insert(picked.coordinate);
+        }
+        // The requests HRW would have sent to the down backend redistribute across the survivors,
+        // not to a single hotspot.
+        assert!(
+            survivors.len() >= 2,
+            "load redistributes across healthy backends"
+        );
     }
 }
