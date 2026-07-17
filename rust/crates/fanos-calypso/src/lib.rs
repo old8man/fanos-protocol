@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub mod address;
+pub mod balance;
 pub mod hosting;
 pub mod pow;
 pub mod rendezvous;
@@ -29,6 +30,7 @@ use fanos_field::Field;
 use fanos_geometry::Line;
 
 pub use address::ServiceAddress;
+pub use balance::{InstanceRef, MasterDescriptor, master_descriptor_key};
 pub use rendezvous::rendezvous_line;
 
 /// A hidden service — its public key and self-certifying address (spec Part XII).
