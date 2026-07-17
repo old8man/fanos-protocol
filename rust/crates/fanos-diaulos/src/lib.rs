@@ -32,9 +32,11 @@ pub mod conn;
 pub mod endpoint;
 pub mod frame;
 pub mod handshake;
+pub mod session;
 
 pub use cell::{CELL_LEN, Key, open, seal};
 pub use conn::Connection;
 pub use endpoint::StreamEndpoint;
 pub use frame::Frame;
 pub use handshake::{ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair};
+pub use session::{Dialed, PendingDial, accept, dial};
