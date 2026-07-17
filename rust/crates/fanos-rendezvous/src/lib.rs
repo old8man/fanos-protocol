@@ -28,6 +28,9 @@ use fanos_field::Field;
 use fanos_geometry::{Line, Triple};
 use fanos_pqcrypto::kem::HybridKemPublic;
 
+mod transport;
+pub use transport::{RendezvousClient, RendezvousService, SessionId};
+
 /// The anonymous-source sentinel a threshold delivery carries (`from` in `Notification::Delivered`).
 pub use fanos_aphantos::threshold_router::ANONYMOUS;
 /// The combiner coordinate where an onion bound for `line` is finally delivered — the point a party
@@ -89,6 +92,9 @@ impl MixDirectory {
 /// without weakening either property.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Request {
+    /// A per-session cookie: the service demultiplexes concurrent clients by it and binds each to its
+    /// reply circuit, so it need not learn who any client is.
+    pub cookie: [u8; 16],
     /// Hop lines to the client's reply rendezvous (the last is where the client listens).
     pub reply_circuit: Vec<Triple>,
     /// The inner payload (a DIAULOS `ClientHello` or cell).
@@ -111,10 +117,12 @@ fn coord_from(b: &[u8; 12]) -> Triple {
 }
 
 impl Request {
-    /// Encode as `hop_count(1) ‖ hop_line×12 … ‖ payload`.
+    /// Encode as `cookie(16) ‖ hop_count(1) ‖ hop_line×12 … ‖ payload`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + self.reply_circuit.len() * 12 + self.payload.len());
+        let mut out =
+            Vec::with_capacity(16 + 1 + self.reply_circuit.len() * 12 + self.payload.len());
+        out.extend_from_slice(&self.cookie);
         out.push(u8::try_from(self.reply_circuit.len()).unwrap_or(u8::MAX));
         for &line in &self.reply_circuit {
             coord_bytes(line, &mut out);
@@ -126,7 +134,8 @@ impl Request {
     /// Decode a request wrapper; `None` if truncated.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (&n, mut rest) = bytes.split_first()?;
+        let (cookie, rest) = bytes.split_first_chunk::<16>()?;
+        let (&n, mut rest) = rest.split_first()?;
         let mut reply_circuit = Vec::with_capacity(usize::from(n));
         for _ in 0..n {
             let (head, tail) = rest.split_at_checked(12)?;
@@ -134,6 +143,7 @@ impl Request {
             reply_circuit.push(coord_from(head.try_into().ok()?));
         }
         Some(Self {
+            cookie: *cookie,
             reply_circuit,
             payload: rest.to_vec(),
         })
@@ -191,13 +201,52 @@ mod tests {
     #[test]
     fn request_wrapper_round_trips() {
         let req = Request {
+            cookie: *b"session-cookie16",
             reply_circuit: vec![[1, 2, 3], [4, 5, 6]],
             payload: b"inner diaulos bytes".to_vec(),
         };
         let wire = req.encode();
         assert_eq!(Request::decode(&wire), Some(req));
+        // Too short to hold even the cookie.
         assert!(Request::decode(&[]).is_none());
-        // A truncated hop-line is rejected.
-        assert!(Request::decode(&[2, 0, 0, 0, 1]).is_none());
+        assert!(Request::decode(&[0; 15]).is_none());
+        // A cookie but no hop-count byte is truncated.
+        assert!(Request::decode(&[0; 16]).is_none());
+        // A cookie but a truncated hop-line is rejected (16 cookie + count=2 + partial coord).
+        assert!(
+            Request::decode(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn request_wrapper_boundary_shapes() {
+        // Empty reply circuit and empty payload — the minimal well-formed wrapper (16 cookie + 1 count).
+        let bare = Request {
+            cookie: [0xAB; 16],
+            reply_circuit: vec![],
+            payload: vec![],
+        };
+        let wire = bare.encode();
+        assert_eq!(wire.len(), 17);
+        assert_eq!(Request::decode(&wire), Some(bare));
+
+        // A payload but no reply circuit (a follow-up cell that relies on the service's cookie binding).
+        let follow = Request {
+            cookie: [0xCD; 16],
+            reply_circuit: vec![],
+            payload: b"cell-bytes".to_vec(),
+        };
+        assert_eq!(Request::decode(&follow.encode()), Some(follow));
+
+        // The maximum hop count that fits the 1-byte length prefix round-trips exactly.
+        let max = Request {
+            cookie: [1; 16],
+            reply_circuit: (0..255u32).map(|i| [i, i.wrapping_add(1), i.wrapping_add(2)]).collect(),
+            payload: b"tail".to_vec(),
+        };
+        let wire = max.encode();
+        assert_eq!(wire.len(), 16 + 1 + 255 * 12 + 4);
+        assert_eq!(Request::decode(&wire), Some(max));
     }
 }

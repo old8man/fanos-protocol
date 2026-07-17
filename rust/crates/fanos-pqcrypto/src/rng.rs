@@ -29,6 +29,12 @@ impl SeedRng {
             reader: hasher.finalize_xof(),
         }
     }
+
+    /// Fill `dst` with keystream. Infallible (the BLAKE3 XOF never runs dry), so callers that only
+    /// need bytes can avoid the `rand_core` `TryRng` machinery entirely.
+    pub fn fill(&mut self, dst: &mut [u8]) {
+        self.reader.fill(dst);
+    }
 }
 
 impl TryRng for SeedRng {

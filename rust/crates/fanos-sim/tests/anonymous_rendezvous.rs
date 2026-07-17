@@ -9,14 +9,20 @@
 //! (3) a **full session** — handshake + a request/response, every cell wrapped and routed both ways,
 //! completing end-to-end over the mixnet.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines
+)]
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_field::F2;
 use fanos_geometry::{Line, Point, Triple};
 use fanos_pqcrypto::{HybridKemSecret, SeedRng};
 use fanos_rendezvous::{
-    ANONYMOUS, MixDirectory, Request, combiner_for, meeting_line, seal_forward,
+    ANONYMOUS, MixDirectory, RendezvousClient, RendezvousService, Request, SessionId, combiner_for,
+    meeting_line, seal_forward,
 };
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
@@ -101,6 +107,7 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
     let (pending, client_hello) = fanos_diaulos::dial(&service.public, &mut crng);
     let reply_circuit = vec![hop_to_rp, rp_c];
     let request = Request {
+        cookie: *b"bidi-cookie-0001",
         reply_circuit: reply_circuit.clone(),
         payload: client_hello,
     }
@@ -179,10 +186,20 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
 
     let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
     let hop_to_rp = *lines.iter().find(|&&l| l != rp_c).unwrap();
-    let reply_circuit = vec![hop_to_rp, rp_c];
     let source = Point::<F2>::at(6).coords();
 
-    // The two session halves ride the anonymous transport via their payload-level API.
+    // The reusable rendezvous transport core carries the session: the client seals each DIAULOS payload
+    // to the meeting line (naming its reply circuit + cookie), and the service demultiplexes by cookie
+    // and seals replies back through the recorded circuit — no manual onion wrapping in the driver.
+    let mut rclient = RendezvousClient::<F2>::new(
+        vec![hop_to_l, meeting],
+        vec![hop_to_rp, rp_c],
+        dir.clone(),
+        t,
+        b"rdv-sess-cli-secret",
+    );
+    let mut rservice = RendezvousService::<F2>::new(dir.clone(), t, b"rdv-sess-svc-secret");
+
     let mut crng = SeedRng::from_seed(b"rdv-sess-cli");
     let mut client = ClientSession::dial(meeting, &service.public, &mut crng);
     let mut server = ServerSession::new();
@@ -191,23 +208,11 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
     let request = b"anon GET /".to_vec();
     let (mut wrote, mut answered) = (false, false);
     let mut seen = 0usize;
-    let mut onion = 0u64; // a fresh per-onion seed (never reuse per-hop key material)
-
-    let mut next_seed = || {
-        onion += 1;
-        onion.to_be_bytes().to_vec()
-    };
 
     for _round in 0..40 {
-        // client → service: wrap each payload with the reply circuit and seal to the meeting line.
+        // client → service: seal each DIAULOS payload to the meeting line through the transport core.
         for payload in client.poll_payloads() {
-            let req = Request {
-                reply_circuit: reply_circuit.clone(),
-                payload,
-            }
-            .encode();
-            let fwd =
-                seal_forward::<F2>(&[hop_to_l, meeting], &dir, t, &req, &next_seed()).unwrap();
+            let fwd = rclient.seal_send(&payload).unwrap();
             sim.inject_frame(source, fwd.combiner, fwd.frame);
         }
         if client.is_live() && !wrote {
@@ -225,6 +230,7 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
             &mut server,
             &mut srng,
             &mut client,
+            &mut rservice,
         );
 
         // service answers once the request has fully arrived.
@@ -239,9 +245,9 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
             server.finish(sid);
             answered = true;
         }
-        // service → client: seal each payload to the client's reply rendezvous.
+        // service → client: seal each DIAULOS reply back through the client's circuit, keyed by cookie.
         for payload in server.poll_payloads() {
-            let fwd = seal_forward::<F2>(&reply_circuit, &dir, t, &payload, &next_seed()).unwrap();
+            let fwd = rservice.seal_reply(&rclient.cookie(), &payload).unwrap();
             sim.inject_frame(l_combiner, fwd.combiner, fwd.frame);
         }
         sim.run_for(Duration::from_millis(2000));
@@ -254,6 +260,7 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
             &mut server,
             &mut srng,
             &mut client,
+            &mut rservice,
         );
 
         if client.is_done() {
@@ -272,8 +279,9 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
     );
 }
 
-/// Drain newly-delivered anonymous onions: those at the meeting-line combiner feed the service (after
-/// unwrapping the Request), those at the client rendezvous feed the client.
+/// Drain newly-delivered anonymous onions through the rendezvous transport core: those at the
+/// meeting-line combiner are `ingest`ed by the service (unwrapping the cookie + reply route) and fed to
+/// the DIAULOS server; those at the client rendezvous feed the client.
 #[allow(clippy::too_many_arguments)]
 fn drain(
     sim: &Sim,
@@ -284,6 +292,7 @@ fn drain(
     server: &mut fanos_diaulos::ServerSession,
     srng: &mut SeedRng,
     client: &mut fanos_diaulos::ClientSession,
+    rservice: &mut RendezvousService<F2>,
 ) {
     let new: Vec<(Triple, Vec<u8>)> = sim
         .report()
@@ -295,13 +304,172 @@ fn drain(
     *seen = sim.report().deliveries().count();
     for (recv, bytes) in new {
         if recv == l_combiner {
-            // A client request arriving at the service's meeting line: unwrap and feed the service.
-            if let Some(req) = Request::decode(&bytes) {
-                server.handle_payload(keypair, &req.payload, srng);
+            // A client request arriving at the service's meeting line: the transport ingests it (binding
+            // the cookie to its reply circuit) and surfaces the inner DIAULOS bytes for the server.
+            if let Some((_cookie, payload)) = rservice.ingest(&bytes) {
+                server.handle_payload(keypair, &payload, srng);
             }
         } else if recv == rp_combiner {
             // A service reply arriving at the client's rendezvous: feed the client.
             client.handle_payload(&bytes);
         }
     }
+}
+
+#[test]
+fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
+    use std::collections::BTreeMap;
+
+    use fanos_diaulos::{ClientSession, ServerSession};
+
+    let mut sim = Sim::new(0x5151);
+    let t = 2u8;
+    let dir = spawn_mixnet(&mut sim, usize::from(t));
+
+    // One service, one meeting line — both clients aim at the same L, and the service tells them apart
+    // *only* by the per-session cookie in each Request (never by identity or location).
+    let mut skp = SeedRng::from_seed(b"rdv-mux-svc");
+    let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
+    let epoch = 11u32;
+    let meeting = meeting_line::<F2>(&service.public.encode(), epoch).coords();
+    let l_combiner = combiner_for::<F2>(meeting).unwrap();
+
+    let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
+    let combiner = |l: Triple| combiner_for::<F2>(l).unwrap();
+    // Two reply rendezvous lines whose combiners are distinct from L's and from each other, so the two
+    // clients' return traffic never crosses (or lands on the service's own listening point).
+    let rp_a = lines
+        .iter()
+        .copied()
+        .find(|&l| combiner(l) != l_combiner)
+        .unwrap();
+    let rp_b = lines
+        .iter()
+        .copied()
+        .find(|&l| combiner(l) != l_combiner && combiner(l) != combiner(rp_a))
+        .unwrap();
+    let (rp_a_comb, rp_b_comb) = (combiner(rp_a), combiner(rp_b));
+    assert_ne!(rp_a_comb, rp_b_comb, "the two clients listen at distinct points");
+
+    let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
+    let hop_a = *lines.iter().find(|&&l| l != rp_a).unwrap();
+    let hop_b = *lines.iter().find(|&&l| l != rp_b).unwrap();
+    let source = Point::<F2>::at(6).coords();
+
+    // Two independent client transports (distinct secrets → distinct cookies + reply rendezvous).
+    let mut rc_a = RendezvousClient::<F2>::new(
+        vec![hop_to_l, meeting],
+        vec![hop_a, rp_a],
+        dir.clone(),
+        t,
+        b"rdv-mux-cli-a",
+    );
+    let mut rc_b = RendezvousClient::<F2>::new(
+        vec![hop_to_l, meeting],
+        vec![hop_b, rp_b],
+        dir.clone(),
+        t,
+        b"rdv-mux-cli-b",
+    );
+    let (cookie_a, cookie_b) = (rc_a.cookie(), rc_b.cookie());
+    assert_ne!(cookie_a, cookie_b, "independent secrets yield distinct cookies");
+
+    // One service transport fronts both; DIAULOS server sessions are keyed by cookie.
+    let mut rsvc = RendezvousService::<F2>::new(dir.clone(), t, b"rdv-mux-svc-secret");
+    let mut servers: BTreeMap<SessionId, ServerSession> = BTreeMap::new();
+    let mut answered: BTreeMap<SessionId, bool> = BTreeMap::new();
+    let mut srng = SeedRng::from_seed(b"rdv-mux-accept");
+
+    let mut client_a = ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"ca"));
+    let mut client_b = ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"cb"));
+    let (mut wrote_a, mut wrote_b) = (false, false);
+    let mut seen = 0usize;
+
+    for _round in 0..60 {
+        // Both clients → service (each seals to L, tagged with its own cookie + reply route).
+        for payload in client_a.poll_payloads() {
+            let fwd = rc_a.seal_send(&payload).unwrap();
+            sim.inject_frame(source, fwd.combiner, fwd.frame);
+        }
+        for payload in client_b.poll_payloads() {
+            let fwd = rc_b.seal_send(&payload).unwrap();
+            sim.inject_frame(source, fwd.combiner, fwd.frame);
+        }
+        if client_a.is_live() && !wrote_a {
+            client_a.write(b"GET /a");
+            client_a.finish();
+            wrote_a = true;
+        }
+        if client_b.is_live() && !wrote_b {
+            client_b.write(b"GET /b");
+            client_b.finish();
+            wrote_b = true;
+        }
+
+        for _half in 0..2 {
+            sim.run_for(Duration::from_millis(2000));
+
+            // Dispatch every new anonymous delivery by where it landed.
+            let new: Vec<(Triple, Vec<u8>)> = sim
+                .report()
+                .deliveries()
+                .skip(seen)
+                .filter(|(_, from, _)| *from == ANONYMOUS)
+                .map(|(recv, _, bytes)| (recv, bytes.to_vec()))
+                .collect();
+            seen = sim.report().deliveries().count();
+            for (recv, bytes) in new {
+                if recv == l_combiner {
+                    if let Some((cookie, payload)) = rsvc.ingest(&bytes) {
+                        servers
+                            .entry(cookie)
+                            .or_default()
+                            .handle_payload(&service, &payload, &mut srng);
+                    }
+                } else if recv == rp_a_comb {
+                    client_a.handle_payload(&bytes);
+                } else if recv == rp_b_comb {
+                    client_b.handle_payload(&bytes);
+                }
+            }
+
+            // Each server answers its own client once that request has fully arrived, echoing the path.
+            for (cookie, server) in &mut servers {
+                if let Some(sid) = server.primary()
+                    && !answered.get(cookie).copied().unwrap_or(false)
+                    && server.receiver_finished(sid)
+                {
+                    let got = server.read(sid);
+                    let mut resp = b"anon-200:".to_vec();
+                    resp.extend_from_slice(&got);
+                    server.write(sid, &resp);
+                    server.finish(sid);
+                    answered.insert(*cookie, true);
+                }
+                for payload in server.poll_payloads() {
+                    if let Some(fwd) = rsvc.seal_reply(cookie, &payload) {
+                        sim.inject_frame(l_combiner, fwd.combiner, fwd.frame);
+                    }
+                }
+            }
+        }
+
+        if client_a.is_done() && client_b.is_done() {
+            break;
+        }
+    }
+
+    // Both anonymous sessions completed, each demultiplexed to its own reply — no cross-talk.
+    assert!(client_a.is_live() && client_b.is_live(), "both sessions live");
+    assert_eq!(
+        client_a.read(),
+        b"anon-200:GET /a",
+        "client A received exactly its own response"
+    );
+    assert_eq!(
+        client_b.read(),
+        b"anon-200:GET /b",
+        "client B received exactly its own response"
+    );
+    assert_eq!(servers.len(), 2, "the service tracked two distinct cookies");
 }
