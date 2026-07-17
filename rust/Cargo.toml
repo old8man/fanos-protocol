@@ -28,6 +28,7 @@ members = [
     "crates/fanos-keygen",
     "crates/fanos-sim",
     "crates/fanos-diaulos",
+    "crates/fanos-telemetry",
     "crates/fanos-node",
     "crates/fanos-proxy",
     "crates/fanos-cli",
@@ -90,6 +91,7 @@ fanos-crypto = { path = "crates/fanos-crypto", version = "0.1.0", default-featur
 fanos-onoma = { path = "crates/fanos-onoma", version = "0.1.0", default-features = false }
 fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }
 fanos-runtime = { path = "crates/fanos-runtime", version = "0.1.0", default-features = false }
+fanos-telemetry = { path = "crates/fanos-telemetry", version = "0.1.0", default-features = false }
 
 # External dependencies (isolated to the crypto/privacy layers and above).
 blake3 = { version = "1", default-features = false }

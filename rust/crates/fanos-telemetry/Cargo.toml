@@ -1,0 +1,26 @@
+[package]
+name = "fanos-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS telemetry & self-observation: the mandatory per-node CoherenceFrame (a provably-minimal cell self-scan) and its canonical KAT-pinned encoding (docs/design-telemetry.md)."
+keywords = ["telemetry", "observability", "coherence", "self-healing", "fanos"]
+categories = ["network-programming"]
+
+[dependencies]
+# The coherence measures (Φ/P/R, regime, alarm) a frame folds from a cell's correlation matrix.
+fanos-diakrisis = { workspace = true }
+# The Fano/Hamming 3-bit syndrome — the load-bearing minimal fault localizer.
+fanos-code = { workspace = true }
+
+[features]
+default = ["std"]
+# std uses hardware float intrinsics; a no_std monitor supplies them via libm.
+std = ["fanos-diakrisis/std", "fanos-code/std"]
+libm = ["fanos-diakrisis/libm"]
+
+[lints]
+workspace = true

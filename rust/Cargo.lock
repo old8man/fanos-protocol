@@ -849,6 +849,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-telemetry"
+version = "0.1.0"
+dependencies = [
+ "fanos-code",
+ "fanos-diakrisis",
+]
+
+[[package]]
 name = "fanos-vrf"
 version = "0.1.0"
 dependencies = [

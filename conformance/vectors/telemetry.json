@@ -1,0 +1,42 @@
+{
+  "description": "FANOS telemetry — the canonical CoherenceFrame wire format and a known-answer vector. The load-bearing field is the 3-bit Fano/Hamming syndrome (Minimal Self-Observation Overhead theorem, docs/design-telemetry.md §1); the f32 coherence scalars are convenience. Pinned in fanos-telemetry (src/frame.rs).",
+  "coherence_frame": {
+    "frame_len_bytes": 52,
+    "layout_big_endian": [
+      { "field": "cell_id", "bytes": 16, "type": "opaque" },
+      { "field": "epoch", "bytes": 8, "type": "u64" },
+      { "field": "syndrome", "bytes": 1, "type": "u8", "note": "3-bit Fano/Hamming localizer: 0 healthy, 1..=7 faulted point address" },
+      { "field": "verdict", "bytes": 1, "type": "u8", "note": "bits[0:1] regime (0 Aggregate,1 CollectiveSubject,2 OverCoupled); bits[2:3] alarm (0 Healthy,1 Integration,2 Structure); bit[4] integrated (Phi>=1)" },
+      { "field": "phi", "bytes": 4, "type": "f32", "note": "integration; threshold 1" },
+      { "field": "purity", "bytes": 4, "type": "f32", "note": "P = Tr(Gamma^2); threshold 2/N" },
+      { "field": "reflection", "bytes": 4, "type": "f32", "note": "R = 1/(N*P); threshold 1/3" },
+      { "field": "mean_r", "bytes": 4, "type": "f32", "note": "mean inter-node correlation; r* = 1/sqrt(N-1)" },
+      { "field": "gap", "bytes": 4, "type": "f32", "note": "spectral gap Delta; tau = 1/Delta" },
+      { "field": "forecast", "bytes": 2, "type": "i16", "note": "windows to over-coupling; -1 none" },
+      { "field": "heal_seq", "bytes": 4, "type": "u32", "note": "monotone healing-action counter" }
+    ],
+    "kat": {
+      "input": {
+        "cell_id": "11111111111111111111111111111111",
+        "epoch": 42,
+        "cell": "equicorrelated PG(2,2) Fano cell, mean r = 0.5 (collective-subject window)",
+        "degraded_mask": "0b00000001 (point 0 faulted)",
+        "gap": 0.5,
+        "forecast": -1,
+        "heal_seq": 3
+      },
+      "derived": {
+        "syndrome": 4,
+        "verdict": 17,
+        "regime": "CollectiveSubject",
+        "alarm": "Healthy",
+        "integrated": true,
+        "phi": 1.5,
+        "purity": 0.35714287,
+        "reflection": 0.4,
+        "mean_r": 0.5
+      },
+      "encoded_hex": "11111111111111111111111111111111000000000000002a04113fc000003eb6db6e3ecccccd3f0000003f000000ffff00000003"
+    }
+  }
+}
