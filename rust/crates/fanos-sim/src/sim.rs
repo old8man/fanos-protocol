@@ -63,6 +63,7 @@ fn note_desc(note: &Notification) -> String {
         Notification::MemberJoined { coord, .. } => format!("MemberJoined {}", fmt_coord(*coord)),
         Notification::EpochAdvanced(e) => format!("EpochAdvanced {e}"),
         Notification::DkgComplete(y) => format!("DkgComplete {}", short_digest(y)),
+        Notification::Observed(bytes) => format!("Observed {}B", bytes.len()),
     }
 }
 
@@ -410,6 +411,7 @@ impl Sim {
                         Notification::Stored(_) => m.stores += 1,
                         Notification::Retrieved { value: Some(_), .. } => m.retrieval_hits += 1,
                         Notification::Retrieved { value: None, .. } => m.retrieval_misses += 1,
+                        Notification::Observed(_) => m.observations += 1,
                         _ => {}
                     }
                     self.log(format!("notify {} {}", fmt_coord(node), note_desc(&note)));

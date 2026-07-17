@@ -78,6 +78,36 @@ impl SelfObserver {
         Some(frame)
     }
 
+    /// Fold a frame from a liveness-only view, when full per-node signal vectors are not (yet)
+    /// gathered: model the cell as equicorrelated over its `alive_count` live nodes at the healthy
+    /// correlation `correlation`, with the real `degraded` syndrome from missed heartbeats. This is
+    /// the honest minimal self-observation a node can always produce — the 3-bit syndrome is exact;
+    /// the coherence scalars are the model's (design-telemetry.md §2: the syndrome is load-bearing).
+    /// Records the frame and returns it to publish.
+    pub fn observe_liveness(
+        &mut self,
+        now_nanos: u64,
+        alive_count: usize,
+        correlation: f64,
+        degraded: u8,
+        gap: f64,
+        forecast: i16,
+    ) -> CoherenceFrame {
+        let matrix = CoherenceMatrix::equicorrelated(alive_count.max(1), correlation);
+        let epoch = now_nanos / self.window_nanos;
+        let frame = CoherenceFrame::observe(
+            self.cell_id,
+            epoch,
+            &matrix,
+            degraded,
+            gap,
+            forecast,
+            self.heal_seq,
+        );
+        self.history.record_frame(now_nanos, &frame);
+        frame
+    }
+
     /// Note that a healing action fired: bump and return the monotone `heal_seq` (the sparse healing
     /// event stream is keyed off this, so it costs nothing in steady state).
     pub fn note_healing(&mut self) -> u32 {
@@ -163,6 +193,22 @@ mod tests {
     fn too_few_signals_yield_no_frame() {
         let mut obs = SelfObserver::new(CellId([3; 16]), 1_000_000_000, HistoryConfig::compact());
         assert!(obs.observe_cell(0, &[], 0, 0.0, -1).is_none());
+    }
+
+    #[test]
+    fn liveness_frame_carries_the_syndrome_and_is_recorded() {
+        let mut obs = SelfObserver::new(CellId([5; 16]), 1_000_000_000, HistoryConfig::compact());
+        // 6 alive, point 0 faulted (bit 0 set), healthy correlation 0.5.
+        let frame = obs.observe_liveness(3_000_000_000, 6, 0.5, 0b0000_0001, 0.4, -1);
+        assert_eq!(frame.epoch, 3);
+        assert!(frame.is_faulted(), "a real syndrome from the degraded mask");
+        assert!(
+            obs.history()
+                .series(MetricId::PHI)
+                .unwrap()
+                .latest()
+                .is_some()
+        );
     }
 
     #[test]

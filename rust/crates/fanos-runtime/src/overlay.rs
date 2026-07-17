@@ -15,6 +15,7 @@ use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::{HealingAction, Observation, diagnose, plan_healing};
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
+use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
 /// Storage `Publish` sub-type: the responsible node fans out replicas; a replica just stores.
@@ -122,6 +123,28 @@ pub struct OverlayNode<F: Field> {
     /// The current epoch, driven by the flooded beacon (adopt-max, spec §L3). Epoch-derived
     /// rendezvous/shapes rotate as it advances.
     epoch: u32,
+    /// Mandatory per-node self-observation (`fanos_telemetry`): every diagnosis folds the cell's
+    /// health into a `CoherenceFrame` and records it into bounded local history. Not optional — the
+    /// reflexive loop cannot diagnose without observing (docs/design-telemetry.md).
+    observer: SelfObserver,
+}
+
+/// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
+/// point coordinates, so every node in the cell derives the *same* id and their coherence frames
+/// agree on which cell they describe.
+fn cell_id<F: Field>() -> CellId {
+    let mut input = Vec::with_capacity(7 * 12);
+    for i in 0..7usize {
+        for x in Point::<F>::at(i).coords() {
+            input.extend_from_slice(&x.to_be_bytes());
+        }
+    }
+    let digest = hash_labeled("FANOS-v1/cell-id", &input);
+    let mut id = [0u8; 16];
+    for (dst, src) in id.iter_mut().zip(digest) {
+        *dst = src;
+    }
+    CellId(id)
 }
 
 impl<F: Field> OverlayNode<F> {
@@ -146,6 +169,12 @@ impl<F: Field> OverlayNode<F> {
         } else {
             None
         };
+        // The observation window is the heartbeat interval; local history stays compact and bounded.
+        let observer = SelfObserver::new(
+            cell_id::<F>(),
+            config.heartbeat.as_nanos(),
+            HistoryConfig::compact(),
+        );
         Self {
             coord,
             config,
@@ -161,6 +190,7 @@ impl<F: Field> OverlayNode<F> {
             pending_gets: BTreeMap::new(),
             members: BTreeMap::new(),
             epoch: 0,
+            observer,
         }
     }
 
@@ -645,8 +675,26 @@ impl<F: Field> OverlayNode<F> {
             // stratum: Φ_net = (alive−1)·r² (spec §2.7). This gates the reroute-depth budget.
             let phi = phi_equicorrelated(alive_count, self.config.healthy_correlation);
             let plan = plan_healing(&verdict, self_index, degraded, phi);
+            if !plan.is_empty() {
+                self.observer.note_healing();
+            }
             effects.extend(self.apply_healing_plan(&plan));
         }
+        // Mandatory self-observation (docs/design-telemetry.md): fold this window's cell health into
+        // a CoherenceFrame — the exact 3-bit syndrome from the degraded mask, the coherence scalars
+        // from the equicorrelated liveness model — record it in local history, and emit its wire
+        // bytes. Diagnosis cannot happen without observing.
+        let frame = self.observer.observe_liveness(
+            now.as_nanos(),
+            alive_count,
+            self.config.healthy_correlation,
+            degraded,
+            0.0, // spectral gap Δ: not tracked from liveness alone; 0 = unknown this window
+            -1,  // cascade forecast: none from liveness alone
+        );
+        effects.push(Effect::Notify(Notification::Observed(
+            frame.encode().to_vec(),
+        )));
         effects
     }
 

@@ -34,6 +34,8 @@ pub struct Metrics {
     pub retrieval_hits: u64,
     /// DHT `Get` completions that found nothing.
     pub retrieval_misses: u64,
+    /// Mandatory self-observations emitted (one `CoherenceFrame` per node per diagnosis).
+    pub observations: u64,
 }
 
 /// A notification observed from a node, tagged with the observer's coordinate.

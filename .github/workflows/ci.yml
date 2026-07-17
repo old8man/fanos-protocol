@@ -71,6 +71,7 @@ jobs:
           cargo build -p fanos-runtime  --target wasm32-unknown-unknown --no-default-features --features libm
           cargo build -p fanos-calypso  --target wasm32-unknown-unknown --no-default-features --features alloc
           cargo build -p fanos-proteus  --target wasm32-unknown-unknown --no-default-features --features alloc
+          cargo build -p fanos-telemetry --target wasm32-unknown-unknown --no-default-features --features libm
 
   miri:
     name: miri (undefined-behavior check)

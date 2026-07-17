@@ -822,6 +822,7 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-telemetry",
  "fanos-wire",
 ]
 
@@ -842,6 +843,7 @@ dependencies = [
  "fanos-onoma",
  "fanos-pqcrypto",
  "fanos-runtime",
+ "fanos-telemetry",
  "fanos-vrf",
  "fanos-wire",
  "proptest",

@@ -23,6 +23,8 @@ path = "src/bin/demo.rs"
 
 [dev-dependencies]
 proptest.workspace = true
+# For decoding the mandatory CoherenceFrames nodes emit each diagnosis (telemetry e2e scenario).
+fanos-telemetry = { workspace = true, features = ["std"] }
 # For the NYX anonymity-routing scenario (real onion over the simulated network).
 fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
 fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }

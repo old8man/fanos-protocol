@@ -149,6 +149,12 @@ pub enum Notification {
     PeerDown(Triple),
     /// A local diagnosis verdict (spec §6.9).
     Verdict(fanos_diakrisis::Verdict),
+    /// A mandatory self-observation: the node's encoded `CoherenceFrame` for this window
+    /// (`fanos_telemetry`), carrying the 3-bit Fano/Hamming syndrome and the cell's coherence
+    /// scalars. Emitted every diagnosis; decode with `fanos_telemetry::CoherenceFrame::decode`. The
+    /// wire bytes (not the struct) are carried so this stays a plain, `Eq` payload — the same bytes a
+    /// node gossips or publishes (docs/design-telemetry.md).
+    Observed(Vec<u8>),
     /// Self-healing: traffic for the (down) node `around` is now served by the co-linear
     /// survivor `via` — the projective LRC reroute (spec §L4, §6.7).
     Rerouted {
