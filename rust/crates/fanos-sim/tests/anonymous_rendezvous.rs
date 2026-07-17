@@ -1,9 +1,13 @@
-//! Anonymous rendezvous (forward path): a real DIAULOS `ClientHello` reaches the service's *computed*
-//! meeting line over a threshold onion, delivered **anonymously** (`from == ANONYMOUS`) at the line's
-//! combiner. The client and service derive the same meeting line from the service key + epoch with no
-//! lookup (CALYPSO); each onion hop is a line no single node can peel (APHANTOS). So the mixnet — and
-//! the service — carry the session's bytes without learning where the client is. This is the forward
-//! half of the anonymous DIAULOS profile (the reply half is a symmetric onion to a client rendezvous).
+//! Anonymous rendezvous end-to-end: DIAULOS payloads ride threshold onions (APHANTOS, "a hop is a
+//! line", `t`-of-`(q+1)` — no single node peels a hop) to *computed* meeting lines (CALYPSO — client
+//! and service derive the same line from the service key + epoch, no lookup, rotating each epoch), so
+//! deliveries are anonymous (`from == ANONYMOUS`) and neither party learns the other's location.
+//!
+//! Three cases, building up: (1) the forward path — a real `ClientHello` reaches the service's meeting
+//! line anonymously; (2) the bidirectional handshake — the service seals the `ServerHello` back along
+//! the client's reply circuit to a client rendezvous, completing the 1-RTT into a live connection;
+//! (3) a **full session** — handshake + a request/response, every cell wrapped and routed both ways,
+//! completing end-to-end over the mixnet.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -145,4 +149,159 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
     };
     // A live connection with its primary stream — the anonymous DIAULOS session is established.
     assert_eq!(dialed.primary, 0);
+}
+
+#[test]
+fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
+    use fanos_diaulos::{ClientSession, ServerSession};
+
+    let mut sim = Sim::new(0xABCD);
+    let t = 2u8;
+    let dir = spawn_mixnet(&mut sim, usize::from(t));
+
+    let mut skp = SeedRng::from_seed(b"rdv-sess-svc");
+    let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
+    let epoch = 3u32;
+    let meeting = meeting_line::<F2>(&service.public.encode(), epoch).coords();
+    let l_combiner = combiner_for::<F2>(meeting).unwrap();
+
+    let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
+    // The client's reply rendezvous must have a combiner *distinct* from the service's meeting line —
+    // otherwise the service, listening at its combiner, would also receive the client's reply traffic
+    // (two lines can share their combiner point). The client derives its reply line and picks one that
+    // avoids the collision.
+    let rp_c = lines
+        .iter()
+        .copied()
+        .find(|&l| l != meeting && combiner_for::<F2>(l) != Some(l_combiner))
+        .unwrap();
+    let rp_combiner = combiner_for::<F2>(rp_c).unwrap();
+
+    let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
+    let hop_to_rp = *lines.iter().find(|&&l| l != rp_c).unwrap();
+    let reply_circuit = vec![hop_to_rp, rp_c];
+    let source = Point::<F2>::at(6).coords();
+
+    // The two session halves ride the anonymous transport via their payload-level API.
+    let mut crng = SeedRng::from_seed(b"rdv-sess-cli");
+    let mut client = ClientSession::dial(meeting, &service.public, &mut crng);
+    let mut server = ServerSession::new();
+    let mut srng = SeedRng::from_seed(b"rdv-sess-accept");
+
+    let request = b"anon GET /".to_vec();
+    let (mut wrote, mut answered) = (false, false);
+    let mut seen = 0usize;
+    let mut onion = 0u64; // a fresh per-onion seed (never reuse per-hop key material)
+
+    let mut next_seed = || {
+        onion += 1;
+        onion.to_be_bytes().to_vec()
+    };
+
+    for _round in 0..40 {
+        // client → service: wrap each payload with the reply circuit and seal to the meeting line.
+        for payload in client.poll_payloads() {
+            let req = Request {
+                reply_circuit: reply_circuit.clone(),
+                payload,
+            }
+            .encode();
+            let fwd =
+                seal_forward::<F2>(&[hop_to_l, meeting], &dir, t, &req, &next_seed()).unwrap();
+            sim.inject_frame(source, fwd.combiner, fwd.frame);
+        }
+        if client.is_live() && !wrote {
+            client.write(&request);
+            client.finish();
+            wrote = true;
+        }
+        sim.run_for(Duration::from_millis(2000));
+        drain(
+            &sim,
+            &mut seen,
+            l_combiner,
+            rp_combiner,
+            &service,
+            &mut server,
+            &mut srng,
+            &mut client,
+        );
+
+        // service answers once the request has fully arrived.
+        if let Some(sid) = server.primary()
+            && !answered
+            && server.receiver_finished(sid)
+        {
+            let got = server.read(sid);
+            let mut resp = b"anon-200:".to_vec();
+            resp.extend_from_slice(&got);
+            server.write(sid, &resp);
+            server.finish(sid);
+            answered = true;
+        }
+        // service → client: seal each payload to the client's reply rendezvous.
+        for payload in server.poll_payloads() {
+            let fwd = seal_forward::<F2>(&reply_circuit, &dir, t, &payload, &next_seed()).unwrap();
+            sim.inject_frame(l_combiner, fwd.combiner, fwd.frame);
+        }
+        sim.run_for(Duration::from_millis(2000));
+        drain(
+            &sim,
+            &mut seen,
+            l_combiner,
+            rp_combiner,
+            &service,
+            &mut server,
+            &mut srng,
+            &mut client,
+        );
+
+        if client.is_done() {
+            break;
+        }
+    }
+
+    assert!(
+        client.is_live(),
+        "the anonymous handshake completed over the mixnet"
+    );
+    assert_eq!(
+        client.read(),
+        b"anon-200:anon GET /",
+        "a full request/response completed end-to-end over the anonymous rendezvous"
+    );
+}
+
+/// Drain newly-delivered anonymous onions: those at the meeting-line combiner feed the service (after
+/// unwrapping the Request), those at the client rendezvous feed the client.
+#[allow(clippy::too_many_arguments)]
+fn drain(
+    sim: &Sim,
+    seen: &mut usize,
+    l_combiner: Triple,
+    rp_combiner: Triple,
+    keypair: &fanos_diaulos::StaticKeypair,
+    server: &mut fanos_diaulos::ServerSession,
+    srng: &mut SeedRng,
+    client: &mut fanos_diaulos::ClientSession,
+) {
+    let new: Vec<(Triple, Vec<u8>)> = sim
+        .report()
+        .deliveries()
+        .skip(*seen)
+        .filter(|(_, from, _)| *from == ANONYMOUS)
+        .map(|(recv, _, bytes)| (recv, bytes.to_vec()))
+        .collect();
+    *seen = sim.report().deliveries().count();
+    for (recv, bytes) in new {
+        if recv == l_combiner {
+            // A client request arriving at the service's meeting line: unwrap and feed the service.
+            if let Some(req) = Request::decode(&bytes) {
+                server.handle_payload(keypair, &req.payload, srng);
+            }
+        } else if recv == rp_combiner {
+            // A service reply arriving at the client's rendezvous: feed the client.
+            client.handle_payload(&bytes);
+        }
+    }
 }
