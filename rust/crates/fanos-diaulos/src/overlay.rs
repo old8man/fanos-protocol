@@ -196,10 +196,12 @@ impl ClientSession {
     }
 }
 
-/// The service half: accept a client's dial and carry the session, all over the overlay datagram
-/// transport. Bound to one client (the first that hellos); a real service runs one per client.
+/// The service half of one client's session: accept a dial and carry the session over the overlay
+/// datagram transport. Bound to one client (the first that hellos). The service identity
+/// ([`StaticKeypair`]) is **not** owned here — it is passed by reference at accept time, so one
+/// identity backs many concurrent [`ServerSession`]s (a real multi-client hidden service).
+#[derive(Default)]
 pub struct ServerSession {
-    keypair: StaticKeypair,
     client: Option<Coord>,
     conn: Option<Connection>,
     /// The cached `ServerHello`, resent for each `ClientHello` (never re-accepted).
@@ -210,17 +212,10 @@ pub struct ServerSession {
 }
 
 impl ServerSession {
-    /// A service listening with the static identity `keypair`.
+    /// A fresh, unbound service-side session.
     #[must_use]
-    pub fn new(keypair: StaticKeypair) -> Self {
-        Self {
-            keypair,
-            client: None,
-            conn: None,
-            server_hello: None,
-            resend_hello: false,
-            primary: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The framed payloads to send to the client now (transport-agnostic): the (re)sent `ServerHello`
@@ -258,16 +253,21 @@ impl ServerSession {
     }
 
     /// Ingest a payload from the client (the transport has resolved addressing). The first
-    /// `ClientHello` derives the session (`accept`); a repeat re-arms the `ServerHello` resend
-    /// (never re-accepting); a cell feeds the connection.
-    pub fn handle_payload<R: CryptoRng>(&mut self, payload: &[u8], rng: &mut R) {
+    /// `ClientHello` derives the session (`accept`, using the service `keypair`); a repeat re-arms the
+    /// `ServerHello` resend (never re-accepting); a cell feeds the connection.
+    pub fn handle_payload<R: CryptoRng>(
+        &mut self,
+        keypair: &StaticKeypair,
+        payload: &[u8],
+        rng: &mut R,
+    ) {
         let Some((tag, body)) = unframe(payload) else {
             return;
         };
         match tag {
             TAG_HELLO => {
                 if self.conn.is_none()
-                    && let Some((conn, hello)) = session::accept(&self.keypair, body, rng)
+                    && let Some((conn, hello)) = session::accept(keypair, body, rng)
                 {
                     self.conn = Some(conn);
                     self.server_hello = Some(hello);
@@ -290,13 +290,19 @@ impl ServerSession {
 
     /// Ingest an overlay delivery. Binds the client coordinate on the first accepted `ClientHello`;
     /// once bound, deliveries from any other coordinate are ignored.
-    pub fn handle_delivery<R: CryptoRng>(&mut self, from: Coord, payload: &[u8], rng: &mut R) {
+    pub fn handle_delivery<R: CryptoRng>(
+        &mut self,
+        keypair: &StaticKeypair,
+        from: Coord,
+        payload: &[u8],
+        rng: &mut R,
+    ) {
         if let Some(client) = self.client
             && from != client
         {
             return;
         }
-        self.handle_payload(payload, rng);
+        self.handle_payload(keypair, payload, rng);
         if self.client.is_none() && self.conn.is_some() {
             self.client = Some(from);
         }
@@ -336,6 +342,15 @@ impl ServerSession {
             .as_ref()
             .is_some_and(|c| c.receiver_finished(stream_id))
     }
+
+    /// Whether `stream_id` is complete in both directions (request received, response acknowledged) —
+    /// a multi-client service uses this to retire a finished session.
+    #[must_use]
+    pub fn is_stream_done(&self, stream_id: u32) -> bool {
+        self.conn
+            .as_ref()
+            .is_some_and(|c| c.is_stream_done(stream_id))
+    }
 }
 
 #[cfg(test)]
@@ -363,7 +378,7 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"diaulos-overlay");
         let service_kp = StaticKeypair::generate(&mut rng);
         let mut client = ClientSession::dial(SERVICE, &service_kp.public, &mut rng);
-        let mut server = ServerSession::new(service_kp);
+        let mut server = ServerSession::new();
         let mut srng = SeedRng::from_seed(b"diaulos-overlay-server");
 
         let request = b"GET /index HTTP/1.0\r\n\r\n".to_vec();
@@ -373,7 +388,7 @@ mod tests {
             // client → service
             for (to, payload) in datagrams(client.poll_transmit()) {
                 assert_eq!(to, SERVICE);
-                server.handle_delivery(CLIENT, &payload, &mut srng);
+                server.handle_delivery(&service_kp, CLIENT, &payload, &mut srng);
             }
             // Once live, the client writes its request exactly once.
             if client.is_live() && !wrote_request {

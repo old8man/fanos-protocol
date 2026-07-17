@@ -20,6 +20,7 @@ type Coord = [u32; 3];
 fn dispatch(
     sim: &Sim,
     seen: &mut usize,
+    keypair: &StaticKeypair,
     client_node: Coord,
     service_node: Coord,
     client: &mut ClientSession,
@@ -30,7 +31,7 @@ fn dispatch(
     for obs in &notes[*seen..] {
         if let Notification::Delivered { from, payload } = &obs.note {
             if obs.node == service_node {
-                server.handle_delivery(*from, payload, srng);
+                server.handle_delivery(keypair, *from, payload, srng);
             } else if obs.node == client_node {
                 client.handle_delivery(*from, payload);
             }
@@ -55,7 +56,7 @@ fn run_request_response(mut sim: Sim, rounds: usize, request: &[u8]) -> (bool, V
     let service_public = keypair.public.clone();
     let mut drng = SeedRng::from_seed(b"overlay-client");
     let mut client = ClientSession::dial(service_node, &service_public, &mut drng);
-    let mut server = ServerSession::new(keypair);
+    let mut server = ServerSession::new();
     let mut srng = SeedRng::from_seed(b"overlay-server");
 
     let (mut wrote, mut answered) = (false, false);
@@ -74,6 +75,7 @@ fn run_request_response(mut sim: Sim, rounds: usize, request: &[u8]) -> (bool, V
         dispatch(
             &sim,
             &mut seen,
+            &keypair,
             client_node,
             service_node,
             &mut client,
@@ -99,6 +101,7 @@ fn run_request_response(mut sim: Sim, rounds: usize, request: &[u8]) -> (bool, V
         dispatch(
             &sim,
             &mut seen,
+            &keypair,
             client_node,
             service_node,
             &mut client,

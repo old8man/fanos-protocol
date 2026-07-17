@@ -184,7 +184,7 @@ mod tests {
         outbound: UnboundedSender<Vec<u8>>,
         mut inbound: UnboundedReceiver<Vec<u8>>,
     ) {
-        let mut server = ServerSession::new(keypair);
+        let mut server = ServerSession::new();
         let mut rng = SeedRng::from_seed(b"async-session-server");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
@@ -206,7 +206,7 @@ mod tests {
             }
             tokio::select! {
                 maybe = inbound.recv() => match maybe {
-                    Some(payload) => server.handle_payload(&payload, &mut rng),
+                    Some(payload) => server.handle_payload(&keypair, &payload, &mut rng),
                     None => return,
                 },
                 _ = ticker.tick() => {}
@@ -275,7 +275,7 @@ mod tests {
         mut inbound: UnboundedReceiver<(Coord, Vec<u8>)>,
         outbound: UnboundedSender<(Coord, Vec<u8>)>,
     ) {
-        let mut server = ServerSession::new(keypair);
+        let mut server = ServerSession::new();
         let mut rng = SeedRng::from_seed(b"mock-svc");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
@@ -297,7 +297,7 @@ mod tests {
             }
             tokio::select! {
                 msg = inbound.recv() => match msg {
-                    Some((_from, payload)) => server.handle_payload(&payload, &mut rng),
+                    Some((_from, payload)) => server.handle_payload(&keypair, &payload, &mut rng),
                     None => return,
                 },
                 _ = ticker.tick() => {}

@@ -14,6 +14,7 @@ use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
 use fanos_session::{OverlayTransport, dial_over_transport};
 use rand_core::CryptoRng;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
@@ -71,39 +72,59 @@ pub fn dial_service<R: CryptoRng>(
 /// `handler(request)`. Spawns a background task bound to the first client that connects; returns
 /// immediately. (A full multi-client hidden service is a follow-up — it needs the service identity
 /// shared across sessions by reference rather than owned here.)
-pub fn serve_one<R, H>(client: Client, keypair: StaticKeypair, mut rng: R, handler: H)
+/// One in-flight client session at the service, plus its primary stream and whether it was answered.
+#[derive(Default)]
+struct ClientState {
+    session: ServerSession,
+    primary: Option<u32>,
+    answered: bool,
+}
+
+/// Run a **multi-client** DIAULOS request/response service on `client`'s node: one [`ServerSession`]
+/// per client coordinate, each answered with `handler(request)`, retiring a session once its exchange
+/// completes both ways. A single service `keypair` (the identity) backs every client — passed by
+/// reference, so no per-client key clone. Spawns a background task and returns immediately.
+pub fn serve<R, H>(client: Client, keypair: StaticKeypair, mut rng: R, handler: H)
 where
     R: CryptoRng + Send + 'static,
     H: Fn(&[u8]) -> Vec<u8> + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut server = ServerSession::new(keypair);
         let mut deliveries = client.subscribe();
+        let mut sessions: BTreeMap<Coord, ClientState> = BTreeMap::new();
         let mut ticker = tokio::time::interval(SERVE_TICK);
-        let mut peer: Option<Coord> = None;
-        let mut answered = false;
         loop {
-            if let Some(to) = peer {
-                for payload in server.poll_payloads() {
-                    client.command(Command::Send { to, payload });
+            let mut retire: Vec<Coord> = Vec::new();
+            for (&peer, st) in &mut sessions {
+                for payload in st.session.poll_payloads() {
+                    client.command(Command::Send { to: peer, payload });
+                }
+                if st.primary.is_none() {
+                    st.primary = st.session.primary();
+                }
+                if let Some(sid) = st.primary {
+                    if !st.answered && st.session.receiver_finished(sid) {
+                        let response = handler(&st.session.read(sid));
+                        st.session.write(sid, &response);
+                        st.session.finish(sid);
+                        st.answered = true;
+                    }
+                    if st.answered && st.session.is_stream_done(sid) {
+                        retire.push(peer);
+                    }
                 }
             }
-            if let Some(sid) = server.primary()
-                && !answered
-                && server.receiver_finished(sid)
-            {
-                let response = handler(&server.read(sid));
-                server.write(sid, &response);
-                server.finish(sid);
-                answered = true;
+            for peer in retire {
+                sessions.remove(&peer);
             }
             tokio::select! {
                 event = deliveries.recv() => match event {
                     Ok(Notification::Delivered { from, payload }) => {
-                        let bound = *peer.get_or_insert(from);
-                        if bound == from {
-                            server.handle_payload(&payload, &mut rng);
-                        }
+                        sessions
+                            .entry(from)
+                            .or_default()
+                            .session
+                            .handle_payload(&keypair, &payload, &mut rng);
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
