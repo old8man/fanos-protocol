@@ -23,8 +23,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 pub mod frame;
+pub mod history;
 pub mod sysmetrics;
 
 pub use frame::{AlarmLevel, CellId, CoherenceFrame, FRAME_LEN, Regime};
+pub use history::{Bucket, HistoryConfig, MetricId, MetricStore, Series};
 pub use sysmetrics::{CpuTimes, NullProbe, SystemProbe, SystemSample};
