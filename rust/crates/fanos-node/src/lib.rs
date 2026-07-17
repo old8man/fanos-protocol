@@ -21,6 +21,7 @@ pub mod diaulos;
 pub mod error;
 pub mod identity;
 pub mod node;
+pub mod rendezvous;
 pub mod resolve;
 
 pub use config::{NodeConfig, Peer, RoleSet};
@@ -29,4 +30,5 @@ pub use diaulos::{
 };
 pub use error::NodeError;
 pub use node::{Health, Node};
+pub use rendezvous::dial_anonymous;
 pub use resolve::ResolvedService;

@@ -737,6 +737,7 @@ dependencies = [
  "fanos-pqcrypto",
  "fanos-proxy",
  "fanos-quic",
+ "fanos-rendezvous",
  "fanos-runtime",
  "fanos-session",
  "getrandom 0.3.4",

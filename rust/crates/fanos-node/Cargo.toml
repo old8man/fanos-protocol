@@ -25,6 +25,9 @@ fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
 # DIAULOS reliable encrypted sessions over the node's datagram transport, driven as async streams.
 fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
 fanos-session = { path = "../fanos-session", version = "0.1.0" }
+# The anonymous profile: carry the same DIAULOS session over threshold onions to a computed meeting
+# line (the sans-I/O RendezvousClient core, wrapped as an async transport under the identical stream).
+fanos-rendezvous = { path = "../fanos-rendezvous", version = "0.1.0" }
 fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
 # The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
 # is the integration point that provides a Dialer).
