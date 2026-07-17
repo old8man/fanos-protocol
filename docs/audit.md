@@ -19,7 +19,7 @@ The deficiencies are therefore **not in the primitives but in the composition an
 4. **A systemic robustness gap: unbounded state and absent back-pressure.** Waiter maps, session maps, rendezvous route tables, and every driver channel are unbounded; receiver flow control is advertised but not enforced. A single connected peer can OOM a node.
 5. **Best-in-class hygiene the mandate demands is missing workspace-wide:** no `zeroize`, no `subtle`; several secret types even derive `Copy`/`Debug`.
 
-None of these is fatal, and none contradicts the architecture — they are the gap between an excellent skeleton and the "flawless, fully-fundamental" bar the project sets for itself. The remainder of this document enumerates them with file/line anchors and a prioritized remediation path (§9).
+None of these is fatal, and none contradicts the architecture — they are the gap between an excellent skeleton and the "flawless, fully-fundamental" bar the project sets for itself. The remainder of this document enumerates them with file/line anchors and a prioritized remediation path (§11).
 
 **Overall grade:** foundations A; composition and productionization C+. The distance between the two is the subject of this audit.
 

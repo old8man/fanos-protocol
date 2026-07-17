@@ -119,6 +119,13 @@ async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport:
     let mut pending: Vec<u8> = Vec::new(); // app writes made before the session went live
     let mut app_eof = false; // the app closed its write side
     let mut finished = false; // we called session.finish()
+    // Emit outbound cells only when the send state actually changes — on startup (the ClientHello),
+    // when the app hands us new data, or on the retransmit tick — never on every inbound datagram.
+    // `poll_payloads` re-sends the whole window each call, so emitting on each received ack would make
+    // one side's window re-transmit per ack while the peer acks per cell: a mutual amplification that
+    // is quadratic (in fact runaway) over an unbounded channel. The periodic tick carries acks and
+    // retransmits within one `TICK`, which bounds latency without the feedback storm.
+    let mut emit = true;
 
     loop {
         // Once live, flush any buffered pre-handshake writes and propagate the app's close.
@@ -126,17 +133,21 @@ async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport:
             if !pending.is_empty() {
                 session.write(&pending);
                 pending.clear();
+                emit = true;
             }
             if app_eof && !finished {
                 session.finish();
                 finished = true;
+                emit = true;
             }
         }
-        // Emit outbound datagrams and deliver any received bytes to the app.
-        for payload in session.poll_payloads() {
-            if outbound.send(payload).is_err() {
-                return; // the transport is gone
+        if emit {
+            for payload in session.poll_payloads() {
+                if outbound.send(payload).is_err() {
+                    return; // the transport is gone
+                }
             }
+            emit = false;
         }
         let data = session.read();
         if !data.is_empty() && wr.write_all(&data).await.is_err() {
@@ -150,6 +161,9 @@ async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport:
         tokio::select! {
             biased;
             maybe = inbound.recv() => match maybe {
+                // Absorb the delivery (acks advance the window, data feeds the receiver); the next tick
+                // emits the resulting ack/retransmit, so a burst of deliveries costs one emit, not one
+                // per datagram.
                 Some(payload) => session.handle_payload(&payload),
                 None => return, // peer transport closed
             },
@@ -159,13 +173,14 @@ async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport:
                     let chunk = buf.get(..n).unwrap_or(&[]);
                     if session.is_live() {
                         session.write(chunk);
+                        emit = true; // new app data to send now
                     } else {
                         pending.extend_from_slice(chunk);
                     }
                 }
                 Err(_) => return,
             },
-            _ = ticker.tick() => {}
+            _ = ticker.tick() => emit = true,
         }
     }
 }
@@ -188,12 +203,8 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"async-session-server");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
+        let mut emit = false; // gated like the client driver — emit on tick / on writing the response
         loop {
-            for payload in server.poll_payloads() {
-                if outbound.send(payload).is_err() {
-                    return;
-                }
-            }
             if let Some(sid) = server.primary()
                 && !answered
                 && server.receiver_finished(sid)
@@ -203,13 +214,22 @@ mod tests {
                 server.write(sid, &resp);
                 server.finish(sid);
                 answered = true;
+                emit = true;
+            }
+            if emit {
+                for payload in server.poll_payloads() {
+                    if outbound.send(payload).is_err() {
+                        return;
+                    }
+                }
+                emit = false;
             }
             tokio::select! {
                 maybe = inbound.recv() => match maybe {
                     Some(payload) => server.handle_payload(&keypair, &payload, &mut rng),
                     None => return,
                 },
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => emit = true,
             }
         }
     }
@@ -279,12 +299,8 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"mock-svc");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
+        let mut emit = false;
         loop {
-            for payload in server.poll_payloads() {
-                if outbound.send((SERVICE, payload)).is_err() {
-                    return;
-                }
-            }
             if let Some(sid) = server.primary()
                 && !answered
                 && server.receiver_finished(sid)
@@ -294,13 +310,22 @@ mod tests {
                 server.write(sid, &resp);
                 server.finish(sid);
                 answered = true;
+                emit = true;
+            }
+            if emit {
+                for payload in server.poll_payloads() {
+                    if outbound.send((SERVICE, payload)).is_err() {
+                        return;
+                    }
+                }
+                emit = false;
             }
             tokio::select! {
                 msg = inbound.recv() => match msg {
                     Some((_from, payload)) => server.handle_payload(&keypair, &payload, &mut rng),
                     None => return,
                 },
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => emit = true,
             }
         }
     }
@@ -336,5 +361,70 @@ mod tests {
             "the response arrived over the coordinate transport"
         );
         let _ = CLIENT; // documents the client coordinate in this scenario
+    }
+
+    #[tokio::test]
+    async fn a_large_payload_streams_through_the_async_stream() {
+        // ~100 KB each way exercises the multi-cell path: the driver's READ_CHUNK loop, many
+        // poll/handle rounds, the sliding window, and the retransmit tick — not just a single cell.
+        let mut rng = SeedRng::from_seed(b"async-large-key");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut crng = SeedRng::from_seed(b"async-large-client");
+        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+
+        let (c2s_tx, c2s_rx) = unbounded_channel();
+        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let mut stream = stream_over_channels(
+            client,
+            ChannelTransport {
+                outbound: c2s_tx,
+                inbound: s2c_rx,
+            },
+        );
+        tokio::spawn(serve_uppercase(keypair, s2c_tx, c2s_rx));
+
+        let request: Vec<u8> = (0..100_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let expected: Vec<u8> = request.iter().map(u8::to_ascii_uppercase).collect();
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            stream.write_all(&request).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.unwrap();
+            resp
+        })
+        .await
+        .expect("the large transfer completed in time");
+        assert_eq!(result, expected, "the whole payload streamed through, uppercased");
+    }
+
+    #[tokio::test]
+    async fn an_empty_request_completes_cleanly() {
+        // The app closes its write side without sending a byte. The driver still propagates the finish
+        // (an empty FIN stream), the service answers empty, and the client reads a clean EOF — no hang.
+        let mut rng = SeedRng::from_seed(b"async-empty-key");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut crng = SeedRng::from_seed(b"async-empty-client");
+        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+
+        let (c2s_tx, c2s_rx) = unbounded_channel();
+        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let mut stream = stream_over_channels(
+            client,
+            ChannelTransport {
+                outbound: c2s_tx,
+                inbound: s2c_rx,
+            },
+        );
+        tokio::spawn(serve_uppercase(keypair, s2c_tx, c2s_rx));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            stream.shutdown().await.unwrap(); // no write at all
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.unwrap();
+            resp
+        })
+        .await
+        .expect("the empty request completed in time");
+        assert!(result.is_empty(), "an empty request yields an empty response, cleanly");
     }
 }
