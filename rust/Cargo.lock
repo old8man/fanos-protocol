@@ -730,11 +730,15 @@ name = "fanos-node"
 version = "0.1.0"
 dependencies = [
  "fanos-calypso",
+ "fanos-diaulos",
  "fanos-field",
  "fanos-geometry",
  "fanos-onoma",
+ "fanos-pqcrypto",
  "fanos-quic",
  "fanos-runtime",
+ "fanos-session",
+ "rand_core 0.10.1",
  "tokio",
  "tracing",
  "tracing-subscriber",

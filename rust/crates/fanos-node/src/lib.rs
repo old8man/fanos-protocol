@@ -17,12 +17,14 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod diaulos;
 pub mod error;
 pub mod identity;
 pub mod node;
 pub mod resolve;
 
 pub use config::{NodeConfig, Peer, RoleSet};
+pub use diaulos::{NodeTransport, dial_service, serve_one};
 pub use error::NodeError;
 pub use node::{Health, Node};
 pub use resolve::ResolvedService;

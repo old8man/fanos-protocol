@@ -22,11 +22,18 @@ fanos-quic = { path = "../fanos-quic", version = "0.1.0" }
 # For `.fanos` name resolution: ONOMA addresses/derivations + CALYPSO descriptors.
 fanos-onoma = { path = "../fanos-onoma", version = "0.1.0", features = ["std"] }
 fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+# DIAULOS reliable encrypted sessions over the node's datagram transport, driven as async streams.
+fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
+fanos-session = { path = "../fanos-session", version = "0.1.0" }
+fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+rand_core = { version = "0.10", default-features = false }
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "time",
     "signal",
+    "sync",
+    "io-util",
 ] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
