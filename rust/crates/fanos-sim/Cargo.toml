@@ -32,6 +32,8 @@ fanos-crypto = { workspace = true, features = ["std"] }
 fanos-core = { workspace = true, features = ["std"] }
 # For the CALYPSO hidden-service flow (address, per-epoch rendezvous, PoW) over the overlay.
 fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+# For the ONOMA name-system resolution scenario (address derivations + descriptor publish/resolve).
+fanos-onoma = { path = "../fanos-onoma", version = "0.1.0" }
 # For the NYX mixnet scenarios (anonymity-set entropy math).
 fanos-nyx = { workspace = true, features = ["std"] }
 # For the networked DKG scenario (DkgNode engine driven over the sim).

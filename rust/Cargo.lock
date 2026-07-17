@@ -803,6 +803,7 @@ dependencies = [
  "fanos-incentives",
  "fanos-keygen",
  "fanos-nyx",
+ "fanos-onoma",
  "fanos-pqcrypto",
  "fanos-runtime",
  "fanos-vrf",
