@@ -18,7 +18,9 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use rand_core::CryptoRng;
 
 use crate::conn::Connection;
-use crate::handshake::{ClientHandshake, ServerHandshake, StaticKeypair};
+use crate::handshake::{
+    ClientHandshake, ServerHandshake, StaticKeypair, service_public_from_bundle,
+};
 
 /// A dial in flight: the `ClientHello` has been produced; hold this until the `ServerHello` arrives,
 /// then [`establish`](PendingDial::establish) it.
@@ -41,6 +43,15 @@ pub struct Dialed {
 pub fn dial<R: CryptoRng>(service_public: &HybridKemPublic, rng: &mut R) -> (PendingDial, Vec<u8>) {
     let (handshake, hello) = ClientHandshake::start(service_public, rng);
     (PendingDial { handshake }, hello)
+}
+
+/// Begin dialing straight from a service's canonical identity bundle (the `bundle` a `.fanos`
+/// resolution yields) — [`service_public_from_bundle`] then [`dial`]. `None` if the bundle is
+/// malformed. This is the one call a proxy makes after resolving a `.fanos` name.
+#[must_use]
+pub fn dial_bundle<R: CryptoRng>(bundle: &[u8], rng: &mut R) -> Option<(PendingDial, Vec<u8>)> {
+    let service_public = service_public_from_bundle(bundle)?;
+    Some(dial(&service_public, rng))
 }
 
 impl PendingDial {

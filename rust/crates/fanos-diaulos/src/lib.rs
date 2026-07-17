@@ -38,5 +38,7 @@ pub use cell::{CELL_LEN, Key, open, seal};
 pub use conn::Connection;
 pub use endpoint::StreamEndpoint;
 pub use frame::Frame;
-pub use handshake::{ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair};
-pub use session::{Dialed, PendingDial, accept, dial};
+pub use handshake::{
+    ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, service_public_from_bundle,
+};
+pub use session::{Dialed, PendingDial, accept, dial, dial_bundle};
