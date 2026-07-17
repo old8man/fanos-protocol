@@ -36,6 +36,8 @@ fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
 fanos-nyx = { workspace = true, features = ["std"] }
 # For the networked DKG scenario (DkgNode engine driven over the sim).
 fanos-keygen = { path = "../fanos-keygen", version = "0.1.0" }
+# For crafting the adversary's dealing in the Byzantine-equivocating-dealer DKG scenario.
+fanos-vrf = { path = "../fanos-vrf", version = "0.1.0" }
 # For crafting Byzantine/forged frames in the adversary scenarios.
 fanos-wire = { workspace = true, features = ["std"] }
 # For the anonymous paid-introduction scenario (VOPRF relay credits over the CALYPSO flow).

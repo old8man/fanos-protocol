@@ -107,9 +107,13 @@ canonical hashing rule; and a VRF key derives from *any* seed (a hash-to-scalar,
 canonical-bytes gate). L4 reads now **repair across the replica line** — a `Get`
 queries the responsible primary, then falls back through the co-linear replicas on a miss or a
 silent-replica timeout, so any survivor answers even when the primary recovered empty after churn.
-The networked **DKG completes on a timed qualified subset** — a node finalizes as soon as every
-member qualifies, or, once a collection deadline elapses, on whatever qualified set reached the
-threshold, so an offline dealer no longer stalls the honest majority. Documented as known
+The networked **DKG is Byzantine-robust via a complaint round** — a node finalizes as soon as every
+member qualifies, or (past a collection deadline) on the qualified set reaching the threshold, so an
+offline dealer cannot stall the majority; and a node missing or holding an *invalid* share complains,
+the dealer must publicly justify (reveal) the complainer's share against its commitment, and a dealer
+with an unanswered complaint is disqualified. Because commitments, complaints, and justifications are
+reliably broadcast, every honest node computes the same qualified set even against a dealer that
+*equivocates* (valid share to some, invalid to others), so they still agree on one key.
 The APHANTOS onion is **constant-size on the wire** — every hop's packet is
 padded to a fixed bucket with the real layer length carried in an *encrypted* field, so a passive
 observer cannot link entry to exit by the shrinking size a naive nested onion leaks. PROTEUS junk
@@ -117,10 +121,10 @@ is now **per-packet**: a random-looking nonce seeds each packet's junk/padding k
 two sends of the identical frame shape to different bytes (no fixed intra-epoch prefix, cf.
 AmneziaWG). NYX **cover traffic is now byte-indistinguishable from real onions** — a cover cell is
 the same `Tessera` frame type and the same constant onion size, and it simply fails to peel (the
-drop path a wrong-relay onion takes), so an observer cannot tell an idle node from a busy one. Documented as known limitations with a fix path (see the module docs): the processing
-relay still learns its own onion layer length (full position-hiding is the Sphinx filler
-construction), and DKG's qualified-set agreement is robust to crash/offline dealers but not yet to a
-Byzantine *equivocating* dealer (the classic complaint round).
+drop path a wrong-relay onion takes), so an observer cannot tell an idle node from a busy one.
+Documented as a known limitation with a fix path (see the module docs): the onion's processing relay
+still learns its own layer length (full position-hiding is the Sphinx filler construction; a passive
+network observer already learns nothing from size).
 
 ### Build, verify, and simulate
 
