@@ -175,7 +175,20 @@ pub async fn spawn(
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client) = node_configs()?;
-    spawn_inner(engine, directory, None, None, server, client)
+    spawn_inner(
+        engine,
+        directory,
+        None,
+        None,
+        server,
+        client,
+        default_bind(),
+    )
+}
+
+/// The default bind address for the test/loopback wrappers: an ephemeral port on localhost.
+fn default_bind() -> SocketAddr {
+    (Ipv4Addr::LOCALHOST, 0).into()
 }
 
 /// Bring up a **self-certifying** node: its overlay coordinate is `MapToPoint(H(cert))`, bound to
@@ -187,7 +200,14 @@ pub async fn spawn_self_certifying<F: Field + 'static>(
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, cert) = node_configs_mutual()?;
-    self_certifying_inner::<F, _>(server, client, &cert, make_engine, directory)
+    self_certifying_inner::<F, _>(
+        server,
+        client,
+        &cert,
+        make_engine,
+        directory,
+        default_bind(),
+    )
 }
 
 /// Like [`spawn_self_certifying`], but reuses persisted [`NodeCredentials`] so the node keeps the
@@ -198,7 +218,27 @@ pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, cert) = node_configs_mutual_from(credentials)?;
-    self_certifying_inner::<F, _>(server, client, &cert, make_engine, directory)
+    self_certifying_inner::<F, _>(
+        server,
+        client,
+        &cert,
+        make_engine,
+        directory,
+        default_bind(),
+    )
+}
+
+/// Like [`spawn_self_certifying_persistent`], but binds the QUIC endpoint to an explicit address
+/// (e.g. `0.0.0.0:9000` for a publicly reachable node) instead of an ephemeral localhost port. This
+/// is the production entry point a node binary uses; the coordinate stays cert-derived and stable.
+pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
+    bind: SocketAddr,
+    credentials: &NodeCredentials,
+    make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
+    directory: Directory,
+) -> Result<NodeHandle, QuicError> {
+    let (server, client, cert) = node_configs_mutual_from(credentials)?;
+    self_certifying_inner::<F, _>(server, client, &cert, make_engine, directory, bind)
 }
 
 fn self_certifying_inner<F: Field + 'static, M>(
@@ -207,6 +247,7 @@ fn self_certifying_inner<F: Field + 'static, M>(
     cert: &rustls::pki_types::CertificateDer<'static>,
     make_engine: M,
     directory: Directory,
+    bind: SocketAddr,
 ) -> Result<NodeHandle, QuicError>
 where
     M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
@@ -215,7 +256,7 @@ where
     let derive: Identity = Some(Arc::new(|der: &[u8]| {
         Some(coordinate_from_cert::<F>(der).coords())
     }));
-    spawn_inner(engine, directory, None, derive, server, client)
+    spawn_inner(engine, directory, None, derive, server, client, bind)
 }
 
 /// Like [`spawn`], but every frame on the wire is PROTEUS-shaped with the shared `community_secret`
@@ -230,7 +271,15 @@ pub async fn spawn_shaped(
 ) -> Result<NodeHandle, QuicError> {
     let shaper = Arc::new(ProteusShaper::new(community_secret, epoch));
     let (server, client) = node_configs()?;
-    spawn_inner(engine, directory, Some(shaper), None, server, client)
+    spawn_inner(
+        engine,
+        directory,
+        Some(shaper),
+        None,
+        server,
+        client,
+        default_bind(),
+    )
 }
 
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
@@ -242,6 +291,7 @@ fn spawn_inner(
     identity: Identity,
     mut server_cfg: ServerConfig,
     mut client_cfg: ClientConfig,
+    bind: SocketAddr,
 ) -> Result<NodeHandle, QuicError> {
     let addr = engine.address();
 
@@ -249,7 +299,6 @@ fn spawn_inner(
     server_cfg.transport_config(tuned_transport());
     client_cfg.transport_config(tuned_transport());
 
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut endpoint = Endpoint::server(server_cfg, bind)?;
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;

@@ -1,0 +1,43 @@
+[package]
+name = "fanos-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS node — the unified `fanos` daemon: composes the sans-I/O engines behind the QUIC driver, with a persistent self-certifying identity and bootstrap."
+keywords = ["p2p", "overlay", "node", "daemon", "fanos"]
+categories = ["network-programming", "command-line-utilities"]
+
+[[bin]]
+name = "fanos"
+path = "src/bin/fanos.rs"
+
+[dependencies]
+fanos-field = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-runtime = { workspace = true, features = ["std"] }
+fanos-quic = { path = "../fanos-quic", version = "0.1.0" }
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "signal",
+] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+] }
+
+[lints]
+workspace = true
