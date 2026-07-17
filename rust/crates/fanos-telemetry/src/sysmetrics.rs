@@ -252,8 +252,9 @@ fn is_virtual_or_partition(name: &str) -> bool {
     false
 }
 
-/// The best system probe for the platform this was compiled for: an optimized `ProcProbe` on Linux,
-/// otherwise a [`NullProbe`] (until an opt-in backend is enabled). Boxed so callers stay agnostic.
+/// The best system probe for the platform this was compiled for: the optimized `/proc` [`linux::
+/// ProcProbe`] on Linux; the cross-platform [`portable::SysinfoProbe`] elsewhere when the `sysinfo`
+/// feature is on; otherwise a [`NullProbe`]. Boxed so callers stay platform-agnostic.
 #[cfg(feature = "std")]
 #[must_use]
 pub fn platform_probe() -> Box<dyn SystemProbe + Send> {
@@ -261,7 +262,94 @@ pub fn platform_probe() -> Box<dyn SystemProbe + Send> {
     if let Some(p) = linux::ProcProbe::open() {
         return Box::new(p);
     }
+    #[cfg(all(feature = "sysinfo", not(target_os = "linux")))]
+    return Box::new(portable::SysinfoProbe::new());
+    #[cfg(not(all(feature = "sysinfo", not(target_os = "linux"))))]
     Box::new(NullProbe)
+}
+
+/// The cross-platform backend (macOS/Windows/etc.), built on the `sysinfo` crate. Opt-in via the
+/// `sysinfo` feature; on Linux the direct `/proc` probe is preferred. `sysinfo` does not expose
+/// system-wide disk throughput, so those fields stay `0` here (the Linux probe fills them).
+#[cfg(all(feature = "sysinfo", feature = "std"))]
+pub mod portable {
+    use sysinfo::{Networks, System};
+
+    use super::{SystemProbe, SystemSample, rate};
+
+    /// A `sysinfo`-backed probe. Refreshes only CPU/memory/network each sample (not the whole
+    /// system) for efficiency; network counters are turned into rates via the shared clock.
+    pub struct SysinfoProbe {
+        sys: System,
+        networks: Networks,
+        prev_net: Option<(u64, u64, u64)>,
+    }
+
+    impl SysinfoProbe {
+        /// Create and prime the probe (a first CPU refresh, so the next sample has a delta).
+        #[must_use]
+        pub fn new() -> Self {
+            let mut sys = System::new();
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+            Self {
+                sys,
+                networks: Networks::new_with_refreshed_list(),
+                prev_net: None,
+            }
+        }
+    }
+
+    impl Default for SysinfoProbe {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SystemProbe for SysinfoProbe {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        fn sample(&mut self, now_nanos: u64) -> SystemSample {
+            self.sys.refresh_cpu_usage();
+            self.sys.refresh_memory();
+            self.networks.refresh(true);
+
+            let cpu = (self.sys.global_cpu_usage() / 100.0).clamp(0.0, 1.0);
+            let total = self.sys.total_memory();
+            let used = self.sys.used_memory();
+            let mem = if total > 0 {
+                (used as f64 / total as f64).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let cores = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f32);
+            let load = System::load_average().one as f32 / cores;
+
+            let (mut rx, mut tx) = (0u64, 0u64);
+            for (_iface, data) in &self.networks {
+                rx = rx.saturating_add(data.total_received());
+                tx = tx.saturating_add(data.total_transmitted());
+            }
+
+            let mut s = SystemSample {
+                cpu_busy: cpu,
+                mem_used: mem,
+                load_per_core: load,
+                net_rx_bps: 0.0,
+                net_tx_bps: 0.0,
+                disk_read_bps: 0.0,
+                disk_write_bps: 0.0,
+                proc_rss: 0,
+                available: true,
+            };
+            if let Some((prx, ptx, pat)) = self.prev_net {
+                let dt = now_nanos.saturating_sub(pat);
+                s.net_rx_bps = rate(prx, rx, dt);
+                s.net_tx_bps = rate(ptx, tx, dt);
+            }
+            self.prev_net = Some((rx, tx, now_nanos));
+            s
+        }
+    }
 }
 
 #[cfg(all(feature = "std", target_os = "linux"))]
@@ -476,5 +564,20 @@ Inter-|   Receive                                                |  Transmit
     #[test]
     fn null_probe_is_unavailable() {
         assert!(!NullProbe.sample(0).available);
+    }
+
+    #[cfg(feature = "sysinfo")]
+    #[test]
+    fn sysinfo_probe_reads_real_vitals_in_range() {
+        let mut p = portable::SysinfoProbe::new();
+        let _first = p.sample(0);
+        let s = p.sample(1_000_000_000); // ~1 s later on the shared clock
+        assert!(s.available, "the platform backend produced a real sample");
+        assert!((0.0..=1.0).contains(&s.cpu_busy), "cpu in [0,1]");
+        assert!((0.0..=1.0).contains(&s.mem_used), "mem in [0,1]");
+        assert!(
+            s.net_rx_bps >= 0.0 && s.net_tx_bps >= 0.0,
+            "rates non-negative"
+        );
     }
 }
