@@ -25,7 +25,7 @@ fanos-protocol/
 ├── spec/            The protocol specification (spec/protocol.md) — the source of truth
 ├── rust/            Reference implementation (Rust) — a Cargo workspace, see rust/README.md
 ├── conformance/     Language-agnostic known-answer test vectors (KATs) — the interop contract
-├── docs/            Supplementary documentation
+├── docs/            Supplementary documentation (see docs/roadmap.md for the strategic vision)
 └── <lang>/          Future implementations (go/, python/, …) slot in as siblings
 ```
 
