@@ -819,6 +819,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-rendezvous"
+version = "0.1.0"
+dependencies = [
+ "fanos-aphantos",
+ "fanos-calypso",
+ "fanos-field",
+ "fanos-geometry",
+ "fanos-pqcrypto",
+]
+
+[[package]]
 name = "fanos-runtime"
 version = "0.1.0"
 dependencies = [
@@ -858,6 +869,7 @@ dependencies = [
  "fanos-nyx",
  "fanos-onoma",
  "fanos-pqcrypto",
+ "fanos-rendezvous",
  "fanos-runtime",
  "fanos-telemetry",
  "fanos-vrf",

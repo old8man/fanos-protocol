@@ -30,6 +30,7 @@ members = [
     "crates/fanos-diaulos",
     "crates/fanos-telemetry",
     "crates/fanos-session",
+    "crates/fanos-rendezvous",
     "crates/fanos-node",
     "crates/fanos-proxy",
     "crates/fanos-cli",

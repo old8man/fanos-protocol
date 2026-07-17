@@ -1,0 +1,24 @@
+[package]
+name = "fanos-rendezvous"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Anonymous rendezvous for DIAULOS: carry a session's payloads over threshold onions (APHANTOS) to a computed meeting line (CALYPSO), so neither party learns the other's location."
+keywords = ["anonymity", "rendezvous", "onion", "mixnet", "fanos"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+# The meeting line derivation (client and service compute the same line, no lookup).
+fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+# The threshold onion (a hop is a line) the payloads ride, and its router framing.
+fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
+fanos-geometry = { workspace = true, features = ["std"] }
+fanos-field = { workspace = true, features = ["std"] }
+# Hybrid KEM public keys of the mixnet members (the onion seals to them).
+fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+
+[lints]
+workspace = true
