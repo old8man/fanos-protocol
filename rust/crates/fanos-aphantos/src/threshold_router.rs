@@ -192,9 +192,12 @@ impl<F: Field> ThresholdRouter<F> {
             }
             Ok(ThresholdPeel::Forward { next, onion }) => Self::combiner_of(next)
                 .map(|c| {
+                    // Re-pad the inner onion to the constant bucket so the forwarded packet is the
+                    // same size as the one we received — no cross-hop size correlation.
+                    let padded = threshold::pad_onion(&onion).unwrap_or(onion);
                     alloc::vec![Effect::Send {
                         to: c,
-                        frame: encode_onion(next, &onion),
+                        frame: encode_onion(next, &padded),
                     }]
                 })
                 .unwrap_or_default(),

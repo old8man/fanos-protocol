@@ -45,6 +45,33 @@ pub enum ThresholdError {
     Sharing,
     /// A KEM ciphertext failed to parse.
     Kem,
+    /// The built onion would exceed the fixed [`THRESHOLD_ONION_LEN`] bucket (path too long).
+    TooLong,
+}
+
+/// The fixed on-the-wire size of a threshold onion. Every hop's packet is padded to this constant
+/// bucket, so a passive observer cannot link hops by the shrinking layer size a naive nested onion
+/// leaks (spec §5.7). Sized to hold a Fano threshold circuit of several hops. (Residual, documented:
+/// the per-layer `ct_len` in the layer header is cleartext — needed by every line member to parse
+/// its share slot — so an observer that *parses* the packet still sees the layer size; full
+/// field-level hiding is the flat-header Sphinx construction. Packet **size** is fully constant.)
+/// It is a network-wide parameter — every node must agree on it — sized for the deepest supported
+/// threshold circuit (each hop costs `≈ line_size × 1169` bytes of KEM-sealed shares).
+pub const THRESHOLD_ONION_LEN: usize = 20480;
+
+/// Pad a threshold onion to the constant [`THRESHOLD_ONION_LEN`] bucket with keystream filler that
+/// looks like ciphertext (the receiver's [`ThresholdSealed::from_bytes`] self-delimits and ignores
+/// it). Errors with [`ThresholdError::TooLong`] if the onion already exceeds the bucket.
+pub fn pad_onion(onion: &[u8]) -> Result<Vec<u8>, ThresholdError> {
+    if onion.len() > THRESHOLD_ONION_LEN {
+        return Err(ThresholdError::TooLong);
+    }
+    let mut out = Vec::with_capacity(THRESHOLD_ONION_LEN);
+    out.extend_from_slice(onion);
+    let mut pad = alloc::vec![0u8; THRESHOLD_ONION_LEN - onion.len()];
+    fanos_crypto::hash::hash_xof("FANOS-v1/threshold-onion-pad", onion, &mut pad);
+    out.extend_from_slice(&pad);
+    Ok(out)
 }
 
 /// A threshold-sealed onion layer: the AEAD ciphertext of the routing command plus, for each line
@@ -313,7 +340,8 @@ pub fn seal_onion(
         )?;
         inner = sealed.to_bytes();
     }
-    Ok(inner)
+    // Pad the outermost packet to the constant bucket (each forwarded hop is re-padded likewise).
+    pad_onion(&inner)
 }
 
 /// `(threshold − 1) · 32` bytes of deterministic sharing randomness from a seed.
@@ -497,6 +525,11 @@ mod tests {
 
         let payload = b"threshold-routed anonymous hello";
         let mut onion = seal_onion(&hops, t, payload, b"circuit-seed").unwrap();
+        assert_eq!(
+            onion.len(),
+            THRESHOLD_ONION_LEN,
+            "the built onion is the fixed bucket size"
+        );
 
         // Route through each hop: a threshold subset of the line's members cooperate to peel.
         for kps in &lines {
@@ -507,7 +540,15 @@ mod tests {
                 .map(|(i, (sk, _))| (i, sk))
                 .collect();
             match peel_onion(&onion, &members).unwrap() {
-                ThresholdPeel::Forward { onion: inner, .. } => onion = inner,
+                ThresholdPeel::Forward { onion: inner, .. } => {
+                    // Re-pad the inner onion as the router does: every hop's packet is the same size.
+                    onion = pad_onion(&inner).unwrap();
+                    assert_eq!(
+                        onion.len(),
+                        THRESHOLD_ONION_LEN,
+                        "each hop stays constant-size"
+                    );
+                }
                 ThresholdPeel::Deliver { payload: got } => {
                     assert_eq!(got, payload, "the payload arrives intact");
                     return;
