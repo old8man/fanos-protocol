@@ -18,8 +18,9 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{ANONYMOUS, MixDirectory, RendezvousClient, meeting_line};
 use fanos_runtime::{Command, Notification};
-use fanos_session::{ChannelTransport, stream_over_channels};
+use fanos_session::{ChannelTransport, stream_over_channels_paced};
 use rand_core::CryptoRng;
+use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -98,14 +99,20 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
         },
         deliveries,
     ));
-    stream_over_channels(
+    stream_over_channels_paced(
         session,
         ChannelTransport {
             outbound: out_tx,
             inbound: in_rx,
         },
+        RENDEZVOUS_TICK,
     )
 }
+
+/// Retransmit cadence for an anonymous session. A hop is a multi-round threshold gather over the
+/// overlay, so the effective round trip is far larger than the Direct profile's base tick; pace
+/// retransmits to it so the client does not flood onions faster than the mixnet can peel them.
+const RENDEZVOUS_TICK: Duration = Duration::from_millis(250);
 
 /// The circuit + mixnet parameters a client uses to reach a service anonymously. `forward_hops` and
 /// `reply_circuit` are hop *lines* (a hop is a line); the meeting line is appended to the forward hops

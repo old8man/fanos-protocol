@@ -45,8 +45,22 @@ pub struct ChannelTransport {
 /// Must be called from within a tokio runtime (it spawns the driver task).
 #[must_use]
 pub fn stream_over_channels(session: ClientSession, transport: ChannelTransport) -> DuplexStream {
+    stream_over_channels_paced(session, transport, TICK)
+}
+
+/// Like [`stream_over_channels`] but with an explicit retransmit/keep-alive `tick`. A high-latency
+/// transport — e.g. a multi-hop threshold-onion rendezvous, whose effective round trip dwarfs the base
+/// `TICK` — must pace retransmits to that round trip, or the driver floods datagrams faster than they
+/// can be acknowledged and saturates the path. Coordinate-addressed (Direct) transports use the base
+/// tick via [`stream_over_channels`].
+#[must_use]
+pub fn stream_over_channels_paced(
+    session: ClientSession,
+    transport: ChannelTransport,
+    tick: Duration,
+) -> DuplexStream {
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
-    tokio::spawn(drive(session, driver_side, transport));
+    tokio::spawn(drive(session, driver_side, transport, tick));
     app_side
 }
 
@@ -108,13 +122,18 @@ async fn bridge<T: OverlayTransport>(
     }
 }
 
-async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport: ChannelTransport) {
+async fn drive(
+    mut session: ClientSession,
+    driver_side: DuplexStream,
+    transport: ChannelTransport,
+    tick: Duration,
+) {
     let ChannelTransport {
         outbound,
         mut inbound,
     } = transport;
     let (mut rd, mut wr) = tokio::io::split(driver_side);
-    let mut ticker = tokio::time::interval(TICK);
+    let mut ticker = tokio::time::interval(tick);
     let mut buf = vec![0u8; READ_CHUNK];
     let mut pending: Vec<u8> = Vec::new(); // app writes made before the session went live
     let mut app_eof = false; // the app closed its write side
