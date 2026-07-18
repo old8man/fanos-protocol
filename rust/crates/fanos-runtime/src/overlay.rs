@@ -35,6 +35,14 @@ const HEARTBEAT: TimerToken = TimerToken(0);
 /// last this-many per-node relay-activity samples. Bounded, so the self-model memory is `7 × this`.
 const BEHAVIOR_WINDOW: usize = 8;
 
+/// How long a locally-distrusted (Byzantine) member stays quarantined before it is re-admitted for
+/// re-evaluation. Quarantine is an *operational* safeguard, not a proven permanent exclusion (spec §6.2):
+/// permanently exiling a member would strand one that only glitched transiently. After this window the
+/// member is re-admitted; if it is still structurally inconsistent the next diagnosis re-quarantines it
+/// (the polar sum-rules re-catch it), and the authoritative clear remains the parent's re-provisioning
+/// (escalation). Bounded, so `quarantined` cannot grow without limit either (audit C5).
+const QUARANTINE_TTL: Duration = Duration::from_millis(60_000);
+
 /// Configuration of a node's liveness behaviour.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Config {
@@ -105,7 +113,7 @@ pub struct OverlayNode<F: Field> {
     repaired: BTreeSet<Triple>,
     /// Members locally distrusted after a polar-rule violation (spec §6.2); their frames are
     /// dropped pending parental re-provisioning.
-    quarantined: BTreeSet<Triple>,
+    quarantined: BTreeMap<Triple, Instant>,
     /// Witness-corroborated liveness (spec §6.4): for each peer, the freshest time *each distinct
     /// witness* directly observed it, learned from health-view gossip (`DiagGossip`). A lossy link
     /// cannot forge a false PeerDown (any honest witness rescues liveness), and a *Byzantine* liar
@@ -202,7 +210,7 @@ impl<F: Field> OverlayNode<F> {
             self_index,
             reroute: BTreeMap::new(),
             repaired: BTreeSet::new(),
-            quarantined: BTreeSet::new(),
+            quarantined: BTreeMap::new(),
             witnessed: BTreeMap::new(),
             store: BTreeMap::new(),
             pending_gets: BTreeMap::new(),
@@ -375,9 +383,14 @@ impl<F: Field> OverlayNode<F> {
     }
 
     fn on_message(&mut self, now: Instant, from: Triple, frame: &[u8]) -> Vec<Effect> {
-        // A locally-quarantined (Byzantine) member's frames are dropped (spec §6.2, §6.4).
-        if self.quarantined.contains(&from) {
-            return Vec::new();
+        // A locally-quarantined (Byzantine) member's frames are dropped (spec §6.2, §6.4) — but only for
+        // the bounded quarantine window; once it elapses the member is re-admitted for re-evaluation, so a
+        // transient fault is not a permanent exile (audit C5).
+        if let Some(&since) = self.quarantined.get(&from) {
+            if now.since(since) <= QUARANTINE_TTL {
+                return Vec::new();
+            }
+            self.quarantined.remove(&from); // window elapsed — re-admit; re-diagnosis re-quarantines if bad
         }
         let Ok((frame, _)) = decode_frame(frame) else {
             return Vec::new(); // canonical decode failure — drop (spec §7.5)
@@ -765,7 +778,7 @@ impl<F: Field> OverlayNode<F> {
             if !plan.is_empty() {
                 self.observer.note_healing();
             }
-            effects.extend(self.apply_healing_plan(&plan));
+            effects.extend(self.apply_healing_plan(now, &plan));
 
             // Behavioural homeostasis: run the coherence homeostat on the *measured* Γ_net (the relay-
             // activity self-model), not the liveness proxy. A common-mode flood shows as behavioural
@@ -791,7 +804,11 @@ impl<F: Field> OverlayNode<F> {
 
     /// Apply a [`HealingPlan`], mutating the reroute / repaired / quarantine state and emitting a
     /// notification for each *new* corrective action (idempotent across repeated rounds).
-    fn apply_healing_plan(&mut self, plan: &fanos_diakrisis::HealingPlan) -> Vec<Effect> {
+    fn apply_healing_plan(
+        &mut self,
+        now: Instant,
+        plan: &fanos_diakrisis::HealingPlan,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         for action in &plan.actions {
             match *action {
@@ -813,7 +830,8 @@ impl<F: Field> OverlayNode<F> {
                 }
                 HealingAction::Quarantine { node } => {
                     let node_c = Point::<F>::at(node).coords();
-                    if self.quarantined.insert(node_c) {
+                    // Insert (or refresh the window on) the quarantine; notify only on a *new* distrust.
+                    if self.quarantined.insert(node_c, now).is_none() {
                         effects.push(Effect::Notify(Notification::Quarantined(node_c)));
                     }
                 }
@@ -1015,6 +1033,42 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
             "a quiet cell does not spuriously shed correlation"
+        );
+    }
+
+    #[test]
+    fn quarantine_is_bounded_and_re_admits_a_member_after_the_ttl() {
+        // A distrusted member is not exiled forever: within the window its frames are dropped, but once the
+        // quarantine TTL elapses it is re-admitted for re-evaluation (a transient fault is not permanent).
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let member = Point::<F2>::at(1).coords();
+        node.quarantined.insert(member, Instant(0)); // as a Structural verdict would, at t=0
+
+        // Within the window: frames are dropped and it stays quarantined.
+        let within = node.step(
+            Instant(1_000),
+            Input::Message {
+                from: member,
+                frame: encode(FrameType::Route, b"x"),
+            },
+        );
+        assert!(within.is_empty(), "a quarantined member's frames are dropped within the window");
+        assert!(node.quarantined.contains_key(&member), "still quarantined within the window");
+
+        // Past the TTL (70 s > 60 s): re-admitted, and its frames are processed again.
+        let after = node.step(
+            Instant(70_000_000_000),
+            Input::Message {
+                from: member,
+                frame: encode(FrameType::Route, b"x"),
+            },
+        );
+        assert!(!node.quarantined.contains_key(&member), "re-admitted once the window elapses");
+        assert!(
+            after
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Delivered { .. }))),
+            "the re-admitted member's frames are processed again"
         );
     }
 
