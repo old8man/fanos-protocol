@@ -38,6 +38,7 @@ pub mod partition;
 pub mod plan;
 pub mod polar;
 pub mod regeneration;
+pub mod stability;
 pub mod window;
 
 use alloc::vec::Vec;

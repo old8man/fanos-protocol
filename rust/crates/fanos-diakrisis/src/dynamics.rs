@@ -21,7 +21,7 @@
 //! controller is [`homeostat::Homeostat`], which this simulator drives to confirm its guarantees.
 
 use crate::coherence::p_crit;
-use crate::homeostat::{stability_radius, v_preservation_gate};
+use crate::stability::{stability_radius, v_preservation_gate};
 
 /// The maximally-mixed purity `1/N` — the "heat-death" floor the dissipator relaxes toward.
 #[must_use]
