@@ -64,7 +64,7 @@ structure, which is why the answers compose instead of conflicting:
 | C2 | **Content-length / digest correlation** | Constant-size cells; padding indistinguishable from data | ✅ 🟡 | cells ✅; C4 content-digest gap 🟡 (#65) |
 | C3 | **Predictable beacons / mix from public coord** | Mix schedule/delays must not derive from the public coordinate | ⬜ | #61 (E5/E6) |
 | C4 | **Sender/recipient linkability** | Threshold onions (APHANTOS), computed meeting line (CALYPSO), symmetric-forward routing, cookie demux | ✅ 🟡 | anonymous path ✅ (wired); forward-secrecy both directions 🟡 (#61 E4) |
-| C5 | **Intersection / disclosure over epochs** | Epoch rotation; descriptor-nonce salting to unlink appearances | ⬜ | #58 (E3) + #61 |
+| C5 | **Statistical disclosure / intersection over epochs** | Epoch rotation unlinks *appearances*; against an enumerating adversary, **cover + the per-service anonymity set** make a service's line active independently of the target, erasing the disclosure signal | ✅ | `calypso/tests/statistical_disclosure.rs` (SDA advantage 0.904 undefended → −0.058 defended) |
 | C6 | **Guard discovery / entry enumeration** | Membership is geometric, not a public list; entry set per-client | ✅ | `calypso/tests/entry_unlinkability.rs` (uniform, unguessable, epoch-unlinkable, avalanche) |
 | C7 | **Telemetry deanonymization** (self-observation leaks) | Cell-granular floor; differential-privacy on exported coherence | ⬜ | #65 (C7) |
 | C8 | **Active tagging / tamper-and-trace** (flip bits to mark a flow) | Per-hop ChaCha20-Poly1305 AEAD: any tamper fails the tag at the first relay and is dropped; padding is regenerated per hop | ✅ | `aphantos/tests/onion_tamper.rs` (0 surviving tags over every core byte-flip) |
