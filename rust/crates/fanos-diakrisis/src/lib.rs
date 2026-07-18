@@ -40,12 +40,14 @@ pub mod plan;
 pub mod polar;
 pub mod regeneration;
 pub mod stability;
+pub mod vitals;
 pub mod window;
 
 use alloc::vec::Vec;
 
 pub use coherence::CoherenceMatrix;
 pub use homeostat::{BandControl, Homeostat};
+pub use vitals::VitalSigns;
 pub use plan::{HealingAction, HealingPlan, plan_healing};
 // Re-export the localization types from the code crate so callers have one diagnosis surface.
 pub use fanos_code::{Fault, Sector, decode_themes, locate, syndrome3, theme_flags};
