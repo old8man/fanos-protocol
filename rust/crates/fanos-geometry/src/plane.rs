@@ -289,7 +289,7 @@ mod tests {
     extern crate alloc;
     use alloc::vec::Vec;
 
-    use fanos_field::{F2, F7, F13, F31};
+    use fanos_field::{F2, F4, F7, F8, F13, F31};
 
     use super::*;
 
@@ -302,6 +302,29 @@ mod tests {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    /// The dual reference: the lines through a point are those `L` the point lies on.
+    fn brute_force_lines_through<F: Field>(point: Point<F>) -> Vec<Triple> {
+        let mut v: Vec<Triple> = Plane::<F>::lines()
+            .filter(|l| point.is_on(l))
+            .map(|l| l.coords())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn check_lines_through_matches_brute_force<F: Field>() {
+        let q = F::Q;
+        for p in 0..Plane::<F>::N as usize {
+            let point = Point::<F>::at(p);
+            let mut fast: Vec<Triple> = Plane::<F>::lines_through(point).map(|l| l.coords()).collect();
+            fast.sort_unstable();
+            assert_eq!(fast.len(), (q + 1) as usize, "q+1 lines through point {p}");
+            fast.dedup();
+            assert_eq!(fast.len(), (q + 1) as usize, "no duplicate lines through point {p}");
+            assert_eq!(fast, brute_force_lines_through(point), "point {p} line set");
+        }
     }
 
     fn check_points_on_matches_brute_force<F: Field>() {
@@ -345,9 +368,25 @@ mod tests {
     #[test]
     fn points_on_matches_brute_force_across_fields() {
         check_points_on_matches_brute_force::<F2>();
+        // Binary *extension* fields (q > 2, carry-less clmul arithmetic, char 2) — the case the prime
+        // fields below never exercise, where the basis span and neg = sub(0,x) identity run against
+        // real GF(2^m) multiplication.
+        check_points_on_matches_brute_force::<F4>();
+        check_points_on_matches_brute_force::<F8>();
         check_points_on_matches_brute_force::<F7>();
         check_points_on_matches_brute_force::<F13>();
         check_points_on_matches_brute_force::<F31>();
+    }
+
+    #[test]
+    fn lines_through_matches_brute_force_across_fields() {
+        // The dual of the above, as a *set* (not merely the q+1 count): a bug returning q+1 wrong
+        // lines through a point would pass a count-only check but fail here.
+        check_lines_through_matches_brute_force::<F2>();
+        check_lines_through_matches_brute_force::<F4>();
+        check_lines_through_matches_brute_force::<F8>();
+        check_lines_through_matches_brute_force::<F7>();
+        check_lines_through_matches_brute_force::<F13>();
     }
 
     #[test]

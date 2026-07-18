@@ -76,10 +76,18 @@ pub struct CoherenceFrame {
     pub heal_seq: u32,
 }
 
+/// Coerce a non-finite scalar (`NaN`/`±∞`, e.g. from a degenerate coherence matrix) to `0.0`, so a
+/// frame is always finite. This keeps the wire round-trip an equality (`NaN != NaN` would otherwise
+/// break `decode(encode(f)) == f`) and stops a meaningless value from poisoning forecasts, history
+/// aggregation, or any comparison downstream.
+fn finite(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
 impl CoherenceFrame {
     /// Fold a cell's coherence `matrix`, its degraded-node bitmask, and its spectral `gap` into a
     /// frame. The `degraded` mask (bit `k` = point `k` faulted) becomes the 3-bit syndrome; the
-    /// scalars and regime/alarm are read from the matrix.
+    /// scalars and regime/alarm are read from the matrix. Non-finite scalars are coerced to `0.0`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // f64→f32 narrowing is deliberate for the wire frame.
     pub fn observe(
@@ -111,11 +119,11 @@ impl CoherenceFrame {
             epoch,
             syndrome: syndrome3(degraded) & SYNDROME_MASK,
             verdict,
-            phi: m.phi as f32,
-            purity: m.purity as f32,
-            reflection: m.reflection as f32,
-            mean_r: matrix.mean_correlation() as f32,
-            gap: gap as f32,
+            phi: finite(m.phi as f32),
+            purity: finite(m.purity as f32),
+            reflection: finite(m.reflection as f32),
+            mean_r: finite(matrix.mean_correlation() as f32),
+            gap: finite(gap as f32),
             forecast,
             heal_seq,
         }
@@ -262,6 +270,33 @@ mod tests {
         let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0);
         assert!(f.is_faulted());
         assert!(f.syndrome <= 7, "syndrome is 3 bits");
+    }
+
+    #[test]
+    fn syndrome_folds_a_multi_bit_degraded_mask() {
+        let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
+        // Several faulted points at once: the mask still folds to a valid 3-bit syndrome (no panic,
+        // no overflow), and the frame round-trips.
+        for mask in [0b0000_0110u8, 0b0101_1010, 0b1111_1111] {
+            let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, mask, 0.0, -1, 0);
+            assert!(f.syndrome <= 7, "a multi-bit mask still yields a 3-bit syndrome");
+            assert_eq!(CoherenceFrame::decode(&f.encode()), Some(f));
+        }
+    }
+
+    #[test]
+    fn observe_sanitizes_non_finite_scalars() {
+        let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
+        // A non-finite gap (a degenerate spectral computation could produce one) must not leak into
+        // the frame: NaN would break the by-value round-trip (NaN != NaN) and poison comparisons.
+        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, f64::NAN, 0, 0);
+        assert!(f.gap.is_finite() && f.gap == 0.0, "a non-finite gap is coerced to 0.0");
+        assert!(
+            [f.phi, f.purity, f.reflection, f.mean_r, f.gap].iter().all(|x| x.is_finite()),
+            "every scalar in a frame is finite"
+        );
+        // With all scalars finite the frame round-trips by value, not merely byte-for-byte.
+        assert_eq!(CoherenceFrame::decode(&f.encode()), Some(f));
     }
 
     #[test]
