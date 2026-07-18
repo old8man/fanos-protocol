@@ -45,6 +45,10 @@ const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
 /// carries a small request id). No real request id reaches `2^63`.
 const MIX_FLAG: u64 = 1 << 63;
 
+/// The dedicated **cover-traffic** tick token (bit 62) — distinct from mix tokens (bit 63 set) and
+/// small gather-deadline request ids. A single recurring timer, matched exactly.
+const COVER_TOKEN: u64 = 1 << 62;
+
 /// Cap on distinct candidate shares a combiner will hold for one pending peel. A line has only `q + 1`
 /// real members, so honest operation never approaches this; the cap bounds memory (and the peel search
 /// below) against an attacker flooding forged `TAG_REP` replies.
@@ -84,6 +88,15 @@ pub struct ThresholdRouter<F: Field> {
     /// schedule on a secret (not the public coordinate) means a global passive adversary cannot recompute
     /// the delay sequence a priori and relink a hop's in/out flows (audit E2).
     mix_seed: [u8; 32],
+    /// Mean interval between **cover cells** (0 ⇒ disabled). When on, the router emits a constant-size
+    /// keystream cover onion on a Poisson schedule so its send pattern is uniform whether or not it is
+    /// forwarding real traffic — a global passive adversary sees the same rate and size either way,
+    /// closing the Full/threshold profile's cover-traffic gap (audit E1, spec §L5/V8).
+    cover_interval: Duration,
+    /// Whether the cover schedule is currently running.
+    covering: bool,
+    /// Counter driving the secret-keyed cover PRF (destination choice, cell keystream, inter-cell gaps).
+    cover_seq: u64,
 }
 
 impl<F: Field> ThresholdRouter<F> {
@@ -103,6 +116,9 @@ impl<F: Field> ThresholdRouter<F> {
             mix_pending: BTreeMap::new(),
             mix_seq: 0,
             mix_seed,
+            cover_interval: Duration(0),
+            covering: false,
+            cover_seq: 0,
         }
     }
 
@@ -119,6 +135,76 @@ impl<F: Field> ThresholdRouter<F> {
     pub fn with_mixing(mut self, mean_delay: Duration) -> Self {
         self.mean_delay = mean_delay;
         self
+    }
+
+    /// Enable constant-rate **cover traffic** at mean interval `interval` (Poisson). The schedule begins
+    /// on the first `Command::StartHeartbeat`; zero (the default) leaves cover off. Each tick emits a
+    /// constant-size cover onion that is byte-indistinguishable from a real one, so the router's send
+    /// rate and packet size reveal nothing about whether it is carrying real traffic (audit E1).
+    #[must_use]
+    pub fn with_cover(mut self, interval: Duration) -> Self {
+        self.cover_interval = interval;
+        self
+    }
+
+    /// A secret-keyed PRF unit in `[0, 1)` for the cover schedule (destination, gaps): keyed on the same
+    /// secret `mix_seed` as the mix delay, so the whole cover pattern is unpredictable from public data.
+    fn cover_prf_unit(&self, counter: u64) -> f64 {
+        let mut data = self.mix_seed.to_vec();
+        data.extend_from_slice(&counter.to_be_bytes());
+        let digest = fanos_crypto::hash_labeled("FANOS-v1/threshold-cover-prf", &data);
+        let bits = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
+        (bits as f64) / (u64::MAX as f64 + 1.0)
+    }
+
+    /// Arm the next cover tick after a fresh exponential gap (mean [`cover_interval`](Self::cover_interval)).
+    fn arm_cover(&mut self) -> Effect {
+        self.cover_seq = self.cover_seq.wrapping_add(1);
+        let u = self.cover_prf_unit(self.cover_seq).max(1e-12);
+        let gap = (-(self.cover_interval.as_nanos() as f64) * u.ln()) as u64;
+        Effect::ArmTimer {
+            token: TimerToken(COVER_TOKEN),
+            after: Duration(gap.max(1)),
+        }
+    }
+
+    /// Begin the cover schedule (arm the first tick) if cover is enabled and not already running.
+    fn start_cover(&mut self) -> Vec<Effect> {
+        if self.cover_interval.as_nanos() == 0 || self.covering {
+            return Vec::new();
+        }
+        self.covering = true;
+        alloc::vec![self.arm_cover()]
+    }
+
+    /// Emit one constant-size keystream **cover onion** to a pseudo-randomly chosen line's combiner, and
+    /// re-arm the cover tick. The cell is a full [`THRESHOLD_ONION_LEN`] block of keystream that looks
+    /// exactly like a padded threshold onion; the recipient tries to peel it, the KEM/AEAD fails on the
+    /// random bytes, and it is dropped — the identical path a real onion routed to the wrong line takes,
+    /// so cover and real traffic are unobservable to a network adversary (audit E1, spec §5.5/V8).
+    fn emit_cover(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        // A secret-keyed pseudo-random destination line (there are `N` lines in the plane).
+        self.cover_seq = self.cover_seq.wrapping_add(1);
+        let n_lines = Plane::<F>::N as usize;
+        let idx = (self.cover_prf_unit(self.cover_seq) * n_lines as f64) as usize;
+        let line = Line::<F>::at(idx.min(n_lines.saturating_sub(1))).coords();
+        // A constant-size block of keystream, indistinguishable from a real padded threshold onion.
+        self.cover_seq = self.cover_seq.wrapping_add(1);
+        let mut material = self.mix_seed.to_vec();
+        material.extend_from_slice(&self.cover_seq.to_be_bytes());
+        let mut cell = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        fanos_crypto::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
+        if let Some(combiner) = Self::combiner_of(line) {
+            effects.push(Effect::Send {
+                to: combiner,
+                frame: encode_onion(line, &cell),
+            });
+        }
+        if self.covering && self.cover_interval.as_nanos() > 0 {
+            effects.push(self.arm_cover());
+        }
+        effects
     }
 
     /// Forward `frame` to `to` — immediately, or (when mixing is on) held for a sampled exponential
@@ -364,7 +450,10 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                 _ => Vec::new(),
             },
             Input::Timer(TimerToken(token)) => {
-                if token & MIX_FLAG != 0 {
+                if token == COVER_TOKEN {
+                    // The cover tick fired: emit one indistinguishable cover onion and re-arm.
+                    self.emit_cover()
+                } else if token & MIX_FLAG != 0 {
                     // A held mix delay elapsed: release the forward now.
                     match self.mix_pending.remove(&(token & !MIX_FLAG)) {
                         Some((to, frame)) => alloc::vec![Effect::Send { to, frame }],
@@ -383,6 +472,8 @@ impl<F: Field> Engine for ThresholdRouter<F> {
             Input::Command(Command::Send { to, payload }) => {
                 alloc::vec![Effect::Send { to, frame: payload }]
             }
+            // Begin the cover schedule (if `with_cover` enabled it), mirroring the other node engines.
+            Input::Command(Command::StartHeartbeat) => self.start_cover(),
             Input::Command(_) => Vec::new(),
         }
     }
@@ -513,6 +604,45 @@ mod tests {
         // Deterministic for a given secret — the sans-I/O replay property is preserved.
         let seq_a2: Vec<u64> = (1..=8).map(|i| a.sample_delay(i).as_nanos()).collect();
         assert_eq!(seq_a, seq_a2, "the schedule is deterministic for a given secret");
+    }
+
+    #[test]
+    fn cover_traffic_emits_indistinguishable_constant_size_cells_at_a_uniform_rate() {
+        // E1. With cover enabled, StartHeartbeat arms the schedule; each tick emits ONE constant-size
+        // cover onion — byte-indistinguishable from a real padded threshold onion — and re-arms, so the
+        // router's send rate and packet size are uniform whether or not it is carrying real traffic.
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"cover-on"));
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s, 2)
+            .with_cover(Duration::from_millis(100));
+
+        let armed = r.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let is_cover_timer =
+            |e: &Effect| matches!(e, Effect::ArmTimer { token: TimerToken(t), .. } if *t == COVER_TOKEN);
+        assert!(armed.iter().any(is_cover_timer), "StartHeartbeat arms the cover schedule");
+
+        let tick = r.step(Instant(1), Input::Timer(TimerToken(COVER_TOKEN)));
+        let sends: Vec<&[u8]> = tick
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send { frame, .. } => Some(frame.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends.len(), 1, "exactly one cover cell per tick");
+        // The cover cell is exactly the size of a real launched onion carrying a full padded packet.
+        let real_len = launch_frame([0, 0, 0], &alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN]).len();
+        assert_eq!(sends[0].len(), real_len, "cover cell is the constant threshold-onion size");
+        assert!(tick.iter().any(is_cover_timer), "the schedule re-arms (constant rate)");
+
+        // Without `with_cover`, StartHeartbeat is inert (no cover on the mixing-only path).
+        let (s2, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"cover-off"));
+        let mut plain = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s2, 2);
+        assert!(
+            plain
+                .step(Instant(0), Input::Command(Command::StartHeartbeat))
+                .is_empty(),
+            "no cover configured ⇒ StartHeartbeat is a no-op"
+        );
     }
 
     #[test]
