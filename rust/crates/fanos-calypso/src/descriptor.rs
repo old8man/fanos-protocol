@@ -29,8 +29,11 @@ use fanos_onoma::derive::{descriptor_key, lookup_point};
 use crate::pow;
 
 const NONCE_LABEL: &str = "FANOS-v1/onoma-desc-nonce";
+const NONCE_SALT_LABEL: &str = "FANOS-v1/onoma-desc-nonce-salt";
 const SIGN_LABEL: &str = "FANOS-v1/onoma-desc-sign";
 const NONCE_LEN: usize = 12;
+/// The per-publish nonce salt length, carried in the wire form.
+const SALT_LEN: usize = 16;
 
 /// An error sealing or opening a descriptor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -146,16 +149,20 @@ impl Descriptor {
 pub struct SealedDescriptor {
     /// The proof-of-work nonce over the ciphertext.
     pub pow_nonce: u64,
-    /// `AEAD(descriptor_key(addr, epoch), nonce, encode(descriptor))`.
+    /// The per-publish AEAD nonce salt (bound to the plaintext), carried so the reader re-derives the
+    /// AEAD nonce and a mid-epoch republish of a changed body never reuses one (audit E3).
+    pub nonce_salt: [u8; SALT_LEN],
+    /// `AEAD(descriptor_key(addr, epoch), nonce(addr, epoch, nonce_salt), encode(descriptor))`.
     pub ciphertext: Vec<u8>,
 }
 
 impl SealedDescriptor {
-    /// Wire form: `pow_nonce(8 LE) ‖ ciphertext`.
+    /// Wire form: `pow_nonce(8 LE) ‖ nonce_salt(16) ‖ ciphertext`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(8 + self.ciphertext.len());
+        let mut b = Vec::with_capacity(8 + SALT_LEN + self.ciphertext.len());
         b.extend_from_slice(&self.pow_nonce.to_le_bytes());
+        b.extend_from_slice(&self.nonce_salt);
         b.extend_from_slice(&self.ciphertext);
         b
     }
@@ -165,30 +172,54 @@ impl SealedDescriptor {
     /// # Errors
     /// [`DescriptorError::Malformed`] if shorter than the 8-byte nonce prefix.
     pub fn decode(bytes: &[u8]) -> Result<Self, DescriptorError> {
-        let (head, tail) = bytes
+        let (head, rest) = bytes
             .split_at_checked(8)
+            .ok_or(DescriptorError::Malformed)?;
+        let (salt, tail) = rest
+            .split_at_checked(SALT_LEN)
             .ok_or(DescriptorError::Malformed)?;
         let mut a = [0u8; 8];
         a.copy_from_slice(head);
+        let mut s = [0u8; SALT_LEN];
+        s.copy_from_slice(salt);
         Ok(Self {
             pow_nonce: u64::from_le_bytes(a),
+            nonce_salt: s,
             ciphertext: tail.to_vec(),
         })
     }
 }
 
-/// The deterministic 12-byte AEAD nonce for `(addr, epoch)` — safe because `K` is single-use per
-/// address per epoch.
-fn nonce_bytes(addr: &Address, epoch: u64) -> [u8; NONCE_LEN] {
-    let mut input = Vec::with_capacity(33 + 8);
+/// The 12-byte AEAD nonce for `(addr, epoch, salt)`. Folding in a per-publish `salt` is what makes a
+/// mid-epoch republish safe: the deterministic `(addr, epoch)` nonce would reuse the same keystream and MAC
+/// tag if the descriptor body changed within an epoch (a new rendezvous set), catastrophically leaking the
+/// XOR of the two bodies. With the salt bound to the body (see [`nonce_salt`]) a changed body yields a
+/// fresh nonce (audit E3).
+fn nonce_bytes(addr: &Address, epoch: u64, salt: &[u8; SALT_LEN]) -> [u8; NONCE_LEN] {
+    let mut input = Vec::with_capacity(33 + 8 + SALT_LEN);
     input.extend_from_slice(&addr.payload());
     input.extend_from_slice(&epoch.to_le_bytes());
+    input.extend_from_slice(salt);
     let digest = hash_labeled(NONCE_LABEL, &input);
     let mut n = [0u8; NONCE_LEN];
     if let Some(prefix) = digest.get(..NONCE_LEN) {
         n.copy_from_slice(prefix);
     }
     n
+}
+
+/// The per-publish nonce salt, derived from the descriptor **plaintext** — a synthetic (SIV-style) nonce:
+/// a *different* body always yields a *fresh* salt (hence a fresh AEAD nonce, so no keystream/MAC reuse on a
+/// mid-epoch republish, E3), while an *identical* body yields an identical salt, which is safe (the same
+/// message under the same nonce). It is carried in the wire form so the reader re-derives the nonce, and the
+/// AEAD tag authenticates it — a swapped salt simply fails to decrypt. No entropy is required.
+fn nonce_salt(plaintext: &[u8]) -> [u8; SALT_LEN] {
+    let digest = hash_labeled(NONCE_SALT_LABEL, plaintext);
+    let mut s = [0u8; SALT_LEN];
+    if let Some(prefix) = digest.get(..SALT_LEN) {
+        s.copy_from_slice(prefix);
+    }
+    s
 }
 
 /// The PoW challenge binding the address, epoch, and ciphertext.
@@ -219,13 +250,16 @@ pub fn seal(
 ) -> Result<SealedDescriptor, DescriptorError> {
     let cipher = ChaCha20Poly1305::new_from_slice(&descriptor_key(addr, epoch))
         .map_err(|_| DescriptorError::Aead)?;
-    let nonce = nonce_bytes(addr, epoch);
+    let plaintext = desc.encode();
+    let salt = nonce_salt(&plaintext);
+    let nonce = nonce_bytes(addr, epoch, &salt);
     let ciphertext = cipher
-        .encrypt(&Nonce::from(nonce), desc.encode().as_ref())
+        .encrypt(&Nonce::from(nonce), plaintext.as_ref())
         .map_err(|_| DescriptorError::Aead)?;
     let pow_nonce = pow::solve(&pow_challenge(addr, epoch, &ciphertext), difficulty);
     Ok(SealedDescriptor {
         pow_nonce,
+        nonce_salt: salt,
         ciphertext,
     })
 }
@@ -253,7 +287,7 @@ pub fn open(
     }
     let cipher = ChaCha20Poly1305::new_from_slice(&descriptor_key(addr, epoch))
         .map_err(|_| DescriptorError::Aead)?;
-    let nonce = nonce_bytes(addr, epoch);
+    let nonce = nonce_bytes(addr, epoch, &sealed.nonce_salt);
     let plaintext = cipher
         .decrypt(&Nonce::from(nonce), sealed.ciphertext.as_ref())
         .map_err(|_| DescriptorError::Aead)?;
@@ -296,6 +330,35 @@ mod tests {
         let sealed = seal(&addr, 42, &desc, 4).unwrap();
         let opened = open(&addr, 42, &sealed, 4).unwrap();
         assert_eq!(opened, desc);
+    }
+
+    #[test]
+    fn a_mid_epoch_republish_of_a_changed_body_uses_a_fresh_nonce() {
+        // E3: within one epoch, re-sealing a *different* descriptor body must NOT reuse the AEAD nonce
+        // (which would leak the XOR of the two bodies). The salt is bound to the body, so a changed body
+        // yields a fresh salt → a fresh nonce.
+        let (addr, bundle) = service();
+        let epoch = 5;
+        let d1 = descriptor(epoch, bundle.clone());
+        let mut d2 = descriptor(epoch, bundle);
+        d2.metadata = vec![0xAB; 40]; // a changed rendezvous set — same addr, same epoch
+
+        let s1 = seal(&addr, epoch, &d1, 0).unwrap();
+        let s2 = seal(&addr, epoch, &d2, 0).unwrap();
+        assert_ne!(s1.nonce_salt, s2.nonce_salt, "a changed body yields a fresh nonce salt");
+        assert_ne!(
+            nonce_bytes(&addr, epoch, &s1.nonce_salt),
+            nonce_bytes(&addr, epoch, &s2.nonce_salt),
+            "hence a fresh AEAD nonce — no keystream/MAC reuse on the republish"
+        );
+
+        // Both still open correctly (the salt round-trips through the wire form and is authenticated).
+        assert_eq!(open(&addr, epoch, &s1, 0).unwrap(), d1);
+        assert_eq!(open(&addr, epoch, &s2, 0).unwrap(), d2);
+        assert_eq!(SealedDescriptor::decode(&s2.encode()).unwrap(), s2, "wire form carries the salt");
+
+        // An identical body re-seals to the identical salt — deterministic and safe (same message).
+        assert_eq!(seal(&addr, epoch, &d1, 0).unwrap().nonce_salt, s1.nonce_salt);
     }
 
     #[test]
