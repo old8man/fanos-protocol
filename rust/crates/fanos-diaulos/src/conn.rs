@@ -196,7 +196,7 @@ impl Connection {
     /// segments (selective repeat within its window) plus one `ACK` cell per stream.
     pub fn outbound(&mut self) -> Vec<Vec<u8>> {
         let mut frames: Vec<Frame> = Vec::new();
-        for (&id, s) in &self.streams {
+        for (&id, s) in &mut self.streams {
             for seg in s.sender.outbound() {
                 frames.push(Frame::Data(seg));
             }

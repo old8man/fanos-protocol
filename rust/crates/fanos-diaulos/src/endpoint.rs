@@ -259,8 +259,14 @@ mod tests {
 
     #[test]
     fn converges_under_sustained_alternating_loss() {
-        // Loss on *every* round (not just round 0): position k is dropped on rounds of one parity and
-        // delivered on the other, so every cell eventually gets through and selective repeat converges.
+        // A *periodic adversarial* dropper: on every round it deletes the cell at position k iff
+        // `(round + k)` has a fixed parity — opposite parities up and down. This is the pattern that
+        // exposes retransmit **mode-locking**: a bare RTO (or a fast retransmit fired in lock-step with
+        // the ack that triggers it) keeps resending a lost segment on the very phase the adversary drops,
+        // livelocking forever. The sender's golden-ratio retransmit jitter (an irrational, equidistributed
+        // Weyl schedule) walks each resend across loss phases, so it must still converge — and promptly.
+        // A dedicated loop (like the heavy-loss case) grants more than the happy-path `run` budget; the
+        // bound is the regression guard against the mode-lock returning (empirically it converges in 77).
         let (mut client, mut service) = endpoints();
         let up: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(11)) as u8).collect();
         let down: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(13)) as u8).collect();
@@ -268,12 +274,26 @@ mod tests {
         client.finish();
         service.write(&down);
         service.finish();
-        let (client_got, service_got) = run(
-            &mut client,
-            &mut service,
-            |round, k| (round + k).is_multiple_of(2),
-            |round, k| !(round + k).is_multiple_of(2),
-        );
+        let (mut client_got, mut service_got) = (Vec::new(), Vec::new());
+        let mut round = 0usize;
+        while !(client.is_done() && service.is_done()) {
+            for (k, cell) in client.outbound().into_iter().enumerate() {
+                if !(round + k).is_multiple_of(2) {
+                    service.on_cell(&cell);
+                }
+            }
+            service_got.extend_from_slice(&service.read());
+            for (k, cell) in service.outbound().into_iter().enumerate() {
+                if (round + k).is_multiple_of(2) {
+                    client.on_cell(&cell);
+                }
+            }
+            client_got.extend_from_slice(&client.read());
+            round += 1;
+            assert!(round < 160, "anti-resonance jitter must break the mode-lock and converge");
+        }
+        client_got.extend_from_slice(&client.read());
+        service_got.extend_from_slice(&service.read());
         assert_eq!(service_got, up);
         assert_eq!(client_got, down);
     }
@@ -302,7 +322,7 @@ mod tests {
                 }
             }
             round += 1;
-            assert!(round < 400, "heavy loss must still converge");
+            assert!(round < 200, "heavy loss must still converge");
         }
         service_got.extend_from_slice(&service.read());
         assert_eq!(service_got, up, "recovered under sustained 2/3 loss");

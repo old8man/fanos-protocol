@@ -38,6 +38,133 @@ pub const SACK_WIDTH: u32 = 64;
 /// The default sliding-window size (max in-flight / lookahead segments). Bounded by [`SACK_WIDTH`].
 pub const DEFAULT_WINDOW: u32 = 32;
 
+/// Retransmit-timer bounds, in **logical ticks** — one tick per [`StreamSender::outbound`] sweep. A
+/// driver calls `outbound` at a fixed cadence (once per sim step; once per pacing timer under real
+/// QUIC), so the sweep count is a monotone clock proportional to wall time, and RTT estimated in this
+/// unit (RFC 6298) needs no wall-clock threaded through the whole stack — the sender stays sans-I/O
+/// while still adapting to the driver's real cadence. `INIT` is the pre-measurement timeout (RFC 6298
+/// §2.1); `MIN`/`MAX` clamp it. Historically TCP itself measured RTT in coarse timer ticks (RFC 793),
+/// so a tick-clocked estimator is a derived, well-precedented construction, not an approximation of
+/// convenience.
+const RTO_INIT_TICKS: u32 = 3;
+const RTO_MIN_TICKS: u32 = 1;
+/// An absolute safety ceiling on the RTO, only ever reached before any RTT measurement exists (the
+/// real ceiling is relative — see [`RTO_BACKOFF_MULT`]).
+const RTO_MAX_TICKS: u32 = 240;
+
+/// The exponential back-off ceiling, **relative to the measured base RTO** (`SRTT + 4·RTTVAR`). RFC
+/// 6298's large absolute cap (≈60 s) exists to spare a *congested* path from retransmit storms — but
+/// FANOS sends at a **constant cell rate** (a resend merely displaces a padding cell; see
+/// [`Connection::outbound_padded`]), so a retransmit never adds network load and there is nothing to
+/// back off *for*. Backing off far past the RTT would then only stall recovery under heavy loss with no
+/// congestion benefit. Capping at a small multiple of the base RTO keeps spike protection (the base
+/// already carries a 4·RTTVAR margin) while bounding recovery latency — and, being expressed in the
+/// estimator's own RTT units, it adapts to whatever real cadence the driver sweeps at rather than
+/// hard-coding a tick count that is only meaningful for one transport.
+const RTO_BACKOFF_MULT: u32 = 4;
+
+/// Duplicate acknowledgements that trigger a **fast retransmit** (RFC 5681 §3.2): three acks that repeat
+/// the cumulative point while reporting fresh out-of-order data mean the gap segment was lost, so resend
+/// it well before the RTO would expire.
+const DUP_ACK_THRESHOLD: u32 = 3;
+
+/// The span (in ticks) of the golden-ratio jitter applied when fast retransmit reschedules a lost gap.
+/// Fast retransmit must be *prompt* but not fire in lock-step with the ack-clock that triggers it — else
+/// the resend phase-locks with a periodic loss pattern exactly as a bare RTO would. A short jittered
+/// delay in `[0, SPAN)` keeps it fast while walking the resend across loss phases (see [`jitter_ticks`]).
+const FAST_RETX_JITTER_SPAN: u32 = 5;
+
+/// An RFC 6298 smoothed-RTT / retransmit-timeout estimator in logical ticks, kept in the classic
+/// Jacobson–Karels scaled-integer form (`srtt` ×8, `rttvar` ×4). This is a **local timing** value — it
+/// gates only when the sender resends, never a security or consensus quantity — so exact integer ticks
+/// (no `f64`) keep it deterministic and panic-free across platforms.
+#[derive(Clone, Debug)]
+struct RttEstimator {
+    /// Smoothed round-trip time, scaled ×8. `0` means no measurement has been taken yet.
+    srtt_x8: u32,
+    /// Round-trip-time variation, scaled ×4.
+    rttvar_x4: u32,
+    /// The current retransmit timeout, in ticks (already clamped) — includes any exponential back-off.
+    rto: u32,
+    /// The measured base RTO `SRTT + max(1, 4·RTTVAR)` **before** back-off. Back-off is capped at
+    /// [`RTO_BACKOFF_MULT`]·`base_rto`, so the ceiling tracks the real RTT rather than a fixed tick count.
+    base_rto: u32,
+}
+
+impl RttEstimator {
+    fn new() -> Self {
+        Self {
+            srtt_x8: 0,
+            rttvar_x4: 0,
+            rto: RTO_INIT_TICKS,
+            base_rto: RTO_INIT_TICKS,
+        }
+    }
+
+    /// Fold in one round-trip measurement `m` (ticks), updating `SRTT`, `RTTVAR` and the `RTO`
+    /// (RFC 6298 §2, K = 4, clock granularity G = 1 tick). A measurement is floored at one tick: an ack
+    /// seen in the same sweep as the send is still a full (minimal) round. A fresh measurement also
+    /// clears any accumulated back-off (the new RTO is the base).
+    fn sample(&mut self, m: u32) {
+        let m = m.max(1);
+        if self.srtt_x8 == 0 {
+            self.srtt_x8 = m << 3; // SRTT   = m       (×8)
+            self.rttvar_x4 = m << 1; // RTTVAR = m / 2   (×4)
+        } else {
+            let srtt = self.srtt_x8 >> 3;
+            let delta = srtt.abs_diff(m); // |SRTT − m|
+            // RTTVAR ← 3/4·RTTVAR + 1/4·|SRTT − m|, all ×4 (so +delta, not +delta/4).
+            self.rttvar_x4 = self.rttvar_x4 - (self.rttvar_x4 >> 2) + delta;
+            // SRTT   ← 7/8·SRTT + 1/8·m, all ×8 (so +m, not +m/8).
+            self.srtt_x8 = self.srtt_x8 - (self.srtt_x8 >> 3) + m;
+        }
+        // RTO = SRTT + max(G, K·RTTVAR); K·RTTVAR is exactly `rttvar_x4`, G = 1 tick.
+        self.base_rto =
+            ((self.srtt_x8 >> 3) + self.rttvar_x4.max(1)).clamp(RTO_MIN_TICKS, RTO_MAX_TICKS);
+        self.rto = self.base_rto;
+    }
+
+    /// Exponential back-off on a retransmit timeout (RFC 6298 §5.5): double the RTO, but cap it at a
+    /// small multiple of the measured base RTO rather than a large absolute value — under constant-rate
+    /// cover traffic a resend adds no load, so backing off far past the RTT only delays recovery (see
+    /// [`RTO_BACKOFF_MULT`]). A later unambiguous [`sample`](Self::sample) resets to the base.
+    fn back_off(&mut self) {
+        let ceiling = self
+            .base_rto
+            .saturating_mul(RTO_BACKOFF_MULT)
+            .min(RTO_MAX_TICKS);
+        self.rto = self.rto.saturating_mul(2).min(ceiling).max(RTO_MIN_TICKS);
+    }
+}
+
+/// `frac(φ) · 2³²` for the golden ratio `φ = (√5 − 1)/2` — Knuth's Fibonacci-hashing multiplier. The
+/// golden ratio is, by Hurwitz's theorem, the real number *worst* approximable by rationals.
+const GOLDEN_Q32: u32 = 0x9E37_79B9;
+/// `frac(√2) · 2³²` — a second irrational step, incommensurable with the golden ratio, to spread the
+/// jitter across sequence numbers as well as across attempts (a 2-D Kronecker sequence). Also the
+/// SHA-2 `h₀` constant, a standard nothing-up-my-sleeve value.
+const SILVER_Q32: u32 = 0x6A09_E667;
+
+/// A deterministic, **provably non-resonant** retransmit jitter in `[0, rto)` ticks.
+///
+/// A pure exponential-backoff RTO is periodic, so against a *periodic* loss pattern a stuck segment's
+/// retransmits can phase-lock onto the dropped phase and never get through — a mode-locking livelock.
+/// Real stacks break this with random jitter; a sans-I/O engine has no randomness, so instead we use a
+/// **golden-ratio Weyl (Kronecker) sequence**: `frac(seq·√2 + attempt·φ)` scaled into `[0, rto)`. By
+/// Weyl's theorem this is equidistributed, and because `φ` is the most irrational number the sequence
+/// is maximally resistant to phase-locking with any rational-period loss — the same anti-synchronisation
+/// principle as phyllotaxis's golden angle, derived rather than analogised. Because it is a pure
+/// function of `(seq, attempt, rto)` the engine stays fully deterministic and replayable.
+fn jitter_ticks(seq: u32, attempt: u32, rto: u32) -> u32 {
+    let phase = seq
+        .wrapping_mul(SILVER_Q32)
+        .wrapping_add(attempt.wrapping_mul(GOLDEN_Q32));
+    // floor(frac(phase) · rto): scale the Q0.32 phase by `rto` and keep the integer part. The product
+    // is < rto·2³² ≤ 240·2³², so the shifted result is < rto and the `try_from` never falls back.
+    let scaled = (u64::from(phase) * u64::from(rto.max(1))) >> 32;
+    u32::try_from(scaled).unwrap_or(0)
+}
+
 /// A selective acknowledgement plus a receive-window credit. `cumulative` is the next sequence the
 /// receiver still needs (all below it are in order); `sack` is a bitmap where bit `i` set means
 /// sequence `cumulative + i` has already been received out of order (bit `0` is always clear —
@@ -118,6 +245,27 @@ pub struct StreamSender {
     window: u32,
     /// The receiver's last-advertised credit (flow control); the effective window is `min` of the two.
     peer_rwnd: u32,
+    /// Logical retransmit clock — advanced one tick per [`outbound`](Self::outbound) sweep. All send
+    /// times and the RTO live in this unit (see [`RTO_INIT_TICKS`]).
+    clock: u32,
+    /// The tick each in-flight seq was last (re)sent — the RTT-sample timebase. Bounded by the window
+    /// and pruned as segments are reclaimed, so it never grows with the transfer.
+    last_sent: BTreeMap<u32, u32>,
+    /// The earliest tick at which each in-flight seq may next be (re)sent — the **jittered retransmit
+    /// schedule**. Absent ⇒ never sent ⇒ due immediately. Both the RTO timer and fast retransmit act by
+    /// writing this one schedule, so every resend passes through the same anti-resonance jitter.
+    due_at: BTreeMap<u32, u32>,
+    /// Seqs retransmitted at least once, mapped to their **retransmit count**. Presence excludes the seq
+    /// from RTT sampling (Karn's algorithm — an ack for a resent segment is unattributable); the count
+    /// drives the per-attempt retransmit jitter (see [`jitter_ticks`]). Pruned on reclaim.
+    retransmitted: BTreeMap<u32, u32>,
+    /// The RFC 6298 RTT/RTO estimator, in ticks.
+    rtt: RttEstimator,
+    /// The last cumulative-ack point seen, and how many times it has repeated while reporting fresh
+    /// out-of-order data — the RFC 5681 fast-retransmit counter.
+    last_cumulative: u32,
+    /// Count of duplicate acks accumulated at `last_cumulative` (reset on progress or on firing).
+    dup_acks: u32,
 }
 
 impl StreamSender {
@@ -135,6 +283,13 @@ impl StreamSender {
             sacked: BTreeSet::new(),
             window: DEFAULT_WINDOW,
             peer_rwnd: SACK_WIDTH,
+            clock: 0,
+            last_sent: BTreeMap::new(),
+            due_at: BTreeMap::new(),
+            retransmitted: BTreeMap::new(),
+            rtt: RttEstimator::new(),
+            last_cumulative: 0,
+            dup_acks: 0,
         }
     }
 
@@ -202,36 +357,113 @@ impl StreamSender {
         self.finished = true;
     }
 
-    /// The segments to (re)send now — call on open/push and on each retransmit tick. Only the
-    /// **missing** segments within the effective window `[acked, acked + min(window, peer_rwnd))` are
-    /// emitted: any sequence already selectively acked is skipped (selective repeat), and the final
-    /// segment carries `fin` once the stream is finished.
+    /// The segments to (re)send now — call on open/push and on each retransmit tick (one tick per call).
+    /// Only segments within the effective window `[acked, acked + min(window, peer_rwnd))` that are
+    /// **actually due** are emitted; every call advances the logical [`clock`](Self::clock) one tick.
+    ///
+    /// A segment is due iff it is (a) being sent for the **first time** (never transmitted), (b) flagged
+    /// by **fast retransmit** (RFC 5681 — three dup-acks confirmed the gap lost), or (c) past its **RTO**
+    /// (RFC 6298 — the estimated round trip has elapsed since its last send). Selectively-acked sequences
+    /// are skipped (selective repeat). This replaces the old "resend the whole window every tick" policy,
+    /// which spuriously retransmitted in-flight data and, under a constant-rate shaper, crowded genuine
+    /// cover traffic out of the cell budget (audit F4-RTO); the freed budget is now filled by padding.
+    /// The final segment carries `fin` once the stream is finished.
     #[must_use]
-    pub fn outbound(&self) -> Vec<Segment> {
+    pub fn outbound(&mut self) -> Vec<Segment> {
+        self.clock = self.clock.saturating_add(1);
         let total = self.total();
         let last = total.saturating_sub(1);
         let win = self.window.min(self.peer_rwnd.max(1)); // at least 1: a zero-window probe
         let end = (self.acked + win).min(total);
-        (self.acked..end)
-            .filter(|seq| !self.sacked.contains(seq))
-            .filter_map(|seq| {
-                // `seq >= acked >= base`, so the index into the in-flight deque is non-negative.
-                let idx = seq.checked_sub(self.base)? as usize;
-                self.segments.get(idx).map(|data| Segment {
+        // A timeout backs the RTO off once per sweep (not once per timed-out segment).
+        let mut backed_off = false;
+        let mut out = Vec::new();
+        for seq in self.acked..end {
+            if self.sacked.contains(&seq) {
+                continue;
+            }
+            // `seq >= acked >= base`, so the index into the in-flight deque is non-negative and in range.
+            let Some(idx) = seq.checked_sub(self.base) else {
+                continue;
+            };
+            // A segment is due iff it has never been scheduled (first send) or its scheduled (jittered)
+            // retransmit tick has arrived. Fast retransmit and the RTO both act only by writing `due_at`,
+            // so every resend — whichever triggered it — is spaced by the same anti-resonance jitter.
+            let scheduled = self.due_at.get(&seq).copied();
+            let due = match scheduled {
+                None => true,
+                Some(at) => self.clock >= at,
+            };
+            if !due {
+                continue;
+            }
+            if scheduled.is_some() {
+                // A retransmission: bump the attempt count (also Karn-excludes the seq from RTT sampling)
+                // and back the RTO off once per sweep.
+                *self.retransmitted.entry(seq).or_insert(0) += 1;
+                if !backed_off {
+                    self.rtt.back_off();
+                    backed_off = true;
+                }
+            }
+            // Schedule the next eligible resend: RTO + a golden-ratio jitter over the retransmit count,
+            // so a stuck segment's resends cannot phase-lock with a periodic loss pattern.
+            let attempt = self.retransmitted.get(&seq).copied().unwrap_or(0);
+            let interval = self
+                .rtt
+                .rto
+                .saturating_add(jitter_ticks(seq, attempt, self.rtt.rto));
+            self.last_sent.insert(seq, self.clock);
+            self.due_at.insert(seq, self.clock.saturating_add(interval));
+            if let Some(data) = self.segments.get(idx as usize) {
+                out.push(Segment {
                     stream_id: self.stream_id,
                     seq,
                     fin: self.finished && seq == last,
                     data: data.clone(),
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        out
     }
 
     /// Apply a selective ack: adopt the receiver's advertised credit, advance the cumulative point,
-    /// and record the individually-acked sequences from the SACK bitmap so they are not retransmitted.
+    /// record the individually-acked sequences from the SACK bitmap (not retransmitted), update the RTT
+    /// estimate off an unambiguous newly-acked segment, and count duplicate acks for fast retransmit.
     pub fn on_ack(&mut self, ack: Ack) {
         self.peer_rwnd = ack.rwnd;
         let total = self.total();
+        let prev_acked = self.acked;
+
+        // Fast-retransmit trigger (RFC 5681 §3.2): an ack that repeats the cumulative point while
+        // reporting fresh out-of-order data (`sack != 0`) is a duplicate. `DUP_ACK_THRESHOLD` of them
+        // mean the gap segment — the one *at* the cumulative point — was lost. Reschedule it to resend
+        // within a short golden-ratio-jittered delay: prompt, but deliberately *not* in lock-step with
+        // this ack's arrival tick, which would re-create the mode-lock on the fast path. An ack that
+        // advances the cumulative point instead resets the counter.
+        if ack.cumulative == self.last_cumulative && ack.sack != 0 && ack.cumulative < total {
+            self.dup_acks = self.dup_acks.saturating_add(1);
+            if self.dup_acks >= DUP_ACK_THRESHOLD {
+                let seq = ack.cumulative;
+                let attempt = self.retransmitted.get(&seq).copied().unwrap_or(0);
+                let target = self
+                    .clock
+                    .saturating_add(jitter_ticks(seq, attempt, FAST_RETX_JITTER_SPAN));
+                // Only ever pull the resend *earlier* — never push it later. A segment that has not yet
+                // fired keeps `attempt == 0`, so its jitter is a fixed value; without the `min`, each new
+                // dup-ack burst would reset the schedule to `clock + that_fixed_delay` before `clock`
+                // could ever reach it, starving the resend forever.
+                self.due_at
+                    .entry(seq)
+                    .and_modify(|d| *d = (*d).min(target))
+                    .or_insert(target);
+                self.dup_acks = 0;
+            }
+        } else if ack.cumulative > self.last_cumulative {
+            self.last_cumulative = ack.cumulative;
+            self.dup_acks = 0;
+        }
+
         self.acked = self.acked.max(ack.cumulative).min(total);
         for i in 1..SACK_WIDTH {
             if ack.sack & (1u64 << i) != 0 {
@@ -250,12 +482,35 @@ impl StreamSender {
         }
         // Drop stale selective acks below the cumulative point.
         self.sacked = self.sacked.split_off(&self.acked);
+
+        // RTT sample (RFC 6298 §4 / Karn's algorithm): among the sequences this ack newly acknowledged
+        // — `[prev_acked, acked)` — take the highest that was sent exactly once (not retransmitted), so
+        // the round trip is unambiguously attributable. Ranging over the `sent_at` map (not the seq
+        // interval) bounds the scan by the in-flight window, so even a hostile far-future cumulative
+        // cannot turn this into a long loop.
+        if self.acked > prev_acked {
+            let sample = self
+                .last_sent
+                .range(prev_acked..self.acked)
+                .rev()
+                .find(|&(seq, _)| !self.retransmitted.contains_key(seq))
+                .map(|(_, &sent)| self.clock.wrapping_sub(sent));
+            if let Some(m) = sample {
+                self.rtt.sample(m);
+            }
+        }
+
         // Reclaim every segment now fully acknowledged (below the cumulative point): it is never
         // retransmitted, so it need not be held — the in-flight buffer stays bounded by the window,
         // independent of the total transfer size (audit F3).
         while self.base < self.acked && self.segments.pop_front().is_some() {
             self.base = self.base.saturating_add(1);
         }
+        // Prune the timing state below the cumulative point in lock-step, so it stays bounded by the
+        // window rather than growing with the transfer.
+        self.last_sent = self.last_sent.split_off(&self.acked);
+        self.due_at = self.due_at.split_off(&self.acked);
+        self.retransmitted = self.retransmitted.split_off(&self.acked);
     }
 
     /// Whether the stream is finished and every segment has been acknowledged.
@@ -410,6 +665,154 @@ impl StreamReceiver {
 mod tests {
     use super::*;
 
+    // ---- RTT/RTO estimator + retransmit scheduling (audit F4-RTO) ----
+
+    #[test]
+    fn an_in_flight_segment_is_not_resent_before_its_rto() {
+        // The core efficiency property: once a segment is sent, repeated `outbound` sweeps do NOT resend
+        // it until its RTO elapses — the old "resend the whole window every tick" behaviour is gone.
+        let payload: Vec<u8> = (0..4 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut tx = StreamSender::new(0, &payload).with_window(8);
+        let first = tx.outbound();
+        assert!(!first.is_empty(), "first sweep sends the window");
+        let sent_seqs: BTreeSet<u32> = first.iter().map(|s| s.seq).collect();
+        // Immediately-following sweeps, with no ack, send nothing until the RTO (init = 3 ticks) passes:
+        // the earliest possible resend is clock(1) + RTO(3) + jitter(≥0) = tick 4, so ticks 2 and 3 are
+        // silent. This is the efficiency property — no blind whole-window resend every tick.
+        assert!(tx.outbound().is_empty(), "tick 2: nothing due yet");
+        assert!(tx.outbound().is_empty(), "tick 3: nothing due yet");
+        // Across the following sweeps every unacked segment is retransmitted exactly once — but NOT all
+        // in the same sweep: the golden-ratio jitter deliberately de-synchronises them across ticks so a
+        // loss burst cannot align with the whole window at once (anti-resonance). Collect the set.
+        let mut resent = BTreeSet::new();
+        for _ in 0..RTO_MAX_TICKS {
+            for seg in tx.outbound() {
+                resent.insert(seg.seq);
+            }
+            if resent == sent_seqs {
+                break;
+            }
+        }
+        assert_eq!(
+            resent, sent_seqs,
+            "after the RTO the whole unacked window is eventually retransmitted (jitter-spread, not before tick 4)"
+        );
+    }
+
+    #[test]
+    fn the_rtt_estimator_converges_to_a_stable_rto() {
+        // Feed a constant 10-tick round trip; SRTT → 10, and RTTVAR decays to the integer granularity
+        // floor (RTTVAR ≈ 0.75, i.e. rttvar_x4 = 3, since 3 >> 2 = 0 — the standard scaled-integer RFC
+        // 6298 artifact), so RTO → SRTT + 3 = 13. The point: it converges just above the true RTT — never
+        // to zero, never runaway.
+        let mut est = RttEstimator::new();
+        for _ in 0..50 {
+            est.sample(10);
+        }
+        assert!(
+            (11..=14).contains(&est.rto),
+            "RTO converges just above the true RTT, got {}",
+            est.rto
+        );
+        // A single large spike widens RTTVAR and thus the RTO (the 4·RTTVAR safety margin), then decays.
+        est.sample(40);
+        assert!(est.rto > 14, "a latency spike widens the RTO, got {}", est.rto);
+    }
+
+    #[test]
+    fn back_off_is_bounded_by_a_multiple_of_the_base_rto() {
+        let mut est = RttEstimator::new();
+        for _ in 0..20 {
+            est.sample(10); // base RTO ≈ 10
+        }
+        let base = est.rto;
+        for _ in 0..20 {
+            est.back_off(); // repeated timeouts
+        }
+        assert!(
+            est.rto <= base * RTO_BACKOFF_MULT + 1,
+            "back-off is capped at MULT·base ({}·{}), got {}",
+            RTO_BACKOFF_MULT,
+            base,
+            est.rto
+        );
+        // A fresh measurement clears the back-off back to the base.
+        est.sample(10);
+        assert!(est.rto <= base + 1, "a new sample resets the back-off");
+    }
+
+    #[test]
+    fn fast_retransmit_resends_the_gap_without_waiting_for_the_rto() {
+        // Three dup-acks (same cumulative, fresh SACK data) resend the gap segment within the short
+        // fast-retransmit window — well before the RTO would fire.
+        let payload: Vec<u8> = (0..6 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut tx = StreamSender::new(7, &payload).with_window(8);
+        let _ = tx.outbound(); // send the window; seq 0 is the "lost" gap
+        // Three acks that keep cumulative = 0 but SACK seqs 1,2,3 (bits 1..=3) — classic dup-acks.
+        for _ in 0..3 {
+            tx.on_ack(Ack {
+                cumulative: 0,
+                sack: 0b1110,
+                rwnd: 64,
+            });
+        }
+        // Within FAST_RETX_JITTER_SPAN sweeps the gap (seq 0) is resent, ahead of the RTO.
+        let mut gap_resent = false;
+        for _ in 0..=FAST_RETX_JITTER_SPAN {
+            if tx.outbound().iter().any(|s| s.seq == 0) {
+                gap_resent = true;
+                break;
+            }
+        }
+        assert!(gap_resent, "fast retransmit resends the SACKed gap promptly");
+    }
+
+    #[test]
+    fn the_golden_ratio_jitter_is_equidistributed_and_in_range() {
+        // Weyl-sequence property: frac(seq·√2 + attempt·φ), scaled into [0, span), spreads roughly
+        // uniformly across the range as `attempt` advances — this is what defeats phase-locking. Check
+        // both the bound and that every bucket of a modest range is hit (no clustering).
+        let span = 16u32;
+        let mut buckets = [0u32; 16];
+        for attempt in 0..2000u32 {
+            let j = jitter_ticks(12345, attempt, span);
+            assert!(j < span, "jitter {j} out of range for span {span}");
+            buckets[j as usize] += 1;
+        }
+        assert!(
+            buckets.iter().all(|&c| c > 0),
+            "every jitter bucket is visited (equidistribution), got {buckets:?}"
+        );
+        // A zero span never divides by zero and yields zero delay.
+        assert_eq!(jitter_ticks(1, 1, 0), 0);
+    }
+
+    #[test]
+    fn timing_state_stays_bounded_by_the_window_over_a_long_transfer() {
+        // Reliability-under-loss over a large transfer must not let the per-seq timing maps grow with the
+        // stream: they are pruned below the cumulative ack in lock-step with segment reclaim (audit F3).
+        let payload: Vec<u8> = (0..200 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut tx = StreamSender::new(0, &payload).with_window(16);
+        let mut rx = StreamReceiver::new(0).with_recv_window(16);
+        let mut ack = rx.ack();
+        let mut guard = 0;
+        while !tx.is_complete() {
+            tx.on_ack(ack);
+            for seg in tx.outbound() {
+                ack = rx.on_segment(&seg);
+            }
+            let _ = rx.take();
+            assert!(
+                tx.last_sent.len() <= SACK_WIDTH as usize
+                    && tx.due_at.len() <= SACK_WIDTH as usize
+                    && tx.retransmitted.len() <= SACK_WIDTH as usize,
+                "timing maps stay window-bounded, not transfer-bounded"
+            );
+            guard += 1;
+            assert!(guard < 10_000, "should converge");
+        }
+    }
+
     #[test]
     fn segment_bytes_round_trip() {
         let seg = Segment {
@@ -425,11 +828,14 @@ mod tests {
     fn a_small_payload_is_one_fin_segment_and_reassembles() {
         let mut sender = StreamSender::new(1, b"short");
         let mut receiver = StreamReceiver::new(1);
-        for seg in sender.outbound() {
-            receiver.on_segment(&seg);
+        // Capture the one sweep's segments; `outbound` is now stateful (it ticks the retransmit clock and
+        // will not re-emit an in-flight segment until its RTO), so a second call would return nothing.
+        let segs = sender.outbound();
+        for seg in &segs {
+            receiver.on_segment(seg);
         }
         assert_eq!(receiver.deliver().as_deref(), Some(&b"short"[..]));
-        sender.on_ack(receiver.on_segment(&sender.outbound()[0]));
+        sender.on_ack(receiver.on_segment(&segs[0]));
         assert!(sender.is_complete());
     }
 
@@ -449,7 +855,17 @@ mod tests {
         sender.on_ack(last_ack);
 
         assert_eq!(last_ack.cumulative, 2);
-        let resend = sender.outbound();
+        // With only a single ack there is no dup-ack burst, so recovery is by RTO: after the timeout the
+        // lost gap resends — and when it does, ONLY the gap (seq 2) goes out (3.. are selectively acked,
+        // everything else is still in flight and not yet timed out). This is the point of the change:
+        // the whole window is no longer blindly re-emitted each tick.
+        let mut resend = Vec::new();
+        for _ in 0..RTO_MAX_TICKS {
+            resend = sender.outbound();
+            if !resend.is_empty() {
+                break;
+            }
+        }
         assert_eq!(resend.len(), 1, "only the lost segment is retransmitted");
         assert_eq!(resend[0].seq, 2);
 
@@ -461,7 +877,7 @@ mod tests {
     #[test]
     fn the_send_window_bounds_in_flight_segments() {
         let payload: Vec<u8> = (0..100 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
-        let sender = StreamSender::new(4, &payload).with_window(8);
+        let mut sender = StreamSender::new(4, &payload).with_window(8);
         assert_eq!(
             sender.outbound().len(),
             8,
@@ -472,13 +888,11 @@ mod tests {
     #[test]
     fn a_large_payload_reassembles_in_order() {
         let payload: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
-        let sender = StreamSender::new(9, &payload);
-        assert!(
-            sender.outbound().len() >= 5,
-            "5000 bytes spans several segments"
-        );
-        let mut receiver = StreamReceiver::new(9);
+        let mut sender = StreamSender::new(9, &payload);
+        // One stateful sweep; assert its size and reuse it (a second sweep would re-emit nothing yet).
         let mut segs = sender.outbound();
+        assert!(segs.len() >= 5, "5000 bytes spans several segments");
+        let mut receiver = StreamReceiver::new(9);
         segs.reverse();
         for seg in &segs {
             receiver.on_segment(seg);
@@ -536,7 +950,7 @@ mod tests {
     #[test]
     fn a_finish_without_data_still_delivers_a_fin() {
         // finish() on an empty stream produces one empty FIN segment.
-        let sender = StreamSender::new(6, b"");
+        let mut sender = StreamSender::new(6, b"");
         let mut receiver = StreamReceiver::new(6);
         for seg in sender.outbound() {
             receiver.on_segment(&seg);
@@ -549,7 +963,7 @@ mod tests {
     fn receiver_advertises_shrinking_then_recovering_credit() {
         // With a small window, out-of-order holds consume credit; taking the in-order prefix frees it.
         let payload: Vec<u8> = (0..3 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
-        let sender = StreamSender::new(7, &payload); // 4 segments (3 data + empty fin)
+        let mut sender = StreamSender::new(7, &payload); // 4 segments (3 data + empty fin)
         let mut receiver = StreamReceiver::new(7).with_recv_window(4);
 
         // Deliver seq 1,2 (out of order) — held, credit drops; seq 0 still missing.
