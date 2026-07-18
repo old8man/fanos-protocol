@@ -229,16 +229,20 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"async-session-server");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
+        let mut request = Vec::new();
         loop {
-            if let Some(sid) = server.primary()
-                && !answered
-                && server.receiver_finished(sid)
-            {
-                let req = server.read(sid);
-                let resp: Vec<u8> = req.iter().map(u8::to_ascii_uppercase).collect();
-                server.write(sid, &resp);
-                server.finish(sid);
-                answered = true;
+            if let Some(sid) = server.primary() {
+                // Drain available request bytes every round so `delivered` advances and the receive
+                // window slides. A bounded receiver (C3/F1) stalls the sender once its buffer fills, so
+                // waiting for `receiver_finished` before the first read would deadlock any request larger
+                // than the window — the flow-control contract is "drain to make progress".
+                request.extend_from_slice(&server.read(sid));
+                if !answered && server.receiver_finished(sid) {
+                    let resp: Vec<u8> = request.iter().map(u8::to_ascii_uppercase).collect();
+                    server.write(sid, &resp);
+                    server.finish(sid);
+                    answered = true;
+                }
             }
             // One emit per wake (below): the inbound arm coalesces its whole batch first, so this is
             // one emit per batch or tick — never one per datagram.
@@ -327,16 +331,20 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"mock-svc");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
+        let mut request = Vec::new();
         loop {
-            if let Some(sid) = server.primary()
-                && !answered
-                && server.receiver_finished(sid)
-            {
-                let req = server.read(sid);
-                let resp: Vec<u8> = req.iter().map(u8::to_ascii_uppercase).collect();
-                server.write(sid, &resp);
-                server.finish(sid);
-                answered = true;
+            if let Some(sid) = server.primary() {
+                // Drain available request bytes every round so `delivered` advances and the receive
+                // window slides. A bounded receiver (C3/F1) stalls the sender once its buffer fills, so
+                // waiting for `receiver_finished` before the first read would deadlock any request larger
+                // than the window — the flow-control contract is "drain to make progress".
+                request.extend_from_slice(&server.read(sid));
+                if !answered && server.receiver_finished(sid) {
+                    let resp: Vec<u8> = request.iter().map(u8::to_ascii_uppercase).collect();
+                    server.write(sid, &resp);
+                    server.finish(sid);
+                    answered = true;
+                }
             }
             for payload in server.poll_payloads() {
                 if outbound.send((SERVICE, payload)).is_err() {
