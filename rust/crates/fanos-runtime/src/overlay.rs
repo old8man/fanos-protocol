@@ -18,7 +18,7 @@ use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagno
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple, fano};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
-use fanos_wire::{FrameType, decode_frame, encode_frame};
+use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
 /// Storage `Publish` sub-type: the responsible node fans out replicas; a replica just stores.
 const PUBLISH_ORIGIN: u8 = 0;
@@ -657,11 +657,9 @@ impl<F: Field> OverlayNode<F> {
     }
 
     fn on_lookup(&self, from: Triple, body: &[u8]) -> Vec<Effect> {
-        let Some(digest) = parse_digest(body.get(..DIGEST)) else {
+        // Canonical derived codec (audit A1): rejects a short or trailing-byte Lookup.
+        let Ok(LookupBody { key: digest, nonce }) = LookupBody::from_wire(body) else {
             return Vec::new();
-        };
-        let Some(nonce) = parse_u64(body, DIGEST) else {
-            return Vec::new(); // a Lookup must carry the reader's correlation nonce (audit C4)
         };
         let (found, value): (bool, &[u8]) = match self.store.get(&digest) {
             Some(v) => (true, v),
@@ -1052,13 +1050,18 @@ fn encode_publish(flag: u8, digest: &[u8; DIGEST], value: &[u8]) -> Vec<u8> {
     encode(FrameType::Publish, &body)
 }
 
-/// A `Lookup` frame: `key(32) ‖ nonce(8)` (spec §L4). The nonce is the reader's per-request correlator,
-/// echoed in the `Value` reply so a stale/replayed answer cannot resolve a different read (audit C4).
+/// The `Lookup` frame body: `key(32) ‖ nonce(8)` (spec §L4). The nonce is the reader's per-request
+/// correlator, echoed in the `Value` reply so a stale/replayed answer cannot resolve a different read
+/// (audit C4). Its canonical codec is **derived** — one definition, one encoding (audit A1/G2).
+#[derive(fanos_wire_derive::Wire)]
+struct LookupBody {
+    key: [u8; DIGEST],
+    nonce: u64,
+}
+
+/// A `Lookup` frame (the derived body under the frame header).
 fn encode_lookup(digest: &[u8; DIGEST], nonce: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(DIGEST + 8);
-    body.extend_from_slice(digest);
-    body.extend_from_slice(&nonce.to_be_bytes());
-    encode(FrameType::Lookup, &body)
+    encode(FrameType::Lookup, &LookupBody { key: *digest, nonce }.to_wire())
 }
 
 /// A `Value` reply: `key(32) ‖ found(1) ‖ nonce(8) ‖ value` (spec §L4) — the nonce echoes the `Lookup`'s.

@@ -846,6 +846,7 @@ dependencies = [
  "fanos-geometry",
  "fanos-telemetry",
  "fanos-wire",
+ "fanos-wire-derive",
 ]
 
 [[package]]

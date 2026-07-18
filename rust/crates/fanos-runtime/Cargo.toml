@@ -19,6 +19,7 @@ fanos-telemetry.workspace = true
 fanos-crypto.workspace = true
 fanos-core.workspace = true
 fanos-wire.workspace = true
+fanos-wire-derive.workspace = true
 
 [features]
 default = ["std"]
