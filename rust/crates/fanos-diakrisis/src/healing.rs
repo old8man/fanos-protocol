@@ -37,17 +37,25 @@ pub fn phi_after_coarse_hops(phi: f64, d: u32) -> f64 {
 /// the integration threshold `Φ = 1` (spec §6.7). Returns `0` if already below `1`.
 #[must_use]
 pub fn max_reroute_depth(phi: f64) -> u32 {
-    if phi < 1.0 {
+    // A non-finite Φ (NaN from a degenerate coherence matrix, or +∞) is not a routable integration
+    // level: `∞ · PHI_CONTRACTION = ∞ ≥ 1` would spin this loop forever (a live-confirmed DoS if a
+    // gossiped reading reaches here). Reject it, and cap the loop regardless as defence in depth — the
+    // depth of any finite Φ is at most a few (Φ/9^d < 1), far below the cap.
+    if !phi.is_finite() || phi < 1.0 {
         return 0;
     }
     let mut depth = 0;
     let mut current = phi;
-    while current * PHI_CONTRACTION >= 1.0 {
+    while current * PHI_CONTRACTION >= 1.0 && depth < MAX_REROUTE_DEPTH {
         current *= PHI_CONTRACTION;
         depth += 1;
     }
     depth
 }
+
+/// A hard ceiling on reroute depth: `Φ / 9^d < 1` for any physically-meaningful Φ within a handful of
+/// hops, so this only ever bites a pathological (e.g. astronomically large but finite) input.
+const MAX_REROUTE_DEPTH: u32 = 64;
 
 /// The reintegration cooldown `τ ≈ 1/Δ` from the current rate-gap `Δ` (spec §6.7, T-226(v)).
 /// A cell tightens this adaptively from its own line rates rather than using a worst-case
@@ -81,6 +89,20 @@ pub fn reflection_sufficient(purity: f64, n: usize) -> bool {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_reroute_depth_is_total_and_terminates_on_non_finite_phi() {
+        // A well-behaved Φ gives a small finite depth (Φ/9^d < 1).
+        assert_eq!(max_reroute_depth(0.5), 0);
+        assert_eq!(max_reroute_depth(1.0), 0, "exactly 1 does not reroute");
+        assert_eq!(max_reroute_depth(9.0), 1);
+        assert_eq!(max_reroute_depth(82.0), 2);
+        // Non-finite Φ must not spin the loop forever (the D1 DoS): +∞·(1/9)=∞≥1 would never exit.
+        assert_eq!(max_reroute_depth(f64::INFINITY), 0);
+        assert_eq!(max_reroute_depth(f64::NAN), 0);
+        // Even an astronomically large finite Φ is capped, not unbounded.
+        assert!(max_reroute_depth(f64::MAX) <= MAX_REROUTE_DEPTH);
+    }
 
     #[test]
     fn coarse_hop_contracts_phi_by_one_ninth() {

@@ -102,7 +102,15 @@ pub fn violated_classes(rates: &[[f64; N]; N], tol: f64) -> Vec<usize> {
     for k in 0..N {
         let [(a, b), (c, d), (e, f)] = polar_class(k);
         let (r0, r1, r2) = (rates[a][b], rates[c][d], rates[e][f]);
-        if (r0 - r1).abs() > tol || (r0 - r2).abs() > tol {
+        // A non-finite rate is a violation, not a pass: `(NaN − r).abs() > tol` is false, so an
+        // unguarded check would let a Byzantine node reporting NaN/±∞ rates satisfy every polar
+        // identity and evade detection. The organism treats a non-finite observable as inconsistent.
+        if !r0.is_finite()
+            || !r1.is_finite()
+            || !r2.is_finite()
+            || (r0 - r1).abs() > tol
+            || (r0 - r2).abs() > tol
+        {
             violated.push(k);
         }
     }
@@ -119,6 +127,25 @@ pub fn sum_rules_hold(rates: &[[f64; N]; N], tol: f64) -> bool {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn violated_classes_flags_non_finite_rates() {
+        // A uniform rate matrix satisfies every polar identity — no violations.
+        let uniform = [[1.0f64; N]; N];
+        assert!(violated_classes(&uniform, 1e-9).is_empty());
+        // A single NaN rate must be reported as a violation, not silently satisfy the identity: an
+        // unguarded (NaN − r).abs() > tol is false, which would let a Byzantine node evade the check
+        // by reporting non-finite rates (D3).
+        let mut poisoned = uniform;
+        let (a, b) = polar_class(0)[0];
+        poisoned[a][b] = f64::NAN;
+        assert!(violated_classes(&poisoned, 1e-9).contains(&0));
+        // ±∞ likewise.
+        let mut inf = uniform;
+        let (c, d) = polar_class(3)[0];
+        inf[c][d] = f64::INFINITY;
+        assert!(violated_classes(&inf, 1e-9).contains(&3));
+    }
 
     #[test]
     fn polar_classes_partition_all_21_pairs() {

@@ -87,6 +87,14 @@ impl CoherenceMatrix {
         if n == 0 || c.len() != n * n {
             return None;
         }
+        // Reject any non-finite entry up front. NaN/±∞ silently pass the tolerance checks below (every
+        // comparison with NaN is false), so an unguarded matrix would admit a poisoned self-model —
+        // and a single non-finite entry propagates to Φ, which then hangs the reroute-depth loop and
+        // evades the Byzantine polar check. This is the boundary of the organism's self-observation:
+        // nothing non-finite enters the coherence state.
+        if c.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
         for i in 0..n {
             if (c.get(i * n + i)? - 1.0).abs() > 1e-9 {
                 return None;
@@ -294,6 +302,21 @@ pub fn purity_equicorrelated(n: usize, r: f64) -> f64 {
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_correlation_rejects_non_finite_entries() {
+        // A valid 2×2 correlation matrix is accepted.
+        assert!(CoherenceMatrix::from_correlation(vec![1.0, 0.3, 0.3, 1.0], 2).is_some());
+        // NaN or ±∞ anywhere is rejected — they would silently pass the tolerance checks (every
+        // comparison with NaN is false) and poison the self-model (D2).
+        assert!(CoherenceMatrix::from_correlation(vec![1.0, f64::NAN, f64::NAN, 1.0], 2).is_none());
+        assert!(
+            CoherenceMatrix::from_correlation(vec![f64::INFINITY, 0.0, 0.0, 1.0], 2).is_none()
+        );
+        assert!(
+            CoherenceMatrix::from_correlation(vec![1.0, 0.3, 0.3, f64::NEG_INFINITY], 2).is_none()
+        );
+    }
 
     #[test]
     fn simd_frobenius_matches_scalar() {
