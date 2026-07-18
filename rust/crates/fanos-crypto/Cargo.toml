@@ -14,6 +14,8 @@ categories = ["cryptography", "no-std"]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
 blake3 = { workspace = true }
+# Wipe Shamir share bytes (secret) on drop. `alloc` for the `Vec<u8>` share value; stays `no_std`.
+zeroize = { workspace = true, features = ["alloc"] }
 
 [features]
 default = ["std"]

@@ -98,6 +98,8 @@ fanos-telemetry = { path = "crates/fanos-telemetry", version = "0.1.0", default-
 # External dependencies (isolated to the crypto/privacy layers and above).
 blake3 = { version = "1", default-features = false }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+# Secret-material zeroization (wipe key bytes on drop). `no_std`; crates opt into `alloc` as needed.
+zeroize = { version = "1", default-features = false }
 
 # Test-only: property-based testing across all crates.
 proptest = "1"

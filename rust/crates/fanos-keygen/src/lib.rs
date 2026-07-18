@@ -33,6 +33,7 @@ use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notificat
 use fanos_vrf::dkg::{self, Dealing, Participant};
 use fanos_vrf::vss::{self, DeterministicRng, VssCommitment, VssShare};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The sharing-phase deadline timer: after this, a node complains about missing/invalid shares.
 const DKG_SHARE_DEADLINE: TimerToken = TimerToken(0);
@@ -383,6 +384,17 @@ impl<F: Field> DkgNode<F> {
         self.participant.final_share().value_bytes()
     }
 }
+
+impl<F: Field> Drop for DkgNode<F> {
+    /// Wipe this node's DKG secret contribution from memory on drop. (The derived shares in
+    /// `participant`/`my_shares` are `Copy` ristretto scalars from `fanos-vrf` and cannot be wiped
+    /// here without dropping their `Copy` — see that crate.)
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl<F: Field> ZeroizeOnDrop for DkgNode<F> {}
 
 /// A one-element effect vector emitting `DkgComplete(joint)`.
 fn alloc_vec_notify(joint: [u8; 32]) -> Vec<Effect> {

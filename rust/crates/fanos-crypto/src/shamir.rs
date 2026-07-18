@@ -14,8 +14,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use fanos_field::{F256, Field};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A share: its non-zero `x`-coordinate and the per-byte evaluations `y`.
+///
+/// The evaluations `y` are secret material (any `t` shares reconstruct the secret), so a `Share`
+/// wipes them from memory when it is dropped ([`ZeroizeOnDrop`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Share {
     /// The evaluation point (`1..=255`, distinct per share).
@@ -23,6 +27,14 @@ pub struct Share {
     /// The polynomial evaluations, one per secret byte.
     pub y: Vec<u8>,
 }
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        self.y.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Share {}
 
 /// Failure modes of the sharing API.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

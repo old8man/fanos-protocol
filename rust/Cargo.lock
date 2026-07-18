@@ -665,6 +665,7 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "proptest",
+ "zeroize",
 ]
 
 [[package]]
@@ -688,6 +689,7 @@ dependencies = [
  "fanos-runtime",
  "proptest",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -723,6 +725,7 @@ dependencies = [
  "fanos-runtime",
  "fanos-vrf",
  "fanos-wire",
+ "zeroize",
 ]
 
 [[package]]

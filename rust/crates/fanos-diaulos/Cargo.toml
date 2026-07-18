@@ -19,6 +19,8 @@ fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
 fanos-crypto = { workspace = true }
 # The `CryptoRng` bound the KEM keygen/encapsulation are generic over (0.10 matches fanos-pqcrypto).
 rand_core = { version = "0.10", default-features = false }
+# Wipe the direction/session AEAD keys and the handshake shared secret on drop.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use fanos_runtime::stream::{StreamReceiver, StreamSender};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::cell::{Key, open, seal};
 use crate::frame::Frame;
@@ -279,6 +280,16 @@ impl Connection {
         }
     }
 }
+
+impl Drop for Connection {
+    /// Wipe both direction keys from memory on drop; the reliability state holds no key material.
+    fn drop(&mut self) {
+        self.key_tx.zeroize();
+        self.key_rx.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Connection {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]

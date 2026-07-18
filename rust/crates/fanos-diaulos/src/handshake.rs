@@ -29,6 +29,7 @@ use fanos_pqcrypto::kem::{
     CIPHERTEXT_LEN, HybridCiphertext, HybridKemPublic, HybridKemSecret, PUBLIC_LEN, SessionKey,
 };
 use rand_core::CryptoRng;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::conn::Connection;
 
@@ -96,6 +97,16 @@ impl core::fmt::Debug for SessionKeys {
     }
 }
 
+impl Drop for SessionKeys {
+    /// Wipe both direction keys from memory on drop.
+    fn drop(&mut self) {
+        self.key_c2s.zeroize();
+        self.key_s2c.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SessionKeys {}
+
 impl SessionKeys {
     /// Build the client's (initiator) multiplexed connection: seals with `key_c2s`, opens `key_s2c`.
     #[must_use]
@@ -135,7 +146,9 @@ fn derive_keys(
 /// and receiving the `ServerHello`, then [`finish`](ClientHandshake::finish) it.
 pub struct ClientHandshake {
     ephemeral_secret: HybridKemSecret,
-    ss_static: SessionKey,
+    /// The hybrid shared secret from the service's static key; wiped on drop. (`ephemeral_secret`
+    /// already wipes itself via its X25519/ML-KEM fields' own `ZeroizeOnDrop`.)
+    ss_static: Zeroizing<SessionKey>,
     /// `service_public ‖ client_hello` — the transcript so far; `server_hello` is appended at finish.
     transcript_pre: Vec<u8>,
 }
@@ -159,7 +172,7 @@ impl ClientHandshake {
         (
             Self {
                 ephemeral_secret,
-                ss_static,
+                ss_static: Zeroizing::new(ss_static),
                 transcript_pre,
             },
             hello,
