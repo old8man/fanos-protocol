@@ -12,7 +12,8 @@ use alloc::vec::Vec;
 use fanos_crypto::hash::label;
 use fanos_crypto::{hash_labeled, map_to_point};
 use fanos_diakrisis::coherence::phi_equicorrelated;
-use fanos_diakrisis::{HealingAction, Observation, diagnose, plan_healing};
+use fanos_diakrisis::monitor::BehaviorMonitor;
+use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
@@ -29,6 +30,10 @@ use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notificati
 
 /// The single heartbeat timer token.
 const HEARTBEAT: TimerToken = TimerToken(0);
+
+/// The behavioural-coherence observation window, in heartbeat samples: the cell's `Γ_net` is read from the
+/// last this-many per-node relay-activity samples. Bounded, so the self-model memory is `7 × this`.
+const BEHAVIOR_WINDOW: usize = 8;
 
 /// Configuration of a node's liveness behaviour.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -127,6 +132,19 @@ pub struct OverlayNode<F: Field> {
     /// health into a `CoherenceFrame` and records it into bounded local history. Not optional — the
     /// reflexive loop cannot diagnose without observing (docs/design-telemetry.md).
     observer: SelfObserver,
+    /// Per-peer **data-relay** activity (`Route` frames) accumulated since the last behavioural sample —
+    /// the raw counts the coherence self-model is built from. Control chatter (pings, gossip) is excluded,
+    /// so this reflects *load*, not liveness.
+    activity: BTreeMap<Triple, u32>,
+    /// This node's own relay activity (`Route` frames it originated) since the last sample — the self slot
+    /// of the behavioural sample vector.
+    self_activity: u32,
+    /// The behavioural coherence monitor: a bounded window of per-node relay activity, read as the cell's
+    /// real `Γ_net` so the [`Homeostat`] runs on *measured* correlation, not the liveness proxy (base cell).
+    monitor: BehaviorMonitor,
+    /// The coherence homeostat this node runs on its behavioural self-model — the sense→act seam, with the
+    /// monitor sensing and `on_diagnose` actuating its band-keeping decision.
+    homeostat: Homeostat,
 }
 
 /// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
@@ -191,6 +209,10 @@ impl<F: Field> OverlayNode<F> {
             members: BTreeMap::new(),
             epoch: 0,
             observer,
+            activity: BTreeMap::new(),
+            self_activity: 0,
+            monitor: BehaviorMonitor::new(7, BEHAVIOR_WINDOW),
+            homeostat: Homeostat::conservative(),
         }
     }
 
@@ -258,11 +280,34 @@ impl<F: Field> OverlayNode<F> {
         }
         // Read repair: advance any Get whose current replica has gone silent past the read timeout.
         self.sweep_pending_gets(now, &mut effects);
+        // Fold this window's relay activity into the behavioural coherence self-model.
+        self.sample_behavior();
         effects.push(Effect::ArmTimer {
             token: HEARTBEAT,
             after: self.config.heartbeat,
         });
         effects
+    }
+
+    /// Fold this window's per-node relay activity into the behavioural coherence [`monitor`](Self::monitor),
+    /// then reset the accumulators. Base Fano cell only, where the 7-point index geometry applies; the
+    /// sample's `i`-th slot is point `i`'s relay activity (this node's own for its index, else the peer's).
+    fn sample_behavior(&mut self) {
+        let Some(self_index) = self.self_index else {
+            return;
+        };
+        let mut sample = [0.0f64; 7];
+        for (i, slot) in sample.iter_mut().enumerate() {
+            *slot = if i == self_index {
+                f64::from(self.self_activity)
+            } else {
+                let coord = Point::<F>::at(i).coords();
+                f64::from(self.activity.get(&coord).copied().unwrap_or(0))
+            };
+        }
+        self.monitor.record(&sample);
+        self.activity.clear();
+        self.self_activity = 0;
     }
 
     /// Advance reads whose outstanding replica has not answered within `read_timeout`: try the next
@@ -352,10 +397,16 @@ impl<F: Field> OverlayNode<F> {
                 self.repaired.remove(&from);
                 Vec::new()
             }
-            Some(FrameType::Route) => alloc::vec![Effect::Notify(Notification::Delivered {
-                from,
-                payload: frame.body.to_vec(),
-            })],
+            Some(FrameType::Route) => {
+                // Data relay is the behavioural load signal (control chatter is excluded); count it toward
+                // this peer's activity, folded into the coherence self-model on the next heartbeat sample.
+                let a = self.activity.entry(from).or_insert(0);
+                *a = a.saturating_add(1);
+                alloc::vec![Effect::Notify(Notification::Delivered {
+                    from,
+                    payload: frame.body.to_vec(),
+                })]
+            }
             Some(FrameType::DiagGossip) => {
                 // Receiving the gossip is itself a direct observation of the sender; its body
                 // corroborates the sender's view of the rest of the cell (spec §6.4).
@@ -378,7 +429,9 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
-    fn on_send(&self, to: Triple, payload: &[u8]) -> Vec<Effect> {
+    fn on_send(&mut self, to: Triple, payload: &[u8]) -> Vec<Effect> {
+        // This node originating a relay is its own behavioural activity (the self slot of the sample).
+        self.self_activity = self.self_activity.saturating_add(1);
         let mut effects = Vec::new();
         // Compute the rendezvous line u × v (O(1)); report it for observation, then deliver.
         if let Some(dst) = Point::<F>::new(to)
@@ -713,6 +766,23 @@ impl<F: Field> OverlayNode<F> {
                 self.observer.note_healing();
             }
             effects.extend(self.apply_healing_plan(&plan));
+
+            // Behavioural homeostasis: run the coherence homeostat on the *measured* Γ_net (the relay-
+            // activity self-model), not the liveness proxy. A common-mode flood shows as behavioural
+            // over-coupling; the homeostat's band-keeping decision is then to shed correlation. Low
+            // behavioural correlation is the healthy diversified regime, so the other decisions
+            // (Hold / Bind / Escalate) take no discrete action here — consistent with `diagnose`, whose
+            // Systemic arm encodes the same over-coupling rule for the standalone diagnosis surface.
+            if let Some(coherence) = self.monitor.coherence() {
+                let m = coherence.measures();
+                if let BandControl::Decouple { .. } =
+                    self.homeostat
+                        .control(m.purity, coherence.mean_correlation(), coherence.n())
+                {
+                    self.observer.note_healing();
+                    effects.push(Effect::Notify(Notification::Decoupled));
+                }
+            }
         }
         // Mandatory self-observation: diagnosis cannot happen without observing.
         effects.push(self.emit_observation(now, alive_count, degraded));
@@ -885,6 +955,67 @@ mod tests {
         assert_eq!(pings, 6, "pings all 6 neighbours");
         assert_eq!(gossips, 6, "gossips its health-view to all 6 neighbours");
         assert_eq!(arms, 1, "re-arms the heartbeat");
+    }
+
+    #[test]
+    fn behavioural_over_coupling_drives_the_homeostat_to_decouple() {
+        // The live homeostat runs on the MEASURED Γ_net (relay activity), not the liveness proxy. Feed a
+        // common-mode flood: every peer relays the same lockstep-varying amount each window, so node 0's
+        // observed per-peer slots move together — perfectly correlated (mean r ≈ 0.71 > 1/√3), i.e. the
+        // over-coupled/groupthink regime. The homeostat's band-keeping response is to shed correlation.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+
+        let mut t = 1u64;
+        for w in 0..(BEHAVIOR_WINDOW + 2) {
+            let bursts = (w % 3) + 1; // varying, but identical across all peers → correlated in lockstep
+            for i in 1..7usize {
+                let from = Point::<F2>::at(i).coords();
+                for _ in 0..bursts {
+                    node.step(
+                        Instant(t),
+                        Input::Message {
+                            from,
+                            frame: encode(FrameType::Route, b"x"),
+                        },
+                    );
+                    t += 1;
+                }
+            }
+            // Fire the heartbeat: it takes this window's behavioural sample into the coherence monitor.
+            node.step(Instant(t), Input::Timer(HEARTBEAT));
+            t += 1;
+        }
+
+        // Diagnose: the homeostat sees over-coupling in the measured Γ_net and sheds correlation.
+        let effects = node.step(Instant(t), Input::Command(Command::Diagnose));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
+            "behavioural over-coupling drives the live homeostat to Decouple"
+        );
+    }
+
+    #[test]
+    fn a_quiet_cell_does_not_spuriously_decouple() {
+        // With no relay traffic the behavioural signal is degenerate; the homeostat must NOT fire a
+        // spurious Decouple (only genuine over-coupling acts — low/absent correlation is the healthy
+        // diversified regime). Run many heartbeats with zero Route activity, then diagnose.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let mut t = 1u64;
+        for _ in 0..(BEHAVIOR_WINDOW + 4) {
+            node.step(Instant(t), Input::Timer(HEARTBEAT));
+            t += 1;
+        }
+        let effects = node.step(Instant(t), Input::Command(Command::Diagnose));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
+            "a quiet cell does not spuriously shed correlation"
+        );
     }
 
     #[test]
