@@ -34,6 +34,7 @@ pub mod eig;
 pub mod healing;
 pub mod homeostat;
 pub mod loadbalance;
+pub mod monitor;
 pub mod partition;
 pub mod plan;
 pub mod polar;
