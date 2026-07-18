@@ -12,7 +12,9 @@
 //!
 //! * [`frame`] — the [`CoherenceFrame`](frame::CoherenceFrame): the minimal sufficient statistic for
 //!   a cell's health at a window (3-bit syndrome + coherence scalars), with a canonical KAT-pinned
-//!   encoding. The load-bearing signal is 3 bits; the fold *is* the anonymization.
+//!   encoding. The load-bearing signal is 3 bits. The fold *minimizes* data (per-node raw signals stay
+//!   local), but is **not** anonymization — the frame still names the faulted point and the cell's exact
+//!   health; differential privacy is future work (audit C7).
 //! * [`sysmetrics`] — platform-optimal acquisition of a node's raw vitals (CPU/memory/disk/network),
 //!   the sensory input whose [`pressure`](sysmetrics::SystemSample::pressure) becomes each node's
 //!   scalar in the cell correlation. Pure, tested parsers plus a cached-handle Linux `/proc` probe.

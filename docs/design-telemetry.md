@@ -204,14 +204,19 @@ Telemetry must never become a deanonymization oracle. The floor is enforced by *
 can contain* (design-platform.md §5, invariant 14), and the theorem makes the safe choice also the
 minimal one:
 
-- **Cell-granularity floor.** A frame is a *cell aggregate* — a `3`-bit syndrome plus scalars folded from
-  a correlation matrix. Per-node raw signals never leave their node; the fold *is* the anonymization. The
-  monitor node cannot emit, and the WS cannot carry, a per-flow or per-node-raw field.
+- **Cell-granularity floor (data minimization).** A frame is a *cell aggregate* — a `3`-bit syndrome plus
+  scalars folded from a correlation matrix. Per-node raw signals never leave their node, and the monitor
+  cannot emit (nor the WS carry) a per-flow or per-node-raw field. This is genuine **minimization** — but
+  it is **not** anonymization: the syndrome still names the exact faulted point and the scalars are the
+  cell's exact health, so any frame observer learns which node is down and how the cell is doing.
 - **Third-order only.** By sightedness (§1.2.2), anything finer than the cell aggregate is *both* blind
   *and* forbidden — the minimal report is also the maximal safe one. The interests coincide.
-- **DP-noised exports.** Scalars crossing the WS to a shareable dashboard are differential-privacy noised;
-  favorable sensitivity (`r` is a mean over `21` pairs, one flow's marginal effect `O(1/21)`), so a small
-  budget hides any single flow while preserving the cell signal.
+- **DP-noised exports — DESIGN, not yet implemented (audit C7).** The intended floor for a *shareable*
+  export is differential-privacy noise on the scalars, with favorable sensitivity (`r` is a mean over
+  `21` pairs, one flow's marginal effect `O(1/21)`) so a small ε budget hides any single flow while
+  preserving the cell signal — plus coarsening/withholding the exact syndrome. **The current
+  `fanos-telemetry` build has no DP machinery** (no noise, no ε budget): an emitted `CoherenceFrame`
+  carries the exact syndrome and scalars and must NOT be treated as anonymized until this is built.
 - **Full-domain frames carry no timing.** For a `Full`-privacy cell, the frame excludes schedule-derived
   fields (constant-rate cover makes them information-free anyway); a `Direct` cell may expose more.
 - **Per-PID `Γ_app`.** An overlay's own coherence is a first-class scope, so app developers watch *their*

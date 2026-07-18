@@ -5,7 +5,11 @@
 //! `syndrome` (the perfect-code fault localizer — `Θ(log N)` bits, information-theoretically minimal
 //! by the Minimal Self-Observation Overhead theorem); the `f32` coherence scalars (`Φ`, `P`, `R`,
 //! mean `r`, spectral gap) are a convenience for humans and cross-cell roll-up. Per-node raw signals
-//! never appear — the fold *is* the anonymization (design-telemetry.md §5).
+//! never *leave their node* — only this cell-level fold does. Note this is data *minimization*, not
+//! anonymization: the frame still names the faulted point (the exact 3-bit syndrome) and the cell's
+//! exact scalars, so a frame observer learns which node is down and the cell's health. Differential
+//! privacy (calibrated noise + an ε budget) or coarsening/withholding the syndrome before export is
+//! future work — do not treat an emitted frame as anonymized (audit C7, design-telemetry.md §5).
 
 use fanos_code::syndrome::syndrome3;
 use fanos_diakrisis::coherence::{CoherenceMatrix, PHI_TH};
