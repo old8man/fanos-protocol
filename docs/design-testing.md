@@ -32,7 +32,7 @@ is blind to — so the suite is a ladder, not a heap:
 |---|---|---|---|---|
 | **T0 Engine unit** | none (pure `step`) | `crates/*/src` `#[cfg(test)]` (114 modules) | state-machine logic, pure math | wire bytes, transport, cross-node emergence |
 | **T1 Conformance KAT** | fixed byte vectors | `conformance/vectors/*.json` + `*/tests/conformance.rs` | byte-exact formats across *all* language impls | dynamics (vectors are static) |
-| **T2 Simulator scenario** | `fanos-sim` (virtual time) | `crates/fanos-sim/tests` (28 files) | multi-node protocol behaviour, adversaries, healing, coherence | real sockets, real TLS, real concurrency |
+| **T2 Simulator scenario** | `fanos-sim` (virtual time) | `crates/fanos-sim/tests` (30 files) | multi-node protocol behaviour, adversaries, healing, coherence — enumerated *and* Monte-Carlo | real sockets, real TLS, real concurrency |
 | **T3 Real-QUIC transport** | `fanos-quic` (UDP+TLS) | `crates/fanos-quic/tests/{loopback,proteus,self_certifying}.rs` | driver, serialization, handshake, self-certifying identity, PROTEUS shaping | cell-scale integration |
 | **T4 Real-QUIC full cell** | `fanos-quic` (7 nodes) | `crates/fanos-quic/tests/cell_e2e.rs` | cross-node DHT / replication / read-repair / availability over real links | application stack above the overlay |
 | **T5 Application e2e** | `fanos-node` / `fanos-proxy` | `crates/fanos-node/tests`, `crates/fanos-proxy/tests/socks5.rs` | the user path: SOCKS5 → DIAULOS session → overlay → service; anonymous rendezvous | — (the top of the stack) |
@@ -80,9 +80,26 @@ scenario files are the protocol's behavioural spec: `healing`, `catastrophe`, `b
 This is where emergent, multi-node, adversarial properties are proven, and where a regression that needs
 a *network* (not a single engine) to appear is pinned.
 
+T2 has two faces. The **enumerated** scenarios pin named situations (the ones above). The **Monte-Carlo**
+layer instead samples a *distribution* of situations and asserts invariants across the whole sample —
+this is where "predict and model stochastic scenarios" and "maximal coverage of every attack surface"
+live:
+
+- `stochastic_invariants.rs` sweeps 160 seeds per invariant (≈ 960 randomized adversarial scenarios):
+  random loss, random timed fault sets, random DHT floods, random forged frames — and asserts the
+  load-bearing safety/liveness invariants hold on *every* draw (determinism, syndrome soundness — never
+  blame a live node, saturation → escalation, replicated availability under minority loss,
+  malformed-input safety, no spurious quarantine). Each scenario is *seed-derived*, so a violation is a
+  seed that reproduces the counterexample forever — property-based testing with the determinism contract
+  as its backstop.
+- `cascade_forecast_stochastic.rs` characterizes the critical-slowing-down predictor over an *ensemble*
+  of random cell parameterizations, not one: it measures **sensitivity** (fraction of random cascades
+  warned before the viability crossing) and **specificity** (fraction of stable cells that falsely
+  alarm) as deterministic pass/fail rates — the honest operating point of the early-warning system.
+
 The tier's own correctness rests on a contract — see §2.
 
-**Catches:** protocol logic across nodes, healing/coherence dynamics, adversary resistance, timing/order.
+**Catches:** protocol logic across nodes, healing/coherence dynamics, adversary resistance, timing/order, and — via the Monte-Carlo layer — invariant violations and predictor blind spots anywhere in a distribution of scenarios.
 **Cannot catch:** real-socket faults, TLS handshake, OS concurrency, serialization at the driver seam.
 
 ### T3 — Real-QUIC transport (loopback, identity, shaping)
@@ -178,7 +195,10 @@ The decision procedure, cheapest-first:
 2. **Is it a wire/format fact that other language impls must share?** → **T1.** Add or regenerate a
    vector; the change to the `.json` *is* the reviewable artifact.
 3. **Does it need several engines, an adversary, loss, or churn to appear?** → **T2.** A seeded
-   `fanos-sim` scenario. Deterministic, so it is a permanent regression guard, not a flaky one.
+   `fanos-sim` scenario. Deterministic, so it is a permanent regression guard, not a flaky one. If the
+   property should hold across a *class* of situations rather than one — an invariant, or a predictor's
+   operating point — add it to the **Monte-Carlo** layer (`stochastic_invariants.rs` /
+   `cascade_forecast_stochastic.rs`) as a seed sweep with a fixed pass/fail rate, not a single case.
 4. **Is it a fault of the real socket, TLS, serialization, or identity handshake?** → **T3.** A
    loopback/self-certifying test — the only tier that exercises the driver seam.
 5. **Does it only appear with a whole cell of real nodes interacting?** → **T4.** `spawn_cell` + the
@@ -221,9 +241,11 @@ cargo test --workspace --lib
 cargo test --workspace --test conformance          # per-crate conformance.rs
 cargo test -p fanos-cli --test conformance_vectors
 
-# T2 — deterministic scenarios + the determinism contract
+# T2 — deterministic scenarios, the determinism contract, and the Monte-Carlo invariant/predictor sweeps
 cargo test -p fanos-sim
 cargo test -p fanos-sim --test determinism
+cargo test -p fanos-sim --test stochastic_invariants
+cargo test -p fanos-sim --test cascade_forecast_stochastic
 
 # T3/T4 — real-QUIC transport and the full cell
 cargo test -p fanos-quic                            # loopback, proteus, self_certifying, cell_e2e
