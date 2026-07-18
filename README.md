@@ -128,6 +128,7 @@ that even a future *learnable* controller cannot steer the cell out of viability
 - [`docs/coherent-cybernetics.md`](docs/coherent-cybernetics.md) — the organism theory FANOS instantiates
 - [`docs/network-threat-model.md`](docs/network-threat-model.md) — the systematic threat sweep (Sybil-cost & eclipse verified in `fanos-sim`)
 - [`docs/frontier-synthesis.md`](docs/frontier-synthesis.md) — the research frontier, measured against what FANOS already derives
+- [`docs/design-testing.md`](docs/design-testing.md) — the verification tier taxonomy (one engine, many drivers → T0–T5) and the byte-identical-replay contract
 
 Two simulation-driven investigations produced protocol improvements. (1) Naive per-link liveness
 times out spuriously under packet loss (5→84 false positives as loss climbs 10→50%), so liveness is

@@ -365,8 +365,11 @@ Ordered so each step is independently valuable, gated, and preserves shipping be
    (§6, §8).
 8. **DevEx** — `fanos-harness`, `fanos dev`, `#[derive(Wire)]` codegen + KAT gen, `fanos replay`, bindings
    (§7, §8).
-9. **The multi-node cell test harness** — a driver seam to pin coordinates so a full 7-node F2 cell runs
-   over real QUIC (self-certifying coords are random today), enabling e2e store/rendezvous tests.
+9. **The multi-node cell test harness** *(delivered)* — a driver seam to pin coordinates so a full 7-node
+   F2 cell runs over real QUIC (self-certifying coords are random today), enabling e2e store/rendezvous
+   tests. Implemented as `fanos-quic::spawn_cell` (rejection-sampled self-certifying credentials, not a
+   backdoor) with `tests/cell_e2e.rs`; the full verification ladder and the byte-identical-replay
+   contract are documented in [`design-testing.md`](design-testing.md).
 
 The reference tenant `fanos.tunnel` (SOCKS5/`.fanos`, then VPN, then exit) rides on top and special-cases
 nothing.
