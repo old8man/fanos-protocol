@@ -84,17 +84,23 @@ impl SelfObserver {
     /// the honest minimal self-observation a node can always produce — the 3-bit syndrome is exact;
     /// the coherence scalars are the model's (design-telemetry.md §2: the syndrome is load-bearing).
     /// Records the frame and returns it to publish.
+    #[allow(clippy::too_many_arguments)] // distinct scalar inputs to the fold; a params struct adds no clarity
     pub fn observe_liveness(
         &mut self,
         now_nanos: u64,
+        epoch: u64,
         alive_count: usize,
         correlation: f64,
         degraded: u8,
         gap: f64,
         forecast: i16,
     ) -> CoherenceFrame {
+        // The frame's `epoch` is the cell's **agreed** epoch (the adopt-max flooded beacon), supplied by
+        // the caller — NOT `now_nanos / window`, which under a real transport is each node's *local*
+        // elapsed time, so two nodes would stamp different epochs on the same window and any
+        // `(cell_id, epoch)` cross-node roll-up would mis-bucket (audit A3). `now_nanos` still times the
+        // local RRD history below.
         let matrix = CoherenceMatrix::equicorrelated(alive_count.max(1), correlation);
-        let epoch = now_nanos / self.window_nanos;
         let frame = CoherenceFrame::observe(
             self.cell_id,
             epoch,
@@ -198,9 +204,11 @@ mod tests {
     #[test]
     fn liveness_frame_carries_the_syndrome_and_is_recorded() {
         let mut obs = SelfObserver::new(CellId([5; 16]), 1_000_000_000, HistoryConfig::compact());
-        // 6 alive, point 0 faulted (bit 0 set), healthy correlation 0.5.
-        let frame = obs.observe_liveness(3_000_000_000, 6, 0.5, 0b0000_0001, 0.4, -1);
-        assert_eq!(frame.epoch, 3);
+        // 6 alive, point 0 faulted (bit 0 set), healthy correlation 0.5. The frame stamps the AGREED
+        // epoch passed in (3), NOT now_nanos/window (which here would be 9) — so nodes at different local
+        // clocks but the same beacon epoch agree on the frame epoch (audit A3).
+        let frame = obs.observe_liveness(9_000_000_000, 3, 6, 0.5, 0b0000_0001, 0.4, -1);
+        assert_eq!(frame.epoch, 3, "frame epoch is the agreed epoch, decoupled from the local clock");
         assert!(frame.is_faulted(), "a real syndrome from the degraded mask");
         assert!(
             obs.history()

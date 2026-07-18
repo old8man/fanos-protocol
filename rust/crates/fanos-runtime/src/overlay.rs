@@ -855,6 +855,7 @@ impl<F: Field> OverlayNode<F> {
         let correlation = self.effective_correlation();
         let frame = self.observer.observe_liveness(
             now.as_nanos(),
+            u64::from(self.epoch), // the cell's AGREED epoch (flooded beacon), so cross-node roll-up buckets consistently (audit A3)
             alive_count,
             correlation,
             degraded,
