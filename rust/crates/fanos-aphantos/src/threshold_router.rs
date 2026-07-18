@@ -554,6 +554,24 @@ mod tests {
     }
 
     #[test]
+    fn the_combiner_set_is_a_strict_subset_of_the_points() {
+        use fanos_geometry::Plane;
+        // A line's combiner is its first `points_on` member, so many points are never any line's
+        // combiner (Fano: 4 of 7; PG(2,7): 14 of 57). A rendezvous design must not assume a client is
+        // reachable as the combiner of a line through its own coordinate — the service's replies have
+        // to route to a *designated* rendezvous (combiner) point that relays them to the client.
+        let n = Plane::<F2>::N as usize;
+        let combiners: alloc::collections::BTreeSet<Triple> = (0..n)
+            .filter_map(|l| combiner_for::<F2>(Line::<F2>::at(l).coords()))
+            .collect();
+        assert!(!combiners.is_empty());
+        assert!(
+            combiners.len() < n,
+            "not every point is a combiner — replies need a designated rendezvous point"
+        );
+    }
+
+    #[test]
     fn a_reply_with_an_out_of_range_index_is_rejected() {
         // A share whose x is not a real member index (here x = 200, far beyond the 3 members) must be
         // dropped outright — it can never join the candidate set, so it cannot flood or poison it.
