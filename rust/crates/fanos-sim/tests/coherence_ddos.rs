@@ -12,6 +12,9 @@
 //! The experiment is *controlled*: both the concentrated and the balanced case are generated from the
 //! **same** shared/idiosyncratic noise realization, so the only difference is the load distribution.
 
+// Test code over fixed-size arrays and always-present readings: indexing and unwrap/expect read clearest.
+#![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+
 use fanos_diakrisis::loadbalance::{self, N};
 use fanos_diakrisis::window::CollectiveState;
 use fanos_sim::read;
