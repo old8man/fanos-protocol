@@ -7,6 +7,7 @@
 //! for the network plumbing; [`verify_descriptor`] is the pure, security-critical core.
 
 use std::future::Future;
+use std::time::Duration;
 
 use fanos_calypso::descriptor::{Descriptor, SealedDescriptor, open, seal};
 use fanos_diaulos::{Coord, service_public_from_bundle};
@@ -121,6 +122,10 @@ pub async fn publish_service(
 /// `(coordinate, KEM key)` by fetching and authenticating the published descriptor (the real ONOMA
 /// path, as opposed to a fixed [`StaticResolver`](crate::diaulos::StaticResolver)). This is what a
 /// [`FanosDialer`](crate::diaulos::FanosDialer) uses in production.
+/// How long a store lookup (a descriptor or a mix key) waits before giving up, so a Get that never
+/// resolves fails the resolution instead of hanging the caller forever.
+pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct NodeResolver {
     client: Client,
     epoch: u64,
@@ -151,7 +156,11 @@ impl ServiceResolver for NodeResolver {
         async move {
             let address = Address::parse(&host).ok()?;
             let slot = lookup_key(&address, epoch).to_vec();
-            let blob = client.get(slot).await?;
+            // Bound the store lookup: a Get that never resolves (unknown key, unreachable responsible
+            // node) must fail the resolution rather than hang the dial forever.
+            let blob = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(slot))
+                .await
+                .ok()??;
             let resolved = verify_descriptor(&address, epoch, &blob, min_pow).ok()?;
             let coord = decode_coord(&resolved.metadata)?;
             let public = service_public_from_bundle(&resolved.bundle)?;

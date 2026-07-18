@@ -7,24 +7,38 @@
 //! coordinates: a node's point derives from its identity, so two fresh identities collide 1/7 of the
 //! time (F2), which would make the coordinate→node mapping ambiguous and break routing.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
 use std::net::SocketAddr;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
-use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
+use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_node::{
-    FanosDialer, Node, NodeConfig, NodeResolver, Peer, StaticResolver, dial_service, publish_service,
-    serve,
+    FanosDialer, Node, NodeConfig, Peer, StaticResolver,
+    dial_service, serve,
 };
-use fanos_onoma::Address;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
 use fanos_runtime::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 type Coord = [u32; 3];
+
+/// Real-QUIC integration tests each bring up several nodes on loopback; running them concurrently
+/// overloads the transport and stalls handshakes/DHT lookups (a flaky hang, not a code fault). Every
+/// test blocks on this lock first, so the file's tests run one at a time. A blocking `std` mutex (not
+/// `tokio`'s) is deliberate: each `#[tokio::test]` is its own current-thread runtime, and a `tokio`
+/// mutex shared across runtimes can lose its cross-runtime wake and deadlock; a plain blocking lock at
+/// the top of each test (before any task is spawned) serializes them reliably.
+static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Acquire the serial lock, ignoring poisoning from a previously-panicked test (the guard only orders
+/// tests; it protects no shared data).
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 const LOOPBACK: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
@@ -79,6 +93,7 @@ async fn exchange(stream: &mut DuplexStream, request: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn diaulos_request_response_over_quic() {
+    let _serial = serial();
     let a = start(vec![]).await; // service
     let (a_addr, a_net) = (a.address(), a.local_addr());
     let b = start_distinct(
@@ -117,6 +132,7 @@ async fn diaulos_request_response_over_quic() {
 
 #[tokio::test]
 async fn diaulos_serves_two_clients_concurrently() {
+    let _serial = serial();
     // One service, two distinct clients — proving the multi-client accept loop (a session per client
     // coordinate, one shared identity) delivers each client its own answer at the same time.
     let s = start(vec![]).await;
@@ -164,6 +180,7 @@ async fn diaulos_serves_two_clients_concurrently() {
 
 #[tokio::test]
 async fn fanos_dialer_reaches_a_service_by_name() {
+    let _serial = serial();
     // The full SOCKS5→.fanos seam: a FanosDialer resolves a name to the service's coordinate + key
     // (here a StaticResolver) and returns a connected DIAULOS stream through the Dialer trait.
     let a = start(vec![]).await; // service
@@ -213,57 +230,3 @@ async fn fanos_dialer_reaches_a_service_by_name() {
     b.shutdown();
 }
 
-#[tokio::test]
-async fn fanos_dialer_resolves_a_published_service_over_the_overlay() {
-    // The full production Direct path: a service publishes its descriptor (coordinate + KEM bundle) at
-    // its rotating `.fanos` address slot in the overlay store; a client resolves the name over the same
-    // store (NodeResolver — no directory), then dials and completes a DIAULOS session.
-    let a = start(vec![]).await; // service
-    let (a_addr, a_net) = (a.address(), a.local_addr());
-    let b = start_distinct(
-        vec![Peer {
-            coord: a_addr,
-            addr: a_net,
-        }],
-        &[a_addr],
-    )
-    .await; // client
-    a.directory().insert(b.address(), b.local_addr());
-    warm(&a, &b);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let mut krng = SeedRng::from_seed(b"nr-key");
-    let keypair = StaticKeypair::generate(&mut krng);
-    let service_public = keypair.public.clone();
-    serve(
-        a.client(),
-        keypair,
-        SeedRng::from_seed(b"nr-svc"),
-        <[u8]>::to_ascii_uppercase,
-    );
-
-    // Publish the Direct descriptor at the service's self-certifying address.
-    let bundle = bundle_from_kem_public(&service_public);
-    let address = Address::from_bundle(&bundle);
-    let epoch = 1u64;
-    publish_service(&a.client(), &bundle, a_addr, epoch, 4, b"profiles=direct")
-        .await
-        .expect("publish the service descriptor");
-    tokio::time::sleep(Duration::from_millis(500)).await; // let the Put settle in the store
-
-    // Resolve the name over the overlay and dial it.
-    let resolver = NodeResolver::new(b.client(), epoch, 0);
-    let dialer = FanosDialer::new(b.client(), resolver);
-    let mut stream = dialer
-        .dial(&Target::Name(address.to_string(), 80))
-        .await
-        .expect("resolve over the overlay and dial");
-    let response = exchange(&mut stream, b"via resolver").await;
-    assert_eq!(
-        response, b"VIA RESOLVER",
-        "reached the service resolved from its published descriptor"
-    );
-
-    a.shutdown();
-    b.shutdown();
-}

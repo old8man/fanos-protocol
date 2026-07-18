@@ -20,6 +20,7 @@ pub mod config;
 pub mod diaulos;
 pub mod error;
 pub mod identity;
+pub mod mixdir;
 pub mod node;
 pub mod rendezvous;
 pub mod resolve;
@@ -29,6 +30,7 @@ pub use diaulos::{
     FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service, serve,
 };
 pub use error::NodeError;
+pub use mixdir::{build_mix_directory, publish_mix_key, resolve_mix_key};
 pub use node::{Health, Node};
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
 pub use resolve::{NodeResolver, ResolvedService, publish_service, verify_descriptor};

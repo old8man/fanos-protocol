@@ -94,6 +94,11 @@ struct Transport {
     me: Triple,
 }
 
+/// How long a store `get`/`put` waits for its reply before giving up. A store request whose
+/// responsible node is unreachable (down, or absent from a sparse cell) must fail, not hang the
+/// caller's task forever (audit C1).
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A running QUIC-backed node: the handle an application uses to drive it and hear from it.
 ///
 /// Dropping the handle (or calling [`NodeHandle::shutdown`]) closes the endpoint and lets the
@@ -221,7 +226,12 @@ impl Client {
         {
             return None;
         }
-        rx.await.ok().flatten()
+        // Bound the wait: a key whose responsible node is unreachable (or absent from a sparse cell)
+        // must resolve to `None`, never hang the caller forever (audit C1).
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(value)) => value,
+            _ => None,
+        }
     }
 
     /// Store `value` under `key`, awaiting the responsible node's acknowledgement. `false` if the
@@ -239,7 +249,9 @@ impl Client {
         {
             return false;
         }
-        rx.await.is_ok()
+        // Bound the wait for the responsible node's ack; a timeout is reported as a failed store, not a
+        // hang (audit C1).
+        matches!(tokio::time::timeout(REQUEST_TIMEOUT, rx).await, Ok(Ok(_)))
     }
 
     /// Subscribe to the full notification stream (Delivered, PeerDown, Verdict, healing events, …).
