@@ -74,6 +74,14 @@ const HELLO_LEN: usize = 12;
 /// Per-frame receive cap. Onion/Tessera frames are far smaller; this only bounds abuse.
 const MAX_FRAME: usize = 1 << 20;
 
+/// The bound on the engine's inbound `Input` queue. The per-connection frame readers feed this channel and
+/// **await** when it is full, so a peer flooding frames is back-pressured through QUIC's own flow control
+/// rather than growing this queue without limit (audit C2). The timer/command producers share it; commands
+/// use a non-blocking `try_send` (dropped under a sustained flood, the caller sees `false`), timers await.
+/// The outbound/notification channels stay unbounded — they are bounded *transitively*, since the engine
+/// can only produce effects as fast as it drains this now-bounded input.
+const INPUT_CAP: usize = 1024;
+
 /// A coordinate → live connection cache. A `Connection` is a cheap handle (an `Arc` inside).
 type ConnMap = Arc<Mutex<HashMap<Triple, Connection>>>;
 
@@ -88,7 +96,7 @@ struct SendRequest {
 struct Transport {
     endpoint: Endpoint,
     conns: ConnMap,
-    input_tx: mpsc::UnboundedSender<Input>,
+    input_tx: mpsc::Sender<Input>,
     shaper: Shaper,
     identity: Identity,
     me: Triple,
@@ -106,7 +114,7 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub struct NodeHandle {
     addr: Triple,
     local_addr: SocketAddr,
-    input_tx: mpsc::UnboundedSender<Input>,
+    input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
     events_rx: broadcast::Receiver<Notification>,
@@ -129,7 +137,7 @@ impl NodeHandle {
     /// Inject an application command (delivered to the engine as `Input::Command`). Returns
     /// `false` if the engine actor has stopped.
     pub fn command(&self, cmd: Command) -> bool {
-        self.input_tx.send(Input::Command(cmd)).is_ok()
+        self.input_tx.try_send(Input::Command(cmd)).is_ok()
     }
 
     /// Await the next application notification the engine emits, or `None` once it stops. Backed by a
@@ -193,7 +201,7 @@ enum Control {
 #[derive(Clone)]
 pub struct Client {
     addr: Triple,
-    input_tx: mpsc::UnboundedSender<Input>,
+    input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
 }
@@ -207,7 +215,7 @@ impl Client {
 
     /// Inject a fire-and-forget command (`Input::Command`). `false` once the engine has stopped.
     pub fn command(&self, cmd: Command) -> bool {
-        self.input_tx.send(Input::Command(cmd)).is_ok()
+        self.input_tx.try_send(Input::Command(cmd)).is_ok()
     }
 
     /// Retrieve `key` from the L4 store, awaiting *this* request's answer (correlated by the storage
@@ -221,7 +229,7 @@ impl Client {
         }
         if self
             .input_tx
-            .send(Input::Command(Command::Get { key }))
+            .try_send(Input::Command(Command::Get { key }))
             .is_err()
         {
             return None;
@@ -244,14 +252,14 @@ impl Client {
         }
         if self
             .input_tx
-            .send(Input::Command(Command::Put { key, value }))
+            .try_send(Input::Command(Command::Put { key, value }))
             .is_err()
         {
             return false;
         }
         // Bound the wait for the responsible node's ack; a timeout is reported as a failed store, not a
         // hang (audit C1).
-        matches!(tokio::time::timeout(REQUEST_TIMEOUT, rx).await, Ok(Ok(_)))
+        matches!(tokio::time::timeout(REQUEST_TIMEOUT, rx).await, Ok(Ok(())))
     }
 
     /// Subscribe to the full notification stream (Delivered, PeerDown, Verdict, healing events, …).
@@ -478,7 +486,7 @@ fn spawn_inner(
     directory.insert(addr, local_addr);
     tracing::debug!(?addr, %local_addr, self_certifying = identity.is_some(), "fanos-quic node up");
 
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<Input>();
+    let (input_tx, input_rx) = mpsc::channel::<Input>(INPUT_CAP);
     let (send_tx, send_rx) = mpsc::unbounded_channel::<SendRequest>();
     let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Notification>();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Control>();
@@ -525,8 +533,8 @@ fn spawn_inner(
 /// The engine actor: the sole owner of the engine, dispatching its effects.
 async fn engine_loop(
     mut engine: Box<dyn Engine + Send>,
-    mut input_rx: mpsc::UnboundedReceiver<Input>,
-    input_tx: mpsc::UnboundedSender<Input>,
+    mut input_rx: mpsc::Receiver<Input>,
+    input_tx: mpsc::Sender<Input>,
     send_tx: mpsc::UnboundedSender<SendRequest>,
     notify_tx: mpsc::UnboundedSender<Notification>,
 ) {
@@ -553,12 +561,12 @@ async fn engine_loop(
 
 /// Sleep for `delay`, then hand the engine its `Timer` input.
 async fn fire_timer(
-    tx: mpsc::UnboundedSender<Input>,
+    tx: mpsc::Sender<Input>,
     token: TimerToken,
     delay: std::time::Duration,
 ) {
     tokio::time::sleep(delay).await;
-    let _ = tx.send(Input::Timer(token));
+    let _ = tx.send(Input::Timer(token)).await;
 }
 
 /// The transport loop: performs `Effect::Send` by writing one QUIC uni-stream per frame.
@@ -649,7 +657,7 @@ fn cached(conns: &ConnMap, peer: Triple) -> Option<Connection> {
 async fn accept_loop(
     endpoint: Endpoint,
     conns: ConnMap,
-    input_tx: mpsc::UnboundedSender<Input>,
+    input_tx: mpsc::Sender<Input>,
     shaper: Shaper,
     identity: Identity,
 ) {
@@ -696,7 +704,7 @@ async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
 async fn read_frames(
     conn: Connection,
     from: Triple,
-    input_tx: mpsc::UnboundedSender<Input>,
+    input_tx: mpsc::Sender<Input>,
     shaper: Shaper,
 ) {
     // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
@@ -708,8 +716,8 @@ async fn read_frames(
         let Some(frame) = shape_in(&shaper, raw) else {
             continue;
         };
-        if input_tx.send(Input::Message { from, frame }).is_err() {
-            break; // engine actor gone
+        if input_tx.send(Input::Message { from, frame }).await.is_err() {
+            break; // engine actor gone (or, while it drains a flood, back-pressured here — bounded)
         }
     }
 }
