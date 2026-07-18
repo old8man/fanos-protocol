@@ -36,6 +36,16 @@ const HEARTBEAT: TimerToken = TimerToken(0);
 /// last this-many per-node relay-activity samples. Bounded, so the self-model memory is `7 × this`.
 const BEHAVIOR_WINDOW: usize = 8;
 
+/// Homeostatic **decoupling** control (audit C6). `Decouple` must actually lower the cell's integration,
+/// not merely notify: the node carries a mutable shed factor in `[0, DECOUPLE_MAX]` that scales its
+/// effective correlation down, and that reduced correlation feeds `phi_equicorrelated` — so each
+/// over-coupled round genuinely restores headroom, and the reflexive loop lowers `Φ` (spec §2.7/§6.5).
+/// Over-coupling raises the factor by `DECOUPLE_STEP` per round (capped); once back in band it decays by
+/// `DECOUPLE_DECAY` toward zero (re-integration).
+const DECOUPLE_STEP: f64 = 0.25;
+const DECOUPLE_MAX: f64 = 0.6;
+const DECOUPLE_DECAY: f64 = 0.5;
+
 /// DoS backstops on the DHT slice (audit A4). The distributed store and the in-flight-read table both
 /// accept adversary-supplied keys, so without a cap a peer that floods `Publish`/`Get` with distinct
 /// digests exhausts memory. These are *safety* ceilings far above any legitimate working set — a
@@ -175,6 +185,14 @@ pub struct OverlayNode<F: Field> {
     /// The coherence homeostat this node runs on its behavioural self-model — the sense→act seam, with the
     /// monitor sensing and `on_diagnose` actuating its band-keeping decision.
     homeostat: Homeostat,
+    /// The mutable **decoupling** shed factor `∈ [0, DECOUPLE_MAX]` (audit C6): scales this node's
+    /// effective correlation down so a `Decouple` actually lowers `Φ`. `decoupled`/`bound_notified` and
+    /// `escalated_coherence` dedup the homeostat notifications (which previously re-fired every diagnose).
+    decoupling: f64,
+    /// Dedup: currently in the shed (decoupled) regime — so `Decoupled` fires once on entry, not each round.
+    decoupled: bool,
+    /// Dedup: currently escalated on a coherence collapse — so `Escalated` fires once on entry.
+    escalated_coherence: bool,
 }
 
 /// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
@@ -267,6 +285,9 @@ impl<F: Field> OverlayNode<F> {
             self_activity: 0,
             monitor: BehaviorMonitor::new(7, BEHAVIOR_WINDOW),
             homeostat: Homeostat::conservative(),
+            decoupling: 0.0,
+            decoupled: false,
+            escalated_coherence: false,
         }
     }
 
@@ -822,14 +843,22 @@ impl<F: Field> OverlayNode<F> {
         Some((self_index, degraded, alive_count))
     }
 
+    /// This node's **effective** equicorrelated correlation: the healthy baseline scaled down by the
+    /// current [`decoupling`](Self::decoupling) shed factor (audit C6). Everything that computes `Φ`/`P`
+    /// from a scalar correlation reads this, so a `Decouple` genuinely lowers the cell's integration.
+    fn effective_correlation(&self) -> f64 {
+        self.config.healthy_correlation * (1.0 - self.decoupling)
+    }
+
     /// Fold this window's cell health into a `CoherenceFrame`, record it in local history, and return
     /// the effect that publishes its wire bytes. The exact 3-bit syndrome comes from `degraded`; the
     /// coherence scalars from the equicorrelated liveness model (docs/design-telemetry.md §2).
     fn emit_observation(&mut self, now: Instant, alive_count: usize, degraded: u8) -> Effect {
+        let correlation = self.effective_correlation();
         let frame = self.observer.observe_liveness(
             now.as_nanos(),
             alive_count,
-            self.config.healthy_correlation,
+            correlation,
             degraded,
             polar_gap_from_liveness(degraded), // spectral gap Δ (T-226(v)) from this window's health topology
             -1,                                // cascade forecast: none from liveness alone
@@ -854,39 +883,65 @@ impl<F: Field> OverlayNode<F> {
         let Some((self_index, degraded, alive_count)) = self.cell_liveness(now) else {
             return Vec::new();
         };
-        // The base node senses only liveness, so it feeds the degraded mask; partition and
-        // cascade verdicts require the global coherence view (the simulator's observatory / a
-        // real deployment's cross-attestation), not this local liveness alone (spec §6.5).
+        // The base node senses liveness, and — the #74 unification — the *measured* behavioural
+        // coherence `Γ_net` (the relay-activity self-model). Feeding `Γ_net` into `diagnose` makes its
+        // Systemic (over-coupling) verdict fire on the same signal the homeostat acts on, so there is one
+        // over-coupling authority, not a dormant liveness-only arm beside a separate behavioural check.
+        // (Partition/cascade still need the global cross-attestation view, not this local sense alone.)
+        let measured = self.monitor.coherence();
         let verdict = diagnose(&Observation {
             degraded,
+            coherence: measured.clone(),
             ..Default::default()
         });
 
         let mut effects = alloc::vec![Effect::Notify(Notification::Verdict(verdict.clone()))];
         if self.config.self_healing {
-            // Estimate the cell's integration from its live membership on the equicorrelated
-            // stratum: Φ_net = (alive−1)·r² (spec §2.7). This gates the reroute-depth budget.
-            let phi = phi_equicorrelated(alive_count, self.config.healthy_correlation);
+            // Φ from the cell's live membership on the equicorrelated stratum, at the *effective*
+            // (post-shed) correlation — so a prior `Decouple` has genuinely lowered it (audit C6). Gates
+            // the reroute-depth budget.
+            let phi = phi_equicorrelated(alive_count, self.effective_correlation());
             let plan = plan_healing(&verdict, self_index, degraded, phi);
             if !plan.is_empty() {
                 self.observer.note_healing();
             }
+            // Over-coupling actuation (`Decouple`) flows through this verdict→plan path: `apply_healing_plan`
+            // now raises the mutable decoupling state and dedups the notification (audit C6).
             effects.extend(self.apply_healing_plan(now, &plan));
 
-            // Behavioural homeostasis: run the coherence homeostat on the *measured* Γ_net (the relay-
-            // activity self-model), not the liveness proxy. A common-mode flood shows as behavioural
-            // over-coupling; the homeostat's band-keeping decision is then to shed correlation. Low
-            // behavioural correlation is the healthy diversified regime, so the other decisions
-            // (Hold / Bind / Escalate) take no discrete action here — consistent with `diagnose`, whose
-            // Systemic arm encodes the same over-coupling rule for the standalone diagnosis surface.
-            if let Some(coherence) = self.monitor.coherence() {
+            // The homeostat covers the bands the Systemic verdict does not: **re-integration** once the
+            // measured `Γ_net` is back in (or below) the band (Bind/Hold — decay the shed), and
+            // **escalation** on a coherence *collapse* (`P ≤ 2/N`). Over-coupling is the verdict path's.
+            if let Some(coherence) = measured {
                 let m = coherence.measures();
-                if let BandControl::Decouple { .. } =
-                    self.homeostat
-                        .control(m.purity, coherence.mean_correlation(), coherence.n())
+                match self
+                    .homeostat
+                    .control(m.purity, coherence.mean_correlation(), coherence.n())
                 {
-                    self.observer.note_healing();
-                    effects.push(Effect::Notify(Notification::Decoupled));
+                    BandControl::Escalate => {
+                        if !self.escalated_coherence {
+                            self.escalated_coherence = true;
+                            self.observer.note_healing();
+                            effects.push(Effect::Notify(Notification::Escalated(0)));
+                        }
+                    }
+                    BandControl::Decouple { .. } => {
+                        // Actuated via the verdict→plan path above; only clear the escalation latch.
+                        self.escalated_coherence = false;
+                    }
+                    BandControl::Bind { .. } | BandControl::Hold => {
+                        // In or below the band: let any prior shedding decay back toward the baseline
+                        // coupling, and notify `Bound` once when fully re-integrated.
+                        self.decoupling *= DECOUPLE_DECAY;
+                        if self.decoupling < 1e-9 {
+                            self.decoupling = 0.0;
+                        }
+                        self.escalated_coherence = false;
+                        if self.decoupled && self.decoupling == 0.0 {
+                            self.decoupled = false;
+                            effects.push(Effect::Notify(Notification::Bound));
+                        }
+                    }
                 }
             }
         }
@@ -929,7 +984,14 @@ impl<F: Field> OverlayNode<F> {
                     }
                 }
                 HealingAction::Decouple => {
-                    effects.push(Effect::Notify(Notification::Decoupled));
+                    // Real correlation-shedding (audit C6): raise the mutable decoupling factor (capped),
+                    // which lowers the effective correlation feeding `Φ` next round — the loop actually
+                    // restores headroom. Notify once on *entering* the shed regime (dedup), not each round.
+                    self.decoupling = (self.decoupling + DECOUPLE_STEP).min(DECOUPLE_MAX);
+                    if !self.decoupled {
+                        self.decoupled = true;
+                        effects.push(Effect::Notify(Notification::Decoupled));
+                    }
                 }
                 HealingAction::Escalate { unrecoverable } => {
                     effects.push(Effect::Notify(Notification::Escalated(unrecoverable)));
@@ -1116,6 +1178,66 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
             "behavioural over-coupling drives the live homeostat to Decouple"
+        );
+    }
+
+    #[test]
+    fn decouple_genuinely_sheds_correlation_and_is_deduped() {
+        // C6 + #74. A `Decouple` is no longer a no-op: it raises the mutable decoupling factor, which
+        // lowers the *effective* correlation feeding Φ — so the reflexive loop actually restores headroom.
+        // Detection is unified (#74): the verdict itself is `Systemic`, driven by the measured Γ_net.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let mut t = 1u64;
+        for w in 0..(BEHAVIOR_WINDOW + 2) {
+            let bursts = (w % 3) + 1; // common-mode: every peer relays in lockstep
+            for i in 1..7usize {
+                let from = Point::<F2>::at(i).coords();
+                for _ in 0..bursts {
+                    node.step(
+                        Instant(t),
+                        Input::Message { from, frame: encode(FrameType::Route, b"x") },
+                    );
+                    t += 1;
+                }
+            }
+            node.step(Instant(t), Input::Timer(HEARTBEAT));
+            t += 1;
+        }
+        assert!(node.decoupling.abs() < 1e-12, "no shed before diagnosis");
+        let base = node.effective_correlation();
+
+        let d1 = node.step(Instant(t), Input::Command(Command::Diagnose));
+        t += 1;
+        // Unified detection: the verdict is Systemic (from the measured Γ_net, not a dormant proxy).
+        assert!(
+            d1.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::Verdict(fanos_diakrisis::Verdict::Systemic))
+            )),
+            "diagnose's verdict is driven by the measured over-coupling (#74 unification)"
+        );
+        assert!(
+            d1.iter().any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
+            "over-coupling decouples"
+        );
+        assert!(node.decoupling > 0.0, "the decoupling shed factor is raised (audit C6)");
+        assert!(
+            node.effective_correlation() < base - 1e-9,
+            "the effective correlation is genuinely lowered — Φ headroom restored, not a no-op"
+        );
+        // The mutable factor really is what scales the correlation (the feedback into Φ).
+        assert!(
+            (node.effective_correlation() - Config::default().healthy_correlation * (1.0 - node.decoupling))
+                .abs()
+                < 1e-12
+        );
+
+        // Dedup: a second over-coupled diagnose keeps shedding but does NOT re-fire the notification.
+        let d2 = node.step(Instant(t), Input::Command(Command::Diagnose));
+        assert!(
+            !d2.iter().any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
+            "Decoupled is emitted once on entering the shed regime, not every diagnose (audit C6 dedup)"
         );
     }
 

@@ -177,6 +177,9 @@ pub enum Notification {
     /// Self-healing: the cascade early-warning fired while every node was still live; the cell
     /// pre-emptively shed correlation to restore headroom (spec §2.7, §6.5).
     Decoupled,
+    /// Self-healing: after shedding, the cell's behavioural coherence fell back to the collective-subject
+    /// band, so the node re-integrated (undid its decoupling) — the homeostat's `Bind` band control.
+    Bound,
     /// A DHT `Put` was acknowledged by the responsible node (spec §L4); carries the key digest.
     Stored([u8; 32]),
     /// A DHT `Get` completed (spec §L4): the value if found, else `None`; carries the key digest.
