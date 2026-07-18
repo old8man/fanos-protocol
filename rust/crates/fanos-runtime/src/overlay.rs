@@ -36,6 +36,20 @@ const HEARTBEAT: TimerToken = TimerToken(0);
 /// last this-many per-node relay-activity samples. Bounded, so the self-model memory is `7 × this`.
 const BEHAVIOR_WINDOW: usize = 8;
 
+/// DoS backstops on the DHT slice (audit A4). The distributed store and the in-flight-read table both
+/// accept adversary-supplied keys, so without a cap a peer that floods `Publish`/`Get` with distinct
+/// digests exhausts memory. These are *safety* ceilings far above any legitimate working set — a
+/// reference node holding real application data never approaches them — chosen to bound worst-case
+/// memory (`MAX_STORE_ENTRIES × MAX_VALUE_LEN` ≈ 256 MiB, `MAX_PENDING_GETS × PendingGet` ≈ a few MiB),
+/// not to constrain honest use. When full, a *new* key is refused rather than an existing one evicted,
+/// so an attacker cannot displace already-stored replicas (LRC availability is preserved); overwriting
+/// an existing key is always allowed (it does not grow the map).
+const MAX_STORE_ENTRIES: usize = 4096;
+/// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
+const MAX_VALUE_LEN: usize = 65_536;
+/// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
+const MAX_PENDING_GETS: usize = 1024;
+
 /// How long a locally-distrusted (Byzantine) member stays quarantined before it is re-admitted for
 /// re-evaluation. Quarantine is an *operational* safeguard, not a proven permanent exclusion (spec §6.2):
 /// permanently exiling a member would strand one that only glitched transiently. After this window the
@@ -496,11 +510,25 @@ impl<F: Field> OverlayNode<F> {
         (digest, primary)
     }
 
+    /// Whether the local DHT slice will admit `(digest, value_len)` under the A4 DoS caps: the value is
+    /// within [`MAX_VALUE_LEN`], and either the key already exists (an overwrite — no growth) or the
+    /// store is below [`MAX_STORE_ENTRIES`]. A **new** key is refused once full so a `Publish` flood
+    /// cannot displace already-stored replicas (LRC availability is preserved), while updates to existing
+    /// keys are always allowed. Both store paths (`on_put`, `on_publish`) gate on this one predicate.
+    fn admits_store(&self, digest: &[u8; DIGEST], value_len: usize) -> bool {
+        value_len <= MAX_VALUE_LEN
+            && (self.store.len() < MAX_STORE_ENTRIES || self.store.contains_key(digest))
+    }
+
     /// `Command::Put` — store a value at its responsible point and replicate it across the cell.
     fn on_put(&mut self, key: &[u8], value: Vec<u8>) -> Vec<Effect> {
         let (digest, primary) = Self::address_of(key);
         if primary == self.coord.coords() {
-            // We are the responsible node: store, replicate to the cell, ack ourselves.
+            // We are the responsible node. Refuse (over cap / over-size) without replicating or claiming
+            // it stored; otherwise replicate to the cell, ack ourselves, and store (moving the value in).
+            if !self.admits_store(&digest, value.len()) {
+                return Vec::new();
+            }
             let mut effects = self.replicate(&digest, &value);
             effects.push(Effect::Notify(Notification::Stored(digest)));
             self.store.insert(digest, value);
@@ -526,6 +554,16 @@ impl<F: Field> OverlayNode<F> {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value: Some(value.clone()),
+            })];
+        }
+        // Cap in-flight reads (A4 DoS backstop): once [`MAX_PENDING_GETS`] distinct reads are
+        // outstanding, refuse a *new* one — concluding `Retrieved(None)` — rather than track it, so a
+        // flood of distinct-key `Get`s cannot grow `pending_gets` without bound. A repeat Get for an
+        // already-pending digest is allowed through (it refreshes the existing entry, no growth).
+        if self.pending_gets.len() >= MAX_PENDING_GETS && !self.pending_gets.contains_key(&digest) {
+            return alloc::vec![Effect::Notify(Notification::Retrieved {
+                key: digest,
+                value: None,
             })];
         }
         // Fallback replicas: every other cell member could hold a replica; query the primary now
@@ -565,6 +603,11 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         };
         let value = body.get(1 + DIGEST..).unwrap_or(&[]).to_vec();
+        // Store under the A4 DoS caps. A refused publish (over cap / over-size) is dropped without an
+        // Ack or replication — a relayed flood of distinct digests cannot exhaust this node's memory.
+        if !self.admits_store(&digest, value.len()) {
+            return Vec::new();
+        }
         self.store.insert(digest, value.clone());
         if flag == PUBLISH_ORIGIN {
             // We are the responsible node: replicate across the cell and acknowledge the origin.
@@ -1087,6 +1130,103 @@ mod tests {
             prev = g;
         }
         assert!((prev - 0.0).abs() < 1e-12, "a fully degraded cell has zero recovery gap");
+    }
+
+    // ---- A4: the DHT slice and in-flight-read table stay bounded under a flood (audit #62) ----
+
+    /// A distinct 32-byte digest for flood index `i`, built without indexing (iterator zip).
+    fn flood_digest(i: u32) -> [u8; DIGEST] {
+        let mut d = [0u8; DIGEST];
+        for (dst, src) in d.iter_mut().zip(i.to_be_bytes()) {
+            *dst = src;
+        }
+        d
+    }
+
+    #[test]
+    fn a_publish_flood_cannot_grow_the_store_without_bound() {
+        // A relayed-Publish flood of distinct digests must not exhaust memory: the store is capped and a
+        // new key is refused once full (existing replicas are never evicted).
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let from = Point::<F2>::at(1).coords();
+        for i in 0..(MAX_STORE_ENTRIES as u32 + 500) {
+            let frame = encode_publish(PUBLISH_REPLICA, &flood_digest(i), b"v");
+            node.step(Instant(1), Input::Message { from, frame });
+        }
+        assert!(
+            node.store.len() <= MAX_STORE_ENTRIES,
+            "the store is bounded under a publish flood, got {}",
+            node.store.len()
+        );
+    }
+
+    #[test]
+    fn an_oversize_published_value_is_refused() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let from = Point::<F2>::at(1).coords();
+        let digest = [7u8; DIGEST];
+        let too_big = alloc::vec![0u8; MAX_VALUE_LEN + 1];
+        node.step(
+            Instant(1),
+            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &digest, &too_big) },
+        );
+        assert!(!node.store.contains_key(&digest), "an over-size value is refused");
+        // A value exactly at the limit is accepted.
+        let at_limit = alloc::vec![0u8; MAX_VALUE_LEN];
+        node.step(
+            Instant(1),
+            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &digest, &at_limit) },
+        );
+        assert!(node.store.contains_key(&digest), "a within-limit value is stored");
+    }
+
+    #[test]
+    fn an_existing_key_updates_even_when_the_store_is_full() {
+        // Reject-when-full must never block overwriting an already-stored key (no growth) — otherwise a
+        // flood that fills the store would freeze legitimate updates to existing replicas.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let from = Point::<F2>::at(1).coords();
+        for i in 0..MAX_STORE_ENTRIES as u32 {
+            let frame = encode_publish(PUBLISH_REPLICA, &flood_digest(i), b"a");
+            node.step(Instant(1), Input::Message { from, frame });
+        }
+        assert_eq!(node.store.len(), MAX_STORE_ENTRIES, "the store filled to the cap");
+        // Overwrite an existing key: allowed, no growth.
+        let existing = flood_digest(0);
+        node.step(
+            Instant(1),
+            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &existing, b"updated") },
+        );
+        assert_eq!(
+            node.store.get(&existing).map(Vec::as_slice),
+            Some(&b"updated"[..]),
+            "an existing key still updates when the store is full"
+        );
+        // A brand-new key is refused, and the cap is never exceeded.
+        node.step(
+            Instant(1),
+            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &[0xABu8; DIGEST], b"x") },
+        );
+        assert!(!node.store.contains_key(&[0xABu8; DIGEST]), "a new key is refused when full");
+        assert_eq!(node.store.len(), MAX_STORE_ENTRIES, "the store never exceeds its cap");
+    }
+
+    #[test]
+    fn a_get_flood_cannot_grow_pending_reads_without_bound() {
+        // A flood of distinct-key reads must not grow the in-flight table without bound; beyond the cap a
+        // new read is settled `Retrieved(None)` immediately rather than tracked.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        for i in 0..(MAX_PENDING_GETS as u32 + 500) {
+            node.step(
+                Instant(1),
+                Input::Command(Command::Get { key: i.to_be_bytes().to_vec() }),
+            );
+        }
+        assert!(
+            node.pending_gets.len() <= MAX_PENDING_GETS,
+            "pending reads are bounded under a get flood, got {}",
+            node.pending_gets.len()
+        );
     }
 
     #[test]
