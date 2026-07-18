@@ -890,6 +890,8 @@ version = "0.1.0"
 dependencies = [
  "fanos-code",
  "fanos-diakrisis",
+ "fanos-wire",
+ "fanos-wire-derive",
  "proptest",
  "sysinfo",
 ]

@@ -15,6 +15,9 @@ categories = ["network-programming"]
 fanos-diakrisis = { workspace = true }
 # The Fano/Hamming 3-bit syndrome — the load-bearing minimal fault localizer.
 fanos-code = { workspace = true }
+# Canonical wire codec: the CoherenceFrame's byte layout is a derived Wire (audit A1).
+fanos-wire = { workspace = true, features = ["alloc"] }
+fanos-wire-derive = { workspace = true }
 # Optional cross-platform metric backend (macOS/Windows/etc.); Linux prefers the direct /proc probe.
 # Its internal FFI/unsafe lives in the dependency — this crate stays `forbid(unsafe_code)`.
 sysinfo = { version = "0.39", default-features = false, features = [
@@ -29,7 +32,7 @@ proptest.workspace = true
 [features]
 default = ["std"]
 # std uses hardware float intrinsics; a no_std monitor supplies them via libm.
-std = ["fanos-diakrisis/std", "fanos-code/std"]
+std = ["fanos-diakrisis/std", "fanos-code/std", "fanos-wire/std"]
 libm = ["fanos-diakrisis/libm"]
 # The cross-platform system-metric backend (implies std).
 sysinfo = ["std", "dep:sysinfo"]

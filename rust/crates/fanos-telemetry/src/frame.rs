@@ -10,9 +10,10 @@
 use fanos_code::syndrome::syndrome3;
 use fanos_diakrisis::coherence::{CoherenceMatrix, PHI_TH};
 use fanos_diakrisis::window::{Alarm, CollectiveState};
+use fanos_wire::Wire;
 
 /// A 16-byte opaque cell identifier (a leaf cell, a rolled-up parent cell, or a per-PID `Γ_app` cell).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, fanos_wire_derive::Wire)]
 pub struct CellId(pub [u8; 16]);
 
 /// The collective-subject regime of a cell (from its mean inter-node correlation, spec §18.2).
@@ -48,8 +49,11 @@ const SYNDROME_MASK: u8 = 0b0000_0111;
 /// The canonical on-wire length of a [`CoherenceFrame`] (bytes). Fixed and KAT-pinned.
 pub const FRAME_LEN: usize = 52;
 
-/// A cell's coherence at one observation window — the unit of FANOS telemetry.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// A cell's coherence at one observation window — the unit of FANOS telemetry. The struct field order
+/// **is** the canonical byte layout: `#[derive(Wire)]` emits exactly `cell_id(16) ‖ epoch(8) ‖
+/// syndrome(1) ‖ verdict(1) ‖ phi(4) ‖ purity(4) ‖ reflection(4) ‖ mean_r(4) ‖ gap(4) ‖ forecast(2) ‖
+/// heal_seq(4)` = [`FRAME_LEN`] bytes (audit A1).
+#[derive(Clone, Copy, PartialEq, Debug, fanos_wire_derive::Wire)]
 pub struct CoherenceFrame {
     /// Which cell this describes.
     pub cell_id: CellId,
@@ -166,77 +170,18 @@ impl CoherenceFrame {
     /// heal_seq(4)`, all big-endian, `f32` as IEEE-754 bits.
     #[must_use]
     pub fn encode(&self) -> [u8; FRAME_LEN] {
-        let mut buf = [0u8; FRAME_LEN];
-        let mut w = Writer { buf: &mut buf };
-        w.put(&self.cell_id.0);
-        w.put(&self.epoch.to_be_bytes());
-        w.put(&[self.syndrome, self.verdict]);
-        w.put(&self.phi.to_bits().to_be_bytes());
-        w.put(&self.purity.to_bits().to_be_bytes());
-        w.put(&self.reflection.to_bits().to_be_bytes());
-        w.put(&self.mean_r.to_bits().to_be_bytes());
-        w.put(&self.gap.to_bits().to_be_bytes());
-        w.put(&self.forecast.to_be_bytes());
-        w.put(&self.heal_seq.to_be_bytes());
-        buf
+        // The derived `Wire` codec emits the fields in declaration order, which is exactly the layout
+        // above — byte-for-byte identical to the previous hand-rolled writer (audit A1). A fixed-layout
+        // frame is always `FRAME_LEN` bytes, so the conversion never falls back.
+        Wire::to_wire(self).try_into().unwrap_or([0u8; FRAME_LEN])
     }
 
     /// Decode a frame from its canonical encoding. Reads exactly [`FRAME_LEN`] bytes from the front
-    /// (any trailing bytes are ignored, so a frame may be embedded); `None` if too short.
+    /// (any trailing bytes are left unread, so a frame may be embedded); `None` if too short.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut r = Reader { buf: bytes };
-        let cell_id = CellId(r.take()?);
-        let epoch = u64::from_be_bytes(r.take()?);
-        let [syndrome, verdict] = r.take()?;
-        let phi = f32::from_bits(u32::from_be_bytes(r.take()?));
-        let purity = f32::from_bits(u32::from_be_bytes(r.take()?));
-        let reflection = f32::from_bits(u32::from_be_bytes(r.take()?));
-        let mean_r = f32::from_bits(u32::from_be_bytes(r.take()?));
-        let gap = f32::from_bits(u32::from_be_bytes(r.take()?));
-        let forecast = i16::from_be_bytes(r.take()?);
-        let heal_seq = u32::from_be_bytes(r.take()?);
-        Some(Self {
-            cell_id,
-            epoch,
-            syndrome,
-            verdict,
-            phi,
-            purity,
-            reflection,
-            mean_r,
-            gap,
-            forecast,
-            heal_seq,
-        })
-    }
-}
-
-/// A forward byte writer over a fixed buffer — sequential `copy_from_slice` with no indexing or
-/// panics for a correctly-sized total (each [`put`](Writer::put) consumes exactly its bytes).
-struct Writer<'a> {
-    buf: &'a mut [u8],
-}
-
-impl Writer<'_> {
-    fn put(&mut self, bytes: &[u8]) {
-        let taken = core::mem::take(&mut self.buf);
-        let (head, tail) = taken.split_at_mut(bytes.len());
-        head.copy_from_slice(bytes);
-        self.buf = tail;
-    }
-}
-
-/// A forward byte reader returning fixed-size arrays, `None` when exhausted (no indexing/unwrap).
-struct Reader<'a> {
-    buf: &'a [u8],
-}
-
-impl Reader<'_> {
-    fn take<const M: usize>(&mut self) -> Option<[u8; M]> {
-        let (head, tail) = self.buf.split_at_checked(M)?;
-        self.buf = tail;
-        head.try_into().ok()
+        let mut cur = bytes;
+        Wire::wire_decode(&mut cur).ok()
     }
 }
 
