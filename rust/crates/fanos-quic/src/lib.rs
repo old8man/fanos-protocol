@@ -30,6 +30,7 @@
 
 mod directory;
 mod driver;
+mod harness;
 mod identity;
 mod tls;
 
@@ -37,6 +38,9 @@ pub use directory::Directory;
 pub use driver::{
     Client, NodeHandle, QuicError, spawn, spawn_self_certifying, spawn_self_certifying_persistent,
     spawn_self_certifying_persistent_on, spawn_shaped,
+};
+pub use harness::{
+    Cell, DEFAULT_GRIND_LIMIT, credentials_for_point, spawn_cell, spawn_pinned,
 };
 pub use identity::coordinate_from_cert;
 pub use tls::{NodeCredentials, TlsError};

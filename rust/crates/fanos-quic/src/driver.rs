@@ -323,6 +323,10 @@ pub enum QuicError {
     Tls(TlsError),
     /// Binding the UDP socket or reading its address failed.
     Io(std::io::Error),
+    /// Rejection sampling could not mint self-certifying credentials for a requested coordinate
+    /// within the grind limit (see [`harness::credentials_for_point`](crate::credentials_for_point)).
+    /// Impossible for a real Fano cell; signals an unreachable target or a mis-set limit.
+    Grind,
 }
 
 impl core::fmt::Display for QuicError {
@@ -330,6 +334,7 @@ impl core::fmt::Display for QuicError {
         match self {
             Self::Tls(e) => write!(f, "TLS setup: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::Grind => write!(f, "could not grind credentials for the requested coordinate"),
         }
     }
 }
