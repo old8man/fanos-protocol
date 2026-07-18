@@ -53,4 +53,23 @@ mod tests {
             rendezvous_line::<F31>(b"service-b", 3)
         );
     }
+
+    #[test]
+    fn derivation_is_total_at_the_epoch_and_pubkey_extremes() {
+        // The derivation cannot fail, so exercise the input edges: the epoch counter's extremes and an
+        // empty pubkey all yield stable, deterministic lines, and the extremes stay distinct.
+        let pk = b"edge-service";
+        assert_eq!(
+            rendezvous_line::<F31>(pk, u32::MAX),
+            rendezvous_line::<F31>(pk, u32::MAX),
+            "u32::MAX epoch is deterministic"
+        );
+        assert_ne!(
+            rendezvous_line::<F31>(pk, 0),
+            rendezvous_line::<F31>(pk, u32::MAX),
+            "the epoch counter's two extremes are distinct"
+        );
+        // An empty pubkey is a degenerate but valid input — still a stable line, no panic.
+        assert_eq!(rendezvous_line::<F31>(&[], 5), rendezvous_line::<F31>(&[], 5));
+    }
 }
