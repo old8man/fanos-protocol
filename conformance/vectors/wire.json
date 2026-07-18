@@ -55,18 +55,17 @@
     ]
   },
   "tessera_layout": {
-    "comment": "Fixed-size Sphinx-derived packet (§7.7); constant total for length-indistinguishability.",
+    "comment": "Fixed-size sealed onion (§5.7, §7.7); constant total for length-indistinguishability. The holonomy path-authenticator is carried ENCRYPTED inside the innermost DELIVER command, NEVER a cleartext header field — a constant tag at a fixed offset would be a perfect cross-hop correlator (audit A1). Mirrors fanos_aphantos::sealed.",
     "version": 1,
-    "fields": [
+    "cleartext_header": [
       { "name": "version", "bytes": 1 },
-      { "name": "epoch", "bytes": 4 },
-      { "name": "group_element", "bytes": 1120, "note": "X25519(32) || ML-KEM-768 ct(1088)" },
-      { "name": "routing_cmd", "bytes": 32 },
-      { "name": "header_mac", "bytes": 16 },
-      { "name": "holonomy_tag", "bytes": 32 },
-      { "name": "payload", "bytes": 2048 }
+      { "name": "kem_ct", "bytes": 1120, "note": "X25519 ephemeral(32) || ML-KEM-768 ct(1088)" },
+      { "name": "nonce", "bytes": 12 },
+      { "name": "len_ct", "bytes": 18, "note": "AEAD(u16 body_len) = 2 + 16 tag; the real layer length, encrypted" }
     ],
-    "total_bytes": 4096
+    "header_bytes": 1151,
+    "encrypted_body": "body_ct = AEAD(cmd || inner) then keystream padding to total_bytes; cmd = (DELIVER || holonomy(32)) | (NEXT || next_coord(12))",
+    "total_bytes": 8192
   },
   "reject": {
     "comment": "A conformant decoder MUST reject every one of these as non-canonical.",

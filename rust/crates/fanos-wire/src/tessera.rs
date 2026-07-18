@@ -1,71 +1,110 @@
-//! The Tessera packet wire format (spec §5.7, §7.7).
+//! The Tessera / APHANTOS sealed-onion wire format (spec §5.7, §7.7) — the canonical,
+//! length-indistinguishable packet of NYX.
 //!
-//! Tessera is the fixed-size, Sphinx-derived, threshold, post-quantum packet of NYX. This
-//! module pins its **layout** — the field sizes and offsets, and the constant total size that
-//! makes packets length-indistinguishable regardless of path length or hop position. The
-//! cryptographic content (hybrid group elements, the β-ratchet, threshold routing commands)
-//! is produced by the privacy/crypto layers; here we define and validate the byte frame.
+//! This module pins the onion's **canonical byte layout**: the fixed *cleartext* header fields and
+//! their offsets, and the constant total size [`TOTAL_LEN`] that makes every hop's packet identical in
+//! length regardless of path length or hop position. It mirrors the shipping onion in
+//! `fanos_aphantos::sealed`; the cryptographic content (the hybrid-KEM layer key, the nested AEAD
+//! layers, the threshold routing commands) is produced by the privacy/crypto layers — here we define
+//! and validate the byte frame that carries them.
+//!
+//! ```text
+//! onion   = version(1) ‖ kem_ct(1120) ‖ nonce(12) ‖ len_ct(18) ‖ body_ct(len) ‖ padding  → TOTAL_LEN
+//! len_ct  = AEAD(len_key,  nonce, u16 body_len)        — the real layer length, encrypted
+//! body_ct = AEAD(body_key, nonce, cmd ‖ inner)         — the routing layer, encrypted
+//! cmd     = (DELIVER ‖ holonomy(32)) | (NEXT ‖ next_coord(12))   — inside body_ct, never cleartext
+//! ```
+//!
+//! # The path authenticator is encrypted, never a cleartext header field
+//!
+//! The **holonomy** path-authenticator travels *inside the innermost (DELIVER) command*, AEAD-encrypted
+//! end-to-end, so it is visible only to the endpoint. It is deliberately **not** a cleartext header
+//! field: a constant per-circuit tag at a fixed offset would be a perfect **cross-hop correlator** —
+//! any two relays, or any observer of a single un-encrypted hop, could link entry to exit by matching
+//! it, collapsing the threshold `P_hop^L` endpoint-unlinkability to `1` (spec §5.4). An earlier
+//! revision of this canonical layout carried exactly such a cleartext `holonomy_tag`; it has been
+//! removed, and this invariant is documented here so no re-implementation reintroduces the leak
+//! (audit A1). The only widths given for `holonomy`/`next_coord` live in [`command`] — they never
+//! appear at a fixed packet offset.
 
 use crate::error::WireError;
 
 /// Tessera format version.
 pub const VERSION: u8 = 1;
-
 /// `version` field width.
 pub const VERSION_LEN: usize = 1;
-/// `epoch` field width (spec §7.7).
-pub const EPOCH_LEN: usize = 4;
-/// Hybrid `group_element`: `X25519 (32) ‖ ML-KEM-768 ciphertext (1088)` (spec §7.7).
-pub const GROUP_ELEMENT_LEN: usize = 32 + 1088;
-/// Encrypted `routing_cmd` (peeled by the line threshold).
-pub const ROUTING_CMD_LEN: usize = 32;
-/// `header_mac` integrity tag for the current hop.
-pub const HEADER_MAC_LEN: usize = 16;
-/// Accumulated `holonomy_tag` — the path authenticator (spec §5.4).
-pub const HOLONOMY_TAG_LEN: usize = 32;
-/// AEAD `payload`, re-encrypted per hop.
-pub const PAYLOAD_LEN: usize = 2048;
 
-/// The constant total packet size (spec §7.7): a wire-level requirement, independent of path
-/// length or hop position, so packets are indistinguishable by size.
-pub const TOTAL_LEN: usize = 4096;
+/// Hybrid per-hop KEM ciphertext `X25519 ephemeral (32) ‖ ML-KEM-768 ciphertext (1088)` (spec §7.7).
+/// Equals `fanos_pqcrypto::kem::CIPHERTEXT_LEN`; defined locally to keep this codec crate dependency-free
+/// (a debug assertion in `fanos_aphantos::sealed` pins the two together).
+pub const KEM_CT_LEN: usize = 32 + 1088;
+/// Per-packet AEAD `nonce` width (ChaCha20-Poly1305).
+pub const NONCE_LEN: usize = 12;
+/// AEAD authentication-tag width (ChaCha20-Poly1305).
+pub const TAG_LEN: usize = 16;
+/// Encrypted `len` field: AEAD of a 2-byte big-endian body length (`2 + TAG_LEN`).
+pub const LEN_CT_LEN: usize = 2 + TAG_LEN;
 
-/// Byte offset of each field within the packet.
+/// The constant total packet size (spec §7.7): a wire-level requirement, independent of path length or
+/// hop position, so packets are length-indistinguishable. Matches `fanos_aphantos::sealed::ONION_LEN`.
+pub const TOTAL_LEN: usize = 8192;
+
+/// Byte offset of each **cleartext header** field within the packet. Everything from [`offset::BODY_CT`]
+/// onward is AEAD ciphertext followed by keystream padding — opaque to every relay but the one peeling it.
 pub mod offset {
-    use super::{
-        EPOCH_LEN, GROUP_ELEMENT_LEN, HEADER_MAC_LEN, HOLONOMY_TAG_LEN, ROUTING_CMD_LEN,
-        VERSION_LEN,
-    };
+    use super::{KEM_CT_LEN, LEN_CT_LEN, NONCE_LEN, VERSION_LEN};
     /// Offset of `version`.
     pub const VERSION: usize = 0;
-    /// Offset of `epoch`.
-    pub const EPOCH: usize = VERSION + VERSION_LEN;
-    /// Offset of `group_element`.
-    pub const GROUP_ELEMENT: usize = EPOCH + EPOCH_LEN;
-    /// Offset of `routing_cmd`.
-    pub const ROUTING_CMD: usize = GROUP_ELEMENT + GROUP_ELEMENT_LEN;
-    /// Offset of `header_mac`.
-    pub const HEADER_MAC: usize = ROUTING_CMD + ROUTING_CMD_LEN;
-    /// Offset of `holonomy_tag`.
-    pub const HOLONOMY_TAG: usize = HEADER_MAC + HEADER_MAC_LEN;
-    /// Offset of `payload`.
-    pub const PAYLOAD: usize = HOLONOMY_TAG + HOLONOMY_TAG_LEN;
+    /// Offset of the hybrid KEM ciphertext.
+    pub const KEM_CT: usize = VERSION + VERSION_LEN;
+    /// Offset of the AEAD nonce.
+    pub const NONCE: usize = KEM_CT + KEM_CT_LEN;
+    /// Offset of the encrypted length field.
+    pub const LEN_CT: usize = NONCE + NONCE_LEN;
+    /// Offset of the encrypted routing body (and, after it, keystream padding to `TOTAL_LEN`).
+    pub const BODY_CT: usize = LEN_CT + LEN_CT_LEN;
 }
 
-/// The number of bytes of padding after the payload, filling up to [`TOTAL_LEN`].
-pub const PADDING_LEN: usize = TOTAL_LEN - (offset::PAYLOAD + PAYLOAD_LEN);
+/// The fixed cleartext-header length: everything before the encrypted body (`= offset::BODY_CT`).
+pub const HEADER_LEN: usize = offset::BODY_CT;
 
-// Compile-time guarantee that the declared fields fit the fixed packet.
+/// The most encrypted-body-plus-padding bytes the packet holds (`TOTAL_LEN − HEADER_LEN`). The padding
+/// is keystream-derived, so it is indistinguishable from ciphertext and a passive observer sees a
+/// constant-size packet at every hop.
+pub const MAX_BODY_CT_LEN: usize = TOTAL_LEN - HEADER_LEN;
+
+/// The **encrypted** routing-command layout, carried inside `body_ct` — never at a fixed packet offset.
+/// Documented for a re-implementation: `cmd = (DELIVER ‖ holonomy(32)) | (NEXT ‖ next_coord(12))`. That
+/// the holonomy width appears only here, and never among the cleartext [`offset`]s, is what keeps the
+/// path-authenticator from being a cross-hop correlator (see the module docs).
+pub mod command {
+    /// `DELIVER` command tag (first byte of the decrypted body): the payload has reached its endpoint.
+    pub const DELIVER: u8 = 0;
+    /// `NEXT` command tag: forward the inner onion to the carried next-hop coordinate.
+    pub const NEXT: u8 = 1;
+    /// The path-authenticator holonomy carried in a `DELIVER` command (encrypted, endpoint-only).
+    pub const HOLONOMY_LEN: usize = 32;
+    /// The next-hop coordinate carried in a `NEXT` command (a projective triple, `3 × u32`).
+    pub const NEXT_COORD_LEN: usize = 12;
+}
+
+// Compile-time guarantee that the cleartext header fits the fixed packet with room for a body.
 const _: () = assert!(
-    offset::PAYLOAD + PAYLOAD_LEN <= TOTAL_LEN,
-    "Tessera fields must fit within the fixed total size",
+    HEADER_LEN < TOTAL_LEN,
+    "Tessera cleartext header must fit within the fixed total size",
 );
 
-/// A view over the fixed-size Tessera packet buffer, exposing each field slice.
+/// A view over the fixed-size Tessera packet buffer, exposing each **cleartext** field slice. The
+/// routing body ([`body`](TesseraView::body)) is AEAD ciphertext; this view does not — and cannot —
+/// decrypt it (that requires the hop key), and there is no holonomy accessor because the authenticator
+/// is not a cleartext field.
 pub struct TesseraView<'a>(&'a [u8; TOTAL_LEN]);
 
 impl<'a> TesseraView<'a> {
     /// Wrap a fixed-size buffer, checking the version byte.
+    ///
+    /// # Errors
+    /// Returns [`WireError::UnsupportedVersion`] if the leading version byte is not [`VERSION`].
     pub fn new(buf: &'a [u8; TOTAL_LEN]) -> Result<Self, WireError> {
         if buf.first().copied() != Some(VERSION) {
             return Err(WireError::UnsupportedVersion);
@@ -73,30 +112,25 @@ impl<'a> TesseraView<'a> {
         Ok(Self(buf))
     }
 
-    /// The `epoch` field bytes.
+    /// The hybrid KEM ciphertext bytes (this hop's layer-key encapsulation).
     #[must_use]
-    pub fn epoch(&self) -> &[u8] {
-        self.field(offset::EPOCH, EPOCH_LEN)
+    pub fn kem_ct(&self) -> &[u8] {
+        self.field(offset::KEM_CT, KEM_CT_LEN)
     }
-    /// The `group_element` field bytes.
+    /// The AEAD nonce bytes.
     #[must_use]
-    pub fn group_element(&self) -> &[u8] {
-        self.field(offset::GROUP_ELEMENT, GROUP_ELEMENT_LEN)
+    pub fn nonce(&self) -> &[u8] {
+        self.field(offset::NONCE, NONCE_LEN)
     }
-    /// The encrypted `routing_cmd` field bytes.
+    /// The encrypted length-field bytes.
     #[must_use]
-    pub fn routing_cmd(&self) -> &[u8] {
-        self.field(offset::ROUTING_CMD, ROUTING_CMD_LEN)
+    pub fn len_ct(&self) -> &[u8] {
+        self.field(offset::LEN_CT, LEN_CT_LEN)
     }
-    /// The `holonomy_tag` field bytes.
+    /// The encrypted routing body plus keystream padding (opaque without the hop key).
     #[must_use]
-    pub fn holonomy_tag(&self) -> &[u8] {
-        self.field(offset::HOLONOMY_TAG, HOLONOMY_TAG_LEN)
-    }
-    /// The AEAD `payload` field bytes.
-    #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        self.field(offset::PAYLOAD, PAYLOAD_LEN)
+    pub fn body(&self) -> &[u8] {
+        self.field(offset::BODY_CT, MAX_BODY_CT_LEN)
     }
 
     fn field(&self, off: usize, len: usize) -> &[u8] {
@@ -112,30 +146,47 @@ mod tests {
 
     #[test]
     fn layout_offsets_are_consistent_and_fit() {
-        assert_eq!(offset::EPOCH, 1);
-        assert_eq!(offset::GROUP_ELEMENT, 5);
-        assert_eq!(offset::PAYLOAD + PAYLOAD_LEN + PADDING_LEN, TOTAL_LEN);
-        // Fields sum plus padding equals the constant total.
-        let used = VERSION_LEN
-            + EPOCH_LEN
-            + GROUP_ELEMENT_LEN
-            + ROUTING_CMD_LEN
-            + HEADER_MAC_LEN
-            + HOLONOMY_TAG_LEN
-            + PAYLOAD_LEN;
-        assert_eq!(used + PADDING_LEN, TOTAL_LEN);
+        assert_eq!(offset::VERSION, 0);
+        assert_eq!(offset::KEM_CT, 1);
+        assert_eq!(offset::NONCE, 1 + KEM_CT_LEN);
+        assert_eq!(offset::LEN_CT, offset::NONCE + NONCE_LEN);
+        assert_eq!(offset::BODY_CT, offset::LEN_CT + LEN_CT_LEN);
+        assert_eq!(HEADER_LEN, offset::BODY_CT);
+        // The cleartext header plus the maximum encrypted body equals the constant total.
+        assert_eq!(HEADER_LEN + MAX_BODY_CT_LEN, TOTAL_LEN);
     }
 
     #[test]
-    fn view_exposes_fields_and_checks_version() {
+    fn the_header_matches_the_shipping_onion_layout() {
+        // Byte-exact agreement with fanos_aphantos::sealed's cleartext header (one source of truth):
+        // version(1) ‖ kem_ct(1120) ‖ nonce(12) ‖ len_ct(18) = 1151, total 8192.
+        assert_eq!(KEM_CT_LEN, 1120);
+        assert_eq!(LEN_CT_LEN, 18);
+        assert_eq!(HEADER_LEN, 1 + 1120 + 12 + 18);
+        assert_eq!(TOTAL_LEN, 8192);
+    }
+
+    #[test]
+    fn view_exposes_cleartext_fields_and_checks_version() {
         let mut buf = [0u8; TOTAL_LEN];
         buf[offset::VERSION] = VERSION;
         let view = TesseraView::new(&buf).unwrap();
-        assert_eq!(view.epoch().len(), EPOCH_LEN);
-        assert_eq!(view.group_element().len(), GROUP_ELEMENT_LEN);
-        assert_eq!(view.payload().len(), PAYLOAD_LEN);
+        assert_eq!(view.kem_ct().len(), KEM_CT_LEN);
+        assert_eq!(view.nonce().len(), NONCE_LEN);
+        assert_eq!(view.len_ct().len(), LEN_CT_LEN);
+        assert_eq!(view.body().len(), MAX_BODY_CT_LEN);
 
         buf[offset::VERSION] = 99;
         assert!(TesseraView::new(&buf).is_err());
+    }
+
+    #[test]
+    fn there_is_no_cleartext_holonomy_field() {
+        // Regression guard for the removed cross-hop correlator: the cleartext header is exactly
+        // version ‖ kem_ct ‖ nonce ‖ len_ct — no authenticator among them — and the holonomy width is
+        // defined only within the (encrypted) `command` module, never as a packet offset.
+        assert_eq!(HEADER_LEN, offset::LEN_CT + LEN_CT_LEN);
+        assert_eq!(command::HOLONOMY_LEN, 32);
+        assert_eq!(command::NEXT_COORD_LEN, 12);
     }
 }
