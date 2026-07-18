@@ -11,11 +11,17 @@ use fanos_geometry::Point;
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_runtime::{Command, Config, Notification, OverlayNode, Triple};
 
-/// A brisk liveness profile so tests run in ~a second, not the 500 ms production cadence.
+/// A brisk liveness profile so this test runs in a couple of seconds, not the 500 ms production
+/// cadence. `liveness_timeout` is kept a full 10 heartbeats wide (1000 ms) on purpose: this is a
+/// *real-QUIC, real-wall-clock* test that shares the machine with the whole workspace, and a tighter
+/// window (an earlier 350 ms) let CPU-starvation jitter delay B's pings past the deadline so A wrongly
+/// declared a *live* peer dead — a load-sensitive flake. 1000 ms swamps that jitter while staying fast;
+/// the quiet-window assertion below still spans more than one `liveness_timeout`, so it remains a real
+/// check (parallel-safe real-QUIC tests, audit #56/#77).
 fn brisk() -> Config {
     Config {
         heartbeat: fanos_runtime::Duration::from_millis(100),
-        liveness_timeout: fanos_runtime::Duration::from_millis(350),
+        liveness_timeout: fanos_runtime::Duration::from_millis(1000),
         ..Config::default()
     }
 }
@@ -88,9 +94,12 @@ async fn heartbeat_keeps_a_live_peer_up_then_detects_its_death() {
     a.command(Command::StartHeartbeat);
     b.command(Command::StartHeartbeat);
 
-    // For the first ~600 ms, B answers A's pings, so A must NOT report B down. (A *will* report
-    // the never-present Fano neighbours 2..6 down — we only care about B here.)
-    let quiet = tokio::time::timeout(StdDuration::from_millis(600), async {
+    // For ~1400 ms — comfortably longer than one `liveness_timeout` (1000 ms), so a broken liveness
+    // that declared a live peer dead WOULD fire and be caught here — B keeps answering A's pings, so A
+    // must NOT report B down. (A *will* report the never-present Fano neighbours 2..6 down — we only
+    // care about B here.) The window exceeds the timeout to stay a real check; the timeout is wide
+    // enough that load jitter cannot forge a false PeerDown.
+    let quiet = tokio::time::timeout(StdDuration::from_millis(1400), async {
         loop {
             if let Some(Notification::PeerDown(p)) = a.next_notification().await
                 && p == b.address()
@@ -101,9 +110,10 @@ async fn heartbeat_keeps_a_live_peer_up_then_detects_its_death() {
     });
     assert!(quiet.await.is_err(), "A declared a live peer dead");
 
-    // Now kill B. Within a few liveness windows, A must report exactly B down.
+    // Now kill B. Within a few liveness windows, A must report exactly B down. 5 s is a generous
+    // margin over the 1000 ms `liveness_timeout`, robust even when the machine is loaded.
     b.shutdown();
-    let detected = tokio::time::timeout(StdDuration::from_secs(3), async {
+    let detected = tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             if let Some(Notification::PeerDown(p)) = a.next_notification().await
                 && p == b.address()
