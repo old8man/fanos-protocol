@@ -396,6 +396,53 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_stored_descriptor_is_rejected() {
+        // DHT poisoning: a sealed descriptor sits in a MUTABLE DHT slot, so a storage node — or anyone
+        // who can overwrite the slot — may flip its bytes. Every such tamper fails the address-gated
+        // AEAD on open, so the resolver rejects the poisoned blob and falls through to the next replica.
+        // Difficulty 0 isolates the AEAD gate (a non-zero PoW would reject a changed ciphertext earlier).
+        let (addr, bundle) = service();
+
+        let mut ct_tampered = seal(&addr, 7, &descriptor(7, bundle.clone()), 0).unwrap();
+        if let Some(b) = ct_tampered.ciphertext.first_mut() {
+            *b ^= 0x01;
+        }
+        assert_eq!(
+            open(&addr, 7, &ct_tampered, 0),
+            Err(DescriptorError::Aead),
+            "a flipped ciphertext byte fails the AEAD tag"
+        );
+
+        let mut salt_tampered = seal(&addr, 7, &descriptor(7, bundle), 0).unwrap();
+        if let Some(b) = salt_tampered.nonce_salt.first_mut() {
+            *b ^= 0x01;
+        }
+        assert_eq!(
+            open(&addr, 7, &salt_tampered, 0),
+            Err(DescriptorError::Aead),
+            "a flipped nonce salt yields the wrong nonce → AEAD failure"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_replayed_into_another_epoch_is_rejected() {
+        // Cross-epoch replay: a valid descriptor captured at one epoch cannot be re-served at the next —
+        // the slot, the address-gated key, and the nonce are all epoch-bound.
+        let (addr, bundle) = service();
+        let sealed = seal(&addr, 7, &descriptor(7, bundle), 0).unwrap();
+        assert_eq!(
+            open(&addr, 8, &sealed, 0),
+            Err(DescriptorError::Aead),
+            "an epoch-7 descriptor does not open under epoch 8's address-gated key"
+        );
+        assert_ne!(
+            publish_point::<F7>(&addr, 7),
+            publish_point::<F7>(&addr, 8),
+            "and the DHT slot rotates per epoch, so a stale descriptor is not even found there"
+        );
+    }
+
+    #[test]
     fn epoch_mismatch_is_rejected() {
         let (addr, bundle) = service();
         let sealed = seal(&addr, 42, &descriptor(42, bundle), 4).unwrap();

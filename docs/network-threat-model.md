@@ -80,6 +80,7 @@ structure, which is why the answers compose instead of conflicting:
 | D4 | **Equivocation** (two faces to two peers) | Quorum-corroborated liveness (one liar out-voted); reliable-broadcast echo | 🟡 | `overlay.rs` liveness ✅; equivocation-specific test ⬜ |
 | D5 | **Selective forwarding / data withholding** | Redundancy on `q+1` lines (any hop reachable via a co-linear survivor); repair by peeling | ✅ 🟡 | `plan.rs` LRC ✅; withholding-detection sim 🟡 |
 | D6 | **Quarantine correctness** (permanent exile / no-op decouple) | Quarantine + escalate (corpus does not prove exclusion restores wiring); decouple must lower `Φ` | 🟡 | #65 (C5/C6) |
+| D7 | **DHT poisoning** (overwrite/forge a stored record) | The overlay store is mutable, so integrity is at the record: descriptors are address-gated **AEAD-encrypted**, **self-certifying** (`H(bundle)==addr`), epoch-bound, and stored at an unenumerable rotating slot `H(addr‖epoch)` — a poisoned/forged/tampered/replayed blob is rejected on `open` | ✅ | `calypso/descriptor.rs` (tamper→Aead, forge→NotCertified, wrong-addr→Aead, cross-epoch→Aead, PoW) |
 
 ## E. Cryptography
 
