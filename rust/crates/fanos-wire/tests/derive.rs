@@ -1,7 +1,7 @@
 //! End-to-end check of `#[derive(Wire)]`: a derived struct round-trips and enforces canonicity
 //! (rejects trailing bytes), and its layout is exactly the field order.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use fanos_wire::{Wire, WireError};
 use fanos_wire_derive::Wire;
