@@ -619,4 +619,55 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn seal_onion_rejects_bad_parameters() {
+        use fanos_geometry::Point;
+        let kps = line(3, 0x9E);
+        let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
+        let line_coord = Point::<fanos_field::F2>::at(1).coords();
+
+        // An empty circuit has no hop to seal.
+        assert!(matches!(seal_onion(&[], 2, b"x", b"s"), Err(ThresholdError::Malformed)));
+        // A threshold larger than the member count is unsatisfiable.
+        assert!(
+            seal_onion(
+                &[HopLine {
+                    line: line_coord,
+                    members: &pubs,
+                }],
+                4,
+                b"x",
+                b"s",
+            )
+            .is_err(),
+            "threshold > members is rejected"
+        );
+        // A zero threshold is degenerate.
+        assert!(
+            seal_onion(
+                &[HopLine {
+                    line: line_coord,
+                    members: &pubs,
+                }],
+                0,
+                b"x",
+                b"s",
+            )
+            .is_err(),
+            "threshold 0 is rejected"
+        );
+    }
+
+    #[test]
+    fn pad_onion_boundary() {
+        // A short onion pads up to the constant bucket.
+        assert_eq!(pad_onion(b"short").unwrap().len(), THRESHOLD_ONION_LEN);
+        // Exactly the bucket size is a no-op pad (0 filler), still Ok.
+        let exact = alloc::vec![0u8; THRESHOLD_ONION_LEN];
+        assert_eq!(pad_onion(&exact).unwrap().len(), THRESHOLD_ONION_LEN);
+        // One byte over the bucket cannot be padded down.
+        let over = alloc::vec![0u8; THRESHOLD_ONION_LEN + 1];
+        assert!(matches!(pad_onion(&over), Err(ThresholdError::TooLong)));
+    }
 }
