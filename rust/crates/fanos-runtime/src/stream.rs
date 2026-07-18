@@ -24,7 +24,7 @@
 //! with either transport. Multiplexing is by `stream_id`: many independent streams share one peer
 //! link, each with its own sender/receiver state, so a loss on one stream never stalls another.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 /// Maximum payload bytes per segment (keeps a segment within a typical datagram / onion cell).
@@ -99,8 +99,13 @@ impl Segment {
 #[derive(Clone, Debug)]
 pub struct StreamSender {
     stream_id: u32,
-    /// Sealed (immutable, sendable) segments.
-    segments: Vec<Vec<u8>>,
+    /// Sealed (immutable, sendable) segments still in flight, `segments[i]` bearing sequence
+    /// `base + i`. Fully-acked segments are reclaimed off the front (they are never retransmitted), so
+    /// this holds only the unacknowledged window — a transfer far larger than RAM streams in bounded
+    /// memory (audit F3).
+    segments: VecDeque<Vec<u8>>,
+    /// Sequence number of `segments.front()` — the count of segments already reclaimed.
+    base: u32,
     /// The unsealed tail — bytes pushed but not yet formed into a full segment.
     pending: Vec<u8>,
     /// Set once [`finish`](Self::finish) has sealed the final (FIN-bearing) segment.
@@ -122,7 +127,8 @@ impl StreamSender {
     pub fn open(stream_id: u32) -> Self {
         Self {
             stream_id,
-            segments: Vec::new(),
+            segments: VecDeque::new(),
+            base: 0,
             pending: Vec::new(),
             finished: false,
             acked: 0,
@@ -130,6 +136,12 @@ impl StreamSender {
             window: DEFAULT_WINDOW,
             peer_rwnd: SACK_WIDTH,
         }
+    }
+
+    /// The total number of segments ever sealed (reclaimed + in-flight) — the sequence space, used as
+    /// the send-window upper bound and the FIN-bearing last sequence.
+    fn total(&self) -> u32 {
+        self.base + self.segments.len() as u32
     }
 
     /// Open a stream carrying a complete `payload` (one-shot / whole-message convenience): equivalent
@@ -153,7 +165,7 @@ impl StreamSender {
         while self.pending.len() >= MAX_SEGMENT {
             let rest = self.pending.split_off(MAX_SEGMENT);
             let seg = core::mem::replace(&mut self.pending, rest);
-            self.segments.push(seg);
+            self.segments.push_back(seg);
         }
     }
 
@@ -175,7 +187,7 @@ impl StreamSender {
             return;
         }
         let seg = core::mem::take(&mut self.pending);
-        self.segments.push(seg);
+        self.segments.push_back(seg);
     }
 
     /// Close the send side: seal the remaining tail as the final **FIN-bearing** segment (an empty one
@@ -186,7 +198,7 @@ impl StreamSender {
             return;
         }
         let seg = core::mem::take(&mut self.pending);
-        self.segments.push(seg);
+        self.segments.push_back(seg);
         self.finished = true;
     }
 
@@ -196,14 +208,16 @@ impl StreamSender {
     /// segment carries `fin` once the stream is finished.
     #[must_use]
     pub fn outbound(&self) -> Vec<Segment> {
-        let len = self.segments.len() as u32;
-        let last = len.saturating_sub(1);
+        let total = self.total();
+        let last = total.saturating_sub(1);
         let win = self.window.min(self.peer_rwnd.max(1)); // at least 1: a zero-window probe
-        let end = (self.acked + win).min(len);
+        let end = (self.acked + win).min(total);
         (self.acked..end)
             .filter(|seq| !self.sacked.contains(seq))
             .filter_map(|seq| {
-                self.segments.get(seq as usize).map(|data| Segment {
+                // `seq >= acked >= base`, so the index into the in-flight deque is non-negative.
+                let idx = seq.checked_sub(self.base)? as usize;
+                self.segments.get(idx).map(|data| Segment {
                     stream_id: self.stream_id,
                     seq,
                     fin: self.finished && seq == last,
@@ -217,11 +231,17 @@ impl StreamSender {
     /// and record the individually-acked sequences from the SACK bitmap so they are not retransmitted.
     pub fn on_ack(&mut self, ack: Ack) {
         self.peer_rwnd = ack.rwnd;
-        let len = self.segments.len() as u32;
-        self.acked = self.acked.max(ack.cumulative).min(len);
+        let total = self.total();
+        self.acked = self.acked.max(ack.cumulative).min(total);
         for i in 1..SACK_WIDTH {
             if ack.sack & (1u64 << i) != 0 {
-                self.sacked.insert(ack.cumulative.saturating_add(i));
+                let seq = ack.cumulative.saturating_add(i);
+                // Only record a selective ack for a sequence that actually exists; a crafted ack with a
+                // far-future `cumulative` must not seed the `sacked` set with unbounded phantom
+                // sequences (audit F4).
+                if seq < total {
+                    self.sacked.insert(seq);
+                }
             }
         }
         // A gap may now be filled by contiguous sacked sequences — advance the cumulative point.
@@ -230,12 +250,18 @@ impl StreamSender {
         }
         // Drop stale selective acks below the cumulative point.
         self.sacked = self.sacked.split_off(&self.acked);
+        // Reclaim every segment now fully acknowledged (below the cumulative point): it is never
+        // retransmitted, so it need not be held — the in-flight buffer stays bounded by the window,
+        // independent of the total transfer size (audit F3).
+        while self.base < self.acked && self.segments.pop_front().is_some() {
+            self.base += 1;
+        }
     }
 
     /// Whether the stream is finished and every segment has been acknowledged.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.finished && self.acked as usize >= self.segments.len()
+        self.finished && self.acked >= self.total()
     }
 }
 
@@ -283,10 +309,15 @@ impl StreamReceiver {
         if segment.stream_id != self.stream_id {
             return self.ack();
         }
-        // Accept only sequences in the current window: not already taken, not beyond the advertised
-        // credit. Dropping out-of-window segments is what bounds the receive buffer.
+        // Admit only sequences in `[delivered, delivered + recv_window)` — anchored on the *delivered*
+        // frontier (what the application has drained), NOT on `next` (what has merely arrived). This is
+        // the load-bearing bound: the buffer then holds at most `recv_window` segments no matter how
+        // the sequences arrive, so a peer that floods past its advertised credit has the excess
+        // *dropped*, not buffered — flow control is enforced, not merely advisory, and the receiver
+        // cannot be driven out of memory (audit C3/F1). A slow reader (delivered lagging) shrinks the
+        // admissible window, throttling the sender.
         let in_window = segment.seq >= self.delivered
-            && segment.seq < self.next.saturating_add(self.recv_window);
+            && segment.seq < self.delivered.saturating_add(self.recv_window);
         if in_window {
             if segment.fin {
                 self.fin_seq = Some(segment.seq);
@@ -555,6 +586,37 @@ mod tests {
     }
 
     #[test]
+    fn the_receive_buffer_is_bounded_by_recv_window_under_a_flood() {
+        // A peer that ignores its advertised credit and floods far past the window has the excess
+        // *dropped*, not buffered: the buffer holds at most recv_window segments (audit C3/F1).
+        let mut rx = StreamReceiver::new(0).with_recv_window(4);
+        for seq in 0..20u32 {
+            rx.on_segment(&Segment {
+                stream_id: 0,
+                seq,
+                fin: false,
+                data: alloc::vec![seq as u8],
+            });
+        }
+        assert!(
+            rx.received.len() <= 4,
+            "the receive buffer never exceeds recv_window, whatever the sender floods"
+        );
+        // The admitted in-order prefix delivers; everything past the window was dropped.
+        assert_eq!(rx.take(), alloc::vec![0, 1, 2, 3]);
+        // Draining slides the window forward — the next block is now admissible.
+        for seq in 4..8u32 {
+            rx.on_segment(&Segment {
+                stream_id: 0,
+                seq,
+                fin: false,
+                data: alloc::vec![seq as u8],
+            });
+        }
+        assert_eq!(rx.take(), alloc::vec![4, 5, 6, 7]);
+    }
+
+    #[test]
     fn the_receive_window_edge_is_exact() {
         let mut rx = StreamReceiver::new(0).with_recv_window(4);
         let seg = |seq| Segment {
@@ -603,6 +665,39 @@ mod tests {
             1,
             "zero credit still emits exactly one probe segment"
         );
+    }
+
+    #[test]
+    fn the_sender_reclaims_acked_segments() {
+        // A 50-segment transfer: once a prefix is cumulatively acked, those segments are dropped from
+        // the in-flight buffer, so memory tracks the window, not the whole transfer (audit F3).
+        let payload = alloc::vec![0u8; 50 * MAX_SEGMENT];
+        let mut tx = StreamSender::new(0, &payload); // 50 data + 1 FIN
+        let total = tx.total();
+        assert_eq!(tx.segments.len() as u32, total, "all segments buffered before any ack");
+
+        tx.on_ack(Ack {
+            cumulative: 40,
+            sack: 0,
+            rwnd: 64,
+        });
+        assert_eq!(tx.base, 40, "reclaimed the 40 acked segments");
+        assert_eq!(tx.segments.len() as u32, total - 40, "the in-flight buffer shrank");
+        // Retransmission still addresses the right sequences after reclaim.
+        assert!(
+            tx.outbound().iter().all(|s| s.seq >= 40),
+            "outbound resumes from the cumulative point over the reclaimed deque"
+        );
+
+        // Fully ack: complete, and every segment reclaimed.
+        tx.on_ack(Ack {
+            cumulative: total,
+            sack: 0,
+            rwnd: 64,
+        });
+        assert!(tx.is_complete());
+        assert!(tx.segments.is_empty(), "no segment is retained once fully acknowledged");
+        assert!(tx.outbound().is_empty());
     }
 
     #[test]

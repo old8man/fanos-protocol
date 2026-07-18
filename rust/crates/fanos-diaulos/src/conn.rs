@@ -8,7 +8,6 @@
 //! negotiation. A `DATA` frame for an unknown id **implicitly opens** an inbound stream, queued for
 //! [`accept`](Connection::accept).
 
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
 
 use fanos_runtime::stream::{StreamReceiver, StreamSender};
@@ -31,6 +30,18 @@ impl Stream {
     }
 }
 
+/// The hard ceiling on streams held concurrently on one connection. Once reached, a peer's *implicit*
+/// opens (a `DATA` for an id we never saw) are refused, so a peer that floods `DATA` frames bearing an
+/// ever-growing `stream_id` cannot force unbounded stream-state allocation (audit F2). The connection's
+/// stream memory is then capped at `MAX_CONCURRENT_STREAMS ×` per-stream reliability state, whatever the
+/// peer sends — and per-stream state is itself window-bounded (C3/F1). Because [`retire_stream`] frees a
+/// completed stream's slot, the bound limits *concurrency*, not lifetime stream throughput. `256` mirrors
+/// the concurrency a well-behaved QUIC endpoint grants by default; it is a resource bound, not a tuning
+/// knob, so it is fixed rather than negotiated.
+///
+/// [`retire_stream`]: Connection::retire_stream
+pub const MAX_CONCURRENT_STREAMS: usize = 256;
+
 /// A multiplexed, bidirectional, end-to-end-encrypted DIAULOS connection.
 pub struct Connection {
     key_tx: Key,
@@ -40,6 +51,13 @@ pub struct Connection {
     /// The low-bit parity an id must have for the *peer* to have opened it: the initiator (local even)
     /// accepts implicit opens only on odd ids, the responder only on even. Guards our own id space.
     peer_id_parity: u32,
+    /// Retirement frontier: a peer-parity id `< peer_closed_below` has already been retired, so a late
+    /// duplicate `DATA` for it is a straggler to drop, not a fresh stream to open. Peer ids are handed out
+    /// strictly monotonically (`open_stream` steps by 2), so an unknown id below a retired one cannot be a
+    /// legitimate new open — this is the QUIC closed-stream rule, and it prevents a retired stream from
+    /// being resurrected as a phantom. Only advances on peer-id retirement; local ids need no frontier
+    /// (a straggler for a retired local id is dropped by the parity guard or the unknown-ack no-op).
+    peer_closed_below: u32,
     streams: BTreeMap<u32, Stream>,
     accept_queue: VecDeque<u32>,
 }
@@ -55,6 +73,7 @@ impl Connection {
             nonce_tx: 0,
             next_local_id: u32::from(!initiator),
             peer_id_parity: u32::from(initiator),
+            peer_closed_below: 0,
             streams: BTreeMap::new(),
             accept_queue: VecDeque::new(),
         }
@@ -116,6 +135,35 @@ impl Connection {
         self.sender_complete(stream_id) && self.receiver_finished(stream_id)
     }
 
+    /// The number of streams currently held — local plus peer-opened. Bounded by
+    /// [`MAX_CONCURRENT_STREAMS`]; exposed so a driver can watch pressure on the slot budget.
+    #[must_use]
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Retire a completed stream, freeing its reliability state and its slot against the concurrency cap
+    /// ([`MAX_CONCURRENT_STREAMS`]). Returns `true` only if the stream existed and was done in **both**
+    /// directions — so no unacknowledged send data and no unreceived segment is ever discarded; an
+    /// unfinished or unknown id is left untouched and returns `false`. Retiring a **peer**-opened stream
+    /// advances the retirement frontier, so a straggler `DATA` for that id is dropped rather than
+    /// re-opening a phantom stream (the ids are monotone, so nothing legitimate lives below a retired one).
+    ///
+    /// The application calls this once it has read a done stream to completion; long-lived connections then
+    /// stay within the cap without ever refusing a fresh stream. By contract the caller has consumed what
+    /// it needs via [`read`](Self::read) — retirement reclaims the buffer, it does not deliver it.
+    pub fn retire_stream(&mut self, stream_id: u32) -> bool {
+        if !self.is_stream_done(stream_id) || self.streams.remove(&stream_id).is_none() {
+            return false;
+        }
+        if stream_id & 1 == self.peer_id_parity {
+            // Close the peer id space through this id: ids step by 2, so `id + 1` (the other parity, never
+            // a peer id) marks every peer id ≤ this one as retired.
+            self.peer_closed_below = self.peer_closed_below.max(stream_id.saturating_add(1));
+        }
+        true
+    }
+
     fn next_nonce(&mut self) -> u64 {
         let n = self.nonce_tx;
         self.nonce_tx = self.nonce_tx.wrapping_add(1);
@@ -170,21 +218,24 @@ impl Connection {
         match Frame::decode(&frame_bytes) {
             Some(Frame::Data(seg)) => {
                 let id = seg.stream_id;
-                // A DATA for an id we never opened ⇒ the peer opened it (implicit OPEN) — but only in
-                // the peer's own id space. A DATA for an unopened id of *our* parity is a hostile (or
-                // buggy) attempt to seize a stream id we will later hand out from `open_stream`, which
-                // would clobber the local stream; drop it.
-                match self.streams.entry(id) {
-                    Entry::Occupied(mut e) => {
-                        e.get_mut().receiver.on_segment(&seg);
+                // A DATA for an id we never opened ⇒ the peer opened it (implicit OPEN). Admit such an
+                // open only in the peer's own parity space (a DATA for an unopened id of *our* parity is a
+                // hostile/buggy attempt to seize an id `open_stream` will later hand out — it would clobber
+                // the local stream), only above the retirement frontier (else a straggler resurrects a
+                // retired stream as a phantom), and only below the concurrency cap (else a flood of
+                // ever-new ids exhausts memory — F2). Each condition drops the frame rather than allocate.
+                if !self.streams.contains_key(&id) {
+                    let admissible = id & 1 == self.peer_id_parity
+                        && id >= self.peer_closed_below
+                        && self.streams.len() < MAX_CONCURRENT_STREAMS;
+                    if admissible {
+                        self.streams.insert(id, Stream::new(id));
+                        self.accept_queue.push_back(id);
                     }
-                    Entry::Vacant(e) => {
-                        if id & 1 == self.peer_id_parity {
-                            e.insert(Stream::new(id)).receiver.on_segment(&seg);
-                            self.accept_queue.push_back(id);
-                        }
-                        // else: wrong-parity implicit open — dropped.
-                    }
+                }
+                // Deliver to the stream if it now exists (pre-existing or just opened); otherwise dropped.
+                if let Some(s) = self.streams.get_mut(&id) {
+                    s.receiver.on_segment(&seg);
                 }
             }
             Some(Frame::Ack { stream_id, ack }) => {
@@ -347,6 +398,115 @@ mod tests {
         for cell in &cover {
             assert_eq!(cell.len(), CELL_LEN);
         }
+    }
+
+    #[test]
+    fn implicit_opens_are_capped_to_bound_stream_memory() {
+        use fanos_runtime::stream::Segment;
+        let (c2s, s2c) = ([7u8; 32], [1u8; 32]);
+        // A responder: its peer (the initiator) opens EVEN ids (parity 0). Flood far more distinct even
+        // ids than the cap — each is a fresh implicit open a malicious peer could use to exhaust memory.
+        let mut service = Connection::new(s2c, c2s, false);
+        let flood = MAX_CONCURRENT_STREAMS + 50;
+        for i in 0..flood {
+            let id = (i as u32) * 2; // 0, 2, 4, … all in the peer's parity space
+            let cell = seal(
+                &c2s,
+                i as u64,
+                &Frame::Data(Segment {
+                    stream_id: id,
+                    seq: 0,
+                    fin: false,
+                    data: vec![1],
+                })
+                .encode(),
+            )
+            .unwrap();
+            service.on_cell(&cell);
+        }
+        assert_eq!(
+            service.stream_count(),
+            MAX_CONCURRENT_STREAMS,
+            "a flood of fresh stream ids is capped — it cannot exhaust memory (F2)"
+        );
+        let mut accepted = 0;
+        while service.accept().is_some() {
+            accepted += 1;
+        }
+        assert_eq!(accepted, MAX_CONCURRENT_STREAMS, "exactly the cap were opened; the rest dropped");
+    }
+
+    #[test]
+    fn retiring_a_done_stream_frees_its_slot_and_blocks_a_phantom_reopen() {
+        use fanos_runtime::stream::Segment;
+        let (c2s, s2c) = ([2u8; 32], [3u8; 32]);
+        let mut client = Connection::new(c2s, s2c, true); // opens even ids
+        let mut service = Connection::new(s2c, c2s, false); // peer parity 0 (even)
+
+        let id = client.open_stream(); // 0
+        client.write(id, b"ping");
+        client.finish(id);
+
+        // Drive both directions to completion (service echoes and finishes so its send side completes too).
+        let mut round = 0;
+        loop {
+            for cell in client.outbound() {
+                service.on_cell(&cell);
+            }
+            while let Some(sid) = service.accept() {
+                service.write(sid, b"pong");
+                service.finish(sid);
+            }
+            let _ = service.read(id);
+            for cell in service.outbound() {
+                client.on_cell(&cell);
+            }
+            let _ = client.read(id);
+            if client.is_stream_done(id) && service.is_stream_done(id) {
+                break;
+            }
+            round += 1;
+            assert!(round < 40, "should converge");
+        }
+
+        // Retire the completed peer-opened stream: its slot is freed and the frontier advances.
+        assert!(service.is_stream_done(id));
+        assert!(service.retire_stream(id), "a done stream retires");
+        assert_eq!(service.stream_count(), 0, "the slot is reclaimed");
+        assert!(!service.retire_stream(id), "retiring an already-gone id is a no-op");
+
+        // A straggler DATA for the retired id must not resurrect it as a phantom stream.
+        let straggler = seal(
+            &c2s,
+            9_999,
+            &Frame::Data(Segment {
+                stream_id: id,
+                seq: 0,
+                fin: false,
+                data: vec![9],
+            })
+            .encode(),
+        )
+        .unwrap();
+        service.on_cell(&straggler);
+        assert_eq!(service.stream_count(), 0, "a straggler cannot resurrect a retired stream");
+        assert!(service.accept().is_none(), "no phantom stream is queued for accept");
+
+        // Forward progress is unaffected: a genuinely new, higher peer id still opens.
+        let fresh = seal(
+            &c2s,
+            10_000,
+            &Frame::Data(Segment {
+                stream_id: 2,
+                seq: 0,
+                fin: false,
+                data: vec![5],
+            })
+            .encode(),
+        )
+        .unwrap();
+        service.on_cell(&fresh);
+        assert_eq!(service.accept(), Some(2), "a fresh higher id still opens after retirement");
     }
 
     /// A small deterministic LCG so a proptest seed reproduces the exact loss pattern.
