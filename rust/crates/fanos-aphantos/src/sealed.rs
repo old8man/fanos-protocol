@@ -39,28 +39,36 @@ use fanos_geometry::Triple;
 use fanos_nyx::{Circuit, circuit_holonomy};
 use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
+use fanos_wire::tessera;
 
-const VERSION: u8 = 1;
-const CMD_DELIVER: u8 = 0;
-const CMD_NEXT: u8 = 1;
-const NONCE_LEN: usize = 12;
-const HOLONOMY_LEN: usize = 32;
-/// AEAD tag length (ChaCha20-Poly1305).
-const TAG_LEN: usize = 16;
-/// The encrypted `len` field: AEAD of a 2-byte big-endian body length.
-const LEN_CT_LEN: usize = 2 + TAG_LEN;
+// The onion's byte layout has a single source of truth — the canonical `fanos_wire::tessera`. These are
+// aliases so the sealing/peeling logic reads naturally, while any drift from the canonical reference is a
+// *compile error* here rather than a silent wire bifurcation (audit A1).
+const VERSION: u8 = tessera::VERSION;
+const CMD_DELIVER: u8 = tessera::command::DELIVER;
+const CMD_NEXT: u8 = tessera::command::NEXT;
+const NONCE_LEN: usize = tessera::NONCE_LEN;
+const HOLONOMY_LEN: usize = tessera::command::HOLONOMY_LEN;
+const LEN_CT_LEN: usize = tessera::LEN_CT_LEN;
 
-/// The constant on-the-wire onion size (the padding bucket). Every hop's packet is exactly this
-/// size, so a passive observer cannot distinguish packets — or link them across hops — by length.
-/// Sized to hold the deepest supported circuit (≈4 hybrid-KEM layers plus a multi-KB payload); an
-/// onion that would exceed it is rejected at [`build`] time rather than silently truncated.
-pub const ONION_LEN: usize = 8192;
+/// The constant on-the-wire onion size (the padding bucket) — the canonical [`tessera::TOTAL_LEN`].
+/// Every hop's packet is exactly this size, so a passive observer cannot distinguish packets — or link
+/// them across hops — by length. It holds the deepest supported circuit (≈4 hybrid-KEM layers plus a
+/// multi-KB payload); an onion that would exceed it is rejected at [`build`] time, never truncated.
+pub const ONION_LEN: usize = tessera::TOTAL_LEN;
 
-/// Byte offsets of the fixed cleartext header fields.
-const OFF_KEM: usize = 1; // after VERSION
-const OFF_NONCE: usize = OFF_KEM + CIPHERTEXT_LEN;
-const OFF_LEN_CT: usize = OFF_NONCE + NONCE_LEN;
-const OFF_BODY_CT: usize = OFF_LEN_CT + LEN_CT_LEN;
+// The hybrid-KEM ciphertext width MUST equal the canonical `kem_ct` field, or the offsets below — and any
+// second implementation reading the canonical layout — would disagree with what we actually write.
+const _: () = assert!(
+    CIPHERTEXT_LEN == tessera::KEM_CT_LEN,
+    "hybrid-KEM ciphertext width must match the canonical Tessera kem_ct field",
+);
+
+// Byte offsets of the fixed cleartext header fields — from the canonical layout.
+const OFF_KEM: usize = tessera::offset::KEM_CT;
+const OFF_NONCE: usize = tessera::offset::NONCE;
+const OFF_LEN_CT: usize = tessera::offset::LEN_CT;
+const OFF_BODY_CT: usize = tessera::offset::BODY_CT;
 
 /// Errors from sealing or peeling an onion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
