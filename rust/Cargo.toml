@@ -13,6 +13,7 @@ members = [
     "crates/fanos-code",
     "crates/fanos-diakrisis",
     "crates/fanos-wire",
+    "crates/fanos-wire-derive",
     "crates/fanos-crypto",
     "crates/fanos-aphantos",
     "crates/fanos-calypso",
@@ -89,6 +90,7 @@ fanos-geometry = { path = "crates/fanos-geometry", version = "0.1.0", default-fe
 fanos-code = { path = "crates/fanos-code", version = "0.1.0", default-features = false }
 fanos-diakrisis = { path = "crates/fanos-diakrisis", version = "0.1.0", default-features = false }
 fanos-wire = { path = "crates/fanos-wire", version = "0.1.0", default-features = false }
+fanos-wire-derive = { path = "crates/fanos-wire-derive", version = "0.1.0" }
 fanos-crypto = { path = "crates/fanos-crypto", version = "0.1.0", default-features = false }
 fanos-onoma = { path = "crates/fanos-onoma", version = "0.1.0", default-features = false }
 fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }
@@ -103,6 +105,12 @@ zeroize = { version = "1", default-features = false }
 
 # Test-only: property-based testing across all crates.
 proptest = "1"
+
+# Proc-macro toolchain — used ONLY by the `fanos-wire-derive` build-time crate (compile-time deps; they
+# do not ship in any binary), so the runtime/foundational crates stay dependency-light.
+syn = { version = "2", features = ["derive"] }
+quote = "1"
+proc-macro2 = "1"
 
 # Privacy and simulation crates (added as they land).
 fanos-nyx = { path = "crates/fanos-nyx", version = "0.1.0", default-features = false }

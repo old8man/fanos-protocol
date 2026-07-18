@@ -21,6 +21,8 @@ alloc = ["fanos-geometry/alloc"]
 
 [dev-dependencies]
 proptest.workspace = true
+# Exercise `#[derive(Wire)]` end-to-end (a dev-only cycle, permitted by Cargo).
+fanos-wire-derive.workspace = true
 
 [lints]
 workspace = true

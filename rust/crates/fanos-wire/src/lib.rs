@@ -24,9 +24,21 @@ pub mod error;
 pub mod frame;
 pub mod tessera;
 pub mod varint;
+pub mod wire;
 
 pub use error::{ProtocolError, WireError};
 pub use frame::{Frame, FrameType, decode_frame, encode_frame};
+pub use wire::Wire;
+
+/// Re-exports the `#[derive(Wire)]` macro expansion refers to, so generated code resolves the same
+/// types regardless of the consuming crate's imports or `std`/`alloc` setup. Not a stable public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::error::WireError;
+    pub use crate::wire::Wire;
+    pub use alloc::vec::Vec;
+    pub use core::result::Result;
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]

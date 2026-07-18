@@ -22,6 +22,9 @@ pub enum WireError {
     ValueTooLarge,
     /// A packet or frame declared a version this build does not support.
     UnsupportedVersion,
+    /// Bytes remained after a complete object was decoded — a canonical decoder consumes its input
+    /// exactly, so trailing bytes are a (non-canonical) error.
+    TrailingBytes,
 }
 
 impl core::fmt::Display for WireError {
@@ -35,6 +38,7 @@ impl core::fmt::Display for WireError {
             Self::UnknownCriticalFrame => "unknown critical frame type",
             Self::ValueTooLarge => "value too large for target width",
             Self::UnsupportedVersion => "unsupported format version",
+            Self::TrailingBytes => "trailing bytes after a complete object",
         };
         f.write_str(msg)
     }

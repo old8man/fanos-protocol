@@ -911,7 +911,17 @@ version = "0.1.0"
 dependencies = [
  "fanos-field",
  "fanos-geometry",
+ "fanos-wire-derive",
  "proptest",
+]
+
+[[package]]
+name = "fanos-wire-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
