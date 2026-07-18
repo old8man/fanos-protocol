@@ -91,6 +91,28 @@ flood both raises behavioural noise and erodes the environmental coherence the c
 This is why the noise channel's threshold is half the others' (`κ_bootstrap/2`): dissipation and regeneration
 are attacked at once.
 
+### 2A. Dissolving the hotspot — projective load balancing (no local extrema)
+
+The *differential* flood's first effect is a **load hotspot**: excess piles onto the targeted nodes while
+the rest idle — a local extremum that, uncorrected, is what turns into the correlation split above. FANOS
+dissolves it by the geometry, not by tuning (`fanos-diakrisis::loadbalance`). Each node relaxes its load
+toward the mean of the lines it lies on; because any two points of `PG(2,q)` share exactly one line, the
+incidence obeys `A·Aᵀ = q·I + J`, so this line-averaging diffusion has the uniform load as its **unique**
+fixed point and contracts every deviation from it by exactly
+
+```
+λ₂ = q/(q+1)²          (Fano q=2:  λ₂ = 2/9,  spectral gap 7/9)
+```
+
+per round. Two guarantees fall out, both tested: **(i)** the process cannot stall in a hotspot — the uniform
+distribution is the only fixed point (2-transitivity of `Aut(PG(2,q))` leaves no other invariant), so the
+*whole* cell is driven to the global mean; **(ii)** convergence is geometric at the tuning-free rate `λ₂`,
+`≈ 3.3×` reduction per round for the Fano cell, a handful of rounds for any imbalance. The projective
+identity even collapses the step to a closed form `new[i] = (q·load[i] + S)/(q+1)²` (O(N), total-conserving) —
+minimalism by theorem. This is the **metabolic** homeostat: it removes the differential flood's hotspot
+*before* it decoheres the self-model, so load balancing and the coherence homeostat (§3) are two readings of
+one projective structure.
+
 ---
 
 ## 3. Theorem (DDoS survival) — an instance of T-104
