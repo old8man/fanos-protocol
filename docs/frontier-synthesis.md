@@ -448,6 +448,10 @@ sense, CBF act) or instruments it (CSD, basin), and none is allowed to become a 
 Each: **Claim · Why better · Derivation · Validation on `fanos-sim` · Status.** Ranked by
 value × derivability × verifiability × fit to FANOS priorities. **Report-back top 3 = #1, #2, #3.**
 
+> **Landed so far:** #1 (`fanos-diakrisis::loadbalance::balance_exact`) and #2
+> (`fanos-diakrisis::cbf`, the CBF safety seam) are implemented, derived, and verified. #3
+> (critical-slowing-down early-warning) is in progress. The rest remain candidates.
+
 ### 1. Finite-time (one-round) *exact* projective load balancing  `[D]`, high confidence
 
 **Claim.** The projective balancer reaches the **exact** uniform load in **one** communication round
