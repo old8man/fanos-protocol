@@ -177,14 +177,18 @@ impl Connection {
         if stream_id & 1 == self.peer_id_parity {
             self.peer_closed_below = self.peer_closed_below.max(stream_id.saturating_add(1));
         }
-        let nonce = self.next_nonce();
+        let nonce = self.next_nonce()?;
         seal(&self.key_tx, nonce, &Frame::Reset { stream_id }.encode())
     }
 
-    fn next_nonce(&mut self) -> u64 {
+    /// The next per-cell AEAD nonce, or `None` once the 2⁶⁴ nonce space is exhausted. Nonce reuse is
+    /// catastrophic for the AEAD — it breaks both confidentiality and integrity — so at the limit the
+    /// connection refuses to mint any further cell rather than wrap: a hard kill. (2⁶⁴ constant-size cells
+    /// is ~18 ZB per connection, astronomically unreachable, so this only ever guards the invariant.)
+    fn next_nonce(&mut self) -> Option<u64> {
         let n = self.nonce_tx;
-        self.nonce_tx = self.nonce_tx.wrapping_add(1);
-        n
+        self.nonce_tx = self.nonce_tx.checked_add(1)?;
+        Some(n)
     }
 
     /// All cells to (re)send now, across every stream: `DATA` cells for each stream's outbound
@@ -203,7 +207,7 @@ impl Connection {
         frames
             .into_iter()
             .filter_map(|f| {
-                let nonce = self.next_nonce();
+                let nonce = self.next_nonce()?;
                 seal(&self.key_tx, nonce, &f.encode())
             })
             .collect()
@@ -217,7 +221,9 @@ impl Connection {
     pub fn outbound_padded(&mut self, min_cells: usize) -> Vec<Vec<u8>> {
         let mut cells = self.outbound();
         while cells.len() < min_cells {
-            let nonce = self.next_nonce();
+            let Some(nonce) = self.next_nonce() else {
+                break; // nonce space exhausted — mint no more cover cells
+            };
             match seal(&self.key_tx, nonce, &Frame::Padding.encode()) {
                 Some(cell) => cells.push(cell),
                 None => break,
@@ -577,6 +583,22 @@ mod tests {
         service.on_cell(&straggler);
         assert_eq!(service.stream_count(), 0, "a straggler cannot re-open a reset stream");
         assert!(service.accept().is_none());
+    }
+
+    #[test]
+    fn the_connection_hard_kills_at_nonce_exhaustion_rather_than_reusing_a_nonce() {
+        // Nonce reuse would be catastrophic for the AEAD, so at the top of the 2⁶⁴ nonce space the
+        // connection refuses to mint any further cell rather than wrap.
+        let mut c = Connection::new([1u8; 32], [2u8; 32], true);
+        c.nonce_tx = u64::MAX - 2; // two nonces from the top
+        // Exactly the two remaining nonces are usable; then the space is spent.
+        assert_eq!(c.outbound_padded(10).len(), 2, "only the two remaining nonces are minted");
+        // Exhausted: NO further cell is minted, through any path (no wrap, no reuse).
+        assert!(c.outbound_padded(10).is_empty(), "no cover cell after exhaustion");
+        assert!(c.outbound().is_empty(), "no data/ack cell after exhaustion");
+        let id = c.open_stream();
+        c.write(id, b"x");
+        assert!(c.reset_stream(id).is_none(), "cannot even mint a RESET cell after exhaustion");
     }
 
     /// A small deterministic LCG so a proptest seed reproduces the exact loss pattern.
