@@ -81,8 +81,19 @@ impl<F: Field> NyxNode<F> {
         kem_secret: HybridKemSecret,
         directory: Directory,
         seed: [u8; 32],
+        boot_nonce: [u8; 32],
         path_len: usize,
     ) -> Self {
+        // Mix fresh per-boot entropy into the node seed, so every PRF derived from it — the circuit
+        // seeds (hence per-hop onion KEM ephemerals, layer keys, and AEAD nonces), the cover-cell
+        // material, and the mix delays — does NOT repeat across restarts. `circuit_counter` resets to 0
+        // on reboot, so with a bare persistent `seed` the first circuits after a restart would re-derive
+        // identical per-hop keys and nonces: catastrophic AEAD `(key, nonce)` reuse (keystream + tag
+        // reuse). `boot_nonce` MUST be fresh each boot (a CSPRNG draw in production); a fixed value keeps
+        // a test deterministic (audit: onion nonce-counter reset-on-boot, the E3 latent instance).
+        let mut material = seed.to_vec();
+        material.extend_from_slice(&boot_nonce);
+        let seed = hash_labeled("FANOS-v1/nyx-boot-seed", &material);
         Self {
             coord,
             kem_secret,
@@ -313,6 +324,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_fresh_boot_nonce_freshens_the_seed_so_reboots_dont_reuse_onion_nonces() {
+        // Audit (onion nonce-counter reset-on-boot): every circuit/cover/delay PRF derives from the node
+        // seed, and `circuit_counter` resets to 0 on restart — so the seed itself must be freshened per
+        // boot, or a reboot re-derives identical per-hop onion keys and AEAD nonces (catastrophic reuse).
+        // Same `seed` + different `boot_nonce` ⇒ DIFFERENT derived seed; same (seed, boot_nonce) is
+        // deterministic (replayable).
+        let derived = |boot: [u8; 32]| {
+            let (secret, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"boot-seed"));
+            NyxNode::<F31>::new(Point::at(0), secret, Directory::new(), [9u8; 32], boot, 2).seed
+        };
+        assert_ne!(derived([1u8; 32]), derived([2u8; 32]), "a fresh boot nonce freshens the seed");
+        assert_eq!(derived([5u8; 32]), derived([5u8; 32]), "same seed+boot is deterministic");
+    }
+
     /// A cover cell must be byte-indistinguishable from a real onion: the same `Tessera` frame type,
     /// the same constant [`sealed::ONION_LEN`] size, and it must simply fail to peel (the drop path a
     /// wrong-relay real onion takes) — never a give-away short `Cover`-typed frame (spec §5.5/V8).
@@ -326,7 +352,7 @@ mod tests {
         let peer_coord = Point::<F31>::at(9).coords();
         directory.insert(peer_coord, peer_public);
 
-        let mut node = NyxNode::new(Point::<F31>::at(0), secret, directory, [7u8; 32], 2)
+        let mut node = NyxNode::new(Point::<F31>::at(0), secret, directory, [7u8; 32], [0u8; 32], 2)
             .with_mixing(Duration(0), Duration::from_millis(200));
 
         // Start cover, then fire the cover timer to emit one cell.
