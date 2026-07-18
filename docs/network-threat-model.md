@@ -48,8 +48,8 @@ structure, which is why the answers compose instead of conflicting:
 
 | # | Threat / attack surface | FANOS fundamental answer | Status | Verified / owned by |
 |---|---|---|---|---|
-| B1 | **Sybil** (flood fake identities) | Coordinate = `H(cert)` → identities are hash-grinding-priced and land uniformly; cell membership is `q+1`-bounded per line | 🟡 | geometry ✅; a *quantified* Sybil-cost bound is ⬜ (new task) |
-| B2 | **Eclipse** (surround a node with adversarial peers) | Neighbours are *derived* from the plane (`lines_through(coord)`), not discovered — an attacker cannot choose a victim's peers without owning those exact coordinates | 🟡 | geometry ✅; adversarial eclipse sim is ⬜ (new task) |
+| B1 | **Sybil** (flood fake identities) | Coordinate = `H(cert)` → identities are hash-grinding-priced and land uniformly; cell membership is `q+1`-bounded per line | ✅ | `sim/tests/sybil_cost.rs`: `E[T]=N` per seat, coupon-collector `N·(H_s−H_{s−t})`, χ²-uniformity — cost is `Θ(N·log)`, so real Sybil resistance needs a per-admission cost |
+| B2 | **Eclipse** (surround a node with adversarial peers) | Neighbours are *derived* from the plane (`lines_through(coord)`), not discovered — an attacker cannot choose a victim's peers without owning those exact coordinates | ✅ | `sim/tests/eclipse.rs`: neighbour-set invariant under forged floods; eclipse ⇒ B1 coordinate-seizure (only crashing the witness's coordinate severs it) |
 | B3 | **Routing/DHT poisoning** (false routes/records) | Self-certifying records; responsible-point routing is algebraic (`u×v`), not gossiped | 🟡 | `fanos-quic::directory` collision-detect ✅; poisoning sim ⬜ |
 | B4 | **Partition / netsplit** | Fiedler `λ₂ = 0` detected (`Verdict::Partition`); fragment operates degraded, escalates the cut to the parent for cross-cell repair | 🟡 | `partition.rs` ✅; live cross-cell repair path 🟡 |
 | B5 | **Coordinate hijack / seizing** | Not possible without a cert hashing to that point (self-certifying); collisions relocate by sub-cell descent | 🟡 | #55 ⬜ (sub-cell descent on JOIN) |
@@ -122,10 +122,10 @@ structure, which is why the answers compose instead of conflicting:
 Existing audit tasks cover most code-level gaps (#57–#69). This model surfaces **network-science** gaps that
 deserve their own verified treatment, tracked as new tasks:
 
-- **Sybil-cost bound (B1):** derive and verify the hash-grinding cost to seize a target coordinate / fraction
-  of a cell, and simulate the admission response.
-- **Eclipse resistance (B2):** prove the derived-neighbour property blocks peer-set control, and adversarially
-  simulate an eclipse attempt on the sim.
+- ~~**Sybil-cost bound (B1):**~~ **done** — `sim/tests/sybil_cost.rs` derives + measures `E[T]=N` per seat
+  (coupon-collector for thresholds), grounded in `MapToPoint` uniformity.
+- ~~**Eclipse resistance (B2):**~~ **done** — `sim/tests/eclipse.rs` proves the derived-neighbour invariant
+  and reduces eclipse to B1 coordinate-seizure on the sim.
 - **Guard discovery / entry enumeration (C6):** formalize the entry-set unlinkability and test it.
 - **Global-adversary / total-control (G3):** simulate a fraction-of-network adversary and measure the
   containment bound empirically.
