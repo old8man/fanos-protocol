@@ -17,11 +17,21 @@
 //!    public key `Y = Σ_{d∈QUAL} C_{d,0}` ([`Notification::DkgComplete`]) and folds exactly the
 //!    `QUAL` shares into its final key share — so `Y` and the share are over the identical set.
 //!
-//! Because commitments, complaints, and justifications are reliably broadcast (each is echoed on
-//! first receipt), every honest node observes the same evidence and computes the **same** `QUAL` —
-//! even against a *Byzantine equivocating* dealer that deals validly to some members and
-//! invalidly/not-at-all to others. No node ever learns the joint secret. The same engine runs under
-//! the simulator and a real transport, exactly like the overlay node.
+//! **Authentication (Byzantine robustness).** Every control frame is bound to its origin so a malicious
+//! member cannot speak for an honest one:
+//! * a **commitment** is accepted only *direct from its own dealer* (the transport authenticates the
+//!   sender), so no one can pre-register a bogus commitment for a silent dealer;
+//! * a **complaint** is accepted only *direct from its own complainer*, so no one can forge a complaint
+//!   against an honest dealer to evict it (the attack that would otherwise void GJKR robustness);
+//! * a **justification** is *self-authenticating* — the revealed share is checked against the commitment
+//!   everyone qualified on — so it can be, and is, reliably echoed; an equivocating dealer that reveals to
+//!   only some members is still overruled.
+//!
+//! In the base cell every member reaches every other directly, so an honest complainer's complaint reaches
+//! the accused dealer (to be justified) without an echo relay. Every honest node therefore observes the
+//! same evidence and computes the **same** `QUAL` — even against a *Byzantine equivocating* dealer that
+//! deals validly to some members and invalidly/not-at-all to others. No node ever learns the joint secret.
+//! The same engine runs under the simulator and a real transport, exactly like the overlay node.
 
 #![forbid(unsafe_code)]
 
@@ -225,42 +235,54 @@ impl<F: Field> DkgNode<F> {
             return Vec::new(); // not our share
         }
         self.my_shares.entry(dealer).or_insert(share);
-        // The deal carries the commitment too; adopt it (and echo it for reliable broadcast) if new.
-        if self.note_commitment(dealer, commitment.clone()) {
-            self.broadcast_to_peers(&commit_frame(dealer, &commitment))
-        } else {
-            self.try_verify(dealer);
-            Vec::new()
-        }
+        // The deal carries the dealer's commitment too; adopt it. No echo: the dealer broadcasts its
+        // commitment directly to the whole (complete-graph) cell, and a commitment is only accepted from
+        // its own dealer now (see `on_commit`), so a relayed copy would be rejected anyway.
+        self.note_commitment(dealer, commitment);
+        self.try_verify(dealer); // in case the commitment was already known, qualify now we hold the share
+        Vec::new()
     }
 
-    /// A broadcast `DkgCommit` echo for dealer `d`.
-    fn on_commit(&mut self, body: &[u8]) -> Vec<Effect> {
+    /// A `DkgCommit` from dealer `d`. **Authenticated**: a commitment for dealer `d` is accepted only
+    /// direct from `d` (the transport authenticates `from`). Without this, a Byzantine node pre-registers
+    /// a bogus commitment for a silent dealer (first-writer-wins) — commitment poisoning (audit B1). The
+    /// dealer broadcasts its commitment directly to every member, so no echo (which would fail this check)
+    /// is needed.
+    fn on_commit(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
         if self.done {
             return Vec::new();
         }
         let Some((d, commitment)) = parse_commit(body) else {
             return Vec::new();
         };
-        if self.note_commitment(d, commitment.clone()) {
-            // Echo once for reliable broadcast.
-            return self.broadcast_to_peers(&commit_frame(d, &commitment));
+        if self.dealer_of(from) != Some(d) {
+            return Vec::new(); // a commitment may only come from its own dealer
         }
+        self.note_commitment(d, commitment);
         Vec::new()
     }
 
-    /// A broadcast `DkgComplaint` (complainer `c` against dealer `d`).
-    fn on_complaint(&mut self, body: &[u8]) -> Vec<Effect> {
+    /// A `DkgComplaint` (complainer `c` against dealer `d`). **Authenticated**: a complaint is accepted
+    /// only direct from its complainer `c`. Without this, a Byzantine node forges
+    /// `DkgComplaint{complainer = d, dealer = d}` against any honest dealer `d` — which `d` cannot answer
+    /// (the self-justify guard `c != self.index`) — so `d` is dropped from `QUAL` at finalize, evicting
+    /// every honest dealer (audit B1, CRITICAL). An honest complainer broadcasts directly to the whole
+    /// complete-graph cell (including the accused), so the complaint reaches the dealer to be justified
+    /// without an echo relay (which would fail the `from` check).
+    fn on_complaint(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
         if self.done {
             return Vec::new();
         }
         let Some((c, d)) = parse_complaint(body) else {
             return Vec::new();
         };
+        if self.dealer_of(from) != Some(c) {
+            return Vec::new(); // a complaint may only come from its own complainer
+        }
         let mut effects = Vec::new();
         if self.complaints.entry(d).or_default().insert(c) {
-            // New complaint — echo it, and if we are the accused dealer, justify.
-            effects.extend(self.broadcast_to_peers(&complaint_frame(c, d)));
+            // If we are the accused dealer, justify by revealing `c`'s correct share (the one consistent
+            // with our published commitment), broadcast directly to the whole cell.
             if d == self.index
                 && c != self.index
                 && let Some(dealing) = &self.dealing
@@ -275,19 +297,27 @@ impl<F: Field> DkgNode<F> {
         effects
     }
 
-    /// A broadcast `DkgJustify` (dealer `d` reveals the share for complainer `share.index()`).
-    fn on_justify(&mut self, body: &[u8]) -> Vec<Effect> {
+    /// A `DkgJustify` (dealer `d` reveals the share for complainer `share.index()`). A justification is
+    /// **self-authenticating** — the revealed share is checked against the commitment everyone *qualified*
+    /// on ([`commitments`](Self::commitments)`[d]`), not one carried in the frame (audit B3): an
+    /// equivocating dealer must not clear a complaint with a share consistent with a *different*,
+    /// unqualified commitment. Because a valid justification cannot be forged (the VSS check), it is
+    /// reliably echoed (self-authenticating reliable broadcast), so an equivocating dealer that reveals to
+    /// only some members is still overruled — every honest node converges on the same `QUAL`.
+    fn on_justify(&mut self, _from: Triple, body: &[u8]) -> Vec<Effect> {
         if self.done {
             return Vec::new();
         }
-        let Some((d, share, commitment)) = parse_justify(body) else {
+        let Some((d, share, _frame_commitment)) = parse_justify(body) else {
             return Vec::new();
         };
-        // The revealed share must verify against the dealer's public commitment.
+        // B3: verify against the qualified commitment, ignoring any commitment carried in the frame.
+        let Some(commitment) = self.commitments.get(&d).cloned() else {
+            return Vec::new(); // we have no qualified commitment for d yet — cannot verify the reveal
+        };
         if !vss::verify_share(&share, &commitment) {
             return Vec::new();
         }
-        self.note_commitment(d, commitment.clone());
         let complainer = share.index();
         let mut effects = Vec::new();
         if self.justified.entry(d).or_default().insert(complainer) {
@@ -359,8 +389,12 @@ impl<F: Field> DkgNode<F> {
             if let (Some(commitment), Some(share)) =
                 (self.commitments.get(&d), self.my_shares.get(&d))
             {
-                self.participant.ingest_share(share, commitment);
-                refs.push(commitment);
+                // Add d to the joint key `Y` ONLY if its share actually folds into our final share
+                // (the Feldman check passes). Pushing the commitment unconditionally could put a dealer's
+                // C₀ into `Y` while its share is *not* in our secret share, so `x·G ≠ Y` (audit B2).
+                if self.participant.ingest_share(share, commitment) {
+                    refs.push(commitment);
+                }
             }
         }
         let joint = dkg::joint_public_from_commitments(&refs);
@@ -409,9 +443,9 @@ impl<F: Field> Engine for DkgNode<F> {
             Input::Message { from, frame } => match decode_frame(&frame) {
                 Ok((f, _)) => match f.frame_type() {
                     Some(FrameType::DkgDeal) => self.on_deal(from, f.body),
-                    Some(FrameType::DkgCommit) => self.on_commit(f.body),
-                    Some(FrameType::DkgComplaint) => self.on_complaint(f.body),
-                    Some(FrameType::DkgJustify) => self.on_justify(f.body),
+                    Some(FrameType::DkgCommit) => self.on_commit(from, f.body),
+                    Some(FrameType::DkgComplaint) => self.on_complaint(from, f.body),
+                    Some(FrameType::DkgJustify) => self.on_justify(from, f.body),
                     _ => Vec::new(),
                 },
                 Err(_) => Vec::new(),
@@ -484,4 +518,118 @@ fn parse_justify(body: &[u8]) -> Option<(u8, VssShare, VssCommitment)> {
     let share = VssShare::from_bytes(body.get(1..1 + SHARE_LEN)?)?;
     let commitment = VssCommitment::from_bytes(body.get(1 + SHARE_LEN..)?)?;
     Some((d, share, commitment))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    //! Byzantine-robustness tests for the DKG control frames — the cluster the audit flagged CRITICAL
+    //! (B1–B3) and previously untested. Each drives one participant with crafted adversarial frames.
+    use super::*;
+    use fanos_field::F2;
+
+    fn coord(i: u8) -> Triple {
+        DkgNode::<F2>::coord_of(i)
+    }
+
+    /// Dealer `d`'s (commit-frame, deal-to-`j`-frame) from a fixed per-dealer secret, so a test can feed a
+    /// participant a *valid* dealing without spinning a whole second node.
+    fn dealer_frames(d: u8, j: u8, threshold: usize, n: usize) -> (Vec<u8>, Vec<u8>) {
+        let secret = [d; 32];
+        let mut rng = DeterministicRng::new(&secret);
+        let dealing = dkg::deal(&secret, threshold, n, &mut rng).unwrap();
+        let commitment = dealing.commitment().clone();
+        let share = dealing.share_for(j).unwrap();
+        (commit_frame(d, &commitment), deal_frame(share, &commitment))
+    }
+
+    fn completed(effects: &[Effect]) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Notify(Notification::DkgComplete(_))))
+    }
+
+    #[test]
+    fn a_forged_complaint_cannot_evict_an_honest_dealer() {
+        // B1 (CRITICAL). O is participant 1; dealer 2 deals to it validly, so O qualifies dealer 2. A
+        // Byzantine node 3 then forges DkgComplaint{complainer = 2, dealer = 2} — the self-complaint an
+        // accused dealer cannot answer. With origin authentication O rejects it (from = 3 ≠ complainer 2),
+        // so dealer 2 survives and O finalizes with QUAL = {1, 2} ≥ threshold 2, emitting DkgComplete.
+        // WITHOUT the fix the forged complaint evicts dealer 2 and O never completes.
+        let (n, threshold) = (7, 2);
+        let mut o = DkgNode::<F2>::new(Point::at(0), threshold, [1u8; 32])
+            .with_deadlines(Duration::from_millis(10), Duration::from_millis(10));
+        o.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let (commit2, deal2) = dealer_frames(2, 1, threshold, n);
+        o.step(Instant(1), Input::Message { from: coord(2), frame: commit2 });
+        o.step(Instant(1), Input::Message { from: coord(2), frame: deal2 });
+
+        // The forged self-complaint against dealer 2, sent by attacker node 3.
+        o.step(Instant(2), Input::Message { from: coord(3), frame: complaint_frame(2, 2) });
+
+        o.step(Instant(20), Input::Timer(DKG_SHARE_DEADLINE));
+        let fin = o.step(Instant(40), Input::Timer(DKG_COMPLAINT_DEADLINE));
+        assert!(
+            completed(&fin),
+            "an honest dealer survives a forged complaint and the DKG completes"
+        );
+    }
+
+    #[test]
+    fn a_commitment_is_only_accepted_from_its_own_dealer() {
+        // B1 (CRITICAL). A commitment for dealer 2 relayed by an impostor (node 3) is rejected — no bogus
+        // commitment can be pre-registered for a silent dealer (first-writer-wins poisoning). The real
+        // dealer 2's direct commit is accepted.
+        let mut o = DkgNode::<F2>::new(Point::at(0), 2, [1u8; 32]);
+        o.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let (commit2, _deal2) = dealer_frames(2, 1, 2, 7);
+        o.step(Instant(1), Input::Message { from: coord(3), frame: commit2 });
+        assert!(
+            !o.commitments.contains_key(&2),
+            "a commitment relayed by an impostor is rejected"
+        );
+        let (commit2b, _) = dealer_frames(2, 1, 2, 7);
+        o.step(Instant(1), Input::Message { from: coord(2), frame: commit2b });
+        assert!(
+            o.commitments.contains_key(&2),
+            "the real dealer's own commitment is accepted"
+        );
+    }
+
+    #[test]
+    fn a_justification_is_checked_against_the_qualified_commitment() {
+        // B3 (CRITICAL). O qualifies dealer 2 on commitment C2. An equivocating dealer 2 answers a
+        // complaint with a justify carrying a DIFFERENT commitment C2' and a share consistent with C2' —
+        // which would clear the complaint if verified against the frame's own commitment. Verifying
+        // against the qualified C2 (stored) instead, the share does not match, so the justify is rejected
+        // and the complaint stays unanswered.
+        let (n, threshold) = (7, 2);
+        let mut o = DkgNode::<F2>::new(Point::at(0), threshold, [1u8; 32]);
+        o.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        // O adopts dealer 2's real commitment C2 (direct from dealer 2).
+        let (commit2, _) = dealer_frames(2, 1, threshold, n);
+        o.step(Instant(1), Input::Message { from: coord(2), frame: commit2 });
+        assert!(o.commitments.contains_key(&2));
+
+        // A complaint by node 3 against dealer 2 (authentic: from = complainer 3).
+        o.step(Instant(2), Input::Message { from: coord(3), frame: complaint_frame(3, 2) });
+
+        // Dealer 2 tries to clear it with a share/commitment from a DIFFERENT polynomial (secret 22).
+        let bogus_secret = [22u8; 32];
+        let mut rng = DeterministicRng::new(&bogus_secret);
+        let bogus = dkg::deal(&bogus_secret, threshold, n, &mut rng).unwrap();
+        let bogus_commitment = bogus.commitment().clone();
+        let bogus_share = *bogus.share_for(3).unwrap();
+        o.step(
+            Instant(3),
+            Input::Message {
+                from: coord(2),
+                frame: justify_frame(2, &bogus_share, &bogus_commitment),
+            },
+        );
+        assert!(
+            !o.justified.get(&2).is_some_and(|s| s.contains(&3)),
+            "a justify against a non-qualified commitment does not clear the complaint"
+        );
+    }
 }
