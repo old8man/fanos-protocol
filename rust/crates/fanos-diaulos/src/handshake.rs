@@ -51,6 +51,17 @@ pub fn service_public_from_bundle(bundle: &[u8]) -> Option<HybridKemPublic> {
     HybridKemPublic::decode(bundle.get(KEM_OFFSET_IN_BUNDLE..)?)
 }
 
+/// Build a minimal identity bundle carrying just this KEM key — the inverse of
+/// [`service_public_from_bundle`] (`service_public_from_bundle(bundle_from_kem_public(pk)) == pk`). The
+/// signature-key prefix is zero-filled, so this is for a KEM-only service that publishes a Direct
+/// descriptor without an offline signing root; a full identity bundle carries real signing keys there.
+#[must_use]
+pub fn bundle_from_kem_public(public: &HybridKemPublic) -> Vec<u8> {
+    let mut bundle = vec![0u8; KEM_OFFSET_IN_BUNDLE];
+    bundle.extend_from_slice(&public.encode());
+    bundle
+}
+
 /// A service's long-term hybrid KEM identity — the secret it keeps and the public key it publishes
 /// (via ONOMA). A client authenticates the service by encapsulating to [`public`](Self::public).
 pub struct StaticKeypair {
@@ -237,6 +248,17 @@ mod tests {
         let exact = ED25519_PK_LEN + MLDSA65_PK_LEN + PUBLIC_LEN;
         assert_eq!(bundle.len(), exact);
         assert!(service_public_from_bundle(&bundle[..exact - 1]).is_none());
+    }
+
+    #[test]
+    fn bundle_from_kem_public_round_trips() {
+        let mut rng = SeedRng::from_seed(b"bundle-build");
+        let (secret, public) = HybridKemSecret::generate(&mut rng);
+        let bundle = bundle_from_kem_public(&public);
+        let extracted = service_public_from_bundle(&bundle).expect("valid KEM-only bundle");
+        // The extracted key is the same one — it encapsulates to the same secret.
+        let (ct, k) = extracted.encapsulate(&mut rng);
+        assert_eq!(secret.decapsulate(&ct), k, "round-trips the KEM key");
     }
 
     #[test]

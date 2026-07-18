@@ -12,9 +12,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use fanos_diaulos::StaticKeypair;
+use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
 use fanos_field::F2;
-use fanos_node::{FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_service, serve};
+use fanos_node::{
+    FanosDialer, Node, NodeConfig, NodeResolver, Peer, StaticResolver, dial_service, publish_service,
+    serve,
+};
+use fanos_onoma::Address;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
 use fanos_runtime::Command;
@@ -204,6 +208,61 @@ async fn fanos_dialer_reaches_a_service_by_name() {
         .dial(&Target::Name("example.com".to_owned(), 443))
         .await;
     assert!(matches!(clear, Err(DialError::Unsupported(_))));
+
+    a.shutdown();
+    b.shutdown();
+}
+
+#[tokio::test]
+async fn fanos_dialer_resolves_a_published_service_over_the_overlay() {
+    // The full production Direct path: a service publishes its descriptor (coordinate + KEM bundle) at
+    // its rotating `.fanos` address slot in the overlay store; a client resolves the name over the same
+    // store (NodeResolver — no directory), then dials and completes a DIAULOS session.
+    let a = start(vec![]).await; // service
+    let (a_addr, a_net) = (a.address(), a.local_addr());
+    let b = start_distinct(
+        vec![Peer {
+            coord: a_addr,
+            addr: a_net,
+        }],
+        &[a_addr],
+    )
+    .await; // client
+    a.directory().insert(b.address(), b.local_addr());
+    warm(&a, &b);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut krng = SeedRng::from_seed(b"nr-key");
+    let keypair = StaticKeypair::generate(&mut krng);
+    let service_public = keypair.public.clone();
+    serve(
+        a.client(),
+        keypair,
+        SeedRng::from_seed(b"nr-svc"),
+        <[u8]>::to_ascii_uppercase,
+    );
+
+    // Publish the Direct descriptor at the service's self-certifying address.
+    let bundle = bundle_from_kem_public(&service_public);
+    let address = Address::from_bundle(&bundle);
+    let epoch = 1u64;
+    publish_service(&a.client(), &bundle, a_addr, epoch, 4, b"profiles=direct")
+        .await
+        .expect("publish the service descriptor");
+    tokio::time::sleep(Duration::from_millis(500)).await; // let the Put settle in the store
+
+    // Resolve the name over the overlay and dial it.
+    let resolver = NodeResolver::new(b.client(), epoch, 0);
+    let dialer = FanosDialer::new(b.client(), resolver);
+    let mut stream = dialer
+        .dial(&Target::Name(address.to_string(), 80))
+        .await
+        .expect("resolve over the overlay and dial");
+    let response = exchange(&mut stream, b"via resolver").await;
+    assert_eq!(
+        response, b"VIA RESOLVER",
+        "reached the service resolved from its published descriptor"
+    );
 
     a.shutdown();
     b.shutdown();

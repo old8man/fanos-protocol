@@ -40,7 +40,8 @@ pub use conn::Connection;
 pub use endpoint::StreamEndpoint;
 pub use frame::Frame;
 pub use handshake::{
-    ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, service_public_from_bundle,
+    ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, bundle_from_kem_public,
+    service_public_from_bundle,
 };
 pub use overlay::{ClientSession, Coord, ServerSession};
 pub use session::{Dialed, PendingDial, accept, dial, dial_bundle};
