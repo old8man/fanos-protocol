@@ -2,7 +2,9 @@
 //!
 //! Staking binds identity to capital, so paying for relay service would deanonymise. FANOS uses
 //! **anonymous credits** instead (spec §L7): a Privacy-Pass-class **verifiable oblivious PRF**
-//! (VOPRF, RFC 9497/9578) on ristretto255. A client blinds a random input, the issuer evaluates the
+//! (a VOPRF on ristretto255 — Privacy-Pass *in spirit*, but with a BLAKE3-XOF hash-to-curve and a bespoke
+//! Chaum–Pedersen DLEQ, so **not** wire-compatible with RFC 9497/9578; the RFCs are a reference, not a
+//! conformance claim). A client blinds a random input, the issuer evaluates the
 //! PRF on the *blinded* point (learning nothing about the input) with a **DLEQ proof** that it used
 //! its real key, and the client unblinds to a credit `N = k·H(x)`. Issuance sees only the blinded
 //! point; redemption sees `x`; the two are **unlinkable** because the blind is uniformly random —

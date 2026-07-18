@@ -1,8 +1,10 @@
 //! # fanos-vrf — a real verifiable random function for the beacon & rendezvous
 //!
 //! The hash derivation in [`fanos_crypto::vrf`] is deterministic but **unverifiable**: nothing
-//! stops a node lying about the coordinate it derived. This crate replaces it with an RFC 9381-style
-//! VRF on the ristretto255 group (via the vetted [`vrf_r255`] crate): a node *proves* that its
+//! stops a node lying about the coordinate it derived. This crate replaces it with an RFC 9381-*style*
+//! VRF on the ristretto255 group (via the vetted [`vrf_r255`] crate) — it is *not* the
+//! `ECVRF-EDWARDS25519-SHA512` ciphersuite of RFC 9381 and is not wire-compatible with it, so the RFC is a
+//! reference, not a conformance claim: a node *proves* that its
 //! per-epoch coordinate was derived correctly from its secret key, and anyone holding the node's
 //! public key verifies that proof **without learning the secret** (spec §L6, §L1 beacon).
 //!
