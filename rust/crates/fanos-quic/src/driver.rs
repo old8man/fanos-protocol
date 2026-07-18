@@ -556,8 +556,10 @@ async fn transport_loop(
     mut send_rx: mpsc::UnboundedReceiver<SendRequest>,
 ) {
     while let Some(SendRequest { to, frame }) = send_rx.recv().await {
-        // Unresolved coordinate → drop, exactly as the simulator drops to an unknown node.
+        // Unresolved coordinate → drop, exactly as the simulator drops to an unknown node — but count
+        // and log it so the drop is observable, not silent (a symptom of a stale/colliding address).
         let Some(addr) = directory.resolve(to) else {
+            directory.note_unresolved_drop(to);
             continue;
         };
         let Some(conn) = get_or_connect(&t, to, addr).await else {
