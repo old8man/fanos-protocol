@@ -154,6 +154,33 @@ mod tests {
     }
 
     #[test]
+    fn the_cbf_holds_the_barrier_under_a_rising_attack_then_escalates_while_viable() {
+        // A time-varying disturbance: the attack ramps upward past the CBF's control authority. The barrier
+        // must hold (P > 2/N) at every step, and when even maximal control can no longer hold it the filter
+        // escalates — while the cell is STILL viable, handing off before it could ever cross ∂𝒱.
+        let mut d = PurityDynamics::new(0.05, KAPPA_BOOTSTRAP, 0.9, 0.01, N, 0.9);
+        let mut attack = 0.0;
+        let mut escalated = false;
+        for _ in 0..50_000 {
+            attack += 0.0002; // rising disturbance
+            assert!(d.viable(), "P is above the boundary before every controlled step");
+            let (drift, gain) = d.barrier_coeffs(attack);
+            match cbf_filter_default(KAPPA_BOOTSTRAP, d.barrier(), drift, gain) {
+                SafeControl::Apply(u) => {
+                    d.step_with_control(attack, u);
+                }
+                SafeControl::Escalate => {
+                    escalated = true;
+                    assert!(d.viable(), "escalates while still viable");
+                    break;
+                }
+            }
+        }
+        assert!(escalated, "a rising attack eventually exceeds the CBF authority and escalates");
+        assert!(d.viable(), "the barrier was never crossed on the way there");
+    }
+
+    #[test]
     fn the_cbf_tolerates_a_stronger_attack_than_the_fixed_clamp() {
         // Same proposal (κ_bootstrap) both ways. A fixed κ_bootstrap clamp crosses the boundary at this
         // attack; the CBF raises κ toward the barrier minimum (up to 1) and never crosses it.
