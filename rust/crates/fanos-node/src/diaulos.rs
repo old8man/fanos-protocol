@@ -92,14 +92,8 @@ where
         let mut deliveries = client.subscribe();
         let mut sessions: BTreeMap<Coord, ClientState> = BTreeMap::new();
         let mut ticker = tokio::time::interval(SERVE_TICK);
-        // Emit each session's outbound cells only on the tick or right after writing a response — never
-        // on every delivery. `poll_payloads` re-sends the whole window per call, so emitting per ack
-        // would make the send window retransmit on each ack while the peer acks per cell: a quadratic,
-        // runaway amplification. The tick carries acks/retransmits within one `SERVE_TICK`.
-        let mut emit = false;
         loop {
             let mut retire: Vec<Coord> = Vec::new();
-            let mut wrote = false;
             for (&peer, st) in &mut sessions {
                 if st.primary.is_none() {
                     st.primary = st.session.primary();
@@ -110,20 +104,19 @@ where
                         st.session.write(sid, &response);
                         st.session.finish(sid);
                         st.answered = true;
-                        wrote = true;
                     }
                     if st.answered && st.session.is_stream_done(sid) {
                         retire.push(peer);
                     }
                 }
             }
-            if emit || wrote {
-                for (&peer, st) in &mut sessions {
-                    for payload in st.session.poll_payloads() {
-                        client.command(Command::Send { to: peer, payload });
-                    }
+            // One emit per wake: the delivery arm below coalesces its whole ready batch before looping,
+            // so this re-sends each session's window once per batch or tick, never once per datagram
+            // (which would make the two sides amplify each other's retransmits without bound).
+            for (&peer, st) in &mut sessions {
+                for payload in st.session.poll_payloads() {
+                    client.command(Command::Send { to: peer, payload });
                 }
-                emit = false;
             }
             for peer in retire {
                 sessions.remove(&peer);
@@ -136,11 +129,21 @@ where
                             .or_default()
                             .session
                             .handle_payload(&keypair, &payload, &mut rng);
+                        // Coalesce the rest of the ready batch, then emit once for all of them.
+                        while let Ok(ev) = deliveries.try_recv() {
+                            if let Notification::Delivered { from, payload } = ev {
+                                sessions
+                                    .entry(from)
+                                    .or_default()
+                                    .session
+                                    .handle_payload(&keypair, &payload, &mut rng);
+                            }
+                        }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
-                _ = ticker.tick() => emit = true,
+                _ = ticker.tick() => {}
             }
         }
     });

@@ -120,11 +120,12 @@ async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport:
     let mut app_eof = false; // the app closed its write side
     let mut finished = false; // we called session.finish()
     // Emit outbound cells only when the send state actually changes — on startup (the ClientHello),
-    // when the app hands us new data, or on the retransmit tick — never on every inbound datagram.
-    // `poll_payloads` re-sends the whole window each call, so emitting on each received ack would make
-    // one side's window re-transmit per ack while the peer acks per cell: a mutual amplification that
-    // is quadratic (in fact runaway) over an unbounded channel. The periodic tick carries acks and
-    // retransmits within one `TICK`, which bounds latency without the feedback storm.
+    // when the app hands us new data, after draining a *batch* of inbound datagrams, or on the
+    // retransmit tick. `poll_payloads` re-sends the whole window each call, so emitting on *every*
+    // inbound datagram would make one side's window retransmit per ack while the peer acks per cell —
+    // a mutual, runaway amplification over an unbounded channel. Coalescing the inbound (drain all that
+    // are ready, then emit once) collapses that to one emit per batch, so throughput is bounded by the
+    // round trip, not by the tick, with no feedback storm.
     let mut emit = true;
 
     loop {
@@ -161,10 +162,16 @@ async fn drive(mut session: ClientSession, driver_side: DuplexStream, transport:
         tokio::select! {
             biased;
             maybe = inbound.recv() => match maybe {
-                // Absorb the delivery (acks advance the window, data feeds the receiver); the next tick
-                // emits the resulting ack/retransmit, so a burst of deliveries costs one emit, not one
-                // per datagram.
-                Some(payload) => session.handle_payload(&payload),
+                Some(payload) => {
+                    // Coalesce: absorb this delivery and every other one already queued, then emit once
+                    // (the ack for the whole batch plus any newly-unblocked segments). A burst of N
+                    // deliveries costs one emit, not N.
+                    session.handle_payload(&payload);
+                    while let Ok(more) = inbound.try_recv() {
+                        session.handle_payload(&more);
+                    }
+                    emit = true;
+                }
                 None => return, // peer transport closed
             },
             read = rd.read(&mut buf), if !app_eof => match read {
@@ -203,7 +210,6 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"async-session-server");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
-        let mut emit = false; // gated like the client driver — emit on tick / on writing the response
         loop {
             if let Some(sid) = server.primary()
                 && !answered
@@ -214,22 +220,25 @@ mod tests {
                 server.write(sid, &resp);
                 server.finish(sid);
                 answered = true;
-                emit = true;
             }
-            if emit {
-                for payload in server.poll_payloads() {
-                    if outbound.send(payload).is_err() {
-                        return;
-                    }
+            // One emit per wake (below): the inbound arm coalesces its whole batch first, so this is
+            // one emit per batch or tick — never one per datagram.
+            for payload in server.poll_payloads() {
+                if outbound.send(payload).is_err() {
+                    return;
                 }
-                emit = false;
             }
             tokio::select! {
                 maybe = inbound.recv() => match maybe {
-                    Some(payload) => server.handle_payload(&keypair, &payload, &mut rng),
+                    Some(payload) => {
+                        server.handle_payload(&keypair, &payload, &mut rng);
+                        while let Ok(more) = inbound.try_recv() {
+                            server.handle_payload(&keypair, &more, &mut rng);
+                        }
+                    }
                     None => return,
                 },
-                _ = ticker.tick() => emit = true,
+                _ = ticker.tick() => {}
             }
         }
     }
@@ -299,7 +308,6 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"mock-svc");
         let mut ticker = tokio::time::interval(TICK);
         let mut answered = false;
-        let mut emit = false;
         loop {
             if let Some(sid) = server.primary()
                 && !answered
@@ -310,22 +318,23 @@ mod tests {
                 server.write(sid, &resp);
                 server.finish(sid);
                 answered = true;
-                emit = true;
             }
-            if emit {
-                for payload in server.poll_payloads() {
-                    if outbound.send((SERVICE, payload)).is_err() {
-                        return;
-                    }
+            for payload in server.poll_payloads() {
+                if outbound.send((SERVICE, payload)).is_err() {
+                    return;
                 }
-                emit = false;
             }
             tokio::select! {
                 msg = inbound.recv() => match msg {
-                    Some((_from, payload)) => server.handle_payload(&keypair, &payload, &mut rng),
+                    Some((_from, payload)) => {
+                        server.handle_payload(&keypair, &payload, &mut rng);
+                        while let Ok((_from, more)) = inbound.try_recv() {
+                            server.handle_payload(&keypair, &more, &mut rng);
+                        }
+                    }
                     None => return,
                 },
-                _ = ticker.tick() => emit = true,
+                _ = ticker.tick() => {}
             }
         }
     }
