@@ -126,6 +126,9 @@ pub async fn publish_service(
 /// resolves fails the resolution instead of hanging the caller forever.
 pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A [`ServiceResolver`] over the overlay store: resolves a service's rendezvous descriptor (and mix
+/// keys) by looking them up at their coordinate-derived store slots, bounded by [`RESOLVE_TIMEOUT`] so a
+/// missing service fails rather than hangs. This is the discovery side of the Direct profile.
 pub struct NodeResolver {
     client: Client,
     epoch: u64,
