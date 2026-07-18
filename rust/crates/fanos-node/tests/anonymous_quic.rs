@@ -18,7 +18,8 @@ use fanos_aphantos::ThresholdRouter;
 use fanos_diaulos::{ServerSession, StaticKeypair};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
-use fanos_node::{RendezvousRoute, anonymous_dial};
+use fanos_node::{FanosDialer, RendezvousRoute, StaticResolver};
+use fanos_proxy::{Dialer, Target};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_rendezvous::{
@@ -226,14 +227,15 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         threshold: t as u8,
         epoch,
     };
-    let mut cli_rng = SeedRng::from_seed(b"anon-quic-cli");
-    let mut stream = anonymous_dial(
-        client_node.client(),
-        &service_public,
-        &route,
-        b"anon-quic-cli-secret",
-        &mut cli_rng,
-    );
+    // Dial through the production seam: a FanosDialer on the anonymous profile resolves the name to the
+    // service key and rides the DIAULOS session over the mixnet (the coordinate is unused anonymously —
+    // the meeting line comes from the key).
+    let resolver = StaticResolver::new().with("anon.fanos", meeting, service_public);
+    let dialer = FanosDialer::anonymous(client_node.client(), resolver, route);
+    let mut stream = dialer
+        .dial(&Target::Name("anon.fanos".to_owned(), 80))
+        .await
+        .expect("anonymous dial by name");
 
     let response = tokio::time::timeout(StdDuration::from_secs(40), async {
         stream.write_all(b"GET /anon").await.unwrap();

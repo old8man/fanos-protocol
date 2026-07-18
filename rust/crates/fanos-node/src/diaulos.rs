@@ -191,13 +191,35 @@ impl ServiceResolver for StaticResolver {
 pub struct FanosDialer<R: ServiceResolver> {
     client: Client,
     resolver: R,
+    /// The rendezvous route for the **anonymous** profile; `None` selects the Direct profile (dial by
+    /// coordinate). When set, dials carry the same DIAULOS session over threshold onions instead, so
+    /// neither party learns the other's location.
+    anonymous: Option<crate::rendezvous::RendezvousRoute>,
 }
 
 impl<R: ServiceResolver> FanosDialer<R> {
-    /// A dialer on `client`'s node resolving names through `resolver`.
+    /// A **Direct** dialer on `client`'s node resolving names through `resolver`: it reaches services
+    /// by coordinate (fast, but reveals *where* each party is).
     #[must_use]
     pub fn new(client: Client, resolver: R) -> Self {
-        Self { client, resolver }
+        Self {
+            client,
+            resolver,
+            anonymous: None,
+        }
+    }
+
+    /// An **anonymous** dialer: every dial rides threshold onions along `route` to the service's
+    /// computed meeting line, hiding both parties' locations. `route` supplies the mixnet directory,
+    /// threshold, epoch, and the client's forward/reply circuits (the per-target meeting line is
+    /// derived from the resolved service key at dial time).
+    #[must_use]
+    pub fn anonymous(client: Client, resolver: R, route: crate::rendezvous::RendezvousRoute) -> Self {
+        Self {
+            client,
+            resolver,
+            anonymous: Some(route),
+        }
     }
 }
 
@@ -221,11 +243,27 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
         getrandom::fill(&mut seed)
             .map_err(|e| DialError::Io(std::io::Error::other(format!("OS entropy failed: {e}"))))?;
         let mut rng = SeedRng::from_seed(&seed);
-        Ok(dial_service(
-            self.client.clone(),
-            coord,
-            &service_public,
-            &mut rng,
-        ))
+        match &self.anonymous {
+            None => Ok(dial_service(
+                self.client.clone(),
+                coord,
+                &service_public,
+                &mut rng,
+            )),
+            Some(route) => {
+                // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
+                let mut secret = [0u8; 32];
+                getrandom::fill(&mut secret).map_err(|e| {
+                    DialError::Io(std::io::Error::other(format!("OS entropy failed: {e}")))
+                })?;
+                Ok(crate::rendezvous::anonymous_dial(
+                    self.client.clone(),
+                    &service_public,
+                    route,
+                    &secret,
+                    &mut rng,
+                ))
+            }
+        }
     }
 }
