@@ -60,7 +60,7 @@ structure, which is why the answers compose instead of conflicting:
 
 | # | Threat / attack surface | FANOS fundamental answer | Status | Verified / owned by |
 |---|---|---|---|---|
-| C1 | **Timing / traffic-confirmation** | Constant-rate cover traffic (`outbound_padded`), mix delays; anonymity set `λ/μ` (Little's law) | 🟡 | cover mechanism ✅; per-profile cover *policy* + delays ⬜ (#61) |
+| C1 | **Timing / traffic-confirmation (flow correlation)** | **Constant-rate** cover: a real forward *displaces* a cover cell (audit E6) so emitted volume is independent of real traffic; secret-keyed mix delays; anonymity set `λ/μ` | ✅ | `aphantos/tests/flow_correlation.rs` (leak slope dE/dN: 0.667 additive → **0.000** constant-rate) |
 | C2 | **Content-length / digest correlation** | Constant-size cells; padding indistinguishable from data | ✅ 🟡 | cells ✅; C4 content-digest gap 🟡 (#65) |
 | C3 | **Predictable beacons / mix from public coord** | Mix schedule/delays must not derive from the public coordinate | ⬜ | #61 (E5/E6) |
 | C4 | **Sender/recipient linkability** | Threshold onions (APHANTOS), computed meeting line (CALYPSO), symmetric-forward routing, cookie demux | ✅ 🟡 | anonymous path ✅ (wired); forward-secrecy both directions 🟡 (#61 E4) |

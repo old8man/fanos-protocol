@@ -77,7 +77,18 @@ pub struct NyxNode<F: Field> {
     replay_seen: BTreeSet<[u8; sealed::REPLAY_TAG_LEN]>,
     /// Insertion order for [`replay_seen`](Self::replay_seen)'s bounded FIFO eviction.
     replay_order: VecDeque<[u8; sealed::REPLAY_TAG_LEN]>,
+    /// Real forwards awaiting a constant-rate send slot when cover is on (audit E6). Each slot emits
+    /// exactly one cell — a queued real cell (which *displaces* a cover cell) if any, else cover — so
+    /// the node's emitted volume is the slot count, independent of how much real traffic it carries: a
+    /// flow-correlation adversary counting cells sees no signal. Bounded by [`MAX_OUTBOX`] (drop-oldest
+    /// under overload) so a flood cannot grow it without bound. Empty (and unused) in the cover-off
+    /// direct profile, where forwards leave immediately.
+    outbox: VecDeque<(Triple, Vec<u8>)>,
 }
+
+/// Bound on the constant-rate [`outbox`](NyxNode::outbox): real forwards queued for a send slot. Beyond
+/// this the oldest is dropped (the reliability layer retransmits) — bounded memory under a flood.
+const MAX_OUTBOX: usize = 2048;
 
 /// Bound on the replay cache (§L5): the count of recently-seen cell tags a relay retains. A replay
 /// within this window is dropped; beyond it, key rotation (E4) is the second line of defence. Bounding
@@ -120,6 +131,7 @@ impl<F: Field> NyxNode<F> {
             delay_seq: 0,
             replay_seen: BTreeSet::new(),
             replay_order: VecDeque::new(),
+            outbox: VecDeque::new(),
         }
     }
 
@@ -180,10 +192,27 @@ impl<F: Field> NyxNode<F> {
         Duration(ns.max(1))
     }
 
-    /// Forward an onion — immediately, or (when mixing is on) held for a sampled delay so a batch
-    /// of onions leaves reordered (spec §L5, V7).
+    /// Forward an onion. With cover on (the Full/anonymity profile) the cell is **queued for the next
+    /// constant-rate send slot** (audit E6): it will displace a cover cell rather than add to the send
+    /// rate, so the node's emitted volume never tracks its real traffic. With cover off (the direct
+    /// profile) it leaves immediately, or — if a per-cell mixing delay is set — is held for a sampled
+    /// exponential delay so a batch leaves reordered (spec §L5, V7).
     fn forward(&mut self, next: Triple, onion: &[u8]) -> Vec<Effect> {
         let frame = Self::nyx_frame(onion);
+        if self.cover_interval.as_nanos() != 0 {
+            // Constant-rate: enqueue (bounded, drop-oldest under overload) and let the slot loop drain
+            // it. Start the slot loop if it is not already running, so queued cells are guaranteed to
+            // leave even before a `StartHeartbeat`.
+            if self.outbox.len() >= MAX_OUTBOX {
+                self.outbox.pop_front();
+            }
+            self.outbox.push_back((next, frame));
+            return if self.covering {
+                Vec::new()
+            } else {
+                self.start_cover()
+            };
+        }
         if self.mean_delay.as_nanos() == 0 {
             return alloc::vec![Effect::Send { to: next, frame }];
         }
@@ -196,27 +225,39 @@ impl<F: Field> NyxNode<F> {
         }]
     }
 
-    /// Emit one cover cell to a pseudo-randomly chosen known node and re-arm the cover timer, so
-    /// the node's send pattern stays uniform whether or not it has real traffic (spec §L5, V8).
+    /// Emit one **send slot** and re-arm the next (spec §L5, V8; audit E6). Every slot emits exactly one
+    /// cell, so the node's send rate is constant whether or not it carries real traffic. If a real
+    /// forward is queued it is sent — *displacing* a cover cell, not adding to the rate — picked
+    /// pseudo-randomly from the [`outbox`](Self::outbox) so a batch leaves reordered (the mixing/V7
+    /// property). Otherwise a cover cell is emitted: a byte-indistinguishable constant-size
+    /// ([`sealed::ONION_LEN`]) block of keystream that looks exactly like ciphertext, which the
+    /// recipient fails to peel and drops — the same path a real onion at the wrong relay takes, so cover
+    /// and real are unobservable.
     fn emit_cover(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let peers: Vec<Triple> = self.directory.entries.keys().copied().collect();
-        if !peers.is_empty() {
+        if self.outbox.is_empty() {
+            // No queued real cell: emit a cover cell to a pseudo-random known peer.
+            let peers: Vec<Triple> = self.directory.entries.keys().copied().collect();
+            if !peers.is_empty() {
+                self.delay_seq = self.delay_seq.wrapping_add(1);
+                let idx = (self.prf_unit("FANOS-v1/nyx-cover-dst", self.delay_seq)
+                    * peers.len() as f64) as usize;
+                if let Some(&dst) = peers.get(idx.min(peers.len() - 1)) {
+                    let mut cell = alloc::vec![0u8; sealed::ONION_LEN];
+                    hash_xof("FANOS-v1/nyx-cover-body", &self.cover_material(), &mut cell);
+                    effects.push(Effect::Send {
+                        to: dst,
+                        frame: Self::nyx_frame(&cell),
+                    });
+                }
+            }
+        } else {
+            // A queued real cell displaces this cover slot; the random pick reorders the batch (V7).
             self.delay_seq = self.delay_seq.wrapping_add(1);
-            let idx = (self.prf_unit("FANOS-v1/nyx-cover-dst", self.delay_seq) * peers.len() as f64)
-                as usize;
-            if let Some(&dst) = peers.get(idx.min(peers.len() - 1)) {
-                // A cover cell is byte-indistinguishable from a real onion: the *same* Tessera frame
-                // type carrying a full constant-size ([`sealed::ONION_LEN`]) block of keystream that
-                // looks exactly like ciphertext (spec §5.5/V8). The recipient tries to peel it, the
-                // KEM/AEAD fails on the random bytes, and it is dropped — the identical code path a
-                // real onion addressed to the wrong relay takes, so cover and real are unobservable.
-                let mut cell = alloc::vec![0u8; sealed::ONION_LEN];
-                hash_xof("FANOS-v1/nyx-cover-body", &self.cover_material(), &mut cell);
-                effects.push(Effect::Send {
-                    to: dst,
-                    frame: Self::nyx_frame(&cell),
-                });
+            let idx = (self.prf_unit("FANOS-v1/nyx-slot-pick", self.delay_seq)
+                * self.outbox.len() as f64) as usize;
+            if let Some((to, frame)) = self.outbox.remove(idx.min(self.outbox.len() - 1)) {
+                effects.push(Effect::Send { to, frame });
             }
         }
         if self.covering && self.cover_interval.as_nanos() > 0 {
