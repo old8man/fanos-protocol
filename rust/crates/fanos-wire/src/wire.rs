@@ -72,7 +72,18 @@ macro_rules! impl_wire_int {
         }
     )*};
 }
-impl_wire_int!(u8, u16, u32, u64);
+impl_wire_int!(u8, u16, u32, u64, i16, i32, i64);
+
+/// IEEE-754 `f32`, encoded as its big-endian bit pattern (`to_bits`) — bit-exact and portable, the
+/// convention the coherence telemetry frames already use.
+impl Wire for f32 {
+    fn wire_encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_bits().to_be_bytes());
+    }
+    fn wire_decode(cur: &mut &[u8]) -> Result<Self, WireError> {
+        Ok(Self::from_bits(u32::wire_decode(cur)?))
+    }
+}
 
 impl Wire for bool {
     fn wire_encode(&self, out: &mut Vec<u8>) {
