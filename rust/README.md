@@ -6,22 +6,77 @@ stays wire-compatible with the others.
 
 ## Crates
 
-| Crate | Depends on | Provides |
-|---|---|---|
-| [`fanos-field`](crates/fanos-field) | — | `GF(2^m)` (carry-less) and `GF(p)` arithmetic; zero-dependency, `no_std` |
-| [`fanos-geometry`](crates/fanos-geometry) | field | `PG(2,q)` points/lines, `u×v` rendezvous, incidence, flags, const Fano tables |
-| [`fanos-code`](crates/fanos-code) | geometry | Hamming(7,4) syndrome, projective LRC peeling, hyperoval detection |
-| [`fanos-diakrisis`](crates/fanos-diakrisis) | geometry, code | coherence matrix Φ/P/R, polar sum-rules, Fiedler partition, self-healing |
-| [`fanos-wire`](crates/fanos-wire) | geometry | canonical varints, point/line encoding, frame registry, Tessera layout |
-| [`fanos-crypto`](crates/fanos-crypto) | geometry | domain-separated BLAKE3, MapToPoint, Shamir threshold, hybrid keys, VRF surface |
-| [`fanos-core`](crates/fanos-core) | all above | coordinates, rendezvous, Maekawa quorums, hierarchy, the `Node` API |
-| [`fanos-cli`](crates/fanos-cli) | all above | `fanos-verify` — reproduces V1–V22 and demos the protocol |
+The workspace is **27 crates** mirroring `L0–L7 + DIAKRISIS`, so a build selects exactly what it
+needs ("DHT only", "DHT+VPN", or the full mixnet+services stack) and stays wire-compatible with the
+rest via the canonical encoding. All are implemented and tested unless tagged otherwise.
+
+**Algebraic core & wire**
+
+| Crate | Provides |
+|---|---|
+| [`fanos-field`](crates/fanos-field) | `GF(2^m)` (carry-less) and `GF(p)` arithmetic; zero-dependency, `no_std` |
+| [`fanos-geometry`](crates/fanos-geometry) | `PG(2,q)` points/lines, `u×v` rendezvous, incidence, flags, const Fano tables |
+| [`fanos-code`](crates/fanos-code) | Hamming(7,4) syndrome, projective LRC peeling, hyperoval detection |
+| [`fanos-wire`](crates/fanos-wire) | canonical varints, point/line encoding, frame registry, Tessera layout |
+
+**Diagnosis, healing & stabilization (the DIAKRISIS plane)**
+
+| Crate | Provides |
+|---|---|
+| [`fanos-diakrisis`](crates/fanos-diakrisis) | coherence matrix Φ/P/R, polar sum-rules, Fiedler partition, self-healing, **and the coherence homeostat** — T-104 Lyapunov `stability`, purity `dynamics`, a Control-Barrier-Function safety seam (`cbf`), projective load-balancing (`loadbalance::balance_exact`), `vitals`/`monitor` |
+| [`fanos-telemetry`](crates/fanos-telemetry) | the mandatory per-node `CoherenceFrame` self-scan and its canonical KAT-pinned encoding |
+
+**Crypto, identity & naming**
+
+| Crate | Provides |
+|---|---|
+| [`fanos-crypto`](crates/fanos-crypto) | domain-separated BLAKE3, MapToPoint, Shamir threshold, hybrid keys (secrets zeroized on drop) |
+| [`fanos-pqcrypto`](crates/fanos-pqcrypto) | hybrid PQ: Ed25519+ML-DSA-65 signatures, X25519+ML-KEM-768 KEM, node identity |
+| [`fanos-vrf`](crates/fanos-vrf) | ristretto255 ECVRF → self-certifying epoch coordinates, Feldman VSS, interactive multi-dealer DKG |
+| [`fanos-keygen`](crates/fanos-keygen) | distributed key generation as a running engine — a Byzantine-robust `t`-of-`n` DKG over the overlay |
+| [`fanos-onoma`](crates/fanos-onoma) | ONOMA self-certifying `.fanos` names — bech32m codec, unenumerable epoch derivations, subdomains |
+
+**Core, privacy & services**
+
+| Crate | Provides |
+|---|---|
+| [`fanos-core`](crates/fanos-core) | coordinates, rendezvous, Maekawa quorums, hierarchy, stratified diagnosis, the `Node` API |
+| [`fanos-nyx`](crates/fanos-nyx) | threshold-sheaf onion: flag paths, `t`-of-`q+1` hops, holonomic ratchet, mixing |
+| [`fanos-aphantos`](crates/fanos-aphantos) | KEM-sealed constant-size onion + the `NyxNode` engine, Poisson mixing, cover traffic |
+| [`fanos-incentives`](crates/fanos-incentives) | anonymous VOPRF relay credits (blind tokens + DLEQ; Privacy-Pass class) |
+| [`fanos-calypso`](crates/fanos-calypso) | self-certifying `.fanos` services, computed rendezvous, hashcash PoW, threshold hosting, CALYPSO-Balance, Lindbladian anti-DDoS |
+| [`fanos-proteus`](crates/fanos-proteus) | polymorphic transport: per-packet junk, beacon-rotating shape, moving-target bridges |
+
+**Streams, runtime, drivers & node**
+
+| Crate | Provides |
+|---|---|
+| [`fanos-diaulos`](crates/fanos-diaulos) | DIAULOS reliable, multiplexed, encrypted byte streams over constant-size cells (flow control, stream cap/retire, RST/abort, nonce hard-kill) |
+| [`fanos-runtime`](crates/fanos-runtime) | the sans-I/O `OverlayNode` engine — liveness, storage, membership/beacon, streams, the live sense→act healing loop and coherence homeostat |
+| [`fanos-quic`](crates/fanos-quic) | the QUIC/TLS-1.3 driver over real UDP — cert-bound self-certifying identity, persistent credentials, PROTEUS-shapeable |
+| [`fanos-sim`](crates/fanos-sim) | deterministic in-process simulator driving the real engines + the coherence observatory (early-warning, threat-model scenarios) |
+| [`fanos-session`](crates/fanos-session) | async DIAULOS streams — a `ClientSession` as a tokio `AsyncRead`+`AsyncWrite` |
+| [`fanos-rendezvous`](crates/fanos-rendezvous) | anonymous rendezvous — APHANTOS onions to a computed CALYPSO meeting line |
+| [`fanos-node`](crates/fanos-node) | 🟡 the unified `fanos` daemon (supervisor: identity, config, bootstrap, engine composition) — landed, in-process tested |
+| [`fanos-proxy`](crates/fanos-proxy) | 🟡 SOCKS5 CONNECT front-end with DNS-leak-free `.fanos` handling — landed, in-process tested |
+
+**Tooling**
+
+| Crate | Provides |
+|---|---|
+| [`fanos-cli`](crates/fanos-cli) | `fanos-verify` — reproduces V1–V22 and demos the protocol |
+| [`fanos-bench`](crates/fanos-bench) | hot-path micro-benchmarks (rendezvous ≈ 5 ns) |
+
+For the cybernetics behind the DIAKRISIS plane — the DDoS-stabilizing homeostat and the systematic
+threat model — see [`../docs/ddos-homeostasis.md`](../docs/ddos-homeostasis.md),
+[`../docs/coherent-cybernetics.md`](../docs/coherent-cybernetics.md), and
+[`../docs/network-threat-model.md`](../docs/network-threat-model.md).
 
 ## Quick start
 
 ```console
 $ cargo run -p fanos-cli        # the reference verifier — reproduces V1–V22
-$ cargo test --workspace        # 119 tests
+$ cargo test --workspace        # ~700 tests across 27 crates
 $ cargo doc --no-deps --open    # API docs
 ```
 

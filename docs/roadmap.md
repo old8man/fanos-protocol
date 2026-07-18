@@ -93,7 +93,9 @@ adds the two things neither can: a **structural** substrate and a **reflexive** 
 3. **One dial, two networks.** Direct / Lite / Full unify Tor-class and Nym-class anonymity in one
    overlay, chosen per stream. *(Engines built; the dial is wired at the node layer — Phase 1–2.)*
 4. **Lindbladian stability.** DDoS is a perturbation; the answer is dissipation with a provable
-   spectral gap and super-linear attacker cost. *(Built: `fanos-calypso::stabilize`.)*
+   spectral gap and super-linear attacker cost. *(Built: the `fanos-diakrisis` coherence homeostat —
+   `homeostat`/`stability`/`dynamics`/`cbf`/`loadbalance` — wired live into `OverlayNode`, plus the
+   `fanos-calypso::stabilize` load channel; derived in [`ddos-homeostasis.md`](ddos-homeostasis.md).)*
 5. **Directory-free by geometry.** No authority to seize or censor — the plane *is* the map, epochs
    rotate it, VRF makes positions self-certifying. *(Substrate built; VRF primitive built.)*
 6. **Post-quantum, structurally anti-Sybil, evolvable.** Hybrid PQ throughout; `(q+1)/N` centrality
@@ -105,11 +107,12 @@ adds the two things neither can: a **structural** substrate and a **reflexive** 
 
 ### 3.1 The substrate (Phase 0 — **[T]** built)
 
-Twenty `no_std`-friendly crates mirror `L0–L7 + DIAKRISIS`. Node logic is **sans-I/O**: a pure
+Twenty-seven `no_std`-friendly crates mirror `L0–L7 + DIAKRISIS`. Node logic is **sans-I/O**: a pure
 `Engine::step(now, Input) → [Effect]`, driven identically by `fanos-sim` (deterministic, fault-testable)
 and `fanos-quic` (real UDP + QUIC/TLS 1.3). Four engines exist — `OverlayNode` (membership, liveness,
-storage, healing), `NyxNode` (single-relay onion + mixing + cover), `ThresholdRouter` (line-hop
-threshold onion), `DkgNode` (distributed key generation). 414 tests, the V1–V22 verifier, wasm cross-builds.
+storage, healing, now with a live **coherence homeostat**), `NyxNode` (single-relay onion + mixing + cover),
+`ThresholdRouter` (line-hop threshold onion), `DkgNode` (distributed key generation) — plus the **DIAULOS**
+reliable-stream layer, composed by the `fanos-node` supervisor. ~700 tests, the V1–V22 verifier, wasm cross-builds.
 
 ### 3.2 The node — one `fanos` binary (Phase 1)
 
@@ -219,8 +222,8 @@ UHM dynamics, not tuned.** That is what keeps the platform coherent as it evolve
 
 | Phase | Deliverable | State | Proves |
 |---|---|---|---|
-| **0 — Coherent core** | 20 crates, 4 engines, sim + quic drivers, verifier, 414 tests | **[T] done** | the protocol works in simulation & loopback |
-| **1 — The `fanos` node** | single daemon: `fanos node` over QUIC, identity, cell join, membership/beacon, storage, healing, config, bootstrap | **[C] next** | a real multi-machine network runs |
+| **0 — Coherent core** | 27 crates, 4 engines + DIAULOS streams, sim + quic drivers, verifier, ~700 tests | **[T] done** | the protocol works in simulation & loopback |
+| **1 — The `fanos` node** | single daemon: `fanos node` over QUIC, identity, cell join, membership/beacon, storage, healing, config, bootstrap | **[C] in progress** — supervisor crate + `fanos` binary landed & in-process tested | a real multi-machine network runs |
 | **2 — Application surface** | `fanos proxy`: SOCKS5/HTTP-CONNECT, `.fanos` resolution, DNS-over-FANOS (no leak), UDP-ASSOCIATE; the Direct/Lite/Full dial | **[C]** | any unmodified app tunnels through FANOS |
 | **3 — Scale & anti-censorship** | cell hierarchy (`N^k`), gossip membership at scale, DHT storage, exit policy, PROTEUS moving-target bridges, capability-negotiated evolution | **[C]** | censored bootstrap, `10⁶–10⁹` scale |
 | **4 — Incentives & sustainability** | VOPRF credit settlement, coherence reputation, mixmining-style rewards | **[C]/[P]** | relays are paid without deanonymization |
@@ -232,10 +235,12 @@ proofs of Tessera, the ratchet, PQ-VRF/beacon/shuffle); performance hardening (c
 hot-path benches); the C ABI + language bindings; mobile/embedded profiles; and continuous
 reproduce-then-verify (every headline claim stays an executable test).
 
-**Immediate next step (Phase 1 kickoff):** the `fanos-node` crate — a supervisor binding `OverlayNode`
-(+ optional relay/service engines) to the `fanos-quic` driver with a config file and bootstrap, so the
-proven engines leave the simulator and form a real network. Everything downstream (proxy, VPN, scale)
-composes on that one runnable node.
+**Immediate next step (Phase 1):** the `fanos-node` crate — a supervisor binding `OverlayNode`
+(+ optional relay/service engines) to the `fanos-quic` driver with a config file and bootstrap — **has
+landed** with the `fanos` binary and passes in-process tests; a `fanos-proxy` SOCKS5 front-end and the
+`fanos-session`/`fanos-rendezvous` stream surfaces have landed alongside it. The open part of Phase 1 is
+the live **multi-machine** bring-up (proven engines leaving the simulator to form a real network); the
+proxy, VPN, and scale work composes on that one runnable node.
 
 ---
 

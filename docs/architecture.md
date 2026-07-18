@@ -90,6 +90,13 @@ tuned. The node applies the plan to its own reroute/repair/quarantine state and 
 notifications, so the simulator can assert service continuity (traffic to a crashed node still
 delivers via its co-linear survivor) as an emergent property.
 
+The reflexive loop now also runs a **live coherence homeostat**: each round `OverlayNode` feeds its
+*measured* `Γ_net` (behavioural correlation, not the liveness proxy) to the `fanos-diakrisis`
+homeostat, whose band-keeping decision sheds correlation when the cell is over-coupled — the same
+dissipative control that stabilizes the network under a multi-target DDoS (`docs/ddos-homeostasis.md`).
+A **Control-Barrier-Function** seam (`diakrisis::cbf`) filters every regeneration control so that no
+action — present or a future *learnable* one — can push the cell out of its viability region.
+
 ## What the simulator buys us (why simulate)
 
 A deterministic, single-host simulator of the real code lets us **research** the protocol's

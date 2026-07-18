@@ -40,19 +40,21 @@ Every implementation is bound by two interoperability guarantees (spec Part VII 
 ## Rust reference implementation
 
 A `#![no_std]`-friendly Cargo workspace whose crates mirror the protocol's module structure
-(spec Part XI). The algebraic core, the diagnosis plane, the wire, the addressing/crypto
-surface, the NYX anonymity layer, and a **deterministic network simulator** that runs the real
-node code are implemented and verified:
+(spec Part XI). The algebraic core, the diagnosis plane (now with a **DDoS-stabilizing coherence
+homeostat**), the wire, the addressing/crypto surface, the NYX/APHANTOS anonymity layer, CALYPSO
+services, ONOMA naming, the DIAULOS reliable-stream layer, a real QUIC transport, and a
+**deterministic network simulator** that runs the real node code are implemented and verified:
 
 | Crate | Layer | What it provides | Status |
 |---|---|---|---|
 | `fanos-field` | — | `GF(2^m)` + `GF(p)` arithmetic, zero-dep, `no_std` | ✅ verified |
 | `fanos-geometry` | L1 | `PG(2,q)` points/lines, cross rendezvous, incidence, the Fano cell | ✅ verified |
 | `fanos-code` | L4 | Hamming(7,4) syndrome, projective LRC, hyperoval peeling | ✅ verified |
-| `fanos-diakrisis` | ⟂ | coherence matrix Φ/P/R, polar sum-rules, partition, the **active healing controller** (reroute/repair/quarantine/escalate) and regeneration dynamics (`κ(Γ)`, `τ=1/Δ`) | ✅ verified |
+| `fanos-diakrisis` | ⟂ | coherence matrix Φ/P/R, polar sum-rules, partition, the **active healing controller** (reroute/repair/quarantine/escalate) and regeneration dynamics (`κ(Γ)`, `τ=1/Δ`), plus the **coherence homeostat** — T-104 ISS/Lyapunov `stability`, purity `dynamics`, a **Control-Barrier-Function** safety seam (`cbf`), projective load-balancing (`loadbalance::balance_exact`), and `vitals`/`monitor` | ✅ verified |
 | `fanos-wire` | VII | canonical varints, point/line encoding, frames, Tessera layout | ✅ verified |
-| `fanos-crypto` | L0/L6 | domain-separated BLAKE3, MapToPoint, Shamir threshold, hybrid keys | ✅ verified |
+| `fanos-crypto` | L0/L6 | domain-separated BLAKE3, MapToPoint, Shamir threshold, hybrid keys (secrets zeroized on drop, audit A6) | ✅ verified |
 | `fanos-core` | L0/L1/L3 | coordinates, rendezvous, Maekawa quorums, the `Node` API, and **stratified diagnosis** — the parent-cell tier that *consumes* escalation (self-similar `ParentCell`) | ✅ verified |
+| `fanos-onoma` | L5 | **ONOMA** self-certifying `.fanos` names — bech32m codec, unenumerable per-epoch derivations, readable names & subdomains | ✅ verified |
 | `fanos-nyx` | L5 | threshold-sheaf onion: geometric flag paths, `t`-of-`q+1` hops, holonomic ratchet, mixing | ✅ verified |
 | `fanos-pqcrypto` | L6 | **real** hybrid post-quantum crypto: Ed25519+ML-DSA-65 signatures, X25519+ML-KEM-768 KEM, node identity | ✅ verified |
 | `fanos-vrf` | L6 | **real** verifiable random function (ristretto255 ECVRF) → self-certifying epoch coordinates, **Feldman VSS**, and **interactive multi-dealer DKG** (a joint key no party holds) | ✅ verified |
@@ -61,10 +63,37 @@ node code are implemented and verified:
 | `fanos-aphantos` | L5 | KEM-sealed onion + the `NyxNode` routing engine, with **Poisson mixing** and **cover traffic** | ✅ verified |
 | `fanos-calypso` | services | self-certifying `.fanos` addresses, epoch-rotating rendezvous, hashcash PoW, threshold hosting — plus the running hidden-service flow over the overlay | ✅ verified |
 | `fanos-proteus` | XIII | polymorphic transport: beacon-rotating shape, moving-target bridges, morphs, and the `ProteusShaper` driver wrapper | ✅ verified |
-| `fanos-runtime` | — | the node as a **sans-I/O** state machine (`OverlayNode`) — witness-corroborated liveness, rendezvous, the **sense→act** healing loop, **L4 storage**, reliable **streams**, and **membership/JOIN + epoch beacon** (flooded key distribution, adopt-max consensus) | ✅ verified |
-| `fanos-sim` | — | deterministic in-process **simulator** driving the real engines (faults, traces, metrics) + the **coherence observatory** that forecasts cascades | ✅ verified |
+| `fanos-diaulos` | L2/L3 | **DIAULOS** reliable, multiplexed, end-to-end-encrypted byte streams over constant-size cells — two-level flow control, stream cap/retire, RST/abort (`Frame::Reset`), and AEAD nonce hard-kill | ✅ verified |
+| `fanos-telemetry` | ⟂ | the mandatory per-node **CoherenceFrame** (a minimal cell self-scan) and its canonical KAT-pinned encoding | ✅ verified |
+| `fanos-runtime` | — | the node as a **sans-I/O** state machine (`OverlayNode`) — witness-corroborated liveness, rendezvous, the **sense→act** healing loop and live **coherence homeostat**, **L4 storage**, reliable **streams**, and **membership/JOIN + epoch beacon** (flooded key distribution, adopt-max consensus) | ✅ verified |
+| `fanos-sim` | — | deterministic in-process **simulator** driving the real engines (faults, traces, metrics) + the **coherence observatory** that forecasts cascades (early-warning `CriticalSlowingDown` detector; Sybil-cost & eclipse threat-model scenarios) | ✅ verified |
 | `fanos-quic` | L2 | the **second sans-I/O driver** — the *same* engine over real UDP + QUIC (TLS 1.3), optionally PROTEUS-shaped, with **cert-bound self-certifying identity** (mutual TLS), **persistent credentials** (durable coordinate), keep-alive/idle tuning, and `tracing` | ✅ verified |
+| `fanos-rendezvous` | — | anonymous rendezvous — carry a session over APHANTOS threshold onions to a computed CALYPSO meeting line, so neither party learns the other's location | ✅ verified |
+| `fanos-session` | — | async DIAULOS byte streams — a sans-I/O `ClientSession` as a tokio `AsyncRead`+`AsyncWrite` (the bridge a SOCKS5 proxy uses) | ✅ verified |
+| `fanos-node` | — | the unified **`fanos` daemon** (supervisor): durable self-certifying identity, config, bootstrap, and engine composition behind the QUIC driver | 🟡 landed, in-process tested |
+| `fanos-proxy` | — | SOCKS5 CONNECT front-end over a pluggable `Dialer`, with DNS-leak-free `.fanos` target handling | 🟡 landed, in-process tested |
 | `fanos-cli` / `fanos-bench` | — | `fanos-verify` reproduces V1–V22; `fanos-bench` benchmarks the hot paths (rendezvous ≈ 5 ns) | ✅ verified |
+
+### Status at a glance
+
+Every crate in the table above is implemented **and** tested (`✅ verified`); the tiers below track
+the *product* surface built on them — honest about what is proven vs. still integrating vs. designed-only.
+
+- **✅ implemented + tested** — the algebraic substrate; DIAKRISIS self-diagnosis, self-healing, and
+  the **coherence homeostat** (Lyapunov stability, a CBF safety seam, projective load-balancing); the
+  canonical wire; hybrid post-quantum crypto, ECVRF, and networked DKG; the NYX/APHANTOS threshold
+  onion with mixing + cover; CALYPSO services; ONOMA naming; DIAULOS reliable streams; the sans-I/O
+  `OverlayNode` engine under **two drivers** (the `fanos-sim` simulator and the `fanos-quic`
+  real-socket transport); the observatory's early-warning detector; and the Sybil-cost / eclipse
+  threat-model verifications.
+- **🟡 partial / integrating** — the unified `fanos` node daemon and the SOCKS5 proxy (crates and a
+  `fanos` binary have landed and pass in-process tests; a live multi-machine deployment is not
+  demonstrated here); the Direct/Lite/Full anonymity dial (engines exist; per-stream selection is
+  still being wired at the node layer).
+- **📐 designed-only** — the full-tunnel VPN (`fanos vpn`); clearnet DNS-over-FANOS and UDP-ASSOCIATE
+  at the proxy (leak-free `.fanos` handling already ships, but clearnet resolution over an exit does
+  not); and the research-horizon *coherent blockchain* (consensus-via-coherence). See
+  [`docs/roadmap.md`](docs/roadmap.md).
 
 The node logic is written **sans-I/O** (see [`docs/architecture.md`](docs/architecture.md)): it
 reacts to inputs and returns effects, touching no clock, socket, or RNG. The simulator and the
@@ -84,6 +113,21 @@ via the reroute, and a cell that saturates its syndrome decoder at ≥3 faults s
 signals and calls a cascade a full regime **before any node fails** (spec §2.7, V15) — the mean
 correlation crosses `r* = 1/√6` with a measurable lead time ahead of the first liveness failure.
 Run `cargo run -p fanos-sim --example forecast` to watch it.
+
+**Coherent cybernetics — stabilization by dynamics, not filters.** FANOS treats a DDoS not as traffic
+to filter but as a **perturbation of the network's coherence**, answered by dissipation with a provable
+spectral gap. A multi-target flood is the canonical `h^(D)` noise attack on a cell's coherence matrix;
+by the T-104 stability theorem the organism returns exponentially to its healthy attractor as long as
+the aggregate decoherence stays under `κ_bootstrap/2 = 1/14`, and two provably-relaxing controllers —
+admission (load) and the coherence homeostat (self-model) — hold it there. This is implemented in
+`fanos-diakrisis` (`homeostat`, `stability`, `dynamics`, `cbf`, `loadbalance`), wired live into the
+`OverlayNode` engine, and validated on the simulator; a **Control-Barrier-Function** seam guarantees
+that even a future *learnable* controller cannot steer the cell out of viability.
+
+- [`docs/ddos-homeostasis.md`](docs/ddos-homeostasis.md) — the math-verified derivation (T-104, the `1/14` survival bound, the homeostat)
+- [`docs/coherent-cybernetics.md`](docs/coherent-cybernetics.md) — the organism theory FANOS instantiates
+- [`docs/network-threat-model.md`](docs/network-threat-model.md) — the systematic threat sweep (Sybil-cost & eclipse verified in `fanos-sim`)
+- [`docs/frontier-synthesis.md`](docs/frontier-synthesis.md) — the research frontier, measured against what FANOS already derives
 
 Two simulation-driven investigations produced protocol improvements. (1) Naive per-link liveness
 times out spuriously under packet loss (5→84 false positives as loss climbs 10→50%), so liveness is
@@ -130,12 +174,13 @@ network observer already learns nothing from size).
 
 ```console
 $ cd rust
-$ cargo run -p fanos-cli                          # reference verifier — 18 headline claims (V1–V21, T-226)
+$ cargo run -p fanos-cli                          # reference verifier — 18 headline claims (V1–V22, T-226)
 $ cargo run -p fanos-sim --bin fanos-sim-demo     # drive a real cell: crash, partition, rendezvous
 $ cargo run -p fanos-sim --example forecast       # forecast a cascade before it collapses
 $ cargo run -p fanos-sim --example catastrophe    # loss/churn/scale robustness probe
 $ cargo bench -p fanos-bench                       # hot-path micro-benchmarks
-$ cargo test --workspace                          # 368 tests
+$ cargo test --workspace                          # ~700 tests across 27 crates
+$ cargo clippy --all-targets -- -D warnings       # pedantic lints, zero warnings (CI gate)
 ```
 
 The verifier reproduces the specification's headline numbers exactly, e.g. the NYX endpoint
