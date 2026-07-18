@@ -87,7 +87,13 @@ impl BehaviorMonitor {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_range_loop
+)]
 mod tests {
     use super::*;
 

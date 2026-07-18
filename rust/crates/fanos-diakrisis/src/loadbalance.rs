@@ -223,8 +223,8 @@ mod tests {
         // there is no other fixed point, i.e. no local extremum the process could get trapped in.
         let uniform = [4.0; N];
         let stepped = balance_step(&uniform);
-        for i in 0..N {
-            assert!(approx(stepped[i], 4.0), "uniform is fixed");
+        for &x in &stepped {
+            assert!(approx(x, 4.0), "uniform is fixed");
         }
         // Every non-uniform pattern strictly contracts (deviation drops), so it cannot be a fixed point.
         for pattern in [

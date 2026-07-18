@@ -166,14 +166,14 @@ mod tests {
     fn empirical_threshold(base: PurityDynamics, hi0: f64) -> f64 {
         let (mut lo, mut hi) = (0.0, hi0);
         for _ in 0..50 {
-            let mid = 0.5 * (lo + hi);
+            let mid = f64::midpoint(lo, hi);
             if settle(base, mid, 20_000).viable() {
                 lo = mid;
             } else {
                 hi = mid;
             }
         }
-        0.5 * (lo + hi)
+        f64::midpoint(lo, hi)
     }
 
     #[test]

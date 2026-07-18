@@ -105,12 +105,12 @@ mod tests {
         // raised to that minimum (which is above κ_bootstrap, so the clamp does not bind).
         match cbf_filter(0.0, 0.3, -0.5, 0.6, 1.0, KAPPA_BOOTSTRAP, 1.0) {
             SafeControl::Apply(u) => assert!((u - 1.0 / 3.0).abs() < 1e-6, "raised to u_min_safe, got {u}"),
-            other => panic!("expected Apply, got {other:?}"),
+            SafeControl::Escalate => panic!("expected Apply, got Escalate"),
         }
         // A proposal already above the minimum is left untouched (minimal invasion).
         match cbf_filter(0.8, 0.3, -0.5, 0.6, 1.0, KAPPA_BOOTSTRAP, 1.0) {
             SafeControl::Apply(u) => assert!((u - 0.8).abs() < 1e-12, "a safe proposal is unchanged"),
-            other => panic!("expected Apply, got {other:?}"),
+            SafeControl::Escalate => panic!("expected Apply, got Escalate"),
         }
     }
 
