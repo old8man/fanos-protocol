@@ -35,6 +35,7 @@ pub const INPUT_LEN: usize = 32;
 
 const H2C_LABEL: &str = "FANOS-v1/credit-h2c";
 const DLEQ_LABEL: &str = "FANOS-v1/credit-dleq";
+const DLEQ_NONCE_LABEL: &str = "FANOS-v1/credit-dleq-nonce";
 
 /// Hash an input to a ristretto255 point (`H(x)`), the PRF's domain map.
 fn hash_to_curve(input: &[u8]) -> RistrettoPoint {
@@ -61,15 +62,30 @@ pub struct Dleq {
     z: Scalar,
 }
 
-fn prove_dleq<R: RngCore + CryptoRng>(
-    k: Scalar,
+/// The **synthetic** (deterministic) DLEQ nonce `s = H(k ‖ K ‖ B ‖ Z)` — derived from the issuer secret
+/// `k` and the full transcript, RFC-6979 style. It is unique per statement and never repeats across
+/// different statements, and it does not depend on caller entropy — so a weak or reused RNG can no longer
+/// leak `k` (two proofs sharing a nonce would give `k = (z₁−z₂)/(c₁−c₂)`; audit B4). Including the secret
+/// makes `s` unpredictable to anyone without `k`; the hash is one-way, so it does not reveal `k`.
+fn synthetic_dleq_nonce(
+    k: &Scalar,
     pk: &RistrettoPoint,
     b: &RistrettoPoint,
     z_point: &RistrettoPoint,
-    rng: &mut R,
-) -> Dleq {
+) -> Scalar {
+    let mut data = Vec::with_capacity(4 * 32);
+    data.extend_from_slice(k.as_bytes());
+    data.extend_from_slice(pk.compress().as_bytes());
+    data.extend_from_slice(b.compress().as_bytes());
+    data.extend_from_slice(z_point.compress().as_bytes());
+    let mut wide = [0u8; 64];
+    hash_xof(DLEQ_NONCE_LABEL, &data, &mut wide);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+fn prove_dleq(k: Scalar, pk: &RistrettoPoint, b: &RistrettoPoint, z_point: &RistrettoPoint) -> Dleq {
     let g = RISTRETTO_BASEPOINT_POINT;
-    let s = Scalar::random(rng);
+    let s = synthetic_dleq_nonce(&k, pk, b, z_point);
     let a1 = s * g;
     let a2 = s * b;
     let c = dleq_challenge(&[&g, pk, b, z_point, &a1, &a2]);
@@ -206,14 +222,12 @@ impl CreditIssuer {
     }
 
     /// Blind-evaluate a client's token: `Z = k·B`, with a DLEQ proof of correct evaluation. The
-    /// issuer learns nothing about the underlying input.
-    pub fn issue<R: RngCore + CryptoRng>(
-        &self,
-        blinded: &BlindedToken,
-        rng: &mut R,
-    ) -> SignedToken {
+    /// issuer learns nothing about the underlying input. Needs no entropy — the DLEQ nonce is synthetic
+    /// (deterministic from the secret + transcript), so issuance cannot be weakened by a bad RNG (B4).
+    #[must_use]
+    pub fn issue(&self, blinded: &BlindedToken) -> SignedToken {
         let evaluated = self.k * blinded.0;
-        let proof = prove_dleq(self.k, &self.public, &blinded.0, &evaluated, rng);
+        let proof = prove_dleq(self.k, &self.public, &blinded.0, &evaluated);
         SignedToken { evaluated, proof }
     }
 
@@ -309,7 +323,7 @@ mod tests {
         let mut rng = TestRng::new("a");
         let mut issuer = CreditIssuer::from_seed(b"relay-issuer");
         let (req, blinded) = request(&mut rng);
-        let signed = issuer.issue(&blinded, &mut rng);
+        let signed = issuer.issue(&blinded);
         let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
         assert!(issuer.verify(&credit));
         assert_eq!(issuer.redeem(&credit), Redemption::Accepted);
@@ -320,7 +334,7 @@ mod tests {
         let mut rng = TestRng::new("b");
         let mut issuer = CreditIssuer::from_seed(b"issuer");
         let (req, blinded) = request(&mut rng);
-        let signed = issuer.issue(&blinded, &mut rng);
+        let signed = issuer.issue(&blinded);
         let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
         assert_eq!(issuer.redeem(&credit), Redemption::Accepted);
         assert_eq!(issuer.redeem(&credit), Redemption::DoubleSpent);
@@ -338,13 +352,35 @@ mod tests {
     }
 
     #[test]
+    fn the_dleq_proof_is_deterministic_so_a_bad_rng_cannot_leak_the_key() {
+        // The synthetic nonce makes the DLEQ proof deterministic: the same statement always yields the
+        // identical proof, so there is no caller RNG to weaken (B4). Two proofs of the same transcript are
+        // byte-equal, and a different transcript uses a different nonce — no reuse across statements.
+        let k = Scalar::from(12_345u64);
+        let g = RISTRETTO_BASEPOINT_POINT;
+        let pk = k * g;
+        let b = hash_to_curve(b"a-blinded-input");
+        let z = k * b;
+        let p1 = prove_dleq(k, &pk, &b, &z);
+        let p2 = prove_dleq(k, &pk, &b, &z);
+        assert_eq!(p1.c.as_bytes(), p2.c.as_bytes(), "same statement → same challenge");
+        assert_eq!(p1.z.as_bytes(), p2.z.as_bytes(), "same statement → same response");
+        assert!(verify_dleq(&pk, &b, &z, &p1), "and the deterministic proof still verifies");
+
+        let b2 = hash_to_curve(b"a-different-input");
+        let z2 = k * b2;
+        let p3 = prove_dleq(k, &pk, &b2, &z2);
+        assert_ne!(p1.z.as_bytes(), p3.z.as_bytes(), "a different statement uses a different nonce");
+    }
+
+    #[test]
     fn a_wrong_key_issuance_is_caught_by_the_dleq_proof() {
         let mut rng = TestRng::new("c");
         let honest = CreditIssuer::from_seed(b"honest");
         let cheat = CreditIssuer::from_seed(b"cheat");
         let (req, blinded) = request(&mut rng);
         // The cheat evaluates with its own key but we verify against the honest public key.
-        let signed = cheat.issue(&blinded, &mut rng);
+        let signed = cheat.issue(&blinded);
         assert!(finalize(req, &blinded, &signed, &honest.public()).is_none());
     }
 
@@ -358,7 +394,7 @@ mod tests {
         let mk = |blind: Scalar| {
             let req = TokenRequest { input, blind };
             let blinded = BlindedToken(blind * hash_to_curve(&input));
-            let signed = issuer.issue(&blinded, &mut TestRng::new("e"));
+            let signed = issuer.issue(&blinded);
             (
                 blinded,
                 finalize(req, &blinded, &signed, &issuer.public()).unwrap(),
@@ -382,7 +418,7 @@ mod tests {
         let mut rng = TestRng::new("f");
         let mut issuer = CreditIssuer::from_seed(b"issuer");
         let (req, blinded) = request(&mut rng);
-        let signed = issuer.issue(&blinded, &mut rng);
+        let signed = issuer.issue(&blinded);
         let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
         let wire = credit.to_bytes();
         let recovered = Credit::from_bytes(&wire).unwrap();

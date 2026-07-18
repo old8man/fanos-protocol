@@ -103,7 +103,7 @@ fn an_anonymous_credit_pays_for_a_calypso_introduction_exactly_once() {
     let mut bank = CreditIssuer::from_seed(b"fanos-relay-bank");
     let mut wallet = SplitMix64::seeded("client-wallet");
     let (req, blinded) = request(&mut wallet);
-    let signed = bank.issue(&blinded, &mut wallet);
+    let signed = bank.issue(&blinded);
     let credit = finalize(req, &blinded, &signed, &bank.public()).expect("valid DLEQ proof");
     // The unblinded credit is a different group element than the blinded point the bank signed —
     // the bank cannot link this redemption back to that issuance (VOPRF unlinkability).
@@ -189,7 +189,7 @@ fn a_forged_credit_does_not_buy_an_introduction() {
     let other = CreditIssuer::from_seed(b"an-impostor-bank");
     let mut rng = SplitMix64::seeded("forger");
     let (req, blinded) = request(&mut rng);
-    let signed = other.issue(&blinded, &mut rng);
+    let signed = other.issue(&blinded);
     let forged = finalize(req, &blinded, &signed, &other.public()).expect("valid under other key");
 
     assert_eq!(
