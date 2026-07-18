@@ -30,5 +30,5 @@ pub use diaulos::{
 };
 pub use error::NodeError;
 pub use node::{Health, Node};
-pub use rendezvous::dial_anonymous;
+pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
 pub use resolve::ResolvedService;

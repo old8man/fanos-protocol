@@ -56,6 +56,8 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "time",
 ] }
+# The anonymous-profile QUIC e2e spins up a threshold-onion mixnet of real QUIC nodes.
+fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
 
 [lints]
 workspace = true

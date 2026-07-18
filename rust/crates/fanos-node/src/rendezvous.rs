@@ -13,11 +13,13 @@
 //! wires it to a real [`Client`].
 
 use fanos_diaulos::{ClientSession, Coord};
-use fanos_field::Field;
+use fanos_field::{F2, Field};
+use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
-use fanos_rendezvous::{ANONYMOUS, RendezvousClient};
+use fanos_rendezvous::{ANONYMOUS, MixDirectory, RendezvousClient, meeting_line};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, stream_over_channels};
+use rand_core::CryptoRng;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -99,6 +101,56 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
             inbound: in_rx,
         },
     )
+}
+
+/// The circuit + mixnet parameters a client uses to reach a service anonymously. `forward_hops` and
+/// `reply_circuit` are hop *lines* (a hop is a line); the meeting line is appended to the forward hops
+/// by [`anonymous_dial`], and the reply circuit ends at the client's own rendezvous (see the
+/// combiner-reachability note there).
+pub struct RendezvousRoute {
+    /// Intermediate hop lines before the service's meeting line.
+    pub forward_hops: Vec<Coord>,
+    /// Hop lines ending at the client's reply rendezvous, where the service's replies are delivered.
+    pub reply_circuit: Vec<Coord>,
+    /// The mixnet members' KEM keys the onions seal to.
+    pub directory: MixDirectory,
+    /// How many of each hop line's `q + 1` members must cooperate to peel it.
+    pub threshold: u8,
+    /// The rendezvous epoch — the meeting line rotates each epoch, so there is no fixed target.
+    pub epoch: u32,
+}
+
+/// Dial a service **anonymously** by its static KEM public key — the anonymous analogue of
+/// [`dial_service`](crate::diaulos::dial_service).
+///
+/// The client derives the service's meeting line for `route.epoch` from `service_public` (the very
+/// line the service listens on, with no lookup), opens a DIAULOS session to it, and rides that session
+/// over threshold onions through `route`'s circuit. `secret` seeds this session's cookie and its
+/// per-onion key material — pass OS entropy in production. Returns the async byte stream; a background
+/// task owns the session and the rendezvous bridge. Must run inside a tokio runtime.
+///
+/// As with [`dial_anonymous`], the node must be reachable at its reply rendezvous: `route.reply_circuit`
+/// must end at a line whose combiner relays deliveries to this node.
+#[must_use]
+pub fn anonymous_dial<R: CryptoRng>(
+    client: Client,
+    service_public: &HybridKemPublic,
+    route: &RendezvousRoute,
+    secret: &[u8],
+    rng: &mut R,
+) -> DuplexStream {
+    let meeting = meeting_line::<F2>(&service_public.encode(), route.epoch).coords();
+    let mut forward_circuit = route.forward_hops.clone();
+    forward_circuit.push(meeting);
+    let rclient = RendezvousClient::<F2>::new(
+        forward_circuit,
+        route.reply_circuit.clone(),
+        route.directory.clone(),
+        route.threshold,
+        secret,
+    );
+    let session = ClientSession::dial(meeting, service_public, rng);
+    dial_anonymous(client, session, rclient)
 }
 
 #[cfg(test)]

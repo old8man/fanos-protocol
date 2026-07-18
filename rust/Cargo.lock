@@ -729,6 +729,7 @@ dependencies = [
 name = "fanos-node"
 version = "0.1.0"
 dependencies = [
+ "fanos-aphantos",
  "fanos-calypso",
  "fanos-diaulos",
  "fanos-field",
