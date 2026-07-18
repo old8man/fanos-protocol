@@ -36,6 +36,7 @@ members = [
     "crates/fanos-proxy",
     "crates/fanos-cli",
     "crates/fanos-bench",
+    "crates/fanos-observatory",
 ]
 
 [workspace.package]
@@ -103,6 +104,11 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 # Secret-material zeroization (wipe key bytes on drop). `no_std`; crates opt into `alloc` as needed.
 zeroize = { version = "1", default-features = false }
 
+# Terminal UI for the operator observatory (`fanos-monitor`): a native, embedded-friendly TUI — no
+# browser, minimal resources. `crossterm` is the terminal backend.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+
 # Test-only: property-based testing across all crates.
 proptest = "1"
 
@@ -115,6 +121,7 @@ proc-macro2 = "1"
 # Privacy and simulation crates (added as they land).
 fanos-nyx = { path = "crates/fanos-nyx", version = "0.1.0", default-features = false }
 fanos-sim = { path = "crates/fanos-sim", version = "0.1.0", default-features = false }
+fanos-observatory = { path = "crates/fanos-observatory", version = "0.1.0", default-features = false }
 
 # ----------------------------------------------------------------------------
 # Build profiles. FANOS targets "extreme performance"; the default release build

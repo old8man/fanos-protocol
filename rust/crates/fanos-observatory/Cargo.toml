@@ -1,0 +1,24 @@
+[package]
+name = "fanos-observatory"
+version = "0.1.0"
+edition = "2024"
+description = "fanos-monitor: the terminal Coherence Observatory — a native TUI reading the network's coherence self-model, for human operators (and --json for agents)"
+keywords = ["tui", "observability", "coherence", "monitoring", "fanos"]
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "fanos-monitor"
+path = "src/main.rs"
+
+[dependencies]
+# A binary runs on std; the coherence math + snapshot come from the shipped telemetry crate, so the
+# operator sees exactly the production self-model.
+fanos-telemetry = { workspace = true, features = ["std"] }
+fanos-diakrisis = { workspace = true, features = ["std"] }
+fanos-field = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[lints]
+workspace = true
