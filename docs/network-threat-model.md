@@ -65,7 +65,7 @@ structure, which is why the answers compose instead of conflicting:
 | C3 | **Predictable beacons / mix from public coord** | Mix schedule/delays must not derive from the public coordinate | ⬜ | #61 (E5/E6) |
 | C4 | **Sender/recipient linkability** | Threshold onions (APHANTOS), computed meeting line (CALYPSO), symmetric-forward routing, cookie demux | ✅ 🟡 | anonymous path ✅ (wired); forward-secrecy both directions 🟡 (#61 E4) |
 | C5 | **Intersection / disclosure over epochs** | Epoch rotation; descriptor-nonce salting to unlink appearances | ⬜ | #58 (E3) + #61 |
-| C6 | **Guard discovery / entry enumeration** | Membership is geometric, not a public list; entry set per-client | ⬜ | new task (anonymity) |
+| C6 | **Guard discovery / entry enumeration** | Membership is geometric, not a public list; entry set per-client | ✅ | `calypso/tests/entry_unlinkability.rs` (uniform, unguessable, epoch-unlinkable, avalanche) |
 | C7 | **Telemetry deanonymization** (self-observation leaks) | Cell-granular floor; differential-privacy on exported coherence | ⬜ | #65 (C7) |
 
 ## D. Byzantine faults & integrity
@@ -103,7 +103,7 @@ structure, which is why the answers compose instead of conflicting:
 |---|---|---|---|---|
 | G1 | **Active probing / DPI fingerprinting** | PROTEUS adaptive camouflage; indistinguishable cover cells | 🟡 | design; morph-negotiation impl later |
 | G2 | **Entry-point enumeration & blocking** | Geometric membership (no public bridge list); capability-negotiated morphs | 🟡 | design |
-| G3 | **Total-control / global adversary** | Bounded blast radius: per-cell ISS + `⌊log₉Φ⌋` containment; no operator, no seizable center | ✅ 🟡 | `ddos-homeostasis.md §7`; global-adversary sim ⬜ |
+| G3 | **Total-control / global adversary** | Bounded blast radius: per-cell ISS + `⌊log₉Φ⌋` containment; no operator, no seizable center | ✅ | `ddos-homeostasis.md §7`; `sim/tests/global_adversary.rs` (local footprint, finite tier depth, `⌊log₉Φ⌋` gate) |
 
 ---
 
@@ -126,9 +126,15 @@ deserve their own verified treatment, tracked as new tasks:
   (coupon-collector for thresholds), grounded in `MapToPoint` uniformity.
 - ~~**Eclipse resistance (B2):**~~ **done** — `sim/tests/eclipse.rs` proves the derived-neighbour invariant
   and reduces eclipse to B1 coordinate-seizure on the sim.
-- **Guard discovery / entry enumeration (C6):** formalize the entry-set unlinkability and test it.
-- **Global-adversary / total-control (G3):** simulate a fraction-of-network adversary and measure the
-  containment bound empirically.
+- ~~**Guard discovery / entry enumeration (C6):**~~ **done** — `calypso/tests/entry_unlinkability.rs`
+  quantifies the entry (rendezvous) line derivation as un-enumerable and unlinkable: uniform over the
+  whole line space (no small guard set), unguessable beyond `1/N` without the identity, epoch-rotating
+  with no cross-epoch correlation, and avalanche (a near-miss identity reveals nothing).
+- ~~**Global-adversary / total-control (G3):**~~ **done** — `sim/tests/global_adversary.rs` measures, on
+  the real engine + stratum, that an attack's footprint stays local (the syndrome never blames an honest
+  node; a tier reroutes only around attacked cells), the escalation depth is finite (one tier for a
+  within-decoder attack, one more for an irrecoverable stopping set, no further), and the reroute budget
+  gate is exactly the analytic `⌊log₉Φ⌋`.
 
 Each follows the same discipline: derive the bound, implement the minimal mechanism, validate on
 `fanos-sim`, and only then mark it ✅.
