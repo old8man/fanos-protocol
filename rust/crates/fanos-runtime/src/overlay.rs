@@ -102,6 +102,10 @@ impl Default for Config {
 struct PendingGet {
     issued: Instant,
     remaining: Vec<Triple>,
+    /// The per-request nonce this read is correlated on: a `Value` reply resolves it only if the reply
+    /// echoes this exact nonce, so a stale/replayed reply from a prior get for the same key cannot drain
+    /// it with an old value (audit C4).
+    nonce: u64,
 }
 
 /// What we know about a cell neighbour.
@@ -145,6 +149,9 @@ pub struct OverlayNode<F: Field> {
     /// silent-replica timeout, concluding "absent" only once the replicas are exhausted — so any
     /// surviving replica answers even when the primary recovered empty after churn.
     pending_gets: BTreeMap<[u8; DIGEST], PendingGet>,
+    /// Monotonic per-request nonce source for reads (audit C4): each `Get` takes the next value, carried
+    /// end-to-end in its `Lookup`/`Value` frames so a reply is matched to the exact in-flight read.
+    get_seq: u64,
     /// The membership view: cell coordinate → announced info (public keys, capabilities), learned
     /// by flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
     members: BTreeMap<Triple, Vec<u8>>,
@@ -252,6 +259,7 @@ impl<F: Field> OverlayNode<F> {
             witnessed: BTreeMap::new(),
             store: BTreeMap::new(),
             pending_gets: BTreeMap::new(),
+            get_seq: 0,
             members: BTreeMap::new(),
             epoch: 0,
             observer,
@@ -574,14 +582,19 @@ impl<F: Field> OverlayNode<F> {
             .copied()
             .filter(|&c| c != primary)
             .collect();
+        // A fresh per-request nonce correlates this read's replies (audit C4); a repeat Get for the same
+        // key supersedes the old one with a new nonce, so the old read's in-flight replies go stale.
+        self.get_seq = self.get_seq.wrapping_add(1);
+        let nonce = self.get_seq;
         self.pending_gets.insert(
             digest,
             PendingGet {
                 issued: now,
                 remaining,
+                nonce,
             },
         );
-        alloc::vec![self.routed_send(primary, encode_lookup(&digest))]
+        alloc::vec![self.routed_send(primary, encode_lookup(&digest, nonce))]
     }
 
     /// Fan a value out to every cell member as a replica (LRC availability, spec §L4).
@@ -626,13 +639,16 @@ impl<F: Field> OverlayNode<F> {
         let Some(digest) = parse_digest(body.get(..DIGEST)) else {
             return Vec::new();
         };
+        let Some(nonce) = parse_u64(body, DIGEST) else {
+            return Vec::new(); // a Lookup must carry the reader's correlation nonce (audit C4)
+        };
         let (found, value): (bool, &[u8]) = match self.store.get(&digest) {
             Some(v) => (true, v),
             None => (false, &[]),
         };
         alloc::vec![Effect::Send {
             to: from,
-            frame: encode_value(&digest, found, value),
+            frame: encode_value(&digest, found, value, nonce),
         }]
     }
 
@@ -644,22 +660,31 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         };
         let found = body.get(DIGEST).copied().unwrap_or(0) != 0;
+        let Some(nonce) = parse_u64(body, DIGEST + 1) else {
+            return Vec::new();
+        };
+        // Correlate on the per-request nonce, NOT merely the key: a reply resolves a read only if it
+        // matches the read currently in flight for this key. A stale/replayed `Value` from a prior get
+        // (old nonce), or one with no in-flight read at all, is ignored — so it emits no spurious
+        // `Retrieved` and can never drain a later same-key get with an old value (read-your-writes,
+        // audit C4). The value bytes follow the nonce.
+        match self.pending_gets.get(&digest) {
+            Some(p) if p.nonce == nonce => {}
+            _ => return Vec::new(),
+        }
         if found {
-            // A survivor has it. Deliver once and retire the pending read (later dup replies are
-            // ignored because the entry is gone).
+            // A survivor has it. Deliver once and retire the pending read (later dup replies no longer
+            // match — the entry is gone).
             self.pending_gets.remove(&digest);
-            let value = Some(body.get(DIGEST + 1..).unwrap_or(&[]).to_vec());
+            let value = Some(body.get(DIGEST + 1 + 8..).unwrap_or(&[]).to_vec());
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value
             })];
         }
-        // A negative reply: advance the pending read to the next replica, or conclude it absent.
-        // (No pending entry ⇒ already resolved / stale reply ⇒ nothing to do.)
+        // A negative reply for the in-flight read: advance to the next replica, or conclude it absent.
         let mut effects = Vec::new();
-        if self.pending_gets.contains_key(&digest) {
-            self.advance_pending_get(now, digest, &mut effects);
-        }
+        self.advance_pending_get(now, digest, &mut effects);
         effects
     }
 
@@ -677,9 +702,10 @@ impl<F: Field> OverlayNode<F> {
         };
         if let Some(next) = pending.remaining.pop() {
             pending.issued = now;
+            let nonce = pending.nonce;
             effects.push(Effect::Send {
                 to: next,
-                frame: encode_lookup(&digest),
+                frame: encode_lookup(&digest, nonce),
             });
         } else {
             self.pending_gets.remove(&digest);
@@ -964,18 +990,29 @@ fn encode_publish(flag: u8, digest: &[u8; DIGEST], value: &[u8]) -> Vec<u8> {
     encode(FrameType::Publish, &body)
 }
 
-/// A `Lookup` frame: the bare 32-byte key digest (spec §L4).
-fn encode_lookup(digest: &[u8; DIGEST]) -> Vec<u8> {
-    encode(FrameType::Lookup, digest)
+/// A `Lookup` frame: `key(32) ‖ nonce(8)` (spec §L4). The nonce is the reader's per-request correlator,
+/// echoed in the `Value` reply so a stale/replayed answer cannot resolve a different read (audit C4).
+fn encode_lookup(digest: &[u8; DIGEST], nonce: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(DIGEST + 8);
+    body.extend_from_slice(digest);
+    body.extend_from_slice(&nonce.to_be_bytes());
+    encode(FrameType::Lookup, &body)
 }
 
-/// A `Value` reply: `key(32) ‖ found(1) ‖ value` (spec §L4).
-fn encode_value(digest: &[u8; DIGEST], found: bool, value: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(DIGEST + 1 + value.len());
+/// A `Value` reply: `key(32) ‖ found(1) ‖ nonce(8) ‖ value` (spec §L4) — the nonce echoes the `Lookup`'s.
+fn encode_value(digest: &[u8; DIGEST], found: bool, value: &[u8], nonce: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(DIGEST + 1 + 8 + value.len());
     body.extend_from_slice(digest);
     body.push(u8::from(found));
+    body.extend_from_slice(&nonce.to_be_bytes());
     body.extend_from_slice(value);
     encode(FrameType::Value, &body)
+}
+
+/// Parse a big-endian `u64` at byte offset `off` from `body`, or `None` if it is too short.
+fn parse_u64(body: &[u8], off: usize) -> Option<u64> {
+    let bytes: [u8; 8] = body.get(off..off.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }
 
 /// Parse a 32-byte key digest from an optional slice.
@@ -1226,6 +1263,54 @@ mod tests {
             node.pending_gets.len() <= MAX_PENDING_GETS,
             "pending reads are bounded under a get flood, got {}",
             node.pending_gets.len()
+        );
+    }
+
+    #[test]
+    fn a_stale_value_reply_cannot_resolve_a_read_it_does_not_belong_to() {
+        // C4. A `Value` correlates on the read's per-request nonce, not just the key. A reply with no
+        // in-flight read, or a stale/replayed reply from a superseded prior get (old nonce), is ignored —
+        // so it emits no spurious Retrieved and never drains a later same-key get with an old value.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let key = b"k";
+        let (digest, _) = OverlayNode::<F2>::address_of(key);
+        let peer = Point::<F2>::at(1).coords();
+        let has_retrieved = |effects: &[Effect]| {
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Retrieved { .. })))
+        };
+
+        // A found=true Value with NO in-flight read is ignored (no spurious Retrieved).
+        let stray = node.step(
+            Instant(1),
+            Input::Message { from: peer, frame: encode_value(&digest, true, b"ghost", 999) },
+        );
+        assert!(!has_retrieved(&stray), "a Value with no in-flight read emits no Retrieved");
+
+        // Issue read #1 (nonce 1), then supersede it with read #2 (nonce 2) for the same key.
+        node.step(Instant(2), Input::Command(Command::Get { key: key.to_vec() }));
+        node.step(Instant(3), Input::Command(Command::Get { key: key.to_vec() }));
+
+        // A delayed reply from read #1 (old nonce 1) carrying a stale value must be ignored.
+        let stale = node.step(
+            Instant(4),
+            Input::Message { from: peer, frame: encode_value(&digest, true, b"old", 1) },
+        );
+        assert!(!has_retrieved(&stale), "a stale reply (old nonce) does not resolve the newer read");
+
+        // The reply matching the in-flight nonce (2) resolves the read with the fresh value.
+        let fresh = node.step(
+            Instant(5),
+            Input::Message { from: peer, frame: encode_value(&digest, true, b"new", 2) },
+        );
+        assert!(
+            fresh.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::Retrieved { key: k, value: Some(v) })
+                    if *k == digest && v.as_slice() == b"new"
+            )),
+            "the reply matching the in-flight nonce resolves the read with the fresh value"
         );
     }
 
