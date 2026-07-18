@@ -110,4 +110,21 @@ impl Report {
             _ => None,
         })
     }
+
+    /// The nodes whose behavioural homeostat shed correlation (fired `Decouple`), in causal order — the
+    /// live coherence self-model acting on measured over-coupling (`docs/ddos-homeostasis.md`).
+    pub fn decouples(&self) -> impl Iterator<Item = Triple> + '_ {
+        self.notifications.iter().filter_map(|o| match &o.note {
+            Notification::Decoupled => Some(o.node),
+            _ => None,
+        })
+    }
+
+    /// Whether any node shed correlation under behavioural over-coupling.
+    #[must_use]
+    pub fn any_decoupled(&self) -> bool {
+        self.notifications
+            .iter()
+            .any(|o| matches!(&o.note, Notification::Decoupled))
+    }
 }
