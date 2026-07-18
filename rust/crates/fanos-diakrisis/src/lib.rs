@@ -31,6 +31,7 @@ pub mod blindness;
 pub mod coherence;
 pub mod eig;
 pub mod healing;
+pub mod homeostat;
 pub mod partition;
 pub mod plan;
 pub mod polar;
@@ -40,6 +41,7 @@ pub mod window;
 use alloc::vec::Vec;
 
 pub use coherence::CoherenceMatrix;
+pub use homeostat::{BandControl, Homeostat};
 pub use plan::{HealingAction, HealingPlan, plan_healing};
 // Re-export the localization types from the code crate so callers have one diagnosis surface.
 pub use fanos_code::{Fault, Sector, decode_themes, locate, syndrome3, theme_flags};

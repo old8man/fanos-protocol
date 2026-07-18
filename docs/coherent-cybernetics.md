@@ -11,8 +11,9 @@
 
 Companion to [`design.md`](design.md) (invariants), [`design-platform.md`](design-platform.md)
 (architecture), [`design-telemetry.md`](design-telemetry.md) (the minimal-overhead observation theorem),
-[`roadmap.md`](roadmap.md) (phases). Where those engineer the network, this names the *discipline* the
-engineering instantiates. **Notation.** FANOS writes the coherence density `ρ`/`Γ_net`; the canon writes
+[`ddos-homeostasis.md`](ddos-homeostasis.md) (the worked T-104 instantiation: multi-target DDoS as the
+`h^(D)` noise channel, survival threshold `1/14`, the coherence homeostat), and [`roadmap.md`](roadmap.md)
+(phases). Where those engineer the network, this names the *discipline* the engineering instantiates. **Notation.** FANOS writes the coherence density `ρ`/`Γ_net`; the canon writes
 `Γ` and reserves `ρ*` for the *self-model target* `φ(Γ)`. Read them as the same object (§9).
 
 ---
