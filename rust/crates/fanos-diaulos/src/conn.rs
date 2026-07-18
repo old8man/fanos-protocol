@@ -164,6 +164,23 @@ impl Connection {
         true
     }
 
+    /// Abort `stream_id` in both directions: drop its local reliability state immediately (whether or not
+    /// it is complete), close the id against re-opening, and return a sealed `RESET` cell to send so the
+    /// peer drops its side too. Returns `None` only if sealing fails, or the stream was unknown (nothing to
+    /// abort). Unlike [`retire_stream`](Self::retire_stream) — which requires completion — reset reclaims a
+    /// stream at *any* point, so a driver can shed a stalled or half-open stream (e.g. a peer that opened it
+    /// and never sent `FIN`) rather than pinning a slot until the connection closes.
+    pub fn reset_stream(&mut self, stream_id: u32) -> Option<Vec<u8>> {
+        // Nothing to abort if the stream is already gone (unknown/retired) — the dropped `Stream` is unused.
+        self.streams.remove(&stream_id)?;
+        self.accept_queue.retain(|&id| id != stream_id);
+        if stream_id & 1 == self.peer_id_parity {
+            self.peer_closed_below = self.peer_closed_below.max(stream_id.saturating_add(1));
+        }
+        let nonce = self.next_nonce();
+        seal(&self.key_tx, nonce, &Frame::Reset { stream_id }.encode())
+    }
+
     fn next_nonce(&mut self) -> u64 {
         let n = self.nonce_tx;
         self.nonce_tx = self.nonce_tx.wrapping_add(1);
@@ -241,6 +258,15 @@ impl Connection {
             Some(Frame::Ack { stream_id, ack }) => {
                 if let Some(s) = self.streams.get_mut(&stream_id) {
                     s.sender.on_ack(ack);
+                }
+            }
+            Some(Frame::Reset { stream_id }) => {
+                // The peer aborts this stream: drop our state, unqueue any pending accept, and (for a
+                // peer-opened id) advance the retirement frontier so a straggler cannot re-open it.
+                self.streams.remove(&stream_id);
+                self.accept_queue.retain(|&id| id != stream_id);
+                if stream_id & 1 == self.peer_id_parity {
+                    self.peer_closed_below = self.peer_closed_below.max(stream_id.saturating_add(1));
                 }
             }
             _ => {}
@@ -507,6 +533,50 @@ mod tests {
         .unwrap();
         service.on_cell(&fresh);
         assert_eq!(service.accept(), Some(2), "a fresh higher id still opens after retirement");
+    }
+
+    #[test]
+    fn reset_aborts_a_stream_both_ways_and_blocks_reopen() {
+        use fanos_runtime::stream::Segment;
+        let (c2s, s2c) = ([1u8; 32], [2u8; 32]);
+        let mut client = Connection::new(c2s, s2c, true); // opens even ids
+        let mut service = Connection::new(s2c, c2s, false); // peer parity 0 (even)
+
+        let id = client.open_stream(); // 0
+        client.write(id, b"hello");
+        client.finish(id);
+        // Deliver so the service implicitly opens the stream.
+        for cell in client.outbound() {
+            service.on_cell(&cell);
+        }
+        assert_eq!(service.accept(), Some(id));
+        assert_eq!(service.stream_count(), 1);
+
+        // The service aborts the (peer-opened, never-to-complete) stream, reclaiming the slot at once.
+        let reset = service.reset_stream(id).expect("a known stream resets");
+        assert_eq!(service.stream_count(), 0, "reset frees the slot immediately");
+        assert!(service.reset_stream(id).is_none(), "resetting an unknown stream is a no-op");
+
+        // The peer's reset drops the client's side too.
+        client.on_cell(&reset);
+        assert_eq!(client.stream_count(), 0, "the peer's reset aborts our side");
+
+        // A straggler DATA for the reset id cannot resurrect it as a phantom on the service side.
+        let straggler = seal(
+            &c2s,
+            9_999,
+            &Frame::Data(Segment {
+                stream_id: id,
+                seq: 0,
+                fin: false,
+                data: vec![9],
+            })
+            .encode(),
+        )
+        .unwrap();
+        service.on_cell(&straggler);
+        assert_eq!(service.stream_count(), 0, "a straggler cannot re-open a reset stream");
+        assert!(service.accept().is_none());
     }
 
     /// A small deterministic LCG so a proptest seed reproduces the exact loss pattern.

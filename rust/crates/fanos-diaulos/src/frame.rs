@@ -13,6 +13,7 @@ use fanos_runtime::stream::{Ack, MAX_SEGMENT, Segment};
 const FT_PADDING: u8 = 0x00;
 const FT_DATA: u8 = 0x01;
 const FT_ACK: u8 = 0x02;
+const FT_RESET: u8 = 0x03;
 
 /// A DIAULOS frame carried inside one cell.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -30,6 +31,13 @@ pub enum Frame {
     },
     /// A cover cell — no payload.
     Padding,
+    /// Abort a stream in both directions: the sender drops its state and the receiver drops its side,
+    /// reclaiming the slot immediately (the teardown a plain FIN cannot give — a peer that opens a stream
+    /// and never FINs would otherwise pin it). Carries only the `stream_id` to reset.
+    Reset {
+        /// The stream being aborted.
+        stream_id: u32,
+    },
 }
 
 fn read_u16(cur: &mut &[u8]) -> Option<u16> {
@@ -81,6 +89,12 @@ impl Frame {
                 out
             }
             Self::Padding => vec![FT_PADDING],
+            Self::Reset { stream_id } => {
+                let mut out = Vec::with_capacity(5);
+                out.push(FT_RESET);
+                out.extend_from_slice(&stream_id.to_be_bytes());
+                out
+            }
         }
     }
 
@@ -92,6 +106,10 @@ impl Frame {
         let mut cur = rest;
         match ftype {
             FT_PADDING => Some(Self::Padding),
+            FT_RESET => {
+                let stream_id = read_u32(&mut cur)?;
+                Some(Self::Reset { stream_id })
+            }
             FT_DATA => {
                 let stream_id = read_u32(&mut cur)?;
                 let seq = read_u32(&mut cur)?;
@@ -171,6 +189,16 @@ mod tests {
             Frame::decode(&Frame::Padding.encode()),
             Some(Frame::Padding)
         );
+    }
+
+    #[test]
+    fn reset_frame_round_trips_ignoring_pad() {
+        let f = Frame::Reset { stream_id: 0x1234_5678 };
+        let mut wire = f.encode();
+        wire.extend_from_slice(&[0u8; 128]); // cell zero-padding after the frame
+        assert_eq!(Frame::decode(&wire), Some(f));
+        // A RESET cut mid-field is rejected (stream_id needs 4 bytes).
+        assert_eq!(Frame::decode(&[FT_RESET, 0, 0]), None);
     }
 
     #[test]
