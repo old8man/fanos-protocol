@@ -31,10 +31,14 @@ pub fn paths_out<F: Field>(node: &Point<F>) -> impl Iterator<Item = Line<F>> + C
     Plane::<F>::lines_through(*node)
 }
 
-/// The point responsible for a content key: `target = MapToPoint(H(key))` (spec §L0/§L4).
+/// The point responsible for a content key: `target = MapToPoint(H_storage(key))` (spec §L4). Uses the
+/// **storage** domain label, matching the running engine's `address_of` and the canonical conformance
+/// vector (`conformance/vectors/services.json`) — NOT the `coord` (node-placement) domain. Keying this
+/// on `label::COORD` was an audit bug (C7): a value stored by the engine (storage domain) and located by
+/// this function (coord domain) hashed to *different* points, so the lookup silently missed.
 #[must_use]
 pub fn content_address<F: Field>(key: &[u8]) -> Point<F> {
-    map_to_point::<F>(label::COORD, key)
+    map_to_point::<F>(label::STORAGE, key)
 }
 
 /// The `q + 1` replica lines that erasure-code a target point's data (spec §L4 projective
@@ -85,5 +89,23 @@ mod tests {
         );
         // Deterministic addressing.
         assert_eq!(target, content_address::<F7>(b"my-resource-key"));
+    }
+
+    #[test]
+    fn content_address_uses_the_storage_domain_matching_the_engine() {
+        // Audit C7: content addressing must resolve in the STORAGE domain (the engine's `address_of`
+        // and the canonical conformance vector), NOT the COORD (node-placement) domain — else a stored
+        // value and its lookup hash to different points and the read silently misses.
+        let key = b"a-key";
+        assert_eq!(
+            content_address::<F31>(key),
+            map_to_point::<F31>(label::STORAGE, key),
+            "content address is in the storage domain"
+        );
+        assert_ne!(
+            content_address::<F31>(key),
+            map_to_point::<F31>(label::COORD, key),
+            "and is NOT the (distinct) coord domain — the bug this guards against"
+        );
     }
 }
