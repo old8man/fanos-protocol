@@ -12,7 +12,7 @@ use fanos_diaulos::{ClientSession, ServerSession, StaticKeypair};
 use fanos_field::F2;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_runtime::{Command, Config, Duration, Notification};
-use fanos_sim::{NetworkModel, Sim, spawn_cell};
+use fanos_sim::{NetworkModel, Rng, Sim, spawn_cell};
 
 type Coord = [u32; 3];
 
@@ -165,4 +165,34 @@ fn diaulos_carries_a_large_multi_cell_payload_under_loss() {
         expected(&request),
         "the full 8 KiB round-tripped intact under loss"
     );
+}
+
+#[test]
+fn diaulos_reliability_holds_across_random_loss_and_payloads() {
+    // The complex-integration invariant, swept stochastically: the reliable-stream layer composed with
+    // the real overlay engine delivers the *exact* bytes for ANY payload under ANY moderate loss —
+    // selective repeat and reassembly must converge regardless of which datagrams the network eats.
+    // Each seed derives its own loss rate and random payload (size and content), so this is coverage of
+    // a distribution of integration scenarios, not three hand-picked ones. Loss and size are bounded and
+    // the round budget is generous so the test measures *reliability*, never a starved timeout; the pump
+    // breaks as soon as the exchange completes, so typical seeds finish fast.
+    for seed in 0..24u64 {
+        let mut rng = Rng::new(seed);
+        let loss = 0.30 * rng.unit();
+        let len = rng.below(1500) as usize;
+        let request: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), loss);
+        let (live, response) = run_request_response(Sim::with_network(seed, net), 400, &request);
+
+        assert!(
+            live,
+            "seed {seed}: the handshake must complete (loss={loss:.3}, {len} bytes)"
+        );
+        assert_eq!(
+            response,
+            expected(&request),
+            "seed {seed}: the exact payload must round-trip (loss={loss:.3}, {len} bytes)"
+        );
+    }
 }
