@@ -181,6 +181,42 @@ mod tests {
     }
 
     #[test]
+    fn the_cbf_holds_the_barrier_against_arbitrary_adversarial_policies() {
+        // Fuzz the safety guarantee: for many pseudo-random sequences of (proposed control, attack) — the
+        // proposals ranging over adversarial and out-of-range values, the attack jumping arbitrarily each
+        // step — the CBF must NEVER let P cross 2/N. It may escalate, but only while still viable. This is
+        // the safety-critical property the SYNARC envelope rests on, so it is fuzzed hard.
+        let mut lcg = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (lcg >> 33) as f64 / (1u64 << 31) as f64 // in [0, 1)
+        };
+        for _ in 0..200 {
+            let lambda = 0.03 + 0.12 * next();
+            let p_ideal = 0.55 + 0.4 * next();
+            let p0 = 0.45 + 0.45 * next();
+            let mut d = PurityDynamics::new(lambda, KAPPA_BOOTSTRAP, p_ideal, 0.02, N, p0);
+            for _ in 0..2_000 {
+                assert!(d.viable(), "the barrier held before this step");
+                let u_prop = -0.5 + 2.5 * next(); // [−0.5, 2.0]: adversarial and out-of-range proposals
+                let attack = 1.5 * next(); // [0, 1.5]: an arbitrarily jumping disturbance
+                let (drift, gain) = d.barrier_coeffs(attack);
+                match cbf_filter_default(u_prop, d.barrier(), drift, gain) {
+                    SafeControl::Apply(u) => {
+                        d.step_with_control(attack, u);
+                    }
+                    SafeControl::Escalate => {
+                        assert!(d.viable(), "escalates only while viable — never after crossing");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_cbf_tolerates_a_stronger_attack_than_the_fixed_clamp() {
         // Same proposal (κ_bootstrap) both ways. A fixed κ_bootstrap clamp crosses the boundary at this
         // attack; the CBF raises κ toward the barrier minimum (up to 1) and never crosses it.
