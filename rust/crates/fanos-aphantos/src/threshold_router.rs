@@ -19,7 +19,7 @@
 //! transport. Member coordinates come from the projective geometry (`points_on`), so the router
 //! needs no directory; only the client that *builds* an onion needs the hops' member public keys.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_crypto::shamir::Share;
@@ -97,7 +97,17 @@ pub struct ThresholdRouter<F: Field> {
     covering: bool,
     /// Counter driving the secret-keyed cover PRF (destination choice, cell keystream, inter-cell gaps).
     cover_seq: u64,
+    /// Real forwards awaiting a constant-rate send slot when cover is on (audit E6). Each slot emits one
+    /// cell — a queued real forward (which *displaces* a cover cell) if any, else cover — so the router's
+    /// emitted volume is its slot count, independent of the real traffic it carries: a flow-correlation
+    /// adversary counting cells on the Full profile sees no signal. Bounded by [`MAX_OUTBOX`]
+    /// (drop-oldest) so a flood cannot grow it. Empty in the cover-off path, where forwards leave at once.
+    outbox: VecDeque<(Triple, Vec<u8>)>,
 }
+
+/// Bound on the constant-rate [`outbox`](ThresholdRouter::outbox): real forwards queued for a send slot.
+/// Beyond this the oldest is dropped (the reliability layer retransmits) — bounded memory under flood.
+const MAX_OUTBOX: usize = 2048;
 
 impl<F: Field> ThresholdRouter<F> {
     /// A router at `coord` with its hybrid KEM secret, peeling hops that need a threshold of `t`.
@@ -119,6 +129,7 @@ impl<F: Field> ThresholdRouter<F> {
             cover_interval: Duration(0),
             covering: false,
             cover_seq: 0,
+            outbox: VecDeque::new(),
         }
     }
 
@@ -184,22 +195,33 @@ impl<F: Field> ThresholdRouter<F> {
     /// so cover and real traffic are unobservable to a network adversary (audit E1, spec §5.5/V8).
     fn emit_cover(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        // A secret-keyed pseudo-random destination line (there are `N` lines in the plane).
-        self.cover_seq = self.cover_seq.wrapping_add(1);
-        let n_lines = Plane::<F>::N as usize;
-        let idx = (self.cover_prf_unit(self.cover_seq) * n_lines as f64) as usize;
-        let line = Line::<F>::at(idx.min(n_lines.saturating_sub(1))).coords();
-        // A constant-size block of keystream, indistinguishable from a real padded threshold onion.
-        self.cover_seq = self.cover_seq.wrapping_add(1);
-        let mut material = self.mix_seed.to_vec();
-        material.extend_from_slice(&self.cover_seq.to_be_bytes());
-        let mut cell = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
-        fanos_crypto::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
-        if let Some(combiner) = Self::combiner_of(line) {
-            effects.push(Effect::Send {
-                to: combiner,
-                frame: encode_onion(line, &cell),
-            });
+        if self.outbox.is_empty() {
+            // A secret-keyed pseudo-random destination line (there are `N` lines in the plane).
+            self.cover_seq = self.cover_seq.wrapping_add(1);
+            let n_lines = Plane::<F>::N as usize;
+            let idx = (self.cover_prf_unit(self.cover_seq) * n_lines as f64) as usize;
+            let line = Line::<F>::at(idx.min(n_lines.saturating_sub(1))).coords();
+            // A constant-size block of keystream, indistinguishable from a real padded threshold onion.
+            self.cover_seq = self.cover_seq.wrapping_add(1);
+            let mut material = self.mix_seed.to_vec();
+            material.extend_from_slice(&self.cover_seq.to_be_bytes());
+            let mut cell = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+            fanos_crypto::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
+            if let Some(combiner) = Self::combiner_of(line) {
+                effects.push(Effect::Send {
+                    to: combiner,
+                    frame: encode_onion(line, &cell),
+                });
+            }
+        } else {
+            // A queued real forward displaces this cover slot; the pseudo-random pick reorders the
+            // batch (the mixing property) while the emission rate stays constant (audit E6).
+            self.cover_seq = self.cover_seq.wrapping_add(1);
+            let idx =
+                (self.cover_prf_unit(self.cover_seq) * self.outbox.len() as f64) as usize;
+            if let Some((to, frame)) = self.outbox.remove(idx.min(self.outbox.len() - 1)) {
+                effects.push(Effect::Send { to, frame });
+            }
         }
         if self.covering && self.cover_interval.as_nanos() > 0 {
             effects.push(self.arm_cover());
@@ -207,9 +229,23 @@ impl<F: Field> ThresholdRouter<F> {
         effects
     }
 
-    /// Forward `frame` to `to` — immediately, or (when mixing is on) held for a sampled exponential
-    /// mix delay so a batch of forwards leaves reordered.
+    /// Forward `frame` to `to`. With cover on (the Full profile) the cell is **queued for the next
+    /// constant-rate send slot** (audit E6): it displaces a cover cell rather than adding to the send
+    /// rate, so emitted volume never tracks real traffic. With cover off it leaves immediately, or — if
+    /// a per-cell mixing delay is set — is held for a sampled exponential delay so a batch leaves
+    /// reordered.
     fn forward_send(&mut self, to: Triple, frame: Vec<u8>) -> Vec<Effect> {
+        if self.cover_interval.as_nanos() != 0 {
+            if self.outbox.len() >= MAX_OUTBOX {
+                self.outbox.pop_front();
+            }
+            self.outbox.push_back((to, frame));
+            return if self.covering {
+                Vec::new()
+            } else {
+                self.start_cover()
+            };
+        }
         if self.mean_delay.as_nanos() == 0 {
             return alloc::vec![Effect::Send { to, frame }];
         }
@@ -642,6 +678,49 @@ mod tests {
                 .step(Instant(0), Input::Command(Command::StartHeartbeat))
                 .is_empty(),
             "no cover configured ⇒ StartHeartbeat is a no-op"
+        );
+    }
+
+    #[test]
+    fn a_queued_real_forward_displaces_a_cover_slot_at_a_constant_rate() {
+        // E6. On the Full profile a real forward must NOT add a send on top of the cover rate — it
+        // DISPLACES the next cover slot, so the emission rate is constant whether or not real traffic
+        // flows and a flow-correlation adversary counting cells learns nothing about the real load.
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"e6-displace"));
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s, 2)
+            .with_cover(Duration::from_millis(100));
+        r.step(Instant(0), Input::Command(Command::StartHeartbeat));
+
+        // A real forward (what the peel path calls) is queued, not sent immediately, while cover is on.
+        let dest = Point::<F2>::at(3).coords();
+        let real = alloc::vec![0xABu8; threshold::THRESHOLD_ONION_LEN];
+        let queued = r.forward_send(dest, encode_onion(dest, &real));
+        assert!(
+            !queued.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "with cover on, a real forward is queued for the next slot, not sent at once"
+        );
+
+        // The next slot emits the QUEUED REAL cell (to its destination), displacing the cover cell —
+        // one emission, so the rate is unchanged.
+        let tick = r.step(Instant(1), Input::Timer(TimerToken(COVER_TOKEN)));
+        let dests: Vec<Triple> = tick
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send { to, .. } => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dests, alloc::vec![dest], "the slot emitted the queued real cell, not cover");
+
+        // With the queue empty again, the next slot falls back to a cover cell — still one emission.
+        let tick2 = r.step(Instant(2), Input::Timer(TimerToken(COVER_TOKEN)));
+        assert_eq!(
+            tick2
+                .iter()
+                .filter(|e| matches!(e, Effect::Send { .. }))
+                .count(),
+            1,
+            "an empty queue emits one cover cell — the rate stays constant"
         );
     }
 
