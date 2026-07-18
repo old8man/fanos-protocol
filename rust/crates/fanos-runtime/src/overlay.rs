@@ -13,9 +13,10 @@ use fanos_crypto::hash::label;
 use fanos_crypto::{hash_labeled, map_to_point};
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
+use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
-use fanos_geometry::{Plane, Point, Triple};
+use fanos_geometry::{Plane, Point, Triple, fano};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
@@ -171,6 +172,29 @@ fn cell_id<F: Field>() -> CellId {
         *dst = src;
     }
     CellId(id)
+}
+
+/// The cell's polar spectral gap `Δ` (T-226(v)) read from this window's **liveness topology** — the
+/// recovery rate whose reciprocal `τ = 1/Δ` is the slowest polar mode's healing time constant.
+///
+/// Each Fano line's rate is the count of its three points that are corroborated-alive (`degraded` bit
+/// clear), i.e. the coherence *flux* that axis can still carry; feeding these line rates to
+/// [`spectral_gap`] yields `Δ = (G − maxₖ Tₖ)/6`. Deriving `Δ` from the same liveness signal that sets
+/// the rest of the frame keeps the observation internally consistent — and, crucially, this is the
+/// *polar* gap from the health topology, **not** the second-eigenvalue gap of the behavioural coherence
+/// matrix `Γ_net`, which is a different quantity that must not be substituted here (audit #74). A fully
+/// healthy cell has uniform line rates `γ̄ = 3`, giving the theorem's maximal `Δ = (2/3)·3 = 2`; each
+/// degraded point lowers the incident axes' flux and so slows recovery, exactly as T-226(v) predicts.
+fn polar_gap_from_liveness(degraded: u8) -> f64 {
+    let mut line_rates = [0.0f64; fano::N];
+    for (rate, points) in line_rates.iter_mut().zip(fano::LINE_POINTS.iter()) {
+        let live = points
+            .iter()
+            .filter(|&&p| degraded & (1u8 << p) == 0)
+            .count();
+        *rate = live as f64;
+    }
+    spectral_gap(&line_rates)
 }
 
 impl<F: Field> OverlayNode<F> {
@@ -738,8 +762,8 @@ impl<F: Field> OverlayNode<F> {
             alive_count,
             self.config.healthy_correlation,
             degraded,
-            0.0, // spectral gap Δ: not tracked from liveness alone; 0 = unknown this window
-            -1,  // cascade forecast: none from liveness alone
+            polar_gap_from_liveness(degraded), // spectral gap Δ (T-226(v)) from this window's health topology
+            -1,                                // cascade forecast: none from liveness alone
         );
         Effect::Notify(Notification::Observed(frame.encode().to_vec()))
     }
@@ -1034,6 +1058,35 @@ mod tests {
                 .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
             "a quiet cell does not spuriously shed correlation"
         );
+    }
+
+    #[test]
+    fn the_polar_gap_tracks_the_liveness_topology() {
+        // Δ is the T-226(v) polar recovery rate derived from the health topology. A fully healthy cell
+        // has uniform line rates γ̄ = 3 ⇒ Δ = (2/3)·3 = 2 (the theorem's maximal gap); each degraded
+        // point lowers the flux on its three incident axes and so slows the slowest polar mode.
+        let healthy = polar_gap_from_liveness(0);
+        assert!((healthy - 2.0).abs() < 1e-12, "healthy cell has the maximal gap Δ = 2, got {healthy}");
+
+        // Degrading one point drops its 3 incident lines to rate 2: G = 18, max_k T_k = 8, Δ = 10/6.
+        let one_down = polar_gap_from_liveness(1 << 0);
+        assert!(
+            (one_down - 10.0 / 6.0).abs() < 1e-12,
+            "one degraded point gives Δ = 10/6 ≈ 1.667, got {one_down}"
+        );
+        assert!(one_down < healthy, "a fault slows recovery (smaller Δ)");
+
+        // Monotone erosion: as more points fall, the gap never rises, and a dead cell has Δ = 0.
+        let mut prev = healthy;
+        let mut mask = 0u8;
+        for p in 0..7u8 {
+            mask |= 1 << p;
+            let g = polar_gap_from_liveness(mask);
+            assert!(g <= prev + 1e-12, "each additional fault does not raise the gap: {prev} → {g}");
+            assert!(g >= -1e-12, "the gap never goes negative");
+            prev = g;
+        }
+        assert!((prev - 0.0).abs() < 1e-12, "a fully degraded cell has zero recovery gap");
     }
 
     #[test]
