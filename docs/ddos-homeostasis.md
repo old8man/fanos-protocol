@@ -370,5 +370,30 @@ Per the standing "no speculative solutions" constraint, the exact epistemic stat
 
 ---
 
+## 11. Frontier hardenings (derived, landed)
+
+Two improvements mined from the frontier ([`frontier-synthesis.md`](frontier-synthesis.md) §4) and made FANOS
+theorems — each derived from the same projective / stability structure, not imported wholesale:
+
+- **One-round exact load balancing** (`fanos-diakrisis::loadbalance::balance_exact`). Because
+  `A·Aᵀ = q·I + J` gives the line-averaging operator exactly two eigenvalues `{1, λ₂}`, the spectral
+  projector onto the uniform mode is exact: `(balance_step(load) − λ₂·load)/(1 − λ₂) = S/N` at every node.
+  The metabolic hotspot (§2A) is dissolved to the *exact* global mean in **one** communication round plus a
+  local affine combine — replacing the geometric `λ₂`-contraction loop, with no iteration and no global sum.
+  This is finite-time consensus, made possible precisely by the two-eigenvalue structure of `PG(2,q)`.
+
+- **The CBF safety envelope for the learnable seam** (`fanos-diakrisis::cbf`). The homeostat's control
+  authority is where a future SYNARC policy will learn. To make the learnable layer *unable to break
+  safety*, every proposed regeneration control `κ` is filtered through a control barrier function on
+  `h(P) = P − 2/N` (the viability barrier): the closed-form CBF-QP raises `κ` to the least value satisfying
+  `ḣ + γh ≥ 0`, so **no** learned or adversarial action can drive `P` below `2/N` while the filter is
+  feasible — the policy is free *within* the proven envelope and safe *at its edge*. And at the boundary the
+  V-gate closes (`control_gain → 0`), the minimal safe control diverges, and the filter returns `Escalate`:
+  the "point of no return without external help" (§5) is thus recovered from CBF **feasibility**, not
+  hand-set. This is the rigorous form of the reflex/cognition envelope [`synarc-node-architecture`] demands —
+  the guarantee that learning can tune the *approach* to the attractor but never leave its safe basin.
+
+---
+
 *This derivation makes FANOS's DDoS resistance a theorem with a number (`1/14`) and a deterministic test,
 not a hope: the organism metabolises the attack by the same dissipative dynamics that make it work.*
