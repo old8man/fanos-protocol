@@ -319,6 +319,23 @@ impl StreamReceiver {
         let in_window = segment.seq >= self.delivered
             && segment.seq < self.delivered.saturating_add(self.recv_window);
         if in_window {
+            // A FIN declares its `seq` the *final* segment of the stream. Reject anything that would
+            // contradict a declared end, so a peer cannot truncate the stream (which would make
+            // `deliver()` stop early while `take()` keeps draining — the two disagreeing on the payload):
+            //   (a) a segment strictly beyond an already-established FIN is past the end — drop it;
+            //   (b) a FIN whose seq sits below a segment we already hold contradicts accepted data —
+            //       drop it (its own data included; a compliant sender never sets FIN before its tail).
+            // A well-behaved sender — FIN only on its true last segment, nothing after — always passes.
+            let beyond_declared_end = self.fin_seq.is_some_and(|fin| segment.seq > fin);
+            let fin_contradicts_held = segment.fin
+                && self
+                    .received
+                    .keys()
+                    .next_back()
+                    .is_some_and(|&hi| hi > segment.seq);
+            if beyond_declared_end || fin_contradicts_held {
+                return self.ack();
+            }
             if segment.fin {
                 self.fin_seq = Some(segment.seq);
             }
@@ -614,6 +631,77 @@ mod tests {
             });
         }
         assert_eq!(rx.take(), alloc::vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_peer_cannot_truncate_the_stream_with_an_early_fin() {
+        // Deliver 0..4 without FIN, then a malicious early FIN on seq 2 (below the held frontier) must
+        // NOT finish/truncate the stream — otherwise deliver() would stop at 2 while take() drains more.
+        let mut rx = StreamReceiver::new(0);
+        for seq in 0..4u32 {
+            rx.on_segment(&Segment {
+                stream_id: 0,
+                seq,
+                fin: false,
+                data: alloc::vec![seq as u8],
+            });
+        }
+        rx.on_segment(&Segment {
+            stream_id: 0,
+            seq: 2,
+            fin: true,
+            data: alloc::vec![2],
+        });
+        assert!(!rx.is_finished(), "an early FIN under held data cannot finish the stream");
+
+        // The legitimate final segment (4, with FIN) finishes it.
+        rx.on_segment(&Segment {
+            stream_id: 0,
+            seq: 4,
+            fin: true,
+            data: alloc::vec![4],
+        });
+        assert!(rx.is_finished(), "the true tail FIN finishes the stream");
+
+        // A straggler past the declared end is refused, so it cannot be injected after the FIN.
+        rx.on_segment(&Segment {
+            stream_id: 0,
+            seq: 5,
+            fin: false,
+            data: alloc::vec![5],
+        });
+        assert_eq!(
+            rx.take(),
+            alloc::vec![0, 1, 2, 3, 4],
+            "the full payload with no truncation and no past-end injection"
+        );
+        // deliver() (whole-message mode) agrees with take() on the same payload boundary.
+        let mut rx2 = StreamReceiver::new(0);
+        for seq in 0..4u32 {
+            rx2.on_segment(&Segment {
+                stream_id: 0,
+                seq,
+                fin: false,
+                data: alloc::vec![seq as u8],
+            });
+        }
+        rx2.on_segment(&Segment {
+            stream_id: 0,
+            seq: 2,
+            fin: true,
+            data: alloc::vec![2],
+        });
+        rx2.on_segment(&Segment {
+            stream_id: 0,
+            seq: 4,
+            fin: true,
+            data: alloc::vec![4],
+        });
+        assert_eq!(
+            rx2.deliver(),
+            Some(alloc::vec![0, 1, 2, 3, 4]),
+            "deliver() sees the same untruncated payload as take()"
+        );
     }
 
     #[test]
