@@ -67,21 +67,18 @@ impl<const M: u32> Gf2m<M> {
         let mut a = a & Self::MASK;
         let mut b = b & Self::MASK;
         let mut acc = 0u32;
-        let top = 1u32 << (M - 1);
         let mut i = 0;
         while i < M {
-            // Add a shifted copy of `a` for each set bit of `b`.
-            if b & 1 != 0 {
-                acc ^= a;
-            }
+            // Add a shifted copy of `a` for each set bit of `b` — **branchless**: a mask of all-ones (iff
+            // the low bit is set) or all-zeros replaces the `if`, so this multiply runs in data-independent
+            // time and leaks nothing about the operands. It is used on secret Shamir shares (audit B7).
+            let add_mask = 0u32.wrapping_sub(b & 1);
+            acc ^= a & add_mask;
             b >>= 1;
-            // Multiply `a` by x, reducing when the degree would reach `m`.
-            let overflow = a & top;
-            a <<= 1;
-            if overflow != 0 {
-                a ^= Self::POLY;
-            }
-            a &= Self::MASK;
+            // Multiply `a` by x, reducing by the field polynomial when the degree would reach `m` — also
+            // branchless: XOR `POLY` under a mask derived from the top bit, never a conditional jump.
+            let reduce_mask = 0u32.wrapping_sub((a >> (M - 1)) & 1);
+            a = ((a << 1) ^ (Self::POLY & reduce_mask)) & Self::MASK;
             i += 1;
         }
         acc & Self::MASK
