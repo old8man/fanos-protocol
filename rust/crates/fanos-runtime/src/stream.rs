@@ -246,7 +246,7 @@ impl StreamSender {
         }
         // A gap may now be filled by contiguous sacked sequences — advance the cumulative point.
         while self.sacked.remove(&self.acked) {
-            self.acked += 1;
+            self.acked = self.acked.saturating_add(1);
         }
         // Drop stale selective acks below the cumulative point.
         self.sacked = self.sacked.split_off(&self.acked);
@@ -254,7 +254,7 @@ impl StreamSender {
         // retransmitted, so it need not be held — the in-flight buffer stays bounded by the window,
         // independent of the total transfer size (audit F3).
         while self.base < self.acked && self.segments.pop_front().is_some() {
-            self.base += 1;
+            self.base = self.base.saturating_add(1);
         }
     }
 
@@ -343,7 +343,7 @@ impl StreamReceiver {
                 .entry(segment.seq)
                 .or_insert_with(|| segment.data.clone());
             while self.received.contains_key(&self.next) {
-                self.next += 1;
+                self.next = self.next.saturating_add(1);
             }
         }
         self.ack()
@@ -378,7 +378,7 @@ impl StreamReceiver {
             if let Some(seg) = self.received.remove(&self.delivered) {
                 out.extend_from_slice(&seg);
             }
-            self.delivered += 1;
+            self.delivered = self.delivered.saturating_add(1);
         }
         out
     }
