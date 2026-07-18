@@ -45,17 +45,13 @@ async fn rendezvous_bridge<F, S>(
     F: Field + Send + 'static,
     S: Fn(Coord, Vec<u8>) + Send + 'static,
 {
-    loop {
-        tokio::select! {
-            outbound = app_out.recv() => match outbound {
-                Some(payload) => {
-                    if let Some(fwd) = rclient.seal_send(&payload) {
-                        send_frame(fwd.combiner, fwd.frame);
-                    }
-                }
-                None => break, // the stream driver is gone
-            },
-            event = deliveries.recv() => match event {
+    // The two directions are independent and each retransmits until the peer acks, so multiplexing
+    // them in one `select!` lets whichever is busier starve the other (each side floods handshake
+    // retransmits until the *other* direction completes them — a mutual starvation). Run them as two
+    // concurrent halves on the one task instead: each progresses whenever its own input is ready.
+    let inbound = async {
+        loop {
+            match deliveries.recv().await {
                 Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
                     if app_in.send(payload).is_err() {
                         break; // the stream driver is gone
@@ -63,9 +59,17 @@ async fn rendezvous_bridge<F, S>(
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
-            },
+            }
         }
-    }
+    };
+    let outbound = async {
+        while let Some(payload) = app_out.recv().await {
+            if let Some(fwd) = rclient.seal_send(&payload) {
+                send_frame(fwd.combiner, fwd.frame);
+            }
+        }
+    };
+    tokio::join!(inbound, outbound);
 }
 
 /// Dial a service **anonymously**: drive `session` (a DIAULOS [`ClientSession`] whose peer is the

@@ -26,7 +26,7 @@ use fanos_crypto::shamir::Share;
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_pqcrypto::HybridKemSecret;
-use fanos_runtime::{Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
 use crate::threshold::{self, ThresholdPeel};
 
@@ -372,6 +372,13 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                     Vec::new()
                 }
             }
+            // A node may also *originate* onions as a client: `Command::Send { to, payload }` launches
+            // the already-sealed frame `payload` to `to` verbatim (the combiner of its first hop), so
+            // the same node that peels replies here can inject its own launch frames. Other commands do
+            // not apply to a router.
+            Input::Command(Command::Send { to, payload }) => {
+                alloc::vec![Effect::Send { to, frame: payload }]
+            }
             Input::Command(_) => Vec::new(),
         }
     }
@@ -550,6 +557,27 @@ mod tests {
         assert!(
             has_delivery(&e2, payload),
             "the honest share completes the hop despite the forged one"
+        );
+    }
+
+    #[test]
+    fn a_command_send_launches_a_raw_frame() {
+        // A router node can also originate onions as a client: Command::Send emits the frame verbatim.
+        let (secret, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"launch"));
+        let mut router = ThresholdRouter::<F2>::new(Point::<F2>::at(0), secret, 2);
+        let effects = router.step(
+            Instant(0),
+            Input::Command(Command::Send {
+                to: [1, 2, 3],
+                payload: alloc::vec![9, 9, 9],
+            }),
+        );
+        assert_eq!(
+            effects,
+            alloc::vec![Effect::Send {
+                to: [1, 2, 3],
+                frame: alloc::vec![9, 9, 9],
+            }]
         );
     }
 

@@ -3,6 +3,12 @@
 //! the sim-proven flow (`fanos-sim/tests/anonymous_rendezvous.rs`) driven over a real UDP + TLS socket,
 //! confirming the `ThresholdRouter` engine peels and forwards hops identically on the production
 //! transport — the sans-I/O boundary holding once more.
+//!
+//! Scope: this covers the **forward path** (client → service) end to end over QUIC. The full
+//! bidirectional session (handshake + request/response) is proven deterministically in the simulator;
+//! its real-QUIC form additionally needs congestion handling between the DIAULOS retransmit clock and
+//! the multi-hop mixnet's much larger effective round trip (see task #50) — a paced client, not a
+//! 20 ms-tick retransmitter, so the per-hop threshold gathers are not saturated.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -18,8 +24,8 @@ use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, Tripl
 
 /// A minimal engine that injects a **raw** wire frame on command: `Command::Send { to, payload }` →
 /// `Effect::Send { to, frame: payload }`, verbatim. Unlike `OverlayNode` (which wraps the payload in
-/// its own routing frame) or `ThresholdRouter` (which ignores commands), this delivers the launch
-/// frame to the entry combiner exactly as a client would put it on the wire.
+/// its own routing frame), this delivers the launch frame to the entry combiner exactly as a client
+/// would put it on the wire — the way a `.fanos` client originates an onion.
 struct RawInjector {
     coord: Triple,
 }
@@ -27,19 +33,13 @@ struct RawInjector {
 impl Engine for RawInjector {
     fn step(&mut self, _now: Instant, input: Input) -> Vec<Effect> {
         match input {
-            Input::Command(Command::Send { to, payload }) => {
-                alloc_effect_send(to, payload)
-            }
+            Input::Command(Command::Send { to, payload }) => vec![Effect::Send { to, frame: payload }],
             _ => Vec::new(),
         }
     }
     fn address(&self) -> Triple {
         self.coord
     }
-}
-
-fn alloc_effect_send(to: Triple, frame: Vec<u8>) -> Vec<Effect> {
-    vec![Effect::Send { to, frame }]
 }
 
 /// Spawn one QUIC node running a `ThresholdRouter` at Fano point `i`, returning its handle and KEM key.
@@ -110,9 +110,8 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     // Seal a payload into a 2-hop onion and launch it at the first hop's combiner over QUIC.
     let payload = b"anon hello over quic".to_vec();
     let fwd = seal_forward::<F2>(&[hop, meeting], &mix, t as u8, &payload, b"quic-seed").unwrap();
-    let entry: Triple = fwd.combiner;
     injector.command(Command::Send {
-        to: entry,
+        to: fwd.combiner,
         payload: fwd.frame,
     });
 
