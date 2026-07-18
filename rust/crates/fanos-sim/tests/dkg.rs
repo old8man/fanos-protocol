@@ -29,12 +29,21 @@ fn secret_of(i: usize) -> [u8; 32] {
     s
 }
 
+/// A distinct per-node session nonce (fresh per-DKG-instance entropy, audit B6). Deterministic here so
+/// the simulation stays reproducible; a real deployment draws it from a CSPRNG each run.
+fn nonce_of(i: usize) -> [u8; 32] {
+    let mut s = [0u8; 32];
+    s[0] = i as u8;
+    s[1] = 0x9E;
+    s
+}
+
 /// Spawn a cell of `DkgNode`s (one per Fano point), each with a distinct secret seed.
 fn spawn_dkg_cell(sim: &mut Sim, threshold: usize) -> Vec<Triple> {
     let mut coords = Vec::new();
     for (i, point) in Plane::<F2>::points().enumerate() {
         let node =
-            DkgNode::<F2>::new(point, threshold, secret_of(i)).with_deadlines(SHARING, COMPLAINT);
+            DkgNode::<F2>::new(point, threshold, secret_of(i), nonce_of(i)).with_deadlines(SHARING, COMPLAINT);
         coords.push(sim.add(Box::new(node)));
     }
     coords
@@ -121,7 +130,7 @@ fn a_byzantine_equivocating_dealer_is_disqualified_and_honest_nodes_still_agree(
         .iter()
         .enumerate()
         .map(|(i, &p)| {
-            let node = DkgNode::<F2>::new(p, 4, secret_of(i)).with_deadlines(SHARING, COMPLAINT);
+            let node = DkgNode::<F2>::new(p, 4, secret_of(i), nonce_of(i)).with_deadlines(SHARING, COMPLAINT);
             sim.add(Box::new(node))
         })
         .collect();

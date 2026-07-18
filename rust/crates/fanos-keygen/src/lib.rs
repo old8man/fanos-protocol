@@ -5,8 +5,8 @@
 //! Feldman/Pedersen DKG with a **complaint round** (Gennaro–Jarecki–Krawczyk–Rabin) across its cell:
 //!
 //! 1. **Sharing.** Each node deals a Feldman VSS of its secret: it sends every member a private
-//!    share (`DkgDeal`) and broadcasts its public commitment (`DkgCommit`, echoed for reliable
-//!    broadcast). A share is accepted only if it verifies against the commitment.
+//!    share (`DkgDeal`) and broadcasts its public commitment (`DkgCommit`) directly to every member. A
+//!    share is accepted only if it verifies against the commitment.
 //! 2. **Complaint.** At the sharing deadline, a node that is missing or holds an *invalid* share
 //!    from some dealer broadcasts a `DkgComplaint` against it.
 //! 3. **Justification.** A dealer answers each complaint by broadcasting the complainer's correct
@@ -78,6 +78,10 @@ pub struct DkgNode<F: Field> {
     n: usize,
     threshold: usize,
     secret: [u8; 32],
+    /// Fresh per-DKG-instance entropy, mixed into the sharing polynomial's randomness so that the
+    /// coefficients (and hence every member's share) do **not** repeat across runs that reuse the same
+    /// long-term `secret` (audit B6). It is a caller input to keep the engine sans-I/O deterministic.
+    session_nonce: [u8; 32],
     /// Accumulates exactly the qualified dealers' shares — folded at finalize, not during sharing,
     /// so the final share is over `QUAL` (never over a dealer that others later disqualified).
     participant: Participant,
@@ -102,8 +106,13 @@ pub struct DkgNode<F: Field> {
 
 impl<F: Field> DkgNode<F> {
     /// A DKG participant at `coord` contributing `secret`, targeting threshold `threshold`.
+    ///
+    /// `session_nonce` is **fresh per-DKG-instance** entropy folded into the sharing polynomial (audit
+    /// B6): supply a distinct value each run — from a CSPRNG in production — so the dealt shares never
+    /// repeat even if `secret` is a long-term key reused across runs. It is an explicit input rather than
+    /// drawn internally so the engine stays sans-I/O and replayable.
     #[must_use]
-    pub fn new(coord: Point<F>, threshold: usize, secret: [u8; 32]) -> Self {
+    pub fn new(coord: Point<F>, threshold: usize, secret: [u8; 32], session_nonce: [u8; 32]) -> Self {
         let n = Plane::<F>::N as usize;
         let index = (0..n)
             .find(|&i| Point::<F>::at(i) == coord)
@@ -114,6 +123,7 @@ impl<F: Field> DkgNode<F> {
             n,
             threshold,
             secret,
+            session_nonce,
             participant: Participant::new(index),
             dealing: None,
             commitments: BTreeMap::new(),
@@ -155,7 +165,14 @@ impl<F: Field> DkgNode<F> {
         }
         self.phase = Phase::Sharing;
         self.started_at = now;
-        let mut rng = DeterministicRng::new(&self.secret);
+        // Seed the polynomial randomness with `secret ‖ session_nonce`, so the non-constant coefficients
+        // (and thus every share) are fresh per run even when `secret` is reused (audit B6). `secret`
+        // remains the a₀ contribution; only the RNG that draws a₁… is nonce-dependent.
+        let mut seed = Vec::with_capacity(64);
+        seed.extend_from_slice(&self.secret);
+        seed.extend_from_slice(&self.session_nonce);
+        let mut rng = DeterministicRng::new(&seed);
+        seed.zeroize();
         let Some(dealing) = dkg::deal(&self.secret, self.threshold, self.n, &mut rng) else {
             return Vec::new();
         };
@@ -425,6 +442,7 @@ impl<F: Field> Drop for DkgNode<F> {
     /// here without dropping their `Copy` — see that crate.)
     fn drop(&mut self) {
         self.secret.zeroize();
+        self.session_nonce.zeroize();
     }
 }
 
@@ -557,7 +575,7 @@ mod tests {
         // so dealer 2 survives and O finalizes with QUAL = {1, 2} ≥ threshold 2, emitting DkgComplete.
         // WITHOUT the fix the forged complaint evicts dealer 2 and O never completes.
         let (n, threshold) = (7, 2);
-        let mut o = DkgNode::<F2>::new(Point::at(0), threshold, [1u8; 32])
+        let mut o = DkgNode::<F2>::new(Point::at(0), threshold, [1u8; 32], [9u8; 32])
             .with_deadlines(Duration::from_millis(10), Duration::from_millis(10));
         o.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let (commit2, deal2) = dealer_frames(2, 1, threshold, n);
@@ -580,7 +598,7 @@ mod tests {
         // B1 (CRITICAL). A commitment for dealer 2 relayed by an impostor (node 3) is rejected — no bogus
         // commitment can be pre-registered for a silent dealer (first-writer-wins poisoning). The real
         // dealer 2's direct commit is accepted.
-        let mut o = DkgNode::<F2>::new(Point::at(0), 2, [1u8; 32]);
+        let mut o = DkgNode::<F2>::new(Point::at(0), 2, [1u8; 32], [9u8; 32]);
         o.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let (commit2, _deal2) = dealer_frames(2, 1, 2, 7);
         o.step(Instant(1), Input::Message { from: coord(3), frame: commit2 });
@@ -604,7 +622,7 @@ mod tests {
         // against the qualified C2 (stored) instead, the share does not match, so the justify is rejected
         // and the complaint stays unanswered.
         let (n, threshold) = (7, 2);
-        let mut o = DkgNode::<F2>::new(Point::at(0), threshold, [1u8; 32]);
+        let mut o = DkgNode::<F2>::new(Point::at(0), threshold, [1u8; 32], [9u8; 32]);
         o.step(Instant(0), Input::Command(Command::StartHeartbeat));
         // O adopts dealer 2's real commitment C2 (direct from dealer 2).
         let (commit2, _) = dealer_frames(2, 1, threshold, n);
@@ -631,5 +649,31 @@ mod tests {
             !o.justified.get(&2).is_some_and(|s| s.contains(&3)),
             "a justify against a non-qualified commitment does not clear the complaint"
         );
+    }
+
+    #[test]
+    fn a_fresh_session_nonce_makes_the_dealing_fresh() {
+        // B6. The same long-term secret with DIFFERENT session nonces must produce DIFFERENT dealt
+        // frames, so a node re-keying with a reused secret does not repeat its shares — while the same
+        // (secret, nonce) stays deterministic (the sans-I/O replay property).
+        let secret = [7u8; 32];
+        let deals = |nonce: [u8; 32]| -> Vec<Vec<u8>> {
+            DkgNode::<F2>::new(Point::at(0), 2, secret, nonce)
+                .step(Instant(0), Input::Command(Command::StartHeartbeat))
+                .into_iter()
+                .filter_map(|e| match e {
+                    Effect::Send { frame, .. } => Some(frame),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a = deals([1u8; 32]);
+        assert!(!a.is_empty(), "dealing emits frames");
+        assert_ne!(
+            a,
+            deals([2u8; 32]),
+            "different session nonces yield different dealings (fresh shares)"
+        );
+        assert_eq!(a, deals([1u8; 32]), "same secret+nonce is deterministic (replayable)");
     }
 }
