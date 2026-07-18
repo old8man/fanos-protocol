@@ -84,16 +84,47 @@ pub fn build_circuit<F: Field>(
     }
     relays.push(dest);
 
-    let mut hop_lines = Vec::with_capacity(hops);
-    for k in 0..hops {
-        let a = relays.get(k)?;
-        let b = relays.get(k + 1)?;
-        hop_lines.push(a.join(b)?);
+    circuit_from_relays(relays)
+}
+
+/// Assemble a [`Circuit`] from an ordered relay chain, computing each hop line `r_k × r_{k+1}`.
+/// `None` if fewer than two relays or any adjacent pair coincides (no unique join line).
+fn circuit_from_relays<F: Field>(relays: Vec<Point<F>>) -> Option<Circuit<F>> {
+    if relays.len() < 2 {
+        return None;
+    }
+    let mut hop_lines = Vec::with_capacity(relays.len() - 1);
+    for k in 0..relays.len() - 1 {
+        hop_lines.push(relays.get(k)?.join(relays.get(k + 1)?)?);
     }
     Some(Circuit {
         relays,
         hops: hop_lines,
     })
+}
+
+/// Build an `hops`-length circuit whose **first hop is the fixed `guard`** — a stable, per-client entry
+/// relay that bounds the predecessor attack (Wright et al.): `source → guard → r₂ … → dest`. The
+/// guard-onward segment is an ordinary seed-derived circuit, so only the entry is pinned; the interior
+/// still rotates per circuit. `None` for a degenerate request (`hops < 2`, or `source` equal to `guard`
+/// or `dest`, or an unrecoverable relay collision).
+#[must_use]
+pub fn build_circuit_via_guard<F: Field>(
+    source: Point<F>,
+    guard: Point<F>,
+    dest: Point<F>,
+    hops: usize,
+    seed: &[u8],
+) -> Option<Circuit<F>> {
+    if hops < 2 || source == guard || source == dest {
+        return None;
+    }
+    // `guard → … → dest` is an ordinary derived circuit of one fewer hop; prepend the source.
+    let inner = build_circuit(guard, dest, hops - 1, seed)?;
+    let mut relays = Vec::with_capacity(inner.relays.len() + 1);
+    relays.push(source);
+    relays.extend_from_slice(&inner.relays);
+    circuit_from_relays(relays)
 }
 
 impl<F: Field> Circuit<F> {

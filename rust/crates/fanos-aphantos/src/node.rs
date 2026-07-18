@@ -8,10 +8,11 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_crypto::hash::hash_xof;
+use fanos_crypto::map_to_point;
 use fanos_crypto::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
-use fanos_nyx::build_circuit;
+use fanos_nyx::{build_circuit, build_circuit_via_guard};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
@@ -274,6 +275,25 @@ impl<F: Field> NyxNode<F> {
         effects
     }
 
+    /// The node's stable **guard**: a fixed first-hop relay derived from the node seed alone — not the
+    /// destination, not the circuit counter — so the client always enters through the same relay. A
+    /// fixed entry bounds the predecessor attack (Wright et al., NDSS'02): with a rotating first hop an
+    /// adversary holding a fraction `f` of relays is the initiator's direct successor on ~`f` of every
+    /// circuit and identifies it after ~`1/f` rounds; with a guard it sees the initiator only if it
+    /// controls that one guard (probability ~`f`, once), independent of the round count. Derived by
+    /// rejection so it never coincides with the node itself (a self-loop is no guard).
+    fn guard(&self) -> Point<F> {
+        for i in 0..8u8 {
+            let mut data = self.seed.to_vec();
+            data.push(i);
+            let g = map_to_point::<F>("FANOS-v1/nyx-guard", &data);
+            if g != self.coord {
+                return g;
+            }
+        }
+        self.coord // astronomically unlikely; `build_circuit_via_guard` then falls back to guardless
+    }
+
     /// Originate an anonymous circuit to `dest` carrying `payload`.
     fn originate(&mut self, dest: Triple, payload: &[u8]) -> Vec<Effect> {
         let Some(destination) = Point::<F>::new(dest) else {
@@ -283,7 +303,12 @@ impl<F: Field> NyxNode<F> {
         let mut circuit_seed = self.seed.to_vec();
         circuit_seed.extend_from_slice(&self.circuit_counter.to_be_bytes());
 
-        let Some(circuit) = build_circuit(self.coord, destination, self.path_len, &circuit_seed)
+        // Enter through the stable guard (predecessor-attack bound); fall back to a fully derived
+        // circuit only for a 1-hop path or the rare guard/source/dest collision.
+        let guard = self.guard();
+        let Some(circuit) =
+            build_circuit_via_guard(self.coord, guard, destination, self.path_len, &circuit_seed)
+                .or_else(|| build_circuit(self.coord, destination, self.path_len, &circuit_seed))
         else {
             return Vec::new();
         };

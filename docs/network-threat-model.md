@@ -69,6 +69,7 @@ structure, which is why the answers compose instead of conflicting:
 | C7 | **Telemetry deanonymization** (self-observation leaks) | Cell-granular floor; differential-privacy on exported coherence | ⬜ | #65 (C7) |
 | C8 | **Active tagging / tamper-and-trace** (flip bits to mark a flow) | Per-hop ChaCha20-Poly1305 AEAD: any tamper fails the tag at the first relay and is dropped; padding is regenerated per hop | ✅ | `aphantos/tests/onion_tamper.rs` (0 surviving tags over every core byte-flip) |
 | C9 | **Replay path-confirmation** (re-inject a captured cell to confirm a relay is on-path) | Bounded per-relay replay cache keyed on `sealed::replay_tag` (drops a recurring cell before decap); relay-key rotation (E4) is the second line | ✅ 🟡 | `aphantos/tests/replay_attack.rs` (replay dropped, distinct cells forwarded); E4 rotation ⬜ (#61) |
+| C10 | **Predecessor attack** (identify the initiator by counting predecessors over repeated circuits) | A stable per-client **guard** (`build_circuit_via_guard`): a fixed first hop pins exposure to guard-compromise (~`f`, once) instead of ~`f` per circuit; the interior still rotates | ✅ 🟡 | `nyx/tests/predecessor.rs` (guardless exposure 1.000 → guarded 0.325 ≈ f); guard-set + slow rotation ⬜ |
 
 ## D. Byzantine faults & integrity
 
