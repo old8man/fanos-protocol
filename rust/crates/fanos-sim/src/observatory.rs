@@ -18,6 +18,8 @@
 //! `P < 2/N` cross *together* here. The strict lead time lives in the *cascade* axis (`r` vs
 //! liveness), which is what this observatory forecasts.
 
+use std::collections::VecDeque;
+
 use fanos_diakrisis::coherence::CoherenceMatrix;
 use fanos_diakrisis::window::{Alarm, CollectiveState};
 
@@ -183,6 +185,121 @@ pub fn forecast_cascade(
         out.trajectory.push((progress, reading, live));
     }
     out
+}
+
+/// Population variance of a scalar window, `Var = (1/n) Σ (xᵢ − x̄)²`. Returns `0` for an empty
+/// or constant series. The *second*, dynamical leading indicator (with [`lag1_autocorrelation`]):
+/// near the coherence saddle-node the fluctuation variance rises (Scheffer et al., Nature 2009).
+#[must_use]
+pub fn windowed_variance(series: &[f64]) -> f64 {
+    let n = series.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = series.iter().sum::<f64>() / n as f64;
+    series.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n as f64
+}
+
+/// Lag-1 autocorrelation `ρ₁ = Σ_i (xᵢ − x̄)(x_{i+1} − x̄) / Σ_i (xᵢ − x̄)²` — the standard AR(1)
+/// early-warning estimator (Scheffer et al., Nature 2009). Ranges in `[−1, 1]`; returns `0` for a
+/// series of fewer than two samples or one with zero variance. As a dynamical system approaches a
+/// saddle-node its recovery eigenvalue → 0, so (Ornstein–Uhlenbeck theory) `ρ₁ → 1`: a value near
+/// `1` is the critical-slowing-down signature that fires while the mean is still in-band.
+#[must_use]
+pub fn lag1_autocorrelation(series: &[f64]) -> f64 {
+    let n = series.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let mean = series.iter().sum::<f64>() / n as f64;
+    let denom = series.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>();
+    if denom <= 0.0 {
+        return 0.0;
+    }
+    let numer = series
+        .iter()
+        .zip(series.iter().skip(1))
+        .map(|(&a, &b)| (a - mean) * (b - mean))
+        .sum::<f64>();
+    numer / denom
+}
+
+/// A streaming **critical-slowing-down** detector over a scalar coherence series (`P` or `r`) — a
+/// *second*, dynamical leading indicator complementing the threshold indicator `{P<2/N}⊂{Φ<1}`
+/// (`docs/frontier-synthesis.md §4.3`). FANOS's loss of viability is a proven saddle-node
+/// bifurcation (`fanos_diakrisis::dynamics`), so as a sustained attack approaches the empirical
+/// threshold the recovery eigenvalue → 0 and — by Ornstein–Uhlenbeck theory — the state's lag-1
+/// autocorrelation → 1 and its variance rises *before* the mean leaves the band.
+///
+/// It maintains a sliding window of the most recent samples and raises [`alarm`](Self::alarm) once
+/// BOTH the windowed variance and the lag-1 autocorrelation exceed caller-supplied thresholds
+/// (calibrated to a healthy baseline). It is **pure observation** — it holds no control authority
+/// and cannot move the attractor, so it can never harm the proven envelope.
+#[derive(Clone, Debug)]
+pub struct CriticalSlowingDown {
+    window: usize,
+    var_threshold: f64,
+    ar1_threshold: f64,
+    samples: VecDeque<f64>,
+}
+
+impl CriticalSlowingDown {
+    /// A detector over a sliding `window` of samples that fires when the windowed variance exceeds
+    /// `var_threshold` AND the lag-1 autocorrelation exceeds `ar1_threshold`. `window` is clamped
+    /// to `≥ 2` (the minimum for a lag-1 estimate).
+    #[must_use]
+    pub fn new(window: usize, var_threshold: f64, ar1_threshold: f64) -> Self {
+        let window = window.max(2);
+        Self {
+            window,
+            var_threshold,
+            ar1_threshold,
+            samples: VecDeque::with_capacity(window),
+        }
+    }
+
+    /// Ingest one sample of the scalar series, evicting the oldest once the window is full.
+    pub fn observe(&mut self, x: f64) {
+        if self.samples.len() == self.window {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(x);
+    }
+
+    /// Whether the sliding window is full — statistics below are only meaningful once it is.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.samples.len() == self.window
+    }
+
+    /// The current windowed variance (see [`windowed_variance`]).
+    #[must_use]
+    pub fn variance(&self) -> f64 {
+        windowed_variance(&self.snapshot())
+    }
+
+    /// The current windowed lag-1 autocorrelation (see [`lag1_autocorrelation`]).
+    #[must_use]
+    pub fn lag1_autocorrelation(&self) -> f64 {
+        lag1_autocorrelation(&self.snapshot())
+    }
+
+    /// Whether the critical-slowing-down alarm is firing: the window is full AND both statistics
+    /// are above their thresholds — the dynamical early-warning that a saddle-node is near.
+    #[must_use]
+    pub fn alarm(&self) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        let w = self.snapshot();
+        windowed_variance(&w) > self.var_threshold && lag1_autocorrelation(&w) > self.ar1_threshold
+    }
+
+    /// The window contents in temporal order (oldest first) — `VecDeque` preserves insertion order,
+    /// so this is the correctly-ordered series the two estimators consume.
+    fn snapshot(&self) -> Vec<f64> {
+        self.samples.iter().copied().collect()
+    }
 }
 
 #[cfg(test)]

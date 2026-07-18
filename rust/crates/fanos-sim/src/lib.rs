@@ -36,7 +36,10 @@ mod trace;
 
 pub use metrics::{Metrics, Observed, Report};
 pub use network::NetworkModel;
-pub use observatory::{CascadeForecast, CoherenceReading, HealthField, forecast_cascade, read};
+pub use observatory::{
+    CascadeForecast, CoherenceReading, CriticalSlowingDown, HealthField, forecast_cascade,
+    lag1_autocorrelation, read, windowed_variance,
+};
 pub use rng::Rng;
 pub use sim::Sim;
 pub use trace::{Trace, fmt_coord};
