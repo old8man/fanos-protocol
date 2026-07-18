@@ -84,12 +84,38 @@ impl PurityDynamics {
     /// new purity. Regeneration is gated by `g_V(P)`, so once `P` crosses the viability boundary the pull
     /// toward health vanishes and only dissipation remains — the death spiral, faithfully reproduced.
     pub fn step(&mut self, attack: f64) -> f64 {
+        self.step_with_control(attack, self.kappa)
+    }
+
+    /// Like [`step`](Self::step) but driven by an **externally supplied** regeneration control `control`
+    /// (the `κ` for this step) instead of the fixed `kappa` — so a controller (the homeostat, or the CBF
+    /// safety filter [`crate::cbf`]) can drive the dynamics. Same gated master-equation update.
+    pub fn step_with_control(&mut self, attack: f64, control: f64) -> f64 {
         let a = attack.max(0.0);
         let gate = v_preservation_gate(self.p, self.n);
         let dissipation = -2.0 * (self.lambda + a) * (self.p - mixed_purity(self.n));
-        let regeneration = 2.0 * self.kappa * gate * (self.p_ideal - self.p);
+        let regeneration = 2.0 * control.max(0.0) * gate * (self.p_ideal - self.p);
         self.p = (self.p + self.dt * (dissipation + regeneration)).clamp(mixed_purity(self.n), 1.0);
         self.p
+    }
+
+    /// The current purity's viability barrier value `h = P − 2/N` (T-104): `h ≥ 0` is the safe set. The CBF
+    /// filter ([`crate::cbf`]) keeps this non-negative under any control.
+    #[must_use]
+    pub fn barrier(self) -> f64 {
+        self.p - p_crit(self.n)
+    }
+
+    /// The dynamics coefficients `(drift, control_gain)` at the current state under `attack`, i.e. the
+    /// affine decomposition `dP/dτ = drift + control_gain · κ`: `drift = −2(λ+a)(P − 1/N)` (the
+    /// uncontrolled fall) and `control_gain = 2·g_V(P)·(P_ideal − P)` (the barrier's sensitivity to
+    /// regeneration). The CBF filter reads these to compute the minimal safe control.
+    #[must_use]
+    pub fn barrier_coeffs(self, attack: f64) -> (f64, f64) {
+        let a = attack.max(0.0);
+        let drift = -2.0 * (self.lambda + a) * (self.p - mixed_purity(self.n));
+        let control_gain = 2.0 * v_preservation_gate(self.p, self.n) * (self.p_ideal - self.p);
+        (drift, control_gain)
     }
 
     /// The analytic steady-state purity under a *sustained* attack `a`, in the `g_V = 1` regime

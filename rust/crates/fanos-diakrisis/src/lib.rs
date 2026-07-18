@@ -28,6 +28,7 @@ extern crate alloc;
 mod mathfns;
 
 pub mod blindness;
+pub mod cbf;
 pub mod coherence;
 pub mod dynamics;
 pub mod eig;
