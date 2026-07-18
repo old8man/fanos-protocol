@@ -30,6 +30,7 @@ extern crate alloc;
 pub mod frame;
 pub mod history;
 pub mod observer;
+pub mod snapshot;
 #[cfg(feature = "std")]
 pub mod persist;
 pub mod sysmetrics;
@@ -37,4 +38,7 @@ pub mod sysmetrics;
 pub use frame::{AlarmLevel, CellId, CoherenceFrame, FRAME_LEN, Regime};
 pub use history::{Bucket, HistoryConfig, MetricId, MetricStore, Series};
 pub use observer::SelfObserver;
+pub use snapshot::{
+    CELL_N, CoherenceSnapshot, OVER_COUPLING, PHI_THRESHOLD, PURITY_FLOOR, R_STAR, REFLECTION_FLOOR,
+};
 pub use sysmetrics::{CpuTimes, NullProbe, SystemProbe, SystemSample};
