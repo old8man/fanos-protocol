@@ -4,7 +4,7 @@
 //! receives by peeling its own hop and forwarding the inner onion — using only the runtime's
 //! `Input`/`Effect` ports, so the same engine runs under the simulator and a real transport.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_crypto::hash::hash_xof;
@@ -70,7 +70,19 @@ pub struct NyxNode<F: Field> {
     pending: BTreeMap<u64, (Triple, Vec<u8>)>,
     /// Monotonic counter for delay ids and delay-sample domain separation.
     delay_seq: u64,
+    /// Replay cache: the [`sealed::replay_tag`]s of recently-forwarded cells. A cell whose tag is
+    /// already here is a replay and is dropped (path-confirmation defense). Bounded by
+    /// [`MAX_REPLAY_CACHE`] with FIFO eviction so a flood of distinct cells cannot grow it without
+    /// bound (a memory-DoS); [`replay_order`](Self::replay_order) tracks insertion order for eviction.
+    replay_seen: BTreeSet<[u8; sealed::REPLAY_TAG_LEN]>,
+    /// Insertion order for [`replay_seen`](Self::replay_seen)'s bounded FIFO eviction.
+    replay_order: VecDeque<[u8; sealed::REPLAY_TAG_LEN]>,
 }
+
+/// Bound on the replay cache (§L5): the count of recently-seen cell tags a relay retains. A replay
+/// within this window is dropped; beyond it, key rotation (E4) is the second line of defence. Bounding
+/// it keeps a flood of distinct cells from exhausting memory (audit A4 discipline).
+const MAX_REPLAY_CACHE: usize = 8192;
 
 impl<F: Field> NyxNode<F> {
     /// Create a node at `coord` with its KEM secret, a membership directory, an entropy seed,
@@ -106,6 +118,20 @@ impl<F: Field> NyxNode<F> {
             covering: false,
             pending: BTreeMap::new(),
             delay_seq: 0,
+            replay_seen: BTreeSet::new(),
+            replay_order: VecDeque::new(),
+        }
+    }
+
+    /// Record a forwarded cell's replay `tag`, evicting the oldest once the cache is full (bounded FIFO).
+    fn note_replay(&mut self, tag: [u8; sealed::REPLAY_TAG_LEN]) {
+        if self.replay_seen.insert(tag) {
+            self.replay_order.push_back(tag);
+            if self.replay_order.len() > MAX_REPLAY_CACHE
+                && let Some(old) = self.replay_order.pop_front()
+            {
+                self.replay_seen.remove(&old);
+            }
         }
     }
 
@@ -250,9 +276,28 @@ impl<F: Field> NyxNode<F> {
         if frame.frame_type() != Some(FrameType::Tessera) {
             return Vec::new(); // cover cells and foreign frames are dropped here
         }
+        // Replay defense (before the expensive decapsulation): a cell whose tag we have already
+        // forwarded is a replay — drop it, so an adversary cannot re-inject a captured cell to make us
+        // re-forward it and confirm we are on its path.
+        let tag = sealed::replay_tag(frame.body);
+        if let Some(tag) = tag
+            && self.replay_seen.contains(&tag)
+        {
+            return Vec::new();
+        }
         match sealed::peel(frame.body, &self.kem_secret) {
-            Ok(PeelOutcome::Forward { next, onion }) => self.forward(next, &onion),
+            Ok(PeelOutcome::Forward { next, onion }) => {
+                // Record the tag only on a *successful* peel: a cell that fails to peel (not our layer,
+                // tampered) never enters the cache, so a flood of junk cannot evict genuine tags.
+                if let Some(tag) = tag {
+                    self.note_replay(tag);
+                }
+                self.forward(next, &onion)
+            }
             Ok(PeelOutcome::Deliver { payload, .. }) => {
+                if let Some(tag) = tag {
+                    self.note_replay(tag);
+                }
                 alloc::vec![Effect::Notify(Notification::Delivered {
                     from: ANONYMOUS,
                     payload,

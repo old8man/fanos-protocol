@@ -231,6 +231,25 @@ pub fn build<F: Field>(
     pad_to_bucket(inner, &outer_session)
 }
 
+/// Length of a [`replay_tag`].
+pub const REPLAY_TAG_LEN: usize = 16;
+
+/// A compact tag binding a sealed cell to its KEM ciphertext — unique per cell (each layer is a fresh
+/// encapsulation) and reused verbatim by a replay. A relay keeps a bounded set of the tags it has
+/// forwarded and drops any cell whose tag recurs, defeating the **replay path-confirmation** attack: a
+/// captured cell re-injected at a relay peels identically and re-forwards to the same next hop, letting
+/// an adversary confirm that relay is on the path. Computed from a fixed offset *before* the expensive
+/// KEM decapsulation, so a replay is dropped cheaply. `None` if the onion is too short to carry a KEM
+/// ciphertext.
+#[must_use]
+pub fn replay_tag(onion: &[u8]) -> Option<[u8; REPLAY_TAG_LEN]> {
+    let kem_ct = onion.get(OFF_KEM..OFF_NONCE)?;
+    let digest = hash_labeled("FANOS-v1/aphantos-replay-tag", kem_ct);
+    let mut tag = [0u8; REPLAY_TAG_LEN];
+    tag.copy_from_slice(digest.get(..REPLAY_TAG_LEN)?);
+    Some(tag)
+}
+
 /// Peel the current hop of a sealed onion with a relay's KEM secret key (spec §5.7).
 pub fn peel(onion: &[u8], kem_secret: &HybridKemSecret) -> Result<PeelOutcome, SealedError> {
     if onion.first().copied() != Some(VERSION) {
