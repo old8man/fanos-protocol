@@ -77,6 +77,11 @@ struct ClientState {
     session: ServerSession,
     primary: Option<u32>,
     answered: bool,
+    /// The request bytes drained so far. Accumulated **incrementally** (not read only at FIN), so the
+    /// receiver buffer keeps freeing and its `rwnd` recovers — otherwise a request larger than one recv
+    /// window never `receiver_finished`s (buffer full ⇒ rwnd 0 ⇒ sender stalls) and the exchange
+    /// deadlocks (audit #66 service-duplex; same fix the sans-I/O test service loop already carries).
+    request: Vec<u8>,
 }
 
 /// Run a **multi-client** DIAULOS request/response service on `client`'s node: one [`ServerSession`]
@@ -99,11 +104,16 @@ where
                     st.primary = st.session.primary();
                 }
                 if let Some(sid) = st.primary {
-                    if !st.answered && st.session.receiver_finished(sid) {
-                        let response = handler(&st.session.read(sid));
-                        st.session.write(sid, &response);
-                        st.session.finish(sid);
-                        st.answered = true;
+                    if !st.answered {
+                        // Drain the delivered prefix EVERY tick (freeing the receiver window), and answer
+                        // once the whole request has arrived — never blocking the first read on FIN.
+                        st.request.extend_from_slice(&st.session.read(sid));
+                        if st.session.receiver_finished(sid) {
+                            let response = handler(&st.request);
+                            st.session.write(sid, &response);
+                            st.session.finish(sid);
+                            st.answered = true;
+                        }
                     }
                     if st.answered && st.session.is_stream_done(sid) {
                         retire.push(peer);
