@@ -29,6 +29,7 @@ mod mathfns;
 
 pub mod blindness;
 pub mod coherence;
+pub mod dynamics;
 pub mod eig;
 pub mod healing;
 pub mod homeostat;
