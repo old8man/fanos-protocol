@@ -74,12 +74,26 @@ impl HybridCiphertext {
     }
 }
 
-/// Combine the two shared secrets with SHAKE256 into a 32-byte session key.
-fn combine(x25519_ss: &[u8], mlkem_ss: &[u8]) -> SessionKey {
+/// Combine the two shared secrets into a 32-byte session key, **binding the full transcript** (X-Wing /
+/// CFRG hybrid guidance, MAL-BIND-K,PK/CT): SHAKE256 over the two shared secrets *and* the ciphertext
+/// (X25519 ephemeral ‖ ML-KEM ct) and the recipient's X25519 static key. Without the transcript the
+/// combiner met only MAL-BIND-K, so a re-encapsulation could bind one key to two contexts (audit B5). The
+/// ML-KEM encapsulation key is bound transitively — `mlkem_ss` is `decap(dk, ct)` and `ct = encap(ek)`, so
+/// folding `mlkem_ss ‖ mlkem_ct` pins `ek`. Both encapsulate and decapsulate feed the identical bytes.
+fn combine(
+    x25519_ss: &[u8],
+    mlkem_ss: &[u8],
+    x25519_ephemeral: &[u8],
+    mlkem_ct: &[u8],
+    x25519_recipient_pk: &[u8],
+) -> SessionKey {
     let mut hasher = Shake256::default();
     hasher.update(KEM_COMBINER_LABEL);
     hasher.update(x25519_ss);
     hasher.update(mlkem_ss);
+    hasher.update(x25519_ephemeral);
+    hasher.update(mlkem_ct);
+    hasher.update(x25519_recipient_pk);
     let mut out = [0u8; 32];
     hasher.finalize_xof().read(&mut out);
     out
@@ -110,7 +124,15 @@ impl HybridKemSecret {
         let ephemeral = PublicKey::from(ciphertext.x25519_ephemeral);
         let x_ss = self.x25519.diffie_hellman(&ephemeral);
         let mlkem_ss = self.mlkem.decapsulate(&ciphertext.mlkem);
-        combine(x_ss.as_bytes(), mlkem_ss.as_slice())
+        // The recipient's own X25519 static public key (this node) — the same pk the sender encapsulated to.
+        let recipient_pk = PublicKey::from(&self.x25519);
+        combine(
+            x_ss.as_bytes(),
+            mlkem_ss.as_slice(),
+            &ciphertext.x25519_ephemeral,
+            ciphertext.mlkem.as_slice(),
+            recipient_pk.as_bytes(),
+        )
     }
 }
 
@@ -147,10 +169,18 @@ impl HybridKemPublic {
         let ephemeral_pk = PublicKey::from(&ephemeral);
         let x_ss = ephemeral.diffie_hellman(&self.x25519);
         let (mlkem_ct, mlkem_ss) = self.mlkem.encapsulate_with_rng(rng);
-        let session = combine(x_ss.as_bytes(), mlkem_ss.as_slice());
+        let ephemeral_bytes = ephemeral_pk.to_bytes();
+        // `self.x25519` is the recipient's static public key we are encapsulating to.
+        let session = combine(
+            x_ss.as_bytes(),
+            mlkem_ss.as_slice(),
+            &ephemeral_bytes,
+            mlkem_ct.as_slice(),
+            self.x25519.as_bytes(),
+        );
         (
             HybridCiphertext {
-                x25519_ephemeral: ephemeral_pk.to_bytes(),
+                x25519_ephemeral: ephemeral_bytes,
                 mlkem: mlkem_ct,
             },
             session,

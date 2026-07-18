@@ -104,7 +104,7 @@ fn handshake_derivation_is_pinned() {
     );
     assert_eq!(
         digest_hex(&keymat),
-        "3d6e24ffa7ac40b29a86c8ded9afda33b5e9f02a6c6d46f9d92d11fa8ba90451",
-        "derived key_c2s ‖ key_s2c (the whole hybrid-KEM + KDF pipeline)"
+        "a5966ca00aea8449529efdb18da525df1a220c270d7d396f12a64d266f0682e8",
+        "derived key_c2s ‖ key_s2c (the whole hybrid-KEM + KDF pipeline; transcript-bound combiner, B5)"
     );
 }
