@@ -67,6 +67,7 @@ structure, which is why the answers compose instead of conflicting:
 | C5 | **Intersection / disclosure over epochs** | Epoch rotation; descriptor-nonce salting to unlink appearances | ⬜ | #58 (E3) + #61 |
 | C6 | **Guard discovery / entry enumeration** | Membership is geometric, not a public list; entry set per-client | ✅ | `calypso/tests/entry_unlinkability.rs` (uniform, unguessable, epoch-unlinkable, avalanche) |
 | C7 | **Telemetry deanonymization** (self-observation leaks) | Cell-granular floor; differential-privacy on exported coherence | ⬜ | #65 (C7) |
+| C8 | **Active tagging / tamper-and-trace** (flip bits to mark a flow) | Per-hop ChaCha20-Poly1305 AEAD: any tamper fails the tag at the first relay and is dropped; padding is regenerated per hop | ✅ | `aphantos/tests/onion_tamper.rs` (0 surviving tags over every core byte-flip) |
 
 ## D. Byzantine faults & integrity
 
