@@ -71,6 +71,28 @@ pub fn balance_step_closed_form(loads: &[f64; N]) -> [f64; N] {
     core::array::from_fn(|i| (2.0 * loads[i] + s) / 9.0)
 }
 
+/// The **finite-time exact** balance: the global mean load at every node in a *single* round.
+///
+/// Because `A·Aᵀ = q·I + J`, the line-averaging operator `M` has exactly two eigenvalues — `1` on the
+/// uniform mode and `λ₂ = q/(q+1)²` on every other mode. A matrix with only two eigenvalues has an exact
+/// spectral projector onto the `λ = 1` eigenspace, `P₁ = (M − λ₂·I)/(1 − λ₂) = 11ᵀ/N`, so
+///
+/// ```text
+///     (balance_step(load) − λ₂·load) / (1 − λ₂)  =  (S/N)·1     exactly,   S = Σ load.
+/// ```
+///
+/// One round of the *local* line-averaging operator ([`balance_step`]) plus a *local* affine combine
+/// therefore reaches the exact global mean — no iteration, and no explicit global sum. This replaces the
+/// geometric [`balance_to_uniform`] loop (a handful of rounds) with one, and it is exact to floating point,
+/// not merely `ε`-close. (Derived from the projective incidence spectrum — see `docs/frontier-synthesis.md`
+/// candidate 1; the two-eigenvalue structure is what makes finite-time consensus possible here.)
+#[must_use]
+pub fn balance_exact(loads: &[f64; N]) -> [f64; N] {
+    let stepped = balance_step(loads);
+    let denom = 1.0 - DEVIATION_CONTRACTION;
+    core::array::from_fn(|i| (stepped[i] - DEVIATION_CONTRACTION * loads[i]) / denom)
+}
+
 /// Run [`balance_step`] until the peak-to-peak load spread is within `epsilon` of uniform, or `max_rounds`
 /// is reached. Returns `(final_loads, rounds_used)`. Since the spread contracts by `λ₂ = 2/9` per round,
 /// this terminates in `⌈log(ε/spread₀)/log(2/9)⌉` rounds — a few for any realistic imbalance.
@@ -150,6 +172,33 @@ mod tests {
                 "deviation contracts by exactly 2/9: {d0} → {d1}, expected {}",
                 DEVIATION_CONTRACTION * d0
             );
+        }
+    }
+
+    #[test]
+    fn balance_exact_reaches_the_global_mean_in_one_round() {
+        // The finite-time consensus: one round + a local combine yields the exact mean at every node,
+        // matching the fixed point of the iterative balancer to floating point.
+        for pattern in [
+            [70.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0],
+        ] {
+            let mean = pattern.iter().sum::<f64>() / N as f64;
+            let exact = balance_exact(&pattern);
+            for (i, &x) in exact.iter().enumerate() {
+                assert!((x - mean).abs() < 1e-12, "node {i}: {x} vs mean {mean}");
+            }
+            // It agrees with the converged iterative balancer (the same uniform fixed point).
+            let (iter, _) = balance_to_uniform(&pattern, 1e-12, 100);
+            for i in 0..N {
+                assert!((exact[i] - iter[i]).abs() < 1e-9, "exact == iterated at node {i}");
+            }
+        }
+        // Uniform is a fixed point of the exact map too.
+        let uniform = balance_exact(&[4.0; N]);
+        for &x in &uniform {
+            assert!((x - 4.0).abs() < 1e-12);
         }
     }
 
