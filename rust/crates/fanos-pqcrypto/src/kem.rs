@@ -134,6 +134,21 @@ impl HybridKemSecret {
             recipient_pk.as_bytes(),
         )
     }
+
+    /// Derive a 32-byte, domain-separated secret subkey from this KEM secret — a one-way SHAKE256 KDF
+    /// output that reveals nothing about the underlying key material. Use it to seed secret-keyed PRFs
+    /// (e.g. a relay's mixing-delay schedule) that must not be recomputable from public data: keying such
+    /// a PRF on a node's public coordinate lets a global passive adversary replay the schedule and relink
+    /// a hop's in/out flows (audit E2).
+    #[must_use]
+    pub fn derive_subkey(&self, domain: &str) -> [u8; 32] {
+        let mut hasher = Shake256::default();
+        hasher.update(domain.as_bytes());
+        hasher.update(&self.x25519.to_bytes());
+        let mut out = [0u8; 32];
+        hasher.finalize_xof().read(&mut out);
+        out
+    }
 }
 
 impl HybridKemPublic {

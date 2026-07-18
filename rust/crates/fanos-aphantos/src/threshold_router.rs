@@ -80,12 +80,18 @@ pub struct ThresholdRouter<F: Field> {
     /// Forwards held for their sampled mix delay, keyed by mix id (timer token = `MIX_FLAG | id`).
     mix_pending: BTreeMap<u64, (Triple, Vec<u8>)>,
     mix_seq: u64,
+    /// A **secret** PRF key for the mixing-delay schedule, derived from the node's KEM secret. Keying the
+    /// schedule on a secret (not the public coordinate) means a global passive adversary cannot recompute
+    /// the delay sequence a priori and relink a hop's in/out flows (audit E2).
+    mix_seed: [u8; 32],
 }
 
 impl<F: Field> ThresholdRouter<F> {
     /// A router at `coord` with its hybrid KEM secret, peeling hops that need a threshold of `t`.
     #[must_use]
     pub fn new(coord: Point<F>, kem_secret: HybridKemSecret, threshold: usize) -> Self {
+        // Derive the secret mixing-delay PRF key from the KEM secret up front (see `mix_seed`).
+        let mix_seed = kem_secret.derive_subkey("FANOS-v1/threshold-mix-seed");
         Self {
             coord,
             kem_secret,
@@ -96,6 +102,7 @@ impl<F: Field> ThresholdRouter<F> {
             mean_delay: Duration(0),
             mix_pending: BTreeMap::new(),
             mix_seq: 0,
+            mix_seed,
         }
     }
 
@@ -130,14 +137,11 @@ impl<F: Field> ThresholdRouter<F> {
         }]
     }
 
-    /// Sample an exponential mixing delay with the configured mean (`−mean·ln u`), seeded per node.
+    /// Sample an exponential mixing delay with the configured mean (`−mean·ln u`), seeded from the node's
+    /// **secret** `mix_seed` (not its public coordinate), so the delay sequence cannot be recomputed from
+    /// public data — the timing correlation Poisson mixing exists to destroy (audit E2).
     fn sample_delay(&self, id: u64) -> Duration {
-        let mut data = self
-            .coord
-            .coords()
-            .iter()
-            .flat_map(|w| w.to_be_bytes())
-            .collect::<Vec<u8>>();
+        let mut data = self.mix_seed.to_vec();
         data.extend_from_slice(&id.to_be_bytes());
         let digest = fanos_crypto::hash_labeled("FANOS-v1/threshold-mix", &data);
         let bits = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
@@ -485,6 +489,30 @@ mod tests {
             matches!(e, Effect::Notify(Notification::Delivered { from, payload: p })
                 if *from == ANONYMOUS && p == payload)
         })
+    }
+
+    #[test]
+    fn the_mixing_delay_is_secret_keyed_not_a_public_function_of_the_coordinate() {
+        // E2. Two routers at the SAME public coordinate but with DIFFERENT KEM secrets must produce
+        // DIFFERENT delay schedules — otherwise a global passive adversary who knows a node's (public)
+        // coordinate could recompute its whole `D(coord, 1), D(coord, 2), …` sequence a priori and relink
+        // a hop's in/out flows by timing. Before the fix the schedule was a pure function of the
+        // coordinate, so these would be byte-identical.
+        let (s0, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"mix-secret-a"));
+        let (s1, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"mix-secret-b"));
+        let mean = Duration::from_millis(50);
+        let a = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s0, 2).with_mixing(mean);
+        let b = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s1, 2).with_mixing(mean);
+
+        let seq_a: Vec<u64> = (1..=8).map(|i| a.sample_delay(i).as_nanos()).collect();
+        let seq_b: Vec<u64> = (1..=8).map(|i| b.sample_delay(i).as_nanos()).collect();
+        assert_ne!(
+            seq_a, seq_b,
+            "the delay schedule must depend on the node's secret, not just its public coordinate"
+        );
+        // Deterministic for a given secret — the sans-I/O replay property is preserved.
+        let seq_a2: Vec<u64> = (1..=8).map(|i| a.sample_delay(i).as_nanos()).collect();
+        assert_eq!(seq_a, seq_a2, "the schedule is deterministic for a given secret");
     }
 
     #[test]
