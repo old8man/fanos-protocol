@@ -26,7 +26,12 @@ fanos-wire-derive.workspace = true
 
 [features]
 default = ["std"]
+# The sans-I/O overlay engine is heapful (BTreeMap/Vec) but needs no `std`: `alloc` is the substrate,
+# `std` builds on it. A no_std embedded node selects `alloc` + `libm` — the engine (and its signed-
+# membership verification via the no_std fanos-pqcrypto) then runs on-target. (`cargo build -p
+# fanos-runtime --no-default-features --features alloc,libm` is the embedded build.)
 std = [
+    "alloc",
     "fanos-geometry/std",
     "fanos-code/std",
     "fanos-diakrisis/std",
@@ -34,6 +39,15 @@ std = [
     "fanos-primitives/std",
     "fanos-core/std",
     "fanos-wire/std",
+]
+alloc = [
+    "fanos-geometry/alloc",
+    "fanos-code/alloc",
+    "fanos-diakrisis/alloc",
+    "fanos-telemetry/alloc",
+    "fanos-primitives/alloc",
+    "fanos-core/alloc",
+    "fanos-wire/alloc",
 ]
 # For no_std targets: supply DIAKRISIS's float backend.
 libm = ["fanos-diakrisis/libm", "fanos-telemetry/libm"]

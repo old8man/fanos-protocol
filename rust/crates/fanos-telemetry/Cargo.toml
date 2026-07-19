@@ -31,8 +31,11 @@ proptest.workspace = true
 
 [features]
 default = ["std"]
-# std uses hardware float intrinsics; a no_std monitor supplies them via libm.
-std = ["fanos-diakrisis/std", "fanos-code/std", "fanos-wire/std"]
+# `alloc` is the no_std substrate (the CoherenceFrame codec + history use Vec); `std` builds on it and
+# adds the file-I/O persistence + the platform system-metric probes (both `#[cfg(feature="std")]`-gated).
+# A no_std embedded monitor selects `alloc` + `libm` (the float backend).
+std = ["alloc", "fanos-diakrisis/std", "fanos-code/std", "fanos-wire/std"]
+alloc = ["fanos-diakrisis/alloc", "fanos-code/alloc", "fanos-wire/alloc"]
 libm = ["fanos-diakrisis/libm"]
 # The cross-platform system-metric backend (implies std).
 sysinfo = ["std", "dep:sysinfo"]
