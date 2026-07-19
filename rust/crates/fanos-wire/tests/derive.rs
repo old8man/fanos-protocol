@@ -61,14 +61,21 @@ fn a_derived_struct_rejects_trailing_bytes() {
     bytes.push(0x00);
     assert_eq!(Header::from_wire(&bytes), Err(WireError::TrailingBytes));
     // Truncation is rejected too.
-    assert_eq!(Header::from_wire(&bytes[..5]), Err(WireError::UnexpectedEnd));
+    assert_eq!(
+        Header::from_wire(&bytes[..5]),
+        Err(WireError::UnexpectedEnd)
+    );
 }
 
 #[test]
 fn a_tuple_struct_and_nested_derived_type_round_trip() {
     let c = CellId([7u8; 16]);
     assert_eq!(CellId::from_wire(&c.to_wire()).unwrap(), c);
-    assert_eq!(c.to_wire().len(), 16, "newtype is exactly its inner encoding");
+    assert_eq!(
+        c.to_wire().len(),
+        16,
+        "newtype is exactly its inner encoding"
+    );
     let n = Nested {
         cell: CellId([0xAB; 16]),
         epoch: 99,
@@ -85,7 +92,10 @@ fn a_length_prefixed_body_field_round_trips() {
     };
     assert_eq!(WithBody::from_wire(&w.to_wire()).unwrap(), w);
     // The body length prefix means a struct with a different body decodes distinctly.
-    let empty = WithBody { id: 42, body: vec![] };
+    let empty = WithBody {
+        id: 42,
+        body: vec![],
+    };
     assert_ne!(w.to_wire(), empty.to_wire());
     assert_eq!(WithBody::from_wire(&empty.to_wire()).unwrap(), empty);
 }

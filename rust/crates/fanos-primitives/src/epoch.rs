@@ -12,6 +12,9 @@
 //! escape for the one KAT-pinned exception, the 32-bit VRF `coord_input` encoding, so the byte-for-byte
 //! test vectors stay stable while the *type* unifies.
 
+#[cfg(feature = "wire")]
+use alloc::vec::Vec;
+
 /// A protocol epoch: the beacon-round index a coordinate, descriptor, or rendezvous line is bound to.
 ///
 /// Ordering is by round (`e0 < e1` ⇔ `e0` is the older window), so "is this descriptor newer than the
@@ -121,6 +124,20 @@ impl core::fmt::Display for Epoch {
     }
 }
 
+/// Canonical [`Wire`](fanos_wire::Wire) codec: the full **8-byte big-endian** form (spec §7.1, matching
+/// `u64`), so an `Epoch` field composes into any `#[derive(Wire)]` struct. The 4-byte
+/// [`low32_be_bytes`](Self::low32_be_bytes) form is a separate KAT-pinned exception, *not* the
+/// composable default — a struct that wants the narrow form encodes that field explicitly.
+#[cfg(feature = "wire")]
+impl fanos_wire::Wire for Epoch {
+    fn wire_encode(&self, out: &mut Vec<u8>) {
+        fanos_wire::Wire::wire_encode(&self.0, out);
+    }
+    fn wire_decode(cur: &mut &[u8]) -> Result<Self, fanos_wire::WireError> {
+        Ok(Self(<u64 as fanos_wire::Wire>::wire_decode(cur)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +186,16 @@ mod tests {
     fn converts_to_and_from_u64_explicitly() {
         assert_eq!(u64::from(Epoch::from(7u64)), 7);
         assert_eq!(Epoch::from(9u64).get(), 9);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn wire_codec_is_eight_byte_big_endian() {
+        use fanos_wire::Wire;
+        let e = Epoch::new(0x0102_0304_0506_0708);
+        // Canonical composable form is the full 8-byte big-endian u64 — NOT the 4-byte low32 exception.
+        assert_eq!(e.to_wire(), e.get().to_be_bytes().to_vec());
+        assert_eq!(e.to_wire().len(), 8);
+        assert_eq!(Epoch::from_wire(&e.to_wire()), Ok(e));
     }
 }

@@ -13,6 +13,9 @@ categories = ["cryptography", "no-std"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
+# The canonical wire codec (behind the `wire` feature), so protocol types like `Epoch` carry one
+# `#[derive(Wire)]`-compatible encoding. Optional: a pure-hashing consumer keeps the lean dep set.
+fanos-wire = { workspace = true, optional = true }
 blake3 = { workspace = true }
 # Wipe Shamir share bytes (secret) on drop. `alloc` for the `Vec<u8>` share value; stays `no_std`.
 zeroize = { workspace = true, features = ["alloc"] }
@@ -26,6 +29,8 @@ std = ["alloc", "blake3/std", "fanos-geometry/std"]
 alloc = ["fanos-geometry/alloc"]
 # The shared AEAD primitive (pulls chacha20poly1305). Consumers that seal/open opt in.
 aead = ["dep:chacha20poly1305", "alloc"]
+# `Wire` codec impls for protocol types (`Epoch`). Consumers that serialize opt in; pulls fanos-wire.
+wire = ["dep:fanos-wire", "alloc"]
 
 [dev-dependencies]
 proptest.workspace = true

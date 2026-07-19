@@ -103,6 +103,32 @@ pub fn decode_bytes(buf: &[u8]) -> Result<(&[u8], usize), WireError> {
     Ok((body, end))
 }
 
+/// A typed projective **point** serializes at the field-optimal width (three `GF(q)` elements, spec
+/// §7.1) — narrower than the 12-byte field-erased [`[u32; 3]`](crate::Wire) coordinate — so a struct
+/// carrying a `Point<F>` can `#[derive(Wire)]`. Decoding rejects non-canonical triples.
+impl<F: Field> crate::Wire for Point<F> {
+    fn wire_encode(&self, out: &mut Vec<u8>) {
+        encode_point::<F>(self, out);
+    }
+    fn wire_decode(cur: &mut &[u8]) -> Result<Self, WireError> {
+        let (point, n) = decode_point::<F>(cur)?;
+        *cur = cur.get(n..).ok_or(WireError::UnexpectedEnd)?;
+        Ok(point)
+    }
+}
+
+/// A typed projective **line** — the dual of [`Point`], same field-optimal encoding.
+impl<F: Field> crate::Wire for Line<F> {
+    fn wire_encode(&self, out: &mut Vec<u8>) {
+        encode_line::<F>(self, out);
+    }
+    fn wire_decode(cur: &mut &[u8]) -> Result<Self, WireError> {
+        let (line, n) = decode_line::<F>(cur)?;
+        *cur = cur.get(n..).ok_or(WireError::UnexpectedEnd)?;
+        Ok(line)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
