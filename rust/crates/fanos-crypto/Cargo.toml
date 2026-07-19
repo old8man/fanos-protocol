@@ -16,6 +16,8 @@ fanos-geometry.workspace = true
 blake3 = { workspace = true }
 # Wipe Shamir share bytes (secret) on drop. `alloc` for the `Vec<u8>` share value; stays `no_std`.
 zeroize = { workspace = true, features = ["alloc"] }
+# Hybrid node-identity signatures (spec §7.1): classical Ed25519 + post-quantum ML-DSA-65 (FIPS 204).
+ed25519-dalek = { workspace = true }
 
 [features]
 default = ["std"]

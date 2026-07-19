@@ -694,6 +694,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -706,6 +707,7 @@ dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519",
  "rand_core 0.10.1",
+ "serde",
  "sha2 0.11.0",
  "signature",
  "subtle",
@@ -813,6 +815,7 @@ name = "fanos-crypto"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ed25519-dalek",
  "fanos-field",
  "fanos-geometry",
  "proptest",

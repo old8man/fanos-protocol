@@ -104,6 +104,13 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 # Secret-material zeroization (wipe key bytes on drop). `no_std`; crates opt into `alloc` as needed.
 zeroize = { version = "1", default-features = false }
 
+# Hybrid node-identity signatures (spec §7.1, §L0): classical Ed25519 + post-quantum ML-DSA-65
+# (FIPS 204). Both are `no_std` and driven deterministically from a seed, so identity keygen and
+# signing are reproducible in the deterministic simulator. A hybrid signature verifies iff BOTH
+# components verify, so forging one demands breaking a classical AND a lattice assumption.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+fips204 = { version = "0.4", default-features = false }
+
 # Terminal UI for the operator observatory (`fanos-monitor`): a native, embedded-friendly TUI — no
 # browser, minimal resources. `crossterm` is the terminal backend.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
