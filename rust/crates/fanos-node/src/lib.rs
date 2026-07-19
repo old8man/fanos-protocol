@@ -36,7 +36,10 @@ pub use epoch_driver::EpochDriver;
 pub use error::NodeError;
 pub use fanos_onoma::Epoch;
 pub use mix_relay::MixRelay;
-pub use mixdir::{build_mix_directory, publish_mix_key, resolve_mix_key};
+pub use mixdir::{
+    build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,
+    resolve_mix_key, spawn_mix_publisher,
+};
 pub use node::{Health, Node};
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
 pub use rendezvous_relay::{RendezvousRelay, register_frame};
