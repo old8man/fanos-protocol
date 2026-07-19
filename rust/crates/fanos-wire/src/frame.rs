@@ -55,6 +55,9 @@ pub enum FrameType {
     RdvIntro = 0x50,
     RdvReply = 0x51,
     SvcAnnounce = 0x52,
+    /// A client registers its coordinate with a [rendezvous relay] so the relay forwards anonymous
+    /// replies delivered at its combiner to the client (audit #54; the sender is the client).
+    RdvRegister = 0x53,
     // 0x6* DIAKRISIS
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
@@ -107,6 +110,7 @@ impl FrameType {
             0x50 => Self::RdvIntro,
             0x51 => Self::RdvReply,
             0x52 => Self::SvcAnnounce,
+            0x53 => Self::RdvRegister,
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,

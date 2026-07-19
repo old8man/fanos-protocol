@@ -25,6 +25,7 @@ pub mod mix_relay;
 pub mod mixdir;
 pub mod node;
 pub mod rendezvous;
+pub mod rendezvous_relay;
 pub mod resolve;
 
 pub use config::{NodeConfig, Peer, RoleSet};
@@ -38,4 +39,5 @@ pub use mix_relay::MixRelay;
 pub use mixdir::{build_mix_directory, publish_mix_key, resolve_mix_key};
 pub use node::{Health, Node};
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
+pub use rendezvous_relay::{RendezvousRelay, register_frame};
 pub use resolve::{NodeResolver, ResolvedService, publish_service, verify_descriptor};
