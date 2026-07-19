@@ -9,11 +9,15 @@
 //! * `PADDING` — a pure cover cell, byte-indistinguishable from `DATA` once sealed.
 
 use fanos_runtime::stream::{Ack, MAX_SEGMENT, Segment};
+use fanos_wire::SessionFrameType;
 
-const FT_PADDING: u8 = 0x00;
-const FT_DATA: u8 = 0x01;
-const FT_ACK: u8 = 0x02;
-const FT_RESET: u8 = 0x03;
+// The inner-session `ftype` bytes come from the one canonical registry (`fanos_wire::SessionFrameType`),
+// so DIAULOS is not a second numbering authority (audit A1). The codes are unchanged, so the pinned
+// `frame_encodings_are_pinned` KAT holds.
+const FT_PADDING: u8 = SessionFrameType::Padding as u8;
+const FT_DATA: u8 = SessionFrameType::Data as u8;
+const FT_ACK: u8 = SessionFrameType::Ack as u8;
+const FT_RESET: u8 = SessionFrameType::Reset as u8;
 
 /// A DIAULOS frame carried inside one cell.
 #[derive(Clone, PartialEq, Eq, Debug)]

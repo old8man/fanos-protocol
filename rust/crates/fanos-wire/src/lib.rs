@@ -27,7 +27,7 @@ pub mod varint;
 pub mod wire;
 
 pub use error::{ProtocolError, WireError};
-pub use frame::{Frame, FrameType, decode_frame, encode_frame};
+pub use frame::{Frame, FrameType, SessionFrameType, decode_frame, encode_frame};
 pub use wire::Wire;
 
 /// Re-exports the `#[derive(Wire)]` macro expansion refers to, so generated code resolves the same

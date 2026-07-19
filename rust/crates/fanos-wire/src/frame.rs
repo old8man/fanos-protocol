@@ -56,6 +56,9 @@ pub enum FrameType {
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
     DiagVerdict = 0x62,
+    // 0x7* Application overlays (Kernel/Protocol split, design-platform.md §Kernel): a system Protocol
+    // runs on port 0 and application overlays multiplex under one length-skippable outer type.
+    App = 0x70,
 }
 
 impl FrameType {
@@ -103,6 +106,7 @@ impl FrameType {
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
+            0x70 => Self::App,
             _ => return None,
         })
     }
@@ -111,6 +115,45 @@ impl FrameType {
     #[must_use]
     pub fn code(self) -> u64 {
         self as u64
+    }
+}
+
+/// The **inner-session** frame registry — the frame types carried *inside* one AEAD-encrypted DIAULOS
+/// cell (spec §L2), a deliberately distinct layer from the outer overlay-transport [`FrameType`]. Like
+/// QUIC frames inside a packet, these reuse the small `0x0*` range with no collision because they live
+/// **behind the cell's encryption**, never on the cleartext wire. Keeping both registries in this one
+/// crate makes `fanos-wire` the single frame-code numbering authority (audit A1): `fanos_diaulos::frame`
+/// derives its `ftype` bytes from this enum rather than from private constants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum SessionFrameType {
+    /// A pure cover cell — no payload (byte-indistinguishable from [`Data`](Self::Data) once sealed).
+    Padding = 0x00,
+    /// A reliability segment (stream data).
+    Data = 0x01,
+    /// A selective acknowledgement with receive credit.
+    Ack = 0x02,
+    /// Abort a stream in both directions, reclaiming its slot immediately.
+    Reset = 0x03,
+}
+
+impl SessionFrameType {
+    /// The numeric `ftype` byte this frame is tagged with inside the cell.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The registry entry for an inner-session `ftype` byte, or `None` if unknown to this build.
+    #[must_use]
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0x00 => Self::Padding,
+            0x01 => Self::Data,
+            0x02 => Self::Ack,
+            0x03 => Self::Reset,
+            _ => return None,
+        })
     }
 }
 

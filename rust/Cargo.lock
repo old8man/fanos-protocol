@@ -827,6 +827,7 @@ dependencies = [
  "fanos-pqcrypto",
  "fanos-primitives",
  "fanos-runtime",
+ "fanos-wire",
  "proptest",
  "rand_core 0.10.1",
  "zeroize",

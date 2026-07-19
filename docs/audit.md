@@ -118,7 +118,7 @@ Consequences:
   - *Foreign-crypto fixed wrappers* (Tier 5): pqcrypto kem/sig, vrf `VssShare`/`VssCommitment` (Ristretto **group-validation** on decode), the node-ID key bundle.
   - `geometry::HierAddr` already is a single validated codec (its `u8` depth equals a varint for all `depth < 64 = MAX_DEPTH`, so migrating buys no canonicity and would only risk the `Point::new` validation).
 
-Net: the drift-prone hand-rolled **struct (de)serializers** are gone; what remains hand-written is transcripts, layered crypto, and group-validated foreign types — where a single explicit codec is the correct engineering, not a bypass. The `FrameType` registry unification (consequence 1) and the stale cleartext-`Tessera` regeneration (consequence 3) remain open follow-ups.
+Net: the drift-prone hand-rolled **struct (de)serializers** are gone; what remains hand-written is transcripts, layered crypto, and group-validated foreign types — where a single explicit codec is the correct engineering, not a bypass. Consequence 3 is **already resolved** — `fanos-wire/src/tessera.rs` now pins the real onion (`TOTAL_LEN = 8192`, the path authenticator encrypted *inside* `body_ct`, the cleartext `holonomy_tag` removed). The only genuine remainder is consequence 1, the `FrameType` registry vs the DIAULOS inner-session `ftype` namespace — and those are arguably **two correct layers** (outer overlay transport vs the inner encrypted-cell session), not one authority split; unifying them is a naming/registry cleanup, not a canonicity fix.
 
 ### A2 — General-`q` capability is stranded below a `q=2` ceiling *(MEDIUM, architectural)*
 
