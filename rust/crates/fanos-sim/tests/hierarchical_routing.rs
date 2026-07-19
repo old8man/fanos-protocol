@@ -16,7 +16,7 @@
 
 use fanos_field::F2;
 use fanos_geometry::{HierAddr, Point};
-use fanos_runtime::{Config, Duration, Notification, OverlayNode};
+use fanos_runtime::{Command, Config, Duration, Notification, OverlayNode};
 use fanos_sim::Sim;
 use fanos_wire::{FrameType, encode_frame};
 
@@ -132,5 +132,51 @@ fn a_routing_hole_fails_closed_without_misdelivery_or_loop() {
         sim.report().metrics.frames_sent,
         1,
         "the entry forwards one hop to the gateway, which then drops — no echo, no loop",
+    );
+}
+
+#[test]
+fn join_announcements_auto_seed_the_hierarchical_routing_table() {
+    // The self-organizing property: NO hand-seeded peer tables. Nodes JOIN, each flooding its overlay
+    // address, and a hierarchical send to a DESCENDED sub-cell node is delivered — the routing table
+    // populated itself from the announcements alone (§L1).
+    //
+    // The proof is made discriminating by seating the descended node's TRANSPORT coordinate (point 6)
+    // away from its overlay leaf point (5): the geometric bootstrap fallback would forward toward
+    // point 5 — where no node lives — and drop. Only a table *learned* from the JOIN announcement maps
+    // `[2,5] → point 6`, so a successful delivery is proof the announcement seeded the table.
+    let mut sim = Sim::new(0x00A2_5EED);
+
+    let a_addr = HierAddr::root(Point::<F2>::at(1));
+    let g_addr = HierAddr::root(Point::<F2>::at(2));
+    let d_addr = HierAddr::from_path(vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
+
+    // Built with overlay addresses but ZERO `with_hier_peer` calls — the tables start empty.
+    let entry = OverlayNode::<F2>::new(Point::<F2>::at(1), Config::default())
+        .with_hier_address(a_addr.clone());
+    let gateway = OverlayNode::<F2>::new(Point::<F2>::at(2), Config::default())
+        .with_hier_address(g_addr.clone());
+    let dest = OverlayNode::<F2>::new(Point::<F2>::at(6), Config::default()) // transport 6, overlay [2,5]
+        .with_hier_address(d_addr.clone());
+
+    let a_id = sim.add(Box::new(entry));
+    let _g_id = sim.add(Box::new(gateway));
+    let d_id = sim.add(Box::new(dest));
+    assert_ne!(d_id, Point::<F2>::at(5).coords(), "the descended node is NOT at its overlay leaf point");
+
+    // Everyone joins: announcements flood, carrying each node's overlay address, and every receiver
+    // seeds `(hier → transport coord)`.
+    sim.inject_all(&Command::Join { info: b"keys".to_vec() });
+    sim.run_for(Duration::from_millis(2_000));
+
+    // Now originate a hierarchical send to the descended node. No peer table was ever hand-configured.
+    let frame = route_hier_frame(&d_addr, PAYLOAD);
+    sim.inject_frame(Point::<F2>::at(3).coords(), a_id, frame);
+    sim.run_for(Duration::from_millis(2_000));
+
+    let delivered = deliveries(&sim);
+    assert!(
+        delivered.iter().any(|(node, payload)| *node == d_id && payload == PAYLOAD),
+        "the descended node [2,5] is reachable purely from its JOIN announcement (auto-seeded table)",
     );
 }
