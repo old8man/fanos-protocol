@@ -41,6 +41,9 @@ pub enum FrameType {
     StreamOpen = 0x31,
     StreamData = 0x32,
     StreamFin = 0x33,
+    /// Hierarchical route: `HierAddr(dst) ‖ payload` — forwarded cell-to-cell toward a multi-level
+    /// destination (§L1 recursion). Degenerates to `Route` for a depth-1 (single-plane) address.
+    RouteHier = 0x34,
     // 0x4* APHANTOS / NYX
     Tessera = 0x40,
     PartialDec = 0x41,
@@ -90,6 +93,7 @@ impl FrameType {
             0x31 => Self::StreamOpen,
             0x32 => Self::StreamData,
             0x33 => Self::StreamFin,
+            0x34 => Self::RouteHier,
             0x40 => Self::Tessera,
             0x41 => Self::PartialDec,
             0x42 => Self::Cover,

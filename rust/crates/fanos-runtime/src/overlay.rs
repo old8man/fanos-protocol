@@ -16,7 +16,7 @@ use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
-use fanos_geometry::{Plane, Point, Triple, fano};
+use fanos_geometry::{HierAddr, Plane, Point, Triple, fano};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -128,6 +128,10 @@ struct Peer {
 /// The base overlay node engine, generic over the cell's field `F`.
 pub struct OverlayNode<F: Field> {
     coord: Point<F>,
+    /// This node's hierarchical address (§L1). Defaults to the depth-1 `root(coord)` — the ordinary
+    /// single-plane case — and is deepened only when the node descends into a sub-cell on a collision
+    /// (§L0). It governs hierarchical (`RouteHier`) forwarding; single-plane routing is unchanged.
+    hier: HierAddr<F>,
     config: Config,
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
@@ -266,6 +270,7 @@ impl<F: Field> OverlayNode<F> {
         );
         Self {
             coord,
+            hier: HierAddr::root(coord),
             config,
             started_at: Instant::default(),
             peers,
@@ -487,6 +492,7 @@ impl<F: Field> OverlayNode<F> {
                     payload: frame.body.to_vec(),
                 })]
             }
+            Some(FrameType::RouteHier) => self.on_route_hier(from, frame.body),
             Some(FrameType::DiagGossip) => {
                 // Receiving the gossip is itself a direct observation of the sender; its body
                 // corroborates the sender's view of the rest of the cell (spec §6.4).
@@ -506,6 +512,78 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::Announce) => self.on_announce(frame.body),
             Some(FrameType::Beacon) => self.on_beacon(frame.body),
             _ => Vec::new(),
+        }
+    }
+
+    /// Seat this node at a deeper hierarchical address (builder). A node keeps the default depth-1
+    /// `root(coord)` unless it descended into a sub-cell on a collision; `hier.point_at(0)` must equal
+    /// `coord` (the address roots at the node's top-cell point). Ignored otherwise.
+    #[must_use]
+    pub fn with_hier_address(mut self, hier: HierAddr<F>) -> Self {
+        if hier.point_at(0) == Some(self.coord) {
+            self.hier = hier;
+        }
+        self
+    }
+
+    /// This node's hierarchical address (§L1).
+    #[must_use]
+    pub fn hier_address(&self) -> &HierAddr<F> {
+        &self.hier
+    }
+
+    /// The next-hop coordinate toward hierarchical destination `dst`, or `None` if this node is already
+    /// in `dst`'s cell (the message is delivered here). The recursive rendezvous collapsed to one step:
+    /// with `cp = commonPrefix(self, dst)`, forward to `dst.point_at(cp)` — `dst`'s own point at the
+    /// level where the paths first diverge (or the next level down when this node is an ancestor). That
+    /// hop is one prefix level closer, so forwarding converges in `≤ dst.depth` hops (§L1, `O(k)`).
+    #[must_use]
+    pub fn hier_next_hop(&self, dst: &HierAddr<F>) -> Option<Triple> {
+        let cp = self.hier.common_prefix(dst);
+        if cp == dst.depth() {
+            return None;
+        }
+        dst.point_at(cp).map(|p| p.coords())
+    }
+
+    /// Originate a hierarchical send to `dst`: deliver locally if we are its cell, else emit a
+    /// `RouteHier` frame (`HierAddr(dst) ‖ payload`) toward the next hop — the driver entry a client
+    /// uses to reach a multi-level destination (the single-plane [`on_send`](Self::on_send) is unchanged).
+    pub fn send_hier(&mut self, dst: &HierAddr<F>, payload: &[u8]) -> Vec<Effect> {
+        self.self_activity = self.self_activity.saturating_add(1);
+        let mut body = dst.encode();
+        body.extend_from_slice(payload);
+        match self.hier_next_hop(dst) {
+            None => alloc::vec![Effect::Notify(Notification::Delivered {
+                from: self.coord.coords(),
+                payload: payload.to_vec(),
+            })],
+            Some(next) => alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, &body))],
+        }
+    }
+
+    /// Handle an incoming `RouteHier` frame (`HierAddr(dst) ‖ payload`): deliver if we are in the
+    /// destination cell, else forward one cell closer (see [`hier_next_hop`](Self::hier_next_hop)). The
+    /// destination address travels unchanged, so every hop re-derives its own next step.
+    fn on_route_hier(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+        let Some(&depth) = body.first() else {
+            return Vec::new();
+        };
+        let addr_len = 1 + usize::from(depth) * 12;
+        let Some(dst) = body.get(..addr_len).and_then(HierAddr::<F>::decode) else {
+            return Vec::new();
+        };
+        let payload = body.get(addr_len..).unwrap_or(&[]);
+        match self.hier_next_hop(&dst) {
+            None => {
+                let a = self.activity.entry(from).or_insert(0);
+                *a = a.saturating_add(1);
+                alloc::vec![Effect::Notify(Notification::Delivered {
+                    from,
+                    payload: payload.to_vec(),
+                })]
+            }
+            Some(next) => alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, body))],
         }
     }
 
@@ -1117,6 +1195,104 @@ mod tests {
         assert_eq!(node.neighbours().count(), 6);
         let big = OverlayNode::<F7>::new(Point::at(0), Config::default());
         assert_eq!(big.neighbours().count(), 56);
+    }
+
+    #[test]
+    fn hierarchical_route_delivers_at_the_destination_cell() {
+        let dst = HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
+        let mut node =
+            OverlayNode::<F2>::new(Point::at(2), Config::default()).with_hier_address(dst.clone());
+        assert_eq!(node.hier_next_hop(&dst), None, "the node is in the destination cell");
+        let mut body = dst.encode();
+        body.extend_from_slice(b"hi");
+        let frame = encode(FrameType::RouteHier, &body);
+        let effects = node.step(
+            Instant::default(),
+            Input::Message { from: Point::<F2>::at(1).coords(), frame },
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                Effect::Notify(Notification::Delivered { payload, .. }) if payload == b"hi")),
+            "the destination cell delivers the payload",
+        );
+    }
+
+    #[test]
+    fn hierarchical_route_forwards_toward_the_destination_cell() {
+        // A depth-1 node at point 1 forwards a RouteHier for [2,5] to point 2 (the divergence level).
+        let mut node = OverlayNode::<F2>::new(Point::at(1), Config::default());
+        let dst = HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
+        assert_eq!(
+            node.hier_next_hop(&dst),
+            Some(Point::<F2>::at(2).coords()),
+            "forward toward the destination's top-cell point",
+        );
+        let effects = node.send_hier(&dst, b"p");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send { to, .. } if *to == Point::<F2>::at(2).coords())),
+            "emits a RouteHier toward point 2",
+        );
+    }
+
+    #[test]
+    fn a_sub_cell_root_descends_toward_a_deeper_destination() {
+        // A node at [2] forwarding to [2,5] descends into its sub-cell toward point 5 (dst.point_at(1)).
+        let node = OverlayNode::<F2>::new(Point::at(2), Config::default());
+        let dst = HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
+        assert_eq!(
+            node.hier_next_hop(&dst),
+            Some(Point::<F2>::at(5).coords()),
+            "an ancestor descends one level toward the destination",
+        );
+    }
+
+    #[test]
+    fn hierarchical_delivery_end_to_end_across_two_levels() {
+        // A real two-engine hop: an origin in the top cell (address `[1]`) reaches a depth-2
+        // destination (`[2,5]`). The origin forwards toward the destination's top point (2); the
+        // destination engine decodes the `RouteHier`, sees every level match, and delivers. We drive
+        // the emitted frames through a minimal routing loop — the same forward/deliver decision the
+        // live mesh runs, exercised over real `OverlayNode` engines rather than in isolation.
+        let mut origin = OverlayNode::<F2>::new(Point::at(1), Config::default());
+        let dst = HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
+        let mut dest =
+            OverlayNode::<F2>::new(Point::at(2), Config::default()).with_hier_address(dst.clone());
+        assert_eq!(dest.hier_address(), &dst, "the destination is seated at [2,5]");
+
+        // Engines reachable by their transport coordinate — the key the mesh forwards on.
+        let now = Instant::default();
+        let origin_coord = Point::<F2>::at(1).coords();
+        let dest_coord = Point::<F2>::at(2).coords();
+        let mut pending: Vec<(Triple, Triple, Vec<u8>)> = Vec::new(); // (from, to, frame)
+        for e in origin.send_hier(&dst, b"unit-e2e") {
+            if let Effect::Send { to, frame } = e {
+                pending.push((origin_coord, to, frame));
+            }
+        }
+        assert_eq!(pending.len(), 1, "origin emits exactly one hop, not a local delivery");
+
+        let mut delivered = false;
+        let mut hops = 0u32;
+        while let Some((from, to, frame)) = pending.pop() {
+            hops += 1;
+            assert!(hops <= fanos_geometry::MAX_DEPTH as u32 + 1, "routing must converge, not loop");
+            // In this topology the only transport point that hosts an engine is the destination's.
+            assert_eq!(to, dest_coord, "the hop targets the destination cell");
+            for e in dest.step(now, Input::Message { from, frame }) {
+                match e {
+                    Effect::Notify(Notification::Delivered { payload, .. })
+                        if payload == b"unit-e2e" =>
+                    {
+                        delivered = true;
+                    }
+                    Effect::Send { to: next, frame } => pending.push((dest_coord, next, frame)),
+                    _ => {}
+                }
+            }
+        }
+        assert!(delivered, "the depth-2 destination delivered the payload end-to-end");
     }
 
     #[test]
