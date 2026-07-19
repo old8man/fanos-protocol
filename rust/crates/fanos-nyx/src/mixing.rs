@@ -26,6 +26,14 @@ pub fn anonymity_set(arrival_rate: f64, mu: f64) -> f64 {
 }
 
 /// The anonymity entropy in bits: `log₂(anonymity_set)`.
+///
+/// **Informational only — never gate wire-visible behaviour on this value.** It is the sole caller of
+/// [`crate::mathfns::log2`], whose result is *not* correctly-rounded and so may differ by an ULP
+/// between a `std` node (hardware `f64::log2`) and a `no_std` node (`libm::log2`). That divergence is
+/// harmless *because* this metric only ever feeds operator-facing reporting ([`DialPoint`]) and tests —
+/// no route, `Effect`, or serialized byte depends on it, so two nodes can never disagree on the wire
+/// over it. If this value is ever wired into a protocol decision it must first be quantized to a
+/// backend-independent fixed-point form (see the determinism invariant, `docs/design-testing.md`).
 #[must_use]
 pub fn anonymity_entropy_bits(arrival_rate: f64, mu: f64) -> f64 {
     let set = anonymity_set(arrival_rate, mu);

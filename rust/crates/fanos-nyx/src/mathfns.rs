@@ -24,6 +24,11 @@ pub(crate) fn powi(base: f64, exp: i32) -> f64 {
 }
 
 /// Base-2 logarithm, dispatched by target.
+///
+/// **Not correctly-rounded** — `std`'s hardware `f64::log2` and `no_std`'s `libm::log2` may differ by
+/// an ULP. Its only caller is [`crate::mixing::anonymity_entropy_bits`], an informational metric that
+/// gates no wire-visible behaviour, so the divergence is harmless. Any new caller feeding a protocol
+/// decision must first quantize the result to a backend-independent form (determinism invariant).
 #[inline]
 #[must_use]
 pub(crate) fn log2(x: f64) -> f64 {
