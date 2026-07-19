@@ -275,13 +275,13 @@ impl CriticalSlowingDown {
     /// The current windowed variance (see [`windowed_variance`]).
     #[must_use]
     pub fn variance(&self) -> f64 {
-        windowed_variance(&self.snapshot())
+        windowed_variance(&self.window())
     }
 
     /// The current windowed lag-1 autocorrelation (see [`lag1_autocorrelation`]).
     #[must_use]
     pub fn lag1_autocorrelation(&self) -> f64 {
-        lag1_autocorrelation(&self.snapshot())
+        lag1_autocorrelation(&self.window())
     }
 
     /// Whether the critical-slowing-down alarm is firing: the window is full AND both statistics
@@ -291,13 +291,13 @@ impl CriticalSlowingDown {
         if !self.ready() {
             return false;
         }
-        let w = self.snapshot();
+        let w = self.window();
         windowed_variance(&w) > self.var_threshold && lag1_autocorrelation(&w) > self.ar1_threshold
     }
 
     /// The window contents in temporal order (oldest first) — `VecDeque` preserves insertion order,
     /// so this is the correctly-ordered series the two estimators consume.
-    fn snapshot(&self) -> Vec<f64> {
+    fn window(&self) -> Vec<f64> {
         self.samples.iter().copied().collect()
     }
 }
