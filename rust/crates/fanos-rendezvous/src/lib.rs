@@ -28,6 +28,7 @@ pub use fanos_calypso::Epoch;
 use fanos_field::Field;
 use fanos_geometry::{Line, Triple};
 use fanos_pqcrypto::kem::HybridKemPublic;
+use fanos_wire::Wire;
 
 mod transport;
 pub use transport::{RendezvousClient, RendezvousService, SessionId};
@@ -91,7 +92,10 @@ impl MixDirectory {
 /// circuit's destination combiner. The onion already hides the path, and DIAULOS already encrypts the
 /// inner bytes end-to-end, so this wrapper carries the return route in the clear at the meeting point
 /// without weakening either property.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `#[derive(Wire)]` emits the canonical `cookie(16) ‖ reply_circuit(varint count ‖ Triple×12) ‖
+/// payload(varint-prefixed)` (spec §7.1) — one derived codec for the wrapper, replacing the hand-rolled
+/// `u8` hop-count + raw trailing payload.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct Request {
     /// A per-session cookie: the service demultiplexes concurrent clients by it and binds each to its
     /// reply circuit, so it need not learn who any client is.
@@ -103,36 +107,16 @@ pub struct Request {
 }
 
 impl Request {
-    /// Encode as `cookie(16) ‖ hop_count(1) ‖ hop_line×12 … ‖ payload`.
+    /// The canonical wire bytes (the derived [`Wire`] codec).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(16 + 1 + self.reply_circuit.len() * 12 + self.payload.len());
-        out.extend_from_slice(&self.cookie);
-        out.push(u8::try_from(self.reply_circuit.len()).unwrap_or(u8::MAX));
-        for &line in &self.reply_circuit {
-            out.extend_from_slice(&fanos_geometry::encode_triple(line));
-        }
-        out.extend_from_slice(&self.payload);
-        out
+        self.to_wire()
     }
 
-    /// Decode a request wrapper; `None` if truncated.
+    /// Decode a request wrapper; `None` if malformed, non-canonical, or carrying trailing bytes.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (cookie, rest) = bytes.split_first_chunk::<16>()?;
-        let (&n, mut rest) = rest.split_first()?;
-        let mut reply_circuit = Vec::with_capacity(usize::from(n));
-        for _ in 0..n {
-            let (head, tail) = rest.split_at_checked(12)?;
-            rest = tail;
-            reply_circuit.push(fanos_geometry::decode_triple(head)?);
-        }
-        Some(Self {
-            cookie: *cookie,
-            reply_circuit,
-            payload: rest.to_vec(),
-        })
+        Self::from_wire(bytes).ok()
     }
 }
 
@@ -209,14 +193,14 @@ mod tests {
 
     #[test]
     fn request_wrapper_boundary_shapes() {
-        // Empty reply circuit and empty payload — the minimal well-formed wrapper (16 cookie + 1 count).
+        // Empty reply circuit and empty payload — the minimal wrapper: 16 cookie ‖ varint(0) ‖ varint(0).
         let bare = Request {
             cookie: [0xAB; 16],
             reply_circuit: vec![],
             payload: vec![],
         };
         let wire = bare.encode();
-        assert_eq!(wire.len(), 17);
+        assert_eq!(wire.len(), 18);
         assert_eq!(Request::decode(&wire), Some(bare));
 
         // A payload but no reply circuit (a follow-up cell that relies on the service's cookie binding).
@@ -227,16 +211,17 @@ mod tests {
         };
         assert_eq!(Request::decode(&follow.encode()), Some(follow));
 
-        // The maximum hop count that fits the 1-byte length prefix round-trips exactly.
-        let max = Request {
+        // The varint hop count lifts the old 255-hop `u8` ceiling (which silently truncated): a 300-hop
+        // circuit round-trips exactly — `16 cookie ‖ varint(300)=2 ‖ 300×12 triples ‖ varint(4)=1 ‖ 4`.
+        let big = Request {
             cookie: [1; 16],
-            reply_circuit: (0..255u32)
+            reply_circuit: (0..300u32)
                 .map(|i| [i, i.wrapping_add(1), i.wrapping_add(2)])
                 .collect(),
             payload: b"tail".to_vec(),
         };
-        let wire = max.encode();
-        assert_eq!(wire.len(), 16 + 1 + 255 * 12 + 4);
-        assert_eq!(Request::decode(&wire), Some(max));
+        let wire = big.encode();
+        assert_eq!(wire.len(), 16 + 2 + 300 * 12 + 1 + 4);
+        assert_eq!(Request::decode(&wire), Some(big));
     }
 }

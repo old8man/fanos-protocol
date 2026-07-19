@@ -998,6 +998,8 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "fanos-pqcrypto",
+ "fanos-wire",
+ "fanos-wire-derive",
 ]
 
 [[package]]
