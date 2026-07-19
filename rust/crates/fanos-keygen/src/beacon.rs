@@ -50,6 +50,9 @@ pub struct BeaconNode<F: Field> {
     seed: [u8; 32],
     /// Verified partials collected for each not-yet-adopted future epoch, until a round assembles.
     pending: BTreeMap<Epoch, Vec<BeaconPartial>>,
+    /// The current epoch's assembled round, cached so this node can answer a `BeaconReq` pull-sync from a
+    /// joining node (spec §7.8 bootstrap) — `None` until the first round is adopted.
+    current_round: Option<BeaconRound>,
 }
 
 impl<F: Field> BeaconNode<F> {
@@ -72,6 +75,7 @@ impl<F: Field> BeaconNode<F> {
             epoch: Epoch::ZERO,
             seed: [0u8; 32],
             pending: BTreeMap::new(),
+            current_round: None,
         }
     }
 
@@ -142,8 +146,7 @@ impl<F: Field> BeaconNode<F> {
         let Some(seed) = round.verify_and_seed(&self.commitment, self.threshold) else {
             return Vec::new();
         };
-        self.adopt(epoch, seed);
-        self.announce(epoch, seed, &round)
+        self.adopt_and_announce(epoch, seed, round)
     }
 
     /// A received round: verify it against the group commitment and, if strictly newer, adopt + re-flood.
@@ -158,8 +161,7 @@ impl<F: Field> BeaconNode<F> {
         let Some(seed) = round.verify_and_seed(&self.commitment, self.threshold) else {
             return Vec::new();
         };
-        self.adopt(epoch, seed);
-        self.announce(epoch, seed, &round)
+        self.adopt_and_announce(epoch, seed, round)
     }
 
     /// A received partial: verify its DLEQ against the group commitment, buffer it, and try to assemble.
@@ -181,11 +183,44 @@ impl<F: Field> BeaconNode<F> {
         self.pending.retain(|&e, _| e > epoch);
     }
 
+    /// Adopt `round`'s epoch + seed, cache the round so this node can answer a later `BeaconReq`, and
+    /// announce it (flood to the cell + notify the driver).
+    fn adopt_and_announce(
+        &mut self,
+        epoch: Epoch,
+        seed: [u8; 32],
+        round: BeaconRound,
+    ) -> Vec<Effect> {
+        self.adopt(epoch, seed);
+        let effects = self.announce(epoch, seed, &round);
+        self.current_round = Some(round);
+        effects
+    }
+
     /// Flood `round` to the cell and emit the `BeaconReady` notification for the driver.
     fn announce(&self, epoch: Epoch, seed: [u8; 32], round: &BeaconRound) -> Vec<Effect> {
         let mut effects = self.broadcast(&round_frame(round));
         effects.push(Effect::Notify(Notification::BeaconReady { epoch, seed }));
         effects
+    }
+
+    /// Answer a joining node's `BeaconReq` pull-sync: send it the current epoch's round (which it verifies
+    /// against the group commitment and adopts). Silent until this node has itself adopted a round.
+    fn on_beacon_req(&self, from: Triple) -> Vec<Effect> {
+        match &self.current_round {
+            Some(round) => std::vec![Effect::Send {
+                to: from,
+                frame: round_frame(round),
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// Request the current beacon from the cell on join (spec §7.8 bootstrap): broadcast a `BeaconReq`, to
+    /// which any synced peer replies with its round — so a node that missed live rounds still adopts the
+    /// current epoch's verified seed rather than assuming one.
+    fn request_sync(&self) -> Vec<Effect> {
+        self.broadcast(&encode(FrameType::BeaconReq, &[]))
     }
 }
 
@@ -194,10 +229,13 @@ impl<F: Field> Engine for BeaconNode<F> {
         match input {
             // The epoch-advance trigger (a timer/driver tick): an anchor proposes the next epoch's beacon.
             Input::Command(Command::AdvanceEpoch) => self.advance(),
-            Input::Message { frame, .. } => match decode_frame(&frame) {
+            // On join, pull the current beacon from the cell (spec §7.8 bootstrap).
+            Input::Command(Command::StartHeartbeat) => self.request_sync(),
+            Input::Message { from, frame } => match decode_frame(&frame) {
                 Ok((f, _)) => match f.frame_type() {
                     Some(FrameType::BeaconPartial) => self.on_partial(f.body),
                     Some(FrameType::Beacon) => self.on_round(f.body),
+                    Some(FrameType::BeaconReq) => self.on_beacon_req(from),
                     _ => Vec::new(),
                 },
                 Err(_) => Vec::new(),
@@ -406,5 +444,82 @@ mod tests {
             );
         }
         assert_eq!(node.epoch(), Epoch::ZERO, "the node stays at genesis");
+    }
+
+    #[test]
+    fn a_joining_node_pull_syncs_the_current_beacon() {
+        // A node that missed the live round adopts the current epoch by asking a synced peer (BeaconReq),
+        // rather than assuming an epoch — the bootstrap path (spec §7.8).
+        let t = 4usize;
+        let (shares, commitment) = deal(
+            &[0x5C; 32],
+            t,
+            N,
+            &mut DeterministicRng::new(b"beacon-sync"),
+        )
+        .unwrap();
+
+        // A synced anchor: it proposes epoch 1 (its own partial) and receives the rest, so it adopts and
+        // caches the round.
+        let mut synced =
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0]), commitment.clone(), t);
+        synced.step(Instant(0), Input::Command(Command::AdvanceEpoch));
+        for share in &shares[1..t] {
+            let p = partial_eval(share, Epoch::new(1));
+            synced.step(
+                Instant(0),
+                Input::Message {
+                    from: [0, 0, 0],
+                    frame: partial_frame(Epoch::new(1), &p),
+                },
+            );
+        }
+        assert_eq!(synced.epoch(), Epoch::new(1), "the anchor adopted epoch 1");
+
+        // A fresh consumer that saw none of it.
+        let mut fresh = BeaconNode::<F2>::new(Point::at(1), None, commitment, t);
+        assert_eq!(fresh.epoch(), Epoch::ZERO);
+
+        // On join it broadcasts a BeaconReq; the synced peer answers with its round; the fresh node
+        // verifies and adopts — reaching epoch 1 with the identical seed, no trust in the peer.
+        let req_frame = fresh
+            .step(Instant(1), Input::Command(Command::StartHeartbeat))
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Send { frame, .. } => Some(frame),
+                _ => None,
+            })
+            .expect("join broadcasts a BeaconReq");
+        let round_frame = synced
+            .step(
+                Instant(2),
+                Input::Message {
+                    from: Point::<F2>::at(1).coords(),
+                    frame: req_frame,
+                },
+            )
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Send { frame, .. } => Some(frame),
+                _ => None,
+            })
+            .expect("a synced peer answers the BeaconReq with its round");
+        fresh.step(
+            Instant(3),
+            Input::Message {
+                from: Point::<F2>::at(0).coords(),
+                frame: round_frame,
+            },
+        );
+        assert_eq!(
+            fresh.epoch(),
+            Epoch::new(1),
+            "the joining node synced to epoch 1"
+        );
+        assert_eq!(
+            fresh.seed(),
+            synced.seed(),
+            "and adopted the identical verified seed"
+        );
     }
 }
