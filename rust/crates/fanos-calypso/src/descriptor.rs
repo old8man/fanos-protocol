@@ -23,6 +23,8 @@ use fanos_onoma::Address;
 use fanos_onoma::derive::{descriptor_key, lookup_point};
 use fanos_primitives::Epoch;
 use fanos_primitives::hash::hash_labeled;
+use fanos_wire::Wire;
+use fanos_wire::element::encode_bytes;
 
 use crate::pow;
 
@@ -63,7 +65,11 @@ impl core::fmt::Display for DescriptorError {
 impl core::error::Error for DescriptorError {}
 
 /// A service descriptor (plaintext form).
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// The canonical byte layout **is** the field order — `#[derive(Wire)]` emits
+/// `epoch(8B BE) ‖ bundle ‖ metadata ‖ cert ‖ sig` (each `Vec<u8>` varint-length-prefixed, spec §7.1),
+/// so this plaintext has one canonical encoding and no hand-rolled decoder to drift (audit A1).
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct Descriptor {
     /// The epoch this descriptor is valid for.
     pub epoch: Epoch,
@@ -77,40 +83,21 @@ pub struct Descriptor {
     pub sig: Vec<u8>,
 }
 
-fn push_field(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-fn read_u64(cur: &mut &[u8]) -> Option<u64> {
-    let (head, tail) = cur.split_at_checked(8)?;
-    *cur = tail;
-    let mut a = [0u8; 8];
-    a.copy_from_slice(head);
-    Some(u64::from_le_bytes(a))
-}
-
-fn read_field(cur: &mut &[u8]) -> Option<Vec<u8>> {
-    let (head, tail) = cur.split_at_checked(4)?;
-    let mut a = [0u8; 4];
-    a.copy_from_slice(head);
-    let n = u32::from_le_bytes(a) as usize;
-    let (body, rest) = tail.split_at_checked(n)?;
-    *cur = rest;
-    Some(body.to_vec())
-}
-
 impl Descriptor {
-    /// The canonical bytes an owner signs (everything except the signature itself).
+    /// The canonical bytes an owner signs (everything except the signature itself): the domain label,
+    /// then the epoch and the three opaque fields in the same canonical §7.1 form the [`Wire`] codec
+    /// uses (`epoch` big-endian, each field varint-length-prefixed via [`encode_bytes`]). It stays a
+    /// hand-written transcript — not the derived struct codec — because it is domain-separated and omits
+    /// `sig`, but it shares the one canonical field encoding so signer and verifier cannot diverge.
     #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(SIGN_LABEL.as_bytes());
         b.push(0x1f);
-        b.extend_from_slice(&self.epoch.to_le_bytes());
-        push_field(&mut b, &self.bundle);
-        push_field(&mut b, &self.metadata);
-        push_field(&mut b, &self.cert);
+        b.extend_from_slice(&self.epoch.to_be_bytes());
+        encode_bytes(&self.bundle, &mut b);
+        encode_bytes(&self.metadata, &mut b);
+        encode_bytes(&self.cert, &mut b);
         b
     }
 
@@ -123,41 +110,13 @@ impl Descriptor {
     {
         verify(&self.signing_bytes(), &self.sig)
     }
-
-    /// Canonical serialization (the plaintext that gets encrypted).
-    #[must_use]
-    fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&self.epoch.to_le_bytes());
-        push_field(&mut b, &self.bundle);
-        push_field(&mut b, &self.metadata);
-        push_field(&mut b, &self.cert);
-        push_field(&mut b, &self.sig);
-        b
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, DescriptorError> {
-        let mut cur = bytes;
-        let epoch = Epoch::new(read_u64(&mut cur).ok_or(DescriptorError::Malformed)?);
-        let bundle = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
-        let metadata = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
-        let cert = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
-        let sig = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
-        if !cur.is_empty() {
-            return Err(DescriptorError::Malformed); // canonical: no trailing bytes
-        }
-        Ok(Self {
-            epoch,
-            bundle,
-            metadata,
-            cert,
-            sig,
-        })
-    }
 }
 
 /// A sealed (encrypted + PoW-stamped) descriptor, ready to publish at [`publish_point`].
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// `#[derive(Wire)]` emits the canonical `pow_nonce(8B BE) ‖ nonce_salt(16) ‖ ciphertext` — the
+/// ciphertext varint-length-prefixed (spec §7.1), so this composes and has one canonical decoder.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct SealedDescriptor {
     /// The proof-of-work nonce over the ciphertext.
     pub pow_nonce: u64,
@@ -169,36 +128,18 @@ pub struct SealedDescriptor {
 }
 
 impl SealedDescriptor {
-    /// Wire form: `pow_nonce(8 LE) ‖ nonce_salt(16) ‖ ciphertext`.
+    /// The canonical wire bytes (the derived [`Wire`] codec).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(8 + SALT_LEN + self.ciphertext.len());
-        b.extend_from_slice(&self.pow_nonce.to_le_bytes());
-        b.extend_from_slice(&self.nonce_salt);
-        b.extend_from_slice(&self.ciphertext);
-        b
+        self.to_wire()
     }
 
-    /// Parse the wire form.
+    /// Parse the canonical wire form.
     ///
     /// # Errors
-    /// [`DescriptorError::Malformed`] if shorter than the 8-byte nonce prefix.
+    /// [`DescriptorError::Malformed`] on any malformed or non-canonical input (including trailing bytes).
     pub fn decode(bytes: &[u8]) -> Result<Self, DescriptorError> {
-        let (head, rest) = bytes
-            .split_at_checked(8)
-            .ok_or(DescriptorError::Malformed)?;
-        let (salt, tail) = rest
-            .split_at_checked(SALT_LEN)
-            .ok_or(DescriptorError::Malformed)?;
-        let mut a = [0u8; 8];
-        a.copy_from_slice(head);
-        let mut s = [0u8; SALT_LEN];
-        s.copy_from_slice(salt);
-        Ok(Self {
-            pow_nonce: u64::from_le_bytes(a),
-            nonce_salt: s,
-            ciphertext: tail.to_vec(),
-        })
+        Self::from_wire(bytes).map_err(|_| DescriptorError::Malformed)
     }
 }
 
@@ -260,7 +201,7 @@ pub fn seal(
     desc: &Descriptor,
     difficulty: u32,
 ) -> Result<SealedDescriptor, DescriptorError> {
-    let plaintext = desc.encode();
+    let plaintext = desc.to_wire();
     let salt = nonce_salt(&plaintext);
     let nonce = nonce_bytes(addr, epoch, &salt);
     let ciphertext = fanos_primitives::aead::seal(&descriptor_key(addr, epoch), &nonce, &plaintext)
@@ -298,7 +239,7 @@ pub fn open(
     let plaintext =
         fanos_primitives::aead::open(&descriptor_key(addr, epoch), &nonce, &sealed.ciphertext)
             .ok_or(DescriptorError::Aead)?;
-    let desc = Descriptor::decode(&plaintext)?;
+    let desc = Descriptor::from_wire(&plaintext).map_err(|_| DescriptorError::Malformed)?;
     if desc.epoch != epoch {
         return Err(DescriptorError::EpochMismatch);
     }

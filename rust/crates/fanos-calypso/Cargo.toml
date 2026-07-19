@@ -13,7 +13,9 @@ categories = ["cryptography", "network-programming"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
-fanos-primitives = { workspace = true, features = ["aead"] }
+fanos-primitives = { workspace = true, features = ["aead", "wire"] }
+fanos-wire.workspace = true
+fanos-wire-derive.workspace = true
 fanos-onoma.workspace = true
 # The DIAKRISIS spectral gap Δ = (G − max_k T_k)/6 (T-226(v)) that the admission controller's
 # relaxation rate is derived from — one Δ for healing and for admission (derive, don't tune).

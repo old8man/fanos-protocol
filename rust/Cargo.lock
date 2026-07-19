@@ -770,6 +770,8 @@ dependencies = [
  "fanos-geometry",
  "fanos-onoma",
  "fanos-primitives",
+ "fanos-wire",
+ "fanos-wire-derive",
  "proptest",
 ]
 
