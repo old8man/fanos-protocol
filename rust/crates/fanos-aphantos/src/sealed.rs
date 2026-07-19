@@ -82,6 +82,20 @@ pub enum SealedError {
     TooLong,
 }
 
+impl core::fmt::Display for SealedError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "malformed onion bytes",
+            Self::Kem => "KEM ciphertext failed to parse",
+            Self::Aead => "AEAD authentication failed (wrong relay or tampered layer)",
+            Self::KeyMismatch => "circuit and relay-key list length mismatch",
+            Self::TooLong => "onion exceeds the fixed length bucket",
+        })
+    }
+}
+
+impl core::error::Error for SealedError {}
+
 /// The result of peeling one hop.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PeelOutcome {

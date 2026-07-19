@@ -102,3 +102,29 @@ impl ProtocolError {
         self as u16 as u64
     }
 }
+
+impl core::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let msg = match self {
+            Self::Unsupported => "unsupported feature or version",
+            Self::Malformed => "malformed message",
+            Self::NonCanonical => "non-canonical encoding",
+            Self::BadCoord => "coordinate proof failed to verify",
+            Self::EpochStale => "peer epoch is stale relative to the beacon",
+            Self::SybilReject => "Sybil admission rejected the peer",
+            Self::NoRoute => "no route to the destination",
+            Self::QuorumUnavail => "required quorum line unavailable",
+            Self::ThresholdUnmet => "line threshold could not be met",
+            Self::PathBroken => "NYX path broke mid-circuit",
+            Self::HolonomyFail => "holonomy authenticator failed",
+            Self::CoverStarved => "cover traffic starved",
+            Self::SvcUnreachable => "hidden service unreachable",
+            Self::RdvExpired => "rendezvous line expired (epoch rolled)",
+            Self::PowRequired => "proof-of-work required for this request",
+        };
+        // Prefix the numeric wire code so a log line carries both (spec §7.5).
+        write!(f, "[{}] {msg}", self.code())
+    }
+}
+
+impl core::error::Error for ProtocolError {}

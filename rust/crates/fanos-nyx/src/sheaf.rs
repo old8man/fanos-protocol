@@ -38,6 +38,25 @@ impl From<ShamirError> for NyxError {
     }
 }
 
+impl core::fmt::Display for NyxError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Aead => f.write_str("AEAD sealing/opening failed (wrong key or below threshold)"),
+            Self::Sharing(e) => write!(f, "secret sharing failed: {e}"),
+            Self::KeyLength => f.write_str("reconstructed key was the wrong length"),
+        }
+    }
+}
+
+impl core::error::Error for NyxError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Sharing(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// A sealed threshold layer: the AEAD ciphertext, its nonce, and the `q+1` key shares (each
 /// distributed to a line member privately — cryptographically KEM-sealed per member in the
 /// production form, `fanos_aphantos::threshold::ThresholdSealed`).

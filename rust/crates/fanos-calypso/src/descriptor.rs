@@ -48,6 +48,20 @@ pub enum DescriptorError {
     EpochMismatch,
 }
 
+impl core::fmt::Display for DescriptorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "malformed descriptor bytes",
+            Self::Aead => "AEAD authentication failed (not an address-holder or tampered)",
+            Self::BadPow => "proof-of-work below the required difficulty",
+            Self::NotCertified => "descriptor does not certify this address (impersonation)",
+            Self::EpochMismatch => "descriptor epoch does not match the requested epoch",
+        })
+    }
+}
+
+impl core::error::Error for DescriptorError {}
+
 /// A service descriptor (plaintext form).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Descriptor {

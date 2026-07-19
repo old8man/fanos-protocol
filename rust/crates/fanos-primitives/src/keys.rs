@@ -38,6 +38,14 @@ pub struct KemPublicKey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BadKeyLength;
 
+impl core::fmt::Display for BadKeyLength {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a key component had the wrong length")
+    }
+}
+
+impl core::error::Error for BadKeyLength {}
+
 impl SigPublicKey {
     /// Assemble from components, validating the ML-DSA length.
     pub fn new(ed25519: [u8; ED25519_PK_LEN], mldsa65: Vec<u8>) -> Result<Self, BadKeyLength> {

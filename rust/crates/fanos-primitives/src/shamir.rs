@@ -49,6 +49,19 @@ pub enum ShamirError {
     BadShares,
 }
 
+impl core::fmt::Display for ShamirError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::BadThreshold => "threshold is zero or exceeds the share count",
+            Self::BadShareCount => "share count is zero or exceeds 255",
+            Self::InsufficientRandomness => "not enough randomness for the sharing polynomial",
+            Self::BadShares => "too few shares, or duplicate/zero x-coordinates",
+        })
+    }
+}
+
+impl core::error::Error for ShamirError {}
+
 #[inline]
 fn mul(a: u8, b: u8) -> u8 {
     F256::mul(u32::from(a), u32::from(b)) as u8

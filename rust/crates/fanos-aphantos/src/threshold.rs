@@ -46,6 +46,20 @@ pub enum ThresholdError {
     TooLong,
 }
 
+impl core::fmt::Display for ThresholdError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "malformed key, share, or ciphertext",
+            Self::Aead => "AEAD authentication failed (wrong key or below-threshold or tamper)",
+            Self::Sharing => "invalid secret-sharing parameters or shares",
+            Self::Kem => "KEM ciphertext failed to parse",
+            Self::TooLong => "threshold onion exceeds the fixed length bucket",
+        })
+    }
+}
+
+impl core::error::Error for ThresholdError {}
+
 /// The fixed on-the-wire size of a threshold onion. Every hop's packet is padded to this constant
 /// bucket, so a passive observer cannot link hops by the shrinking layer size a naive nested onion
 /// leaks (spec §5.7). Sized to hold a Fano threshold circuit of several hops. Packet **size** is
