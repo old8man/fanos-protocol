@@ -55,7 +55,7 @@ None of these is fatal, and none contradicts the architecture — they are the g
 | G1 | `rust/README.md` stale — "119 tests", documents 8 of 27 crates | **MEDIUM (docs)** | `rust/README.md` |
 | G2 | `#[derive(Wire)]` "codec+KATs from one definition" (design-platform.md) is unbuilt | **LOW (docs)** | — |
 | — | Service side is one-shot RPC while the client gets a full duplex stream | **MEDIUM** | `fanos-node/src/diaulos.rs:86-135` |
-| — | AEAD nonce counter uses `wrapping_add` (should hard-kill the connection at the limit) | **LOW** | `fanos-diaulos/src/conn.rs:115-117` |
+| — | ~~AEAD nonce counter uses `wrapping_add`~~ **RESOLVED** — `next_nonce` uses `checked_add` and returns `None` at 2⁶⁴, so the connection hard-kills rather than reuse a nonce (pinned by `conn::tests::the_connection_hard_kills_at_nonce_exhaustion_rather_than_reusing_a_nonce`) | ~~LOW~~ | `fanos-diaulos/src/conn.rs:189` |
 | E1 | Full/threshold profile emits no cover traffic — GPA resistance below the Lite profile's | **HIGH** | `fanos-aphantos/src/threshold_router.rs` |
 | E2 | Threshold mix delays seeded from the node's public coordinate — GPA can predict/relink | **HIGH** | `fanos-aphantos/src/threshold_router.rs:122-136` |
 | E3 | Descriptor deterministic AEAD nonce — keystream+MAC reuse on mid-epoch republish | **MEDIUM** | `fanos-calypso/src/descriptor.rs:180-192` |
