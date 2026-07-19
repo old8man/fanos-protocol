@@ -164,10 +164,17 @@ pub struct OverlayNode<F: Field> {
     /// blackhole (a bounded DoS), never impersonate a destination. Cert-verifying an announced address
     /// against its coordinate (poisoning resistance) is the QUIC-layer follow-up.
     hier_peers: BTreeMap<Triple, HierAddr<F>>,
-    /// This node's long-term identity bytes (spec §L0 — the node-id / key-bundle hash), the pre-image
-    /// its self-certifying address `hier` is derived from. Carried in this node's `Announce` so peers can
-    /// verify the address it claims. Empty when self-certification is not in use (the address is trusted).
+    /// This node's long-term identity bytes (spec §L0): its hybrid **signature public-key bundle**
+    /// `Ed25519(32) ‖ ML-DSA-65(1952)`, which both derives its self-certifying address `hier`
+    /// (`MapToPoint`) and verifies its descriptor signature. Carried in this node's `Announce`. Empty
+    /// when self-certification is not in use (the address is trusted without proof).
     identity: Vec<u8>,
+    /// The signature over this node's descriptor `coord ‖ hier ‖ id`, produced once by its hybrid
+    /// signing key at deployment (the secret never enters the engine). Carried in the `Announce` and
+    /// checked by peers under self-certified membership, so an attacker cannot announce a *different*
+    /// transport coordinate for an identity's address without that identity's private key (§79/§80,
+    /// the transport-hijack defence). Empty when unsigned.
+    descriptor_sig: Vec<u8>,
     config: Config,
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
@@ -309,6 +316,7 @@ impl<F: Field> OverlayNode<F> {
             hier: HierAddr::root(coord),
             hier_peers: BTreeMap::new(),
             identity: Vec::new(),
+            descriptor_sig: Vec::new(),
             config,
             started_at: Instant::default(),
             peers,
@@ -571,13 +579,26 @@ impl<F: Field> OverlayNode<F> {
         &self.hier
     }
 
-    /// Seat this node's long-term identity (spec §L0 — the node-id / key-bundle hash), the pre-image
-    /// its `hier` address is derived from (builder). Carried in this node's `Announce` so peers running
-    /// self-certified membership can verify the address it claims. Only meaningful when `hier` is
+    /// Seat this node's long-term identity (spec §L0): its hybrid signature public-key bundle, the
+    /// pre-image its `hier` address is derived from (builder). Carried in the node's `Announce` so peers
+    /// running self-certified membership can verify the address it claims. Only meaningful when `hier` is
     /// actually `id`'s descent chain ([`fanos_crypto::address_point`]); a deployment sets both together.
     #[must_use]
     pub fn with_identity(mut self, id: Vec<u8>) -> Self {
         self.identity = id;
+        self
+    }
+
+    /// Seat a fully **signed descriptor** (builder): the identity bundle `id` and a `sig` over
+    /// [`descriptor_message(coord, hier, id)`](descriptor_message) produced by the identity's hybrid
+    /// signing key. Under self-certified membership peers verify this signature, so the transport
+    /// coordinate is bound to the identity — an attacker cannot re-announce another node's address at
+    /// its own endpoint (§80). The signing secret is never handed to the engine; a deployment signs
+    /// once and installs the result here.
+    #[must_use]
+    pub fn with_signed_descriptor(mut self, id: Vec<u8>, sig: Vec<u8>) -> Self {
+        self.identity = id;
+        self.descriptor_sig = sig;
         self
     }
 
@@ -928,7 +949,7 @@ impl<F: Field> OverlayNode<F> {
         let coord = self.coord.coords();
         let frame = encode(
             FrameType::Announce,
-            &announce_body(coord, &self.hier, &self.identity, &info),
+            &announce_body(coord, &self.hier, &self.identity, &self.descriptor_sig, &info),
         );
         let effects = self.flood(&frame);
         self.members.insert(coord, info);
@@ -938,7 +959,7 @@ impl<F: Field> OverlayNode<F> {
     /// A received announcement: on first sight of a member, record it, notify, and re-flood so the
     /// key propagates cell-wide; on a repeat, drop (the monotone guard terminates the flood).
     fn on_announce(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((coord, hier, id, info)) = parse_announce::<F>(body) else {
+        let Some((coord, hier, id, sig, info)) = parse_announce::<F>(body) else {
             return Vec::new();
         };
         // Validate: a member coordinate must be a real, canonical projective point of this plane.
@@ -949,13 +970,17 @@ impl<F: Field> OverlayNode<F> {
         let Some(coord) = Point::<F>::new(coord).map(|p| p.coords()) else {
             return Vec::new();
         };
-        // Self-certified membership (opt-in): the announced overlay address must be the announcer's
-        // own derived descent chain from its identity `id` — otherwise it is a routing-table poisoning
-        // attempt (a peer claiming an address it did not earn, to attract a target's `RouteHier`
-        // traffic) and the whole announcement is dropped: neither `members` nor `hier_peers` is written.
-        // Forging a match to a chosen target then costs `≈ N^k` identity grinding (threat §79/B1).
+        // Self-certified membership (opt-in) drops the whole announcement unless BOTH hold:
+        //  1. the overlay address is the identity's own derived descent chain — else it is a
+        //     routing-table poisoning attempt (a peer claiming an address it did not earn to attract a
+        //     target's `RouteHier` traffic); forging a match costs `≈ N^k` grinding (threat §79/B1);
+        //  2. the descriptor signature binds this exact transport `coord` to the identity — else it is a
+        //     transport hijack (re-announcing another identity's address at the attacker's own endpoint),
+        //     which without the identity's private key cannot be signed (threat §80).
+        // Neither `members` nor `hier_peers` is written on failure.
         if self.config.require_self_certified_membership
-            && !fanos_crypto::address_matches_identity::<F>(&id, &hier)
+            && (!fanos_crypto::address_matches_identity::<F>(&id, &hier)
+                || !descriptor_signature_ok::<F>(coord, &hier, &id, &sig))
         {
             return Vec::new();
         }
@@ -970,7 +995,7 @@ impl<F: Field> OverlayNode<F> {
         // descended sub-cell member thus becomes routable cell-wide from its announcement alone (§L1);
         // a depth-1 announcer adds its own direct entry, so `send_hier` also delivers within one plane.
         self.learn_hier_peer(hier.clone(), coord);
-        let frame = encode(FrameType::Announce, &announce_body(coord, &hier, &id, &info));
+        let frame = encode(FrameType::Announce, &announce_body(coord, &hier, &id, &sig, &info));
         let mut effects = self.flood(&frame);
         effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
         effects
@@ -1276,33 +1301,77 @@ fn parse_digest(slice: Option<&[u8]>) -> Option<[u8; DIGEST]> {
     <[u8; DIGEST]>::try_from(slice?).ok()
 }
 
-/// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ id_len(2) ‖ id ‖ info` (spec §7.8 JOIN, §L1
-/// address). `coord` is the transport point peers send to; `hier` is the announcer's overlay address,
-/// so a receiver seeds its hierarchical routing table (`hier → coord`) — descended sub-cell members
-/// become reachable without out-of-band configuration. `id` is the announcer's long-term identity
-/// (§L0): under self-certified membership a receiver checks `hier` is `id`'s derived descent chain
-/// before trusting it. Both the `hier` block (leading depth byte) and `id` (length prefix) are
-/// self-delimiting, so `info` follows unambiguously.
-fn announce_body<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8], info: &[u8]) -> Vec<u8> {
+/// The bytes a node's hybrid signing key signs to bind its **transport coordinate** to its identity's
+/// **overlay address**: `coord(12) ‖ hier ‖ id` (spec §80). A deployment signs this once and installs
+/// the signature via [`OverlayNode::with_signed_descriptor`]; a receiver reconstructs it from the parsed
+/// announce and checks the signature — so an attacker cannot re-announce another identity's address at
+/// its own coordinate (it would have to forge that identity's signature over a *different* `coord`).
+#[must_use]
+pub fn descriptor_message<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8]) -> Vec<u8> {
+    let hier_bytes = hier.encode();
+    let mut msg = Vec::with_capacity(12 + hier_bytes.len() + id.len());
+    for word in coord {
+        msg.extend_from_slice(&word.to_be_bytes());
+    }
+    msg.extend_from_slice(&hier_bytes);
+    msg.extend_from_slice(id);
+    msg
+}
+
+/// Whether `sig` is a valid hybrid signature over the descriptor `coord ‖ hier ‖ id`, under the identity
+/// keys packed at the front of `id` (`Ed25519(32) ‖ ML-DSA-65(1952)`). Binds the transport coordinate to
+/// the identity, so a peer cannot re-announce another node's address at its own coordinate (§80). Any
+/// wrong length or bad half returns `false` — never panics.
+fn descriptor_signature_ok<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8], sig: &[u8]) -> bool {
+    const ED: usize = fanos_crypto::sig::ED25519_PK_LEN;
+    const ML: usize = fanos_crypto::sig::MLDSA65_PK_LEN;
+    let Some(ed_pub) = id.get(..ED).and_then(|s| <[u8; ED]>::try_from(s).ok()) else {
+        return false;
+    };
+    let Some(ml_pub) = id.get(ED..ED + ML).and_then(|s| <[u8; ML]>::try_from(s).ok()) else {
+        return false;
+    };
+    let msg = descriptor_message(coord, hier, id);
+    fanos_crypto::hybrid_verify(&ed_pub, &ml_pub, &msg, sig)
+}
+
+/// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖ info` (spec
+/// §7.8 JOIN, §L1 address, §80 signed descriptor). `coord` is the transport point peers send to; `hier`
+/// is the announcer's overlay address, so a receiver seeds its routing table (`hier → coord`). `id` is
+/// the announcer's identity bundle (§L0) — the address derives from it — and `sig` is the hybrid
+/// signature over [`descriptor_message`] binding the coordinate to that identity. Every variable field
+/// is length- or self-delimited, so `info` follows unambiguously.
+fn announce_body<F: Field>(
+    coord: Triple,
+    hier: &HierAddr<F>,
+    id: &[u8],
+    sig: &[u8],
+    info: &[u8],
+) -> Vec<u8> {
     let hier_bytes = hier.encode();
     let id_len = u16::try_from(id.len()).unwrap_or(u16::MAX);
     let id = id.get(..usize::from(id_len)).unwrap_or(id);
-    let mut body = Vec::with_capacity(12 + hier_bytes.len() + 2 + id.len() + info.len());
+    let sig_len = u16::try_from(sig.len()).unwrap_or(u16::MAX);
+    let sig = sig.get(..usize::from(sig_len)).unwrap_or(sig);
+    let mut body =
+        Vec::with_capacity(12 + hier_bytes.len() + 2 + id.len() + 2 + sig.len() + info.len());
     for word in coord {
         body.extend_from_slice(&word.to_be_bytes());
     }
     body.extend_from_slice(&hier_bytes);
     body.extend_from_slice(&id_len.to_be_bytes());
     body.extend_from_slice(id);
+    body.extend_from_slice(&sig_len.to_be_bytes());
+    body.extend_from_slice(sig);
     body.extend_from_slice(info);
     body
 }
 
-/// The parsed pieces of an `Announce` body: `(coord, hier, id, info)` (see [`parse_announce`]).
-type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>);
+/// The parsed pieces of an `Announce` body: `(coord, hier, id, sig, info)` (see [`parse_announce`]).
+type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<u8>);
 
-/// Parse an `Announce` body into `(coord, hier, id, info)`. `None` on a short buffer or a non-canonical
-/// hierarchical address (so a forged announce cannot inject a bogus routing-table entry).
+/// Parse an `Announce` body into `(coord, hier, id, sig, info)`. `None` on a short buffer or a
+/// non-canonical hierarchical address (so a forged announce cannot inject a bogus routing-table entry).
 fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
     let x = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?);
     let y = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
@@ -1313,8 +1382,11 @@ fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
     let after_hier = rest.get(hier_len..)?;
     let id_len = usize::from(u16::from_be_bytes(after_hier.get(0..2)?.try_into().ok()?));
     let id = after_hier.get(2..2 + id_len)?.to_vec();
-    let info = after_hier.get(2 + id_len..)?.to_vec();
-    Some(([x, y, z], hier, id, info))
+    let after_id = after_hier.get(2 + id_len..)?;
+    let sig_len = usize::from(u16::from_be_bytes(after_id.get(0..2)?.try_into().ok()?));
+    let sig = after_id.get(2..2 + sig_len)?.to_vec();
+    let info = after_id.get(2 + sig_len..)?.to_vec();
+    Some(([x, y, z], hier, id, sig, info))
 }
 
 #[cfg(test)]
@@ -1833,7 +1905,7 @@ mod tests {
 
         // Honest first announce → recorded and MemberJoined notified.
         let peer_addr = HierAddr::root(Point::<F2>::at(3));
-        let honest = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"HONEST"));
+        let honest = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"", b"HONEST"));
         let e1 = node.step(
             Instant(1),
             Input::Message {
@@ -1848,7 +1920,7 @@ mod tests {
         assert_eq!(info_of(peer, &node), Some(b"HONEST".to_vec()));
 
         // A repeat for the same coord with attacker keys must NOT overwrite or re-notify.
-        let forged = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"ATTACKER"));
+        let forged = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"", b"ATTACKER"));
         let e2 = node.step(
             Instant(2),
             Input::Message {
@@ -1868,7 +1940,7 @@ mod tests {
 
         // The zero vector is not a projective point → rejected, never stored.
         let count_before = node.members().count();
-        let zero = encode(FrameType::Announce, &announce_body([0, 0, 0], &peer_addr, b"", b"ZERO"));
+        let zero = encode(FrameType::Announce, &announce_body([0, 0, 0], &peer_addr, b"", b"", b"ZERO"));
         node.step(Instant(3), Input::Message { from, frame: zero });
         assert_eq!(
             node.members().count(),
