@@ -16,10 +16,12 @@ extern crate alloc;
 
 pub mod identity;
 pub mod kem;
+pub mod onion_ratchet;
 pub mod rng;
 pub mod sig;
 
 pub use identity::{Identity, NodeId, PublicIdentity};
 pub use kem::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SessionKey};
+pub use onion_ratchet::OnionKeyRatchet;
 pub use rng::SeedRng;
 pub use sig::{HybridSigSecret, HybridSignature, HybridVerifier};

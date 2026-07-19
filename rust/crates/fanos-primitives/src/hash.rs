@@ -37,6 +37,9 @@ pub mod label {
     pub const DIAULOS_TH: &str = "FANOS-v1/diaulos-th";
     /// DIAULOS handshake session-key **expansion** (`key_c2s ‖ key_s2c`).
     pub const DIAULOS_KEY: &str = "FANOS-v1/diaulos-key";
+    /// Forward-secure onion-key ratchet: one-way per-epoch advance of a relay's onion decap seed so a
+    /// compromise of the current seed cannot recover past epochs' keys (relay forward secrecy, audit E4).
+    pub const ONION_RATCHET: &str = "FANOS-v1/onion-key-ratchet";
 }
 
 /// A domain-separated BLAKE3 hasher. The label and a unit separator are absorbed first, so
