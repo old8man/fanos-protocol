@@ -15,26 +15,38 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use fanos_observatory::{App, Control, ScenarioSource, SnapshotSource, ui};
+use fanos_observatory::{App, Control, LiveCellSource, ScenarioSource, SnapshotSource, ui};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().any(|a| a == "--json") {
-        // Agent mode: emit one canonical snapshot and exit.
-        let source = ScenarioSource::new();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+    // The source is chosen once; both the TUI and `--json` read the same seam.
+    let source = build_source(args.iter().any(|a| a == "--live"));
+    if args.iter().any(|a| a == "--json") {
         let mut out = io::stdout().lock();
         writeln!(out, "{}", source.snapshot().to_json())?;
         return Ok(());
     }
-    if std::env::args().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return Ok(());
+    run_tui(source)
+}
+
+/// `--live` drives a real cell of production `OverlayNode` engines; the default is the self-contained
+/// `PurityDynamics` demo. Both are the same [`SnapshotSource`] seam — a remote telemetry feed adds a third.
+fn build_source(live: bool) -> Box<dyn SnapshotSource> {
+    if live {
+        Box::new(LiveCellSource::new())
+    } else {
+        Box::new(ScenarioSource::new())
     }
-    run_tui()
 }
 
 fn print_help() {
     println!("fanos-monitor — the terminal Coherence Observatory\n");
-    println!("USAGE:\n  fanos-monitor            open the live TUI");
+    println!("USAGE:\n  fanos-monitor            open the TUI (demo PurityDynamics cell)");
+    println!("  fanos-monitor --live     drive a live cell of real OverlayNode engines");
     println!("  fanos-monitor --json     print one CoherenceSnapshot as JSON (for agents)\n");
     println!("TUI KEYS:\n  q/Esc quit · space pause · a attack · z relieve · f inject fault · h heal");
 }
@@ -49,14 +61,14 @@ fn install_panic_hook() {
     }));
 }
 
-fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
+fn run_tui(source: Box<dyn SnapshotSource>) -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut terminal);
+    let result = event_loop(&mut terminal, source);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -66,8 +78,9 @@ fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    source: Box<dyn SnapshotSource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(Box::new(ScenarioSource::new()));
+    let mut app = App::new(source);
     let tick = Duration::from_millis(120);
     let mut last = Instant::now();
 

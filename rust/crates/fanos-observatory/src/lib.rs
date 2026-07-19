@@ -11,8 +11,10 @@
 //! the rendering. Everything the operator sees is produced by the shipped telemetry code.
 
 pub mod app;
+pub mod live;
 pub mod source;
 pub mod ui;
 
 pub use app::App;
+pub use live::LiveCellSource;
 pub use source::{Control, ScenarioSource, SnapshotSource};

@@ -923,6 +923,8 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-runtime",
+ "fanos-sim",
  "fanos-telemetry",
  "ratatui",
 ]

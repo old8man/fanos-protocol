@@ -17,6 +17,10 @@ fanos-telemetry = { workspace = true, features = ["std"] }
 fanos-diakrisis = { workspace = true, features = ["std"] }
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
+# The live feed drives a real cell of production OverlayNode engines under the deterministic simulator
+# (the devnet-is-production seam); a remote/IPC telemetry source can be added behind the same trait.
+fanos-sim = { workspace = true }
+fanos-runtime = { workspace = true, features = ["std"] }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 
