@@ -19,7 +19,10 @@ libm = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
-std = ["fanos-geometry/std", "fanos-code/std"]
+# `alloc` is the no_std substrate (the crate uses `Vec`/`BTreeMap` unconditionally); `std` builds on it
+# and adds hardware float intrinsics. A no_std embedded build selects `alloc` + `libm`.
+std = ["alloc", "fanos-geometry/std", "fanos-code/std"]
+alloc = ["fanos-geometry/alloc", "fanos-code/alloc"]
 # Enable on no_std targets to supply sqrt via libm.
 libm = ["dep:libm"]
 

@@ -19,11 +19,20 @@ fanos-diakrisis.workspace = true
 
 [features]
 default = ["std"]
+# `alloc` is the no_std substrate; `std` builds on it. A no_std embedded build selects `alloc` + `libm`,
+# matching the crate's `no-std` category claim (the overlay core is heapful but does not require `std`).
 std = [
+    "alloc",
     "fanos-geometry/std",
     "fanos-code/std",
     "fanos-primitives/std",
     "fanos-diakrisis/std",
+]
+alloc = [
+    "fanos-geometry/alloc",
+    "fanos-code/alloc",
+    "fanos-primitives/alloc",
+    "fanos-diakrisis/alloc",
 ]
 # For no_std targets: supply DIAKRISIS's float backend (used by the stratified healing budget).
 libm = ["fanos-diakrisis/libm"]
