@@ -76,6 +76,39 @@ fn the_old_any_witness_rule_would_be_fooled_by_one_liar() {
 }
 
 #[test]
+fn byzantine_tolerance_is_exactly_quorum_minus_one_distinct_witnesses() {
+    // The equivocation/Sybil boundary (spec §6.4, threat D4): quorum-corroborated liveness tolerates up
+    // to `quorum − 1` DISTINCT witnesses lying in concert — the distinctness is what forces an attacker
+    // to control that many separate line identities (each an owned coordinate, priced by the B1 Sybil
+    // bound). We pin the boundary exactly: with quorum 3, TWO distinct liars are outvoted, but THREE
+    // (= quorum) succeed. A single node repeating the same lie is one witness, not a majority — so this
+    // is strictly the multi-identity (equivocating) case the single-liar tests don't cover.
+    let liars_defeated = |n_liars: usize| -> bool {
+        let (mut sim, cell) = cell_with_dead_node(3);
+        // `n_liars` DISTINCT honest-looking neighbours (cells 1..=n_liars) each vouch that the dead
+        // node 5 is alive. (Node 5 is the crash; nodes 1..=4 are live witnesses an attacker would have
+        // to have seized to speak as.)
+        for round in 0..4 {
+            for liar in 1..=n_liars {
+                sim.inject_frame(cell[liar], cell[0], forged_liveness_for(5));
+            }
+            let _ = round;
+            sim.run_for(Duration::from_millis(200));
+        }
+        sim.inject(cell[0], Command::Diagnose);
+        sim.settle();
+        // "Defeated" = the crash is still localized despite the lie (the honest node was not fooled).
+        sim.report().any_verdict(&Verdict::Localized(Fault::Single(5)))
+    };
+
+    // quorum − 1 = 2 distinct liars: outvoted, crash localized.
+    assert!(liars_defeated(2), "2 < quorum 3 distinct liars are outvoted — the crash is still seen");
+    // quorum = 3 distinct liars: they meet the corroboration bar, masking the crash — the exact point
+    // the tolerance is exceeded. This is the calibrated floor: safety holds iff #liars < quorum.
+    assert!(!liars_defeated(3), "3 = quorum distinct liars reach the bar and mask the crash");
+}
+
+#[test]
 fn garbage_frame_floods_do_not_disturb_a_healthy_cell() {
     // A Byzantine node floods malformed frames; honest nodes drop them (canonical decode failure)
     // and the cell stays healthy.
