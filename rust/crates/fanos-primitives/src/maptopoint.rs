@@ -20,16 +20,9 @@ use fanos_geometry::{Line, Point};
 
 use crate::hash::xof_reader;
 
-/// Bytes needed to cover the value range `0..q` (smallest `w` with `256^w ≥ q`).
-const fn coord_bytes(q: u32) -> usize {
-    let mut w = 1usize;
-    let mut space = 256u64;
-    while space < q as u64 {
-        space *= 256;
-        w += 1;
-    }
-    w
-}
+/// Bytes needed to cover the value range `0..q` — the one canonical [`fanos_field::element_width`],
+/// shared with the wire codec so sampling and serialization agree on the width.
+use fanos_field::element_width as coord_bytes;
 
 /// Draw one uniform `GF(q)` element from the XOF stream.
 fn sample_element<F: Field>(reader: &mut OutputReader) -> u32 {

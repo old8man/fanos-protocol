@@ -9,18 +9,10 @@ use fanos_geometry::{Line, Point};
 use crate::error::WireError;
 use crate::varint;
 
-/// The fixed byte width of a `GF(q)` element: `⌈log₂ q / 8⌉` (spec §7.1). Every element of the
-/// field is encoded big-endian, high bits zero-padded, in exactly this many bytes.
-#[must_use]
-pub const fn field_element_width(q: u32) -> usize {
-    let max = q - 1;
-    let bits = if max == 0 {
-        1
-    } else {
-        32 - max.leading_zeros()
-    };
-    bits.div_ceil(8) as usize
-}
+/// The fixed byte width of a `GF(q)` element: `⌈log₂ q / 8⌉` (spec §7.1). Every element of the field
+/// is encoded big-endian, high bits zero-padded, in exactly this many bytes. A re-export of the one
+/// canonical [`fanos_field::element_width`], so the wire codec and the `MapToPoint` sampler share it.
+pub use fanos_field::element_width as field_element_width;
 
 /// The element width for the field `F`.
 #[must_use]

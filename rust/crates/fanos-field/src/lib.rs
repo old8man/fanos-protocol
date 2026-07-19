@@ -44,6 +44,41 @@ pub enum FieldKind {
     Prime,
 }
 
+/// The number of bytes needed to represent one `GF(q)` element: the smallest `w` with `256^w ≥ q`
+/// (equivalently, the byte width of the largest element `q − 1`). This is the one canonical width used
+/// by both the wire codec ([`fanos_wire`]) to serialize a coordinate and the `MapToPoint` sampler to
+/// draw one — a single definition, so the two can never disagree on how wide a field element is.
+#[must_use]
+pub const fn element_width(q: u32) -> usize {
+    // Bytes to hold the largest element `q − 1`: `⌊log₂(q−1) / 8⌋ + 1` (and `1` for the degenerate
+    // `q ≤ 1`). Equivalently the smallest `w` with `256^w ≥ q`.
+    match q.saturating_sub(1) {
+        0 => 1,
+        max => (max.ilog2() as usize / 8) + 1,
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::element_width;
+
+    #[test]
+    fn element_width_covers_the_element_range() {
+        // Exactly `w` bytes must hold every element `0..q`, and `w − 1` must not.
+        for q in [2u32, 7, 8, 13, 256, 257, 65_536, 65_537] {
+            let w = element_width(q);
+            assert!(256u64.pow(w as u32) >= u64::from(q), "q={q} fits in {w} bytes");
+            if w > 1 {
+                assert!(256u64.pow(w as u32 - 1) < u64::from(q), "q={q} needs the {w}th byte");
+            }
+        }
+        // Small binary/prime fields FANOS instantiates are 1 byte; q=257 crosses to 2.
+        assert_eq!(element_width(2), 1);
+        assert_eq!(element_width(256), 1);
+        assert_eq!(element_width(257), 2);
+    }
+}
+
 /// A finite field `GF(q)` exposed as compile-time operations over `u32` element codes.
 ///
 /// Implementors are zero-sized types; all methods are associated functions so that a
