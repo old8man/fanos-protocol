@@ -97,6 +97,43 @@ impl<F: Field> HierAddr<F> {
     pub fn is_ancestor_of(&self, other: &Self) -> bool {
         self.path.len() <= other.path.len() && self.common_prefix(other) == self.path.len()
     }
+
+    /// The canonical wire bytes: `depth(1) ‖ depth × coord(12)` (each point's `[x:y:z]` big-endian).
+    /// Compact and fixed-per-depth, so an address travels on the overlay wire like any coordinate.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.path.len() * 12);
+        out.push(self.path.len() as u8);
+        for p in &self.path {
+            for w in p.coords() {
+                out.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        out
+    }
+
+    /// Decode the wire bytes written by [`encode`](Self::encode). `None` on a bad length, an
+    /// out-of-range depth, or a non-canonical projective point (so a forged address cannot inject a
+    /// bogus coordinate).
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&depth, rest) = bytes.split_first()?;
+        let depth = depth as usize;
+        if depth == 0 || depth > MAX_DEPTH || rest.len() != depth * 12 {
+            return None;
+        }
+        let mut path = Vec::with_capacity(depth);
+        let (coords, _) = rest.as_chunks::<12>();
+        for coord in coords {
+            let (quads, _) = coord.as_chunks::<4>();
+            let mut w = [0u32; 3];
+            for (slot, quad) in w.iter_mut().zip(quads) {
+                *slot = u32::from_be_bytes(*quad);
+            }
+            path.push(Point::new(w)?);
+        }
+        Some(Self { path })
+    }
 }
 
 /// Derive a node's address by **sub-cell descent**. At each level the node's candidate point is
@@ -211,6 +248,58 @@ mod tests {
         let (level, line) = rendezvous(&a, &b).unwrap();
         assert_eq!(level, 1, "they diverge one level down");
         assert_eq!(line, p(5).join(&p(6)).unwrap());
+    }
+
+    #[test]
+    fn rendezvous_is_symmetric_so_both_parties_meet_on_one_bus() {
+        // The routing-agreement property: A→B and B→A resolve to the SAME level and the SAME line, so
+        // both post to / listen on one bus (spec §L1). Without this, rendezvous routing could not meet.
+        let a = HierAddr::from_path(alloc::vec![p(2), p(5)]).unwrap();
+        let b = HierAddr::from_path(alloc::vec![p(2), p(6)]).unwrap();
+        assert_eq!(rendezvous(&a, &b), rendezvous(&b, &a));
+        let c = HierAddr::root(p(1));
+        let d = HierAddr::from_path(alloc::vec![p(4), p(3)]).unwrap();
+        assert_eq!(rendezvous(&c, &d), rendezvous(&d, &c));
+    }
+
+    #[test]
+    fn rendezvous_routing_strictly_converges_toward_the_target() {
+        // The routing-correctness core. H and D share level 0 and diverge at level 1. The rendezvous
+        // meets on the line H[1]×D[1]; D's own point at that level lies ON that line, so a node in D's
+        // sub-cell is reachable there — and it shares one MORE prefix level with D than H did. Repeating
+        // this reaches D in ≤ D.depth hops (the O(k) rendezvous depth, spec §L1).
+        let h = HierAddr::from_path(alloc::vec![p(2), p(5), p(1)]).unwrap();
+        let d = HierAddr::from_path(alloc::vec![p(2), p(6), p(3)]).unwrap();
+        let (level, line) = rendezvous(&h, &d).unwrap();
+        assert_eq!(level, 1, "they diverge one level down");
+        assert!(
+            d.point_at(level).unwrap().is_on(&line),
+            "D's divergence-level point is on the meeting bus — D's sub-cell is reachable there",
+        );
+        let reached = HierAddr::from_path(d.points()[..=level].to_vec()).unwrap();
+        assert!(
+            reached.common_prefix(&d) > h.common_prefix(&d),
+            "each rendezvous hop shares one more prefix level with the target — strict convergence",
+        );
+    }
+
+    #[test]
+    fn address_wire_form_round_trips_and_rejects_junk() {
+        for addr in [
+            HierAddr::root(p(3)),
+            HierAddr::from_path(alloc::vec![p(2), p(5)]).unwrap(),
+            HierAddr::from_path(alloc::vec![p(0), p(6), p(1)]).unwrap(),
+        ] {
+            assert_eq!(HierAddr::<F2>::decode(&addr.encode()), Some(addr));
+        }
+        assert_eq!(HierAddr::<F2>::decode(&[]), None, "empty");
+        assert_eq!(HierAddr::<F2>::decode(&[0]), None, "zero depth");
+        assert_eq!(HierAddr::<F2>::decode(&[1, 0, 0, 0]), None, "truncated coord");
+        assert_eq!(
+            HierAddr::<F2>::decode(&[(MAX_DEPTH as u8) + 1]),
+            None,
+            "over-deep"
+        );
     }
 
     #[test]
