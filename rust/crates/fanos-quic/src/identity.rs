@@ -7,8 +7,8 @@
 //! occupy a coordinate whose key it does not hold. The [`Directory`](crate::Directory) then serves
 //! only address resolution (a hint for dialing), never identity.
 
-use fanos_crypto::hash::label;
-use fanos_crypto::map_to_point;
+use fanos_primitives::hash::label;
+use fanos_primitives::map_to_point;
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Point, derive_address};
 use quinn::Connection;
@@ -25,11 +25,11 @@ pub fn coordinate_from_cert<F: Field>(cert_der: &[u8]) -> Point<F> {
 /// cert-bound point in the sub-cell, domain-separated by the level, so a node that collides can descend
 /// to a coordinate it *earned* rather than shadow the occupant (§L0). Deterministic and unforgeable:
 /// only the certificate's holder can produce its whole descent chain. Delegates to the shared
-/// derivation [`fanos_crypto::address_point`] (the single source of truth) with the certificate DER as
+/// derivation [`fanos_primitives::address_point`] (the single source of truth) with the certificate DER as
 /// the node identity — so the overlay's announcement verifier recomputes byte-identical points.
 #[must_use]
 pub fn coordinate_at_level<F: Field>(cert_der: &[u8], level: usize) -> Point<F> {
-    fanos_crypto::address_point::<F>(cert_der, level)
+    fanos_primitives::address_point::<F>(cert_der, level)
 }
 
 /// Resolve a node's **hierarchical address** by sub-cell descent (§L0/§L1): the shortest self-certifying

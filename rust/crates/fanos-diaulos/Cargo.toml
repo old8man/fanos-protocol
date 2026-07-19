@@ -16,7 +16,7 @@ fanos-runtime = { workspace = true, features = ["std"] }
 chacha20poly1305 = { workspace = true }
 # The 1-RTT handshake: hybrid X25519+ML-KEM-768 KEM (encaps/decaps) and the labeled KDF.
 fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
-fanos-crypto = { workspace = true }
+fanos-primitives = { workspace = true }
 # The `CryptoRng` bound the KEM keygen/encapsulation are generic over (0.10 matches fanos-pqcrypto).
 rand_core = { version = "0.10", default-features = false }
 # Wipe the direction/session AEAD keys and the handshake shared secret on drop.

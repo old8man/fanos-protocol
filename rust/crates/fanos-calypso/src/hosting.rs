@@ -8,9 +8,9 @@
 
 use alloc::vec::Vec;
 
-use fanos_crypto::shamir::{self, ShamirError};
+use fanos_primitives::shamir::{self, ShamirError};
 
-pub use fanos_crypto::shamir::Share;
+pub use fanos_primitives::shamir::Share;
 
 /// Shard a service secret across the `line_size` members of a service-line, so any `threshold`
 /// of them can reconstruct it (spec §12.3). `randomness` supplies the sharing polynomial.

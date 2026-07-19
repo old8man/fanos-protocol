@@ -16,7 +16,7 @@ fanos-geometry.workspace = true
 fanos-code.workspace = true
 fanos-diakrisis.workspace = true
 fanos-telemetry.workspace = true
-fanos-crypto.workspace = true
+fanos-primitives.workspace = true
 # The overlay engine verifies signed membership descriptors (§80) — the real hybrid verifier lives in
 # fanos-pqcrypto (no_std), so the sans-I/O engine authenticates membership natively on any target.
 fanos-pqcrypto.workspace = true
@@ -31,7 +31,7 @@ std = [
     "fanos-code/std",
     "fanos-diakrisis/std",
     "fanos-telemetry/std",
-    "fanos-crypto/std",
+    "fanos-primitives/std",
     "fanos-core/std",
     "fanos-wire/std",
 ]

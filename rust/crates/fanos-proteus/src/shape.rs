@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use fanos_crypto::hash_labeled;
+use fanos_primitives::hash_labeled;
 
 const SHAPE_LABEL: &str = "FANOS-v1/proteus-shape";
 

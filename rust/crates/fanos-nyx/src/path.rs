@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use blake3::OutputReader;
 
-use fanos_crypto::hash::xof_reader;
+use fanos_primitives::hash::xof_reader;
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point};
 

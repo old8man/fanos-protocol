@@ -8,7 +8,7 @@
 
 use alloc::string::String;
 
-use fanos_crypto::hash::{hash_labeled, label};
+use fanos_primitives::hash::{hash_labeled, label};
 
 use crate::bech32;
 use crate::error::OnomaError;

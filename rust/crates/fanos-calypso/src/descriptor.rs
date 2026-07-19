@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use fanos_crypto::hash::hash_labeled;
+use fanos_primitives::hash::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_onoma::Address;

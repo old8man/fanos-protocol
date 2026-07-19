@@ -18,7 +18,7 @@
 //!   unenumerable and address-gated.
 //! * [`mnemonic`] — a dictionary-free, pronounceable (proquint) rendering for human verification.
 //!
-//! `#![no_std]` with `alloc`; the only dependency chain is `fanos-crypto` (BLAKE3 + `MapToPoint`).
+//! `#![no_std]` with `alloc`; the only dependency chain is `fanos-primitives` (BLAKE3 + `MapToPoint`).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

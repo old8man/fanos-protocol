@@ -161,7 +161,7 @@ pub fn reconstruct_joint_secret(final_shares: &[VssShare]) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use crate::vss::DeterministicRng;
-    use fanos_crypto::hash::hash_xof;
+    use fanos_primitives::hash::hash_xof;
 
     fn secret(tag: &str) -> [u8; 32] {
         let mut s = [0u8; 32];

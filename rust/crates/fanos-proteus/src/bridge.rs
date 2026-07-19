@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::Line;
 
-use fanos_crypto::map_to_line;
+use fanos_primitives::map_to_line;
 
 const BRIDGE_LABEL: &str = "FANOS-v1/proteus-bridge";
 

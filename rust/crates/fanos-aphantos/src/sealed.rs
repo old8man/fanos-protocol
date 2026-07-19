@@ -32,8 +32,8 @@ use alloc::vec::Vec;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use fanos_crypto::hash::hash_xof;
-use fanos_crypto::hash_labeled;
+use fanos_primitives::hash::hash_xof;
+use fanos_primitives::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_nyx::{Circuit, circuit_holonomy};

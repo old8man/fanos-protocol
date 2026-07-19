@@ -23,8 +23,8 @@
 //! to the two direction keys `key_c2s ‖ key_s2c` a [`Connection`] uses. The client is the connection
 //! *initiator* (even stream ids); the service is the *responder* (odd).
 
-use fanos_crypto::hash::{hash_labeled, hash_xof, label};
-use fanos_crypto::keys::{ED25519_PK_LEN, MLDSA65_PK_LEN};
+use fanos_primitives::hash::{hash_labeled, hash_xof, label};
+use fanos_primitives::keys::{ED25519_PK_LEN, MLDSA65_PK_LEN};
 use fanos_pqcrypto::kem::{
     CIPHERTEXT_LEN, HybridCiphertext, HybridKemPublic, HybridKemSecret, PUBLIC_LEN, SessionKey,
 };
@@ -39,13 +39,13 @@ pub const CLIENT_HELLO_LEN: usize = PUBLIC_LEN + CIPHERTEXT_LEN;
 pub const SERVER_HELLO_LEN: usize = CIPHERTEXT_LEN;
 
 /// The offset of the hybrid KEM key within a canonical identity bundle, whose layout is
-/// `Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768` (`fanos_crypto::keys::HybridPublicKey::encode`). The
+/// `Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768` (`fanos_primitives::keys::HybridPublicKey::encode`). The
 /// trailing [`PUBLIC_LEN`] bytes from here are exactly the KEM key the handshake needs.
 const KEM_OFFSET_IN_BUNDLE: usize = ED25519_PK_LEN + MLDSA65_PK_LEN;
 
 /// Extract a service's [`HybridKemPublic`] (the handshake input) from its canonical ONOMA identity
 /// bundle — the `bundle` field a `.fanos` resolution yields. The KEM key is byte-identical whether
-/// produced by `fanos_crypto::keys::KemPublicKey` or `fanos_pqcrypto`, so the trailing `PUBLIC_LEN`
+/// produced by `fanos_primitives::keys::KemPublicKey` or `fanos_pqcrypto`, so the trailing `PUBLIC_LEN`
 /// bytes decode directly. Returns `None` if the bundle is malformed (too short or an invalid key).
 #[must_use]
 pub fn service_public_from_bundle(bundle: &[u8]) -> Option<HybridKemPublic> {

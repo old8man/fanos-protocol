@@ -13,7 +13,7 @@
 
 use fanos_code::{is_hyperoval_fano, is_recoverable_fano, locate, syndrome::Sector};
 use fanos_core::{Hierarchy, Node, NodeId, Observation, Verdict, membership::centrality_fraction};
-use fanos_crypto::{reconstruct, split};
+use fanos_primitives::{reconstruct, split};
 use fanos_diakrisis::{
     Fault, blindness, coherence::CoherenceMatrix, healing, partition, polar, window,
 };

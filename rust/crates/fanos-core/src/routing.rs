@@ -8,8 +8,8 @@
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point};
 
-use fanos_crypto::hash::label;
-use fanos_crypto::map_to_point;
+use fanos_primitives::hash::label;
+use fanos_primitives::map_to_point;
 
 /// The **rendezvous line** `L = u × v` on which `u` and `v` can meet (spec §L1). Returns
 /// `None` iff the two points are equal.

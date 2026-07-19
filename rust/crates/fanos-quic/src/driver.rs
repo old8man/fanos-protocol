@@ -22,7 +22,7 @@ use std::time::Instant as StdInstant;
 use quinn::{Connection, Endpoint};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use fanos_crypto::{hash_labeled, label};
+use fanos_primitives::{hash_labeled, label};
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
 use fanos_proteus::ProteusShaper;

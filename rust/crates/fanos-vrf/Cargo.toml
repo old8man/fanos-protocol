@@ -17,7 +17,7 @@ categories = ["cryptography"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
-fanos-crypto = { workspace = true, features = ["alloc"] }
+fanos-primitives = { workspace = true, features = ["alloc"] }
 vrf-r255 = "0.1"
 # Feldman VSS shares the ristretto255 group vrf-r255 already pulls in (same version).
 curve25519-dalek = { version = "4", features = ["rand_core"] }

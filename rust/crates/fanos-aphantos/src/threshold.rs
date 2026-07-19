@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use fanos_crypto::hash_labeled;
-use fanos_crypto::shamir::{self, Share};
+use fanos_primitives::hash_labeled;
+use fanos_primitives::shamir::{self, Share};
 use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
 
@@ -70,7 +70,7 @@ pub fn pad_onion(onion: &[u8]) -> Result<Vec<u8>, ThresholdError> {
     let mut out = Vec::with_capacity(THRESHOLD_ONION_LEN);
     out.extend_from_slice(onion);
     let mut pad = alloc::vec![0u8; THRESHOLD_ONION_LEN - onion.len()];
-    fanos_crypto::hash::hash_xof("FANOS-v1/threshold-onion-pad", onion, &mut pad);
+    fanos_primitives::hash::hash_xof("FANOS-v1/threshold-onion-pad", onion, &mut pad);
     out.extend_from_slice(&pad);
     Ok(out)
 }
@@ -349,7 +349,7 @@ pub fn seal_onion(
 fn sharing_randomness(seed: &[u8], threshold: u8) -> Vec<u8> {
     let n = usize::from(threshold.saturating_sub(1)) * 32;
     let mut out = alloc::vec![0u8; n];
-    fanos_crypto::hash::hash_xof("FANOS-v1/threshold-onion-sharing", seed, &mut out);
+    fanos_primitives::hash::hash_xof("FANOS-v1/threshold-onion-sharing", seed, &mut out);
     out
 }
 

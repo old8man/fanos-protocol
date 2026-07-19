@@ -1,4 +1,4 @@
-//! # fanos-crypto — the cryptographic surface
+//! # fanos-primitives — the cryptographic surface
 //!
 //! FANOS's novelty is the *architectural composition* of vetted post-quantum primitives, not
 //! new hardness (spec §L6). This crate provides the composition points the rest of the stack

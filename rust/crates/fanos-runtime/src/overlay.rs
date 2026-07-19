@@ -9,8 +9,8 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use fanos_crypto::hash::label;
-use fanos_crypto::{hash_labeled, map_to_point};
+use fanos_primitives::hash::label;
+use fanos_primitives::{hash_labeled, map_to_point};
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::regeneration::spectral_gap;
@@ -92,7 +92,7 @@ pub struct Config {
     pub read_timeout: Duration,
     /// Whether to require **self-certified** membership: seed a peer's hierarchical address into the
     /// routing table only if it matches the descent chain of the identity carried in its announcement
-    /// ([`fanos_crypto::address_matches_identity`]). Off by default (a peer's announced address is
+    /// ([`fanos_primitives::address_matches_identity`]). Off by default (a peer's announced address is
     /// trusted, as the `members` view always is); on for a deployment that wants routing-table
     /// poisoning resistance — a peer then cannot announce an overlay address it did not earn, so
     /// attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding (threat §79/B1).
@@ -582,7 +582,7 @@ impl<F: Field> OverlayNode<F> {
     /// Seat this node's long-term identity (spec §L0): its hybrid signature public-key bundle, the
     /// pre-image its `hier` address is derived from (builder). Carried in the node's `Announce` so peers
     /// running self-certified membership can verify the address it claims. Only meaningful when `hier` is
-    /// actually `id`'s descent chain ([`fanos_crypto::address_point`]); a deployment sets both together.
+    /// actually `id`'s descent chain ([`fanos_primitives::address_point`]); a deployment sets both together.
     #[must_use]
     pub fn with_identity(mut self, id: Vec<u8>) -> Self {
         self.identity = id;
@@ -979,7 +979,7 @@ impl<F: Field> OverlayNode<F> {
         //     which without the identity's private key cannot be signed (threat §80).
         // Neither `members` nor `hier_peers` is written on failure.
         if self.config.require_self_certified_membership
-            && (!fanos_crypto::address_matches_identity::<F>(&id, &hier)
+            && (!fanos_primitives::address_matches_identity::<F>(&id, &hier)
                 || !descriptor_signature_ok::<F>(coord, &hier, &id, &sig))
         {
             return Vec::new();

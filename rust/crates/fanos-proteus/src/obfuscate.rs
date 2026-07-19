@@ -12,7 +12,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use fanos_crypto::hash::hash_xof;
+use fanos_primitives::hash::hash_xof;
 
 use crate::shape::ShapeParams;
 

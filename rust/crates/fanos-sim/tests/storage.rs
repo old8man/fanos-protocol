@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use fanos_crypto::{hash::label, map_to_point};
+use fanos_primitives::{hash::label, map_to_point};
 use fanos_field::F2;
 use fanos_geometry::fano;
 use fanos_runtime::{Command, Config, Duration};

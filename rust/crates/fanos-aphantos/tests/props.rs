@@ -5,7 +5,7 @@
 
 use fanos_aphantos::threshold::{member_partial, pad_onion, peel_onion_with_shares};
 use fanos_aphantos::{PeelOutcome, ThresholdSealed, sealed};
-use fanos_crypto::shamir::Share;
+use fanos_primitives::shamir::Share;
 use fanos_field::F31;
 use fanos_geometry::Point;
 use fanos_nyx::build_circuit;

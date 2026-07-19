@@ -87,7 +87,7 @@
 
 use std::collections::BTreeSet;
 
-use fanos_crypto::{hash::label, map_to_point};
+use fanos_primitives::{hash::label, map_to_point};
 use fanos_field::{F7, F13, F16, Field};
 use fanos_geometry::{Line, Plane};
 use fanos_sim::Rng;

@@ -13,7 +13,7 @@ categories = ["cryptography", "network-programming"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
-fanos-crypto.workspace = true
+fanos-primitives.workspace = true
 fanos-onoma.workspace = true
 # The DIAKRISIS spectral gap Δ = (G − max_k T_k)/6 (T-226(v)) that the admission controller's
 # relaxation rate is derived from — one Δ for healing and for admission (derive, don't tune).
@@ -22,10 +22,10 @@ chacha20poly1305 = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["fanos-geometry/std", "fanos-crypto/std", "fanos-onoma/std", "fanos-diakrisis/std"]
+std = ["fanos-geometry/std", "fanos-primitives/std", "fanos-onoma/std", "fanos-diakrisis/std"]
 alloc = [
     "fanos-geometry/alloc",
-    "fanos-crypto/alloc",
+    "fanos-primitives/alloc",
     "fanos-onoma/alloc",
     "fanos-diakrisis/libm",
 ]

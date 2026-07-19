@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use fanos_calypso::ServiceAddress;
-use fanos_crypto::{hash::label, hash_labeled, map_to_point};
+use fanos_primitives::{hash::label, hash_labeled, map_to_point};
 use fanos_field::F7;
 
 fn hex(bytes: &[u8]) -> String {

@@ -11,8 +11,8 @@
 
 use alloc::vec::Vec;
 
-use fanos_crypto::hash::{DIGEST_LEN, hash_labeled, label};
-use fanos_crypto::map_to_point;
+use fanos_primitives::hash::{DIGEST_LEN, hash_labeled, label};
+use fanos_primitives::map_to_point;
 use fanos_field::Field;
 use fanos_geometry::Point;
 

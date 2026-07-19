@@ -10,7 +10,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use fanos_crypto::hash::hash_xof;
+use fanos_primitives::hash::hash_xof;
 
 use crate::obfuscate::{NONCE_LEN, deobfuscate, obfuscate};
 use crate::shape::{ShapeParams, epoch_shape};

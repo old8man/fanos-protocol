@@ -30,7 +30,7 @@ use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand_core::{CryptoRng, RngCore};
 
-use fanos_crypto::hash::hash_xof;
+use fanos_primitives::hash::hash_xof;
 
 /// The input length of a credit (a random nonce chosen by the client).
 pub const INPUT_LEN: usize = 32;

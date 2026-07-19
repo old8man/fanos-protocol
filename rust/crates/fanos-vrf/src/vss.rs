@@ -20,7 +20,7 @@ use curve25519_dalek::traits::Identity;
 use curve25519_dalek::{RistrettoPoint, Scalar};
 use rand_core::{CryptoRng, RngCore};
 
-use fanos_crypto::hash::hash_xof;
+use fanos_primitives::hash::hash_xof;
 
 /// A deterministic BLAKE3-XOF RNG for reproducible dealing (tests, seeded deployments). It
 /// implements `rand_core` 0.6 so it can drive `Scalar::random`.

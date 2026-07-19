@@ -9,8 +9,8 @@
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point};
 
-use fanos_crypto::NodeId;
-use fanos_crypto::coordinate_for;
+use fanos_primitives::NodeId;
+use fanos_primitives::coordinate_for;
 
 /// A cell member: its long-term identity and its epoch-bound coordinate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -33,7 +33,7 @@ fanos-rendezvous = { path = "../fanos-rendezvous", version = "0.1.0" }
 fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
 fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
 # For the L4 storage scenarios (computing a key's responsible node, MapToPoint).
-fanos-crypto = { workspace = true, features = ["std"] }
+fanos-primitives = { workspace = true, features = ["std"] }
 # For the hierarchy scenario (feeding a child cell's escalation to the parent tier).
 fanos-core = { workspace = true, features = ["std"] }
 # For the CALYPSO hidden-service flow (address, per-epoch rendezvous, PoW) over the overlay.

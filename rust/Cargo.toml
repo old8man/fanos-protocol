@@ -14,7 +14,7 @@ members = [
     "crates/fanos-diakrisis",
     "crates/fanos-wire",
     "crates/fanos-wire-derive",
-    "crates/fanos-crypto",
+    "crates/fanos-primitives",
     "crates/fanos-aphantos",
     "crates/fanos-calypso",
     "crates/fanos-core",
@@ -85,14 +85,14 @@ many_single_char_names = "allow" # dense numerical kernels use math-style names
 missing_errors_doc = "allow"     # error types (WireError etc.) are self-documenting enums
 
 [workspace.dependencies]
-# Foundational math crates are zero-dependency; only fanos-crypto and above pull externals.
+# Foundational math crates are zero-dependency; only fanos-primitives and above pull externals.
 fanos-field = { path = "crates/fanos-field", version = "0.1.0", default-features = false }
 fanos-geometry = { path = "crates/fanos-geometry", version = "0.1.0", default-features = false }
 fanos-code = { path = "crates/fanos-code", version = "0.1.0", default-features = false }
 fanos-diakrisis = { path = "crates/fanos-diakrisis", version = "0.1.0", default-features = false }
 fanos-wire = { path = "crates/fanos-wire", version = "0.1.0", default-features = false }
 fanos-wire-derive = { path = "crates/fanos-wire-derive", version = "0.1.0" }
-fanos-crypto = { path = "crates/fanos-crypto", version = "0.1.0", default-features = false }
+fanos-primitives = { path = "crates/fanos-primitives", version = "0.1.0", default-features = false }
 fanos-pqcrypto = { path = "crates/fanos-pqcrypto", version = "0.1.0" }
 fanos-onoma = { path = "crates/fanos-onoma", version = "0.1.0", default-features = false }
 fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }
@@ -107,7 +107,7 @@ zeroize = { version = "1", default-features = false }
 
 # The real post-quantum hybrid primitives (Ed25519+ML-DSA-65, X25519+ML-KEM-768) live in the
 # `fanos-pqcrypto` crate (RustCrypto `ed25519-dalek`/`x25519-dalek`/`ml-kem`/`ml-dsa`, all `no_std`),
-# which owns those dependencies directly — so the light math core (`fanos-crypto`, BLAKE3-only) stays
+# which owns those dependencies directly — so the light math core (`fanos-primitives`, BLAKE3-only) stays
 # free of them and only the crates that need real keys pull them in.
 
 # Terminal UI for the operator observatory (`fanos-monitor`): a native, embedded-friendly TUI — no

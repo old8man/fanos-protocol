@@ -25,7 +25,7 @@ fanos-runtime = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-field = { workspace = true, features = ["std"] }
 # For self-certifying identity: coordinate = MapToPoint(H(cert)).
-fanos-crypto = { workspace = true, features = ["std"] }
+fanos-primitives = { workspace = true, features = ["std"] }
 # Optional PROTEUS transport shaping (polymorph obfuscation below the sans-I/O boundary).
 fanos-proteus = { path = "../fanos-proteus", version = "0.1.0", features = ["std"] }
 

@@ -22,7 +22,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_crypto::shamir::Share;
+use fanos_primitives::shamir::Share;
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_pqcrypto::HybridKemSecret;
@@ -163,7 +163,7 @@ impl<F: Field> ThresholdRouter<F> {
     fn cover_prf_unit(&self, counter: u64) -> f64 {
         let mut data = self.mix_seed.to_vec();
         data.extend_from_slice(&counter.to_be_bytes());
-        let digest = fanos_crypto::hash_labeled("FANOS-v1/threshold-cover-prf", &data);
+        let digest = fanos_primitives::hash_labeled("FANOS-v1/threshold-cover-prf", &data);
         let bits = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
         (bits as f64) / (u64::MAX as f64 + 1.0)
     }
@@ -206,7 +206,7 @@ impl<F: Field> ThresholdRouter<F> {
             let mut material = self.mix_seed.to_vec();
             material.extend_from_slice(&self.cover_seq.to_be_bytes());
             let mut cell = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
-            fanos_crypto::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
+            fanos_primitives::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
             if let Some(combiner) = Self::combiner_of(line) {
                 effects.push(Effect::Send {
                     to: combiner,
@@ -265,7 +265,7 @@ impl<F: Field> ThresholdRouter<F> {
     fn sample_delay(&self, id: u64) -> Duration {
         let mut data = self.mix_seed.to_vec();
         data.extend_from_slice(&id.to_be_bytes());
-        let digest = fanos_crypto::hash_labeled("FANOS-v1/threshold-mix", &data);
+        let digest = fanos_primitives::hash_labeled("FANOS-v1/threshold-mix", &data);
         let bits = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
         let u = ((bits as f64) / (u64::MAX as f64 + 1.0)).max(1e-12);
         let ns = (-(self.mean_delay.as_nanos() as f64) * u.ln()) as u64;

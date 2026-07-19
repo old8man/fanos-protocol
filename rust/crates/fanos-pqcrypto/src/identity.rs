@@ -2,7 +2,7 @@
 //!
 //! A FANOS node's long-term identifier is the BLAKE3 hash of the canonical concatenation of
 //! its hybrid signature and KEM public keys. This is the real, post-quantum realization of the
-//! identity that [`fanos_crypto`](https://docs.rs/fanos-crypto) models as a placeholder.
+//! identity that [`fanos_primitives`](https://docs.rs/fanos-primitives) models as a placeholder.
 
 use rand_core::CryptoRng;
 
@@ -33,9 +33,9 @@ pub struct PublicIdentity {
 
 impl PublicIdentity {
     /// The long-term node identifier: domain-separated `BLAKE3` of the canonical public-key
-    /// bundle (spec §L0). This reproduces `fanos_crypto::hash_labeled(NODE_ID, sig ‖ kem)`
+    /// bundle (spec §L0). This reproduces `fanos_primitives::hash_labeled(NODE_ID, sig ‖ kem)`
     /// **byte-for-byte** — including the `0x1f` unit separator after the label — so the placeholder
-    /// identity in `fanos-crypto` and this real hybrid one agree on the same node ID (a
+    /// identity in `fanos-primitives` and this real hybrid one agree on the same node ID (a
     /// cross-crate test in `tests/node_id_parity.rs` pins the two together).
     #[must_use]
     pub fn node_id(&self) -> NodeId {
@@ -106,15 +106,15 @@ mod tests {
     }
 
     #[test]
-    fn node_id_matches_the_canonical_fanos_crypto_rule() {
-        // The real hybrid identity and the `fanos-crypto` placeholder must agree on the node ID,
+    fn node_id_matches_the_canonical_fanos_primitives_rule() {
+        // The real hybrid identity and the `fanos-primitives` placeholder must agree on the node ID,
         // or the two impls disagree on addressing (spec §L0). Pin them: the pqcrypto node_id equals
         // `hash_labeled(NODE_ID, sig ‖ kem)` byte-for-byte (this catches a missing/extra separator).
         let mut rng = SeedRng::from_seed(b"id-parity");
         let node = Identity::generate(&mut rng);
         let mut bundle = node.public.signature.encode();
         bundle.extend_from_slice(&node.public.kem.encode());
-        let canonical = fanos_crypto::hash_labeled(fanos_crypto::label::NODE_ID, &bundle);
+        let canonical = fanos_primitives::hash_labeled(fanos_primitives::label::NODE_ID, &bundle);
         assert_eq!(node.node_id().0, canonical);
     }
 }

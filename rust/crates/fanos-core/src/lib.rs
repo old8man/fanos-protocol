@@ -26,7 +26,7 @@ pub mod routing;
 pub mod stratum;
 
 // Re-export the stack's core types so an application depends on `fanos-core` alone.
-pub use fanos_crypto::{HybridPublicKey, NodeId};
+pub use fanos_primitives::{HybridPublicKey, NodeId};
 pub use fanos_diakrisis::{Observation, Verdict, diagnose};
 pub use fanos_field::Field;
 pub use fanos_geometry::{Line, Plane, Point};

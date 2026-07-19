@@ -30,7 +30,7 @@
 
 use alloc::vec::Vec;
 
-use fanos_crypto::hash_labeled;
+use fanos_primitives::hash_labeled;
 use fanos_geometry::Triple;
 
 use crate::ServiceAddress;

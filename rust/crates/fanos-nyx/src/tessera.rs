@@ -16,8 +16,8 @@ use alloc::vec::Vec;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use fanos_crypto::hash::xof_reader;
-use fanos_crypto::{hash_labeled, shamir};
+use fanos_primitives::hash::xof_reader;
+use fanos_primitives::{hash_labeled, shamir};
 use fanos_field::Field;
 
 use crate::path::Circuit;

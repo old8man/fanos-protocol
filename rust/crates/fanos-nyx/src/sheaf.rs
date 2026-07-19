@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use fanos_crypto::shamir::{self, ShamirError, Share};
+use fanos_primitives::shamir::{self, ShamirError, Share};
 
 /// A NYX error.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

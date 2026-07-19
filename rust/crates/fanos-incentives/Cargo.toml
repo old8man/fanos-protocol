@@ -16,7 +16,7 @@ keywords = ["voprf", "privacy-pass", "anonymous-credentials", "incentives", "fan
 categories = ["cryptography"]
 
 [dependencies]
-fanos-crypto = { workspace = true, features = ["alloc"] }
+fanos-primitives = { workspace = true, features = ["alloc"] }
 curve25519-dalek = { version = "4", features = ["rand_core"] }
 rand_core = { version = "0.6", default-features = false }
 

@@ -13,12 +13,12 @@ categories = ["network-programming", "cryptography"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
-fanos-crypto.workspace = true
+fanos-primitives.workspace = true
 
 [features]
 default = ["std"]
-std = ["fanos-geometry/std", "fanos-crypto/std"]
-alloc = ["fanos-geometry/alloc", "fanos-crypto/alloc"]
+std = ["fanos-geometry/std", "fanos-primitives/std"]
+alloc = ["fanos-geometry/alloc", "fanos-primitives/alloc"]
 
 [dev-dependencies]
 proptest.workspace = true

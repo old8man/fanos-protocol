@@ -14,7 +14,7 @@ categories = ["network-programming"]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
 fanos-code.workspace = true
-fanos-crypto.workspace = true
+fanos-primitives.workspace = true
 fanos-diakrisis.workspace = true
 
 [features]
@@ -22,7 +22,7 @@ default = ["std"]
 std = [
     "fanos-geometry/std",
     "fanos-code/std",
-    "fanos-crypto/std",
+    "fanos-primitives/std",
     "fanos-diakrisis/std",
 ]
 # For no_std targets: supply DIAKRISIS's float backend (used by the stratified healing budget).

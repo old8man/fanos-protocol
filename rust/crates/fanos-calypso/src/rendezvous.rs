@@ -9,8 +9,8 @@
 
 use alloc::vec::Vec;
 
-use fanos_crypto::hash::label;
-use fanos_crypto::map_to_line;
+use fanos_primitives::hash::label;
+use fanos_primitives::map_to_line;
 use fanos_field::Field;
 use fanos_geometry::Line;
 

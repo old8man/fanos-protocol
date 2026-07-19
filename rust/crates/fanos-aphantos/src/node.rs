@@ -7,9 +7,9 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_crypto::hash::hash_xof;
-use fanos_crypto::map_to_point;
-use fanos_crypto::hash_labeled;
+use fanos_primitives::hash::hash_xof;
+use fanos_primitives::map_to_point;
+use fanos_primitives::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
 use fanos_nyx::{build_circuit, build_circuit_via_guard};

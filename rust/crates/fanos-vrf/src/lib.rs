@@ -1,6 +1,6 @@
 //! # fanos-vrf — a real verifiable random function for the beacon & rendezvous
 //!
-//! The hash derivation in [`fanos_crypto::vrf`] is deterministic but **unverifiable**: nothing
+//! The hash derivation in [`fanos_primitives::vrf`] is deterministic but **unverifiable**: nothing
 //! stops a node lying about the coordinate it derived. This crate replaces it with an RFC 9381-*style*
 //! VRF on the ristretto255 group (via the vetted [`vrf_r255`] crate) — it is *not* the
 //! `ECVRF-EDWARDS25519-SHA512` ciphersuite of RFC 9381 and is not wire-compatible with it, so the RFC is a
@@ -26,8 +26,8 @@ pub mod vss;
 
 use alloc::vec::Vec;
 
-use fanos_crypto::hash::label;
-use fanos_crypto::map_to_point;
+use fanos_primitives::hash::label;
+use fanos_primitives::map_to_point;
 use fanos_field::Field;
 use fanos_geometry::Point;
 use vrf_r255::{Proof, PublicKey, SecretKey};
@@ -64,7 +64,7 @@ impl VrfSecret {
     #[must_use]
     pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
         let mut wide = [0u8; 64];
-        fanos_crypto::hash::hash_xof("FANOS-v1/vrf-seed", &seed, &mut wide);
+        fanos_primitives::hash::hash_xof("FANOS-v1/vrf-seed", &seed, &mut wide);
         let scalar = curve25519_dalek::Scalar::from_bytes_mod_order_wide(&wide);
         Option::from(SecretKey::from_bytes(scalar.to_bytes())).map(Self)
     }

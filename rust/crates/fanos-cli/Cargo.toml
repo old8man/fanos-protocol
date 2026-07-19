@@ -19,7 +19,7 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-code = { workspace = true, features = ["std"] }
 fanos-diakrisis = { workspace = true, features = ["std"] }
-fanos-crypto = { workspace = true, features = ["std"] }
+fanos-primitives = { workspace = true, features = ["std"] }
 fanos-core = { workspace = true, features = ["std"] }
 
 [dev-dependencies]

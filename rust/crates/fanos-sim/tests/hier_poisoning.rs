@@ -16,7 +16,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_crypto::{address_matches_identity, address_point};
+use fanos_primitives::{address_matches_identity, address_point};
 use fanos_pqcrypto::{Identity, SeedRng};
 use fanos_field::{F7, Field};
 use fanos_geometry::{HierAddr, Point, Triple};

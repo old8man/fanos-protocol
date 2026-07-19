@@ -740,11 +740,11 @@ name = "fanos-aphantos"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
- "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
  "fanos-nyx",
  "fanos-pqcrypto",
+ "fanos-primitives",
  "fanos-runtime",
  "fanos-wire",
  "proptest",
@@ -756,10 +756,10 @@ name = "fanos-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "fanos-crypto",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
 ]
 
 [[package]]
@@ -767,11 +767,11 @@ name = "fanos-calypso"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
- "fanos-crypto",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
  "fanos-onoma",
+ "fanos-primitives",
  "proptest",
 ]
 
@@ -781,10 +781,10 @@ version = "0.1.0"
 dependencies = [
  "fanos-code",
  "fanos-core",
- "fanos-crypto",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "serde_json",
 ]
 
@@ -802,22 +802,11 @@ name = "fanos-core"
 version = "0.1.0"
 dependencies = [
  "fanos-code",
- "fanos-crypto",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "proptest",
-]
-
-[[package]]
-name = "fanos-crypto"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "fanos-field",
- "fanos-geometry",
- "proptest",
- "zeroize",
 ]
 
 [[package]]
@@ -836,8 +825,8 @@ name = "fanos-diaulos"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
- "fanos-crypto",
  "fanos-pqcrypto",
+ "fanos-primitives",
  "fanos-runtime",
  "proptest",
  "rand_core 0.10.1",
@@ -864,7 +853,7 @@ name = "fanos-incentives"
 version = "0.1.0"
 dependencies = [
  "curve25519-dalek 4.1.3",
- "fanos-crypto",
+ "fanos-primitives",
  "rand_core 0.6.4",
 ]
 
@@ -909,9 +898,9 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
- "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "libm",
  "proptest",
 ]
@@ -934,9 +923,9 @@ dependencies = [
 name = "fanos-onoma"
 version = "0.1.0"
 dependencies = [
- "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "proptest",
 ]
 
@@ -946,7 +935,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
- "fanos-crypto",
+ "fanos-primitives",
  "ml-dsa",
  "ml-kem",
  "proptest",
@@ -956,12 +945,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-primitives"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fanos-field",
+ "fanos-geometry",
+ "proptest",
+ "zeroize",
+]
+
+[[package]]
 name = "fanos-proteus"
 version = "0.1.0"
 dependencies = [
- "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "proptest",
 ]
 
@@ -977,9 +977,9 @@ dependencies = [
 name = "fanos-quic"
 version = "0.1.0"
 dependencies = [
- "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "fanos-proteus",
  "fanos-runtime",
  "quinn",
@@ -1006,11 +1006,11 @@ version = "0.1.0"
 dependencies = [
  "fanos-code",
  "fanos-core",
- "fanos-crypto",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
  "fanos-pqcrypto",
+ "fanos-primitives",
  "fanos-telemetry",
  "fanos-wire",
  "fanos-wire-derive",
@@ -1032,7 +1032,6 @@ dependencies = [
  "fanos-aphantos",
  "fanos-calypso",
  "fanos-core",
- "fanos-crypto",
  "fanos-diakrisis",
  "fanos-diaulos",
  "fanos-field",
@@ -1042,6 +1041,7 @@ dependencies = [
  "fanos-nyx",
  "fanos-onoma",
  "fanos-pqcrypto",
+ "fanos-primitives",
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-telemetry",
@@ -1068,9 +1068,9 @@ name = "fanos-vrf"
 version = "0.1.0"
 dependencies = [
  "curve25519-dalek 4.1.3",
- "fanos-crypto",
  "fanos-field",
  "fanos-geometry",
+ "fanos-primitives",
  "rand_core 0.6.4",
  "vrf-r255",
 ]

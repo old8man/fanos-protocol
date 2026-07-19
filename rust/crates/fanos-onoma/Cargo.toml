@@ -13,12 +13,12 @@ categories = ["cryptography", "no-std"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
-fanos-crypto.workspace = true
+fanos-primitives.workspace = true
 
 [features]
 default = ["std"]
-std = ["alloc", "fanos-crypto/std", "fanos-geometry/std"]
-alloc = ["fanos-crypto/alloc", "fanos-geometry/alloc"]
+std = ["alloc", "fanos-primitives/std", "fanos-geometry/std"]
+alloc = ["fanos-primitives/alloc", "fanos-geometry/alloc"]
 
 [dev-dependencies]
 proptest.workspace = true

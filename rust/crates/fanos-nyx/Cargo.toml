@@ -13,15 +13,15 @@ categories = ["cryptography", "network-programming"]
 [dependencies]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
-fanos-crypto.workspace = true
+fanos-primitives.workspace = true
 blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 libm = { version = "0.2", default-features = false, optional = true }
 
 [features]
 default = ["std"]
-std = ["fanos-geometry/std", "fanos-crypto/std"]
-alloc = ["fanos-geometry/alloc", "fanos-crypto/alloc"]
+std = ["fanos-geometry/std", "fanos-primitives/std"]
+alloc = ["fanos-geometry/alloc", "fanos-primitives/alloc"]
 # For no_std targets: supply the float backend used by the mixing entropy.
 libm = ["dep:libm"]
 
