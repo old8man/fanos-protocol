@@ -32,6 +32,8 @@ use alloc::vec::Vec;
 
 use fanos_geometry::Triple;
 use fanos_primitives::{Epoch, hash_labeled};
+use fanos_wire::Wire;
+use fanos_wire::element::encode_bytes;
 
 use crate::ServiceAddress;
 
@@ -48,7 +50,9 @@ const HRW_LABEL: &str = "FANOS-v1/calypso-balance-hrw";
 /// identity (which the `.fanos` address certifies) can stay offline: it issues this once, and the
 /// online signing key does the per-epoch work. Outside `[valid_from, valid_until]` the key is not
 /// trusted, so a compromise is bounded and revocation is "don't re-issue".
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `#[derive(Wire)]` emits the canonical `signing_pubkey ‖ valid_from(8B BE) ‖ valid_until(8B BE) ‖
+/// root_sig` (§7.1); nesting it inside [`MasterDescriptor`] composes byte-for-byte with its signing body.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct SigningKeyCert {
     /// The epoch signing key's public key.
     pub signing_pubkey: Vec<u8>,
@@ -71,10 +75,10 @@ impl SigningKeyCert {
     ) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(SIGNING_CERT_LABEL.as_bytes());
-        put_bytes(&mut m, root_pubkey);
-        put_bytes(&mut m, signing_pubkey);
-        m.extend_from_slice(&from.low32_be_bytes());
-        m.extend_from_slice(&until.low32_be_bytes());
+        encode_bytes(root_pubkey, &mut m);
+        encode_bytes(signing_pubkey, &mut m);
+        from.wire_encode(&mut m);
+        until.wire_encode(&mut m);
         m
     }
 
@@ -101,7 +105,8 @@ impl SigningKeyCert {
 
 /// A backend instance within a master descriptor: its public key, its overlay coordinate (where a
 /// client meets it), a relative load `weight`, and the signing key's delegation signature.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `#[derive(Wire)]` emits `instance_pubkey ‖ coordinate(12B) ‖ weight(2B BE) ‖ delegation_sig` (§7.1).
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct InstanceRef {
     /// The backend's own public key (distinct from the root and signing keys).
     pub instance_pubkey: Vec<u8>,
@@ -126,19 +131,21 @@ pub fn delegation_message(
 ) -> Vec<u8> {
     let mut m = Vec::new();
     m.extend_from_slice(DELEGATION_LABEL.as_bytes());
-    put_bytes(&mut m, root_pubkey);
-    m.extend_from_slice(&epoch.low32_be_bytes());
-    put_bytes(&mut m, instance_pubkey);
-    for w in coordinate {
-        m.extend_from_slice(&w.to_be_bytes());
-    }
-    m.extend_from_slice(&weight.to_be_bytes());
+    encode_bytes(root_pubkey, &mut m);
+    epoch.wire_encode(&mut m);
+    encode_bytes(instance_pubkey, &mut m);
+    coordinate.wire_encode(&mut m);
+    weight.wire_encode(&mut m);
     m
 }
 
 /// The master's signed, load-balanced descriptor for an epoch — the published bulletin that maps a
 /// master `.fanos` address to its backend fleet, under the offline-root / epoch-signing-key hierarchy.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `#[derive(Wire)]` emits the canonical storage form `root_pubkey ‖ signing_cert ‖ epoch(8B BE) ‖
+/// instances(varint-counted) ‖ descriptor_sig` (§7.1). The signed [`body_bytes`](Self::body_bytes) is
+/// exactly this minus the trailing `descriptor_sig`, built from the *same* `Wire` field codecs — so the
+/// stored bytes and the signed bytes can never drift.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct MasterDescriptor {
     /// The root identity's public key (the `.fanos` address certifies this).
     pub root_pubkey: Vec<u8>,
@@ -154,25 +161,16 @@ pub struct MasterDescriptor {
 }
 
 impl MasterDescriptor {
-    /// The parseable descriptor *body* (everything signed, minus the domain label): root key,
-    /// signing cert, epoch, and every instance's identity, coordinate, weight, and delegation.
+    /// The parseable descriptor *body* (everything signed, minus the domain label): the canonical
+    /// `Wire` encoding of every field **except** the trailing `descriptor_sig`. It composes the exact
+    /// same field codecs the derived `Wire` uses, so `encode()` == `body_bytes ‖ descriptor_sig` by
+    /// construction and the stored and signed forms cannot diverge.
     fn body_bytes(&self) -> Vec<u8> {
         let mut m = Vec::new();
-        put_bytes(&mut m, &self.root_pubkey);
-        put_bytes(&mut m, &self.signing_cert.signing_pubkey);
-        m.extend_from_slice(&self.signing_cert.valid_from.low32_be_bytes());
-        m.extend_from_slice(&self.signing_cert.valid_until.low32_be_bytes());
-        put_bytes(&mut m, &self.signing_cert.root_sig);
-        m.extend_from_slice(&self.epoch.low32_be_bytes());
-        m.extend_from_slice(&(self.instances.len() as u32).to_be_bytes());
-        for inst in &self.instances {
-            put_bytes(&mut m, &inst.instance_pubkey);
-            for w in inst.coordinate {
-                m.extend_from_slice(&w.to_be_bytes());
-            }
-            m.extend_from_slice(&inst.weight.to_be_bytes());
-            put_bytes(&mut m, &inst.delegation_sig);
-        }
+        self.root_pubkey.wire_encode(&mut m);
+        self.signing_cert.wire_encode(&mut m);
+        self.epoch.wire_encode(&mut m);
+        self.instances.wire_encode(&mut m);
         m
     }
 
@@ -185,55 +183,17 @@ impl MasterDescriptor {
         m
     }
 
-    /// Canonically serialize the descriptor for publication at the master's `descriptor_key`.
+    /// Canonically serialize the descriptor for publication at the master's `descriptor_key` (the
+    /// derived [`Wire`] codec — `body_bytes ‖ descriptor_sig` by construction).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = self.body_bytes();
-        put_bytes(&mut out, &self.descriptor_sig);
-        out
+        self.to_wire()
     }
 
-    /// Decode a descriptor from its canonical bytes, or `None` if malformed.
+    /// Decode a descriptor from its canonical bytes, or `None` if malformed or non-canonical.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(bytes);
-        let root_pubkey = c.take_bytes()?.to_vec();
-        let signing_pubkey = c.take_bytes()?.to_vec();
-        let valid_from = Epoch::from_low32_be_bytes(c.take_array()?);
-        let valid_until = Epoch::from_low32_be_bytes(c.take_array()?);
-        let root_sig = c.take_bytes()?.to_vec();
-        let epoch = Epoch::from_low32_be_bytes(c.take_array()?);
-        let count = u32::from_be_bytes(c.take_array()?) as usize;
-        let mut instances = Vec::with_capacity(count.min(4096));
-        for _ in 0..count {
-            let instance_pubkey = c.take_bytes()?.to_vec();
-            let coordinate = [
-                u32::from_be_bytes(c.take_array()?),
-                u32::from_be_bytes(c.take_array()?),
-                u32::from_be_bytes(c.take_array()?),
-            ];
-            let weight = u16::from_be_bytes(c.take_array()?);
-            let delegation_sig = c.take_bytes()?.to_vec();
-            instances.push(InstanceRef {
-                instance_pubkey,
-                coordinate,
-                weight,
-                delegation_sig,
-            });
-        }
-        let descriptor_sig = c.take_bytes()?.to_vec();
-        Some(Self {
-            root_pubkey,
-            signing_cert: SigningKeyCert {
-                signing_pubkey,
-                valid_from,
-                valid_until,
-                root_sig,
-            },
-            epoch,
-            instances,
-            descriptor_sig,
-        })
+        Self::from_wire(bytes).ok()
     }
 
     /// Fully verify the descriptor against the master's `address` using the signature predicate
@@ -340,37 +300,6 @@ fn hrw_score(selector: &[u8], inst: &InstanceRef) -> u128 {
             .unwrap_or([0; 8]),
     );
     u128::from(h) * u128::from(inst.weight)
-}
-
-// --- canonical length-prefixed encoding (u32 big-endian length ‖ bytes) ---
-
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(bytes);
-}
-
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn take_array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        let slice = self.buf.get(self.pos..self.pos.checked_add(N)?)?;
-        self.pos += N;
-        slice.try_into().ok()
-    }
-
-    fn take_bytes(&mut self) -> Option<&'a [u8]> {
-        let len = u32::from_be_bytes(self.take_array()?) as usize;
-        let slice = self.buf.get(self.pos..self.pos.checked_add(len)?)?;
-        self.pos += len;
-        Some(slice)
-    }
 }
 
 #[cfg(test)]
