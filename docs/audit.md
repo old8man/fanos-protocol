@@ -108,6 +108,18 @@ Consequences:
 
 **Recommendation.** Treat `fanos-wire` as the mandatory substrate: (a) build the `#[derive(Wire)]` proc-macro so every framed type derives its codec and emits its KAT from one definition; (b) migrate DIAULOS/rendezvous/ONOMA/CALYPSO/PROTEUS frames onto it, registering their type codes in the one registry; (c) regenerate the canonical `Tessera`/onion layout from the real `aphantos` format and delete the stale cleartext-holonomy packet. This is the single highest-leverage structural fix in the audit.
 
+**Progress (ARCH-1 / #82).** `#[derive(Wire)]` **exists** (`fanos-wire-derive`; consequence 4 above is stale) and is now the substrate for the migratable surface:
+
+- **Enablers added** so composite types derive: `Wire` for `f64`, `Vec<T>`, `VecDeque<T>`, `Option<T>`, the field-erased `Triple` (`[u32;3]`, 12-byte), typed `Point<F>`/`Line<F>` (field-optimal, validated), and `Epoch` (8-byte BE, behind `fanos-primitives/wire`).
+- **Struct families migrated to the derive** (each re-canonicalized to §7.1 BE+varint, KATs held or absent, hand-rolled decoders deleted): calypso `Descriptor`/`SealedDescriptor` (was LE + u32-prefix), telemetry `Bucket`/`Series`/`Tier`/`Snapshot` history persistence (deleted 13 helpers), rendezvous `Request` (also fixed a latent >255-hop `u8` truncation), quic `NodeCredentials`, plus the pre-existing telemetry `CoherenceFrame` and runtime `LookupBody`. Signing transcripts that could canonicalize did (calypso descriptor `signing_bytes` now uses `encode_bytes` + BE epoch).
+- **Justified must-stay-custom** (a change would lose a real property, not reduce drift):
+  - *Signing/hash transcripts* (Tier 3): onoma `signing_bytes` (epoch LE is **names.json-KAT-pinned**), calypso-balance `signing_message`/`delegation_message`/`body_bytes` (encode **shares** `body_bytes` with signing — a separate codec would *create* drift), runtime `descriptor_message` (§80 sig), diaulos handshake, kem `combine`, incentives DLEQ.
+  - *Onion / AEAD / traffic-shape layouts* (Tier 4, several KAT-pinned): aphantos `sealed`/`threshold`, nyx `tessera`, diaulos `frame`/`cell`, proteus `obfuscate`.
+  - *Foreign-crypto fixed wrappers* (Tier 5): pqcrypto kem/sig, vrf `VssShare`/`VssCommitment` (Ristretto **group-validation** on decode), the node-ID key bundle.
+  - `geometry::HierAddr` already is a single validated codec (its `u8` depth equals a varint for all `depth < 64 = MAX_DEPTH`, so migrating buys no canonicity and would only risk the `Point::new` validation).
+
+Net: the drift-prone hand-rolled **struct (de)serializers** are gone; what remains hand-written is transcripts, layered crypto, and group-validated foreign types — where a single explicit codec is the correct engineering, not a bypass. The `FrameType` registry unification (consequence 1) and the stale cleartext-`Tessera` regeneration (consequence 3) remain open follow-ups.
+
 ### A2 — General-`q` capability is stranded below a `q=2` ceiling *(MEDIUM, architectural)*
 
 The addressing substrate is generic over `q`, but **DIAKRISIS is hardcoded to `N = 7`** in every module (`blindness.rs`, `polar.rs`, `partition.rs`, `coherence.rs`, `healing.rs`, `regeneration.rs`: `pub const N: usize = 7`, fixed `[[f64; 7]; 7]` kernels, `1.0/7.0` constants). This is *theoretically correct* — the 3-bit Hamming(7,4) syndrome is intrinsically a Fano-plane object — but its architectural consequence is under-acknowledged: the entire live stack above geometry (self-diagnosis, healing, the runtime, the node binary, which fixes `F = F2`) is **`q=2`-only**. The `Plane::<F7/F13/F31>` generality is exercised only in geometry unit tests; nothing above geometry can run a large-`q` cell.
@@ -356,7 +368,7 @@ The initiator-even/responder-odd parity is also not enforced on implicit open, s
 7. **Bind the KEM transcript (B5); seed DKG per-run (B6); constant-time Shamir (B7); rotate relay KEM keys per epoch or scope the FS claim (E4).**
 
 **Tier 2 — fundamentality / architecture**
-7. **Re-canonicalize the wire (A1):** build `#[derive(Wire)]`, migrate the hand-rolled subsystems onto `fanos-wire`, unify the frame registry, regenerate the `Tessera`/onion layout, delete the stale cleartext-holonomy packet.
+7. **Re-canonicalize the wire (A1):** ~~build `#[derive(Wire)]`~~ (exists) and ~~migrate the hand-rolled subsystems onto `fanos-wire`~~ (**#82: enablers + every migratable struct serializer done** — calypso descriptors, telemetry history, rendezvous `Request`, quic creds; the rest are justified must-stay transcripts / layered crypto / group-validated foreign types — see the A1 §Progress note). **Still open:** unify the frame registry, regenerate the `Tessera`/onion layout, delete the stale cleartext-holonomy packet.
 8. ~~**Introduce the `Epoch` newtype and fix the telemetry frame epoch (A3).**~~ **DONE (#90):** `fanos_primitives::Epoch(u64)` threaded through every protocol-epoch seam (calypso u32/u64 split closed); telemetry frame epoch fed the agreed beacon `Epoch` via `observe_liveness`. All KATs byte-identical; clippy/fmt clean. See the A3 §resolution.
 9. **Resolve the placeholder/real split (A7):** wire `fanos-vrf` into membership, or delete the placeholder and document the gap.
 10. **Make `Decouple` real or remove it (C6); give quarantine an exit + multi-witness gate (C5); make telemetry DP-safe or drop the anonymization claim (C7).**
