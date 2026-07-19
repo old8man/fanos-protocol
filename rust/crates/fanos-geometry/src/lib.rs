@@ -34,7 +34,7 @@ mod plane;
 
 pub use element::{Triple, canonicalize, cross, dot};
 pub use flag::Flag;
-pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, rendezvous};
+pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, next_hop, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};
 
 // Re-export the field crate so downstream users get a matched version.

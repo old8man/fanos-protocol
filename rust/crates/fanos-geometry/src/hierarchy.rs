@@ -169,8 +169,31 @@ pub fn rendezvous<F: Field>(a: &HierAddr<F>, b: &HierAddr<F>) -> Option<(usize, 
         .and_then(|(level, (pa, pb))| pa.join(pb).map(|line| (level, line)))
 }
 
+/// The greedy next hop toward `dst` from the node currently holding the message, given the addresses it
+/// can reach this hop (`reachable` — its rendezvous-line members and cell peers): the reachable address
+/// sharing the **longest** prefix with `dst`, provided that is strictly longer than what the current
+/// holder `from` shares. Returns `None` when `from` already lies in `dst`'s cell (delivered) or nothing
+/// reachable is closer. Repeating this delivers in `≤ dst.depth − commonPrefix(from,dst)` hops, because
+/// the rendezvous guarantees `dst`'s next ancestor is reachable and each hop adds one shared level.
+#[must_use]
+pub fn next_hop<F: Field>(
+    from: &HierAddr<F>,
+    dst: &HierAddr<F>,
+    reachable: &[HierAddr<F>],
+) -> Option<HierAddr<F>> {
+    let here = from.common_prefix(dst);
+    if here == dst.depth() {
+        return None; // already in the destination cell
+    }
+    reachable
+        .iter()
+        .filter(|n| n.common_prefix(dst) > here)
+        .max_by_key(|n| n.common_prefix(dst))
+        .cloned()
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use fanos_field::F2;
@@ -281,6 +304,46 @@ mod tests {
             reached.common_prefix(&d) > h.common_prefix(&d),
             "each rendezvous hop shares one more prefix level with the target — strict convergence",
         );
+    }
+
+    #[test]
+    fn recursive_rendezvous_delivers_across_a_multi_level_network() {
+        // A prefix-closed network: each sub-cell has a root/gateway, so `dst`'s ancestor at every level
+        // is present. A message walks the prefix chain — one rendezvous per level — and is delivered.
+        let dst = HierAddr::from_path(alloc::vec![p(2), p(4), p(6)]).unwrap();
+        let network = alloc::vec![
+            HierAddr::root(p(1)),                                        // a far node, other top cell
+            HierAddr::root(p(2)),                                        // dst's top-cell root  (cp 1)
+            HierAddr::from_path(alloc::vec![p(2), p(4)]).unwrap(),       // dst's level-2 ancestor (cp 2)
+            dst.clone(),                                                 // dst                    (cp 3)
+        ];
+        let mut current = HierAddr::root(p(1));
+        let (mut hops, mut prev_cp) = (0usize, current.common_prefix(&dst));
+        while current != dst {
+            let cp = current.common_prefix(&dst);
+            // The rendezvous from `current` reaches `dst`'s ancestor one level deeper — the members of
+            // the meeting line share exactly `cp+1` levels with `dst`.
+            let reachable: Vec<HierAddr<F2>> = network
+                .iter()
+                .filter(|n| n.common_prefix(&dst) == cp + 1)
+                .cloned()
+                .collect();
+            let next = next_hop(&current, &dst, &reachable).expect("dst's next ancestor is reachable");
+            assert!(next.common_prefix(&dst) > prev_cp, "strictly closer each hop");
+            prev_cp = next.common_prefix(&dst);
+            current = next;
+            hops += 1;
+            assert!(hops <= dst.depth(), "delivered within ≤ depth hops (O(k) rendezvous depth)");
+        }
+        assert_eq!(current, dst, "the message reached the destination across three cells");
+        assert_eq!(hops, 3);
+    }
+
+    #[test]
+    fn next_hop_is_none_once_in_the_destination_cell() {
+        let dst = HierAddr::from_path(alloc::vec![p(2), p(4)]).unwrap();
+        // A node already at dst's prefix (dst itself) has no closer hop.
+        assert_eq!(next_hop(&dst, &dst, &[HierAddr::root(p(1))]), None);
     }
 
     #[test]
