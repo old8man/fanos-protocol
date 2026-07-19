@@ -22,11 +22,12 @@ sha3 = { version = "0.11", default-features = false }
 # rand_core 0.10 matches the RustCrypto crates above (via crypto-common 0.2).
 rand_core = { version = "0.10", default-features = false }
 blake3 = { workspace = true }
+# The canonical node-ID hash rule + the NodeId type live in the light primitives core; deriving the
+# node identifier here goes through it (one source of truth), so the two crates cannot drift.
+fanos-primitives = { workspace = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 proptest.workspace = true
-# Pin the hybrid node-ID to the canonical `fanos_primitives::hash_labeled` rule (parity test).
-fanos-primitives = { workspace = true, default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

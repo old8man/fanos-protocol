@@ -4,24 +4,16 @@
 //! its hybrid signature and KEM public keys. This is the real, post-quantum realization of the
 //! identity that [`fanos_primitives`](https://docs.rs/fanos-primitives) models as a placeholder.
 
+use fanos_primitives::{hash_labeled, label};
 use rand_core::CryptoRng;
 
 use crate::kem::{HybridKemPublic, HybridKemSecret};
 use crate::sig::{HybridSigSecret, HybridVerifier};
 
-const NODE_ID_LABEL: &[u8] = b"FANOS-v1/node-id";
-
-/// A 32-byte long-term node identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct NodeId(pub [u8; 32]);
-
-impl NodeId {
-    /// The identifier bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
+/// The 32-byte long-term node identifier — the canonical type from [`fanos_primitives`], re-exported
+/// here so a consumer of the real hybrid identity names one `NodeId`, not two (they were identical
+/// byte-for-byte; the duplicate is retired).
+pub use fanos_primitives::NodeId;
 
 /// A node's public identity: its hybrid signature and KEM public keys (spec §L0).
 pub struct PublicIdentity {
@@ -32,19 +24,15 @@ pub struct PublicIdentity {
 }
 
 impl PublicIdentity {
-    /// The long-term node identifier: domain-separated `BLAKE3` of the canonical public-key
-    /// bundle (spec §L0). This reproduces `fanos_primitives::hash_labeled(NODE_ID, sig ‖ kem)`
-    /// **byte-for-byte** — including the `0x1f` unit separator after the label — so the placeholder
-    /// identity in `fanos-primitives` and this real hybrid one agree on the same node ID (a
-    /// cross-crate test in `tests/node_id_parity.rs` pins the two together).
+    /// The long-term node identifier: domain-separated `BLAKE3` of the canonical public-key bundle
+    /// `sig ‖ kem` (spec §L0), via the one canonical [`fanos_primitives::hash_labeled`] under the shared
+    /// [`label::NODE_ID`] — the single source of truth, so this real identity and the byte-model in
+    /// `fanos-primitives` cannot drift apart.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(NODE_ID_LABEL);
-        hasher.update(&[0x1f]); // canonical unit separator — matches `hash_labeled`
-        hasher.update(&self.signature.encode());
-        hasher.update(&self.kem.encode());
-        NodeId(*hasher.finalize().as_bytes())
+        let mut bundle = self.signature.encode();
+        bundle.extend_from_slice(&self.kem.encode());
+        NodeId(hash_labeled(label::NODE_ID, &bundle))
     }
 }
 
@@ -82,6 +70,7 @@ impl Identity {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::rng::SeedRng;
@@ -106,15 +95,23 @@ mod tests {
     }
 
     #[test]
-    fn node_id_matches_the_canonical_fanos_primitives_rule() {
-        // The real hybrid identity and the `fanos-primitives` placeholder must agree on the node ID,
-        // or the two impls disagree on addressing (spec §L0). Pin them: the pqcrypto node_id equals
-        // `hash_labeled(NODE_ID, sig ‖ kem)` byte-for-byte (this catches a missing/extra separator).
-        let mut rng = SeedRng::from_seed(b"id-parity");
-        let node = Identity::generate(&mut rng);
-        let mut bundle = node.public.signature.encode();
-        bundle.extend_from_slice(&node.public.kem.encode());
-        let canonical = fanos_primitives::hash_labeled(fanos_primitives::label::NODE_ID, &bundle);
-        assert_eq!(node.node_id().0, canonical);
+    fn node_id_matches_the_primitives_byte_model() {
+        // Cross-crate parity (spec §L0): the real hybrid identity and the `fanos-primitives` byte-model
+        // must derive the SAME node id from the SAME public bundle, or the two impls disagree on
+        // addressing. Reconstruct the byte-model from the real identity's component keys and compare —
+        // this pins the bundle layout `Ed25519 ‖ ML-DSA ‖ X25519 ‖ ML-KEM` and the hash rule together.
+        use fanos_primitives::keys::{HybridPublicKey, KemPublicKey, SigPublicKey};
+
+        let node = Identity::generate(&mut SeedRng::from_seed(b"id-parity"));
+        let sig_bytes = node.public.signature.encode();
+        let kem_bytes = node.public.kem.encode();
+        // Split each hybrid public key into its (classical 32, PQ rest) components.
+        let (ed, mldsa) = sig_bytes.split_at(32);
+        let (x, mlkem) = kem_bytes.split_at(32);
+        let model = HybridPublicKey {
+            sig: SigPublicKey::new(ed.try_into().unwrap(), mldsa.to_vec()).unwrap(),
+            kem: KemPublicKey::new(x.try_into().unwrap(), mlkem.to_vec()).unwrap(),
+        };
+        assert_eq!(node.node_id(), model.node_id(), "real identity and byte-model agree on the node id");
     }
 }
