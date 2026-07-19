@@ -9,7 +9,7 @@
 //! * `PADDING` — a pure cover cell, byte-indistinguishable from `DATA` once sealed.
 
 use fanos_runtime::stream::{Ack, MAX_SEGMENT, Segment};
-use fanos_wire::SessionFrameType;
+use fanos_wire::{SessionFrameType, Wire};
 
 // The inner-session `ftype` bytes come from the one canonical registry (`fanos_wire::SessionFrameType`),
 // so DIAULOS is not a second numbering authority (audit A1). The codes are unchanged, so the pinned
@@ -42,28 +42,6 @@ pub enum Frame {
         /// The stream being aborted.
         stream_id: u32,
     },
-}
-
-fn read_u16(cur: &mut &[u8]) -> Option<u16> {
-    let (head, tail) = cur.split_at_checked(2)?;
-    *cur = tail;
-    let mut a = [0u8; 2];
-    a.copy_from_slice(head);
-    Some(u16::from_be_bytes(a))
-}
-fn read_u32(cur: &mut &[u8]) -> Option<u32> {
-    let (head, tail) = cur.split_at_checked(4)?;
-    *cur = tail;
-    let mut a = [0u8; 4];
-    a.copy_from_slice(head);
-    Some(u32::from_be_bytes(a))
-}
-fn read_u64(cur: &mut &[u8]) -> Option<u64> {
-    let (head, tail) = cur.split_at_checked(8)?;
-    *cur = tail;
-    let mut a = [0u8; 8];
-    a.copy_from_slice(head);
-    Some(u64::from_be_bytes(a))
 }
 
 impl Frame {
@@ -111,15 +89,15 @@ impl Frame {
         match ftype {
             FT_PADDING => Some(Self::Padding),
             FT_RESET => {
-                let stream_id = read_u32(&mut cur)?;
+                let stream_id = u32::wire_decode(&mut cur).ok()?;
                 Some(Self::Reset { stream_id })
             }
             FT_DATA => {
-                let stream_id = read_u32(&mut cur)?;
-                let seq = read_u32(&mut cur)?;
+                let stream_id = u32::wire_decode(&mut cur).ok()?;
+                let seq = u32::wire_decode(&mut cur).ok()?;
                 let (&fin, r) = cur.split_first()?;
                 cur = r;
-                let len = read_u16(&mut cur)? as usize;
+                let len = u16::wire_decode(&mut cur).ok()? as usize;
                 // Enforce the segment-size invariant on the parse side too: `encode` clamps to
                 // `MAX_SEGMENT`, so a frame claiming more is malformed. Without this, a crafted DATA
                 // frame could set `len` past `MAX_SEGMENT` and pull the cell's trailing zero-pad in as
@@ -136,10 +114,10 @@ impl Frame {
                 }))
             }
             FT_ACK => {
-                let stream_id = read_u32(&mut cur)?;
-                let cumulative = read_u32(&mut cur)?;
-                let sack = read_u64(&mut cur)?;
-                let rwnd = read_u32(&mut cur)?;
+                let stream_id = u32::wire_decode(&mut cur).ok()?;
+                let cumulative = u32::wire_decode(&mut cur).ok()?;
+                let sack = u64::wire_decode(&mut cur).ok()?;
+                let rwnd = u32::wire_decode(&mut cur).ok()?;
                 Some(Self::Ack {
                     stream_id,
                     ack: Ack {
