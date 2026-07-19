@@ -268,22 +268,6 @@ pub enum ThresholdPeel {
     },
 }
 
-fn coord_to_bytes(coord: fanos_geometry::Triple) -> [u8; 12] {
-    let mut out = [0u8; 12];
-    let (chunks, _) = out.as_chunks_mut::<4>();
-    for (chunk, w) in chunks.iter_mut().zip(coord) {
-        *chunk = w.to_be_bytes();
-    }
-    out
-}
-
-fn coord_from_bytes(b: &[u8]) -> Option<fanos_geometry::Triple> {
-    Some([
-        u32::from_be_bytes(b.get(0..4)?.try_into().ok()?),
-        u32::from_be_bytes(b.get(4..8)?.try_into().ok()?),
-        u32::from_be_bytes(b.get(8..12)?.try_into().ok()?),
-    ])
-}
 
 /// Build a **nested threshold onion** over `hops`: each layer is a [`ThresholdSealed`] to that hop
 /// line's members, so a hop is peeled only by a threshold `t` of its `q+1` members — the "a hop is a
@@ -308,7 +292,7 @@ pub fn seal_onion(
             cmd.push(CMD_DELIVER);
         } else if let Some(next) = hops.get(k + 1) {
             cmd.push(CMD_NEXT);
-            cmd.extend_from_slice(&coord_to_bytes(next.line));
+            cmd.extend_from_slice(&fanos_geometry::encode_triple(next.line));
         }
         cmd.extend_from_slice(&inner);
 
@@ -391,7 +375,7 @@ fn peel_command(
             payload: rest.to_vec(),
         }),
         CMD_NEXT => {
-            let next = coord_from_bytes(rest.get(..12).ok_or(ThresholdError::Malformed)?)
+            let next = fanos_geometry::decode_triple(rest.get(..12).ok_or(ThresholdError::Malformed)?)
                 .ok_or(ThresholdError::Malformed)?;
             let onion = rest.get(12..).ok_or(ThresholdError::Malformed)?.to_vec();
             Ok(ThresholdPeel::Forward { next, onion })

@@ -539,34 +539,20 @@ pub fn line_member_coords<F: Field>(line: Triple) -> Vec<Triple> {
 }
 
 // --- internal framing ---
-
-fn coord_bytes(c: Triple) -> [u8; 12] {
-    let mut out = [0u8; 12];
-    let (chunks, _) = out.as_chunks_mut::<4>();
-    for (chunk, w) in chunks.iter_mut().zip(c) {
-        *chunk = w.to_be_bytes();
-    }
-    out
-}
-
-fn coord_from(b: &[u8]) -> Option<Triple> {
-    Some([
-        u32::from_be_bytes(b.get(0..4)?.try_into().ok()?),
-        u32::from_be_bytes(b.get(4..8)?.try_into().ok()?),
-        u32::from_be_bytes(b.get(8..12)?.try_into().ok()?),
-    ])
-}
+//
+// Coordinates serialize via the canonical `fanos_geometry::{encode_triple, decode_triple}` (12-byte
+// big-endian) — see the framing helpers below.
 
 fn encode_onion(line: Triple, onion: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(1 + 12 + onion.len());
     v.push(TAG_ONION);
-    v.extend_from_slice(&coord_bytes(line));
+    v.extend_from_slice(&fanos_geometry::encode_triple(line));
     v.extend_from_slice(onion);
     v
 }
 
 fn decode_onion(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
-    let line = coord_from(body.get(..12)?)?;
+    let line = fanos_geometry::decode_triple(body.get(..12)?)?;
     Some((line, body.get(12..)?.to_vec()))
 }
 
@@ -574,16 +560,16 @@ fn encode_req(req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<
     let mut v = Vec::with_capacity(1 + 8 + 12 + 12 + onion.len());
     v.push(TAG_REQ);
     v.extend_from_slice(&req_id.to_be_bytes());
-    v.extend_from_slice(&coord_bytes(combiner));
-    v.extend_from_slice(&coord_bytes(line));
+    v.extend_from_slice(&fanos_geometry::encode_triple(combiner));
+    v.extend_from_slice(&fanos_geometry::encode_triple(line));
     v.extend_from_slice(onion);
     v
 }
 
 fn decode_req(body: &[u8]) -> Option<(u64, Triple, Triple, &[u8])> {
     let req_id = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
-    let combiner = coord_from(body.get(8..20)?)?;
-    let line = coord_from(body.get(20..32)?)?;
+    let combiner = fanos_geometry::decode_triple(body.get(8..20)?)?;
+    let line = fanos_geometry::decode_triple(body.get(20..32)?)?;
     Some((req_id, combiner, line, body.get(32..)?))
 }
 

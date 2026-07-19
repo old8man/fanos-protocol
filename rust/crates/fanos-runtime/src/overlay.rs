@@ -1310,9 +1310,7 @@ fn parse_digest(slice: Option<&[u8]>) -> Option<[u8; DIGEST]> {
 pub fn descriptor_message<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8]) -> Vec<u8> {
     let hier_bytes = hier.encode();
     let mut msg = Vec::with_capacity(12 + hier_bytes.len() + id.len());
-    for word in coord {
-        msg.extend_from_slice(&word.to_be_bytes());
-    }
+    msg.extend_from_slice(&fanos_geometry::encode_triple(coord));
     msg.extend_from_slice(&hier_bytes);
     msg.extend_from_slice(id);
     msg
@@ -1356,9 +1354,7 @@ fn announce_body<F: Field>(
     let sig = sig.get(..usize::from(sig_len)).unwrap_or(sig);
     let mut body =
         Vec::with_capacity(12 + hier_bytes.len() + 2 + id.len() + 2 + sig.len() + info.len());
-    for word in coord {
-        body.extend_from_slice(&word.to_be_bytes());
-    }
+    body.extend_from_slice(&fanos_geometry::encode_triple(coord));
     body.extend_from_slice(&hier_bytes);
     body.extend_from_slice(&id_len.to_be_bytes());
     body.extend_from_slice(id);
@@ -1374,9 +1370,7 @@ type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<u8>);
 /// Parse an `Announce` body into `(coord, hier, id, sig, info)`. `None` on a short buffer or a
 /// non-canonical hierarchical address (so a forged announce cannot inject a bogus routing-table entry).
 fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
-    let x = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?);
-    let y = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
-    let z = u32::from_be_bytes(body.get(8..12)?.try_into().ok()?);
+    let coord = fanos_geometry::decode_triple(body.get(..12)?)?;
     let rest = body.get(12..)?;
     let hier_len = 1 + usize::from(*rest.first()?) * 12;
     let hier = HierAddr::<F>::decode(rest.get(..hier_len)?)?;
@@ -1387,7 +1381,7 @@ fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
     let sig_len = usize::from(u16::from_be_bytes(after_id.get(0..2)?.try_into().ok()?));
     let sig = after_id.get(2..2 + sig_len)?.to_vec();
     let info = after_id.get(2 + sig_len..)?.to_vec();
-    Some(([x, y, z], hier, id, sig, info))
+    Some((coord, hier, id, sig, info))
 }
 
 #[cfg(test)]

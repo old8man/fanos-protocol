@@ -23,9 +23,7 @@ use crate::resolve::RESOLVE_TIMEOUT;
 /// the store, keyed by the node's coordinate. The `Client` hashes this into the storage address.
 fn mix_key_slot(coord: Coord) -> Vec<u8> {
     let mut key = b"FANOS-v1/mix-key/".to_vec();
-    for w in coord {
-        key.extend_from_slice(&w.to_be_bytes());
-    }
+    key.extend_from_slice(&fanos_geometry::encode_triple(coord));
     key
 }
 

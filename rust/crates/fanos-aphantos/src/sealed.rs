@@ -142,24 +142,6 @@ fn aead_open(key: &[u8; 32], nonce: &[u8; NONCE_LEN], ct: &[u8]) -> Result<Vec<u
         .map_err(|_| SealedError::Aead)
 }
 
-fn coord_to_bytes(coord: Triple) -> [u8; 12] {
-    let mut out = [0u8; 12];
-    let (chunks, _) = out.as_chunks_mut::<4>();
-    for (chunk, value) in chunks.iter_mut().zip(coord) {
-        *chunk = value.to_be_bytes();
-    }
-    out
-}
-
-fn coord_from_bytes(bytes: &[u8]) -> Option<Triple> {
-    let (chunks, _) = bytes.get(..12)?.as_chunks::<4>();
-    Some([
-        u32::from_be_bytes(*chunks.first()?),
-        u32::from_be_bytes(*chunks.get(1)?),
-        u32::from_be_bytes(*chunks.get(2)?),
-    ])
-}
-
 /// A bounds-checked `buf[off .. off+len]`, or [`SealedError::Malformed`] if it runs past the end.
 fn slice_at(buf: &[u8], off: usize, len: usize) -> Result<&[u8], SealedError> {
     let end = off.checked_add(len).ok_or(SealedError::Malformed)?;
@@ -208,7 +190,7 @@ pub fn build<F: Field>(
         } else {
             body.push(CMD_NEXT);
             let next = relays.get(k + 1).ok_or(SealedError::Malformed)?;
-            body.extend_from_slice(&coord_to_bytes(next.coords()));
+            body.extend_from_slice(&fanos_geometry::encode_triple(next.coords()));
         }
         body.extend_from_slice(&inner);
 
@@ -292,7 +274,10 @@ pub fn peel(onion: &[u8], kem_secret: &HybridKemSecret) -> Result<PeelOutcome, S
             Ok(PeelOutcome::Deliver { payload, holonomy })
         }
         CMD_NEXT => {
-            let next = coord_from_bytes(rest).ok_or(SealedError::Malformed)?;
+            let next = rest
+                .get(..12)
+                .and_then(fanos_geometry::decode_triple)
+                .ok_or(SealedError::Malformed)?;
             let inner = rest.get(12..).ok_or(SealedError::Malformed)?;
             // Re-head the inner onion for the next relay and re-pad to the constant bucket, so the
             // forwarded packet is the same size as the one we received — no cross-hop size link.

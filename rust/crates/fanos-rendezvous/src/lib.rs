@@ -101,21 +101,6 @@ pub struct Request {
     pub payload: Vec<u8>,
 }
 
-fn coord_bytes(c: Triple, out: &mut Vec<u8>) {
-    for w in c {
-        out.extend_from_slice(&w.to_be_bytes());
-    }
-}
-
-fn coord_from(b: &[u8; 12]) -> Triple {
-    let mut c = [0u32; 3];
-    let (chunks, _) = b.as_chunks::<4>();
-    for (slot, chunk) in c.iter_mut().zip(chunks) {
-        *slot = u32::from_be_bytes(*chunk);
-    }
-    c
-}
-
 impl Request {
     /// Encode as `cookie(16) ‖ hop_count(1) ‖ hop_line×12 … ‖ payload`.
     #[must_use]
@@ -125,7 +110,7 @@ impl Request {
         out.extend_from_slice(&self.cookie);
         out.push(u8::try_from(self.reply_circuit.len()).unwrap_or(u8::MAX));
         for &line in &self.reply_circuit {
-            coord_bytes(line, &mut out);
+            out.extend_from_slice(&fanos_geometry::encode_triple(line));
         }
         out.extend_from_slice(&self.payload);
         out
@@ -140,7 +125,7 @@ impl Request {
         for _ in 0..n {
             let (head, tail) = rest.split_at_checked(12)?;
             rest = tail;
-            reply_circuit.push(coord_from(head.try_into().ok()?));
+            reply_circuit.push(fanos_geometry::decode_triple(head)?);
         }
         Some(Self {
             cookie: *cookie,

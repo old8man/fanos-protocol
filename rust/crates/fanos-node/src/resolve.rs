@@ -24,23 +24,17 @@ use crate::error::NodeError;
 /// KEM key from the bundle, so a wrong coordinate only fails the dial, it cannot impersonate.
 const COORD_META_LEN: usize = 12;
 
+/// Serialize the coordinate as the metadata's leading [`COORD_META_LEN`] bytes, via the canonical
+/// [`fanos_geometry::encode_triple`] (12-byte big-endian).
 fn encode_coord(coord: Coord) -> [u8; COORD_META_LEN] {
-    let mut out = [0u8; COORD_META_LEN];
-    let (chunks, _) = out.as_chunks_mut::<4>();
-    for (chunk, w) in chunks.iter_mut().zip(coord) {
-        *chunk = w.to_be_bytes();
-    }
-    out
+    fanos_geometry::encode_triple(coord)
 }
 
+/// Read the coordinate from the **leading** [`COORD_META_LEN`] bytes of a descriptor's metadata (the
+/// opaque profile bytes follow), via the canonical [`fanos_geometry::decode_triple`]. `None` if the
+/// metadata is shorter than a coordinate.
 fn decode_coord(metadata: &[u8]) -> Option<Coord> {
-    let head = metadata.get(..COORD_META_LEN)?;
-    let (chunks, _) = head.as_chunks::<4>();
-    let mut coord = [0u32; 3];
-    for (slot, chunk) in coord.iter_mut().zip(chunks) {
-        *slot = u32::from_be_bytes(*chunk);
-    }
-    Some(coord)
+    fanos_geometry::decode_triple(metadata.get(..COORD_META_LEN)?)
 }
 
 /// A resolved `.fanos` service: its self-certifying address plus the authenticated descriptor
