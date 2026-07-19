@@ -88,7 +88,15 @@ pub fn cbf_filter(
 /// is strictly stronger than the fixed `κ_bootstrap` clamp it supersedes.
 #[must_use]
 pub fn cbf_filter_default(u_prop: f64, h: f64, drift: f64, control_gain: f64) -> SafeControl {
-    cbf_filter(u_prop, h, drift, control_gain, DEFAULT_GAMMA, KAPPA_BOOTSTRAP, 1.0)
+    cbf_filter(
+        u_prop,
+        h,
+        drift,
+        control_gain,
+        DEFAULT_GAMMA,
+        KAPPA_BOOTSTRAP,
+        1.0,
+    )
 }
 
 #[cfg(test)]
@@ -104,12 +112,17 @@ mod tests {
         // h=0.3, drift=−0.5, gain=0.6, γ=1 ⇒ slack=−0.2, u_min_safe=0.2/0.6≈0.333. An adversarial κ=0 is
         // raised to that minimum (which is above κ_bootstrap, so the clamp does not bind).
         match cbf_filter(0.0, 0.3, -0.5, 0.6, 1.0, KAPPA_BOOTSTRAP, 1.0) {
-            SafeControl::Apply(u) => assert!((u - 1.0 / 3.0).abs() < 1e-6, "raised to u_min_safe, got {u}"),
+            SafeControl::Apply(u) => assert!(
+                (u - 1.0 / 3.0).abs() < 1e-6,
+                "raised to u_min_safe, got {u}"
+            ),
             SafeControl::Escalate => panic!("expected Apply, got Escalate"),
         }
         // A proposal already above the minimum is left untouched (minimal invasion).
         match cbf_filter(0.8, 0.3, -0.5, 0.6, 1.0, KAPPA_BOOTSTRAP, 1.0) {
-            SafeControl::Apply(u) => assert!((u - 0.8).abs() < 1e-12, "a safe proposal is unchanged"),
+            SafeControl::Apply(u) => {
+                assert!((u - 0.8).abs() < 1e-12, "a safe proposal is unchanged")
+            }
             SafeControl::Escalate => panic!("expected Apply, got Escalate"),
         }
     }
@@ -138,19 +151,28 @@ mod tests {
         let mut d = PurityDynamics::new(0.1, 0.5, 0.9, 0.02, N, 0.6);
         let attack = 0.5;
         for _ in 0..20_000 {
-            assert!(d.viable(), "P is above the boundary at the start of every controlled step");
+            assert!(
+                d.viable(),
+                "P is above the boundary at the start of every controlled step"
+            );
             let (drift, gain) = d.barrier_coeffs(attack);
             match cbf_filter_default(0.0, d.barrier(), drift, gain) {
                 SafeControl::Apply(u) => {
                     d.step_with_control(attack, u);
                 }
                 SafeControl::Escalate => {
-                    assert!(d.viable(), "escalates while still viable — hands off before crossing");
+                    assert!(
+                        d.viable(),
+                        "escalates while still viable — hands off before crossing"
+                    );
                     return;
                 }
             }
         }
-        assert!(d.viable(), "the barrier was never crossed under adversarial control");
+        assert!(
+            d.viable(),
+            "the barrier was never crossed under adversarial control"
+        );
     }
 
     #[test]
@@ -163,7 +185,10 @@ mod tests {
         let mut escalated = false;
         for _ in 0..50_000 {
             attack += 0.0002; // rising disturbance
-            assert!(d.viable(), "P is above the boundary before every controlled step");
+            assert!(
+                d.viable(),
+                "P is above the boundary before every controlled step"
+            );
             let (drift, gain) = d.barrier_coeffs(attack);
             match cbf_filter_default(KAPPA_BOOTSTRAP, d.barrier(), drift, gain) {
                 SafeControl::Apply(u) => {
@@ -176,7 +201,10 @@ mod tests {
                 }
             }
         }
-        assert!(escalated, "a rising attack eventually exceeds the CBF authority and escalates");
+        assert!(
+            escalated,
+            "a rising attack eventually exceeds the CBF authority and escalates"
+        );
         assert!(d.viable(), "the barrier was never crossed on the way there");
     }
 
@@ -208,7 +236,10 @@ mod tests {
                         d.step_with_control(attack, u);
                     }
                     SafeControl::Escalate => {
-                        assert!(d.viable(), "escalates only while viable — never after crossing");
+                        assert!(
+                            d.viable(),
+                            "escalates only while viable — never after crossing"
+                        );
                         break;
                     }
                 }
@@ -227,19 +258,28 @@ mod tests {
         for _ in 0..20_000 {
             fixed.step(attack); // uses the fixed κ = κ_bootstrap
         }
-        assert!(!fixed.viable(), "the fixed κ_bootstrap clamp crosses ∂𝒱 at this attack");
+        assert!(
+            !fixed.viable(),
+            "the fixed κ_bootstrap clamp crosses ∂𝒱 at this attack"
+        );
 
         let mut cbf = make();
         for _ in 0..20_000 {
             let (drift, gain) = cbf.barrier_coeffs(attack);
             match cbf_filter_default(KAPPA_BOOTSTRAP, cbf.barrier(), drift, gain) {
                 SafeControl::Apply(u) => {
-                    assert!(u >= KAPPA_BOOTSTRAP - 1e-12, "never drops below the guaranteed floor");
+                    assert!(
+                        u >= KAPPA_BOOTSTRAP - 1e-12,
+                        "never drops below the guaranteed floor"
+                    );
                     cbf.step_with_control(attack, u);
                 }
                 SafeControl::Escalate => break, // escalated while viable (asserted below)
             }
         }
-        assert!(cbf.viable(), "the CBF holds viability where the fixed clamp died");
+        assert!(
+            cbf.viable(),
+            "the CBF holds viability where the fixed clamp died"
+        );
     }
 }
