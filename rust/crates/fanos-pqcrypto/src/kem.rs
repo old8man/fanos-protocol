@@ -269,4 +269,57 @@ mod tests {
         assert_eq!(secret.decapsulate(&parsed), key);
         assert!(HybridCiphertext::from_bytes(&bytes[..10]).is_none());
     }
+
+    #[test]
+    fn the_combiner_binds_every_transcript_element() {
+        // B5 / MAL-BIND-K,PK,CT (audit #63, threat E1): the session key must commit to the *whole*
+        // transcript — both shared secrets AND the ciphertext (X25519 ephemeral ‖ ML-KEM ct) AND the
+        // recipient's static key — not merely the two shared secrets. We pin that directly on the
+        // private `combine`, at the real field widths (32 ‖ 32 ‖ 32 ‖ 1088 ‖ 32): from a fixed
+        // baseline, flipping ONE byte of ANY field in place must move the key. If a future edit dropped
+        // a field from the SHAKE transcript, that field's mutation would leave the key unchanged and
+        // this assertion would fail — exactly the re-encapsulation/context-reuse regression B5 guards.
+        let x_ss = [0x11u8; 32];
+        let mlkem_ss = [0x22u8; 32];
+        let ephemeral = [0x33u8; 32];
+        let mlkem_ct = [0x44u8; 1088]; // ML-KEM-768 ciphertext width
+        let recipient_pk = [0x55u8; 32];
+        let baseline = combine(&x_ss, &mlkem_ss, &ephemeral, &mlkem_ct, &recipient_pk);
+
+        let mut a = x_ss;
+        a[0] ^= 1;
+        assert_ne!(
+            baseline,
+            combine(&a, &mlkem_ss, &ephemeral, &mlkem_ct, &recipient_pk),
+            "the X25519 shared secret is bound"
+        );
+        let mut b = mlkem_ss;
+        b[0] ^= 1;
+        assert_ne!(
+            baseline,
+            combine(&x_ss, &b, &ephemeral, &mlkem_ct, &recipient_pk),
+            "the ML-KEM shared secret is bound"
+        );
+        let mut c = ephemeral;
+        c[0] ^= 1;
+        assert_ne!(
+            baseline,
+            combine(&x_ss, &mlkem_ss, &c, &mlkem_ct, &recipient_pk),
+            "the X25519 ephemeral (ciphertext) is bound"
+        );
+        let mut d = mlkem_ct;
+        d[0] ^= 1;
+        assert_ne!(
+            baseline,
+            combine(&x_ss, &mlkem_ss, &ephemeral, &d, &recipient_pk),
+            "the ML-KEM ciphertext is bound"
+        );
+        let mut e = recipient_pk;
+        e[0] ^= 1;
+        assert_ne!(
+            baseline,
+            combine(&x_ss, &mlkem_ss, &ephemeral, &mlkem_ct, &e),
+            "the recipient static key is bound"
+        );
+    }
 }

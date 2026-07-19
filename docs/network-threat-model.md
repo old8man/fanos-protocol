@@ -87,7 +87,7 @@ structure, which is why the answers compose instead of conflicting:
 
 | # | Threat / attack surface | FANOS fundamental answer | Status | Verified / owned by |
 |---|---|---|---|---|
-| E1 | **Harvest-now-decrypt-later (quantum)** | Hybrid `X25519 + ML-KEM-768` handshake, transcript-bound combiner | ✅ 🟡 | handshake ✅; combiner-transcript B5 🟡 (#63) |
+| E1 | **Harvest-now-decrypt-later (quantum)** | Hybrid `X25519 + ML-KEM-768` handshake, transcript-bound combiner | ✅ | handshake ✅; transcript-bound combiner ✅ (`pqcrypto::kem::combine` folds both shared secrets ‖ X25519 ephemeral ‖ ML-KEM ct ‖ recipient static pk — MAL-BIND-K,PK,CT; `kem::tests::the_combiner_binds_every_transcript_element` flips one byte of each field in place → key must move, closing audit B5 #63) |
 | E2 | **Nonce / seed reuse** (leaks secrets) | Per-cell explicit monotone nonce (fresh per retransmit); synthetic DLEQ nonce | ✅ ⬜ | cells ✅; B4 DLEQ + E3 descriptor-nonce ⬜ (#58) |
 | E3 | **Side channels** (non-constant-time on secrets) | Constant-time `GF(256)` on secret shares; `subtle`/`zeroize` | ⬜ | #63 (A6/B7) |
 | E4 | **Downgrade / MitM** | Transcript binds service identity; ephemeral-KEM forward secrecy | ✅ | handshake (audit "excellent") |

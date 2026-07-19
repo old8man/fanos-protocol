@@ -739,7 +739,6 @@ dependencies = [
 name = "fanos-aphantos"
 version = "0.1.0"
 dependencies = [
- "chacha20poly1305",
  "fanos-field",
  "fanos-geometry",
  "fanos-nyx",
@@ -766,7 +765,6 @@ dependencies = [
 name = "fanos-calypso"
 version = "0.1.0"
 dependencies = [
- "chacha20poly1305",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
@@ -824,7 +822,6 @@ dependencies = [
 name = "fanos-diaulos"
 version = "0.1.0"
 dependencies = [
- "chacha20poly1305",
  "fanos-pqcrypto",
  "fanos-primitives",
  "fanos-runtime",
@@ -885,7 +882,7 @@ dependencies = [
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-session",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rand_core 0.10.1",
  "tokio",
  "tracing",
@@ -897,7 +894,6 @@ name = "fanos-nyx"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "chacha20poly1305",
  "fanos-field",
  "fanos-geometry",
  "fanos-primitives",
@@ -949,6 +945,7 @@ name = "fanos-primitives"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chacha20poly1305",
  "fanos-field",
  "fanos-geometry",
  "proptest",
