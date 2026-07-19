@@ -90,6 +90,13 @@ pub struct Config {
     /// replica on the responsible point's line (spec §L4 read repair). Only bounds the latency of
     /// the *silent-replica* case — a `found=false` answer advances immediately. Default `1600 ms`.
     pub read_timeout: Duration,
+    /// Whether to require **self-certified** membership: seed a peer's hierarchical address into the
+    /// routing table only if it matches the descent chain of the identity carried in its announcement
+    /// ([`fanos_crypto::address_matches_identity`]). Off by default (a peer's announced address is
+    /// trusted, as the `members` view always is); on for a deployment that wants routing-table
+    /// poisoning resistance — a peer then cannot announce an overlay address it did not earn, so
+    /// attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding (threat §79/B1).
+    pub require_self_certified_membership: bool,
 }
 
 impl Default for Config {
@@ -101,6 +108,7 @@ impl Default for Config {
             self_healing: true,
             corroboration_quorum: 2,
             read_timeout: Duration::from_millis(1600),
+            require_self_certified_membership: false,
         }
     }
 }
@@ -156,6 +164,10 @@ pub struct OverlayNode<F: Field> {
     /// blackhole (a bounded DoS), never impersonate a destination. Cert-verifying an announced address
     /// against its coordinate (poisoning resistance) is the QUIC-layer follow-up.
     hier_peers: BTreeMap<Triple, HierAddr<F>>,
+    /// This node's long-term identity bytes (spec §L0 — the node-id / key-bundle hash), the pre-image
+    /// its self-certifying address `hier` is derived from. Carried in this node's `Announce` so peers can
+    /// verify the address it claims. Empty when self-certification is not in use (the address is trusted).
+    identity: Vec<u8>,
     config: Config,
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
@@ -296,6 +308,7 @@ impl<F: Field> OverlayNode<F> {
             coord,
             hier: HierAddr::root(coord),
             hier_peers: BTreeMap::new(),
+            identity: Vec::new(),
             config,
             started_at: Instant::default(),
             peers,
@@ -556,6 +569,16 @@ impl<F: Field> OverlayNode<F> {
     #[must_use]
     pub fn hier_address(&self) -> &HierAddr<F> {
         &self.hier
+    }
+
+    /// Seat this node's long-term identity (spec §L0 — the node-id / key-bundle hash), the pre-image
+    /// its `hier` address is derived from (builder). Carried in this node's `Announce` so peers running
+    /// self-certified membership can verify the address it claims. Only meaningful when `hier` is
+    /// actually `id`'s descent chain ([`fanos_crypto::address_point`]); a deployment sets both together.
+    #[must_use]
+    pub fn with_identity(mut self, id: Vec<u8>) -> Self {
+        self.identity = id;
+        self
     }
 
     /// Register a hierarchical peer reachable in one hop — the transport coordinate that reaches it and
@@ -903,7 +926,10 @@ impl<F: Field> OverlayNode<F> {
     /// so every member learns our keys and how to route to us hierarchically.
     fn on_join(&mut self, info: Vec<u8>) -> Vec<Effect> {
         let coord = self.coord.coords();
-        let frame = encode(FrameType::Announce, &announce_body(coord, &self.hier, &info));
+        let frame = encode(
+            FrameType::Announce,
+            &announce_body(coord, &self.hier, &self.identity, &info),
+        );
         let effects = self.flood(&frame);
         self.members.insert(coord, info);
         effects
@@ -912,7 +938,7 @@ impl<F: Field> OverlayNode<F> {
     /// A received announcement: on first sight of a member, record it, notify, and re-flood so the
     /// key propagates cell-wide; on a repeat, drop (the monotone guard terminates the flood).
     fn on_announce(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((coord, hier, info)) = parse_announce::<F>(body) else {
+        let Some((coord, hier, id, info)) = parse_announce::<F>(body) else {
             return Vec::new();
         };
         // Validate: a member coordinate must be a real, canonical projective point of this plane.
@@ -923,6 +949,16 @@ impl<F: Field> OverlayNode<F> {
         let Some(coord) = Point::<F>::new(coord).map(|p| p.coords()) else {
             return Vec::new();
         };
+        // Self-certified membership (opt-in): the announced overlay address must be the announcer's
+        // own derived descent chain from its identity `id` — otherwise it is a routing-table poisoning
+        // attempt (a peer claiming an address it did not earn, to attract a target's `RouteHier`
+        // traffic) and the whole announcement is dropped: neither `members` nor `hier_peers` is written.
+        // Forging a match to a chosen target then costs `≈ N^k` identity grinding (threat §79/B1).
+        if self.config.require_self_certified_membership
+            && !fanos_crypto::address_matches_identity::<F>(&id, &hier)
+        {
+            return Vec::new();
+        }
         // First sight only. A repeat must NOT overwrite the stored key bundle — otherwise any peer
         // could silently replace a member's advertised keys in our local view (and suppress the
         // re-flood, diverging the cell). Ignore repeats entirely; the monotone guard ends the flood.
@@ -934,7 +970,7 @@ impl<F: Field> OverlayNode<F> {
         // descended sub-cell member thus becomes routable cell-wide from its announcement alone (§L1);
         // a depth-1 announcer adds its own direct entry, so `send_hier` also delivers within one plane.
         self.learn_hier_peer(hier.clone(), coord);
-        let frame = encode(FrameType::Announce, &announce_body(coord, &hier, &info));
+        let frame = encode(FrameType::Announce, &announce_body(coord, &hier, &id, &info));
         let mut effects = self.flood(&frame);
         effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
         effects
@@ -1240,33 +1276,45 @@ fn parse_digest(slice: Option<&[u8]>) -> Option<[u8; DIGEST]> {
     <[u8; DIGEST]>::try_from(slice?).ok()
 }
 
-/// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ info` (spec §7.8 JOIN, §L1 address). `coord`
-/// is the transport point peers send to; `hier` is the announcer's overlay address, so a receiver
-/// seeds its hierarchical routing table (`hier → coord`) — the descended sub-cell members become
-/// reachable without any out-of-band configuration. The `hier` block is self-delimiting (leading
-/// depth byte), so `info` follows unambiguously.
-fn announce_body<F: Field>(coord: Triple, hier: &HierAddr<F>, info: &[u8]) -> Vec<u8> {
+/// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ id_len(2) ‖ id ‖ info` (spec §7.8 JOIN, §L1
+/// address). `coord` is the transport point peers send to; `hier` is the announcer's overlay address,
+/// so a receiver seeds its hierarchical routing table (`hier → coord`) — descended sub-cell members
+/// become reachable without out-of-band configuration. `id` is the announcer's long-term identity
+/// (§L0): under self-certified membership a receiver checks `hier` is `id`'s derived descent chain
+/// before trusting it. Both the `hier` block (leading depth byte) and `id` (length prefix) are
+/// self-delimiting, so `info` follows unambiguously.
+fn announce_body<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8], info: &[u8]) -> Vec<u8> {
     let hier_bytes = hier.encode();
-    let mut body = Vec::with_capacity(12 + hier_bytes.len() + info.len());
+    let id_len = u16::try_from(id.len()).unwrap_or(u16::MAX);
+    let id = id.get(..usize::from(id_len)).unwrap_or(id);
+    let mut body = Vec::with_capacity(12 + hier_bytes.len() + 2 + id.len() + info.len());
     for word in coord {
         body.extend_from_slice(&word.to_be_bytes());
     }
     body.extend_from_slice(&hier_bytes);
+    body.extend_from_slice(&id_len.to_be_bytes());
+    body.extend_from_slice(id);
     body.extend_from_slice(info);
     body
 }
 
-/// Parse an `Announce` body into `(coord, hier, info)`. `None` on a short buffer or a non-canonical
+/// The parsed pieces of an `Announce` body: `(coord, hier, id, info)` (see [`parse_announce`]).
+type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>);
+
+/// Parse an `Announce` body into `(coord, hier, id, info)`. `None` on a short buffer or a non-canonical
 /// hierarchical address (so a forged announce cannot inject a bogus routing-table entry).
-fn parse_announce<F: Field>(body: &[u8]) -> Option<(Triple, HierAddr<F>, Vec<u8>)> {
+fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
     let x = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?);
     let y = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
     let z = u32::from_be_bytes(body.get(8..12)?.try_into().ok()?);
     let rest = body.get(12..)?;
     let hier_len = 1 + usize::from(*rest.first()?) * 12;
     let hier = HierAddr::<F>::decode(rest.get(..hier_len)?)?;
-    let info = rest.get(hier_len..)?.to_vec();
-    Some(([x, y, z], hier, info))
+    let after_hier = rest.get(hier_len..)?;
+    let id_len = usize::from(u16::from_be_bytes(after_hier.get(0..2)?.try_into().ok()?));
+    let id = after_hier.get(2..2 + id_len)?.to_vec();
+    let info = after_hier.get(2 + id_len..)?.to_vec();
+    Some(([x, y, z], hier, id, info))
 }
 
 #[cfg(test)]
@@ -1785,7 +1833,7 @@ mod tests {
 
         // Honest first announce → recorded and MemberJoined notified.
         let peer_addr = HierAddr::root(Point::<F2>::at(3));
-        let honest = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"HONEST"));
+        let honest = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"HONEST"));
         let e1 = node.step(
             Instant(1),
             Input::Message {
@@ -1800,7 +1848,7 @@ mod tests {
         assert_eq!(info_of(peer, &node), Some(b"HONEST".to_vec()));
 
         // A repeat for the same coord with attacker keys must NOT overwrite or re-notify.
-        let forged = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"ATTACKER"));
+        let forged = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"ATTACKER"));
         let e2 = node.step(
             Instant(2),
             Input::Message {
@@ -1820,7 +1868,7 @@ mod tests {
 
         // The zero vector is not a projective point → rejected, never stored.
         let count_before = node.members().count();
-        let zero = encode(FrameType::Announce, &announce_body([0, 0, 0], &peer_addr, b"ZERO"));
+        let zero = encode(FrameType::Announce, &announce_body([0, 0, 0], &peer_addr, b"", b"ZERO"));
         node.step(Instant(3), Input::Message { from, frame: zero });
         assert_eq!(
             node.members().count(),

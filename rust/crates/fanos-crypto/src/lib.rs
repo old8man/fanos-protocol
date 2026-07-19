@@ -6,6 +6,8 @@
 //!
 //! * [`hash`] — domain-separated BLAKE3 and the FANOS label registry (§7.1).
 //! * [`maptopoint`] — `MapToPoint` / `MapToLine`, uniform hashing into `PG(2, q)` (§7.1, L0).
+//! * [`address`] — self-certifying hierarchical addresses: the identity→address chain and its
+//!   verifier, the single source of truth for the `MapToPoint` descent (§L0, §L1).
 //! * [`shamir`] — Shamir secret sharing over `GF(256)`: the threshold substrate (§L6, §5.2).
 //! * [`keys`] — hybrid PQ key bundles and the node identifier (§L0).
 //! * [`vrf`] — the VRF surface for epoch-bound coordinate/rendezvous derivation (§L0, §5.6).
@@ -17,12 +19,14 @@
 
 extern crate alloc;
 
+pub mod address;
 pub mod hash;
 pub mod keys;
 pub mod maptopoint;
 pub mod shamir;
 pub mod vrf;
 
+pub use address::{address_matches_identity, address_point};
 pub use hash::{DIGEST_LEN, hash_labeled, label};
 pub use keys::{HybridPublicKey, NodeId};
 pub use maptopoint::{map_to_line, map_to_point};

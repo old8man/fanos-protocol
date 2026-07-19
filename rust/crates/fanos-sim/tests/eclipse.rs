@@ -94,17 +94,19 @@ fn frame(ty: FrameType, body: &[u8]) -> Vec<u8> {
 
 /// A forged `Announce` claiming coordinate `coord` exists with attacker-chosen `info` — the
 /// adversary asserting false topology / membership. Body layout is `coord(12) ‖ hier(1+depth×12) ‖
-/// info` (spec §7.8, §L1). The adversary announces `hier = root(coord)` for a valid coordinate (a
-/// self-consistent depth-1 lie), or a placeholder overlay address when the coordinate itself is the
-/// impossible-point being tested — either way the receiver's coordinate check is what decides.
+/// id_len(2) ‖ id ‖ info` (spec §7.8, §L1). The adversary announces `hier = root(coord)` for a valid
+/// coordinate (a self-consistent depth-1 lie), or a placeholder overlay address when the coordinate
+/// itself is the impossible-point being tested; `id` is empty (this cell does not require
+/// self-certified membership), so the receiver's coordinate check is what decides.
 fn forged_announce(coord: Triple, info: &[u8]) -> Vec<u8> {
     let hier = Point::<F2>::new(coord).map_or_else(|| HierAddr::root(Point::<F2>::at(0)), HierAddr::root);
     let hier_bytes = hier.encode();
-    let mut body = Vec::with_capacity(12 + hier_bytes.len() + info.len());
+    let mut body = Vec::with_capacity(12 + hier_bytes.len() + 2 + info.len());
     for word in coord {
         body.extend_from_slice(&word.to_be_bytes());
     }
     body.extend_from_slice(&hier_bytes);
+    body.extend_from_slice(&0u16.to_be_bytes()); // id_len = 0 (self-certification off in this test)
     body.extend_from_slice(info);
     frame(FrameType::Announce, &body)
 }

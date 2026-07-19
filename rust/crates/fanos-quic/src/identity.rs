@@ -24,15 +24,12 @@ pub fn coordinate_from_cert<F: Field>(cert_der: &[u8]) -> Point<F> {
 /// ordinary top-cell coordinate ([`coordinate_from_cert`]); each deeper level is a fresh, still
 /// cert-bound point in the sub-cell, domain-separated by the level, so a node that collides can descend
 /// to a coordinate it *earned* rather than shadow the occupant (§L0). Deterministic and unforgeable:
-/// only the certificate's holder can produce its whole descent chain.
+/// only the certificate's holder can produce its whole descent chain. Delegates to the shared
+/// derivation [`fanos_crypto::address_point`] (the single source of truth) with the certificate DER as
+/// the node identity — so the overlay's announcement verifier recomputes byte-identical points.
 #[must_use]
 pub fn coordinate_at_level<F: Field>(cert_der: &[u8], level: usize) -> Point<F> {
-    if level == 0 {
-        return coordinate_from_cert::<F>(cert_der);
-    }
-    let mut data = cert_der.to_vec();
-    data.extend_from_slice(&(level as u64).to_be_bytes());
-    map_to_point::<F>("FANOS-v1/subcell-coord", &data)
+    fanos_crypto::address_point::<F>(cert_der, level)
 }
 
 /// Resolve a node's **hierarchical address** by sub-cell descent (§L0/§L1): the shortest self-certifying
