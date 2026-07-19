@@ -1318,21 +1318,22 @@ pub fn descriptor_message<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8]
     msg
 }
 
-/// Whether `sig` is a valid hybrid signature over the descriptor `coord ‖ hier ‖ id`, under the identity
-/// keys packed at the front of `id` (`Ed25519(32) ‖ ML-DSA-65(1952)`). Binds the transport coordinate to
-/// the identity, so a peer cannot re-announce another node's address at its own coordinate (§80). Any
-/// wrong length or bad half returns `false` — never panics.
+/// Whether `sig` is a valid hybrid signature over the descriptor `coord ‖ hier ‖ id`, under the
+/// signature verifier packed at the front of the identity bundle `id` (`Ed25519(32) ‖ ML-DSA-65(1952)`
+/// = [`HYBRID_VK_LEN`](fanos_pqcrypto::sig::HYBRID_VK_LEN) bytes). Binds the transport coordinate to the
+/// identity, so a peer cannot re-announce another node's address at its own coordinate (§80). Any wrong
+/// length or bad half returns `false` — never panics.
 fn descriptor_signature_ok<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8], sig: &[u8]) -> bool {
-    const ED: usize = fanos_crypto::sig::ED25519_PK_LEN;
-    const ML: usize = fanos_crypto::sig::MLDSA65_PK_LEN;
-    let Some(ed_pub) = id.get(..ED).and_then(|s| <[u8; ED]>::try_from(s).ok()) else {
+    let Some(verifier) =
+        id.get(..fanos_pqcrypto::sig::HYBRID_VK_LEN).and_then(fanos_pqcrypto::HybridVerifier::decode)
+    else {
         return false;
     };
-    let Some(ml_pub) = id.get(ED..ED + ML).and_then(|s| <[u8; ML]>::try_from(s).ok()) else {
+    let Some(signature) = fanos_pqcrypto::HybridSignature::from_bytes(sig) else {
         return false;
     };
     let msg = descriptor_message(coord, hier, id);
-    fanos_crypto::hybrid_verify(&ed_pub, &ml_pub, &msg, sig)
+    verifier.verify(&msg, &signature)
 }
 
 /// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖ info` (spec

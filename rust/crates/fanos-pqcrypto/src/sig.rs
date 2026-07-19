@@ -4,6 +4,8 @@
 //! therefore requires breaking Ed25519 **and** ML-DSA-65 — a classical + post-quantum hedge.
 //! This binds a FANOS node's long-term identity and its coordinate proofs (spec §L0, §7.3).
 
+use alloc::vec::Vec;
+
 use ed25519_dalek::{
     Signature as EdSignature, SigningKey as EdSigningKey, VerifyingKey as EdVerifyingKey,
 };

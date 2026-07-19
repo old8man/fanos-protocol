@@ -4,6 +4,8 @@
 //! shared secrets combined with SHAKE256, so the session key is secure if *either* primitive
 //! is (classical hedge + post-quantum). This is the per-hop key establishment NYX needs.
 
+use alloc::vec::Vec;
+
 use ml_kem::array::Array;
 use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, KeySizeUser, MlKem768};
 use rand_core::CryptoRng;

@@ -16,7 +16,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_crypto::{HybridIdentity, HybridSigningKey, address_matches_identity, address_point};
+use fanos_crypto::{address_matches_identity, address_point};
+use fanos_pqcrypto::{Identity, SeedRng};
 use fanos_field::{F7, Field};
 use fanos_geometry::{HierAddr, Point, Triple};
 use fanos_runtime::overlay::descriptor_message;
@@ -51,16 +52,24 @@ fn derived_address<F: Field>(id: &[u8], depth: usize) -> HierAddr<F> {
     HierAddr::from_path((0..depth).map(|l| address_point::<F>(id, l)).collect()).unwrap()
 }
 
-/// A complete signed descriptor for a node, built from a **real `HybridIdentity`** (the full-stack
-/// path a deployment uses): the identity's canonical bundle, its derived overlay address, and a hybrid
-/// signature binding `transport` to that address. `(id, hier, sig)`. This threads the real composed
-/// identity through the whole membership/poisoning stack — the crypto identity and the overlay agree.
-fn signed_descriptor(seed: &[u8; 32], transport: Triple, depth: usize) -> (Vec<u8>, HierAddr<F7>, Vec<u8>) {
-    let identity = HybridIdentity::from_seed(seed);
-    let id = identity.identity_bytes().to_vec();
-    let hier =
-        HierAddr::from_path((0..depth).map(|l| identity.address_point::<F7>(l)).collect()).unwrap();
-    let sig = identity.sign(&descriptor_message::<F7>(transport, &hier, &id)).expect("hybrid sign");
+/// The canonical identity bundle `sig-verifier(Ed25519‖ML-DSA) ‖ kem-public(X25519‖ML-KEM)` — the `id`
+/// a membership announcement carries. The signature verifier is at the front (where the overlay reads it).
+fn identity_bundle(identity: &Identity) -> Vec<u8> {
+    let mut id = identity.public.signature.encode();
+    id.extend_from_slice(&identity.public.kem.encode());
+    id
+}
+
+/// A complete signed descriptor for a node, built from a **real `fanos_pqcrypto::Identity`** (the
+/// full-stack path a deployment uses): the identity's canonical bundle, its derived overlay address,
+/// and a hybrid signature binding `transport` to that address. `(id, hier, sig)`. This threads the real
+/// composed identity through the whole membership/poisoning stack — the crypto identity and the overlay
+/// agree.
+fn signed_descriptor(seed: &[u8], transport: Triple, depth: usize) -> (Vec<u8>, HierAddr<F7>, Vec<u8>) {
+    let identity = Identity::generate(&mut SeedRng::from_seed(seed));
+    let id = identity_bundle(&identity);
+    let hier = derived_address::<F7>(&id, depth);
+    let sig = identity.signing.sign(&descriptor_message::<F7>(transport, &hier, &id)).to_bytes();
     (id, hier, sig)
 }
 
@@ -85,8 +94,10 @@ fn self_certified_membership_accepts_a_signed_descriptor_and_rejects_a_poisoned_
     let a_coord = Point::<F7>::at(9).coords();
     let (a_id, _, _) = signed_descriptor(&[2u8; 32], a_coord, 2);
     let (_, t_addr, _) = signed_descriptor(&[3u8; 32], Point::<F7>::at(11).coords(), 2);
-    let a_key = HybridSigningKey::from_seed(&[2u8; 32]);
-    let a_sig = a_key.sign(&descriptor_message::<F7>(a_coord, &t_addr, &a_id)).unwrap(); // valid sig, wrong address
+    // A signs a well-formed descriptor for its OWN coordinate but announcing the target's address it
+    // did not derive (a valid signature over the wrong `hier`).
+    let a_identity = Identity::generate(&mut SeedRng::from_seed(&[2u8; 32]));
+    let a_sig = a_identity.signing.sign(&descriptor_message::<F7>(a_coord, &t_addr, &a_id)).to_bytes();
     v.step(now, Input::Message { from, frame: announce_frame(a_coord, &t_addr, &a_id, &a_sig, b"keys-A") });
     assert!(!v.members().any(|(c, _)| c == a_coord), "an address A did not derive is rejected");
     assert_ne!(v.hier_next_hop(&t_addr), Some(a_coord), "A cannot attract T's address to its endpoint");

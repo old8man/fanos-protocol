@@ -11,12 +11,13 @@ keywords = ["post-quantum", "ml-kem", "ml-dsa", "hybrid", "fanos"]
 categories = ["cryptography"]
 
 [dependencies]
-# `rand_core` on ed25519-dalek enables seedable keygen; ml-dsa's default `getrandom` brings
-# the `Generate` trait; ml-kem's `Kem::generate_keypair_from_rng` needs no extra feature.
-ed25519-dalek = { version = "3", features = ["rand_core"] }
-x25519-dalek = { version = "3", features = ["static_secrets"] }
-ml-kem = { version = "0.3" }
-ml-dsa = { version = "0.1" }
+# All four vetted primitives are `no_std`. Key generation runs off a caller-supplied `SeedRng`, so we
+# enable each crate's `rand_core` path (seedable keygen) and `alloc` — never `getrandom` (the OS entropy
+# source), which would forfeit no_std/embedded operation.
+ed25519-dalek = { version = "3", default-features = false, features = ["rand_core", "alloc", "zeroize"] }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
+ml-kem = { version = "0.3", default-features = false, features = ["alloc"] }
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "rand_core"] }
 sha3 = { version = "0.11", default-features = false }
 # rand_core 0.10 matches the RustCrypto crates above (via crypto-common 0.2).
 rand_core = { version = "0.10", default-features = false }
@@ -25,7 +26,7 @@ blake3 = { workspace = true }
 [dev-dependencies]
 proptest.workspace = true
 # Pin the hybrid node-ID to the canonical `fanos_crypto::hash_labeled` rule (parity test).
-fanos-crypto = { workspace = true, features = ["std"] }
+fanos-crypto = { workspace = true, default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true
