@@ -357,7 +357,7 @@ The initiator-even/responder-odd parity is also not enforced on implicit open, s
 
 **Tier 2 — fundamentality / architecture**
 7. **Re-canonicalize the wire (A1):** build `#[derive(Wire)]`, migrate the hand-rolled subsystems onto `fanos-wire`, unify the frame registry, regenerate the `Tessera`/onion layout, delete the stale cleartext-holonomy packet.
-8. **Introduce the `Epoch` newtype and fix the telemetry frame epoch (A3).**
+8. ~~**Introduce the `Epoch` newtype and fix the telemetry frame epoch (A3).**~~ **DONE (#90):** `fanos_primitives::Epoch(u64)` threaded through every protocol-epoch seam (calypso u32/u64 split closed); telemetry frame epoch fed the agreed beacon `Epoch` via `observe_liveness`. All KATs byte-identical; clippy/fmt clean. See the A3 §resolution.
 9. **Resolve the placeholder/real split (A7):** wire `fanos-vrf` into membership, or delete the placeholder and document the gap.
 10. **Make `Decouple` real or remove it (C6); give quarantine an exit + multi-witness gate (C5); make telemetry DP-safe or drop the anonymization claim (C7).**
 
