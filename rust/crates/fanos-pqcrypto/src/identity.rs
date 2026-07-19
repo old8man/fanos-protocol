@@ -112,6 +112,10 @@ mod tests {
             sig: SigPublicKey::new(ed.try_into().unwrap(), mldsa.to_vec()).unwrap(),
             kem: KemPublicKey::new(x.try_into().unwrap(), mlkem.to_vec()).unwrap(),
         };
-        assert_eq!(node.node_id(), model.node_id(), "real identity and byte-model agree on the node id");
+        assert_eq!(
+            node.node_id(),
+            model.node_id(),
+            "real identity and byte-model agree on the node id"
+        );
     }
 }

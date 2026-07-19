@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use fanos_calypso::rendezvous_line;
+use fanos_calypso::{Epoch, rendezvous_line};
 use fanos_field::F7;
 use fanos_geometry::{Line, Plane, Triple};
 
@@ -49,7 +49,7 @@ impl Lcg {
 
 /// The rendezvous (entry) line a service occupies at `epoch`.
 fn line_of(service: &[u8], epoch: u32) -> Triple {
-    rendezvous_line::<F7>(service, epoch).coords()
+    rendezvous_line::<F7>(service, Epoch::new(epoch.into())).coords()
 }
 
 /// Parameters of one SDA scenario.
@@ -139,7 +139,10 @@ fn without_cover_or_an_anonymity_set_the_disclosure_attack_succeeds() {
         seed: 0xC5A,
     });
     eprintln!("[C5 no-defense] score_true={score_true:.3} best_decoy={best_decoy:.3} rank={rank}");
-    assert_eq!(rank, 1, "the SDA must top-rank the true service when it is undefended");
+    assert_eq!(
+        rank, 1,
+        "the SDA must top-rank the true service when it is undefended"
+    );
     assert!(
         score_true - best_decoy > 0.5,
         "the true service must stand out sharply (advantage {:.3})",

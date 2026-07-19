@@ -10,6 +10,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use fanos_primitives::Epoch;
 use fanos_primitives::hash::hash_xof;
 
 use crate::obfuscate::{NONCE_LEN, deobfuscate, obfuscate};
@@ -23,7 +24,7 @@ const NONCE_LABEL: &str = "FANOS-v1/proteus-packet-nonce";
 #[derive(Debug)]
 pub struct ProteusShaper {
     secret: Vec<u8>,
-    epoch: u32,
+    epoch: Epoch,
     shape: ShapeParams,
     counter: AtomicU64,
 }
@@ -31,7 +32,7 @@ pub struct ProteusShaper {
 impl ProteusShaper {
     /// A shaper for `epoch`, keyed by the shared `community_secret`.
     #[must_use]
-    pub fn new(community_secret: impl Into<Vec<u8>>, epoch: u32) -> Self {
+    pub fn new(community_secret: impl Into<Vec<u8>>, epoch: Epoch) -> Self {
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
         Self {
@@ -43,14 +44,14 @@ impl ProteusShaper {
     }
 
     /// Advance to a new epoch: the shape rotates, so the wire signature moves (§13.4, V22).
-    pub fn rotate(&mut self, epoch: u32) {
+    pub fn rotate(&mut self, epoch: Epoch) {
         self.epoch = epoch;
         self.shape = epoch_shape(&self.secret, epoch);
     }
 
     /// The current epoch.
     #[must_use]
-    pub fn epoch(&self) -> u32 {
+    pub fn epoch(&self) -> Epoch {
         self.epoch
     }
 
@@ -89,7 +90,7 @@ mod tests {
 
     #[test]
     fn a_frame_round_trips_through_the_shaper() {
-        let shaper = ProteusShaper::new(b"community".to_vec(), 5);
+        let shaper = ProteusShaper::new(b"community".to_vec(), Epoch::new(5));
         let frame = b"a canonical FANOS wire frame";
         let wire = shaper.outbound(frame);
         assert_ne!(
@@ -102,25 +103,25 @@ mod tests {
 
     #[test]
     fn two_peers_sharing_the_secret_interoperate() {
-        let alice = ProteusShaper::new(b"s".to_vec(), 9);
-        let bob = ProteusShaper::new(b"s".to_vec(), 9);
+        let alice = ProteusShaper::new(b"s".to_vec(), Epoch::new(9));
+        let bob = ProteusShaper::new(b"s".to_vec(), Epoch::new(9));
         let wire = alice.outbound(b"hi bob");
         assert_eq!(bob.inbound(&wire).unwrap(), b"hi bob");
     }
 
     #[test]
     fn the_wire_signature_rotates_every_epoch() {
-        let mut shaper = ProteusShaper::new(b"s".to_vec(), 0);
+        let mut shaper = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
         let w0 = shaper.outbound(b"same payload");
-        shaper.rotate(1);
+        shaper.rotate(Epoch::new(1));
         let w1 = shaper.outbound(b"same payload");
         assert_ne!(w0, w1, "the same frame shapes differently each epoch");
     }
 
     #[test]
     fn the_wrong_secret_cannot_recover_the_frame() {
-        let sender = ProteusShaper::new(b"real-secret".to_vec(), 3);
-        let eavesdropper = ProteusShaper::new(b"guessed-secret".to_vec(), 3);
+        let sender = ProteusShaper::new(b"real-secret".to_vec(), Epoch::new(3));
+        let eavesdropper = ProteusShaper::new(b"guessed-secret".to_vec(), Epoch::new(3));
         let wire = sender.outbound(b"secret payload");
         // Different junk length ⇒ the recovered bytes are not the original frame.
         assert_ne!(
@@ -133,7 +134,7 @@ mod tests {
     fn consecutive_packets_of_the_same_frame_differ_on_the_wire() {
         // Per-packet junk within a single epoch: two sends of the identical frame produce different
         // wire bytes (no fixed intra-epoch prefix / equal-frame linkability), yet both strip back.
-        let shaper = ProteusShaper::new(b"community".to_vec(), 7);
+        let shaper = ProteusShaper::new(b"community".to_vec(), Epoch::new(7));
         let frame = b"identical application frame";
         let w0 = shaper.outbound(frame);
         let w1 = shaper.outbound(frame);
@@ -142,7 +143,7 @@ mod tests {
             "consecutive packets of one frame are not byte-identical"
         );
         // The receiver (fresh counter is irrelevant — it only skips fixed widths) recovers both.
-        let rx = ProteusShaper::new(b"community".to_vec(), 7);
+        let rx = ProteusShaper::new(b"community".to_vec(), Epoch::new(7));
         assert_eq!(rx.inbound(&w0).unwrap(), frame);
         assert_eq!(rx.inbound(&w1).unwrap(), frame);
     }

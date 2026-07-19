@@ -137,8 +137,14 @@ mod tests {
         }
         let r_together = together.coherence().unwrap().mean_correlation();
         let r_apart = apart.coherence().unwrap().mean_correlation();
-        assert!(r_together > 0.9, "co-moving nodes read as highly correlated: {r_together}");
-        assert!(r_apart < -0.9, "anti-moving nodes read as anti-correlated: {r_apart}");
+        assert!(
+            r_together > 0.9,
+            "co-moving nodes read as highly correlated: {r_together}"
+        );
+        assert!(
+            r_apart < -0.9,
+            "anti-moving nodes read as anti-correlated: {r_apart}"
+        );
     }
 
     #[test]

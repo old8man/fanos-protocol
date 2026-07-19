@@ -18,6 +18,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use fanos_primitives::Epoch;
+
 use crate::error::OnomaError;
 use crate::name::is_valid_label;
 use crate::zone::{Target, Zone, ZoneKey, ZoneSource};
@@ -32,7 +34,7 @@ pub struct Registration {
     /// The owner public key that signs (and may later renew/transfer) the claim.
     pub owner: ZoneKey,
     /// The epoch the claim is valid from (renewal/expiry policy lives in the backend).
-    pub epoch: u64,
+    pub epoch: Epoch,
     /// The owner's signature over [`Registration::signing_bytes`].
     pub sig: Vec<u8>,
 }
@@ -173,7 +175,7 @@ mod tests {
 
         let alice_zone = Zone::new(
             alice_key,
-            1,
+            Epoch::new(1),
             vec![
                 Record {
                     label: "@".to_string(),
@@ -229,7 +231,7 @@ mod tests {
             label: "alice".to_string(),
             target: Target::Delegate([7u8; 32]),
             owner: [7u8; 32],
-            epoch: 3,
+            epoch: Epoch::new(3),
             sig: vec![0xEE; 4],
         };
         // Scheme-agnostic verify: the closure receives the bound message.

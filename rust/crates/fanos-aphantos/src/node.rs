@@ -7,13 +7,13 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_primitives::hash::hash_xof;
-use fanos_primitives::map_to_point;
-use fanos_primitives::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
 use fanos_nyx::{build_circuit, build_circuit_via_guard};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
+use fanos_primitives::hash::hash_xof;
+use fanos_primitives::hash_labeled;
+use fanos_primitives::map_to_point;
 use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
@@ -446,8 +446,16 @@ mod tests {
             let (secret, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"boot-seed"));
             NyxNode::<F31>::new(Point::at(0), secret, Directory::new(), [9u8; 32], boot, 2).seed
         };
-        assert_ne!(derived([1u8; 32]), derived([2u8; 32]), "a fresh boot nonce freshens the seed");
-        assert_eq!(derived([5u8; 32]), derived([5u8; 32]), "same seed+boot is deterministic");
+        assert_ne!(
+            derived([1u8; 32]),
+            derived([2u8; 32]),
+            "a fresh boot nonce freshens the seed"
+        );
+        assert_eq!(
+            derived([5u8; 32]),
+            derived([5u8; 32]),
+            "same seed+boot is deterministic"
+        );
     }
 
     /// A cover cell must be byte-indistinguishable from a real onion: the same `Tessera` frame type,
@@ -463,8 +471,15 @@ mod tests {
         let peer_coord = Point::<F31>::at(9).coords();
         directory.insert(peer_coord, peer_public);
 
-        let mut node = NyxNode::new(Point::<F31>::at(0), secret, directory, [7u8; 32], [0u8; 32], 2)
-            .with_mixing(Duration(0), Duration::from_millis(200));
+        let mut node = NyxNode::new(
+            Point::<F31>::at(0),
+            secret,
+            directory,
+            [7u8; 32],
+            [0u8; 32],
+            2,
+        )
+        .with_mixing(Duration(0), Duration::from_millis(200));
 
         // Start cover, then fire the cover timer to emit one cell.
         node.step(Instant(0), Input::Command(Command::StartHeartbeat));

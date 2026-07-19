@@ -28,8 +28,8 @@ extern crate alloc;
 
 pub mod element;
 pub mod fano;
-pub mod hierarchy;
 mod flag;
+pub mod hierarchy;
 mod plane;
 
 pub use element::{

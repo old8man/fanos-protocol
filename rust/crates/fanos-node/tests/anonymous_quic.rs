@@ -19,8 +19,8 @@ use fanos_diaulos::{ServerSession, StaticKeypair};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_node::{FanosDialer, RendezvousRoute, StaticResolver};
-use fanos_proxy::{Dialer, Target};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
+use fanos_proxy::{Dialer, Target};
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_rendezvous::{
     ANONYMOUS, MixDirectory, RendezvousService, SessionId, combiner_for, meeting_line, seal_forward,
@@ -39,7 +39,9 @@ struct RawInjector {
 impl Engine for RawInjector {
     fn step(&mut self, _now: Instant, input: Input) -> Vec<Effect> {
         match input {
-            Input::Command(Command::Send { to, payload }) => vec![Effect::Send { to, frame: payload }],
+            Input::Command(Command::Send { to, payload }) => {
+                vec![Effect::Send { to, frame: payload }]
+            }
             _ => Vec::new(),
         }
     }
@@ -94,7 +96,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
 
     // The service's rotating meeting line for this epoch, and a first hop distinct from it.
     let service_pubkey = b"anon-quic-service";
-    let epoch = 4u32;
+    let epoch = fanos_rendezvous::Epoch::new(4);
     let meeting = meeting_line::<F2>(service_pubkey, epoch).coords();
     let hop = (0..7)
         .map(|i| Line::<F2>::at(i).coords())
@@ -196,7 +198,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let mut skp = SeedRng::from_seed(b"anon-quic-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public.clone();
-    let epoch = 5u32;
+    let epoch = fanos_rendezvous::Epoch::new(5);
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
     let l_index = Point::<F2>::new(l_combiner).unwrap().index();
@@ -210,10 +212,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let rp_combiner = combiner_for::<F2>(rp).unwrap();
     let rp_index = Point::<F2>::new(rp_combiner).unwrap().index();
     let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
-    let hop_to_rp = *lines
-        .iter()
-        .find(|&&l| l != rp && l != meeting)
-        .unwrap();
+    let hop_to_rp = *lines.iter().find(|&&l| l != rp && l != meeting).unwrap();
 
     let service_node = nodes[l_index].take().unwrap();
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"anon-quic-svc-secret");

@@ -26,6 +26,7 @@ pub mod shape;
 pub mod shaper;
 
 pub use bridge::{bridge_line, client_bridge_lines, reachable_fraction};
+pub use fanos_primitives::Epoch;
 pub use morph::{Environment, Morph};
 pub use obfuscate::{deobfuscate, obfuscate};
 pub use shape::{ShapeParams, epoch_shape};
@@ -42,7 +43,7 @@ mod tests {
     #[test]
     fn end_to_end_polymorph_flow() {
         let secret = b"community-bridge-secret";
-        let epoch = 77;
+        let epoch = Epoch::new(77);
 
         // A client in a censored environment selects the flagship morph.
         let env = Environment::DeepCensorship;
@@ -59,7 +60,7 @@ mod tests {
 
         // The client reaches the bridge at the epoch's moving-target line, which rotates.
         let entry = bridge_line::<F31>(secret, epoch);
-        assert_ne!(entry, bridge_line::<F31>(secret, epoch + 1));
+        assert_ne!(entry, bridge_line::<F31>(secret, epoch.next()));
     }
 
     #[test]
@@ -68,8 +69,8 @@ mod tests {
         // The censor blocks this epoch's observed bridge lines; next epoch they have decayed.
         let secret = b"s";
         let mut blocked = BTreeSet::new();
-        for e in 0..50 {
-            blocked.insert(bridge_line::<F31>(secret, e).index());
+        for e in 0u64..50 {
+            blocked.insert(bridge_line::<F31>(secret, Epoch::new(e)).index());
         }
         // Over the *next* 5000 epochs the client is still reachable most of the time, because
         // the blocked set (≈50 lines of 993) barely dents future bridges.

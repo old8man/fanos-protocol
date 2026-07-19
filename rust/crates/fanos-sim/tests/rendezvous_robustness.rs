@@ -28,7 +28,11 @@ type F3 = GfP<3>;
 /// directory. Every point's KEM key is recorded (so sealing always succeeds); a router is *omitted*
 /// for any coordinate in `skip_routers`, which lets a test starve a hop below its threshold while the
 /// onion is still sealed to the full membership.
-fn spawn_plane<F: Field + 'static>(sim: &mut Sim, t: usize, skip_routers: &[Triple]) -> MixDirectory {
+fn spawn_plane<F: Field + 'static>(
+    sim: &mut Sim,
+    t: usize,
+    skip_routers: &[Triple],
+) -> MixDirectory {
     let q = <F as Field>::Q as usize;
     let n = q * q + q + 1;
     let mut dir = MixDirectory::new();
@@ -58,7 +62,7 @@ fn a_deeper_multi_hop_circuit_still_delivers() {
     let t = 2usize;
     let dir = spawn_plane::<F2>(&mut sim, t, &[]);
 
-    let meeting = meeting_line::<F2>(b"deep-svc", 2).coords();
+    let meeting = meeting_line::<F2>(b"deep-svc", fanos_rendezvous::Epoch::new(2)).coords();
     let others: Vec<Triple> = (0..7)
         .map(|i| Line::<F2>::at(i).coords())
         .filter(|&l| l != meeting)
@@ -83,7 +87,7 @@ fn threshold_extremes_still_deliver() {
     for t in [1usize, 3usize] {
         let mut sim = Sim::new(0x7700 + t as u64);
         let dir = spawn_plane::<F2>(&mut sim, t, &[]);
-        let meeting = meeting_line::<F2>(b"thr-svc", 1).coords();
+        let meeting = meeting_line::<F2>(b"thr-svc", fanos_rendezvous::Epoch::new(1)).coords();
         let hop = (0..7)
             .map(|i| Line::<F2>::at(i).coords())
             .find(|&l| l != meeting)
@@ -105,7 +109,7 @@ fn threshold_extremes_still_deliver() {
 fn a_hop_starved_below_threshold_does_not_deliver() {
     let mut sim = Sim::new(0xDEAD);
     let t = 2usize;
-    let meeting = meeting_line::<F2>(b"starve-svc", 1).coords();
+    let meeting = meeting_line::<F2>(b"starve-svc", fanos_rendezvous::Epoch::new(1)).coords();
     // Keep the combiner (the onion's entry point) live but silence the other members, so the final hop
     // has only 1 < t=2 live members and can never be reconstructed.
     let members = line_member_coords::<F2>(meeting);
@@ -131,7 +135,7 @@ fn rendezvous_generalises_to_a_larger_plane_pg_2_3() {
     // PG(2,3): 13 points, 13 lines of 4 points each.
     let dir = spawn_plane::<F3>(&mut sim, t, &[]);
 
-    let meeting = meeting_line::<F3>(b"f3-svc", 1).coords();
+    let meeting = meeting_line::<F3>(b"f3-svc", fanos_rendezvous::Epoch::new(1)).coords();
     let hop = (0..13)
         .map(|i| Line::<F3>::at(i).coords())
         .find(|&l| l != meeting)
@@ -152,8 +156,9 @@ fn rendezvous_generalises_to_a_larger_plane_pg_2_3() {
 fn the_meeting_line_rotates_across_epochs() {
     let key = b"rotating-service";
     // Over a span of epochs the meeting line takes several distinct values — no fixed rendezvous point.
-    let distinct: std::collections::BTreeSet<Triple> =
-        (0..20u32).map(|e| meeting_line::<F2>(key, e).coords()).collect();
+    let distinct: std::collections::BTreeSet<Triple> = (0..20u32)
+        .map(|e| meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into())).coords())
+        .collect();
     assert!(
         distinct.len() > 1,
         "the meeting line must not be constant across epochs (rotation)"
@@ -163,7 +168,7 @@ fn the_meeting_line_rotates_across_epochs() {
     let mut sim = Sim::new(0xE0E0);
     let t = 2usize;
     let dir = spawn_plane::<F2>(&mut sim, t, &[]);
-    let l5 = meeting_line::<F2>(key, 5).coords();
+    let l5 = meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(5)).coords();
     let hop = (0..7)
         .map(|i| Line::<F2>::at(i).coords())
         .find(|&l| l != l5)
@@ -181,7 +186,12 @@ fn the_meeting_line_rotates_across_epochs() {
     // Find some other epoch whose combiner differs from epoch 5's, and confirm this payload never
     // landed there — an epoch-5 onion does not reach a foreign epoch's listening point.
     if let Some(other_c) = (0..20u32)
-        .map(|e| combiner_for::<F2>(meeting_line::<F2>(key, e).coords()).unwrap())
+        .map(|e| {
+            combiner_for::<F2>(
+                meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into())).coords(),
+            )
+            .unwrap()
+        })
         .find(|&c| c != c5)
     {
         assert!(

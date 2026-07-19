@@ -31,7 +31,14 @@ fn spawn_nyx_cell(
     }
     let mut coords = Vec::with_capacity(points.len());
     for (i, (point, secret)) in points.iter().zip(secrets).enumerate() {
-        let mut node = NyxNode::new(*point, secret, directory.clone(), [i as u8; 32], [0u8; 32], path_len);
+        let mut node = NyxNode::new(
+            *point,
+            secret,
+            directory.clone(),
+            [i as u8; 32],
+            [0u8; 32],
+            path_len,
+        );
         if let Some((mean_delay, cover_interval)) = mix {
             node = node.with_mixing(mean_delay, cover_interval);
         }

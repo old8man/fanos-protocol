@@ -7,10 +7,10 @@
 //! occupy a coordinate whose key it does not hold. The [`Directory`](crate::Directory) then serves
 //! only address resolution (a hint for dialing), never identity.
 
-use fanos_primitives::hash::label;
-use fanos_primitives::map_to_point;
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Point, derive_address};
+use fanos_primitives::hash::label;
+use fanos_primitives::map_to_point;
 use quinn::Connection;
 use rustls::pki_types::CertificateDer;
 

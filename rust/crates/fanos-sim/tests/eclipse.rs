@@ -100,7 +100,8 @@ fn frame(ty: FrameType, body: &[u8]) -> Vec<u8> {
 /// empty (this cell does not require self-certified membership), so the receiver's coordinate check is
 /// what decides.
 fn forged_announce(coord: Triple, info: &[u8]) -> Vec<u8> {
-    let hier = Point::<F2>::new(coord).map_or_else(|| HierAddr::root(Point::<F2>::at(0)), HierAddr::root);
+    let hier =
+        Point::<F2>::new(coord).map_or_else(|| HierAddr::root(Point::<F2>::at(0)), HierAddr::root);
     let hier_bytes = hier.encode();
     let mut body = Vec::with_capacity(12 + hier_bytes.len() + 2 + info.len());
     for word in coord {
@@ -170,7 +171,10 @@ fn assert_neighbours_are_colinear<F: Field>() {
             .map(|p| p.coords())
             .filter(|&c| c != coord.coords())
             .collect();
-        assert_eq!(got, all_others, "the neighbour set is every other node of the cell");
+        assert_eq!(
+            got, all_others,
+            "the neighbour set is every other node of the cell"
+        );
 
         // (c) Each neighbour genuinely shares a unique line with `coord`, proven from the geometry
         // primitives (join + incidence) rather than from the construction formula.
@@ -221,14 +225,23 @@ fn no_forged_frame_flood_can_add_or_remove_a_neighbour() {
     let mut t = 1u64;
     for _ in 0..20 {
         for f in &forged {
-            node.step(Instant(t), Input::Message { from: byz, frame: f.clone() });
+            node.step(
+                Instant(t),
+                Input::Message {
+                    from: byz,
+                    frame: f.clone(),
+                },
+            );
             t += 1;
         }
     }
 
     // The DERIVED neighbour set is untouched: no forged frame added or removed a peer.
     let after: BTreeSet<Triple> = node.neighbours().collect();
-    assert_eq!(after, before, "a forged frame flood cannot alter the neighbour set");
+    assert_eq!(
+        after, before,
+        "a forged frame flood cannot alter the neighbour set"
+    );
     assert_eq!(
         after,
         colinear_neighbours::<F2>(coord),

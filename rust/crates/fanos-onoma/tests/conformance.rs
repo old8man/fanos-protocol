@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 
 use fanos_field::F7;
-use fanos_onoma::{Address, derive, lookup_key};
+use fanos_onoma::{Address, Epoch, derive, lookup_key};
 
 const BUNDLE: &[u8] = b"fanos-onoma-conformance-service";
 
@@ -45,12 +45,15 @@ fn address_kat_matches_names_json() {
 fn derivation_kat_matches_names_json() {
     let a = Address::from_bundle(BUNDLE);
     assert_eq!(
-        hex(&lookup_key(&a, 42)),
+        hex(&lookup_key(&a, Epoch::new(42))),
         "3936a45cef80a5c80bc7a1c137d0255082e65f32fa13265550b223627b98f689"
     );
     assert_eq!(
-        hex(&derive::descriptor_key(&a, 42)),
+        hex(&derive::descriptor_key(&a, Epoch::new(42))),
         "54b6eb245c20efeae57d43aa59d89925fa99e63984c8188baf111788acf632f1"
     );
-    assert_eq!(derive::lookup_point::<F7>(&a, 42).coords(), [1, 5, 3]);
+    assert_eq!(
+        derive::lookup_point::<F7>(&a, Epoch::new(42)).coords(),
+        [1, 5, 3]
+    );
 }

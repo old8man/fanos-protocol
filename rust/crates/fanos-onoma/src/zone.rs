@@ -11,6 +11,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use fanos_primitives::Epoch;
+
 use crate::address::Address;
 use crate::error::OnomaError;
 use crate::name::Name;
@@ -64,7 +66,7 @@ pub struct Zone {
     /// The zone's owner public key (also the delegation target that points here).
     pub key: ZoneKey,
     /// The epoch this zone revision was signed at (monotone; newer supersedes older).
-    pub epoch: u64,
+    pub epoch: Epoch,
     /// The records.
     pub records: Vec<Record>,
     /// The owner's signature over [`Zone::signing_bytes`] (scheme-agnostic bytes).
@@ -74,7 +76,7 @@ pub struct Zone {
 impl Zone {
     /// A new unsigned zone (fill [`Zone::sig`] via the owner's signer).
     #[must_use]
-    pub fn new(key: ZoneKey, epoch: u64, records: Vec<Record>) -> Self {
+    pub fn new(key: ZoneKey, epoch: Epoch, records: Vec<Record>) -> Self {
         Self {
             key,
             epoch,
@@ -186,7 +188,7 @@ mod tests {
         let a = Address::from_bundle(b"svc");
         let z1 = Zone::new(
             [1u8; 32],
-            1,
+            Epoch::new(1),
             alloc::vec![Record {
                 label: "a".to_string(),
                 target: Target::Address(a)
@@ -194,7 +196,7 @@ mod tests {
         );
         let z2 = Zone::new(
             [1u8; 32],
-            1,
+            Epoch::new(1),
             alloc::vec![Record {
                 label: "b".to_string(),
                 target: Target::Address(a)
@@ -205,7 +207,7 @@ mod tests {
 
     #[test]
     fn verify_uses_the_closure() {
-        let z = Zone::new([9u8; 32], 0, Vec::new());
+        let z = Zone::new([9u8; 32], Epoch::ZERO, Vec::new());
         assert!(z.verify(|_, _, _| true));
         assert!(!z.verify(|_, _, _| false));
     }

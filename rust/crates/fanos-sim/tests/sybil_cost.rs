@@ -87,9 +87,9 @@
 
 use std::collections::BTreeSet;
 
-use fanos_primitives::{hash::label, map_to_point};
 use fanos_field::{F7, F13, F16, Field};
 use fanos_geometry::{Line, Plane};
+use fanos_primitives::{hash::label, map_to_point};
 use fanos_sim::Rng;
 
 // Fixed, reproducible seeds — one per deterministic experiment.
@@ -135,15 +135,25 @@ fn expected_capture_trials(n: u32, s: u32, t: u32) -> f64 {
 /// coordinates from `targets`, over `RUNS` independent runs off one deterministic
 /// stream. Every trial is counted — hits, misses, and duplicates — because each
 /// is one hash the adversary paid.
-fn mean_capture_trials<F: Field>(rng: &mut Rng, targets: &BTreeSet<usize>, threshold: usize) -> f64 {
-    assert!(threshold <= targets.len(), "cannot bank more seats than exist");
+fn mean_capture_trials<F: Field>(
+    rng: &mut Rng,
+    targets: &BTreeSet<usize>,
+    threshold: usize,
+) -> f64 {
+    assert!(
+        threshold <= targets.len(),
+        "cannot bank more seats than exist"
+    );
     let mut total: u64 = 0;
     for _ in 0..RUNS {
         let mut held: BTreeSet<usize> = BTreeSet::new();
         let mut trials: u64 = 0;
         while held.len() < threshold {
             trials += 1;
-            assert!(trials <= CAP, "grind exceeded CAP — map or derivation is broken");
+            assert!(
+                trials <= CAP,
+                "grind exceeded CAP — map or derivation is broken"
+            );
             let idx = coordinate_index::<F>(rng.next_u64());
             if targets.contains(&idx) {
                 held.insert(idx);

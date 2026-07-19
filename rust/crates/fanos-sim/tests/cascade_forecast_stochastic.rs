@@ -228,5 +228,9 @@ fn the_cascade_ensemble_is_reproducible() {
         }
         (c, w)
     }
-    assert_eq!(sensitivity(), sensitivity(), "the ensemble replays identically");
+    assert_eq!(
+        sensitivity(),
+        sensitivity(),
+        "the ensemble replays identically"
+    );
 }

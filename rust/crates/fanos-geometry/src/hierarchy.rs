@@ -55,7 +55,9 @@ impl<F: Field> HierAddr<F> {
     /// A depth-1 address at the top-cell point `p`.
     #[must_use]
     pub fn root(p: Point<F>) -> Self {
-        Self { path: alloc::vec![p] }
+        Self {
+            path: alloc::vec![p],
+        }
     }
 
     /// Build from a path of points (coarsest first). `None` if empty or deeper than [`MAX_DEPTH`].
@@ -236,9 +238,8 @@ mod tests {
         // Two nodes both derive point 2 at the top (a collision), but different sub-points.
         let occupant = HierAddr::root(p(2));
         let mut taken = alloc::vec![occupant.clone()];
-        let is_taken = |path: &[Point<F2>], taken: &[HierAddr<F2>]| {
-            taken.iter().any(|a| a.points() == path)
-        };
+        let is_taken =
+            |path: &[Point<F2>], taken: &[HierAddr<F2>]| taken.iter().any(|a| a.points() == path);
         // Newcomer A: top 2 (taken) → sub 4.
         let a = derive_address(
             |l| if l == 0 { p(2) } else { p(4) },
@@ -321,10 +322,10 @@ mod tests {
         // is present. A message walks the prefix chain — one rendezvous per level — and is delivered.
         let dst = HierAddr::from_path(alloc::vec![p(2), p(4), p(6)]).unwrap();
         let network = alloc::vec![
-            HierAddr::root(p(1)),                                        // a far node, other top cell
-            HierAddr::root(p(2)),                                        // dst's top-cell root  (cp 1)
-            HierAddr::from_path(alloc::vec![p(2), p(4)]).unwrap(),       // dst's level-2 ancestor (cp 2)
-            dst.clone(),                                                 // dst                    (cp 3)
+            HierAddr::root(p(1)), // a far node, other top cell
+            HierAddr::root(p(2)), // dst's top-cell root  (cp 1)
+            HierAddr::from_path(alloc::vec![p(2), p(4)]).unwrap(), // dst's level-2 ancestor (cp 2)
+            dst.clone(),          // dst                    (cp 3)
         ];
         let mut current = HierAddr::root(p(1));
         let (mut hops, mut prev_cp) = (0usize, current.common_prefix(&dst));
@@ -337,14 +338,24 @@ mod tests {
                 .filter(|n| n.common_prefix(&dst) == cp + 1)
                 .cloned()
                 .collect();
-            let next = next_hop(&current, &dst, &reachable).expect("dst's next ancestor is reachable");
-            assert!(next.common_prefix(&dst) > prev_cp, "strictly closer each hop");
+            let next =
+                next_hop(&current, &dst, &reachable).expect("dst's next ancestor is reachable");
+            assert!(
+                next.common_prefix(&dst) > prev_cp,
+                "strictly closer each hop"
+            );
             prev_cp = next.common_prefix(&dst);
             current = next;
             hops += 1;
-            assert!(hops <= dst.depth(), "delivered within ≤ depth hops (O(k) rendezvous depth)");
+            assert!(
+                hops <= dst.depth(),
+                "delivered within ≤ depth hops (O(k) rendezvous depth)"
+            );
         }
-        assert_eq!(current, dst, "the message reached the destination across three cells");
+        assert_eq!(
+            current, dst,
+            "the message reached the destination across three cells"
+        );
         assert_eq!(hops, 3);
     }
 
@@ -366,7 +377,11 @@ mod tests {
         }
         assert_eq!(HierAddr::<F2>::decode(&[]), None, "empty");
         assert_eq!(HierAddr::<F2>::decode(&[0]), None, "zero depth");
-        assert_eq!(HierAddr::<F2>::decode(&[1, 0, 0, 0]), None, "truncated coord");
+        assert_eq!(
+            HierAddr::<F2>::decode(&[1, 0, 0, 0]),
+            None,
+            "truncated coord"
+        );
         assert_eq!(
             HierAddr::<F2>::decode(&[(MAX_DEPTH as u8) + 1]),
             None,

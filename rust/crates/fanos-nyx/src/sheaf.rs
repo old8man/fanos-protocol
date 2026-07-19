@@ -92,8 +92,7 @@ pub fn seal(
     line_size: u8,
     key_randomness: &[u8],
 ) -> Result<ThresholdLayer, NyxError> {
-    let ciphertext =
-        fanos_primitives::aead::seal(key, nonce, routing_cmd).ok_or(NyxError::Aead)?;
+    let ciphertext = fanos_primitives::aead::seal(key, nonce, routing_cmd).ok_or(NyxError::Aead)?;
     let shares = shamir::split(key, threshold, line_size, key_randomness)?;
     Ok(ThresholdLayer {
         ciphertext,

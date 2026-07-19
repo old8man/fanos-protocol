@@ -74,12 +74,13 @@ pub fn deobfuscate(shape: &ShapeParams, wire: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::shape::epoch_shape;
+    use fanos_primitives::Epoch;
 
     const N0: [u8; NONCE_LEN] = [0; NONCE_LEN];
 
     #[test]
     fn obfuscation_round_trips() {
-        let shape = epoch_shape(b"secret", 5);
+        let shape = epoch_shape(b"secret", Epoch::new(5));
         let payload = b"the real encrypted transport bytes";
         let wire = obfuscate(&shape, payload, &N0);
         assert_eq!(deobfuscate(&shape, &wire).unwrap(), payload);
@@ -90,8 +91,8 @@ mod tests {
         // The same payload obfuscated under different epochs has different bytes and lengths —
         // no shared signature to train on (spec §13.4).
         let payload = b"same payload";
-        let w0 = obfuscate(&epoch_shape(b"s", 0), payload, &N0);
-        let w1 = obfuscate(&epoch_shape(b"s", 1), payload, &N0);
+        let w0 = obfuscate(&epoch_shape(b"s", Epoch::ZERO), payload, &N0);
+        let w1 = obfuscate(&epoch_shape(b"s", Epoch::new(1)), payload, &N0);
         assert_ne!(w0, w1);
     }
 
@@ -99,7 +100,7 @@ mod tests {
     fn the_junk_rotates_per_packet_but_still_round_trips() {
         // The per-packet nonce diversifies junk/padding: the same frame under the same epoch shapes
         // to different bytes for different nonces, yet both strip back to the original payload.
-        let shape = epoch_shape(b"s", 3);
+        let shape = epoch_shape(b"s", Epoch::new(3));
         let payload = b"identical frame";
         let a = obfuscate(&shape, payload, &[1; NONCE_LEN]);
         let b = obfuscate(&shape, payload, &[2; NONCE_LEN]);
@@ -113,16 +114,16 @@ mod tests {
 
     #[test]
     fn output_is_padded_to_the_epoch_granularity() {
-        let shape = epoch_shape(b"s", 9);
+        let shape = epoch_shape(b"s", Epoch::new(9));
         let wire = obfuscate(&shape, b"abc", &N0);
         assert_eq!(wire.len() % usize::from(shape.padding_multiple), 0);
     }
 
     #[test]
     fn a_wrong_shape_does_not_recover() {
-        let wire = obfuscate(&epoch_shape(b"s", 1), b"payload", &N0);
+        let wire = obfuscate(&epoch_shape(b"s", Epoch::new(1)), b"payload", &N0);
         // A different epoch's shape strips the wrong junk length → garbage or None.
-        let recovered = deobfuscate(&epoch_shape(b"s", 2), &wire);
+        let recovered = deobfuscate(&epoch_shape(b"s", Epoch::new(2)), &wire);
         assert_ne!(recovered.as_deref(), Some(&b"payload"[..]));
     }
 }

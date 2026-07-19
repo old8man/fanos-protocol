@@ -182,8 +182,14 @@ mod tests {
         // purity converges to the T-98 balance point, viable and in-band.
         let d = PurityDynamics::new(0.1, 0.5, 0.6, 0.05, N, 0.5);
         let settled = settle(d, 0.0, 5000);
-        assert!(d.steady_state(0.0) >= 3.0 / 7.0, "this operating point is in the gate-open regime");
-        assert!((settled.purity() - d.steady_state(0.0)).abs() < 1e-6, "converges to P_ss(0)");
+        assert!(
+            d.steady_state(0.0) >= 3.0 / 7.0,
+            "this operating point is in the gate-open regime"
+        );
+        assert!(
+            (settled.purity() - d.steady_state(0.0)).abs() < 1e-6,
+            "converges to P_ss(0)"
+        );
         assert!(settled.viable(), "the quiet fixed point is viable");
         assert!(settled.r_stab() > 0.0);
     }
@@ -199,17 +205,29 @@ mod tests {
 
         // A huge sustained flood always spirals to heat death 1/N; a quiet cell always survives.
         let dead = settle(base, bound * 5.0, 20_000);
-        assert!(!dead.viable() && (dead.purity() - 1.0 / N as f64).abs() < 1e-3, "spirals to 1/N");
+        assert!(
+            !dead.viable() && (dead.purity() - 1.0 / N as f64).abs() < 1e-3,
+            "spirals to 1/N"
+        );
         assert!(settle(base, 0.0, 20_000).viable());
 
         // The true (simulated) threshold exists, is positive, and does not exceed the closed-form bound.
         let a_star = empirical_threshold(base, bound * 5.0);
         assert!(a_star > 0.0, "a positive survival margin exists");
-        assert!(a_star <= bound + 1e-6, "the true threshold is at or below the gate-open bound {bound}");
+        assert!(
+            a_star <= bound + 1e-6,
+            "the true threshold is at or below the gate-open bound {bound}"
+        );
 
         // Sharp transition (bifurcation, not a gradual fade): a hair below survives, a hair above collapses.
-        assert!(settle(base, a_star * 0.9, 20_000).viable(), "just below a* survives");
-        assert!(!settle(base, a_star * 1.1, 20_000).viable(), "just above a* collapses");
+        assert!(
+            settle(base, a_star * 0.9, 20_000).viable(),
+            "just below a* survives"
+        );
+        assert!(
+            !settle(base, a_star * 1.1, 20_000).viable(),
+            "just above a* collapses"
+        );
     }
 
     #[test]
@@ -223,9 +241,15 @@ mod tests {
         // The same cell with only the GUARANTEED floor κ_bootstrap survives quiet and a positive attack —
         // the floor alone (no adaptive Coh_E) already yields a non-trivial survival margin (found by sim).
         let floored = PurityDynamics::new(0.02, KAPPA_BOOTSTRAP, 0.9, 0.05, N, 0.6);
-        assert!(settle(floored, 0.0, 20_000).viable(), "κ_bootstrap holds a quiet cell viable");
+        assert!(
+            settle(floored, 0.0, 20_000).viable(),
+            "κ_bootstrap holds a quiet cell viable"
+        );
         let a_star = empirical_threshold(floored, floored.survival_bound_gate_open() * 2.0);
-        assert!(a_star > 0.0, "κ_bootstrap gives a positive survival margin, got {a_star}");
+        assert!(
+            a_star > 0.0,
+            "κ_bootstrap gives a positive survival margin, got {a_star}"
+        );
         assert!(settle(floored, a_star * 0.8, 20_000).viable());
     }
 
@@ -236,8 +260,14 @@ mod tests {
         let base = PurityDynamics::new(0.1, 0.5, 0.9, 0.02, N, 0.9);
         let a = empirical_threshold(base, base.survival_bound_gate_open() * 5.0) * 0.8;
         let stressed = settle(base, a, 20_000);
-        assert!(stressed.viable(), "survives the flood (below the true threshold)");
-        assert!(stressed.purity() < base.steady_state(0.0), "but depressed below the quiet fixed point");
+        assert!(
+            stressed.viable(),
+            "survives the flood (below the true threshold)"
+        );
+        assert!(
+            stressed.purity() < base.steady_state(0.0),
+            "but depressed below the quiet fixed point"
+        );
 
         // Attack stops; the recovery is monotone increasing and reaches the quiet fixed point.
         let mut d = stressed;
@@ -248,7 +278,10 @@ mod tests {
             prev = now;
         }
         let recovered = settle(d, 0.0, 20_000);
-        assert!((recovered.purity() - base.steady_state(0.0)).abs() < 1e-6, "returns to P_ss(0)");
+        assert!(
+            (recovered.purity() - base.steady_state(0.0)).abs() < 1e-6,
+            "returns to P_ss(0)"
+        );
     }
 
     #[test]
@@ -260,6 +293,9 @@ mod tests {
         assert!(strong.survival_bound_gate_open() > weak.survival_bound_gate_open());
         let weak_star = empirical_threshold(weak, weak.survival_bound_gate_open() * 2.0);
         let strong_star = empirical_threshold(strong, strong.survival_bound_gate_open() * 2.0);
-        assert!(strong_star > weak_star, "stronger gain tolerates a larger attack: {weak_star} → {strong_star}");
+        assert!(
+            strong_star > weak_star,
+            "stronger gain tolerates a larger attack: {weak_star} → {strong_star}"
+        );
     }
 }

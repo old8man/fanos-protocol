@@ -206,27 +206,42 @@ mod tests {
     fn cookie_is_deterministic_in_the_secret_and_distinct_across_secrets() {
         let dir = fano_directory();
         let cookie = |secret: &[u8]| {
-            RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], dir.clone(), 2, secret).cookie()
+            RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], dir.clone(), 2, secret)
+                .cookie()
         };
-        assert_eq!(cookie(b"alpha"), cookie(b"alpha"), "same secret → same cookie");
-        assert_ne!(cookie(b"alpha"), cookie(b"beta"), "distinct secrets → distinct cookies");
+        assert_eq!(
+            cookie(b"alpha"),
+            cookie(b"alpha"),
+            "same secret → same cookie"
+        );
+        assert_ne!(
+            cookie(b"alpha"),
+            cookie(b"beta"),
+            "distinct secrets → distinct cookies"
+        );
         // Many independent secrets stay collision-free (the cookie space is a 128-bit CSPRNG draw).
         let mut all = std::collections::BTreeSet::new();
         for i in 0..256u32 {
-            assert!(all.insert(cookie(&i.to_be_bytes())), "cookie collision at {i}");
+            assert!(
+                all.insert(cookie(&i.to_be_bytes())),
+                "cookie collision at {i}"
+            );
         }
     }
 
     #[test]
     fn seal_send_draws_fresh_key_material_per_onion() {
         let dir = fano_directory();
-        let meeting = meeting_line::<F2>(b"svc", 1).coords();
+        let meeting = meeting_line::<F2>(b"svc", crate::Epoch::new(1)).coords();
         let hop = (0..7).map(line).find(|&l| l != meeting).unwrap();
         let mut c =
             RendezvousClient::<F2>::new(vec![hop, meeting], vec![line(3)], dir, 2, b"secret");
         let a = c.seal_send(b"hello").unwrap();
         let b = c.seal_send(b"hello").unwrap();
-        assert_eq!(a.combiner, b.combiner, "same first hop → same launch combiner");
+        assert_eq!(
+            a.combiner, b.combiner,
+            "same first hop → same launch combiner"
+        );
         assert_ne!(
             a.frame, b.frame,
             "a fresh per-onion seed must change the sealed frame — no key-material reuse"
@@ -302,7 +317,10 @@ mod tests {
             .unwrap();
         assert_eq!(got, cookie);
         assert_eq!(payload, b"more");
-        assert!(svc.knows(&cookie), "an empty reply circuit does not unbind the cookie");
+        assert!(
+            svc.knows(&cookie),
+            "an empty reply circuit does not unbind the cookie"
+        );
         assert!(svc.seal_reply(&cookie, b"resp").is_some());
         assert_eq!(svc.sessions(), 1, "still exactly one session");
     }
@@ -340,7 +358,10 @@ mod tests {
         let a = seal_forward::<F2>(&circuit, &dir, 2, b"payload", b"seed-1").unwrap();
         let b = seal_forward::<F2>(&circuit, &dir, 2, b"payload", b"seed-1").unwrap();
         let c = seal_forward::<F2>(&circuit, &dir, 2, b"payload", b"seed-2").unwrap();
-        assert_eq!(a.frame, b.frame, "same seed → identical onion (reproducible under the sim)");
+        assert_eq!(
+            a.frame, b.frame,
+            "same seed → identical onion (reproducible under the sim)"
+        );
         assert_ne!(a.frame, c.frame, "a different seed changes the onion");
     }
 }

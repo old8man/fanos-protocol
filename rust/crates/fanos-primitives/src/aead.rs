@@ -61,7 +61,15 @@ mod tests {
         bad[0] ^= 0x01;
         assert_eq!(open(&key, &nonce, &bad), None, "tamper is rejected");
         // The wrong key / wrong nonce cannot open it.
-        assert_eq!(open(&[8u8; KEY_LEN], &nonce, &ct), None, "wrong key rejected");
-        assert_eq!(open(&key, &[4u8; NONCE_LEN], &ct), None, "wrong nonce rejected");
+        assert_eq!(
+            open(&[8u8; KEY_LEN], &nonce, &ct),
+            None,
+            "wrong key rejected"
+        );
+        assert_eq!(
+            open(&key, &[4u8; NONCE_LEN], &ct),
+            None,
+            "wrong nonce rejected"
+        );
     }
 }

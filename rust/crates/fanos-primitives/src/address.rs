@@ -88,7 +88,8 @@ mod tests {
         );
         // The level-0-only address of a *different* identity also does not match `id`
         // (with overwhelming probability over the 7 Fano points; asserted by construction here).
-        let other_root = HierAddr::<F2>::from_path(alloc::vec![address_point::<F2>(other, 0)]).unwrap();
+        let other_root =
+            HierAddr::<F2>::from_path(alloc::vec![address_point::<F2>(other, 0)]).unwrap();
         let id_root = HierAddr::<F2>::from_path(alloc::vec![address_point::<F2>(id, 0)]).unwrap();
         // Whichever way the two roots landed, each identity verifies its OWN root.
         assert!(address_matches_identity::<F2>(other, &other_root));

@@ -150,7 +150,10 @@ mod tests {
         let r = 0.5;
         let p = purity_equicorrelated(N, r);
         assert!(phi_equicorrelated(N, r) >= 1.0, "integrated");
-        assert_eq!(Homeostat::conservative().control(p, r, N), BandControl::Hold);
+        assert_eq!(
+            Homeostat::conservative().control(p, r, N),
+            BandControl::Hold
+        );
     }
 
     #[test]
@@ -161,7 +164,10 @@ mod tests {
         let p = purity_equicorrelated(N, r);
         match Homeostat::new(0.5).control(p, r, N) {
             BandControl::Decouple { effort } => {
-                assert!(effort > 0.0 && effort <= 1.0, "proportional shed effort, got {effort}");
+                assert!(
+                    effort > 0.0 && effort <= 1.0,
+                    "proportional shed effort, got {effort}"
+                );
             }
             other => panic!("expected Decouple, got {other:?}"),
         }
@@ -186,9 +192,18 @@ mod tests {
     #[test]
     fn a_collapsed_cell_escalates_regardless_of_correlation() {
         // P ≤ 2/7 ⇒ g_V = 0 ⇒ no self-recovery ⇒ Escalate, whatever r is.
-        assert_eq!(Homeostat::conservative().control(0.25, 0.5, N), BandControl::Escalate);
-        assert_eq!(Homeostat::conservative().control(0.25, 0.05, N), BandControl::Escalate);
-        assert_eq!(Homeostat::conservative().control(2.0 / 7.0, 0.5, N), BandControl::Escalate);
+        assert_eq!(
+            Homeostat::conservative().control(0.25, 0.5, N),
+            BandControl::Escalate
+        );
+        assert_eq!(
+            Homeostat::conservative().control(0.25, 0.05, N),
+            BandControl::Escalate
+        );
+        assert_eq!(
+            Homeostat::conservative().control(2.0 / 7.0, 0.5, N),
+            BandControl::Escalate
+        );
     }
 
     #[test]

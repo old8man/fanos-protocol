@@ -163,7 +163,10 @@ mod tests {
     fn a_fresh_cell_is_ready_and_healthy() {
         let src = ScenarioSource::new();
         let snap = src.snapshot();
-        assert!(snap.is_ready(), "a fresh gate-open cell is a bound, self-observing subject");
+        assert!(
+            snap.is_ready(),
+            "a fresh gate-open cell is a bound, self-observing subject"
+        );
         assert!(snap.phi >= 1.0, "Φ ≥ 1");
         assert_eq!(snap.syndrome, 0, "no faults");
     }
@@ -174,12 +177,18 @@ mod tests {
         for _ in 0..20 {
             src.control(Control::Attack);
         }
-        assert!(src.pressure() > 1.0, "the operator pushed past the survival bound");
+        assert!(
+            src.pressure() > 1.0,
+            "the operator pushed past the survival bound"
+        );
         for _ in 0..5000 {
             src.tick();
         }
         let snap = src.snapshot();
-        assert!(!snap.is_ready(), "a cell held past a* loses viability (not ready)");
+        assert!(
+            !snap.is_ready(),
+            "a cell held past a* loses viability (not ready)"
+        );
     }
 
     #[test]
@@ -194,6 +203,9 @@ mod tests {
         let healed = src.snapshot();
         assert_eq!(src.degraded(), 0, "healing cleared the degraded set");
         assert!(!healed.faulted, "and the syndrome is clean");
-        assert!(healed.heal_seq > snap.heal_seq, "the healing counter advanced");
+        assert!(
+            healed.heal_seq > snap.heal_seq,
+            "the healing counter advanced"
+        );
     }
 }

@@ -167,7 +167,10 @@ mod tests {
         let src = LiveCellSource::new();
         let snap = src.snapshot();
         assert_eq!(src.degraded(), 0, "a settled cell has no timed-out nodes");
-        assert!(snap.is_ready(), "seven live nodes are a bound, self-observing subject");
+        assert!(
+            snap.is_ready(),
+            "seven live nodes are a bound, self-observing subject"
+        );
     }
 
     #[test]
@@ -182,14 +185,23 @@ mod tests {
             src.tick();
         }
         let snap = src.snapshot();
-        assert!(src.degraded().count_ones() >= 3, "the crashed nodes time out and show degraded");
-        assert!(!snap.is_ready(), "a cell that lost its majority is no longer ready");
+        assert!(
+            src.degraded().count_ones() >= 3,
+            "the crashed nodes time out and show degraded"
+        );
+        assert!(
+            !snap.is_ready(),
+            "a cell that lost its majority is no longer ready"
+        );
 
         // Healing recovers every node; after settling the cell is ready again.
         src.control(Control::Heal);
         for _ in 0..8 {
             src.tick();
         }
-        assert!(src.snapshot().is_ready(), "healing restores the live cell to readiness");
+        assert!(
+            src.snapshot().is_ready(),
+            "healing restores the live cell to readiness"
+        );
     }
 }

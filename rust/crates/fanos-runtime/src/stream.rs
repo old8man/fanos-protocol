@@ -446,9 +446,9 @@ impl StreamSender {
             if self.dup_acks >= DUP_ACK_THRESHOLD {
                 let seq = ack.cumulative;
                 let attempt = self.retransmitted.get(&seq).copied().unwrap_or(0);
-                let target = self
-                    .clock
-                    .saturating_add(jitter_ticks(seq, attempt, FAST_RETX_JITTER_SPAN));
+                let target =
+                    self.clock
+                        .saturating_add(jitter_ticks(seq, attempt, FAST_RETX_JITTER_SPAN));
                 // Only ever pull the resend *earlier* — never push it later. A segment that has not yet
                 // fired keeps `attempt == 0`, so its jitter is a fixed value; without the `min`, each new
                 // dup-ack burst would reset the schedule to `clock + that_fixed_delay` before `clock`
@@ -716,7 +716,11 @@ mod tests {
         );
         // A single large spike widens RTTVAR and thus the RTO (the 4·RTTVAR safety margin), then decays.
         est.sample(40);
-        assert!(est.rto > 14, "a latency spike widens the RTO, got {}", est.rto);
+        assert!(
+            est.rto > 14,
+            "a latency spike widens the RTO, got {}",
+            est.rto
+        );
     }
 
     #[test]
@@ -764,7 +768,10 @@ mod tests {
                 break;
             }
         }
-        assert!(gap_resent, "fast retransmit resends the SACKed gap promptly");
+        assert!(
+            gap_resent,
+            "fast retransmit resends the SACKed gap promptly"
+        );
     }
 
     #[test]
@@ -1066,7 +1073,10 @@ mod tests {
             fin: true,
             data: alloc::vec![2],
         });
-        assert!(!rx.is_finished(), "an early FIN under held data cannot finish the stream");
+        assert!(
+            !rx.is_finished(),
+            "an early FIN under held data cannot finish the stream"
+        );
 
         // The legitimate final segment (4, with FIN) finishes it.
         rx.on_segment(&Segment {
@@ -1129,10 +1139,18 @@ mod tests {
         };
         // next = 0, window = 4 ⇒ acceptable seqs are [0, 4). seq == next + recv_window (4) is dropped.
         rx.on_segment(&seg(4));
-        assert_eq!(rx.ack().sack, 0, "a seq exactly at next+recv_window is dropped");
+        assert_eq!(
+            rx.ack().sack,
+            0,
+            "a seq exactly at next+recv_window is dropped"
+        );
         // seq == next + recv_window - 1 (3) is the last accepted slot.
         rx.on_segment(&seg(3));
-        assert_ne!(rx.ack().sack & (1u64 << 3), 0, "next+recv_window-1 is accepted");
+        assert_ne!(
+            rx.ack().sack & (1u64 << 3),
+            0,
+            "next+recv_window-1 is accepted"
+        );
     }
 
     #[test]
@@ -1176,7 +1194,11 @@ mod tests {
         let payload = alloc::vec![0u8; 50 * MAX_SEGMENT];
         let mut tx = StreamSender::new(0, &payload); // 50 data + 1 FIN
         let total = tx.total();
-        assert_eq!(tx.segments.len() as u32, total, "all segments buffered before any ack");
+        assert_eq!(
+            tx.segments.len() as u32,
+            total,
+            "all segments buffered before any ack"
+        );
 
         tx.on_ack(Ack {
             cumulative: 40,
@@ -1184,7 +1206,11 @@ mod tests {
             rwnd: 64,
         });
         assert_eq!(tx.base, 40, "reclaimed the 40 acked segments");
-        assert_eq!(tx.segments.len() as u32, total - 40, "the in-flight buffer shrank");
+        assert_eq!(
+            tx.segments.len() as u32,
+            total - 40,
+            "the in-flight buffer shrank"
+        );
         // Retransmission still addresses the right sequences after reclaim.
         assert!(
             tx.outbound().iter().all(|s| s.seq >= 40),
@@ -1198,7 +1224,10 @@ mod tests {
             rwnd: 64,
         });
         assert!(tx.is_complete());
-        assert!(tx.segments.is_empty(), "no segment is retained once fully acknowledged");
+        assert!(
+            tx.segments.is_empty(),
+            "no segment is retained once fully acknowledged"
+        );
         assert!(tx.outbound().is_empty());
     }
 
@@ -1227,8 +1256,14 @@ mod tests {
             sack: 0,
             rwnd: 64,
         });
-        assert!(tx.is_complete(), "an over-large cumulative clamps to len and completes");
-        assert!(tx.outbound().is_empty(), "nothing remains to send once complete");
+        assert!(
+            tx.is_complete(),
+            "an over-large cumulative clamps to len and completes"
+        );
+        assert!(
+            tx.outbound().is_empty(),
+            "nothing remains to send once complete"
+        );
     }
 
     #[test]
@@ -1244,12 +1279,19 @@ mod tests {
         assert_eq!(rx.take(), b"A"); // delivered advances past 0
         // A replay of an already-taken sequence is out of window ⇒ dropped, surfacing nothing.
         rx.on_segment(&seg(0, b'Z'));
-        assert!(rx.take().is_empty(), "a replay below the delivered frontier yields nothing");
+        assert!(
+            rx.take().is_empty(),
+            "a replay below the delivered frontier yields nothing"
+        );
         // The first bytes seen at a held seq win; a replay with altered payload cannot overwrite them.
         rx.on_segment(&seg(2, b'C'));
         rx.on_segment(&seg(2, b'X')); // replay, mangled
         rx.on_segment(&seg(1, b'B')); // fills the gap
-        assert_eq!(rx.take(), b"BC", "a replay cannot corrupt buffered out-of-order bytes");
+        assert_eq!(
+            rx.take(),
+            b"BC",
+            "a replay cannot corrupt buffered out-of-order bytes"
+        );
     }
 
     #[test]

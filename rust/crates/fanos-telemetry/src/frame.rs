@@ -228,7 +228,10 @@ mod tests {
         // no overflow), and the frame round-trips.
         for mask in [0b0000_0110u8, 0b0101_1010, 0b1111_1111] {
             let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, mask, 0.0, -1, 0);
-            assert!(f.syndrome <= 7, "a multi-bit mask still yields a 3-bit syndrome");
+            assert!(
+                f.syndrome <= 7,
+                "a multi-bit mask still yields a 3-bit syndrome"
+            );
             assert_eq!(CoherenceFrame::decode(&f.encode()), Some(f));
         }
     }
@@ -239,9 +242,14 @@ mod tests {
         // A non-finite gap (a degenerate spectral computation could produce one) must not leak into
         // the frame: NaN would break the by-value round-trip (NaN != NaN) and poison comparisons.
         let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, f64::NAN, 0, 0);
-        assert!(f.gap.is_finite() && f.gap == 0.0, "a non-finite gap is coerced to 0.0");
         assert!(
-            [f.phi, f.purity, f.reflection, f.mean_r, f.gap].iter().all(|x| x.is_finite()),
+            f.gap.is_finite() && f.gap == 0.0,
+            "a non-finite gap is coerced to 0.0"
+        );
+        assert!(
+            [f.phi, f.purity, f.reflection, f.mean_r, f.gap]
+                .iter()
+                .all(|x| x.is_finite()),
             "every scalar in a frame is finite"
         );
         // With all scalars finite the frame round-trips by value, not merely byte-for-byte.

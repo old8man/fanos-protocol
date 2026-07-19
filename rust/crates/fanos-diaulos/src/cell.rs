@@ -113,7 +113,11 @@ mod tests {
         let frame = vec![0xABu8; CELL_PLAINTEXT];
         let cell = seal(&key, 0, &frame).unwrap();
         assert_eq!(cell.len(), CELL_LEN);
-        assert_eq!(open(&key, &cell).unwrap(), frame, "a max-size frame round-trips");
+        assert_eq!(
+            open(&key, &cell).unwrap(),
+            frame,
+            "a max-size frame round-trips"
+        );
     }
 
     #[test]
@@ -124,6 +128,9 @@ mod tests {
         let key = [5u8; 32];
         let mut cell = seal(&key, 100, b"bind the nonce").unwrap();
         cell[0] ^= 0x01;
-        assert!(open(&key, &cell).is_none(), "a tampered cnonce prefix is rejected");
+        assert!(
+            open(&key, &cell).is_none(),
+            "a tampered cnonce prefix is rejected"
+        );
     }
 }

@@ -2,7 +2,9 @@
 
 #![allow(clippy::unwrap_used)]
 
-use fanos_calypso::{HiddenService, ServiceAddress, client_meeting_line, pow, rendezvous_line};
+use fanos_calypso::{
+    Epoch, HiddenService, ServiceAddress, client_meeting_line, pow, rendezvous_line,
+};
 use fanos_field::F31;
 use proptest::prelude::*;
 
@@ -29,6 +31,7 @@ proptest! {
         pubkey in proptest::collection::vec(any::<u8>(), 1..48),
         epoch in 0u32..100_000,
     ) {
+        let epoch = Epoch::new(epoch.into());
         let service = HiddenService::new(pubkey.clone());
         let line = client_meeting_line::<F31>(service.address(), &pubkey, epoch).unwrap();
         prop_assert_eq!(line, service.rendezvous_line::<F31>(epoch));

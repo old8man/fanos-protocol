@@ -16,10 +16,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_primitives::{address_matches_identity, address_point};
-use fanos_pqcrypto::{Identity, SeedRng};
 use fanos_field::{F7, Field};
 use fanos_geometry::{HierAddr, Point, Triple};
+use fanos_pqcrypto::{Identity, SeedRng};
+use fanos_primitives::{address_matches_identity, address_point};
 use fanos_runtime::overlay::descriptor_message;
 use fanos_runtime::{Command, Config, Effect, Engine, Input, Instant, OverlayNode};
 use fanos_wire::{FrameType, encode_frame};
@@ -65,16 +65,26 @@ fn identity_bundle(identity: &Identity) -> Vec<u8> {
 /// and a hybrid signature binding `transport` to that address. `(id, hier, sig)`. This threads the real
 /// composed identity through the whole membership/poisoning stack — the crypto identity and the overlay
 /// agree.
-fn signed_descriptor(seed: &[u8], transport: Triple, depth: usize) -> (Vec<u8>, HierAddr<F7>, Vec<u8>) {
+fn signed_descriptor(
+    seed: &[u8],
+    transport: Triple,
+    depth: usize,
+) -> (Vec<u8>, HierAddr<F7>, Vec<u8>) {
     let identity = Identity::generate(&mut SeedRng::from_seed(seed));
     let id = identity_bundle(&identity);
     let hier = derived_address::<F7>(&id, depth);
-    let sig = identity.signing.sign(&descriptor_message::<F7>(transport, &hier, &id)).to_bytes();
+    let sig = identity
+        .signing
+        .sign(&descriptor_message::<F7>(transport, &hier, &id))
+        .to_bytes();
     (id, hier, sig)
 }
 
 fn self_certified_cell() -> Config {
-    Config { require_self_certified_membership: true, ..Config::default() }
+    Config {
+        require_self_certified_membership: true,
+        ..Config::default()
+    }
 }
 
 #[test]
@@ -86,9 +96,22 @@ fn self_certified_membership_accepts_a_signed_descriptor_and_rejects_a_poisoned_
     // Honest peer H: a real signed descriptor (depth-2 address derived from its identity).
     let h_coord = Point::<F7>::at(5).coords();
     let (h_id, h_addr, h_sig) = signed_descriptor(&[1u8; 32], h_coord, 2);
-    v.step(now, Input::Message { from, frame: announce_frame(h_coord, &h_addr, &h_id, &h_sig, b"keys-H") });
-    assert!(v.members().any(|(c, _)| c == h_coord), "a valid signed descriptor is accepted");
-    assert_eq!(v.hier_next_hop(&h_addr), Some(h_coord), "and seeds the hierarchical routing table");
+    v.step(
+        now,
+        Input::Message {
+            from,
+            frame: announce_frame(h_coord, &h_addr, &h_id, &h_sig, b"keys-H"),
+        },
+    );
+    assert!(
+        v.members().any(|(c, _)| c == h_coord),
+        "a valid signed descriptor is accepted"
+    );
+    assert_eq!(
+        v.hier_next_hop(&h_addr),
+        Some(h_coord),
+        "and seeds the hierarchical routing table"
+    );
 
     // Address poisoning: A announces a target's address it did not derive, signed under A's own id.
     let a_coord = Point::<F7>::at(9).coords();
@@ -97,10 +120,26 @@ fn self_certified_membership_accepts_a_signed_descriptor_and_rejects_a_poisoned_
     // A signs a well-formed descriptor for its OWN coordinate but announcing the target's address it
     // did not derive (a valid signature over the wrong `hier`).
     let a_identity = Identity::generate(&mut SeedRng::from_seed(&[2u8; 32]));
-    let a_sig = a_identity.signing.sign(&descriptor_message::<F7>(a_coord, &t_addr, &a_id)).to_bytes();
-    v.step(now, Input::Message { from, frame: announce_frame(a_coord, &t_addr, &a_id, &a_sig, b"keys-A") });
-    assert!(!v.members().any(|(c, _)| c == a_coord), "an address A did not derive is rejected");
-    assert_ne!(v.hier_next_hop(&t_addr), Some(a_coord), "A cannot attract T's address to its endpoint");
+    let a_sig = a_identity
+        .signing
+        .sign(&descriptor_message::<F7>(a_coord, &t_addr, &a_id))
+        .to_bytes();
+    v.step(
+        now,
+        Input::Message {
+            from,
+            frame: announce_frame(a_coord, &t_addr, &a_id, &a_sig, b"keys-A"),
+        },
+    );
+    assert!(
+        !v.members().any(|(c, _)| c == a_coord),
+        "an address A did not derive is rejected"
+    );
+    assert_ne!(
+        v.hier_next_hop(&t_addr),
+        Some(a_coord),
+        "A cannot attract T's address to its endpoint"
+    );
 }
 
 #[test]
@@ -116,15 +155,38 @@ fn a_signed_descriptor_blocks_the_transport_hijack() {
 
     // The genuine descriptor (at the victim's own coordinate) is accepted.
     let mut good = OverlayNode::<F7>::new(Point::at(0), cfg);
-    good.step(now, Input::Message { from, frame: announce_frame(victim_coord, &addr, &id, &sig, b"k") });
-    assert_eq!(good.hier_next_hop(&addr), Some(victim_coord), "the genuine signed descriptor is accepted");
+    good.step(
+        now,
+        Input::Message {
+            from,
+            frame: announce_frame(victim_coord, &addr, &id, &sig, b"k"),
+        },
+    );
+    assert_eq!(
+        good.hier_next_hop(&addr),
+        Some(victim_coord),
+        "the genuine signed descriptor is accepted"
+    );
 
     // The hijack: identical (id, addr, sig), announced at the ATTACKER's coordinate.
     let attacker_coord = Point::<F7>::at(9).coords();
     let mut v = OverlayNode::<F7>::new(Point::at(0), cfg);
-    v.step(now, Input::Message { from, frame: announce_frame(attacker_coord, &addr, &id, &sig, b"k") });
-    assert!(!v.members().any(|(c, _)| c == attacker_coord), "the hijack announce is rejected");
-    assert_ne!(v.hier_next_hop(&addr), Some(attacker_coord), "the victim's address is NOT routed to the attacker");
+    v.step(
+        now,
+        Input::Message {
+            from,
+            frame: announce_frame(attacker_coord, &addr, &id, &sig, b"k"),
+        },
+    );
+    assert!(
+        !v.members().any(|(c, _)| c == attacker_coord),
+        "the hijack announce is rejected"
+    );
+    assert_ne!(
+        v.hier_next_hop(&addr),
+        Some(attacker_coord),
+        "the victim's address is NOT routed to the attacker"
+    );
 }
 
 #[test]
@@ -136,7 +198,13 @@ fn without_the_gate_a_transport_hijack_succeeds() {
     let from = Point::<F7>::at(1).coords();
     let (id, addr, sig) = signed_descriptor(&[7u8; 32], Point::<F7>::at(5).coords(), 2);
     let attacker_coord = Point::<F7>::at(9).coords();
-    v.step(now, Input::Message { from, frame: announce_frame(attacker_coord, &addr, &id, &sig, b"k") });
+    v.step(
+        now,
+        Input::Message {
+            from,
+            frame: announce_frame(attacker_coord, &addr, &id, &sig, b"k"),
+        },
+    );
     assert_eq!(
         v.hier_next_hop(&addr),
         Some(attacker_coord),
@@ -158,7 +226,12 @@ fn a_deployed_identity_node_self_certifies_end_to_end() {
         .with_hier_address(hier.clone())
         .with_signed_descriptor(id.clone(), sig.clone());
     let flooded = deployer
-        .step(now, Input::Command(Command::Join { info: b"keys".to_vec() }))
+        .step(
+            now,
+            Input::Command(Command::Join {
+                info: b"keys".to_vec(),
+            }),
+        )
         .into_iter()
         .find_map(|e| match e {
             Effect::Send { frame, .. } => Some(frame),
@@ -167,9 +240,22 @@ fn a_deployed_identity_node_self_certifies_end_to_end() {
         .expect("JOIN floods an announcement");
 
     let mut peer = OverlayNode::<F7>::new(Point::at(0), self_certified_cell());
-    peer.step(now, Input::Message { from: coord, frame: flooded });
-    assert!(peer.members().any(|(c, _)| c == coord), "the flooded real-identity descriptor is accepted");
-    assert_eq!(peer.hier_next_hop(&hier), Some(coord), "and the peer can route to the deployer");
+    peer.step(
+        now,
+        Input::Message {
+            from: coord,
+            frame: flooded,
+        },
+    );
+    assert!(
+        peer.members().any(|(c, _)| c == coord),
+        "the flooded real-identity descriptor is accepted"
+    );
+    assert_eq!(
+        peer.hier_next_hop(&hier),
+        Some(coord),
+        "and the peer can route to the deployer"
+    );
 }
 
 #[test]
@@ -186,7 +272,10 @@ fn forging_an_address_near_a_target_costs_exponential_grinding() {
         let mut id = b"attacker/".to_vec();
         id.extend_from_slice(&(i as u64).to_be_bytes());
         let chain = derived_address::<F7>(&id, 3);
-        assert!(address_matches_identity::<F7>(&id, &chain), "an attacker's own chain self-certifies");
+        assert!(
+            address_matches_identity::<F7>(&id, &chain),
+            "an attacker's own chain self-certifies"
+        );
         let cp = target.common_prefix(&chain);
         best_cp = best_cp.max(cp);
         if cp >= 2 {
@@ -196,9 +285,18 @@ fn forging_an_address_near_a_target_costs_exponential_grinding() {
             ge3 += 1;
         }
     }
-    assert_eq!(ge3, 0, "a full-prefix forge must not appear within budget (got {ge3})");
-    assert!(best_cp < target.depth(), "no attacker identity reproduced the target address");
-    assert!(ge2 <= 8, "≥2-level near-forgeries stay at the N² wall (got {ge2})");
+    assert_eq!(
+        ge3, 0,
+        "a full-prefix forge must not appear within budget (got {ge3})"
+    );
+    assert!(
+        best_cp < target.depth(),
+        "no attacker identity reproduced the target address"
+    );
+    assert!(
+        ge2 <= 8,
+        "≥2-level near-forgeries stay at the N² wall (got {ge2})"
+    );
     assert_eq!(
         target.common_prefix(&target),
         target.depth(),

@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used)]
 
 use fanos_calypso::ServiceAddress;
-use fanos_primitives::{hash::label, hash_labeled, map_to_point};
 use fanos_field::F7;
+use fanos_primitives::{hash::label, hash_labeled, map_to_point};
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;

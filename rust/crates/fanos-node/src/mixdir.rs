@@ -61,7 +61,11 @@ mod tests {
     fn mix_key_slots_are_deterministic_distinct_and_domain_separated() {
         let a = mix_key_slot([1, 2, 3]);
         assert_eq!(a, mix_key_slot([1, 2, 3]), "same coordinate → same slot");
-        assert_ne!(a, mix_key_slot([1, 2, 4]), "distinct coordinates → distinct slots");
+        assert_ne!(
+            a,
+            mix_key_slot([1, 2, 4]),
+            "distinct coordinates → distinct slots"
+        );
         assert!(
             a.starts_with(b"FANOS-v1/mix-key/"),
             "the slot is domain-separated from every other store use"

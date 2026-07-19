@@ -6,6 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use fanos_field::F2;
+use fanos_primitives::Epoch;
 use fanos_runtime::{Command, Config, Duration, Notification};
 use fanos_sim::{Sim, spawn_cell};
 
@@ -56,7 +57,7 @@ fn the_epoch_beacon_reaches_monotone_consensus_from_one_trigger() {
         .report()
         .notifications
         .iter()
-        .filter(|o| matches!(&o.note, Notification::EpochAdvanced(1)))
+        .filter(|o| matches!(&o.note, Notification::EpochAdvanced(Epoch(1))))
         .count();
     assert_eq!(adopted, 7, "all seven nodes adopted epoch 1");
 
@@ -67,7 +68,7 @@ fn the_epoch_beacon_reaches_monotone_consensus_from_one_trigger() {
         .report()
         .notifications
         .iter()
-        .filter(|o| matches!(&o.note, Notification::EpochAdvanced(2)))
+        .filter(|o| matches!(&o.note, Notification::EpochAdvanced(Epoch(2))))
         .count();
     assert_eq!(at_two, 7, "all seven nodes advanced to epoch 2");
 }

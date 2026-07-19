@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 // Public-key (= verifying-key, for these schemes) lengths come from the one byte-model in
 // `fanos_primitives::keys`, so the identity bundle layout has a single source of truth; the round-trip
 // tests (encode → decode → verify) pin these to the real RustCrypto sizes.
-use fanos_primitives::keys::{ED25519_PK_LEN as ED25519_VK_LEN, MLDSA65_PK_LEN as MLDSA65_VK_LEN};
 use ed25519_dalek::{
     Signature as EdSignature, SigningKey as EdSigningKey, VerifyingKey as EdVerifyingKey,
 };
+use fanos_primitives::keys::{ED25519_PK_LEN as ED25519_VK_LEN, MLDSA65_PK_LEN as MLDSA65_VK_LEN};
 use ml_dsa::signature::{Keypair, Signer, Verifier};
 use ml_dsa::{
     EncodedVerifyingKey, Generate, MlDsa65, Signature as MlSignature, SigningKey as MlSigningKey,

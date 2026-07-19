@@ -31,11 +31,18 @@ async fn full_fano_cell_assembles_at_the_seven_points() {
 
     // Every canonical point 0..7 is occupied exactly once: the pin put each node where it was asked,
     // and every occupant is a genuine self-certifying node (its cert hashes to that very point).
-    let mut coords: Vec<_> = cell.nodes.iter().map(fanos_quic::NodeHandle::address).collect();
+    let mut coords: Vec<_> = cell
+        .nodes
+        .iter()
+        .map(fanos_quic::NodeHandle::address)
+        .collect();
     coords.sort_unstable();
     let mut want: Vec<_> = (0..7).map(|i| Point::<F2>::at(i).coords()).collect();
     want.sort_unstable();
-    assert_eq!(coords, want, "the seven nodes occupy the seven distinct Fano points");
+    assert_eq!(
+        coords, want,
+        "the seven nodes occupy the seven distinct Fano points"
+    );
 
     for n in cell.nodes {
         n.shutdown();

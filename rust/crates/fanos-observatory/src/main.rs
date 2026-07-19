@@ -44,7 +44,9 @@ fn build_source(live: bool) -> Box<dyn SnapshotSource> {
     }
     #[cfg(not(feature = "sim"))]
     if live {
-        eprintln!("--live was compiled out (built without the `sim` feature); using the scenario demo");
+        eprintln!(
+            "--live was compiled out (built without the `sim` feature); using the scenario demo"
+        );
     }
     Box::new(ScenarioSource::new())
 }
@@ -54,7 +56,9 @@ fn print_help() {
     println!("USAGE:\n  fanos-monitor            open the TUI (demo PurityDynamics cell)");
     println!("  fanos-monitor --live     drive a live cell of real OverlayNode engines");
     println!("  fanos-monitor --json     print one CoherenceSnapshot as JSON (for agents)\n");
-    println!("TUI KEYS:\n  q/Esc quit · space pause · a attack · z relieve · f inject fault · h heal");
+    println!(
+        "TUI KEYS:\n  q/Esc quit · space pause · a attack · z relieve · f inject fault · h heal"
+    );
 }
 
 /// Restore the terminal on panic, so a crash never leaves the shell in raw mode / the alt screen.

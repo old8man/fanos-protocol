@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use fanos_calypso::rendezvous_line;
+use fanos_calypso::{Epoch, rendezvous_line};
 use fanos_field::F7;
 use fanos_geometry::{Plane, Triple};
 
@@ -37,7 +37,7 @@ fn identity(i: u32) -> [u8; 4] {
 
 /// The entry (rendezvous) line an identity uses at `epoch`, as a comparable bucket key.
 fn entry_line(id: &[u8], epoch: u32) -> Triple {
-    rendezvous_line::<F7>(id, epoch).coords()
+    rendezvous_line::<F7>(id, Epoch::new(epoch.into())).coords()
 }
 
 /// Histogram of entry lines over identities `0..count` at `epoch`.
@@ -58,7 +58,12 @@ fn entry_lines_cover_the_whole_space_uniformly() {
     let h = histogram(m, 0);
 
     // Every one of the N lines is used — there is no unreachable region and no small guard subset.
-    assert_eq!(h.len(), N, "entry lines must cover all {N} lines (got {})", h.len());
+    assert_eq!(
+        h.len(),
+        N,
+        "entry lines must cover all {N} lines (got {})",
+        h.len()
+    );
 
     // ~Uniform: a chi-square goodness-of-fit far below the tail. E[χ²] ≈ N-1 = 56 under uniformity;
     // the bound is generous (a good hash sits near 56), but a *biased* derivation with a hot/cold
@@ -71,9 +76,14 @@ fn entry_lines_cover_the_whole_space_uniformly() {
             d * d / exp
         })
         .sum();
-    eprintln!("[C6 uniformity] N={N} m={m} exp={exp:.1} chi2={chi2:.1} maxload={}",
-        h.values().max().copied().unwrap_or(0));
-    assert!(chi2 < 2.0 * N as f64, "entry-line distribution is not uniform (chi2={chi2:.1})");
+    eprintln!(
+        "[C6 uniformity] N={N} m={m} exp={exp:.1} chi2={chi2:.1} maxload={}",
+        h.values().max().copied().unwrap_or(0)
+    );
+    assert!(
+        chi2 < 2.0 * N as f64,
+        "entry-line distribution is not uniform (chi2={chi2:.1})"
+    );
 }
 
 /// Without the identity, the entry line is unguessable beyond chance: the most-used line's frequency
@@ -87,8 +97,10 @@ fn an_adversary_cannot_guess_an_entry_line_better_than_uniform() {
     let max_load = h.values().max().copied().unwrap_or(0);
     let max_freq = max_load as f64 / f64::from(m);
     let uniform = 1.0 / N as f64;
-    eprintln!("[C6 guessing] max_freq={max_freq:.4} uniform={uniform:.4} ratio={:.2}",
-        max_freq / uniform);
+    eprintln!(
+        "[C6 guessing] max_freq={max_freq:.4} uniform={uniform:.4} ratio={:.2}",
+        max_freq / uniform
+    );
     // The best line an adversary could guess is used at most ~2× the uniform rate — the min-entropy of
     // the entry line stays near log2(N), so guessing succeeds with probability ≈ 1/N.
     assert!(
@@ -105,10 +117,18 @@ fn entry_lines_are_unpredictable_across_epochs() {
     let m = (N * 40) as u32;
 
     // Rotation: the fraction of identities whose entry line changes from epoch e to e+1 is ≈ 1 − 1/N.
-    let rotated = (0..m).filter(|&i| entry_line(&identity(i), 0) != entry_line(&identity(i), 1)).count();
+    let rotated = (0..m)
+        .filter(|&i| entry_line(&identity(i), 0) != entry_line(&identity(i), 1))
+        .count();
     let rotate_rate = rotated as f64 / f64::from(m);
-    eprintln!("[C6 rotation] rate={rotate_rate:.4}  (ideal {:.4})", 1.0 - 1.0 / N as f64);
-    assert!(rotate_rate > 0.95, "entry lines must rotate per epoch (rate={rotate_rate:.4})");
+    eprintln!(
+        "[C6 rotation] rate={rotate_rate:.4}  (ideal {:.4})",
+        1.0 - 1.0 / N as f64
+    );
+    assert!(
+        rotate_rate > 0.95,
+        "entry lines must rotate per epoch (rate={rotate_rate:.4})"
+    );
 
     // No cross-epoch correlation: the count of identities whose e+1 line equals *some other* identity's
     // e line stays at the chance level — knowing epoch e's occupancy does not predict epoch e+1's. We
@@ -116,7 +136,10 @@ fn entry_lines_are_unpredictable_across_epochs() {
     // lines are spread, not concentrated (max onward-load near the uniform expectation).
     let mut by_e0: BTreeMap<Triple, Vec<u32>> = BTreeMap::new();
     for i in 0..m {
-        by_e0.entry(entry_line(&identity(i), 0)).or_default().push(i);
+        by_e0
+            .entry(entry_line(&identity(i), 0))
+            .or_default()
+            .push(i);
     }
     // Take the most populated epoch-0 line and see where its members land at epoch 1.
     let group = by_e0.values().max_by_key(|v| v.len()).unwrap();
@@ -125,8 +148,11 @@ fn entry_lines_are_unpredictable_across_epochs() {
         *onward.entry(entry_line(&identity(i), 1)).or_insert(0) += 1;
     }
     let onward_max = onward.values().max().copied().unwrap_or(0);
-    eprintln!("[C6 no-correlation] group={} onward_distinct={} onward_max={onward_max}",
-        group.len(), onward.len());
+    eprintln!(
+        "[C6 no-correlation] group={} onward_distinct={} onward_max={onward_max}",
+        group.len(),
+        onward.len()
+    );
     // If epoch-1 lines were correlated with epoch-0, this group would re-concentrate; instead it
     // scatters — the onward max-load is a small fraction of the group.
     assert!(
@@ -149,7 +175,12 @@ fn a_near_miss_identity_reveals_nothing() {
         })
         .count();
     let rate = changed as f64 / f64::from(m);
-    eprintln!("[C6 avalanche] one-bit-flip changes the line at rate {rate:.4}  (ideal {:.4})",
-        1.0 - 1.0 / N as f64);
-    assert!(rate > 0.95, "a one-bit identity change must give an unrelated line (rate={rate:.4})");
+    eprintln!(
+        "[C6 avalanche] one-bit-flip changes the line at rate {rate:.4}  (ideal {:.4})",
+        1.0 - 1.0 / N as f64
+    );
+    assert!(
+        rate > 0.95,
+        "a one-bit identity change must give an unrelated line (rate={rate:.4})"
+    );
 }

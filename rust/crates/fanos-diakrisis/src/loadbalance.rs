@@ -152,7 +152,10 @@ mod tests {
         let loads = [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let before: f64 = loads.iter().sum();
         let after: f64 = balance_step(&loads).iter().sum();
-        assert!(approx(before, after), "total load is conserved: {before} vs {after}");
+        assert!(
+            approx(before, after),
+            "total load is conserved: {before} vs {after}"
+        );
     }
 
     #[test]
@@ -192,7 +195,10 @@ mod tests {
             // It agrees with the converged iterative balancer (the same uniform fixed point).
             let (iter, _) = balance_to_uniform(&pattern, 1e-12, 100);
             for i in 0..N {
-                assert!((exact[i] - iter[i]).abs() < 1e-9, "exact == iterated at node {i}");
+                assert!(
+                    (exact[i] - iter[i]).abs() < 1e-9,
+                    "exact == iterated at node {i}"
+                );
             }
         }
         // Uniform is a fixed point of the exact map too.
@@ -210,7 +216,10 @@ mod tests {
         let mean = 70.0 / N as f64;
         let (final_loads, rounds) = balance_to_uniform(&loads, 1e-9, 100);
         for (i, &x) in final_loads.iter().enumerate() {
-            assert!((x - mean).abs() < 1e-9, "node {i} reached the global mean {mean}, got {x}");
+            assert!(
+                (x - mean).abs() < 1e-9,
+                "node {i} reached the global mean {mean}, got {x}"
+            );
         }
         // Geometric convergence at λ₂ = 2/9 ⇒ a handful of rounds, not a stall.
         assert!(rounds <= 20, "converges in a few rounds, took {rounds}");
@@ -233,7 +242,10 @@ mod tests {
         ] {
             let d0 = deviation_from_mean(&pattern);
             let d1 = deviation_from_mean(&balance_step(&pattern));
-            assert!(d1 < d0, "non-uniform strictly contracts (no local extremum): {d0} → {d1}");
+            assert!(
+                d1 < d0,
+                "non-uniform strictly contracts (no local extremum): {d0} → {d1}"
+            );
         }
     }
 

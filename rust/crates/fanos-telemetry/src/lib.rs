@@ -30,9 +30,9 @@ extern crate alloc;
 pub mod frame;
 pub mod history;
 pub mod observer;
-pub mod snapshot;
 #[cfg(feature = "std")]
 pub mod persist;
+pub mod snapshot;
 pub mod sysmetrics;
 
 pub use frame::{AlarmLevel, CellId, CoherenceFrame, FRAME_LEN, Regime};

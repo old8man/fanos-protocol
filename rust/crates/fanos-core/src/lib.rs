@@ -26,10 +26,10 @@ pub mod routing;
 pub mod stratum;
 
 // Re-export the stack's core types so an application depends on `fanos-core` alone.
-pub use fanos_primitives::{HybridPublicKey, NodeId};
 pub use fanos_diakrisis::{Observation, Verdict, diagnose};
 pub use fanos_field::Field;
 pub use fanos_geometry::{Line, Plane, Point};
+pub use fanos_primitives::{Epoch, HybridPublicKey, NodeId};
 
 pub use hierarchy::Hierarchy;
 pub use membership::Member;
@@ -49,7 +49,7 @@ impl<F: Field> Node<F> {
     /// Join the cell: derive this node's coordinate for `epoch` from its identity (spec §7.8
     /// JOIN, steps 3–4).
     #[must_use]
-    pub fn open(id: NodeId, epoch: u32) -> Self {
+    pub fn open(id: NodeId, epoch: Epoch) -> Self {
         Self {
             member: Member::assign(id, epoch),
         }
@@ -104,8 +104,8 @@ mod tests {
     #[test]
     fn two_nodes_share_a_rendezvous_line() {
         // The end-to-end overlay flow: two identities → coordinates → a shared meeting line.
-        let alice = Node::<F31>::open(NodeId([1u8; 32]), 5);
-        let bob = Node::<F31>::open(NodeId([2u8; 32]), 5);
+        let alice = Node::<F31>::open(NodeId([1u8; 32]), Epoch::new(5));
+        let bob = Node::<F31>::open(NodeId([2u8; 32]), Epoch::new(5));
         let line = alice.rendezvous_with(&bob.coordinate()).unwrap();
         assert!(alice.coordinate().is_on(&line));
         assert!(bob.coordinate().is_on(&line));
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn a_node_has_q_plus_one_quorums_that_all_intersect() {
-        let node = Node::<F31>::open(NodeId([3u8; 32]), 0);
+        let node = Node::<F31>::open(NodeId([3u8; 32]), Epoch::ZERO);
         let quorums: Vec<_> = node.quorums().collect();
         assert_eq!(quorums.len(), 32);
         // Every pair of the node's quorums intersects (Maekawa); the node itself is common.

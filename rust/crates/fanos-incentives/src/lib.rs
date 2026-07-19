@@ -85,7 +85,12 @@ fn synthetic_dleq_nonce(
     Scalar::from_bytes_mod_order_wide(&wide)
 }
 
-fn prove_dleq(k: Scalar, pk: &RistrettoPoint, b: &RistrettoPoint, z_point: &RistrettoPoint) -> Dleq {
+fn prove_dleq(
+    k: Scalar,
+    pk: &RistrettoPoint,
+    b: &RistrettoPoint,
+    z_point: &RistrettoPoint,
+) -> Dleq {
     let g = RISTRETTO_BASEPOINT_POINT;
     let s = synthetic_dleq_nonce(&k, pk, b, z_point);
     let a1 = s * g;
@@ -365,14 +370,29 @@ mod tests {
         let z = k * b;
         let p1 = prove_dleq(k, &pk, &b, &z);
         let p2 = prove_dleq(k, &pk, &b, &z);
-        assert_eq!(p1.c.as_bytes(), p2.c.as_bytes(), "same statement → same challenge");
-        assert_eq!(p1.z.as_bytes(), p2.z.as_bytes(), "same statement → same response");
-        assert!(verify_dleq(&pk, &b, &z, &p1), "and the deterministic proof still verifies");
+        assert_eq!(
+            p1.c.as_bytes(),
+            p2.c.as_bytes(),
+            "same statement → same challenge"
+        );
+        assert_eq!(
+            p1.z.as_bytes(),
+            p2.z.as_bytes(),
+            "same statement → same response"
+        );
+        assert!(
+            verify_dleq(&pk, &b, &z, &p1),
+            "and the deterministic proof still verifies"
+        );
 
         let b2 = hash_to_curve(b"a-different-input");
         let z2 = k * b2;
         let p3 = prove_dleq(k, &pk, &b2, &z2);
-        assert_ne!(p1.z.as_bytes(), p3.z.as_bytes(), "a different statement uses a different nonce");
+        assert_ne!(
+            p1.z.as_bytes(),
+            p3.z.as_bytes(),
+            "a different statement uses a different nonce"
+        );
     }
 
     #[test]

@@ -273,7 +273,8 @@ impl Connection {
                 self.streams.remove(&stream_id);
                 self.accept_queue.retain(|&id| id != stream_id);
                 if stream_id & 1 == self.peer_id_parity {
-                    self.peer_closed_below = self.peer_closed_below.max(stream_id.saturating_add(1));
+                    self.peer_closed_below =
+                        self.peer_closed_below.max(stream_id.saturating_add(1));
                 }
             }
             _ => {}
@@ -387,8 +388,14 @@ mod tests {
         })
         .encode();
         initiator.on_cell(&seal(&s2c, 0, &even).unwrap());
-        assert!(initiator.accept().is_none(), "a wrong-parity (even) implicit open is refused");
-        assert!(initiator.read(0).is_empty(), "no stream state was injected at id 0");
+        assert!(
+            initiator.accept().is_none(),
+            "a wrong-parity (even) implicit open is refused"
+        );
+        assert!(
+            initiator.read(0).is_empty(),
+            "no stream state was injected at id 0"
+        );
 
         // open_stream still hands out id 0 as a fresh local stream, uncorrupted by the injection.
         assert_eq!(initiator.open_stream(), 0);
@@ -402,7 +409,11 @@ mod tests {
         })
         .encode();
         initiator.on_cell(&seal(&s2c, 1, &odd).unwrap());
-        assert_eq!(initiator.accept(), Some(1), "a correct-parity implicit open is accepted");
+        assert_eq!(
+            initiator.accept(),
+            Some(1),
+            "a correct-parity implicit open is accepted"
+        );
     }
 
     #[test]
@@ -476,7 +487,10 @@ mod tests {
         while service.accept().is_some() {
             accepted += 1;
         }
-        assert_eq!(accepted, MAX_CONCURRENT_STREAMS, "exactly the cap were opened; the rest dropped");
+        assert_eq!(
+            accepted, MAX_CONCURRENT_STREAMS,
+            "exactly the cap were opened; the rest dropped"
+        );
     }
 
     #[test]
@@ -516,7 +530,10 @@ mod tests {
         assert!(service.is_stream_done(id));
         assert!(service.retire_stream(id), "a done stream retires");
         assert_eq!(service.stream_count(), 0, "the slot is reclaimed");
-        assert!(!service.retire_stream(id), "retiring an already-gone id is a no-op");
+        assert!(
+            !service.retire_stream(id),
+            "retiring an already-gone id is a no-op"
+        );
 
         // A straggler DATA for the retired id must not resurrect it as a phantom stream.
         let straggler = seal(
@@ -532,8 +549,15 @@ mod tests {
         )
         .unwrap();
         service.on_cell(&straggler);
-        assert_eq!(service.stream_count(), 0, "a straggler cannot resurrect a retired stream");
-        assert!(service.accept().is_none(), "no phantom stream is queued for accept");
+        assert_eq!(
+            service.stream_count(),
+            0,
+            "a straggler cannot resurrect a retired stream"
+        );
+        assert!(
+            service.accept().is_none(),
+            "no phantom stream is queued for accept"
+        );
 
         // Forward progress is unaffected: a genuinely new, higher peer id still opens.
         let fresh = seal(
@@ -549,7 +573,11 @@ mod tests {
         )
         .unwrap();
         service.on_cell(&fresh);
-        assert_eq!(service.accept(), Some(2), "a fresh higher id still opens after retirement");
+        assert_eq!(
+            service.accept(),
+            Some(2),
+            "a fresh higher id still opens after retirement"
+        );
     }
 
     #[test]
@@ -571,8 +599,15 @@ mod tests {
 
         // The service aborts the (peer-opened, never-to-complete) stream, reclaiming the slot at once.
         let reset = service.reset_stream(id).expect("a known stream resets");
-        assert_eq!(service.stream_count(), 0, "reset frees the slot immediately");
-        assert!(service.reset_stream(id).is_none(), "resetting an unknown stream is a no-op");
+        assert_eq!(
+            service.stream_count(),
+            0,
+            "reset frees the slot immediately"
+        );
+        assert!(
+            service.reset_stream(id).is_none(),
+            "resetting an unknown stream is a no-op"
+        );
 
         // The peer's reset drops the client's side too.
         client.on_cell(&reset);
@@ -592,7 +627,11 @@ mod tests {
         )
         .unwrap();
         service.on_cell(&straggler);
-        assert_eq!(service.stream_count(), 0, "a straggler cannot re-open a reset stream");
+        assert_eq!(
+            service.stream_count(),
+            0,
+            "a straggler cannot re-open a reset stream"
+        );
         assert!(service.accept().is_none());
     }
 
@@ -603,13 +642,23 @@ mod tests {
         let mut c = Connection::new([1u8; 32], [2u8; 32], true);
         c.nonce_tx = u64::MAX - 2; // two nonces from the top
         // Exactly the two remaining nonces are usable; then the space is spent.
-        assert_eq!(c.outbound_padded(10).len(), 2, "only the two remaining nonces are minted");
+        assert_eq!(
+            c.outbound_padded(10).len(),
+            2,
+            "only the two remaining nonces are minted"
+        );
         // Exhausted: NO further cell is minted, through any path (no wrap, no reuse).
-        assert!(c.outbound_padded(10).is_empty(), "no cover cell after exhaustion");
+        assert!(
+            c.outbound_padded(10).is_empty(),
+            "no cover cell after exhaustion"
+        );
         assert!(c.outbound().is_empty(), "no data/ack cell after exhaustion");
         let id = c.open_stream();
         c.write(id, b"x");
-        assert!(c.reset_stream(id).is_none(), "cannot even mint a RESET cell after exhaustion");
+        assert!(
+            c.reset_stream(id).is_none(),
+            "cannot even mint a RESET cell after exhaustion"
+        );
     }
 
     /// A small deterministic LCG so a proptest seed reproduces the exact loss pattern.

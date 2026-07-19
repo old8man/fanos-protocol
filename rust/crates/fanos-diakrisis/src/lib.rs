@@ -48,8 +48,8 @@ use alloc::vec::Vec;
 
 pub use coherence::CoherenceMatrix;
 pub use homeostat::{BandControl, Homeostat};
-pub use vitals::VitalSigns;
 pub use plan::{HealingAction, HealingPlan, plan_healing};
+pub use vitals::VitalSigns;
 // Re-export the localization types from the code crate so callers have one diagnosis surface.
 pub use fanos_code::{Fault, Sector, decode_themes, locate, syndrome3, theme_flags};
 

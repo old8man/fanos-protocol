@@ -49,7 +49,7 @@ fn a_diaulos_hello_reaches_the_meeting_line_anonymously() {
     // The service's rotating meeting line (client and service derive the identical one; no lookup).
     let mut srng = SeedRng::from_seed(b"rdv-service");
     let (_svc_secret, svc_public) = HybridKemSecret::generate(&mut srng);
-    let epoch = 5u32;
+    let epoch = fanos_rendezvous::Epoch::new(5);
     let meeting = meeting_line::<F2>(&svc_public.encode(), epoch).coords();
 
     // A 2-hop anonymous circuit: a first line distinct from the meeting line, then the meeting line.
@@ -94,7 +94,7 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
     // rendezvous line RP_c it will listen on.
     let mut skp = SeedRng::from_seed(b"rdv-bidi-svc");
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
-    let epoch = 9u32;
+    let epoch = fanos_rendezvous::Epoch::new(9);
     let meeting = meeting_line::<F2>(&service.public.encode(), epoch).coords();
     let rp_c = meeting_line::<F2>(b"client-reply-rendezvous", epoch).coords();
 
@@ -168,7 +168,7 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
 
     let mut skp = SeedRng::from_seed(b"rdv-sess-svc");
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
-    let epoch = 3u32;
+    let epoch = fanos_rendezvous::Epoch::new(3);
     let meeting = meeting_line::<F2>(&service.public.encode(), epoch).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
 
@@ -330,7 +330,7 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
     // *only* by the per-session cookie in each Request (never by identity or location).
     let mut skp = SeedRng::from_seed(b"rdv-mux-svc");
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
-    let epoch = 11u32;
+    let epoch = fanos_rendezvous::Epoch::new(11);
     let meeting = meeting_line::<F2>(&service.public.encode(), epoch).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
 
@@ -349,7 +349,10 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
         .find(|&l| combiner(l) != l_combiner && combiner(l) != combiner(rp_a))
         .unwrap();
     let (rp_a_comb, rp_b_comb) = (combiner(rp_a), combiner(rp_b));
-    assert_ne!(rp_a_comb, rp_b_comb, "the two clients listen at distinct points");
+    assert_ne!(
+        rp_a_comb, rp_b_comb,
+        "the two clients listen at distinct points"
+    );
 
     let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
     let hop_a = *lines.iter().find(|&&l| l != rp_a).unwrap();
@@ -372,7 +375,10 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
         b"rdv-mux-cli-b",
     );
     let (cookie_a, cookie_b) = (rc_a.cookie(), rc_b.cookie());
-    assert_ne!(cookie_a, cookie_b, "independent secrets yield distinct cookies");
+    assert_ne!(
+        cookie_a, cookie_b,
+        "independent secrets yield distinct cookies"
+    );
 
     // One service transport fronts both; DIAULOS server sessions are keyed by cookie.
     let mut rsvc = RendezvousService::<F2>::new(dir.clone(), t, b"rdv-mux-svc-secret");
@@ -380,8 +386,10 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
     let mut answered: BTreeMap<SessionId, bool> = BTreeMap::new();
     let mut srng = SeedRng::from_seed(b"rdv-mux-accept");
 
-    let mut client_a = ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"ca"));
-    let mut client_b = ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"cb"));
+    let mut client_a =
+        ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"ca"));
+    let mut client_b =
+        ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"cb"));
     let (mut wrote_a, mut wrote_b) = (false, false);
     let mut seen = 0usize;
 
@@ -460,7 +468,10 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
     }
 
     // Both anonymous sessions completed, each demultiplexed to its own reply — no cross-talk.
-    assert!(client_a.is_live() && client_b.is_live(), "both sessions live");
+    assert!(
+        client_a.is_live() && client_b.is_live(),
+        "both sessions live"
+    );
     assert_eq!(
         client_a.read(),
         b"anon-200:GET /a",

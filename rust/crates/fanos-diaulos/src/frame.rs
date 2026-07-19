@@ -193,7 +193,9 @@ mod tests {
 
     #[test]
     fn reset_frame_round_trips_ignoring_pad() {
-        let f = Frame::Reset { stream_id: 0x1234_5678 };
+        let f = Frame::Reset {
+            stream_id: 0x1234_5678,
+        };
         let mut wire = f.encode();
         wire.extend_from_slice(&[0u8; 128]); // cell zero-padding after the frame
         assert_eq!(Frame::decode(&wire), Some(f));
@@ -221,7 +223,11 @@ mod tests {
         // len = MAX_SEGMENT + 1 with that many bytes present — inside the cell but past the invariant.
         let mut over = data_header(7, 0, false, (MAX_SEGMENT + 1) as u16);
         over.extend_from_slice(&vec![0u8; MAX_SEGMENT + 1]);
-        assert_eq!(Frame::decode(&over), None, "len past MAX_SEGMENT is rejected");
+        assert_eq!(
+            Frame::decode(&over),
+            None,
+            "len past MAX_SEGMENT is rejected"
+        );
 
         // Exactly MAX_SEGMENT is accepted (the boundary).
         let mut ok = data_header(7, 0, false, MAX_SEGMENT as u16);
@@ -239,7 +245,11 @@ mod tests {
         // A DATA len exceeding the bytes actually present.
         let mut short = data_header(0, 0, false, 10);
         short.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(Frame::decode(&short), None, "len exceeding available bytes is rejected");
+        assert_eq!(
+            Frame::decode(&short),
+            None,
+            "len exceeding available bytes is rejected"
+        );
         // An ACK cut mid-field.
         assert_eq!(Frame::decode(&[FT_ACK, 0, 0, 0]), None);
         // A DATA frame with exactly the header and len 0 → an empty-data segment (the FIN-only case).

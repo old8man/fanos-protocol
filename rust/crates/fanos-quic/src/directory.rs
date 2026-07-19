@@ -70,7 +70,10 @@ impl Directory {
     /// unroutable coordinate is *observable* (counted + logged) rather than silent.
     pub fn note_unresolved_drop(&self, coord: Triple) {
         self.unresolved_drops.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(?coord, "dropped a send to an unresolved coordinate (no known address)");
+        tracing::debug!(
+            ?coord,
+            "dropped a send to an unresolved coordinate (no known address)"
+        );
     }
 
     /// How many sends this directory has seen dropped for an unresolved destination coordinate.
@@ -127,7 +130,11 @@ mod tests {
         // The counter is shared across clones (a node's health surface reads the same table).
         let clone = dir.clone();
         clone.insert([1, 2, 3], sa(3000));
-        assert_eq!(dir.collisions(), 2, "collision count is shared across clones");
+        assert_eq!(
+            dir.collisions(),
+            2,
+            "collision count is shared across clones"
+        );
 
         // A distinct coordinate is unaffected.
         dir.insert([4, 5, 6], sa(4000));

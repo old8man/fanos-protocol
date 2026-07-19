@@ -23,11 +23,11 @@
 //! to the two direction keys `key_c2s ‖ key_s2c` a [`Connection`] uses. The client is the connection
 //! *initiator* (even stream ids); the service is the *responder* (odd).
 
-use fanos_primitives::hash::{hash_labeled, hash_xof, label};
-use fanos_primitives::keys::{ED25519_PK_LEN, MLDSA65_PK_LEN};
 use fanos_pqcrypto::kem::{
     CIPHERTEXT_LEN, HybridCiphertext, HybridKemPublic, HybridKemSecret, PUBLIC_LEN, SessionKey,
 };
+use fanos_primitives::hash::{hash_labeled, hash_xof, label};
+use fanos_primitives::keys::{ED25519_PK_LEN, MLDSA65_PK_LEN};
 use rand_core::CryptoRng;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -353,8 +353,14 @@ mod tests {
         // The length gates are exact equality, so both the short and long neighbours must be refused.
         let mut rng = SeedRng::from_seed(b"diaulos-hs-len");
         let service = StaticKeypair::generate(&mut rng);
-        assert!(ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN - 1], &mut rng).is_none());
-        assert!(ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN + 1], &mut rng).is_none());
+        assert!(
+            ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN - 1], &mut rng)
+                .is_none()
+        );
+        assert!(
+            ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN + 1], &mut rng)
+                .is_none()
+        );
         let (hs_short, _) = ClientHandshake::start(&service.public, &mut rng);
         assert!(hs_short.finish(&vec![0u8; SERVER_HELLO_LEN - 1]).is_none());
         let (hs_long, _) = ClientHandshake::start(&service.public, &mut rng);
@@ -389,7 +395,9 @@ mod tests {
         let (server_keys, mut server_hello) =
             ServerHandshake::respond(&service, &client_hello, &mut rng).unwrap();
         server_hello[3] ^= 0xFF;
-        let client_keys = client_hs.finish(&server_hello).expect("still the right length");
+        let client_keys = client_hs
+            .finish(&server_hello)
+            .expect("still the right length");
         assert_ne!(
             client_keys, server_keys,
             "tampering the ServerHello prevents a shared session key"

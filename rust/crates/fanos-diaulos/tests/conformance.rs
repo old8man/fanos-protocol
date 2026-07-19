@@ -10,10 +10,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fanos_primitives::hash::hash_labeled;
 use fanos_diaulos::frame::Frame;
 use fanos_diaulos::{CELL_LEN, ClientHandshake, ServerHandshake, StaticKeypair, seal};
 use fanos_pqcrypto::rng::SeedRng;
+use fanos_primitives::hash::hash_labeled;
 use fanos_runtime::stream::{Ack, Segment};
 
 const KAT_LABEL: &str = "FANOS-v1/diaulos-kat";

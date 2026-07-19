@@ -31,11 +31,7 @@ fn hyperoval() -> u8 {
     (0u8..=0x7F)
         .find(|&m| {
             m.count_ones() == 4
-                && (0..7).all(|l| {
-                    fano::INCIDENCE
-                        .get(l)
-                        .is_none_or(|&line| line & m != line)
-                })
+                && (0..7).all(|l| fano::INCIDENCE.get(l).is_none_or(|&line| line & m != line))
         })
         .unwrap()
 }
@@ -124,7 +120,10 @@ fn an_attack_is_localized_to_exactly_the_seized_nodes() {
     // cannot make the cell blame a node it did not seize — the blast is confined to its own footprint.
     for (_, v) in sim.report().verdicts() {
         for a in accused(v) {
-            assert!(a == 1 || a == 4, "an honest node {a} was accused (blast escaped its footprint)");
+            assert!(
+                a == 1 || a == 4,
+                "an honest node {a} was accused (blast escaped its footprint)"
+            );
         }
     }
 }
@@ -146,14 +145,23 @@ fn a_bounded_adversary_is_contained_at_the_parent_and_stays_local() {
     // The diagnosis names exactly the attacked cells (no honest cell implicated).
     let mut named = accused(&parent.diagnose());
     named.sort_unstable();
-    assert_eq!(named, attacked, "the parent localizes exactly the attacked cells");
+    assert_eq!(
+        named, attacked,
+        "the parent localizes exactly the attacked cells"
+    );
     // Locality of the response: every reroute routes *around* an attacked cell, *via* an honest one —
     // an honest cell is never the casualty of someone else's attack.
     let reroutes = parent.coarse_reroutes(phi);
     assert!(!reroutes.is_empty(), "the parent installs coarse reroutes");
     for (around, via) in reroutes {
-        assert!(attacked.contains(&around), "rerouted around an un-attacked cell {around}");
-        assert!(!attacked.contains(&via), "rerouted via an attacked cell {via}");
+        assert!(
+            attacked.contains(&around),
+            "rerouted around an un-attacked cell {around}"
+        );
+        assert!(
+            !attacked.contains(&via),
+            "rerouted via an attacked cell {via}"
+        );
     }
 }
 
@@ -167,7 +175,9 @@ fn a_bounded_adversary_is_contained_at_the_parent_and_stays_local() {
 fn an_irrecoverable_adversary_escalates_one_more_tier_but_no_further() {
     let residue = real_escalation_residue(0x6002);
     let hov = hyperoval(); // four attacked child cells, no three collinear: an irrecoverable residue
-    let self_index = (0..7).find(|i| hov & (1 << i) == 0).expect("a point outside the hyperoval");
+    let self_index = (0..7)
+        .find(|i| hov & (1 << i) == 0)
+        .expect("a point outside the hyperoval");
     let phi = 100.0;
 
     let mut parent = ParentCell::new(self_index);

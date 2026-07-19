@@ -64,7 +64,9 @@ fn guardless_relays(client: Point<F7>, dest: Point<F7>, client_seed: &[u8], c: u
 fn guard_of(client: Point<F7>, dest: Point<F7>, client_seed: &[u8]) -> Point<F7> {
     let mut s = client_seed.to_vec();
     s.extend_from_slice(b"/guard");
-    build_circuit::<F7>(client, dest, 2, &s).expect("guard circuit").relays()[1]
+    build_circuit::<F7>(client, dest, 2, &s)
+        .expect("guard circuit")
+        .relays()[1]
 }
 
 /// The **guarded** relay sequence: the first hop is the stable guard; the remainder is derived per
@@ -158,12 +160,21 @@ fn the_guard_pins_a_stable_first_hop_while_the_interior_rotates() {
     let client = Point::<F7>::at(0);
     let dest = Point::<F7>::at(30);
     let seed = b"initiator-secret-seed";
-    let first_hops: std::collections::BTreeSet<Triple> =
-        (0..20).map(|c| guarded_relays(client, dest, seed, c)[1]).collect();
-    assert_eq!(first_hops.len(), 1, "the guard is the same first hop on every circuit");
-    let interior: std::collections::BTreeSet<Triple> =
-        (0..20).map(|c| guarded_relays(client, dest, seed, c)[2]).collect();
-    assert!(interior.len() > 1, "the interior hops still rotate per circuit (only the entry is pinned)");
+    let first_hops: std::collections::BTreeSet<Triple> = (0..20)
+        .map(|c| guarded_relays(client, dest, seed, c)[1])
+        .collect();
+    assert_eq!(
+        first_hops.len(),
+        1,
+        "the guard is the same first hop on every circuit"
+    );
+    let interior: std::collections::BTreeSet<Triple> = (0..20)
+        .map(|c| guarded_relays(client, dest, seed, c)[2])
+        .collect();
+    assert!(
+        interior.len() > 1,
+        "the interior hops still rotate per circuit (only the entry is pinned)"
+    );
 }
 
 /// A stable guard bounds it: the initiator is exposed only in the fraction of trials where the

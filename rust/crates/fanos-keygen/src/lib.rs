@@ -112,7 +112,12 @@ impl<F: Field> DkgNode<F> {
     /// repeat even if `secret` is a long-term key reused across runs. It is an explicit input rather than
     /// drawn internally so the engine stays sans-I/O and replayable.
     #[must_use]
-    pub fn new(coord: Point<F>, threshold: usize, secret: [u8; 32], session_nonce: [u8; 32]) -> Self {
+    pub fn new(
+        coord: Point<F>,
+        threshold: usize,
+        secret: [u8; 32],
+        session_nonce: [u8; 32],
+    ) -> Self {
         let n = Plane::<F>::N as usize;
         let index = (0..n)
             .find(|&i| Point::<F>::at(i) == coord)
@@ -579,11 +584,29 @@ mod tests {
             .with_deadlines(Duration::from_millis(10), Duration::from_millis(10));
         o.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let (commit2, deal2) = dealer_frames(2, 1, threshold, n);
-        o.step(Instant(1), Input::Message { from: coord(2), frame: commit2 });
-        o.step(Instant(1), Input::Message { from: coord(2), frame: deal2 });
+        o.step(
+            Instant(1),
+            Input::Message {
+                from: coord(2),
+                frame: commit2,
+            },
+        );
+        o.step(
+            Instant(1),
+            Input::Message {
+                from: coord(2),
+                frame: deal2,
+            },
+        );
 
         // The forged self-complaint against dealer 2, sent by attacker node 3.
-        o.step(Instant(2), Input::Message { from: coord(3), frame: complaint_frame(2, 2) });
+        o.step(
+            Instant(2),
+            Input::Message {
+                from: coord(3),
+                frame: complaint_frame(2, 2),
+            },
+        );
 
         o.step(Instant(20), Input::Timer(DKG_SHARE_DEADLINE));
         let fin = o.step(Instant(40), Input::Timer(DKG_COMPLAINT_DEADLINE));
@@ -601,13 +624,25 @@ mod tests {
         let mut o = DkgNode::<F2>::new(Point::at(0), 2, [1u8; 32], [9u8; 32]);
         o.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let (commit2, _deal2) = dealer_frames(2, 1, 2, 7);
-        o.step(Instant(1), Input::Message { from: coord(3), frame: commit2 });
+        o.step(
+            Instant(1),
+            Input::Message {
+                from: coord(3),
+                frame: commit2,
+            },
+        );
         assert!(
             !o.commitments.contains_key(&2),
             "a commitment relayed by an impostor is rejected"
         );
         let (commit2b, _) = dealer_frames(2, 1, 2, 7);
-        o.step(Instant(1), Input::Message { from: coord(2), frame: commit2b });
+        o.step(
+            Instant(1),
+            Input::Message {
+                from: coord(2),
+                frame: commit2b,
+            },
+        );
         assert!(
             o.commitments.contains_key(&2),
             "the real dealer's own commitment is accepted"
@@ -626,11 +661,23 @@ mod tests {
         o.step(Instant(0), Input::Command(Command::StartHeartbeat));
         // O adopts dealer 2's real commitment C2 (direct from dealer 2).
         let (commit2, _) = dealer_frames(2, 1, threshold, n);
-        o.step(Instant(1), Input::Message { from: coord(2), frame: commit2 });
+        o.step(
+            Instant(1),
+            Input::Message {
+                from: coord(2),
+                frame: commit2,
+            },
+        );
         assert!(o.commitments.contains_key(&2));
 
         // A complaint by node 3 against dealer 2 (authentic: from = complainer 3).
-        o.step(Instant(2), Input::Message { from: coord(3), frame: complaint_frame(3, 2) });
+        o.step(
+            Instant(2),
+            Input::Message {
+                from: coord(3),
+                frame: complaint_frame(3, 2),
+            },
+        );
 
         // Dealer 2 tries to clear it with a share/commitment from a DIFFERENT polynomial (secret 22).
         let bogus_secret = [22u8; 32];
@@ -674,6 +721,10 @@ mod tests {
             deals([2u8; 32]),
             "different session nonces yield different dealings (fresh shares)"
         );
-        assert_eq!(a, deals([1u8; 32]), "same secret+nonce is deterministic (replayable)");
+        assert_eq!(
+            a,
+            deals([1u8; 32]),
+            "same secret+nonce is deterministic (replayable)"
+        );
     }
 }

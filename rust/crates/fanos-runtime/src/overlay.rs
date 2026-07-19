@@ -9,14 +9,14 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use fanos_primitives::hash::label;
-use fanos_primitives::{hash_labeled, map_to_point};
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple, fano, next_hop};
+use fanos_primitives::hash::label;
+use fanos_primitives::{Epoch, hash_labeled, map_to_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -214,7 +214,7 @@ pub struct OverlayNode<F: Field> {
     members: BTreeMap<Triple, Vec<u8>>,
     /// The current epoch, driven by the flooded beacon (adopt-max, spec §L3). Epoch-derived
     /// rendezvous/shapes rotate as it advances.
-    epoch: u32,
+    epoch: Epoch,
     /// Mandatory per-node self-observation (`fanos_telemetry`): every diagnosis folds the cell's
     /// health into a `CoherenceFrame` and records it into bounded local history. Not optional — the
     /// reflexive loop cannot diagnose without observing (docs/design-telemetry.md).
@@ -330,7 +330,7 @@ impl<F: Field> OverlayNode<F> {
             pending_gets: BTreeMap::new(),
             get_seq: 0,
             members: BTreeMap::new(),
-            epoch: 0,
+            epoch: Epoch::ZERO,
             observer,
             activity: BTreeMap::new(),
             self_activity: 0,
@@ -949,7 +949,13 @@ impl<F: Field> OverlayNode<F> {
         let coord = self.coord.coords();
         let frame = encode(
             FrameType::Announce,
-            &announce_body(coord, &self.hier, &self.identity, &self.descriptor_sig, &info),
+            &announce_body(
+                coord,
+                &self.hier,
+                &self.identity,
+                &self.descriptor_sig,
+                &info,
+            ),
         );
         let effects = self.flood(&frame);
         self.members.insert(coord, info);
@@ -995,7 +1001,10 @@ impl<F: Field> OverlayNode<F> {
         // descended sub-cell member thus becomes routable cell-wide from its announcement alone (§L1);
         // a depth-1 announcer adds its own direct entry, so `send_hier` also delivers within one plane.
         self.learn_hier_peer(hier.clone(), coord);
-        let frame = encode(FrameType::Announce, &announce_body(coord, &hier, &id, &sig, &info));
+        let frame = encode(
+            FrameType::Announce,
+            &announce_body(coord, &hier, &id, &sig, &info),
+        );
         let mut effects = self.flood(&frame);
         effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
         effects
@@ -1003,8 +1012,8 @@ impl<F: Field> OverlayNode<F> {
 
     /// `Command::AdvanceEpoch` — bump the epoch and flood the beacon so the cell adopts it.
     fn on_advance_epoch(&mut self) -> Vec<Effect> {
-        self.epoch = self.epoch.saturating_add(1);
-        let mut effects = self.flood(&encode(FrameType::Beacon, &self.epoch.to_be_bytes()));
+        self.epoch = self.epoch.next();
+        let mut effects = self.flood(&encode(FrameType::Beacon, &self.epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(self.epoch)));
         effects
     }
@@ -1014,12 +1023,12 @@ impl<F: Field> OverlayNode<F> {
         let Some(bytes) = body.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
             return Vec::new();
         };
-        let epoch = u32::from_be_bytes(bytes);
+        let epoch = Epoch::from_low32_be_bytes(bytes);
         if epoch <= self.epoch {
             return Vec::new(); // not newer — drop (terminates the flood)
         }
         self.epoch = epoch;
-        let mut effects = self.flood(&encode(FrameType::Beacon, &epoch.to_be_bytes()));
+        let mut effects = self.flood(&encode(FrameType::Beacon, &epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(epoch)));
         effects
     }
@@ -1031,7 +1040,7 @@ impl<F: Field> OverlayNode<F> {
 
     /// The current beacon epoch.
     #[must_use]
-    pub fn epoch(&self) -> u32 {
+    pub fn epoch(&self) -> Epoch {
         self.epoch
     }
 
@@ -1070,7 +1079,7 @@ impl<F: Field> OverlayNode<F> {
         let correlation = self.effective_correlation();
         let frame = self.observer.observe_liveness(
             now.as_nanos(),
-            u64::from(self.epoch), // the cell's AGREED epoch (flooded beacon), so cross-node roll-up buckets consistently (audit A3)
+            self.epoch.get(), // the cell's AGREED epoch (flooded beacon) as the observation-window value, so cross-node roll-up buckets consistently (audit A3)
             alive_count,
             correlation,
             degraded,
@@ -1277,7 +1286,14 @@ struct LookupBody {
 
 /// A `Lookup` frame (the derived body under the frame header).
 fn encode_lookup(digest: &[u8; DIGEST], nonce: u64) -> Vec<u8> {
-    encode(FrameType::Lookup, &LookupBody { key: *digest, nonce }.to_wire())
+    encode(
+        FrameType::Lookup,
+        &LookupBody {
+            key: *digest,
+            nonce,
+        }
+        .to_wire(),
+    )
 }
 
 /// A `Value` reply: `key(32) ‖ found(1) ‖ nonce(8) ‖ value` (spec §L4) — the nonce echoes the `Lookup`'s.
@@ -1321,9 +1337,15 @@ pub fn descriptor_message<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8]
 /// = [`HYBRID_VK_LEN`](fanos_pqcrypto::sig::HYBRID_VK_LEN) bytes). Binds the transport coordinate to the
 /// identity, so a peer cannot re-announce another node's address at its own coordinate (§80). Any wrong
 /// length or bad half returns `false` — never panics.
-fn descriptor_signature_ok<F: Field>(coord: Triple, hier: &HierAddr<F>, id: &[u8], sig: &[u8]) -> bool {
-    let Some(verifier) =
-        id.get(..fanos_pqcrypto::sig::HYBRID_VK_LEN).and_then(fanos_pqcrypto::HybridVerifier::decode)
+fn descriptor_signature_ok<F: Field>(
+    coord: Triple,
+    hier: &HierAddr<F>,
+    id: &[u8],
+    sig: &[u8],
+) -> bool {
+    let Some(verifier) = id
+        .get(..fanos_pqcrypto::sig::HYBRID_VK_LEN)
+        .and_then(fanos_pqcrypto::HybridVerifier::decode)
     else {
         return false;
     };
@@ -1404,13 +1426,20 @@ mod tests {
         let dst = HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
         let mut node =
             OverlayNode::<F2>::new(Point::at(2), Config::default()).with_hier_address(dst.clone());
-        assert_eq!(node.hier_next_hop(&dst), None, "the node is in the destination cell");
+        assert_eq!(
+            node.hier_next_hop(&dst),
+            None,
+            "the node is in the destination cell"
+        );
         let mut body = dst.encode();
         body.extend_from_slice(b"hi");
         let frame = encode(FrameType::RouteHier, &body);
         let effects = node.step(
             Instant::default(),
-            Input::Message { from: Point::<F2>::at(1).coords(), frame },
+            Input::Message {
+                from: Point::<F2>::at(1).coords(),
+                frame,
+            },
         );
         assert!(
             effects.iter().any(|e| matches!(e,
@@ -1431,9 +1460,9 @@ mod tests {
         );
         let effects = node.send_hier(&dst, b"p");
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Send { to, .. } if *to == Point::<F2>::at(2).coords())),
+            effects.iter().any(
+                |e| matches!(e, Effect::Send { to, .. } if *to == Point::<F2>::at(2).coords())
+            ),
             "emits a RouteHier toward point 2",
         );
     }
@@ -1461,7 +1490,11 @@ mod tests {
         let dst = HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(5)]).unwrap();
         let mut dest =
             OverlayNode::<F2>::new(Point::at(2), Config::default()).with_hier_address(dst.clone());
-        assert_eq!(dest.hier_address(), &dst, "the destination is seated at [2,5]");
+        assert_eq!(
+            dest.hier_address(),
+            &dst,
+            "the destination is seated at [2,5]"
+        );
 
         // Engines reachable by their transport coordinate — the key the mesh forwards on.
         let now = Instant::default();
@@ -1473,13 +1506,20 @@ mod tests {
                 pending.push((origin_coord, to, frame));
             }
         }
-        assert_eq!(pending.len(), 1, "origin emits exactly one hop, not a local delivery");
+        assert_eq!(
+            pending.len(),
+            1,
+            "origin emits exactly one hop, not a local delivery"
+        );
 
         let mut delivered = false;
         let mut hops = 0u32;
         while let Some((from, to, frame)) = pending.pop() {
             hops += 1;
-            assert!(hops <= fanos_geometry::MAX_DEPTH as u32 + 1, "routing must converge, not loop");
+            assert!(
+                hops <= fanos_geometry::MAX_DEPTH as u32 + 1,
+                "routing must converge, not loop"
+            );
             // In this topology the only transport point that hosts an engine is the destination's.
             assert_eq!(to, dest_coord, "the hop targets the destination cell");
             for e in dest.step(now, Input::Message { from, frame }) {
@@ -1494,7 +1534,10 @@ mod tests {
                 }
             }
         }
-        assert!(delivered, "the depth-2 destination delivered the payload end-to-end");
+        assert!(
+            delivered,
+            "the depth-2 destination delivered the payload end-to-end"
+        );
     }
 
     #[test]
@@ -1578,7 +1621,10 @@ mod tests {
                 for _ in 0..bursts {
                     node.step(
                         Instant(t),
-                        Input::Message { from, frame: encode(FrameType::Route, b"x") },
+                        Input::Message {
+                            from,
+                            frame: encode(FrameType::Route, b"x"),
+                        },
                     );
                     t += 1;
                 }
@@ -1600,17 +1646,22 @@ mod tests {
             "diagnose's verdict is driven by the measured over-coupling (#74 unification)"
         );
         assert!(
-            d1.iter().any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
+            d1.iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
             "over-coupling decouples"
         );
-        assert!(node.decoupling > 0.0, "the decoupling shed factor is raised (audit C6)");
+        assert!(
+            node.decoupling > 0.0,
+            "the decoupling shed factor is raised (audit C6)"
+        );
         assert!(
             node.effective_correlation() < base - 1e-9,
             "the effective correlation is genuinely lowered — Φ headroom restored, not a no-op"
         );
         // The mutable factor really is what scales the correlation (the feedback into Φ).
         assert!(
-            (node.effective_correlation() - Config::default().healthy_correlation * (1.0 - node.decoupling))
+            (node.effective_correlation()
+                - Config::default().healthy_correlation * (1.0 - node.decoupling))
                 .abs()
                 < 1e-12
         );
@@ -1618,7 +1669,8 @@ mod tests {
         // Dedup: a second over-coupled diagnose keeps shedding but does NOT re-fire the notification.
         let d2 = node.step(Instant(t), Input::Command(Command::Diagnose));
         assert!(
-            !d2.iter().any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
+            !d2.iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
             "Decoupled is emitted once on entering the shed regime, not every diagnose (audit C6 dedup)"
         );
     }
@@ -1650,7 +1702,10 @@ mod tests {
         // has uniform line rates γ̄ = 3 ⇒ Δ = (2/3)·3 = 2 (the theorem's maximal gap); each degraded
         // point lowers the flux on its three incident axes and so slows the slowest polar mode.
         let healthy = polar_gap_from_liveness(0);
-        assert!((healthy - 2.0).abs() < 1e-12, "healthy cell has the maximal gap Δ = 2, got {healthy}");
+        assert!(
+            (healthy - 2.0).abs() < 1e-12,
+            "healthy cell has the maximal gap Δ = 2, got {healthy}"
+        );
 
         // Degrading one point drops its 3 incident lines to rate 2: G = 18, max_k T_k = 8, Δ = 10/6.
         let one_down = polar_gap_from_liveness(1 << 0);
@@ -1666,11 +1721,17 @@ mod tests {
         for p in 0..7u8 {
             mask |= 1 << p;
             let g = polar_gap_from_liveness(mask);
-            assert!(g <= prev + 1e-12, "each additional fault does not raise the gap: {prev} → {g}");
+            assert!(
+                g <= prev + 1e-12,
+                "each additional fault does not raise the gap: {prev} → {g}"
+            );
             assert!(g >= -1e-12, "the gap never goes negative");
             prev = g;
         }
-        assert!((prev - 0.0).abs() < 1e-12, "a fully degraded cell has zero recovery gap");
+        assert!(
+            (prev - 0.0).abs() < 1e-12,
+            "a fully degraded cell has zero recovery gap"
+        );
     }
 
     // ---- A4: the DHT slice and in-flight-read table stay bounded under a flood (audit #62) ----
@@ -1709,16 +1770,28 @@ mod tests {
         let too_big = alloc::vec![0u8; MAX_VALUE_LEN + 1];
         node.step(
             Instant(1),
-            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &digest, &too_big) },
+            Input::Message {
+                from,
+                frame: encode_publish(PUBLISH_REPLICA, &digest, &too_big),
+            },
         );
-        assert!(!node.store.contains_key(&digest), "an over-size value is refused");
+        assert!(
+            !node.store.contains_key(&digest),
+            "an over-size value is refused"
+        );
         // A value exactly at the limit is accepted.
         let at_limit = alloc::vec![0u8; MAX_VALUE_LEN];
         node.step(
             Instant(1),
-            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &digest, &at_limit) },
+            Input::Message {
+                from,
+                frame: encode_publish(PUBLISH_REPLICA, &digest, &at_limit),
+            },
         );
-        assert!(node.store.contains_key(&digest), "a within-limit value is stored");
+        assert!(
+            node.store.contains_key(&digest),
+            "a within-limit value is stored"
+        );
     }
 
     #[test]
@@ -1731,12 +1804,19 @@ mod tests {
             let frame = encode_publish(PUBLISH_REPLICA, &flood_digest(i), b"a");
             node.step(Instant(1), Input::Message { from, frame });
         }
-        assert_eq!(node.store.len(), MAX_STORE_ENTRIES, "the store filled to the cap");
+        assert_eq!(
+            node.store.len(),
+            MAX_STORE_ENTRIES,
+            "the store filled to the cap"
+        );
         // Overwrite an existing key: allowed, no growth.
         let existing = flood_digest(0);
         node.step(
             Instant(1),
-            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &existing, b"updated") },
+            Input::Message {
+                from,
+                frame: encode_publish(PUBLISH_REPLICA, &existing, b"updated"),
+            },
         );
         assert_eq!(
             node.store.get(&existing).map(Vec::as_slice),
@@ -1746,10 +1826,20 @@ mod tests {
         // A brand-new key is refused, and the cap is never exceeded.
         node.step(
             Instant(1),
-            Input::Message { from, frame: encode_publish(PUBLISH_REPLICA, &[0xABu8; DIGEST], b"x") },
+            Input::Message {
+                from,
+                frame: encode_publish(PUBLISH_REPLICA, &[0xABu8; DIGEST], b"x"),
+            },
         );
-        assert!(!node.store.contains_key(&[0xABu8; DIGEST]), "a new key is refused when full");
-        assert_eq!(node.store.len(), MAX_STORE_ENTRIES, "the store never exceeds its cap");
+        assert!(
+            !node.store.contains_key(&[0xABu8; DIGEST]),
+            "a new key is refused when full"
+        );
+        assert_eq!(
+            node.store.len(),
+            MAX_STORE_ENTRIES,
+            "the store never exceeds its cap"
+        );
     }
 
     #[test]
@@ -1760,7 +1850,9 @@ mod tests {
         for i in 0..(MAX_PENDING_GETS as u32 + 500) {
             node.step(
                 Instant(1),
-                Input::Command(Command::Get { key: i.to_be_bytes().to_vec() }),
+                Input::Command(Command::Get {
+                    key: i.to_be_bytes().to_vec(),
+                }),
             );
         }
         assert!(
@@ -1788,25 +1880,46 @@ mod tests {
         // A found=true Value with NO in-flight read is ignored (no spurious Retrieved).
         let stray = node.step(
             Instant(1),
-            Input::Message { from: peer, frame: encode_value(&digest, true, b"ghost", 999) },
+            Input::Message {
+                from: peer,
+                frame: encode_value(&digest, true, b"ghost", 999),
+            },
         );
-        assert!(!has_retrieved(&stray), "a Value with no in-flight read emits no Retrieved");
+        assert!(
+            !has_retrieved(&stray),
+            "a Value with no in-flight read emits no Retrieved"
+        );
 
         // Issue read #1 (nonce 1), then supersede it with read #2 (nonce 2) for the same key.
-        node.step(Instant(2), Input::Command(Command::Get { key: key.to_vec() }));
-        node.step(Instant(3), Input::Command(Command::Get { key: key.to_vec() }));
+        node.step(
+            Instant(2),
+            Input::Command(Command::Get { key: key.to_vec() }),
+        );
+        node.step(
+            Instant(3),
+            Input::Command(Command::Get { key: key.to_vec() }),
+        );
 
         // A delayed reply from read #1 (old nonce 1) carrying a stale value must be ignored.
         let stale = node.step(
             Instant(4),
-            Input::Message { from: peer, frame: encode_value(&digest, true, b"old", 1) },
+            Input::Message {
+                from: peer,
+                frame: encode_value(&digest, true, b"old", 1),
+            },
         );
-        assert!(!has_retrieved(&stale), "a stale reply (old nonce) does not resolve the newer read");
+        assert!(
+            !has_retrieved(&stale),
+            "a stale reply (old nonce) does not resolve the newer read"
+        );
 
         // The reply matching the in-flight nonce (2) resolves the read with the fresh value.
         let fresh = node.step(
             Instant(5),
-            Input::Message { from: peer, frame: encode_value(&digest, true, b"new", 2) },
+            Input::Message {
+                from: peer,
+                frame: encode_value(&digest, true, b"new", 2),
+            },
         );
         assert!(
             fresh.iter().any(|e| matches!(
@@ -1834,8 +1947,14 @@ mod tests {
                 frame: encode(FrameType::Route, b"x"),
             },
         );
-        assert!(within.is_empty(), "a quarantined member's frames are dropped within the window");
-        assert!(node.quarantined.contains_key(&member), "still quarantined within the window");
+        assert!(
+            within.is_empty(),
+            "a quarantined member's frames are dropped within the window"
+        );
+        assert!(
+            node.quarantined.contains_key(&member),
+            "still quarantined within the window"
+        );
 
         // Past the TTL (70 s > 60 s): re-admitted, and its frames are processed again.
         let after = node.step(
@@ -1845,7 +1964,10 @@ mod tests {
                 frame: encode(FrameType::Route, b"x"),
             },
         );
-        assert!(!node.quarantined.contains_key(&member), "re-admitted once the window elapses");
+        assert!(
+            !node.quarantined.contains_key(&member),
+            "re-admitted once the window elapses"
+        );
         assert!(
             after
                 .iter()
@@ -1900,7 +2022,10 @@ mod tests {
 
         // Honest first announce → recorded and MemberJoined notified.
         let peer_addr = HierAddr::root(Point::<F2>::at(3));
-        let honest = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"", b"HONEST"));
+        let honest = encode(
+            FrameType::Announce,
+            &announce_body(peer, &peer_addr, b"", b"", b"HONEST"),
+        );
         let e1 = node.step(
             Instant(1),
             Input::Message {
@@ -1915,7 +2040,10 @@ mod tests {
         assert_eq!(info_of(peer, &node), Some(b"HONEST".to_vec()));
 
         // A repeat for the same coord with attacker keys must NOT overwrite or re-notify.
-        let forged = encode(FrameType::Announce, &announce_body(peer, &peer_addr, b"", b"", b"ATTACKER"));
+        let forged = encode(
+            FrameType::Announce,
+            &announce_body(peer, &peer_addr, b"", b"", b"ATTACKER"),
+        );
         let e2 = node.step(
             Instant(2),
             Input::Message {
@@ -1935,7 +2063,10 @@ mod tests {
 
         // The zero vector is not a projective point → rejected, never stored.
         let count_before = node.members().count();
-        let zero = encode(FrameType::Announce, &announce_body([0, 0, 0], &peer_addr, b"", b"", b"ZERO"));
+        let zero = encode(
+            FrameType::Announce,
+            &announce_body([0, 0, 0], &peer_addr, b"", b"", b"ZERO"),
+        );
         node.step(Instant(3), Input::Message { from, frame: zero });
         assert_eq!(
             node.members().count(),

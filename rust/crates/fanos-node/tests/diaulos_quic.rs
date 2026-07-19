@@ -15,10 +15,7 @@ use std::time::Duration;
 
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
-use fanos_node::{
-    FanosDialer, Node, NodeConfig, Peer, StaticResolver,
-    dial_service, serve,
-};
+use fanos_node::{FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_service, serve};
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
 use fanos_runtime::Command;
@@ -229,4 +226,3 @@ async fn fanos_dialer_reaches_a_service_by_name() {
     a.shutdown();
     b.shutdown();
 }
-

@@ -102,7 +102,10 @@ mod tests {
         // Byte-for-byte equal to `hash_labeled(label, seed ‖ counter_be)` (the form it replaces).
         let mut concat = seed.to_vec();
         concat.extend_from_slice(&7u32.to_be_bytes());
-        assert_eq!(subkey(label::KDF, &seed, 7), hash_labeled(label::KDF, &concat));
+        assert_eq!(
+            subkey(label::KDF, &seed, 7),
+            hash_labeled(label::KDF, &concat)
+        );
         // Distinct counters and distinct labels give independent subkeys.
         assert_ne!(subkey(label::KDF, &seed, 7), subkey(label::KDF, &seed, 8));
         assert_ne!(subkey(label::KDF, &seed, 7), subkey(label::COORD, &seed, 7));

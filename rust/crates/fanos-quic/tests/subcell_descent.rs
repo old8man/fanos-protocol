@@ -41,16 +41,30 @@ fn a_colliding_newcomer_descends_into_a_sub_cell_rather_than_shadowing() {
     // The occupant arrives first: no collision, a depth-1 address at point 3.
     let occupant = hierarchical_coordinate::<F2>(occupant_cred.cert_der(), |p| occupied(&taken, p))
         .expect("occupant address");
-    assert_eq!(occupant.depth(), 1, "the first arrival keeps a plain coordinate");
+    assert_eq!(
+        occupant.depth(),
+        1,
+        "the first arrival keeps a plain coordinate"
+    );
     assert_eq!(occupant.point_at(0), Some(target));
     taken.insert(key_of(&occupant));
 
     // The newcomer collides at point 3 and must descend.
     let newcomer = hierarchical_coordinate::<F2>(newcomer_cred.cert_der(), |p| occupied(&taken, p))
         .expect("newcomer address");
-    assert!(newcomer.depth() >= 2, "the colliding newcomer descends into a sub-cell");
-    assert_eq!(newcomer.point_at(0), Some(target), "it still roots at the collided top point");
-    assert_ne!(newcomer, occupant, "it does NOT shadow the occupant's binding");
+    assert!(
+        newcomer.depth() >= 2,
+        "the colliding newcomer descends into a sub-cell"
+    );
+    assert_eq!(
+        newcomer.point_at(0),
+        Some(target),
+        "it still roots at the collided top point"
+    );
+    assert_ne!(
+        newcomer, occupant,
+        "it does NOT shadow the occupant's binding"
+    );
 
     // The descended point is the newcomer's own, earned from its certificate — not the occupant's.
     assert_eq!(
@@ -72,7 +86,11 @@ fn level_zero_matches_the_ordinary_coordinate_and_levels_diverge() {
     // draws, so a node's own path does not trivially repeat one point.
     let l1 = coordinate_at_level::<F2>(cred.cert_der(), 1);
     let l2 = coordinate_at_level::<F2>(cred.cert_der(), 2);
-    assert_eq!(l1, coordinate_at_level::<F2>(cred.cert_der(), 1), "deterministic per level");
+    assert_eq!(
+        l1,
+        coordinate_at_level::<F2>(cred.cert_der(), 1),
+        "deterministic per level"
+    );
     // (l1 and l2 may coincide by chance at 1/N; assert only determinism, not distinctness, here.)
     let _ = l2;
 }

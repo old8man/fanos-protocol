@@ -9,6 +9,7 @@
 use alloc::vec::Vec;
 
 use fanos_geometry::Triple;
+use fanos_primitives::Epoch;
 
 /// A monotonic instant in nanoseconds since the run's origin. Virtual — never the wall clock.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]
@@ -197,7 +198,7 @@ pub enum Notification {
         info: Vec<u8>,
     },
     /// The epoch beacon advanced to this value (spec §L3).
-    EpochAdvanced(u32),
+    EpochAdvanced(Epoch),
     /// A distributed key generation completed (spec §L6): the 32-byte joint public key the cell
     /// agreed on, whose secret no single node holds.
     DkgComplete([u8; 32]),

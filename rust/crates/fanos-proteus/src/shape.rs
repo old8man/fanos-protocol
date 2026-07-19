@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash_labeled;
+use fanos_primitives::{Epoch, hash_labeled};
 
 const SHAPE_LABEL: &str = "FANOS-v1/proteus-shape";
 
@@ -36,10 +36,10 @@ impl ShapeParams {
 /// Derive the epoch shape `θ_epoch` from the community secret and epoch (spec §13.4).
 #[must_use]
 #[allow(clippy::indexing_slicing)] // seed is [u8; 32]; indices 0..=2 are always in bounds
-pub fn epoch_shape(community_secret: &[u8], epoch: u32) -> ShapeParams {
+pub fn epoch_shape(community_secret: &[u8], epoch: Epoch) -> ShapeParams {
     let mut data = Vec::with_capacity(community_secret.len() + 4);
     data.extend_from_slice(community_secret);
-    data.extend_from_slice(&epoch.to_be_bytes());
+    data.extend_from_slice(&epoch.low32_be_bytes());
     let seed = hash_labeled(SHAPE_LABEL, &data);
     ShapeParams {
         junk_count: (seed[0] % 16) + 1,
@@ -57,9 +57,9 @@ mod tests {
     fn shape_rotates_every_epoch() {
         // V22: θ(e0) ≠ θ(e1) ≠ θ(e2).
         let secret = b"community-bridge-secret";
-        let s0 = epoch_shape(secret, 0);
-        let s1 = epoch_shape(secret, 1);
-        let s2 = epoch_shape(secret, 2);
+        let s0 = epoch_shape(secret, Epoch::new(0));
+        let s1 = epoch_shape(secret, Epoch::new(1));
+        let s2 = epoch_shape(secret, Epoch::new(2));
         assert_ne!(s0, s1);
         assert_ne!(s1, s2);
         assert_ne!(s0, s2);
@@ -68,15 +68,21 @@ mod tests {
     #[test]
     fn shape_is_unpredictable_without_the_secret() {
         // A different community secret yields a different shape (can't predict without it).
-        assert_ne!(epoch_shape(b"secret-a", 5), epoch_shape(b"secret-b", 5));
+        assert_ne!(
+            epoch_shape(b"secret-a", Epoch::new(5)),
+            epoch_shape(b"secret-b", Epoch::new(5))
+        );
         // Deterministic for those who hold the secret.
-        assert_eq!(epoch_shape(b"s", 5), epoch_shape(b"s", 5));
+        assert_eq!(
+            epoch_shape(b"s", Epoch::new(5)),
+            epoch_shape(b"s", Epoch::new(5))
+        );
     }
 
     #[test]
     fn parameters_are_in_range() {
-        for e in 0..64 {
-            let shape = epoch_shape(b"s", e);
+        for e in 0u64..64 {
+            let shape = epoch_shape(b"s", Epoch::new(e));
             assert!((1..=16).contains(&shape.junk_count));
             assert!((16..80).contains(&shape.junk_size));
             assert!((64..192).contains(&shape.padding_multiple));

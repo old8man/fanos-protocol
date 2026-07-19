@@ -40,7 +40,11 @@ fn onion(relay: &HybridKemPublic, dest: &HybridKemPublic, build_seed: &[u8]) -> 
     let circuit =
         fanos_nyx::build_circuit(Point::<F31>::at(1), Point::<F31>::at(9), 2, b"replay").unwrap();
     let onion = sealed::build(&circuit, &[relay, dest], b"anonymous payload", build_seed).unwrap();
-    assert_eq!(onion.len(), ONION_LEN, "a sealed cell is the constant bucket");
+    assert_eq!(
+        onion.len(),
+        ONION_LEN,
+        "a sealed cell is the constant bucket"
+    );
     onion
 }
 
@@ -71,11 +75,23 @@ fn a_replayed_cell_is_dropped_not_re_forwarded() {
     let from = Point::<F31>::at(0).coords();
 
     // First receipt: the relay peels its hop and forwards to the next hop.
-    let first = relay.step(Instant::default(), Input::Message { from, frame: frame.clone() });
+    let first = relay.step(
+        Instant::default(),
+        Input::Message {
+            from,
+            frame: frame.clone(),
+        },
+    );
     assert_eq!(forwards(&first), 1, "the relay forwards a fresh cell once");
 
     // Re-injection (the attack): the same captured cell must NOT be forwarded a second time.
-    let replay = relay.step(Instant::default(), Input::Message { from, frame: frame.clone() });
+    let replay = relay.step(
+        Instant::default(),
+        Input::Message {
+            from,
+            frame: frame.clone(),
+        },
+    );
     assert_eq!(
         forwards(&replay),
         0,
@@ -113,12 +129,22 @@ fn distinct_cells_are_each_forwarded() {
 
     let fa = relay.step(
         Instant::default(),
-        Input::Message { from, frame: tessera_frame(&onion_a) },
+        Input::Message {
+            from,
+            frame: tessera_frame(&onion_a),
+        },
     );
     let fb = relay.step(
         Instant::default(),
-        Input::Message { from, frame: tessera_frame(&onion_b) },
+        Input::Message {
+            from,
+            frame: tessera_frame(&onion_b),
+        },
     );
     assert_eq!(forwards(&fa), 1, "the first distinct cell is forwarded");
-    assert_eq!(forwards(&fb), 1, "the second distinct cell is forwarded, not dropped as a replay");
+    assert_eq!(
+        forwards(&fb),
+        1,
+        "the second distinct cell is forwarded, not dropped as a replay"
+    );
 }

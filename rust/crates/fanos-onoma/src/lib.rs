@@ -37,6 +37,7 @@ pub mod zone;
 pub use address::{Address, COMMITMENT_LEN, DEFAULT_TLD, HRP};
 pub use derive::{descriptor_key, lookup_key, lookup_point};
 pub use error::OnomaError;
+pub use fanos_primitives::Epoch;
 pub use name::Name;
 pub use registry::{Registration, Registry};
 pub use zone::{Record, Target, Zone};

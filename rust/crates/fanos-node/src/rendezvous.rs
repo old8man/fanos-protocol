@@ -14,6 +14,7 @@
 
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
+use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{ANONYMOUS, MixDirectory, RendezvousClient, meeting_line};
@@ -128,7 +129,7 @@ pub struct RendezvousRoute {
     /// How many of each hop line's `q + 1` members must cooperate to peel it.
     pub threshold: u8,
     /// The rendezvous epoch — the meeting line rotates each epoch, so there is no fixed target.
-    pub epoch: u32,
+    pub epoch: Epoch,
 }
 
 /// Dial a service **anonymously** by its static KEM public key — the anonymous analogue of
@@ -186,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_seals_outbound_and_surfaces_only_anonymous_replies() {
         let dir = fano_directory();
-        let meeting = meeting_line::<F2>(b"anon-svc", 1).coords();
+        let meeting = meeting_line::<F2>(b"anon-svc", Epoch::new(1)).coords();
         let hop = (0..7)
             .map(|i| Line::<F2>::at(i).coords())
             .find(|&l| l != meeting)
@@ -195,13 +196,8 @@ mod tests {
             .map(|i| Line::<F2>::at(i).coords())
             .find(|&l| l != hop)
             .unwrap();
-        let rclient = RendezvousClient::<F2>::new(
-            vec![hop, meeting],
-            vec![rp],
-            dir,
-            2,
-            b"bridge-secret",
-        );
+        let rclient =
+            RendezvousClient::<F2>::new(vec![hop, meeting], vec![rp], dir, 2, b"bridge-secret");
         let expected_first_combiner = combiner_for::<F2>(hop).unwrap();
 
         let (out_tx, out_rx) = unbounded_channel();
@@ -227,7 +223,10 @@ mod tests {
             to, expected_first_combiner,
             "the onion launches at the first hop's combiner"
         );
-        assert_ne!(frame, b"diaulos-hello", "the payload was sealed, not forwarded verbatim");
+        assert_ne!(
+            frame, b"diaulos-hello",
+            "the payload was sealed, not forwarded verbatim"
+        );
         assert!(!frame.is_empty());
 
         // A non-anonymous delivery is filtered; the following anonymous one is surfaced verbatim. Since

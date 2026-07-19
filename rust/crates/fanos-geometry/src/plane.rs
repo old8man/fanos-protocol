@@ -318,11 +318,17 @@ mod tests {
         let q = F::Q;
         for p in 0..Plane::<F>::N as usize {
             let point = Point::<F>::at(p);
-            let mut fast: Vec<Triple> = Plane::<F>::lines_through(point).map(|l| l.coords()).collect();
+            let mut fast: Vec<Triple> = Plane::<F>::lines_through(point)
+                .map(|l| l.coords())
+                .collect();
             fast.sort_unstable();
             assert_eq!(fast.len(), (q + 1) as usize, "q+1 lines through point {p}");
             fast.dedup();
-            assert_eq!(fast.len(), (q + 1) as usize, "no duplicate lines through point {p}");
+            assert_eq!(
+                fast.len(),
+                (q + 1) as usize,
+                "no duplicate lines through point {p}"
+            );
             assert_eq!(fast, brute_force_lines_through(point), "point {p} line set");
         }
     }
@@ -351,7 +357,11 @@ mod tests {
         assert!(Point::<F7>::new([1, 0, 9]).is_none());
         // A valid in-range triple is accepted and canonicalizes to a member of the enumeration.
         let p = Point::<F7>::new([2, 4, 6]).unwrap();
-        assert_eq!(Point::<F7>::at(p.index()), p, "new ∘ index is the canonical point");
+        assert_eq!(
+            Point::<F7>::at(p.index()),
+            p,
+            "new ∘ index is the canonical point"
+        );
     }
 
     #[test]
@@ -359,9 +369,15 @@ mod tests {
         // The degenerate duals of the incidence operations: identical operands have no unique result.
         for i in 0..Plane::<F7>::N as usize {
             let l = Line::<F7>::at(i);
-            assert!(l.meet(&l).is_none(), "a line does not meet itself in one point");
+            assert!(
+                l.meet(&l).is_none(),
+                "a line does not meet itself in one point"
+            );
             let p = Point::<F7>::at(i);
-            assert!(p.join(&p).is_none(), "a point does not join itself into one line");
+            assert!(
+                p.join(&p).is_none(),
+                "a point does not join itself into one line"
+            );
         }
     }
 

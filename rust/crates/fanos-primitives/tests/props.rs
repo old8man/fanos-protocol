@@ -8,10 +8,10 @@
     clippy::float_cmp
 )]
 
-use fanos_primitives::hash::label;
-use fanos_primitives::{map_to_point, reconstruct, split};
 use fanos_field::{F31, F256};
 use fanos_geometry::Point;
+use fanos_primitives::hash::label;
+use fanos_primitives::{map_to_point, reconstruct, split};
 use proptest::prelude::*;
 
 proptest! {

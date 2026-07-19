@@ -17,14 +17,14 @@
 
 use fanos_calypso::descriptor::{Descriptor, SealedDescriptor, open, seal};
 use fanos_field::F2;
-use fanos_onoma::{Address, lookup_key};
+use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_runtime::{Command, Config, Duration};
 use fanos_sim::{Sim, spawn_cell};
 
 /// The descriptor-publish PoW difficulty (small, for a fast test).
 const POW_BITS: u32 = 8;
 
-fn service_descriptor(epoch: u64, bundle: &[u8]) -> Descriptor {
+fn service_descriptor(epoch: Epoch, bundle: &[u8]) -> Descriptor {
     Descriptor {
         epoch,
         bundle: bundle.to_vec(),
@@ -50,7 +50,7 @@ fn a_client_with_only_the_address_resolves_and_authenticates_the_descriptor() {
 
     let bundle = b"onoma-service-hybrid-bundle".to_vec();
     let addr = Address::from_bundle(&bundle);
-    let epoch = 7u64;
+    let epoch = Epoch::new(7);
     let desc = service_descriptor(epoch, &bundle);
     let sealed = seal(&addr, epoch, &desc, POW_BITS).unwrap();
 
@@ -102,7 +102,7 @@ fn a_storage_node_cannot_open_the_address_gated_descriptor() {
 
     let bundle = b"confidential-service".to_vec();
     let addr = Address::from_bundle(&bundle);
-    let epoch = 11u64;
+    let epoch = Epoch::new(11);
     let sealed = seal(&addr, epoch, &service_descriptor(epoch, &bundle), POW_BITS).unwrap();
 
     let slot = lookup_key(&addr, epoch).to_vec();
@@ -145,12 +145,21 @@ fn the_lookup_slot_and_descriptor_are_epoch_bound() {
 
     let bundle = b"rotating-service".to_vec();
     let addr = Address::from_bundle(&bundle);
-    let sealed7 = seal(&addr, 7, &service_descriptor(7, &bundle), POW_BITS).unwrap();
+    let sealed7 = seal(
+        &addr,
+        Epoch::new(7),
+        &service_descriptor(Epoch::new(7), &bundle),
+        POW_BITS,
+    )
+    .unwrap();
 
     // The slot rotates every epoch — no static location to seize.
-    assert_ne!(lookup_key(&addr, 7), lookup_key(&addr, 8));
+    assert_ne!(
+        lookup_key(&addr, Epoch::new(7)),
+        lookup_key(&addr, Epoch::new(8))
+    );
 
-    let slot7 = lookup_key(&addr, 7).to_vec();
+    let slot7 = lookup_key(&addr, Epoch::new(7)).to_vec();
     sim.inject(
         cell[0],
         Command::Put {
@@ -164,14 +173,14 @@ fn the_lookup_slot_and_descriptor_are_epoch_bound() {
     sim.inject(
         cell[3],
         Command::Get {
-            key: lookup_key(&addr, 7).to_vec(),
+            key: lookup_key(&addr, Epoch::new(7)).to_vec(),
         },
     );
     sim.run_for(Duration::from_millis(1000));
     let value = fetch(&sim, cell[3]).expect("epoch-7 blob retrievable at its own slot");
     let blob = SealedDescriptor::decode(&value).unwrap();
     assert!(
-        open(&addr, 8, &blob, 0).is_err(),
+        open(&addr, Epoch::new(8), &blob, 0).is_err(),
         "an epoch-7 descriptor must not resolve for epoch 8"
     );
 }
@@ -185,7 +194,7 @@ fn a_tampered_or_junk_blob_is_rejected_client_side() {
 
     let bundle = b"integrity-service".to_vec();
     let addr = Address::from_bundle(&bundle);
-    let epoch = 5u64;
+    let epoch = Epoch::new(5);
     let sealed = seal(&addr, epoch, &service_descriptor(epoch, &bundle), POW_BITS).unwrap();
 
     // A flipped ciphertext byte fails AEAD authentication.

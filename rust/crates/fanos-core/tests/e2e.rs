@@ -7,7 +7,7 @@
     clippy::float_cmp
 )]
 
-use fanos_core::{Hierarchy, Line, Node, NodeId, Plane, Quorum};
+use fanos_core::{Epoch, Hierarchy, Line, Node, NodeId, Plane, Quorum};
 use fanos_field::F31;
 use proptest::prelude::*;
 
@@ -21,8 +21,8 @@ proptest! {
     #[test]
     fn two_identities_share_a_rendezvous_line(a in 0u8..=255, b in 0u8..=255, epoch in 0u32..4096) {
         prop_assume!(a != b);
-        let alice = Node::<F31>::open(NodeId([a; 32]), epoch);
-        let bob = Node::<F31>::open(NodeId([b; 32]), epoch);
+        let alice = Node::<F31>::open(NodeId([a; 32]), Epoch::new(epoch.into()));
+        let bob = Node::<F31>::open(NodeId([b; 32]), Epoch::new(epoch.into()));
         if alice.coordinate() != bob.coordinate() {
             let line = alice.rendezvous_with(&bob.coordinate()).unwrap();
             prop_assert!(alice.coordinate().is_on(&line));
@@ -46,7 +46,7 @@ proptest! {
     /// so a Sybil gains nothing (spec §L3, V3).
     #[test]
     fn centrality_is_uniform(seed in 0u8..=255, epoch in 0u32..1000) {
-        let node = Node::<F31>::open(NodeId([seed; 32]), epoch);
+        let node = Node::<F31>::open(NodeId([seed; 32]), Epoch::new(epoch.into()));
         prop_assert_eq!(node.quorums().count() as u32, Plane::<F31>::LINE_SIZE);
     }
 

@@ -38,6 +38,7 @@ pub use rendezvous::rendezvous_line;
 // domain-meaningful alias used across the services code.
 pub use fanos_onoma::Address;
 pub use fanos_onoma::Address as ServiceAddress;
+pub use fanos_primitives::Epoch;
 
 /// A hidden service — its public key and self-certifying address (spec Part XII).
 pub struct HiddenService {
@@ -67,7 +68,7 @@ impl HiddenService {
 
     /// The service's rendezvous line for `epoch` (spec §12.2).
     #[must_use]
-    pub fn rendezvous_line<F: Field>(&self, epoch: u32) -> Line<F> {
+    pub fn rendezvous_line<F: Field>(&self, epoch: Epoch) -> Line<F> {
         rendezvous_line::<F>(&self.pubkey, epoch)
     }
 }
@@ -79,7 +80,7 @@ impl HiddenService {
 pub fn client_meeting_line<F: Field>(
     address: &ServiceAddress,
     service_pubkey: &[u8],
-    epoch: u32,
+    epoch: Epoch,
 ) -> Option<Line<F>> {
     address
         .verifies(service_pubkey)
@@ -91,10 +92,10 @@ pub fn client_meeting_line<F: Field>(
 /// with the service's public key derive it identically; it rotates every epoch, so a censor
 /// cannot pin a static location. The overlay hashes this to a responsible point (`MapToPoint`).
 #[must_use]
-pub fn descriptor_key(service_pubkey: &[u8], epoch: u32) -> Vec<u8> {
+pub fn descriptor_key(service_pubkey: &[u8], epoch: Epoch) -> Vec<u8> {
     let mut key = Vec::with_capacity(service_pubkey.len() + 4);
     key.extend_from_slice(service_pubkey);
-    key.extend_from_slice(&epoch.to_be_bytes());
+    key.extend_from_slice(&epoch.low32_be_bytes());
     key
 }
 
@@ -105,7 +106,7 @@ pub fn descriptor_key(service_pubkey: &[u8], epoch: u32) -> Vec<u8> {
 pub fn client_descriptor_key(
     address: &ServiceAddress,
     service_pubkey: &[u8],
-    epoch: u32,
+    epoch: Epoch,
 ) -> Option<Vec<u8>> {
     address
         .verifies(service_pubkey)
@@ -127,7 +128,7 @@ mod tests {
 
         // A client that learns (address, pubkey) verifies the binding and computes the SAME
         // rendezvous line the service listens on — no HSDir lookup anywhere.
-        let epoch = 42;
+        let epoch = Epoch::new(42);
         let client_line =
             client_meeting_line::<F31>(&address, service.pubkey(), epoch).expect("certifies");
         assert_eq!(client_line, service.rendezvous_line::<F31>(epoch));
@@ -140,8 +141,8 @@ mod tests {
     fn the_meeting_point_moves_every_epoch() {
         let service = HiddenService::new(b"svc".to_vec());
         assert_ne!(
-            service.rendezvous_line::<F31>(100),
-            service.rendezvous_line::<F31>(101)
+            service.rendezvous_line::<F31>(Epoch::new(100)),
+            service.rendezvous_line::<F31>(Epoch::new(101))
         );
     }
 
@@ -149,7 +150,7 @@ mod tests {
     fn full_flow_address_rendezvous_pow_threshold() {
         // Address + rendezvous + a PoW-gated intro + threshold hosting, composed.
         let service = HiddenService::new(b"whole-flow-key".to_vec());
-        let line = service.rendezvous_line::<F31>(7);
+        let line = service.rendezvous_line::<F31>(Epoch::new(7));
         assert!(line.coords()[0] <= 1); // canonical line
 
         // The client attaches a PoW to its intro cookie.

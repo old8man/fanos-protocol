@@ -34,11 +34,7 @@ fn contract_config() -> Config {
 /// genuinely depends on the seed. Returns the full trace dump (the causal log the contract is stated
 /// over) and the final metrics.
 fn run_scenario(seed: u64) -> (String, Metrics) {
-    let net = NetworkModel::new(
-        Duration::from_millis(20),
-        Duration::from_millis(10),
-        0.3,
-    );
+    let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), 0.3);
     let mut sim = Sim::with_network(seed, net);
     sim.enable_trace(true);
     let cell = spawn_cell::<F2>(&mut sim, contract_config());

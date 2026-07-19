@@ -208,7 +208,10 @@ mod tests {
         // epoch passed in (3), NOT now_nanos/window (which here would be 9) — so nodes at different local
         // clocks but the same beacon epoch agree on the frame epoch (audit A3).
         let frame = obs.observe_liveness(9_000_000_000, 3, 6, 0.5, 0b0000_0001, 0.4, -1);
-        assert_eq!(frame.epoch, 3, "frame epoch is the agreed epoch, decoupled from the local clock");
+        assert_eq!(
+            frame.epoch, 3,
+            "frame epoch is the agreed epoch, decoupled from the local clock"
+        );
         assert!(frame.is_faulted(), "a real syndrome from the degraded mask");
         assert!(
             obs.history()

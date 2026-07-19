@@ -67,9 +67,15 @@ mod width_tests {
         // Exactly `w` bytes must hold every element `0..q`, and `w − 1` must not.
         for q in [2u32, 7, 8, 13, 256, 257, 65_536, 65_537] {
             let w = element_width(q);
-            assert!(256u64.pow(w as u32) >= u64::from(q), "q={q} fits in {w} bytes");
+            assert!(
+                256u64.pow(w as u32) >= u64::from(q),
+                "q={q} fits in {w} bytes"
+            );
             if w > 1 {
-                assert!(256u64.pow(w as u32 - 1) < u64::from(q), "q={q} needs the {w}th byte");
+                assert!(
+                    256u64.pow(w as u32 - 1) < u64::from(q),
+                    "q={q} needs the {w}th byte"
+                );
             }
         }
         // Small binary/prime fields FANOS instantiates are 1 byte; q=257 crosses to 2.

@@ -26,10 +26,10 @@ pub mod vss;
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash::label;
-use fanos_primitives::map_to_point;
 use fanos_field::Field;
 use fanos_geometry::Point;
+use fanos_primitives::hash::label;
+use fanos_primitives::{Epoch, map_to_point};
 use vrf_r255::{Proof, PublicKey, SecretKey};
 
 /// Length of a serialized VRF proof (`Γ ‖ c ‖ s`), in bytes.
@@ -133,10 +133,10 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 }
 
 /// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch` (spec §L1 beacon).
-fn beacon_alpha(node_id: &[u8], epoch: u32) -> Vec<u8> {
+fn beacon_alpha(node_id: &[u8], epoch: Epoch) -> Vec<u8> {
     let mut alpha = Vec::with_capacity(node_id.len() + 4);
     alpha.extend_from_slice(node_id);
-    alpha.extend_from_slice(&epoch.to_be_bytes());
+    alpha.extend_from_slice(&epoch.low32_be_bytes());
     alpha
 }
 
@@ -146,7 +146,7 @@ fn beacon_alpha(node_id: &[u8], epoch: u32) -> Vec<u8> {
 pub fn prove_coordinate<F: Field>(
     secret: &VrfSecret,
     node_id: &[u8],
-    epoch: u32,
+    epoch: Epoch,
 ) -> (Point<F>, VrfProof) {
     let (proof, output) = secret.prove(&beacon_alpha(node_id, epoch));
     (coordinate_from_output::<F>(&output), proof)
@@ -158,7 +158,7 @@ pub fn prove_coordinate<F: Field>(
 pub fn verify_coordinate<F: Field>(
     public: &VrfPublic,
     node_id: &[u8],
-    epoch: u32,
+    epoch: Epoch,
     claimed: &Point<F>,
     proof: &VrfProof,
 ) -> bool {
@@ -224,22 +224,34 @@ mod tests {
     fn the_verifiable_coordinate_is_deterministic_and_checks_out() {
         let sk = secret(4);
         let pk = sk.public();
-        let (coord, proof) = prove_coordinate::<F31>(&sk, b"node-A", 7);
+        let (coord, proof) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(7));
         // Deterministic: the same key+epoch always yields the same coordinate.
-        let (coord2, _) = prove_coordinate::<F31>(&sk, b"node-A", 7);
+        let (coord2, _) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(7));
         assert_eq!(coord, coord2);
         // Anyone with the public key verifies the coordinate without the secret.
-        assert!(verify_coordinate::<F31>(&pk, b"node-A", 7, &coord, &proof));
+        assert!(verify_coordinate::<F31>(
+            &pk,
+            b"node-A",
+            Epoch::new(7),
+            &coord,
+            &proof
+        ));
         // A forged coordinate (from a different epoch) does not verify for epoch 7.
-        let (other, _) = prove_coordinate::<F31>(&sk, b"node-A", 8);
-        assert!(!verify_coordinate::<F31>(&pk, b"node-A", 7, &other, &proof));
+        let (other, _) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(8));
+        assert!(!verify_coordinate::<F31>(
+            &pk,
+            b"node-A",
+            Epoch::new(7),
+            &other,
+            &proof
+        ));
     }
 
     #[test]
     fn the_coordinate_rotates_every_epoch() {
         let sk = secret(5);
-        let (c7, _) = prove_coordinate::<F31>(&sk, b"n", 7);
-        let (c8, _) = prove_coordinate::<F31>(&sk, b"n", 8);
+        let (c7, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(7));
+        let (c8, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(8));
         assert_ne!(c7, c8, "the beacon coordinate moves each epoch");
     }
 

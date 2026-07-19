@@ -14,9 +14,9 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::Triple;
+use fanos_primitives::hash_labeled;
 
 use crate::path::Circuit;
 

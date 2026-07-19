@@ -98,14 +98,21 @@ fn byzantine_tolerance_is_exactly_quorum_minus_one_distinct_witnesses() {
         sim.inject(cell[0], Command::Diagnose);
         sim.settle();
         // "Defeated" = the crash is still localized despite the lie (the honest node was not fooled).
-        sim.report().any_verdict(&Verdict::Localized(Fault::Single(5)))
+        sim.report()
+            .any_verdict(&Verdict::Localized(Fault::Single(5)))
     };
 
     // quorum − 1 = 2 distinct liars: outvoted, crash localized.
-    assert!(liars_defeated(2), "2 < quorum 3 distinct liars are outvoted — the crash is still seen");
+    assert!(
+        liars_defeated(2),
+        "2 < quorum 3 distinct liars are outvoted — the crash is still seen"
+    );
     // quorum = 3 distinct liars: they meet the corroboration bar, masking the crash — the exact point
     // the tolerance is exceeded. This is the calibrated floor: safety holds iff #liars < quorum.
-    assert!(!liars_defeated(3), "3 = quorum distinct liars reach the bar and mask the crash");
+    assert!(
+        !liars_defeated(3),
+        "3 = quorum distinct liars reach the bar and mask the crash"
+    );
 }
 
 #[test]

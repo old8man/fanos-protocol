@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use fanos_calypso::balance::{InstanceRef, MasterDescriptor, SigningKeyCert, delegation_message};
-use fanos_calypso::{ServiceAddress, master_descriptor_key};
+use fanos_calypso::{Epoch, ServiceAddress, master_descriptor_key};
 use fanos_field::F2;
 use fanos_pqcrypto::sig::HybridSignature;
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
@@ -38,10 +38,10 @@ fn signed_descriptor(
     root_pubkey: &[u8],
     signing: &HybridSigSecret,
     signing_pubkey: &[u8],
-    epoch: u32,
+    epoch: Epoch,
     backends: &[(Triple, &[u8], u16)],
 ) -> MasterDescriptor {
-    let (valid_from, valid_until) = (epoch, epoch + 4);
+    let (valid_from, valid_until) = (epoch, epoch.saturating_add(4));
     let root_sig = root
         .sign(&SigningKeyCert::signing_message(
             root_pubkey,
@@ -96,7 +96,7 @@ fn a_master_domain_load_balances_across_verified_backends_over_the_overlay() {
     let (signing, signing_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"epoch-signer"));
     let signing_pubkey = signing_vk.encode();
     let address = ServiceAddress::from_bundle(&root_pubkey);
-    let epoch = 12;
+    let epoch = Epoch::new(12);
 
     // Three backend instances at distinct cell coordinates, one with double weight.
     let backends: Vec<(Triple, &[u8], u16)> = vec![
@@ -192,7 +192,7 @@ fn a_client_fails_over_when_a_backend_is_down() {
     let (signing, signing_vk) =
         HybridSigSecret::generate(&mut SeedRng::from_seed(b"failover-signer"));
     let signing_pubkey = signing_vk.encode();
-    let epoch = 3;
+    let epoch = Epoch::new(3);
     let backends: Vec<(Triple, &[u8], u16)> = vec![
         (cell[1], b"b1".as_slice(), 1),
         (cell[3], b"b2".as_slice(), 1),

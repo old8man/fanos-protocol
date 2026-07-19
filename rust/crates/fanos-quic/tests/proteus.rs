@@ -15,7 +15,7 @@ use fanos_runtime::{Command, Config, Notification, OverlayNode};
 #[tokio::test]
 async fn shaped_nodes_deliver_over_a_polymorph_transport() {
     let secret = b"community-transport-secret".to_vec();
-    let epoch = 11;
+    let epoch = fanos_proteus::Epoch::new(11);
     let dir = Directory::new();
 
     let a = spawn_shaped(

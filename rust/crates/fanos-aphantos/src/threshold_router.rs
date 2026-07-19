@@ -22,10 +22,10 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_primitives::shamir::Share;
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_pqcrypto::HybridKemSecret;
+use fanos_primitives::shamir::Share;
 use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
 use crate::threshold::{self, ThresholdPeel};
@@ -217,8 +217,7 @@ impl<F: Field> ThresholdRouter<F> {
             // A queued real forward displaces this cover slot; the pseudo-random pick reorders the
             // batch (the mixing property) while the emission rate stays constant (audit E6).
             self.cover_seq = self.cover_seq.wrapping_add(1);
-            let idx =
-                (self.cover_prf_unit(self.cover_seq) * self.outbox.len() as f64) as usize;
+            let idx = (self.cover_prf_unit(self.cover_seq) * self.outbox.len() as f64) as usize;
             if let Some((to, frame)) = self.outbox.remove(idx.min(self.outbox.len() - 1)) {
                 effects.push(Effect::Send { to, frame });
             }
@@ -439,7 +438,10 @@ fn peel_search(
 ) -> Option<ThresholdPeel> {
     if chosen.len() == threshold {
         *attempts += 1;
-        let subset: Vec<Share> = chosen.iter().filter_map(|&i| shares.get(i).cloned()).collect();
+        let subset: Vec<Share> = chosen
+            .iter()
+            .filter_map(|&i| shares.get(i).cloned())
+            .collect();
         return threshold::peel_onion_with_shares(onion, &subset).ok();
     }
     for i in start..shares.len() {
@@ -625,7 +627,10 @@ mod tests {
         );
         // Deterministic for a given secret — the sans-I/O replay property is preserved.
         let seq_a2: Vec<u64> = (1..=8).map(|i| a.sample_delay(i).as_nanos()).collect();
-        assert_eq!(seq_a, seq_a2, "the schedule is deterministic for a given secret");
+        assert_eq!(
+            seq_a, seq_a2,
+            "the schedule is deterministic for a given secret"
+        );
     }
 
     #[test]
@@ -638,9 +643,11 @@ mod tests {
             .with_cover(Duration::from_millis(100));
 
         let armed = r.step(Instant(0), Input::Command(Command::StartHeartbeat));
-        let is_cover_timer =
-            |e: &Effect| matches!(e, Effect::ArmTimer { token: TimerToken(t), .. } if *t == COVER_TOKEN);
-        assert!(armed.iter().any(is_cover_timer), "StartHeartbeat arms the cover schedule");
+        let is_cover_timer = |e: &Effect| matches!(e, Effect::ArmTimer { token: TimerToken(t), .. } if *t == COVER_TOKEN);
+        assert!(
+            armed.iter().any(is_cover_timer),
+            "StartHeartbeat arms the cover schedule"
+        );
 
         let tick = r.step(Instant(1), Input::Timer(TimerToken(COVER_TOKEN)));
         let sends: Vec<&[u8]> = tick
@@ -652,9 +659,17 @@ mod tests {
             .collect();
         assert_eq!(sends.len(), 1, "exactly one cover cell per tick");
         // The cover cell is exactly the size of a real launched onion carrying a full padded packet.
-        let real_len = launch_frame([0, 0, 0], &alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN]).len();
-        assert_eq!(sends[0].len(), real_len, "cover cell is the constant threshold-onion size");
-        assert!(tick.iter().any(is_cover_timer), "the schedule re-arms (constant rate)");
+        let real_len =
+            launch_frame([0, 0, 0], &alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN]).len();
+        assert_eq!(
+            sends[0].len(),
+            real_len,
+            "cover cell is the constant threshold-onion size"
+        );
+        assert!(
+            tick.iter().any(is_cover_timer),
+            "the schedule re-arms (constant rate)"
+        );
 
         // Without `with_cover`, StartHeartbeat is inert (no cover on the mixing-only path).
         let (s2, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"cover-off"));
@@ -696,7 +711,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(dests, alloc::vec![dest], "the slot emitted the queued real cell, not cover");
+        assert_eq!(
+            dests,
+            alloc::vec![dest],
+            "the slot emitted the queued real cell, not cover"
+        );
 
         // With the queue empty again, the next slot falls back to a cover cell — still one emission.
         let tick2 = r.step(Instant(2), Input::Timer(TimerToken(COVER_TOKEN)));
@@ -747,7 +766,10 @@ mod tests {
                 frame: onion_frame,
             },
         );
-        assert!(!has_delivery(&e0, payload), "one share (t=2) cannot deliver");
+        assert!(
+            !has_delivery(&e0, payload),
+            "one share (t=2) cannot deliver"
+        );
 
         // The honest member-1 reply (the real partial) and a forgery at the same index with mangled y.
         let honest1 = member_partial(&onion, 1, &sec1).unwrap();
@@ -755,7 +777,10 @@ mod tests {
             x: honest1.x,
             y: honest1.y.iter().map(|b| b ^ 0xFF).collect(),
         };
-        assert_ne!(forged.y, honest1.y, "the forgery differs from the real share");
+        assert_ne!(
+            forged.y, honest1.y,
+            "the forgery differs from the real share"
+        );
 
         // Inject the forgery first: it reaches the threshold count but cannot peel, and must NOT be
         // allowed to force a (wrong) delivery or discard the pending peel.
@@ -766,7 +791,10 @@ mod tests {
                 frame: encode_rep(0, &forged),
             },
         );
-        assert!(!has_delivery(&e1, payload), "a forged share does not complete the hop");
+        assert!(
+            !has_delivery(&e1, payload),
+            "a forged share does not complete the hop"
+        );
 
         // The honest reply now arrives: a valid subset (combiner + honest member 1) exists, so the hop
         // completes despite the forged candidate still sitting in the set.
@@ -858,10 +886,19 @@ mod tests {
                 Instant(1),
                 Input::Message {
                     from: [2, 2, 2],
-                    frame: encode_rep(0, &Share { x: bad_x, y: alloc::vec![0u8; 8] }),
+                    frame: encode_rep(
+                        0,
+                        &Share {
+                            x: bad_x,
+                            y: alloc::vec![0u8; 8],
+                        },
+                    ),
                 },
             );
-            assert!(e.is_empty(), "an out-of-range share index (x={bad_x}) is dropped");
+            assert!(
+                e.is_empty(),
+                "an out-of-range share index (x={bad_x}) is dropped"
+            );
         }
     }
 }

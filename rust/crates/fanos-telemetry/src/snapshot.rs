@@ -180,13 +180,20 @@ mod tests {
         // A healthy collective subject (r in the band) is integrated (Φ≥1) and self-observing (R≥1/3).
         let healthy = CoherenceSnapshot::from_frame(&frame(0.5));
         assert!(healthy.phi >= PHI_THRESHOLD, "Φ={} ≥ 1", healthy.phi);
-        assert!(healthy.reflection >= REFLECTION_FLOOR, "R={} ≥ 1/3", healthy.reflection);
+        assert!(
+            healthy.reflection >= REFLECTION_FLOOR,
+            "R={} ≥ 1/3",
+            healthy.reflection
+        );
         assert!(healthy.is_ready(), "a healthy collective subject is ready");
 
         // A weakly-coupled aggregate (r small) is NOT integrated (Φ<1) → not ready.
         let aggregate = CoherenceSnapshot::from_frame(&frame(0.05));
         assert!(aggregate.phi < PHI_THRESHOLD, "Φ={} < 1", aggregate.phi);
-        assert!(!aggregate.is_ready(), "an unintegrated aggregate is not ready");
+        assert!(
+            !aggregate.is_ready(),
+            "an unintegrated aggregate is not ready"
+        );
     }
 
     #[test]
@@ -201,9 +208,18 @@ mod tests {
     fn band_thresholds_match_their_closed_forms() {
         // The operator bands are theorem-fixed, not tuned — verify the published constants.
         assert!((R_STAR - 1.0 / 6.0_f64.sqrt()).abs() < 1e-12, "r* = 1/√6");
-        assert!((OVER_COUPLING - 1.0 / 3.0_f64.sqrt()).abs() < 1e-12, "over-coupling = 1/√3");
-        assert!((PURITY_FLOOR - 2.0 / 7.0).abs() < 1e-12, "P_crit = 2/N = 2/7");
-        assert!((REFLECTION_FLOOR - 1.0 / 3.0).abs() < 1e-12, "R floor = 1/3");
+        assert!(
+            (OVER_COUPLING - 1.0 / 3.0_f64.sqrt()).abs() < 1e-12,
+            "over-coupling = 1/√3"
+        );
+        assert!(
+            (PURITY_FLOOR - 2.0 / 7.0).abs() < 1e-12,
+            "P_crit = 2/N = 2/7"
+        );
+        assert!(
+            (REFLECTION_FLOOR - 1.0 / 3.0).abs() < 1e-12,
+            "R floor = 1/3"
+        );
         // The band ordering `r* < 1/√3` is now a compile-time `const _` assertion above.
     }
 

@@ -7,7 +7,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_calypso::{HiddenService, client_descriptor_key, descriptor_key, pow};
+use fanos_calypso::{Epoch, HiddenService, client_descriptor_key, descriptor_key, pow};
 use fanos_field::F2;
 use fanos_runtime::{Command, Config, Duration, Triple};
 use fanos_sim::{Sim, spawn_cell};
@@ -39,7 +39,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
 
     let service = HiddenService::new(b"my-service-hybrid-pubkey".to_vec());
     let address = *service.address();
-    let epoch = 7;
+    let epoch = Epoch::new(7);
     let service_node = cell[0];
     let client_node = cell[3];
 
@@ -99,7 +99,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
     // The rendezvous moves every epoch — no static location to seize.
     assert_ne!(
         descriptor_key(service.pubkey(), epoch),
-        descriptor_key(service.pubkey(), epoch + 1)
+        descriptor_key(service.pubkey(), epoch.next())
     );
 }
 
@@ -108,6 +108,6 @@ fn a_client_with_only_the_address_cannot_forge_the_rendezvous() {
     // Only a public key the address certifies yields the rendezvous key (self-certifying, §12.2).
     let service = HiddenService::new(b"another-service".to_vec());
     let address = *service.address();
-    assert!(client_descriptor_key(&address, service.pubkey(), 3).is_some());
-    assert!(client_descriptor_key(&address, b"impostor", 3).is_none());
+    assert!(client_descriptor_key(&address, service.pubkey(), Epoch::new(3)).is_some());
+    assert!(client_descriptor_key(&address, b"impostor", Epoch::new(3)).is_none());
 }

@@ -108,8 +108,7 @@ fn a_decorrelated_flood_of_equal_volume_does_not_decouple() {
     // over-coupling rather than traffic volume. (The hash mixes window and peer with distinct odd
     // multipliers, giving a per-(window,peer) value in {1,2,3}, mean 2 — matching the lockstep mean.)
     let bursts = |w: usize, peer: usize| -> u32 {
-        let h = (w as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        let h = (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (peer as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
         ((h >> 29) % 3) as u32 + 1
     };

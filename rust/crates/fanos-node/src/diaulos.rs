@@ -224,7 +224,11 @@ impl<R: ServiceResolver> FanosDialer<R> {
     /// threshold, epoch, and the client's forward/reply circuits (the per-target meeting line is
     /// derived from the resolved service key at dial time).
     #[must_use]
-    pub fn anonymous(client: Client, resolver: R, route: crate::rendezvous::RendezvousRoute) -> Self {
+    pub fn anonymous(
+        client: Client,
+        resolver: R,
+        route: crate::rendezvous::RendezvousRoute,
+    ) -> Self {
         Self {
             client,
             resolver,

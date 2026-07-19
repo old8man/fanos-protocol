@@ -13,9 +13,9 @@
 
 use alloc::vec::Vec;
 
+use fanos_field::Field;
 use fanos_primitives::hash::xof_reader;
 use fanos_primitives::shamir;
-use fanos_field::Field;
 
 use crate::path::Circuit;
 use crate::ratchet::circuit_holonomy;

@@ -30,8 +30,8 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash_labeled;
 use fanos_geometry::Triple;
+use fanos_primitives::{Epoch, hash_labeled};
 
 use crate::ServiceAddress;
 
@@ -53,9 +53,9 @@ pub struct SigningKeyCert {
     /// The epoch signing key's public key.
     pub signing_pubkey: Vec<u8>,
     /// First epoch the signing key is valid for (inclusive).
-    pub valid_from: u32,
+    pub valid_from: Epoch,
     /// Last epoch the signing key is valid for (inclusive).
-    pub valid_until: u32,
+    pub valid_until: Epoch,
     /// The root's signature over [`SigningKeyCert::signing_message`].
     pub root_sig: Vec<u8>,
 }
@@ -66,15 +66,15 @@ impl SigningKeyCert {
     pub fn signing_message(
         root_pubkey: &[u8],
         signing_pubkey: &[u8],
-        from: u32,
-        until: u32,
+        from: Epoch,
+        until: Epoch,
     ) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(SIGNING_CERT_LABEL.as_bytes());
         put_bytes(&mut m, root_pubkey);
         put_bytes(&mut m, signing_pubkey);
-        m.extend_from_slice(&from.to_be_bytes());
-        m.extend_from_slice(&until.to_be_bytes());
+        m.extend_from_slice(&from.low32_be_bytes());
+        m.extend_from_slice(&until.low32_be_bytes());
         m
     }
 
@@ -82,7 +82,7 @@ impl SigningKeyCert {
     fn is_valid<V: Fn(&[u8], &[u8], &[u8]) -> bool>(
         &self,
         root_pubkey: &[u8],
-        epoch: u32,
+        epoch: Epoch,
         verify: &V,
     ) -> bool {
         (self.valid_from..=self.valid_until).contains(&epoch)
@@ -119,7 +119,7 @@ pub struct InstanceRef {
 #[must_use]
 pub fn delegation_message(
     root_pubkey: &[u8],
-    epoch: u32,
+    epoch: Epoch,
     instance_pubkey: &[u8],
     coordinate: Triple,
     weight: u16,
@@ -127,7 +127,7 @@ pub fn delegation_message(
     let mut m = Vec::new();
     m.extend_from_slice(DELEGATION_LABEL.as_bytes());
     put_bytes(&mut m, root_pubkey);
-    m.extend_from_slice(&epoch.to_be_bytes());
+    m.extend_from_slice(&epoch.low32_be_bytes());
     put_bytes(&mut m, instance_pubkey);
     for w in coordinate {
         m.extend_from_slice(&w.to_be_bytes());
@@ -145,7 +145,7 @@ pub struct MasterDescriptor {
     /// The root-signed certificate authorizing the epoch signing key.
     pub signing_cert: SigningKeyCert,
     /// The epoch this descriptor is valid for.
-    pub epoch: u32,
+    pub epoch: Epoch,
     /// The backend instances, each with its delegation signature by the signing key.
     pub instances: Vec<InstanceRef>,
     /// The **signing key's** signature over [`MasterDescriptor::signing_bytes`] — binds the whole
@@ -160,10 +160,10 @@ impl MasterDescriptor {
         let mut m = Vec::new();
         put_bytes(&mut m, &self.root_pubkey);
         put_bytes(&mut m, &self.signing_cert.signing_pubkey);
-        m.extend_from_slice(&self.signing_cert.valid_from.to_be_bytes());
-        m.extend_from_slice(&self.signing_cert.valid_until.to_be_bytes());
+        m.extend_from_slice(&self.signing_cert.valid_from.low32_be_bytes());
+        m.extend_from_slice(&self.signing_cert.valid_until.low32_be_bytes());
         put_bytes(&mut m, &self.signing_cert.root_sig);
-        m.extend_from_slice(&self.epoch.to_be_bytes());
+        m.extend_from_slice(&self.epoch.low32_be_bytes());
         m.extend_from_slice(&(self.instances.len() as u32).to_be_bytes());
         for inst in &self.instances {
             put_bytes(&mut m, &inst.instance_pubkey);
@@ -199,10 +199,10 @@ impl MasterDescriptor {
         let mut c = Cursor::new(bytes);
         let root_pubkey = c.take_bytes()?.to_vec();
         let signing_pubkey = c.take_bytes()?.to_vec();
-        let valid_from = u32::from_be_bytes(c.take_array()?);
-        let valid_until = u32::from_be_bytes(c.take_array()?);
+        let valid_from = Epoch::from_low32_be_bytes(c.take_array()?);
+        let valid_until = Epoch::from_low32_be_bytes(c.take_array()?);
         let root_sig = c.take_bytes()?.to_vec();
-        let epoch = u32::from_be_bytes(c.take_array()?);
+        let epoch = Epoch::from_low32_be_bytes(c.take_array()?);
         let count = u32::from_be_bytes(c.take_array()?) as usize;
         let mut instances = Vec::with_capacity(count.min(4096));
         for _ in 0..count {
@@ -323,7 +323,7 @@ impl MasterDescriptor {
 /// per-epoch rendezvous key a single service uses, so a client with only the root key and address
 /// finds it with no directory. (Alias of [`crate::descriptor_key`] over the root key.)
 #[must_use]
-pub fn master_descriptor_key(root_pubkey: &[u8], epoch: u32) -> Vec<u8> {
+pub fn master_descriptor_key(root_pubkey: &[u8], epoch: Epoch) -> Vec<u8> {
     crate::descriptor_key(root_pubkey, epoch)
 }
 
@@ -406,7 +406,7 @@ mod tests {
         signing_sk: Vec<u8>,
     }
 
-    fn setup(epoch: u32, weights: &[u16]) -> Setup {
+    fn setup(epoch: Epoch, weights: &[u16]) -> Setup {
         let root_sk = b"root-offline-secret".to_vec();
         let root_pk = toy_pub(&root_sk);
         let address = ServiceAddress::from_bundle(&root_pk);
@@ -417,7 +417,7 @@ mod tests {
             (root_pk.clone(), root_sk.clone()),
             (signing_pk.clone(), signing_sk.clone())
         ];
-        let (valid_from, valid_until) = (epoch.saturating_sub(1), epoch + 2);
+        let (valid_from, valid_until) = (epoch.saturating_sub(1), epoch.saturating_add(2));
         let root_sig = toy_sign(
             &root_sk,
             &SigningKeyCert::signing_message(&root_pk, &signing_pk, valid_from, valid_until),
@@ -469,13 +469,13 @@ mod tests {
 
     #[test]
     fn a_valid_descriptor_verifies_through_the_root_signing_key_hierarchy() {
-        let s = setup(9, &[1, 1, 1]);
+        let s = setup(Epoch::new(9), &[1, 1, 1]);
         assert!(s.desc.verify(&s.address, toy_verify(&s.registry)));
     }
 
     #[test]
     fn a_descriptor_round_trips_through_its_wire_encoding() {
-        let s = setup(9, &[1, 2, 3]);
+        let s = setup(Epoch::new(9), &[1, 2, 3]);
         let decoded = MasterDescriptor::decode(&s.desc.encode()).unwrap();
         assert_eq!(decoded, s.desc);
         assert!(decoded.verify(&s.address, toy_verify(&s.registry)));
@@ -484,15 +484,15 @@ mod tests {
     #[test]
     fn a_signing_key_outside_its_epoch_window_is_rejected() {
         // The cert authorizes [epoch-1, epoch+2]; a descriptor claiming a far epoch fails.
-        let mut s = setup(9, &[1, 1]);
-        s.desc.epoch = 100;
+        let mut s = setup(Epoch::new(9), &[1, 1]);
+        s.desc.epoch = Epoch::new(100);
         // Re-sign the delegations + descriptor for the new epoch so only the *cert window* is wrong.
         for inst in &mut s.desc.instances {
             inst.delegation_sig = toy_sign(
                 &s.signing_sk,
                 &delegation_message(
                     &s.desc.root_pubkey,
-                    100,
+                    Epoch::new(100),
                     &inst.instance_pubkey,
                     inst.coordinate,
                     inst.weight,
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn an_undelegated_or_tampered_backend_is_rejected() {
-        let s = setup(9, &[1, 1, 1]);
+        let s = setup(Epoch::new(9), &[1, 1, 1]);
         // Undelegated injected backend.
         let mut d1 = s.desc.clone();
         d1.instances.push(InstanceRef {
@@ -529,7 +529,7 @@ mod tests {
     fn a_forged_signing_cert_from_a_non_root_key_is_rejected() {
         // The signing cert must be signed by the ROOT; a cert signed by anyone else fails even if
         // that key then signs everything else consistently.
-        let mut s = setup(9, &[1, 1]);
+        let mut s = setup(Epoch::new(9), &[1, 1]);
         let evil_sk = b"not-the-root".to_vec();
         s.desc.signing_cert.root_sig = toy_sign(
             &evil_sk,
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn weighted_hrw_is_consistent_and_capacity_aware() {
-        let s = setup(9, &[1, 1, 1]);
+        let s = setup(Epoch::new(9), &[1, 1, 1]);
         // Deterministic per selector; failover walks the ranking.
         let a = s.desc.select_instance(b"req", 0).unwrap().coordinate;
         assert_eq!(a, s.desc.select_instance(b"req", 0).unwrap().coordinate);
@@ -569,7 +569,7 @@ mod tests {
         );
 
         // Capacity: a heavily-weighted backend wins a large majority of requests.
-        let heavy = setup(9, &[1, 1, 50]);
+        let heavy = setup(Epoch::new(9), &[1, 1, 50]);
         let heavy_coord = heavy.desc.instances[2].coordinate;
         let hits = (0..300u32)
             .filter(|i| {
@@ -587,7 +587,7 @@ mod tests {
         );
 
         // A zero-weight backend is drained (never selected).
-        let drained = setup(9, &[0, 1]);
+        let drained = setup(Epoch::new(9), &[0, 1]);
         for i in 0..50u32 {
             assert_ne!(
                 drained
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn health_aware_selection_skips_a_down_backend() {
-        let s = setup(9, &[1, 1, 1]);
+        let s = setup(Epoch::new(9), &[1, 1, 1]);
         let down = s.desc.instances[1].coordinate;
         // With backend 1 marked unhealthy, no request — for any selector — picks it as primary.
         let mut survivors = alloc::collections::BTreeSet::new();

@@ -6,11 +6,11 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use fanos_primitives::hash::label;
-use fanos_primitives::{hash_labeled, map_to_point};
 use fanos_diakrisis::coherence::frobenius_sq;
 use fanos_field::{F7, F256};
 use fanos_geometry::cross;
+use fanos_primitives::hash::label;
+use fanos_primitives::{hash_labeled, map_to_point};
 
 fn rendezvous(c: &mut Criterion) {
     let u = [1u32, 2, 3];

@@ -31,7 +31,14 @@ fn spawn_nyx_cell(sim: &mut Sim, path_len: usize) -> Vec<Triple> {
 
     let mut coords = Vec::with_capacity(points.len());
     for (i, (point, secret)) in points.iter().zip(secrets).enumerate() {
-        let node = NyxNode::new(*point, secret, directory.clone(), [i as u8; 32], [0u8; 32], path_len);
+        let node = NyxNode::new(
+            *point,
+            secret,
+            directory.clone(),
+            [i as u8; 32],
+            [0u8; 32],
+            path_len,
+        );
         coords.push(sim.add(Box::new(node)));
     }
     coords

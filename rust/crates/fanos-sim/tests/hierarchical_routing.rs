@@ -75,8 +75,14 @@ fn a_message_descends_two_levels_to_a_sub_cell_node() {
     let o_id = sim.add(Box::new(origin));
     let g_id = sim.add(Box::new(gateway));
     let d_id = sim.add(Box::new(dest));
-    assert_eq!(o_id, o_tp, "the sim keys a node by its transport coordinate");
-    assert_ne!(g_id, d_id, "the gateway [2] and the sub-cell node [2,5] are distinct transport nodes");
+    assert_eq!(
+        o_id, o_tp,
+        "the sim keys a node by its transport coordinate"
+    );
+    assert_ne!(
+        g_id, d_id,
+        "the gateway [2] and the sub-cell node [2,5] are distinct transport nodes"
+    );
 
     // A client hands the entry relay a RouteHier for [2,5]. The address travels unchanged; each hop
     // re-derives its own next step.
@@ -85,9 +91,19 @@ fn a_message_descends_two_levels_to_a_sub_cell_node() {
     sim.run_for(Duration::from_millis(5_000));
 
     let delivered = deliveries(&sim);
-    assert_eq!(delivered.len(), 1, "exactly one delivery — no misroute, drop, or duplication");
-    assert_eq!(delivered[0].0, d_id, "delivered at the depth-2 destination's own transport node");
-    assert_eq!(delivered[0].1, PAYLOAD, "payload intact across the two-level descent");
+    assert_eq!(
+        delivered.len(),
+        1,
+        "exactly one delivery — no misroute, drop, or duplication"
+    );
+    assert_eq!(
+        delivered[0].0, d_id,
+        "delivered at the depth-2 destination's own transport node"
+    );
+    assert_eq!(
+        delivered[0].1, PAYLOAD,
+        "payload intact across the two-level descent"
+    );
 
     // Convergence: the top-cell hop plus the descent hop — two RouteHier relays, no more.
     assert_eq!(
@@ -127,7 +143,10 @@ fn a_routing_hole_fails_closed_without_misdelivery_or_loop() {
     sim.inject_frame(Point::<F2>::at(3).coords(), o_id, frame);
     sim.run_for(Duration::from_millis(5_000));
 
-    assert!(deliveries(&sim).is_empty(), "a routing hole fails closed — no delivery at all");
+    assert!(
+        deliveries(&sim).is_empty(),
+        "a routing hole fails closed — no delivery at all"
+    );
     assert_eq!(
         sim.report().metrics.frames_sent,
         1,
@@ -162,11 +181,17 @@ fn join_announcements_auto_seed_the_hierarchical_routing_table() {
     let a_id = sim.add(Box::new(entry));
     let _g_id = sim.add(Box::new(gateway));
     let d_id = sim.add(Box::new(dest));
-    assert_ne!(d_id, Point::<F2>::at(5).coords(), "the descended node is NOT at its overlay leaf point");
+    assert_ne!(
+        d_id,
+        Point::<F2>::at(5).coords(),
+        "the descended node is NOT at its overlay leaf point"
+    );
 
     // Everyone joins: announcements flood, carrying each node's overlay address, and every receiver
     // seeds `(hier → transport coord)`.
-    sim.inject_all(&Command::Join { info: b"keys".to_vec() });
+    sim.inject_all(&Command::Join {
+        info: b"keys".to_vec(),
+    });
     sim.run_for(Duration::from_millis(2_000));
 
     // Now originate a hierarchical send to the descended node. No peer table was ever hand-configured.
@@ -176,7 +201,9 @@ fn join_announcements_auto_seed_the_hierarchical_routing_table() {
 
     let delivered = deliveries(&sim);
     assert!(
-        delivered.iter().any(|(node, payload)| *node == d_id && payload == PAYLOAD),
+        delivered
+            .iter()
+            .any(|(node, payload)| *node == d_id && payload == PAYLOAD),
         "the descended node [2,5] is reachable purely from its JOIN announcement (auto-seeded table)",
     );
 }

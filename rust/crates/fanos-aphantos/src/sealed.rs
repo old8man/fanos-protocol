@@ -29,13 +29,13 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash::hash_xof;
-use fanos_primitives::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_nyx::{Circuit, circuit_holonomy};
 use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
+use fanos_primitives::hash::hash_xof;
+use fanos_primitives::hash_labeled;
 use fanos_wire::tessera;
 
 // The onion's byte layout has a single source of truth — the canonical `fanos_wire::tessera`. These are

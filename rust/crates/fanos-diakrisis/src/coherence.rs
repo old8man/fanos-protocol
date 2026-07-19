@@ -310,9 +310,7 @@ mod tests {
         // NaN or ±∞ anywhere is rejected — they would silently pass the tolerance checks (every
         // comparison with NaN is false) and poison the self-model (D2).
         assert!(CoherenceMatrix::from_correlation(vec![1.0, f64::NAN, f64::NAN, 1.0], 2).is_none());
-        assert!(
-            CoherenceMatrix::from_correlation(vec![f64::INFINITY, 0.0, 0.0, 1.0], 2).is_none()
-        );
+        assert!(CoherenceMatrix::from_correlation(vec![f64::INFINITY, 0.0, 0.0, 1.0], 2).is_none());
         assert!(
             CoherenceMatrix::from_correlation(vec![1.0, 0.3, 0.3, f64::NEG_INFINITY], 2).is_none()
         );

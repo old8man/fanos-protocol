@@ -68,8 +68,12 @@ fn load_balancing_restores_coherence_under_a_differential_flood() {
     // A differential flood: nodes 5 and 6 are saturated (excess 16 each); the rest idle.
     let excess_concentrated = [0.0, 0.0, 0.0, 0.0, 0.0, 16.0, 16.0];
     // The projective load balancer spreads the excess to the global mean (conserving the total).
-    let (excess_balanced, rounds) = loadbalance::balance_to_uniform(&excess_concentrated, 1e-9, 100);
-    assert!(rounds > 0 && rounds <= 20, "balancing converges in a few rounds, took {rounds}");
+    let (excess_balanced, rounds) =
+        loadbalance::balance_to_uniform(&excess_concentrated, 1e-9, 100);
+    assert!(
+        rounds > 0 && rounds <= 20,
+        "balancing converges in a few rounds, took {rounds}"
+    );
 
     let concentrated = read(&signals(&couplings(&excess_concentrated), &shared, &idio))
         .expect("well-formed signals");
@@ -102,7 +106,10 @@ fn load_balancing_restores_coherence_under_a_differential_flood() {
     // 3. Total load is conserved by balancing (no work created or destroyed — pure redistribution).
     let total_before: f64 = excess_concentrated.iter().sum();
     let total_after: f64 = excess_balanced.iter().sum();
-    assert!((total_before - total_after).abs() < 1e-6, "redistribution conserves total load");
+    assert!(
+        (total_before - total_after).abs() < 1e-6,
+        "redistribution conserves total load"
+    );
 }
 
 #[test]
@@ -126,8 +133,14 @@ fn balancing_monotonically_improves_coherence_round_by_round() {
             .unwrap()
             .mean_correlation;
         // Monotone non-decreasing (small tolerance for finite-window sampling noise).
-        assert!(r >= prev_r - 2e-3, "coherence does not regress while balancing: {prev_r:.4} → {r:.4}");
+        assert!(
+            r >= prev_r - 2e-3,
+            "coherence does not regress while balancing: {prev_r:.4} → {r:.4}"
+        );
         prev_r = r;
     }
-    assert!(prev_r > start_r + 0.02, "balancing raised coherence overall: {start_r:.3} → {prev_r:.3}");
+    assert!(
+        prev_r > start_r + 0.02,
+        "balancing raised coherence overall: {start_r:.3} → {prev_r:.3}"
+    );
 }

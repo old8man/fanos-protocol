@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 
 use blake3::OutputReader;
 
-use fanos_primitives::hash::xof_reader;
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point};
+use fanos_primitives::hash::xof_reader;
 
 /// The domain label for NYX path derivation.
 const PATH_LABEL: &str = "FANOS-v1/nyx-path";

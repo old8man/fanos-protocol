@@ -19,9 +19,10 @@
 
 extern crate alloc;
 
+pub mod address;
 #[cfg(feature = "aead")]
 pub mod aead;
-pub mod address;
+pub mod epoch;
 pub mod hash;
 pub mod keys;
 pub mod maptopoint;
@@ -29,6 +30,7 @@ pub mod shamir;
 pub mod vrf;
 
 pub use address::{address_matches_identity, address_point};
+pub use epoch::Epoch;
 pub use hash::{DIGEST_LEN, hash_labeled, label, subkey};
 pub use keys::{HybridPublicKey, NodeId};
 pub use maptopoint::{map_to_line, map_to_point};
@@ -47,7 +49,7 @@ mod tests {
     fn identity_to_coordinate_pipeline() {
         // A node's bundle hashes to an ID, which (with an epoch) derives a cell coordinate.
         let node = NodeId([42u8; 32]);
-        let coord = coordinate_for::<F31>(&node, 7);
+        let coord = coordinate_for::<F31>(&node, Epoch::new(7));
         assert_eq!(Point::<F31>::at(coord.index()), coord);
     }
 

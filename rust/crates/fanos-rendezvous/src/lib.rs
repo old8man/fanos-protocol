@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 
 use fanos_aphantos::threshold::{HopLine, seal_onion};
 use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
+pub use fanos_calypso::Epoch;
 use fanos_field::Field;
 use fanos_geometry::{Line, Triple};
 use fanos_pqcrypto::kem::HybridKemPublic;
@@ -41,7 +42,7 @@ pub use fanos_aphantos::threshold_router::combiner_for;
 /// line from the service's public key and the `epoch`, with no lookup or published record (CALYPSO).
 /// It rotates every epoch, so there is no fixed rendezvous point to enumerate, block, or seize.
 #[must_use]
-pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: u32) -> Line<F> {
+pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: Epoch) -> Line<F> {
     fanos_calypso::rendezvous::rendezvous_line::<F>(service_pubkey, epoch)
 }
 
@@ -199,8 +200,10 @@ mod tests {
         assert!(Request::decode(&[0; 16]).is_none());
         // A cookie but a truncated hop-line is rejected (16 cookie + count=2 + partial coord).
         assert!(
-            Request::decode(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1])
-                .is_none()
+            Request::decode(&[
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1
+            ])
+            .is_none()
         );
     }
 
@@ -227,7 +230,9 @@ mod tests {
         // The maximum hop count that fits the 1-byte length prefix round-trips exactly.
         let max = Request {
             cookie: [1; 16],
-            reply_circuit: (0..255u32).map(|i| [i, i.wrapping_add(1), i.wrapping_add(2)]).collect(),
+            reply_circuit: (0..255u32)
+                .map(|i| [i, i.wrapping_add(1), i.wrapping_add(2)])
+                .collect(),
             payload: b"tail".to_vec(),
         };
         let wire = max.encode();

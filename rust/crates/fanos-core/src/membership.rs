@@ -9,8 +9,8 @@
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point};
 
-use fanos_primitives::NodeId;
 use fanos_primitives::coordinate_for;
+use fanos_primitives::{Epoch, NodeId};
 
 /// A cell member: its long-term identity and its epoch-bound coordinate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,13 +20,13 @@ pub struct Member<F: Field> {
     /// The projective coordinate for the current epoch.
     pub coord: Point<F>,
     /// The epoch this coordinate was derived for.
-    pub epoch: u32,
+    pub epoch: Epoch,
 }
 
 impl<F: Field> Member<F> {
     /// Assign a member's coordinate for `epoch` (reference VRF derivation, spec §L0).
     #[must_use]
-    pub fn assign(id: NodeId, epoch: u32) -> Self {
+    pub fn assign(id: NodeId, epoch: Epoch) -> Self {
         Self {
             id,
             coord: coordinate_for::<F>(&id, epoch),
@@ -74,9 +74,9 @@ mod tests {
     #[test]
     fn member_coordinate_is_epoch_bound() {
         let id = NodeId([5u8; 32]);
-        let m0 = Member::<F31>::assign(id, 0);
-        let m1 = Member::<F31>::assign(id, 1);
-        assert_eq!(m0.epoch, 0);
+        let m0 = Member::<F31>::assign(id, Epoch::ZERO);
+        let m1 = Member::<F31>::assign(id, Epoch::new(1));
+        assert_eq!(m0.epoch, Epoch::ZERO);
         assert_ne!(m0.coord, m1.coord, "epoch reshuffle moves the coordinate");
         assert_eq!(m0.lines().count() as u32, lines_per_node::<F31>());
     }
@@ -85,7 +85,7 @@ mod tests {
     fn sybil_gains_no_extra_centrality() {
         // Many identities all land on exactly q+1 lines — mass does not buy centrality.
         for seed in 0u8..20 {
-            let m = Member::<F31>::assign(NodeId([seed; 32]), 0);
+            let m = Member::<F31>::assign(NodeId([seed; 32]), Epoch::ZERO);
             assert_eq!(m.lines().count() as u32, 32);
         }
     }

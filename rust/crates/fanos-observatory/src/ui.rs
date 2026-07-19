@@ -60,18 +60,32 @@ fn render_header(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnaps
     };
     let paused = if app.is_paused() { "  ⏸ PAUSED" } else { "" };
     let title = Line::from(vec![
-        Span::styled("◇ FANOS Coherence Observatory", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("   {}   ", app.source_label()), Style::default().fg(MUTED)),
-        Span::styled(format!("epoch {}", snap.epoch), Style::default().fg(Color::Gray)),
+        Span::styled(
+            "◇ FANOS Coherence Observatory",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   {}   ", app.source_label()),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            format!("epoch {}", snap.epoch),
+            Style::default().fg(Color::Gray),
+        ),
         Span::styled(paused.to_string(), Style::default().fg(WARN)),
     ]);
     let verdict = Line::from(vec![Span::styled(
         format!(" {ready_txt} "),
-        Style::default().fg(Color::Black).bg(ready_col).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Black)
+            .bg(ready_col)
+            .add_modifier(Modifier::BOLD),
     )])
     .alignment(Alignment::Right);
 
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(MUTED));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let cols = Layout::default()
@@ -96,24 +110,41 @@ fn render_left(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnapsho
 
     // Φ ≥ 1 ⇒ one bound subject. Gauge maps Φ=2 to full; the theorem line is at half.
     gauge(
-        f, rows[0], "Φ  integration",
+        f,
+        rows[0],
+        "Φ  integration",
         (snap.phi / 2.0).clamp(0.0, 1.0),
         format!("{:.3}   bound if ≥ 1", snap.phi),
         if snap.phi >= 1.0 { READY } else { WARN },
     );
     // P > 2/N ⇒ structured/viable.
     gauge(
-        f, rows[1], "P  structure",
+        f,
+        rows[1],
+        "P  structure",
         snap.purity.clamp(0.0, 1.0),
         format!("{:.3}   viable if > 2/7 ({PURITY_FLOOR:.3})", snap.purity),
-        if snap.purity > PURITY_FLOOR { READY } else { CRIT },
+        if snap.purity > PURITY_FLOOR {
+            READY
+        } else {
+            CRIT
+        },
     );
     // R ≥ 1/3 ⇒ still self-observing (not over-coupled).
     gauge(
-        f, rows[2], "R  reflection",
+        f,
+        rows[2],
+        "R  reflection",
         snap.reflection.clamp(0.0, 1.0),
-        format!("{:.3}   self-model if ≥ 1/3 ({REFLECTION_FLOOR:.3})", snap.reflection),
-        if snap.reflection >= REFLECTION_FLOOR { READY } else { CRIT },
+        format!(
+            "{:.3}   self-model if ≥ 1/3 ({REFLECTION_FLOOR:.3})",
+            snap.reflection
+        ),
+        if snap.reflection >= REFLECTION_FLOOR {
+            READY
+        } else {
+            CRIT
+        },
     );
 
     render_spectrum(f, rows[3], snap);
@@ -122,10 +153,23 @@ fn render_left(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnapsho
 
 fn gauge(f: &mut Frame<'_>, area: Rect, title: &str, ratio: f64, label: String, col: Color) {
     let g = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title(Span::styled(format!(" {title} "), Style::default().fg(Color::Gray))).border_style(Style::default().fg(MUTED)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    format!(" {title} "),
+                    Style::default().fg(Color::Gray),
+                ))
+                .border_style(Style::default().fg(MUTED)),
+        )
         .gauge_style(Style::default().fg(col))
         .ratio(ratio.clamp(0.0, 1.0))
-        .label(Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        .label(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
     f.render_widget(g, area);
 }
 
@@ -135,12 +179,16 @@ fn gauge(f: &mut Frame<'_>, area: Rect, title: &str, ratio: f64, label: String, 
 fn render_spectrum(f: &mut Frame<'_>, area: Rect, snap: &CoherenceSnapshot) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" coherence spectrum  r ", Style::default().fg(Color::Gray)))
+        .title(Span::styled(
+            " coherence spectrum  r ",
+            Style::default().fg(Color::Gray),
+        ))
         .border_style(Style::default().fg(MUTED));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let w = inner.width.max(1) as usize;
-    let marker = ((snap.mean_correlation.clamp(0.0, 1.0)) * (w.saturating_sub(1)) as f64).round() as usize;
+    let marker =
+        ((snap.mean_correlation.clamp(0.0, 1.0)) * (w.saturating_sub(1)) as f64).round() as usize;
 
     let mut band = Vec::with_capacity(w);
     for i in 0..w {
@@ -159,7 +207,10 @@ fn render_spectrum(f: &mut Frame<'_>, area: Rect, snap: &CoherenceSnapshot) {
     let axis = Line::from(vec![
         Span::styled("0", Style::default().fg(MUTED)),
         Span::styled(format!("  r*={R_STAR:.2}  "), Style::default().fg(WARN)),
-        Span::styled(format!("band  1/√3={OVER_COUPLING:.2}"), Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("band  1/√3={OVER_COUPLING:.2}"),
+            Style::default().fg(ACCENT),
+        ),
         Span::styled("  1", Style::default().fg(MUTED)),
     ]);
     let para = Paragraph::new(vec![Line::from(band), axis]);
@@ -169,7 +220,12 @@ fn render_spectrum(f: &mut Frame<'_>, area: Rect, snap: &CoherenceSnapshot) {
 fn render_trend(f: &mut Frame<'_>, area: Rect, app: &App) {
     let data: Vec<u64> = app.phi_history().iter().copied().collect();
     let spark = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(Span::styled(" Φ trend ", Style::default().fg(Color::Gray))).border_style(Style::default().fg(MUTED)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" Φ trend ", Style::default().fg(Color::Gray)))
+                .border_style(Style::default().fg(MUTED)),
+        )
         .data(&data)
         .style(Style::default().fg(ACCENT));
     f.render_widget(spark, area);
@@ -200,22 +256,68 @@ fn render_vitals(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnaps
         Span::styled("over-coupled — shed correlation", Style::default().fg(CRIT))
     };
     let cascade = if snap.cascade_lead >= 0 {
-        Span::styled(format!("forecast in {} ticks", snap.cascade_lead), Style::default().fg(CRIT))
+        Span::styled(
+            format!("forecast in {} ticks", snap.cascade_lead),
+            Style::default().fg(CRIT),
+        )
     } else {
         Span::styled("none", Style::default().fg(MUTED))
     };
     let pcol = if app.pressure() >= 1.0 { CRIT } else { WARN };
     let lines = vec![
-        kv("mean r", &format!("{:.3}", snap.mean_correlation), ACCENT, Some(band_note)),
-        kv("spectral Δ", &format!("{:.3}", snap.spectral_gap), Color::White, None),
-        kv("stability r_stab", &format!("{:.3}", snap.stability_radius), Color::White, None),
-        kv_span("regime", Span::styled(reg_txt, Style::default().fg(reg_col).add_modifier(Modifier::BOLD))),
-        kv_span("alarm", Span::styled(al_txt, Style::default().fg(al_col).add_modifier(Modifier::BOLD))),
-        kv("pressure a/a*", &format!("{:.0}%", app.pressure() * 100.0), pcol, None),
+        kv(
+            "mean r",
+            &format!("{:.3}", snap.mean_correlation),
+            ACCENT,
+            Some(band_note),
+        ),
+        kv(
+            "spectral Δ",
+            &format!("{:.3}", snap.spectral_gap),
+            Color::White,
+            None,
+        ),
+        kv(
+            "stability r_stab",
+            &format!("{:.3}", snap.stability_radius),
+            Color::White,
+            None,
+        ),
+        kv_span(
+            "regime",
+            Span::styled(
+                reg_txt,
+                Style::default().fg(reg_col).add_modifier(Modifier::BOLD),
+            ),
+        ),
+        kv_span(
+            "alarm",
+            Span::styled(
+                al_txt,
+                Style::default().fg(al_col).add_modifier(Modifier::BOLD),
+            ),
+        ),
+        kv(
+            "pressure a/a*",
+            &format!("{:.0}%", app.pressure() * 100.0),
+            pcol,
+            None,
+        ),
         kv_span("cascade", cascade),
-        kv("heal_seq", &format!("{}", snap.heal_seq), Color::White, None),
+        kv(
+            "heal_seq",
+            &format!("{}", snap.heal_seq),
+            Color::White,
+            None,
+        ),
     ];
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(" vital signs ", Style::default().fg(Color::Gray))).border_style(Style::default().fg(MUTED));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " vital signs ",
+            Style::default().fg(Color::Gray),
+        ))
+        .border_style(Style::default().fg(MUTED));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -226,22 +328,40 @@ fn render_syndrome(f: &mut Frame<'_>, area: Rect, degraded: u8, syndrome: u8) {
     let pts: Vec<Span<'_>> = (0..7)
         .map(|i| {
             if degraded & (1u8 << i) != 0 {
-                Span::styled(" ✖ ", Style::default().fg(CRIT).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    " ✖ ",
+                    Style::default().fg(CRIT).add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled(" ● ", Style::default().fg(READY))
             }
         })
         .collect();
     let title = format!(" Fano nodes  ·  syndrome 0b{syndrome:03b} ");
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(title, Style::default().fg(Color::Gray))).border_style(Style::default().fg(MUTED));
-    f.render_widget(Paragraph::new(vec![Line::from(idx), Line::from(pts)]).block(block), area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(Color::Gray)))
+        .border_style(Style::default().fg(MUTED));
+    f.render_widget(
+        Paragraph::new(vec![Line::from(idx), Line::from(pts)]).block(block),
+        area,
+    );
 }
 
 fn render_json(f: &mut Frame<'_>, area: Rect, snap: &CoherenceSnapshot) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(" agent snapshot · JSON ", Style::default().fg(Color::Gray))).border_style(Style::default().fg(MUTED));
-    let para = Paragraph::new(Span::styled(snap.to_json(), Style::default().fg(Color::Gray)))
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " agent snapshot · JSON ",
+            Style::default().fg(Color::Gray),
+        ))
+        .border_style(Style::default().fg(MUTED));
+    let para = Paragraph::new(Span::styled(
+        snap.to_json(),
+        Style::default().fg(Color::Gray),
+    ))
+    .block(block)
+    .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -268,7 +388,10 @@ fn render_footer(f: &mut Frame<'_>, area: Rect) {
 fn kv(key: &str, val: &str, col: Color, note: Option<Span<'static>>) -> Line<'static> {
     let mut spans = vec![
         Span::styled(format!("{key:<18}"), Style::default().fg(MUTED)),
-        Span::styled(format!("{val:<9}"), Style::default().fg(col).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{val:<9}"),
+            Style::default().fg(col).add_modifier(Modifier::BOLD),
+        ),
     ];
     if let Some(n) = note {
         spans.push(n);
@@ -277,7 +400,10 @@ fn kv(key: &str, val: &str, col: Color, note: Option<Span<'static>>) -> Line<'st
 }
 
 fn kv_span(key: &str, val: Span<'static>) -> Line<'static> {
-    Line::from(vec![Span::styled(format!("{key:<18}"), Style::default().fg(MUTED)), val])
+    Line::from(vec![
+        Span::styled(format!("{key:<18}"), Style::default().fg(MUTED)),
+        val,
+    ])
 }
 
 const fn regime_label(r: Regime) -> (Color, &'static str) {
@@ -309,7 +435,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(96, 32)).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]
@@ -319,9 +448,18 @@ mod tests {
         assert!(text.contains("Coherence Observatory"));
         assert!(text.contains("READY"));
         assert!(text.contains('Φ') && text.contains('P') && text.contains('R'));
-        assert!(text.contains("COLLECTIVE SUBJECT"), "a fresh cell is a collective subject");
-        assert!(text.contains("agent snapshot"), "the agent JSON panel is present");
-        assert!(text.contains("\"ready\":true"), "the live JSON reflects readiness");
+        assert!(
+            text.contains("COLLECTIVE SUBJECT"),
+            "a fresh cell is a collective subject"
+        );
+        assert!(
+            text.contains("agent snapshot"),
+            "the agent JSON panel is present"
+        );
+        assert!(
+            text.contains("\"ready\":true"),
+            "the live JSON reflects readiness"
+        );
     }
 
     #[test]
@@ -334,7 +472,10 @@ mod tests {
             app.on_tick();
         }
         let text = rendered_text(&app);
-        assert!(text.contains("NOT READY"), "a cell driven past a* shows NOT READY");
+        assert!(
+            text.contains("NOT READY"),
+            "a cell driven past a* shows NOT READY"
+        );
     }
 
     use crate::source::Control;

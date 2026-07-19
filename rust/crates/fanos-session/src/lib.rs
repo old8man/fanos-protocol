@@ -430,7 +430,10 @@ mod tests {
         })
         .await
         .expect("the large transfer completed in time");
-        assert_eq!(result, expected, "the whole payload streamed through, uppercased");
+        assert_eq!(
+            result, expected,
+            "the whole payload streamed through, uppercased"
+        );
     }
 
     #[tokio::test]
@@ -461,6 +464,9 @@ mod tests {
         })
         .await
         .expect("the empty request completed in time");
-        assert!(result.is_empty(), "an empty request yields an empty response, cleanly");
+        assert!(
+            result.is_empty(),
+            "an empty request yields an empty response, cleanly"
+        );
     }
 }

@@ -87,8 +87,14 @@ mod tests {
     #[test]
     fn stability_radius_matches_t104() {
         // r_stab = √(P − 2/7): zero at the boundary, √(1/7) at the band's upper edge P = 3/7.
-        assert!(stability_radius(2.0 / 7.0, N).abs() < 1e-12, "zero at collapse");
-        assert!(stability_radius(0.2, N).abs() < 1e-12, "clamped to zero below the boundary");
+        assert!(
+            stability_radius(2.0 / 7.0, N).abs() < 1e-12,
+            "zero at collapse"
+        );
+        assert!(
+            stability_radius(0.2, N).abs() < 1e-12,
+            "clamped to zero below the boundary"
+        );
         assert!((stability_radius(3.0 / 7.0, N) - sqrt(1.0 / 7.0)).abs() < 1e-12);
         // A pure state P = 1 gives the theoretical maximum √(5/7).
         assert!((stability_radius(1.0, N) - sqrt(5.0 / 7.0)).abs() < 1e-12);
@@ -117,7 +123,10 @@ mod tests {
             e = excursion_step(e, kappa, noise);
         }
         let want = ultimate_excursion(kappa, noise);
-        assert!((e - want).abs() < 1e-9, "converged to h/κ = {want}, got {e}");
+        assert!(
+            (e - want).abs() < 1e-9,
+            "converged to h/κ = {want}, got {e}"
+        );
         assert!((want - noise / kappa).abs() < 1e-12);
     }
 
@@ -138,7 +147,10 @@ mod tests {
         let r_stab = stability_radius(3.0 / 7.0, N); // √(1/7) ≈ 0.378
         assert!(survives(r_stab, 0.5, 0.1), "0.1 < 0.5·0.378 survives");
         assert!(!survives(r_stab, 0.5, 0.3), "0.3 > 0.5·0.378 does not");
-        assert!((NOISE_SURVIVAL_THRESHOLD - 1.0 / 14.0).abs() < 1e-12, "h^(D) bound is 1/14");
+        assert!(
+            (NOISE_SURVIVAL_THRESHOLD - 1.0 / 14.0).abs() < 1e-12,
+            "h^(D) bound is 1/14"
+        );
         // A cell at the boundary (r_stab = 0) survives no perturbation at all.
         assert!(!survives(0.0, 1.0, 1e-9));
     }

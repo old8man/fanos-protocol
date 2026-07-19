@@ -81,11 +81,7 @@ fn index_of(cell: &[Triple], coord: Triple) -> usize {
 fn adversarial_metrics(seed: u64) -> fanos_sim::Metrics {
     let mut rng = Rng::new(seed);
     let loss = 0.4 * rng.unit();
-    let net = NetworkModel::new(
-        Duration::from_millis(20),
-        Duration::from_millis(10),
-        loss,
-    );
+    let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), loss);
     let mut sim = Sim::with_network(seed, net);
     let cell = spawn_cell::<F2>(&mut sim, cell_config());
     sim.inject_all(&Command::StartHeartbeat);
@@ -198,7 +194,10 @@ fn i2_syndrome_never_blames_a_live_node() {
                     .report()
                     .verdicts()
                     .any(|(_, v)| !matches!(v, Verdict::Healthy));
-            assert!(noticed, "seed {seed}: crash set {crashed:?} went entirely unnoticed");
+            assert!(
+                noticed,
+                "seed {seed}: crash set {crashed:?} went entirely unnoticed"
+            );
         }
     }
 }
@@ -236,7 +235,10 @@ fn i3_three_or_more_faults_escalate() {
         }
         // … and the saturation is recognized: someone escalates or flags a systemic/partition event.
         let saturated = sim.report().verdicts().any(|(_, v)| {
-            matches!(v, Verdict::Escalate(_) | Verdict::Partition | Verdict::Systemic)
+            matches!(
+                v,
+                Verdict::Escalate(_) | Verdict::Partition | Verdict::Systemic
+            )
         });
         assert!(
             saturated,
@@ -357,11 +359,7 @@ fn i6_honest_nodes_are_never_spuriously_quarantined() {
     for seed in 0..SAMPLES {
         let mut rng = Rng::new(seed);
         let loss = 0.5 * rng.unit();
-        let net = NetworkModel::new(
-            Duration::from_millis(20),
-            Duration::from_millis(10),
-            loss,
-        );
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), loss);
         let mut sim = Sim::with_network(seed, net);
         let cell = spawn_cell::<F2>(&mut sim, cell_config());
         sim.inject_all(&Command::StartHeartbeat);

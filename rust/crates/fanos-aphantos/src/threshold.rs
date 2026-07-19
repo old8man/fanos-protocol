@@ -19,10 +19,10 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash_labeled;
-use fanos_primitives::shamir::{self, Share};
 use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
+use fanos_primitives::hash_labeled;
+use fanos_primitives::shamir::{self, Share};
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -379,8 +379,9 @@ fn peel_command(
             payload: rest.to_vec(),
         }),
         CMD_NEXT => {
-            let next = fanos_geometry::decode_triple(rest.get(..12).ok_or(ThresholdError::Malformed)?)
-                .ok_or(ThresholdError::Malformed)?;
+            let next =
+                fanos_geometry::decode_triple(rest.get(..12).ok_or(ThresholdError::Malformed)?)
+                    .ok_or(ThresholdError::Malformed)?;
             let onion = rest.get(12..).ok_or(ThresholdError::Malformed)?.to_vec();
             Ok(ThresholdPeel::Forward { next, onion })
         }
@@ -616,7 +617,10 @@ mod tests {
         let line_coord = Point::<fanos_field::F2>::at(1).coords();
 
         // An empty circuit has no hop to seal.
-        assert!(matches!(seal_onion(&[], 2, b"x", b"s"), Err(ThresholdError::Malformed)));
+        assert!(matches!(
+            seal_onion(&[], 2, b"x", b"s"),
+            Err(ThresholdError::Malformed)
+        ));
         // A threshold larger than the member count is unsatisfiable.
         assert!(
             seal_onion(

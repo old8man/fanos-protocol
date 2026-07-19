@@ -41,7 +41,11 @@ fn victim_onion() -> (Vec<u8>, HybridKemSecret) {
     let keypairs = relays(circuit.hop_count(), 7);
     let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
     let onion = build(&circuit, &pubkeys, b"anonymous payload", b"seed").expect("seal");
-    assert_eq!(onion.len(), ONION_LEN, "sealed onion is the constant bucket");
+    assert_eq!(
+        onion.len(),
+        ONION_LEN,
+        "sealed onion is the constant bucket"
+    );
     let (r1_secret, _) = keypairs.into_iter().next().unwrap();
     (onion, r1_secret)
 }
@@ -120,7 +124,11 @@ fn size_gives_no_tag_and_no_layer_strip() {
     // Whatever does peel forwards at exactly the constant bucket size — length reveals nothing.
     match peel(&onion, &r1).unwrap() {
         PeelOutcome::Forward { onion: inner, .. } => {
-            assert_eq!(inner.len(), ONION_LEN, "the forwarded cell is the constant bucket size");
+            assert_eq!(
+                inner.len(),
+                ONION_LEN,
+                "the forwarded cell is the constant bucket size"
+            );
         }
         PeelOutcome::Deliver { .. } => panic!("a 3-hop onion forwards at hop 1"),
     }

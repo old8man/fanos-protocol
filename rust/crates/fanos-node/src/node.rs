@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use fanos_field::Field;
 use fanos_geometry::Triple;
-use fanos_onoma::{Address, lookup_key};
+use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_quic::{Client, Directory, NodeHandle, spawn_self_certifying_persistent_on};
 use fanos_runtime::{Command, Config as OverlayConfig, Notification, OverlayNode};
 
@@ -149,7 +149,7 @@ impl Node {
     pub async fn resolve(
         &self,
         name: &str,
-        epoch: u64,
+        epoch: Epoch,
         min_pow: u32,
     ) -> Result<ResolvedService, NodeError> {
         let address = Address::parse(name)
@@ -185,8 +185,8 @@ mod tests {
         // Concurrency-safe: two resolves run at once without stealing each other's replies (both
         // fail at parse here, before any network I/O — deterministic).
         let (a, b) = tokio::join!(
-            node.resolve("definitely not a .fanos name", 0, 0),
-            node.resolve("also-not-valid", 7, 0),
+            node.resolve("definitely not a .fanos name", Epoch::new(0), 0),
+            node.resolve("also-not-valid", Epoch::new(7), 0),
         );
         assert!(matches!(a, Err(NodeError::Resolve(_))));
         assert!(matches!(b, Err(NodeError::Resolve(_))));

@@ -13,16 +13,16 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::Line;
 
-use fanos_primitives::map_to_line;
+use fanos_primitives::{Epoch, map_to_line};
 
 const BRIDGE_LABEL: &str = "FANOS-v1/proteus-bridge";
 
 /// A client's primary bridge line for an epoch (spec §13.6). Rotates every epoch.
 #[must_use]
-pub fn bridge_line<F: Field>(community_secret: &[u8], epoch: u32) -> Line<F> {
+pub fn bridge_line<F: Field>(community_secret: &[u8], epoch: Epoch) -> Line<F> {
     let mut data = Vec::with_capacity(community_secret.len() + 4);
     data.extend_from_slice(community_secret);
-    data.extend_from_slice(&epoch.to_be_bytes());
+    data.extend_from_slice(&epoch.low32_be_bytes());
     map_to_line::<F>(BRIDGE_LABEL, &data)
 }
 
@@ -30,14 +30,14 @@ pub fn bridge_line<F: Field>(community_secret: &[u8], epoch: u32) -> Line<F> {
 #[must_use]
 pub fn client_bridge_lines<F: Field>(
     community_secret: &[u8],
-    epoch: u32,
+    epoch: Epoch,
     count: usize,
 ) -> Vec<Line<F>> {
     (0..count)
         .map(|i| {
             let mut data = Vec::with_capacity(community_secret.len() + 8);
             data.extend_from_slice(community_secret);
-            data.extend_from_slice(&epoch.to_be_bytes());
+            data.extend_from_slice(&epoch.low32_be_bytes());
             data.extend_from_slice(&(i as u32).to_be_bytes());
             map_to_line::<F>(BRIDGE_LABEL, &data)
         })
@@ -56,7 +56,9 @@ pub fn reachable_fraction<F: Field>(
         return 1.0;
     }
     let reachable = (0..epochs)
-        .filter(|&e| !blocked.contains(&bridge_line::<F>(community_secret, e).index()))
+        .filter(|&e| {
+            !blocked.contains(&bridge_line::<F>(community_secret, Epoch::new(e.into())).index())
+        })
         .count();
     reachable as f64 / f64::from(epochs)
 }
@@ -66,7 +68,7 @@ pub fn reachable_fraction<F: Field>(
 #[must_use]
 pub fn is_blocked_this_epoch<F: Field>(
     community_secret: &[u8],
-    epoch: u32,
+    epoch: Epoch,
     line_count: usize,
     blocked: &BTreeSet<usize>,
 ) -> bool {
@@ -84,7 +86,10 @@ mod tests {
     #[test]
     fn bridges_rotate_every_epoch() {
         let secret = b"bridge-secret";
-        assert_ne!(bridge_line::<F31>(secret, 0), bridge_line::<F31>(secret, 1));
+        assert_ne!(
+            bridge_line::<F31>(secret, Epoch::ZERO),
+            bridge_line::<F31>(secret, Epoch::new(1))
+        );
     }
 
     #[test]
@@ -100,7 +105,7 @@ mod tests {
     #[test]
     fn blocking_one_epoch_needs_all_q_plus_one_lines() {
         let secret = b"anti-eclipse";
-        let epoch = 3;
+        let epoch = Epoch::new(3);
         let lines = client_bridge_lines::<F31>(secret, epoch, 32);
         let all: BTreeSet<usize> = lines.iter().map(Line::index).collect();
         // Blocking all 32 lines blocks the epoch...

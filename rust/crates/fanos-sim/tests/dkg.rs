@@ -42,8 +42,8 @@ fn nonce_of(i: usize) -> [u8; 32] {
 fn spawn_dkg_cell(sim: &mut Sim, threshold: usize) -> Vec<Triple> {
     let mut coords = Vec::new();
     for (i, point) in Plane::<F2>::points().enumerate() {
-        let node =
-            DkgNode::<F2>::new(point, threshold, secret_of(i), nonce_of(i)).with_deadlines(SHARING, COMPLAINT);
+        let node = DkgNode::<F2>::new(point, threshold, secret_of(i), nonce_of(i))
+            .with_deadlines(SHARING, COMPLAINT);
         coords.push(sim.add(Box::new(node)));
     }
     coords
@@ -130,7 +130,8 @@ fn a_byzantine_equivocating_dealer_is_disqualified_and_honest_nodes_still_agree(
         .iter()
         .enumerate()
         .map(|(i, &p)| {
-            let node = DkgNode::<F2>::new(p, 4, secret_of(i), nonce_of(i)).with_deadlines(SHARING, COMPLAINT);
+            let node = DkgNode::<F2>::new(p, 4, secret_of(i), nonce_of(i))
+                .with_deadlines(SHARING, COMPLAINT);
             sim.add(Box::new(node))
         })
         .collect();

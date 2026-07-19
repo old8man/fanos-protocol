@@ -60,15 +60,11 @@ fn emissions(cover_ms: u64, delay_ms: u64, real_cells: usize) -> usize {
             keypair(&[0xE, i]).1,
         );
     }
-    let mut node = NyxNode::new(
-        Point::<F31>::at(3),
-        secret_r,
-        dir,
-        [0x5A; 32],
-        [0u8; 32],
-        2,
-    )
-    .with_mixing(Duration::from_millis(delay_ms), Duration::from_millis(cover_ms));
+    let mut node = NyxNode::new(Point::<F31>::at(3), secret_r, dir, [0x5A; 32], [0u8; 32], 2)
+        .with_mixing(
+            Duration::from_millis(delay_ms),
+            Duration::from_millis(cover_ms),
+        );
 
     let from = Point::<F31>::at(0).coords();
     let mut now = 0u64;
@@ -95,7 +91,11 @@ fn emissions(cover_ms: u64, delay_ms: u64, real_cells: usize) -> usize {
     let total = 2000 * MS;
     let half = total / 2;
     // Injection schedule: `real_cells` evenly spread over the first half.
-    let step = if real_cells == 0 { half } else { half / real_cells as u64 };
+    let step = if real_cells == 0 {
+        half
+    } else {
+        half / real_cells as u64
+    };
     let mut next_inject = 0u64;
     let mut injected = 0usize;
     let mut ctr = 0u64;
@@ -136,7 +136,9 @@ fn a_relays_emitted_volume_does_not_leak_its_real_traffic_volume() {
 
     // Extra emitted cells per extra real cell — averaged over the 0→60 span.
     let slope = (e60 as f64 - e0 as f64) / 60.0;
-    eprintln!("[C1 flow-corr] emissions: N=0 -> {e0}, N=30 -> {e30}, N=60 -> {e60}; leak slope dE/dN = {slope:.3}");
+    eprintln!(
+        "[C1 flow-corr] emissions: N=0 -> {e0}, N=30 -> {e30}, N=60 -> {e60}; leak slope dE/dN = {slope:.3}"
+    );
 
     assert!(
         slope < 0.15,

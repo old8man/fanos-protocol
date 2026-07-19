@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fanos_field::F2;
-use fanos_node::{Node, NodeConfig, NodeError, Peer, RoleSet, identity};
+use fanos_node::{Epoch, Node, NodeConfig, NodeError, Peer, RoleSet, identity};
 use fanos_runtime::Notification;
 use tracing::info;
 
@@ -124,10 +124,11 @@ async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
         .find(|a| !a.starts_with("--"))
         .ok_or_else(|| NodeError::Config("`fanos resolve` needs a .fanos name".to_string()))?;
     let epoch = match flag(args, "--epoch") {
-        Some(s) => s
-            .parse::<u64>()
-            .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
-        None => 0,
+        Some(s) => Epoch::new(
+            s.parse::<u64>()
+                .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
+        ),
+        None => Epoch::ZERO,
     };
     let min_pow = match flag(args, "--min-pow") {
         Some(s) => s
@@ -170,7 +171,7 @@ fn log_notification(note: &Notification) {
         }
         Notification::PeerDown(p) => info!(peer = ?p, "peer down"),
         Notification::MemberJoined { coord, .. } => info!(?coord, "member joined"),
-        Notification::EpochAdvanced(e) => info!(epoch = e, "epoch advanced"),
+        Notification::EpochAdvanced(e) => info!(epoch = e.get(), "epoch advanced"),
         Notification::Rerouted { around, via } => info!(?around, ?via, "rerouted (self-heal)"),
         Notification::Repaired(p) => info!(node = ?p, "shard repaired"),
         Notification::Quarantined(p) => info!(node = ?p, "member quarantined"),

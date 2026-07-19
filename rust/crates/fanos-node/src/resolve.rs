@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use fanos_calypso::descriptor::{Descriptor, SealedDescriptor, open, seal};
 use fanos_diaulos::{Coord, service_public_from_bundle};
-use fanos_onoma::{Address, lookup_key};
+use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 
@@ -44,7 +44,7 @@ pub struct ResolvedService {
     /// The self-certifying address the name resolved to.
     pub address: Address,
     /// The epoch the descriptor was published for.
-    pub epoch: u64,
+    pub epoch: Epoch,
     /// The hybrid public-key bundle, verified to satisfy `H(bundle) == address`.
     pub bundle: Vec<u8>,
     /// Opaque service metadata (supported profiles, intro policy, …).
@@ -60,7 +60,7 @@ pub struct ResolvedService {
 /// key, epoch mismatch, or a bundle that does not certify the address).
 pub fn verify_descriptor(
     address: &Address,
-    epoch: u64,
+    epoch: Epoch,
     blob: &[u8],
     min_pow: u32,
 ) -> Result<ResolvedService, NodeError> {
@@ -88,7 +88,7 @@ pub async fn publish_service(
     client: &Client,
     bundle: &[u8],
     coord: Coord,
-    epoch: u64,
+    epoch: Epoch,
     difficulty: u32,
     extra: &[u8],
 ) -> Result<(), NodeError> {
@@ -108,7 +108,9 @@ pub async fn publish_service(
     if client.put(slot, sealed.encode()).await {
         Ok(())
     } else {
-        Err(NodeError::Resolve("the store rejected the descriptor".to_string()))
+        Err(NodeError::Resolve(
+            "the store rejected the descriptor".to_string(),
+        ))
     }
 }
 
@@ -125,14 +127,14 @@ pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// missing service fails rather than hangs. This is the discovery side of the Direct profile.
 pub struct NodeResolver {
     client: Client,
-    epoch: u64,
+    epoch: Epoch,
     min_pow: u32,
 }
 
 impl NodeResolver {
     /// Resolve descriptors from `client`'s store for `epoch`, requiring at least `min_pow` PoW bits.
     #[must_use]
-    pub fn new(client: Client, epoch: u64, min_pow: u32) -> Self {
+    pub fn new(client: Client, epoch: Epoch, min_pow: u32) -> Self {
         Self {
             client,
             epoch,
@@ -142,10 +144,7 @@ impl NodeResolver {
 }
 
 impl ServiceResolver for NodeResolver {
-    fn resolve(
-        &self,
-        host: &str,
-    ) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send {
+    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send {
         let client = self.client.clone();
         let epoch = self.epoch;
         let min_pow = self.min_pow;
@@ -171,7 +170,7 @@ impl ServiceResolver for NodeResolver {
 mod tests {
     use super::*;
 
-    fn published(epoch: u64) -> (Address, Vec<u8>, Vec<u8>) {
+    fn published(epoch: Epoch) -> (Address, Vec<u8>, Vec<u8>) {
         let bundle = b"resolver-unit-test-service".to_vec();
         let address = Address::from_bundle(&bundle);
         let desc = Descriptor {
@@ -187,8 +186,8 @@ mod tests {
 
     #[test]
     fn authenticates_a_valid_descriptor() {
-        let (address, bundle, blob) = published(3);
-        let resolved = verify_descriptor(&address, 3, &blob, 0).unwrap();
+        let (address, bundle, blob) = published(Epoch::new(3));
+        let resolved = verify_descriptor(&address, Epoch::new(3), &blob, 0).unwrap();
         assert_eq!(resolved.address, address);
         assert_eq!(resolved.bundle, bundle);
         assert_eq!(resolved.metadata, b"profiles=full");
@@ -196,18 +195,18 @@ mod tests {
 
     #[test]
     fn rejects_junk_and_wrong_epoch_and_wrong_address() {
-        let (address, _, blob) = published(3);
-        assert!(verify_descriptor(&address, 3, b"not-a-descriptor", 0).is_err());
-        assert!(verify_descriptor(&address, 4, &blob, 0).is_err()); // epoch mismatch
+        let (address, _, blob) = published(Epoch::new(3));
+        assert!(verify_descriptor(&address, Epoch::new(3), b"not-a-descriptor", 0).is_err());
+        assert!(verify_descriptor(&address, Epoch::new(4), &blob, 0).is_err()); // epoch mismatch
         let other = Address::from_bundle(b"someone-else");
-        assert!(verify_descriptor(&other, 3, &blob, 0).is_err()); // address-gated
+        assert!(verify_descriptor(&other, Epoch::new(3), &blob, 0).is_err()); // address-gated
     }
 
     #[test]
     fn enforces_a_minimum_pow() {
-        let (address, _, blob) = published(3);
+        let (address, _, blob) = published(Epoch::new(3));
         // The descriptor was stamped at difficulty 4; requiring 40 bits rejects it.
-        assert!(verify_descriptor(&address, 3, &blob, 40).is_err());
+        assert!(verify_descriptor(&address, Epoch::new(3), &blob, 40).is_err());
     }
 
     #[test]
@@ -238,20 +237,24 @@ mod tests {
         let mut metadata = encode_coord(coord).to_vec();
         metadata.extend_from_slice(b"profiles=direct");
         let desc = Descriptor {
-            epoch: 9,
+            epoch: Epoch::new(9),
             bundle: bundle.clone(),
             metadata,
             cert: Vec::new(),
             sig: Vec::new(),
         };
-        let blob = seal(&address, 9, &desc, 4).unwrap().encode();
+        let blob = seal(&address, Epoch::new(9), &desc, 4).unwrap().encode();
 
         // What NodeResolver::resolve does once it has fetched the blob: authenticate, then recover the
         // coordinate and the KEM key.
-        let resolved = verify_descriptor(&address, 9, &blob, 0).unwrap();
+        let resolved = verify_descriptor(&address, Epoch::new(9), &blob, 0).unwrap();
         assert_eq!(decode_coord(&resolved.metadata), Some(coord));
         let extracted = service_public_from_bundle(&resolved.bundle).unwrap();
         let (ct, k) = extracted.encapsulate(&mut rng);
-        assert_eq!(secret.decapsulate(&ct), k, "resolved the service's real KEM key");
+        assert_eq!(
+            secret.decapsulate(&ct),
+            k,
+            "resolved the service's real KEM key"
+        );
     }
 }

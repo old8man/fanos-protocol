@@ -238,22 +238,35 @@ mod tests {
         client.finish();
         service.finish();
         let (client_got, service_got) = run(&mut client, &mut service, |_, _| false, |_, _| false);
-        assert!(client_got.is_empty() && service_got.is_empty(), "no bytes either way");
-        assert!(client.is_done() && service.is_done(), "an empty exchange still completes");
+        assert!(
+            client_got.is_empty() && service_got.is_empty(),
+            "no bytes either way"
+        );
+        assert!(
+            client.is_done() && service.is_done(),
+            "an empty exchange still completes"
+        );
     }
 
     #[test]
     fn boundary_payload_sizes_round_trip_exactly() {
         // Sizes straddling the MAX_SEGMENT (1024) and window (32 segments = 32768 bytes) boundaries —
         // the off-by-one cases where segmentation or the sliding window is most likely to misbehave.
-        for size in [0usize, 1, 1023, 1024, 1025, 2047, 2048, 32767, 32768, 32769, 40960] {
+        for size in [
+            0usize, 1, 1023, 1024, 1025, 2047, 2048, 32767, 32768, 32769, 40960,
+        ] {
             let (mut client, mut service) = endpoints();
-            let up: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+            let up: Vec<u8> = (0..size)
+                .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+                .collect();
             client.write(&up);
             client.finish();
             service.finish();
             let (_c, service_got) = run(&mut client, &mut service, |_, _| false, |_, _| false);
-            assert_eq!(service_got, up, "payload of {size} bytes round-trips exactly");
+            assert_eq!(
+                service_got, up,
+                "payload of {size} bytes round-trips exactly"
+            );
         }
     }
 
@@ -290,7 +303,10 @@ mod tests {
             }
             client_got.extend_from_slice(&client.read());
             round += 1;
-            assert!(round < 160, "anti-resonance jitter must break the mode-lock and converge");
+            assert!(
+                round < 160,
+                "anti-resonance jitter must break the mode-lock and converge"
+            );
         }
         client_got.extend_from_slice(&client.read());
         service_got.extend_from_slice(&service.read());
@@ -348,7 +364,10 @@ mod tests {
         }
         let after_replay = service.read();
         assert_eq!(once, b"exactly once", "delivered once");
-        assert!(after_replay.is_empty(), "the replay surfaced no additional bytes");
+        assert!(
+            after_replay.is_empty(),
+            "the replay surfaced no additional bytes"
+        );
 
         // And the exchange still completes normally afterward.
         let (_c, mut service_got) = run(&mut client, &mut service, |_, _| false, |_, _| false);

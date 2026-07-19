@@ -22,9 +22,9 @@ use std::time::Instant as StdInstant;
 use quinn::{Connection, Endpoint};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use fanos_primitives::{hash_labeled, label};
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
+use fanos_primitives::{Epoch, hash_labeled, label};
 use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use quinn::{ClientConfig, ServerConfig};
@@ -334,7 +334,10 @@ impl core::fmt::Display for QuicError {
         match self {
             Self::Tls(e) => write!(f, "TLS setup: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
-            Self::Grind => write!(f, "could not grind credentials for the requested coordinate"),
+            Self::Grind => write!(
+                f,
+                "could not grind credentials for the requested coordinate"
+            ),
         }
     }
 }
@@ -453,7 +456,7 @@ pub async fn spawn_shaped(
     engine: Box<dyn Engine + Send>,
     directory: Directory,
     community_secret: Vec<u8>,
-    epoch: u32,
+    epoch: Epoch,
 ) -> Result<NodeHandle, QuicError> {
     let shaper = Arc::new(ProteusShaper::new(community_secret, epoch));
     let (server, client) = node_configs()?;
@@ -565,11 +568,7 @@ async fn engine_loop(
 }
 
 /// Sleep for `delay`, then hand the engine its `Timer` input.
-async fn fire_timer(
-    tx: mpsc::Sender<Input>,
-    token: TimerToken,
-    delay: std::time::Duration,
-) {
+async fn fire_timer(tx: mpsc::Sender<Input>, token: TimerToken, delay: std::time::Duration) {
     tokio::time::sleep(delay).await;
     let _ = tx.send(Input::Timer(token)).await;
 }
@@ -726,4 +725,3 @@ async fn read_frames(
         }
     }
 }
-

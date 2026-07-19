@@ -17,12 +17,12 @@
 
 use alloc::vec::Vec;
 
-
-use fanos_primitives::hash::hash_labeled;
 use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_onoma::Address;
 use fanos_onoma::derive::{descriptor_key, lookup_point};
+use fanos_primitives::Epoch;
+use fanos_primitives::hash::hash_labeled;
 
 use crate::pow;
 
@@ -66,7 +66,7 @@ impl core::error::Error for DescriptorError {}
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Descriptor {
     /// The epoch this descriptor is valid for.
-    pub epoch: u64,
+    pub epoch: Epoch,
     /// The canonical hybrid public-key bundle — opens the address commitment.
     pub bundle: Vec<u8>,
     /// Opaque service metadata (supported profiles, intro policy, …).
@@ -138,7 +138,7 @@ impl Descriptor {
 
     fn decode(bytes: &[u8]) -> Result<Self, DescriptorError> {
         let mut cur = bytes;
-        let epoch = read_u64(&mut cur).ok_or(DescriptorError::Malformed)?;
+        let epoch = Epoch::new(read_u64(&mut cur).ok_or(DescriptorError::Malformed)?);
         let bundle = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
         let metadata = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
         let cert = read_field(&mut cur).ok_or(DescriptorError::Malformed)?;
@@ -207,7 +207,7 @@ impl SealedDescriptor {
 /// tag if the descriptor body changed within an epoch (a new rendezvous set), catastrophically leaking the
 /// XOR of the two bodies. With the salt bound to the body (see [`nonce_salt`]) a changed body yields a
 /// fresh nonce (audit E3).
-fn nonce_bytes(addr: &Address, epoch: u64, salt: &[u8; SALT_LEN]) -> [u8; NONCE_LEN] {
+fn nonce_bytes(addr: &Address, epoch: Epoch, salt: &[u8; SALT_LEN]) -> [u8; NONCE_LEN] {
     let mut input = Vec::with_capacity(33 + 8 + SALT_LEN);
     input.extend_from_slice(&addr.payload());
     input.extend_from_slice(&epoch.to_le_bytes());
@@ -235,7 +235,7 @@ fn nonce_salt(plaintext: &[u8]) -> [u8; SALT_LEN] {
 }
 
 /// The PoW challenge binding the address, epoch, and ciphertext.
-fn pow_challenge(addr: &Address, epoch: u64, ciphertext: &[u8]) -> Vec<u8> {
+fn pow_challenge(addr: &Address, epoch: Epoch, ciphertext: &[u8]) -> Vec<u8> {
     let mut c = Vec::with_capacity(33 + 8 + ciphertext.len());
     c.extend_from_slice(&addr.payload());
     c.extend_from_slice(&epoch.to_le_bytes());
@@ -245,7 +245,7 @@ fn pow_challenge(addr: &Address, epoch: u64, ciphertext: &[u8]) -> Vec<u8> {
 
 /// The rotating coordinate a descriptor is published at (directory-free, unenumerable).
 #[must_use]
-pub fn publish_point<F: Field>(addr: &Address, epoch: u64) -> Point<F> {
+pub fn publish_point<F: Field>(addr: &Address, epoch: Epoch) -> Point<F> {
     lookup_point::<F>(addr, epoch)
 }
 
@@ -256,7 +256,7 @@ pub fn publish_point<F: Field>(addr: &Address, epoch: u64) -> Point<F> {
 /// [`DescriptorError::Aead`] if encryption fails (only on absurd input sizes).
 pub fn seal(
     addr: &Address,
-    epoch: u64,
+    epoch: Epoch,
     desc: &Descriptor,
     difficulty: u32,
 ) -> Result<SealedDescriptor, DescriptorError> {
@@ -283,7 +283,7 @@ pub fn seal(
 /// caller moves on to the next candidate.
 pub fn open(
     addr: &Address,
-    epoch: u64,
+    epoch: Epoch,
     sealed: &SealedDescriptor,
     difficulty: u32,
 ) -> Result<Descriptor, DescriptorError> {
@@ -320,7 +320,7 @@ mod tests {
         (Address::from_bundle(&bundle), bundle)
     }
 
-    fn descriptor(epoch: u64, bundle: Vec<u8>) -> Descriptor {
+    fn descriptor(epoch: Epoch, bundle: Vec<u8>) -> Descriptor {
         Descriptor {
             epoch,
             bundle,
@@ -333,9 +333,9 @@ mod tests {
     #[test]
     fn seal_open_round_trips() {
         let (addr, bundle) = service();
-        let desc = descriptor(42, bundle);
-        let sealed = seal(&addr, 42, &desc, 4).unwrap();
-        let opened = open(&addr, 42, &sealed, 4).unwrap();
+        let desc = descriptor(Epoch::new(42), bundle);
+        let sealed = seal(&addr, Epoch::new(42), &desc, 4).unwrap();
+        let opened = open(&addr, Epoch::new(42), &sealed, 4).unwrap();
         assert_eq!(opened, desc);
     }
 
@@ -345,14 +345,17 @@ mod tests {
         // (which would leak the XOR of the two bodies). The salt is bound to the body, so a changed body
         // yields a fresh salt → a fresh nonce.
         let (addr, bundle) = service();
-        let epoch = 5;
+        let epoch = Epoch::new(5);
         let d1 = descriptor(epoch, bundle.clone());
         let mut d2 = descriptor(epoch, bundle);
         d2.metadata = vec![0xAB; 40]; // a changed rendezvous set — same addr, same epoch
 
         let s1 = seal(&addr, epoch, &d1, 0).unwrap();
         let s2 = seal(&addr, epoch, &d2, 0).unwrap();
-        assert_ne!(s1.nonce_salt, s2.nonce_salt, "a changed body yields a fresh nonce salt");
+        assert_ne!(
+            s1.nonce_salt, s2.nonce_salt,
+            "a changed body yields a fresh nonce salt"
+        );
         assert_ne!(
             nonce_bytes(&addr, epoch, &s1.nonce_salt),
             nonce_bytes(&addr, epoch, &s2.nonce_salt),
@@ -362,10 +365,17 @@ mod tests {
         // Both still open correctly (the salt round-trips through the wire form and is authenticated).
         assert_eq!(open(&addr, epoch, &s1, 0).unwrap(), d1);
         assert_eq!(open(&addr, epoch, &s2, 0).unwrap(), d2);
-        assert_eq!(SealedDescriptor::decode(&s2.encode()).unwrap(), s2, "wire form carries the salt");
+        assert_eq!(
+            SealedDescriptor::decode(&s2.encode()).unwrap(),
+            s2,
+            "wire form carries the salt"
+        );
 
         // An identical body re-seals to the identical salt — deterministic and safe (same message).
-        assert_eq!(seal(&addr, epoch, &d1, 0).unwrap().nonce_salt, s1.nonce_salt);
+        assert_eq!(
+            seal(&addr, epoch, &d1, 0).unwrap().nonce_salt,
+            s1.nonce_salt
+        );
     }
 
     #[test]
@@ -373,20 +383,29 @@ mod tests {
         let (addr, bundle) = service();
         // Difficulty 0 isolates the AEAD gate (PoW is address-bound, so a non-zero difficulty
         // would make a wrong address fail at the PoW stage first — also a rejection).
-        let sealed = seal(&addr, 42, &descriptor(42, bundle), 0).unwrap();
+        let sealed = seal(
+            &addr,
+            Epoch::new(42),
+            &descriptor(Epoch::new(42), bundle),
+            0,
+        )
+        .unwrap();
         let other = Address::from_bundle(b"a-different-service");
         // The other address derives a different key → AEAD fails.
-        assert_eq!(open(&other, 42, &sealed, 0), Err(DescriptorError::Aead));
+        assert_eq!(
+            open(&other, Epoch::new(42), &sealed, 0),
+            Err(DescriptorError::Aead)
+        );
     }
 
     #[test]
     fn impersonation_is_rejected() {
         // A descriptor whose bundle does not match the address must not certify it.
         let (addr, _) = service();
-        let forged = descriptor(42, vec![0xFFu8; 64]); // bundle != addr's bundle
-        let sealed = seal(&addr, 42, &forged, 4).unwrap();
+        let forged = descriptor(Epoch::new(42), vec![0xFFu8; 64]); // bundle != addr's bundle
+        let sealed = seal(&addr, Epoch::new(42), &forged, 4).unwrap();
         assert_eq!(
-            open(&addr, 42, &sealed, 4),
+            open(&addr, Epoch::new(42), &sealed, 4),
             Err(DescriptorError::NotCertified)
         );
     }
@@ -394,10 +413,16 @@ mod tests {
     #[test]
     fn insufficient_pow_is_rejected() {
         let (addr, bundle) = service();
-        let sealed = seal(&addr, 42, &descriptor(42, bundle), 1).unwrap();
+        let sealed = seal(
+            &addr,
+            Epoch::new(42),
+            &descriptor(Epoch::new(42), bundle),
+            1,
+        )
+        .unwrap();
         // Require far more work than was stamped.
         assert!(matches!(
-            open(&addr, 42, &sealed, 40),
+            open(&addr, Epoch::new(42), &sealed, 40),
             Err(DescriptorError::BadPow)
         ));
     }
@@ -410,22 +435,29 @@ mod tests {
         // Difficulty 0 isolates the AEAD gate (a non-zero PoW would reject a changed ciphertext earlier).
         let (addr, bundle) = service();
 
-        let mut ct_tampered = seal(&addr, 7, &descriptor(7, bundle.clone()), 0).unwrap();
+        let mut ct_tampered = seal(
+            &addr,
+            Epoch::new(7),
+            &descriptor(Epoch::new(7), bundle.clone()),
+            0,
+        )
+        .unwrap();
         if let Some(b) = ct_tampered.ciphertext.first_mut() {
             *b ^= 0x01;
         }
         assert_eq!(
-            open(&addr, 7, &ct_tampered, 0),
+            open(&addr, Epoch::new(7), &ct_tampered, 0),
             Err(DescriptorError::Aead),
             "a flipped ciphertext byte fails the AEAD tag"
         );
 
-        let mut salt_tampered = seal(&addr, 7, &descriptor(7, bundle), 0).unwrap();
+        let mut salt_tampered =
+            seal(&addr, Epoch::new(7), &descriptor(Epoch::new(7), bundle), 0).unwrap();
         if let Some(b) = salt_tampered.nonce_salt.first_mut() {
             *b ^= 0x01;
         }
         assert_eq!(
-            open(&addr, 7, &salt_tampered, 0),
+            open(&addr, Epoch::new(7), &salt_tampered, 0),
             Err(DescriptorError::Aead),
             "a flipped nonce salt yields the wrong nonce → AEAD failure"
         );
@@ -436,15 +468,15 @@ mod tests {
         // Cross-epoch replay: a valid descriptor captured at one epoch cannot be re-served at the next —
         // the slot, the address-gated key, and the nonce are all epoch-bound.
         let (addr, bundle) = service();
-        let sealed = seal(&addr, 7, &descriptor(7, bundle), 0).unwrap();
+        let sealed = seal(&addr, Epoch::new(7), &descriptor(Epoch::new(7), bundle), 0).unwrap();
         assert_eq!(
-            open(&addr, 8, &sealed, 0),
+            open(&addr, Epoch::new(8), &sealed, 0),
             Err(DescriptorError::Aead),
             "an epoch-7 descriptor does not open under epoch 8's address-gated key"
         );
         assert_ne!(
-            publish_point::<F7>(&addr, 7),
-            publish_point::<F7>(&addr, 8),
+            publish_point::<F7>(&addr, Epoch::new(7)),
+            publish_point::<F7>(&addr, Epoch::new(8)),
             "and the DHT slot rotates per epoch, so a stale descriptor is not even found there"
         );
     }
@@ -452,21 +484,30 @@ mod tests {
     #[test]
     fn epoch_mismatch_is_rejected() {
         let (addr, bundle) = service();
-        let sealed = seal(&addr, 42, &descriptor(42, bundle), 4).unwrap();
+        let sealed = seal(
+            &addr,
+            Epoch::new(42),
+            &descriptor(Epoch::new(42), bundle),
+            4,
+        )
+        .unwrap();
         // Same slot key only if epoch matches; here we open at a different epoch → AEAD/epoch fail.
-        assert!(open(&addr, 7, &sealed, 4).is_err());
+        assert!(open(&addr, Epoch::new(7), &sealed, 4).is_err());
     }
 
     #[test]
     fn publish_point_rotates_per_epoch() {
         let (addr, _) = service();
-        assert_ne!(publish_point::<F7>(&addr, 1), publish_point::<F7>(&addr, 2));
+        assert_ne!(
+            publish_point::<F7>(&addr, Epoch::new(1)),
+            publish_point::<F7>(&addr, Epoch::new(2))
+        );
     }
 
     #[test]
     fn signature_binding_is_verifiable() {
         let (addr, bundle) = service();
-        let desc = descriptor(5, bundle);
+        let desc = descriptor(Epoch::new(5), bundle);
         let _ = addr;
         let expected = desc.signing_bytes();
         assert!(desc.verify_signature(|msg, sig| msg == expected.as_slice() && sig == [7u8; 8]));
