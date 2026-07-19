@@ -22,7 +22,7 @@ use crate::error::NodeError;
 /// big-endian `u32`s), before any opaque profile bytes. A Direct-profile client dials this coordinate;
 /// it need not be authenticated on its own — the DIAULOS handshake binds the session to the service's
 /// KEM key from the bundle, so a wrong coordinate only fails the dial, it cannot impersonate.
-const COORD_META_LEN: usize = 12;
+const COORD_META_LEN: usize = fanos_geometry::TRIPLE_WIRE_LEN;
 
 /// Serialize the coordinate as the metadata's leading [`COORD_META_LEN`] bytes, via the canonical
 /// [`fanos_geometry::encode_triple`] (12-byte big-endian).

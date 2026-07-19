@@ -84,8 +84,9 @@ pub mod command {
     pub const NEXT: u8 = 1;
     /// The path-authenticator holonomy carried in a `DELIVER` command (encrypted, endpoint-only).
     pub const HOLONOMY_LEN: usize = 32;
-    /// The next-hop coordinate carried in a `NEXT` command (a projective triple, `3 × u32`).
-    pub const NEXT_COORD_LEN: usize = 12;
+    /// The next-hop coordinate carried in a `NEXT` command (a projective triple, `3 × u32`) — the one
+    /// canonical [`fanos_geometry::TRIPLE_WIRE_LEN`].
+    pub const NEXT_COORD_LEN: usize = fanos_geometry::TRIPLE_WIRE_LEN;
 }
 
 // Compile-time guarantee that the cleartext header fits the fixed packet with room for a body.

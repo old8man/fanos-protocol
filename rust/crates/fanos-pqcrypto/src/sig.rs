@@ -6,6 +6,10 @@
 
 use alloc::vec::Vec;
 
+// Public-key (= verifying-key, for these schemes) lengths come from the one byte-model in
+// `fanos_primitives::keys`, so the identity bundle layout has a single source of truth; the round-trip
+// tests (encode → decode → verify) pin these to the real RustCrypto sizes.
+use fanos_primitives::keys::{ED25519_PK_LEN as ED25519_VK_LEN, MLDSA65_PK_LEN as MLDSA65_VK_LEN};
 use ed25519_dalek::{
     Signature as EdSignature, SigningKey as EdSigningKey, VerifyingKey as EdVerifyingKey,
 };
@@ -22,10 +26,6 @@ const ED25519_SIG_LEN: usize = 64;
 const MLDSA65_SIG_LEN: usize = 3309;
 /// The serialized [`HybridSignature`] length: `Ed25519(64) ‖ ML-DSA-65(3309)`.
 pub const HYBRID_SIG_LEN: usize = ED25519_SIG_LEN + MLDSA65_SIG_LEN;
-/// Ed25519 verifying-key length (bytes).
-const ED25519_VK_LEN: usize = 32;
-/// ML-DSA-65 verifying-key length (bytes).
-const MLDSA65_VK_LEN: usize = 1952;
 /// The serialized [`HybridVerifier`] length: `Ed25519(32) ‖ ML-DSA-65(1952)`.
 pub const HYBRID_VK_LEN: usize = ED25519_VK_LEN + MLDSA65_VK_LEN;
 

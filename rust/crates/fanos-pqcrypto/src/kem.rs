@@ -6,6 +6,10 @@
 
 use alloc::vec::Vec;
 
+// Public-key lengths come from the one byte-model in `fanos_primitives::keys` (single source of truth
+// for the identity bundle); the round-trip tests below pin them to the real RustCrypto sizes.
+use fanos_primitives::keys::MLKEM768_PK_LEN as MLKEM768_EK_LEN;
+use fanos_primitives::keys::X25519_PK_LEN as X25519_LEN;
 use ml_kem::array::Array;
 use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, KeySizeUser, MlKem768};
 use rand_core::CryptoRng;
@@ -42,13 +46,10 @@ pub struct HybridCiphertext {
 pub type SessionKey = [u8; 32];
 
 /// Serialized hybrid-ciphertext length: `X25519 ephemeral (32) ‖ ML-KEM-768 ciphertext (1088)`.
-pub const CIPHERTEXT_LEN: usize = 32 + 1088;
-
-/// ML-KEM-768 encapsulation-key length (FIPS 203).
-const MLKEM768_EK_LEN: usize = 1184;
+pub const CIPHERTEXT_LEN: usize = X25519_LEN + 1088;
 
 /// Serialized hybrid public-key length: `X25519 (32) ‖ ML-KEM-768 encapsulation key (1184)`.
-pub const PUBLIC_LEN: usize = 32 + MLKEM768_EK_LEN;
+pub const PUBLIC_LEN: usize = X25519_LEN + MLKEM768_EK_LEN;
 
 impl HybridCiphertext {
     /// Serialize to `CIPHERTEXT_LEN` bytes (for the wire).

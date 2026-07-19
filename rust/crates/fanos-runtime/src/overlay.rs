@@ -24,8 +24,8 @@ use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 const PUBLISH_ORIGIN: u8 = 0;
 /// Storage `Publish` sub-type: a replica copy — store it, do not re-fan-out.
 const PUBLISH_REPLICA: u8 = 1;
-/// The DHT key-digest / storage-address length (BLAKE3-256).
-const DIGEST: usize = 32;
+/// The DHT key-digest / storage-address length (BLAKE3-256) — the one canonical digest width.
+const DIGEST: usize = fanos_primitives::DIGEST_LEN;
 
 use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
