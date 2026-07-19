@@ -118,12 +118,10 @@ impl<F: Field> HierAddr<F> {
     /// Compact and fixed-per-depth, so an address travels on the overlay wire like any coordinate.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + self.path.len() * 12);
+        let mut out = Vec::with_capacity(1 + self.path.len() * crate::TRIPLE_WIRE_LEN);
         out.push(self.path.len() as u8);
         for p in &self.path {
-            for w in p.coords() {
-                out.extend_from_slice(&w.to_be_bytes());
-            }
+            out.extend_from_slice(&crate::encode_triple(p.coords()));
         }
         out
     }
@@ -135,18 +133,13 @@ impl<F: Field> HierAddr<F> {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&depth, rest) = bytes.split_first()?;
         let depth = depth as usize;
-        if depth == 0 || depth > MAX_DEPTH || rest.len() != depth * 12 {
+        if depth == 0 || depth > MAX_DEPTH || rest.len() != depth * crate::TRIPLE_WIRE_LEN {
             return None;
         }
         let mut path = Vec::with_capacity(depth);
-        let (coords, _) = rest.as_chunks::<12>();
+        let (coords, _) = rest.as_chunks::<{ crate::TRIPLE_WIRE_LEN }>();
         for coord in coords {
-            let (quads, _) = coord.as_chunks::<4>();
-            let mut w = [0u32; 3];
-            for (slot, quad) in w.iter_mut().zip(quads) {
-                *slot = u32::from_be_bytes(*quad);
-            }
-            path.push(Point::new(w)?);
+            path.push(Point::new(crate::decode_triple(coord)?)?);
         }
         Some(Self { path })
     }

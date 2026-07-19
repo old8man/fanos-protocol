@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use fanos_crypto::{hash_labeled, label};
 use fanos_field::Field;
-use fanos_geometry::{Point, Triple};
+use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
 use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use quinn::{ClientConfig, ServerConfig};
@@ -70,7 +70,7 @@ fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// Bytes of a HELLO: three little-endian `u32`s (a projective coordinate).
-const HELLO_LEN: usize = 12;
+const HELLO_LEN: usize = fanos_geometry::TRIPLE_WIRE_LEN;
 /// Per-frame receive cap. Onion/Tessera frames are far smaller; this only bounds abuse.
 const MAX_FRAME: usize = 1 << 20;
 
@@ -727,36 +727,3 @@ async fn read_frames(
     }
 }
 
-/// Encode a coordinate as 12 little-endian bytes.
-fn encode_triple(t: Triple) -> [u8; HELLO_LEN] {
-    let mut out = [0u8; HELLO_LEN];
-    out[0..4].copy_from_slice(&t[0].to_le_bytes());
-    out[4..8].copy_from_slice(&t[1].to_le_bytes());
-    out[8..12].copy_from_slice(&t[2].to_le_bytes());
-    out
-}
-
-/// Decode a coordinate from exactly 12 little-endian bytes.
-fn decode_triple(b: &[u8]) -> Option<Triple> {
-    let bytes: [u8; HELLO_LEN] = b.try_into().ok()?;
-    let x = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    let y = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    let z = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    Some([x, y, z])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn triple_codec_round_trips() {
-        let t = [7u32, 0, 1];
-        assert_eq!(decode_triple(&encode_triple(t)), Some(t));
-    }
-
-    #[test]
-    fn short_hello_is_rejected() {
-        assert_eq!(decode_triple(&[0u8; 4]), None);
-    }
-}

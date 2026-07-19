@@ -32,7 +32,9 @@ pub mod hierarchy;
 mod flag;
 mod plane;
 
-pub use element::{Triple, canonicalize, cross, dot};
+pub use element::{
+    TRIPLE_WIRE_LEN, Triple, canonicalize, cross, decode_triple, dot, encode_triple,
+};
 pub use flag::Flag;
 pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, next_hop, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};

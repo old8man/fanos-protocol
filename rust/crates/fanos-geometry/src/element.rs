@@ -11,6 +11,41 @@ use fanos_field::Field;
 /// A homogeneous coordinate triple, stored as three canonical `GF(q)` element codes.
 pub type Triple = [u32; 3];
 
+/// The fixed serialized width of a [`Triple`] as a field-agnostic overlay/transport address:
+/// `x‖y‖z`, each a 4-byte **big-endian** `u32`.
+pub const TRIPLE_WIRE_LEN: usize = 12;
+
+/// Encode a [`Triple`] as its canonical 12-byte wire form (`x‖y‖z`, each big-endian `u32`).
+///
+/// This is the field-agnostic address form used wherever a coordinate travels as an opaque
+/// transport/overlay address (a `Triple`, its field erased). It is deliberately distinct from
+/// `fanos_wire::encode_point`, which serializes a *typed* `Point<F>` at the field-optimal width
+/// (`⌈log₂q/8⌉` bytes per element). Big-endian is the one canonical spelling across the whole stack
+/// (spec §7.1 "one encoding") — every coordinate serializer must agree, or two nodes disagree on the
+/// same bytes.
+#[inline]
+#[must_use]
+pub fn encode_triple(t: Triple) -> [u8; TRIPLE_WIRE_LEN] {
+    let [x, y, z] = t;
+    let ([x0, x1, x2, x3], [y0, y1, y2, y3], [z0, z1, z2, z3]) =
+        (x.to_be_bytes(), y.to_be_bytes(), z.to_be_bytes());
+    [x0, x1, x2, x3, y0, y1, y2, y3, z0, z1, z2, z3]
+}
+
+/// Decode a [`Triple`] from exactly [`TRIPLE_WIRE_LEN`] big-endian bytes, or `None` on a wrong length.
+/// The inverse of [`encode_triple`].
+#[inline]
+#[must_use]
+pub fn decode_triple(bytes: &[u8]) -> Option<Triple> {
+    let [x0, x1, x2, x3, y0, y1, y2, y3, z0, z1, z2, z3]: [u8; TRIPLE_WIRE_LEN] =
+        bytes.try_into().ok()?;
+    Some([
+        u32::from_be_bytes([x0, x1, x2, x3]),
+        u32::from_be_bytes([y0, y1, y2, y3]),
+        u32::from_be_bytes([z0, z1, z2, z3]),
+    ])
+}
+
 /// The cross product `a × b` over `GF(q)`.
 ///
 /// This single operation is FANOS's O(1) rendezvous (spec §2.2): the join of two points is
@@ -80,5 +115,28 @@ pub fn is_canonical(a: Triple) -> bool {
         [0, 0, z] => z == 1,
         [0, y, _] => y == 1,
         [x, _, _] => x == 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triple_wire_codec_round_trips_big_endian() {
+        for t in [[0u32, 0, 1], [7, 0, 1], [1, 2, 3], [u32::MAX, 0, u32::MAX]] {
+            let bytes = encode_triple(t);
+            assert_eq!(bytes.len(), TRIPLE_WIRE_LEN);
+            assert_eq!(decode_triple(&bytes), Some(t));
+        }
+        // Big-endian is the canonical spelling: the top byte of x leads.
+        assert_eq!(encode_triple([0x0102_0304, 0, 0])[0], 0x01);
+    }
+
+    #[test]
+    fn decode_triple_rejects_wrong_length() {
+        assert_eq!(decode_triple(&[0u8; 4]), None);
+        assert_eq!(decode_triple(&[0u8; TRIPLE_WIRE_LEN + 1]), None);
+        assert_eq!(decode_triple(&[]), None);
     }
 }
