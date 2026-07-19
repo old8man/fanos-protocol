@@ -28,11 +28,13 @@ extern crate alloc;
 
 pub mod element;
 pub mod fano;
+pub mod hierarchy;
 mod flag;
 mod plane;
 
 pub use element::{Triple, canonicalize, cross, dot};
 pub use flag::Flag;
+pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};
 
 // Re-export the field crate so downstream users get a matched version.

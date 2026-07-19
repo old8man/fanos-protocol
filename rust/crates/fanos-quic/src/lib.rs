@@ -42,5 +42,5 @@ pub use driver::{
 pub use harness::{
     Cell, DEFAULT_GRIND_LIMIT, credentials_for_point, spawn_cell, spawn_pinned,
 };
-pub use identity::coordinate_from_cert;
+pub use identity::{coordinate_at_level, coordinate_from_cert, hierarchical_coordinate};
 pub use tls::{NodeCredentials, TlsError};
