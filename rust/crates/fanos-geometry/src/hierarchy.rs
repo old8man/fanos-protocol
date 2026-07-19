@@ -30,9 +30,25 @@ pub const MAX_DEPTH: usize = 8;
 /// A hierarchical node address: a non-empty path of projective points, coarsest first. `path[0]` is the
 /// node's point in the top cell; `path[i]` is its point in the sub-cell rooted at `path[i-1]`. Depth 1
 /// is an ordinary single-plane coordinate.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone)]
 pub struct HierAddr<F: Field> {
     path: Vec<Point<F>>,
+}
+
+// `Eq`/`Debug` keyed on `path` only (mirroring `Point`/`Line`), so `F` needs no `PartialEq`/`Eq`/`Debug`
+// bound: a `HierAddr<F>` is comparable and printable for *every* field. The overlay routing table relies
+// on this — it compares generic `HierAddr<F>` to resolve a peer, where `F` is only bounded by `Field`.
+impl<F: Field> PartialEq for HierAddr<F> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+impl<F: Field> Eq for HierAddr<F> {}
+impl<F: Field> core::fmt::Debug for HierAddr<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("HierAddr").field(&self.path).finish()
+    }
 }
 
 impl<F: Field> HierAddr<F> {

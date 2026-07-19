@@ -16,7 +16,7 @@ use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
-use fanos_geometry::{HierAddr, Plane, Point, Triple, fano};
+use fanos_geometry::{HierAddr, Plane, Point, Triple, fano, next_hop};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -125,6 +125,16 @@ struct Peer {
     reported_down: bool,
 }
 
+/// The forwarding decision for a `RouteHier` frame at a node (see [`OverlayNode::hier_route`]).
+enum HierRoute {
+    /// This node is in the destination cell — deliver the payload locally.
+    Deliver,
+    /// Forward to this transport coordinate, one hop closer to the destination.
+    Forward(Triple),
+    /// Not the destination and no known peer is closer — drop (a routing hole).
+    Drop,
+}
+
 /// The base overlay node engine, generic over the cell's field `F`.
 pub struct OverlayNode<F: Field> {
     coord: Point<F>,
@@ -132,6 +142,14 @@ pub struct OverlayNode<F: Field> {
     /// single-plane case — and is deepened only when the node descends into a sub-cell on a collision
     /// (§L0). It governs hierarchical (`RouteHier`) forwarding; single-plane routing is unchanged.
     hier: HierAddr<F>,
+    /// Learned hierarchical peers reachable in one hop: each overlay [`HierAddr`] mapped to the
+    /// **transport** coordinate that reaches it. Empty on a single-plane node (transport ≡ overlay);
+    /// populated as the node learns sub-cell gateways and siblings (a deployment seed, or JOIN/Announce).
+    /// `RouteHier` forwarding is greedy longest-prefix over these keys — the physical peer whose address
+    /// shares the most levels with the destination ([`next_hop`]). This is what lets a node route
+    /// *through* cells it is not a member of, and it decouples the node's transport coordinate (`coord`)
+    /// from its overlay address (`hier`), exactly as a flat transport underlays a structured overlay.
+    hier_peers: Vec<(HierAddr<F>, Triple)>,
     config: Config,
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
@@ -271,6 +289,7 @@ impl<F: Field> OverlayNode<F> {
         Self {
             coord,
             hier: HierAddr::root(coord),
+            hier_peers: Vec::new(),
             config,
             started_at: Instant::default(),
             peers,
@@ -515,14 +534,15 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
-    /// Seat this node at a deeper hierarchical address (builder). A node keeps the default depth-1
-    /// `root(coord)` unless it descended into a sub-cell on a collision; `hier.point_at(0)` must equal
-    /// `coord` (the address roots at the node's top-cell point). Ignored otherwise.
+    /// Seat this node at an overlay hierarchical address (builder), decoupled from its transport `coord`.
+    /// A depth-1 node keeps the default `root(coord)`; a node that descended into a sub-cell (§L0), or a
+    /// deployment that assigns transport addresses independently of overlay position, seats a deeper or
+    /// different address here. Only the (type-guaranteed non-empty) address is needed — routing reads
+    /// `hier`, transport reads `coord`, and the two need not coincide past depth 1 (a flat transport
+    /// underlaying a structured overlay).
     #[must_use]
     pub fn with_hier_address(mut self, hier: HierAddr<F>) -> Self {
-        if hier.point_at(0) == Some(self.coord) {
-            self.hier = hier;
-        }
+        self.hier = hier;
         self
     }
 
@@ -532,18 +552,59 @@ impl<F: Field> OverlayNode<F> {
         &self.hier
     }
 
-    /// The next-hop coordinate toward hierarchical destination `dst`, or `None` if this node is already
-    /// in `dst`'s cell (the message is delivered here). The recursive rendezvous collapsed to one step:
-    /// with `cp = commonPrefix(self, dst)`, forward to `dst.point_at(cp)` — `dst`'s own point at the
-    /// level where the paths first diverge (or the next level down when this node is an ancestor). That
-    /// hop is one prefix level closer, so forwarding converges in `≤ dst.depth` hops (§L1, `O(k)`).
+    /// Register a hierarchical peer reachable in one hop — its overlay [`HierAddr`] and the transport
+    /// coordinate that reaches it — replacing any existing entry for that address. This *is* the
+    /// hierarchical routing table: `RouteHier` frames are forwarded greedily over it. A single-plane
+    /// node needs none (transport ≡ overlay); a deployment or the membership layer seeds it for depth > 1.
+    pub fn learn_hier_peer(&mut self, addr: HierAddr<F>, transport: Triple) {
+        if let Some(slot) = self.hier_peers.iter_mut().find(|(a, _)| *a == addr) {
+            slot.1 = transport;
+        } else {
+            self.hier_peers.push((addr, transport));
+        }
+    }
+
+    /// Builder form of [`learn_hier_peer`](Self::learn_hier_peer).
+    #[must_use]
+    pub fn with_hier_peer(mut self, addr: HierAddr<F>, transport: Triple) -> Self {
+        self.learn_hier_peer(addr, transport);
+        self
+    }
+
+    /// Resolve the forwarding decision for hierarchical destination `dst` (§L1). If this node is already
+    /// in `dst`'s cell it delivers. Otherwise, with **learned peers**, it routes greedily by longest
+    /// shared prefix ([`next_hop`]) and resolves the chosen overlay address to its transport coordinate —
+    /// the physical hop one level closer, so forwarding converges in `≤ dst.depth − commonPrefix` hops. A
+    /// node with **no learned peers** (the bootstrap origin, or a single populated plane) targets `dst`'s
+    /// own point at the divergence level directly. No closer peer and not the destination ⇒ drop (hole).
+    fn hier_route(&self, dst: &HierAddr<F>) -> HierRoute {
+        if self.hier.common_prefix(dst) == dst.depth() {
+            return HierRoute::Deliver;
+        }
+        if !self.hier_peers.is_empty() {
+            let reachable: Vec<HierAddr<F>> =
+                self.hier_peers.iter().map(|(a, _)| a.clone()).collect();
+            return match next_hop(&self.hier, dst, &reachable) {
+                Some(next) => self
+                    .hier_peers
+                    .iter()
+                    .find(|(a, _)| *a == next)
+                    .map_or(HierRoute::Drop, |(_, t)| HierRoute::Forward(*t)),
+                None => HierRoute::Drop,
+            };
+        }
+        dst.point_at(self.hier.common_prefix(dst))
+            .map_or(HierRoute::Drop, |p| HierRoute::Forward(p.coords()))
+    }
+
+    /// The next-hop transport coordinate toward `dst`, or `None` if this node delivers `dst` locally or
+    /// has no route to it. A thin accessor over [`hier_route`](Self::hier_route) for drivers and tests.
     #[must_use]
     pub fn hier_next_hop(&self, dst: &HierAddr<F>) -> Option<Triple> {
-        let cp = self.hier.common_prefix(dst);
-        if cp == dst.depth() {
-            return None;
+        match self.hier_route(dst) {
+            HierRoute::Forward(next) => Some(next),
+            HierRoute::Deliver | HierRoute::Drop => None,
         }
-        dst.point_at(cp).map(|p| p.coords())
     }
 
     /// Originate a hierarchical send to `dst`: deliver locally if we are its cell, else emit a
@@ -551,19 +612,22 @@ impl<F: Field> OverlayNode<F> {
     /// uses to reach a multi-level destination (the single-plane [`on_send`](Self::on_send) is unchanged).
     pub fn send_hier(&mut self, dst: &HierAddr<F>, payload: &[u8]) -> Vec<Effect> {
         self.self_activity = self.self_activity.saturating_add(1);
-        let mut body = dst.encode();
-        body.extend_from_slice(payload);
-        match self.hier_next_hop(dst) {
-            None => alloc::vec![Effect::Notify(Notification::Delivered {
+        match self.hier_route(dst) {
+            HierRoute::Deliver => alloc::vec![Effect::Notify(Notification::Delivered {
                 from: self.coord.coords(),
                 payload: payload.to_vec(),
             })],
-            Some(next) => alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, &body))],
+            HierRoute::Forward(next) => {
+                let mut body = dst.encode();
+                body.extend_from_slice(payload);
+                alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, &body))]
+            }
+            HierRoute::Drop => Vec::new(),
         }
     }
 
     /// Handle an incoming `RouteHier` frame (`HierAddr(dst) ‖ payload`): deliver if we are in the
-    /// destination cell, else forward one cell closer (see [`hier_next_hop`](Self::hier_next_hop)). The
+    /// destination cell, else forward one cell closer (see [`hier_route`](Self::hier_route)). The
     /// destination address travels unchanged, so every hop re-derives its own next step.
     fn on_route_hier(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(&depth) = body.first() else {
@@ -574,8 +638,8 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         };
         let payload = body.get(addr_len..).unwrap_or(&[]);
-        match self.hier_next_hop(&dst) {
-            None => {
+        match self.hier_route(&dst) {
+            HierRoute::Deliver => {
                 let a = self.activity.entry(from).or_insert(0);
                 *a = a.saturating_add(1);
                 alloc::vec![Effect::Notify(Notification::Delivered {
@@ -583,7 +647,10 @@ impl<F: Field> OverlayNode<F> {
                     payload: payload.to_vec(),
                 })]
             }
-            Some(next) => alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, body))],
+            HierRoute::Forward(next) => {
+                alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, body))]
+            }
+            HierRoute::Drop => Vec::new(),
         }
     }
 
