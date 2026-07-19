@@ -167,6 +167,28 @@ impl<T: Wire> Wire for Vec<T> {
     }
 }
 
+/// A double-ended queue, encoded exactly like [`Vec<T>`] (varint count ‖ elements) — the ring-buffer
+/// history tiers persist their finalized buckets this way, and it decodes with the same input-bounded
+/// allocation guard.
+impl<T: Wire> Wire for alloc::collections::VecDeque<T> {
+    fn wire_encode(&self, out: &mut Vec<u8>) {
+        varint::encode(self.len() as u64, out);
+        for elem in self {
+            elem.wire_encode(out);
+        }
+    }
+    fn wire_decode(cur: &mut &[u8]) -> Result<Self, WireError> {
+        let (len, consumed) = varint::decode(cur)?;
+        *cur = cur.get(consumed..).ok_or(WireError::UnexpectedEnd)?;
+        let len = usize::try_from(len).map_err(|_| WireError::ValueTooLarge)?;
+        let mut out = Self::with_capacity(len.min(cur.len()));
+        for _ in 0..len {
+            out.push_back(T::wire_decode(cur)?);
+        }
+        Ok(out)
+    }
+}
+
 /// An optional value: a 1-byte canonical tag (`0` = none, `1` = some) then, if present, the value.
 /// Any other tag byte is non-canonical and rejected (the one-encoding rule).
 impl<T: Wire> Wire for Option<T> {
@@ -233,6 +255,10 @@ mod tests {
         round_trip(&Some(7u32));
         round_trip(&Option::<u32>::None);
         round_trip(&alloc::vec![Some(1u8), None, Some(2)]); // Vec<Option<T>>
+        // VecDeque encodes identically to Vec (varint count ‖ elements).
+        let dq: alloc::collections::VecDeque<u32> = alloc::vec![10u32, 20, 30].into();
+        round_trip(&dq);
+        assert_eq!(dq.to_wire(), alloc::vec![10u32, 20, 30].to_wire());
     }
 
     #[test]

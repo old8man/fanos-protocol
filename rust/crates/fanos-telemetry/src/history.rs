@@ -21,11 +21,15 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
+use fanos_wire::Wire;
+
 use crate::frame::CoherenceFrame;
 use crate::sysmetrics::SystemSample;
 
 /// One resolution-bucket: an aggregate of a scalar metric over a fixed time window.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// The canonical byte layout is the field order — `#[derive(Wire)]` emits
+/// `start_nanos(8B BE) ‖ count(4B BE) ‖ min ‖ max ‖ mean ‖ last` (each `f64` big-endian bits, spec §7.1).
+#[derive(Clone, Copy, PartialEq, Debug, fanos_wire_derive::Wire)]
 pub struct Bucket {
     /// Window start (nanoseconds, aligned to the tier resolution).
     pub start_nanos: u64,
@@ -171,7 +175,9 @@ impl Tier {
 }
 
 /// A single scalar metric over time at multiple resolutions (the RRD).
-#[derive(Clone, Debug)]
+/// `#[derive(Wire)]` emits the varint-counted [`Tier`] list; `record` no-ops on an empty series, so the
+/// decode needs no separate non-empty guard.
+#[derive(Clone, Debug, fanos_wire_derive::Wire)]
 pub struct Series {
     tiers: Vec<Tier>,
 }
@@ -228,7 +234,7 @@ impl Series {
 
 /// A metric identifier — an open space so overlays add their own series. Well-known ids below;
 /// application-defined metrics should use `>= APP_BASE`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, fanos_wire_derive::Wire)]
 pub struct MetricId(pub u16);
 
 impl MetricId {
@@ -356,21 +362,30 @@ impl MetricStore {
     /// snapshot, so history survives a restart. Append-only structure makes this cheap and lossless.
     #[must_use]
     pub fn snapshot(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let body = Snapshot {
+            config: self
+                .config
+                .tiers
+                .iter()
+                .map(|&(resolution_nanos, cap)| TierConfig {
+                    resolution_nanos,
+                    capacity: cap as u32,
+                })
+                .collect(),
+            entries: self
+                .series
+                .iter()
+                .map(|(&id, series)| SeriesEntry {
+                    id,
+                    series: series.clone(),
+                })
+                .collect(),
+        };
+        // Frame the derived body with the self-describing `FTS1` magic + version.
+        let mut out = Vec::with_capacity(SNAPSHOT_MAGIC.len() + 1);
         out.extend_from_slice(&SNAPSHOT_MAGIC);
         out.push(SNAPSHOT_VERSION);
-        // Config: the tier specs new series will use.
-        write_u16(&mut out, self.config.tiers.len() as u16);
-        for &(res, cap) in &self.config.tiers {
-            out.extend_from_slice(&res.to_be_bytes());
-            write_u32(&mut out, cap as u32);
-        }
-        // Series.
-        write_u32(&mut out, self.series.len() as u32);
-        for (id, series) in &self.series {
-            out.extend_from_slice(&id.0.to_be_bytes());
-            series.write(&mut out);
-        }
+        body.wire_encode(&mut out);
         out
     }
 
@@ -378,24 +393,24 @@ impl MetricStore {
     /// truncation.
     #[must_use]
     pub fn restore(bytes: &[u8]) -> Option<Self> {
-        let mut cur = bytes;
-        if take::<4>(&mut cur)? != SNAPSHOT_MAGIC || take::<1>(&mut cur)?[0] != SNAPSHOT_VERSION {
+        // Unframe: exact magic then version, then the canonical derived body with no trailing bytes.
+        let rest = bytes.strip_prefix(&SNAPSHOT_MAGIC)?;
+        let (&version, mut cur) = rest.split_first()?;
+        if version != SNAPSHOT_VERSION {
             return None;
         }
-        let tier_count = read_u16(&mut cur)? as usize;
-        let mut tiers = Vec::with_capacity(tier_count);
-        for _ in 0..tier_count {
-            let res = u64::from_be_bytes(take::<8>(&mut cur)?);
-            let cap = read_u32(&mut cur)? as usize;
-            tiers.push((res, cap));
+        let body = Snapshot::wire_decode(&mut cur).ok()?;
+        if !cur.is_empty() {
+            return None; // canonical: no trailing bytes after the snapshot body
         }
-        let config = HistoryConfig { tiers };
-        let series_count = read_u32(&mut cur)?;
-        let mut series = BTreeMap::new();
-        for _ in 0..series_count {
-            let id = MetricId(u16::from_be_bytes(take::<2>(&mut cur)?));
-            series.insert(id, Series::read(&mut cur)?);
-        }
+        let config = HistoryConfig {
+            tiers: body
+                .config
+                .iter()
+                .map(|t| (t.resolution_nanos, t.capacity as usize))
+                .collect(),
+        };
+        let series = body.entries.into_iter().map(|e| (e.id, e.series)).collect();
         Some(Self { config, series })
     }
 }
@@ -403,116 +418,49 @@ impl MetricStore {
 /// Snapshot magic (`FTS1` — Fanos Telemetry Series v1) and version, so the format is self-describing.
 const SNAPSHOT_MAGIC: [u8; 4] = *b"FTS1";
 const SNAPSHOT_VERSION: u8 = 1;
-/// The minimum on-wire size of one serialized [`Bucket`] (`start_nanos` u64 + `count` u32 + four f64s),
-/// used to bound speculative allocation when reading an untrusted finalized-bucket count.
-const BUCKET_BYTES: usize = 8 + 4 + 4 * 8;
 
-fn write_u16(out: &mut Vec<u8>, v: u16) {
-    out.extend_from_slice(&v.to_be_bytes());
-}
-fn write_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_be_bytes());
-}
-fn write_f64(out: &mut Vec<u8>, v: f64) {
-    out.extend_from_slice(&v.to_bits().to_be_bytes());
+/// The wire form of one [`HistoryConfig`] tier spec (`capacity` narrowed to a fixed 4-byte width).
+#[derive(fanos_wire_derive::Wire)]
+struct TierConfig {
+    resolution_nanos: u64,
+    capacity: u32,
 }
 
-fn take<const M: usize>(cur: &mut &[u8]) -> Option<[u8; M]> {
-    let (head, tail) = cur.split_at_checked(M)?;
-    *cur = tail;
-    head.try_into().ok()
-}
-fn read_u16(cur: &mut &[u8]) -> Option<u16> {
-    Some(u16::from_be_bytes(take::<2>(cur)?))
-}
-fn read_u32(cur: &mut &[u8]) -> Option<u32> {
-    Some(u32::from_be_bytes(take::<4>(cur)?))
-}
-fn read_f64(cur: &mut &[u8]) -> Option<f64> {
-    Some(f64::from_bits(u64::from_be_bytes(take::<8>(cur)?)))
+/// One `(id, series)` pair in a store snapshot.
+#[derive(fanos_wire_derive::Wire)]
+struct SeriesEntry {
+    id: MetricId,
+    series: Series,
 }
 
-impl Bucket {
-    fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.start_nanos.to_be_bytes());
-        write_u32(out, self.count);
-        write_f64(out, self.min);
-        write_f64(out, self.max);
-        write_f64(out, self.mean);
-        write_f64(out, self.last);
+/// The full serializable state of a [`MetricStore`] — the tier config new series adopt, then every
+/// series. One `#[derive(Wire)]` yields the entire body codec (composing [`Series`]→[`Tier`]→[`Bucket`]),
+/// so [`MetricStore::snapshot`]/[`restore`](MetricStore::restore) only add the `FTS1` magic + version
+/// frame and never touch a byte by hand.
+#[derive(fanos_wire_derive::Wire)]
+struct Snapshot {
+    config: Vec<TierConfig>,
+    entries: Vec<SeriesEntry>,
+}
+/// [`Tier`] carries a `usize` capacity and a `VecDeque` ring, so it can't plain-derive; this is a thin
+/// composition of the derived [`Bucket`] codec and the generic `VecDeque`/`Option` codecs — the only
+/// bespoke step is narrowing `capacity` to a fixed 4-byte wire width. It is self-describing (it serializes
+/// its own resolution/capacity), so a series round-trips with no external config, and the `VecDeque`
+/// decode inherits the standard input-bounded allocation guard.
+impl Wire for Tier {
+    fn wire_encode(&self, out: &mut Vec<u8>) {
+        self.resolution_nanos.wire_encode(out);
+        (self.capacity as u32).wire_encode(out);
+        self.finalized.wire_encode(out);
+        self.current.wire_encode(out);
     }
-    fn read(cur: &mut &[u8]) -> Option<Self> {
-        Some(Self {
-            start_nanos: u64::from_be_bytes(take::<8>(cur)?),
-            count: read_u32(cur)?,
-            min: read_f64(cur)?,
-            max: read_f64(cur)?,
-            mean: read_f64(cur)?,
-            last: read_f64(cur)?,
+    fn wire_decode(cur: &mut &[u8]) -> Result<Self, fanos_wire::WireError> {
+        Ok(Self {
+            resolution_nanos: u64::wire_decode(cur)?.max(1),
+            capacity: (u32::wire_decode(cur)? as usize).max(1),
+            finalized: VecDeque::<Bucket>::wire_decode(cur)?,
+            current: Option::<Bucket>::wire_decode(cur)?,
         })
-    }
-}
-
-impl Tier {
-    fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.resolution_nanos.to_be_bytes());
-        write_u32(out, self.capacity as u32);
-        write_u32(out, self.finalized.len() as u32);
-        for b in &self.finalized {
-            b.write(out);
-        }
-        match &self.current {
-            Some(b) => {
-                out.push(1);
-                b.write(out);
-            }
-            None => out.push(0),
-        }
-    }
-    fn read(cur: &mut &[u8]) -> Option<Self> {
-        let resolution_nanos = u64::from_be_bytes(take::<8>(cur)?);
-        let capacity = read_u32(cur)? as usize;
-        let n = read_u32(cur)? as usize;
-        // Never speculatively allocate on an untrusted count: a crafted snapshot can claim ~4.29B
-        // finalized buckets and force a multi-hundred-GB `VecDeque` allocation before a single bucket
-        // is validated. Cap the reservation to what the remaining bytes could actually supply (each
-        // bucket occupies at least `BUCKET_BYTES`); if `n` overstates it, `Bucket::read` returns `None`
-        // mid-loop and the whole restore fails cleanly. Mirrors the `members.min(..)` cap in the
-        // threshold-onion parser.
-        let mut finalized = VecDeque::with_capacity(n.min(cur.len() / BUCKET_BYTES));
-        for _ in 0..n {
-            finalized.push_back(Bucket::read(cur)?);
-        }
-        let current = match take::<1>(cur)?[0] {
-            0 => None,
-            _ => Some(Bucket::read(cur)?),
-        };
-        Some(Self {
-            resolution_nanos: resolution_nanos.max(1),
-            capacity: capacity.max(1),
-            finalized,
-            current,
-        })
-    }
-}
-
-impl Series {
-    fn write(&self, out: &mut Vec<u8>) {
-        write_u16(out, self.tiers.len() as u16);
-        for t in &self.tiers {
-            t.write(out);
-        }
-    }
-    fn read(cur: &mut &[u8]) -> Option<Self> {
-        let n = read_u16(cur)? as usize;
-        let mut tiers = Vec::with_capacity(n);
-        for _ in 0..n {
-            tiers.push(Tier::read(cur)?);
-        }
-        if tiers.is_empty() {
-            return None;
-        }
-        Some(Self { tiers })
     }
 }
 
@@ -658,16 +606,17 @@ mod tests {
         // hundreds of GB); it returns None cleanly once the promised buckets fail to materialize. The
         // random-bytes proptest never reaches this path — arbitrary bytes almost never carry the FTS1
         // magic — so this hand-crafted vector is the only cover for the untrusted-length allocation.
+        use fanos_wire::varint;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&SNAPSHOT_MAGIC);
         bytes.push(SNAPSHOT_VERSION);
-        write_u16(&mut bytes, 0); // config: no tier specs
-        write_u32(&mut bytes, 1); // one series follows
-        write_u16(&mut bytes, 0); // series id (u16)
-        write_u16(&mut bytes, 1); // the series carries one tier
+        varint::encode(0, &mut bytes); // config: no tier specs
+        varint::encode(1, &mut bytes); // one series entry follows
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // series id — MetricId(0)
+        varint::encode(1, &mut bytes); // the series carries one tier
         bytes.extend_from_slice(&1u64.to_be_bytes()); // tier resolution
-        write_u32(&mut bytes, 1); // tier capacity
-        write_u32(&mut bytes, u32::MAX); // finalized count — hostile, with no buckets following
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // tier capacity
+        varint::encode(u64::from(u32::MAX), &mut bytes); // finalized count — hostile, no buckets following
         assert!(
             MetricStore::restore(&bytes).is_none(),
             "an impossible finalized-bucket count is rejected, not speculatively allocated"
@@ -677,16 +626,16 @@ mod tests {
         let mut ok = Vec::new();
         ok.extend_from_slice(&SNAPSHOT_MAGIC);
         ok.push(SNAPSHOT_VERSION);
-        write_u16(&mut ok, 0);
-        write_u32(&mut ok, 1);
-        write_u16(&mut ok, 0);
-        write_u16(&mut ok, 1);
+        varint::encode(0, &mut ok);
+        varint::encode(1, &mut ok);
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        varint::encode(1, &mut ok);
         ok.extend_from_slice(&1u64.to_be_bytes());
-        write_u32(&mut ok, 4);
-        write_u32(&mut ok, 2); // claims two finalized buckets but supplies one → still rejected
-        // one bucket: start_nanos u64, count u32, four f64s
+        ok.extend_from_slice(&1u32.to_be_bytes()); // tier capacity
+        varint::encode(2, &mut ok); // claims two finalized buckets but supplies one → still rejected
+        // one bucket: start_nanos u64, count u32, four f64s (the derived Bucket field order)
         ok.extend_from_slice(&0u64.to_be_bytes());
-        write_u32(&mut ok, 1);
+        ok.extend_from_slice(&1u32.to_be_bytes());
         for _ in 0..4 {
             ok.extend_from_slice(&0f64.to_be_bytes());
         }
