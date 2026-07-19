@@ -818,8 +818,11 @@ dependencies = [
  "ed25519-dalek",
  "fanos-field",
  "fanos-geometry",
+ "fips203",
  "fips204",
  "proptest",
+ "rand_core 0.6.4",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -1125,6 +1128,18 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "fips203"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8bdb6454f692ca2a2b45cd554c6828c639d7f9c968cf83a678899ec4443a280"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha3 0.10.9",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "fips204"

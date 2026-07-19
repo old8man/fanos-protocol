@@ -10,6 +10,8 @@
 //!   verifier, the single source of truth for the `MapToPoint` descent (§L0, §L1).
 //! * [`shamir`] — Shamir secret sharing over `GF(256)`: the threshold substrate (§L6, §5.2).
 //! * [`keys`] — hybrid PQ key bundles and the node identifier (§L0).
+//! * [`sig`] — hybrid node-identity signatures: Ed25519 + ML-DSA-65, deterministic from a seed (§7.1).
+//! * [`kem`] — hybrid key encapsulation: X25519 + ML-KEM-768, deterministic from a seed (§7.1, §L0).
 //! * [`vrf`] — the VRF surface for epoch-bound coordinate/rendezvous derivation (§L0, §5.6).
 //!
 //! `#![no_std]` with `alloc`; BLAKE3 is the only external dependency.
@@ -21,6 +23,7 @@ extern crate alloc;
 
 pub mod address;
 pub mod hash;
+pub mod kem;
 pub mod keys;
 pub mod maptopoint;
 pub mod shamir;
@@ -29,6 +32,7 @@ pub mod vrf;
 
 pub use address::{address_matches_identity, address_point};
 pub use hash::{DIGEST_LEN, hash_labeled, label};
+pub use kem::{HybridKemKey, hybrid_encapsulate};
 pub use sig::{
     Ed25519SigningKey, HybridSigningKey, MlDsa65SigningKey, ed25519_verify, hybrid_verify,
     mldsa65_verify,

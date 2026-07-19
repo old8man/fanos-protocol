@@ -111,6 +111,17 @@ zeroize = { version = "1", default-features = false }
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
 fips204 = { version = "0.4", default-features = false }
 
+# Hybrid KEM (spec §7.1, §L0): classical X25519 + post-quantum ML-KEM-768 (FIPS 203), combined for
+# forward-secret key agreement. Both `no_std` and driven deterministically from a seed. The combiner is
+# a domain-separated BLAKE3 KDF over both shared secrets and the ciphertext — a standard secure KEM
+# combiner (the hybrid stays IND-CCA as long as either component does).
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
+fips203 = { version = "0.4", default-features = false }
+# ML-KEM encapsulation needs an RNG; we feed a BLAKE3-XOF-seeded deterministic CSPRNG so encaps is
+# reproducible in the simulator. Version 0.6 matches fips203's `CryptoRngCore` bound. (X25519 needs no
+# RNG — its secrets are built directly from seed bytes via `From<[u8; 32]>`.)
+rand_core = { version = "0.6", default-features = false }
+
 # Terminal UI for the operator observatory (`fanos-monitor`): a native, embedded-friendly TUI — no
 # browser, minimal resources. `crossterm` is the terminal backend.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
