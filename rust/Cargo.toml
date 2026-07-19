@@ -111,6 +111,7 @@ fanos-quic = { path = "crates/fanos-quic", version = "0.1.0" }
 fanos-session = { path = "crates/fanos-session", version = "0.1.0" }
 fanos-rendezvous = { path = "crates/fanos-rendezvous", version = "0.1.0" }
 fanos-proxy = { path = "crates/fanos-proxy", version = "0.1.0" }
+fanos-node = { path = "crates/fanos-node", version = "0.1.0" }
 
 # External dependencies (isolated to the crypto/privacy layers and above).
 blake3 = { version = "1", default-features = false }

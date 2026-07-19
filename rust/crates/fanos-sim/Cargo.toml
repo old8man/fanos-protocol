@@ -42,8 +42,10 @@ fanos-calypso.workspace = true
 fanos-onoma.workspace = true
 # For the NYX mixnet scenarios (anonymity-set entropy math).
 fanos-nyx = { workspace = true, features = ["std"] }
-# For the networked DKG scenario (DkgNode engine driven over the sim).
+# For the networked DKG scenario (DkgNode engine driven over the sim), and the MixRelay composite (via
+# fanos-node) for the E4∩E5 mix-relay scenario.
 fanos-keygen.workspace = true
+fanos-node.workspace = true
 # For crafting the adversary's dealing in the Byzantine-equivocating-dealer DKG scenario.
 fanos-vrf.workspace = true
 # For crafting Byzantine/forged frames in the adversary scenarios.

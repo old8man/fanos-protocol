@@ -21,6 +21,7 @@ pub mod diaulos;
 pub mod epoch_driver;
 pub mod error;
 pub mod identity;
+pub mod mix_relay;
 pub mod mixdir;
 pub mod node;
 pub mod rendezvous;
@@ -33,6 +34,7 @@ pub use diaulos::{
 pub use epoch_driver::EpochDriver;
 pub use error::NodeError;
 pub use fanos_onoma::Epoch;
+pub use mix_relay::MixRelay;
 pub use mixdir::{build_mix_directory, publish_mix_key, resolve_mix_key};
 pub use node::{Health, Node};
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
