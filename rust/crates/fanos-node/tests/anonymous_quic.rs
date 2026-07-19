@@ -23,8 +23,13 @@ use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng}
 use fanos_proxy::{Dialer, Target};
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_rendezvous::{
-    ANONYMOUS, MixDirectory, RendezvousService, SessionId, combiner_for, meeting_line, seal_forward,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousService, SessionId, combiner_for, meeting_line,
+    seal_forward,
 };
+
+/// The epoch's public randomness beacon, shared by the service (which listens on the derived meeting
+/// line) and the client (which dials it) so both compute the same line (audit E5).
+const TEST_BEACON: BeaconSeed = BeaconSeed::new([0x5E; 32]);
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, Triple};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -104,7 +109,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     // The service's rotating meeting line for this epoch, and a first hop distinct from it.
     let service_pubkey = b"anon-quic-service";
     let epoch = fanos_rendezvous::Epoch::new(4);
-    let meeting = meeting_line::<F2>(service_pubkey, epoch).coords();
+    let meeting = meeting_line::<F2>(service_pubkey, epoch, &TEST_BEACON).coords();
     let hop = (0..7)
         .map(|i| Line::<F2>::at(i).coords())
         .find(|&l| l != meeting)
@@ -206,7 +211,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public.clone();
     let epoch = fanos_rendezvous::Epoch::new(5);
-    let meeting = meeting_line::<F2>(&service_public.encode(), epoch).coords();
+    let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
     let l_index = Point::<F2>::new(l_combiner).unwrap().index();
 
@@ -232,6 +237,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         directory: mix,
         threshold: t as u8,
         epoch,
+        beacon: TEST_BEACON,
     };
     // Dial through the production seam: a FanosDialer on the anonymous profile resolves the name to the
     // service key and rides the DIAULOS session over the mixnet (the coordinate is unused anonymously —

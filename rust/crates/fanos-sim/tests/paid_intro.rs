@@ -14,12 +14,15 @@
     clippy::cast_possible_truncation
 )]
 
-use fanos_calypso::{HiddenService, client_descriptor_key, descriptor_key, pow};
+use fanos_calypso::{BeaconSeed, HiddenService, client_descriptor_key, descriptor_key, pow};
 use fanos_field::F2;
 use fanos_incentives::{Credit, CreditIssuer, Redemption, finalize, request};
 use fanos_runtime::{Command, Config, Duration, Triple};
 use fanos_sim::{Sim, spawn_cell};
 use rand_core::{CryptoRng, RngCore};
+
+/// The epoch's public randomness beacon, folded into descriptor keys (audit E5); fixed for this test.
+const BEACON: BeaconSeed = BeaconSeed::new([0xB1; 32]);
 
 /// The PoW difficulty gating an introduction (small, for a fast test).
 const POW_BITS: u32 = 8;
@@ -119,7 +122,7 @@ fn an_anonymous_credit_pays_for_a_calypso_introduction_exactly_once() {
     let epoch = fanos_calypso::Epoch::new(5);
     let service_node = cell[0];
     let client_node = cell[3];
-    let key = descriptor_key(service.pubkey(), epoch);
+    let key = descriptor_key(service.pubkey(), epoch, &BEACON);
     sim.inject(
         service_node,
         Command::Put {
@@ -130,7 +133,7 @@ fn an_anonymous_credit_pays_for_a_calypso_introduction_exactly_once() {
     sim.run_for(Duration::from_millis(1000));
 
     // Client: verify the self-certifying address, compute the same key, fetch the descriptor.
-    let client_key = client_descriptor_key(&address, service.pubkey(), epoch).unwrap();
+    let client_key = client_descriptor_key(&address, service.pubkey(), epoch, &BEACON).unwrap();
     sim.inject(
         client_node,
         Command::Get {

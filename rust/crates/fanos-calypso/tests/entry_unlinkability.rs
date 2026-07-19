@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use fanos_calypso::{Epoch, rendezvous_line};
+use fanos_calypso::{BeaconSeed, Epoch, rendezvous_line};
 use fanos_field::F7;
 use fanos_geometry::{Plane, Triple};
 
@@ -35,9 +35,11 @@ fn identity(i: u32) -> [u8; 4] {
     i.to_be_bytes()
 }
 
-/// The entry (rendezvous) line an identity uses at `epoch`, as a comparable bucket key.
+/// The entry (rendezvous) line an identity uses at `epoch`, as a comparable bucket key. The beacon is
+/// held fixed across epochs here (this test studies per-identity spread, not beacon unpredictability),
+/// so the line still rotates by epoch exactly as in production.
 fn entry_line(id: &[u8], epoch: u32) -> Triple {
-    rendezvous_line::<F7>(id, Epoch::new(epoch.into())).coords()
+    rendezvous_line::<F7>(id, Epoch::new(epoch.into()), &BeaconSeed::new([0xB7; 32])).coords()
 }
 
 /// Histogram of entry lines over identities `0..count` at `epoch`.

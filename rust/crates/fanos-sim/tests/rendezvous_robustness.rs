@@ -17,12 +17,18 @@ use fanos_aphantos::threshold_router::line_member_coords;
 use fanos_field::{F2, Field, GfP};
 use fanos_geometry::{Line, Point, Triple};
 use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
-use fanos_rendezvous::{ANONYMOUS, MixDirectory, combiner_for, meeting_line, seal_forward};
+use fanos_rendezvous::{
+    ANONYMOUS, BeaconSeed, MixDirectory, combiner_for, meeting_line, seal_forward,
+};
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
 
 /// GF(3): the field of the next projective plane up from Fano, PG(2,3).
 type F3 = GfP<3>;
+
+/// A fixed live-epoch beacon seed for these derivation tests, held constant across epochs (the line
+/// still rotates by epoch; the beacon's per-epoch variation is exercised in the beacon's own tests).
+const BEACON: BeaconSeed = BeaconSeed::new([0x5B; 32]);
 
 /// Spawn a `ThresholdRouter` at every point of PG(2,q) for field `F`, returning the members' key
 /// directory. Every point's KEM key is recorded (so sealing always succeeds); a router is *omitted*
@@ -72,7 +78,8 @@ fn a_deeper_multi_hop_circuit_still_delivers() {
     let t = 2usize;
     let dir = spawn_plane::<F2>(&mut sim, t, &[]);
 
-    let meeting = meeting_line::<F2>(b"deep-svc", fanos_rendezvous::Epoch::new(2)).coords();
+    let meeting =
+        meeting_line::<F2>(b"deep-svc", fanos_rendezvous::Epoch::new(2), &BEACON).coords();
     let others: Vec<Triple> = (0..7)
         .map(|i| Line::<F2>::at(i).coords())
         .filter(|&l| l != meeting)
@@ -97,7 +104,8 @@ fn threshold_extremes_still_deliver() {
     for t in [1usize, 3usize] {
         let mut sim = Sim::new(0x7700 + t as u64);
         let dir = spawn_plane::<F2>(&mut sim, t, &[]);
-        let meeting = meeting_line::<F2>(b"thr-svc", fanos_rendezvous::Epoch::new(1)).coords();
+        let meeting =
+            meeting_line::<F2>(b"thr-svc", fanos_rendezvous::Epoch::new(1), &BEACON).coords();
         let hop = (0..7)
             .map(|i| Line::<F2>::at(i).coords())
             .find(|&l| l != meeting)
@@ -119,7 +127,8 @@ fn threshold_extremes_still_deliver() {
 fn a_hop_starved_below_threshold_does_not_deliver() {
     let mut sim = Sim::new(0xDEAD);
     let t = 2usize;
-    let meeting = meeting_line::<F2>(b"starve-svc", fanos_rendezvous::Epoch::new(1)).coords();
+    let meeting =
+        meeting_line::<F2>(b"starve-svc", fanos_rendezvous::Epoch::new(1), &BEACON).coords();
     // Keep the combiner (the onion's entry point) live but silence the other members, so the final hop
     // has only 1 < t=2 live members and can never be reconstructed.
     let members = line_member_coords::<F2>(meeting);
@@ -145,7 +154,7 @@ fn rendezvous_generalises_to_a_larger_plane_pg_2_3() {
     // PG(2,3): 13 points, 13 lines of 4 points each.
     let dir = spawn_plane::<F3>(&mut sim, t, &[]);
 
-    let meeting = meeting_line::<F3>(b"f3-svc", fanos_rendezvous::Epoch::new(1)).coords();
+    let meeting = meeting_line::<F3>(b"f3-svc", fanos_rendezvous::Epoch::new(1), &BEACON).coords();
     let hop = (0..13)
         .map(|i| Line::<F3>::at(i).coords())
         .find(|&l| l != meeting)
@@ -167,7 +176,7 @@ fn the_meeting_line_rotates_across_epochs() {
     let key = b"rotating-service";
     // Over a span of epochs the meeting line takes several distinct values — no fixed rendezvous point.
     let distinct: std::collections::BTreeSet<Triple> = (0..20u32)
-        .map(|e| meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into())).coords())
+        .map(|e| meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into()), &BEACON).coords())
         .collect();
     assert!(
         distinct.len() > 1,
@@ -178,7 +187,7 @@ fn the_meeting_line_rotates_across_epochs() {
     let mut sim = Sim::new(0xE0E0);
     let t = 2usize;
     let dir = spawn_plane::<F2>(&mut sim, t, &[]);
-    let l5 = meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(5)).coords();
+    let l5 = meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(5), &BEACON).coords();
     let hop = (0..7)
         .map(|i| Line::<F2>::at(i).coords())
         .find(|&l| l != l5)
@@ -198,7 +207,7 @@ fn the_meeting_line_rotates_across_epochs() {
     if let Some(other_c) = (0..20u32)
         .map(|e| {
             combiner_for::<F2>(
-                meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into())).coords(),
+                meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into()), &BEACON).coords(),
             )
             .unwrap()
         })

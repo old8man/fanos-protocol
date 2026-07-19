@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use fanos_calypso::balance::{InstanceRef, MasterDescriptor, SigningKeyCert, delegation_message};
-use fanos_calypso::{Epoch, ServiceAddress, master_descriptor_key};
+use fanos_calypso::{BeaconSeed, Epoch, ServiceAddress, master_descriptor_key};
 use fanos_field::F2;
 use fanos_pqcrypto::sig::HybridSignature;
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
@@ -115,7 +115,7 @@ fn a_master_domain_load_balances_across_verified_backends_over_the_overlay() {
 
     // Publish the signed descriptor to the L4 store at the master's per-epoch descriptor key.
     let publisher = cell[6];
-    let key = master_descriptor_key(&root_pubkey, epoch);
+    let key = master_descriptor_key(&root_pubkey, epoch, &BeaconSeed::new([0xBA; 32]));
     sim.inject(
         publisher,
         Command::Put {

@@ -22,6 +22,7 @@ extern crate alloc;
 pub mod address;
 #[cfg(feature = "aead")]
 pub mod aead;
+pub mod beacon;
 pub mod epoch;
 pub mod hash;
 pub mod keys;
@@ -30,6 +31,7 @@ pub mod shamir;
 pub mod vrf;
 
 pub use address::{address_matches_identity, address_point};
+pub use beacon::BeaconSeed;
 pub use epoch::Epoch;
 pub use hash::{DIGEST_LEN, hash_labeled, label, subkey};
 pub use keys::{HybridPublicKey, NodeId};

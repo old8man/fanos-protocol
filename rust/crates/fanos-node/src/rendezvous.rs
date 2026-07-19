@@ -17,7 +17,7 @@ use fanos_field::{F2, Field};
 use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
-use fanos_rendezvous::{ANONYMOUS, MixDirectory, RendezvousClient, meeting_line};
+use fanos_rendezvous::{ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, meeting_line};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, stream_over_channels_paced};
 use rand_core::CryptoRng;
@@ -130,6 +130,10 @@ pub struct RendezvousRoute {
     pub threshold: u8,
     /// The rendezvous epoch — the meeting line rotates each epoch, so there is no fixed target.
     pub epoch: Epoch,
+    /// The epoch's randomness-beacon seed, folded into the meeting-line derivation so a future epoch's
+    /// line is unpredictable in advance (audit E5). The client obtains it via a `BEACON` sync; both
+    /// parties must use the same epoch's seed to meet. [`BeaconSeed::GENESIS`] before the first round.
+    pub beacon: BeaconSeed,
 }
 
 /// Dial a service **anonymously** by its static KEM public key — the anonymous analogue of
@@ -151,7 +155,7 @@ pub fn anonymous_dial<R: CryptoRng>(
     secret: &[u8],
     rng: &mut R,
 ) -> DuplexStream {
-    let meeting = meeting_line::<F2>(&service_public.encode(), route.epoch).coords();
+    let meeting = meeting_line::<F2>(&service_public.encode(), route.epoch, &route.beacon).coords();
     let mut forward_circuit = route.forward_hops.clone();
     forward_circuit.push(meeting);
     let rclient = RendezvousClient::<F2>::new(
@@ -187,7 +191,8 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_seals_outbound_and_surfaces_only_anonymous_replies() {
         let dir = fano_directory();
-        let meeting = meeting_line::<F2>(b"anon-svc", Epoch::new(1)).coords();
+        let meeting =
+            meeting_line::<F2>(b"anon-svc", Epoch::new(1), &BeaconSeed::new([0x0E; 32])).coords();
         let hop = (0..7)
             .map(|i| Line::<F2>::at(i).coords())
             .find(|&l| l != meeting)

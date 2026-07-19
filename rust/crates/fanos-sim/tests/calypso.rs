@@ -7,10 +7,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_calypso::{Epoch, HiddenService, client_descriptor_key, descriptor_key, pow};
+use fanos_calypso::{BeaconSeed, Epoch, HiddenService, client_descriptor_key, descriptor_key, pow};
 use fanos_field::F2;
 use fanos_runtime::{Command, Config, Duration, Triple};
 use fanos_sim::{Sim, spawn_cell};
+
+/// The epoch's public randomness beacon, folded into descriptor keys (audit E5); fixed across this
+/// test so keys still rotate by epoch exactly as in production.
+const BEACON: BeaconSeed = BeaconSeed::new([0xCA; 32]);
 
 /// The PoW difficulty gating an introduction (small, for a fast test).
 const POW_BITS: u32 = 8;
@@ -44,7 +48,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
     let client_node = cell[3];
 
     // Service publishes its contact descriptor at the epoch rendezvous key.
-    let key = descriptor_key(service.pubkey(), epoch);
+    let key = descriptor_key(service.pubkey(), epoch, &BEACON);
     sim.inject(
         service_node,
         Command::Put {
@@ -55,7 +59,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
     sim.run_for(Duration::from_millis(1000));
 
     // Client verifies the self-certifying address, PoW-gates the intro, computes the SAME key.
-    let client_key = client_descriptor_key(&address, service.pubkey(), epoch).unwrap();
+    let client_key = client_descriptor_key(&address, service.pubkey(), epoch, &BEACON).unwrap();
     assert_eq!(
         client_key, key,
         "client derives the service's rendezvous key"
@@ -66,7 +70,7 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
         "the intro PoW is valid"
     );
     // A forged key that the address does not certify yields no rendezvous at all.
-    assert!(client_descriptor_key(&address, b"forged-key", epoch).is_none());
+    assert!(client_descriptor_key(&address, b"forged-key", epoch, &BEACON).is_none());
 
     // Client fetches the descriptor from the store.
     sim.inject(client_node, Command::Get { key: client_key });
@@ -98,8 +102,8 @@ fn hidden_service_hosting_and_client_meeting_over_the_overlay() {
 
     // The rendezvous moves every epoch — no static location to seize.
     assert_ne!(
-        descriptor_key(service.pubkey(), epoch),
-        descriptor_key(service.pubkey(), epoch.next())
+        descriptor_key(service.pubkey(), epoch, &BEACON),
+        descriptor_key(service.pubkey(), epoch.next(), &BEACON)
     );
 }
 
@@ -108,6 +112,6 @@ fn a_client_with_only_the_address_cannot_forge_the_rendezvous() {
     // Only a public key the address certifies yields the rendezvous key (self-certifying, §12.2).
     let service = HiddenService::new(b"another-service".to_vec());
     let address = *service.address();
-    assert!(client_descriptor_key(&address, service.pubkey(), Epoch::new(3)).is_some());
-    assert!(client_descriptor_key(&address, b"impostor", Epoch::new(3)).is_none());
+    assert!(client_descriptor_key(&address, service.pubkey(), Epoch::new(3), &BEACON).is_some());
+    assert!(client_descriptor_key(&address, b"impostor", Epoch::new(3), &BEACON).is_none());
 }

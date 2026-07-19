@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use fanos_calypso::{Epoch, rendezvous_line};
+use fanos_calypso::{BeaconSeed, Epoch, rendezvous_line};
 use fanos_field::F7;
 use fanos_geometry::{Line, Plane, Triple};
 
@@ -47,9 +47,16 @@ impl Lcg {
     }
 }
 
-/// The rendezvous (entry) line a service occupies at `epoch`.
+/// The rendezvous (entry) line a service occupies at `epoch`. The beacon is held fixed across epochs
+/// here (this test studies epoch rotation, not beacon unpredictability), so the line still rotates by
+/// epoch exactly as in production where each epoch's beacon differs.
 fn line_of(service: &[u8], epoch: u32) -> Triple {
-    rendezvous_line::<F7>(service, Epoch::new(epoch.into())).coords()
+    rendezvous_line::<F7>(
+        service,
+        Epoch::new(epoch.into()),
+        &BeaconSeed::new([0xB7; 32]),
+    )
+    .coords()
 }
 
 /// Parameters of one SDA scenario.

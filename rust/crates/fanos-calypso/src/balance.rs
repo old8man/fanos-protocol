@@ -31,7 +31,7 @@
 use alloc::vec::Vec;
 
 use fanos_geometry::Triple;
-use fanos_primitives::{Epoch, hash_labeled};
+use fanos_primitives::{BeaconSeed, Epoch, hash_labeled};
 use fanos_wire::Wire;
 use fanos_wire::element::encode_bytes;
 
@@ -279,12 +279,13 @@ impl MasterDescriptor {
     }
 }
 
-/// The L4 storage key under which a master publishes its balanced descriptor for `epoch` — the same
-/// per-epoch rendezvous key a single service uses, so a client with only the root key and address
-/// finds it with no directory. (Alias of [`crate::descriptor_key`] over the root key.)
+/// The L4 storage key under which a master publishes its balanced descriptor for `epoch` under the
+/// epoch's randomness `beacon` — the same per-epoch rendezvous key a single service uses, so a client
+/// with only the root key and address finds it with no directory. (Alias of [`crate::descriptor_key`]
+/// over the root key.)
 #[must_use]
-pub fn master_descriptor_key(root_pubkey: &[u8], epoch: Epoch) -> Vec<u8> {
-    crate::descriptor_key(root_pubkey, epoch)
+pub fn master_descriptor_key(root_pubkey: &[u8], epoch: Epoch, beacon: &BeaconSeed) -> Vec<u8> {
+    crate::descriptor_key(root_pubkey, epoch, beacon)
 }
 
 /// The weighted rendezvous score of one instance for a selector: `weight · uniform_hash`.

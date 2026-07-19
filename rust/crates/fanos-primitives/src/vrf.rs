@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::{Line, Point};
 
+use crate::beacon::BeaconSeed;
 use crate::epoch::Epoch;
 use crate::hash::{hash_labeled, label};
 use crate::keys::NodeId;
@@ -53,13 +54,22 @@ pub fn coordinate_for<F: Field>(node: &NodeId, epoch: Epoch) -> Point<F> {
     coordinate_from_vrf::<F>(&seed)
 }
 
-/// Derive a private rendezvous line from a shared secret and epoch (spec §5.6, §12.2):
-/// `L_rdv = MapToLine(VRF(secret, epoch))`. Reference derivation, ECVRF in production.
+/// Derive a private rendezvous line from a shared secret, epoch, and the epoch's randomness `beacon`
+/// (spec §5.6, §12.2, audit E5): `L_rdv = MapToLine(H(secret ‖ epoch ‖ beacon))`. Folding the beacon
+/// in is what makes a future epoch's line unpredictable — without it the line is a public function of
+/// the (long-lived) shared secret and epoch, computable arbitrarily far ahead. Reference derivation
+/// (ECVRF/DVRF beacon in production); both parties, holding the same secret and the epoch's public
+/// beacon seed, derive the same line with no lookup.
 #[must_use]
-pub fn rendezvous_line<F: Field>(shared_secret: &[u8], epoch: Epoch) -> Line<F> {
-    let mut input = Vec::with_capacity(shared_secret.len() + 4);
+pub fn rendezvous_line<F: Field>(
+    shared_secret: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> Line<F> {
+    let mut input = Vec::with_capacity(shared_secret.len() + 4 + 32);
     input.extend_from_slice(shared_secret);
     input.extend_from_slice(&epoch.low32_be_bytes());
+    input.extend_from_slice(beacon.as_bytes());
     map_to_line::<F>(label::RDV, &input)
 }
 
@@ -89,12 +99,21 @@ mod tests {
     }
 
     #[test]
-    fn rendezvous_line_rotates_with_epoch() {
+    fn rendezvous_line_rotates_with_epoch_and_beacon() {
         let secret = b"shared-pake-output";
-        let l0 = rendezvous_line::<F31>(secret, Epoch::ZERO);
-        let l1 = rendezvous_line::<F31>(secret, Epoch::new(1));
+        let beacon = BeaconSeed::new([7u8; 32]);
+        let l0 = rendezvous_line::<F31>(secret, Epoch::ZERO, &beacon);
+        let l1 = rendezvous_line::<F31>(secret, Epoch::new(1), &beacon);
         assert_ne!(l0, l1, "L_rdv rotates each epoch (spec §5.6)");
-        // Both parties with the same secret+epoch derive the same line.
-        assert_eq!(l0, rendezvous_line::<F31>(secret, Epoch::ZERO));
+        // Both parties with the same secret+epoch+beacon derive the same line.
+        assert_eq!(l0, rendezvous_line::<F31>(secret, Epoch::ZERO, &beacon));
+        // E5: a different beacon seed for the same (secret, epoch) yields a different line — so a
+        // future epoch's line is unknowable until its beacon is revealed.
+        let other = BeaconSeed::new([8u8; 32]);
+        assert_ne!(
+            l0,
+            rendezvous_line::<F31>(secret, Epoch::ZERO, &other),
+            "the meeting line depends on the epoch beacon (unpredictable-ahead)"
+        );
     }
 }

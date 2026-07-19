@@ -232,7 +232,12 @@ mod tests {
     #[test]
     fn seal_send_draws_fresh_key_material_per_onion() {
         let dir = fano_directory();
-        let meeting = meeting_line::<F2>(b"svc", crate::Epoch::new(1)).coords();
+        let meeting = meeting_line::<F2>(
+            b"svc",
+            crate::Epoch::new(1),
+            &crate::BeaconSeed::new([0x0E; 32]),
+        )
+        .coords();
         let hop = (0..7).map(line).find(|&l| l != meeting).unwrap();
         let mut c =
             RendezvousClient::<F2>::new(vec![hop, meeting], vec![line(3)], dir, 2, b"secret");

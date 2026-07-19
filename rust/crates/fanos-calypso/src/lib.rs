@@ -38,7 +38,7 @@ pub use rendezvous::rendezvous_line;
 // domain-meaningful alias used across the services code.
 pub use fanos_onoma::Address;
 pub use fanos_onoma::Address as ServiceAddress;
-pub use fanos_primitives::Epoch;
+pub use fanos_primitives::{BeaconSeed, Epoch};
 
 /// A hidden service — its public key and self-certifying address (spec Part XII).
 pub struct HiddenService {
@@ -66,36 +66,40 @@ impl HiddenService {
         &self.pubkey
     }
 
-    /// The service's rendezvous line for `epoch` (spec §12.2).
+    /// The service's rendezvous line for `epoch` under the epoch's randomness `beacon` (spec §12.2,
+    /// audit E5).
     #[must_use]
-    pub fn rendezvous_line<F: Field>(&self, epoch: Epoch) -> Line<F> {
-        rendezvous_line::<F>(&self.pubkey, epoch)
+    pub fn rendezvous_line<F: Field>(&self, epoch: Epoch, beacon: &BeaconSeed) -> Line<F> {
+        rendezvous_line::<F>(&self.pubkey, epoch, beacon)
     }
 }
 
 /// The client side: given a `.fanos` address and the service's public key, verify the address
-/// self-certifies the key and derive the same rendezvous line the service uses (spec §12.2).
-/// Returns `None` if the address does not certify the key.
+/// self-certifies the key and derive the same rendezvous line the service uses for `epoch` under its
+/// randomness `beacon` (spec §12.2, audit E5). Returns `None` if the address does not certify the key.
 #[must_use]
 pub fn client_meeting_line<F: Field>(
     address: &ServiceAddress,
     service_pubkey: &[u8],
     epoch: Epoch,
+    beacon: &BeaconSeed,
 ) -> Option<Line<F>> {
     address
         .verifies(service_pubkey)
-        .then(|| rendezvous_line::<F>(service_pubkey, epoch))
+        .then(|| rendezvous_line::<F>(service_pubkey, epoch, beacon))
 }
 
-/// The L4 storage key under which a service publishes its contact descriptor for `epoch` — the
-/// rendezvous realized over the distributed store (spec §12.2). Both the service and any client
-/// with the service's public key derive it identically; it rotates every epoch, so a censor
-/// cannot pin a static location. The overlay hashes this to a responsible point (`MapToPoint`).
+/// The L4 storage key under which a service publishes its contact descriptor for `epoch` under the
+/// epoch's randomness `beacon` — the rendezvous realized over the distributed store (spec §12.2, audit
+/// E5). Both the service and any client with the service's public key derive it identically; it rotates
+/// every epoch *and* with the beacon, so a censor can neither pin a static location nor pre-compute the
+/// next epoch's. The overlay hashes this to a responsible point (`MapToPoint`).
 #[must_use]
-pub fn descriptor_key(service_pubkey: &[u8], epoch: Epoch) -> Vec<u8> {
-    let mut key = Vec::with_capacity(service_pubkey.len() + 4);
+pub fn descriptor_key(service_pubkey: &[u8], epoch: Epoch, beacon: &BeaconSeed) -> Vec<u8> {
+    let mut key = Vec::with_capacity(service_pubkey.len() + 4 + 32);
     key.extend_from_slice(service_pubkey);
     key.extend_from_slice(&epoch.low32_be_bytes());
+    key.extend_from_slice(beacon.as_bytes());
     key
 }
 
@@ -107,10 +111,11 @@ pub fn client_descriptor_key(
     address: &ServiceAddress,
     service_pubkey: &[u8],
     epoch: Epoch,
+    beacon: &BeaconSeed,
 ) -> Option<Vec<u8>> {
     address
         .verifies(service_pubkey)
-        .then(|| descriptor_key(service_pubkey, epoch))
+        .then(|| descriptor_key(service_pubkey, epoch, beacon))
 }
 
 #[cfg(test)]
@@ -119,6 +124,9 @@ mod tests {
     //! The end-to-end CALYPSO contact flow, without a directory.
     use super::*;
     use fanos_field::F31;
+
+    /// A fixed non-genesis beacon seed standing for a live epoch's public beacon value.
+    const BEACON: BeaconSeed = BeaconSeed::new([0xC1; 32]);
 
     #[test]
     fn client_and_service_meet_with_no_directory() {
@@ -129,20 +137,20 @@ mod tests {
         // A client that learns (address, pubkey) verifies the binding and computes the SAME
         // rendezvous line the service listens on — no HSDir lookup anywhere.
         let epoch = Epoch::new(42);
-        let client_line =
-            client_meeting_line::<F31>(&address, service.pubkey(), epoch).expect("certifies");
-        assert_eq!(client_line, service.rendezvous_line::<F31>(epoch));
+        let client_line = client_meeting_line::<F31>(&address, service.pubkey(), epoch, &BEACON)
+            .expect("certifies");
+        assert_eq!(client_line, service.rendezvous_line::<F31>(epoch, &BEACON));
 
         // A forged pubkey that does not match the address is rejected.
-        assert!(client_meeting_line::<F31>(&address, b"forged", epoch).is_none());
+        assert!(client_meeting_line::<F31>(&address, b"forged", epoch, &BEACON).is_none());
     }
 
     #[test]
     fn the_meeting_point_moves_every_epoch() {
         let service = HiddenService::new(b"svc".to_vec());
         assert_ne!(
-            service.rendezvous_line::<F31>(Epoch::new(100)),
-            service.rendezvous_line::<F31>(Epoch::new(101))
+            service.rendezvous_line::<F31>(Epoch::new(100), &BEACON),
+            service.rendezvous_line::<F31>(Epoch::new(101), &BEACON)
         );
     }
 
@@ -150,7 +158,7 @@ mod tests {
     fn full_flow_address_rendezvous_pow_threshold() {
         // Address + rendezvous + a PoW-gated intro + threshold hosting, composed.
         let service = HiddenService::new(b"whole-flow-key".to_vec());
-        let line = service.rendezvous_line::<F31>(Epoch::new(7));
+        let line = service.rendezvous_line::<F31>(Epoch::new(7), &BEACON);
         assert!(line.coords()[0] <= 1); // canonical line
 
         // The client attaches a PoW to its intro cookie.

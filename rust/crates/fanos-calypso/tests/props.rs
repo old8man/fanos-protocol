@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used)]
 
 use fanos_calypso::{
-    Epoch, HiddenService, ServiceAddress, client_meeting_line, pow, rendezvous_line,
+    BeaconSeed, Epoch, HiddenService, ServiceAddress, client_meeting_line, pow, rendezvous_line,
 };
 use fanos_field::F31;
 use proptest::prelude::*;
@@ -30,12 +30,15 @@ proptest! {
     fn client_and_service_derive_the_same_line(
         pubkey in proptest::collection::vec(any::<u8>(), 1..48),
         epoch in 0u32..100_000,
+        beacon_bytes in any::<[u8; 32]>(),
     ) {
         let epoch = Epoch::new(epoch.into());
+        let beacon = BeaconSeed::new(beacon_bytes);
         let service = HiddenService::new(pubkey.clone());
-        let line = client_meeting_line::<F31>(service.address(), &pubkey, epoch).unwrap();
-        prop_assert_eq!(line, service.rendezvous_line::<F31>(epoch));
-        prop_assert_eq!(rendezvous_line::<F31>(&pubkey, epoch), line);
+        // All three derivations (client, service method, free function) agree for any beacon.
+        let line = client_meeting_line::<F31>(service.address(), &pubkey, epoch, &beacon).unwrap();
+        prop_assert_eq!(line, service.rendezvous_line::<F31>(epoch, &beacon));
+        prop_assert_eq!(rendezvous_line::<F31>(&pubkey, epoch, &beacon), line);
     }
 
     /// A PoW solution verifies and also satisfies any lower difficulty.
