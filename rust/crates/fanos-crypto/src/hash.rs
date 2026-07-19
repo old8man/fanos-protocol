@@ -25,6 +25,10 @@ pub mod label {
     pub const NODE_ID: &str = "FANOS-v1/node-id";
     /// Sub-cell descent coordinate: the self-certifying point at a deeper hierarchy level (spec §L1).
     pub const SUBCELL_COORD: &str = "FANOS-v1/subcell-coord";
+    /// Ed25519 signing-key derivation from the node identity seed (hybrid signature, classical half).
+    pub const ID_ED25519: &str = "FANOS-v1/id-ed25519";
+    /// ML-DSA-65 signing-key derivation from the node identity seed (hybrid signature, PQ half).
+    pub const ID_MLDSA65: &str = "FANOS-v1/id-mldsa65";
     /// L4 storage key → responsible point / key digest (`MapToPoint`, spec §L4).
     pub const STORAGE: &str = "FANOS-v1/storage";
     /// ONOMA address commitment: `BLAKE3` of the canonical hybrid key bundle (name system).

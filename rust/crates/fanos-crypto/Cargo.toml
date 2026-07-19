@@ -18,6 +18,7 @@ blake3 = { workspace = true }
 zeroize = { workspace = true, features = ["alloc"] }
 # Hybrid node-identity signatures (spec §7.1): classical Ed25519 + post-quantum ML-DSA-65 (FIPS 204).
 ed25519-dalek = { workspace = true }
+fips204 = { workspace = true, features = ["ml-dsa-65"] }
 
 [features]
 default = ["std"]

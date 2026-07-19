@@ -29,7 +29,10 @@ pub mod vrf;
 
 pub use address::{address_matches_identity, address_point};
 pub use hash::{DIGEST_LEN, hash_labeled, label};
-pub use sig::{Ed25519SigningKey, ed25519_verify};
+pub use sig::{
+    Ed25519SigningKey, HybridSigningKey, MlDsa65SigningKey, ed25519_verify, hybrid_verify,
+    mldsa65_verify,
+};
 pub use keys::{HybridPublicKey, NodeId};
 pub use maptopoint::{map_to_line, map_to_point};
 pub use shamir::{Share, reconstruct, split};
