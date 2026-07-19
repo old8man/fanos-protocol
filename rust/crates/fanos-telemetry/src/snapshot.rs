@@ -29,6 +29,11 @@ pub const R_STAR: f64 = 0.408_248_290_463_863;
 /// Over-coupling bound `1/√3 ≈ 0.5774` — above this the cell loses its self-model (`R < 1/3`, V19).
 pub const OVER_COUPLING: f64 = 0.577_350_269_189_626;
 
+// The collective-subject band is the half-open interval `(r*, 1/√3]`, so its endpoints must be
+// ordered. A compile-time guarantee (stronger than a runtime test): if the published constants were
+// ever mistyped out of order, the crate would fail to build.
+const _: () = assert!(R_STAR < OVER_COUPLING);
+
 /// A cell's vital signs at one observation window, enriched for an operator.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoherenceSnapshot {
@@ -199,7 +204,7 @@ mod tests {
         assert!((OVER_COUPLING - 1.0 / 3.0_f64.sqrt()).abs() < 1e-12, "over-coupling = 1/√3");
         assert!((PURITY_FLOOR - 2.0 / 7.0).abs() < 1e-12, "P_crit = 2/N = 2/7");
         assert!((REFLECTION_FLOOR - 1.0 / 3.0).abs() < 1e-12, "R floor = 1/3");
-        assert!(R_STAR < OVER_COUPLING, "the collective-subject band is (r*, 1/√3]");
+        // The band ordering `r* < 1/√3` is now a compile-time `const _` assertion above.
     }
 
     #[test]
