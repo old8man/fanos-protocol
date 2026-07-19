@@ -18,20 +18,20 @@ path = "src/bin/fanos.rs"
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-runtime = { workspace = true, features = ["std"] }
-fanos-quic = { path = "../fanos-quic", version = "0.1.0" }
+fanos-quic.workspace = true
 # For `.fanos` name resolution: ONOMA addresses/derivations + CALYPSO descriptors.
-fanos-onoma = { path = "../fanos-onoma", version = "0.1.0", features = ["std"] }
-fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+fanos-onoma = { workspace = true, features = ["std"] }
+fanos-calypso.workspace = true
 # DIAULOS reliable encrypted sessions over the node's datagram transport, driven as async streams.
-fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
-fanos-session = { path = "../fanos-session", version = "0.1.0" }
+fanos-diaulos.workspace = true
+fanos-session.workspace = true
 # The anonymous profile: carry the same DIAULOS session over threshold onions to a computed meeting
 # line (the sans-I/O RendezvousClient core, wrapped as an async transport under the identical stream).
-fanos-rendezvous = { path = "../fanos-rendezvous", version = "0.1.0" }
-fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+fanos-rendezvous.workspace = true
+fanos-pqcrypto.workspace = true
 # The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
 # is the integration point that provides a Dialer).
-fanos-proxy = { path = "../fanos-proxy", version = "0.1.0" }
+fanos-proxy.workspace = true
 rand_core = { version = "0.10", default-features = false }
 # OS entropy to seed each dial's ephemeral handshake keys (a fresh CSPRNG per dial).
 getrandom = "0.3"
@@ -57,7 +57,7 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 # The anonymous-profile QUIC e2e spins up a threshold-onion mixnet of real QUIC nodes.
-fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
+fanos-aphantos.workspace = true
 
 [lints]
 workspace = true

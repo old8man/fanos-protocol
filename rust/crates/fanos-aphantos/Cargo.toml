@@ -17,7 +17,7 @@ fanos-primitives = { workspace = true, features = ["std", "aead"] }
 fanos-wire = { workspace = true, features = ["std"] }
 fanos-nyx = { workspace = true, features = ["std"] }
 fanos-runtime = { workspace = true, features = ["std"] }
-fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+fanos-pqcrypto.workspace = true
 rand_core = { version = "0.10", default-features = false }
 
 [dev-dependencies]

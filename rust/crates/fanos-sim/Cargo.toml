@@ -26,30 +26,30 @@ proptest.workspace = true
 # For decoding the mandatory CoherenceFrames nodes emit each diagnosis (telemetry e2e scenario).
 fanos-telemetry = { workspace = true, features = ["std"] }
 # For the DIAULOS-over-overlay scenario (a reliable encrypted session over the datagram transport).
-fanos-diaulos = { path = "../fanos-diaulos", version = "0.1.0" }
+fanos-diaulos.workspace = true
 # For the anonymous-rendezvous scenario (DIAULOS payloads over threshold onions to a meeting line).
-fanos-rendezvous = { path = "../fanos-rendezvous", version = "0.1.0" }
+fanos-rendezvous.workspace = true
 # For the NYX anonymity-routing scenario (real onion over the simulated network).
-fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
-fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+fanos-aphantos.workspace = true
+fanos-pqcrypto.workspace = true
 # For the L4 storage scenarios (computing a key's responsible node, MapToPoint).
 fanos-primitives = { workspace = true, features = ["std"] }
 # For the hierarchy scenario (feeding a child cell's escalation to the parent tier).
 fanos-core = { workspace = true, features = ["std"] }
 # For the CALYPSO hidden-service flow (address, per-epoch rendezvous, PoW) over the overlay.
-fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+fanos-calypso.workspace = true
 # For the ONOMA name-system resolution scenario (address derivations + descriptor publish/resolve).
-fanos-onoma = { path = "../fanos-onoma", version = "0.1.0" }
+fanos-onoma.workspace = true
 # For the NYX mixnet scenarios (anonymity-set entropy math).
 fanos-nyx = { workspace = true, features = ["std"] }
 # For the networked DKG scenario (DkgNode engine driven over the sim).
-fanos-keygen = { path = "../fanos-keygen", version = "0.1.0" }
+fanos-keygen.workspace = true
 # For crafting the adversary's dealing in the Byzantine-equivocating-dealer DKG scenario.
-fanos-vrf = { path = "../fanos-vrf", version = "0.1.0" }
+fanos-vrf.workspace = true
 # For crafting Byzantine/forged frames in the adversary scenarios.
 fanos-wire = { workspace = true, features = ["std"] }
 # For the anonymous paid-introduction scenario (VOPRF relay credits over the CALYPSO flow).
-fanos-incentives = { path = "../fanos-incentives", version = "0.1.0" }
+fanos-incentives.workspace = true
 rand_core = { version = "0.6", default-features = false }
 
 [lints]

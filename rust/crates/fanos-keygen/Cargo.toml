@@ -19,7 +19,7 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-wire = { workspace = true, features = ["std"] }
 fanos-runtime = { workspace = true, features = ["std"] }
-fanos-vrf = { path = "../fanos-vrf", version = "0.1.0" }
+fanos-vrf.workspace = true
 # Wipe this node's DKG secret contribution from memory on drop.
 zeroize = { workspace = true }
 

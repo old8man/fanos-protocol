@@ -12,13 +12,13 @@ categories = ["network-programming", "cryptography"]
 
 [dependencies]
 # The meeting line derivation (client and service compute the same line, no lookup).
-fanos-calypso = { path = "../fanos-calypso", version = "0.1.0" }
+fanos-calypso.workspace = true
 # The threshold onion (a hop is a line) the payloads ride, and its router framing.
-fanos-aphantos = { path = "../fanos-aphantos", version = "0.1.0" }
+fanos-aphantos.workspace = true
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-field = { workspace = true, features = ["std"] }
 # Hybrid KEM public keys of the mixnet members (the onion seals to them).
-fanos-pqcrypto = { path = "../fanos-pqcrypto", version = "0.1.0" }
+fanos-pqcrypto.workspace = true
 
 [lints]
 workspace = true

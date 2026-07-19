@@ -98,6 +98,19 @@ fanos-onoma = { path = "crates/fanos-onoma", version = "0.1.0", default-features
 fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }
 fanos-runtime = { path = "crates/fanos-runtime", version = "0.1.0", default-features = false }
 fanos-telemetry = { path = "crates/fanos-telemetry", version = "0.1.0", default-features = false }
+# Privacy / transport / service layers and the DKG node — declared here so every consumer references
+# them uniformly as `<crate>.workspace = true`, never a bare `path` (one source of truth for versions).
+fanos-proteus = { path = "crates/fanos-proteus", version = "0.1.0", default-features = false }
+fanos-vrf = { path = "crates/fanos-vrf", version = "0.1.0", default-features = false }
+fanos-incentives = { path = "crates/fanos-incentives", version = "0.1.0", default-features = false }
+fanos-aphantos = { path = "crates/fanos-aphantos", version = "0.1.0" }
+fanos-calypso = { path = "crates/fanos-calypso", version = "0.1.0" }
+fanos-diaulos = { path = "crates/fanos-diaulos", version = "0.1.0" }
+fanos-keygen = { path = "crates/fanos-keygen", version = "0.1.0" }
+fanos-quic = { path = "crates/fanos-quic", version = "0.1.0" }
+fanos-session = { path = "crates/fanos-session", version = "0.1.0" }
+fanos-rendezvous = { path = "crates/fanos-rendezvous", version = "0.1.0" }
+fanos-proxy = { path = "crates/fanos-proxy", version = "0.1.0" }
 
 # External dependencies (isolated to the crypto/privacy layers and above).
 blake3 = { version = "1", default-features = false }
@@ -124,10 +137,9 @@ syn = { version = "2", features = ["derive"] }
 quote = "1"
 proc-macro2 = "1"
 
-# Privacy and simulation crates (added as they land).
 fanos-nyx = { path = "crates/fanos-nyx", version = "0.1.0", default-features = false }
 fanos-sim = { path = "crates/fanos-sim", version = "0.1.0", default-features = false }
-fanos-observatory = { path = "crates/fanos-observatory", version = "0.1.0", default-features = false }
+# (fanos-observatory, -node, -cli are binary crates — nothing depends on them, so no table entry.)
 
 # ----------------------------------------------------------------------------
 # Build profiles. FANOS targets "extreme performance"; the default release build
