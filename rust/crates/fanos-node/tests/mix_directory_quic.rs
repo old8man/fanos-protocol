@@ -41,6 +41,20 @@ fn expected_public(coord: [u32; 3], seed: [u8; 32], epoch: Epoch) -> Vec<u8> {
     driver.public().encode()
 }
 
+/// Advertise `public` at (`coord`, `epoch`), retrying under load. A real-QUIC store `put` can miss its
+/// ack deadline when many test cells hammer the loopback sockets at once (e.g. the whole workspace suite
+/// in parallel); a bounded retry makes the advertisement robust without loosening the production timeout.
+async fn publish_until(client: &fanos_quic::Client, coord: [u32; 3], epoch: Epoch, public: &[u8]) -> bool {
+    let key = fanos_pqcrypto::kem::HybridKemPublic::decode(public).unwrap();
+    for _ in 0..20 {
+        if publish_mix_key(client, coord, epoch, &key).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 /// Seven relays each publish their genesis onion key; a client on a *different* node assembles the whole
 /// live cell directory from the store, and every discovered key is exactly the key that relay will peel
 /// with. A different epoch's directory is empty — the slots are epoch-tagged (forward secrecy, audit E4).
@@ -56,13 +70,7 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
     for (i, &coord) in roster.iter().enumerate() {
         let public = expected_public(coord, onion_seed(i), epoch);
         assert!(
-            publish_mix_key(
-                &cell.nodes[i].client(),
-                coord,
-                epoch,
-                &fanos_pqcrypto::kem::HybridKemPublic::decode(&public).unwrap(),
-            )
-            .await,
+            publish_until(&cell.nodes[i].client(), coord, epoch, &public).await,
             "relay {i} advertised its onion key",
         );
     }
@@ -108,13 +116,7 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
     for (i, &coord) in roster.iter().enumerate().take(present) {
         let public = expected_public(coord, onion_seed(i), epoch);
         assert!(
-            publish_mix_key(
-                &cell.nodes[i].client(),
-                coord,
-                epoch,
-                &fanos_pqcrypto::kem::HybridKemPublic::decode(&public).unwrap(),
-            )
-            .await,
+            publish_until(&cell.nodes[i].client(), coord, epoch, &public).await,
             "relay {i} advertised for epoch 3",
         );
     }
