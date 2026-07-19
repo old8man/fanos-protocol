@@ -117,6 +117,19 @@ blake3 = { version = "1", default-features = false }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 # Secret-material zeroization (wipe key bytes on drop). `no_std`; crates opt into `alloc` as needed.
 zeroize = { version = "1", default-features = false }
+# `libm` float backend for the no_std DIAKRISIS/NYX math (an optional dep in those crates).
+libm = { version = "0.2", default-features = false }
+# The RustCrypto RNG trait line (0.10), used by the PQ-KEM/onion/driver crates. NB: fanos-vrf,
+# -incentives, and -sim pin rand_core 0.6 locally — the curve25519-dalek v4 / vrf-r255 ecosystem —
+# a genuine two-major-version split that collapses only when those upstreams migrate.
+rand_core = { version = "0.10", default-features = false }
+# ristretto255 group ops for the verifiable-crypto crates (ECVRF, VOPRF).
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+
+# Async runtime + tracing for the I/O driver layer (quic/node/proxy/session). Base version here; each
+# driver selects only the tokio features it needs.
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # The real post-quantum hybrid primitives (Ed25519+ML-DSA-65, X25519+ML-KEM-768) live in the
 # `fanos-pqcrypto` crate (RustCrypto `ed25519-dalek`/`x25519-dalek`/`ml-kem`/`ml-dsa`, all `no_std`),

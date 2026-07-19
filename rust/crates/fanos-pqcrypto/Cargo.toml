@@ -20,7 +20,7 @@ ml-kem = { version = "0.3", default-features = false, features = ["alloc"] }
 ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "rand_core"] }
 sha3 = { version = "0.11", default-features = false }
 # rand_core 0.10 matches the RustCrypto crates above (via crypto-common 0.2).
-rand_core = { version = "0.10", default-features = false }
+rand_core.workspace = true
 blake3 = { workspace = true }
 # The canonical node-ID hash rule + the NodeId type live in the light primitives core; deriving the
 # node identifier here goes through it (one source of truth), so the two crates cannot drift.

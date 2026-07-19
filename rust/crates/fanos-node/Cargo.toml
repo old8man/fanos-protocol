@@ -32,10 +32,10 @@ fanos-pqcrypto.workspace = true
 # The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
 # is the integration point that provides a Dialer).
 fanos-proxy.workspace = true
-rand_core = { version = "0.10", default-features = false }
+rand_core.workspace = true
 # OS entropy to seed each dial's ephemeral handshake keys (a fresh CSPRNG per dial).
-getrandom = "0.3"
-tokio = { version = "1", default-features = false, features = [
+getrandom = "0.4.3"
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "time",
@@ -43,7 +43,7 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "io-util",
 ] }
-tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "ansi",
@@ -51,7 +51,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "time",

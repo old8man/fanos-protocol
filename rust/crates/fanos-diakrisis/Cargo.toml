@@ -15,7 +15,7 @@ fanos-field.workspace = true
 fanos-geometry.workspace = true
 fanos-code.workspace = true
 # Float math for no_std builds (std uses hardware intrinsics instead).
-libm = { version = "0.2", default-features = false, optional = true }
+libm = { workspace = true, optional = true }
 
 [features]
 default = ["std"]

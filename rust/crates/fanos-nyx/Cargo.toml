@@ -15,7 +15,7 @@ fanos-field.workspace = true
 fanos-geometry.workspace = true
 fanos-primitives = { workspace = true, features = ["aead"] }
 blake3 = { workspace = true }
-libm = { version = "0.2", default-features = false, optional = true }
+libm = { workspace = true, optional = true }
 
 [features]
 default = ["std"]

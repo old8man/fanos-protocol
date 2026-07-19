@@ -18,7 +18,7 @@ fanos-wire = { workspace = true, features = ["std"] }
 fanos-nyx = { workspace = true, features = ["std"] }
 fanos-runtime = { workspace = true, features = ["std"] }
 fanos-pqcrypto.workspace = true
-rand_core = { version = "0.10", default-features = false }
+rand_core.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

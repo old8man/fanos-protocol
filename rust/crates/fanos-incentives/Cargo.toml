@@ -17,7 +17,7 @@ categories = ["cryptography"]
 
 [dependencies]
 fanos-primitives = { workspace = true, features = ["alloc"] }
-curve25519-dalek = { version = "4", features = ["rand_core"] }
+curve25519-dalek.workspace = true
 rand_core = { version = "0.6", default-features = false }
 
 [lints]

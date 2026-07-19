@@ -17,7 +17,7 @@ fanos-runtime = { workspace = true, features = ["std"] }
 fanos-pqcrypto.workspace = true
 fanos-primitives = { workspace = true, features = ["aead"] }
 # The `CryptoRng` bound the KEM keygen/encapsulation are generic over (0.10 matches fanos-pqcrypto).
-rand_core = { version = "0.10", default-features = false }
+rand_core.workspace = true
 # Wipe the direction/session AEAD keys and the handshake shared secret on drop.
 zeroize = { workspace = true }
 
