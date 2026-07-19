@@ -29,7 +29,8 @@ pub mod stratum;
 pub use fanos_diakrisis::{Observation, Verdict, diagnose};
 pub use fanos_field::Field;
 pub use fanos_geometry::{Line, Plane, Point};
-pub use fanos_primitives::{Epoch, HybridPublicKey, NodeId};
+pub use fanos_primitives::{BeaconSeed, Epoch, HybridPublicKey, NodeId};
+pub use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
 
 pub use hierarchy::Hierarchy;
 pub use membership::Member;
@@ -46,12 +47,15 @@ pub struct Node<F: Field> {
 }
 
 impl<F: Field> Node<F> {
-    /// Join the cell: derive this node's coordinate for `epoch` from its identity (spec §7.8
-    /// JOIN, steps 3–4).
+    /// Join the cell: derive this node's **verifiable** coordinate for (`epoch`, `beacon`) from its VRF
+    /// secret — `coord = MapToPoint(VRF(vrf_secret, id ‖ epoch ‖ beacon))` (spec §7.8 JOIN steps 3–4).
+    /// `vrf_secret` is the key committed in `id`'s identity bundle; `beacon` is the epoch's beacon seed
+    /// ([`BeaconSeed::GENESIS`] before the first round), so the placement reshuffles unpredictably and is
+    /// unforgeable (§3.2 assumptions 1–2).
     #[must_use]
-    pub fn open(id: NodeId, epoch: Epoch) -> Self {
+    pub fn open(vrf_secret: &VrfSecret, id: NodeId, epoch: Epoch, beacon: &BeaconSeed) -> Self {
         Self {
-            member: Member::assign(id, epoch),
+            member: Member::assign(vrf_secret, id, epoch, beacon),
         }
     }
 
@@ -103,9 +107,19 @@ mod tests {
 
     #[test]
     fn two_nodes_share_a_rendezvous_line() {
-        // The end-to-end overlay flow: two identities → coordinates → a shared meeting line.
-        let alice = Node::<F31>::open(NodeId([1u8; 32]), Epoch::new(5));
-        let bob = Node::<F31>::open(NodeId([2u8; 32]), Epoch::new(5));
+        // The end-to-end overlay flow: two identities → verifiable coordinates → a shared meeting line.
+        let alice = Node::<F31>::open(
+            &VrfSecret::from_seed([1u8; 32]),
+            NodeId([1u8; 32]),
+            Epoch::new(5),
+            &BeaconSeed::GENESIS,
+        );
+        let bob = Node::<F31>::open(
+            &VrfSecret::from_seed([2u8; 32]),
+            NodeId([2u8; 32]),
+            Epoch::new(5),
+            &BeaconSeed::GENESIS,
+        );
         let line = alice.rendezvous_with(&bob.coordinate()).unwrap();
         assert!(alice.coordinate().is_on(&line));
         assert!(bob.coordinate().is_on(&line));
@@ -115,7 +129,12 @@ mod tests {
 
     #[test]
     fn a_node_has_q_plus_one_quorums_that_all_intersect() {
-        let node = Node::<F31>::open(NodeId([3u8; 32]), Epoch::ZERO);
+        let node = Node::<F31>::open(
+            &VrfSecret::from_seed([3u8; 32]),
+            NodeId([3u8; 32]),
+            Epoch::ZERO,
+            &BeaconSeed::GENESIS,
+        );
         let quorums: Vec<_> = node.quorums().collect();
         assert_eq!(quorums.len(), 32);
         // Every pair of the node's quorums intersects (Maekawa); the node itself is common.

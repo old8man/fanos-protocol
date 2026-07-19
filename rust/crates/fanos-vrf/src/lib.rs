@@ -11,12 +11,14 @@
 //! * [`VrfSecret`] / [`VrfPublic`] / [`VrfProof`] wrap the primitive with a small, misuse-resistant
 //!   surface (seed-derivable keys, byte encodings).
 //! * [`prove_coordinate`] / [`verify_coordinate`] lift it to the protocol object: a **verifiable
-//!   projective coordinate** `MapToPoint(VRF(sk, node ‖ epoch))` that rotates every epoch and
-//!   cannot be forged or misreported.
+//!   projective coordinate** `MapToPoint(VRF(sk, node ‖ epoch ‖ beacon))` that rotates every epoch —
+//!   folding the epoch's beacon seed so it is unpredictable ahead of time — and cannot be forged or
+//!   misreported (the `HELLO` proof-of-coordinate, spec §7.3).
 //!
 //! The composition adds no new hardness assumption — ristretto255 discrete log, already assumed by
 //! the X25519/Ed25519 hybrid — and the primitive is a published construction, not a novel one.
 
+#![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
@@ -30,7 +32,7 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_primitives::hash::label;
-use fanos_primitives::{Epoch, map_to_point};
+use fanos_primitives::{BeaconSeed, Epoch, map_to_point};
 use vrf_r255::{Proof, PublicKey, SecretKey};
 
 /// Length of a serialized VRF proof (`Γ ‖ c ‖ s`), in bytes.
@@ -54,20 +56,30 @@ pub struct VrfPublic(PublicKey);
 pub struct VrfProof(Proof);
 
 impl VrfSecret {
-    /// Derive a secret key from any 32-byte seed.
+    /// Derive a secret key from any 32-byte seed — **total**: every seed yields a key.
     ///
-    /// The seed is hashed **uniformly into the scalar field** (a wide reduction of a
-    /// domain-separated XOF), so every seed yields a key. A raw `SecretKey::from_bytes` would
-    /// instead demand an already-canonical scalar (`< ℓ ≈ 2²⁵²`) and reject ~15/16 of random
-    /// seeds — a trap for any caller deriving a VRF key deterministically from a node seed. The
-    /// reduced scalar's canonical bytes are always accepted, so this only returns `None` on the
-    /// (unreachable) event that the reduction is non-canonical.
+    /// The seed is hashed **uniformly into the scalar field** (a wide reduction of a domain-separated
+    /// XOF). A raw `SecretKey::from_bytes` would instead demand an already-canonical scalar
+    /// (`< ℓ ≈ 2²⁵²`) and reject ~15/16 of random seeds — a trap for any caller deriving a VRF key
+    /// deterministically from a node seed. Reducing mod order first makes the bytes always canonical,
+    /// so the construction cannot fail; a node identity can derive its coordinate-VRF key from its seed
+    /// with no error path (spec §L0).
+    ///
+    /// # Panics
+    /// Never in practice: the mod-order reduction yields a scalar `< ℓ`, whose canonical bytes
+    /// `SecretKey::from_bytes` always accepts. The internal assertion only documents that invariant.
     #[must_use]
-    pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
+    pub fn from_seed(seed: [u8; 32]) -> Self {
         let mut wide = [0u8; 64];
         fanos_primitives::hash::hash_xof("FANOS-v1/vrf-seed", &seed, &mut wide);
         let scalar = curve25519_dalek::Scalar::from_bytes_mod_order_wide(&wide);
-        Option::from(SecretKey::from_bytes(scalar.to_bytes())).map(Self)
+        // A mod-order-reduced scalar (< ℓ) has canonical bytes that `SecretKey::from_bytes` always
+        // accepts, so this is total — the reduction above is exactly what guarantees it.
+        #[allow(clippy::expect_used)]
+        Self(
+            Option::from(SecretKey::from_bytes(scalar.to_bytes()))
+                .expect("a mod-order-reduced scalar is a canonical VRF secret key"),
+        )
     }
 
     /// The 32-byte canonical encoding of this secret key.
@@ -133,37 +145,45 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
     map_to_point::<F>(label::COORD, output)
 }
 
-/// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch` (spec §L1 beacon).
-fn beacon_alpha(node_id: &[u8], epoch: Epoch) -> Vec<u8> {
-    let mut alpha = Vec::with_capacity(node_id.len() + 4);
+/// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch_low32_be ‖ beacon_seed`
+/// (spec §L0/§L3 `VRF_beacon`). Folding the epoch's **beacon seed** is what makes the coordinate
+/// *unpredictable ahead of the epoch* — an adversary cannot grind for a future placement it cannot yet
+/// compute (§3.2 assumption 2), the load-bearing anti-pre-settling defence on the base cell.
+fn beacon_alpha(node_id: &[u8], epoch: Epoch, beacon: &BeaconSeed) -> Vec<u8> {
+    let mut alpha = Vec::with_capacity(node_id.len() + 4 + 32);
     alpha.extend_from_slice(node_id);
     alpha.extend_from_slice(&epoch.low32_be_bytes());
+    alpha.extend_from_slice(beacon.as_bytes());
     alpha
 }
 
-/// Prove a node's verifiable coordinate for `epoch`: `MapToPoint(VRF(sk, node_id ‖ epoch))`,
-/// with the proof that lets anyone check the derivation (spec §L1, §L6).
+/// Prove a node's verifiable coordinate for `epoch` under the epoch's `beacon` seed:
+/// `MapToPoint(VRF(sk, node_id ‖ epoch ‖ beacon))`, with the proof that lets anyone check the derivation
+/// (spec §L0, §L3, §7.3 proof-of-coordinate). Use [`BeaconSeed::GENESIS`] before the first beacon round.
 #[must_use]
 pub fn prove_coordinate<F: Field>(
     secret: &VrfSecret,
     node_id: &[u8],
     epoch: Epoch,
+    beacon: &BeaconSeed,
 ) -> (Point<F>, VrfProof) {
-    let (proof, output) = secret.prove(&beacon_alpha(node_id, epoch));
+    let (proof, output) = secret.prove(&beacon_alpha(node_id, epoch, beacon));
     (coordinate_from_output::<F>(&output), proof)
 }
 
-/// Verify that `claimed` is the correct epoch coordinate for the node with `public` key — i.e.
-/// that it equals `MapToPoint(VRF(sk, node_id ‖ epoch))` — without the secret (spec §L1, §L6).
+/// Verify that `claimed` is the correct epoch coordinate for the node with `public` key under the
+/// epoch's `beacon` seed — i.e. that it equals `MapToPoint(VRF(sk, node_id ‖ epoch ‖ beacon))` — without
+/// the secret (spec §L0, §L3, §7.3). This is the check a peer runs on a `HELLO` proof-of-coordinate.
 #[must_use]
 pub fn verify_coordinate<F: Field>(
     public: &VrfPublic,
     node_id: &[u8],
     epoch: Epoch,
+    beacon: &BeaconSeed,
     claimed: &Point<F>,
     proof: &VrfProof,
 ) -> bool {
-    match public.verify(&beacon_alpha(node_id, epoch), proof) {
+    match public.verify(&beacon_alpha(node_id, epoch, beacon), proof) {
         Some(output) => &coordinate_from_output::<F>(&output) == claimed,
         None => false,
     }
@@ -176,7 +196,7 @@ mod tests {
     use fanos_field::F31;
 
     fn secret(seed: u8) -> VrfSecret {
-        VrfSecret::from_seed([seed; 32]).unwrap()
+        VrfSecret::from_seed([seed; 32])
     }
 
     #[test]
@@ -184,14 +204,14 @@ mod tests {
         // Seeds whose raw bytes are NOT a canonical scalar (top bytes 0xFF ⇒ ≥ 2²⁵⁵ > ℓ) would be
         // rejected by a raw `from_bytes`; hashing into the field accepts them and the key works.
         for seed in [[0xFFu8; 32], [0x80; 32], [0xEE; 32], [0x00; 32]] {
-            let sk = VrfSecret::from_seed(seed).unwrap(); // hashed seed is always a valid key
+            let sk = VrfSecret::from_seed(seed); // hashed seed is always a valid key
             let (proof, output) = sk.prove(b"alpha");
             assert_eq!(sk.public().verify(b"alpha", &proof), Some(output));
         }
         // Distinct seeds give distinct keys (the hash is injective in practice).
         assert_ne!(
-            VrfSecret::from_seed([0xFF; 32]).unwrap().to_bytes(),
-            VrfSecret::from_seed([0xEE; 32]).unwrap().to_bytes()
+            VrfSecret::from_seed([0xFF; 32]).to_bytes(),
+            VrfSecret::from_seed([0xEE; 32]).to_bytes()
         );
     }
 
@@ -225,24 +245,27 @@ mod tests {
     fn the_verifiable_coordinate_is_deterministic_and_checks_out() {
         let sk = secret(4);
         let pk = sk.public();
-        let (coord, proof) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(7));
-        // Deterministic: the same key+epoch always yields the same coordinate.
-        let (coord2, _) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(7));
+        let beacon = BeaconSeed::new([0xB7; 32]);
+        let (coord, proof) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(7), &beacon);
+        // Deterministic: the same key+epoch+beacon always yields the same coordinate.
+        let (coord2, _) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(7), &beacon);
         assert_eq!(coord, coord2);
         // Anyone with the public key verifies the coordinate without the secret.
         assert!(verify_coordinate::<F31>(
             &pk,
             b"node-A",
             Epoch::new(7),
+            &beacon,
             &coord,
             &proof
         ));
         // A forged coordinate (from a different epoch) does not verify for epoch 7.
-        let (other, _) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(8));
+        let (other, _) = prove_coordinate::<F31>(&sk, b"node-A", Epoch::new(8), &beacon);
         assert!(!verify_coordinate::<F31>(
             &pk,
             b"node-A",
             Epoch::new(7),
+            &beacon,
             &other,
             &proof
         ));
@@ -251,9 +274,32 @@ mod tests {
     #[test]
     fn the_coordinate_rotates_every_epoch() {
         let sk = secret(5);
-        let (c7, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(7));
-        let (c8, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(8));
+        let beacon = BeaconSeed::new([0x5B; 32]);
+        let (c7, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(7), &beacon);
+        let (c8, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(8), &beacon);
         assert_ne!(c7, c8, "the beacon coordinate moves each epoch");
+    }
+
+    #[test]
+    fn the_coordinate_folds_the_beacon_and_is_unpredictable_ahead() {
+        // The same key + epoch under a DIFFERENT beacon seed yields a different coordinate — so a node's
+        // placement cannot be computed (nor pre-settled onto a victim's lines) until the epoch's beacon is
+        // revealed (spec §3.2 assumption 2). A coordinate proven under one seed does not verify under
+        // another, so a peer cannot replay a past epoch's proof against the current seed.
+        let sk = secret(6);
+        let pk = sk.public();
+        let (c_a, proof_a) =
+            prove_coordinate::<F31>(&sk, b"n", Epoch::new(3), &BeaconSeed::new([0xA1; 32]));
+        let (c_b, _) = prove_coordinate::<F31>(&sk, b"n", Epoch::new(3), &BeaconSeed::new([0xB2; 32]));
+        assert_ne!(c_a, c_b, "the coordinate depends on the beacon seed");
+        assert!(!verify_coordinate::<F31>(
+            &pk,
+            b"n",
+            Epoch::new(3),
+            &BeaconSeed::new([0xB2; 32]),
+            &c_a,
+            &proof_a
+        ), "a proof under one beacon does not verify under another");
     }
 
     #[test]

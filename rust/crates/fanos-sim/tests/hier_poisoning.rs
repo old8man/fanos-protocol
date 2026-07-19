@@ -52,12 +52,12 @@ fn derived_address<F: Field>(id: &[u8], depth: usize) -> HierAddr<F> {
     HierAddr::from_path((0..depth).map(|l| address_point::<F>(id, l)).collect()).unwrap()
 }
 
-/// The canonical identity bundle `sig-verifier(Ed25519‖ML-DSA) ‖ kem-public(X25519‖ML-KEM)` — the `id`
-/// a membership announcement carries. The signature verifier is at the front (where the overlay reads it).
+/// The canonical identity bundle `sig(Ed25519‖ML-DSA) ‖ kem(X25519‖ML-KEM) ‖ vrf` — the `id` a
+/// membership announcement carries. Built via the identity's own canonical [`PublicIdentity::encode`] (the
+/// single source of truth for the bundle layout), so the overlay address it commits to matches the
+/// identity's `NodeId` byte-for-byte — including the coordinate-VRF key (spec §L0).
 fn identity_bundle(identity: &Identity) -> Vec<u8> {
-    let mut id = identity.public.signature.encode();
-    id.extend_from_slice(&identity.public.kem.encode());
-    id
+    identity.public.encode()
 }
 
 /// A complete signed descriptor for a node, built from a **real `fanos_pqcrypto::Identity`** (the

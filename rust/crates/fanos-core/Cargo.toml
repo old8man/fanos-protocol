@@ -16,6 +16,9 @@ fanos-geometry.workspace = true
 fanos-code.workspace = true
 fanos-primitives.workspace = true
 fanos-diakrisis.workspace = true
+# The real, verifiable coordinate VRF (spec §L0/§L3): a node's coordinate is MapToPoint(VRF(sk, epoch‖
+# beacon)), proven + checked here — replacing the forgeable placeholder. fanos-vrf is no_std.
+fanos-vrf.workspace = true
 
 [features]
 default = ["std"]

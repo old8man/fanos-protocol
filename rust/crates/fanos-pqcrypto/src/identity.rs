@@ -1,10 +1,14 @@
 //! Node identity from the hybrid public keys (spec §L0, §7.1).
 //!
-//! A FANOS node's long-term identifier is the BLAKE3 hash of the canonical concatenation of
-//! its hybrid signature and KEM public keys. This is the real, post-quantum realization of the
-//! identity that [`fanos_primitives`](https://docs.rs/fanos-primitives) models as a placeholder.
+//! A FANOS node's long-term identifier is the BLAKE3 hash of the canonical concatenation of its hybrid
+//! signature key, hybrid KEM key, and **coordinate-VRF** key. This is the real, post-quantum realization
+//! of the identity that [`fanos_primitives`](https://docs.rs/fanos-primitives) models as a byte-bundle.
+//! The VRF key is what makes the node's projective coordinate verifiable — `coord = MapToPoint(VRF(vrf_sk,
+//! epoch ‖ beacon))` — and because it is in the bundle, the `NodeId` commits to it (see
+//! `docs/design-coordinates.md`). All three keys derive from one CSPRNG draw, so an identity is one seed.
 
 use fanos_primitives::{hash_labeled, label};
+use fanos_vrf::{VrfPublic, VrfSecret};
 use rand_core::CryptoRng;
 
 use crate::kem::{HybridKemPublic, HybridKemSecret};
@@ -15,49 +19,74 @@ use crate::sig::{HybridSigSecret, HybridVerifier};
 /// byte-for-byte; the duplicate is retired).
 pub use fanos_primitives::NodeId;
 
-/// A node's public identity: its hybrid signature and KEM public keys (spec §L0).
+/// A node's public identity: its hybrid signature, KEM, and coordinate-VRF public keys (spec §L0).
 pub struct PublicIdentity {
     /// The hybrid signature verifier.
     pub signature: HybridVerifier,
     /// The hybrid KEM public key.
     pub kem: HybridKemPublic,
+    /// The coordinate-VRF public key — verifies this node's `HELLO` proof-of-coordinate.
+    pub vrf: VrfPublic,
 }
 
 impl PublicIdentity {
-    /// The long-term node identifier: domain-separated `BLAKE3` of the canonical public-key bundle
-    /// `sig ‖ kem` (spec §L0), via the one canonical [`fanos_primitives::hash_labeled`] under the shared
+    /// The canonical public-key **bundle** bytes `sig ‖ kem ‖ vrf` (spec §7.1) — the one input the
+    /// [`NodeId`] and the ONOMA/CALYPSO address commitment are both computed from. The VRF public is
+    /// appended last, matching [`fanos_primitives::keys::HybridPublicKey::encode`], so the identifier
+    /// commits to the key that earns the node's verifiable coordinate. This is the single source of truth
+    /// for the bundle layout — never re-concatenate the components by hand.
+    #[must_use]
+    pub fn encode(&self) -> alloc::vec::Vec<u8> {
+        let mut bundle = self.signature.encode();
+        bundle.extend_from_slice(&self.kem.encode());
+        bundle.extend_from_slice(&self.vrf.to_bytes());
+        bundle
+    }
+
+    /// The long-term node identifier: domain-separated `BLAKE3` of the canonical [`encode`](Self::encode)d
+    /// bundle (spec §L0), via the one canonical [`fanos_primitives::hash_labeled`] under the shared
     /// [`label::NODE_ID`] — the single source of truth, so this real identity and the byte-model in
     /// `fanos-primitives` cannot drift apart.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
-        let mut bundle = self.signature.encode();
-        bundle.extend_from_slice(&self.kem.encode());
-        NodeId(hash_labeled(label::NODE_ID, &bundle))
+        NodeId(hash_labeled(label::NODE_ID, &self.encode()))
     }
 }
 
-/// A node's full identity — the secret signing and KEM keys plus the derived public identity.
+/// A node's full identity — the secret signing, KEM, and coordinate-VRF keys plus the derived public
+/// identity.
 pub struct Identity {
     /// The hybrid signing key.
     pub signing: HybridSigSecret,
     /// The hybrid KEM secret key.
     pub kem: HybridKemSecret,
+    /// The coordinate-VRF secret key — proves this node's verifiable epoch coordinate.
+    pub vrf: VrfSecret,
     /// The derived public identity.
     pub public: PublicIdentity,
 }
 
 impl Identity {
-    /// Generate a fresh node identity from a CSPRNG.
+    /// Generate a fresh node identity from a CSPRNG — the hybrid signature, KEM, and coordinate-VRF keys
+    /// all drawn from the one source, so the identity is one seed (spec §L0).
     #[must_use]
     pub fn generate<R: CryptoRng>(rng: &mut R) -> Self {
         let (signing, sig_public) = HybridSigSecret::generate(rng);
         let (kem_secret, kem_public) = HybridKemSecret::generate(rng);
+        // The coordinate-VRF key: a draw from the same CSPRNG. `from_seed` reduces into the scalar
+        // field, so every draw yields a valid key (no error path — spec §L0 coordinate assignment).
+        let mut vrf_seed = [0u8; 32];
+        rng.fill_bytes(&mut vrf_seed);
+        let vrf = VrfSecret::from_seed(vrf_seed);
+        let vrf_public = vrf.public();
         Self {
             signing,
             kem: kem_secret,
+            vrf,
             public: PublicIdentity {
                 signature: sig_public,
                 kem: kem_public,
+                vrf: vrf_public,
             },
         }
     }
@@ -99,7 +128,7 @@ mod tests {
         // Cross-crate parity (spec §L0): the real hybrid identity and the `fanos-primitives` byte-model
         // must derive the SAME node id from the SAME public bundle, or the two impls disagree on
         // addressing. Reconstruct the byte-model from the real identity's component keys and compare —
-        // this pins the bundle layout `Ed25519 ‖ ML-DSA ‖ X25519 ‖ ML-KEM` and the hash rule together.
+        // this pins the bundle layout `Ed25519 ‖ ML-DSA ‖ X25519 ‖ ML-KEM ‖ VRF` and the hash rule.
         use fanos_primitives::keys::{HybridPublicKey, KemPublicKey, SigPublicKey};
 
         let node = Identity::generate(&mut SeedRng::from_seed(b"id-parity"));
@@ -111,6 +140,7 @@ mod tests {
         let model = HybridPublicKey {
             sig: SigPublicKey::new(ed.try_into().unwrap(), mldsa.to_vec()).unwrap(),
             kem: KemPublicKey::new(x.try_into().unwrap(), mlkem.to_vec()).unwrap(),
+            vrf: node.public.vrf.to_bytes(),
         };
         assert_eq!(
             node.node_id(),

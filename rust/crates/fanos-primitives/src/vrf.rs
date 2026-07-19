@@ -45,9 +45,11 @@ pub fn coordinate_from_vrf<F: Field>(vrf_output: &[u8; 32]) -> Point<F> {
     map_to_point::<F>(label::COORD, vrf_output)
 }
 
-/// Reference (non-VRF) coordinate derivation binding `(node, epoch)`, standing in for
-/// `MapToPoint(VRF(pubkey, epoch))` until ECVRF is wired in. Deterministic and epoch-binding,
-/// but **not** unforgeable — see the module note.
+/// Reference (non-VRF) coordinate derivation binding `(node, epoch)` — the deterministic no_std
+/// **addressing reference** that exercises `MapToPoint` and the hierarchy descent without a keyed proof.
+/// It is epoch-binding but **not** unforgeable, so it is *not* the coordinate authority: real node
+/// placement uses the verifiable VRF `fanos_vrf::prove_coordinate`, now wired into `fanos-core`
+/// membership (see `docs/design-coordinates.md` and the module note). Kept for no_std addressing tests.
 #[must_use]
 pub fn coordinate_for<F: Field>(node: &NodeId, epoch: Epoch) -> Point<F> {
     let seed = hash_labeled(label::COORD, &coord_input(node, epoch));

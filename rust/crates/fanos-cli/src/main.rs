@@ -13,7 +13,8 @@
 
 use fanos_code::{is_hyperoval_fano, is_recoverable_fano, locate, syndrome::Sector};
 use fanos_core::{
-    Epoch, Hierarchy, Node, NodeId, Observation, Verdict, membership::centrality_fraction,
+    BeaconSeed, Epoch, Hierarchy, Node, NodeId, Observation, VrfSecret, Verdict,
+    membership::centrality_fraction,
 };
 use fanos_diakrisis::{
     Fault, blindness, coherence::CoherenceMatrix, healing, partition, polar, window,
@@ -247,8 +248,18 @@ fn verify_lrc_and_polar(r: &mut Report) {
 /// End-to-end demonstration of the overlay flow.
 fn demo() {
     println!("\n Demo — identity → rendezvous → diagnosis → threshold\n");
-    let alice = Node::<F31>::open(NodeId([0xA1; 32]), Epoch::new(42));
-    let bob = Node::<F31>::open(NodeId([0xB0; 32]), Epoch::new(42));
+    let alice = Node::<F31>::open(
+        &VrfSecret::from_seed([0xA1; 32]),
+        NodeId([0xA1; 32]),
+        Epoch::new(42),
+        &BeaconSeed::GENESIS,
+    );
+    let bob = Node::<F31>::open(
+        &VrfSecret::from_seed([0xB0; 32]),
+        NodeId([0xB0; 32]),
+        Epoch::new(42),
+        &BeaconSeed::GENESIS,
+    );
     let line = alice.rendezvous_with(&bob.coordinate()).unwrap();
     println!(
         "  rendezvous: Alice{:?} × Bob{:?} = bus {:?}",

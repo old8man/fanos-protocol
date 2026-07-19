@@ -25,6 +25,9 @@ blake3 = { workspace = true }
 # The canonical node-ID hash rule + the NodeId type live in the light primitives core; deriving the
 # node identifier here goes through it (one source of truth), so the two crates cannot drift.
 fanos-primitives = { workspace = true, default-features = false, features = ["alloc"] }
+# The coordinate-VRF keypair is part of a node's identity (spec §L0): the bundle commits the VRF public
+# so the node's projective coordinate is verifiable. fanos-vrf is no_std (ristretto via curve25519-dalek).
+fanos-vrf = { workspace = true, default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true
