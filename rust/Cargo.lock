@@ -982,6 +982,8 @@ dependencies = [
  "fanos-primitives",
  "fanos-proteus",
  "fanos-runtime",
+ "fanos-wire",
+ "fanos-wire-derive",
  "quinn",
  "rcgen",
  "rustls",

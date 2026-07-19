@@ -86,7 +86,9 @@ pub(crate) fn node_configs() -> Result<(ServerConfig, ClientConfig), TlsError> {
 /// A node's long-term TLS identity — its certificate and private key. Persist these bytes
 /// ([`to_bytes`](NodeCredentials::to_bytes)) and reload them ([`from_bytes`](NodeCredentials::from_bytes))
 /// to keep the same self-certifying coordinate `MapToPoint(H(cert))` across restarts.
-#[derive(Clone, Debug)]
+/// `#[derive(Wire)]` emits the canonical `cert_der ‖ key_der` (each `Vec<u8>` varint-length-prefixed,
+/// spec §7.1); the [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) persistence API wraps it.
+#[derive(Clone, Debug, fanos_wire_derive::Wire)]
 pub struct NodeCredentials {
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -109,23 +111,16 @@ impl NodeCredentials {
         &self.cert_der
     }
 
-    /// Serialize as `certlen(4) ‖ cert ‖ key` for persistence.
+    /// Serialize for persistence (the canonical [`Wire`](fanos_wire::Wire) codec).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.cert_der.len() + self.key_der.len());
-        out.extend_from_slice(&(self.cert_der.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.cert_der);
-        out.extend_from_slice(&self.key_der);
-        out
+        fanos_wire::Wire::to_wire(self)
     }
 
-    /// Reload persisted credentials, or `None` if the bytes are malformed.
+    /// Reload persisted credentials, or `None` if the bytes are malformed or carry trailing data.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let len = u32::from_be_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
-        let cert_der = bytes.get(4..4 + len)?.to_vec();
-        let key_der = bytes.get(4 + len..)?.to_vec();
-        Some(Self { cert_der, key_der })
+        fanos_wire::Wire::from_wire(bytes).ok()
     }
 }
 

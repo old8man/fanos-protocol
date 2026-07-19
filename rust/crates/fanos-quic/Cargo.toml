@@ -28,6 +28,8 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-primitives = { workspace = true, features = ["std"] }
 # Optional PROTEUS transport shaping (polymorph obfuscation below the sans-I/O boundary).
 fanos-proteus = { workspace = true, features = ["std"] }
+fanos-wire.workspace = true
+fanos-wire-derive.workspace = true
 
 # Real transport stack. Pinned to the ring crypto provider for portability (no
 # aws-lc-rs C toolchain requirement) and reproducible cross-platform builds.
