@@ -121,7 +121,7 @@ mod tests {
         // A proposal already above the minimum is left untouched (minimal invasion).
         match cbf_filter(0.8, 0.3, -0.5, 0.6, 1.0, KAPPA_BOOTSTRAP, 1.0) {
             SafeControl::Apply(u) => {
-                assert!((u - 0.8).abs() < 1e-12, "a safe proposal is unchanged")
+                assert!((u - 0.8).abs() < 1e-12, "a safe proposal is unchanged");
             }
             SafeControl::Escalate => panic!("expected Apply, got Escalate"),
         }
