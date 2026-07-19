@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod beacon;
 pub mod dkg;
 pub mod vss;
 

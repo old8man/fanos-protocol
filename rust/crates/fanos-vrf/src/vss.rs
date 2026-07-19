@@ -149,6 +149,21 @@ impl VssCommitment {
             .unwrap_or_else(RistrettoPoint::identity)
     }
 
+    /// The public key `Y_i = Σ_j i^j·C_j` of the share held at `index`, evaluated in the exponent by
+    /// Horner. This is the value the Feldman check ([`verify_share`]) and a DVRF partial's DLEQ proof
+    /// ([`crate::beacon`]) are verified against; derived from the public commitment alone, it reveals
+    /// nothing about the secret.
+    pub(crate) fn public_share(&self, index: u8) -> RistrettoPoint {
+        let x = Scalar::from(u64::from(index));
+        let mut acc = RistrettoPoint::identity();
+        let mut x_pow = Scalar::ONE;
+        for c in &self.coeffs {
+            acc += x_pow * c;
+            x_pow *= x;
+        }
+        acc
+    }
+
     /// The `t(1) ‖ C_0 ‖ … ‖ C_{t-1}` wire encoding (`1 + 32t` bytes).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -218,14 +233,7 @@ pub fn deal<R: RngCore + CryptoRng>(
 /// holder that fails this has been handed an inconsistent share by a cheating dealer.
 #[must_use]
 pub fn verify_share(share: &VssShare, commitment: &VssCommitment) -> bool {
-    let x = Scalar::from(u64::from(share.index));
-    let mut rhs = RistrettoPoint::identity();
-    let mut x_pow = Scalar::ONE;
-    for c in &commitment.coeffs {
-        rhs += x_pow * c;
-        x_pow *= x;
-    }
-    share.value * RISTRETTO_BASEPOINT_POINT == rhs
+    share.value * RISTRETTO_BASEPOINT_POINT == commitment.public_share(share.index)
 }
 
 /// Reconstruct the secret from any `≥ t` shares by Lagrange interpolation at `x = 0`. Returns
