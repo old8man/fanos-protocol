@@ -14,13 +14,16 @@
 
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
+use fanos_geometry::{Line, Plane};
 use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
-use fanos_rendezvous::{ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, meeting_line};
+use fanos_rendezvous::{
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_line,
+};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, stream_over_channels_paced};
-use rand_core::CryptoRng;
+use rand_core::{CryptoRng, Rng};
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
@@ -136,6 +139,80 @@ pub struct RendezvousRoute {
     pub beacon: BeaconSeed,
 }
 
+impl RendezvousRoute {
+    /// Draw a **fresh** route for one anonymous dial (#54): random, distinct forward and reply hop lines —
+    /// a new, unlinkable path each dial rather than a fixed route — with the client's reply rendezvous
+    /// chosen to have a combiner distinct from the service's meeting line, so the service (listening at its
+    /// own combiner) never also receives the client's reply traffic. `forward_depth`/`reply_depth` are the
+    /// `depths` is `(forward, reply)` — the number of intermediate hops before the meeting line / before
+    /// the reply rendezvous. `rng` MUST be a CSPRNG in production — the path's unpredictability is what
+    /// unlinks successive dials.
+    #[must_use]
+    pub fn draw<F: Field, R: CryptoRng>(
+        directory: MixDirectory,
+        threshold: u8,
+        epoch: Epoch,
+        beacon: BeaconSeed,
+        service_meeting: Coord,
+        depths: (usize, usize),
+        rng: &mut R,
+    ) -> Self {
+        let meeting_combiner = combiner_for::<F>(service_meeting);
+        // The client's reply rendezvous: a random line distinct from the meeting line AND with a distinct
+        // combiner. Falls back to the meeting line only on a degenerate plane that has no such line.
+        let reply_rendezvous = draw_line::<F, R>(rng, |l| {
+            l != service_meeting && combiner_for::<F>(l) != meeting_combiner
+        })
+        .unwrap_or(service_meeting);
+        let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting], rng);
+        let mut reply_circuit =
+            random_hops::<F, R>(depths.1, &[service_meeting, reply_rendezvous], rng);
+        reply_circuit.push(reply_rendezvous);
+        Self {
+            forward_hops,
+            reply_circuit,
+            directory,
+            threshold,
+            epoch,
+            beacon,
+        }
+    }
+}
+
+/// The bound on random-draw retries relative to the plane size — generous, so a valid draw is found with
+/// overwhelming probability while the search can never run unbounded.
+fn draw_budget<F: Field>() -> usize {
+    (Plane::<F>::N as usize).saturating_mul(16).max(1)
+}
+
+/// Draw `count` distinct random hop lines, none in `avoid` and none repeated — a fresh set of hop lines
+/// for one circuit. Bounded retries, so it always terminates (returning fewer than `count` only if the
+/// plane cannot supply that many distinct non-avoided lines).
+#[must_use]
+pub fn random_hops<F: Field, R: Rng>(count: usize, avoid: &[Coord], rng: &mut R) -> Vec<Coord> {
+    let n = Plane::<F>::N as usize;
+    let mut chosen: Vec<Coord> = Vec::with_capacity(count);
+    let mut attempts = 0usize;
+    let budget = draw_budget::<F>().saturating_add(count.saturating_mul(n));
+    while chosen.len() < count && attempts < budget {
+        attempts += 1;
+        let line = Line::<F>::at((rng.next_u32() as usize) % n.max(1)).coords();
+        if !avoid.contains(&line) && !chosen.contains(&line) {
+            chosen.push(line);
+        }
+    }
+    chosen
+}
+
+/// Draw a single random line satisfying `ok`, or `None` after bounded retries.
+fn draw_line<F: Field, R: Rng>(rng: &mut R, ok: impl Fn(Coord) -> bool) -> Option<Coord> {
+    let n = Plane::<F>::N as usize;
+    (0..draw_budget::<F>()).find_map(|_| {
+        let line = Line::<F>::at((rng.next_u32() as usize) % n.max(1)).coords();
+        ok(line).then_some(line)
+    })
+}
+
 /// Dial a service **anonymously** by its static KEM public key — the anonymous analogue of
 /// [`dial_service`](crate::diaulos::dial_service).
 ///
@@ -186,6 +263,81 @@ mod tests {
             dir.insert(Point::<F2>::at(usize::from(i)).coords(), public);
         }
         dir
+    }
+
+    /// A tiny deterministic SplitMix64 standing in for a CSPRNG in the route-draw test. rand_core 0.10 is
+    /// fallible-first: implementing `TryRng` (with `Error = Infallible`) + the `TryCryptoRng` marker yields
+    /// `Rng`/`RngCore`/`CryptoRng` by that crate's blanket impls.
+    struct TestRng(u64);
+    impl TestRng {
+        fn step(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+    impl rand_core::TryRng for TestRng {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.step() as u32)
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.step())
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dst.chunks_mut(8) {
+                let bytes = self.step().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            Ok(())
+        }
+    }
+    impl rand_core::TryCryptoRng for TestRng {}
+
+    #[test]
+    fn drawn_routes_are_fresh_and_avoid_the_meeting_line() {
+        let dir = fano_directory();
+        let epoch = Epoch::new(1);
+        let meeting = meeting_line::<F2>(b"draw-svc", epoch, &BeaconSeed::GENESIS).coords();
+        let draw = |seed: u64| {
+            RendezvousRoute::draw::<F2, _>(
+                dir.clone(),
+                2,
+                epoch,
+                BeaconSeed::GENESIS,
+                meeting,
+                (2, 2),
+                &mut TestRng(seed),
+            )
+        };
+
+        let r = draw(1);
+        assert!(
+            r.forward_hops.iter().all(|&h| h != meeting),
+            "no forward hop is the meeting line"
+        );
+        assert!(
+            r.forward_hops
+                .iter()
+                .enumerate()
+                .all(|(i, &h)| !r.forward_hops[..i].contains(&h)),
+            "forward hops are distinct"
+        );
+        let reply_rdv = *r.reply_circuit.last().unwrap();
+        assert_ne!(
+            combiner_for::<F2>(reply_rdv),
+            combiner_for::<F2>(meeting),
+            "the reply rendezvous does not collide with the meeting combiner"
+        );
+
+        // Fresh per dial: a different RNG state yields a different path (overwhelmingly likely).
+        let r2 = draw(0x9999);
+        assert!(
+            r.forward_hops != r2.forward_hops || r.reply_circuit != r2.reply_circuit,
+            "two draws produce different circuits"
+        );
     }
 
     #[tokio::test]
