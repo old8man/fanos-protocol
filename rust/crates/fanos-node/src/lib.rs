@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod diaulos;
+pub mod epoch_driver;
 pub mod error;
 pub mod identity;
 pub mod mixdir;
@@ -29,6 +30,7 @@ pub use config::{NodeConfig, Peer, RoleSet};
 pub use diaulos::{
     FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service, serve,
 };
+pub use epoch_driver::EpochDriver;
 pub use error::NodeError;
 pub use fanos_onoma::Epoch;
 pub use mixdir::{build_mix_directory, publish_mix_key, resolve_mix_key};
