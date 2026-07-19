@@ -29,7 +29,7 @@ pub mod shamir;
 pub mod vrf;
 
 pub use address::{address_matches_identity, address_point};
-pub use hash::{DIGEST_LEN, hash_labeled, label};
+pub use hash::{DIGEST_LEN, hash_labeled, label, subkey};
 pub use keys::{HybridPublicKey, NodeId};
 pub use maptopoint::{map_to_line, map_to_point};
 pub use shamir::{Share, reconstruct, split};

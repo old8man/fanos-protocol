@@ -67,6 +67,16 @@ pub fn xof_reader(label: &str, data: &[u8]) -> blake3::OutputReader {
     labeled_hasher(label, data).finalize_xof()
 }
 
+/// A 32-byte subkey derived from a `seed` and a `counter`: `hash_labeled(label, seed ‖ counter_be)`.
+/// The one canonical form of the "one key per hop / per index" pattern (per-hop onion keys and
+/// nonces, per-member seeds), so every derivation of a counter-indexed subkey uses identical bytes.
+#[must_use]
+pub fn subkey(label: &str, seed: &[u8], counter: u32) -> [u8; DIGEST_LEN] {
+    let mut hasher = labeled_hasher(label, seed);
+    hasher.update(&counter.to_be_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +94,18 @@ mod tests {
             hash_labeled(label::KDF, b"x"),
             hash_labeled(label::KDF, b"x")
         );
+    }
+
+    #[test]
+    fn subkey_equals_hash_of_seed_concat_counter_and_separates_by_counter_and_label() {
+        let seed = [9u8; 32];
+        // Byte-for-byte equal to `hash_labeled(label, seed ‖ counter_be)` (the form it replaces).
+        let mut concat = seed.to_vec();
+        concat.extend_from_slice(&7u32.to_be_bytes());
+        assert_eq!(subkey(label::KDF, &seed, 7), hash_labeled(label::KDF, &concat));
+        // Distinct counters and distinct labels give independent subkeys.
+        assert_ne!(subkey(label::KDF, &seed, 7), subkey(label::KDF, &seed, 8));
+        assert_ne!(subkey(label::KDF, &seed, 7), subkey(label::COORD, &seed, 7));
     }
 
     #[test]

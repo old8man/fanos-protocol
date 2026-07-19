@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 
 use fanos_primitives::hash::xof_reader;
-use fanos_primitives::{hash_labeled, shamir};
+use fanos_primitives::shamir;
 use fanos_field::Field;
 
 use crate::path::Circuit;
@@ -67,12 +67,10 @@ fn aead_open(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8]) -> Result<Vec<u8>, Nyx
     fanos_primitives::aead::open(key, nonce, ct).ok_or(NyxError::Aead)
 }
 
-/// Derive the per-hop nonce from the circuit seed and hop index.
+/// Derive the per-hop nonce from the circuit seed and hop index (the canonical counter-indexed
+/// subkey, truncated to the 12-byte AEAD nonce).
 fn hop_nonce(seed: &[u8; 32], hop: usize) -> [u8; 12] {
-    let mut input = [0u8; 36];
-    input[..32].copy_from_slice(seed);
-    input[32..].copy_from_slice(&(hop as u32).to_be_bytes());
-    let digest = hash_labeled(NONCE_LABEL, &input);
+    let digest = fanos_primitives::subkey(NONCE_LABEL, seed, hop as u32);
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&digest[..12]);
     nonce
@@ -80,10 +78,7 @@ fn hop_nonce(seed: &[u8; 32], hop: usize) -> [u8; 12] {
 
 /// Derive the per-hop layer key (the holonomic hop key) from the seed and hop index.
 fn hop_key(seed: &[u8; 32], hop: usize) -> [u8; 32] {
-    let mut input = [0u8; 36];
-    input[..32].copy_from_slice(seed);
-    input[32..].copy_from_slice(&(hop as u32).to_be_bytes());
-    hash_labeled(KEY_LABEL, &input)
+    fanos_primitives::subkey(KEY_LABEL, seed, hop as u32)
 }
 
 impl Tessera {
