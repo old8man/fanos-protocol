@@ -9,9 +9,6 @@
 //! blocking, unlike a running stream cipher. A tampered or wrong-key cell fails AEAD authentication
 //! and [`open`] returns `None`, so it is dropped and (for data) retransmitted.
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-
 /// A 32-byte end-to-end direction key (distinct per direction; distinct from the onion's hop keys).
 pub type Key = [u8; 32];
 
@@ -42,10 +39,7 @@ pub fn seal(key: &Key, cnonce: u64, frame: &[u8]) -> Option<Vec<u8>> {
     }
     let mut plaintext = vec![0u8; CELL_PLAINTEXT];
     plaintext.get_mut(..frame.len())?.copy_from_slice(frame);
-    let cipher = ChaCha20Poly1305::new_from_slice(key).ok()?;
-    let ciphertext = cipher
-        .encrypt(&Nonce::from(aead_nonce(cnonce)), plaintext.as_ref())
-        .ok()?;
+    let ciphertext = fanos_primitives::aead::seal(key, &aead_nonce(cnonce), &plaintext)?;
     let mut out = Vec::with_capacity(CELL_LEN);
     out.extend_from_slice(&cnonce.to_le_bytes());
     out.extend_from_slice(&ciphertext);
@@ -63,10 +57,7 @@ pub fn open(key: &Key, cell: &[u8]) -> Option<Vec<u8>> {
     let (nonce_bytes, ciphertext) = cell.split_at_checked(NONCE_LEN)?;
     let mut cn = [0u8; NONCE_LEN];
     cn.copy_from_slice(nonce_bytes);
-    let cipher = ChaCha20Poly1305::new_from_slice(key).ok()?;
-    cipher
-        .decrypt(&Nonce::from(aead_nonce(u64::from_le_bytes(cn))), ciphertext)
-        .ok()
+    fanos_primitives::aead::open(key, &aead_nonce(u64::from_le_bytes(cn)), ciphertext)
 }
 
 #[cfg(test)]

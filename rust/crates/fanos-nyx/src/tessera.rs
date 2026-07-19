@@ -13,9 +13,6 @@
 
 use alloc::vec::Vec;
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-
 use fanos_primitives::hash::xof_reader;
 use fanos_primitives::{hash_labeled, shamir};
 use fanos_field::Field;
@@ -63,17 +60,11 @@ pub enum PeelResult {
 }
 
 fn aead_seal(key: &[u8; 32], nonce: &[u8; 12], pt: &[u8]) -> Result<Vec<u8>, NyxError> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| NyxError::Aead)?
-        .encrypt(&Nonce::from(*nonce), pt)
-        .map_err(|_| NyxError::Aead)
+    fanos_primitives::aead::seal(key, nonce, pt).ok_or(NyxError::Aead)
 }
 
 fn aead_open(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8]) -> Result<Vec<u8>, NyxError> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| NyxError::Aead)?
-        .decrypt(&Nonce::from(*nonce), ct)
-        .map_err(|_| NyxError::Aead)
+    fanos_primitives::aead::open(key, nonce, ct).ok_or(NyxError::Aead)
 }
 
 /// Derive the per-hop nonce from the circuit seed and hop index.

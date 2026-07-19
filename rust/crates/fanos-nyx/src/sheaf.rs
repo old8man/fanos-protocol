@@ -18,9 +18,6 @@
 
 use alloc::vec::Vec;
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-
 use fanos_primitives::shamir::{self, ShamirError, Share};
 
 /// A NYX error.
@@ -76,10 +73,8 @@ pub fn seal(
     line_size: u8,
     key_randomness: &[u8],
 ) -> Result<ThresholdLayer, NyxError> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| NyxError::Aead)?;
-    let ciphertext = cipher
-        .encrypt(&Nonce::from(*nonce), routing_cmd)
-        .map_err(|_| NyxError::Aead)?;
+    let ciphertext =
+        fanos_primitives::aead::seal(key, nonce, routing_cmd).ok_or(NyxError::Aead)?;
     let shares = shamir::split(key, threshold, line_size, key_randomness)?;
     Ok(ThresholdLayer {
         ciphertext,
@@ -94,13 +89,8 @@ pub fn seal(
 /// so the routing command stays hidden — the zero-knowledge-below-threshold guarantee.
 pub fn open(layer: &ThresholdLayer, shares: &[Share]) -> Result<Vec<u8>, NyxError> {
     let key = shamir::reconstruct(shares)?;
-    if key.len() != 32 {
-        return Err(NyxError::KeyLength);
-    }
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| NyxError::Aead)?;
-    cipher
-        .decrypt(&Nonce::from(layer.nonce), layer.ciphertext.as_ref())
-        .map_err(|_| NyxError::Aead)
+    let key: [u8; 32] = key.as_slice().try_into().map_err(|_| NyxError::KeyLength)?;
+    fanos_primitives::aead::open(&key, &layer.nonce, &layer.ciphertext).ok_or(NyxError::Aead)
 }
 
 #[cfg(test)]

@@ -19,9 +19,6 @@
 
 use alloc::vec::Vec;
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-
 use fanos_primitives::hash_labeled;
 use fanos_primitives::shamir::{self, Share};
 use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
@@ -95,10 +92,7 @@ fn aead_seal(
     nonce: &[u8; NONCE_LEN],
     pt: &[u8],
 ) -> Result<Vec<u8>, ThresholdError> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| ThresholdError::Aead)?
-        .encrypt(&Nonce::from(*nonce), pt)
-        .map_err(|_| ThresholdError::Aead)
+    fanos_primitives::aead::seal(key, nonce, pt).ok_or(ThresholdError::Aead)
 }
 
 fn aead_open(
@@ -106,10 +100,7 @@ fn aead_open(
     nonce: &[u8; NONCE_LEN],
     ct: &[u8],
 ) -> Result<Vec<u8>, ThresholdError> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| ThresholdError::Aead)?
-        .decrypt(&Nonce::from(*nonce), ct)
-        .map_err(|_| ThresholdError::Aead)
+    fanos_primitives::aead::open(key, nonce, ct).ok_or(ThresholdError::Aead)
 }
 
 fn share_to_bytes(share: &Share) -> Option<[u8; SHARE_LEN]> {
@@ -267,7 +258,6 @@ pub enum ThresholdPeel {
         payload: Vec<u8>,
     },
 }
-
 
 /// Build a **nested threshold onion** over `hops`: each layer is a [`ThresholdSealed`] to that hop
 /// line's members, so a hop is peeled only by a threshold `t` of its `q+1` members — the "a hop is a

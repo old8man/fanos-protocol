@@ -19,6 +19,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "aead")]
+pub mod aead;
 pub mod address;
 pub mod hash;
 pub mod keys;

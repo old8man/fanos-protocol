@@ -29,9 +29,6 @@
 
 use alloc::vec::Vec;
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-
 use fanos_primitives::hash::hash_xof;
 use fanos_primitives::hash_labeled;
 use fanos_field::Field;
@@ -129,17 +126,11 @@ fn pad_to_bucket(mut onion: Vec<u8>, session: &[u8; 32]) -> Result<Vec<u8>, Seal
 }
 
 fn aead_seal(key: &[u8; 32], nonce: &[u8; NONCE_LEN], pt: &[u8]) -> Result<Vec<u8>, SealedError> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| SealedError::Aead)?
-        .encrypt(&Nonce::from(*nonce), pt)
-        .map_err(|_| SealedError::Aead)
+    fanos_primitives::aead::seal(key, nonce, pt).ok_or(SealedError::Aead)
 }
 
 fn aead_open(key: &[u8; 32], nonce: &[u8; NONCE_LEN], ct: &[u8]) -> Result<Vec<u8>, SealedError> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| SealedError::Aead)?
-        .decrypt(&Nonce::from(*nonce), ct)
-        .map_err(|_| SealedError::Aead)
+    fanos_primitives::aead::open(key, nonce, ct).ok_or(SealedError::Aead)
 }
 
 /// A bounds-checked `buf[off .. off+len]`, or [`SealedError::Malformed`] if it runs past the end.

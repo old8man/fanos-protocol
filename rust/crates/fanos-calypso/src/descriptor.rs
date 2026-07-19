@@ -17,8 +17,6 @@
 
 use alloc::vec::Vec;
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
 use fanos_primitives::hash::hash_labeled;
 use fanos_field::Field;
@@ -248,14 +246,11 @@ pub fn seal(
     desc: &Descriptor,
     difficulty: u32,
 ) -> Result<SealedDescriptor, DescriptorError> {
-    let cipher = ChaCha20Poly1305::new_from_slice(&descriptor_key(addr, epoch))
-        .map_err(|_| DescriptorError::Aead)?;
     let plaintext = desc.encode();
     let salt = nonce_salt(&plaintext);
     let nonce = nonce_bytes(addr, epoch, &salt);
-    let ciphertext = cipher
-        .encrypt(&Nonce::from(nonce), plaintext.as_ref())
-        .map_err(|_| DescriptorError::Aead)?;
+    let ciphertext = fanos_primitives::aead::seal(&descriptor_key(addr, epoch), &nonce, &plaintext)
+        .ok_or(DescriptorError::Aead)?;
     let pow_nonce = pow::solve(&pow_challenge(addr, epoch, &ciphertext), difficulty);
     Ok(SealedDescriptor {
         pow_nonce,
@@ -285,12 +280,10 @@ pub fn open(
     ) {
         return Err(DescriptorError::BadPow);
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(&descriptor_key(addr, epoch))
-        .map_err(|_| DescriptorError::Aead)?;
     let nonce = nonce_bytes(addr, epoch, &sealed.nonce_salt);
-    let plaintext = cipher
-        .decrypt(&Nonce::from(nonce), sealed.ciphertext.as_ref())
-        .map_err(|_| DescriptorError::Aead)?;
+    let plaintext =
+        fanos_primitives::aead::open(&descriptor_key(addr, epoch), &nonce, &sealed.ciphertext)
+            .ok_or(DescriptorError::Aead)?;
     let desc = Descriptor::decode(&plaintext)?;
     if desc.epoch != epoch {
         return Err(DescriptorError::EpochMismatch);

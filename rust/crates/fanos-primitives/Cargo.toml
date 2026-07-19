@@ -16,11 +16,16 @@ fanos-geometry.workspace = true
 blake3 = { workspace = true }
 # Wipe Shamir share bytes (secret) on drop. `alloc` for the `Vec<u8>` share value; stays `no_std`.
 zeroize = { workspace = true, features = ["alloc"] }
+# The shared ChaCha20-Poly1305 AEAD (behind the `aead` feature), so the whole stack seals with one
+# audited implementation. Optional: a pure-hashing consumer keeps the BLAKE3-only dependency set.
+chacha20poly1305 = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
 std = ["alloc", "blake3/std", "fanos-geometry/std"]
 alloc = ["fanos-geometry/alloc"]
+# The shared AEAD primitive (pulls chacha20poly1305). Consumers that seal/open opt in.
+aead = ["dep:chacha20poly1305", "alloc"]
 
 [dev-dependencies]
 proptest.workspace = true
