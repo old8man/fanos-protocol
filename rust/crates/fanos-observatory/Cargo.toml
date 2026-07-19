@@ -19,10 +19,18 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 # The live feed drives a real cell of production OverlayNode engines under the deterministic simulator
 # (the devnet-is-production seam); a remote/IPC telemetry source can be added behind the same trait.
-fanos-sim = { workspace = true }
+# OPTIONAL: the shipping monitor need not compile the simulator — a lean build (real-feed / scenario
+# only) drops it via `--no-default-features` (audit ARCH-10 D8: no hard prod-tool → test-sim coupling).
+fanos-sim = { workspace = true, optional = true }
 fanos-runtime = { workspace = true, features = ["std"] }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+
+[features]
+# The `--live` demo (a real cell under the simulator) is on by default; a lean operator build turns it
+# off with `--no-default-features`, and then `--live` reports it was compiled out.
+default = ["sim"]
+sim = ["dep:fanos-sim"]
 
 [lints]
 workspace = true

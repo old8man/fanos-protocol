@@ -15,7 +15,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use fanos_observatory::{App, Control, LiveCellSource, ScenarioSource, SnapshotSource, ui};
+#[cfg(feature = "sim")]
+use fanos_observatory::LiveCellSource;
+use fanos_observatory::{App, Control, ScenarioSource, SnapshotSource, ui};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -36,11 +38,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `--live` drives a real cell of production `OverlayNode` engines; the default is the self-contained
 /// `PurityDynamics` demo. Both are the same [`SnapshotSource`] seam — a remote telemetry feed adds a third.
 fn build_source(live: bool) -> Box<dyn SnapshotSource> {
+    #[cfg(feature = "sim")]
     if live {
-        Box::new(LiveCellSource::new())
-    } else {
-        Box::new(ScenarioSource::new())
+        return Box::new(LiveCellSource::new());
     }
+    #[cfg(not(feature = "sim"))]
+    if live {
+        eprintln!("--live was compiled out (built without the `sim` feature); using the scenario demo");
+    }
+    Box::new(ScenarioSource::new())
 }
 
 fn print_help() {
