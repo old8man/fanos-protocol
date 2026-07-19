@@ -19,7 +19,7 @@ use fanos_diaulos::{ServerSession, StaticKeypair};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_node::{FanosDialer, RendezvousRoute, StaticResolver};
-use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
+use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_rendezvous::{
@@ -53,12 +53,19 @@ impl Engine for RawInjector {
 /// Spawn one QUIC node running a `ThresholdRouter` at Fano point `i`, returning its handle and KEM key.
 async fn router(i: usize, dir: &Directory, t: usize) -> (NodeHandle, HybridKemPublic) {
     let mut rng = SeedRng::from_seed(&[0xA0, i as u8]);
-    let (secret, public) = HybridKemSecret::generate(&mut rng);
-    let engine = ThresholdRouter::<F2>::new(Point::<F2>::at(i), secret, t);
+    let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+    // The directory advertises each relay's forward-secure ONION public (audit E4); the relay peels with
+    // the onion secret derived from the same genesis seed. Fixed here for the test; OS entropy in prod.
+    let mut onion_seed = [0xC4u8; 32];
+    onion_seed[31] = i as u8;
+    let onion_public = OnionKeyRatchet::new(onion_seed, fanos_rendezvous::Epoch::ZERO)
+        .public()
+        .clone();
+    let engine = ThresholdRouter::<F2>::new(Point::<F2>::at(i), &secret, t, onion_seed);
     let handle = spawn(Box::new(engine), dir.clone())
         .await
         .expect("spawn router");
-    (handle, public)
+    (handle, onion_public)
 }
 
 /// Await an anonymous delivery of `want` on `node`, within `secs`.

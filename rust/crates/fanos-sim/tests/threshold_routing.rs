@@ -14,7 +14,8 @@ use fanos_aphantos::threshold::{HopLine, seal_onion};
 use fanos_aphantos::threshold_router::{ANONYMOUS, combiner_for, launch_frame, line_member_coords};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point, Triple};
-use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
+use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
+use fanos_rendezvous::Epoch;
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
 
@@ -34,10 +35,17 @@ fn spawn_routers_with(
     for i in 0..7 {
         let point = Point::<F2>::at(i);
         let mut rng = SeedRng::from_seed(&[0xA0, i as u8]);
-        let (secret, public) = HybridKemSecret::generate(&mut rng);
-        pubs.insert(point.coords(), public);
+        let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+        // Seal onions to each relay's forward-secure ONION public (audit E4); the relay peels with the
+        // onion secret from the same genesis seed.
+        let mut onion_seed = [0xC5u8; 32];
+        onion_seed[31] = i as u8;
+        let onion_public = OnionKeyRatchet::new(onion_seed, Epoch::ZERO)
+            .public()
+            .clone();
+        pubs.insert(point.coords(), onion_public);
         sim.add(Box::new(
-            ThresholdRouter::<F2>::new(point, secret, t).with_mixing(mean_delay),
+            ThresholdRouter::<F2>::new(point, &secret, t, onion_seed).with_mixing(mean_delay),
         ));
     }
     pubs

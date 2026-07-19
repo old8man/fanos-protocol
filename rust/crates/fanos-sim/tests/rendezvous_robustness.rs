@@ -16,7 +16,7 @@ use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::threshold_router::line_member_coords;
 use fanos_field::{F2, Field, GfP};
 use fanos_geometry::{Line, Point, Triple};
-use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::{ANONYMOUS, MixDirectory, combiner_for, meeting_line, seal_forward};
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
@@ -40,10 +40,20 @@ fn spawn_plane<F: Field + 'static>(
         let point = Point::<F>::at(i);
         let coord = point.coords();
         let mut rng = SeedRng::from_seed(&[0xB0, i as u8, q as u8]);
-        let (secret, public) = HybridKemSecret::generate(&mut rng);
-        dir.insert(coord, public);
+        let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+        // The directory carries each relay's forward-secure ONION public (audit E4); the relay peels
+        // with the onion secret derived from the same genesis seed.
+        let mut onion_seed = [0xA1u8; 32];
+        onion_seed[30] = q as u8;
+        onion_seed[31] = i as u8;
+        let onion_public = OnionKeyRatchet::new(onion_seed, fanos_rendezvous::Epoch::ZERO)
+            .public()
+            .clone();
+        dir.insert(coord, onion_public);
         if !skip_routers.contains(&coord) {
-            sim.add(Box::new(ThresholdRouter::<F>::new(point, secret, t)));
+            sim.add(Box::new(ThresholdRouter::<F>::new(
+                point, &secret, t, onion_seed,
+            )));
         }
     }
     dir

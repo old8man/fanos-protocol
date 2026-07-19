@@ -24,7 +24,8 @@ use alloc::vec::Vec;
 
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point, Triple};
-use fanos_pqcrypto::HybridKemSecret;
+use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet};
+use fanos_primitives::Epoch;
 use fanos_primitives::shamir::Share;
 use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
@@ -72,7 +73,12 @@ struct Pending {
 /// requests from other combiners.
 pub struct ThresholdRouter<F: Field> {
     coord: Point<F>,
-    kem_secret: HybridKemSecret,
+    /// The forward-secure per-epoch **onion** decap keypair (audit E4). Shares addressed to this node are
+    /// peeled with the ratchet's live keys (`onion.secrets()` — the current epoch plus a bounded grace
+    /// window of recent ones, so an onion in flight across a rotation still peels). On each epoch advance
+    /// the ratchet rotates one-way, so a recorded onion becomes undecryptable once we ratchet more than
+    /// the window past its epoch. Distinct from the long-term identity key.
+    onion: OnionKeyRatchet,
     threshold: usize,
     gather_timeout: Duration,
     pending: BTreeMap<u64, Pending>,
@@ -110,14 +116,28 @@ pub struct ThresholdRouter<F: Field> {
 const MAX_OUTBOX: usize = 2048;
 
 impl<F: Field> ThresholdRouter<F> {
-    /// A router at `coord` with its hybrid KEM secret, peeling hops that need a threshold of `t`.
+    /// A router at `coord`, peeling hops that need a threshold of `t`. `kem_secret` (the node's long-term
+    /// identity KEM secret) is **borrowed only** to derive the secret mix-schedule key (audit E2) — it is
+    /// neither consumed nor retained, since hops are peeled with the forward-secure onion ratchet below,
+    /// so a driver may keep using its identity secret elsewhere.
+    ///
+    /// `onion_seed` is the **genesis** of the forward-secure onion ratchet (audit E4): fresh entropy in
+    /// production (a driver CSPRNG draw), so a later compromise of the long-term `kem_secret` cannot
+    /// recompute past epochs' onion keys; a fixed value under the deterministic simulator.
     #[must_use]
-    pub fn new(coord: Point<F>, kem_secret: HybridKemSecret, threshold: usize) -> Self {
-        // Derive the secret mixing-delay PRF key from the KEM secret up front (see `mix_seed`).
+    pub fn new(
+        coord: Point<F>,
+        kem_secret: &HybridKemSecret,
+        threshold: usize,
+        onion_seed: [u8; 32],
+    ) -> Self {
+        // Derive the secret mixing-delay PRF key from the identity KEM secret up front (see `mix_seed`);
+        // the identity key itself is not retained — the onion is peeled with the forward-secure `onion`
+        // ratchet, so a later compromise of the long-term key cannot recover past hops (audit E4).
         let mix_seed = kem_secret.derive_subkey("FANOS-v1/threshold-mix-seed");
         Self {
             coord,
-            kem_secret,
+            onion: OnionKeyRatchet::new(onion_seed, Epoch::ZERO),
             threshold,
             gather_timeout: DEFAULT_GATHER_TIMEOUT,
             pending: BTreeMap::new(),
@@ -131,6 +151,20 @@ impl<F: Field> ThresholdRouter<F> {
             cover_seq: 0,
             outbox: VecDeque::new(),
         }
+    }
+
+    /// This router's current-epoch **onion public key** — what a client seals hops to, and what the
+    /// node's driver (re)publishes at the epoch-tagged mix-key slot each time the epoch advances (E4).
+    #[must_use]
+    pub fn onion_public(&self) -> &HybridKemPublic {
+        self.onion.public()
+    }
+
+    /// The epoch this router's forward-secure onion key is currently at (advances on
+    /// `Command::AdvanceEpoch`).
+    #[must_use]
+    pub fn onion_epoch(&self) -> Epoch {
+        self.onion.epoch()
     }
 
     /// Override the combiner's partial-gathering deadline (default 2 s).
@@ -300,7 +334,10 @@ impl<F: Field> ThresholdRouter<F> {
         let member_count = members.len();
         let mut shares = Vec::new();
         if let Some(i) = self.my_index(line)
-            && let Some(share) = threshold::member_partial(&onion, i, &self.kem_secret)
+            && let Some(share) = self
+                .onion
+                .secrets()
+                .find_map(|sk| threshold::member_partial(&onion, i, sk))
         {
             shares.push(share);
         }
@@ -341,7 +378,11 @@ impl<F: Field> ThresholdRouter<F> {
         let Some(i) = self.my_index(line) else {
             return Vec::new();
         };
-        let Some(share) = threshold::member_partial(onion, i, &self.kem_secret) else {
+        let Some(share) = self
+            .onion
+            .secrets()
+            .find_map(|sk| threshold::member_partial(onion, i, sk))
+        else {
             return Vec::new();
         };
         alloc::vec![Effect::Send {
@@ -512,6 +553,12 @@ impl<F: Field> Engine for ThresholdRouter<F> {
             }
             // Begin the cover schedule (if `with_cover` enabled it), mirroring the other node engines.
             Input::Command(Command::StartHeartbeat) => self.start_cover(),
+            // The epoch beacon advanced: rotate the forward-secure onion key one step (audit E4). The old
+            // epoch's decap secret is dropped, so onions recorded under it can no longer be peeled here.
+            Input::Command(Command::AdvanceEpoch) => {
+                self.onion.advance_to(self.onion.epoch().next());
+                Vec::new()
+            }
             Input::Command(_) => Vec::new(),
         }
     }
@@ -616,8 +663,10 @@ mod tests {
         let (s0, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"mix-secret-a"));
         let (s1, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"mix-secret-b"));
         let mean = Duration::from_millis(50);
-        let a = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s0, 2).with_mixing(mean);
-        let b = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s1, 2).with_mixing(mean);
+        let a =
+            ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s0, 2, [0x11; 32]).with_mixing(mean);
+        let b =
+            ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s1, 2, [0x11; 32]).with_mixing(mean);
 
         let seq_a: Vec<u64> = (1..=8).map(|i| a.sample_delay(i).as_nanos()).collect();
         let seq_b: Vec<u64> = (1..=8).map(|i| b.sample_delay(i).as_nanos()).collect();
@@ -639,7 +688,7 @@ mod tests {
         // cover onion — byte-indistinguishable from a real padded threshold onion — and re-arms, so the
         // router's send rate and packet size are uniform whether or not it is carrying real traffic.
         let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"cover-on"));
-        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s, 2)
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s, 2, [0x11; 32])
             .with_cover(Duration::from_millis(100));
 
         let armed = r.step(Instant(0), Input::Command(Command::StartHeartbeat));
@@ -673,7 +722,7 @@ mod tests {
 
         // Without `with_cover`, StartHeartbeat is inert (no cover on the mixing-only path).
         let (s2, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"cover-off"));
-        let mut plain = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s2, 2);
+        let mut plain = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s2, 2, [0x11; 32]);
         assert!(
             plain
                 .step(Instant(0), Input::Command(Command::StartHeartbeat))
@@ -688,7 +737,7 @@ mod tests {
         // DISPLACES the next cover slot, so the emission rate is constant whether or not real traffic
         // flows and a flow-correlation adversary counting cells learns nothing about the real load.
         let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"e6-displace"));
-        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), s, 2)
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s, 2, [0x11; 32])
             .with_cover(Duration::from_millis(100));
         r.step(Instant(0), Input::Command(Command::StartHeartbeat));
 
@@ -741,11 +790,18 @@ mod tests {
         assert_eq!(members.len(), 3);
         let t = 2usize;
 
-        // KEM keypair per member, in points_on (seal) order.
-        let (sec0, pub0) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A, 0]));
-        let (sec1, pub1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A, 1]));
-        let (_sec2, pub2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A, 2]));
-        let pubs = [&pub0, &pub1, &pub2];
+        // Forward-secure ONION keypair per member, in points_on (seal) order (audit E4): the onion seals
+        // each member's share to its epoch onion key, and the combiner router peels with its own onion
+        // secret (its long-term identity key is separate and not used to peel).
+        let onion_seed = |i: u8| {
+            let mut s = [0x5Au8; 32];
+            s[31] = i;
+            s
+        };
+        let m0 = OnionKeyRatchet::new(onion_seed(0), Epoch::ZERO);
+        let m1 = OnionKeyRatchet::new(onion_seed(1), Epoch::ZERO);
+        let m2 = OnionKeyRatchet::new(onion_seed(2), Epoch::ZERO);
+        let pubs = [m0.public(), m1.public(), m2.public()];
         let hop = HopLine {
             line: line_coord,
             members: &pubs,
@@ -753,9 +809,10 @@ mod tests {
         let payload = b"anon-payload";
         let onion = seal_onion(&[hop], t as u8, payload, b"seed-router").unwrap();
 
-        // The combiner is member 0.
+        // The combiner is member 0; its onion genesis is onion_seed(0), so its onion_public == pubs[0].
         let combiner = Point::<F2>::new(members[0]).unwrap();
-        let mut router = ThresholdRouter::<F2>::new(combiner, sec0, t);
+        let (identity0, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"identity-0"));
+        let mut router = ThresholdRouter::<F2>::new(combiner, &identity0, t, onion_seed(0));
 
         // Deliver the onion: the combiner seeds its own share and fans out requests — no peel yet.
         let onion_frame = launch_frame(line_coord, &onion);
@@ -772,7 +829,7 @@ mod tests {
         );
 
         // The honest member-1 reply (the real partial) and a forgery at the same index with mangled y.
-        let honest1 = member_partial(&onion, 1, &sec1).unwrap();
+        let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
         let forged = Share {
             x: honest1.x,
             y: honest1.y.iter().map(|b| b ^ 0xFF).collect(),
@@ -815,7 +872,7 @@ mod tests {
     fn a_command_send_launches_a_raw_frame() {
         // A router node can also originate onions as a client: Command::Send emits the frame verbatim.
         let (secret, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"launch"));
-        let mut router = ThresholdRouter::<F2>::new(Point::<F2>::at(0), secret, 2);
+        let mut router = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &secret, 2, [0x11; 32]);
         let effects = router.step(
             Instant(0),
             Input::Command(Command::Send {
@@ -857,10 +914,17 @@ mod tests {
         let line_coord = Line::<F2>::at(2).coords();
         let members = ThresholdRouter::<F2>::line_members(line_coord);
         let t = 2usize;
-        let (sec0, pub0) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x7C, 0]));
+        // Member 0 (the combiner) is peeled with its forward-secure onion key, so its share seals to that
+        // key (audit E4); members 1/2 never reply here, so their sealing keys are arbitrary.
+        let onion_seed0 = {
+            let mut s = [0x7Cu8; 32];
+            s[31] = 0;
+            s
+        };
+        let m0 = OnionKeyRatchet::new(onion_seed0, Epoch::ZERO);
         let (_s1, pub1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x7C, 1]));
         let (_s2, pub2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x7C, 2]));
-        let pubs = [&pub0, &pub1, &pub2];
+        let pubs = [m0.public(), &pub1, &pub2];
         let onion = seal_onion(
             &[HopLine {
                 line: line_coord,
@@ -872,7 +936,8 @@ mod tests {
         )
         .unwrap();
         let combiner = Point::<F2>::new(members[0]).unwrap();
-        let mut router = ThresholdRouter::<F2>::new(combiner, sec0, t);
+        let (identity0, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"identity-2"));
+        let mut router = ThresholdRouter::<F2>::new(combiner, &identity0, t, onion_seed0);
         router.step(
             Instant(0),
             Input::Message {
@@ -900,5 +965,73 @@ mod tests {
                 "an out-of-range share index (x={bad_x}) is dropped"
             );
         }
+    }
+
+    #[test]
+    fn a_recorded_onion_survives_one_rotation_then_becomes_unpeelable() {
+        // E4 end-to-end forward secrecy WITH graceful rotation. An onion sealed to a relay's epoch-0
+        // onion key delivers at epoch 0; after ONE rotation it still delivers (the relay's grace window
+        // keeps the previous epoch decap-able, so onions in flight across a boundary are not dropped);
+        // but once the relay is TWO rotations on, epoch 0 has fallen out of the retain=1 window and the
+        // SAME recorded onion can no longer be peeled — a passive adversary that captured it and later
+        // compromised the relay decrypts nothing. With t = 1 the combiner peels with its own share.
+        let line_coord = Line::<F2>::at(3).coords();
+        let members = ThresholdRouter::<F2>::line_members(line_coord);
+        let t = 1usize;
+        let onion_seed = [0xE4u8; 32];
+        let m0 = OnionKeyRatchet::new(onion_seed, Epoch::ZERO);
+        let (_i1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xE4, 1]));
+        let (_i2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xE4, 2]));
+        let pubs = [m0.public(), &p1, &p2];
+        let payload = b"fs-payload";
+        let onion = seal_onion(
+            &[HopLine {
+                line: line_coord,
+                members: &pubs,
+            }],
+            t as u8,
+            payload,
+            b"fs-seed",
+        )
+        .unwrap();
+
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"fs-identity"));
+        let mut router = ThresholdRouter::<F2>::new(combiner, &identity, t, onion_seed);
+        // Re-inject the SAME recorded onion at time `at` and report whether it was delivered.
+        let replay = |router: &mut ThresholdRouter<F2>, at: u64| {
+            has_delivery(
+                &router.step(
+                    Instant(at),
+                    Input::Message {
+                        from: [9, 9, 9],
+                        frame: launch_frame(line_coord, &onion),
+                    },
+                ),
+                payload,
+            )
+        };
+
+        // Epoch 0: the current-epoch relay peels its own share (t = 1) and delivers.
+        assert!(
+            replay(&mut router, 0),
+            "the current-epoch relay peels a current-epoch onion"
+        );
+
+        // One rotation: the epoch-0 key is now in the grace window, so an onion in flight still delivers.
+        router.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        assert_eq!(router.onion_epoch(), Epoch::new(1));
+        assert!(
+            replay(&mut router, 2),
+            "an onion in flight across one rotation still peels (grace window)"
+        );
+
+        // A second rotation: epoch 0 falls out of the retain=1 window and its secret is gone.
+        router.step(Instant(3), Input::Command(Command::AdvanceEpoch));
+        assert_eq!(router.onion_epoch(), Epoch::new(2));
+        assert!(
+            !replay(&mut router, 4),
+            "past the grace window the recorded onion is unpeelable (E4 forward secrecy)"
+        );
     }
 }

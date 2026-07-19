@@ -19,7 +19,7 @@
 use fanos_aphantos::ThresholdRouter;
 use fanos_field::F2;
 use fanos_geometry::{Line, Point, Triple};
-use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::{
     ANONYMOUS, MixDirectory, RendezvousClient, RendezvousService, Request, SessionId, combiner_for,
     meeting_line, seal_forward,
@@ -27,15 +27,32 @@ use fanos_rendezvous::{
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
 
+/// A relay's forward-secure onion-ratchet genesis seed (audit E4), distinct per Fano point. Fixed here
+/// for the deterministic simulator; a real relay draws it from OS entropy.
+fn onion_seed_for(i: u8) -> [u8; 32] {
+    let mut s = [0xA0u8; 32];
+    s[31] = i;
+    s
+}
+
 /// Spawn a `ThresholdRouter` at every Fano point (the mixnet), returning the members' key directory.
 fn spawn_mixnet(sim: &mut Sim, t: usize) -> MixDirectory {
     let mut dir = MixDirectory::new();
     for i in 0..7 {
         let point = Point::<F2>::at(i);
         let mut rng = SeedRng::from_seed(&[0xB0, i as u8]);
-        let (secret, public) = HybridKemSecret::generate(&mut rng);
-        dir.insert(point.coords(), public);
-        sim.add(Box::new(ThresholdRouter::<F2>::new(point, secret, t)));
+        let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+        // The mixnet directory carries each relay's forward-secure ONION public (audit E4), not its
+        // long-term identity key: the client seals to it, and the relay peels with the matching onion
+        // secret derived from the same genesis seed.
+        let onion_seed = onion_seed_for(i as u8);
+        let onion_public = OnionKeyRatchet::new(onion_seed, fanos_rendezvous::Epoch::ZERO)
+            .public()
+            .clone();
+        dir.insert(point.coords(), onion_public);
+        sim.add(Box::new(ThresholdRouter::<F2>::new(
+            point, &secret, t, onion_seed,
+        )));
     }
     dir
 }
