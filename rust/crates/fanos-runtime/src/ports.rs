@@ -202,6 +202,17 @@ pub enum Notification {
     /// A distributed key generation completed (spec §L6): the 32-byte joint public key the cell
     /// agreed on, whose secret no single node holds.
     DkgComplete([u8; 32]),
+    /// The distributed randomness **beacon** produced (or adopted) an epoch's public seed (spec §L3,
+    /// audit E5): a threshold of anchors' partials combined and verified. The `seed` is public and
+    /// unpredictable-until-now; a driver folds it into the rendezvous meeting line and advances the
+    /// epoch (rotating the E4 onion keys). Distinct from [`EpochAdvanced`](Self::EpochAdvanced), which
+    /// is the bare epoch counter — this carries the verified randomness.
+    BeaconReady {
+        /// The epoch this seed is the beacon for.
+        epoch: Epoch,
+        /// The 32-byte public beacon seed.
+        seed: [u8; 32],
+    },
 }
 
 /// The sans-I/O node engine: a pure state machine over virtual time.

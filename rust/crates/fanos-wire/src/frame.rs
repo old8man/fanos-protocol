@@ -30,6 +30,9 @@ pub enum FrameType {
     DkgJustify = 0x15,
     DkgCommit = 0x16,
     DkgComplaint = 0x17,
+    /// One anchor's distributed-VRF **beacon partial** for an epoch (audit E5): flooded among the
+    /// beacon group; a threshold of them assemble the epoch's [`Beacon`](Self::Beacon) round.
+    BeaconPartial = 0x18,
     // 0x2* Overlay / storage
     Lookup = 0x20,
     Value = 0x21,
@@ -87,6 +90,7 @@ impl FrameType {
             0x15 => Self::DkgJustify,
             0x16 => Self::DkgCommit,
             0x17 => Self::DkgComplaint,
+            0x18 => Self::BeaconPartial,
             0x20 => Self::Lookup,
             0x21 => Self::Value,
             0x22 => Self::Publish,

@@ -24,3 +24,6 @@ pub use ports::{Command, Duration, Effect, Engine, Input, Instant, Notification,
 
 // Re-export the wire address type so drivers and apps speak the same coordinates.
 pub use fanos_geometry::Triple;
+// Re-export the protocol epoch — core engine vocabulary (`EpochAdvanced`, `BeaconReady`), so drivers
+// and sibling engines (e.g. the beacon) speak it without reaching past the runtime.
+pub use fanos_primitives::Epoch;

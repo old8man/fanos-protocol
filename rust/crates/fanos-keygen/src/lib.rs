@@ -35,6 +35,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod beacon;
+pub use beacon::BeaconNode;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_field::Field;
