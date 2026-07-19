@@ -175,6 +175,27 @@ impl VssCommitment {
         out
     }
 
+    /// The coefficient-wise sum of several commitments — the public commitment of the sum of their
+    /// polynomials. All must share the same degree (`threshold`); returns `None` if the slice is empty
+    /// or the degrees differ. Aggregating a DKG's qualified dealers' commitments yields the joint
+    /// polynomial's commitment, whose [`public_share(i)`](Self::public_share) is holder `i`'s public key
+    /// `Y_i = s_i·G` — exactly what a distributed-VRF beacon partial ([`crate::beacon`]) is verified
+    /// against.
+    #[must_use]
+    pub fn aggregate(commitments: &[&VssCommitment]) -> Option<VssCommitment> {
+        let (first, rest) = commitments.split_first()?;
+        let mut coeffs = first.coeffs.clone();
+        for c in rest {
+            if c.coeffs.len() != coeffs.len() {
+                return None;
+            }
+            for (acc, add) in coeffs.iter_mut().zip(&c.coeffs) {
+                *acc += add;
+            }
+        }
+        Some(VssCommitment { coeffs })
+    }
+
     /// Decode a commitment, or `None` if a coefficient is not a valid group element.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
@@ -326,5 +347,29 @@ mod tests {
         let mut rng = DeterministicRng::new(b"deal-5");
         assert!(deal(&secret(), 0, 3, &mut rng).is_none());
         assert!(deal(&secret(), 4, 3, &mut rng).is_none()); // t > n
+    }
+
+    #[test]
+    fn aggregated_commitments_verify_summed_shares() {
+        // Two dealers' sharings of the same degree. The aggregate commitment is the commitment of the
+        // summed polynomial, so holder i's *summed* share (s¹ᵢ + s²ᵢ) verifies against it — the exact
+        // DKG relation the beacon relies on (final share = Σ dealers, joint key = Σ commitments).
+        let (sh1, c1) = deal(&secret(), 3, 5, &mut DeterministicRng::new(b"agg-d1")).unwrap();
+        let mut s2 = [0u8; 32];
+        hash_xof("agg-secret-2", b"second-dealer", &mut s2);
+        let (sh2, c2) = deal(&s2, 3, 5, &mut DeterministicRng::new(b"agg-d2")).unwrap();
+
+        let agg = VssCommitment::aggregate(&[&c1, &c2]).unwrap();
+        for i in 0..5 {
+            let summed = VssShare::from_parts(sh1[i].index, sh1[i].value() + sh2[i].value());
+            assert!(
+                verify_share(&summed, &agg),
+                "the summed share verifies against the aggregate commitment"
+            );
+        }
+        // Mismatched degree, or an empty set, aggregate to nothing.
+        let (_, c_lowdeg) = deal(&secret(), 2, 5, &mut DeterministicRng::new(b"agg-d3")).unwrap();
+        assert!(VssCommitment::aggregate(&[&c1, &c_lowdeg]).is_none());
+        assert!(VssCommitment::aggregate(&[]).is_none());
     }
 }

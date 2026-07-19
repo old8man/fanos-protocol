@@ -102,6 +102,10 @@ pub struct DkgNode<F: Field> {
     share_deadline: Duration,
     complaint_deadline: Duration,
     done: bool,
+    /// The aggregate commitment over the folded (QUAL) dealers, set at finalize. Its `public_share(i)`
+    /// is holder `i`'s public key `Y_i`, so a randomness-beacon partial from a node's final share
+    /// verifies against it (spec §L6 DKG → beacon). `None` until the DKG completes.
+    aggregate: Option<VssCommitment>,
 }
 
 impl<F: Field> DkgNode<F> {
@@ -141,6 +145,7 @@ impl<F: Field> DkgNode<F> {
             share_deadline: DEFAULT_SHARE_DEADLINE,
             complaint_deadline: DEFAULT_COMPLAINT_DEADLINE,
             done: false,
+            aggregate: None,
         }
     }
 
@@ -420,6 +425,10 @@ impl<F: Field> DkgNode<F> {
             }
         }
         let joint = dkg::joint_public_from_commitments(&refs);
+        // The aggregate of exactly the folded commitments is the joint polynomial's commitment: its
+        // `public_share(i)` is holder i's public key `Y_i`, so a beacon partial from a node's final
+        // share verifies against it. Every honest node folds the same QUAL, so all agree on this.
+        self.aggregate = VssCommitment::aggregate(&refs);
         alloc_vec_notify(joint)
     }
 
@@ -438,6 +447,22 @@ impl<F: Field> DkgNode<F> {
     #[must_use]
     pub fn final_share_bytes(&self) -> [u8; 32] {
         self.participant.final_share().value_bytes()
+    }
+
+    /// This node's final key share as a verifiable [`VssShare`] (index + scalar) — the input a member
+    /// feeds to a [beacon partial](fanos_vrf::beacon::partial_eval) once the DKG is complete.
+    #[must_use]
+    pub fn final_share(&self) -> VssShare {
+        self.participant.final_share()
+    }
+
+    /// The aggregate commitment of the qualified dealers once the DKG has completed (`None` before).
+    /// A [beacon partial](fanos_vrf::beacon) from any member's [`final_share`](Self::final_share)
+    /// verifies against this: it is the group's public verification material, and because every honest
+    /// node folds the same `QUAL`, all agree on it.
+    #[must_use]
+    pub fn aggregate_commitment(&self) -> Option<VssCommitment> {
+        self.aggregate.clone()
     }
 }
 
@@ -726,5 +751,83 @@ mod tests {
             deals([1u8; 32]),
             "same secret+nonce is deterministic (replayable)"
         );
+    }
+
+    /// The Fano-point index whose node address is `to` (the inverse of `Point::at`), for routing frames.
+    fn node_at_f2(to: Triple) -> Option<usize> {
+        (0..Plane::<F2>::N as usize).find(|&k| Point::<F2>::at(k).coords() == to)
+    }
+
+    /// Deliver every queued `(from, target, frame)` — routing each node's resulting sends back onto the
+    /// bus — until the bus is quiescent. `clock` advances monotonically so stepped inputs stay ordered.
+    fn drain(nodes: &mut [DkgNode<F2>], bus: &mut Vec<(Triple, usize, Vec<u8>)>, clock: &mut u64) {
+        while !bus.is_empty() {
+            let (from, target, frame) = bus.remove(0);
+            *clock += 1;
+            for e in nodes[target].step(Instant(*clock), Input::Message { from, frame }) {
+                if let Effect::Send { to, frame } = e
+                    && let Some(k) = node_at_f2(to)
+                {
+                    bus.push((Point::<F2>::at(target).coords(), k, frame));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_completed_dkg_exposes_consistent_beacon_material() {
+        // Drive an all-honest t-of-n DKG to completion by hand (so the test keeps ownership of the nodes),
+        // then check the material a randomness beacon consumes (fanos_vrf::beacon): every node exposes the
+        // SAME aggregate commitment, and each node's final share verifies against it — so a beacon partial
+        // from that share verifies and the group can produce its per-epoch seed.
+        let (n, t) = (7usize, 4usize);
+        let mut nodes: Vec<DkgNode<F2>> = (0..n)
+            .map(|i| {
+                DkgNode::<F2>::new(Point::at(i), t, [i as u8 + 1; 32], [(i as u8) ^ 0x5A; 32])
+                    .with_deadlines(Duration::from_millis(10), Duration::from_millis(10))
+            })
+            .collect();
+
+        let mut clock = 0u64;
+        let mut bus: Vec<(Triple, usize, Vec<u8>)> = Vec::new();
+        // Kick off: every node deals its sharing and broadcasts its commitment.
+        for (k, node) in nodes.iter_mut().enumerate() {
+            for e in node.step(Instant(0), Input::Command(Command::StartHeartbeat)) {
+                if let Effect::Send { to, frame } = e
+                    && let Some(j) = node_at_f2(to)
+                {
+                    bus.push((Point::<F2>::at(k).coords(), j, frame));
+                }
+            }
+        }
+        drain(&mut nodes, &mut bus, &mut clock);
+        // Sharing deadline (no complaints — all honest), then complaint deadline ⇒ finalize.
+        for node in &mut nodes {
+            let _ = node.step(Instant(100), Input::Timer(DKG_SHARE_DEADLINE));
+        }
+        drain(&mut nodes, &mut bus, &mut clock);
+        let done = (0..n)
+            .filter(|&k| {
+                completed(&nodes[k].step(Instant(200), Input::Timer(DKG_COMPLAINT_DEADLINE)))
+            })
+            .count();
+        drain(&mut nodes, &mut bus, &mut clock);
+        assert_eq!(done, n, "all honest nodes complete the DKG");
+
+        let agg0 = nodes[0]
+            .aggregate_commitment()
+            .expect("a completed DKG exposes its aggregate commitment");
+        for (k, node) in nodes.iter().enumerate() {
+            let agg = node.aggregate_commitment().expect("aggregate commitment");
+            assert_eq!(
+                agg.to_bytes(),
+                agg0.to_bytes(),
+                "every node agrees on the aggregate commitment"
+            );
+            assert!(
+                vss::verify_share(&node.final_share(), &agg0),
+                "node {k}'s final share verifies against the group aggregate — beacon-ready"
+            );
+        }
     }
 }

@@ -269,11 +269,104 @@ pub fn combine(partials: &[BeaconPartial], threshold: usize) -> Option<BeaconOut
     Some(BeaconOutput { sigma })
 }
 
+/// A self-verifying per-epoch beacon: the threshold set of partials that combine to the epoch's seed.
+///
+/// This is the object the network floods and a joining node syncs (spec `BEACON`). A recipient calls
+/// [`verify_and_seed`](Self::verify_and_seed) to check **every** partial's DLEQ against the group
+/// commitment and recombine, so it trusts the algebra, not the peer that relayed it. Because the
+/// combined `σ = x·M` is subset-independent, two nodes that assembled *different* threshold sets of
+/// partials still derive the identical seed — the beacon is canonical for the epoch.
+#[derive(Clone, Debug)]
+pub struct BeaconRound {
+    epoch: Epoch,
+    partials: Vec<BeaconPartial>,
+}
+
+impl BeaconRound {
+    /// Assemble a round for `epoch`, keeping `threshold` partials with distinct indices. `None` if
+    /// fewer than `threshold` distinct-index partials are supplied (the beacon cannot yet be formed).
+    #[must_use]
+    pub fn assemble(epoch: Epoch, partials: &[BeaconPartial], threshold: usize) -> Option<Self> {
+        if threshold == 0 {
+            return None;
+        }
+        let mut kept: Vec<BeaconPartial> = Vec::with_capacity(threshold);
+        for p in partials {
+            if p.index != 0 && !kept.iter().any(|k| k.index == p.index) {
+                kept.push(p.clone());
+                if kept.len() == threshold {
+                    break;
+                }
+            }
+        }
+        (kept.len() == threshold).then_some(Self {
+            epoch,
+            partials: kept,
+        })
+    }
+
+    /// The epoch this round is the beacon for.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Verify **every** partial against the group `commitment` for this round's epoch and combine to the
+    /// public seed. `None` if the round holds fewer than `threshold` partials, any partial fails its
+    /// DLEQ, or the combination fails — so a forged, short, or wrong-epoch round yields no seed and can
+    /// never be adopted.
+    #[must_use]
+    pub fn verify_and_seed(
+        &self,
+        commitment: &VssCommitment,
+        threshold: usize,
+    ) -> Option<[u8; 32]> {
+        if self.partials.len() < threshold {
+            return None;
+        }
+        if !self
+            .partials
+            .iter()
+            .all(|p| verify_partial(p, self.epoch, commitment))
+        {
+            return None;
+        }
+        combine(&self.partials, threshold).map(|out| out.seed(self.epoch))
+    }
+
+    /// The `epoch(8) ‖ count(1) ‖ partials…` wire encoding — what the `BEACON` frame carries.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 1 + self.partials.len() * PARTIAL_LEN);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.push(self.partials.len() as u8);
+        for p in &self.partials {
+            out.extend_from_slice(&p.to_bytes());
+        }
+        out
+    }
+
+    /// Decode a round from its wire encoding, or `None` if it is truncated or a partial is malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let epoch = Epoch::from_be_bytes(bytes.get(0..8)?.try_into().ok()?);
+        let count = usize::from(*bytes.get(8)?);
+        let mut partials = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 9 + i * PARTIAL_LEN;
+            partials.push(BeaconPartial::from_bytes(
+                bytes.get(start..start + PARTIAL_LEN)?,
+            )?);
+        }
+        Some(Self { epoch, partials })
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::vss::{DeterministicRng, deal, reconstruct};
+    use crate::vss::{DeterministicRng, VssCommitment, VssShare, deal, reconstruct};
 
     /// Deal a fresh `(t, n)` sharing of a test secret, returning the shares and the public commitment.
     fn shared(seed: &[u8], t: usize, n: usize) -> (Vec<VssShare>, VssCommitment, [u8; 32]) {
@@ -436,5 +529,89 @@ mod tests {
         .unwrap()
         .seed(epoch);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_beacon_round_self_verifies_and_round_trips() {
+        let (shares, commitment, _) = shared(b"beacon-round", 3, 5);
+        let epoch = Epoch::new(11);
+        let partials: Vec<_> = shares.iter().map(|s| partial_eval(s, epoch)).collect();
+
+        // A round of the right threshold verifies against the commitment and yields the canonical seed.
+        let round = BeaconRound::assemble(epoch, &partials, 3).unwrap();
+        let seed = round.verify_and_seed(&commitment, 3).unwrap();
+        assert_eq!(
+            seed,
+            combine(&partials, 3).unwrap().seed(epoch),
+            "the round's seed is the canonical combined value"
+        );
+
+        // Round-trips through bytes with the same verdict — this is what the BEACON frame carries.
+        let decoded = BeaconRound::from_bytes(&round.to_bytes()).unwrap();
+        assert_eq!(decoded.verify_and_seed(&commitment, 3), Some(seed));
+
+        // A round carrying one forged partial verifies to nothing — a bad DLEQ sinks the whole round.
+        let mut forged = partials.clone();
+        forged[0].response += Scalar::ONE;
+        let bad = BeaconRound::assemble(epoch, &forged, 3).unwrap();
+        assert!(bad.verify_and_seed(&commitment, 3).is_none());
+
+        // Too few distinct partials cannot assemble a threshold-3 round.
+        assert!(BeaconRound::assemble(epoch, &partials[..2], 3).is_none());
+    }
+
+    #[test]
+    fn a_dkg_group_produces_a_verifiable_beacon() {
+        // Compose the real DKG primitives with the beacon: n dealers each deal a t-of-n sharing; every
+        // participant folds them into a final share; the aggregate of the commitments is the joint
+        // polynomial's commitment. A beacon partial from each DKG final share then verifies against that
+        // aggregate, and any t combine to the group's seed — no node ever holding the joint secret.
+        let (n, t) = (5usize, 3usize);
+        let dealings: Vec<_> = (0..n)
+            .map(|d| {
+                crate::dkg::deal(
+                    &[d as u8 + 1; 32],
+                    t,
+                    n,
+                    &mut DeterministicRng::new(&[0xD, d as u8]),
+                )
+                .unwrap()
+            })
+            .collect();
+        let finals: Vec<VssShare> = (1..=n as u8)
+            .map(|i| {
+                let mut p = crate::dkg::Participant::new(i);
+                for dealing in &dealings {
+                    p.ingest(dealing);
+                }
+                p.final_share()
+            })
+            .collect();
+        let commits: Vec<&VssCommitment> = dealings
+            .iter()
+            .map(crate::dkg::Dealing::commitment)
+            .collect();
+        let agg = VssCommitment::aggregate(&commits).unwrap();
+
+        let epoch = Epoch::new(77);
+        let partials: Vec<_> = finals.iter().map(|s| partial_eval(s, epoch)).collect();
+        assert!(
+            partials.iter().all(|p| verify_partial(p, epoch, &agg)),
+            "a beacon partial from a DKG final share verifies against the DKG aggregate commitment"
+        );
+
+        let seed = BeaconRound::assemble(epoch, &partials, t)
+            .unwrap()
+            .verify_and_seed(&agg, t)
+            .expect("the DKG-backed beacon round verifies");
+        assert_ne!(seed, [0u8; 32]);
+        // Subset-independence over the real DKG shares: a different t-subset yields the same seed.
+        assert_eq!(
+            BeaconRound::assemble(epoch, &partials[2..], t)
+                .unwrap()
+                .verify_and_seed(&agg, t),
+            Some(seed),
+            "any t of the DKG group's partials yield the same beacon seed"
+        );
     }
 }
