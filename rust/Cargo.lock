@@ -855,6 +855,7 @@ dependencies = [
  "curve25519-dalek 4.1.3",
  "fanos-primitives",
  "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]

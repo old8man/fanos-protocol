@@ -19,6 +19,8 @@ categories = ["cryptography"]
 fanos-primitives = { workspace = true, features = ["alloc"] }
 curve25519-dalek.workspace = true
 rand_core = { version = "0.6", default-features = false }
+# Constant-time authenticator comparison in credit redemption (audit B8).
+subtle.workspace = true
 
 [lints]
 workspace = true

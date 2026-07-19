@@ -29,6 +29,7 @@ use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand_core::{CryptoRng, RngCore};
+use subtle::ConstantTimeEq;
 
 use fanos_primitives::hash::hash_xof;
 
@@ -38,12 +39,28 @@ pub const INPUT_LEN: usize = 32;
 const H2C_LABEL: &str = "FANOS-v1/credit-h2c";
 const DLEQ_LABEL: &str = "FANOS-v1/credit-dleq";
 const DLEQ_NONCE_LABEL: &str = "FANOS-v1/credit-dleq-nonce";
+const REDEEM_LABEL: &str = "FANOS-v1/credit-redeem";
 
 /// Hash an input to a ristretto255 point (`H(x)`), the PRF's domain map.
 fn hash_to_curve(input: &[u8]) -> RistrettoPoint {
     let mut wide = [0u8; 64];
     hash_xof(H2C_LABEL, input, &mut wide);
     RistrettoPoint::from_uniform_bytes(&wide)
+}
+
+/// The redemption authenticator binding a credit's **secret** output `N` to a verifier-supplied
+/// `context`: `H(REDEEM_LABEL ‖ N ‖ context)` (audit B8, RFC 9578-style). The client computes it (it
+/// holds `N`); the issuer re-derives it (it recomputes `N = k·H(x)`), so `N` itself never travels — an
+/// in-flight observer sees only `(x, authenticator)` and, lacking `N`, cannot forge an authenticator for
+/// a *different* context, so a credit presented for one redemption cannot be replayed or front-run into
+/// another.
+fn redeem_authenticator(n: &RistrettoPoint, context: &[u8]) -> [u8; 32] {
+    let mut data = Vec::with_capacity(32 + context.len());
+    data.extend_from_slice(n.compress().as_bytes());
+    data.extend_from_slice(context);
+    let mut out = [0u8; 32];
+    hash_xof(REDEEM_LABEL, &data, &mut out);
+    out
 }
 
 /// The Fiat–Shamir challenge over a DLEQ transcript.
@@ -188,6 +205,51 @@ impl Credit {
             output: point,
         })
     }
+
+    /// Prove ownership of this credit for a verifier-supplied `context`, **without revealing** the secret
+    /// output `N` (audit B8). Present the returned [`RedeemProof`] to redeem instead of the raw credit: a
+    /// proof authenticated for one context cannot be replayed or front-run into another, since forging an
+    /// authenticator for a different context needs `N`, which never travels.
+    #[must_use]
+    pub fn prove(&self, context: &[u8]) -> RedeemProof {
+        RedeemProof {
+            input: self.input,
+            authenticator: redeem_authenticator(&self.output, context),
+        }
+    }
+}
+
+/// A context-bound redemption of a [`Credit`] (audit B8, RFC 9578-style): the credit's input `x` and an
+/// authenticator over the verifier's context, presented *instead of* the raw credit so the secret output
+/// `N` never travels. See [`Credit::prove`] / [`CreditIssuer::redeem`].
+#[derive(Clone, Copy, Debug)]
+pub struct RedeemProof {
+    input: [u8; INPUT_LEN],
+    authenticator: [u8; 32],
+}
+
+impl RedeemProof {
+    /// The `input(32) ‖ authenticator(32)` encoding (64 bytes) for transport.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..INPUT_LEN].copy_from_slice(&self.input);
+        out[INPUT_LEN..].copy_from_slice(&self.authenticator);
+        out
+    }
+
+    /// Decode a proof from its 64-byte encoding (both halves are opaque bytes, so this is infallible).
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        let mut input = [0u8; INPUT_LEN];
+        let mut authenticator = [0u8; 32];
+        input.copy_from_slice(&bytes[..INPUT_LEN]);
+        authenticator.copy_from_slice(&bytes[INPUT_LEN..]);
+        Self {
+            input,
+            authenticator,
+        }
+    }
 }
 
 /// The result of presenting a credit for redemption.
@@ -244,12 +306,22 @@ impl CreditIssuer {
         self.k * hash_to_curve(&credit.input) == credit.output
     }
 
-    /// Redeem a credit once: verify it, then reject a replay (double-spend).
-    pub fn redeem(&mut self, credit: &Credit) -> Redemption {
-        if !self.verify(credit) {
+    /// Redeem a credit once, **bound to `context`** (audit B8): recompute `N = k·H(x)` from the proof's
+    /// input, check in constant time that its authenticator binds `N` to this `context`, then reject a
+    /// replay (double-spend on `x`). A proof authenticated for a *different* context is
+    /// [`Redemption::Invalid`] here — so a credit shown for one redemption (which reveals only
+    /// `(x, authenticator)`, never `N`) cannot be replayed or front-run into another context.
+    #[must_use]
+    pub fn redeem(&mut self, proof: &RedeemProof, context: &[u8]) -> Redemption {
+        let n = self.k * hash_to_curve(&proof.input);
+        if redeem_authenticator(&n, context)
+            .ct_eq(&proof.authenticator)
+            .unwrap_u8()
+            == 0
+        {
             return Redemption::Invalid;
         }
-        if self.spent.insert(credit.input) {
+        if self.spent.insert(proof.input) {
             Redemption::Accepted
         } else {
             Redemption::DoubleSpent
@@ -333,7 +405,10 @@ mod tests {
         let signed = issuer.issue(&blinded);
         let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
         assert!(issuer.verify(&credit));
-        assert_eq!(issuer.redeem(&credit), Redemption::Accepted);
+        assert_eq!(
+            issuer.redeem(&credit.prove(b"ctx"), b"ctx"),
+            Redemption::Accepted
+        );
     }
 
     #[test]
@@ -343,8 +418,14 @@ mod tests {
         let (req, blinded) = request(&mut rng);
         let signed = issuer.issue(&blinded);
         let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
-        assert_eq!(issuer.redeem(&credit), Redemption::Accepted);
-        assert_eq!(issuer.redeem(&credit), Redemption::DoubleSpent);
+        assert_eq!(
+            issuer.redeem(&credit.prove(b"ctx"), b"ctx"),
+            Redemption::Accepted
+        );
+        assert_eq!(
+            issuer.redeem(&credit.prove(b"ctx"), b"ctx"),
+            Redemption::DoubleSpent
+        );
     }
 
     #[test]
@@ -355,7 +436,58 @@ mod tests {
             input: [7u8; INPUT_LEN],
             output: RISTRETTO_BASEPOINT_POINT,
         };
-        assert_eq!(issuer.redeem(&forged), Redemption::Invalid);
+        assert_eq!(
+            issuer.redeem(&forged.prove(b"ctx"), b"ctx"),
+            Redemption::Invalid
+        );
+    }
+
+    #[test]
+    fn a_credit_redemption_is_bound_to_its_context() {
+        // B8: a credit presented for one context cannot be replayed or front-run into another. A proof
+        // reveals only `(x, authenticator over N ‖ context)`, never `N`, so an observer cannot forge a
+        // proof for a different context, and a proof for context A is Invalid under context B.
+        let mut rng = TestRng::new("ctx");
+        let mut issuer = CreditIssuer::from_seed(b"ctx-issuer");
+        let (req, blinded) = request(&mut rng);
+        let signed = issuer.issue(&blinded);
+        let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
+
+        // A proof authenticated for context A is rejected under a different context B (no cross-context
+        // replay), checked here against a fresh issuer with the same key so no double-spend state hides it.
+        let mut issuer_b = CreditIssuer::from_seed(b"ctx-issuer");
+        assert_eq!(
+            issuer_b.redeem(&credit.prove(b"context-A"), b"context-B"),
+            Redemption::Invalid,
+            "a proof for one context does not redeem under another"
+        );
+
+        // The proof carries no `N`: its second half (the authenticator) differs from the credit's `N`.
+        let proof_bytes = credit.prove(b"context-A").to_bytes();
+        let credit_bytes = credit.to_bytes();
+        assert_ne!(
+            proof_bytes[INPUT_LEN..],
+            credit_bytes[INPUT_LEN..],
+            "the redemption proof does not carry the secret output N"
+        );
+
+        // The legitimate proof for A is accepted once; the credit is then spent for ANY later context —
+        // one credit, one redemption.
+        assert_eq!(
+            issuer.redeem(&credit.prove(b"context-A"), b"context-A"),
+            Redemption::Accepted
+        );
+        assert_eq!(
+            issuer.redeem(&credit.prove(b"context-C"), b"context-C"),
+            Redemption::DoubleSpent
+        );
+
+        // RedeemProof round-trips through bytes.
+        let p = credit.prove(b"ctx");
+        assert_eq!(
+            RedeemProof::from_bytes(&p.to_bytes()).to_bytes(),
+            p.to_bytes()
+        );
     }
 
     #[test]
@@ -444,7 +576,10 @@ mod tests {
         let credit = finalize(req, &blinded, &signed, &issuer.public()).unwrap();
         let wire = credit.to_bytes();
         let recovered = Credit::from_bytes(&wire).unwrap();
-        assert_eq!(issuer.redeem(&recovered), Redemption::Accepted);
+        assert_eq!(
+            issuer.redeem(&recovered.prove(b"ctx"), b"ctx"),
+            Redemption::Accepted
+        );
         assert!(BlindedToken::from_bytes(&blinded.to_bytes()).is_some());
     }
 }

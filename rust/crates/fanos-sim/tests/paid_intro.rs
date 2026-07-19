@@ -16,7 +16,7 @@
 
 use fanos_calypso::{BeaconSeed, HiddenService, client_descriptor_key, descriptor_key, pow};
 use fanos_field::F2;
-use fanos_incentives::{Credit, CreditIssuer, Redemption, finalize, request};
+use fanos_incentives::{CreditIssuer, RedeemProof, Redemption, finalize, request};
 use fanos_runtime::{Command, Config, Duration, Triple};
 use fanos_sim::{Sim, spawn_cell};
 use rand_core::{CryptoRng, RngCore};
@@ -81,18 +81,20 @@ fn parse_triple(b: &[u8]) -> Option<Triple> {
     Some([x, y, z])
 }
 
-/// An intro payload: `credit(64) ‖ nonce(8, LE) ‖ message`.
-fn intro_payload(credit: &Credit, nonce: u64, msg: &[u8]) -> Vec<u8> {
-    let mut v = credit.to_bytes().to_vec();
+/// An intro payload: `redeem_proof(64) ‖ nonce(8, LE) ‖ message`. The credit is presented as a
+/// **context-bound** [`RedeemProof`] (audit B8) — bound to the descriptor key, so an observer cannot
+/// front-run it into a redemption at a different service, and the secret output `N` never travels.
+fn intro_payload(proof: &RedeemProof, nonce: u64, msg: &[u8]) -> Vec<u8> {
+    let mut v = proof.to_bytes().to_vec();
     v.extend_from_slice(&nonce.to_le_bytes());
     v.extend_from_slice(msg);
     v
 }
 
-fn parse_intro(bytes: &[u8]) -> Option<(Credit, u64, &[u8])> {
-    let credit = Credit::from_bytes(bytes.get(0..64)?.try_into().ok()?)?;
+fn parse_intro(bytes: &[u8]) -> Option<(RedeemProof, u64, &[u8])> {
+    let proof = RedeemProof::from_bytes(bytes.get(0..64)?.try_into().ok()?);
     let nonce = u64::from_le_bytes(bytes.get(64..72)?.try_into().ok()?);
-    Some((credit, nonce, bytes.get(72..)?))
+    Some((proof, nonce, bytes.get(72..)?))
 }
 
 #[test]
@@ -155,7 +157,7 @@ fn an_anonymous_credit_pays_for_a_calypso_introduction_exactly_once() {
         client_node,
         Command::Send {
             to: service_coord,
-            payload: intro_payload(&credit, nonce, b"hello, i paid"),
+            payload: intro_payload(&credit.prove(&client_key), nonce, b"hello, i paid"),
         },
     );
     sim.run_for(Duration::from_millis(500));
@@ -169,16 +171,18 @@ fn an_anonymous_credit_pays_for_a_calypso_introduction_exactly_once() {
         pow::verify(&client_key, got_nonce, POW_BITS),
         "the intro PoW checks out"
     );
+    // The redemption is bound to the descriptor key (the intro's context), so it cannot be replayed at a
+    // different service; `spent` carries only (x, authenticator), never the credit's secret output N.
     assert_eq!(
-        bank.redeem(&spent),
+        bank.redeem(&spent, &client_key),
         Redemption::Accepted,
         "the anonymous credit is accepted for the introduction"
     );
     assert_eq!(msg, b"hello, i paid");
 
-    // One credit, one introduction: replaying the same credit is caught as a double-spend.
+    // One credit, one introduction: replaying the same proof is caught as a double-spend.
     assert_eq!(
-        bank.redeem(&spent),
+        bank.redeem(&spent, &client_key),
         Redemption::DoubleSpent,
         "the credit cannot be spent twice"
     );
@@ -196,7 +200,7 @@ fn a_forged_credit_does_not_buy_an_introduction() {
     let forged = finalize(req, &blinded, &signed, &other.public()).expect("valid under other key");
 
     assert_eq!(
-        bank.redeem(&forged),
+        bank.redeem(&forged.prove(b"intro-ctx"), b"intro-ctx"),
         Redemption::Invalid,
         "a credit not signed by our bank buys nothing"
     );

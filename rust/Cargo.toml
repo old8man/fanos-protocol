@@ -126,6 +126,8 @@ libm = { version = "0.2", default-features = false }
 rand_core = { version = "0.10", default-features = false }
 # ristretto255 group ops for the verifiable-crypto crates (ECVRF, VOPRF).
 curve25519-dalek = { version = "4", features = ["rand_core"] }
+# Constant-time equality for MAC/authenticator checks (the version curve25519-dalek v4 already pins).
+subtle = { version = "2", default-features = false }
 
 # Async runtime + tracing for the I/O driver layer (quic/node/proxy/session). Base version here; each
 # driver selects only the tokio features it needs.
