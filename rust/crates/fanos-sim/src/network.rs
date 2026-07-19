@@ -3,6 +3,13 @@
 //! This substitutes the network. A `Send` effect becomes a delayed `Deliver` input (or is
 //! dropped) according to this model — the engine is unchanged whether it runs here or over
 //! real UDP.
+//!
+//! The transport *port* is one method — [`NetworkModel::delay`] `(from, to, rng) -> Option<Duration>`
+//! (`None` = dropped). Today one model implements it, and it already spans the adversarial network
+//! surface the tests need: independent loss, latency + jitter, and hard partitions. A `Transport`
+//! trait over `delay` should be extracted the moment a *second* model exists to be its client (e.g. a
+//! trace-driven replay or an asymmetric-partition adversary) — not before, or it is an abstraction
+//! with no consumer (cf. the deleted `fanos_primitives::vrf::Vrf`).
 
 use std::collections::BTreeSet;
 

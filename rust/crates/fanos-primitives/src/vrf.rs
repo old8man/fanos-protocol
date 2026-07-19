@@ -3,15 +3,17 @@
 //! A node's coordinate is `MapToPoint(VRF(pubkey, epoch))`: the VRF binds the coordinate to
 //! the epoch (so it reshuffles when the beacon advances) and is verifiable and not cheaply
 //! grindable. The production instantiation is **ECVRF-Edwards25519** (RFC 9381), which needs
-//! elliptic-curve crypto and is therefore pluggable behind the [`Vrf`] trait.
+//! elliptic-curve crypto and so lives in its own crate.
 //!
-//! This module exposes the trait plus a *deterministic* coordinate derivation that binds
-//! `(bundle, epoch)` exactly as production does, so no_std addressing is testable end to end. It
-//! has no keyed proof and so is not unforgeable on its own. The **real, verifiable** VRF lives in
+//! This module exposes a *deterministic* coordinate derivation that binds `(bundle, epoch)` exactly
+//! as production does, so no_std addressing is testable end to end. It has no keyed proof and so is
+//! not unforgeable on its own. The **real, verifiable** VRF lives in
 //! [`fanos-vrf`](https://docs.rs/fanos-vrf): a ristretto255 RFC 9381-style VRF whose
-//! `prove_coordinate` / `verify_coordinate` give an unforgeable, self-certifying coordinate — a
-//! node proves its epoch position from its key, checkable by anyone without the secret. Use that
-//! where the anti-grinding guarantees of §3.2 must hold; this hash form is the no_std reference.
+//! `prove_coordinate` / `verify_coordinate` give an unforgeable, self-certifying coordinate — a node
+//! proves its epoch position from its key, checkable by anyone without the secret. Use that where the
+//! anti-grinding guarantees of §3.2 must hold; this hash form is the no_std reference. (`fanos-vrf`'s
+//! `VrfSecret`/`VrfPublic`/`VrfProof` are the concrete API; there is no generic `Vrf` trait — nothing
+//! is written generically over "any VRF backend", so a trait would be an abstraction without a client.)
 
 use alloc::vec::Vec;
 
@@ -21,21 +23,6 @@ use fanos_geometry::{Line, Point};
 use crate::hash::{hash_labeled, label};
 use crate::keys::NodeId;
 use crate::maptopoint::{map_to_line, map_to_point};
-
-/// A verifiable random function (spec §L6, ECVRF-Edwards25519 in production).
-pub trait Vrf {
-    /// The proof accompanying an output.
-    type Proof;
-    /// The secret key type.
-    type SecretKey;
-    /// The public key type.
-    type PublicKey;
-
-    /// Produce the VRF output and its proof for `input`.
-    fn prove(sk: &Self::SecretKey, input: &[u8]) -> ([u8; 32], Self::Proof);
-    /// Verify that `output` is the correct VRF value of `input` under `pk`.
-    fn verify(pk: &Self::PublicKey, input: &[u8], output: &[u8; 32], proof: &Self::Proof) -> bool;
-}
 
 /// The VRF input for coordinate assignment: the node's identity bound to an epoch.
 #[must_use]
