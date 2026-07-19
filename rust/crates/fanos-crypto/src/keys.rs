@@ -47,6 +47,25 @@ impl SigPublicKey {
         Ok(Self { ed25519, mldsa65 })
     }
 
+    /// Assemble from fixed-size component keys — infallible (the lengths are guaranteed by the array
+    /// types). Used when composing an identity from real primitive keys ([`crate::HybridIdentity`]).
+    #[must_use]
+    pub fn from_parts(ed25519: [u8; ED25519_PK_LEN], mldsa65: [u8; MLDSA65_PK_LEN]) -> Self {
+        Self { ed25519, mldsa65: mldsa65.to_vec() }
+    }
+
+    /// The Ed25519 public-key bytes.
+    #[must_use]
+    pub fn ed25519(&self) -> [u8; ED25519_PK_LEN] {
+        self.ed25519
+    }
+
+    /// The ML-DSA-65 public-key bytes (length [`MLDSA65_PK_LEN`]).
+    #[must_use]
+    pub fn mldsa65(&self) -> &[u8] {
+        &self.mldsa65
+    }
+
     /// The canonical concatenation `Ed25519 ‖ ML-DSA-65`.
     fn extend_canonical(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.ed25519);
@@ -61,6 +80,25 @@ impl KemPublicKey {
             return Err(BadKeyLength);
         }
         Ok(Self { x25519, mlkem768 })
+    }
+
+    /// Assemble from fixed-size component keys — infallible (the lengths are guaranteed by the array
+    /// types). Used when composing an identity from real primitive keys ([`crate::HybridIdentity`]).
+    #[must_use]
+    pub fn from_parts(x25519: [u8; X25519_PK_LEN], mlkem768: [u8; MLKEM768_PK_LEN]) -> Self {
+        Self { x25519, mlkem768: mlkem768.to_vec() }
+    }
+
+    /// The X25519 public-key bytes.
+    #[must_use]
+    pub fn x25519(&self) -> [u8; X25519_PK_LEN] {
+        self.x25519
+    }
+
+    /// The ML-KEM-768 encapsulation-key bytes (length [`MLKEM768_PK_LEN`]).
+    #[must_use]
+    pub fn mlkem768(&self) -> &[u8] {
+        &self.mlkem768
     }
 
     /// The canonical concatenation `X25519 ‖ ML-KEM-768`.
@@ -99,6 +137,30 @@ impl HybridPublicKey {
     #[must_use]
     pub fn node_id(&self) -> NodeId {
         NodeId(hash_labeled(label::NODE_ID, &self.encode()))
+    }
+
+    /// The exact length of an encoded bundle: `Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768`.
+    pub const ENCODED_LEN: usize =
+        ED25519_PK_LEN + MLDSA65_PK_LEN + X25519_PK_LEN + MLKEM768_PK_LEN;
+
+    /// Parse a bundle produced by [`encode`](Self::encode). `None` unless the length is exactly
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN) — so a truncated or oversized identity is rejected, never
+    /// silently accepted with a wrong-length component.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let (a, b) = (ED25519_PK_LEN, ED25519_PK_LEN + MLDSA65_PK_LEN);
+        let c = b + X25519_PK_LEN;
+        let ed25519 = <[u8; ED25519_PK_LEN]>::try_from(bytes.get(..a)?).ok()?;
+        let mldsa65 = bytes.get(a..b)?.to_vec();
+        let x25519 = <[u8; X25519_PK_LEN]>::try_from(bytes.get(b..c)?).ok()?;
+        let mlkem768 = bytes.get(c..)?.to_vec();
+        Some(Self {
+            sig: SigPublicKey { ed25519, mldsa65 },
+            kem: KemPublicKey { x25519, mlkem768 },
+        })
     }
 }
 

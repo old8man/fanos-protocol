@@ -106,6 +106,26 @@ impl HybridKemKey {
         &self.public
     }
 
+    /// The X25519 public-key bytes (the classical KEM half).
+    #[must_use]
+    pub fn x25519_public(&self) -> [u8; X25519_LEN] {
+        let mut b = [0u8; X25519_LEN];
+        if let Some(s) = self.public.get(..X25519_LEN) {
+            b.copy_from_slice(s);
+        }
+        b
+    }
+
+    /// The ML-KEM-768 encapsulation-key bytes (the post-quantum KEM half).
+    #[must_use]
+    pub fn mlkem768_public(&self) -> [u8; MLKEM768_EK_LEN] {
+        let mut b = [0u8; MLKEM768_EK_LEN];
+        if let Some(s) = self.public.get(X25519_LEN..HYBRID_KEM_PK_LEN) {
+            b.copy_from_slice(s);
+        }
+        b
+    }
+
     /// Decapsulate a hybrid ciphertext to the shared secret. `None` on a malformed ciphertext.
     #[must_use]
     pub fn decapsulate(&self, ct: &[u8]) -> Option<[u8; HYBRID_KEM_SS_LEN]> {
