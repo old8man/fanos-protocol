@@ -42,7 +42,7 @@ structure, which is why the answers compose instead of conflicting:
 | A5 | **Algorithmic-complexity DoS** (non-finite `Φ` → hang) | Reject non-finite coherence at the boundary; bounded reroute-depth loop | ✅ | #59, `coherence`/`healing`/`polar` |
 | A6 | **Slowloris / connection pinning** (open, never finish) | Stream concurrency cap bounds memory; explicit RST/abort + idle-retire to reclaim slots | 🟡 | #60 ✅ (cap); #69 ⬜ (RST/idle-timeout) |
 | A7 | **Amplification** (small request → large response/broadcast) | Constant-size cells; reliable-broadcast echo bounded; response ≤ request by protocol | 🟡 | audit — verify no super-unit fan-out remains |
-| A8 | **Retransmission storms / spurious retransmit** | RTT-estimated RTO + fast-retransmit (replace tick-as-RTO) | ⬜ | #69 |
+| A8 | **Retransmission storms / spurious retransmit** | An RTT-estimated RTO (Jacobson/Karels `srtt`/`rttvar`, bounded exponential backoff) replaces tick-as-RTO, and fast-retransmit resends a gap on the dup-ACK threshold without waiting for the RTO | ✅ | `runtime/stream.rs`: `the_rtt_estimator_converges_to_a_stable_rto`, `an_in_flight_segment_is_not_resent_before_its_rto`, `back_off_is_bounded_by_a_multiple_of_the_base_rto`, `fast_retransmit_resends_the_gap_without_waiting_for_the_rto` |
 
 ## B. Routing & topology attacks
 
