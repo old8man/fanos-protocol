@@ -16,11 +16,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_crypto::{HybridSigningKey, address_matches_identity, address_point};
+use fanos_crypto::{HybridIdentity, HybridSigningKey, address_matches_identity, address_point};
 use fanos_field::{F7, Field};
 use fanos_geometry::{HierAddr, Point, Triple};
 use fanos_runtime::overlay::descriptor_message;
-use fanos_runtime::{Config, Engine, Input, Instant, OverlayNode};
+use fanos_runtime::{Command, Config, Effect, Engine, Input, Instant, OverlayNode};
 use fanos_wire::{FrameType, encode_frame};
 
 /// Build an `Announce` wire frame `coord ‖ hier ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖ info`.
@@ -51,14 +51,16 @@ fn derived_address<F: Field>(id: &[u8], depth: usize) -> HierAddr<F> {
     HierAddr::from_path((0..depth).map(|l| address_point::<F>(id, l)).collect()).unwrap()
 }
 
-/// A complete signed descriptor for a node: identity bundle, its derived overlay address, and a hybrid
-/// signature binding `transport` to that address. `(id, hier, sig)`.
+/// A complete signed descriptor for a node, built from a **real `HybridIdentity`** (the full-stack
+/// path a deployment uses): the identity's canonical bundle, its derived overlay address, and a hybrid
+/// signature binding `transport` to that address. `(id, hier, sig)`. This threads the real composed
+/// identity through the whole membership/poisoning stack — the crypto identity and the overlay agree.
 fn signed_descriptor(seed: &[u8; 32], transport: Triple, depth: usize) -> (Vec<u8>, HierAddr<F7>, Vec<u8>) {
-    let key = HybridSigningKey::from_seed(seed);
-    let mut id = key.ed25519_public().to_vec();
-    id.extend_from_slice(&key.mldsa65_public());
-    let hier = derived_address::<F7>(&id, depth);
-    let sig = key.sign(&descriptor_message::<F7>(transport, &hier, &id)).expect("hybrid sign");
+    let identity = HybridIdentity::from_seed(seed);
+    let id = identity.identity_bytes().to_vec();
+    let hier =
+        HierAddr::from_path((0..depth).map(|l| identity.address_point::<F7>(l)).collect()).unwrap();
+    let sig = identity.sign(&descriptor_message::<F7>(transport, &hier, &id)).expect("hybrid sign");
     (id, hier, sig)
 }
 
@@ -129,6 +131,34 @@ fn without_the_gate_a_transport_hijack_succeeds() {
         Some(attacker_coord),
         "ungated, the attacker attracts the victim's traffic for free (one announce)",
     );
+}
+
+#[test]
+fn a_deployed_identity_node_self_certifies_end_to_end() {
+    // The full deployment path, crypto identity ⇒ live membership: a node is built from a real
+    // HybridIdentity's signed descriptor, JOINs, and a self-certified peer accepts the flooded
+    // announcement and can route to it — the secret never enters the engine (the descriptor is signed
+    // out of band and installed via the builder).
+    let now = Instant::default();
+    let coord = Point::<F7>::at(5).coords();
+    let (id, hier, sig) = signed_descriptor(&[42u8; 32], coord, 2);
+
+    let mut deployer = OverlayNode::<F7>::new(Point::at(5), self_certified_cell())
+        .with_hier_address(hier.clone())
+        .with_signed_descriptor(id.clone(), sig.clone());
+    let flooded = deployer
+        .step(now, Input::Command(Command::Join { info: b"keys".to_vec() }))
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::Send { frame, .. } => Some(frame),
+            _ => None,
+        })
+        .expect("JOIN floods an announcement");
+
+    let mut peer = OverlayNode::<F7>::new(Point::at(0), self_certified_cell());
+    peer.step(now, Input::Message { from: coord, frame: flooded });
+    assert!(peer.members().any(|(c, _)| c == coord), "the flooded real-identity descriptor is accepted");
+    assert_eq!(peer.hier_next_hop(&hier), Some(coord), "and the peer can route to the deployer");
 }
 
 #[test]
