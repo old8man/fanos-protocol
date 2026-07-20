@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dialer;
+pub mod http;
 pub mod socks5;
 pub mod target;
 
