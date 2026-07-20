@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_primitives::hash::{DIGEST_LEN, hash_labeled, label};
-use fanos_primitives::{Epoch, map_to_point};
+use fanos_primitives::{Epoch, storage_point};
 
 use crate::address::Address;
 
@@ -39,11 +39,17 @@ pub fn descriptor_key(addr: &Address, epoch: Epoch) -> [u8; DIGEST_LEN] {
     hash_labeled(label::ONOMA_ENC, &epoch_input(addr, epoch))
 }
 
-/// The projective coordinate `MapToPoint(L)` the descriptor's replica line is anchored at —
-/// geometry-routed and directory-free.
+/// The projective coordinate the descriptor's replica line is anchored at — geometry-routed and
+/// directory-free.
+///
+/// A descriptor is stored under its lookup **key** ([`lookup_key`]), and the DHT re-hashes that key on
+/// its **storage** domain to choose the replica line (`fanos_primitives::storage_point`). So the actual
+/// coordinate is `storage_point(lookup_key)`, NOT a direct `MapToPoint` of the lookup pre-image — this
+/// derives it correctly, in lock-step with where the resolver's put/get land (audit #128/C5: the old
+/// single-hash form named a *different* point, so code routing by it would have missed the descriptor).
 #[must_use]
 pub fn lookup_point<F: Field>(addr: &Address, epoch: Epoch) -> Point<F> {
-    map_to_point::<F>(label::ONOMA_LOOKUP, &epoch_input(addr, epoch))
+    storage_point::<F>(&lookup_key(addr, epoch))
 }
 
 #[cfg(test)]
@@ -86,6 +92,19 @@ mod tests {
         assert_eq!(
             lookup_point::<F7>(&a, Epoch::new(9)),
             lookup_point::<F7>(&a, Epoch::new(9))
+        );
+    }
+
+    #[test]
+    fn lookup_point_is_the_actual_storage_anchor() {
+        // #128/C5 lock-step: the descriptor lives where the DHT stores its lookup KEY —
+        // storage_point(lookup_key), exactly where the resolver's Client::put/get land — never a direct
+        // MapToPoint of the lookup pre-image. Guards against the two ever drifting apart again.
+        let a = addr();
+        let e = Epoch::new(11);
+        assert_eq!(
+            lookup_point::<F7>(&a, e),
+            storage_point::<F7>(&lookup_key(&a, e))
         );
     }
 

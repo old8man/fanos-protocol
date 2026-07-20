@@ -53,7 +53,9 @@ fn derivation_kat_matches_names_json() {
         "54b6eb245c20efeae57d43aa59d89925fa99e63984c8188baf111788acf632f1"
     );
     assert_eq!(
+        // The descriptor's storage anchor is storage_point(lookup_key) — where the resolver's put/get
+        // actually land — not a direct MapToPoint of the lookup pre-image (audit #128/C5).
         derive::lookup_point::<F7>(&a, Epoch::new(42)).coords(),
-        [1, 5, 3]
+        [1, 6, 1]
     );
 }
