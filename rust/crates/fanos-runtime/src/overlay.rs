@@ -203,7 +203,7 @@ struct Peer {
     reported_down: bool,
 }
 
-/// The forwarding decision for a `RouteHier` frame at a node (see [`OverlayNode::hier_route`]).
+/// The forwarding decision for a `RouteHier` frame at a node (see [`Router::route`]).
 enum HierRoute {
     /// This node is in the destination cell — deliver the payload locally.
     Deliver,
@@ -213,27 +213,85 @@ enum HierRoute {
     Drop,
 }
 
-/// The base overlay node engine, generic over the cell's field `F`.
-pub struct OverlayNode<F: Field> {
-    coord: Point<F>,
+/// The hierarchical-routing concern factored out of [`OverlayNode`] (audit #125 decompose): this node's
+/// own overlay address plus its learned longest-prefix routing table, and the pure `RouteHier` forwarding
+/// decision over them. Transport — the physical `coord` — stays on the facade: a flat transport underlays
+/// this structured overlay and the two need not coincide past depth 1. This owns the addressing state and
+/// the routing decision; the facade orchestrates the frame flow (an `Announce` carries the address out,
+/// `on_announce` seeds a learned peer from one received).
+struct Router<F: Field> {
     /// This node's hierarchical address (§L1). Defaults to the depth-1 `root(coord)` — the ordinary
     /// single-plane case — and is deepened only when the node descends into a sub-cell on a collision
     /// (§L0). It governs hierarchical (`RouteHier`) forwarding; single-plane routing is unchanged.
-    hier: HierAddr<F>,
+    address: HierAddr<F>,
     /// Learned hierarchical routing table: **transport coordinate → the overlay [`HierAddr`] reachable
     /// there**. Empty on a single-plane node (transport ≡ overlay); populated as the node learns sub-cell
     /// gateways and siblings (a deployment seed, or a JOIN/Announce). `RouteHier` forwarding is greedy
     /// longest-prefix over the addresses ([`next_hop`]), then resolved back to the transport coordinate to
     /// send on — this is what lets a node route *through* cells it is not a member of, and it decouples the
-    /// node's transport coordinate (`coord`) from its overlay address (`hier`), as a flat transport
+    /// node's transport coordinate (`coord`) from its overlay address (`address`), as a flat transport
     /// underlays a structured overlay. **Keyed by transport coordinate** (one overlay address per physical
-    /// endpoint), so — exactly like [`members`](Self::members) — it is bounded by the plane size `N`: a
-    /// peer cannot grow it without limit by announcing many forged addresses (audit C1/C2 DoS class). Like
+    /// endpoint), so — exactly like [`OverlayNode::members`] — it is bounded by the plane size `N`: a peer
+    /// cannot grow it without limit by announcing many forged addresses (audit C1/C2 DoS class). Like
     /// `members` it is an attacker-*writable* discovered view; safety does not rest on its integrity —
-    /// delivery is decided by this node's own cert-bound `hier`, so a poisoned entry can only misroute or
-    /// blackhole (a bounded DoS), never impersonate a destination. Cert-verifying an announced address
+    /// delivery is decided by this node's own cert-bound `address`, so a poisoned entry can only misroute
+    /// or blackhole (a bounded DoS), never impersonate a destination. Cert-verifying an announced address
     /// against its coordinate (poisoning resistance) is the QUIC-layer follow-up.
-    hier_peers: BTreeMap<Triple, HierAddr<F>>,
+    peers: BTreeMap<Triple, HierAddr<F>>,
+}
+
+impl<F: Field> Router<F> {
+    /// Seat this node at its default depth-1 overlay address `root(coord)`, with an empty routing table.
+    /// A deployment that descends into a sub-cell or assigns overlay position independently of transport
+    /// re-seats the address afterwards ([`OverlayNode::with_hier_address`]).
+    fn new(coord: Point<F>) -> Self {
+        Self {
+            address: HierAddr::root(coord),
+            peers: BTreeMap::new(),
+        }
+    }
+
+    /// Register a hierarchical peer reachable in one hop — the transport coordinate that reaches it and the
+    /// overlay [`HierAddr`] it serves — replacing any existing address for that coordinate. This *is* the
+    /// hierarchical routing table: `RouteHier` frames are forwarded greedily over it. A single-plane node
+    /// needs none (transport ≡ overlay); a deployment or the membership layer seeds it for depth > 1.
+    fn learn_peer(&mut self, addr: HierAddr<F>, transport: Triple) {
+        self.peers.insert(transport, addr);
+    }
+
+    /// Resolve the forwarding decision for hierarchical destination `dst` (§L1). If this node is already
+    /// in `dst`'s cell it delivers. Otherwise, with **learned peers**, it routes greedily by longest
+    /// shared prefix ([`next_hop`]) and resolves the chosen overlay address to its transport coordinate —
+    /// the physical hop one level closer, so forwarding converges in `≤ dst.depth − commonPrefix` hops. A
+    /// node with **no learned peers** (the bootstrap origin, or a single populated plane) targets `dst`'s
+    /// own point at the divergence level directly. No closer peer and not the destination ⇒ drop (hole).
+    fn route(&self, dst: &HierAddr<F>) -> HierRoute {
+        if self.address.common_prefix(dst) == dst.depth() {
+            return HierRoute::Deliver;
+        }
+        if !self.peers.is_empty() {
+            let reachable: Vec<HierAddr<F>> = self.peers.values().cloned().collect();
+            return match next_hop(&self.address, dst, &reachable) {
+                Some(next) => self
+                    .peers
+                    .iter()
+                    .find(|(_, a)| **a == next)
+                    .map_or(HierRoute::Drop, |(t, _)| HierRoute::Forward(*t)),
+                None => HierRoute::Drop,
+            };
+        }
+        dst.point_at(self.address.common_prefix(dst))
+            .map_or(HierRoute::Drop, |p| HierRoute::Forward(p.coords()))
+    }
+}
+
+/// The base overlay node engine, generic over the cell's field `F`.
+pub struct OverlayNode<F: Field> {
+    coord: Point<F>,
+    /// The hierarchical-routing concern — this node's overlay address + learned longest-prefix routing
+    /// table (§L1). Factored into a [`Router`] collaborator (audit #125 decompose); the facade orchestrates
+    /// the frame flow, the router owns the addressing state and the `RouteHier` forwarding decision.
+    router: Router<F>,
     /// This node's long-term identity bytes (spec §L0): its hybrid **signature public-key bundle**
     /// `Ed25519(32) ‖ ML-DSA-65(1952)`, which both derives its self-certifying address `hier`
     /// (`MapToPoint`) and verifies its descriptor signature. Carried in this node's `Announce`. Empty
@@ -398,8 +456,7 @@ impl<F: Field> OverlayNode<F> {
         );
         Self {
             coord,
-            hier: HierAddr::root(coord),
-            hier_peers: BTreeMap::new(),
+            router: Router::new(coord),
             identity: Vec::new(),
             descriptor_sig: Vec::new(),
             admission_proof: Vec::new(),
@@ -708,14 +765,14 @@ impl<F: Field> OverlayNode<F> {
     /// underlaying a structured overlay).
     #[must_use]
     pub fn with_hier_address(mut self, hier: HierAddr<F>) -> Self {
-        self.hier = hier;
+        self.router.address = hier;
         self
     }
 
     /// This node's hierarchical address (§L1).
     #[must_use]
     pub fn hier_address(&self) -> &HierAddr<F> {
-        &self.hier
+        &self.router.address
     }
 
     /// Seat this node's long-term identity (spec §L0): its hybrid signature public-key bundle, the
@@ -769,7 +826,7 @@ impl<F: Field> OverlayNode<F> {
     /// the hierarchical routing table: `RouteHier` frames are forwarded greedily over it. A single-plane
     /// node needs none (transport ≡ overlay); a deployment or the membership layer seeds it for depth > 1.
     pub fn learn_hier_peer(&mut self, addr: HierAddr<F>, transport: Triple) {
-        self.hier_peers.insert(transport, addr);
+        self.router.learn_peer(addr, transport);
     }
 
     /// Builder form of [`learn_hier_peer`](Self::learn_hier_peer).
@@ -779,36 +836,11 @@ impl<F: Field> OverlayNode<F> {
         self
     }
 
-    /// Resolve the forwarding decision for hierarchical destination `dst` (§L1). If this node is already
-    /// in `dst`'s cell it delivers. Otherwise, with **learned peers**, it routes greedily by longest
-    /// shared prefix ([`next_hop`]) and resolves the chosen overlay address to its transport coordinate —
-    /// the physical hop one level closer, so forwarding converges in `≤ dst.depth − commonPrefix` hops. A
-    /// node with **no learned peers** (the bootstrap origin, or a single populated plane) targets `dst`'s
-    /// own point at the divergence level directly. No closer peer and not the destination ⇒ drop (hole).
-    fn hier_route(&self, dst: &HierAddr<F>) -> HierRoute {
-        if self.hier.common_prefix(dst) == dst.depth() {
-            return HierRoute::Deliver;
-        }
-        if !self.hier_peers.is_empty() {
-            let reachable: Vec<HierAddr<F>> = self.hier_peers.values().cloned().collect();
-            return match next_hop(&self.hier, dst, &reachable) {
-                Some(next) => self
-                    .hier_peers
-                    .iter()
-                    .find(|(_, a)| **a == next)
-                    .map_or(HierRoute::Drop, |(t, _)| HierRoute::Forward(*t)),
-                None => HierRoute::Drop,
-            };
-        }
-        dst.point_at(self.hier.common_prefix(dst))
-            .map_or(HierRoute::Drop, |p| HierRoute::Forward(p.coords()))
-    }
-
     /// The next-hop transport coordinate toward `dst`, or `None` if this node delivers `dst` locally or
-    /// has no route to it. A thin accessor over [`hier_route`](Self::hier_route) for drivers and tests.
+    /// has no route to it. A thin accessor over [`Router::route`] for drivers and tests.
     #[must_use]
     pub fn hier_next_hop(&self, dst: &HierAddr<F>) -> Option<Triple> {
-        match self.hier_route(dst) {
+        match self.router.route(dst) {
             HierRoute::Forward(next) => Some(next),
             HierRoute::Deliver | HierRoute::Drop => None,
         }
@@ -819,7 +851,7 @@ impl<F: Field> OverlayNode<F> {
     /// uses to reach a multi-level destination (the single-plane [`on_send`](Self::on_send) is unchanged).
     pub fn send_hier(&mut self, dst: &HierAddr<F>, payload: &[u8]) -> Vec<Effect> {
         self.self_activity = self.self_activity.saturating_add(1);
-        match self.hier_route(dst) {
+        match self.router.route(dst) {
             HierRoute::Deliver => alloc::vec![Effect::Notify(Notification::Delivered {
                 from: self.coord.coords(),
                 payload: payload.to_vec(),
@@ -834,7 +866,7 @@ impl<F: Field> OverlayNode<F> {
     }
 
     /// Handle an incoming `RouteHier` frame (`HierAddr(dst) ‖ payload`): deliver if we are in the
-    /// destination cell, else forward one cell closer (see [`hier_route`](Self::hier_route)). The
+    /// destination cell, else forward one cell closer (see [`Router::route`]). The
     /// destination address travels unchanged, so every hop re-derives its own next step.
     fn on_route_hier(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(&depth) = body.first() else {
@@ -845,7 +877,7 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         };
         let payload = body.get(addr_len..).unwrap_or(&[]);
-        match self.hier_route(&dst) {
+        match self.router.route(&dst) {
             HierRoute::Deliver => {
                 let a = self.activity.entry(from).or_insert(0);
                 *a = a.saturating_add(1);
@@ -1116,7 +1148,7 @@ impl<F: Field> OverlayNode<F> {
             FrameType::Announce,
             &announce_body(
                 coord,
-                &self.hier,
+                &self.router.address,
                 &self.identity,
                 &self.descriptor_sig,
                 &self.admission_proof,
@@ -1169,7 +1201,7 @@ impl<F: Field> OverlayNode<F> {
         //  2. the descriptor signature binds this exact transport `coord` to the identity — else it is a
         //     transport hijack (re-announcing another identity's address at the attacker's own endpoint),
         //     which without the identity's private key cannot be signed (threat §80).
-        // Neither `members` nor `hier_peers` is written on failure.
+        // Neither `members` nor the router's peer table is written on failure.
         if self.config.require_self_certified_membership
             && (!fanos_primitives::address_matches_identity::<F>(&id, &hier)
                 || !descriptor_signature_ok::<F>(coord, &hier, &id, &sig))
