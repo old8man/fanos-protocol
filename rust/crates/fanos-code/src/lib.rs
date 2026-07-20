@@ -8,20 +8,34 @@
 //! * [`hamming`] — the Hamming(7,4) / Fano correspondence and single-error syndrome (V10).
 //! * [`syndrome`] — the `21 → 7 → 3 → 1` localization pyramid: 3-bit syndrome for one fault,
 //!   the 7-theme layer for two (V13, V21).
-//! * [`lrc`] — projective erasure repair by peeling, and hyperoval failure (V9, V20).
+//! * [`lrc`] — projective erasure repair by peeling, and hyperoval failure (V9, V20): a
+//!   recoverability *oracle* only.
+//! * [`erasure`] — the byte-level `[7,3,4]` simplex codec built on `lrc`'s peeling (spec
+//!   §L4): the actual erasure-coded data path. Needs the `alloc` feature (a heap to hold the
+//!   coded shards); `hamming`/`lrc`/`syndrome` do not.
 //!
-//! `#![no_std]`; the tables are compile-time and the decoders are branch-light bit work.
+//! `#![no_std]`; the `hamming`/`lrc`/`syndrome` tables are compile-time and the decoders are
+//! branch-light bit work.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
 pub mod hamming;
 pub mod lrc;
 pub mod syndrome;
 
+#[cfg(feature = "alloc")]
+pub mod erasure;
+
 pub use hamming::{LINE_CODEWORDS, point_address, syndrome as hamming_syndrome};
 pub use lrc::{is_hyperoval_fano, is_recoverable_fano, peel_fano};
 pub use syndrome::{Fault, Sector, decode_themes, locate, syndrome3, theme_flags};
+
+#[cfg(feature = "alloc")]
+pub use erasure::{encode, reconstruct};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]

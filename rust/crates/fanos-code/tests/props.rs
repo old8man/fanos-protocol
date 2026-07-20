@@ -7,6 +7,7 @@
     clippy::float_cmp
 )]
 
+use fanos_code::erasure;
 use fanos_code::syndrome::{Fault, index_of_address};
 use fanos_code::{hamming, is_hyperoval_fano, is_recoverable_fano, locate, syndrome3, theme_flags};
 use proptest::prelude::*;
@@ -71,5 +72,29 @@ proptest! {
         prop_assert_eq!(theme_flags(mask).count_ones(), 5);
         let (lo, hi) = (i.min(j), i.max(j));
         prop_assert_eq!(locate(mask), Fault::Pair(lo, hi));
+    }
+
+    /// Erasure round-trip (spec §L4, V9/V20): for arbitrary payload bytes and lengths,
+    /// `reconstruct` recovers the exact payload iff the erasure mask peel-recovers under
+    /// `is_recoverable_fano` — complementing `erasure.rs`'s own fixed-payload exhaustive test
+    /// with random payload content/length.
+    #[test]
+    fn erasure_round_trip_matches_recoverability(
+        data in proptest::collection::vec(any::<u8>(), 0..40),
+        mask in 0u8..128,
+    ) {
+        let shards = erasure::encode(&data);
+        let mut input: [Option<Vec<u8>>; erasure::N] = core::array::from_fn(|_| None);
+        for p in 0..erasure::N {
+            if mask & (1 << p) == 0 {
+                input[p] = Some(shards[p].clone());
+            }
+        }
+        let got = erasure::reconstruct(&input);
+        if is_recoverable_fano(mask) {
+            prop_assert_eq!(got, Some(data));
+        } else {
+            prop_assert_eq!(got, None);
+        }
     }
 }
