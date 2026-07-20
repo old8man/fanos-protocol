@@ -77,7 +77,10 @@ pub fn deal<R: RngCore + CryptoRng>(
 }
 
 /// A participant aggregating the verified shares it receives into its final key share.
-#[derive(Clone, Copy)]
+///
+/// Deliberately **not** `Copy` (audit #124): the `accumulator` is a live secret key share, so it must not
+/// be silently duplicated across stack frames — every copy is an explicit `clone`.
+#[derive(Clone)]
 pub struct Participant {
     index: u8,
     accumulator: Scalar,

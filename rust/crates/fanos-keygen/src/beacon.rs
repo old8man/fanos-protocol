@@ -354,7 +354,7 @@ mod tests {
         )
         .unwrap();
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
-            .map(|i| BeaconNode::new(Point::at(i), Some(shares[i]), commitment.clone(), t))
+            .map(|i| BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t))
             .collect();
 
         // Trigger the next epoch on every anchor, then route their partials + assembled rounds.
@@ -397,7 +397,7 @@ mod tests {
             .map(|i| {
                 BeaconNode::new(
                     Point::at(i),
-                    (i < 6).then_some(shares[i]),
+                    (i < 6).then_some(shares[i].clone()),
                     commitment.clone(),
                     t,
                 )
@@ -422,7 +422,7 @@ mod tests {
             &mut DeterministicRng::new(b"beacon-forge"),
         )
         .unwrap();
-        let mut node = BeaconNode::<F2>::new(Point::at(0), Some(shares[0]), commitment, 1);
+        let mut node = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment, 1);
 
         // A valid partial from anchor 2 (index 3), with a flipped response byte.
         let honest = partial_eval(&shares[2], Epoch::new(1));
@@ -462,7 +462,7 @@ mod tests {
         // A synced anchor: it proposes epoch 1 (its own partial) and receives the rest, so it adopts and
         // caches the round.
         let mut synced =
-            BeaconNode::<F2>::new(Point::at(0), Some(shares[0]), commitment.clone(), t);
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
         synced.step(Instant(0), Input::Command(Command::AdvanceEpoch));
         for share in &shares[1..t] {
             let p = partial_eval(share, Epoch::new(1));

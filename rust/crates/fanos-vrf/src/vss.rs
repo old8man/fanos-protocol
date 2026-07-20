@@ -73,7 +73,11 @@ impl RngCore for DeterministicRng {
 impl CryptoRng for DeterministicRng {}
 
 /// A verifiable share of a secret: `(index, f(index))`.
-#[derive(Clone, Copy)]
+///
+/// Deliberately **not** `Copy` (audit #124, mirroring `VrfSecret`): a secret share must not be silently
+/// duplicated across stack frames — every propagation is an explicit `clone`, so the places a secret
+/// travels are visible and auditable.
+#[derive(Clone)]
 pub struct VssShare {
     /// The holder's evaluation point (`1..=n`).
     pub index: u8,
@@ -330,7 +334,7 @@ mod tests {
         let (shares, _c) = deal(&secret(), 3, 5, &mut rng).unwrap();
         // Several different 3-subsets all recover the same secret.
         for subset in [[0, 1, 2], [1, 3, 4], [0, 2, 4]] {
-            let picked: Vec<_> = subset.iter().map(|&i| shares[i]).collect();
+            let picked: Vec<_> = subset.iter().map(|&i| shares[i].clone()).collect();
             assert_eq!(reconstruct(&picked), Some(expected));
         }
     }

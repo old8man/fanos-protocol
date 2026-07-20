@@ -194,7 +194,7 @@ impl<F: Field> DkgNode<F> {
         // Record our own commitment and our own share (self-dealt, trivially valid).
         self.commitments.insert(self.index, commitment.clone());
         if let Some(mine) = dealing.share_for(self.index) {
-            self.my_shares.insert(self.index, *mine);
+            self.my_shares.insert(self.index, mine.clone());
             self.qualified.insert(self.index);
         }
 
@@ -319,7 +319,7 @@ impl<F: Field> DkgNode<F> {
                 && let Some(share) = dealing.share_for(c)
             {
                 let commitment = dealing.commitment().clone();
-                let share = *share;
+                let share = share.clone();
                 self.justified.entry(d).or_default().insert(c);
                 effects.extend(self.broadcast_to_peers(&justify_frame(d, &share, &commitment)));
             }
@@ -353,7 +353,7 @@ impl<F: Field> DkgNode<F> {
         if self.justified.entry(d).or_default().insert(complainer) {
             // If this reveals *our* share from d, adopt it (we can now qualify d).
             if complainer == self.index {
-                self.my_shares.entry(d).or_insert(share);
+                self.my_shares.entry(d).or_insert(share.clone());
                 self.try_verify(d);
             }
             effects.extend(self.broadcast_to_peers(&justify_frame(d, &share, &commitment)));
@@ -716,7 +716,7 @@ mod tests {
         let mut rng = DeterministicRng::new(&bogus_secret);
         let bogus = dkg::deal(&bogus_secret, threshold, n, &mut rng).unwrap();
         let bogus_commitment = bogus.commitment().clone();
-        let bogus_share = *bogus.share_for(3).unwrap();
+        let bogus_share = bogus.share_for(3).unwrap().clone();
         o.step(
             Instant(3),
             Input::Message {

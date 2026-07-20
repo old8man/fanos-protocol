@@ -199,7 +199,7 @@ mod tests {
             .map(|i| {
                 let overlay = OverlayNode::<F2>::new(Point::at(i), OverlayConfig::default());
                 let beacon =
-                    BeaconNode::<F2>::new(Point::at(i), Some(shares[i]), commitment.clone(), T);
+                    BeaconNode::<F2>::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), T);
                 OverlayBeaconNode::new(overlay, beacon)
             })
             .collect();
