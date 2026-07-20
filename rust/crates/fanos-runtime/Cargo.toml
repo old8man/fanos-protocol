@@ -23,6 +23,10 @@ fanos-pqcrypto.workspace = true
 fanos-core.workspace = true
 fanos-wire.workspace = true
 fanos-wire-derive.workspace = true
+# The reliable-stream layer, extracted to its own transport-agnostic leaf crate (audit #73) and
+# re-exported here as `stream`; a consumer that wants only the reliability types links the leaf, not
+# this whole engine.
+fanos-stream.workspace = true
 
 [features]
 default = ["std"]
@@ -39,6 +43,7 @@ std = [
     "fanos-primitives/std",
     "fanos-core/std",
     "fanos-wire/std",
+    "fanos-stream/std",
 ]
 alloc = [
     "fanos-geometry/alloc",
@@ -48,6 +53,7 @@ alloc = [
     "fanos-primitives/alloc",
     "fanos-core/alloc",
     "fanos-wire/alloc",
+    "fanos-stream/alloc",
 ]
 # For no_std targets: supply DIAKRISIS's float backend.
 libm = ["fanos-diakrisis/libm", "fanos-telemetry/libm"]

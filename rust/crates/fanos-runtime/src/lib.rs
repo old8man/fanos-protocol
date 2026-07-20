@@ -9,6 +9,8 @@
 //!
 //! * [`ports`] — the environment contract: [`Instant`], [`Input`], [`Effect`], [`Engine`].
 //! * [`overlay`] — [`OverlayNode`], the base node: liveness, rendezvous, DIAKRISIS diagnosis.
+//! * [`stream`] — reliable ordered byte-streams; re-exported from the transport-agnostic leaf crate
+//!   [`fanos-stream`](fanos_stream), which carries no engine dependency (audit #73).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -17,7 +19,10 @@ extern crate alloc;
 
 pub mod overlay;
 pub mod ports;
-pub mod stream;
+
+// The reliable-stream layer now lives in the transport-agnostic leaf crate `fanos-stream` (audit #73);
+// re-exported here as `stream` so existing `fanos_runtime::stream::*` paths keep resolving.
+pub use fanos_stream as stream;
 
 pub use overlay::{Config, OverlayNode};
 pub use ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};

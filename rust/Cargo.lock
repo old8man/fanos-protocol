@@ -1025,6 +1025,7 @@ dependencies = [
  "fanos-geometry",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-stream",
  "fanos-telemetry",
  "fanos-wire",
  "fanos-wire-derive",
@@ -1066,6 +1067,10 @@ dependencies = [
  "proptest",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "fanos-stream"
+version = "0.1.0"
 
 [[package]]
 name = "fanos-telemetry"

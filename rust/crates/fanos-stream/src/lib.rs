@@ -23,6 +23,16 @@
 //! It is a pure state machine — a driver performs the sends and the retransmit timer — so it composes
 //! with either transport. Multiplexing is by `stream_id`: many independent streams share one peer
 //! link, each with its own sender/receiver state, so a loss on one stream never stalls another.
+//!
+//! This is a **transport-agnostic leaf** (audit #73): pure `alloc`, no dependency on the overlay
+//! engine or the sans-I/O `ports` contract, so a driver or app (e.g. `fanos-diaulos`) can take the
+//! reliability layer alone without linking `OverlayNode` + DIAKRISIS + the whole runtime. Re-exported
+//! as `fanos_runtime::stream` for source compatibility.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;

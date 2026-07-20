@@ -1,0 +1,23 @@
+[package]
+name = "fanos-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reliable, ordered, multiplexed sans-I/O byte streams (selective-repeat / SACK, two-level flow control) over a datagram overlay — a transport-agnostic leaf with no engine dependency."
+keywords = ["sans-io", "reliability", "selective-repeat", "sack", "fanos"]
+categories = ["network-programming", "no-std"]
+
+# A pure-`alloc` leaf: no workspace or external dependencies. The reliability state machine is heapful
+# (BTreeMap/VecDeque) but needs no `std` — `alloc` is the substrate, `std` merely builds on it.
+[dependencies]
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[lints]
+workspace = true
