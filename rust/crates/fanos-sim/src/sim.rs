@@ -38,6 +38,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Get { .. } => "Get",
         Command::Join { .. } => "Join",
         Command::AdvanceEpoch => "AdvanceEpoch",
+        Command::Reseat { .. } => "Reseat",
     }
 }
 
@@ -67,6 +68,9 @@ fn note_desc(note: &Notification) -> String {
         Notification::DkgComplete(y) => format!("DkgComplete {}", short_digest(y)),
         Notification::BeaconReady { epoch, seed } => {
             format!("BeaconReady {epoch} {}", short_digest(seed))
+        }
+        Notification::Reseated { old, new } => {
+            format!("Reseated {}→{}", fmt_coord(*old), fmt_coord(*new))
         }
         Notification::Observed(bytes) => format!("Observed {}B", bytes.len()),
     }
@@ -358,8 +362,14 @@ impl Sim {
             return;
         };
         let effects = slot.engine.step(self.clock, input);
-        self.nodes.insert(node, slot);
-        self.apply(node, effects);
+        // Re-key by the engine's *current* address: a per-epoch reshuffle (`Command::Reseat`) moves a node
+        // to a new coordinate, and frames must continue to route to it. A no-op for every ordinary step
+        // (the address is unchanged). A reshuffle targets an independently-VRF'd point, so the sim — which
+        // models one occupant per coordinate — moves the node to a currently-unoccupied coordinate; its
+        // effects are attributed to the new address, matching the coordinate its re-announce carries.
+        let addr = slot.engine.address();
+        self.nodes.insert(addr, slot);
+        self.apply(addr, effects);
     }
 
     fn apply(&mut self, node: Triple, effects: Vec<Effect>) {

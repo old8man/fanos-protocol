@@ -111,6 +111,16 @@ pub enum Command {
     /// Advance the epoch beacon; the new epoch floods the cell (adopt-max), rotating epoch-derived
     /// rendezvous and shapes (spec §L3 beacon).
     AdvanceEpoch,
+    /// Re-seat this node at a new VRF coordinate for the per-epoch reshuffle (spec §L3 "epoch reshuffle",
+    /// §3.2): the driver computes `coord = MapToPoint(VRF(sk, node‖epoch‖beacon))` for the new epoch (the
+    /// engine is crypto-free and cannot) and hands it here. The engine re-derives its cell neighbours /
+    /// index / hierarchical address for `coord`, re-announces, and keeps its (epoch-stable, content-keyed)
+    /// store — a placement move, not a data migration (spec §L4: fixed points, flowing nodes). The unpre-
+    /// dictable reshuffle is the load-bearing anti-eclipse / anti-path-prediction defence (§3.2 assump. 2).
+    Reseat {
+        /// The node's new VRF-derived coordinate for the current epoch.
+        coord: Triple,
+    },
 }
 
 /// An input delivered to the engine — the only things it reacts to.
@@ -224,6 +234,16 @@ pub enum Notification {
         epoch: Epoch,
         /// The 32-byte public beacon seed.
         seed: [u8; 32],
+    },
+    /// This node re-seated its coordinate for the per-epoch reshuffle (in response to
+    /// [`Command::Reseat`], spec §L3): it moved from `old` to `new`. A driver rebuilds its HELLO
+    /// proof-of-coordinate for the new coordinate, and the simulator re-keys the node at its new address so
+    /// frames continue to route to it. Storage is untouched (content addressing is epoch-stable, §L4).
+    Reseated {
+        /// The coordinate the node held before the reshuffle.
+        old: Triple,
+        /// The coordinate the node holds after the reshuffle.
+        new: Triple,
     },
 }
 

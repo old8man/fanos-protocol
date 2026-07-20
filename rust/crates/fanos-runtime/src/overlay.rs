@@ -1569,6 +1569,73 @@ impl<F: Field> OverlayNode<F> {
         effects
     }
 
+    /// `Command::Reseat` — re-seat this node at `new_coord` for the per-epoch reshuffle (spec §L3 "epoch
+    /// reshuffle", §3.2). The driver supplies the new VRF-derived coordinate (the engine is crypto-free and
+    /// cannot compute it); this re-derives the node's cell neighbours, Fano index, and hierarchical address
+    /// for the new placement, re-announces so the cell relearns how to route to it, and emits
+    /// [`Notification::Reseated`] (a driver rebuilds its HELLO proof-of-coordinate; the simulator re-keys
+    /// the node). The unpredictable reshuffle is the load-bearing anti-eclipse / anti-path-prediction
+    /// defence (§3.2 assumption 2), the one q=2 grinding does not provide.
+    ///
+    /// **STORAGE is deliberately preserved.** Content addressing is epoch-stable (`MapToPoint(H(k))`, §L4)
+    /// and the store is full-cell-replicated, so a within-cell reshuffle is a *placement* move, not a data
+    /// migration ("fixed points, flowing nodes"): the node still holds every value it held and keeps serving
+    /// them across the transition — that preservation **is** the one-epoch grace window (audit C2), so no
+    /// key is lost on rotation. A per-shard prune of values a node is no longer a replica for belongs to the
+    /// erasure-coded store (#115), where a replica can compute its own line-membership; under full
+    /// replication every cell member is a replica for every key, so within a cell there is nothing to prune.
+    ///
+    /// A no-op if `new_coord` is not a canonical projective point or already equals this coordinate.
+    fn on_reseat(&mut self, new_coord: Triple) -> Vec<Effect> {
+        let Some(new_pt) = Point::<F>::new(new_coord) else {
+            return Vec::new(); // not a canonical projective point — ignore
+        };
+        if new_pt == self.coord {
+            return Vec::new(); // already seated here
+        }
+        let old = self.coord.coords();
+        // Re-derive the cell neighbour set for the new coordinate — with fresh liveness, exactly as a join
+        // does: the node re-discovers which neighbours are live at its new position over the next heartbeat
+        // round, so no stale "alive" carries over from the old placement into the responsibility set.
+        let mut peers = BTreeMap::new();
+        for line in Plane::<F>::lines_through(new_pt) {
+            for member in Plane::<F>::points_on(line) {
+                if member != new_pt {
+                    peers.entry(member.coords()).or_insert(Peer {
+                        last_seen: None,
+                        reported_down: false,
+                    });
+                }
+            }
+        }
+        self.peers = peers;
+        self.self_index = if Plane::<F>::N == 7 {
+            (0..7).find(|&i| Point::<F>::at(i) == new_pt)
+        } else {
+            None
+        };
+        self.coord = new_pt;
+        self.router = Router::new(new_pt);
+        // Drop our now-stale self-entry at the old coordinate and re-announce at the new one (spec §7.8), so
+        // the cell relearns our placement; then signal the reshuffle for the driver (rebuild HELLO) and the
+        // simulator (re-key routing). The store, membership view of others, witnessed liveness, and epoch
+        // are all preserved.
+        let info = self.membership.members.remove(&old).unwrap_or_default();
+        let mut effects = self.on_join(info);
+        // Re-establish the liveness heartbeat at the new coordinate. A driver's heartbeat is not
+        // coordinate-keyed, so this merely resets its interval; but under a coordinate-addressed transport
+        // (the simulator) the timer armed at the OLD coordinate is now orphaned, so the reflex would fall
+        // silent after a reshuffle without this — the node must keep pinging from its new placement.
+        if self.heartbeating {
+            effects.push(Effect::ArmTimer {
+                token: HEARTBEAT,
+                after: self.config.heartbeat,
+            });
+        }
+        effects.push(Effect::Notify(Notification::Reseated { old, new: new_coord }));
+        effects
+    }
+
     /// The current membership view (coordinate → announced info), for onion routing / observation.
     pub fn members(&self) -> impl Iterator<Item = (Triple, &[u8])> + '_ {
         self.membership.members.iter().map(|(&c, i)| (c, i.as_slice()))
@@ -1654,6 +1721,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
+            Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
             Input::Timer(HEARTBEAT) if self.heartbeating => self.on_heartbeat(now),
             Input::Timer(_) => Vec::new(),
             Input::Message { from, frame } => self.on_message(now, from, &frame),

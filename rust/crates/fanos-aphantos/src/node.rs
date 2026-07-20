@@ -510,7 +510,8 @@ impl<F: Field> Engine for NyxNode<F> {
                 | Command::Put { .. }
                 | Command::Get { .. }
                 | Command::Join { .. }
-                | Command::AdvanceEpoch,
+                | Command::AdvanceEpoch
+                | Command::Reseat { .. },
             ) => Vec::new(),
         }
     }
