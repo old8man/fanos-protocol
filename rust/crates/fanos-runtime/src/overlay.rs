@@ -147,6 +147,55 @@ struct PendingGet {
     nonce: u64,
 }
 
+/// The DHT-storage concern factored out of [`OverlayNode`] (audit #125 decompose): this node's local
+/// slice of the cell's distributed store plus its in-flight read-repair bookkeeping. The *orchestration*
+/// of a Put/Get — resolving the responsible cell member, replicating across the cell — stays on
+/// `OverlayNode`, which owns the membership view; this owns the local state and the read-repair walk.
+#[derive(Default)]
+struct Store {
+    /// Key digest → value. A value lives on its responsible content point and is replicated across the
+    /// cell for LRC availability, so any survivor answers a lookup (spec §L4).
+    entries: BTreeMap<[u8; DIGEST], Vec<u8>>,
+    /// In-flight `Get`s awaiting a `Value`, keyed by digest — the read-repair walk down the replica line.
+    pending: BTreeMap<[u8; DIGEST], PendingGet>,
+    /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
+    seq: u64,
+}
+
+impl Store {
+    /// Whether the local slice admits `(digest, value_len)` under the A4 DoS caps: within
+    /// [`MAX_VALUE_LEN`], and either the key already exists (an overwrite — no growth) or the store is
+    /// below [`MAX_STORE_ENTRIES`] — so a `Publish` flood cannot displace already-stored replicas, while
+    /// updates to existing keys always pass.
+    fn admits(&self, digest: &[u8; DIGEST], value_len: usize) -> bool {
+        value_len <= MAX_VALUE_LEN
+            && (self.entries.len() < MAX_STORE_ENTRIES || self.entries.contains_key(digest))
+    }
+
+    /// Advance an in-flight read to the next replica on its line, or conclude `Retrieved(None)` once the
+    /// replicas are exhausted (spec §L4 read repair). The next replica comes from the read's own
+    /// `remaining` list, so this needs no membership view.
+    fn advance_pending_get(&mut self, now: Instant, digest: [u8; DIGEST], effects: &mut Vec<Effect>) {
+        let Some(pending) = self.pending.get_mut(&digest) else {
+            return;
+        };
+        if let Some(next) = pending.remaining.pop() {
+            pending.issued = now;
+            let nonce = pending.nonce;
+            effects.push(Effect::Send {
+                to: next,
+                frame: encode_lookup(&digest, nonce),
+            });
+        } else {
+            self.pending.remove(&digest);
+            effects.push(Effect::Notify(Notification::Retrieved {
+                key: digest,
+                value: None,
+            }));
+        }
+    }
+}
+
 /// What we know about a cell neighbour.
 #[derive(Clone, Copy, Debug)]
 struct Peer {
@@ -236,19 +285,11 @@ pub struct OverlayNode<F: Field> {
     /// (`polar::mediator_attestation`); an equivocating member's disagree internally, and
     /// `polar::violated_classes` then localizes exactly it.
     attested: BTreeMap<Triple, ([f64; 3], Instant)>,
-    /// This node's slice of the cell's distributed store (spec §L4): key digest → value. A value
-    /// lives on its responsible point `MapToPoint(H(key))` and is replicated across the cell for
-    /// LRC availability, so any survivor answers a lookup — and a lookup to a *down* primary
-    /// reroutes to a replica through the same self-healing table (§6.7).
-    store: BTreeMap<[u8; DIGEST], Vec<u8>>,
-    /// In-flight `Get`s awaiting a `Value` answer, keyed by digest (spec §L4 read repair). A read
-    /// consults the primary, then falls back through the replica line on a `found=false` or a
-    /// silent-replica timeout, concluding "absent" only once the replicas are exhausted — so any
-    /// surviving replica answers even when the primary recovered empty after churn.
-    pending_gets: BTreeMap<[u8; DIGEST], PendingGet>,
-    /// Monotonic per-request nonce source for reads (audit C4): each `Get` takes the next value, carried
-    /// end-to-end in its `Lookup`/`Value` frames so a reply is matched to the exact in-flight read.
-    get_seq: u64,
+    /// The DHT-storage concern — this node's local store slice + read-repair bookkeeping (spec §L4). A
+    /// value lives on its responsible content point and is cell-replicated for LRC availability, so any
+    /// survivor answers a lookup (a lookup to a *down* primary reroutes through the self-healing table,
+    /// §6.7). Factored into a [`Store`] collaborator (audit #125 decompose); the facade orchestrates.
+    store: Store,
     /// The membership view: cell coordinate → announced info (public keys, capabilities), learned
     /// by flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
     members: BTreeMap<Triple, Vec<u8>>,
@@ -373,9 +414,7 @@ impl<F: Field> OverlayNode<F> {
             quarantined: BTreeMap::new(),
             witnessed: BTreeMap::new(),
             attested: BTreeMap::new(),
-            store: BTreeMap::new(),
-            pending_gets: BTreeMap::new(),
-            get_seq: 0,
+            store: Store::default(),
             members: BTreeMap::new(),
             epoch: Epoch::ZERO,
             observer,
@@ -509,13 +548,14 @@ impl<F: Field> OverlayNode<F> {
     fn sweep_pending_gets(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         let timeout = self.config.read_timeout;
         let stale: Vec<[u8; DIGEST]> = self
-            .pending_gets
+            .store
+            .pending
             .iter()
             .filter(|(_, p)| now.since(p.issued) > timeout)
             .map(|(digest, _)| *digest)
             .collect();
         for digest in stale {
-            self.advance_pending_get(now, digest, effects);
+            self.store.advance_pending_get(now, digest, effects);
         }
     }
 
@@ -890,16 +930,6 @@ impl<F: Field> OverlayNode<F> {
             .map_or(ideal, |&i| Point::<F>::at(i).coords())
     }
 
-    /// Whether the local DHT slice will admit `(digest, value_len)` under the A4 DoS caps: the value is
-    /// within [`MAX_VALUE_LEN`], and either the key already exists (an overwrite — no growth) or the
-    /// store is below [`MAX_STORE_ENTRIES`]. A **new** key is refused once full so a `Publish` flood
-    /// cannot displace already-stored replicas (LRC availability is preserved), while updates to existing
-    /// keys are always allowed. Both store paths (`on_put`, `on_publish`) gate on this one predicate.
-    fn admits_store(&self, digest: &[u8; DIGEST], value_len: usize) -> bool {
-        value_len <= MAX_VALUE_LEN
-            && (self.store.len() < MAX_STORE_ENTRIES || self.store.contains_key(digest))
-    }
-
     /// `Command::Put` — store a value at its responsible point and replicate it across the cell.
     fn on_put(&mut self, key: &[u8], value: Vec<u8>) -> Vec<Effect> {
         let (digest, ideal) = Self::address_of(key);
@@ -907,12 +937,12 @@ impl<F: Field> OverlayNode<F> {
         if primary == self.coord.coords() {
             // We are the responsible node. Refuse (over cap / over-size) without replicating or claiming
             // it stored; otherwise replicate to the cell, ack ourselves, and store (moving the value in).
-            if !self.admits_store(&digest, value.len()) {
+            if !self.store.admits(&digest, value.len()) {
                 return Vec::new();
             }
             let mut effects = self.replicate(&digest, &value);
             effects.push(Effect::Notify(Notification::Stored(digest)));
-            self.store.insert(digest, value);
+            self.store.entries.insert(digest, value);
             effects
         } else {
             alloc::vec![self.routed_send(primary, encode_publish(PUBLISH_ORIGIN, &digest, &value))]
@@ -927,12 +957,12 @@ impl<F: Field> OverlayNode<F> {
     /// on a `found=false` reply or a silent-replica timeout, falls back through the remaining
     /// replicas — concluding `Retrieved(None)` only once they are exhausted. This makes the LRC
     /// availability guarantee hold on *read* too: a value is found even when the primary recovered
-    /// empty after churn while replicas still hold it. The in-flight query is tracked in
-    /// [`pending_gets`](Self::pending_gets); [`on_value`](Self::on_value) and the heartbeat sweep drive it.
+    /// empty after churn while replicas still hold it. The in-flight query is tracked in the
+    /// [`Store`]'s `pending` map; [`on_value`](Self::on_value) and the heartbeat sweep drive it.
     fn on_get(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
         let (digest, ideal) = Self::address_of(key);
         let primary = self.responsible_point(ideal);
-        if let Some(value) = self.store.get(&digest) {
+        if let Some(value) = self.store.entries.get(&digest) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value: Some(value.clone()),
@@ -940,9 +970,9 @@ impl<F: Field> OverlayNode<F> {
         }
         // Cap in-flight reads (A4 DoS backstop): once [`MAX_PENDING_GETS`] distinct reads are
         // outstanding, refuse a *new* one — concluding `Retrieved(None)` — rather than track it, so a
-        // flood of distinct-key `Get`s cannot grow `pending_gets` without bound. A repeat Get for an
+        // flood of distinct-key `Get`s cannot grow the pending map without bound. A repeat Get for an
         // already-pending digest is allowed through (it refreshes the existing entry, no growth).
-        if self.pending_gets.len() >= MAX_PENDING_GETS && !self.pending_gets.contains_key(&digest) {
+        if self.store.pending.len() >= MAX_PENDING_GETS && !self.store.pending.contains_key(&digest) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value: None,
@@ -958,9 +988,9 @@ impl<F: Field> OverlayNode<F> {
             .collect();
         // A fresh per-request nonce correlates this read's replies (audit C4); a repeat Get for the same
         // key supersedes the old one with a new nonce, so the old read's in-flight replies go stale.
-        self.get_seq = self.get_seq.wrapping_add(1);
-        let nonce = self.get_seq;
-        self.pending_gets.insert(
+        self.store.seq = self.store.seq.wrapping_add(1);
+        let nonce = self.store.seq;
+        self.store.pending.insert(
             digest,
             PendingGet {
                 issued: now,
@@ -992,10 +1022,10 @@ impl<F: Field> OverlayNode<F> {
         let value = body.get(1 + DIGEST..).unwrap_or(&[]).to_vec();
         // Store under the A4 DoS caps. A refused publish (over cap / over-size) is dropped without an
         // Ack or replication — a relayed flood of distinct digests cannot exhaust this node's memory.
-        if !self.admits_store(&digest, value.len()) {
+        if !self.store.admits(&digest, value.len()) {
             return Vec::new();
         }
-        self.store.insert(digest, value.clone());
+        self.store.entries.insert(digest, value.clone());
         if flag == PUBLISH_ORIGIN {
             // We are the responsible node: replicate across the cell and acknowledge the origin.
             let mut effects = self.replicate(&digest, &value);
@@ -1014,7 +1044,7 @@ impl<F: Field> OverlayNode<F> {
         let Ok(LookupBody { key: digest, nonce }) = LookupBody::from_wire(body) else {
             return Vec::new();
         };
-        let (found, value): (bool, &[u8]) = match self.store.get(&digest) {
+        let (found, value): (bool, &[u8]) = match self.store.entries.get(&digest) {
             Some(v) => (true, v),
             None => (false, &[]),
         };
@@ -1040,14 +1070,14 @@ impl<F: Field> OverlayNode<F> {
         // (old nonce), or one with no in-flight read at all, is ignored — so it emits no spurious
         // `Retrieved` and can never drain a later same-key get with an old value (read-your-writes,
         // audit C4). The value bytes follow the nonce.
-        match self.pending_gets.get(&digest) {
+        match self.store.pending.get(&digest) {
             Some(p) if p.nonce == nonce => {}
             _ => return Vec::new(),
         }
         if found {
             // A survivor has it. Deliver once and retire the pending read (later dup replies no longer
             // match — the entry is gone).
-            self.pending_gets.remove(&digest);
+            self.store.pending.remove(&digest);
             let value = Some(body.get(DIGEST + 1 + 8..).unwrap_or(&[]).to_vec());
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
@@ -1056,36 +1086,8 @@ impl<F: Field> OverlayNode<F> {
         }
         // A negative reply for the in-flight read: advance to the next replica, or conclude it absent.
         let mut effects = Vec::new();
-        self.advance_pending_get(now, digest, &mut effects);
+        self.store.advance_pending_get(now, digest, &mut effects);
         effects
-    }
-
-    /// Advance one pending `Get` after its outstanding replica declined or went silent: query the
-    /// next replica on the responsible line, or — once they are exhausted — conclude `Retrieved(None)`
-    /// and retire the read. The single seam shared by the negative-reply and timeout-sweep paths.
-    fn advance_pending_get(
-        &mut self,
-        now: Instant,
-        digest: [u8; DIGEST],
-        effects: &mut Vec<Effect>,
-    ) {
-        let Some(pending) = self.pending_gets.get_mut(&digest) else {
-            return;
-        };
-        if let Some(next) = pending.remaining.pop() {
-            pending.issued = now;
-            let nonce = pending.nonce;
-            effects.push(Effect::Send {
-                to: next,
-                frame: encode_lookup(&digest, nonce),
-            });
-        } else {
-            self.pending_gets.remove(&digest);
-            effects.push(Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            }));
-        }
     }
 
     fn on_ack(body: &[u8]) -> Vec<Effect> {
@@ -2092,9 +2094,9 @@ mod tests {
             node.step(Instant(1), Input::Message { from, frame });
         }
         assert!(
-            node.store.len() <= MAX_STORE_ENTRIES,
+            node.store.entries.len() <= MAX_STORE_ENTRIES,
             "the store is bounded under a publish flood, got {}",
-            node.store.len()
+            node.store.entries.len()
         );
     }
 
@@ -2112,7 +2114,7 @@ mod tests {
             },
         );
         assert!(
-            !node.store.contains_key(&digest),
+            !node.store.entries.contains_key(&digest),
             "an over-size value is refused"
         );
         // A value exactly at the limit is accepted.
@@ -2125,7 +2127,7 @@ mod tests {
             },
         );
         assert!(
-            node.store.contains_key(&digest),
+            node.store.entries.contains_key(&digest),
             "a within-limit value is stored"
         );
     }
@@ -2141,7 +2143,7 @@ mod tests {
             node.step(Instant(1), Input::Message { from, frame });
         }
         assert_eq!(
-            node.store.len(),
+            node.store.entries.len(),
             MAX_STORE_ENTRIES,
             "the store filled to the cap"
         );
@@ -2155,7 +2157,7 @@ mod tests {
             },
         );
         assert_eq!(
-            node.store.get(&existing).map(Vec::as_slice),
+            node.store.entries.get(&existing).map(Vec::as_slice),
             Some(&b"updated"[..]),
             "an existing key still updates when the store is full"
         );
@@ -2168,11 +2170,11 @@ mod tests {
             },
         );
         assert!(
-            !node.store.contains_key(&[0xABu8; DIGEST]),
+            !node.store.entries.contains_key(&[0xABu8; DIGEST]),
             "a new key is refused when full"
         );
         assert_eq!(
-            node.store.len(),
+            node.store.entries.len(),
             MAX_STORE_ENTRIES,
             "the store never exceeds its cap"
         );
@@ -2192,9 +2194,9 @@ mod tests {
             );
         }
         assert!(
-            node.pending_gets.len() <= MAX_PENDING_GETS,
+            node.store.pending.len() <= MAX_PENDING_GETS,
             "pending reads are bounded under a get flood, got {}",
-            node.pending_gets.len()
+            node.store.pending.len()
         );
     }
 
