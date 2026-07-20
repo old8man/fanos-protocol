@@ -298,6 +298,34 @@ pub fn fabricators_by_persistent_freshness(
     flagged
 }
 
+/// Localize a single **grey** node from a measured *symmetric* channel-rate matrix (spec §6.3: "grey/degraded
+/// → polar-rate sum-rules, T-226"). A grey node `j` — one that answers but slowly/lossily on ALL its channels
+/// — elevates the rate of every channel *incident* to `j`. By the Fano structure this has a unique signature:
+/// every polar class `m ≠ j` contains **exactly one** `j`-incident channel (its three channels partition the
+/// six non-`m` points into pairs, and `j` — being one of those six — lands in exactly one pair), so that one
+/// elevated rate makes class `m` inconsistent; while class `j`'s own three channels run among the six *non*-`j`
+/// points, contain no `j`-channel, and stay consistent. So a single grey node is the **unique polar class that
+/// does NOT violate** while all six others do. Returns that point on this clean single-grey signature, else
+/// `None` (no grey — no violations — or an ambiguous/multi-fault pattern the syndrome localizer must handle).
+///
+/// `tol` is the rate-consistency slack: it must sit above the honest network-jitter noise floor (so uniform
+/// lossy-but-fair links do not violate) and below the grey rate lift (so a real grey node does). It is the one
+/// value a simulator sweep pins — separating grey from jitter — never a guessed constant.
+#[must_use]
+pub fn grey_endpoint(rates: &[[f64; N]; N], tol: f64) -> Option<usize> {
+    let violated = violated_classes(rates, tol);
+    // The single-grey signature: exactly the six classes OTHER than one violate; that one innocent class is
+    // the grey endpoint. Any other cardinality is not this fault (healthy, or a pattern the syndrome handles).
+    if violated.len() != N - 1 {
+        return None;
+    }
+    let innocent: Vec<usize> = (0..N).filter(|k| !violated.contains(k)).collect();
+    match innocent[..] {
+        [k] => Some(k),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -609,5 +637,51 @@ mod tests {
     #[test]
     fn an_empty_window_flags_nobody() {
         assert!(fabricators_by_persistent_freshness(&[], 3, 0x7F).is_empty());
+    }
+
+    /// A symmetric measured-rate matrix for a single grey node `j`: every channel incident to `j` carries
+    /// `base + lift`, every other channel `base`; zero diagonal (the classes never read it).
+    fn grey_matrix(j: usize, base: f64, lift: f64) -> [[f64; N]; N] {
+        let mut m = [[0.0f64; N]; N];
+        for a in 0..N {
+            for b in 0..N {
+                if a != b {
+                    m[a][b] = base + if a == j || b == j { lift } else { 0.0 };
+                }
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn grey_endpoint_localizes_a_single_lossy_node() {
+        // The §6.3 grey signature, verified for EVERY possible grey point: its incident channels are elevated,
+        // exactly the six OTHER classes violate, and it is recovered as the unique non-violated class.
+        for j in 0..N {
+            let m = grey_matrix(j, 0.1, 0.4);
+            let mut violated = violated_classes(&m, 0.05);
+            violated.sort_unstable();
+            let expect: Vec<usize> = (0..N).filter(|&k| k != j).collect();
+            assert_eq!(violated, expect, "grey {j}: exactly the six non-j classes violate");
+            assert_eq!(grey_endpoint(&m, 0.05), Some(j), "grey {j} is localized");
+        }
+    }
+
+    #[test]
+    fn grey_endpoint_is_silent_on_a_fair_lossy_cell() {
+        // Uniform loss — a congested but FAIR cell where every channel is equally lossy — satisfies the
+        // sum-rules, so nothing is localized: grey is asymmetry, not loss per se.
+        let uniform = [[0.2f64; N]; N];
+        assert!(violated_classes(&uniform, 0.05).is_empty());
+        assert_eq!(grey_endpoint(&uniform, 0.05), None);
+    }
+
+    #[test]
+    fn grey_endpoint_tolerates_jitter_below_tol() {
+        // The FP guard the simulator sweep pins `tol` for: a rate lift BELOW tol (honest jitter) is not grey.
+        for j in 0..N {
+            let m = grey_matrix(j, 0.1, 0.03);
+            assert_eq!(grey_endpoint(&m, 0.05), None, "sub-tol lift at {j} is not grey");
+        }
     }
 }
