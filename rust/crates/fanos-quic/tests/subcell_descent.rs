@@ -1,9 +1,14 @@
-//! **Coordinate-collision relocation by sub-cell descent** (§L0/§L1). A self-certifying coordinate is
-//! `MapToPoint(H(cert))`, so two distinct identities collide on one Fano point with probability `1/N`.
-//! They cannot both occupy it — the later binding would shadow the earlier and break routing — so the
-//! newcomer **descends** into the sub-cell rooted at that point, taking a deeper coordinate it derives
-//! from its *own* certificate (never the occupant's). This exercises that end to end on real credentials
-//! ground to a chosen point, so the collision is genuine, not simulated.
+//! **Coordinate-collision relocation by sub-cell descent** (§L0/§L1). This exercises the *hierarchical
+//! address* — the #79 self-certifying hash-chain `address_point(cert, level)` — which is a **distinct**
+//! addressing scheme from a node's live VRF coordinate: the hierarchy address is a proof-free one-way
+//! hash of the identity (so the no_std overlay verifies an announced address by recomputation), whereas
+//! the live coordinate is the VRF `MapToPoint(VRF(sk, …))` proven in the handshake (A7). Two distinct
+//! identities collide on one Fano point of the hash-chain address with probability `1/N`; they cannot
+//! both occupy it, so the newcomer **descends** into the sub-cell rooted at that point, taking a deeper
+//! point it derives from its *own* certificate (never the occupant's). Unifying the hierarchy under the
+//! VRF (a VRF-seeded descent with proof-carrying #79 verification) is Level B — see
+//! `docs/design-coordinates.md`; here we test the hash-chain descent mechanism on its own terms, so the
+//! test grinds the hash-chain level-0 coordinate rather than the VRF one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -11,7 +16,22 @@ use std::collections::BTreeSet;
 
 use fanos_field::F2;
 use fanos_geometry::{HierAddr, Point, Triple};
-use fanos_quic::{coordinate_at_level, credentials_for_point, hierarchical_coordinate};
+use fanos_quic::{
+    NodeCredentials, coordinate_at_level, coordinate_from_cert, hierarchical_coordinate,
+};
+
+/// Grind a genuine self-certifying identity whose **hash-chain level-0** coordinate
+/// `coordinate_from_cert` is exactly `target` — the addressing scheme the hierarchy descent uses (the
+/// harness `credentials_for_point` grinds the VRF coordinate instead, a different point). Tractable only
+/// because `N = 7`.
+fn grind_hash_point(target: Point<F2>) -> NodeCredentials {
+    loop {
+        let c = NodeCredentials::generate().expect("mint credentials");
+        if coordinate_from_cert::<F2>(c.cert_der()) == target {
+            return c;
+        }
+    }
+}
 
 /// The occupancy oracle over a set of taken hierarchical addresses (each a point path).
 fn occupied(taken: &BTreeSet<Vec<Triple>>, path: &[Point<F2>]) -> bool {
@@ -28,9 +48,9 @@ fn a_colliding_newcomer_descends_into_a_sub_cell_rather_than_shadowing() {
     // Grind two DISTINCT certificates that both hash to the same Fano point 3 — a real coordinate
     // collision (tractable only because N = 7; the whole point of the self-certifying design).
     let target = Point::<F2>::at(3);
-    let occupant_cred = credentials_for_point::<F2>(target, 4096).expect("grind occupant");
+    let occupant_cred = grind_hash_point(target);
     let newcomer_cred = loop {
-        let c = credentials_for_point::<F2>(target, 4096).expect("grind newcomer");
+        let c = grind_hash_point(target);
         if c.cert_der() != occupant_cred.cert_der() {
             break c; // a genuinely different identity on the same point
         }
@@ -76,11 +96,11 @@ fn a_colliding_newcomer_descends_into_a_sub_cell_rather_than_shadowing() {
 
 #[test]
 fn level_zero_matches_the_ordinary_coordinate_and_levels_diverge() {
-    let cred = credentials_for_point::<F2>(Point::<F2>::at(5), 4096).unwrap();
-    // Level 0 is exactly the ordinary self-certifying coordinate.
+    let cred = grind_hash_point(Point::<F2>::at(5));
+    // Level 0 is exactly the ordinary hash-chain self-certifying coordinate.
     assert_eq!(
         coordinate_at_level::<F2>(cred.cert_der(), 0),
-        fanos_quic::coordinate_from_cert::<F2>(cred.cert_der()),
+        coordinate_from_cert::<F2>(cred.cert_der()),
     );
     // The descent chain is deterministic (same cert ⇒ same points) and the levels are independent
     // draws, so a node's own path does not trivially repeat one point.

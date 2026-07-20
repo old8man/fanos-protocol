@@ -16,11 +16,12 @@
 
 use fanos_field::Field;
 use fanos_geometry::Point;
+use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_runtime::Engine;
 
 use crate::directory::Directory;
 use crate::driver::{NodeHandle, QuicError, spawn_self_certifying_persistent};
-use crate::identity::coordinate_from_cert;
+use crate::identity::verifiable_coordinate;
 use crate::tls::NodeCredentials;
 
 /// Rejection-sampling bound for [`credentials_for_point`]. At a Fano cell's `N = 7` points the chance
@@ -45,7 +46,8 @@ pub fn credentials_for_point<F: Field>(
         // A failed mint (no entropy) yields `None` from this closure, so `find_map` simply tries again
         // — a transient generator error costs one wasted attempt, never a spurious match.
         let creds = NodeCredentials::generate().ok()?;
-        (coordinate_from_cert::<F>(creds.cert_der()) == target).then_some(creds)
+        (verifiable_coordinate::<F>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS).0 == target)
+            .then_some(creds)
     })
 }
 
@@ -112,7 +114,8 @@ mod tests {
     use fanos_field::F2;
 
     /// The pure seam: for every one of the seven Fano points, grinding yields a *genuine*
-    /// self-certifying identity whose certificate hashes to exactly that point — earned, not assigned.
+    /// self-certifying identity whose **VRF genesis coordinate** is exactly that point — earned, not
+    /// assigned (the identity's VRF key is derived from its certificate, so this is unforgeable).
     #[test]
     fn grinds_a_self_certifying_identity_for_every_fano_point() {
         for i in 0..Cell::size::<F2>() {
@@ -120,9 +123,9 @@ mod tests {
             let creds = credentials_for_point::<F2>(target, DEFAULT_GRIND_LIMIT)
                 .expect("a Fano point is reachable within the grind limit");
             assert_eq!(
-                coordinate_from_cert::<F2>(creds.cert_der()),
+                verifiable_coordinate::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS).0,
                 target,
-                "point {i}: the minted certificate certifies the pinned coordinate",
+                "point {i}: the minted identity's verifiable coordinate is the pinned point",
             );
         }
     }

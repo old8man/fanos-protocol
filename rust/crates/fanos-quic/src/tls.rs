@@ -26,6 +26,21 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 /// The ALPN token every FANOS QUIC endpoint negotiates (rejects non-FANOS peers early).
 const ALPN: &[u8] = b"fanos/1";
 
+/// The OID of the custom X.509 extension that carries a node's 32-byte coordinate-VRF public key in its
+/// self-signed certificate (a FANOS private-use enterprise arc). rcgen embeds it at generation;
+/// [`crate::identity::vrf_public_from_cert`] reads it back from a peer's authenticated certificate.
+pub(crate) const FANOS_VRF_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 61234, 1];
+
+/// Derive a node's coordinate-VRF secret deterministically from its certificate private-key DER, so the
+/// VRF key is bound to — and as durable as — the TLS identity (spec §L0): a domain-separated hash of the
+/// key seeds `VrfSecret::from_seed` (total). Reloading the same credentials reproduces the same VRF key,
+/// so no extra persisted field is needed.
+pub(crate) fn vrf_secret_from_key(key_der: &[u8]) -> fanos_vrf::VrfSecret {
+    let mut seed = [0u8; 32];
+    fanos_primitives::hash::hash_xof("FANOS-v1/node-vrf-key", key_der, &mut seed);
+    fanos_vrf::VrfSecret::from_seed(seed)
+}
+
 /// A TLS setup failure (certificate generation or config assembly).
 #[derive(Debug)]
 pub enum TlsError {
@@ -95,14 +110,35 @@ pub struct NodeCredentials {
 }
 
 impl NodeCredentials {
-    /// Mint fresh credentials (a self-signed certificate + key).
+    /// Mint fresh credentials: a self-signed certificate + key, with the node's **coordinate-VRF public
+    /// key embedded** as a custom extension (spec §L0). The VRF secret is derived deterministically from
+    /// the certificate's private key, so persistence is unchanged (`cert_der ‖ key_der` still round-trips
+    /// the whole identity) and reloading reconstructs the same VRF key. Because the VRF public is in the
+    /// certificate, `H(cert)` — the node's identity anchor — commits to the key that earns its coordinate,
+    /// and a peer's coordinate proof cannot be transplanted onto another certificate.
     pub fn generate() -> Result<Self, TlsError> {
-        let certified = rcgen::generate_simple_self_signed(vec!["fanos.node".to_owned()])
+        let key = rcgen::KeyPair::generate().map_err(|_| TlsError::Cert)?;
+        let key_der = key.serialize_der();
+        let vrf_public = vrf_secret_from_key(&key_der).public();
+        let mut params = rcgen::CertificateParams::new(vec!["fanos.node".to_owned()])
             .map_err(|_| TlsError::Cert)?;
+        params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(
+            FANOS_VRF_OID,
+            vrf_public.to_bytes().to_vec(),
+        ));
+        let cert = params.self_signed(&key).map_err(|_| TlsError::Cert)?;
         Ok(Self {
-            cert_der: certified.cert.der().to_vec(),
-            key_der: certified.signing_key.serialize_der(),
+            cert_der: cert.der().to_vec(),
+            key_der,
         })
+    }
+
+    /// This node's coordinate-VRF secret key — derived from the certificate's private key, so it is as
+    /// durable as the identity itself (reloaded credentials reproduce it). Proves the node's verifiable
+    /// coordinate `MapToPoint(VRF(vrf_sk, H(cert)‖epoch‖beacon))` (spec §L0/§L3).
+    #[must_use]
+    pub fn vrf_secret(&self) -> fanos_vrf::VrfSecret {
+        vrf_secret_from_key(&self.key_der)
     }
 
     /// The certificate DER — the node's identity (its coordinate is `MapToPoint(H(cert))`).
@@ -124,15 +160,10 @@ impl NodeCredentials {
     }
 }
 
-/// Build a **mutual-TLS** `(server, client, cert)` triple with fresh credentials.
-pub(crate) fn node_configs_mutual()
--> Result<(ServerConfig, ClientConfig, CertificateDer<'static>), TlsError> {
-    node_configs_mutual_from(&NodeCredentials::generate()?)
-}
-
 /// Build a **mutual-TLS** `(server, client, cert)` triple from given credentials. Both ends present
-/// the node's certificate and require the peer's, so each derives the peer's overlay coordinate
-/// `MapToPoint(H(cert))` from the authenticated handshake — no directory-trust, no HELLO. Returns
+/// the node's certificate and require the peer's, so the connection is authenticated to that
+/// certificate; each side then proves its VRF coordinate in a HELLO the other verifies against it
+/// (spec §7.3 — the certificate carries the coordinate-VRF public key). Returns
 /// the node's own certificate DER (its identity), used to derive its coordinate.
 pub(crate) fn node_configs_mutual_from(
     creds: &NodeCredentials,

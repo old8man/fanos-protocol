@@ -40,5 +40,8 @@ pub use driver::{
     spawn_self_certifying_persistent_on, spawn_shaped,
 };
 pub use harness::{Cell, DEFAULT_GRIND_LIMIT, credentials_for_point, spawn_cell, spawn_pinned};
-pub use identity::{coordinate_at_level, coordinate_from_cert, hierarchical_coordinate};
+pub use identity::{
+    coordinate_at_level, coordinate_from_cert, hierarchical_coordinate, verifiable_coordinate,
+    verify_peer_coordinate, vrf_public_from_cert,
+};
 pub use tls::{NodeCredentials, TlsError};

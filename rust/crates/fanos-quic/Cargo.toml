@@ -30,6 +30,11 @@ fanos-primitives = { workspace = true, features = ["std"] }
 fanos-proteus = { workspace = true, features = ["std"] }
 fanos-wire.workspace = true
 fanos-wire-derive.workspace = true
+# The coordinate VRF (spec §L0/§L3): the live node's coordinate is MapToPoint(VRF(sk, H(cert)‖epoch‖
+# beacon)), its VRF key derived from the cert key and its public embedded in the cert. no_std.
+fanos-vrf.workspace = true
+# Read the embedded VRF-public extension out of a peer's authenticated certificate.
+x509-parser = "0.18"
 
 # Real transport stack. Pinned to the ring crypto provider for portability (no
 # aws-lc-rs C toolchain requirement) and reproducible cross-platform builds.

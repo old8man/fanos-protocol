@@ -136,12 +136,19 @@ the live path; demotes `coordinate_for` to what its doc already calls it — the
   `HELLO` proves it, `coordinate_from_cert` is retired. Satisfies assumption 1 (verifiable, forge-proof,
   grind-priced in the VRF key) and unifies the models. The coordinate is *provable and unforgeable*
   everywhere it is used.
-- **Level B — the live per-epoch reshuffle (tracked follow-up).** Nodes re-derive and re-announce their
-  coordinate on each `BeaconReady`, with the JOIN-waits-for-beacon cold-start and the announce/withdraw
-  choreography. Satisfies assumption 2 in the running overlay. This is a deployment mechanism (operating a
-  reshuffling membership), not a primitive; §3 shows it is cheap in FANOS, and it rides the beacon clock
-  that already exists. It is specified here and tracked as its own task so it is delivered against this
-  design, not improvised.
+- **Level B — the live per-epoch reshuffle + hierarchy unification (tracked follow-up).** Two pieces.
+  (1) *Reshuffle:* nodes re-derive and re-announce their coordinate on each `BeaconReady`, with the
+  JOIN-waits-for-beacon cold-start and the announce/withdraw choreography — satisfying assumption 2 in the
+  running overlay. This is a deployment mechanism (operating a reshuffling membership), not a primitive;
+  §3 shows it is cheap in FANOS, and it rides the beacon clock that already exists.
+  (2) *Hierarchy unification:* today the multi-level **hierarchical address** is a proof-free hash-chain of
+  the identity (`fanos_primitives::address_point`, the #79 poisoning defence — a *distinct* scheme from the
+  VRF coordinate, so the no_std overlay verifies an announced address by recomputation). Level A makes a
+  node's **top-level, base-cell** coordinate the VRF one; unifying the *descent* under the VRF — a
+  VRF-seeded chain (`level 0 = MapToPoint(VRF output)`, deeper levels a hash of that output) with
+  proof-carrying #79 verification — is Level B, since the descent only engages on collisions and interacts
+  with the reshuffle. Until then the two coexist: the base cell (what ships, and what `cell_e2e` covers)
+  uses the VRF coordinate consistently, and `subcell_descent` tests the hash-chain descent on its own terms.
 
 Level A closes the A7 defect (forgeable/dead/unverified coordinate) completely and correctly; Level B is
 the operational completion of the same design.
@@ -179,7 +186,10 @@ shipped model is `q = 2` + hierarchy, so the capability is not mistaken for one 
   parity). `HELLO` gains the proof-of-coordinate fields (`fanos-wire`).
 - **Coordinate-pinned tests.** Every test that pins a node to `Point::at(i)` via the cert grind now pins
   via the identity-seed grind; the assertion (node lands on the intended point) is unchanged.
-- **Crates touched (Level A):** `fanos-vrf` (beacon-folded input), `fanos-primitives` (bundle + VRF key +
-  seed-derivation), `fanos-pqcrypto` (identity generation derives the VRF key), `fanos-quic` (coordinate
-  from VRF, harness grind), `fanos-core` (membership uses `prove_coordinate` + `verify`), `fanos-wire` +
-  `fanos-diaulos` (HELLO proof-of-coordinate).
+- **Crates touched (Level A):** `fanos-vrf` (no_std + beacon-folded input), `fanos-primitives` (bundle +
+  VRF key), `fanos-pqcrypto` (identity generation derives the VRF key), `fanos-core` (membership uses
+  `prove_coordinate` + `verify`); and for the live path, `fanos-quic` — the cert embeds the VRF public
+  (rcgen custom extension, read via `x509-parser`), the coordinate is the VRF one, and the driver's
+  connection handshake exchanges + verifies a mutual proof-of-coordinate **HELLO** (the proof is bound to
+  the certificate by `node_id = H(cert)`, so no live challenge is needed) — plus `fanos-node` (the
+  identity coordinate helper).

@@ -1,14 +1,17 @@
 //! The node's durable, self-certifying identity.
 //!
-//! A node's overlay coordinate is `MapToPoint(H(cert))` — derived from its mutual-TLS certificate,
-//! so it is self-authenticating (a peer checks the coordinate against the handshake, no directory
-//! trust). Persisting the [`NodeCredentials`] keeps the **same coordinate across restarts**.
+//! A node's overlay coordinate is its **verifiable** VRF coordinate `MapToPoint(VRF(vrf_sk,
+//! cert‖epoch‖beacon))` — the VRF key is derived from its mutual-TLS certificate, so it is
+//! self-authenticating (a peer checks the coordinate proof against the handshake, no directory trust) and
+//! unforgeable (spec §L0/§7.3). Persisting the [`NodeCredentials`] keeps the **same identity — and so the
+//! same genesis coordinate — across restarts**.
 
 use std::path::Path;
 
 use fanos_field::Field;
 use fanos_geometry::Triple;
-use fanos_quic::{NodeCredentials, coordinate_from_cert};
+use fanos_quic::{NodeCredentials, verifiable_coordinate};
+use fanos_rendezvous::{BeaconSeed, Epoch};
 
 use crate::error::NodeError;
 
@@ -32,10 +35,13 @@ pub fn load_or_generate(path: Option<&Path>) -> Result<NodeCredentials, NodeErro
     }
 }
 
-/// The overlay coordinate a set of credentials resolves to over the field `F`.
+/// The overlay coordinate a set of credentials resolves to over the field `F` — its **genesis** verifiable
+/// coordinate `MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS))`, the same point the live engine is seated at.
 #[must_use]
 pub fn coordinate<F: Field>(credentials: &NodeCredentials) -> Triple {
-    coordinate_from_cert::<F>(credentials.cert_der()).coords()
+    verifiable_coordinate::<F>(credentials, Epoch::ZERO, &BeaconSeed::GENESIS)
+        .0
+        .coords()
 }
 
 #[cfg(test)]

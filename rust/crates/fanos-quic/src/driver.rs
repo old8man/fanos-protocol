@@ -24,15 +24,15 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
-use fanos_primitives::{Epoch, hash_labeled, label};
+use fanos_primitives::{BeaconSeed, Epoch, hash_labeled, label};
 use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
-use crate::identity::{coordinate_from_cert, peer_cert_der};
+use crate::identity::{hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello};
 use crate::tls::{
-    NodeCredentials, TlsError, node_configs, node_configs_mutual, node_configs_mutual_from,
+    NodeCredentials, TlsError, node_configs, node_configs_mutual_from,
 };
 
 /// Production transport tuning: a keep-alive so idle overlay links survive NAT/firewall timeouts,
@@ -50,9 +50,24 @@ fn tuned_transport() -> Arc<quinn::TransportConfig> {
 /// frame (including the identity HELLO) is polymorph-obfuscated on the wire (spec §13.2).
 type Shaper = Option<Arc<ProteusShaper>>;
 
-/// The identity mode. `None` ⇒ HELLO + directory-trust; `Some(f)` ⇒ self-certifying, where `f`
-/// derives a peer's authenticated coordinate from its presented certificate DER.
-type Identity = Option<Arc<dyn Fn(&[u8]) -> Option<Triple> + Send + Sync>>;
+/// A self-certifying node's authenticated-identity handling (VRF-coordinate mode): the HELLO it
+/// announces on a fresh connection — its `epoch ‖ coordinate ‖ proof-of-coordinate` — and a verifier
+/// that checks a peer's HELLO against the peer's authenticated certificate, yielding the peer's
+/// **certified** coordinate. Both are needed because a VRF coordinate is not a function of the
+/// certificate alone: each side proves its coordinate and verifies the other's (spec §7.3).
+/// Verifies a peer's HELLO against its authenticated certificate: `(peer_cert_der, peer_hello) →`
+/// the peer's certified coordinate, or `None` to reject.
+type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> Option<Triple> + Send + Sync>;
+
+#[derive(Clone)]
+struct SelfCert {
+    hello: Arc<Vec<u8>>,
+    verify: HelloVerifier,
+}
+
+/// The identity mode. `None` ⇒ HELLO + directory-trust (unauthenticated coordinate); `Some(_)` ⇒
+/// self-certifying, exchanging + verifying VRF proof-of-coordinate HELLOs.
+type Identity = Option<SelfCert>;
 
 /// Shape an outbound frame for the wire (identity when no shaper is configured).
 fn shape_out(shaper: &Shaper, frame: &[u8]) -> Vec<u8> {
@@ -388,15 +403,9 @@ pub async fn spawn_self_certifying<F: Field + 'static>(
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
-    let (server, client, cert) = node_configs_mutual()?;
-    self_certifying_inner::<F, _>(
-        server,
-        client,
-        &cert,
-        make_engine,
-        directory,
-        default_bind(),
-    )
+    let creds = NodeCredentials::generate()?;
+    let (server, client, _cert) = node_configs_mutual_from(&creds)?;
+    self_certifying_inner::<F, _>(server, client, &creds, make_engine, directory, default_bind())
 }
 
 /// Like [`spawn_self_certifying`], but reuses persisted [`NodeCredentials`] so the node keeps the
@@ -406,11 +415,11 @@ pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
-    let (server, client, cert) = node_configs_mutual_from(credentials)?;
+    let (server, client, _cert) = node_configs_mutual_from(credentials)?;
     self_certifying_inner::<F, _>(
         server,
         client,
-        &cert,
+        credentials,
         make_engine,
         directory,
         default_bind(),
@@ -426,14 +435,14 @@ pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
-    let (server, client, cert) = node_configs_mutual_from(credentials)?;
-    self_certifying_inner::<F, _>(server, client, &cert, make_engine, directory, bind)
+    let (server, client, _cert) = node_configs_mutual_from(credentials)?;
+    self_certifying_inner::<F, _>(server, client, credentials, make_engine, directory, bind)
 }
 
 fn self_certifying_inner<F: Field + 'static, M>(
     server: ServerConfig,
     client: ClientConfig,
-    cert: &rustls::pki_types::CertificateDer<'static>,
+    creds: &NodeCredentials,
     make_engine: M,
     directory: Directory,
     bind: SocketAddr,
@@ -441,11 +450,18 @@ fn self_certifying_inner<F: Field + 'static, M>(
 where
     M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
 {
-    let engine = make_engine(coordinate_from_cert::<F>(cert.as_ref()));
-    let derive: Identity = Some(Arc::new(|der: &[u8]| {
-        Some(coordinate_from_cert::<F>(der).coords())
-    }));
-    spawn_inner(engine, directory, None, derive, server, client, bind)
+    // The node's verifiable coordinate for the genesis epoch: MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS)),
+    // with the proof it announces so peers can verify it (spec §L0/§7.3). (Per-epoch reshuffle off the
+    // live beacon is Level B — see docs/design-coordinates.md.)
+    let (coord, proof) = verifiable_coordinate::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
+    let engine = make_engine(coord);
+    let identity: Identity = Some(SelfCert {
+        hello: Arc::new(hello_bytes(Epoch::ZERO, coord.coords(), &proof)),
+        verify: Arc::new(|peer_cert: &[u8], peer_hello: &[u8]| {
+            verify_hello::<F>(peer_cert, peer_hello, &BeaconSeed::GENESIS)
+        }),
+    });
+    spawn_inner(engine, directory, None, identity, server, client, bind)
 }
 
 /// Like [`spawn`], but every frame on the wire is PROTEUS-shaped with the shared `community_secret`
@@ -618,15 +634,16 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                 let _ = hello.finish();
             }
         }
-        // Self-certifying mode: the peer's certificate must certify the coordinate we dialed —
-        // otherwise the address resolved to an impostor and we drop the connection.
-        Some(derive) => {
-            let peer = peer_cert_der(&conn).and_then(|der| derive(&der));
+        // Self-certifying mode: announce our own proof-of-coordinate, then require the peer to prove it
+        // is the coordinate we dialed — otherwise the address resolved to an impostor and we drop it.
+        Some(id) => {
+            send_hello(&conn, &t.shaper, &id.hello).await;
+            let peer = read_verified_hello(&conn, &t.shaper, &id.verify).await;
             if peer != Some(to) {
                 tracing::warn!(
                     ?to,
                     ?peer,
-                    "peer certificate does not certify the dialed coordinate; rejecting"
+                    "peer did not prove the dialed coordinate; rejecting"
                 );
                 return None;
             }
@@ -674,12 +691,15 @@ async fn accept_loop(
             let Ok(conn) = incoming.await else {
                 return;
             };
-            // Learn the peer's coordinate: from its certificate (self-certifying) or its HELLO.
-            let from = if let Some(derive) = &identity {
-                let Some(coord) = peer_cert_der(&conn).and_then(|der| derive(&der)) else {
-                    tracing::debug!("inbound peer presented no certifiable identity; dropping");
+            // Learn the peer's coordinate: verify its proof-of-coordinate HELLO against its authenticated
+            // certificate (self-certifying), or read its unauthenticated HELLO (directory-trust mode).
+            let from = if let Some(id) = &identity {
+                let Some(coord) = read_verified_hello(&conn, &shaper, &id.verify).await else {
+                    tracing::debug!("inbound peer did not prove its coordinate; dropping");
                     return;
                 };
+                // Announce ours so the dialer can verify us in turn.
+                send_hello(&conn, &shaper, &id.hello).await;
                 coord
             } else {
                 let Some(coord) = read_hello(&conn, &shaper).await else {
@@ -694,6 +714,30 @@ async fn accept_loop(
             read_frames(conn, from, input_tx, shaper).await;
         });
     }
+}
+
+/// Announce our HELLO (`epoch ‖ coord ‖ proof-of-coordinate`) as a uni-stream, shaped like any frame.
+async fn send_hello(conn: &Connection, shaper: &Shaper, hello: &[u8]) {
+    if let Ok(mut stream) = conn.open_uni().await {
+        let _ = stream.write_all(&shape_out(shaper, hello)).await;
+        let _ = stream.finish();
+    }
+}
+
+/// Read the peer's first uni-stream as its HELLO and verify its coordinate proof against the peer's
+/// authenticated certificate, returning the **certified** coordinate (or `None` to drop the peer). This
+/// is the authenticated-identity step for a VRF coordinate — a proof for one certificate does not verify
+/// against another, so no live challenge is needed (spec §7.3).
+async fn read_verified_hello(
+    conn: &Connection,
+    shaper: &Shaper,
+    verify: &HelloVerifier,
+) -> Option<Triple> {
+    let mut stream = conn.accept_uni().await.ok()?;
+    let raw = stream.read_to_end(MAX_FRAME).await.ok()?;
+    let hello = shape_in(shaper, raw)?;
+    let cert = peer_cert_der(conn)?;
+    verify(&cert, &hello)
 }
 
 /// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.
