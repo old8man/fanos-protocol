@@ -257,31 +257,46 @@ pub fn verify_share(share: &VssShare, commitment: &VssCommitment) -> bool {
     share.value * RISTRETTO_BASEPOINT_POINT == commitment.public_share(share.index)
 }
 
-/// Reconstruct the secret from any `≥ t` shares by Lagrange interpolation at `x = 0`. Returns
-/// `None` if there are no shares or two of them share an index.
-#[must_use]
-pub fn reconstruct(shares: &[VssShare]) -> Option<[u8; 32]> {
-    if shares.is_empty() {
+/// The Lagrange basis coefficients `λ_i(0) = Π_{j≠i} x_j / (x_j − x_i)` at `x = 0` for share `indices`
+/// (`x_i = index`), one per index in the given order — the shared core of interpolation in the clear
+/// ([`reconstruct`]) and combination in the exponent ([`crate::beacon::combine`]). `None` if `indices`
+/// is empty or two entries collide (the denominator vanishes and the interpolation is undefined), so both
+/// callers share one guarded derivation instead of hand-rolling it.
+pub(crate) fn lagrange_coeffs_at_zero(indices: &[u8]) -> Option<Vec<Scalar>> {
+    if indices.is_empty() {
         return None;
     }
-    let mut secret = Scalar::ZERO;
-    for si in shares {
-        let xi = Scalar::from(u64::from(si.index));
-        // Lagrange basis λ_i(0) = Π_{j≠i} x_j / (x_j − x_i).
+    let mut coeffs = Vec::with_capacity(indices.len());
+    for &i in indices {
+        let xi = Scalar::from(u64::from(i));
         let mut num = Scalar::ONE;
         let mut den = Scalar::ONE;
-        for sj in shares {
-            if sj.index != si.index {
-                let xj = Scalar::from(u64::from(sj.index));
+        for &j in indices {
+            if j != i {
+                let xj = Scalar::from(u64::from(j));
                 num *= xj;
                 den *= xj - xi;
             }
         }
         if den == Scalar::ZERO {
-            return None; // duplicate index
+            return None; // a duplicate index — the interpolation is undefined
         }
-        secret += num * den.invert() * si.value;
+        coeffs.push(num * den.invert());
     }
+    Some(coeffs)
+}
+
+/// Reconstruct the secret from any `≥ t` shares by Lagrange interpolation at `x = 0`. Returns
+/// `None` if there are no shares or two of them share an index.
+#[must_use]
+pub fn reconstruct(shares: &[VssShare]) -> Option<[u8; 32]> {
+    let indices: Vec<u8> = shares.iter().map(|s| s.index).collect();
+    let coeffs = lagrange_coeffs_at_zero(&indices)?;
+    let secret: Scalar = shares
+        .iter()
+        .zip(&coeffs)
+        .map(|(s, c)| c * s.value)
+        .sum();
     Some(secret.to_bytes())
 }
 

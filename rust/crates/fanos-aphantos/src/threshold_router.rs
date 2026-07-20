@@ -60,10 +60,9 @@ const MAX_CANDIDATES: usize = 64;
 /// forged shares are mixed in and several subsets must be tried.
 const MAX_PEEL_ATTEMPTS: usize = 256;
 
-/// A combiner's in-flight peel: the layer being gathered, its line, its member count (the valid share
-/// index bound), and the candidate partials collected so far.
+/// A combiner's in-flight peel: the layer being gathered, its member count (the valid share index
+/// bound), and the candidate partials collected so far.
 struct Pending {
-    line: Triple,
     onion: Vec<u8>,
     shares: Vec<Share>,
     member_count: usize,
@@ -355,7 +354,6 @@ impl<F: Field> ThresholdRouter<F> {
         self.pending.insert(
             req_id,
             Pending {
-                line,
                 onion,
                 shares,
                 member_count,
@@ -432,8 +430,7 @@ impl<F: Field> ThresholdRouter<F> {
             return None;
         }
         let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
-        let pending = self.pending.remove(&req_id)?;
-        let _ = pending.line;
+        self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
         Some(match peel {
             ThresholdPeel::Deliver { payload } => {
                 alloc::vec![Effect::Notify(Notification::Delivered {

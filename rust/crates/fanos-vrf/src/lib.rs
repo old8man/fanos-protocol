@@ -43,9 +43,18 @@ pub const OUTPUT_LEN: usize = 64;
 /// A VRF output — the pseudo-random hash `β` a valid proof yields.
 pub type VrfOutput = [u8; OUTPUT_LEN];
 
-/// A VRF secret key (seed-derivable; carries its own public key).
-#[derive(Clone, Copy, Debug)]
+/// A VRF secret key (seed-derivable; carries its own public key). Deliberately **not** `Copy` — a
+/// long-term coordinate secret must not be silently duplicated across stack frames (audit A6) — and its
+/// `Debug` is redacted so a secret can never be printed into a log. (Wipe-on-drop is blocked upstream:
+/// `vrf_r255::SecretKey` exposes no `Zeroize`; the derivation seed is wiped by its owner instead.)
+#[derive(Clone)]
 pub struct VrfSecret(SecretKey);
+
+impl core::fmt::Debug for VrfSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("VrfSecret(<redacted>)")
+    }
+}
 
 /// A VRF public key: verifies proofs, reveals nothing about the secret.
 #[derive(Clone, Copy, Debug)]

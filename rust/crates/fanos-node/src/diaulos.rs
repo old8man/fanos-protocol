@@ -274,6 +274,15 @@ impl<R: ServiceResolver> FanosDialer<R> {
     }
 }
 
+/// 32 fresh bytes of OS entropy, mapped to a [`DialError`] on the (unexpected) failure of the OS source
+/// — the one place a dial draws randomness for its ephemeral session material.
+fn os_entropy_32() -> Result<[u8; 32], DialError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| DialError::Io(std::io::Error::other(format!("OS entropy failed: {e}"))))?;
+    Ok(bytes)
+}
+
 impl<R: ServiceResolver> Dialer for FanosDialer<R> {
     type Stream = DuplexStream;
 
@@ -290,10 +299,7 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
             .await
             .ok_or(DialError::Unreachable)?;
         // A fresh CSPRNG seeded from OS entropy for this dial's ephemeral keys.
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed)
-            .map_err(|e| DialError::Io(std::io::Error::other(format!("OS entropy failed: {e}"))))?;
-        let mut rng = SeedRng::from_seed(&seed);
+        let mut rng = SeedRng::from_seed(&os_entropy_32()?);
         match &self.anonymous {
             None => Ok(dial_service(
                 self.client.clone(),
@@ -303,10 +309,7 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
             )),
             Some(route) => {
                 // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
-                let mut secret = [0u8; 32];
-                getrandom::fill(&mut secret).map_err(|e| {
-                    DialError::Io(std::io::Error::other(format!("OS entropy failed: {e}")))
-                })?;
+                let secret = os_entropy_32()?;
                 Ok(crate::rendezvous::anonymous_dial(
                     self.client.clone(),
                     &service_public,

@@ -38,7 +38,6 @@ use alloc::vec::Vec;
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::CompressedRistretto;
-use curve25519_dalek::traits::Identity;
 use curve25519_dalek::{RistrettoPoint, Scalar};
 
 use fanos_primitives::Epoch;
@@ -251,21 +250,15 @@ pub fn combine(partials: &[BeaconPartial], threshold: usize) -> Option<BeaconOut
         return None;
     }
 
-    let mut sigma = RistrettoPoint::identity();
-    for pi in &chosen {
-        let xi = Scalar::from(u64::from(pi.index));
-        // Lagrange basis λ_i(0) = Π_{j≠i} x_j / (x_j − x_i) over the chosen subset.
-        let mut num = Scalar::ONE;
-        let mut den = Scalar::ONE;
-        for pj in &chosen {
-            if pj.index != pi.index {
-                let xj = Scalar::from(u64::from(pj.index));
-                num *= xj;
-                den *= xj - xi;
-            }
-        }
-        sigma += (num * den.invert()) * pi.sigma;
-    }
+    // Combine in the exponent: σ = Σ λ_i(0)·σ_i over the chosen subset — the same Lagrange-at-zero
+    // coefficients as secret reconstruction, now weighting ristretto points (the shared, guarded helper).
+    let indices: Vec<u8> = chosen.iter().map(|p| p.index).collect();
+    let coeffs = crate::vss::lagrange_coeffs_at_zero(&indices)?;
+    let sigma: RistrettoPoint = chosen
+        .iter()
+        .zip(&coeffs)
+        .map(|(p, c)| c * p.sigma)
+        .sum();
     Some(BeaconOutput { sigma })
 }
 
