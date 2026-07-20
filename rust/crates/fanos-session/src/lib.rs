@@ -182,8 +182,18 @@ trait SessionStream: Send + 'static {
     /// EOF while this side keeps writing — a half-close, so a full-duplex handler learns the request ended
     /// and can then stream its response.
     fn peer_write_finished(&self) -> bool;
-    /// The datagram cells to transmit now (the whole send window; re-sent each call).
+    /// The datagram cells to transmit now: the whole due send window (first sends, fast-retransmits,
+    /// and anything past its RTO), plus a fresh ack. Ticks the session's retransmit clock (RFC 6298) —
+    /// call this **only** at the driver's fixed retransmit cadence (the `tick` timer), never
+    /// reactively; see [`poll_new`](Self::poll_new) for the reactive counterpart.
     fn poll_payloads(&mut self) -> Vec<Vec<u8>>;
+    /// The cells to transmit **reactively** — right after handling new inbound data or a fresh app
+    /// write, so the peer is acked/answered promptly — without ticking the retransmit clock: only
+    /// never-before-sent data plus a fresh ack, never a retransmission. Safe to call any number of
+    /// times between ticks; see [`poll_payloads`](Self::poll_payloads)'s doc for why that safety matters
+    /// (a caller that also ticks the clock reactively can race it ahead of real time under load — the
+    /// mechanism behind the anonymous-session retransmit-storm livelock this split exists to prevent).
+    fn poll_new(&mut self) -> Vec<Vec<u8>>;
     /// Fold a received datagram cell into the session.
     fn handle_payload(&mut self, payload: &[u8]);
 }
@@ -209,6 +219,9 @@ impl SessionStream for ClientSession {
     }
     fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
         ClientSession::poll_payloads(self)
+    }
+    fn poll_new(&mut self) -> Vec<Vec<u8>> {
+        ClientSession::poll_new(self)
     }
     fn handle_payload(&mut self, payload: &[u8]) {
         ClientSession::handle_payload(self, payload);
@@ -257,12 +270,37 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
     fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
         self.server.poll_payloads()
     }
+    fn poll_new(&mut self) -> Vec<Vec<u8>> {
+        self.server.poll_new()
+    }
     fn handle_payload(&mut self, payload: &[u8]) {
         self.server
             .handle_payload(&self.keypair, payload, &mut self.rng);
         // Latch the primary stream id once the handshake opens it.
         if self.stream_id.is_none() {
             self.stream_id = self.server.primary();
+        }
+    }
+}
+
+/// What the next emit should do, if anything. `Tick` runs the full clock-ticking retransmit sweep
+/// ([`SessionStream::poll_payloads`]); `Reactive` sends only genuinely new information — first-sent
+/// data and a fresh ack — via [`SessionStream::poll_new`], which never advances the session's RTO
+/// clock. `Tick` is a strict superset of what `Reactive` would send (a first send is always "due" in
+/// `poll_payloads` too), so accumulating triggers within one loop pass keeps the stronger of the two
+/// rather than the most recent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Emit {
+    None,
+    Reactive,
+    Tick,
+}
+
+impl Emit {
+    /// Record that reactive work is ready, without downgrading an already-pending `Tick`.
+    fn mark_reactive(&mut self) {
+        if *self == Emit::None {
+            *self = Emit::Reactive;
         }
     }
 }
@@ -284,14 +322,21 @@ async fn drive<S: SessionStream>(
     let mut app_eof = false; // the app closed its write side
     let mut finished = false; // we called session.finish()
     let mut read_eof = false; // we signaled EOF to the app's read half (the peer finished writing)
-    // Emit outbound cells only when the send state actually changes — on startup (the ClientHello),
-    // when the app hands us new data, after draining a *batch* of inbound datagrams, or on the
-    // retransmit tick. `poll_payloads` re-sends the whole window each call, so emitting on *every*
-    // inbound datagram would make one side's window retransmit per ack while the peer acks per cell —
-    // a mutual, runaway amplification over an unbounded channel. Coalescing the inbound (drain all that
-    // are ready, then emit once) collapses that to one emit per batch, so throughput is bounded by the
-    // round trip, not by the tick, with no feedback storm.
-    let mut emit = true;
+    // Emit outbound cells on startup, when the app hands us new data, after draining a *batch* of
+    // inbound datagrams, or on the retransmit tick — but only the tick runs the clock-ticking
+    // `poll_payloads` sweep (retransmission included); every other trigger is `Reactive` and calls the
+    // non-ticking `poll_new` instead (first-sent data plus a fresh ack, never a resend). This split is
+    // load-bearing: `poll_payloads`'s RTO estimator is calibrated in *calls*, one logical tick each, on
+    // the assumption of a fixed calling cadence (RFC 6298). Calling it reactively too — once per inbound
+    // datagram, coalesced or not — races that clock ahead of real time in proportion to traffic volume:
+    // over a high-latency transport, inbound traffic includes the peer's own retransmissions, so more
+    // reactive calls means a *faster* clock means a *shorter* effective RTO, right when backoff should
+    // be growing it — a mutual retransmission-storm feedback loop between the two ends (the anonymous
+    // real-QUIC session livelock this split exists to prevent), not the bounded, converging backoff RFC
+    // 6298 promises. Coalescing a batch of inbound datagrams into one reactive emit is still worthwhile
+    // (one ack for N deliveries, not N), but coalescing alone cannot fix a *cross-side* alternation —
+    // only keeping the clock tick-exclusive does.
+    let mut emit = Emit::Tick; // startup: send the first cells (ClientHello / initial segments)
 
     loop {
         // Once live, flush any buffered pre-handshake writes and propagate the app's close.
@@ -299,21 +344,24 @@ async fn drive<S: SessionStream>(
             if !pending.is_empty() {
                 session.write(&pending);
                 pending.clear();
-                emit = true;
+                emit.mark_reactive();
             }
             if app_eof && !finished {
                 session.finish();
                 finished = true;
-                emit = true;
+                emit.mark_reactive();
             }
         }
-        if emit {
-            for payload in session.poll_payloads() {
-                if outbound.send(payload).is_err() {
-                    return; // the transport is gone
-                }
+        let payloads = match emit {
+            Emit::Tick => session.poll_payloads(),
+            Emit::Reactive => session.poll_new(),
+            Emit::None => Vec::new(),
+        };
+        emit = Emit::None;
+        for payload in payloads {
+            if outbound.send(payload).is_err() {
+                return; // the transport is gone
             }
-            emit = false;
         }
         let data = session.read();
         if !data.is_empty() && wr.write_all(&data).await.is_err() {
@@ -344,7 +392,7 @@ async fn drive<S: SessionStream>(
                     while let Ok(more) = inbound.try_recv() {
                         session.handle_payload(&more);
                     }
-                    emit = true;
+                    emit = Emit::Reactive;
                 }
                 None => return, // peer transport closed
             },
@@ -354,14 +402,14 @@ async fn drive<S: SessionStream>(
                     let chunk = buf.get(..n).unwrap_or(&[]);
                     if session.is_live() {
                         session.write(chunk);
-                        emit = true; // new app data to send now
+                        emit = Emit::Reactive; // new app data to send now
                     } else {
                         pending.extend_from_slice(chunk);
                     }
                 }
                 Err(_) => return,
             },
-            _ = ticker.tick() => emit = true,
+            _ = ticker.tick() => emit = Emit::Tick,
         }
     }
 }

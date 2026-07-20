@@ -92,6 +92,10 @@ impl ClientSession {
     /// `ClientHello` while handshaking, then one framed cell each once live. A transport turns each
     /// into a datagram — a `Command::Send` to a coordinate (Direct), an onion to the rendezvous line
     /// (anonymous), or a channel write (an async stream driver).
+    ///
+    /// Ticks the live connection's retransmit clock (RFC 6298) — a driver must call this at a **fixed
+    /// cadence** (its retransmit timer), never reactively. See [`poll_new`](Self::poll_new) for the
+    /// reactive counterpart (new inbound data / app writes), which does not.
     pub fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
         match &mut self.state {
             ClientState::Handshaking { hello, .. } => vec![framed(TAG_HELLO, hello)],
@@ -102,6 +106,26 @@ impl ClientSession {
                 .map(|cell| framed(TAG_CELL, cell))
                 .collect(),
             ClientState::Failed => Vec::new(),
+        }
+    }
+
+    /// Like [`poll_payloads`](Self::poll_payloads) but for **reactive** triggers (new inbound data or
+    /// an app write, not the retransmit tick): once live, only never-before-sent stream data plus a
+    /// fresh ack ([`Connection::outbound_new`]) — never a retransmission, and never advances the
+    /// connection's RTO clock. While still handshaking there is nothing RTO-safe to send reactively
+    /// (the `ClientHello` resend is a plain, unpaced retry — see [`poll_payloads`](Self::poll_payloads)
+    /// — so it stays on the tick-only path); the one event that matters reactively during a handshake,
+    /// a `ServerHello` arriving, is handled synchronously by [`handle_payload`](Self::handle_payload)
+    /// and needs no send of its own.
+    pub fn poll_new(&mut self) -> Vec<Vec<u8>> {
+        match &mut self.state {
+            ClientState::Live { dialed } => dialed
+                .conn
+                .outbound_new()
+                .iter()
+                .map(|cell| framed(TAG_CELL, cell))
+                .collect(),
+            ClientState::Handshaking { .. } | ClientState::Failed => Vec::new(),
         }
     }
 
@@ -231,6 +255,10 @@ impl ServerSession {
 
     /// The framed payloads to send to the client now (transport-agnostic): the (re)sent `ServerHello`
     /// if a `ClientHello` just arrived, plus one framed cell each once a connection exists.
+    ///
+    /// Ticks the connection's retransmit clock (RFC 6298) — a driver must call this at a **fixed
+    /// cadence** (its retransmit timer), never reactively. See [`poll_new`](Self::poll_new) for the
+    /// reactive counterpart.
     pub fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         if self.resend_hello {
@@ -241,6 +269,28 @@ impl ServerSession {
         }
         if let Some(conn) = &mut self.conn {
             for cell in conn.outbound() {
+                out.push(framed(TAG_CELL, &cell));
+            }
+        }
+        out
+    }
+
+    /// Like [`poll_payloads`](Self::poll_payloads) but for **reactive** triggers (new inbound data or
+    /// an app write, not the retransmit tick): the `ServerHello` resend (a one-shot flag armed by a
+    /// fresh `ClientHello`, not RTO-paced) still ships immediately — that promptness matters and it
+    /// carries no retransmit-clock state — but the connection contributes only never-before-sent stream
+    /// data plus a fresh ack ([`Connection::outbound_new`]), never a retransmission, and never ticks the
+    /// connection's RTO clock.
+    pub fn poll_new(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if self.resend_hello {
+            if let Some(hello) = &self.server_hello {
+                out.push(framed(TAG_HELLO, hello));
+            }
+            self.resend_hello = false;
+        }
+        if let Some(conn) = &mut self.conn {
+            for cell in conn.outbound_new() {
                 out.push(framed(TAG_CELL, &cell));
             }
         }

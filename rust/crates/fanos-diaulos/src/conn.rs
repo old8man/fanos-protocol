@@ -193,7 +193,10 @@ impl Connection {
     }
 
     /// All cells to (re)send now, across every stream: `DATA` cells for each stream's outbound
-    /// segments (selective repeat within its window) plus one `ACK` cell per stream.
+    /// segments (selective repeat within its window) plus one `ACK` cell per stream. Ticks every
+    /// stream's retransmit clock (RFC 6298) one logical step — a driver must call this at a **fixed
+    /// cadence** (its own retransmit timer), never reactively; see [`outbound_new`](Self::outbound_new)
+    /// for the reactive counterpart.
     pub fn outbound(&mut self) -> Vec<Vec<u8>> {
         let mut frames: Vec<Frame> = Vec::new();
         for (&id, s) in &mut self.streams {
@@ -205,6 +208,34 @@ impl Connection {
                 ack: s.receiver.ack(),
             });
         }
+        self.seal_frames(frames)
+    }
+
+    /// Cells to send **reactively** right now — e.g. once per inbound delivery, so a peer's new data or
+    /// progress is acked promptly — without disturbing any stream's retransmit clock: each stream's
+    /// never-before-sent segments (if any; see [`StreamSender::poll_new`]) plus a fresh `ACK`. Unlike
+    /// [`outbound`](Self::outbound), safe to call any number of times between ticks — it never advances
+    /// a stream's RTO clock, so a burst of reactive calls (inbound traffic over a high-latency transport
+    /// includes the peer's own retransmissions) cannot race that clock ahead of real time and starve
+    /// backoff of the chance to converge (the mechanism behind the anonymous-session retransmit-storm
+    /// livelock this exists to prevent). Only [`outbound`](Self::outbound), driven by the fixed
+    /// retransmit tick, may resend already-in-flight data.
+    pub fn outbound_new(&mut self) -> Vec<Vec<u8>> {
+        let mut frames: Vec<Frame> = Vec::new();
+        for (&id, s) in &mut self.streams {
+            for seg in s.sender.poll_new() {
+                frames.push(Frame::Data(seg));
+            }
+            frames.push(Frame::Ack {
+                stream_id: id,
+                ack: s.receiver.ack(),
+            });
+        }
+        self.seal_frames(frames)
+    }
+
+    /// Seal each frame with the next nonce, dropping any that cannot be sealed (nonce exhaustion).
+    fn seal_frames(&mut self, frames: Vec<Frame>) -> Vec<Vec<u8>> {
         frames
             .into_iter()
             .filter_map(|f| {

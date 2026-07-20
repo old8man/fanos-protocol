@@ -427,6 +427,51 @@ impl StreamSender {
         out
     }
 
+    /// The segments to send **for the first time** right now, without advancing the retransmit clock
+    /// or touching any RTO/backoff state — safe to call any number of times between ticks (e.g. once
+    /// per inbound delivery, for a prompt reaction) without disturbing [`outbound`](Self::outbound)'s
+    /// RTO timing.
+    ///
+    /// [`outbound`]'s `SRTT`/`RTO` estimate is calibrated in **calls to `outbound`**, one logical tick
+    /// per call, on the assumption that the driver calls it at a fixed cadence (see the module doc). A
+    /// caller that also calls the clock-advancing sweep reactively — e.g. once per inbound datagram —
+    /// races the clock ahead of real time in proportion to traffic volume: under a high-latency
+    /// transport, inbound traffic includes the peer's own retransmissions, so more loss/lag means more
+    /// reactive calls means a *faster* clock means a *shorter* effective RTO, exactly when backoff
+    /// should be growing it — a retransmission-storm feedback loop, not a fixed-point. This sweep never
+    /// ticks, so it cannot cause that: a segment it sends is scheduled (`due_at`) against the clock's
+    /// *current* value, and only [`outbound`]'s tick-paced sweep ever reconsiders it for retransmission.
+    #[must_use]
+    pub fn poll_new(&mut self) -> Vec<Segment> {
+        let total = self.total();
+        let last = total.saturating_sub(1);
+        let win = self.window.min(self.peer_rwnd.max(1));
+        let end = (self.acked + win).min(total);
+        let mut out = Vec::new();
+        for seq in self.acked..end {
+            // Already scheduled ⇒ already sent at least once (first send or retransmit) — that segment
+            // is `outbound`'s to reconsider, not a first send.
+            if self.due_at.contains_key(&seq) {
+                continue;
+            }
+            let Some(idx) = seq.checked_sub(self.base) else {
+                continue;
+            };
+            let interval = self.rtt.rto.saturating_add(jitter_ticks(seq, 0, self.rtt.rto));
+            self.last_sent.insert(seq, self.clock);
+            self.due_at.insert(seq, self.clock.saturating_add(interval));
+            if let Some(data) = self.segments.get(idx as usize) {
+                out.push(Segment {
+                    stream_id: self.stream_id,
+                    seq,
+                    fin: self.finished && seq == last,
+                    data: data.clone(),
+                });
+            }
+        }
+        out
+    }
+
     /// Apply a selective ack: adopt the receiver's advertised credit, advance the cumulative point,
     /// record the individually-acked sequences from the SACK bitmap (not retransmitted), update the RTT
     /// estimate off an unambiguous newly-acked segment, and count duplicate acks for fast retransmit.
@@ -697,6 +742,56 @@ mod tests {
             resent, sent_seqs,
             "after the RTO the whole unacked window is eventually retransmitted (jitter-spread, not before tick 4)"
         );
+    }
+
+    #[test]
+    fn poll_new_sends_each_segment_once_and_never_advances_the_clock() {
+        // `poll_new` is the reactive (non-tick) sweep: it must ship every not-yet-sent segment exactly
+        // once, in a single call or spread across many, but must never touch `clock` — only `outbound`
+        // (the tick-paced sweep) may do that (see its doc comment for why).
+        let payload: Vec<u8> = (0..4 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut tx = StreamSender::new(0, &payload).with_window(8);
+        let mut got = BTreeSet::new();
+        // Call it many times in a row, as a flood of reactive triggers would.
+        for _ in 0..20 {
+            for seg in tx.poll_new() {
+                got.insert(seg.seq);
+            }
+        }
+        assert_eq!(tx.clock, 0, "poll_new never advances the retransmit clock");
+        let total = tx.total();
+        assert_eq!(
+            got,
+            (0..total).collect::<BTreeSet<u32>>(),
+            "every segment was sent exactly once across the flood of reactive calls"
+        );
+    }
+
+    #[test]
+    fn reactive_polling_cannot_race_outbounds_rto_ahead_of_the_real_tick() {
+        // The regression this exists to prevent: a caller that reacts to inbound traffic (which, over a
+        // high-latency transport, includes the peer's own retransmissions) must not be able to advance
+        // `outbound`'s RTO clock faster than the real tick — otherwise backoff never converges and a slow
+        // round trip becomes a retransmission storm (the anonymous-session livelock this fixed).
+        let payload: Vec<u8> = (0..4 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+        let mut tx = StreamSender::new(0, &payload).with_window(8);
+        let first = tx.outbound(); // clock: 0 -> 1, schedules due_at ~ 1 + RTO_INIT(3) + jitter
+        assert!(!first.is_empty());
+        // A burst of reactive polls — as if many inbound deliveries arrived between ticks — must not
+        // resend anything (already scheduled) nor advance the clock.
+        for _ in 0..500 {
+            assert!(
+                tx.poll_new().is_empty(),
+                "nothing new to send; poll_new must not resend in-flight segments"
+            );
+        }
+        assert_eq!(tx.clock, 1, "the flood of reactive polls left the clock untouched");
+        // Only two more REAL ticks have passed (clock 1 -> 3); the earliest due tick is 4 (see the
+        // sibling test), so nothing is due yet — proving the reactive flood didn't secretly pull the
+        // schedule forward.
+        assert!(tx.outbound().is_empty(), "tick 2: still nothing due");
+        assert!(tx.outbound().is_empty(), "tick 3: still nothing due");
+        assert_eq!(tx.clock, 3);
     }
 
     #[test]
