@@ -148,6 +148,58 @@ impl Default for NodeConfig {
     }
 }
 
+impl NodeConfig {
+    /// Parse a node config from a simple `key = value` text file — one setting per line, `#` starts a
+    /// comment — the operator-facing alternative to a long CLI-flag line (§11). Recognised keys:
+    /// `listen`, `identity`, `bootstrap` (comma-separated `coord@addr` peers), `role` (comma-separated
+    /// roles), `heartbeat` (`true`/`false`). An unrecognised key is an ERROR, not silently ignored — a
+    /// typo on a production node must fail loudly rather than leave a setting unexpectedly at its
+    /// default. Beacon parameters (the DVRF group commitment) are genesis material provisioned
+    /// out-of-band, not from this file, so `beacon` stays `None` here.
+    ///
+    /// # Errors
+    /// [`NodeError::Config`] on a line without `=`, an unrecognised key, or an unparseable value.
+    pub fn from_config_str(text: &str) -> Result<Self, NodeError> {
+        let mut config = Self::default();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                NodeError::Config(format!("config line {}: expected `key = value`", n + 1))
+            })?;
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "listen" => {
+                    config.listen = value
+                        .parse()
+                        .map_err(|_| NodeError::Config(format!("bad listen '{value}'")))?;
+                }
+                "identity" => config.identity_path = Some(PathBuf::from(value)),
+                "bootstrap" => {
+                    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                        config.bootstrap.push(Peer::parse(part)?);
+                    }
+                }
+                "role" => config.roles = RoleSet::parse(value)?,
+                "heartbeat" => {
+                    config.start_heartbeat = value.parse().map_err(|_| {
+                        NodeError::Config(format!("bad heartbeat '{value}' (expected true/false)"))
+                    })?;
+                }
+                other => {
+                    return Err(NodeError::Config(format!(
+                        "config line {}: unknown key '{other}'",
+                        n + 1
+                    )));
+                }
+            }
+        }
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -176,5 +228,34 @@ mod tests {
         assert!(r.any());
         assert!(RoleSet::parse("bogus").is_err());
         assert!(!RoleSet::default().any());
+    }
+
+    #[test]
+    fn parses_a_config_file() {
+        let cfg = NodeConfig::from_config_str(
+            "# a relay node\nlisten = 127.0.0.1:9000\nrole = relay,storage\nbootstrap = 1:2:3@10.0.0.1:9000, 4:5:6@10.0.0.2:9000\nheartbeat = false\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:9000".parse().unwrap());
+        assert!(cfg.roles.relay && cfg.roles.storage && !cfg.roles.exit);
+        assert_eq!(cfg.bootstrap.len(), 2);
+        assert!(!cfg.start_heartbeat);
+        assert!(cfg.beacon.is_none());
+    }
+
+    #[test]
+    fn config_file_rejects_unknown_keys_and_malformed_values() {
+        assert!(NodeConfig::from_config_str("bogus = 1").is_err()); // unknown key fails loudly
+        assert!(NodeConfig::from_config_str("listen 127.0.0.1:9000").is_err()); // no '='
+        assert!(NodeConfig::from_config_str("listen = not-an-addr").is_err());
+        assert!(NodeConfig::from_config_str("heartbeat = maybe").is_err());
+    }
+
+    #[test]
+    fn config_file_comments_and_blanks_keep_defaults() {
+        let cfg = NodeConfig::from_config_str("\n  # only a comment\n\n").unwrap();
+        assert!(cfg.start_heartbeat); // the default is preserved
+        assert!(cfg.bootstrap.is_empty());
+        assert!(cfg.identity_path.is_none());
     }
 }

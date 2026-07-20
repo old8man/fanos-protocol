@@ -45,32 +45,31 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
 async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
 
-    let listen = match flag(args, "--listen") {
-        Some(s) => s
-            .parse::<SocketAddr>()
-            .map_err(|_| NodeError::Config(format!("bad --listen '{s}'")))?,
-        None => SocketAddr::from(([0, 0, 0, 0], 0)),
+    // A `--config <file>` supplies the base settings; individual CLI flags then override it, so an
+    // operator can keep a config file and tweak one setting on the command line without rewriting it.
+    let mut config = match flag(args, "--config") {
+        Some(path) => NodeConfig::from_config_str(&std::fs::read_to_string(path)?)?,
+        None => NodeConfig::default(),
     };
-    let identity_path = flag(args, "--identity").map(PathBuf::from);
-    let mut bootstrap = Vec::new();
+    if let Some(s) = flag(args, "--listen") {
+        config.listen = s
+            .parse::<SocketAddr>()
+            .map_err(|_| NodeError::Config(format!("bad --listen '{s}'")))?;
+    }
+    if let Some(p) = flag(args, "--identity") {
+        config.identity_path = Some(PathBuf::from(p));
+    }
     for value in flag_all(args, "--bootstrap") {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            bootstrap.push(Peer::parse(part)?);
+            config.bootstrap.push(Peer::parse(part)?);
         }
     }
-    let roles = match flag(args, "--role") {
-        Some(s) => RoleSet::parse(s)?,
-        None => RoleSet::default(),
-    };
-    let start_heartbeat = !has_flag(args, "--no-heartbeat");
-
-    let config = NodeConfig {
-        listen,
-        identity_path,
-        bootstrap,
-        roles,
-        start_heartbeat,
-    };
+    if let Some(s) = flag(args, "--role") {
+        config.roles = RoleSet::parse(s)?;
+    }
+    if has_flag(args, "--no-heartbeat") {
+        config.start_heartbeat = false;
+    }
 
     let mut node = Node::start::<F2>(config).await?;
     let health = node.health();
