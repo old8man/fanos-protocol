@@ -13,6 +13,9 @@ categories = ["network-programming", "asynchronous"]
 [dependencies]
 # The sans-I/O session state machine this crate drives asynchronously.
 fanos-diaulos.workspace = true
+# The service side completes each client's handshake, which needs a CSPRNG (rand_core 0.10, matching
+# `fanos_diaulos::ServerSession::handle_payload`).
+rand_core.workspace = true
 tokio = { workspace = true, features = [
     "io-util",
     "rt",

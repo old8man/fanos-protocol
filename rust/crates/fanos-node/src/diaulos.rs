@@ -8,22 +8,20 @@
 //! the multi-client service accept loop. This is the **Direct** profile — the anonymous rendezvous is
 //! a different transport under the identical stream.
 
-use fanos_diaulos::{ClientSession, Coord, ServerSession, StaticKeypair};
+use fanos_diaulos::{ClientSession, Coord, StaticKeypair};
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
-use fanos_session::{OverlayTransport, dial_over_transport};
+use fanos_session::{ChannelTransport, OverlayTransport, dial_over_transport, serve_over_channels};
 use rand_core::CryptoRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::time::Duration;
+use std::sync::Arc;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
-
-/// The service accept loop's poll/retransmit tick.
-const SERVE_TICK: Duration = Duration::from_millis(20);
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 /// An [`OverlayTransport`] over a node's [`Client`]: outbound payloads become `Command::Send`, and the
 /// node's `Notification::Delivered` events become inbound datagrams.
@@ -71,92 +69,131 @@ pub fn dial_service<R: CryptoRng>(
     dial_over_transport(session, NodeTransport::new(client))
 }
 
-/// One in-flight client session at the service, plus its primary stream and whether it was answered.
-#[derive(Default)]
-struct ClientState {
-    session: ServerSession,
-    primary: Option<u32>,
-    answered: bool,
-    /// The request bytes drained so far. Accumulated **incrementally** (not read only at FIN), so the
-    /// receiver buffer keeps freeing and its `rwnd` recovers — otherwise a request larger than one recv
-    /// window never `receiver_finished`s (buffer full ⇒ rwnd 0 ⇒ sender stalls) and the exchange
-    /// deadlocks (audit #66 service-duplex; same fix the sans-I/O test service loop already carries).
-    request: Vec<u8>,
-}
-
-/// Run a **multi-client** DIAULOS request/response service on `client`'s node: one [`ServerSession`]
-/// per client coordinate, each answered with `handler(request)`, retiring a session once its exchange
-/// completes both ways. A single service `keypair` (the identity) backs every client — passed by
-/// reference, so no per-client key clone. Spawns a background task and returns immediately.
-pub fn serve<R, H>(client: Client, keypair: StaticKeypair, mut rng: R, handler: H)
+/// Run a **multi-client, full-duplex** DIAULOS service on `client`'s node: each client that dials gets its
+/// own session driven as an async [`DuplexStream`] and handed to `handler`, which may read the request and
+/// write the response **concurrently** and stream in both directions — not merely answer once. A single
+/// service `keypair` (the identity) backs every client (cloned per session, so one hidden service serves
+/// many); `rng` is the base entropy each client's session draws a fresh CSPRNG from. Spawns a background
+/// demultiplexer and returns immediately.
+///
+/// The demultiplexer routes each `Notification::Delivered { from, .. }` to that client's session; a new
+/// `from` — or one whose previous session finished — spins up a fresh session + `handler` task, and a
+/// completed session is reaped, so the peer map holds only live clients (does not grow without bound).
+pub fn serve<R, H, Fut>(client: Client, keypair: StaticKeypair, mut rng: R, handler: H)
 where
     R: CryptoRng + Send + 'static,
-    H: Fn(&[u8]) -> Vec<u8> + Send + 'static,
+    H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
+    let handler = Arc::new(handler);
+    // Share the service identity across all client sessions — never copy the secret (audit A6).
+    let keypair = Arc::new(keypair);
     tokio::spawn(async move {
         let mut deliveries = client.subscribe();
-        let mut sessions: BTreeMap<Coord, ClientState> = BTreeMap::new();
-        let mut ticker = tokio::time::interval(SERVE_TICK);
+        let mut peers: HashMap<Coord, UnboundedSender<Vec<u8>>> = HashMap::new();
+        // A session task signals its client coordinate here when its handler completes, so the demux reaps
+        // it — bounding the map to live clients (a step toward the audit-A4 back-pressure hygiene).
+        let (done_tx, mut done_rx) = unbounded_channel::<Coord>();
         loop {
-            let mut retire: Vec<Coord> = Vec::new();
-            for (&peer, st) in &mut sessions {
-                if st.primary.is_none() {
-                    st.primary = st.session.primary();
-                }
-                if let Some(sid) = st.primary {
-                    if !st.answered {
-                        // Drain the delivered prefix EVERY tick (freeing the receiver window), and answer
-                        // once the whole request has arrived — never blocking the first read on FIN.
-                        st.request.extend_from_slice(&st.session.read(sid));
-                        if st.session.receiver_finished(sid) {
-                            let response = handler(&st.request);
-                            st.session.write(sid, &response);
-                            st.session.finish(sid);
-                            st.answered = true;
-                        }
-                    }
-                    if st.answered && st.session.is_stream_done(sid) {
-                        retire.push(peer);
-                    }
-                }
-            }
-            // One emit per wake: the delivery arm below coalesces its whole ready batch before looping,
-            // so this re-sends each session's window once per batch or tick, never once per datagram
-            // (which would make the two sides amplify each other's retransmits without bound).
-            for (&peer, st) in &mut sessions {
-                for payload in st.session.poll_payloads() {
-                    client.command(Command::Send { to: peer, payload });
-                }
-            }
-            for peer in retire {
-                sessions.remove(&peer);
-            }
             tokio::select! {
                 event = deliveries.recv() => match event {
                     Ok(Notification::Delivered { from, payload }) => {
-                        sessions
-                            .entry(from)
-                            .or_default()
-                            .session
-                            .handle_payload(&keypair, &payload, &mut rng);
-                        // Coalesce the rest of the ready batch, then emit once for all of them.
-                        while let Ok(ev) = deliveries.try_recv() {
-                            if let Notification::Delivered { from, payload } = ev {
-                                sessions
-                                    .entry(from)
-                                    .or_default()
-                                    .session
-                                    .handle_payload(&keypair, &payload, &mut rng);
-                            }
+                        // Spin up a session on first contact, or if the previous one finished (its inbound
+                        // channel closed), so a reconnecting client starts clean.
+                        if peers.get(&from).is_none_or(UnboundedSender::is_closed) {
+                            let mut seed = [0u8; 32];
+                            rng.fill_bytes(&mut seed);
+                            let in_tx = spawn_client_session(
+                                client.clone(),
+                                keypair.clone(),
+                                SeedRng::from_seed(&seed),
+                                from,
+                                handler.clone(),
+                                done_tx.clone(),
+                            );
+                            peers.insert(from, in_tx);
+                        }
+                        if let Some(tx) = peers.get(&from) {
+                            let _ = tx.send(payload);
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
-                _ = ticker.tick() => {}
+                reaped = done_rx.recv() => {
+                    // Reap a finished session, but only if a reconnect has not already replaced it with a
+                    // fresh (still-open) one — a race-free drop keyed on the sender being closed.
+                    if let Some(from) = reaped
+                        && peers.get(&from).is_some_and(UnboundedSender::is_closed)
+                    {
+                        peers.remove(&from);
+                    }
+                }
             }
         }
     });
+}
+
+/// A convenience over [`serve`] for the common **request/response** shape: read the whole request (until
+/// the client half-closes), call `handler(&request)`, write the response, and close. Full-duplex or
+/// streaming services (which read and write concurrently) use [`serve`] directly.
+pub fn serve_rpc<R, H>(client: Client, keypair: StaticKeypair, rng: R, handler: H)
+where
+    R: CryptoRng + Send + 'static,
+    H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    serve(client, keypair, rng, move |mut stream: DuplexStream| {
+        let handler = handler.clone();
+        async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = Vec::new();
+            if stream.read_to_end(&mut request).await.is_ok() {
+                let response = handler(&request);
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        }
+    });
+}
+
+/// Spin up one client's full-duplex session: a [`serve_over_channels`] driver bridged to the node
+/// (outbound cells → `Command::Send { to: from }`; inbound is the returned channel the demultiplexer feeds
+/// this client's deliveries into), with `handler` spawned over the resulting stream. When the handler
+/// completes, `done_tx` is signalled so the demultiplexer reaps the session.
+fn spawn_client_session<H, Fut>(
+    client: Client,
+    keypair: Arc<StaticKeypair>,
+    rng: SeedRng,
+    from: Coord,
+    handler: Arc<H>,
+    done_tx: UnboundedSender<Coord>,
+) -> UnboundedSender<Vec<u8>>
+where
+    H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = unbounded_channel::<Vec<u8>>();
+    // Outbound: this session's cells are addressed to the client coordinate over the node.
+    tokio::spawn(async move {
+        while let Some(payload) = out_rx.recv().await {
+            client.command(Command::Send { to: from, payload });
+        }
+    });
+    let stream = serve_over_channels(
+        keypair,
+        rng,
+        ChannelTransport {
+            outbound: out_tx,
+            inbound: in_rx,
+        },
+    );
+    tokio::spawn(async move {
+        handler(stream).await;
+        let _ = done_tx.send(from);
+    });
+    in_tx
 }
 
 /// Resolves a `.fanos` host to the service's overlay coordinate and static KEM public key — the two

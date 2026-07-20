@@ -194,6 +194,17 @@ impl ClientSession {
             _ => false,
         }
     }
+
+    /// Whether the **peer** (the service) has finished writing — its whole response is received and FIN'd —
+    /// so this side's read half can signal EOF even while it keeps writing (half-close, full duplex).
+    /// Mirrors [`ServerSession::receiver_finished`]; `false` before the handshake is live.
+    #[must_use]
+    pub fn receiver_finished(&self) -> bool {
+        match &self.state {
+            ClientState::Live { dialed } => dialed.conn.receiver_finished(dialed.primary),
+            _ => false,
+        }
+    }
 }
 
 /// The service half of one client's session: accept a dial and carry the session over the overlay

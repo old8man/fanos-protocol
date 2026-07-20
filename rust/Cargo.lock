@@ -1034,6 +1034,7 @@ version = "0.1.0"
 dependencies = [
  "fanos-diaulos",
  "fanos-pqcrypto",
+ "rand_core 0.10.1",
  "tokio",
 ]
 

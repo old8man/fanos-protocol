@@ -30,7 +30,7 @@ pub mod resolve;
 
 pub use config::{NodeConfig, Peer, RoleSet};
 pub use diaulos::{
-    FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service, serve,
+    FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service, serve, serve_rpc,
 };
 pub use epoch_driver::EpochDriver;
 pub use error::NodeError;

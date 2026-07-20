@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
-use fanos_node::{FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_service, serve};
+use fanos_node::{
+    FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_service, serve, serve_rpc,
+};
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
 use fanos_runtime::Command;
@@ -108,7 +110,7 @@ async fn diaulos_request_response_over_quic() {
     let mut krng = SeedRng::from_seed(b"quic-diaulos-key");
     let keypair = StaticKeypair::generate(&mut krng);
     let service_public = keypair.public.clone();
-    serve(
+    serve_rpc(
         a.client(),
         keypair,
         SeedRng::from_seed(b"quic-diaulos-svc"),
@@ -121,6 +123,67 @@ async fn diaulos_request_response_over_quic() {
     assert_eq!(
         response, b"QUIC DIAULOS",
         "the encrypted response arrived end-to-end over the real QUIC transport"
+    );
+
+    a.shutdown();
+    b.shutdown();
+}
+
+#[tokio::test]
+async fn diaulos_full_duplex_service_over_quic() {
+    let _serial = serial();
+    // The FULL-DUPLEX serve: a service whose handler **talks first** (an unsolicited banner) and then
+    // stream-echoes — proving the service side is a bidirectional DuplexStream over real QUIC, not
+    // answer-once. A request/response service cannot send before it has read the whole request.
+    let a = start(vec![]).await; // service
+    let (a_addr, a_net) = (a.address(), a.local_addr());
+    let b = start_distinct(
+        vec![Peer {
+            coord: a_addr,
+            addr: a_net,
+        }],
+        &[a_addr],
+    )
+    .await; // client
+    a.directory().insert(b.address(), b.local_addr());
+    warm(&a, &b);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut krng = SeedRng::from_seed(b"quic-duplex-key");
+    let keypair = StaticKeypair::generate(&mut krng);
+    let service_public = keypair.public.clone();
+    serve(
+        a.client(),
+        keypair,
+        SeedRng::from_seed(b"quic-duplex-svc"),
+        |mut stream: DuplexStream| async move {
+            let _ = stream.write_all(b"BANNER:").await; // talk first
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = stream.shutdown().await;
+                        break;
+                    }
+                    Ok(n) => {
+                        let up: Vec<u8> =
+                            buf.get(..n).unwrap_or(&[]).iter().map(u8::to_ascii_uppercase).collect();
+                        if stream.write_all(&up).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        },
+    );
+
+    let mut drng = SeedRng::from_seed(b"quic-duplex-cli");
+    let mut stream = dial_service(b.client(), a_addr, &service_public, &mut drng);
+    let response = exchange(&mut stream, b"hi").await;
+    assert_eq!(
+        response, b"BANNER:HI",
+        "the service's unsolicited banner and streamed echo arrived over real QUIC"
     );
 
     a.shutdown();
@@ -150,7 +213,7 @@ async fn diaulos_serves_two_clients_concurrently() {
     let keypair = StaticKeypair::generate(&mut krng);
     let service_public = keypair.public.clone();
     // Echo the request with an `echo:` prefix.
-    serve(
+    serve_rpc(
         s.client(),
         keypair,
         SeedRng::from_seed(b"quic-multi-svc"),
@@ -197,7 +260,7 @@ async fn fanos_dialer_reaches_a_service_by_name() {
     let mut krng = SeedRng::from_seed(b"fd-key");
     let keypair = StaticKeypair::generate(&mut krng);
     let service_public = keypair.public.clone();
-    serve(
+    serve_rpc(
         a.client(),
         keypair,
         SeedRng::from_seed(b"fd-svc"),

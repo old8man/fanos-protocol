@@ -16,9 +16,11 @@
 #![forbid(unsafe_code)]
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
-use fanos_diaulos::{ClientSession, Coord};
+use fanos_diaulos::{ClientSession, Coord, ServerSession, StaticKeypair};
+use rand_core::CryptoRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -61,6 +63,45 @@ pub fn stream_over_channels_paced(
 ) -> DuplexStream {
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
     tokio::spawn(drive(session, driver_side, transport, tick));
+    app_side
+}
+
+/// Drive the **accepting** side of a DIAULOS session — a service answering one client — as an async
+/// duplex byte stream over `transport`, returning the application side: the `AsyncRead + AsyncWrite` a
+/// service handler reads the request from and writes the response to. It is exactly symmetric with
+/// [`stream_over_channels`] on the client and shares the same driver, so a service is **full-duplex** — it
+/// may read and write concurrently and stream in both directions, not merely answer once. `keypair` is the
+/// service's static identity (it completes each client's handshake); `rng` seeds the handshake response.
+///
+/// `keypair` is shared (`Arc`) so one service identity backs many concurrent client sessions without ever
+/// copying the secret. Must be called from within a tokio runtime (it spawns the driver task).
+#[must_use]
+pub fn serve_over_channels<R: CryptoRng + Send + 'static>(
+    keypair: Arc<StaticKeypair>,
+    rng: R,
+    transport: ChannelTransport,
+) -> DuplexStream {
+    serve_over_channels_paced(keypair, rng, transport, TICK)
+}
+
+/// Like [`serve_over_channels`] but with an explicit retransmit/keep-alive `tick` — a high-latency
+/// transport (e.g. an anonymous rendezvous circuit) must pace retransmits to its round trip, exactly as
+/// [`stream_over_channels_paced`] does on the client side.
+#[must_use]
+pub fn serve_over_channels_paced<R: CryptoRng + Send + 'static>(
+    keypair: Arc<StaticKeypair>,
+    rng: R,
+    transport: ChannelTransport,
+    tick: Duration,
+) -> DuplexStream {
+    let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
+    let server = ServerStream {
+        server: ServerSession::new(),
+        keypair,
+        rng,
+        stream_id: None,
+    };
+    tokio::spawn(drive(server, driver_side, transport, tick));
     app_side
 }
 
@@ -122,8 +163,112 @@ async fn bridge<T: OverlayTransport>(
     }
 }
 
-async fn drive(
-    mut session: ClientSession,
+/// The sans-I/O session surface the async byte-stream [`drive`] loop needs. **Both** the dialing
+/// ([`ClientSession`]) and accepting ([`ServerSession`]) sides implement it, so one driver runs a
+/// full-duplex stream in either direction — a service handler gets the same `AsyncRead + AsyncWrite` a
+/// client's dial does, and the flow-control / retransmit logic lives in exactly one place.
+trait SessionStream: Send + 'static {
+    /// The handshake has completed, so `write`/`finish` take effect (buffer app writes until then).
+    fn is_live(&self) -> bool;
+    /// Queue application bytes to send to the peer.
+    fn write(&mut self, data: &[u8]);
+    /// Take the application bytes received from the peer.
+    fn read(&mut self) -> Vec<u8>;
+    /// Signal end-of-stream (FIN) to the peer.
+    fn finish(&mut self);
+    /// The stream is complete both ways.
+    fn is_done(&self) -> bool;
+    /// The **peer** has finished writing (its whole side is received + FIN'd), so the app's read half can
+    /// EOF while this side keeps writing — a half-close, so a full-duplex handler learns the request ended
+    /// and can then stream its response.
+    fn peer_write_finished(&self) -> bool;
+    /// The datagram cells to transmit now (the whole send window; re-sent each call).
+    fn poll_payloads(&mut self) -> Vec<Vec<u8>>;
+    /// Fold a received datagram cell into the session.
+    fn handle_payload(&mut self, payload: &[u8]);
+}
+
+impl SessionStream for ClientSession {
+    fn is_live(&self) -> bool {
+        ClientSession::is_live(self)
+    }
+    fn write(&mut self, data: &[u8]) {
+        ClientSession::write(self, data);
+    }
+    fn read(&mut self) -> Vec<u8> {
+        ClientSession::read(self)
+    }
+    fn finish(&mut self) {
+        ClientSession::finish(self);
+    }
+    fn is_done(&self) -> bool {
+        ClientSession::is_done(self)
+    }
+    fn peer_write_finished(&self) -> bool {
+        ClientSession::receiver_finished(self)
+    }
+    fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
+        ClientSession::poll_payloads(self)
+    }
+    fn handle_payload(&mut self, payload: &[u8]) {
+        ClientSession::handle_payload(self, payload);
+    }
+}
+
+/// The accepting side of a session as a single duplex stream: a [`ServerSession`] driven through its
+/// **primary** stream, carrying the service keypair and a CSPRNG to complete the client's handshake. Once
+/// the client's `ClientHello` is folded in, `primary()` names the stream and the driver runs it exactly
+/// like a dialed one — so a service handler reads the request and writes the response through the same
+/// async stream, concurrently (full duplex), not answer-once.
+struct ServerStream<R: CryptoRng + Send + 'static> {
+    server: ServerSession,
+    keypair: Arc<StaticKeypair>,
+    rng: R,
+    stream_id: Option<u32>,
+}
+
+impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
+    fn is_live(&self) -> bool {
+        self.stream_id.is_some()
+    }
+    fn write(&mut self, data: &[u8]) {
+        if let Some(sid) = self.stream_id {
+            self.server.write(sid, data);
+        }
+    }
+    fn read(&mut self) -> Vec<u8> {
+        self.stream_id
+            .map(|sid| self.server.read(sid))
+            .unwrap_or_default()
+    }
+    fn finish(&mut self) {
+        if let Some(sid) = self.stream_id {
+            self.server.finish(sid);
+        }
+    }
+    fn is_done(&self) -> bool {
+        self.stream_id
+            .is_some_and(|sid| self.server.is_stream_done(sid))
+    }
+    fn peer_write_finished(&self) -> bool {
+        self.stream_id
+            .is_some_and(|sid| self.server.receiver_finished(sid))
+    }
+    fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
+        self.server.poll_payloads()
+    }
+    fn handle_payload(&mut self, payload: &[u8]) {
+        self.server
+            .handle_payload(&self.keypair, payload, &mut self.rng);
+        // Latch the primary stream id once the handshake opens it.
+        if self.stream_id.is_none() {
+            self.stream_id = self.server.primary();
+        }
+    }
+}
+
+async fn drive<S: SessionStream>(
+    mut session: S,
     driver_side: DuplexStream,
     transport: ChannelTransport,
     tick: Duration,
@@ -138,6 +283,7 @@ async fn drive(
     let mut pending: Vec<u8> = Vec::new(); // app writes made before the session went live
     let mut app_eof = false; // the app closed its write side
     let mut finished = false; // we called session.finish()
+    let mut read_eof = false; // we signaled EOF to the app's read half (the peer finished writing)
     // Emit outbound cells only when the send state actually changes — on startup (the ClientHello),
     // when the app hands us new data, after draining a *batch* of inbound datagrams, or on the
     // retransmit tick. `poll_payloads` re-sends the whole window each call, so emitting on *every*
@@ -173,8 +319,17 @@ async fn drive(
         if !data.is_empty() && wr.write_all(&data).await.is_err() {
             return; // the app dropped its read side
         }
-        if session.is_done() {
+        // Half-close: once the peer has finished writing, signal EOF to the app's read half — so a
+        // full-duplex handler learns the request ended and can then stream its response — but keep this
+        // side's write half open until the app finishes and both directions complete.
+        if !read_eof && session.peer_write_finished() {
             let _ = wr.shutdown().await;
+            read_eof = true;
+        }
+        if session.is_done() {
+            if !read_eof {
+                let _ = wr.shutdown().await;
+            }
             return;
         }
 
@@ -298,6 +453,72 @@ mod tests {
         assert_eq!(
             result, b"HELLO ASYNC",
             "response arrived through the async DIAULOS stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_duplex_service_streams_both_ways() {
+        // The service side is now a DuplexStream via `serve_over_channels`, not an answer-once loop. Prove
+        // it: the handler **talks first** — it writes a banner before any request arrives — then
+        // stream-echoes each chunk uppercased. A request/response-only service cannot send before it has
+        // read the whole request; this one can, so both directions are independent (full duplex).
+        let mut rng = SeedRng::from_seed(b"duplex-key");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut crng = SeedRng::from_seed(b"duplex-client");
+        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+
+        let (c2s_tx, c2s_rx) = unbounded_channel();
+        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let mut client_stream = stream_over_channels(
+            client,
+            ChannelTransport {
+                outbound: c2s_tx,
+                inbound: s2c_rx,
+            },
+        );
+        let server_stream = serve_over_channels(
+            Arc::new(keypair),
+            SeedRng::from_seed(b"duplex-server"),
+            ChannelTransport {
+                outbound: s2c_tx,
+                inbound: c2s_rx,
+            },
+        );
+
+        tokio::spawn(async move {
+            let (mut rd, mut wr) = tokio::io::split(server_stream);
+            wr.write_all(b"BANNER:").await.unwrap(); // talk first — buffered until the handshake is live
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = wr.shutdown().await;
+                        break;
+                    }
+                    Ok(n) => {
+                        let up: Vec<u8> =
+                            buf.get(..n).unwrap_or(&[]).iter().map(u8::to_ascii_uppercase).collect();
+                        if wr.write_all(&up).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            client_stream.write_all(b"hi").await.unwrap();
+            client_stream.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            client_stream.read_to_end(&mut resp).await.unwrap();
+            resp
+        })
+        .await
+        .expect("the full-duplex exchange completed in time");
+        assert_eq!(
+            result, b"BANNER:HI",
+            "the service's unsolicited banner and the streamed echo both arrived"
         );
     }
 
