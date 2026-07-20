@@ -7,7 +7,7 @@
 //! same code runs under the simulator and a real transport.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_core::AdmissionPolicy;
@@ -54,6 +54,16 @@ const DECOUPLE_DECAY: f64 = 0.5;
 /// DDoS response acts on *sustained* over-coupling (structure), never momentary load. Crash/Byzantine
 /// healing is unaffected — this gates only the `Decouple` action.
 const DECOUPLE_DWELL: u32 = 3;
+
+/// §6.4 endpoint cross-attestation window and firm-stale threshold, pinned by the simulator sweep
+/// (`fanos-sim/tests/endpoint_attestation_research.rs`). The detector flags a witness only when it
+/// *persistently* — across this many consecutive heartbeat rounds — vouches a node fresh that a firm
+/// consensus reports stale. `ENDPOINT_WINDOW = 5` heartbeats (≈ 2.5 s > `liveness_timeout`) is longer than
+/// a crash transient (all nodes stale on a dead peer within one heartbeat of each other), so churn cannot
+/// persist across it; `ENDPOINT_MIN_STALE = ⌈(N−1)/2⌉ = 3` is a firm honest majority that still catches any
+/// colluder minority (tolerates up to 3 vouch-fabricators, exceeding the plain `corroboration_quorum`).
+const ENDPOINT_WINDOW: usize = 5;
+const ENDPOINT_MIN_STALE: usize = 3;
 
 /// DoS backstops on the DHT slice (audit A4). The distributed store and the in-flight-read table both
 /// accept adversary-supplied keys, so without a cap a peer that floods `Publish`/`Get` with distinct
@@ -189,7 +199,12 @@ impl Store {
     /// Advance an in-flight read to the next replica on its line, or conclude `Retrieved(None)` once the
     /// replicas are exhausted (spec §L4 read repair). The next replica comes from the read's own
     /// `remaining` list, so this needs no membership view.
-    fn advance_pending_get(&mut self, now: Instant, digest: [u8; DIGEST], effects: &mut Vec<Effect>) {
+    fn advance_pending_get(
+        &mut self,
+        now: Instant,
+        digest: [u8; DIGEST],
+        effects: &mut Vec<Effect>,
+    ) {
         let Some(pending) = self.pending.get_mut(&digest) else {
             return;
         };
@@ -407,6 +422,13 @@ struct Healer {
     /// Dedup: currently in the under-coupled (`Bind`) regime, so `Rebalance` fires once on entry (§6.7), not
     /// each round; cleared when the cell returns to the in-band collective-subject (`Hold`).
     rebalancing: bool,
+    /// The §6.4 endpoint cross-attestation window: the last [`ENDPOINT_WINDOW`] rounds of per-witness
+    /// liveness fresh-masks (bit `p` ⇔ that witness gossiped point `p` fresh), reconstructed each heartbeat
+    /// from the corroborated `witnessed` substrate + own direct view. `attest_endpoints` reads it through
+    /// [`polar::fabricators_by_persistent_freshness`] to catch a colluding vouch-fabricator keeping a dead
+    /// node believed-alive — the third-order fault the plain corroboration quorum, which only *counts*
+    /// vouchers, cannot see. Bounded (`≤ ENDPOINT_WINDOW` tiny arrays), so it adds no unbounded state.
+    endpoint_window: VecDeque<[Option<u8>; 7]>,
 }
 
 impl Healer {
@@ -429,6 +451,7 @@ impl Healer {
             overcoupling_streak: 0,
             last_sample: [0.0; 7],
             rebalancing: false,
+            endpoint_window: VecDeque::new(),
         }
     }
 
@@ -612,7 +635,8 @@ impl Healer {
         // against it FIRST, ahead of the syndrome localizer — an equivocating mediator's own report is
         // internally inconsistent and is caught and localized here; an honest cell's is always consistent,
         // so this never pre-empts the ordinary crash/churn path below, however many members are down.
-        let pairwise_rates = self.attested_pairwise_rates::<F>(now, degraded, config.liveness_timeout);
+        let pairwise_rates =
+            self.attested_pairwise_rates::<F>(now, degraded, config.liveness_timeout);
         let verdict = diagnose(&Observation {
             degraded,
             pairwise_rates: Some(pairwise_rates),
@@ -634,7 +658,10 @@ impl Healer {
             // Φ from the cell's live membership on the equicorrelated stratum, at the *effective*
             // (post-shed) correlation — so a prior `Decouple` has genuinely lowered it (audit C6). Gates
             // the reroute-depth budget.
-            let phi = phi_equicorrelated(alive_count, self.effective_correlation(config.healthy_correlation));
+            let phi = phi_equicorrelated(
+                alive_count,
+                self.effective_correlation(config.healthy_correlation),
+            );
             let plan = plan_healing(&verdict, self_index, degraded, phi);
             if !plan.is_empty() {
                 self.observer.note_healing();
@@ -698,7 +725,13 @@ impl Healer {
             }
         }
         // Mandatory self-observation: diagnosis cannot happen without observing.
-        effects.push(self.emit_observation(now, epoch, alive_count, degraded, config.healthy_correlation));
+        effects.push(self.emit_observation(
+            now,
+            epoch,
+            alive_count,
+            degraded,
+            config.healthy_correlation,
+        ));
         effects
     }
 
@@ -731,10 +764,7 @@ impl Healer {
                 }
                 HealingAction::Quarantine { node } => {
                     let node_c = Point::<F>::at(node).coords();
-                    // Insert (or refresh the window on) the quarantine; notify only on a *new* distrust.
-                    if self.quarantined.insert(node_c, now).is_none() {
-                        effects.push(Effect::Notify(Notification::Quarantined(node_c)));
-                    }
+                    effects.extend(self.quarantine(node_c, now));
                 }
                 HealingAction::Decouple => {
                     // Real correlation-shedding (audit C6), gated by the dwell hysteresis (#122): only once
@@ -753,6 +783,49 @@ impl Healer {
                     effects.push(Effect::Notify(Notification::Escalated(unrecoverable)));
                 }
             }
+        }
+        effects
+    }
+
+    /// Locally quarantine `node_c` (spec §6.2/§6.4): drop its frames for the bounded re-admission window,
+    /// emitting a `Quarantined` notification only on a *new* distrust (idempotent across rounds). The single
+    /// quarantine actuator shared by the mediator model (`violated_classes`, via the healing plan) and the
+    /// endpoint fabrication detector ([`attest_endpoints`]) — one reason for a member's frames to be dropped.
+    fn quarantine(&mut self, node_c: Triple, now: Instant) -> Option<Effect> {
+        self.quarantined
+            .insert(node_c, now)
+            .is_none()
+            .then_some(Effect::Notify(Notification::Quarantined(node_c)))
+    }
+
+    /// The **§6.4 endpoint cross-attestation, live** (#106). Fold this heartbeat's per-witness liveness
+    /// fresh-masks (built by the facade from the corroborated `witnessed` substrate) into the bounded window
+    /// and, once it is full, run the directional fabrication detector: quarantine any witness that
+    /// *persistently* vouches a node fresh while a firm consensus reports it stale — a colluding
+    /// vouch-fabricator keeping a dead node believed-alive, the fault the plain corroboration quorum (which
+    /// only counts vouchers) is defeated by. `subjects` are the points the judge cannot itself directly
+    /// confirm alive (`!own_fresh_mask`), so a node it can see is never adjudicated — the honest-node
+    /// safeguard. Dual to the quorum; complements the mediator model's equivocation catch. Below a full
+    /// window there is not enough history to judge persistence, so nothing fires (churn-safe cold start).
+    fn attest_endpoints<F: Field>(
+        &mut self,
+        now: Instant,
+        round: [Option<u8>; 7],
+        subjects: u8,
+    ) -> Vec<Effect> {
+        self.endpoint_window.push_back(round);
+        while self.endpoint_window.len() > ENDPOINT_WINDOW {
+            self.endpoint_window.pop_front();
+        }
+        if self.endpoint_window.len() < ENDPOINT_WINDOW {
+            return Vec::new();
+        }
+        let window: Vec<[Option<u8>; 7]> = self.endpoint_window.iter().copied().collect();
+        let mut effects = Vec::new();
+        for idx in polar::fabricators_by_persistent_freshness(&window, ENDPOINT_MIN_STALE, subjects)
+        {
+            let node_c = Point::<F>::at(idx).coords();
+            effects.extend(self.quarantine(node_c, now));
         }
         effects
     }
@@ -1366,7 +1439,8 @@ impl<F: Field> OverlayNode<F> {
         // outstanding, refuse a *new* one — concluding `Retrieved(None)` — rather than track it, so a
         // flood of distinct-key `Get`s cannot grow the pending map without bound. A repeat Get for an
         // already-pending digest is allowed through (it refreshes the existing entry, no growth).
-        if self.store.pending.len() >= MAX_PENDING_GETS && !self.store.pending.contains_key(&digest) {
+        if self.store.pending.len() >= MAX_PENDING_GETS && !self.store.pending.contains_key(&digest)
+        {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value: None,
@@ -1681,13 +1755,19 @@ impl<F: Field> OverlayNode<F> {
                 after: self.config.heartbeat,
             });
         }
-        effects.push(Effect::Notify(Notification::Reseated { old, new: new_coord }));
+        effects.push(Effect::Notify(Notification::Reseated {
+            old,
+            new: new_coord,
+        }));
         effects
     }
 
     /// The current membership view (coordinate → announced info), for onion routing / observation.
     pub fn members(&self) -> impl Iterator<Item = (Triple, &[u8])> + '_ {
-        self.membership.members.iter().map(|(&c, i)| (c, i.as_slice()))
+        self.membership
+            .members
+            .iter()
+            .map(|(&c, i)| (c, i.as_slice()))
     }
 
     /// The current beacon epoch.
@@ -1733,6 +1813,63 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
+    /// This node's OWN direct-observation liveness fresh-mask (bit `k` ⇔ it has heard Fano point `k` within
+    /// `liveness_timeout`; self is always fresh) — byte-identical to what its [`health_view`](Self::health_view)
+    /// gossip encodes. Used both as the (guaranteed-honest) judge's own witness row in the §6.4 endpoint
+    /// cross-attestation and, complemented, as the set of subjects it may adjudicate (a node it directly sees
+    /// alive is never cross-examined).
+    fn own_fresh_mask(&self, now: Instant) -> u8 {
+        let timeout = self.config.liveness_timeout;
+        let self_c = self.coord.coords();
+        let mut mask = 0u8;
+        for k in 0..7usize {
+            let coord = Point::<F>::at(k).coords();
+            let fresh = coord == self_c
+                || self
+                    .peers
+                    .get(&coord)
+                    .and_then(|p| p.last_seen)
+                    .is_some_and(|seen| now.since(seen) <= timeout);
+            if fresh {
+                mask |= 1u8 << k;
+            }
+        }
+        mask
+    }
+
+    /// Reconstruct this round's per-witness liveness fresh-masks for the §6.4 endpoint cross-attestation
+    /// (#106): entry `w` (a Fano point index) is `Some(mask)` with bit `k` set ⇔ witness `w` vouches a fresh
+    /// (within `liveness_timeout`) observation of point `k`, or `None` if `w` has vouched nothing this window
+    /// (absent — excluded from the consensus). Peer rows come from the corroborated `witnessed` gossip
+    /// substrate (folded from each member's `DiagGossip`); this node's own row is its direct view
+    /// ([`own_fresh_mask`](Self::own_fresh_mask)), so the honest judge itself counts toward the firm consensus,
+    /// restoring the full 3-colluder tolerance.
+    fn endpoint_round_mask(&self, now: Instant) -> [Option<u8>; 7] {
+        let timeout = self.config.liveness_timeout;
+        let self_c = self.coord.coords();
+        core::array::from_fn(|w| {
+            let witness_c = Point::<F>::at(w).coords();
+            if witness_c == self_c {
+                return Some(self.own_fresh_mask(now));
+            }
+            let mut mask = 0u8;
+            let mut present = false;
+            for k in 0..7usize {
+                let subject_c = Point::<F>::at(k).coords();
+                if let Some(seen) = self
+                    .witnessed
+                    .get(&subject_c)
+                    .and_then(|m| m.get(&witness_c))
+                    && now.since(*seen) <= timeout
+                {
+                    mask |= 1u8 << k;
+                    present = true;
+                }
+            }
+            present.then_some(mask)
+        })
+    }
+
     /// Run the DIAKRISIS reflex (`Command::Diagnose`, and every heartbeat since #122): the facade senses
     /// the cell's liveness locally — on the base Fano cell (N=7) a node sees the whole cell through its
     /// lines, so it builds the full degraded mask (spec §6.3) — then hands that sensed snapshot to the
@@ -1742,8 +1879,24 @@ impl<F: Field> OverlayNode<F> {
         let Some((self_index, degraded, alive_count)) = self.cell_liveness(now) else {
             return Vec::new();
         };
-        self.healer
-            .diagnose::<F>(now, self_index, degraded, alive_count, &self.config, self.epoch)
+        let mut effects = self.healer.diagnose::<F>(
+            now,
+            self_index,
+            degraded,
+            alive_count,
+            &self.config,
+            self.epoch,
+        );
+        // §6.4 endpoint cross-attestation (#106): fold this round's per-witness liveness fresh-masks —
+        // reconstructed from the corroborated `witnessed` gossip substrate plus this node's own direct view —
+        // into the Healer's window, and quarantine any colluding vouch-fabricator keeping a corroborated-dead
+        // node believed-alive (the fault the plain corroboration quorum cannot see). The judge adjudicates
+        // only subjects it cannot itself directly confirm alive (`!own_fresh_mask`) — a node it can see is
+        // never adjudicated, so an honest lone-observer is never quarantined (the safeguard the sim pinned).
+        let round = self.endpoint_round_mask(now);
+        let subjects = !self.own_fresh_mask(now) & 0x7F;
+        effects.extend(self.healer.attest_endpoints::<F>(now, round, subjects));
+        effects
     }
 
     /// The current self-healing reroute table (down node → co-linear survivor), for observation.
@@ -2223,7 +2376,10 @@ mod tests {
             for _ in 0..count {
                 node.step(
                     Instant(t),
-                    Input::Message { from, frame: encode(FrameType::Route, b"x") },
+                    Input::Message {
+                        from,
+                        frame: encode(FrameType::Route, b"x"),
+                    },
                 );
                 t += 1;
             }
@@ -2231,8 +2387,14 @@ mod tests {
         node.step(Instant(t), Input::Timer(HEARTBEAT)); // folds the window into `last_sample`
 
         let loads = node.healer.last_sample;
-        assert!((loads[3] - 20.0).abs() < 1e-9, "the flood on point 3 is sensed from one node");
-        assert!((loads[1] - 1.0).abs() < 1e-9, "an idle peer's load is sensed too");
+        assert!(
+            (loads[3] - 20.0).abs() < 1e-9,
+            "the flood on point 3 is sensed from one node"
+        );
+        assert!(
+            (loads[1] - 1.0).abs() < 1e-9,
+            "an idle peer's load is sensed too"
+        );
         assert!(loads[0].abs() < 1e-9, "self (point 0) originated nothing");
         // The derived projective response: the exact global mean at every point (finite-time consensus).
         let mean = loads.iter().sum::<f64>() / 7.0;
@@ -2266,7 +2428,10 @@ mod tests {
                 for _ in 0..count {
                     node.step(
                         Instant(t),
-                        Input::Message { from, frame: encode(FrameType::Route, b"x") },
+                        Input::Message {
+                            from,
+                            frame: encode(FrameType::Route, b"x"),
+                        },
                     );
                     t += 1;
                 }
@@ -2295,7 +2460,9 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         node.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let mut t = 1u64;
-        let base = node.healer.effective_correlation(Config::default().healthy_correlation); // healthy_correlation, before any shed
+        let base = node
+            .healer
+            .effective_correlation(Config::default().healthy_correlation); // healthy_correlation, before any shed
         let mut decoupled_beats = 0usize;
         let mut systemic_seen = false;
         for w in 0..(BEHAVIOR_WINDOW + 2) {
@@ -2349,12 +2516,16 @@ mod tests {
             "the decoupling shed factor is raised (audit C6)"
         );
         assert!(
-            node.healer.effective_correlation(Config::default().healthy_correlation) < base - 1e-9,
+            node.healer
+                .effective_correlation(Config::default().healthy_correlation)
+                < base - 1e-9,
             "the effective correlation is genuinely lowered — Φ headroom restored, not a no-op"
         );
         // The mutable factor really is what scales the correlation (the feedback into Φ).
         assert!(
-            (node.healer.effective_correlation(Config::default().healthy_correlation)
+            (node
+                .healer
+                .effective_correlation(Config::default().healthy_correlation)
                 - Config::default().healthy_correlation * (1.0 - node.healer.decoupling))
                 .abs()
                 < 1e-12

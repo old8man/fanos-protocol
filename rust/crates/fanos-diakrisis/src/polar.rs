@@ -166,7 +166,10 @@ pub fn rho_vector_from_degraded(degraded: u8) -> [f64; N] {
     }
     let total: f64 = gamma.iter().sum();
     core::array::from_fn(|k| {
-        let t_k: f64 = fano::POINT_LINES[k].iter().map(|&l| gamma[l as usize]).sum();
+        let t_k: f64 = fano::POINT_LINES[k]
+            .iter()
+            .map(|&l| gamma[l as usize])
+            .sum();
         (total - t_k) / 6.0
     })
 }
@@ -251,33 +254,43 @@ pub fn byzantine_by_endpoint_majority(
 /// the `6 − f` honest witnesses (of the 6 non-subject nodes) still reach 3 stale for `f ≤ 3`, fixing the truth.
 /// The dual attack — denying a *live* node — is (soundly) never flagged: it is indistinguishable from honest
 /// link failure, so acting on it would quarantine honest nodes, which must never ship.
+///
+/// `subjects` restricts which points are adjudicated (bit `k` set ⇔ class `k` is examined). A vouch and an
+/// honest lone-observation of a node are *identical* at the gossip layer, so the caller passes only the
+/// subjects it cannot itself directly confirm alive (`!own_fresh_mask` in the live wiring): "only
+/// cross-examine testimony about nodes you can't see yourself." This closes the sole honest false-positive —
+/// a node uniquely reachable to one honest witness — without weakening detection, since a truly dead node is
+/// exactly one the honest judge cannot reach. Pass `0x7F` to adjudicate every class.
 #[must_use]
 pub fn fabricators_by_persistent_freshness(
     rounds: &[[Option<u8>; N]],
     min_stale_consensus: usize,
+    subjects: u8,
 ) -> Vec<usize> {
     let mut flagged = Vec::new();
     if rounds.is_empty() {
         return flagged;
     }
     for w in 0..N {
-        let caught = (0..N).filter(|&k| k != w).any(|k| {
-            rounds.iter().all(|round| {
-                // `w` must be present and persistently VOUCH `k` fresh.
-                let Some(mask) = round[w] else {
-                    return false;
-                };
-                if mask & (1u8 << k) == 0 {
-                    return false;
-                }
-                // …while a firm consensus of the OTHER present witnesses (never `k` itself) reports `k` stale.
-                let stale = (0..N)
-                    .filter(|&v| v != w && v != k)
-                    .filter(|&v| round[v].is_some_and(|m| m & (1u8 << k) == 0))
-                    .count();
-                stale >= min_stale_consensus
-            })
-        });
+        let caught = (0..N)
+            .filter(|&k| k != w && subjects & (1u8 << k) != 0)
+            .any(|k| {
+                rounds.iter().all(|round| {
+                    // `w` must be present and persistently VOUCH `k` fresh.
+                    let Some(mask) = round[w] else {
+                        return false;
+                    };
+                    if mask & (1u8 << k) == 0 {
+                        return false;
+                    }
+                    // …while a firm consensus of the OTHER present witnesses (never `k` itself) reports `k` stale.
+                    let stale = (0..N)
+                        .filter(|&v| v != w && v != k)
+                        .filter(|&v| round[v].is_some_and(|m| m & (1u8 << k) == 0))
+                        .count();
+                    stale >= min_stale_consensus
+                })
+            });
         if caught {
             flagged.push(w);
         }
@@ -481,13 +494,13 @@ mod tests {
         let honest = fresh_except(&[6]); // stale on the dead node
         let liar = ALL_FRESH; // vouches the dead node fresh
         let round: [Option<u8>; N] = core::array::from_fn(|w| match w {
-            6 => None,          // the dead node gossips nothing
+            6 => None,           // the dead node gossips nothing
             1 | 4 => Some(liar), // colluding vouch-fabricators
             _ => Some(honest),
         });
         let rounds = [round; 5];
         assert_eq!(
-            fabricators_by_persistent_freshness(&rounds, 3),
+            fabricators_by_persistent_freshness(&rounds, 3, 0x7F),
             std::vec![1, 4],
             "exactly the two persistent vouch-fabricators are caught"
         );
@@ -506,10 +519,11 @@ mod tests {
             _ => Some(honest_stale),
         });
         // In every later round node 2 has caught up (its age crossed τ), so it no longer vouches 6.
-        let settled: [Option<u8>; N] = core::array::from_fn(|w| if w == 6 { None } else { Some(honest_stale) });
+        let settled: [Option<u8>; N] =
+            core::array::from_fn(|w| if w == 6 { None } else { Some(honest_stale) });
         let rounds = [first, settled, settled, settled, settled];
         assert!(
-            fabricators_by_persistent_freshness(&rounds, 3).is_empty(),
+            fabricators_by_persistent_freshness(&rounds, 3, 0x7F).is_empty(),
             "a one-round transient vouch is not persistent ⇒ no fabrication verdict"
         );
     }
@@ -519,10 +533,11 @@ mod tests {
         // A genuine death with everyone honest: all present nodes report 6 stale, nobody vouches it — so
         // there is no VOUCH-vs-firm-STALE contradiction and nobody is flagged. A real crash is not a lie.
         let honest = fresh_except(&[6]);
-        let round: [Option<u8>; N] = core::array::from_fn(|w| if w == 6 { None } else { Some(honest) });
+        let round: [Option<u8>; N] =
+            core::array::from_fn(|w| if w == 6 { None } else { Some(honest) });
         let rounds = [round; 5];
         assert!(
-            fabricators_by_persistent_freshness(&rounds, 3).is_empty(),
+            fabricators_by_persistent_freshness(&rounds, 3, 0x7F).is_empty(),
             "an honestly-reported death is not a fabrication"
         );
     }
@@ -540,7 +555,7 @@ mod tests {
         });
         let rounds = [round; 5];
         assert!(
-            fabricators_by_persistent_freshness(&rounds, 3).is_empty(),
+            fabricators_by_persistent_freshness(&rounds, 3, 0x7F).is_empty(),
             "denying a live node is not a soundly-attributable lie ⇒ never flagged"
         );
     }
@@ -559,14 +574,40 @@ mod tests {
         });
         let rounds = [round; 5];
         assert_eq!(
-            fabricators_by_persistent_freshness(&rounds, 3),
+            fabricators_by_persistent_freshness(&rounds, 3, 0x7F),
             std::vec![1, 3, 5],
             "all three colluders caught at the tolerance boundary"
         );
     }
 
     #[test]
+    fn a_subject_the_judge_can_see_is_not_adjudicated() {
+        // The soundness safeguard: even a textbook fabrication pattern about point 6 is IGNORED when 6 is
+        // excluded from `subjects` — modelling the live judge that directly sees 6 alive (`!own_fresh_mask`
+        // clears bit 6). A vouch is indistinguishable from an honest lone-observation, so the judge only
+        // cross-examines nodes it cannot itself confirm; here it confirms 6, so nobody is flagged.
+        let honest = fresh_except(&[6]);
+        let liar = ALL_FRESH;
+        let round: [Option<u8>; N] = core::array::from_fn(|w| match w {
+            6 => None,
+            1 | 4 => Some(liar),
+            _ => Some(honest),
+        });
+        let rounds = [round; 5];
+        let subjects = 0x7F & !(1u8 << 6); // the judge directly sees 6 ⇒ 6 is not adjudicated
+        assert!(
+            fabricators_by_persistent_freshness(&rounds, 3, subjects).is_empty(),
+            "a subject the judge directly confirms alive is never adjudicated"
+        );
+        // …but with 6 in `subjects` (the judge cannot see 6), the very same data catches both colluders.
+        assert_eq!(
+            fabricators_by_persistent_freshness(&rounds, 3, 0x7F),
+            std::vec![1, 4]
+        );
+    }
+
+    #[test]
     fn an_empty_window_flags_nobody() {
-        assert!(fabricators_by_persistent_freshness(&[], 3).is_empty());
+        assert!(fabricators_by_persistent_freshness(&[], 3, 0x7F).is_empty());
     }
 }

@@ -39,7 +39,9 @@ use std::sync::{Arc, Mutex};
 
 use fanos_field::F2;
 use fanos_geometry::fano;
-use fanos_runtime::{Command, Config, Duration, Effect, Engine, Input, Instant, OverlayNode, Triple};
+use fanos_runtime::{
+    Command, Config, Duration, Effect, Engine, Input, Instant, Notification, OverlayNode, Triple,
+};
 use fanos_sim::{NetworkModel, Sim};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
@@ -121,10 +123,18 @@ impl ByzantineGossiper {
             return effect;
         };
         let forged_view = (self.policy)(view);
-        self.forged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.forged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut out = Vec::new();
-        encode_frame(FrameType::DiagGossip.code(), &encode_view(&forged_view), &mut out);
-        Effect::Send { to: *to, frame: out }
+        encode_frame(
+            FrameType::DiagGossip.code(),
+            &encode_view(&forged_view),
+            &mut out,
+        );
+        Effect::Send {
+            to: *to,
+            frame: out,
+        }
     }
 }
 
@@ -216,7 +226,13 @@ fn fresh_matrix(snap: &[Option<ClaimedView>; N], tau: u16) -> FreshMatrix {
 
 /// Sample the run at `count` snapshots spaced `step_ms` apart, ending at `end_ns` — the persistence window the
 /// windowed rule reasons over.
-fn window(log: &[ViewEvent], end_ns: u64, count: usize, step_ms: u64, tau: u16) -> Vec<FreshMatrix> {
+fn window(
+    log: &[ViewEvent],
+    end_ns: u64,
+    count: usize,
+    step_ms: u64,
+    tau: u16,
+) -> Vec<FreshMatrix> {
     let step_ns = step_ms * 1_000_000;
     (0..count)
         .rev()
@@ -310,7 +326,10 @@ fn build_cell(
             }),
             None => Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default())),
         };
-        sim.add(Box::new(Recorder { inner, log: log.clone() }));
+        sim.add(Box::new(Recorder {
+            inner,
+            log: log.clone(),
+        }));
     }
     sim.inject_all(&Command::StartHeartbeat);
     (sim, log, forged)
@@ -462,6 +481,94 @@ fn fabrication_rule_abstains_on_deny_liars() {
         assert!(
             flagged.is_empty(),
             "seed {seed}: denying a live node is honest-omission-shaped — the rule must abstain, got {flagged:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// End-to-end: the found rule WIRED into the production engine (polar::fabricators_by_persistent_freshness
+// driven from the live `witnessed` substrate in OverlayNode::on_diagnose). The sim exercises the real reflex.
+// ---------------------------------------------------------------------------------------------------------
+
+/// The offline sweep found the rule; here the REAL engine runs it. Two colluders keep a crashed node
+/// believed-alive by vouching it fresh (exceeding `corroboration_quorum = 2`); every honest node's live §6.4
+/// endpoint attestation localizes and QUARANTINES both — and never an honest node. This is full cohesion: the
+/// verified primitive actuated through the production `OverlayNode`, not just in isolation.
+#[test]
+fn the_wired_engine_quarantines_colluding_vouch_fabricators() {
+    let dead = 6usize;
+    let liars = [1usize, 4usize]; // two colluders — one more than the quorum tolerates
+    for seed in 0..4u64 {
+        let mut byz = [NONE_POLICY; N];
+        for &l in &liars {
+            byz[l] = Some(vouch_fresh(dead));
+        }
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.05);
+        let (mut sim, _log, _forged) = build_cell(0x_C0FFEE ^ seed, net, &byz);
+        sim.run_for(Duration::from_millis(3000));
+        sim.crash(fano::point(dead).coords()); // the node truly dies; the colluders alone keep it "alive"
+        sim.run_for(Duration::from_millis(9000));
+
+        let honest: Vec<Triple> = (0..N)
+            .filter(|i| *i != dead && !liars.contains(i))
+            .map(|i| fano::point(i).coords())
+            .collect();
+
+        // Both colluders are quarantined by at least one honest judge (the detection the plain quorum misses).
+        for &l in &liars {
+            let lc = fano::point(l).coords();
+            let caught = sim.report().notifications.iter().any(|o| {
+                honest.contains(&o.node)
+                    && matches!(&o.note, Notification::Quarantined(c) if *c == lc)
+            });
+            assert!(
+                caught,
+                "seed {seed}: colluder {l} must be quarantined by an honest node"
+            );
+        }
+        // The invariant that must never break: no honest node is quarantined, by ANY observer.
+        let honest_hit = sim
+            .report()
+            .notifications
+            .iter()
+            .find_map(|o| match &o.note {
+                Notification::Quarantined(c) if honest.contains(c) => Some((o.node, *c)),
+                _ => None,
+            });
+        assert!(
+            honest_hit.is_none(),
+            "seed {seed}: an honest node was quarantined: {honest_hit:?}"
+        );
+    }
+}
+
+/// The live false-positive guard: seven honest nodes under heavy loss (25 %) + a crash/recover churn produce
+/// NO quarantine at all — the wired detector never mistakes honest omission (a lost ping / a real death
+/// everyone agrees on) for fabrication. This is the property whose *naive* violation reverted the first wiring.
+#[test]
+fn the_wired_engine_never_quarantines_under_honest_churn() {
+    for seed in 0..8u64 {
+        let byz = [NONE_POLICY; N];
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.25);
+        let (mut sim, _log, _forged) = build_cell(0x_B0BA ^ seed, net, &byz);
+        sim.run_for(Duration::from_millis(2500));
+        sim.crash(fano::point(2).coords());
+        sim.run_for(Duration::from_millis(2500));
+        sim.recover(fano::point(2).coords());
+        sim.run_for(Duration::from_millis(4000));
+
+        let quarantines: Vec<Triple> = sim
+            .report()
+            .notifications
+            .iter()
+            .filter_map(|o| match &o.note {
+                Notification::Quarantined(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            quarantines.is_empty(),
+            "seed {seed}: honest churn must never quarantine, got {quarantines:?}"
         );
     }
 }
