@@ -104,7 +104,7 @@ impl ParentCell {
     /// parent's integration budget `phi` (each coarse reroute costs `Φ → Φ/9`, spec §6.7).
     ///
     /// The budget is **enforced** here (not merely reported): at the parent tier every reroute is a
-    /// coarse boundary, so when `Φ` cannot afford even one hop (`Φ < 9` ⇒ [`coarse_budget`] `= 0`,
+    /// coarse boundary, so when `Φ` cannot afford even one hop (`Φ < 9` ⇒ `coarse_budget = 0`,
     /// spec §6.7/V16), the parent does not install an unaffordable reroute — that would itself drive
     /// `Φ → Φ/9 < 1` and disintegrate it — but escalates the coarse residue to the grandparent.
     #[must_use]

@@ -14,7 +14,32 @@
 //! * [`hierarchy`] — scale by a recursion of cells (§L1, V4).
 //!
 //! [`Node`] ties them together: an identity, its epoch coordinate, its quorums, and a
-//! [`diagnose`](fanos_diakrisis::diagnose) health hook.
+//! [`diagnose`] health hook.
+//!
+//! ## Relationship to the shipping engine (`fanos-runtime`)
+//!
+//! There are two node types in this workspace, on purpose — this is a layering, not accidental
+//! duplication (audit #127):
+//!
+//! * **`fanos_core::Node`** (here) is the **network-free algebraic reference**: every operation is a
+//!   deterministic function of coordinates, testable without a clock or a socket. It is what the CLI
+//!   (`fanos-cli`) drives to demonstrate the protocol, what `fanos-sim` borrows hierarchy/admission types
+//!   from, and where the protocol's math (rendezvous, quorum intersection, centrality, descent) is stated
+//!   most directly.
+//! * **`fanos_runtime::OverlayNode`** is the **shipping sans-I/O engine** — the same math re-expressed as a
+//!   `step(now, Input) -> Vec<Effect>` state machine the QUIC driver and the simulator both run (it is what
+//!   the production `fanos` node binary uses).
+//!
+//! They do **not** drift on the load-bearing derivations, because both delegate to the *single sources of
+//! truth* rather than re-deriving: content addressing is [`fanos_primitives::storage_point`]
+//! ([`routing::content_address`] — the C7-unified storage domain, pinned by
+//! `content_address_uses_the_storage_domain_matching_the_engine`), and the epoch coordinate is
+//! [`fanos_vrf::prove_coordinate`] ([`membership::Member::assign`]) — the very functions the engine calls.
+//! So the reference and the engine agree by construction on where data lives and where a node sits; what
+//! differs is only the *shape* (pure functions vs. an effectful step loop). The `admission::AdmissionPolicy`
+//! trait is shared **into** the engine (`fanos-runtime` depends on it), so the Sybil gate is one
+//! implementation, not two. A future convergence could retire `fanos_core::Node` in favour of driving the
+//! CLI on the shipping engine, but it is not required for correctness and is not a source of divergence.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
