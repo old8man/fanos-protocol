@@ -25,8 +25,11 @@ use crate::conn::Connection;
 use crate::handshake::StaticKeypair;
 use crate::session::{self, Dialed, PendingDial};
 
-/// An overlay coordinate (the base cell address a payload is sent to).
-pub type Coord = [u32; 3];
+/// An overlay coordinate (the base cell address a payload is sent to) — the shared projective
+/// [`Triple`](fanos_ports::Triple), named for its role at this service seam rather than redefined as a
+/// second bare `[u32; 3]` alias (audit C4/#126): a diaulos `Coord` and a `Command::Send { to }` are now
+/// literally one type, so they cannot silently diverge.
+pub use fanos_ports::Triple as Coord;
 
 const TAG_HELLO: u8 = 0x01;
 const TAG_CELL: u8 = 0x02;

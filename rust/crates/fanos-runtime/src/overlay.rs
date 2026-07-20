@@ -714,6 +714,18 @@ impl Healer {
     }
 }
 
+/// A projective point in the **content-address domain** (`MapToPoint(H(key))`, spec §L4): where a key
+/// *ideally* lives, before the cell's actual occupancy is consulted. It is a distinct type from a node
+/// coordinate on purpose (audit C4/#126): it carries no way to become a send target directly, so the
+/// #123 send-to-nobody class — routing a `Put`/`Get` to a never-occupied content point — cannot happen by
+/// construction. A content point is a routing target only once [`OverlayNode::responsible_point`] resolves
+/// it to the nearest *occupied* node coordinate. It deliberately shares the plane's index ring with node
+/// coordinates (that sharing is exactly what makes consistent hashing's "nearest occupied point"
+/// meaningful), so the distinction is one of ROLE — enforced by requiring the explicit resolution step —
+/// not of geometry.
+#[derive(Clone, Copy)]
+struct ContentPoint<F: Field>(Point<F>);
+
 /// The base overlay node engine, generic over the cell's field `F`.
 pub struct OverlayNode<F: Field> {
     coord: Point<F>,
@@ -1221,27 +1233,26 @@ impl<F: Field> OverlayNode<F> {
     }
 
     /// The DHT storage address of `key`: the digest and the **ideal** responsible point (spec §L4). The
-    /// *actual* responsible node is [`responsible_point`](Self::responsible_point) applied to this ideal —
-    /// the nearest occupied point — since a real cell rarely occupies every point exactly.
-    fn address_of(key: &[u8]) -> ([u8; DIGEST], Triple) {
+    /// point is a [`ContentPoint`], not a routing target — the *actual* responsible node is
+    /// [`responsible_point`](Self::responsible_point) applied to this ideal (the nearest occupied point),
+    /// since a real cell rarely occupies every point exactly.
+    fn address_of(key: &[u8]) -> ([u8; DIGEST], ContentPoint<F>) {
         // The one storage-address rule (`fanos_primitives`): digest keys the store, point routes to it —
         // both on the STORAGE domain, so they can never drift to different hashes (audit C7).
-        (storage_digest(key), storage_point::<F>(key).coords())
+        (storage_digest(key), ContentPoint(storage_point::<F>(key)))
     }
 
     /// The node responsible for an ideal storage point: the nearest **occupied** point at or after
     /// `ideal`'s canonical index, wrapping the ring — consistent hashing on projective coordinates
-    /// (spec §L0 "the responsible node is the nearest occupied point"). On a full cell this is `ideal`
-    /// itself; on a sparse or churning cell — the *normal* condition, since independent VRF placement
-    /// covers only a fraction of a plane's points — it routes the key to a live member instead of a
-    /// never-occupied point where a `Put`/`Get` would be a silent send-to-nobody (audit #123). The
-    /// occupied set is this node plus every announced member, so all nodes sharing a membership view
-    /// resolve the same responsible node.
-    fn responsible_point(&self, ideal: Triple) -> Triple {
-        let Some(ideal_pt) = Point::<F>::new(ideal) else {
-            return ideal; // not a canonical point — route as-is
-        };
-        let ideal_idx = ideal_pt.index();
+    /// (spec §L0 "the responsible node is the nearest occupied point"). This is the sole bridge from the
+    /// content-address domain ([`ContentPoint`]) to a node coordinate: on a full cell it is `ideal` itself;
+    /// on a sparse or churning cell — the *normal* condition, since independent VRF placement covers only a
+    /// fraction of a plane's points — it routes the key to a live member instead of a never-occupied point
+    /// where a `Put`/`Get` would be a silent send-to-nobody (audit #123). The occupied set is this node
+    /// plus every announced member, so all nodes sharing a membership view resolve the same responsible
+    /// node.
+    fn responsible_point(&self, ideal: ContentPoint<F>) -> Triple {
+        let ideal_idx = ideal.0.index();
         // Occupied points by canonical index: this node, every cell peer we have heard from (its
         // algebraic slot is actually filled by a live node — liveness populates this even before any
         // JOIN/Announce), and every announced member. A NEVER-occupied point is simply absent, so it
@@ -1260,11 +1271,13 @@ impl<F: Field> OverlayNode<F> {
             .collect();
         occupied.insert(self.coord.index());
         // Successor on the index ring: the smallest occupied index >= ideal, else wrap to the smallest.
+        // The occupied set always contains this node, so the `.or_else` fallback never yields `None` and
+        // the `map_or` default (the ideal point itself) is unreachable — kept only for totality.
         occupied
             .range(ideal_idx..)
             .next()
             .or_else(|| occupied.iter().next())
-            .map_or(ideal, |&i| Point::<F>::at(i).coords())
+            .map_or(ideal.0.coords(), |&i| Point::<F>::at(i).coords())
     }
 
     /// `Command::Put` — store a value at its responsible point and replicate it across the cell.
