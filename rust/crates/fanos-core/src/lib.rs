@@ -9,6 +9,8 @@
 //! * [`routing`] — O(1) rendezvous, bridges, multipath, content addressing (§L1/§L4).
 //! * [`quorum`] — Maekawa quorums with guaranteed intersection (§L4).
 //! * [`membership`] — coordinates and the structural centrality cap (§L0/§L3, V3).
+//! * [`admission`] — pluggable Sybil admission (PoW today; stake/WoT next), the per-join cost
+//!   the structural cap alone does not provide (§L3).
 //! * [`hierarchy`] — scale by a recursion of cells (§L1, V4).
 //!
 //! [`Node`] ties them together: an identity, its epoch coordinate, its quorums, and a
@@ -19,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod admission;
 pub mod hierarchy;
 pub mod membership;
 pub mod quorum;
@@ -32,6 +35,7 @@ pub use fanos_geometry::{Line, Plane, Point};
 pub use fanos_primitives::{BeaconSeed, Epoch, HybridPublicKey, NodeId};
 pub use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
 
+pub use admission::{AdmissionPolicy, PowAdmission};
 pub use hierarchy::Hierarchy;
 pub use membership::Member;
 pub use quorum::Quorum;

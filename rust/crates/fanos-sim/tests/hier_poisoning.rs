@@ -24,7 +24,9 @@ use fanos_runtime::overlay::descriptor_message;
 use fanos_runtime::{Command, Config, Effect, Engine, Input, Instant, OverlayNode};
 use fanos_wire::{FrameType, encode_frame};
 
-/// Build an `Announce` wire frame `coord ‖ hier ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖ info`.
+/// Build an `Announce` wire frame `coord ‖ hier ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖
+/// proof_len(2) ‖ proof ‖ info` (`proof` is always empty here — Sybil admission is untested by
+/// this file; see `sybil_admission.rs`).
 fn announce_frame<F: Field>(
     coord: Triple,
     hier: &HierAddr<F>,
@@ -41,6 +43,7 @@ fn announce_frame<F: Field>(
     body.extend_from_slice(id);
     body.extend_from_slice(&(u16::try_from(sig.len()).unwrap()).to_be_bytes());
     body.extend_from_slice(sig);
+    body.extend_from_slice(&0u16.to_be_bytes()); // proof_len = 0
     body.extend_from_slice(info);
     let mut frame = Vec::new();
     encode_frame(FrameType::Announce.code(), &body, &mut frame);

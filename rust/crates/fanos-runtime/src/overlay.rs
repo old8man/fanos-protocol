@@ -6,9 +6,11 @@
 //! reacts only to [`Input`]s and emits only [`Effect`]s — no clock, socket, or RNG — so the
 //! same code runs under the simulator and a real transport.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use fanos_core::AdmissionPolicy;
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::polar;
@@ -18,7 +20,7 @@ use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple, fano, next_hop};
 use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
-use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
+use fanos_wire::{FrameType, ProtocolError, Wire, decode_frame, encode_frame};
 
 /// Storage `Publish` sub-type: the responsible node fans out replicas; a replica just stores.
 const PUBLISH_ORIGIN: u8 = 0;
@@ -97,6 +99,17 @@ pub struct Config {
     /// poisoning resistance — a peer then cannot announce an overlay address it did not earn, so
     /// attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding (threat §79/B1).
     pub require_self_certified_membership: bool,
+    /// Whether to require **Sybil admission** (spec §L3): an announcing peer's proof must
+    /// satisfy this node's admission policy (a builder-installed
+    /// `Box<dyn `[`AdmissionPolicy`]`>`, e.g. [`fanos_core::PowAdmission`]) or the announcement
+    /// is rejected — not admitted to `members`, and told why (`SYBIL_REJECT`, spec §7.5) —
+    /// rather than merely trusted as today. Off by default, matching every other opt-in
+    /// membership guard here (`require_self_certified_membership`); the structural centrality
+    /// cap (spec §L3, V3) always applies regardless, since it needs no configuration to hold.
+    /// On for a deployment that wants the missing per-admission cost the `sybil_cost.rs`
+    /// threat-model derivation shows the geometry alone does not provide. **Fails closed**:
+    /// turning this on with no policy installed rejects every peer, never silently admits.
+    pub require_admission: bool,
 }
 
 impl Default for Config {
@@ -109,6 +122,7 @@ impl Default for Config {
             corroboration_quorum: 2,
             read_timeout: Duration::from_millis(1600),
             require_self_certified_membership: false,
+            require_admission: false,
         }
     }
 }
@@ -175,6 +189,16 @@ pub struct OverlayNode<F: Field> {
     /// transport coordinate for an identity's address without that identity's private key (§79/§80,
     /// the transport-hijack defence). Empty when unsigned.
     descriptor_sig: Vec<u8>,
+    /// This node's own Sybil-admission proof (spec §L3), attached to its `Announce` when it
+    /// joins. Empty when admission is not in use for this deployment — a peer that requires
+    /// admission then rejects it (fail closed), exactly as an empty `identity`/`descriptor_sig`
+    /// is rejected under `require_self_certified_membership`.
+    admission_proof: Vec<u8>,
+    /// This node's Sybil admission policy (spec §L3): checked against a peer's announced proof
+    /// when `config.require_admission` is set. `None` even with the flag set means this node
+    /// enforces the check but has no policy to check *against* — it then rejects every peer
+    /// (fail closed, never fail open) rather than silently admitting for want of configuration.
+    admission_policy: Option<Box<dyn AdmissionPolicy>>,
     config: Config,
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
@@ -326,6 +350,8 @@ impl<F: Field> OverlayNode<F> {
             hier_peers: BTreeMap::new(),
             identity: Vec::new(),
             descriptor_sig: Vec::new(),
+            admission_proof: Vec::new(),
+            admission_policy: None,
             config,
             started_at: Instant::default(),
             peers,
@@ -653,6 +679,29 @@ impl<F: Field> OverlayNode<F> {
     pub fn with_signed_descriptor(mut self, id: Vec<u8>, sig: Vec<u8>) -> Self {
         self.identity = id;
         self.descriptor_sig = sig;
+        self
+    }
+
+    /// Seat this node's own **Sybil-admission proof** (builder), e.g. produced by
+    /// [`fanos_core::PowAdmission::solve`] over [`admission_challenge`] for this node's
+    /// coordinate and current epoch. Carried in this node's `Announce`; a peer with
+    /// `config.require_admission` set checks it against its own installed policy. Only
+    /// meaningful once `admission_challenge(self.coord.coords(), epoch)` is what a receiving
+    /// peer will re-derive — i.e. the proof was solved for *this* coordinate and an epoch the
+    /// peer still accepts.
+    #[must_use]
+    pub fn with_admission_proof(mut self, proof: Vec<u8>) -> Self {
+        self.admission_proof = proof;
+        self
+    }
+
+    /// Install this node's Sybil admission policy (builder): what a peer's announced proof is
+    /// checked against when `config.require_admission` is set (spec §L3). Not needed to
+    /// *present* a proof when joining — only to *verify* one others present, so a pure joiner
+    /// need not install a policy, only [`with_admission_proof`](Self::with_admission_proof).
+    #[must_use]
+    pub fn with_admission_policy(mut self, policy: Box<dyn AdmissionPolicy>) -> Self {
+        self.admission_policy = Some(policy);
         self
     }
 
@@ -1008,6 +1057,7 @@ impl<F: Field> OverlayNode<F> {
                 &self.hier,
                 &self.identity,
                 &self.descriptor_sig,
+                &self.admission_proof,
                 &info,
             ),
         );
@@ -1019,7 +1069,7 @@ impl<F: Field> OverlayNode<F> {
     /// A received announcement: on first sight of a member, record it, notify, and re-flood so the
     /// key propagates cell-wide; on a repeat, drop (the monotone guard terminates the flood).
     fn on_announce(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((coord, hier, id, sig, info)) = parse_announce::<F>(body) else {
+        let Some((coord, hier, id, sig, proof, info)) = parse_announce::<F>(body) else {
             return Vec::new();
         };
         // Validate: a member coordinate must be a real, canonical projective point of this plane.
@@ -1030,6 +1080,26 @@ impl<F: Field> OverlayNode<F> {
         let Some(coord) = Point::<F>::new(coord).map(|p| p.coords()) else {
             return Vec::new();
         };
+        // Sybil admission (opt-in, spec §L3, §7.8 JOIN step 2): the FIRST gate, ahead of
+        // self-certification and membership — a per-admission cost is exactly what the
+        // structural centrality cap alone does not provide (`sybil_cost.rs`). Fails **closed**:
+        // requiring admission with no policy installed rejects every peer, never silently
+        // admits. A rejection is not admitted to `members` and is told why (`SYBIL_REJECT`,
+        // spec §7.5), sent to the *claimed* coordinate rather than the immediate relay hop —
+        // `Announce` is flooded, so whoever forwarded it to us need not be the joiner itself.
+        if self.config.require_admission {
+            let challenge = admission_challenge(coord, self.epoch);
+            let admitted = self
+                .admission_policy
+                .as_deref()
+                .is_some_and(|policy| policy.admits(&challenge, &proof));
+            if !admitted {
+                return alloc::vec![Effect::Send {
+                    to: coord,
+                    frame: encode_error(ProtocolError::SybilReject),
+                }];
+            }
+        }
         // Self-certified membership (opt-in) drops the whole announcement unless BOTH hold:
         //  1. the overlay address is the identity's own derived descent chain — else it is a
         //     routing-table poisoning attempt (a peer claiming an address it did not earn to attract a
@@ -1057,7 +1127,7 @@ impl<F: Field> OverlayNode<F> {
         self.learn_hier_peer(hier.clone(), coord);
         let frame = encode(
             FrameType::Announce,
-            &announce_body(coord, &hier, &id, &sig, &info),
+            &announce_body(coord, &hier, &id, &sig, &proof, &info),
         );
         let mut effects = self.flood(&frame);
         effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
@@ -1465,17 +1535,21 @@ fn descriptor_signature_ok<F: Field>(
     verifier.verify(&msg, &signature)
 }
 
-/// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖ info` (spec
-/// §7.8 JOIN, §L1 address, §80 signed descriptor). `coord` is the transport point peers send to; `hier`
-/// is the announcer's overlay address, so a receiver seeds its routing table (`hier → coord`). `id` is
-/// the announcer's identity bundle (§L0) — the address derives from it — and `sig` is the hybrid
-/// signature over [`descriptor_message`] binding the coordinate to that identity. Every variable field
-/// is length- or self-delimited, so `info` follows unambiguously.
+/// An `Announce` body: `coord(12) ‖ hier(1+depth×12) ‖ id_len(2) ‖ id ‖ sig_len(2) ‖ sig ‖
+/// proof_len(2) ‖ proof ‖ info` (spec §7.8 JOIN, §L1 address, §80 signed descriptor, §L3 Sybil
+/// admission). `coord` is the transport point peers send to; `hier` is the announcer's overlay
+/// address, so a receiver seeds its routing table (`hier → coord`). `id` is the announcer's
+/// identity bundle (§L0) — the address derives from it — `sig` is the hybrid signature over
+/// [`descriptor_message`] binding the coordinate to that identity, and `proof` is the
+/// announcer's Sybil-admission proof, checked against [`admission_challenge`]`(coord, epoch)`
+/// by a peer requiring admission. Every variable field is length- or self-delimited, so `info`
+/// follows unambiguously.
 fn announce_body<F: Field>(
     coord: Triple,
     hier: &HierAddr<F>,
     id: &[u8],
     sig: &[u8],
+    proof: &[u8],
     info: &[u8],
 ) -> Vec<u8> {
     let hier_bytes = hier.encode();
@@ -1483,23 +1557,30 @@ fn announce_body<F: Field>(
     let id = id.get(..usize::from(id_len)).unwrap_or(id);
     let sig_len = u16::try_from(sig.len()).unwrap_or(u16::MAX);
     let sig = sig.get(..usize::from(sig_len)).unwrap_or(sig);
-    let mut body =
-        Vec::with_capacity(12 + hier_bytes.len() + 2 + id.len() + 2 + sig.len() + info.len());
+    let proof_len = u16::try_from(proof.len()).unwrap_or(u16::MAX);
+    let proof = proof.get(..usize::from(proof_len)).unwrap_or(proof);
+    let mut body = Vec::with_capacity(
+        12 + hier_bytes.len() + 2 + id.len() + 2 + sig.len() + 2 + proof.len() + info.len(),
+    );
     body.extend_from_slice(&fanos_geometry::encode_triple(coord));
     body.extend_from_slice(&hier_bytes);
     body.extend_from_slice(&id_len.to_be_bytes());
     body.extend_from_slice(id);
     body.extend_from_slice(&sig_len.to_be_bytes());
     body.extend_from_slice(sig);
+    body.extend_from_slice(&proof_len.to_be_bytes());
+    body.extend_from_slice(proof);
     body.extend_from_slice(info);
     body
 }
 
-/// The parsed pieces of an `Announce` body: `(coord, hier, id, sig, info)` (see [`parse_announce`]).
-type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<u8>);
+/// The parsed pieces of an `Announce` body: `(coord, hier, id, sig, proof, info)` (see
+/// [`parse_announce`]).
+type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
-/// Parse an `Announce` body into `(coord, hier, id, sig, info)`. `None` on a short buffer or a
-/// non-canonical hierarchical address (so a forged announce cannot inject a bogus routing-table entry).
+/// Parse an `Announce` body into `(coord, hier, id, sig, proof, info)`. `None` on a short buffer
+/// or a non-canonical hierarchical address (so a forged announce cannot inject a bogus
+/// routing-table entry).
 fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
     let coord = fanos_geometry::decode_triple(body.get(..12)?)?;
     let rest = body.get(12..)?;
@@ -1511,8 +1592,55 @@ fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
     let after_id = after_hier.get(2 + id_len..)?;
     let sig_len = usize::from(u16::from_be_bytes(after_id.get(0..2)?.try_into().ok()?));
     let sig = after_id.get(2..2 + sig_len)?.to_vec();
-    let info = after_id.get(2 + sig_len..)?.to_vec();
-    Some((coord, hier, id, sig, info))
+    let after_sig = after_id.get(2 + sig_len..)?;
+    let proof_len = usize::from(u16::from_be_bytes(after_sig.get(0..2)?.try_into().ok()?));
+    let proof = after_sig.get(2..2 + proof_len)?.to_vec();
+    let info = after_sig.get(2 + proof_len..)?.to_vec();
+    Some((coord, hier, id, sig, proof, info))
+}
+
+/// The domain-separated Sybil-admission challenge for a joiner at `coord` in `epoch` (spec §L3):
+/// what an [`AdmissionPolicy`] proof is checked against ([`OverlayNode::with_admission_policy`]).
+/// Binding the coordinate and epoch means a proof cannot be replayed at a different address or
+/// reused past an epoch roll. A live per-epoch beacon *seed* is not yet wired into
+/// `OverlayNode` (§L3.2 / A7 Level B is tracked separately, not by this task); once it is,
+/// folding it in here strengthens the binding as a drop-in change, not a redesign — `epoch`
+/// already rotates unpredictably under the flooded beacon (`on_beacon`), so the binding is real
+/// today, just not yet as strong as the full spec picture.
+#[must_use]
+pub fn admission_challenge(coord: Triple, epoch: Epoch) -> Vec<u8> {
+    let mut challenge = Vec::with_capacity(12 + 4);
+    challenge.extend_from_slice(&fanos_geometry::encode_triple(coord));
+    challenge.extend_from_slice(&epoch.low32_be_bytes());
+    challenge
+}
+
+/// An `Error` frame body: `code(8B BE) ‖ reason` — the numeric [`ProtocolError`] code and an
+/// optional UTF-8 reason (empty here; a human-readable reason is left to the wire-handshake
+/// follow-up, task #100). Canonical derived codec (audit A1) — one definition, one encoding,
+/// the same `#[derive(Wire)]` pattern [`LookupBody`] uses above: a `u64` field's canonical
+/// encoding is a fixed 8-byte big-endian integer (`fanos_wire::wire::impl_wire_int!`), not a
+/// true LEB128 varint. Spec §7.5 describes the ERROR frame prose-level as "a varint code" —
+/// this preliminary body is a real, working `SYBIL_REJECT` producer ahead of that, not the
+/// formalization; reconciling the exact on-wire integer width against the spec text (or
+/// widening the derive's integer convention itself) is task #100's, not this one's, to settle.
+#[derive(fanos_wire_derive::Wire)]
+struct ErrorBody {
+    code: u64,
+    reason: Vec<u8>,
+}
+
+/// An `Error` frame carrying `err`'s numeric code (spec §7.5), e.g. `SYBIL_REJECT` on a failed
+/// admission check.
+fn encode_error(err: ProtocolError) -> Vec<u8> {
+    encode(
+        FrameType::Error,
+        &ErrorBody {
+            code: err.code(),
+            reason: Vec::new(),
+        }
+        .to_wire(),
+    )
 }
 
 #[cfg(test)]
@@ -1674,7 +1802,10 @@ mod tests {
             .count();
         assert_eq!(pings, 6, "pings all 6 neighbours");
         assert_eq!(gossips, 6, "gossips its health-view to all 6 neighbours");
-        assert_eq!(attests, 6, "attests its polar cross-attestation to all 6 neighbours");
+        assert_eq!(
+            attests, 6,
+            "attests its polar cross-attestation to all 6 neighbours"
+        );
         assert_eq!(arms, 1, "re-arms the heartbeat");
     }
 
@@ -2136,7 +2267,7 @@ mod tests {
         let peer_addr = HierAddr::root(Point::<F2>::at(3));
         let honest = encode(
             FrameType::Announce,
-            &announce_body(peer, &peer_addr, b"", b"", b"HONEST"),
+            &announce_body(peer, &peer_addr, b"", b"", b"", b"HONEST"),
         );
         let e1 = node.step(
             Instant(1),
@@ -2154,7 +2285,7 @@ mod tests {
         // A repeat for the same coord with attacker keys must NOT overwrite or re-notify.
         let forged = encode(
             FrameType::Announce,
-            &announce_body(peer, &peer_addr, b"", b"", b"ATTACKER"),
+            &announce_body(peer, &peer_addr, b"", b"", b"", b"ATTACKER"),
         );
         let e2 = node.step(
             Instant(2),
@@ -2177,7 +2308,7 @@ mod tests {
         let count_before = node.members().count();
         let zero = encode(
             FrameType::Announce,
-            &announce_body([0, 0, 0], &peer_addr, b"", b"", b"ZERO"),
+            &announce_body([0, 0, 0], &peer_addr, b"", b"", b"", b"ZERO"),
         );
         node.step(Instant(3), Input::Message { from, frame: zero });
         assert_eq!(

@@ -103,13 +103,14 @@ fn forged_announce(coord: Triple, info: &[u8]) -> Vec<u8> {
     let hier =
         Point::<F2>::new(coord).map_or_else(|| HierAddr::root(Point::<F2>::at(0)), HierAddr::root);
     let hier_bytes = hier.encode();
-    let mut body = Vec::with_capacity(12 + hier_bytes.len() + 2 + info.len());
+    let mut body = Vec::with_capacity(12 + hier_bytes.len() + 2 + 2 + 2 + info.len());
     for word in coord {
         body.extend_from_slice(&word.to_be_bytes());
     }
     body.extend_from_slice(&hier_bytes);
     body.extend_from_slice(&0u16.to_be_bytes()); // id_len = 0 (self-certification off in this test)
     body.extend_from_slice(&0u16.to_be_bytes()); // sig_len = 0
+    body.extend_from_slice(&0u16.to_be_bytes()); // proof_len = 0 (Sybil admission off in this test)
     body.extend_from_slice(info);
     frame(FrameType::Announce, &body)
 }
