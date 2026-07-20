@@ -152,6 +152,77 @@ pub fn sum_rules_hold(rates: &[[f64; N]; N], tol: f64) -> bool {
     violated_classes(rates, tol).is_empty()
 }
 
+/// A node's full **polar vector** `ρ` — its opinion of all 7 polar values — from its own liveness view
+/// `degraded` (bit `p` set ⇔ point `p` reads down), via the T-226 forward model: each line's rate `γ_ℓ` is
+/// its count of degraded points, and `ρ_k = (G − T_k)/6` with `G = Σγ`, `T_k = Σ_{ℓ∋k} γ_ℓ`. This is the
+/// per-class value the [`mediator_attestation`] returns three (equal) copies of; here the whole vector, so
+/// a node's opinion of a class it is an ENDPOINT of (not just the one it mediates) is available for the
+/// §6.4 endpoint cross-attestation.
+#[must_use]
+pub fn rho_vector_from_degraded(degraded: u8) -> [f64; N] {
+    let mut gamma = [0.0f64; N];
+    for (l, g) in gamma.iter_mut().enumerate() {
+        *g = f64::from((degraded & fano::INCIDENCE[l]).count_ones());
+    }
+    let total: f64 = gamma.iter().sum();
+    core::array::from_fn(|k| {
+        let t_k: f64 = fano::POINT_LINES[k].iter().map(|&l| gamma[l as usize]).sum();
+        (total - t_k) / 6.0
+    })
+}
+
+/// The **§6.4 endpoint cross-attestation closure**: catch a *consistent* liar — a Byzantine node whose
+/// self-report is internally consistent (so [`violated_classes`] passes it) but uniformly FALSE.
+///
+/// `reports[w]` is witness `w`'s polar vector [`rho_vector_from_degraded`] reconstructed from the liveness
+/// view `w` gossiped, or `None` if `w` has not gossiped a fresh view (ABSENT — excluded from both the vote
+/// and any verdict, so a silent node is never mistaken for a liar). For each polar class `k`, the value
+/// `ρ_k` is a single global scalar that EVERY node computes; the mediator `k` and both endpoints of each of
+/// `k`'s channels are independent witnesses of it. So we majority-vote the present opinions of `ρ_k`: if a
+/// stable majority of at least `min_agree` witnesses agree on a value (within `tol`), that is the truth —
+/// the honest supermajority who share the corroborated liveness view — and any PRESENT witness deviating
+/// from it (or reporting a non-finite value) is Byzantine on class `k`. If NO such majority exists (a churn
+/// transient where honest views have not yet converged, or too few have reported), the class yields no
+/// verdict — churn-safe. A node flagged on any class it witnesses is returned.
+///
+/// **Soundness.** With `min_agree = ⌈(N+1)/2⌉ = 4` on the Fano cell, the check tolerates up to 3 Byzantine
+/// nodes: the ≥4 honest witnesses form the majority and fix `ρ_k` to the truth, so a liar's fabricated `ρ_k`
+/// (whether it lies "consistently" or not — the vector format admits no per-channel equivocation) is
+/// outvoted and caught. This complements the mediator model (which catches an equivocator via within-class
+/// inconsistency) with the consistent-liar case it structurally cannot see.
+#[must_use]
+pub fn byzantine_by_endpoint_majority(
+    reports: &[Option<[f64; N]>; N],
+    tol: f64,
+    min_agree: usize,
+) -> Vec<usize> {
+    let mut flagged = [false; N];
+    for k in 0..N {
+        let opinions: [Option<f64>; N] = core::array::from_fn(|w| reports[w].map(|r| r[k]));
+        // The truth is a value at least `min_agree` PRESENT, finite opinions share within `tol`.
+        let truth = opinions.iter().flatten().copied().find(|&v| {
+            v.is_finite()
+                && opinions
+                    .iter()
+                    .flatten()
+                    .filter(|&&x| x.is_finite() && (x - v).abs() <= tol)
+                    .count()
+                    >= min_agree
+        });
+        if let Some(truth) = truth {
+            for (w, op) in opinions.iter().enumerate() {
+                // Only a node that ACTUALLY reported can be flagged; an absent witness is never a liar.
+                if let Some(op) = op
+                    && (!op.is_finite() || (op - truth).abs() > tol)
+                {
+                    flagged[w] = true;
+                }
+            }
+        }
+    }
+    (0..N).filter(|&w| flagged[w]).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -261,6 +332,70 @@ mod tests {
             violated,
             std::vec![k],
             "only the mediator's class is flagged"
+        );
+    }
+
+    #[test]
+    fn rho_vector_agrees_with_the_mediator_attestation_for_every_liveness_pattern() {
+        // The full polar vector's k-th entry IS the (single) value the mediator of class k attests — the
+        // two derivations of ρ_k must coincide for every degraded mask, so the endpoint cross-check and the
+        // mediator model speak of the same quantity.
+        for degraded in 0u8..=0x7F {
+            let rho = rho_vector_from_degraded(degraded);
+            for k in 0..N {
+                let [m0, _, _] = mediator_attestation(k, degraded);
+                assert!((rho[k] - m0).abs() < 1e-9, "k={k} degraded={degraded:#09b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_consistent_liar_is_caught_by_the_endpoint_majority() {
+        // §6.4 closure: an honest cell shares one liveness view, so every node's reconstructed ρ vector is
+        // identical — a supermajority. A CONSISTENT liar (self-consistent reports the mediator model passes)
+        // fabricates a DIFFERENT view; its ρ vector deviates and is outvoted by the honest endpoints who
+        // directly witness the channels. Six honest (view D), one liar (view D'): only the liar is flagged.
+        let honest = rho_vector_from_degraded(0b000_0001); // point 0 down
+        let liar = rho_vector_from_degraded(0b000_0110); // a fabricated, different view
+        let mut reports = [Some(honest); N];
+        reports[6] = Some(liar);
+        assert_eq!(
+            byzantine_by_endpoint_majority(&reports, 1e-9, 4),
+            std::vec![6],
+            "the lone consistent liar is caught; the honest majority is untouched"
+        );
+    }
+
+    #[test]
+    fn three_byzantine_liars_are_all_caught_while_four_honest_hold_the_truth() {
+        // The tolerance bound on the Fano cell: with min_agree = ⌈(7+1)/2⌉ = 4, the check withstands up to
+        // 3 Byzantine — the 4 honest witnesses fix ρ, and all 3 liars (each a distinct fabricated view) are
+        // flagged, none of the honest.
+        let honest = rho_vector_from_degraded(0b000_0001);
+        let mut reports = [Some(honest); N];
+        reports[4] = Some(rho_vector_from_degraded(0b000_0010));
+        reports[5] = Some(rho_vector_from_degraded(0b000_0100));
+        reports[6] = Some(rho_vector_from_degraded(0b000_1000));
+        assert_eq!(
+            byzantine_by_endpoint_majority(&reports, 1e-9, 4),
+            std::vec![4, 5, 6],
+            "all three liars caught, the four honest hold"
+        );
+    }
+
+    #[test]
+    fn no_stable_majority_yields_no_verdict_churn_safe() {
+        // Churn-safety: below the majority (here only 3 witnesses reported a finite view, the rest have not
+        // gossiped ⇒ non-finite), NO class reaches min_agree = 4, so there is NO truth to deviate from and
+        // NOBODY is flagged — a transient, unconverged view never quarantines an honest node.
+        let view = rho_vector_from_degraded(0b000_0001);
+        let mut reports: [Option<[f64; N]>; N] = [None; N]; // most nodes have not gossiped yet
+        reports[0] = Some(view);
+        reports[1] = Some(view);
+        reports[2] = Some(view); // only 3 agree — one short of the majority
+        assert!(
+            byzantine_by_endpoint_majority(&reports, 1e-9, 4).is_empty(),
+            "no stable majority ⇒ no Byzantine verdict (churn-safe); absent nodes are never flagged"
         );
     }
 }
