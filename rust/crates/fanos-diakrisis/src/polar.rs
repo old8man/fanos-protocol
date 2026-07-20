@@ -93,6 +93,35 @@ pub fn polar_values(rates: &[[f64; N]; N]) -> [f64; N] {
     rho
 }
 
+/// The honest polar-class cross-attestation node `k` gossips (spec §6.4): the 3 rates for the 3
+/// channels `k` mediates (`polar_class(k)`), derived from a cell-wide liveness snapshot
+/// `degraded` (bit `p` set ⇔ Fano point `p` currently reads down) via the T-226 forward rate
+/// model — each line's rate `γ_l` is its count of degraded points, and
+/// [`line_rates_to_pair_rates`] turns that into the pairwise matrix (spec §6.2).
+///
+/// Because `ρ_k = (G − T_k)/6` depends only on the mediator `k`, never on which of its 3 pairs is
+/// asked, **the 3 returned values are always mutually equal, for every possible `degraded`
+/// pattern** (see `mediator_attestation_is_always_internally_consistent` below) — an
+/// honestly-reporting mediator's own class can therefore never look inconsistent, however many
+/// cell members are simultaneously down. This is what makes the live wiring
+/// (`fanos_runtime::overlay::OverlayNode`) safe against ordinary crash/churn: only a node that
+/// deviates from this formula when it actually gossips — an equivocator — can produce a class
+/// whose 3 attested values disagree, and [`violated_classes`] then catches exactly that (spec
+/// §6.4: "an equivocating node produces inconsistencies on all q+1 of its lines at once").
+#[must_use]
+pub fn mediator_attestation(k: usize, degraded: u8) -> [f64; 3] {
+    let mut gamma = [0.0f64; N];
+    for (l, rate) in gamma.iter_mut().enumerate() {
+        *rate = (degraded & fano::INCIDENCE[l]).count_ones() as f64;
+    }
+    let matrix = line_rates_to_pair_rates(gamma);
+    let mut out = [0.0f64; 3];
+    for (slot, (a, b)) in out.iter_mut().zip(polar_class(k)) {
+        *slot = matrix[a][b];
+    }
+    out
+}
+
 /// Check the fourteen polar equalities against a measured `7×7` rate matrix. Returns the list
 /// of polar points `k` whose class violates the identity beyond `tol` — an empty list means
 /// the wiring is a clean Fano plane (spec §6.2 selector T-226(vi)).
@@ -181,6 +210,39 @@ mod tests {
         let back = polar_values_to_line_rates(rho);
         for i in 0..N {
             assert!((gamma[i] - back[i]).abs() < 1e-9, "γ[{i}] mismatch");
+        }
+    }
+
+    #[test]
+    fn mediator_attestation_is_always_internally_consistent() {
+        // The load-bearing false-positive guard for the live wiring
+        // (`fanos_runtime::overlay::OverlayNode::attested_pairwise_rates`): for EVERY liveness
+        // pattern (every degraded mask, any number of simultaneous crashes), an honestly-attesting
+        // mediator's own 3 reported channel rates agree — so ordinary crash/churn can never trip
+        // the structural (Byzantine) check.
+        for degraded in 0u8..=0x7F {
+            for k in 0..N {
+                let [r0, r1, r2] = mediator_attestation(k, degraded);
+                assert_eq!(r0, r1, "k={k} degraded={degraded:#09b}");
+                assert_eq!(r0, r2, "k={k} degraded={degraded:#09b}");
+            }
+        }
+    }
+
+    #[test]
+    fn mediator_attestation_assembles_into_a_clean_matrix() {
+        // Assembling ALL 7 nodes' honest attestations into a full matrix — as the live engine does,
+        // modulo its per-mediator fallback/override mechanics — satisfies every polar sum-rule.
+        for degraded in [0u8, 1, 0b0101_0001, 0x7F] {
+            let mut matrix = [[0.0f64; N]; N];
+            for k in 0..N {
+                let rates = mediator_attestation(k, degraded);
+                for ((a, b), r) in polar_class(k).into_iter().zip(rates) {
+                    matrix[a][b] = r;
+                    matrix[b][a] = r;
+                }
+            }
+            assert!(sum_rules_hold(&matrix, 1e-9), "degraded={degraded:#09b}");
         }
     }
 

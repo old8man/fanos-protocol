@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
+use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
@@ -195,6 +196,15 @@ pub struct OverlayNode<F: Field> {
     /// cannot forge a false liveness either — a peer is believed alive on gossip only when a
     /// **quorum** of distinct witnesses vouch for it, so `quorum − 1` liars are outvoted.
     witnessed: BTreeMap<Triple, BTreeMap<Triple, Instant>>,
+    /// Live polar cross-attestation (spec §6.4, §6.2): the freshest `DiagAttest` report gossiped
+    /// by each OTHER cell member — its own honest reading of the 3 channel rates it mediates
+    /// (`polar::polar_class`), and when it arrived. [`attested_pairwise_rates`](Self::attested_pairwise_rates)
+    /// assembles these (falling back to this node's own reading for any member it hasn't freshly
+    /// heard from) into the `Observation.pairwise_rates` matrix `on_diagnose` feeds the 14 free
+    /// polar sum-rule alarms. An honest report's 3 values always agree
+    /// (`polar::mediator_attestation`); an equivocating member's disagree internally, and
+    /// `polar::violated_classes` then localizes exactly it.
+    attested: BTreeMap<Triple, ([f64; 3], Instant)>,
     /// This node's slice of the cell's distributed store (spec §L4): key digest → value. A value
     /// lives on its responsible point `MapToPoint(H(key))` and is replicated across the cell for
     /// LRC availability, so any survivor answers a lookup — and a lookup to a *down* primary
@@ -325,6 +335,7 @@ impl<F: Field> OverlayNode<F> {
             repaired: BTreeSet::new(),
             quarantined: BTreeMap::new(),
             witnessed: BTreeMap::new(),
+            attested: BTreeMap::new(),
             store: BTreeMap::new(),
             pending_gets: BTreeMap::new(),
             get_seq: 0,
@@ -376,11 +387,19 @@ impl<F: Field> OverlayNode<F> {
     fn on_heartbeat(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         let ping = encode(FrameType::Ping, &[]);
-        // A health-view: how stale this node's *direct* observation of each cell point is, so
-        // peers can corroborate liveness across the projective witness set (spec §6.4, §6.8).
-        let gossip = self
-            .self_index
-            .map(|_| encode(FrameType::DiagGossip, &self.health_view(now)));
+        // A health-view (how stale this node's direct observation of each cell point is) and a
+        // polar cross-attestation (this node's honest per-channel rate report for the 3 channels
+        // it mediates): both base-cell-only, and read from the SAME corroborated liveness snapshot
+        // this window, so the two stay consistent with each other (spec §6.4, §6.8, §6.2).
+        let gossip_attest = self.cell_liveness(now).map(|(self_index, degraded, _)| {
+            (
+                encode(FrameType::DiagGossip, &self.health_view(now)),
+                encode(
+                    FrameType::DiagAttest,
+                    &encode_diag_attest(self_index, degraded),
+                ),
+            )
+        });
         // Detect newly-down peers (by the corroborated view), and (re-)ping + gossip everyone.
         let neighbours: Vec<Triple> = self.peers.keys().copied().collect();
         for coord in neighbours {
@@ -396,10 +415,14 @@ impl<F: Field> OverlayNode<F> {
                 to: coord,
                 frame: ping.clone(),
             });
-            if let Some(gossip) = &gossip {
+            if let Some((gossip, attest)) = &gossip_attest {
                 effects.push(Effect::Send {
                     to: coord,
                     frame: gossip.clone(),
+                });
+                effects.push(Effect::Send {
+                    to: coord,
+                    frame: attest.clone(),
                 });
             }
         }
@@ -499,6 +522,26 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
+    /// Fold witness `from`'s polar cross-attestation into the `attested` store (spec §6.4): its 3
+    /// reported channel rates (for the pairs it mediates, `polar::polar_class`) and when they
+    /// arrived. A short/malformed body is dropped whole, not partially applied (matching the
+    /// canonical-decode-failure convention elsewhere, spec §7.5). Freshness is enforced at *read*
+    /// time by [`attested_pairwise_rates`](Self::attested_pairwise_rates) (the same
+    /// `liveness_timeout` window the rest of the frame uses), not here.
+    fn apply_diag_attest(&mut self, now: Instant, from: Triple, body: &[u8]) {
+        let mut rates = [0.0f64; 3];
+        for (i, slot) in rates.iter_mut().enumerate() {
+            let Some(bytes) = body
+                .get(i * 8..i * 8 + 8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            else {
+                return; // short/malformed body — drop, do not partially apply
+            };
+            *slot = f64::from_le_bytes(bytes);
+        }
+        self.attested.insert(from, (rates, now));
+    }
+
     fn on_message(&mut self, now: Instant, from: Triple, frame: &[u8]) -> Vec<Effect> {
         // A locally-quarantined (Byzantine) member's frames are dropped (spec §6.2, §6.4) — but only for
         // the bounded quarantine window; once it elapses the member is re-admitted for re-evaluation, so a
@@ -548,6 +591,18 @@ impl<F: Field> OverlayNode<F> {
                 self.reroute.remove(&from);
                 self.repaired.remove(&from);
                 self.apply_health_view(now, from, frame.body);
+                Vec::new()
+            }
+            Some(FrameType::DiagAttest) => {
+                // Likewise a direct observation of the sender (spec §6.4); folds its polar-class
+                // report into the cross-attestation store `attested_pairwise_rates` assembles from.
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.last_seen = Some(now);
+                    peer.reported_down = false;
+                }
+                self.reroute.remove(&from);
+                self.repaired.remove(&from);
+                self.apply_diag_attest(now, from, frame.body);
                 Vec::new()
             }
             Some(FrameType::Publish) => self.on_publish(from, frame.body),
@@ -1099,6 +1154,39 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
+    /// Assemble the live `7×7` polar cross-attestation matrix (spec §6.4) for `diagnose`'s
+    /// structural check: for each polar point `k`, the 3 rates in its class default to this
+    /// node's own honest reading of `degraded` (`polar::mediator_attestation` — always internally
+    /// consistent, for ANY liveness pattern, see its doc), then are overridden by `k`'s own
+    /// freshly-gossiped `DiagAttest`, if any — the mediator is the authoritative witness of the
+    /// channels it mediates (spec §6.4 "the mediator is a natural witness to the relay"). An
+    /// honest override reproduces the same self-consistent triple (an honest attester reads the
+    /// same corroborated liveness); an equivocating one's disagrees internally by construction —
+    /// and `polar::violated_classes` then localizes exactly that mediator, never any OTHER class,
+    /// since each class here is filled atomically from ONE source (fallback or attestation), never
+    /// a mix of the two.
+    fn attested_pairwise_rates(&self, now: Instant, degraded: u8) -> [[f64; 7]; 7] {
+        let mut matrix = [[0.0f64; 7]; 7];
+        for k in 0..7usize {
+            let coord = Point::<F>::at(k).coords();
+            let triple = match self.attested.get(&coord) {
+                Some((rates, seen)) if now.since(*seen) <= self.config.liveness_timeout => *rates,
+                _ => polar::mediator_attestation(k, degraded),
+            };
+            for ((a, b), rate) in polar::polar_class(k).into_iter().zip(triple) {
+                // `a`, `b` are Fano point indices (< 7) by construction of `polar_class`; `.get_mut`
+                // avoids raw bracket indexing rather than asserting that invariant with an allow.
+                if let Some(cell) = matrix.get_mut(a).and_then(|row| row.get_mut(b)) {
+                    *cell = rate;
+                }
+                if let Some(cell) = matrix.get_mut(b).and_then(|row| row.get_mut(a)) {
+                    *cell = rate;
+                }
+            }
+        }
+        matrix
+    }
+
     fn on_diagnose(&mut self, now: Instant) -> Vec<Effect> {
         // DIAKRISIS runs at cell scale. On the base Fano cell (N=7) a node sees the whole cell
         // through its lines, so it can build the full degraded mask locally (spec §6.3).
@@ -1111,8 +1199,16 @@ impl<F: Field> OverlayNode<F> {
         // over-coupling authority, not a dormant liveness-only arm beside a separate behavioural check.
         // (Partition/cascade still need the global cross-attestation view, not this local sense alone.)
         let measured = self.monitor.coherence();
+        // The structural (Byzantine) check (spec §6.4 + §6.2): the live polar cross-attestation
+        // matrix, assembled from gossiped `DiagAttest` reports (§98). `diagnose` runs the 14 free
+        // polar sum-rules against it FIRST, ahead of the syndrome localizer — an equivocating
+        // mediator's own report is internally inconsistent and is caught and localized here; an
+        // honest cell's is always consistent (`polar::mediator_attestation`), so this never
+        // pre-empts the ordinary crash/churn path below, however many members are down.
+        let pairwise_rates = self.attested_pairwise_rates(now, degraded);
         let verdict = diagnose(&Observation {
             degraded,
+            pairwise_rates: Some(pairwise_rates),
             coherence: measured.clone(),
             ..Default::default()
         });
@@ -1281,6 +1377,20 @@ fn encode_publish(flag: u8, digest: &[u8; DIGEST], value: &[u8]) -> Vec<u8> {
 struct LookupBody {
     key: [u8; DIGEST],
     nonce: u64,
+}
+
+/// A `DiagAttest` frame body (spec §6.4): this node's honest polar-class report — the 3 rates
+/// for the channels it mediates (`polar::polar_class(self_index)`), in that fixed order — as raw
+/// `3 × f64` little-endian (24 bytes). Bit-exact, no quantization: an honest report's 3 values are
+/// identical by construction (`polar::mediator_attestation`), and must round-trip identical
+/// against the receiver's tight `POLAR_TOLERANCE` check.
+fn encode_diag_attest(self_index: usize, degraded: u8) -> Vec<u8> {
+    let rates = polar::mediator_attestation(self_index, degraded);
+    let mut body = Vec::with_capacity(24);
+    for r in rates {
+        body.extend_from_slice(&r.to_le_bytes());
+    }
+    body
 }
 
 /// A `Lookup` frame (the derived body under the frame header).
@@ -1540,18 +1650,20 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_pings_and_gossips_every_neighbour_and_rearms() {
+    fn heartbeat_pings_gossips_and_attests_to_every_neighbour_and_rearms() {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let start = node.step(Instant(0), Input::Command(Command::StartHeartbeat));
         assert!(matches!(start.as_slice(), [Effect::ArmTimer { .. }]));
         let effects = node.step(Instant(500_000_000), Input::Timer(HEARTBEAT));
         let mut pings = 0;
         let mut gossips = 0;
+        let mut attests = 0;
         for e in &effects {
             if let Effect::Send { frame, .. } = e {
                 match decode_frame(frame).unwrap().0.frame_type() {
                     Some(FrameType::Ping) => pings += 1,
                     Some(FrameType::DiagGossip) => gossips += 1,
+                    Some(FrameType::DiagAttest) => attests += 1,
                     other => panic!("unexpected heartbeat frame {other:?}"),
                 }
             }
@@ -1562,6 +1674,7 @@ mod tests {
             .count();
         assert_eq!(pings, 6, "pings all 6 neighbours");
         assert_eq!(gossips, 6, "gossips its health-view to all 6 neighbours");
+        assert_eq!(attests, 6, "attests its polar cross-attestation to all 6 neighbours");
         assert_eq!(arms, 1, "re-arms the heartbeat");
     }
 

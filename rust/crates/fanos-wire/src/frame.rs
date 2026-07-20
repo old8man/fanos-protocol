@@ -62,6 +62,12 @@ pub enum FrameType {
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
     DiagVerdict = 0x62,
+    /// A node's live polar-class cross-attestation (audit #98, spec §6.4): the rates it honestly
+    /// reports for the 3 channels it mediates (`fanos_diakrisis::polar::polar_class`), flooded on
+    /// the heartbeat like [`DiagGossip`](Self::DiagGossip). Feeds the 14 free polar sum-rule
+    /// alarms (§6.2) live — an equivocating mediator's own report disagrees with itself and is
+    /// localized by [`fanos_diakrisis::polar::violated_classes`].
+    DiagAttest = 0x63,
     // 0x7* Application overlays (Kernel/Protocol split, design-platform.md §Kernel): a system Protocol
     // runs on port 0 and application overlays multiplex under one length-skippable outer type.
     App = 0x70,
@@ -114,6 +120,7 @@ impl FrameType {
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
+            0x63 => Self::DiagAttest,
             0x70 => Self::App,
             _ => return None,
         })
@@ -224,7 +231,7 @@ mod tests {
 
     #[test]
     fn registry_round_trips() {
-        for code in [0x00u64, 0x05, 0x13, 0x24, 0x40, 0x62] {
+        for code in [0x00u64, 0x05, 0x13, 0x24, 0x40, 0x62, 0x63] {
             let ft = FrameType::from_code(code).unwrap();
             assert_eq!(ft.code(), code);
         }
