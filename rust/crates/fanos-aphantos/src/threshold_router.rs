@@ -399,7 +399,7 @@ impl<F: Field> ThresholdRouter<F> {
         // `1..=member_count`). This caps distinct pollution to the true membership and drops
         // garbage-index forgeries outright, so an attacker cannot balloon the candidate set with
         // arbitrary `x` values.
-        if share.x == 0 || usize::from(share.x) > pending.member_count {
+        if share.x() == 0 || usize::from(share.x()) > pending.member_count {
             return Vec::new();
         }
         // De-duplicate only *exact* (x, y) repeats. Crucially we do NOT drop a differing `y` at an
@@ -408,7 +408,7 @@ impl<F: Field> ThresholdRouter<F> {
         if pending
             .shares
             .iter()
-            .any(|s| s.x == share.x && s.y == share.y)
+            .any(|s| s.x() == share.x() && s.y() == share.y())
         {
             return Vec::new();
         }
@@ -492,7 +492,7 @@ fn peel_search(
         };
         if chosen
             .iter()
-            .any(|&j| shares.get(j).is_some_and(|s| s.x == candidate.x))
+            .any(|&j| shares.get(j).is_some_and(|s| s.x() == candidate.x()))
         {
             continue;
         }
@@ -620,11 +620,11 @@ fn decode_req(body: &[u8]) -> Option<(u64, Triple, Triple, &[u8])> {
 }
 
 fn encode_rep(req_id: u64, share: &Share) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + 8 + 1 + share.y.len());
+    let mut v = Vec::with_capacity(1 + 8 + 1 + share.y().len());
     v.push(TAG_REP);
     v.extend_from_slice(&req_id.to_be_bytes());
-    v.push(share.x);
-    v.extend_from_slice(&share.y);
+    v.push(share.x());
+    v.extend_from_slice(share.y());
     v
 }
 
@@ -632,7 +632,7 @@ fn decode_rep(body: &[u8]) -> Option<(u64, Share)> {
     let req_id = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
     let x = *body.get(8)?;
     let y = body.get(9..)?.to_vec();
-    Some((req_id, Share { x, y }))
+    Some((req_id, Share::new(x, y)))
 }
 
 #[cfg(test)]
@@ -827,12 +827,10 @@ mod tests {
 
         // The honest member-1 reply (the real partial) and a forgery at the same index with mangled y.
         let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
-        let forged = Share {
-            x: honest1.x,
-            y: honest1.y.iter().map(|b| b ^ 0xFF).collect(),
-        };
+        let forged = Share::new(honest1.x(), honest1.y().iter().map(|b| b ^ 0xFF).collect());
         assert_ne!(
-            forged.y, honest1.y,
+            forged.y(),
+            honest1.y(),
             "the forgery differs from the real share"
         );
 
@@ -948,13 +946,7 @@ mod tests {
                 Instant(1),
                 Input::Message {
                     from: [2, 2, 2],
-                    frame: encode_rep(
-                        0,
-                        &Share {
-                            x: bad_x,
-                            y: alloc::vec![0u8; 8],
-                        },
-                    ),
+                    frame: encode_rep(0, &Share::new(bad_x, alloc::vec![0u8; 8])),
                 },
             );
             assert!(

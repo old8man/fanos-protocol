@@ -79,7 +79,10 @@ proptest! {
 
         // Reconstruction over attacker-chosen shares (arbitrary x, arbitrary-length y, possibly
         // duplicate indices) must not divide by zero or panic — only ever Err.
-        let shares: Vec<Share> = raw_shares.into_iter().map(|(x, y)| Share { x, y }).collect();
+        let shares: Vec<Share> = raw_shares
+            .into_iter()
+            .map(|(x, y)| Share::new(x, y))
+            .collect();
         let _ = peel_onion_with_shares(&bytes, &shares);
     }
 }

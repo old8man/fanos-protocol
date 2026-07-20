@@ -19,13 +19,35 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// A share: its non-zero `x`-coordinate and the per-byte evaluations `y`.
 ///
 /// The evaluations `y` are secret material (any `t` shares reconstruct the secret), so a `Share`
-/// wipes them from memory when it is dropped ([`ZeroizeOnDrop`]).
+/// wipes them from memory when it is dropped ([`ZeroizeOnDrop`]). The evaluations are **private** with a
+/// borrowing accessor — a caller cannot `mem::take` or otherwise move the secret out of a `Share`, which
+/// would bypass that drop-wipe; it can only read it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Share {
+    x: u8,
+    y: Vec<u8>,
+}
+
+impl Share {
+    /// Assemble a share from its evaluation point `x` and per-byte evaluations `y`. `x = 0` is the secret
+    /// slot, never a valid share index; a `Share` built with it is rejected at [`reconstruct`], so this
+    /// constructor stays total (parsing that cannot yet vouch for `x` defers the check to reconstruction).
+    #[must_use]
+    pub fn new(x: u8, y: Vec<u8>) -> Self {
+        Self { x, y }
+    }
+
     /// The evaluation point (`1..=255`, distinct per share).
-    pub x: u8,
-    /// The polynomial evaluations, one per secret byte.
-    pub y: Vec<u8>,
+    #[must_use]
+    pub fn x(&self) -> u8 {
+        self.x
+    }
+
+    /// The polynomial evaluations, one per secret byte — a **borrow** (the secret never leaves the share).
+    #[must_use]
+    pub fn y(&self) -> &[u8] {
+        &self.y
+    }
 }
 
 impl Drop for Share {
@@ -109,7 +131,7 @@ pub fn split(
             acc = add(mul(acc, x), s0);
             y.push(acc);
         }
-        out.push(Share { x, y });
+        out.push(Share::new(x, y));
     }
     Ok(out)
 }
@@ -118,14 +140,14 @@ pub fn split(
 /// `x = 0`. All shares must have the same length, distinct non-zero `x`-coordinates.
 pub fn reconstruct(shares: &[Share]) -> Result<Vec<u8>, ShamirError> {
     let first = shares.first().ok_or(ShamirError::BadShares)?;
-    let len = first.y.len();
-    if shares.iter().any(|s| s.y.len() != len || s.x == 0) {
+    let len = first.y().len();
+    if shares.iter().any(|s| s.y().len() != len || s.x() == 0) {
         return Err(ShamirError::BadShares);
     }
     // Distinct x-coordinates.
     for (a, sa) in shares.iter().enumerate() {
         for sb in shares.iter().skip(a + 1) {
-            if sa.x == sb.x {
+            if sa.x() == sb.x() {
                 return Err(ShamirError::BadShares);
             }
         }
@@ -140,11 +162,11 @@ pub fn reconstruct(shares: &[Share]) -> Result<Vec<u8>, ShamirError> {
             if m == j {
                 continue;
             }
-            num = mul(num, sm.x);
-            den = mul(den, add(sm.x, sj.x)); // subtraction == addition in GF(2^8)
+            num = mul(num, sm.x());
+            den = mul(den, add(sm.x(), sj.x())); // subtraction == addition in GF(2^8)
         }
         let coeff = mul(num, F256::inv(u32::from(den)) as u8);
-        for (out, &yij) in secret.iter_mut().zip(&sj.y) {
+        for (out, &yij) in secret.iter_mut().zip(sj.y()) {
             *out = add(*out, mul(coeff, yij));
         }
     }
@@ -213,47 +235,20 @@ mod tests {
     fn reconstruct_rejects_malformed_share_sets() {
         // x = 0 is the secret slot, never a valid share index.
         assert_eq!(
-            reconstruct(&[
-                Share {
-                    x: 0,
-                    y: [1].to_vec()
-                },
-                Share {
-                    x: 2,
-                    y: [3].to_vec()
-                },
-            ]),
+            reconstruct(&[Share::new(0, [1].to_vec()), Share::new(2, [3].to_vec())]),
             Err(ShamirError::BadShares),
             "a share at x = 0 is rejected"
         );
         // Duplicate x-coordinates (a replayed / forged share index) must be rejected rather than
         // dividing by zero in the Lagrange denominator (add(x_m, x_j) = 0 when x_m == x_j).
         assert_eq!(
-            reconstruct(&[
-                Share {
-                    x: 1,
-                    y: [5].to_vec()
-                },
-                Share {
-                    x: 1,
-                    y: [6].to_vec()
-                },
-            ]),
+            reconstruct(&[Share::new(1, [5].to_vec()), Share::new(1, [6].to_vec())]),
             Err(ShamirError::BadShares),
             "duplicate share indices are rejected, not a divide-by-zero"
         );
         // Shares of differing y-length cannot come from one split.
         assert_eq!(
-            reconstruct(&[
-                Share {
-                    x: 1,
-                    y: [1, 2].to_vec()
-                },
-                Share {
-                    x: 2,
-                    y: [3].to_vec()
-                },
-            ]),
+            reconstruct(&[Share::new(1, [1, 2].to_vec()), Share::new(2, [3].to_vec())]),
             Err(ShamirError::BadShares),
             "mismatched share lengths are rejected"
         );

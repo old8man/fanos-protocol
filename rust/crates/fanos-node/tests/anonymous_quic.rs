@@ -209,7 +209,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
 
     let mut skp = SeedRng::from_seed(b"anon-quic-svc");
     let service = StaticKeypair::generate(&mut skp);
-    let service_public = service.public.clone();
+    let service_public = service.public().clone();
     let epoch = fanos_rendezvous::Epoch::new(5);
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();

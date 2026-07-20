@@ -388,7 +388,7 @@ mod tests {
     fn request_response_over_the_overlay_datagram_transport() {
         let mut rng = SeedRng::from_seed(b"diaulos-overlay");
         let service_kp = StaticKeypair::generate(&mut rng);
-        let mut client = ClientSession::dial(SERVICE, &service_kp.public, &mut rng);
+        let mut client = ClientSession::dial(SERVICE, service_kp.public(), &mut rng);
         let mut server = ServerSession::new();
         let mut srng = SeedRng::from_seed(b"diaulos-overlay-server");
 
@@ -440,7 +440,7 @@ mod tests {
     fn a_wrong_coordinate_delivery_is_ignored() {
         let mut rng = SeedRng::from_seed(b"diaulos-overlay-2");
         let kp = StaticKeypair::generate(&mut rng);
-        let mut client = ClientSession::dial(SERVICE, &kp.public, &mut rng);
+        let mut client = ClientSession::dial(SERVICE, kp.public(), &mut rng);
         // A hello "from" the wrong coordinate must not complete the handshake.
         client.handle_delivery([9, 9, 9], &framed(TAG_HELLO, b"junk"));
         assert!(!client.is_live());

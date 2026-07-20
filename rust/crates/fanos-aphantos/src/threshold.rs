@@ -118,19 +118,19 @@ fn aead_open(
 }
 
 fn share_to_bytes(share: &Share) -> Option<[u8; SHARE_LEN]> {
-    if share.y.len() != 32 {
+    if share.y().len() != 32 {
         return None;
     }
     let mut out = [0u8; SHARE_LEN];
-    out[0] = share.x;
-    out[1..].copy_from_slice(&share.y);
+    out[0] = share.x();
+    out[1..].copy_from_slice(share.y());
     Some(out)
 }
 
 fn share_from_bytes(bytes: &[u8]) -> Option<Share> {
     let x = *bytes.first()?;
     let y = bytes.get(1..SHARE_LEN)?.to_vec();
-    Some(Share { x, y })
+    Some(Share::new(x, y))
 }
 
 impl ThresholdSealed {

@@ -57,7 +57,7 @@ fn derived_address<F: Field>(id: &[u8], depth: usize) -> HierAddr<F> {
 /// single source of truth for the bundle layout), so the overlay address it commits to matches the
 /// identity's `NodeId` byte-for-byte — including the coordinate-VRF key (spec §L0).
 fn identity_bundle(identity: &Identity) -> Vec<u8> {
-    identity.public.encode()
+    identity.public().encode()
 }
 
 /// A complete signed descriptor for a node, built from a **real `fanos_pqcrypto::Identity`** (the
@@ -74,7 +74,6 @@ fn signed_descriptor(
     let id = identity_bundle(&identity);
     let hier = derived_address::<F7>(&id, depth);
     let sig = identity
-        .signing
         .sign(&descriptor_message::<F7>(transport, &hier, &id))
         .to_bytes();
     (id, hier, sig)
@@ -121,7 +120,6 @@ fn self_certified_membership_accepts_a_signed_descriptor_and_rejects_a_poisoned_
     // did not derive (a valid signature over the wrong `hier`).
     let a_identity = Identity::generate(&mut SeedRng::from_seed(&[2u8; 32]));
     let a_sig = a_identity
-        .signing
         .sign(&descriptor_message::<F7>(a_coord, &t_addr, &a_id))
         .to_bytes();
     v.step(

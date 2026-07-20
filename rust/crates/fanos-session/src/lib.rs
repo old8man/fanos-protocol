@@ -427,7 +427,7 @@ mod tests {
         let keypair = StaticKeypair::generate(&mut rng);
         let mut crng = SeedRng::from_seed(b"async-session-client");
         // The coordinate is unused by the channel transport (it addresses the single peer).
-        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+        let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
         let (c2s_tx, c2s_rx) = unbounded_channel();
         let (s2c_tx, s2c_rx) = unbounded_channel();
@@ -465,7 +465,7 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"duplex-key");
         let keypair = StaticKeypair::generate(&mut rng);
         let mut crng = SeedRng::from_seed(b"duplex-client");
-        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+        let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
         let (c2s_tx, c2s_rx) = unbounded_channel();
         let (s2c_tx, s2c_rx) = unbounded_channel();
@@ -592,7 +592,7 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"mock-key");
         let keypair = StaticKeypair::generate(&mut rng);
         let mut crng = SeedRng::from_seed(b"mock-client");
-        let session = ClientSession::dial(SERVICE, &keypair.public, &mut crng);
+        let session = ClientSession::dial(SERVICE, keypair.public(), &mut crng);
         assert_eq!(session.peer(), SERVICE);
 
         let (c2s_tx, c2s_rx) = unbounded_channel();
@@ -627,7 +627,7 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"async-large-key");
         let keypair = StaticKeypair::generate(&mut rng);
         let mut crng = SeedRng::from_seed(b"async-large-client");
-        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+        let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
         let (c2s_tx, c2s_rx) = unbounded_channel();
         let (s2c_tx, s2c_rx) = unbounded_channel();
@@ -664,7 +664,7 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"async-empty-key");
         let keypair = StaticKeypair::generate(&mut rng);
         let mut crng = SeedRng::from_seed(b"async-empty-client");
-        let client = ClientSession::dial([0, 1, 0], &keypair.public, &mut crng);
+        let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
         let (c2s_tx, c2s_rx) = unbounded_channel();
         let (s2c_tx, s2c_rx) = unbounded_channel();

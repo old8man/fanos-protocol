@@ -80,7 +80,7 @@ fn handshake_derivation_is_pinned() {
     let mut srng = SeedRng::from_seed(b"diaulos-kat-service");
     let service = StaticKeypair::generate(&mut srng);
     let mut crng = SeedRng::from_seed(b"diaulos-kat-client");
-    let (client, client_hello) = ClientHandshake::start(&service.public, &mut crng);
+    let (client, client_hello) = ClientHandshake::start(service.public(), &mut crng);
     let mut rrng = SeedRng::from_seed(b"diaulos-kat-respond");
     let (server_keys, server_hello) =
         ServerHandshake::respond(&service, &client_hello, &mut rrng).expect("valid hello");

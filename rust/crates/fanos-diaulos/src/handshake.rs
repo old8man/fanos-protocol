@@ -65,11 +65,16 @@ pub fn bundle_from_kem_public(public: &HybridKemPublic) -> Vec<u8> {
 
 /// A service's long-term hybrid KEM identity — the secret it keeps and the public key it publishes
 /// (via ONOMA). A client authenticates the service by encapsulating to [`public`](Self::public).
+///
+/// Both fields are **private**: the decapsulation `secret` never leaves this module (it is read only
+/// by [`ServerHandshake::respond`], and has no accessor at all — a caller cannot copy, log, or
+/// serialize it), and the `public` key is exposed read-only via [`public`](Self::public). This keeps
+/// the secret's exposure surface exactly one function wide.
 pub struct StaticKeypair {
-    /// The decapsulation secret (never leaves the service).
-    pub secret: HybridKemSecret,
+    /// The decapsulation secret (never leaves the service — no accessor, module-private).
+    secret: HybridKemSecret,
     /// The published encapsulation key (the service's stable identity).
-    pub public: HybridKemPublic,
+    public: HybridKemPublic,
 }
 
 impl StaticKeypair {
@@ -78,6 +83,13 @@ impl StaticKeypair {
     pub fn generate<R: CryptoRng>(rng: &mut R) -> Self {
         let (secret, public) = HybridKemSecret::generate(rng);
         Self { secret, public }
+    }
+
+    /// The published encapsulation key — the service's stable identity a client encapsulates to.
+    /// Read-only: the matching decapsulation secret is unreachable from outside this module.
+    #[must_use]
+    pub fn public(&self) -> &HybridKemPublic {
+        &self.public
     }
 }
 

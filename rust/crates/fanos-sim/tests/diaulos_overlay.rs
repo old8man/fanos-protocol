@@ -54,7 +54,7 @@ fn run_request_response(mut sim: Sim, rounds: usize, request: &[u8]) -> (bool, V
 
     let mut krng = SeedRng::from_seed(b"overlay-key");
     let keypair = StaticKeypair::generate(&mut krng);
-    let service_public = keypair.public.clone();
+    let service_public = keypair.public().clone();
     let mut drng = SeedRng::from_seed(b"overlay-client");
     let mut client = ClientSession::dial(service_node, &service_public, &mut drng);
     let mut server = ServerSession::new();

@@ -84,7 +84,7 @@ fn a_diaulos_hello_reaches_the_meeting_line_anonymously() {
     let mut dsvc = SeedRng::from_seed(b"rdv-diaulos-svc");
     let diaulos_service = fanos_diaulos::StaticKeypair::generate(&mut dsvc);
     let mut dcli = SeedRng::from_seed(b"rdv-diaulos-cli");
-    let (_pending, client_hello) = fanos_diaulos::dial(&diaulos_service.public, &mut dcli);
+    let (_pending, client_hello) = fanos_diaulos::dial(diaulos_service.public(), &mut dcli);
 
     // Seal the onion toward the meeting line and launch it at the first hop's combiner.
     let fwd =
@@ -116,7 +116,7 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
     let mut skp = SeedRng::from_seed(b"rdv-bidi-svc");
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
     let epoch = fanos_rendezvous::Epoch::new(9);
-    let meeting = meeting_line::<F2>(&service.public.encode(), epoch, &BEACON).coords();
+    let meeting = meeting_line::<F2>(&service.public().encode(), epoch, &BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
 
     let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
@@ -133,7 +133,7 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
 
     // Client dials (DIAULOS) and wraps its ClientHello with the reply circuit to RP_c.
     let mut crng = SeedRng::from_seed(b"rdv-bidi-cli");
-    let (pending, client_hello) = fanos_diaulos::dial(&service.public, &mut crng);
+    let (pending, client_hello) = fanos_diaulos::dial(service.public(), &mut crng);
     let reply_circuit = vec![hop_to_rp, rp_c];
     let request = Request {
         cookie: *b"bidi-cookie-0001",
@@ -197,7 +197,7 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
     let mut skp = SeedRng::from_seed(b"rdv-sess-svc");
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
     let epoch = fanos_rendezvous::Epoch::new(3);
-    let meeting = meeting_line::<F2>(&service.public.encode(), epoch, &BEACON).coords();
+    let meeting = meeting_line::<F2>(&service.public().encode(), epoch, &BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
 
     let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
@@ -229,7 +229,7 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
     let mut rservice = RendezvousService::<F2>::new(dir.clone(), t, b"rdv-sess-svc-secret");
 
     let mut crng = SeedRng::from_seed(b"rdv-sess-cli");
-    let mut client = ClientSession::dial(meeting, &service.public, &mut crng);
+    let mut client = ClientSession::dial(meeting, service.public(), &mut crng);
     let mut server = ServerSession::new();
     let mut srng = SeedRng::from_seed(b"rdv-sess-accept");
 
@@ -359,7 +359,7 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
     let mut skp = SeedRng::from_seed(b"rdv-mux-svc");
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
     let epoch = fanos_rendezvous::Epoch::new(11);
-    let meeting = meeting_line::<F2>(&service.public.encode(), epoch, &BEACON).coords();
+    let meeting = meeting_line::<F2>(&service.public().encode(), epoch, &BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
 
     let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
@@ -415,9 +415,9 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
     let mut srng = SeedRng::from_seed(b"rdv-mux-accept");
 
     let mut client_a =
-        ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"ca"));
+        ClientSession::dial(meeting, service.public(), &mut SeedRng::from_seed(b"ca"));
     let mut client_b =
-        ClientSession::dial(meeting, &service.public, &mut SeedRng::from_seed(b"cb"));
+        ClientSession::dial(meeting, service.public(), &mut SeedRng::from_seed(b"cb"));
     let (mut wrote_a, mut wrote_b) = (false, false);
     let mut seen = 0usize;
 

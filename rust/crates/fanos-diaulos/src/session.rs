@@ -92,7 +92,7 @@ mod tests {
         let service = StaticKeypair::generate(&mut rng);
 
         // Client dials; service accepts; client establishes — the 1-RTT handshake.
-        let (pending, client_hello) = dial(&service.public, &mut rng);
+        let (pending, client_hello) = dial(service.public(), &mut rng);
         let (mut svc_conn, server_hello) =
             accept(&service, &client_hello, &mut rng).expect("valid client hello");
         let Dialed { mut conn, primary } = pending
@@ -148,7 +148,7 @@ mod tests {
     fn establish_rejects_a_malformed_server_hello() {
         let mut rng = SeedRng::from_seed(b"diaulos-session-bad");
         let service = StaticKeypair::generate(&mut rng);
-        let (pending, _hello) = dial(&service.public, &mut rng);
+        let (pending, _hello) = dial(service.public(), &mut rng);
         assert!(pending.establish(&[0u8; 8]).is_none());
     }
 }

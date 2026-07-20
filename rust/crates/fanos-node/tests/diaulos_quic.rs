@@ -109,7 +109,7 @@ async fn diaulos_request_response_over_quic() {
 
     let mut krng = SeedRng::from_seed(b"quic-diaulos-key");
     let keypair = StaticKeypair::generate(&mut krng);
-    let service_public = keypair.public.clone();
+    let service_public = keypair.public().clone();
     serve_rpc(
         a.client(),
         keypair,
@@ -151,7 +151,7 @@ async fn diaulos_full_duplex_service_over_quic() {
 
     let mut krng = SeedRng::from_seed(b"quic-duplex-key");
     let keypair = StaticKeypair::generate(&mut krng);
-    let service_public = keypair.public.clone();
+    let service_public = keypair.public().clone();
     serve(
         a.client(),
         keypair,
@@ -211,7 +211,7 @@ async fn diaulos_serves_two_clients_concurrently() {
 
     let mut krng = SeedRng::from_seed(b"quic-multi-key");
     let keypair = StaticKeypair::generate(&mut krng);
-    let service_public = keypair.public.clone();
+    let service_public = keypair.public().clone();
     // Echo the request with an `echo:` prefix.
     serve_rpc(
         s.client(),
@@ -259,7 +259,7 @@ async fn fanos_dialer_reaches_a_service_by_name() {
 
     let mut krng = SeedRng::from_seed(b"fd-key");
     let keypair = StaticKeypair::generate(&mut krng);
-    let service_public = keypair.public.clone();
+    let service_public = keypair.public().clone();
     serve_rpc(
         a.client(),
         keypair,
