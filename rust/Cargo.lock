@@ -826,9 +826,10 @@ dependencies = [
 name = "fanos-diaulos"
 version = "0.1.0"
 dependencies = [
+ "fanos-ports",
  "fanos-pqcrypto",
  "fanos-primitives",
- "fanos-runtime",
+ "fanos-stream",
  "fanos-wire",
  "proptest",
  "rand_core 0.10.1",
@@ -935,6 +936,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-ports"
+version = "0.1.0"
+dependencies = [
+ "fanos-diakrisis",
+ "fanos-geometry",
+ "fanos-primitives",
+]
+
+[[package]]
 name = "fanos-pqcrypto"
 version = "0.1.0"
 dependencies = [
@@ -1025,6 +1035,7 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-ports",
  "fanos-pqcrypto",
  "fanos-primitives",
  "fanos-stream",

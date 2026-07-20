@@ -1,7 +1,7 @@
 //! Running a DIAULOS session over the base overlay's **datagram** transport.
 //!
 //! The overlay moves opaque application payloads between coordinates
-//! (`fanos_runtime::Command::Send { to, payload }` out, a delivered `{ from, payload }` in). DIAULOS
+//! (`fanos_ports::Command::Send { to, payload }` out, a delivered `{ from, payload }` in). DIAULOS
 //! rides *on top* of that: its handshake messages and its constant-size cells travel as those
 //! payloads. This module is the thin, sans-I/O adapter that binds a [`Connection`] to that transport
 //! — it **produces** [`Command::Send`]s and **consumes** deliveries, so the very same session logic
@@ -18,7 +18,7 @@
 //! `HELLO`/`CELL` payloads over an onion instead of a bare coordinate — a later layer.
 
 use fanos_pqcrypto::kem::HybridKemPublic;
-use fanos_runtime::Command;
+use fanos_ports::Command;
 use rand_core::CryptoRng;
 
 use crate::conn::Connection;
@@ -419,7 +419,7 @@ impl ServerSession {
 mod tests {
     use super::*;
     use fanos_pqcrypto::rng::SeedRng;
-    use fanos_runtime::Command;
+    use fanos_ports::Command;
 
     const CLIENT: Coord = [1, 0, 0];
     const SERVICE: Coord = [0, 1, 0];

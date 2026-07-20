@@ -5,6 +5,16 @@
 //! clock, socket, or RNG — it receives [`Input`]s and returns [`Effect`]s, and a driver (the
 //! simulator, or a real network stack) performs them. Addresses on the wire are the raw
 //! projective coordinate triple, the field-agnostic form the transport routes on.
+//!
+//! This is the sans-I/O **contract**, extracted to its own leaf crate (audit #73/#125) so a driver or a
+//! sibling engine can depend on the vocabulary — `Command`/`Input`/`Effect`/`Notification`/`Engine` — without
+//! linking the concrete `OverlayNode` engine and its whole subsystem stack. Re-exported as
+//! `fanos_runtime::ports` for source compatibility.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 

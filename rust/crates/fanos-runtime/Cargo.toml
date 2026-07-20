@@ -27,6 +27,9 @@ fanos-wire-derive.workspace = true
 # re-exported here as `stream`; a consumer that wants only the reliability types links the leaf, not
 # this whole engine.
 fanos-stream.workspace = true
+# The sans-I/O contract, extracted to its own light leaf crate (audit #73/#125) and re-exported here as
+# `ports`; a driver or sibling engine that wants only the vocabulary links the leaf, not this whole engine.
+fanos-ports.workspace = true
 
 [features]
 default = ["std"]
@@ -44,6 +47,7 @@ std = [
     "fanos-core/std",
     "fanos-wire/std",
     "fanos-stream/std",
+    "fanos-ports/std",
 ]
 alloc = [
     "fanos-geometry/alloc",
@@ -54,9 +58,10 @@ alloc = [
     "fanos-core/alloc",
     "fanos-wire/alloc",
     "fanos-stream/alloc",
+    "fanos-ports/alloc",
 ]
 # For no_std targets: supply DIAKRISIS's float backend.
-libm = ["fanos-diakrisis/libm", "fanos-telemetry/libm"]
+libm = ["fanos-diakrisis/libm", "fanos-telemetry/libm", "fanos-ports/libm"]
 
 [lints]
 workspace = true

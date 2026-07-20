@@ -11,11 +11,11 @@
 //!   `CELL_LEN` bytes, so a passive observer sees a constant stream; the explicit nonce means a lost
 //!   or reordered cell never stalls decryption of the next (no crypto head-of-line blocking), and a
 //!   tampered or wrong-key cell simply fails to open and is dropped.
-//! * [`frame`] — what a cell carries: `DATA` (a reliability [`Segment`](fanos_runtime::stream::Segment)),
-//!   `ACK` (a selective [`Ack`](fanos_runtime::stream::Ack) + receive credit), or `PADDING` (cover).
+//! * [`frame`] — what a cell carries: `DATA` (a reliability [`Segment`](fanos_stream::Segment)),
+//!   `ACK` (a selective [`Ack`](fanos_stream::Ack) + receive credit), or `PADDING` (cover).
 //!   The real content length is inside the encrypted frame, so the constant cell hides it end-to-end.
 //! * [`endpoint`] — [`StreamEndpoint`](endpoint::StreamEndpoint): a bidirectional reliable stream over
-//!   cells, driving the shipped selective-repeat + SACK core of `fanos_runtime::stream` end-to-end.
+//!   cells, driving the shipped selective-repeat + SACK core of `fanos_stream` end-to-end.
 //! * [`conn`] — [`Connection`](conn::Connection): many such streams multiplexed over one cell channel,
 //!   each with independent reliability (no cross-stream head-of-line blocking), stream ids by role.
 //! * [`handshake`] — the 1-RTT hybrid KEM key exchange ([`ClientHandshake`](handshake::ClientHandshake)

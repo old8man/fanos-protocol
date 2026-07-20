@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use fanos_runtime::stream::{StreamReceiver, StreamSender};
+use fanos_stream::{StreamReceiver, StreamSender};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::cell::{Key, open, seal};
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_wrong_parity_implicit_open_cannot_seize_a_local_id() {
-        use fanos_runtime::stream::Segment;
+        use fanos_stream::Segment;
         let (c2s, s2c) = ([3u8; 32], [4u8; 32]);
         // The initiator's local ids are even; only odd (peer) ids may be implicitly opened.
         let mut initiator = Connection::new(c2s, s2c, true);
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn implicit_opens_are_capped_to_bound_stream_memory() {
-        use fanos_runtime::stream::Segment;
+        use fanos_stream::Segment;
         let (c2s, s2c) = ([7u8; 32], [1u8; 32]);
         // A responder: its peer (the initiator) opens EVEN ids (parity 0). Flood far more distinct even
         // ids than the cap — each is a fresh implicit open a malicious peer could use to exhaust memory.
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn retiring_a_done_stream_frees_its_slot_and_blocks_a_phantom_reopen() {
-        use fanos_runtime::stream::Segment;
+        use fanos_stream::Segment;
         let (c2s, s2c) = ([2u8; 32], [3u8; 32]);
         let mut client = Connection::new(c2s, s2c, true); // opens even ids
         let mut service = Connection::new(s2c, c2s, false); // peer parity 0 (even)
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn reset_aborts_a_stream_both_ways_and_blocks_reopen() {
-        use fanos_runtime::stream::Segment;
+        use fanos_stream::Segment;
         let (c2s, s2c) = ([1u8; 32], [2u8; 32]);
         let mut client = Connection::new(c2s, s2c, true); // opens even ids
         let mut service = Connection::new(s2c, c2s, false); // peer parity 0 (even)

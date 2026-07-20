@@ -1,0 +1,28 @@
+[package]
+name = "fanos-ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The FANOS sans-I/O contract: the Command/Input/Effect/Notification vocabulary and the Engine trait every node engine speaks — a light leaf with no concrete-engine dependency."
+keywords = ["sans-io", "state-machine", "contract", "engine", "fanos"]
+categories = ["network-programming", "no-std"]
+
+[dependencies]
+fanos-geometry.workspace = true
+fanos-primitives.workspace = true
+# The contract's `Notification::Verdict` carries the diagnosis verdict, core engine vocabulary; fanos-diakrisis
+# is a light math crate (field/geometry/code only), so this stays a lean dependency.
+fanos-diakrisis.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc", "fanos-geometry/std", "fanos-primitives/std", "fanos-diakrisis/std"]
+alloc = ["fanos-geometry/alloc", "fanos-primitives/alloc", "fanos-diakrisis/alloc"]
+# For no_std targets: supply DIAKRISIS's float backend.
+libm = ["fanos-diakrisis/libm"]
+
+[lints]
+workspace = true

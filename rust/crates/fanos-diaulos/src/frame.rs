@@ -1,14 +1,14 @@
 //! DIAULOS frames — what a [`cell`](crate::cell) carries.
 //!
 //! A frame is `ftype(1) ‖ body`. The three steady-state frames reuse the reliability vocabulary of
-//! `fanos_runtime::stream` verbatim, so the SACK core is driven end-to-end:
+//! `fanos_stream` verbatim, so the SACK core is driven end-to-end:
 //!
 //! * `DATA` — a [`Segment`] with an explicit `len` (the real byte count; the cell's remaining bytes
 //!   are pad, so the constant cell hides the length end-to-end).
 //! * `ACK` — a selective [`Ack`] (cumulative + SACK bitmap + receive credit `rwnd`).
 //! * `PADDING` — a pure cover cell, byte-indistinguishable from `DATA` once sealed.
 
-use fanos_runtime::stream::{Ack, MAX_SEGMENT, Segment};
+use fanos_stream::{Ack, MAX_SEGMENT, Segment};
 use fanos_wire::{SessionFrameType, Wire};
 
 // The inner-session `ftype` bytes come from the one canonical registry (`fanos_wire::SessionFrameType`),

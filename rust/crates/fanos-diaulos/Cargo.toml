@@ -13,7 +13,11 @@ categories = ["network-programming", "cryptography"]
 [dependencies]
 fanos-wire.workspace = true
 # The reliability core (selective-repeat + SACK) DIAULOS carries end-to-end, verbatim.
-fanos-runtime = { workspace = true, features = ["std"] }
+# DIAULOS needs only the sans-I/O contract (Command) and the reliable-stream types — the two light leaves,
+# NOT the whole OverlayNode engine + DIAKRISIS + telemetry + pqcrypto + the wire-derive proc-macro it used
+# to drag in transitively (audit #73/#125).
+fanos-ports = { workspace = true, features = ["std"] }
+fanos-stream = { workspace = true, features = ["std"] }
 # The 1-RTT handshake: hybrid X25519+ML-KEM-768 KEM (encaps/decaps) and the labeled KDF.
 fanos-pqcrypto.workspace = true
 fanos-primitives = { workspace = true, features = ["aead"] }

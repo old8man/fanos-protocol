@@ -24,6 +24,7 @@ members = [
     "crates/fanos-quic",
     "crates/fanos-runtime",
     "crates/fanos-stream",
+    "crates/fanos-ports",
     "crates/fanos-vrf",
     "crates/fanos-onoma",
     "crates/fanos-incentives",
@@ -100,6 +101,8 @@ fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features =
 fanos-runtime = { path = "crates/fanos-runtime", version = "0.1.0", default-features = false }
 # The reliable-stream reliability layer as a standalone transport-agnostic leaf (audit #73).
 fanos-stream = { path = "crates/fanos-stream", version = "0.1.0", default-features = false }
+# The sans-I/O contract as a light leaf crate (audit #73/#125).
+fanos-ports = { path = "crates/fanos-ports", version = "0.1.0", default-features = false }
 fanos-telemetry = { path = "crates/fanos-telemetry", version = "0.1.0", default-features = false }
 # Privacy / transport / service layers and the DKG node — declared here so every consumer references
 # them uniformly as `<crate>.workspace = true`, never a bare `path` (one source of truth for versions).

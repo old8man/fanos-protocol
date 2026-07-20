@@ -1,13 +1,13 @@
 //! [`StreamEndpoint`] — a bidirectional, reliable, end-to-end-encrypted byte stream over cells.
 //!
-//! It drives the shipped selective-repeat + SACK core of `fanos_runtime::stream` end-to-end, sealing
+//! It drives the shipped selective-repeat + SACK core of `fanos_stream` end-to-end, sealing
 //! its outbound segments and acks into constant-size cells ([`crate::cell`]) and opening inbound
 //! cells back into segments and acks. Each direction has its own key and its own monotone nonce
 //! counter, so the two directions never share nonce space. Reliability, ordering, and flow control
 //! are entirely between the two endpoints — every relay in between sees only opaque, constant-size,
 //! authenticated cells.
 
-use fanos_runtime::stream::{StreamReceiver, StreamSender};
+use fanos_stream::{StreamReceiver, StreamSender};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::cell::{Key, open, seal};

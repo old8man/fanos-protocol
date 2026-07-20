@@ -18,7 +18,10 @@
 extern crate alloc;
 
 pub mod overlay;
-pub mod ports;
+
+// The sans-I/O contract now lives in the leaf crate `fanos-ports` (audit #73/#125); re-exported here as
+// `ports` so existing `fanos_runtime::ports::*` and the crate-root re-exports below keep resolving.
+pub use fanos_ports as ports;
 
 // The reliable-stream layer now lives in the transport-agnostic leaf crate `fanos-stream` (audit #73);
 // re-exported here as `stream` so existing `fanos_runtime::stream::*` paths keep resolving.
