@@ -1,40 +1,73 @@
 //! **§6.4 endpoint cross-attestation — simulator research harness (#106).**
 //!
-//! The §6.4 closure (catch a *consistent* liar the mediator model cannot) is a complex mechanism, so per
-//! the simulation-driven directive it is RESEARCHED here — not derived-then-wired. This file builds the
-//! high-level research affordance the search needs: a **configurable Byzantine gossiper** that forges its
-//! own outbound `DiagGossip` health-view to a chosen false liveness view, and a **recorder** that captures
-//! every node's actually-gossiped view. From those captured views a candidate detection rule can be
-//! evaluated offline against the two metrics that decide it — the FALSE-POSITIVE rate on honest churn and
-//! the DETECTION rate on the attack — so the optimal rule is *found*, not guessed. (The naive rule —
-//! majority-vote the polar vectors `ρ` reconstructed from raw views — was reverted precisely because
-//! honest nodes' asymmetric views make it false-positive; see the gap-map memory.)
+//! The §6.4 closure (catch the *colluding* liars the plain corroboration quorum cannot) is a complex
+//! mechanism, so per the simulation-driven directive it is RESEARCHED here — not derived-then-wired. This
+//! file builds the high-level research affordances the search needs — a **configurable Byzantine gossiper**
+//! that forges its own outbound `DiagGossip` health-view, and a **recorder** that captures every node's
+//! actually-gossiped view as a time series — then *measures* candidate detection rules against the two
+//! metrics that decide them: the FALSE-POSITIVE rate on honest churn+loss and the DETECTION rate on the
+//! attack. The optimal rule is thereby *found on the instrument*, not guessed.
 //!
-//! This module lands the affordance + its self-test; the FP/detection sweep and the rule search build on it.
+//! **What the instrument reveals (the load-bearing finding).** The naive rule — reconstruct the polar
+//! degradation vector `ρ` from raw views and majority-vote — false-positives (it was reverted for exactly
+//! this) because `ρ` is a *symmetric magnitude*: it collapses two fundamentally different claims a node can
+//! make about a peer `k`:
+//!   - **VOUCH** (`age(k) < τ`): a positive, checkable assertion — "I received a fresh pong from `k`." A node's
+//!     reported age is *monotone between real pongs* ([`OverlayNode::health_view`] reads `peers[k].last_seen`,
+//!     set only by a genuine `Pong`), so an honest node **cannot fabricate freshness** for a node it did not
+//!     hear from.
+//!   - **DENY** (`age(k) ≥ τ` or `u16::MAX`): the *absence* of an assertion — honest under any lost ping or cut
+//!     link, regardless of `k`'s true state.
+//!
+//! So the only *soundly attributable* lie is a **VOUCH that a firm consensus denies** — keeping a dead node
+//! believed-alive to suppress its healing (the third-order fault the plain quorum, which merely *counts*
+//! vouchers and so is defeated by `quorum` colluders, cannot catch). The reverse (DENY a live node) is
+//! indistinguishable from honest link failure — and already inert, since every node trusts its *own* direct
+//! observation over any gossip. This module lands the affordances + the sweep that *verifies* this rule beats
+//! the naive one (0 false positives on churn, full detection of colluders), and pins its two parameters
+//! (persistence window `W`, firm-consensus threshold `q`). The verified rule is then wired on the diakrisis
+//! side as `polar`'s directional fabrication detector.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::needless_range_loop
+)]
 
 use std::sync::{Arc, Mutex};
 
 use fanos_field::F2;
 use fanos_geometry::fano;
 use fanos_runtime::{Command, Config, Duration, Effect, Engine, Input, Instant, OverlayNode, Triple};
-use fanos_sim::Sim;
+use fanos_sim::{NetworkModel, Sim};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
-/// A node's claimed liveness view: the 7 per-point ages it gossips (`u16::MAX` = "I do not see this
-/// point"). This IS the raw material of the §6.4 endpoint cross-attestation — what a node *asserts* about
-/// who is alive, honest or forged.
-type ClaimedView = [u16; 7];
+/// The Fano cell size.
+const N: usize = 7;
 
-/// The freshest health-view each node has gossiped, keyed by its coordinate — the research instrument's
-/// capture buffer. Shared so a wrapper on every node writes into it and the test reads it after a run.
-type ViewLog = Arc<Mutex<std::collections::BTreeMap<Triple, ClaimedView>>>;
+/// A node's claimed liveness view: the 7 per-point ages it gossips, in milliseconds (`u16::MAX` = "I have no
+/// fresh observation of this point"). This IS the raw material of the §6.4 endpoint cross-attestation — what a
+/// node *asserts* about who is alive, honest or forged. Byte-for-byte the body of a real `DiagGossip` frame
+/// (see [`OverlayNode::health_view`]).
+type ClaimedView = [u16; N];
 
-/// Decode a `DiagGossip` body (7 little-endian `u16` ages) into a [`ClaimedView`]; `None` if it is not a
-/// well-formed health-view.
+/// A single recorded gossip emission: `(sim-time in ns, emitter coordinate, the view it gossiped)`. The log is
+/// time-ordered (the sim dispatches events in nondecreasing time), so any snapshot is a forward scan.
+type ViewEvent = (u64, Triple, ClaimedView);
+
+/// The research instrument's capture buffer: every `DiagGossip` view every node emitted, in time order.
+/// Shared so a wrapper on each node appends to it and the analysis reads it after a run.
+type ViewLog = Arc<Mutex<Vec<ViewEvent>>>;
+
+/// A per-round fresh/stale matrix reconstructed from captured gossip: `fresh[i][k]` = observer `i` gossiped a
+/// *fresh* (`age < τ`) view of point `k`; `present[i]` = `i` had gossiped at all by that time. This is the
+/// domain the detection rules operate on.
+type FreshMatrix = ([[bool; N]; N], [bool; N]);
+
+/// Decode a `DiagGossip` body (7 little-endian `u16` ages) into a [`ClaimedView`]; `None` if malformed.
 fn decode_view(body: &[u8]) -> Option<ClaimedView> {
-    if body.len() < 14 {
+    if body.len() < N * 2 {
         return None;
     }
     Some(core::array::from_fn(|i| {
@@ -44,7 +77,7 @@ fn decode_view(body: &[u8]) -> Option<ClaimedView> {
 
 /// Encode a [`ClaimedView`] back into a `DiagGossip` frame body.
 fn encode_view(view: &ClaimedView) -> Vec<u8> {
-    let mut body = Vec::with_capacity(14);
+    let mut body = Vec::with_capacity(N * 2);
     for age in view {
         body.extend_from_slice(&age.to_le_bytes());
     }
@@ -55,7 +88,7 @@ fn encode_view(view: &ClaimedView) -> Vec<u8> {
 /// `DiagGossip` health-view is rewritten by a **policy** into a chosen false view. Everything else — pings,
 /// pongs, `DiagAttest`, storage, routing — is honest, so the forgery is a pure liveness *lie*, exactly the
 /// input the §6.4 endpoint check must adjudicate. The policy is `Fn(honest_view) -> forged_view`, so a
-/// scenario can express any lie (claim a live node down, claim a dead node up, see nobody, …).
+/// scenario can express any lie (vouch for a dead node, deny a live one, see nobody, …).
 struct ByzantineGossiper {
     node: OverlayNode<F2>,
     policy: Arc<dyn Fn(ClaimedView) -> ClaimedView + Send + Sync>,
@@ -65,10 +98,7 @@ struct ByzantineGossiper {
 impl Engine for ByzantineGossiper {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         let effects = self.node.step(now, input);
-        effects
-            .into_iter()
-            .map(|e| self.forge_gossip(e))
-            .collect()
+        effects.into_iter().map(|e| self.forge_gossip(e)).collect()
     }
 
     fn address(&self) -> Triple {
@@ -98,10 +128,28 @@ impl ByzantineGossiper {
     }
 }
 
-/// A transparent wrapper that RECORDS every `DiagGossip` view its inner engine emits into a shared
+/// A **vouch-fabrication** policy: always claim point `k` seen 1 ms ago (`age → 1`), so the adversary keeps a
+/// (crashed) `k` believed-alive — the dangerous lie the plain quorum cannot catch beyond `quorum−1` colluders.
+fn vouch_fresh(k: usize) -> Arc<dyn Fn(ClaimedView) -> ClaimedView + Send + Sync> {
+    Arc::new(move |mut v: ClaimedView| {
+        v[k] = 1;
+        v
+    })
+}
+
+/// A **denial** policy: always claim point `k` unseen (`age → u16::MAX`), the honest-omission-shaped lie that
+/// the endpoint check must (soundly) *abstain* on — it is indistinguishable from a cut link and already inert.
+fn deny_point(k: usize) -> Arc<dyn Fn(ClaimedView) -> ClaimedView + Send + Sync> {
+    Arc::new(move |mut v: ClaimedView| {
+        v[k] = u16::MAX;
+        v
+    })
+}
+
+/// A transparent wrapper that RECORDS every `DiagGossip` view its inner engine emits into a shared time-ordered
 /// [`ViewLog`] — the research instrument's capture point — then passes the effect through unchanged. Wrapped
-/// around BOTH honest nodes and the adversary, so the log holds each node's actually-gossiped (honest or
-/// forged) claimed view, the raw data a candidate detection rule is evaluated on.
+/// around BOTH honest nodes and adversaries, so the log holds each node's actually-gossiped (honest or forged)
+/// claimed view, the raw data a candidate rule is evaluated on.
 struct Recorder {
     inner: Box<dyn Engine>,
     log: ViewLog,
@@ -117,7 +165,7 @@ impl Engine for Recorder {
                 && f.frame_type() == Some(FrameType::DiagGossip)
                 && let Some(view) = decode_view(f.body)
             {
-                self.log.lock().unwrap().insert(me, view);
+                self.log.lock().unwrap().push((now.as_nanos(), me, view));
             }
         }
         effects
@@ -130,64 +178,290 @@ impl Engine for Recorder {
 
 /// The Fano point index of a coordinate (`0..7`).
 fn point_index(coord: Triple) -> usize {
-    (0..7).find(|&i| fano::point(i).coords() == coord).unwrap()
+    (0..N).find(|&i| fano::point(i).coords() == coord).unwrap()
 }
 
-#[test]
-fn the_byzantine_gossiper_affordance_forges_the_health_view_it_gossips() {
-    // Validate the research instrument itself: a `ByzantineGossiper` configured to always claim point 5 is
-    // DOWN (age → u16::MAX) actually gossips that lie — the recorder captures a forged view whose slot 5 is
-    // u16::MAX — while it stays otherwise live. Without a working affordance, no §6.4 research is trustworthy.
-    let log: ViewLog = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    let forged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let liar = 3usize;
-    let policy: Arc<dyn Fn(ClaimedView) -> ClaimedView + Send + Sync> = Arc::new(|mut v: ClaimedView| {
-        v[5] = u16::MAX; // "I do not see point 5" — a liveness lie about a node that is in fact alive
-        v
-    });
+/// The protocol's own staleness window τ (`liveness_timeout`), in ms — a peer unheard-from longer than this is
+/// degraded ([`Config`]). The fresh/stale split uses THIS, never a magic threshold.
+fn tau_ms() -> u16 {
+    (Config::default().liveness_timeout.as_nanos() / 1_000_000).min(u64::from(u16::MAX)) as u16
+}
 
-    let mut sim = Sim::new(0x6E_D400);
-    for i in 0..7usize {
-        let inner: Box<dyn Engine> = if i == liar {
-            Box::new(ByzantineGossiper {
+/// The freshest view each node had gossiped as of `t_ns`, indexed by Fano point (`None` = not yet gossiped).
+fn snapshot_at(log: &[ViewEvent], t_ns: u64) -> [Option<ClaimedView>; N] {
+    let mut snap: [Option<ClaimedView>; N] = [None; N];
+    for &(ts, emitter, view) in log {
+        if ts <= t_ns {
+            snap[point_index(emitter)] = Some(view);
+        }
+    }
+    snap
+}
+
+/// Reduce a snapshot to the fresh/stale matrix the detection rules read: `fresh[i][k]` iff `i` gossiped
+/// `age(k) < τ`. `u16::MAX` (unseen) is stale by construction.
+fn fresh_matrix(snap: &[Option<ClaimedView>; N], tau: u16) -> FreshMatrix {
+    let mut fresh = [[false; N]; N];
+    let mut present = [false; N];
+    for i in 0..N {
+        if let Some(view) = snap[i] {
+            present[i] = true;
+            for k in 0..N {
+                fresh[i][k] = view[k] < tau;
+            }
+        }
+    }
+    (fresh, present)
+}
+
+/// Sample the run at `count` snapshots spaced `step_ms` apart, ending at `end_ns` — the persistence window the
+/// windowed rule reasons over.
+fn window(log: &[ViewEvent], end_ns: u64, count: usize, step_ms: u64, tau: u16) -> Vec<FreshMatrix> {
+    let step_ns = step_ms * 1_000_000;
+    (0..count)
+        .rev()
+        .map(|back| {
+            let t = end_ns.saturating_sub(back as u64 * step_ns);
+            fresh_matrix(&snapshot_at(log, t), tau)
+        })
+        .collect()
+}
+
+/// **Rule NAIVE** (the reverted approach, distilled): on a single snapshot, flag `i` if for some subject `k` its
+/// fresh/stale bit contradicts the *strict majority* of the other present nodes — in **either** direction. This
+/// is the symmetric ρ-majority: it treats an honest DENY (lost ping / cut link) as a lie, so it false-positives
+/// on churn. Kept as the baseline the sound rule must beat.
+fn naive_flags(m: &FreshMatrix) -> Vec<usize> {
+    let (fresh, present) = m;
+    let mut flagged = Vec::new();
+    for i in 0..N {
+        if !present[i] {
+            continue;
+        }
+        for k in 0..N {
+            if k == i {
+                continue;
+            }
+            let mut agree = 0i32;
+            let mut disagree = 0i32;
+            for j in 0..N {
+                if j == i || j == k || !present[j] {
+                    continue;
+                }
+                if fresh[j][k] == fresh[i][k] {
+                    agree += 1;
+                } else {
+                    disagree += 1;
+                }
+            }
+            if disagree > agree {
+                flagged.push(i);
+                break;
+            }
+        }
+    }
+    flagged
+}
+
+/// **Rule FABRICATION** (the found rule): flag `i` iff there is a subject `k` such that, *persistently across
+/// the whole window*, `i` VOUCHES `k` fresh while a FIRM consensus (`≥ q` of the other present nodes) reports
+/// `k` STALE. Only this VOUCH-vs-firm-STALE direction is judged — the sound, monotone-freshness-grounded
+/// asymmetry. Persistence filters churn transients; firmness `q` tolerates up to `q−1` colluders on the honest
+/// side of the count while still catching any minority of fabricators the plain quorum lets through.
+fn fabrication_flags(win: &[FreshMatrix], q: usize) -> Vec<usize> {
+    let mut flagged = Vec::new();
+    for i in 0..N {
+        let caught = (0..N).filter(|&k| k != i).any(|k| {
+            win.iter().all(|(fresh, present)| {
+                if !present[i] || !fresh[i][k] {
+                    return false; // `i` must persistently vouch `k` fresh
+                }
+                let firm_stale = (0..N)
+                    .filter(|&j| j != i && j != k && present[j] && !fresh[j][k])
+                    .count();
+                firm_stale >= q
+            })
+        });
+        if caught {
+            flagged.push(i);
+        }
+    }
+    flagged
+}
+
+/// Build a 7-node Fano cell of [`Recorder`]-wrapped engines; `byz[i] = Some(policy)` makes point `i` a
+/// [`ByzantineGossiper`] with that policy, `None` an honest [`OverlayNode`]. Returns the sim, the log, and the
+/// shared forgery counter.
+#[allow(clippy::type_complexity)]
+fn build_cell(
+    seed: u64,
+    net: NetworkModel,
+    byz: &[Option<Arc<dyn Fn(ClaimedView) -> ClaimedView + Send + Sync>>; N],
+) -> (Sim, ViewLog, Arc<std::sync::atomic::AtomicUsize>) {
+    let log: ViewLog = Arc::new(Mutex::new(Vec::new()));
+    let forged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sim = Sim::with_network(seed, net);
+    for i in 0..N {
+        let inner: Box<dyn Engine> = match &byz[i] {
+            Some(policy) => Box::new(ByzantineGossiper {
                 node: OverlayNode::<F2>::new(fano::point(i), Config::default()),
                 policy: policy.clone(),
                 forged: forged.clone(),
-            })
-        } else {
-            Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default()))
+            }),
+            None => Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default())),
         };
         sim.add(Box::new(Recorder { inner, log: log.clone() }));
     }
     sim.inject_all(&Command::StartHeartbeat);
-    sim.run_for(Duration::from_millis(3000)); // several gossip rounds
+    (sim, log, forged)
+}
 
-    let captured = log.lock().unwrap();
-    // The adversary genuinely emitted forged gossip during the run (not a vacuous pass).
+const NONE_POLICY: Option<Arc<dyn Fn(ClaimedView) -> ClaimedView + Send + Sync>> = None;
+
+// ---------------------------------------------------------------------------------------------------------
+// Affordance self-test — validate the instrument before trusting any measurement taken with it.
+// ---------------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_byzantine_gossiper_affordance_forges_the_health_view_it_gossips() {
+    // A `ByzantineGossiper` configured to always claim point 5 DOWN actually gossips that lie — the recorder
+    // captures a forged view whose slot 5 is u16::MAX — while honest nodes still see point 5. Without a working
+    // affordance, no §6.4 measurement is trustworthy.
+    let liar = 3usize;
+    let mut byz = [NONE_POLICY; N];
+    byz[liar] = Some(deny_point(5));
+    let net = NetworkModel::new(Duration::from_millis(10), Duration::from_millis(2), 0.0);
+    let (mut sim, log, forged) = build_cell(0x6E_D400, net, &byz);
+    sim.run_for(Duration::from_millis(3000));
+
+    let log = log.lock().unwrap();
     assert!(
         forged.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "the gossiper forged at least one health-view"
     );
-    // The liar's OWN captured view carries the lie: it claims not to see point 5.
-    let liar_view = captured
-        .iter()
-        .find(|(c, _)| point_index(**c) == liar)
-        .map(|(_, v)| *v)
-        .expect("the liar's gossip was recorded");
+    let end = log.iter().map(|&(t, ..)| t).max().unwrap();
+    let snap = snapshot_at(&log, end);
     assert_eq!(
-        liar_view[5],
+        snap[liar].unwrap()[5],
         u16::MAX,
         "the forged view asserts point 5 is unseen (the configured lie)"
     );
-    // An honest node's captured view does NOT carry the lie — it sees point 5 (a fresh, finite age), so the
-    // affordance forges ONLY the adversary, giving a clean honest/forged contrast for the rule search.
-    let honest_view = captured
-        .iter()
-        .find(|(c, _)| point_index(**c) != liar)
-        .map(|(_, v)| *v)
-        .expect("an honest node's gossip was recorded");
+    let honest = (0..N).find(|&i| i != liar && snap[i].is_some()).unwrap();
     assert!(
-        honest_view[5] != u16::MAX,
+        snap[honest].unwrap()[5] != u16::MAX,
         "an honest node still sees point 5 — only the adversary forges"
     );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// The FP/detection sweep — measure both rules on honest churn+loss and on the collusion attack.
+// ---------------------------------------------------------------------------------------------------------
+
+/// Persistence window and firmness pinned by this sweep (see the module finding): 5 snapshots × 400 ms spans
+/// 2 s > τ, so a crash transient (nodes staling within one heartbeat of each other) cannot persist across it;
+/// `q = 3` is a firm majority of the honest remainder that still catches any colluder minority.
+const W: usize = 5;
+const STEP_MS: u64 = 400;
+const Q_FIRM: usize = 3;
+
+/// **FALSE-POSITIVE metric.** Seven honest nodes under heavy loss (25 %) *and* a crash+recover churn of one
+/// node. The sound fabrication rule must flag NOBODY across a seed sweep — an honest node cannot manufacture a
+/// fresh age it did not earn — while the naive symmetric rule is shown to false-positive on the same data,
+/// which is exactly why it was rejected.
+#[test]
+fn fabrication_rule_has_zero_false_positives_on_honest_churn() {
+    let tau = tau_ms();
+    let mut naive_ever_fired = false;
+    for seed in 0..16u64 {
+        let byz = [NONE_POLICY; N];
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.25);
+        let (mut sim, log, _) = build_cell(0x_A11CE ^ seed, net, &byz);
+        // Honest churn: a node crashes for a spell and rejoins — every honest node stales on it *together*
+        // (symmetric), so no single node stays fresh while a firm quorum is stale.
+        sim.run_for(Duration::from_millis(2500));
+        sim.crash(fano::point(2).coords());
+        sim.run_for(Duration::from_millis(2500));
+        sim.recover(fano::point(2).coords());
+        sim.run_for(Duration::from_millis(4000));
+
+        let log = log.lock().unwrap();
+        let end = log.iter().map(|&(t, ..)| t).max().unwrap();
+        let win = window(&log, end, W, STEP_MS, tau);
+        let flagged = fabrication_flags(&win, Q_FIRM);
+        assert!(
+            flagged.is_empty(),
+            "seed {seed}: the fabrication rule must not flag any honest node, got {flagged:?}"
+        );
+        // Record whether the naive rule would have mis-fired on this same honest data.
+        if !naive_flags(win.last().unwrap()).is_empty() {
+            naive_ever_fired = true;
+        }
+    }
+    assert!(
+        naive_ever_fired,
+        "the naive symmetric rule false-positives on honest churn+loss (the reason it was rejected)"
+    );
+}
+
+/// **DETECTION metric.** A dead node kept alive by *colluding* vouch-fabricators that exceed the corroboration
+/// quorum (`quorum = 2`, so 2 colluders defeat the plain count). The fabrication rule catches every colluder
+/// across a seed sweep — they persistently vouch a node a firm honest consensus reports stale.
+#[test]
+fn fabrication_rule_detects_colluding_vouch_liars() {
+    let tau = tau_ms();
+    let dead = 6usize; // the node the colluders keep "alive"
+    let liars = [1usize, 4usize]; // two colluders — one more than the quorum tolerates
+    for seed in 0..8u64 {
+        let mut byz = [NONE_POLICY; N];
+        for &l in &liars {
+            byz[l] = Some(vouch_fresh(dead));
+        }
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.1);
+        let (mut sim, log, forged) = build_cell(0x_DEAD ^ seed, net, &byz);
+        sim.run_for(Duration::from_millis(3000));
+        sim.crash(fano::point(dead).coords()); // the node truly dies; honest ages on it now grow past τ
+        sim.run_for(Duration::from_millis(6000));
+
+        assert!(forged.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let log = log.lock().unwrap();
+        let end = log.iter().map(|&(t, ..)| t).max().unwrap();
+        let win = window(&log, end, W, STEP_MS, tau);
+        let mut flagged = fabrication_flags(&win, Q_FIRM);
+        flagged.sort_unstable();
+        assert_eq!(
+            flagged,
+            liars.to_vec(),
+            "seed {seed}: exactly the two colluding vouch-fabricators are caught"
+        );
+    }
+}
+
+/// **DIRECTIONALITY (soundness) metric.** The dual attack — colluders DENYing a *live* node — must be *abstained
+/// on*: it is indistinguishable from honest link failure and already inert (every node trusts its own direct
+/// observation). The fabrication rule flags nobody here; catching this direction would mean quarantining honest
+/// nodes that merely have a bad link, which must never ship.
+#[test]
+fn fabrication_rule_abstains_on_deny_liars() {
+    let tau = tau_ms();
+    let victim = 6usize; // a fully-live node the liars falsely deny
+    let liars = [1usize, 4usize];
+    for seed in 0..8u64 {
+        let mut byz = [NONE_POLICY; N];
+        for &l in &liars {
+            byz[l] = Some(deny_point(victim));
+        }
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.1);
+        let (mut sim, log, forged) = build_cell(0x_FEED ^ seed, net, &byz);
+        sim.run_for(Duration::from_millis(9000)); // victim stays alive throughout
+
+        assert!(forged.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let log = log.lock().unwrap();
+        let end = log.iter().map(|&(t, ..)| t).max().unwrap();
+        let win = window(&log, end, W, STEP_MS, tau);
+        let flagged = fabrication_flags(&win, Q_FIRM);
+        assert!(
+            flagged.is_empty(),
+            "seed {seed}: denying a live node is honest-omission-shaped — the rule must abstain, got {flagged:?}"
+        );
+    }
 }
