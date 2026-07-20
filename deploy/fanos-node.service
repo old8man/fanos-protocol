@@ -1,0 +1,61 @@
+# systemd unit for a FANOS node (spec §11 / #120).
+#
+# Install:
+#   install -Dm755 target/release/fanos            /usr/local/bin/fanos
+#   install -Dm644 deploy/node.conf.example        /etc/fanos/node.conf   # then edit it
+#   install -Dm644 deploy/fanos-node.service       /etc/systemd/system/fanos-node.service
+#   systemctl daemon-reload && systemctl enable --now fanos-node
+#
+# The service runs as a dedicated unprivileged user; systemd creates /var/lib/fanos
+# (StateDirectory) and the identity persists there across restarts and upgrades.
+
+[Unit]
+Description=FANOS anonymity-overlay node
+Documentation=file:///usr/share/doc/fanos/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run under a systemd-managed transient user (no useradd, no static UID to leak) whose
+# only persistent footprint is StateDirectory below. This is the modern, lower-footprint
+# alternative to a hand-created `fanos` system account.
+DynamicUser=yes
+ExecStart=/usr/local/bin/fanos node --config /etc/fanos/node.conf
+Restart=on-failure
+RestartSec=5s
+# QUIC recovers its own streams; give a clean node time to drain on stop.
+TimeoutStopSec=30s
+
+# --- persistent state -----------------------------------------------------------------
+# systemd creates and owns /var/lib/fanos; the identity file (the node's coordinate)
+# lives here and survives restarts. With DynamicUser the UID floats, so state MUST go
+# through StateDirectory (systemd keeps it stable across the changing UID).
+StateDirectory=fanos
+StateDirectoryMode=0700
+
+# --- sandboxing (a node needs only its UDP socket and its state dir) ------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

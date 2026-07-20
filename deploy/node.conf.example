@@ -1,0 +1,33 @@
+# FANOS node configuration — loaded with `fanos node --config /etc/fanos/node.conf`.
+#
+# Format: one `key = value` per line; `#` starts a comment; blank lines are ignored.
+# An UNRECOGNISED key is a hard error (a typo fails the node at start rather than
+# silently leaving a setting at its default). Any value here can be overridden on the
+# command line, e.g. `fanos node --config node.conf --listen 0.0.0.0:9100`.
+
+# UDP address the QUIC endpoint binds to. 0.0.0.0 accepts on every interface; pin the
+# port so peers and NAT forwarding have a stable target (the default, port 0, is an
+# ephemeral OS-assigned port — fine for a client, wrong for a reachable server).
+listen = 0.0.0.0:9000
+
+# Where the self-certifying identity is persisted. This file IS the node's overlay
+# coordinate: back it up, keep its permissions tight (0600), and keep it across
+# restarts and upgrades to keep the same coordinate. Omit it to run ephemerally (a new
+# identity — and a new coordinate — on every start).
+identity = /var/lib/fanos/id.bin
+
+# Bootstrap peers: comma-separated `x:y:z@host:port` seeds used to dial into the
+# network (FANOS has no central directory — you seed from nodes you already know).
+# Get a seed from an existing node with `fanos id --identity <its id file>`, which
+# prints a `x:y:z@HOST:PORT` line. Leave commented for the very first (genesis) node.
+# bootstrap = 1:0:0@seed1.example:9000, 2:0:0@seed2.example:9000
+
+# Advertised roles, comma-separated from: relay, storage, service, exit.
+#   relay   — forward others' traffic (the backbone role; advertise it if you can)
+#   storage — hold L4 DHT shards for the cell
+#   service — host hidden services (CALYPSO)
+#   exit    — bridge to the clear net (only if you intend to be an exit)
+role = relay,storage
+
+# Begin liveness heartbeats on start (true/false). Leave true for a normal node.
+heartbeat = true

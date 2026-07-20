@@ -1,0 +1,6 @@
+# Keep the build context small and hermetic — the image builds from source only.
+rust/target/
+**/target/
+.git/
+**/*.rs.bk
+scratchpad/
