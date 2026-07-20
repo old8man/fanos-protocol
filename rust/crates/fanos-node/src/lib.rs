@@ -25,6 +25,7 @@ pub mod mix_relay;
 pub mod mixdir;
 pub mod node;
 pub mod overlay_beacon;
+pub mod proxy;
 pub mod rendezvous;
 pub mod rendezvous_relay;
 pub mod resolve;
@@ -43,6 +44,7 @@ pub use mixdir::{
 };
 pub use node::{Health, Node};
 pub use overlay_beacon::OverlayBeaconNode;
+pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
 pub use rendezvous_relay::{RendezvousRelay, register_frame};
 pub use resolve::{NodeResolver, ResolvedService, publish_service, verify_descriptor};

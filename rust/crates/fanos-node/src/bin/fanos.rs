@@ -2,16 +2,22 @@
 //!
 //! Subcommands:
 //!   * `fanos node`  — run a node (overlay membership, storage, healing) over QUIC.
+//!   * `fanos proxy` — run local SOCKS5 / HTTP-CONNECT listeners tunnelling to `.fanos` services (§11.3).
 //!   * `fanos id`    — print (and optionally persist) a node's self-certifying coordinate.
 //!   * `fanos help`  — usage.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use fanos_field::F2;
-use fanos_node::{Epoch, Node, NodeConfig, NodeError, Peer, RoleSet, identity};
+use fanos_node::{
+    Epoch, FanosDialer, Node, NodeConfig, NodeError, NodeResolver, Peer, RoleSet, identity,
+    serve_proxy,
+};
 use fanos_runtime::Notification;
+use tokio::net::TcpListener;
 use tracing::info;
 
 #[tokio::main]
@@ -29,6 +35,7 @@ async fn main() -> ExitCode {
 async fn run(args: &[String]) -> Result<(), NodeError> {
     match args.get(1).map(String::as_str) {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
+        Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
@@ -41,12 +48,10 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
     }
 }
 
-/// Run a node until Ctrl-C.
-async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
-    init_tracing();
-
-    // A `--config <file>` supplies the base settings; individual CLI flags then override it, so an
-    // operator can keep a config file and tweak one setting on the command line without rewriting it.
+/// Build a [`NodeConfig`] from a `--config <file>` base (if any) with individual CLI flags overriding it,
+/// so an operator can keep a config file and tweak one setting on the command line. Shared by `fanos node`
+/// and `fanos proxy` — both run a full node, they differ only in what they do with its `Client`.
+fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     let mut config = match flag(args, "--config") {
         Some(path) => NodeConfig::from_config_str(&std::fs::read_to_string(path)?)?,
         None => NodeConfig::default(),
@@ -70,7 +75,13 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     if has_flag(args, "--no-heartbeat") {
         config.start_heartbeat = false;
     }
+    Ok(config)
+}
 
+/// Run a node until Ctrl-C.
+async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
+    init_tracing();
+    let config = node_config_from_args(args)?;
     let mut node = Node::start::<F2>(config).await?;
     let health = node.health();
     let [x, y, z] = health.address;
@@ -97,6 +108,82 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     }
     node.shutdown();
     eprintln!("fanos node down");
+    Ok(())
+}
+
+/// Run local SOCKS5 (and optional HTTP-CONNECT) proxy listeners that tunnel `CONNECT <name>.fanos:port`
+/// through this node's FANOS sessions (spec §11.3). This process joins the overlay exactly like `fanos node`,
+/// then its `Client` backs a [`FanosDialer`]: each accepted CONNECT resolves the `.fanos` name to a service
+/// coordinate (via the overlay descriptor store, [`NodeResolver`]) and opens an encrypted hybrid-PQ DIAULOS
+/// byte-stream to it. The local SOCKS/HTTP hop answers `.fanos` addressing itself, so names never reach the
+/// system resolver. Clearnet targets are refused today (a `.fanos`-only surface — no exit dialer yet), as are
+/// UDP ASSOCIATE / BIND.
+async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
+    init_tracing();
+
+    let socks_listen: SocketAddr = match flag(args, "--socks-listen") {
+        Some(s) => s
+            .parse()
+            .map_err(|_| NodeError::Config(format!("bad --socks-listen '{s}'")))?,
+        None => SocketAddr::from(([127, 0, 0, 1], 1080)),
+    };
+    let http_listen: Option<SocketAddr> = match flag(args, "--http-listen") {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|_| NodeError::Config(format!("bad --http-listen '{s}'")))?,
+        ),
+        None => None,
+    };
+    let epoch = match flag(args, "--epoch") {
+        Some(s) => Epoch::new(
+            s.parse()
+                .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
+        ),
+        None => Epoch::ZERO,
+    };
+    let min_pow = match flag(args, "--min-pow") {
+        Some(s) => s
+            .parse()
+            .map_err(|_| NodeError::Config(format!("bad --min-pow '{s}'")))?,
+        None => 0,
+    };
+
+    let config = node_config_from_args(args)?;
+    let mut node = Node::start::<F2>(config).await?;
+    let health = node.health();
+    let resolver = NodeResolver::new(node.client(), epoch, min_pow);
+    // `FanosDialer` is not `Clone`, so `serve_proxy` shares it behind an `Arc` (per-connection handlers need
+    // only `&D`). The dialer holds its own `Client`; the node stays owned here for notification draining + a
+    // clean shutdown.
+    let dialer = Arc::new(FanosDialer::new(node.client(), resolver));
+
+    let socks = TcpListener::bind(socks_listen).await?;
+    let http = match http_listen {
+        Some(addr) => Some(TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let [x, y, z] = health.address;
+    let http_line = http_listen.map_or_else(String::new, |a| {
+        format!("\n  HTTP:    http://{a} (CONNECT)")
+    });
+    eprintln!(
+        "fanos proxy up — coordinate {x}:{y}:{z} on {}\n  SOCKS5:  socks5://{socks_listen}{http_line}",
+        health.local_addr,
+    );
+    info!(coord = ?health.address, %socks_listen, ?http_listen, "fanos proxy up");
+
+    // Serve the proxy until Ctrl-C, while concurrently draining the node's notifications so the overlay keeps
+    // making progress and operator-visible events are logged.
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal received");
+    };
+    tokio::select! {
+        () = serve_proxy(socks, http, dialer, shutdown) => {}
+        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+    }
+    node.shutdown();
+    eprintln!("fanos proxy down");
     Ok(())
 }
 
@@ -219,9 +306,11 @@ fn print_help() {
         "fanos — the FANOS node\n\
          \n\
          USAGE:\n\
-         \x20 fanos node [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
-         \x20            [--role relay,storage,service,exit] [--no-heartbeat]\n\
-         \x20 fanos id   [--identity PATH]\n\
+         \x20 fanos node  [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
+         \x20             [--role relay,storage,service,exit] [--no-heartbeat]\n\
+         \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
+         \x20             [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
+         \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos help\n\
          \n\
@@ -229,6 +318,8 @@ fn print_help() {
          \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\
          \x20 fanos node --listen 0.0.0.0:9000 --identity ~/.fanos/id.bin \\\n\
          \x20            --bootstrap 1:0:0@seed.example:9000 --role relay,storage\n\
+         \x20 fanos proxy --socks-listen 127.0.0.1:1080 --bootstrap 1:0:0@seed.example:9000\n\
+         \x20            # then: curl --socks5-hostname 127.0.0.1:1080 http://<pubkey>.fanos/\n\
          \n\
          Set RUST_LOG=debug for verbose logs."
     );
