@@ -67,31 +67,48 @@ pub struct CoherenceSnapshot {
     pub heal_seq: u32,
     /// Readiness: `Φ ≥ 1 ∧ R ≥ 1/3` — bound *and* self-observing. The theorem-grounded liveness gate.
     pub ready: bool,
+    /// The cell's alive-node count, recovered from the equicorrelated identity `Φ = (N−1)·r²` (spec
+    /// §2.7) by inverting for `N`. **Exact** for the mandatory liveness-only fold
+    /// ([`observer::SelfObserver::observe_liveness`](crate::observer::SelfObserver::observe_liveness),
+    /// the production self-observation every node runs every window: it literally builds an
+    /// `N`-sized equicorrelated matrix from the live count, so the inversion recovers that exact `N`
+    /// for any `r ≠ 0`). Only **approximate** when the frame instead came from measured per-node
+    /// signals (`observe_cell`), whose empirical correlation need not be exactly equicorrelated. The
+    /// compact 3-bit syndrome deliberately carries no count (Minimal Self-Observation Overhead
+    /// theorem) — this is the best operator estimate recoverable without widening the wire frame. A
+    /// degenerate `r ≈ 0` (fully decorrelated — the resilient/diversified regime, not a fault) cannot
+    /// be inverted and falls back to the binary syndrome signal (`CELL_N` healthy, `CELL_N − 1`
+    /// faulted).
+    pub alive_nodes: u32,
 }
 
 impl CoherenceSnapshot {
-    /// Fold a [`CoherenceFrame`] into the operator snapshot, deriving `r_stab` and the readiness verdict.
+    /// Fold a [`CoherenceFrame`] into the operator snapshot, deriving `r_stab`, `alive_nodes`, and the
+    /// readiness verdict.
     #[must_use]
     pub fn from_frame(frame: &CoherenceFrame) -> Self {
         let phi = f64::from(frame.phi);
         let purity = f64::from(frame.purity);
         let reflection = f64::from(frame.reflection);
+        let mean_correlation = f64::from(frame.mean_r);
+        let faulted = frame.is_faulted();
         Self {
             cell_id: frame.cell_id,
             epoch: frame.epoch,
             phi,
             purity,
             reflection,
-            mean_correlation: f64::from(frame.mean_r),
+            mean_correlation,
             spectral_gap: f64::from(frame.gap),
             stability_radius: stability_radius(purity, CELL_N),
             regime: frame.regime(),
             alarm: frame.alarm(),
-            faulted: frame.is_faulted(),
+            faulted,
             syndrome: frame.syndrome,
             cascade_lead: frame.forecast,
             heal_seq: frame.heal_seq,
             ready: phi >= PHI_THRESHOLD && reflection >= REFLECTION_FLOOR,
+            alive_nodes: estimate_alive_nodes(phi, mean_correlation, faulted),
         }
     }
 
@@ -126,13 +143,17 @@ impl CoherenceSnapshot {
         push_num(&mut s, "mean_correlation", self.mean_correlation);
         push_num(&mut s, "spectral_gap", self.spectral_gap);
         push_num(&mut s, "stability_radius", self.stability_radius);
-        let _ = write!(s, "\"regime\":\"{}\",", regime_name(self.regime));
-        let _ = write!(s, "\"alarm\":\"{}\",", alarm_name(self.alarm));
+        let _ = write!(s, "\"regime\":\"{}\",", self.regime.as_str());
+        let _ = write!(s, "\"alarm\":\"{}\",", self.alarm.as_str());
         let _ = write!(s, "\"faulted\":{},", self.faulted);
         let _ = write!(s, "\"syndrome\":{},", self.syndrome);
         let _ = write!(s, "\"cascade_lead\":{},", self.cascade_lead);
         let _ = write!(s, "\"heal_seq\":{},", self.heal_seq);
-        let _ = write!(s, "\"ready\":{}", self.ready);
+        let _ = write!(s, "\"ready\":{},", self.ready);
+        // Appended after the pre-existing fields (never inserted earlier): the doc-promised field
+        // order of everything before it stays byte-identical for an existing consumer, and a fixed
+        // terminal-width renderer (ui.rs) that only has room to show up through "ready" is unaffected.
+        let _ = write!(s, "\"alive_nodes\":{}", self.alive_nodes);
         s.push('}');
         s
     }
@@ -147,19 +168,24 @@ fn push_num(s: &mut String, key: &str, v: f64) {
     }
 }
 
-const fn regime_name(r: Regime) -> &'static str {
-    match r {
-        Regime::Aggregate => "aggregate",
-        Regime::CollectiveSubject => "collective_subject",
-        Regime::OverCoupled => "over_coupled",
-    }
-}
-
-const fn alarm_name(a: AlarmLevel) -> &'static str {
-    match a {
-        AlarmLevel::Healthy => "healthy",
-        AlarmLevel::Integration => "integration",
-        AlarmLevel::Structure => "structure",
+/// Invert the equicorrelated identity `Φ = (N−1)·r²` (spec §2.7) for `N` — see
+/// [`CoherenceSnapshot::alive_nodes`] for when this is exact vs. approximate, and the fallback.
+fn estimate_alive_nodes(phi: f64, mean_correlation: f64, faulted: bool) -> u32 {
+    let r2 = mean_correlation * mean_correlation;
+    let inverted = phi / r2 + 1.0;
+    // A meaningfully nonzero r is required to divide; otherwise fall back to the binary syndrome
+    // signal rather than propagate a division blow-up.
+    if r2 > 1e-9 && inverted.is_finite() {
+        // No `f64::round()` in core-only no_std (it needs libm, and this crate's own `libm` feature
+        // only wires the backend through to fanos-diakrisis, not to bare f64 methods here). Clamp to
+        // non-negative first, then the classic round-to-nearest-via-truncation trick: adding 0.5
+        // before the truncating cast rounds correctly for any non-negative input.
+        let clamped = inverted.clamp(0.0, CELL_N as f64);
+        (clamped + 0.5) as u32
+    } else if faulted {
+        (CELL_N - 1) as u32
+    } else {
+        CELL_N as u32
     }
 }
 
@@ -231,8 +257,57 @@ mod tests {
         assert!(json.contains("\"cell_id\":\"abababababababababababababababab\""));
         assert!(json.contains("\"epoch\":9,"));
         assert!(json.contains("\"regime\":\""));
+        assert!(json.contains("\"alive_nodes\":"));
         assert!(json.contains("\"ready\":"));
         // No non-finite scalar leaked as an invalid JSON token.
         assert!(!json.contains("NaN") && !json.contains("inf"));
+    }
+
+    #[test]
+    fn alive_nodes_is_exact_for_the_equicorrelated_liveness_fold() {
+        // frame(r) builds CoherenceMatrix::equicorrelated(7, r) — exactly the shape
+        // observe_liveness produces from a live alive_count — so Φ=(N−1)r² inverts back to N=7
+        // exactly, for any nonzero r, healthy or weakly correlated alike.
+        for r in [0.05, 0.3, 0.5, 0.7] {
+            let snap = CoherenceSnapshot::from_frame(&frame(r));
+            assert_eq!(snap.alive_nodes, 7, "r={r}");
+        }
+    }
+
+    #[test]
+    fn alive_nodes_tracks_a_smaller_live_count() {
+        // Mirrors SelfObserver::observe_liveness with 2 nodes down (5 alive): the matrix really is
+        // 5×5 equicorrelated, so the inversion recovers 5, not the fixed CELL_N=7.
+        let matrix = CoherenceMatrix::equicorrelated(5, 0.45);
+        let f = CoherenceFrame::observe(CellId([0xCD; 16]), 1, &matrix, 0b0001_1000, 0.3, -1, 0);
+        let snap = CoherenceSnapshot::from_frame(&f);
+        assert_eq!(snap.alive_nodes, 5);
+    }
+
+    #[test]
+    fn alive_nodes_falls_back_to_the_syndrome_when_r_is_degenerate() {
+        // r ≈ 0 (fully decorrelated — the diversified/resilient regime, not itself a fault) makes
+        // Φ/r² un-invertible; the fallback reads the binary syndrome signal instead of blowing up.
+        let healthy = CoherenceSnapshot::from_frame(&frame(0.0));
+        assert_eq!(healthy.alive_nodes, CELL_N as u32, "no fault ⇒ CELL_N");
+
+        let matrix = CoherenceMatrix::equicorrelated(7, 0.0);
+        let faulted_frame = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0);
+        let faulted = CoherenceSnapshot::from_frame(&faulted_frame);
+        assert!(faulted.faulted);
+        assert_eq!(faulted.alive_nodes, CELL_N as u32 - 1, "one localized fault ⇒ CELL_N − 1");
+    }
+
+    #[test]
+    fn alive_nodes_is_always_within_the_physical_cell_bound() {
+        // Whatever r/Φ combination a (possibly adversarial or degenerate) frame carries, the derived
+        // count must never exceed the cell size or go negative — it is clamped, not merely "usually"
+        // in range.
+        for r in [-0.9, -0.1, 0.0, 1e-7, 0.408, 0.577, 0.9, 1.0] {
+            let matrix = CoherenceMatrix::equicorrelated(7, r);
+            let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0);
+            let snap = CoherenceSnapshot::from_frame(&f);
+            assert!(snap.alive_nodes <= CELL_N as u32, "r={r}");
+        }
     }
 }

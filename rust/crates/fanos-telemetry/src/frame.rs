@@ -31,6 +31,20 @@ pub enum Regime {
     OverCoupled,
 }
 
+impl Regime {
+    /// The stable lower-snake-case label (used by `CoherenceSnapshot::to_json` and any labeled-metric
+    /// rendering — one canonical spelling, so a consumer cross-referencing JSON against a metrics
+    /// surface sees the same string in both).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Aggregate => "aggregate",
+            Self::CollectiveSubject => "collective_subject",
+            Self::OverCoupled => "over_coupled",
+        }
+    }
+}
+
 /// The leading-indicator alarm level (spec §6.6): integration crosses before structure.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AlarmLevel {
@@ -40,6 +54,18 @@ pub enum AlarmLevel {
     Integration,
     /// `Φ < 1` and `P < 2/N`.
     Structure,
+}
+
+impl AlarmLevel {
+    /// The stable lower-snake-case label (see [`Regime::as_str`]).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Integration => "integration",
+            Self::Structure => "structure",
+        }
+    }
 }
 
 // `verdict` byte layout: [ .. .. integrated | alarm(2) | regime(2) ].
