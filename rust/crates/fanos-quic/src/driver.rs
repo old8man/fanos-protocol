@@ -27,10 +27,13 @@ use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
 use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_wire::capability::Capabilities;
+use fanos_wire::error::encode_error;
+use fanos_wire::{FrameType, ProtocolError, encode_frame};
 use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
-use crate::identity::{hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello};
+use crate::identity::{HelloResult, hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello};
 use crate::tls::{
     NodeCredentials, TlsError, node_configs, node_configs_mutual_from,
 };
@@ -51,13 +54,14 @@ fn tuned_transport() -> Arc<quinn::TransportConfig> {
 type Shaper = Option<Arc<ProteusShaper>>;
 
 /// A self-certifying node's authenticated-identity handling (VRF-coordinate mode): the HELLO it
-/// announces on a fresh connection — its `epoch ‖ coordinate ‖ proof-of-coordinate` — and a verifier
-/// that checks a peer's HELLO against the peer's authenticated certificate, yielding the peer's
-/// **certified** coordinate. Both are needed because a VRF coordinate is not a function of the
-/// certificate alone: each side proves its coordinate and verifies the other's (spec §7.3).
-/// Verifies a peer's HELLO against its authenticated certificate: `(peer_cert_der, peer_hello) →`
-/// the peer's certified coordinate, or `None` to reject.
-type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> Option<Triple> + Send + Sync>;
+/// announces on a fresh connection — its negotiation parameters and `epoch ‖ coordinate ‖
+/// proof-of-coordinate` (spec §7.3/§7.4) — and a verifier that checks a peer's HELLO against the
+/// peer's authenticated certificate AND negotiates the session, yielding either the agreed
+/// parameters or a protocol-incompatibility reason. Both are needed because a VRF coordinate is not
+/// a function of the certificate alone: each side proves its coordinate and verifies the other's.
+/// Verifies a peer's HELLO against its authenticated certificate and this node's own capabilities:
+/// `(peer_cert_der, peer_hello) →` the negotiation outcome, or `None` to silently reject (bad proof).
+type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> Option<HelloResult> + Send + Sync>;
 
 #[derive(Clone)]
 struct SelfCert {
@@ -396,16 +400,50 @@ fn default_bind() -> SocketAddr {
 }
 
 /// Bring up a **self-certifying** node: its overlay coordinate is `MapToPoint(H(cert))`, bound to
-/// its mutual-TLS certificate, so a peer authenticates the coordinate from the handshake — no HELLO
-/// and no directory-trust for identity (the directory serves only address resolution). The engine
-/// is built at the cert-derived coordinate by `make_engine`.
+/// its mutual-TLS certificate, so a peer authenticates the coordinate from the handshake — no
+/// directory-trust for identity (the directory serves only address resolution). The engine is built
+/// at the cert-derived coordinate by `make_engine`. Advertises the conservative
+/// [`Capabilities::CORE`]-only baseline (spec §7.4): this generic entry point has no visibility
+/// into which optional modules the caller wires up alongside the core engine, so it never overclaims
+/// a feature it might not actually serve. A caller that knows its full module mix should use
+/// [`spawn_self_certifying_with_capabilities`] instead.
 pub async fn spawn_self_certifying<F: Field + 'static>(
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
     let creds = NodeCredentials::generate()?;
     let (server, client, _cert) = node_configs_mutual_from(&creds)?;
-    self_certifying_inner::<F, _>(server, client, &creds, make_engine, directory, default_bind())
+    self_certifying_inner::<F, _>(
+        server,
+        client,
+        &creds,
+        make_engine,
+        directory,
+        default_bind(),
+        Capabilities::CORE,
+    )
+}
+
+/// Like [`spawn_self_certifying`], but advertises an explicit capability set (spec §7.4) instead of
+/// the conservative [`Capabilities::CORE`]-only default — for a deployment (or test) that knows
+/// which optional feature families it actually serves alongside the core engine, so a peer can
+/// negotiate the real intersection rather than always falling back to the baseline.
+pub async fn spawn_self_certifying_with_capabilities<F: Field + 'static>(
+    make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
+    directory: Directory,
+    capabilities: Capabilities,
+) -> Result<NodeHandle, QuicError> {
+    let creds = NodeCredentials::generate()?;
+    let (server, client, _cert) = node_configs_mutual_from(&creds)?;
+    self_certifying_inner::<F, _>(
+        server,
+        client,
+        &creds,
+        make_engine,
+        directory,
+        default_bind(),
+        capabilities,
+    )
 }
 
 /// Like [`spawn_self_certifying`], but reuses persisted [`NodeCredentials`] so the node keeps the
@@ -423,6 +461,7 @@ pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
         make_engine,
         directory,
         default_bind(),
+        Capabilities::CORE,
     )
 }
 
@@ -436,9 +475,18 @@ pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
     directory: Directory,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, _cert) = node_configs_mutual_from(credentials)?;
-    self_certifying_inner::<F, _>(server, client, credentials, make_engine, directory, bind)
+    self_certifying_inner::<F, _>(
+        server,
+        client,
+        credentials,
+        make_engine,
+        directory,
+        bind,
+        Capabilities::CORE,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn self_certifying_inner<F: Field + 'static, M>(
     server: ServerConfig,
     client: ClientConfig,
@@ -446,6 +494,7 @@ fn self_certifying_inner<F: Field + 'static, M>(
     make_engine: M,
     directory: Directory,
     bind: SocketAddr,
+    capabilities: Capabilities,
 ) -> Result<NodeHandle, QuicError>
 where
     M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
@@ -456,9 +505,14 @@ where
     let (coord, proof) = verifiable_coordinate::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
     let engine = make_engine(coord);
     let identity: Identity = Some(SelfCert {
-        hello: Arc::new(hello_bytes(Epoch::ZERO, coord.coords(), &proof)),
-        verify: Arc::new(|peer_cert: &[u8], peer_hello: &[u8]| {
-            verify_hello::<F>(peer_cert, peer_hello, &BeaconSeed::GENESIS)
+        hello: Arc::new(hello_bytes::<F>(
+            Epoch::ZERO,
+            coord.coords(),
+            &proof,
+            capabilities,
+        )),
+        verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
+            verify_hello::<F>(peer_cert, peer_hello, &BeaconSeed::GENESIS, capabilities)
         }),
     });
     spawn_inner(engine, directory, None, identity, server, client, bind)
@@ -634,16 +688,16 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                 let _ = hello.finish();
             }
         }
-        // Self-certifying mode: announce our own proof-of-coordinate, then require the peer to prove it
-        // is the coordinate we dialed — otherwise the address resolved to an impostor and we drop it.
+        // Self-certifying mode: exchange + negotiate HELLOs (spec §7.3/§7.4), then require the peer
+        // to have proved the coordinate we dialed — otherwise the address resolved to an impostor
+        // (or a negotiation-incompatible peer) and we drop it.
         Some(id) => {
-            send_hello(&conn, &t.shaper, &id.hello).await;
-            let peer = read_verified_hello(&conn, &t.shaper, &id.verify).await;
+            let peer = hello_exchange(&conn, &t.shaper, id).await;
             if peer != Some(to) {
                 tracing::warn!(
                     ?to,
                     ?peer,
-                    "peer did not prove the dialed coordinate; rejecting"
+                    "peer did not prove the dialed coordinate (or negotiation failed); rejecting"
                 );
                 return None;
             }
@@ -691,15 +745,15 @@ async fn accept_loop(
             let Ok(conn) = incoming.await else {
                 return;
             };
-            // Learn the peer's coordinate: verify its proof-of-coordinate HELLO against its authenticated
-            // certificate (self-certifying), or read its unauthenticated HELLO (directory-trust mode).
+            // Learn the peer's coordinate: exchange + negotiate proof-of-coordinate HELLOs (self-
+            // certifying), or read its unauthenticated HELLO (directory-trust mode).
             let from = if let Some(id) = &identity {
-                let Some(coord) = read_verified_hello(&conn, &shaper, &id.verify).await else {
-                    tracing::debug!("inbound peer did not prove its coordinate; dropping");
+                let Some(coord) = hello_exchange(&conn, &shaper, id).await else {
+                    tracing::debug!(
+                        "inbound HELLO rejected (bad proof or negotiation incompatible); dropping"
+                    );
                     return;
                 };
-                // Announce ours so the dialer can verify us in turn.
-                send_hello(&conn, &shaper, &id.hello).await;
                 coord
             } else {
                 let Some(coord) = read_hello(&conn, &shaper).await else {
@@ -716,7 +770,8 @@ async fn accept_loop(
     }
 }
 
-/// Announce our HELLO (`epoch ‖ coord ‖ proof-of-coordinate`) as a uni-stream, shaped like any frame.
+/// Announce our HELLO (a pre-built [`FrameType::Hello`] frame: negotiation parameters ‖ `epoch` ‖
+/// `coord` ‖ proof-of-coordinate) as a uni-stream, shaped like any frame.
 async fn send_hello(conn: &Connection, shaper: &Shaper, hello: &[u8]) {
     if let Ok(mut stream) = conn.open_uni().await {
         let _ = stream.write_all(&shape_out(shaper, hello)).await;
@@ -724,20 +779,81 @@ async fn send_hello(conn: &Connection, shaper: &Shaper, hello: &[u8]) {
     }
 }
 
-/// Read the peer's first uni-stream as its HELLO and verify its coordinate proof against the peer's
-/// authenticated certificate, returning the **certified** coordinate (or `None` to drop the peer). This
-/// is the authenticated-identity step for a VRF coordinate — a proof for one certificate does not verify
-/// against another, so no live challenge is needed (spec §7.3).
+/// Write one framed message as a fresh uni-stream, shaped like any frame — the shared send
+/// primitive [`send_hello_ack`] and [`send_error`] build on (spec §7.2 framing).
+async fn send_framed(conn: &Connection, shaper: &Shaper, ty: FrameType, body: &[u8]) {
+    let mut frame = Vec::new();
+    encode_frame(ty.code(), body, &mut frame);
+    if let Ok(mut stream) = conn.open_uni().await {
+        let _ = stream.write_all(&shape_out(shaper, &frame)).await;
+        let _ = stream.finish();
+    }
+}
+
+/// Send a `HELLO_ACK` (spec §7.3/§7.4) echoing the negotiated `version` and `capabilities`: body
+/// `version(2 BE) ‖ capabilities(4 BE)` — the confirmation the state diagram enters `ESTABLISHED`
+/// on. Fire-and-forget: each side computes the SAME deterministic negotiation independently from
+/// the peer's HELLO, so establishing the session never blocks waiting to read the peer's ack back
+/// (a peer that never sends one — e.g. a future build that dropped HelloAck — cannot wedge us).
+async fn send_hello_ack(conn: &Connection, shaper: &Shaper, version: u16, capabilities: Capabilities) {
+    let mut body = Vec::with_capacity(6);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&capabilities.bits().to_be_bytes());
+    send_framed(conn, shaper, FrameType::HelloAck, &body).await;
+}
+
+/// Send an `ERROR` frame (spec §7.5) reporting `err` with no reason text — the handshake's
+/// incompatibility path (state diagram: `HELLO_SENT → CLOSED`). Best-effort: the connection is
+/// being abandoned regardless of whether this write lands.
+async fn send_error(conn: &Connection, shaper: &Shaper, err: ProtocolError) {
+    let body = encode_error(err, b"");
+    send_framed(conn, shaper, FrameType::Error, &body).await;
+}
+
+/// Read the peer's first uni-stream as its HELLO, verify its coordinate proof against the peer's
+/// authenticated certificate, and negotiate the session — returning the raw [`HelloResult`] (or
+/// `None` to drop the peer: canonical-decode failure or a bad proof). This is the authenticated-
+/// identity step for a VRF coordinate — a proof for one certificate does not verify against
+/// another, so no live challenge is needed (spec §7.3).
 async fn read_verified_hello(
     conn: &Connection,
     shaper: &Shaper,
     verify: &HelloVerifier,
-) -> Option<Triple> {
+) -> Option<HelloResult> {
     let mut stream = conn.accept_uni().await.ok()?;
     let raw = stream.read_to_end(MAX_FRAME).await.ok()?;
     let hello = shape_in(shaper, raw)?;
     let cert = peer_cert_der(conn)?;
     verify(&cert, &hello)
+}
+
+/// The full self-certifying HELLO exchange on a fresh connection (spec §7.3/§7.4): announce our own
+/// negotiation-bearing HELLO, then read + verify the peer's. On a successful negotiation, send a
+/// `HELLO_ACK` echoing the agreed (version, capabilities) and return the peer's certified
+/// coordinate. On a version or capability incompatibility, send an `ERROR` frame and abort
+/// (`None`) instead of proceeding. A bad coordinate proof is unchanged: a silent drop (spec §L0 —
+/// an impostor is never told exactly why its forged proof failed).
+///
+/// Both the dialer ([`get_or_connect`]) and the acceptor ([`accept_loop`]) call this same function:
+/// each announces its own HELLO immediately (never waiting on the peer first), so there is no
+/// ordering dependency between the two sides — symmetric, and it cannot deadlock.
+async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Option<Triple> {
+    send_hello(conn, shaper, &id.hello).await;
+    match read_verified_hello(conn, shaper, &id.verify).await? {
+        HelloResult::Established {
+            coord,
+            version,
+            capabilities,
+        } => {
+            send_hello_ack(conn, shaper, version, capabilities).await;
+            Some(coord)
+        }
+        HelloResult::Incompatible(err) => {
+            tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
+            send_error(conn, shaper, err).await;
+            None
+        }
+    }
 }
 
 /// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.

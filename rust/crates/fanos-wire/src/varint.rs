@@ -126,23 +126,8 @@ mod tests {
         assert_eq!(b, [0x9D, 0x7F, 0x3E, 0x7D]); // 4-byte
     }
 
-    /// The exact encode vectors published in `conformance/vectors/wire.json`.
-    #[test]
-    fn conformance_varint_vectors() {
-        let cases: [(u64, &[u8]); 8] = [
-            (0, &[0x00]),
-            (37, &[0x25]),
-            (63, &[0x3F]),
-            (64, &[0x40, 0x40]),
-            (15293, &[0x7B, 0xBD]),
-            (16383, &[0x7F, 0xFF]),
-            (16384, &[0x80, 0x00, 0x40, 0x00]),
-            (494_878_333, &[0x9D, 0x7F, 0x3E, 0x7D]),
-        ];
-        for (value, expected) in cases {
-            let mut b = Vec::new();
-            encode(value, &mut b);
-            assert_eq!(b, expected, "varint({value})");
-        }
-    }
+    // The `conformance/vectors/wire.json` encode vectors are no longer hand-duplicated here — they
+    // are machine-verified directly against that file by `crates/fanos-wire/tests/wire_kat.rs`
+    // (audit #101), which loads it and re-derives every entry from this module. Keeping one copy of
+    // the numbers (in the JSON) means this file and the interop contract cannot silently drift apart.
 }

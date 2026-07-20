@@ -1,5 +1,9 @@
 //! Decode errors and the protocol error taxonomy (spec §7.5).
 
+use alloc::vec::Vec;
+
+use crate::varint;
+
 /// A decoding failure. Canonical encoding means there is exactly one valid byte sequence for
 /// every object, so a decoder rejects everything else — that is what makes signatures and
 /// hashes portable across implementations (spec §7.1).
@@ -101,6 +105,31 @@ impl ProtocolError {
     pub fn code(self) -> u64 {
         self as u16 as u64
     }
+
+    /// The taxonomy entry for a numeric wire code, or `None` if this build does not recognize it
+    /// (a forward-compatible peer's new error class, or a malformed/garbage code). Exhaustive match
+    /// keeps the taxonomy and this decoder in lock-step, mirroring [`crate::FrameType::from_code`].
+    #[must_use]
+    pub fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            100 => Self::Unsupported,
+            101 => Self::Malformed,
+            102 => Self::NonCanonical,
+            200 => Self::BadCoord,
+            201 => Self::EpochStale,
+            202 => Self::SybilReject,
+            300 => Self::NoRoute,
+            301 => Self::QuorumUnavail,
+            302 => Self::ThresholdUnmet,
+            400 => Self::PathBroken,
+            401 => Self::HolonomyFail,
+            402 => Self::CoverStarved,
+            500 => Self::SvcUnreachable,
+            501 => Self::RdvExpired,
+            502 => Self::PowRequired,
+            _ => return None,
+        })
+    }
 }
 
 impl core::fmt::Display for ProtocolError {
@@ -128,3 +157,94 @@ impl core::fmt::Display for ProtocolError {
 }
 
 impl core::error::Error for ProtocolError {}
+
+/// Encode an `ERROR` frame body (spec §7.5): `code:varint ‖ reason:bytes`. `reason` is optional
+/// UTF-8 explanatory text (may be empty) — its length is bounded by the enclosing frame's own
+/// `length` field (spec §7.2), so no redundant inner length prefix is needed; this mirrors
+/// [`crate::frame::encode_frame`]'s own trailing-field convention (e.g. `Publish`'s trailing value).
+#[must_use]
+pub fn encode_error(err: ProtocolError, reason: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + reason.len());
+    varint::encode(err.code(), &mut out);
+    out.extend_from_slice(reason);
+    out
+}
+
+/// Decode an `ERROR` frame body into its raw wire code and reason bytes. Returns the numeric code
+/// **unresolved** (not a [`ProtocolError`]) — exactly like [`crate::Frame::type_code`] versus
+/// [`crate::Frame::frame_type`] — so a caller can log/react to a future error class this build does
+/// not yet name; resolve it with [`ProtocolError::from_code`] when a known code is expected.
+///
+/// # Errors
+/// [`WireError::UnexpectedEnd`] if the body is shorter than its varint code.
+pub fn decode_error(body: &[u8]) -> Result<(u64, &[u8]), WireError> {
+    let (code, n) = varint::decode(body)?;
+    let reason = body.get(n..).ok_or(WireError::UnexpectedEnd)?;
+    Ok((code, reason))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_body_round_trips_with_a_reason() {
+        let body = encode_error(ProtocolError::BadCoord, b"impostor cert");
+        let (code, reason) = decode_error(&body).unwrap();
+        assert_eq!(ProtocolError::from_code(code), Some(ProtocolError::BadCoord));
+        assert_eq!(reason, b"impostor cert");
+    }
+
+    #[test]
+    fn error_body_round_trips_with_an_empty_reason() {
+        let body = encode_error(ProtocolError::Unsupported, b"");
+        // Code 100 needs the 2-byte varint form (≥ 64); no reason bytes follow.
+        assert_eq!(body, [0x40, 0x64]);
+        let (code, reason) = decode_error(&body).unwrap();
+        assert_eq!(ProtocolError::from_code(code), Some(ProtocolError::Unsupported));
+        assert!(reason.is_empty());
+    }
+
+    #[test]
+    fn from_code_is_the_exact_inverse_of_code_for_every_taxonomy_entry() {
+        let all = [
+            ProtocolError::Unsupported,
+            ProtocolError::Malformed,
+            ProtocolError::NonCanonical,
+            ProtocolError::BadCoord,
+            ProtocolError::EpochStale,
+            ProtocolError::SybilReject,
+            ProtocolError::NoRoute,
+            ProtocolError::QuorumUnavail,
+            ProtocolError::ThresholdUnmet,
+            ProtocolError::PathBroken,
+            ProtocolError::HolonomyFail,
+            ProtocolError::CoverStarved,
+            ProtocolError::SvcUnreachable,
+            ProtocolError::RdvExpired,
+            ProtocolError::PowRequired,
+        ];
+        for err in all {
+            assert_eq!(ProtocolError::from_code(err.code()), Some(err), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_code_decodes_but_does_not_resolve() {
+        // Forward compatibility: a future error class this build does not know still decodes as a
+        // raw code (with its reason bytes intact), it just does not resolve to a named variant.
+        let mut body = Vec::new();
+        varint::encode(999, &mut body);
+        body.extend_from_slice(b"future class");
+        let (code, reason) = decode_error(&body).unwrap();
+        assert_eq!(code, 999);
+        assert_eq!(reason, b"future class");
+        assert_eq!(ProtocolError::from_code(code), None);
+    }
+
+    #[test]
+    fn decode_rejects_a_body_shorter_than_its_varint_code() {
+        assert_eq!(decode_error(&[]), Err(WireError::UnexpectedEnd));
+    }
+}

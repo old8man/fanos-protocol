@@ -11,6 +11,7 @@
 //! * [`frame`] — the frame layout and the message-type registry (§7.2).
 //! * [`tessera`] — the fixed-size Tessera packet layout (§7.7).
 //! * [`error`] — decode errors and the protocol error taxonomy (§7.5).
+//! * [`capability`] — protocol-version and capability-bitfield negotiation (§7.4).
 //!
 //! The `#[cfg]` gates keep it `#![no_std]` (with `alloc`).
 
@@ -19,6 +20,7 @@
 
 extern crate alloc;
 
+pub mod capability;
 pub mod element;
 pub mod error;
 pub mod frame;
@@ -26,6 +28,7 @@ pub mod tessera;
 pub mod varint;
 pub mod wire;
 
+pub use capability::{Capabilities, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION, negotiate_version};
 pub use error::{ProtocolError, WireError};
 pub use frame::{Frame, FrameType, SessionFrameType, decode_frame, encode_frame};
 pub use wire::Wire;

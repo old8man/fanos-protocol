@@ -42,17 +42,97 @@
     "comment": "frame = type:varint || length:varint || body[length]. Types are grouped by high nibble.",
     "type_registry": [
       { "name": "HELLO", "code": "0x00", "group": 0 },
+      { "name": "HELLO_ACK", "code": "0x01", "group": 0 },
       { "name": "ERROR", "code": "0x05", "group": 0 },
       { "name": "BEACON", "code": "0x13", "group": 1 },
       { "name": "PUBLISH", "code": "0x22", "group": 2 },
       { "name": "ROUTE", "code": "0x30", "group": 3 },
       { "name": "TESSERA", "code": "0x40", "group": 4 },
       { "name": "RDV_INTRO", "code": "0x50", "group": 5 },
-      { "name": "DIAG_VERDICT", "code": "0x62", "group": 6 }
+      { "name": "DIAG_VERDICT", "code": "0x62", "group": 6 },
+      { "name": "DIAG_ATTEST", "code": "0x63", "group": 6 }
     ],
     "examples": [
       { "type": "0x22", "body_utf8": "payload", "hex": "22077061796c6f6164" }
     ]
+  },
+  "capability_negotiation": {
+    "comment": "spec §7.4: version is a single monotonically-increasing profile number; two peers operate at min(version) and the bitwise-AND intersection of capabilities. CORE is the one mandatory bit (baseline DHT + Direct-profile routing, §7.6) every conformant node sets; an intersection that comes out empty is the handshake's capability-incompatibility condition (distinct from ordinary feature degradation, e.g. a peer simply lacking APHANTOS_FULL).",
+    "protocol_version": 1,
+    "min_supported_version": 1,
+    "capability_flags_comment": "bit position (LSB-first) of each named flag in the u32 capabilities bitfield.",
+    "capability_flags": {
+      "CORE": 0,
+      "APHANTOS_LITE": 1,
+      "APHANTOS_FULL": 2,
+      "CALYPSO": 3,
+      "PQ_ONLY": 4,
+      "GF_2M": 5,
+      "BLOCKCHAIN": 6
+    },
+    "version_negotiation_examples": [
+      { "mine": 1, "theirs": 1, "negotiated": 1 },
+      { "mine": 3, "theirs": 5, "negotiated": 3 },
+      { "mine": 5, "theirs": 3, "negotiated": 3 },
+      { "mine": 1, "theirs": 0, "negotiated": null, "why": "0 predates min_supported_version — incompatible" }
+    ],
+    "capability_intersection_examples": [
+      {
+        "comment": "spec §7.4's own example: a DHT-only (CORE-only) node interoperates with a full node.",
+        "a": ["CORE"],
+        "b": ["CORE", "APHANTOS_LITE", "APHANTOS_FULL", "CALYPSO"],
+        "a_bits": 1,
+        "b_bits": 15,
+        "intersection_bits": 1,
+        "intersection_names": ["CORE"]
+      },
+      {
+        "comment": "disjoint optional-only sets — the genuine incompatibility condition.",
+        "a": ["APHANTOS_LITE"],
+        "b": ["APHANTOS_FULL"],
+        "a_bits": 2,
+        "b_bits": 4,
+        "intersection_bits": 0,
+        "intersection_names": []
+      }
+    ]
+  },
+  "hello_handshake": {
+    "comment": "spec §7.3/§7.4 self-certifying HELLO body layout: version(2 BE) || capabilities(4 BE) || field_q(4 BE) || epoch(8 BE) || coord(12) || proof(80), wrapped as a HELLO(0x00) frame. `proof` here is an OPAQUE PLACEHOLDER (repeated 0xAB bytes), NOT a verified VRF proof — this vector pins the field layout, order, and framing, which is what the codec must reproduce bit-for-bit; cryptographic validity of a real proof is exercised separately by fanos-quic's own tests (crates/fanos-quic/src/identity.rs), which cross-check that a REAL hello_bytes() output's non-proof fields decode to this same layout.",
+    "hello": {
+      "version": 1,
+      "capabilities": 1,
+      "capabilities_names": ["CORE"],
+      "field_q": 2,
+      "epoch": 0,
+      "coord": [1, 0, 0],
+      "proof_placeholder_hex": "ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab",
+      "body_hex": "000100000001000000020000000000000000000000010000000000000000abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "frame_hex": "00406e000100000001000000020000000000000000000000010000000000000000abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+    },
+    "hello_ack": {
+      "comment": "HELLO_ACK(0x01) body = version(2 BE) || capabilities(4 BE) — echoes the negotiated (min version, intersected capabilities), sent once the receiver has verified the peer's HELLO proof and computed the intersection.",
+      "version": 1,
+      "capabilities": 1,
+      "body_hex": "000100000001",
+      "frame_hex": "0106000100000001"
+    },
+    "error_no_reason": {
+      "comment": "ERROR(0x05) body = code:varint || reason:bytes (spec §7.5). Sent on version/capability incompatibility, with no reason text.",
+      "code": 100,
+      "code_name": "UNSUPPORTED",
+      "reason_utf8": "",
+      "body_hex": "4064",
+      "frame_hex": "05024064"
+    },
+    "error_with_reason": {
+      "comment": "ERROR carrying explanatory UTF-8 text after the code — the reason's length is bounded by the enclosing frame's own length field, so no separate inner length prefix is needed.",
+      "code": 200,
+      "code_name": "BAD_COORD",
+      "reason_utf8": "impostor certificate",
+      "body_hex": "40c8696d706f73746f72206365727469666963617465",
+      "frame_hex": "051640c8696d706f73746f72206365727469666963617465"
+    }
   },
   "tessera_layout": {
     "comment": "Fixed-size sealed onion (§5.7, §7.7); constant total for length-indistinguishability. The holonomy path-authenticator is carried ENCRYPTED inside the innermost DELIVER command, NEVER a cleartext header field — a constant tag at a fixed offset would be a perfect cross-hop correlator (audit A1). Mirrors fanos_aphantos::sealed.",
