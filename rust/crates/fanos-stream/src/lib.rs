@@ -619,6 +619,13 @@ impl StreamReceiver {
         if segment.stream_id != self.stream_id {
             return self.ack();
         }
+        // Defensive per-segment size cap (audit F2): a compliant sender chunks payload at `MAX_SEGMENT`
+        // (see `enqueue`), so a larger segment is malformed or hostile — drop it rather than buffer it. The
+        // `recv_window` bound below caps how MANY segments are held; this caps each one's SIZE, so total
+        // reassembly memory is bounded by `recv_window * MAX_SEGMENT`, not by what a peer chooses to send.
+        if segment.data.len() > MAX_SEGMENT {
+            return self.ack();
+        }
         // Admit only sequences in `[delivered, delivered + recv_window)` — anchored on the *delivered*
         // frontier (what the application has drained), NOT on `next` (what has merely arrived). This is
         // the load-bearing bound: the buffer then holds at most `recv_window` segments no matter how
@@ -1412,6 +1419,27 @@ mod tests {
                 fin: true,
                 data: alloc::vec![],
             })
+        );
+    }
+
+    #[test]
+    fn an_oversize_segment_is_dropped_not_buffered() {
+        // Audit F2: a segment larger than MAX_SEGMENT is malformed/hostile (a compliant sender chunks at
+        // MAX_SEGMENT), so the receiver must drop it rather than buffer it — bounding per-entry reassembly
+        // memory to MAX_SEGMENT. Discriminating check: send an oversize seq-0, THEN a valid seq-0. If the
+        // oversize had been buffered, `or_insert_with` would keep it and ignore the valid one, so
+        // `deliver()` would return the oversize bytes; because it is dropped, the valid segment lands.
+        let mut rx = StreamReceiver::new(0).with_recv_window(16);
+        let oversize = Segment { stream_id: 0, seq: 0, fin: false, data: alloc::vec![0u8; MAX_SEGMENT + 1] };
+        rx.on_segment(&oversize);
+        assert!(rx.deliver().is_none(), "nothing is delivered from a dropped oversize segment");
+
+        let valid = Segment { stream_id: 0, seq: 0, fin: true, data: alloc::vec![7u8; MAX_SEGMENT] };
+        rx.on_segment(&valid);
+        assert_eq!(
+            rx.deliver(),
+            Some(alloc::vec![7u8; MAX_SEGMENT]),
+            "the valid MAX_SEGMENT-sized segment is accepted (the oversize did not squat its slot)",
         );
     }
 }

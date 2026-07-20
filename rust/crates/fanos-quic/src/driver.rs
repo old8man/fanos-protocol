@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant as StdInstant;
 
 use quinn::{Connection, Endpoint};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
@@ -96,6 +96,12 @@ fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
 const HELLO_LEN: usize = fanos_geometry::TRIPLE_WIRE_LEN;
 /// Per-frame receive cap. Onion/Tessera frames are far smaller; this only bounds abuse.
 const MAX_FRAME: usize = 1 << 20;
+/// Cap on **concurrent inbound connection-handler tasks** (audit C3): each accepted connection spawns a
+/// task (HELLO exchange, then frame reads), so without a bound a peer opening connections in a loop grows
+/// the task/handshake count without limit. The accept loop takes a permit per connection and holds it for
+/// the task's life, so once this many are in flight, new accepts back-pressure (QUIC queues/rejects) until
+/// one finishes. Generous next to a cell's `N-1` real neighbours; it only bounds abuse.
+const MAX_INBOUND_CONNECTIONS: usize = 512;
 
 /// The bound on the engine's inbound `Input` queue. The per-connection frame readers feed this channel and
 /// **await** when it is full, so a peer flooding frames is back-pressured through QUIC's own flow control
@@ -204,10 +210,14 @@ impl NodeHandle {
 }
 
 /// Pending `get` waiters, keyed by the storage digest the engine echoes (a Vec coalesces concurrent
-/// gets of the same key onto one reply).
-type GetWaiters = HashMap<[u8; 32], Vec<oneshot::Sender<Option<Vec<u8>>>>>;
-/// Pending `put` waiters, keyed by the storage digest.
-type PutWaiters = HashMap<[u8; 32], Vec<oneshot::Sender<()>>>;
+/// gets of the same key onto one reply). Each carries its registration time so the router can evict a
+/// waiter whose reply never comes, rather than leak its `oneshot::Sender` forever (audit C1).
+type GetWaiters = HashMap<[u8; 32], Vec<(std::time::Instant, oneshot::Sender<Option<Vec<u8>>>)>>;
+/// Pending `put` waiters, keyed by the storage digest — with the same registration-time eviction (C1).
+/// The leak this closes is real: the engine emits `Stored` only on a local hit or a remote `Ack`, so a
+/// put whose responsible node is down/absent/malicious never resolves, and without eviction its entry
+/// (and `oneshot::Sender`) would live forever — repeated puts to unreachable keys grow the map unbounded.
+type PutWaiters = HashMap<[u8; 32], Vec<(std::time::Instant, oneshot::Sender<()>)>>;
 
 /// A control message from a [`Client`] to the router: register a waiter for a content-addressed
 /// reply, keyed by the storage digest the engine will echo back.
@@ -310,6 +320,14 @@ async fn router_loop(
 ) {
     let mut gets: GetWaiters = HashMap::new();
     let mut puts: PutWaiters = HashMap::new();
+    // Periodic waiter-map eviction (audit C1): a `get` is self-cleaning (the engine always concludes a
+    // `Retrieved` via read-repair exhaustion), but a `put` to a node that never `Ack`s never resolves — so
+    // sweep both maps, dropping any waiter whose receiver the client already abandoned (`is_closed`, the
+    // common case once its `REQUEST_TIMEOUT` await fired) or that has outlived `REQUEST_TIMEOUT` (the reply
+    // is not coming). Dropping the `oneshot::Sender` resolves the client to `None`/`false`. The map thus
+    // stays bounded even under a flood of puts to unreachable keys.
+    let mut sweep = tokio::time::interval(REQUEST_TIMEOUT);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             note = notify_rx.recv() => {
@@ -317,15 +335,15 @@ async fn router_loop(
                 match &note {
                     Notification::Retrieved { key, value } => {
                         if let Some(waiters) = gets.remove(key) {
-                            for w in waiters {
-                                let _ = w.send(value.clone());
+                            for (_, tx) in waiters {
+                                let _ = tx.send(value.clone());
                             }
                         }
                     }
                     Notification::Stored(key) => {
                         if let Some(waiters) = puts.remove(key) {
-                            for w in waiters {
-                                let _ = w.send(());
+                            for (_, tx) in waiters {
+                                let _ = tx.send(());
                             }
                         }
                     }
@@ -336,13 +354,34 @@ async fn router_loop(
             }
             ctrl = ctrl_rx.recv() => {
                 let Some(ctrl) = ctrl else { break };
+                let now = std::time::Instant::now();
                 match ctrl {
-                    Control::Get { digest, reply } => gets.entry(digest).or_default().push(reply),
-                    Control::Put { digest, reply } => puts.entry(digest).or_default().push(reply),
+                    Control::Get { digest, reply } => gets.entry(digest).or_default().push((now, reply)),
+                    Control::Put { digest, reply } => puts.entry(digest).or_default().push((now, reply)),
                 }
+            }
+            _ = sweep.tick() => {
+                let now = std::time::Instant::now();
+                evict_stale(&mut gets, now);
+                evict_stale(&mut puts, now);
             }
         }
     }
+}
+
+/// Drop request waiters whose reply will never come (audit C1): the client already abandoned the receiver
+/// (`is_closed` — the common case once its `REQUEST_TIMEOUT` await fired), or the waiter has outlived
+/// `REQUEST_TIMEOUT` so no correlated notification is coming. Dropping the `oneshot::Sender` resolves any
+/// still-live client to `None`/`false`; empty digest buckets are removed. Keeps the correlation maps
+/// bounded regardless of how many requests target unreachable keys.
+fn evict_stale<T>(
+    map: &mut HashMap<[u8; 32], Vec<(std::time::Instant, oneshot::Sender<T>)>>,
+    now: std::time::Instant,
+) {
+    map.retain(|_, waiters| {
+        waiters.retain(|(at, tx)| !tx.is_closed() && now.duration_since(*at) < REQUEST_TIMEOUT);
+        !waiters.is_empty()
+    });
 }
 
 /// Errors that can occur bringing a node up.
@@ -833,12 +872,20 @@ async fn accept_loop(
     shaper: Shaper,
     identity: Identity,
 ) {
+    let inbound_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
     while let Some(incoming) = endpoint.accept().await {
+        // Take a connection slot before handling this one; at the cap, this awaits — back-pressuring
+        // accepts so a connection-flood cannot spawn unbounded handler tasks (audit C3). `Err` only if the
+        // semaphore was closed (never, it lives as long as the loop), so a failure just ends the loop.
+        let Ok(permit) = inbound_slots.clone().acquire_owned().await else {
+            break;
+        };
         let conns = conns.clone();
         let input_tx = input_tx.clone();
         let shaper = shaper.clone();
         let identity = identity.clone();
         tokio::spawn(async move {
+            let _permit = permit; // held for this handler's lifetime; released to free the slot on return
             let Ok(conn) = incoming.await else {
                 return;
             };
@@ -1130,5 +1177,38 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         false
+    }
+
+    #[test]
+    fn evict_stale_drops_abandoned_and_expired_waiters_but_keeps_fresh_ones() {
+        // Audit C1: the router's correlation maps must not leak waiters whose reply never comes. Use
+        // forward timestamps only (Instant + Duration never underflows): register the "fresh" entries at
+        // `later` and evaluate at `later`, and the "expired" entry at `t0` so it is `REQUEST_TIMEOUT + 1s`
+        // old at evaluation.
+        let t0 = std::time::Instant::now();
+        let later = t0 + REQUEST_TIMEOUT + std::time::Duration::from_secs(1);
+        let mut puts: PutWaiters = HashMap::new();
+
+        // (a) fresh + live receiver → survives.
+        let (tx_live, _rx_live) = oneshot::channel::<()>();
+        puts.entry([1u8; 32]).or_default().push((later, tx_live));
+        // (b) fresh timestamp but the client already dropped its receiver → evicted (is_closed).
+        let (tx_abandoned, rx_abandoned) = oneshot::channel::<()>();
+        drop(rx_abandoned);
+        puts.entry([2u8; 32]).or_default().push((later, tx_abandoned));
+        // (c) receiver still held but the waiter has outlived REQUEST_TIMEOUT → evicted (age).
+        let (tx_expired, mut rx_expired) = oneshot::channel::<()>();
+        puts.entry([3u8; 32]).or_default().push((t0, tx_expired));
+
+        evict_stale(&mut puts, later);
+
+        assert!(puts.contains_key(&[1u8; 32]), "a fresh, still-awaited waiter survives");
+        assert!(!puts.contains_key(&[2u8; 32]), "a waiter whose receiver was abandoned is evicted");
+        assert!(!puts.contains_key(&[3u8; 32]), "a waiter older than REQUEST_TIMEOUT is evicted");
+        // Evicting (c) dropped its sender, so the client's receiver now resolves to Err → it sees `false`.
+        assert!(
+            matches!(rx_expired.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+            "the expired client's receiver is closed by the eviction (it will observe a failed put)",
+        );
     }
 }
