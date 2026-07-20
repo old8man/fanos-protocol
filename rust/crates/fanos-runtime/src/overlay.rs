@@ -636,7 +636,7 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::Value) => self.on_value(now, frame.body),
             Some(FrameType::Ack) => Self::on_ack(frame.body),
             Some(FrameType::Announce) => self.on_announce(frame.body),
-            Some(FrameType::Beacon) => self.on_beacon(frame.body),
+            Some(FrameType::EpochAgree) => self.on_epoch_agree(frame.body),
             _ => Vec::new(),
         }
     }
@@ -1134,16 +1134,20 @@ impl<F: Field> OverlayNode<F> {
         effects
     }
 
-    /// `Command::AdvanceEpoch` — bump the epoch and flood the beacon so the cell adopts it.
+    /// `Command::AdvanceEpoch` — bump the epoch and flood the epoch-agreement gossip so the cell adopts
+    /// it. This carries only the epoch ordinal ([`FrameType::EpochAgree`]), never randomness — under a
+    /// live threshold-DVRF beacon the composite drives this from an authoritative `Beacon` round instead
+    /// and suppresses the flood (audit #102).
     fn on_advance_epoch(&mut self) -> Vec<Effect> {
         self.epoch = self.epoch.next();
-        let mut effects = self.flood(&encode(FrameType::Beacon, &self.epoch.low32_be_bytes()));
+        let mut effects = self.flood(&encode(FrameType::EpochAgree, &self.epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(self.epoch)));
         effects
     }
 
-    /// A received beacon: adopt it iff strictly newer (monotone), then re-flood and notify.
-    fn on_beacon(&mut self, body: &[u8]) -> Vec<Effect> {
+    /// A received epoch-agreement gossip: adopt it iff strictly newer (monotone), then re-flood and
+    /// notify. The 4-byte body is the epoch ordinal — see [`FrameType::EpochAgree`].
+    fn on_epoch_agree(&mut self, body: &[u8]) -> Vec<Effect> {
         let Some(bytes) = body.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
             return Vec::new();
         };
@@ -1152,7 +1156,7 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new(); // not newer — drop (terminates the flood)
         }
         self.epoch = epoch;
-        let mut effects = self.flood(&encode(FrameType::Beacon, &epoch.low32_be_bytes()));
+        let mut effects = self.flood(&encode(FrameType::EpochAgree, &epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(epoch)));
         effects
     }
@@ -1605,8 +1609,8 @@ fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
 /// reused past an epoch roll. A live per-epoch beacon *seed* is not yet wired into
 /// `OverlayNode` (§L3.2 / A7 Level B is tracked separately, not by this task); once it is,
 /// folding it in here strengthens the binding as a drop-in change, not a redesign — `epoch`
-/// already rotates unpredictably under the flooded beacon (`on_beacon`), so the binding is real
-/// today, just not yet as strong as the full spec picture.
+/// already rotates unpredictably under the flooded epoch-agreement gossip (`on_epoch_agree`), so the
+/// binding is real today, just not yet as strong as the full spec picture.
 #[must_use]
 pub fn admission_challenge(coord: Triple, epoch: Epoch) -> Vec<u8> {
     let mut challenge = Vec::with_capacity(12 + 4);

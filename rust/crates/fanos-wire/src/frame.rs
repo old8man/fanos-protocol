@@ -33,6 +33,14 @@ pub enum FrameType {
     /// One anchor's distributed-VRF **beacon partial** for an epoch (audit E5): flooded among the
     /// beacon group; a threshold of them assemble the epoch's [`Beacon`](Self::Beacon) round.
     BeaconPartial = 0x18,
+    /// A cell's **epoch-number agreement** gossip — a bare 4-byte `epoch_low32_be`, flooded adopt-max so
+    /// the cell converges on the current epoch counter (spec §L3). This is deliberately **not** the
+    /// [`Beacon`](Self::Beacon): the beacon carries a full threshold-DVRF *randomness* round, whereas this
+    /// carries only the epoch ordinal. A node with no beacon configured uses this to advance its epoch;
+    /// under a live beacon the DVRF round is authoritative and the composite suppresses this flood (audit
+    /// #102 — previously the overlay overloaded the `Beacon` code with this 4-byte payload, colliding with
+    /// a real round on the wire).
+    EpochAgree = 0x19,
     // 0x2* Overlay / storage
     Lookup = 0x20,
     Value = 0x21,
@@ -100,6 +108,7 @@ impl FrameType {
             0x16 => Self::DkgCommit,
             0x17 => Self::DkgComplaint,
             0x18 => Self::BeaconPartial,
+            0x19 => Self::EpochAgree,
             0x20 => Self::Lookup,
             0x21 => Self::Value,
             0x22 => Self::Publish,

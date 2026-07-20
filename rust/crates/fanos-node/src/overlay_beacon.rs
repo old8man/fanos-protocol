@@ -15,15 +15,16 @@
 //! a pure consumer that verifies and adopts the rounds the anchors flood (it only needs the group
 //! commitment, a public genesis parameter). Anchors additionally hold a share and contribute partials.
 //!
-//! **The seedless-`Beacon` bifurcation.** `OverlayNode::on_advance_epoch` floods its own bare 4-byte
-//! `FrameType::Beacon` (its pre-beacon self-agreement path). Under a real beacon that frame is
-//! superseded — the authoritative rounds are the `BeaconNode`'s — and worse, it collides on the
-//! `Beacon` frame code with a full round. So this composite (a) routes every inbound
-//! `BeaconPartial`/`Beacon` frame to the beacon, never to the overlay, and (b) **suppresses** the
-//! overlay's seedless `Beacon` floods emitted while we drive its epoch, keeping the epoch bump and its
-//! `EpochAdvanced` notification. Folding the seed into the coordinate itself (the live reshuffle) and
-//! collapsing the one-frame-two-meanings bifurcation at the wire are the overlay-side follow-ups
-//! tracked as #102; this engine is the substrate they build on.
+//! **Epoch agreement vs the beacon (audit #102).** `OverlayNode::on_advance_epoch` floods its own bare
+//! 4-byte epoch ordinal as [`FrameType::EpochAgree`] — the cell's fallback epoch-number agreement when no
+//! beacon is configured. Under a real beacon that gossip is *superseded*: the authoritative epoch clock is
+//! the `BeaconNode`'s DVRF round. The two now travel on **distinct** frame codes (`EpochAgree` vs
+//! `Beacon` — the one-frame-two-meanings collision that predated this is gone), so routing is
+//! unambiguous: this composite (a) routes every inbound `BeaconPartial`/`Beacon` frame to the beacon, and
+//! (b) **suppresses** the overlay's now-redundant `EpochAgree` floods emitted while we drive its epoch,
+//! keeping the epoch bump and its `EpochAdvanced` notification. Folding the beacon *seed* into the
+//! coordinate itself (the live per-epoch reshuffle) is the remaining overlay-side half of #102; this
+//! engine is the substrate it builds on.
 
 use fanos_field::Field;
 use fanos_geometry::Triple;
@@ -70,7 +71,7 @@ impl<F: Field> OverlayBeaconNode<F> {
 
     /// Whether `frame` is a beacon control frame (routed to the beacon; everything else on the wire is
     /// the overlay's). The overlay's own frames never carry the beacon frame codes, so this is
-    /// unambiguous — and it also keeps the overlay from mis-parsing a full round as its seedless epoch.
+    /// unambiguous.
     fn is_beacon_frame(frame: &[u8]) -> bool {
         matches!(
             decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
@@ -78,21 +79,30 @@ impl<F: Field> OverlayBeaconNode<F> {
         )
     }
 
-    /// Drop the overlay's own seedless `Beacon` floods from `effects` (they compete with the real
-    /// beacon's authoritative rounds and would be mis-parsed by peers), keeping every other effect —
-    /// crucially the `EpochAdvanced` notification and any storage/liveness sends. See the module docs.
-    fn strip_seedless_beacon_floods(effects: Vec<Effect>) -> Vec<Effect> {
+    /// Whether `frame` is the overlay's own epoch-agreement gossip ([`FrameType::EpochAgree`]) — the
+    /// flood the authoritative beacon round supersedes.
+    fn is_epoch_agree_frame(frame: &[u8]) -> bool {
+        matches!(
+            decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
+            Some(FrameType::EpochAgree)
+        )
+    }
+
+    /// Drop the overlay's own `EpochAgree` floods from `effects` (redundant under the authoritative
+    /// beacon round we are driving from), keeping every other effect — crucially the `EpochAdvanced`
+    /// notification and any storage/liveness sends. See the module docs.
+    fn strip_overlay_epoch_floods(effects: Vec<Effect>) -> Vec<Effect> {
         effects
             .into_iter()
             .filter(|e| match e {
-                Effect::Send { frame, .. } => !Self::is_beacon_frame(frame),
+                Effect::Send { frame, .. } => !Self::is_epoch_agree_frame(frame),
                 _ => true,
             })
             .collect()
     }
 
     /// After the beacon has stepped, drive the overlay forward to the newest adopted beacon epoch
-    /// (suppressing its seedless floods), appending the overlay's rotation effects. The `BeaconReady`
+    /// (suppressing its redundant `EpochAgree` floods), appending the overlay's rotation effects. The `BeaconReady`
     /// notification is kept so the node driver can republish keys and fold the seed (E5 / #102).
     fn drive_overlay(&mut self, now: Instant, mut effects: Vec<Effect>) -> Vec<Effect> {
         let target = effects
@@ -107,7 +117,7 @@ impl<F: Field> OverlayBeaconNode<F> {
                 let bump = self
                     .overlay
                     .step(now, Input::Command(Command::AdvanceEpoch));
-                effects.extend(Self::strip_seedless_beacon_floods(bump));
+                effects.extend(Self::strip_overlay_epoch_floods(bump));
             }
         }
         effects
@@ -182,8 +192,8 @@ mod tests {
     fn a_cell_of_composites_drives_every_overlay_from_the_converged_beacon() {
         // A full Fano cell of composite nodes, each an anchor (overlay + a beacon share). Running one
         // beacon round among them must converge every beacon on epoch 1 AND drive every overlay to that
-        // same epoch — the clock defined once by the beacon, both roles locked — with no seedless overlay
-        // Beacon flood escaping onto the wire (the bifurcation is suppressed).
+        // same epoch — the clock defined once by the beacon, both roles locked — with no overlay
+        // EpochAgree flood escaping onto the wire (the beacon supersedes it).
         let (shares, commitment) = beacon_key();
         let mut cell: Vec<OverlayBeaconNode<F2>> = (0..7)
             .map(|i| {
