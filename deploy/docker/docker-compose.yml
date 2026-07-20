@@ -1,0 +1,66 @@
+# FANOS multi-node integration cell — real inter-container QUIC (#117/#119, T5 tier).
+#
+# Unlike the in-process `cell_e2e` tests (many QUIC endpoints in ONE process on loopback), this brings
+# up each node as its own container with its own network namespace on a shared bridge, so the overlay
+# runs over genuine inter-host UDP/QUIC — and the bridge can be shaped with `tc`/netem (latency, loss,
+# partition) to exercise the self-healing layer under real network faults.
+#
+# Driven by `run-cell.sh`, NOT `docker compose up` directly: a node's `--bootstrap` list needs the peers'
+# coordinates, and a coordinate is `MapToPoint(VRF(identity, …))` — it only exists once the node has
+# minted its identity. The script mints all four identities first (into the named volumes), then fills the
+# per-service `BOOTSTRAP_*` vars with the resulting full-mesh seed lists. See README.md.
+
+name: fanos-cell
+
+x-node: &node
+  image: fanos-node:integration # built by run-cell.sh from the repo-root Dockerfile (#120)
+  networks: [cell]
+  # QUIC is UDP; each node binds 9000 inside its own namespace. Peers reach each other by service name
+  # on the bridge (e.g. `genesis:9000`) — no host port publishing needed for an intra-cell test.
+  restart: "no"
+  stop_grace_period: 3s
+  healthcheck:
+    test: ["CMD-SHELL", "pgrep -x fanos >/dev/null || exit 1"]
+    interval: 4s
+    timeout: 3s
+    retries: 5
+    start_period: 2s
+
+services:
+  genesis:
+    <<: *node
+    hostname: genesis
+    command: [node, --listen, "0.0.0.0:9000", --identity, /var/lib/fanos/id.bin,
+              --bootstrap, "${BOOTSTRAP_GENESIS:-}", --role, "relay,storage"]
+    volumes: [genesis-id:/var/lib/fanos]
+
+  node2:
+    <<: *node
+    hostname: node2
+    command: [node, --listen, "0.0.0.0:9000", --identity, /var/lib/fanos/id.bin,
+              --bootstrap, "${BOOTSTRAP_NODE2:-}", --role, "relay,storage"]
+    volumes: [node2-id:/var/lib/fanos]
+
+  node3:
+    <<: *node
+    hostname: node3
+    command: [node, --listen, "0.0.0.0:9000", --identity, /var/lib/fanos/id.bin,
+              --bootstrap, "${BOOTSTRAP_NODE3:-}", --role, "relay,storage"]
+    volumes: [node3-id:/var/lib/fanos]
+
+  node4:
+    <<: *node
+    hostname: node4
+    command: [node, --listen, "0.0.0.0:9000", --identity, /var/lib/fanos/id.bin,
+              --bootstrap, "${BOOTSTRAP_NODE4:-}", --role, "relay,storage"]
+    volumes: [node4-id:/var/lib/fanos]
+
+networks:
+  cell:
+    driver: bridge
+
+volumes:
+  genesis-id:
+  node2-id:
+  node3-id:
+  node4-id:

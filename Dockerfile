@@ -17,15 +17,24 @@
 # which rustup installs automatically on the first cargo invocation — so the image toolchain is
 # pinned by the repo, not by the base tag.
 FROM rust:1-bookworm AS build
+# Build profile: `release` (default, production) or `debug` (far faster to compile — for the multi-node
+# integration harness / CI, `deploy/docker/run-cell.sh`, where startup speed and binary size do not matter).
+ARG PROFILE=release
 WORKDIR /src
 COPY rust/ ./rust/
 WORKDIR /src/rust
-# Cache the registry and target dir across builds; copy the release binary OUT of the cached target
-# in the same layer (a cache mount does not persist past the RUN).
+# Cache the registry and target dir across builds; copy the built binary OUT of the cached target in the
+# same layer (a cache mount does not persist past the RUN). `target/$PROFILE/` is `target/release` or
+# `target/debug`; the `--release` flag is added only for the release profile.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/rust/target \
-    cargo build --release -p fanos-node --bin fanos \
- && cp target/release/fanos /usr/local/bin/fanos
+    case "$PROFILE" in \
+      release) FLAG=--release ;; \
+      debug)   FLAG= ;; \
+      *) echo "PROFILE must be 'release' or 'debug', got '$PROFILE'" >&2; exit 1 ;; \
+    esac; \
+    cargo build $FLAG -p fanos-node --bin fanos \
+ && cp "target/$PROFILE/fanos" /usr/local/bin/fanos
 
 # ---- runtime stage -------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
