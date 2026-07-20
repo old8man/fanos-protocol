@@ -399,6 +399,14 @@ struct Healer {
     /// non-over-coupled diagnosis. The `Decouple` shed only actuates once this reaches [`DECOUPLE_DWELL`] —
     /// the hysteresis that keeps the now-continuous reflex from shedding on a transient reading (#122).
     overcoupling_streak: u32,
+    /// The most recent per-point relay-load sample (§6.7): the behavioural sample folded into the monitor
+    /// each heartbeat, RETAINED here (the monitor consumes it, then `activity` is cleared) so a diagnosis can
+    /// read the cell's current load vector for the projective load-balance prescription. All `N` points are
+    /// observable from one node because its `q+1` lines cover the plane.
+    last_sample: [f64; 7],
+    /// Dedup: currently in the under-coupled (`Bind`) regime, so `Rebalance` fires once on entry (§6.7), not
+    /// each round; cleared when the cell returns to the in-band collective-subject (`Hold`).
+    rebalancing: bool,
 }
 
 impl Healer {
@@ -419,6 +427,8 @@ impl Healer {
             decoupled: false,
             escalated_coherence: false,
             overcoupling_streak: 0,
+            last_sample: [0.0; 7],
+            rebalancing: false,
         }
     }
 
@@ -501,6 +511,10 @@ impl Healer {
             };
         }
         self.monitor.record(&sample);
+        // Retain this window's load vector for the §6.7 projective load-balance prescription — the monitor
+        // consumes `sample` into its coherence window, but the diagnosis needs the raw per-point loads, and
+        // `activity` is about to be cleared.
+        self.last_sample = sample;
         self.activity.clear();
         self.self_activity = 0;
     }
@@ -651,7 +665,7 @@ impl Healer {
                         // Actuated via the verdict→plan path above; only clear the escalation latch.
                         self.escalated_coherence = false;
                     }
-                    BandControl::Bind { .. } | BandControl::Hold => {
+                    band @ (BandControl::Bind { .. } | BandControl::Hold) => {
                         // In or below the band: let any prior shedding decay back toward the baseline
                         // coupling, and notify `Bound` once when fully re-integrated.
                         self.decoupling *= DECOUPLE_DECAY;
@@ -662,6 +676,22 @@ impl Healer {
                         if self.decoupled && self.decoupling == 0.0 {
                             self.decoupled = false;
                             effects.push(Effect::Notify(Notification::Bound));
+                        }
+                        // §6.7 differential-DDoS response: the under-coupled `Bind` (`Aggregate`) band is the
+                        // regime a load hotspot induces by decorrelating the cell. Publish the projective load
+                        // state the node sensed — its per-point relay load over the whole cell (observable
+                        // because its q+1 lines cover the plane) — once on ENTERING the band (deduped). The
+                        // derived response is `loadbalance::balance_exact(loads)` = the uniform mean, driving
+                        // the hotspot into the whole cell at the projective contraction `λ₂ = 2/9`. `Hold` is
+                        // the healthy in-band collective subject: clear the latch so a later Bind re-publishes.
+                        if matches!(band, BandControl::Bind { .. }) {
+                            if !self.rebalancing {
+                                self.rebalancing = true;
+                                let loads = self.last_sample.map(|x| x.round() as u32);
+                                effects.push(Effect::Notify(Notification::Rebalance { loads }));
+                            }
+                        } else {
+                            self.rebalancing = false;
                         }
                     }
                 }
@@ -2175,6 +2205,85 @@ mod tests {
         assert!(
             decoupled,
             "sustained over-coupling drives the live homeostat to Decouple on its heartbeat reflex"
+        );
+    }
+
+    #[test]
+    fn a_node_senses_the_whole_cell_load_and_its_projective_balance_target_is_uniform() {
+        // §6.7 grounding: because a node's q+1 lines COVER the plane (Aut(PG(2,q)) 2-transitivity), ONE node
+        // observes every point's relay load. Inject a known hotspot (point 3 flooded, a differential-DDoS
+        // target) in one window; after the heartbeat folds the behavioural sample, the node's sensed load
+        // vector matches the injection exactly, and the DERIVED response `balance_exact(loads)` is the exact
+        // uniform mean at every point — the hotspot dissolved into the whole cell with no local extremum.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let mut t = 1u64;
+        for (i, count) in [(1, 1), (2, 1), (3, 20), (4, 1), (5, 1), (6, 1)] {
+            let from = Point::<F2>::at(i).coords();
+            for _ in 0..count {
+                node.step(
+                    Instant(t),
+                    Input::Message { from, frame: encode(FrameType::Route, b"x") },
+                );
+                t += 1;
+            }
+        }
+        node.step(Instant(t), Input::Timer(HEARTBEAT)); // folds the window into `last_sample`
+
+        let loads = node.healer.last_sample;
+        assert!((loads[3] - 20.0).abs() < 1e-9, "the flood on point 3 is sensed from one node");
+        assert!((loads[1] - 1.0).abs() < 1e-9, "an idle peer's load is sensed too");
+        assert!(loads[0].abs() < 1e-9, "self (point 0) originated nothing");
+        // The derived projective response: the exact global mean at every point (finite-time consensus).
+        let mean = loads.iter().sum::<f64>() / 7.0;
+        for (i, &x) in fanos_diakrisis::loadbalance::balance_exact(&loads)
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                (x - mean).abs() < 1e-9,
+                "point {i}: the hotspot is balanced to the uniform mean {mean}, got {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_differential_flood_drives_the_under_coupled_band_and_emits_a_rebalance_prescription() {
+        // §6.7 live wiring: a DIFFERENTIAL flood — each node relaying an INDEPENDENT amount, the opposite of
+        // the common-mode lockstep that over-couples — decorrelates the measured Γ_net below r*, so the
+        // homeostat enters the under-coupled `Aggregate`/`Bind` band. The engine then publishes the
+        // projective load-balance prescription (`Notification::Rebalance`) once on entry: §6.7 made live.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        let mut t = 1u64;
+        let mut rebalanced = false;
+        // Distinct per-node multipliers ⇒ mutually uncorrelated relay-activity series (decorrelated cell).
+        let mult = [0u64, 2, 3, 5, 7, 11, 13];
+        for w in 0..(BEHAVIOR_WINDOW + 6) {
+            for (i, &m) in mult.iter().enumerate().skip(1) {
+                let from = Point::<F2>::at(i).coords();
+                let count = 1 + (w as u64 * m) % 9; // an independent sequence per node
+                for _ in 0..count {
+                    node.step(
+                        Instant(t),
+                        Input::Message { from, frame: encode(FrameType::Route, b"x") },
+                    );
+                    t += 1;
+                }
+            }
+            let hb = node.step(Instant(t), Input::Timer(HEARTBEAT));
+            if hb
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Rebalance { .. })))
+            {
+                rebalanced = true;
+            }
+            t += 1;
+        }
+        assert!(
+            rebalanced,
+            "a sustained differential flood decorrelates the cell into the under-coupled Bind band, so the \
+             live homeostat emits the §6.7 projective load-balance prescription"
         );
     }
 

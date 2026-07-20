@@ -245,6 +245,18 @@ pub enum Notification {
         /// The coordinate the node holds after the reshuffle.
         new: Triple,
     },
+    /// The **differential-DDoS load-balance prescription** (spec §6.7): on entering the homeostat's
+    /// under-coupled (`Aggregate`/`Bind`) band — the regime a load hotspot induces by decorrelating the cell
+    /// — the node publishes the projective load state it sensed. `loads[i]` is point `i`'s measured relay
+    /// load (the node observes ALL `N` points because its `q+1` lines cover the plane, `Aut(PG(2,q))`
+    /// 2-transitivity). The **derived** response is `fanos_diakrisis::loadbalance::balance_exact(loads)` —
+    /// the exact uniform mean `Σloads/N` at every point in one step (the two-eigenvalue projective diffusion,
+    /// contraction `λ₂ = q/(q+1)²`), which dissolves the hotspot into the whole cell with no local extremum.
+    /// A load balancer / routing layer applies that redistribution; the engine, being sans-I/O, prescribes.
+    Rebalance {
+        /// The measured per-point relay load over the base Fano cell (index = canonical point index).
+        loads: [u32; 7],
+    },
 }
 
 /// The sans-I/O node engine: a pure state machine over virtual time.

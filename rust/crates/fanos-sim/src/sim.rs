@@ -72,6 +72,7 @@ fn note_desc(note: &Notification) -> String {
         Notification::Reseated { old, new } => {
             format!("Reseated {}→{}", fmt_coord(*old), fmt_coord(*new))
         }
+        Notification::Rebalance { loads } => format!("Rebalance {loads:?}"),
         Notification::Observed(bytes) => format!("Observed {}B", bytes.len()),
     }
 }
