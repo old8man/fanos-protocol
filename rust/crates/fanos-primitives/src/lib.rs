@@ -30,7 +30,7 @@ pub mod maptopoint;
 pub mod shamir;
 pub mod vrf;
 
-pub use address::{address_matches_identity, address_point};
+pub use address::{address_matches_identity, address_matches_identity_from, address_point};
 pub use beacon::BeaconSeed;
 pub use epoch::Epoch;
 pub use hash::{DIGEST_LEN, hash_labeled, label, subkey};

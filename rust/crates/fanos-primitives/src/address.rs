@@ -46,9 +46,26 @@ pub fn address_point<F: Field>(id: &[u8], level: usize) -> Point<F> {
 /// match to a chosen target costs `≈ N^k` grinding work for a `k`-level prefix (threat B1/§79).
 #[must_use]
 pub fn address_matches_identity<F: Field>(id: &[u8], addr: &HierAddr<F>) -> bool {
+    address_matches_identity_from::<F>(id, addr, 0)
+}
+
+/// Like [`address_matches_identity`] but verifies only levels `>= min_level` of the descent chain. The
+/// use is a deployment whose **level-0** coordinate is seated by the VRF beacon
+/// (`MapToPoint(VRF(id, epoch, beacon))`, spec §L0/A7), not the hash `address_point(id, 0)`: that
+/// coordinate's authenticity comes from the transport's proof-of-coordinate HELLO plus the descriptor
+/// signature, so the hash-chain check must SKIP level 0 (`min_level = 1`) — else every legitimate VRF
+/// announcement is rejected (audit C3). The sub-cell descent (levels `>= 1`) is hash-derived in both the
+/// hash-chain (§79) and VRF (§A7) schemes, so it is always checked. `min_level = 0` is the full chain.
+#[must_use]
+pub fn address_matches_identity_from<F: Field>(
+    id: &[u8],
+    addr: &HierAddr<F>,
+    min_level: usize,
+) -> bool {
     addr.points()
         .iter()
         .enumerate()
+        .filter(|(level, _)| *level >= min_level)
         .all(|(level, &p)| p == address_point::<F>(id, level))
 }
 
@@ -94,5 +111,49 @@ mod tests {
         // Whichever way the two roots landed, each identity verifies its OWN root.
         assert!(address_matches_identity::<F2>(other, &other_root));
         assert!(address_matches_identity::<F2>(id, &id_root));
+    }
+
+    #[test]
+    fn from_level_skips_a_vrf_seated_level_zero_but_still_binds_the_descent() {
+        // Audit C3: under VRF coordinates the level-0 point is the beacon-seated VRF coordinate, NOT
+        // `address_point(id, 0)`. Model that with a chain whose level 0 is some *other* point but whose
+        // deeper levels ARE id's hash-derived descent. The full check rejects it (level 0 mismatches);
+        // the `min_level = 1` check accepts it — exactly the skip that stops a legitimate VRF announcement
+        // from being wrongly rejected, while the sub-cell descent (levels >= 1) is still verified.
+        let id = b"vrf-node-identity";
+        let foreign_l0 = b"some-other-preimage";
+        let vrf_style = HierAddr::<F2>::from_path(alloc::vec![
+            address_point::<F2>(foreign_l0, 0), // stand-in for a VRF coord: not id's hash level-0 point
+            address_point::<F2>(id, 1),         // real hash-derived sub-cell descent
+            address_point::<F2>(id, 2),
+        ])
+        .unwrap();
+
+        // Non-vacuity: the stand-in level-0 point must actually differ from id's hash level-0 (else the
+        // test proves nothing). On the 7-point plane a collision is possible; pick pre-images that differ.
+        assert_ne!(
+            address_point::<F2>(foreign_l0, 0),
+            address_point::<F2>(id, 0),
+            "the stand-in level-0 point must differ from id's hash-derived one for this test to bite",
+        );
+
+        assert!(
+            !address_matches_identity::<F2>(id, &vrf_style),
+            "full-chain check rejects it — level 0 is not id's hash point (this is the C3 false-reject)",
+        );
+        assert!(
+            address_matches_identity_from::<F2>(id, &vrf_style, 1),
+            "skipping level 0 accepts it — the VRF coord is externally verified, the descent still binds",
+        );
+        // A tampered deeper level is still caught even with the level-0 skip.
+        let tampered = HierAddr::<F2>::from_path(alloc::vec![
+            address_point::<F2>(foreign_l0, 0),
+            address_point::<F2>(b"wrong", 1), // a descent level that is NOT id's
+        ])
+        .unwrap();
+        assert!(
+            !address_matches_identity_from::<F2>(id, &tampered, 1),
+            "the level-0 skip does not weaken the sub-cell descent check",
+        );
     }
 }

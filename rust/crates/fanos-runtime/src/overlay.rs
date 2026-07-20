@@ -78,6 +78,10 @@ const MAX_PENDING_GETS: usize = 1024;
 const QUARANTINE_TTL: Duration = Duration::from_millis(60_000);
 
 /// Configuration of a node's liveness behaviour.
+// The several `bool`s here are independent, orthogonal deployment toggles (self-healing on/off, and the
+// three opt-in membership guards), not a state machine — an enum would not model them (any combination is
+// valid). This is exactly the config-flag case `struct_excessive_bools` over-fires on.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Config {
     /// Interval between heartbeat rounds.
@@ -117,6 +121,15 @@ pub struct Config {
     /// threat-model derivation shows the geometry alone does not provide. **Fails closed**:
     /// turning this on with no policy installed rejects every peer, never silently admits.
     pub require_admission: bool,
+    /// Whether this deployment seats **level-0 coordinates by the VRF beacon** (`MapToPoint(VRF(id, epoch,
+    /// beacon))`, spec §L0/A7) rather than the hash `address_point(id, 0)` (§79). It only affects the
+    /// [`require_self_certified_membership`](Self::require_self_certified_membership) check: with VRF
+    /// coordinates the announced level-0 point is *not* the identity's hash-derived point, so the hash-chain
+    /// check must skip level 0 (its authenticity comes from the proof-of-coordinate HELLO + the descriptor
+    /// signature) — else every legitimate VRF announcement is rejected (audit C3). The sub-cell descent
+    /// (levels `>= 1`) is hash-derived in both schemes and stays checked. Off by default (the §79 hash-chain
+    /// scheme, full-chain check); a VRF deployment (the `A7` node model) sets it alongside its beacon.
+    pub vrf_coordinates: bool,
 }
 
 impl Default for Config {
@@ -130,6 +143,7 @@ impl Default for Config {
             read_timeout: Duration::from_millis(1600),
             require_self_certified_membership: false,
             require_admission: false,
+            vrf_coordinates: false,
         }
     }
 }
@@ -1515,9 +1529,14 @@ impl<F: Field> OverlayNode<F> {
         //  2. the descriptor signature binds this exact transport `coord` to the identity — else it is a
         //     transport hijack (re-announcing another identity's address at the attacker's own endpoint),
         //     which without the identity's private key cannot be signed (threat §80).
+        // Under VRF coordinates (`config.vrf_coordinates`, spec §A7) the level-0 point is the beacon-seated
+        // VRF coordinate, NOT the hash `address_point(id, 0)`, so the chain check starts at level 1 — level
+        // 0's authenticity is the proof-of-coordinate HELLO + the descriptor signature (check 2). Without
+        // this skip a legitimate VRF announcement fails check 1 and is rejected (audit C3).
         // Neither `members` nor the router's peer table is written on failure.
+        let min_level = usize::from(self.config.vrf_coordinates);
         if self.config.require_self_certified_membership
-            && (!fanos_primitives::address_matches_identity::<F>(&id, &hier)
+            && (!fanos_primitives::address_matches_identity_from::<F>(&id, &hier, min_level)
                 || !descriptor_signature_ok::<F>(coord, &hier, &id, &sig))
         {
             return Vec::new();

@@ -67,7 +67,13 @@ impl Node {
             config.listen,
             &credentials,
             move |coord| -> Box<dyn Engine + Send> {
-                let overlay = OverlayNode::<F>::new(coord, OverlayConfig::default());
+                // A deployed node is seated by its VRF beacon coordinate (`spawn_self_certifying…` →
+                // `verifiable_coordinate`), so its level-0 point is NOT the hash `address_point(id, 0)`.
+                // Tell the overlay, so if a deployment turns on self-certified membership the check verifies
+                // level 0 by the proof-of-coordinate HELLO + descriptor signature rather than the hash chain
+                // (which would reject every legitimate VRF announcement, audit C3).
+                let overlay_config = OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() };
+                let overlay = OverlayNode::<F>::new(coord, overlay_config);
                 match beacon {
                     Some(bp) => Box::new(OverlayBeaconNode::new(
                         overlay,
