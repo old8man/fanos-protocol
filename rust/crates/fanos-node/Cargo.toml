@@ -61,6 +61,10 @@ tokio = { workspace = true, features = [
     "macros",
     "time",
 ] }
+# Only tests need the DKG dealing primitives to synthesize a beacon key (deal / VssShare /
+# VssCommitment / DeterministicRng) for the OverlayBeaconNode composite; the crate itself reaches the
+# beacon through fanos-keygen's BeaconNode.
+fanos-vrf.workspace = true
 
 [lints]
 workspace = true
