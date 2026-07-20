@@ -33,6 +33,8 @@ use alloc::collections::VecDeque;
 use fanos_primitives::hash::label;
 use fanos_primitives::{Epoch, hash_labeled};
 
+use zeroize::Zeroize;
+
 use crate::kem::{HybridKemPublic, HybridKemSecret};
 use crate::rng::SeedRng;
 
@@ -55,6 +57,15 @@ pub struct OnionKeyRatchet {
     /// `retain` entries all within `retain` epochs of the current one. Evicted (and zeroized) once they
     /// fall outside the window, so forward-secrecy exposure never exceeds `retain` epochs.
     recent: VecDeque<(Epoch, HybridKemSecret)>,
+}
+
+impl Drop for OnionKeyRatchet {
+    /// Wipe the root seed on drop, so a freed ratchet leaves nothing that could reconstruct the current
+    /// or any future epoch's onion key (audit #124). The retained `recent` secrets wipe via their own
+    /// (now zeroize-enabled) drop.
+    fn drop(&mut self) {
+        self.seed.zeroize();
+    }
 }
 
 impl OnionKeyRatchet {

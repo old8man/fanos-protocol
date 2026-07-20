@@ -16,8 +16,13 @@ categories = ["cryptography"]
 # source), which would forfeit no_std/embedded operation.
 ed25519-dalek = { version = "3", default-features = false, features = ["rand_core", "alloc", "zeroize"] }
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
-ml-kem = { version = "0.3", default-features = false, features = ["alloc"] }
-ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "rand_core"] }
+# `zeroize` ON: the ML-KEM-768 / ML-DSA-65 secret keys wipe on drop, matching their classical hybrid
+# partners (audit #124 — the PQ legs previously skipped it, so half the hybrid secret was left in freed
+# memory while the crate's own docs claimed zeroize-on-drop).
+ml-kem = { version = "0.3", default-features = false, features = ["alloc", "zeroize"] }
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+# Direct zeroize for wiping the onion-ratchet root seed on drop (audit #124).
+zeroize.workspace = true
 sha3 = { version = "0.11", default-features = false }
 # rand_core 0.10 matches the RustCrypto crates above (via crypto-common 0.2).
 rand_core.workspace = true

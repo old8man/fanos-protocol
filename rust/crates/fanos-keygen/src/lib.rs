@@ -389,6 +389,10 @@ impl<F: Field> DkgNode<F> {
         if self.done || self.phase != Phase::Complaint {
             return Vec::new();
         }
+        // The complaint phase is over — this node's own dealing (which held every other participant's
+        // plaintext share from our deal) is no longer needed. Drop it now rather than retain it for the
+        // object's whole life (audit #124 retention-scope).
+        self.dealing = None;
         // QUAL = dealers with a commitment and no *unanswered* complaint.
         let qual: Vec<u8> = self
             .commitments

@@ -948,6 +948,7 @@ dependencies = [
  "rand_core 0.10.1",
  "sha3",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -1278,6 +1279,7 @@ checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
 dependencies = [
  "ctutils",
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -1498,6 +1500,7 @@ dependencies = [
  "pkcs8",
  "shake",
  "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -1512,6 +1515,7 @@ dependencies = [
  "pkcs8",
  "rand_core 0.10.1",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -1523,6 +1527,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
+ "zeroize",
 ]
 
 [[package]]

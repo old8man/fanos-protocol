@@ -156,7 +156,9 @@ impl HybridKemSecret {
     pub fn derive_subkey(&self, domain: &str) -> [u8; 32] {
         let mut hasher = Shake256::default();
         hasher.update(domain.as_bytes());
-        hasher.update(&self.x25519.to_bytes());
+        // Borrow the long-term secret (as_bytes), not to_bytes — the latter would spill an un-zeroized
+        // owned copy of it onto the stack on every subkey derivation (audit #124).
+        hasher.update(self.x25519.as_bytes());
         let mut out = [0u8; 32];
         hasher.finalize_xof().read(&mut out);
         out

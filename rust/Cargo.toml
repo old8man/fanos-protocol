@@ -128,7 +128,7 @@ libm = { version = "0.2", default-features = false }
 # a genuine two-major-version split that collapses only when those upstreams migrate.
 rand_core = { version = "0.10", default-features = false }
 # ristretto255 group ops for the verifiable-crypto crates (ECVRF, VOPRF).
-curve25519-dalek = { version = "4", features = ["rand_core"] }
+curve25519-dalek = { version = "4", features = ["rand_core", "zeroize"] }
 # Constant-time equality for MAC/authenticator checks (the version curve25519-dalek v4 already pins).
 subtle = { version = "2", default-features = false }
 
