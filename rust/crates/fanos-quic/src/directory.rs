@@ -58,6 +58,16 @@ impl Directory {
         }
     }
 
+    /// Unbind a coordinate — a node vacating a point on a per-epoch reshuffle (§L3), so a stale
+    /// coordinate → address binding does not linger and misroute after the occupant has moved. No-op if the
+    /// coordinate is not bound. (In a full deployment the DHT ages these out; here the reshuffling node
+    /// clears its own vacated point.)
+    pub fn remove(&self, coord: Triple) {
+        if let Ok(mut map) = self.inner.write() {
+            map.remove(&coord);
+        }
+    }
+
     /// How many coordinate collisions this directory has observed (distinct addresses claiming one
     /// point). A nonzero value means the projective address space suffered a `MapToPoint` collision —
     /// surfaced here so a node can react (relocate) instead of silently shadowing a peer.

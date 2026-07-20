@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant as StdInstant;
 
 use quinn::{Connection, Endpoint};
@@ -65,7 +65,11 @@ type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> Option<HelloResult> + Send + Sy
 
 #[derive(Clone)]
 struct SelfCert {
-    hello: Arc<Vec<u8>>,
+    /// This node's own HELLO (its proof-of-coordinate for the current epoch). Behind a lock because the
+    /// per-epoch reshuffle (`reshuffle_loop`, #102/L3) rewrites it when the beacon advances — every new
+    /// connection then proves the node's *current* coordinate, not a stale genesis one. Read-cloned per
+    /// connection (an `Arc` swap, no copy under the lock).
+    hello: Arc<RwLock<Arc<Vec<u8>>>>,
     verify: HelloVerifier,
 }
 
@@ -190,6 +194,12 @@ impl NodeHandle {
     /// Close the QUIC endpoint and stop serving. Idempotent.
     pub fn shutdown(&self) {
         self.endpoint.close(0u32.into(), b"shutdown");
+    }
+
+    /// A fresh receiver on the engine's notification broadcast — for an internal driver task (e.g. the
+    /// per-epoch reshuffle loop) that follows the event stream without stealing from `next_notification`.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Notification> {
+        self.events_tx.subscribe()
     }
 }
 
@@ -500,22 +510,102 @@ where
     M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
 {
     // The node's verifiable coordinate for the genesis epoch: MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS)),
-    // with the proof it announces so peers can verify it (spec §L0/§7.3). (Per-epoch reshuffle off the
-    // live beacon is Level B — see docs/design-coordinates.md.)
+    // with the proof it announces so peers can verify it (spec §L0/§7.3).
     let (coord, proof) = verifiable_coordinate::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
     let engine = make_engine(coord);
+    // The self-certifying identity is now LIVE across epochs (Level B, #102): the HELLO and the beacon the
+    // verifier checks peers against both sit behind locks the `reshuffle_loop` rewrites when the beacon
+    // advances. Cold-start values are the genesis coordinate; a node with no beacon simply never reshuffles.
+    let hello_cell = Arc::new(RwLock::new(Arc::new(hello_bytes::<F>(
+        Epoch::ZERO,
+        coord.coords(),
+        &proof,
+        capabilities,
+    ))));
+    let beacon_cell = Arc::new(RwLock::new(BeaconSeed::GENESIS));
+    let verify_beacon = beacon_cell.clone();
     let identity: Identity = Some(SelfCert {
-        hello: Arc::new(hello_bytes::<F>(
-            Epoch::ZERO,
-            coord.coords(),
-            &proof,
-            capabilities,
-        )),
+        hello: hello_cell.clone(),
         verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
-            verify_hello::<F>(peer_cert, peer_hello, &BeaconSeed::GENESIS, capabilities)
+            let beacon = *verify_beacon.read().ok()?; // poisoned ⇒ reject (None), never verify on a stale seed
+            verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities)
         }),
     });
-    spawn_inner(engine, directory, None, identity, server, client, bind)
+    let dir_for_reshuffle = directory.clone();
+    let handle = spawn_inner(engine, directory, None, identity, server, client, bind)?;
+    // Drive the per-epoch coordinate reshuffle off the live beacon (spec §L3, §3.2): on each `BeaconReady`
+    // the loop re-derives this node's VRF coordinate for the new epoch, re-seats the engine, rebinds its
+    // directory coordinate, and publishes the fresh HELLO + beacon so subsequent connections prove/verify
+    // the current placement.
+    let local_addr = handle.local_addr();
+    tokio::spawn(reshuffle_loop::<F>(
+        creds.clone(),
+        capabilities,
+        coord.coords(),
+        local_addr,
+        dir_for_reshuffle,
+        hello_cell,
+        beacon_cell,
+        handle.subscribe(),
+        handle.client(),
+    ));
+    Ok(handle)
+}
+
+/// The per-epoch coordinate reshuffle driver (spec §L3 "epoch reshuffle", §3.2; task #102). It follows the
+/// engine's notification stream and, on each `BeaconReady { epoch, seed }`, re-derives this node's
+/// verifiable coordinate `MapToPoint(VRF(vrf_sk, cert ‖ epoch ‖ seed))`, re-seats the overlay engine to it
+/// (`Command::Reseat`), and republishes the node's HELLO + the beacon the peer-verifier checks against — so
+/// the unpredictable placement rotation that defends against eclipse / path-prediction (the load-bearing
+/// defence on the grindable q=2 base cell) is live end to end. Exits when the engine stops.
+#[allow(clippy::too_many_arguments)]
+async fn reshuffle_loop<F: Field>(
+    creds: NodeCredentials,
+    capabilities: Capabilities,
+    genesis_coord: Triple,
+    local_addr: SocketAddr,
+    directory: Directory,
+    hello: Arc<RwLock<Arc<Vec<u8>>>>,
+    beacon: Arc<RwLock<BeaconSeed>>,
+    mut events: broadcast::Receiver<Notification>,
+    client: Client,
+) {
+    let mut current = genesis_coord;
+    loop {
+        match events.recv().await {
+            Ok(Notification::BeaconReady { epoch, seed }) => {
+                let seed = BeaconSeed::new(seed);
+                let (coord, proof) = verifiable_coordinate::<F>(&creds, epoch, &seed);
+                let new_coord = coord.coords();
+                if new_coord == current {
+                    continue; // this epoch's VRF landed on the same point — nothing to move
+                }
+                // Re-seat the engine at the new coordinate; a dead engine (`false`) ends the loop.
+                if !client.command(Command::Reseat { coord: new_coord }) {
+                    break;
+                }
+                // Rebind the transport directory: bind the new point to our (unchanged) address and clear
+                // the vacated one, so peers dial us at our current coordinate and no stale binding lingers.
+                directory.insert(new_coord, local_addr);
+                directory.remove(current);
+                current = new_coord;
+                // Publish the new HELLO + beacon so subsequent handshakes prove/verify at this epoch. Write
+                // the beacon FIRST: a connection accepted between the two writes then verifies a peer against
+                // the newer beacon while announcing the older coordinate — harmless (the peer re-syncs on an
+                // epoch mismatch, §7.3), and never the reverse (verifying against a stale beacon). A poisoned
+                // lock skips this rotation's publish; the next `BeaconReady` retries.
+                if let Ok(mut b) = beacon.write() {
+                    *b = seed;
+                }
+                if let Ok(mut h) = hello.write() {
+                    *h = Arc::new(hello_bytes::<F>(epoch, coord.coords(), &proof, capabilities));
+                }
+            }
+            // Some other notification, or we fell behind the broadcast — keep following either way.
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break, // engine stopped
+        }
+    }
 }
 
 /// Like [`spawn`], but every frame on the wire is PROTEUS-shaped with the shared `community_secret`
@@ -838,7 +928,11 @@ async fn read_verified_hello(
 /// each announces its own HELLO immediately (never waiting on the peer first), so there is no
 /// ordering dependency between the two sides — symmetric, and it cannot deadlock.
 async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Option<Triple> {
-    send_hello(conn, shaper, &id.hello).await;
+    // Snapshot the current-epoch HELLO (an `Arc` clone) and drop the lock before awaiting, so a concurrent
+    // reshuffle can rewrite it without blocking on this connection's I/O. A poisoned lock rejects the
+    // handshake (`None`), matching the connection-map convention elsewhere in this driver.
+    let hello = id.hello.read().ok()?.clone();
+    send_hello(conn, shaper, &hello).await;
     match read_verified_hello(conn, shaper, &id.verify).await? {
         HelloResult::Established {
             coord,
@@ -883,5 +977,145 @@ async fn read_frames(
         if input_tx.send(Input::Message { from, frame }).await.is_err() {
             break; // engine actor gone (or, while it drains a flood, back-pressured here — bounded)
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use fanos_field::F2;
+
+    /// The per-epoch reshuffle driver (#102): a `BeaconReady` re-derives this node's VRF coordinate for
+    /// the new epoch, re-seats the engine to it, and rebinds its directory coordinate. Driven with a
+    /// synthetic beacon so the outcome is deterministic: the new coordinate is exactly
+    /// `verifiable_coordinate(creds, epoch, seed)`.
+    #[tokio::test]
+    async fn a_beacon_round_reshuffles_the_coordinate_and_rebinds_the_directory() {
+        let creds = NodeCredentials::generate().expect("credentials");
+        let genesis = verifiable_coordinate::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS).0;
+        let genesis_coord = genesis.coords();
+
+        // The epoch-1 beacon and the coordinate it deterministically yields — what the loop must land on.
+        let epoch = Epoch::ZERO.next();
+        let seed = [0x5Au8; 32];
+        let expected = verifiable_coordinate::<F2>(&creds, epoch, &BeaconSeed::new(seed))
+            .0
+            .coords();
+        assert_ne!(expected, genesis_coord, "the beacon must actually move the coordinate for this test");
+
+        // Shared cells + a directory pre-bound at the genesis coordinate.
+        let hello = Arc::new(RwLock::new(Arc::new(vec![0u8]))); // sentinel: rewritten on reshuffle
+        let beacon = Arc::new(RwLock::new(BeaconSeed::GENESIS));
+        let directory = Directory::new();
+        let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_000).into();
+        directory.insert(genesis_coord, local_addr);
+
+        // Channels: the loop's `Client` sends `Reseat` down `input_rx`; we push `BeaconReady` via `events`.
+        let (input_tx, mut input_rx) = mpsc::channel::<Input>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
+        let (events_tx, _events_rx0) = broadcast::channel::<Notification>(8);
+        let client = Client {
+            addr: genesis_coord,
+            input_tx,
+            ctrl_tx,
+            events_tx: events_tx.clone(),
+        };
+
+        tokio::spawn(reshuffle_loop::<F2>(
+            creds,
+            Capabilities::CORE,
+            genesis_coord,
+            local_addr,
+            directory.clone(),
+            hello.clone(),
+            beacon.clone(),
+            events_tx.subscribe(),
+            client,
+        ));
+
+        events_tx
+            .send(Notification::BeaconReady { epoch, seed })
+            .expect("a subscriber (the loop) is listening");
+
+        // The loop re-seats the engine: a `Reseat` command carrying the epoch-1 VRF coordinate.
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), input_rx.recv())
+            .await
+            .expect("the reshuffle loop issued a command in time")
+            .expect("the command channel is open");
+        assert_eq!(
+            cmd,
+            Input::Command(Command::Reseat { coord: expected }),
+            "the engine is re-seated at the epoch's VRF coordinate"
+        );
+
+        // The directory + published cells follow (the loop writes them right after the command). Poll
+        // briefly: those writes happen on the loop's task, concurrent with ours.
+        let rebound = await_until(|| {
+            directory.resolve(expected) == Some(local_addr) && directory.resolve(genesis_coord).is_none()
+        })
+        .await;
+        assert!(rebound, "the new coordinate is bound to our address and the vacated one is cleared");
+        assert_eq!(*beacon.read().unwrap(), BeaconSeed::new(seed), "the verifier's beacon advanced");
+        assert_ne!(
+            **hello.read().unwrap(),
+            vec![0u8],
+            "the published HELLO was rewritten for the new coordinate"
+        );
+    }
+
+    /// A beacon whose VRF lands the node back on its current point is a no-op: no re-seat command.
+    #[tokio::test]
+    async fn a_beacon_that_does_not_move_the_coordinate_is_a_noop() {
+        let creds = NodeCredentials::generate().expect("credentials");
+        let genesis = verifiable_coordinate::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS).0;
+        let genesis_coord = genesis.coords();
+
+        let hello = Arc::new(RwLock::new(Arc::new(vec![0u8])));
+        let beacon = Arc::new(RwLock::new(BeaconSeed::GENESIS));
+        let directory = Directory::new();
+        let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_001).into();
+
+        let (input_tx, mut input_rx) = mpsc::channel::<Input>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
+        let (events_tx, _rx0) = broadcast::channel::<Notification>(8);
+        let client = Client {
+            addr: genesis_coord,
+            input_tx,
+            ctrl_tx,
+            events_tx: events_tx.clone(),
+        };
+        tokio::spawn(reshuffle_loop::<F2>(
+            creds,
+            Capabilities::CORE,
+            genesis_coord,
+            local_addr,
+            directory,
+            hello,
+            beacon,
+            events_tx.subscribe(),
+            client,
+        ));
+
+        // Re-announce the GENESIS beacon at epoch 0 → the same coordinate → the loop must NOT re-seat.
+        events_tx
+            .send(Notification::BeaconReady {
+                epoch: Epoch::ZERO,
+                seed: *BeaconSeed::GENESIS.as_bytes(),
+            })
+            .expect("subscriber listening");
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), input_rx.recv()).await;
+        assert!(quiet.is_err(), "no re-seat command when the coordinate does not move");
+    }
+
+    /// Poll `cond` up to ~2s, yielding between checks; returns whether it became true.
+    async fn await_until(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..400 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
     }
 }
