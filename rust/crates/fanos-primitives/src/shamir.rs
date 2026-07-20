@@ -22,10 +22,21 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// wipes them from memory when it is dropped ([`ZeroizeOnDrop`]). The evaluations are **private** with a
 /// borrowing accessor — a caller cannot `mem::take` or otherwise move the secret out of a `Share`, which
 /// would bypass that drop-wipe; it can only read it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Share {
     x: u8,
     y: Vec<u8>,
+}
+
+// Redacted Debug (audit #124): `y` is secret share material (any `t` shares reconstruct the secret), so
+// the derived Debug — which would print it in full — is replaced; only `x` (the public point) is shown.
+impl core::fmt::Debug for Share {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Share")
+            .field("x", &self.x)
+            .field("y", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Share {

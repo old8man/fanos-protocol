@@ -25,10 +25,22 @@ use rand_core::{CryptoRng, RngCore};
 use crate::vss::{self, VssCommitment, VssShare};
 
 /// One dealer's contribution: its public commitment and the private share for each participant.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Dealing {
     commitment: VssCommitment,
     shares: Vec<VssShare>,
+}
+
+// Redacted Debug (audit #124): a Dealing holds this dealer's FULL n-share set — a stray `{:?}` on it
+// would print >= threshold secret shares, reconstructing the dealer's polynomial. The commitment is
+// public and safe to show; the shares are redacted (VssShare's own Debug is redacted too).
+impl core::fmt::Debug for Dealing {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Dealing")
+            .field("commitment", &self.commitment)
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Dealing {
@@ -65,11 +77,23 @@ pub fn deal<R: RngCore + CryptoRng>(
 }
 
 /// A participant aggregating the verified shares it receives into its final key share.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Participant {
     index: u8,
     accumulator: Scalar,
     accepted: usize,
+}
+
+// Redacted Debug (audit #124): `accumulator` is this node's live DKG key share (a running sum of the
+// received secret shares) — redact it; index/accepted are metadata.
+impl core::fmt::Debug for Participant {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Participant")
+            .field("index", &self.index)
+            .field("accumulator", &"<redacted>")
+            .field("accepted", &self.accepted)
+            .finish()
+    }
 }
 
 impl Participant {

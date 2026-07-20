@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use zeroize::Zeroize;
+
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, ServerConfig};
 use rustls::DigitallySignedStruct;
@@ -103,10 +105,28 @@ pub(crate) fn node_configs() -> Result<(ServerConfig, ClientConfig), TlsError> {
 /// to keep the same self-certifying coordinate `MapToPoint(H(cert))` across restarts.
 /// `#[derive(Wire)]` emits the canonical `cert_der ‖ key_der` (each `Vec<u8>` varint-length-prefixed,
 /// spec §7.1); the [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) persistence API wraps it.
-#[derive(Clone, Debug, fanos_wire_derive::Wire)]
+#[derive(Clone, fanos_wire_derive::Wire)]
 pub struct NodeCredentials {
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
+}
+
+// Redacted Debug + zeroize-on-drop (audit #124): `key_der` is the node's raw PKCS8 TLS/QUIC private key —
+// its compromise lets an attacker clone the node's overlay coordinate. The derived Debug would print it;
+// this one redacts it (showing only the certificate length). Drop wipes the key bytes from freed memory.
+impl core::fmt::Debug for NodeCredentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NodeCredentials")
+            .field("cert_der_len", &self.cert_der.len())
+            .field("key_der", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for NodeCredentials {
+    fn drop(&mut self) {
+        self.key_der.zeroize();
+    }
 }
 
 impl NodeCredentials {

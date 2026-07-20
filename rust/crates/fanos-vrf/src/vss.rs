@@ -73,11 +73,23 @@ impl RngCore for DeterministicRng {
 impl CryptoRng for DeterministicRng {}
 
 /// A verifiable share of a secret: `(index, f(index))`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct VssShare {
     /// The holder's evaluation point (`1..=n`).
     pub index: u8,
     value: Scalar,
+}
+
+// Redacted Debug (audit #124): the derived Debug would print `value` — a raw secret Shamir/Feldman share
+// (curve25519's own Scalar Debug ignores field privacy and prints the bytes) — so one stray `{:?}`/`dbg!`
+// on a share, or on any struct that contains one, would leak enough to reconstruct the dealer's secret.
+impl core::fmt::Debug for VssShare {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VssShare")
+            .field("index", &self.index)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl VssShare {
