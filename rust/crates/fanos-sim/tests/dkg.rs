@@ -153,7 +153,7 @@ fn a_byzantine_equivocating_dealer_is_disqualified_and_honest_nodes_still_agree(
         let share = if holder == 6 {
             corrupt_share_for(&dealing, 6) // wrong value for index 6 → fails verification
         } else {
-            *dealing.share_for(holder).unwrap()
+            dealing.share_for(holder).unwrap().clone()
         };
         sim.inject_frame(adversary, h, deal_frame(&share, &commitment));
     }

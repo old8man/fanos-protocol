@@ -43,7 +43,8 @@ fn beacon_group() -> (Vec<VssShare>, VssCommitment) {
 fn produce_beacon_seed(shares: &[VssShare], commitment: &VssCommitment) -> (Epoch, [u8; 32]) {
     let mut sim = Sim::new(0xB2C0);
     for (i, share) in shares.iter().enumerate() {
-        let node = BeaconNode::<F2>::new(Point::at(i), Some(*share), commitment.clone(), BEACON_T);
+        let node =
+            BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T);
         sim.add(Box::new(node));
     }
     // One epoch tick to every anchor: they flood partials, assemble the round, and announce the seed.

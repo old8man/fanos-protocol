@@ -48,7 +48,7 @@ fn a_mixrelay_cell_beacons_rotates_and_rendezvouses() {
     let mut sim = Sim::new(0x54E0);
 
     // A cell of 7 MixRelays: each hosts a threshold router + a beacon anchor at one Fano point.
-    for (i, &share) in shares.iter().enumerate() {
+    for (i, share) in shares.iter().enumerate() {
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xC0, i as u8]));
         let router = ThresholdRouter::<F2>::new(
             Point::at(i),
@@ -56,7 +56,8 @@ fn a_mixrelay_cell_beacons_rotates_and_rendezvouses() {
             usize::from(ONION_T),
             onion_seed(i),
         );
-        let beacon = BeaconNode::<F2>::new(Point::at(i), Some(share), commitment.clone(), BEACON_T);
+        let beacon =
+            BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T);
         sim.add(Box::new(MixRelay::new(router, beacon)));
     }
 
