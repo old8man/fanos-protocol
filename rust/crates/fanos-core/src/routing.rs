@@ -8,8 +8,7 @@
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point};
 
-use fanos_primitives::hash::label;
-use fanos_primitives::map_to_point;
+use fanos_primitives::storage_point;
 
 /// The **rendezvous line** `L = u × v` on which `u` and `v` can meet (spec §L1). Returns
 /// `None` iff the two points are equal.
@@ -35,10 +34,11 @@ pub fn paths_out<F: Field>(node: &Point<F>) -> impl Iterator<Item = Line<F>> + C
 /// **storage** domain label, matching the running engine's `address_of` and the canonical conformance
 /// vector (`conformance/vectors/services.json`) — NOT the `coord` (node-placement) domain. Keying this
 /// on `label::COORD` was an audit bug (C7): a value stored by the engine (storage domain) and located by
-/// this function (coord domain) hashed to *different* points, so the lookup silently missed.
+/// this function (coord domain) hashed to *different* points, so the lookup silently missed. Delegates to
+/// the single source of truth [`fanos_primitives::storage_point`], so the domain can never drift again.
 #[must_use]
 pub fn content_address<F: Field>(key: &[u8]) -> Point<F> {
-    map_to_point::<F>(label::STORAGE, key)
+    storage_point::<F>(key)
 }
 
 /// The `q + 1` replica lines that erasure-code a target point's data (spec §L4 projective
@@ -53,6 +53,8 @@ mod tests {
     use super::*;
     use fanos_field::{F7, F31};
     use fanos_geometry::Plane;
+    use fanos_primitives::hash::label;
+    use fanos_primitives::map_to_point;
 
     #[test]
     fn rendezvous_puts_both_endpoints_on_the_line() {

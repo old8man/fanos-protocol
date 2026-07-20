@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
-use fanos_primitives::{BeaconSeed, Epoch, hash_labeled, label};
+use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
 use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use quinn::{ClientConfig, ServerConfig};
@@ -236,7 +236,7 @@ impl Client {
     /// Retrieve `key` from the L4 store, awaiting *this* request's answer (correlated by the storage
     /// digest, so concurrent `get`s never cross). `None` if no value is stored or the node stopped.
     pub async fn get(&self, key: Vec<u8>) -> Option<Vec<u8>> {
-        let digest = hash_labeled(label::STORAGE, &key);
+        let digest = storage_digest(&key);
         let (reply, rx) = oneshot::channel();
         // Register the waiter BEFORE issuing the Get, so a fast reply can never be missed.
         if self.ctrl_tx.send(Control::Get { digest, reply }).is_err() {
@@ -260,7 +260,7 @@ impl Client {
     /// Store `value` under `key`, awaiting the responsible node's acknowledgement. `false` if the
     /// node stopped before acking.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        let digest = hash_labeled(label::STORAGE, &key);
+        let digest = storage_digest(&key);
         let (reply, rx) = oneshot::channel();
         if self.ctrl_tx.send(Control::Put { digest, reply }).is_err() {
             return false;

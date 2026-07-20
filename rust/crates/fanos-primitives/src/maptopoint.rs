@@ -18,7 +18,7 @@ use blake3::OutputReader;
 use fanos_field::{Field, FieldKind};
 use fanos_geometry::{Line, Point};
 
-use crate::hash::xof_reader;
+use crate::hash::{DIGEST_LEN, hash_labeled, label, xof_reader};
 
 /// Bytes needed to cover the value range `0..q` — the one canonical [`fanos_field::element_width`],
 /// shared with the wire codec so sampling and serialization agree on the width.
@@ -95,6 +95,25 @@ pub fn map_to_line<F: Field>(label: &str, data: &[u8]) -> Line<F> {
     Line::new(coords).unwrap_or_else(|| Line::at(0))
 }
 
+/// The content-address **digest** of a storage key: `H_storage(key)` — the field-independent 32-byte
+/// content address that keys the L4 store and correlates a request with its reply (spec §L4). The single
+/// source of truth for the storage-domain digest, in lock-step with [`storage_point`] (both key on
+/// [`label::STORAGE`]) so the digest that keys the store and the point that routes to it can never drift
+/// to different hash domains — the audit-C7 class of bug.
+#[must_use]
+pub fn storage_digest(key: &[u8]) -> [u8; DIGEST_LEN] {
+    hash_labeled(label::STORAGE, key)
+}
+
+/// The responsible projective **point** for a storage key: `MapToPoint(H_storage(key))` (spec §L4) —
+/// where the value lives and is LRC-replicated across the point's `q+1` lines. Same `STORAGE` domain as
+/// [`storage_digest`]; both derive from `(STORAGE, key)`, so a value stored by the engine and located by
+/// a client can never hash to different points (audit C7).
+#[must_use]
+pub fn storage_point<F: Field>(key: &[u8]) -> Point<F> {
+    map_to_point::<F>(label::STORAGE, key)
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
@@ -108,6 +127,27 @@ mod tests {
         let a = map_to_point::<F7>(label::COORD, b"node-key");
         let b = map_to_point::<F7>(label::COORD, b"node-key");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn storage_digest_and_point_are_lock_step_on_the_storage_domain() {
+        // The audit-C7 guard: the digest that keys the store and the point that routes to it BOTH derive
+        // from the STORAGE domain, so a value stored by the engine and located by a client hash to the same
+        // point — and the digest is exactly the storage-domain hash, never the coord (node-placement) one.
+        let key = b"content-key";
+        assert_eq!(storage_digest(key), hash_labeled(label::STORAGE, key), "digest is the STORAGE hash");
+        assert_eq!(
+            storage_point::<F31>(key),
+            map_to_point::<F31>(label::STORAGE, key),
+            "point is MapToPoint over the STORAGE domain"
+        );
+        // NOT the coord domain — keying content on COORD was the C7 bug (silent lookup miss).
+        assert_ne!(
+            storage_point::<F31>(key),
+            map_to_point::<F31>(label::COORD, key),
+            "storage and coordinate domains are distinct — they must never be confused"
+        );
+        assert_eq!(storage_digest(key), storage_digest(key), "deterministic");
     }
 
     #[test]

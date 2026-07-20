@@ -35,7 +35,7 @@ pub use beacon::BeaconSeed;
 pub use epoch::Epoch;
 pub use hash::{DIGEST_LEN, hash_labeled, label, subkey};
 pub use keys::{HybridPublicKey, NodeId};
-pub use maptopoint::{map_to_line, map_to_point};
+pub use maptopoint::{map_to_line, map_to_point, storage_digest, storage_point};
 pub use shamir::{Share, reconstruct, split};
 pub use vrf::{coordinate_for, coordinate_from_vrf, rendezvous_line};
 

@@ -15,8 +15,7 @@ use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple, fano, next_hop};
-use fanos_primitives::hash::label;
-use fanos_primitives::{Epoch, hash_labeled, map_to_point};
+use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -724,9 +723,9 @@ impl<F: Field> OverlayNode<F> {
 
     /// The DHT storage address of `key`: the digest and the responsible point (spec §L4).
     fn address_of(key: &[u8]) -> ([u8; DIGEST], Triple) {
-        let digest = hash_labeled(label::STORAGE, key);
-        let primary = map_to_point::<F>(label::STORAGE, key).coords();
-        (digest, primary)
+        // The one storage-address rule (`fanos_primitives`): digest keys the store, point routes to it —
+        // both on the STORAGE domain, so they can never drift to different hashes (audit C7).
+        (storage_digest(key), storage_point::<F>(key).coords())
     }
 
     /// Whether the local DHT slice will admit `(digest, value_len)` under the A4 DoS caps: the value is
