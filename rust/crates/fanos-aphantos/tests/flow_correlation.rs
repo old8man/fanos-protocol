@@ -22,7 +22,7 @@ use fanos_aphantos::{Directory, NyxNode};
 use fanos_field::F31;
 use fanos_geometry::Point;
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
-use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, TimerToken};
+use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, TimerToken};
 
 fn keypair(seed: &[u8]) -> (HybridKemSecret, HybridKemPublic) {
     let mut rng = SeedRng::from_seed(seed);

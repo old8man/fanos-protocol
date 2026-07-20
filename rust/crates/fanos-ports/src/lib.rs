@@ -18,8 +18,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use fanos_geometry::Triple;
-use fanos_primitives::Epoch;
+// Re-export the coordinate + epoch vocabulary the contract is written in, so a driver or sibling engine
+// speaks them through the contract crate without depending on geometry/primitives directly.
+pub use fanos_geometry::Triple;
+pub use fanos_primitives::Epoch;
 
 /// A monotonic instant in nanoseconds since the run's origin. Virtual — never the wall clock.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]

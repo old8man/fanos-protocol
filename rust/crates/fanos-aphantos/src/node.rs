@@ -14,7 +14,7 @@ use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::hash::hash_xof;
 use fanos_primitives::hash_labeled;
 use fanos_primitives::map_to_point;
-use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame};
 
 use crate::sealed::{self, PeelOutcome};

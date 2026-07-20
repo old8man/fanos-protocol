@@ -19,7 +19,7 @@ use fanos_aphantos::{Directory, NyxNode};
 use fanos_field::F31;
 use fanos_geometry::Point;
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
-use fanos_runtime::{Effect, Engine, Input, Instant};
+use fanos_ports::{Effect, Engine, Input, Instant};
 use fanos_wire::{FrameType, encode_frame};
 
 /// A KEM keypair from a fixed seed.

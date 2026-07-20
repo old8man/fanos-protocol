@@ -27,7 +27,7 @@ use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet};
 use fanos_primitives::Epoch;
 use fanos_primitives::shamir::Share;
-use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
 use crate::threshold::{self, ThresholdPeel};
 

@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
-use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_vrf::dkg::{self, Dealing, Participant};
 use fanos_vrf::vss::{self, DeterministicRng, VssCommitment, VssShare};
 use fanos_wire::{FrameType, decode_frame, encode_frame};

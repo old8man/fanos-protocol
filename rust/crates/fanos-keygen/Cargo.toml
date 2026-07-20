@@ -18,7 +18,9 @@ categories = ["cryptography", "network-programming"]
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-wire = { workspace = true, features = ["std"] }
-fanos-runtime = { workspace = true, features = ["std"] }
+# DkgNode/BeaconNode are sans-I/O engines that speak only the contract vocabulary — the light leaf, not
+# the whole OverlayNode engine crate (audit #73/#125).
+fanos-ports = { workspace = true, features = ["std"] }
 fanos-vrf.workspace = true
 # Wipe this node's DKG secret contribution from memory on drop.
 zeroize = { workspace = true }

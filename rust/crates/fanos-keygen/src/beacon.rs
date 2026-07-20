@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
-use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
+use fanos_ports::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
 use fanos_vrf::beacon::{BeaconPartial, BeaconRound, PARTIAL_LEN, partial_eval, verify_partial};
 use fanos_vrf::vss::{VssCommitment, VssShare};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
