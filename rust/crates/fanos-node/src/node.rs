@@ -12,7 +12,10 @@ use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_quic::{Client, Directory, NodeHandle, spawn_self_certifying_persistent_on};
-use fanos_runtime::{Command, Config as OverlayConfig, Notification, OverlayNode};
+use fanos_keygen::BeaconNode;
+use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
+
+use crate::OverlayBeaconNode;
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::error::NodeError;
@@ -55,10 +58,24 @@ impl Node {
             directory.insert(peer.coord, peer.addr);
         }
 
+        // Compose the engine per coordinate: a bare overlay by default, or — when beacon params are
+        // configured — an `OverlayBeaconNode` that runs the live threshold-DVRF epoch clock (§7.6). A
+        // pure consumer (`share = None`) only needs the group commitment + threshold to verify and adopt
+        // the rounds anchors flood; an anchor also contributes partials.
+        let beacon = config.beacon.clone();
         let handle = spawn_self_certifying_persistent_on::<F>(
             config.listen,
             &credentials,
-            move |coord| Box::new(OverlayNode::<F>::new(coord, OverlayConfig::default())),
+            move |coord| -> Box<dyn Engine + Send> {
+                let overlay = OverlayNode::<F>::new(coord, OverlayConfig::default());
+                match beacon {
+                    Some(bp) => Box::new(OverlayBeaconNode::new(
+                        overlay,
+                        BeaconNode::<F>::new(coord, bp.share, bp.commitment, bp.threshold),
+                    )),
+                    None => Box::new(overlay),
+                }
+            },
             directory.clone(),
         )
         .await?;
@@ -168,7 +185,7 @@ impl Node {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
+    use crate::config::{BeaconParams, NodeConfig};
     use fanos_field::F2;
 
     #[tokio::test]
@@ -202,6 +219,32 @@ mod tests {
             health.local_addr.port() > 0,
             "endpoint bound to a real port"
         );
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_node_starts_with_a_beacon_consumer_and_self_certifies_a_coordinate() {
+        // A consumer-mode beacon (share = None) needs only the group commitment + threshold; the node
+        // composes an OverlayBeaconNode, binds real QUIC, and self-certifies a coordinate. With no
+        // anchors flooding rounds it simply sits at genesis — the epoch-advance behaviour is unit-tested
+        // in overlay_beacon. This proves the Node::start wiring spawns the composite end-to-end (§7.6).
+        use fanos_vrf::vss::{DeterministicRng, deal};
+        let (_shares, commitment) =
+            deal(&[0xB5; 32], 2, 3, &mut DeterministicRng::new(b"node-beacon")).unwrap();
+        let node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams {
+                commitment,
+                threshold: 2,
+                share: None,
+            }),
+            ..NodeConfig::default()
+        })
+        .await
+        .unwrap();
+        let health = node.health();
+        assert_eq!(health.address, node.address());
+        assert!(health.local_addr.port() > 0, "endpoint bound");
         node.shutdown();
     }
 

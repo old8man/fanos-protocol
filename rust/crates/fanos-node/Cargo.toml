@@ -35,6 +35,8 @@ fanos-proxy.workspace = true
 # The threshold-onion router and the distributed-beacon engine the MixRelay composite hosts (E4∩E5).
 fanos-aphantos.workspace = true
 fanos-keygen.workspace = true
+# The DKG commitment/share types (VssCommitment/VssShare) a BeaconParams config carries (§7.6, #108).
+fanos-vrf.workspace = true
 # The frame registry MixRelay classifies beacon vs onion traffic with.
 fanos-wire.workspace = true
 rand_core.workspace = true
@@ -61,10 +63,6 @@ tokio = { workspace = true, features = [
     "macros",
     "time",
 ] }
-# Only tests need the DKG dealing primitives to synthesize a beacon key (deal / VssShare /
-# VssCommitment / DeterministicRng) for the OverlayBeaconNode composite; the crate itself reaches the
-# beacon through fanos-keygen's BeaconNode.
-fanos-vrf.workspace = true
 
 [lints]
 workspace = true

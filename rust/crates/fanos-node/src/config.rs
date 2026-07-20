@@ -4,8 +4,27 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use fanos_geometry::Triple;
+use fanos_vrf::vss::{VssCommitment, VssShare};
 
 use crate::error::NodeError;
+
+/// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
+/// `beacon = Some(..)` the node composes an [`OverlayBeaconNode`](crate::OverlayBeaconNode): it
+/// verifies and adopts the threshold-DVRF rounds the anchors flood — needing only the public
+/// `commitment` and `threshold` — and advances its epoch as the network beacon advances (which in turn
+/// rotates rendezvous lines, cover schedules, and the coordinate reshuffle). `share = Some(..)`
+/// additionally makes it an **anchor** that contributes partials; `None` is a pure **consumer**. With
+/// `beacon = None` the node runs a bare [`OverlayNode`](fanos_runtime::OverlayNode), pinned at genesis
+/// (the pre-beacon behaviour), so this is fully backward-compatible.
+#[derive(Clone, Debug)]
+pub struct BeaconParams {
+    /// The beacon group's public commitment — a genesis parameter shared across the network.
+    pub commitment: VssCommitment,
+    /// The DVRF reconstruction threshold `t`.
+    pub threshold: usize,
+    /// This node's beacon share if it is an anchor; `None` for a pure consumer.
+    pub share: Option<VssShare>,
+}
 
 /// A bootstrap peer: a known overlay coordinate bound to a network address. The overlay routes on
 /// coordinates; a fresh node seeds its address book with these so it can dial into the network
@@ -111,6 +130,9 @@ pub struct NodeConfig {
     pub roles: RoleSet,
     /// Whether to begin liveness heartbeats on start.
     pub start_heartbeat: bool,
+    /// The distributed-beacon parameters. `Some(..)` runs the live epoch clock (§7.6); `None` (the
+    /// default) runs a bare overlay pinned at genesis — see [`BeaconParams`].
+    pub beacon: Option<BeaconParams>,
 }
 
 impl Default for NodeConfig {
@@ -121,6 +143,7 @@ impl Default for NodeConfig {
             bootstrap: Vec::new(),
             roles: RoleSet::default(),
             start_heartbeat: true,
+            beacon: None,
         }
     }
 }
