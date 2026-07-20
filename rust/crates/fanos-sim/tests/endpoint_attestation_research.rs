@@ -37,6 +37,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use fanos_diakrisis::polar;
 use fanos_field::F2;
 use fanos_geometry::fano;
 use fanos_runtime::{
@@ -569,6 +570,192 @@ fn the_wired_engine_never_quarantines_under_honest_churn() {
         assert!(
             quarantines.is_empty(),
             "seed {seed}: honest churn must never quarantine, got {quarantines:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// §6.3 GREY-RATE research — localize a lossy/slow node, and the negative result that shaped it.
+//
+// A grey node drops a fraction of its outbound `Pong`s (§6.3 "answers but slowly/lossily"): it stays
+// heartbeat-PRESENT (some pongs get through; gossip/attest honest), so liveness never calls a crash — only
+// its channels' degradation reveals it. FINDING (why the obvious shortcut fails): reconstructing the signal
+// from the gossiped `DiagGossip` AGES is too weak — a near-full-heartbeat baseline age (~460 ms:
+// ping→pong→next gossip) swamps a 50 %-dropper's ~40 ms mean-age lift, so no polar class violates (the sim
+// proved this before any wiring). The sound signal is the DIRECT per-neighbour loss rate — pings-sent vs
+// pongs-received, a clean [0,1] quantity a node measures locally with a large grey/baseline gap. Below: the
+// grey affordance, a probe measuring that loss the way the engine substrate will, and the sweep localizing
+// grey via the pure `polar::grey_endpoint` on the loss matrix, with `tol` pinned to separate grey from jitter.
+// ---------------------------------------------------------------------------------------------------------
+
+/// The research grey node: a fully-live [`OverlayNode`] that drops a fixed fraction (`drop_permille` / 1000)
+/// of its outbound `Pong` frames — the §6.3 "answers but slowly/lossily" fault. It stays heartbeat-*present*
+/// (some pongs get through, and its gossip/attest are honest), so liveness never diagnoses a crash; only the
+/// per-neighbour loss its droppedness induces reveals it. Deterministic (a spreading counter), so reproducible.
+struct GreyNode {
+    node: OverlayNode<F2>,
+    drop_permille: u32,
+    counter: u32,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Engine for GreyNode {
+    fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
+        let mut out = Vec::new();
+        for e in self.node.step(now, input) {
+            if self.drops(&e) {
+                self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    fn address(&self) -> Triple {
+        self.node.address()
+    }
+}
+
+impl GreyNode {
+    fn drops(&mut self, effect: &Effect) -> bool {
+        let Effect::Send { frame, .. } = effect else {
+            return false;
+        };
+        if !is_frame(frame, FrameType::Pong) {
+            return false;
+        }
+        self.counter = self.counter.wrapping_add(1);
+        // 401 is coprime to 1000, so the drop decision spreads evenly rather than clustering.
+        (self.counter.wrapping_mul(401) % 1000) < self.drop_permille
+    }
+}
+
+/// Whether a canonical frame is of the given type.
+fn is_frame(frame: &[u8], ty: FrameType) -> bool {
+    decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()) == Some(ty)
+}
+
+/// Per-observer, per-neighbour ping/pong tally: `(observer, neighbour) → [pings_sent, pongs_received]`. The
+/// direct loss measurement the live engine will keep as per-`Peer` counters; here a probe reconstructs it from
+/// observed traffic, so the rule is validated on the same quantity before the substrate is built.
+type LossLog = Arc<Mutex<std::collections::BTreeMap<(Triple, Triple), [u32; 2]>>>;
+
+/// A transparent wrapper that tallies, per neighbour, the `Ping`s its node SENDS and the `Pong`s it RECEIVES —
+/// exactly the counts a node needs to measure its own outbound channel loss. Passes every effect through.
+struct LossProbe {
+    inner: Box<dyn Engine>,
+    log: LossLog,
+}
+
+impl Engine for LossProbe {
+    fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
+        let me = self.inner.address();
+        if let Input::Message { from, frame } = &input
+            && is_frame(frame, FrameType::Pong)
+        {
+            self.log.lock().unwrap().entry((me, *from)).or_default()[1] += 1;
+        }
+        let effects = self.inner.step(now, input);
+        for e in &effects {
+            if let Effect::Send { to, frame } = e
+                && is_frame(frame, FrameType::Ping)
+            {
+                self.log.lock().unwrap().entry((me, *to)).or_default()[0] += 1;
+            }
+        }
+        effects
+    }
+
+    fn address(&self) -> Triple {
+        self.inner.address()
+    }
+}
+
+/// The symmetric measured-loss channel-rate matrix: `rate[a][b] = max(loss a→b, loss b→a)`, loss `i→j =
+/// 1 − pongs_received(i from j) / pings_sent(i to j)`. A channel is only as good as its worst direction, so a
+/// grey node — lossy only *outbound* — still lifts every channel incident to it (its column), the
+/// `grey_endpoint` signature. Pairs with no pings measured read 0.
+fn loss_matrix(log: &LossLog) -> [[f64; N]; N] {
+    let m = log.lock().unwrap();
+    let loss = |i: usize, j: usize| -> f64 {
+        let (ci, cj) = (fano::point(i).coords(), fano::point(j).coords());
+        match m.get(&(ci, cj)) {
+            Some(&[sent, recv]) if sent > 0 => 1.0 - f64::from(recv) / f64::from(sent),
+            _ => 0.0,
+        }
+    };
+    core::array::from_fn(|a| {
+        core::array::from_fn(|b| if a == b { 0.0 } else { loss(a, b).max(loss(b, a)) })
+    })
+}
+
+/// Build a 7-node cell of [`LossProbe`]-wrapped engines; `grey = Some((point, drop_permille))` seats a
+/// [`GreyNode`] there, else all honest. Returns the sim, the loss tally, and the grey node's drop counter.
+fn build_loss_probed_cell(
+    seed: u64,
+    net: NetworkModel,
+    grey: Option<(usize, u32)>,
+) -> (Sim, LossLog, Arc<std::sync::atomic::AtomicUsize>) {
+    let log: LossLog = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sim = Sim::with_network(seed, net);
+    for i in 0..N {
+        let inner: Box<dyn Engine> = match grey {
+            Some((g, permille)) if g == i => Box::new(GreyNode {
+                node: OverlayNode::<F2>::new(fano::point(i), Config::default()),
+                drop_permille: permille,
+                counter: 0,
+                dropped: dropped.clone(),
+            }),
+            _ => Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default())),
+        };
+        sim.add(Box::new(LossProbe { inner, log: log.clone() }));
+    }
+    sim.inject_all(&Command::StartHeartbeat);
+    (sim, log, dropped)
+}
+
+/// Grey-consistency tolerance — the minimum a grey node's *worst* incident loss must exceed the cell's
+/// baseline (median channel loss) to be localized, pinned by this sweep. A grey node's minimum incident loss
+/// runs ABOVE the global baseline (all its channels are degraded); an honest node's runs BELOW it (its worst
+/// channel is a good honest link), so the excess is negative — a wide separation `0.10` sits inside. Even the
+/// mildest channel of a 50 %-dropper clears it, while a fair 15 %-loss cell (every node's worst channel below
+/// median) never does.
+const GREY_TOL: f64 = 0.10;
+
+/// **DETECTION.** A single grey node dropping half its pongs is localized from measured per-neighbour loss,
+/// every seed — its incident channels' loss rises so its polar class is the unique consistent one.
+#[test]
+fn grey_endpoint_localizes_a_lossy_node_from_measured_loss() {
+    // Every one of the 7 points, as the grey node in turn, is localized — the localization is not an artefact
+    // of a particular coordinate.
+    for grey in 0..N {
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.05);
+        let (mut sim, log, dropped) =
+            build_loss_probed_cell(0x_6E_A1 + grey as u64, net, Some((grey, 500)));
+        sim.run_for(Duration::from_millis(12000));
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed) > 0, "the grey node dropped pongs");
+        assert_eq!(
+            polar::grey_endpoint(&loss_matrix(&log), GREY_TOL),
+            Some(grey),
+            "grey {grey}: localized from measured per-neighbour loss"
+        );
+    }
+}
+
+/// **FALSE POSITIVE.** A fair cell — every node honest, uniform 15 % loss + jitter — localizes NOBODY: the
+/// measured-loss matrix is near-uniform, so no polar class violates at `GREY_TOL`.
+#[test]
+fn grey_endpoint_is_silent_on_a_fair_lossy_cell() {
+    for seed in 0..12u64 {
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), 0.15);
+        let (mut sim, log, _) = build_loss_probed_cell(0x_FA15E ^ seed, net, None);
+        sim.run_for(Duration::from_millis(12000));
+        assert_eq!(
+            polar::grey_endpoint(&loss_matrix(&log), GREY_TOL),
+            None,
+            "seed {seed}: a fair lossy cell (uniform 15% loss) has no grey node"
         );
     }
 }

@@ -299,31 +299,56 @@ pub fn fabricators_by_persistent_freshness(
 }
 
 /// Localize a single **grey** node from a measured *symmetric* channel-rate matrix (spec §6.3: "grey/degraded
-/// → polar-rate sum-rules, T-226"). A grey node `j` — one that answers but slowly/lossily on ALL its channels
-/// — elevates the rate of every channel *incident* to `j`. By the Fano structure this has a unique signature:
-/// every polar class `m ≠ j` contains **exactly one** `j`-incident channel (its three channels partition the
-/// six non-`m` points into pairs, and `j` — being one of those six — lands in exactly one pair), so that one
-/// elevated rate makes class `m` inconsistent; while class `j`'s own three channels run among the six *non*-`j`
-/// points, contain no `j`-channel, and stay consistent. So a single grey node is the **unique polar class that
-/// does NOT violate** while all six others do. Returns that point on this clean single-grey signature, else
-/// `None` (no grey — no violations — or an ambiguous/multi-fault pattern the syndrome localizer must handle).
+/// → answers but slowly/lossily"). A grey node is degraded on **all** its channels, so its *worst* (minimum)
+/// incident rate is still elevated — whereas an honest node always has at least one good, baseline channel (to
+/// another honest peer), so its minimum incident rate sits at the cell baseline. So the grey node is the point
+/// whose **minimum incident rate** most exceeds the cell's baseline (the median of all channel rates), reported
+/// only when that excess clears `tol`. A grey node has *every* channel above `baseline + tol`; no honest node
+/// can (its honest-to-honest channels stay at baseline), so the maximiser is unambiguous when it clears the
+/// bar. `None` on a fair cell (no point's minimum clears baseline) — the healthy case.
 ///
-/// `tol` is the rate-consistency slack: it must sit above the honest network-jitter noise floor (so uniform
-/// lossy-but-fair links do not violate) and below the grey rate lift (so a real grey node does). It is the one
-/// value a simulator sweep pins — separating grey from jitter — never a guessed constant.
+/// **Why the minimum, not the polar sum-rules.** The T-226 identities *do* fire on a grey node — its incident
+/// channels break every class it is an endpoint of — but that "which class stays consistent" localization is
+/// brittle to *uneven* grey: if one of the grey node's channels is only mildly degraded (real loss is not
+/// uniform), that one class slips back under `tol` and the signature ambiguates. The minimum-incident test is
+/// the robust reading of the same geometry — a grey node is bad on its *weakest* link too — and a simulator
+/// sweep confirmed it localizes every grey position where the raw sum-rule signature did not
+/// (`fanos-sim/tests/endpoint_attestation_research.rs`).
+///
+/// `tol` is the loss slack a simulator sweep pins: above the honest per-channel jitter, below a grey node's
+/// lift — never a guessed constant.
 #[must_use]
 pub fn grey_endpoint(rates: &[[f64; N]; N], tol: f64) -> Option<usize> {
-    let violated = violated_classes(rates, tol);
-    // The single-grey signature: exactly the six classes OTHER than one violate; that one innocent class is
-    // the grey endpoint. Any other cardinality is not this fault (healthy, or a pattern the syndrome handles).
-    if violated.len() != N - 1 {
-        return None;
+    // Baseline = median of the 21 undirected channel rates (upper triangle). With a single grey node only its
+    // 6 incident channels are elevated, so the median lands squarely on the healthy rate.
+    let mut channels: Vec<f64> = Vec::with_capacity(N * (N - 1) / 2);
+    for a in 0..N {
+        for b in (a + 1)..N {
+            channels.push(rates[a][b]);
+        }
     }
-    let innocent: Vec<usize> = (0..N).filter(|k| !violated.contains(k)).collect();
-    match innocent[..] {
-        [k] => Some(k),
-        _ => None,
-    }
+    channels.sort_by(|x, y| x.partial_cmp(y).unwrap_or(core::cmp::Ordering::Equal));
+    let baseline = channels[channels.len() / 2];
+
+    // Each point's worst (minimum) incident rate; a non-finite rate makes it ineligible (treated as −∞).
+    let min_incident = |k: usize| -> f64 {
+        (0..N)
+            .filter(|&j| j != k)
+            .map(|j| rates[k][j])
+            .fold(f64::INFINITY, |acc, r| {
+                if r.is_finite() {
+                    acc.min(r)
+                } else {
+                    f64::NEG_INFINITY
+                }
+            })
+    };
+    let grey = (0..N).max_by(|&a, &b| {
+        min_incident(a)
+            .partial_cmp(&min_incident(b))
+            .unwrap_or(core::cmp::Ordering::Equal)
+    })?;
+    (min_incident(grey) - baseline > tol).then_some(grey)
 }
 
 #[cfg(test)]
@@ -655,15 +680,31 @@ mod tests {
 
     #[test]
     fn grey_endpoint_localizes_a_single_lossy_node() {
-        // The §6.3 grey signature, verified for EVERY possible grey point: its incident channels are elevated,
-        // exactly the six OTHER classes violate, and it is recovered as the unique non-violated class.
+        // Verified for EVERY possible grey point: all its incident channels are elevated, so its minimum
+        // incident rate clears the baseline and it is localized.
         for j in 0..N {
             let m = grey_matrix(j, 0.1, 0.4);
-            let mut violated = violated_classes(&m, 0.05);
-            violated.sort_unstable();
-            let expect: Vec<usize> = (0..N).filter(|&k| k != j).collect();
-            assert_eq!(violated, expect, "grey {j}: exactly the six non-j classes violate");
             assert_eq!(grey_endpoint(&m, 0.05), Some(j), "grey {j} is localized");
+        }
+    }
+
+    #[test]
+    fn grey_endpoint_localizes_uneven_grey_the_sum_rules_miss() {
+        // The robustness the simulator forced (real grey is UNEVEN): grey node j is badly lossy on five of its
+        // channels but only MILDLY on one. The raw sum-rule "unique innocent class" ambiguates (that mild
+        // channel's class slips back under tol → two innocent classes), but the minimum-incident test still
+        // localizes j — its weakest channel (the mild one) is still above baseline.
+        for j in 0..N {
+            let mut m = grey_matrix(j, 0.1, 0.4);
+            // Halve the lift on ONE of j's channels (to its line-partner in class 0-ish); pick the first k≠j.
+            let k = (0..N).find(|&k| k != j).unwrap();
+            m[j][k] = 0.1 + 0.18; // mild: 0.28, still above baseline 0.1 by > tol
+            m[k][j] = 0.1 + 0.18;
+            assert_eq!(
+                grey_endpoint(&m, 0.05),
+                Some(j),
+                "uneven grey {j} still localized"
+            );
         }
     }
 
@@ -681,7 +722,11 @@ mod tests {
         // The FP guard the simulator sweep pins `tol` for: a rate lift BELOW tol (honest jitter) is not grey.
         for j in 0..N {
             let m = grey_matrix(j, 0.1, 0.03);
-            assert_eq!(grey_endpoint(&m, 0.05), None, "sub-tol lift at {j} is not grey");
+            assert_eq!(
+                grey_endpoint(&m, 0.05),
+                None,
+                "sub-tol lift at {j} is not grey"
+            );
         }
     }
 }
