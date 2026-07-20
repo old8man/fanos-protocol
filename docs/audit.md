@@ -40,9 +40,9 @@ None of these is fatal, and none contradicts the architecture — they are the g
 | A1 | Wire-codec bifurcation — canonical `fanos-wire` bypassed by ~10 subsystems | **HIGH (arch)** | workspace-wide |
 | A4 | Unbounded rendezvous route table + node session map (no eviction) | **HIGH** | `fanos-rendezvous/src/transport.rs:149`; `fanos-node/src/diaulos.rs:93` |
 | A5 | Anonymous rendezvous path not wired into the node binary (sim-only) | **HIGH (arch)** | `fanos-node` deps |
-| A2 | General-`q` stranded below a `q=2`-only DIAKRISIS/runtime/node ceiling | **MEDIUM (arch)** | `fanos-diakrisis/*` |
+| A2 | ~~General-`q` stranded below a `q=2`-only DIAKRISIS/runtime/node ceiling~~ **RESOLVED (#66)** — decision recorded, `docs/design-coordinates.md` §5 | **MEDIUM (arch)** | `fanos-diakrisis/*` |
 | A3 | "epoch" is three different quantities; frame epoch not cross-node comparable; no `Epoch` type | **MEDIUM** | see A3 |
-| A7 | Real VRF is dead code; live membership uses a self-declared-forgeable placeholder | **MEDIUM** | `fanos-core/src/membership.rs:32` |
+| A7 | ~~Real VRF is dead code; live membership uses a self-declared-forgeable placeholder~~ **RESOLVED (#66, Level A)** — VRF is the coordinate authority, live + HELLO-proven; Level B tracked (#95) | **MEDIUM** | `fanos-core/src/membership.rs:32` |
 | B5 | Hybrid KEM combiner omits transcript (ephemeral pk + ct) — X-Wing binding not met | **MEDIUM** | `fanos-pqcrypto/src/kem.rs:78-86` |
 | B6 | DKG polynomial randomness seeded solely by the long-term secret (reproducible shares) | **MEDIUM** | `fanos-keygen/src/lib.rs:147` |
 | B7 | Non-constant-time GF(256) multiply on secret Shamir shares | **MEDIUM** | `fanos-field/src/gf2m.rs:72-86` |
@@ -54,7 +54,7 @@ None of these is fatal, and none contradicts the architecture — they are the g
 | A4b | `fanos-session` uses unbounded channels between the async stream and the datagram transport | **MEDIUM** | `fanos-session/src/lib.rs:73-74` |
 | G1 | `rust/README.md` stale — "119 tests", documents 8 of 27 crates | **MEDIUM (docs)** | `rust/README.md` |
 | G2 | `#[derive(Wire)]` "codec+KATs from one definition" (design-platform.md) is unbuilt | **LOW (docs)** | — |
-| — | Service side is one-shot RPC while the client gets a full duplex stream | **MEDIUM** | `fanos-node/src/diaulos.rs:86-135` |
+| — | ~~Service side is one-shot RPC while the client gets a full duplex stream~~ **RESOLVED (#66)** — `serve` is a full-duplex per-client stream; `serve_rpc` keeps request/response ergonomic | **MEDIUM** | `fanos-node/src/diaulos.rs` |
 | — | ~~AEAD nonce counter uses `wrapping_add`~~ **RESOLVED** — `next_nonce` uses `checked_add` and returns `None` at 2⁶⁴, so the connection hard-kills rather than reuse a nonce (pinned by `conn::tests::the_connection_hard_kills_at_nonce_exhaustion_rather_than_reusing_a_nonce`) | ~~LOW~~ | `fanos-diaulos/src/conn.rs:189` |
 | E1 | Full/threshold profile emits no cover traffic — GPA resistance below the Lite profile's | **HIGH** | `fanos-aphantos/src/threshold_router.rs` |
 | E2 | Threshold mix delays seeded from the node's public coordinate — GPA can predict/relink | **HIGH** | `fanos-aphantos/src/threshold_router.rs:122-136` |
@@ -136,6 +136,8 @@ So the headline "scale via large-`q`, O(1) rendezvous over `q²+q+1` nodes" is r
 - If large-`q` cells are a genuine deployment target, DIAKRISIS and the runtime need a general-`q` self-observation story (how a 993-node cell is diagnosed by 7-element structures), or
 - If `q=2` + hierarchy is *the* model, document the large-`q` `Plane` as spec-completeness — not a scaling lever — so the capability is not mistaken for a shipping one.
 
+**Resolved (#66).** Decision recorded in `docs/design-coordinates.md` §5: `q = 2` + a recursion of cells is *the* deployment scaling model (spec §L1 Hierarchy, verified V4 — internet scale is `k` levels of Fano cells, `O(log n)` state/depth); the large-`q` `Plane` is retained as **spec-completeness** (the theorems are general-`q`, and it keeps the algebra testable at `q ∈ {7,13,31}`), **not** a scaling lever — no large-`q` cell runs above geometry; and DIAKRISIS `N = 7` is **base-cell proprioception** (the 3-bit Hamming(7,4) syndrome is intrinsically a Fano-plane object, spec Part VI), diagnosing upward by escalation, not a ceiling to be lifted.
+
 ### A3 — "epoch" is three different quantities with no unifying type *(MEDIUM)*
 
 Epoch is a raw integer with divergent widths and, worse, divergent *semantics*:
@@ -178,6 +180,8 @@ No workspace crate depends on `zeroize` or `subtle` (both appear only transitive
 ### A7 — Real primitive built, insecure placeholder shipped *(MEDIUM)*
 
 `fanos-core/src/membership.rs:32` derives every live node coordinate with `fanos_crypto::coordinate_for`, whose own doc-comment reads *"**not** unforgeable … standing in for `MapToPoint(VRF(pubkey, epoch))` until ECVRF is wired in."* Meanwhile the real `fanos_vrf::{prove,verify}_coordinate` — the entire reason `fanos-vrf` exists — has **zero non-test callers**. Live coordinate placement is thus forgeable by anyone (a deterministic hash, not a VRF), so the anti-grinding / Sybil-placement resistance the VRF was designed for is not enforced anywhere in the running system. Either wire `fanos-vrf` into membership/beacon or delete the placeholder and make the gap explicit; shipping the weaker of two same-named primitives from the more-depended-upon crate is a fundamentality hazard.
+
+**Resolved (#66, commits `b90e35d` foundation + `6b6c2f2` live path — Level A).** The real VRF is now the coordinate authority, beacon-folded and identity-bound: `coord = MapToPoint(VRF(vrf_sk, id ‖ epoch ‖ beacon))`. `fanos-vrf` was made `no_std` so the identity core can depend on it; the node identity commits the VRF key (`HybridPublicKey`/cert gain a VRF public, so `NodeId = H(bundle)` / `H(cert)` commits it — a proof cannot be transplanted onto another identity); `fanos-core::membership::Member::{assign,verified}` prove + check it; and the live QUIC node's coordinate is the VRF one, exchanged and verified in a mutual proof-of-coordinate **HELLO** (spec §7.3) at connection time — replacing the pure cert→coord derivation. The forgeable `coordinate_for` is demoted to the documented no_std addressing reference. Full design + the security/operational analysis: `docs/design-coordinates.md`. **Remaining (tracked, #95 — Level B):** the live per-epoch reshuffle *operation* and unifying the multi-level #79 hash-chain hierarchy address under the VRF — the base cell uses the VRF coordinate consistently today.
 
 ---
 
@@ -385,12 +389,12 @@ The initiator-even/responder-odd parity is also not enforced on implicit open, s
 **Tier 2 — fundamentality / architecture**
 7. ~~**Re-canonicalize the wire (A1).**~~ **DONE (#82).** `#[derive(Wire)]` (exists) is the substrate; every migratable struct serializer is on it (calypso `Descriptor`/`SealedDescriptor` + balance `MasterDescriptor`, telemetry history, rendezvous `Request`, quic creds); `fanos-wire` is the single frame-code authority (`FrameType` + `SessionFrameType`, `App=0x70` registered); the duplicate integer/`Cursor` decoders (diaulos frame, calypso-balance) are eliminated; the `Tessera` layout was already regenerated (encrypted holonomy, 8192). The rest is justified must-stay (transcripts / layered crypto / group-validated foreign types). All four A1 consequences resolved — see the A1 §Progress note.
 8. ~~**Introduce the `Epoch` newtype and fix the telemetry frame epoch (A3).**~~ **DONE (#90):** `fanos_primitives::Epoch(u64)` threaded through every protocol-epoch seam (calypso u32/u64 split closed); telemetry frame epoch fed the agreed beacon `Epoch` via `observe_liveness`. All KATs byte-identical; clippy/fmt clean. See the A3 §resolution.
-9. **Resolve the placeholder/real split (A7):** wire `fanos-vrf` into membership, or delete the placeholder and document the gap.
+9. ~~**Resolve the placeholder/real split (A7):** wire `fanos-vrf` into membership, or delete the placeholder and document the gap.~~ **DONE (#66, Level A):** the real VRF is the coordinate authority — beacon-folded, identity-committed, live + HELLO-proven (commits `b90e35d` + `6b6c2f2`); Level B (reshuffle + hierarchy unification) tracked (#95). See the A7 §resolution + `docs/design-coordinates.md`.
 10. **Make `Decouple` real or remove it (C6); give quarantine an exit + multi-witness gate (C5); make telemetry DP-safe or drop the anonymization claim (C7).**
 
 **Tier 3 — capability completion**
-11. **Wire the anonymous rendezvous path into the node binary (A5)**; give the service side a full duplex stream to match the client (currently one-shot RPC).
-12. **Decide and document the large-`q` scaling story (A2).**
+11. **Wire the anonymous rendezvous path into the node binary (A5)**; ~~give the service side a full duplex stream to match the client (currently one-shot RPC).~~ **Service duplex DONE (#66):** `serve` is a full-duplex per-client stream (`serve_rpc` keeps request/response a one-liner); a unified `SessionStream` driver serves both directions. See the service-duplex row.
+12. ~~**Decide and document the large-`q` scaling story (A2).**~~ **DONE (#66):** recorded in `docs/design-coordinates.md` §5 — `q = 2` + hierarchy is the scaling model; large-`q` `Plane` is spec-completeness, not a scaling lever.
 13. **Refresh the README and reconcile the design docs with the shipping surface (G1, G2).**
 
 ---
