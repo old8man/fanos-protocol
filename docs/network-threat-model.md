@@ -18,9 +18,12 @@ points at a task, not a hope.
 Most of the surfaces below are, in classical designs, patched independently. FANOS collapses many into *one*
 structure, which is why the answers compose instead of conflicting:
 
-- **Self-certifying geometry.** A node's coordinate is `MapToPoint(H(cert))` — identity *is* position, so an
-  address cannot be forged or seized without breaking the hash. Sybil, eclipse, and coordinate-hijack all
-  reduce to "grind a hash," which is priced.
+- **Verifiable self-certifying geometry.** A node's coordinate is `MapToPoint(VRF(vrf_sk, id ‖ epoch ‖ beacon))`
+  (A7/#66 Level A, base cell) — identity *is* position, the VRF key is committed in the identity so the
+  coordinate is unforgeable, and folding the epoch beacon makes it unpredictable-until-revealed so it cannot
+  be **pre-settled** onto a target's lines. Sybil, eclipse, and coordinate-hijack reduce to grinding a keyed
+  VRF against an unpredictable reshuffle, which is priced. (Multi-level hierarchy addressing is still the #79
+  hash-chain pending Level B — see `docs/design-coordinates.md`.)
 - **`PG(2,q)` incidence.** Any two points meet in one line ⇒ `O(1)` rendezvous, quorum-by-line, LRC repair,
   and load diffusion with no local extrema — one identity behind routing, availability, and healing.
 - **The coherence self-model (DIAKRISIS).** The network observes its own `Γ`, so DoS, Byzantine faults, and
@@ -48,7 +51,7 @@ structure, which is why the answers compose instead of conflicting:
 
 | # | Threat / attack surface | FANOS fundamental answer | Status | Verified / owned by |
 |---|---|---|---|---|
-| B1 | **Sybil** (flood fake identities) | Coordinate = `H(cert)` → identities are hash-grinding-priced and land uniformly; cell membership is `q+1`-bounded per line | ✅ | `sim/tests/sybil_cost.rs`: `E[T]=N` per seat, coupon-collector `N·(H_s−H_{s−t})`, χ²-uniformity — cost is `Θ(N·log)`, so real Sybil resistance needs a per-admission cost |
+| B1 | **Sybil** (flood fake identities) | Coordinate = `MapToPoint(VRF(sk, epoch‖beacon))` (A7) → placement is keyed-VRF-priced, lands uniformly, and **reshuffles unpredictably each epoch** so a grinded seat cannot be *maintained* (no pre-settling); cell membership is `q+1`-bounded per line | ✅ | `sim/tests/sybil_cost.rs`: `E[T]=N` per seat, coupon-collector `N·(H_s−H_{s−t})`, χ²-uniformity (uniformity holds for the VRF output too) — per-epoch placement cost is `Θ(N·log)`, so real Sybil resistance still needs a per-admission cost on top |
 | B2 | **Eclipse** (surround a node with adversarial peers) | Neighbours are *derived* from the plane (`lines_through(coord)`), not discovered — an attacker cannot choose a victim's peers without owning those exact coordinates | ✅ | `sim/tests/eclipse.rs`: neighbour-set invariant under forged floods; eclipse ⇒ B1 coordinate-seizure (only crashing the witness's coordinate severs it) |
 | B3 | **Routing/DHT poisoning** (false routes/records) | Self-certifying records; responsible-point routing is algebraic (`u×v`), not gossiped. The **hierarchical routing table** learned from flooded announces is guarded by self-certified membership on TWO axes: (a) an address is seeded only if it is the announcer identity's own derived chain (`address_matches_identity`) — **attraction** costs `≈ N^k` grinding, not one announce; (b) the descriptor `coord ‖ hier ‖ id` carries a **hybrid signature** (Ed25519 ‖ ML-DSA-65) the identity produced, so a peer cannot re-announce another identity's address at its own coordinate — closing the **transport hijack** without that identity's private key | ✅ | `fanos-quic::directory` collision-detect ✅; `sim/tests/hier_poisoning.rs` (live engine rejects address-poison AND a signed-descriptor hijack; ungated both succeed in one announce; attraction forge-cost calibrated to the `N^k` wall — 0 full forges, ≤8 two-level near-forges in 3000 grinds at `N=57`); DHT-record poisoning D7 ✅ |
 | B4 | **Partition / netsplit** | Fiedler `λ₂ = 0` detected (`Verdict::Partition`); fragment operates degraded, escalates the cut to the parent for cross-cell repair | 🟡 | `partition.rs` ✅; live cross-cell repair path 🟡 |
@@ -68,7 +71,7 @@ structure, which is why the answers compose instead of conflicting:
 | C6 | **Guard discovery / entry enumeration** | Membership is geometric, not a public list; entry set per-client | ✅ | `calypso/tests/entry_unlinkability.rs` (uniform, unguessable, epoch-unlinkable, avalanche) |
 | C7 | **Telemetry deanonymization** (self-observation leaks) | Cell-granular floor; differential-privacy on exported coherence | ⬜ | #65 (C7) |
 | C8 | **Active tagging / tamper-and-trace** (flip bits to mark a flow) | Per-hop ChaCha20-Poly1305 AEAD: any tamper fails the tag at the first relay and is dropped; padding is regenerated per hop | ✅ | `aphantos/tests/onion_tamper.rs` (0 surviving tags over every core byte-flip) |
-| C9 | **Replay path-confirmation** (re-inject a captured cell to confirm a relay is on-path) | Bounded per-relay replay cache keyed on `sealed::replay_tag` (drops a recurring cell before decap); relay-key rotation (E4) is the second line | ✅ 🟡 | `aphantos/tests/replay_attack.rs` (replay dropped, distinct cells forwarded); E4 rotation ⬜ (#61) |
+| C9 | **Replay path-confirmation** (re-inject a captured cell to confirm a relay is on-path) | Bounded per-relay replay cache keyed on `sealed::replay_tag` (drops a recurring cell before decap); relay-key rotation (E4) is the second line | ✅ | `aphantos/tests/replay_attack.rs` (replay dropped, distinct cells forwarded); **E4 rotation ✅ (#61)** — `fanos-pqcrypto::OnionKeyRatchet` per-epoch forward-secure onion keys (bounded grace window) wired into `ThresholdRouter`, so a recorded cell is unpeelable once the relay ratchets past its epoch |
 | C10 | **Predecessor attack** (identify the initiator by counting predecessors over repeated circuits) | A stable per-client **guard** (`build_circuit_via_guard`): a fixed first hop pins exposure to guard-compromise (~`f`, once) instead of ~`f` per circuit; the interior still rotates | ✅ 🟡 | `nyx/tests/predecessor.rs` (guardless exposure 1.000 → guarded 0.325 ≈ f); guard-set + slow rotation ⬜ |
 
 ## D. Byzantine faults & integrity
@@ -88,10 +91,10 @@ structure, which is why the answers compose instead of conflicting:
 | # | Threat / attack surface | FANOS fundamental answer | Status | Verified / owned by |
 |---|---|---|---|---|
 | E1 | **Harvest-now-decrypt-later (quantum)** | Hybrid `X25519 + ML-KEM-768` handshake, transcript-bound combiner | ✅ | handshake ✅; transcript-bound combiner ✅ (`pqcrypto::kem::combine` folds both shared secrets ‖ X25519 ephemeral ‖ ML-KEM ct ‖ recipient static pk — MAL-BIND-K,PK,CT; `kem::tests::the_combiner_binds_every_transcript_element` flips one byte of each field in place → key must move, closing audit B5 #63) |
-| E2 | **Nonce / seed reuse** (leaks secrets) | Per-cell explicit monotone nonce (fresh per retransmit); synthetic DLEQ nonce | ✅ ⬜ | cells ✅; B4 DLEQ + E3 descriptor-nonce ⬜ (#58) |
-| E3 | **Side channels** (non-constant-time on secrets) | Constant-time `GF(256)` on secret shares; `subtle`/`zeroize` | ⬜ | #63 (A6/B7) |
+| E2 | **Nonce / seed reuse** (leaks secrets) | Per-cell explicit monotone nonce (fresh per retransmit); synthetic DLEQ nonce | ✅ | cells ✅; **B4 DLEQ nonce ✅ (#63)** — `fanos-incentives::synthetic_dleq_nonce` derives `s = H(k ‖ K ‖ B ‖ Z)` deterministically from the issuer secret + transcript (RFC 6979-style), never a caller RNG, so two issuances can't reuse `s` and leak the key |
+| E3 | **Side channels** (non-constant-time on secrets) | Constant-time `GF(256)` on secret shares; `subtle`/`zeroize` | ✅ 🟡 | **#63:** constant-time Shamir (B7), `subtle::ConstantTimeEq` on credit redemption (B8), `zeroize` on onion-ratchet + Shamir secrets (A6); **#73:** `VrfSecret` dropped `Copy` + redacted `Debug`. 🟡 residual: `pub` secret fields (encapsulation — a tracked #73 review item) |
 | E4 | **Downgrade / MitM** | Transcript binds service identity; ephemeral-KEM forward secrecy | ✅ | handshake (audit "excellent") |
-| E5 | **Nonce-counter wrap** | Hard connection-kill at the AEAD nonce limit | ⬜ | #66 |
+| E5 | **Nonce-counter wrap** | Hard connection-kill at the AEAD nonce limit | ✅ | **#66:** `fanos-diaulos::conn` `next_nonce` uses `checked_add` — at 2⁶⁴ constant-size cells the connection refuses to mint any further cell rather than wrap the nonce (a hard kill), so no `(key, nonce)` pair is ever reused |
 
 ## F. Consensus & consistency
 
