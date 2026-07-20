@@ -44,6 +44,9 @@ pub enum ThresholdError {
     Kem,
     /// The built onion would exceed the fixed [`THRESHOLD_ONION_LEN`] bucket (path too long).
     TooLong,
+    /// The hybrid KEM's X25519 leg produced a non-contributory (low-order-point) shared secret —
+    /// a malformed or malicious member key (audit B5, defense-in-depth per X-Wing guidance).
+    NonContributory,
 }
 
 impl core::fmt::Display for ThresholdError {
@@ -54,6 +57,7 @@ impl core::fmt::Display for ThresholdError {
             Self::Sharing => "invalid secret-sharing parameters or shares",
             Self::Kem => "KEM ciphertext failed to parse",
             Self::TooLong => "threshold onion exceeds the fixed length bucket",
+            Self::NonContributory => "hybrid KEM X25519 leg was non-contributory (low-order key)",
         })
     }
 }
@@ -166,7 +170,9 @@ impl ThresholdSealed {
             let mut hop_seed = kem_seed.to_vec();
             hop_seed.extend_from_slice(&(i as u32).to_be_bytes());
             let mut rng = SeedRng::from_seed(&hop_seed);
-            let (kem_ct, session) = public.encapsulate(&mut rng);
+            let (kem_ct, session) = public
+                .encapsulate(&mut rng)
+                .ok_or(ThresholdError::NonContributory)?;
             let sealed = aead_seal(&share_key(&session), nonce, &share_bytes)?;
             let mut slot = Vec::with_capacity(SEALED_SHARE_LEN);
             slot.extend_from_slice(&kem_ct.to_bytes());
@@ -187,7 +193,7 @@ impl ThresholdSealed {
     pub fn member_share(&self, i: usize, member_secret: &HybridKemSecret) -> Option<Share> {
         let slot = self.sealed_shares.get(i)?;
         let kem_ct = HybridCiphertext::from_bytes(slot.get(..CIPHERTEXT_LEN)?)?;
-        let session = member_secret.decapsulate(&kem_ct);
+        let session = member_secret.decapsulate(&kem_ct)?;
         let share_ct = slot.get(CIPHERTEXT_LEN..)?;
         let share_bytes = aead_open(&share_key(&session), &self.nonce, share_ct).ok()?;
         share_from_bytes(&share_bytes)

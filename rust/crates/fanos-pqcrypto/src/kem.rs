@@ -121,21 +121,30 @@ impl HybridKemSecret {
         )
     }
 
-    /// Decapsulate a ciphertext to recover the session key (spec §L6).
+    /// Decapsulate a ciphertext to recover the session key (spec §L6). `None` if the X25519 leg's
+    /// Diffie–Hellman output is **non-contributory** — the all-zero / low-order-point degenerate
+    /// result a malformed or malicious ephemeral key can force (audit B5, X-Wing guidance): the
+    /// ML-KEM leg alone would still secure the combiner against a passive adversary, but a
+    /// conformant hybrid KEM must reject the case outright rather than silently fall back to
+    /// single-primitive security. Checked in constant time via
+    /// [`SharedSecret::was_contributory`](x25519_dalek::SharedSecret::was_contributory).
     #[must_use]
-    pub fn decapsulate(&self, ciphertext: &HybridCiphertext) -> SessionKey {
+    pub fn decapsulate(&self, ciphertext: &HybridCiphertext) -> Option<SessionKey> {
         let ephemeral = PublicKey::from(ciphertext.x25519_ephemeral);
         let x_ss = self.x25519.diffie_hellman(&ephemeral);
+        if !x_ss.was_contributory() {
+            return None;
+        }
         let mlkem_ss = self.mlkem.decapsulate(&ciphertext.mlkem);
         // The recipient's own X25519 static public key (this node) — the same pk the sender encapsulated to.
         let recipient_pk = PublicKey::from(&self.x25519);
-        combine(
+        Some(combine(
             x_ss.as_bytes(),
             mlkem_ss.as_slice(),
             &ciphertext.x25519_ephemeral,
             ciphertext.mlkem.as_slice(),
             recipient_pk.as_bytes(),
-        )
+        ))
     }
 
     /// Derive a 32-byte, domain-separated secret subkey from this KEM secret — a one-way SHAKE256 KDF
@@ -180,12 +189,20 @@ impl HybridKemPublic {
         Some(Self { x25519, mlkem })
     }
 
-    /// Encapsulate to this public key, returning the ciphertext and the session key.
+    /// Encapsulate to this public key, returning the ciphertext and the session key. `None` if the
+    /// X25519 leg's Diffie–Hellman output is **non-contributory** — this recipient key is a
+    /// malformed or malicious low-order point (see [`HybridKemSecret::decapsulate`]'s doc for why
+    /// this must be rejected rather than silently accepted): the sender's freshly random ephemeral
+    /// scalar cannot rescue a degenerate peer key, since any scalar times a low-order point stays
+    /// low-order, so this check is deterministic in the recipient key alone.
     #[must_use]
-    pub fn encapsulate<R: CryptoRng>(&self, rng: &mut R) -> (HybridCiphertext, SessionKey) {
+    pub fn encapsulate<R: CryptoRng>(&self, rng: &mut R) -> Option<(HybridCiphertext, SessionKey)> {
         let ephemeral = StaticSecret::random_from_rng(rng);
         let ephemeral_pk = PublicKey::from(&ephemeral);
         let x_ss = ephemeral.diffie_hellman(&self.x25519);
+        if !x_ss.was_contributory() {
+            return None;
+        }
         let (mlkem_ct, mlkem_ss) = self.mlkem.encapsulate_with_rng(rng);
         let ephemeral_bytes = ephemeral_pk.to_bytes();
         // `self.x25519` is the recipient's static public key we are encapsulating to.
@@ -196,13 +213,13 @@ impl HybridKemPublic {
             mlkem_ct.as_slice(),
             self.x25519.as_bytes(),
         );
-        (
+        Some((
             HybridCiphertext {
                 x25519_ephemeral: ephemeral_bytes,
                 mlkem: mlkem_ct,
             },
             session,
-        )
+        ))
     }
 }
 
@@ -216,8 +233,10 @@ mod tests {
     fn encapsulation_and_decapsulation_agree() {
         let mut rng = SeedRng::from_seed(b"kem-test");
         let (secret, public) = HybridKemSecret::generate(&mut rng);
-        let (ciphertext, sender_key) = public.encapsulate(&mut rng);
-        let receiver_key = secret.decapsulate(&ciphertext);
+        let (ciphertext, sender_key) = public.encapsulate(&mut rng).expect("honest keys contribute");
+        let receiver_key = secret
+            .decapsulate(&ciphertext)
+            .expect("honest keys contribute");
         assert_eq!(
             sender_key, receiver_key,
             "both sides derive the same session key"
@@ -228,21 +247,25 @@ mod tests {
     fn distinct_encapsulations_give_distinct_keys() {
         let mut rng = SeedRng::from_seed(b"kem-test-2");
         let (secret, public) = HybridKemSecret::generate(&mut rng);
-        let (ct1, k1) = public.encapsulate(&mut rng);
-        let (_ct2, k2) = public.encapsulate(&mut rng);
+        let (ct1, k1) = public.encapsulate(&mut rng).expect("honest keys contribute");
+        let (_ct2, k2) = public.encapsulate(&mut rng).expect("honest keys contribute");
         assert_ne!(k1, k2, "fresh encapsulations yield fresh keys");
         // The first still decapsulates correctly.
-        assert_eq!(secret.decapsulate(&ct1), k1);
+        assert_eq!(secret.decapsulate(&ct1), Some(k1));
     }
 
     #[test]
     fn a_different_key_cannot_decapsulate() {
         let mut rng = SeedRng::from_seed(b"kem-test-3");
         let (_secret, public) = HybridKemSecret::generate(&mut rng);
-        let (ciphertext, sender_key) = public.encapsulate(&mut rng);
-        // A different secret derives a different (wrong) session key.
+        let (ciphertext, sender_key) = public.encapsulate(&mut rng).expect("honest keys contribute");
+        // A different secret derives a different (wrong) session key — still a valid (contributory)
+        // decapsulation, just not the sender's key.
         let (other, _) = HybridKemSecret::generate(&mut rng);
-        assert_ne!(other.decapsulate(&ciphertext), sender_key);
+        assert_ne!(
+            other.decapsulate(&ciphertext).expect("honest keys contribute"),
+            sender_key
+        );
     }
 
     #[test]
@@ -253,8 +276,8 @@ mod tests {
         assert_eq!(bytes.len(), PUBLIC_LEN);
         let parsed = HybridKemPublic::decode(&bytes).expect("round-trips");
         // A ciphertext encapsulated to the *decoded* key decapsulates under the original secret.
-        let (ciphertext, key) = parsed.encapsulate(&mut rng);
-        assert_eq!(secret.decapsulate(&ciphertext), key);
+        let (ciphertext, key) = parsed.encapsulate(&mut rng).expect("honest keys contribute");
+        assert_eq!(secret.decapsulate(&ciphertext), Some(key));
         assert!(HybridKemPublic::decode(&bytes[..10]).is_none());
     }
 
@@ -262,12 +285,45 @@ mod tests {
     fn ciphertext_serializes_and_still_decapsulates() {
         let mut rng = SeedRng::from_seed(b"kem-serialize");
         let (secret, public) = HybridKemSecret::generate(&mut rng);
-        let (ciphertext, key) = public.encapsulate(&mut rng);
+        let (ciphertext, key) = public.encapsulate(&mut rng).expect("honest keys contribute");
         let bytes = ciphertext.to_bytes();
         assert_eq!(bytes.len(), CIPHERTEXT_LEN);
         let parsed = HybridCiphertext::from_bytes(&bytes).expect("round-trips");
-        assert_eq!(secret.decapsulate(&parsed), key);
+        assert_eq!(secret.decapsulate(&parsed), Some(key));
         assert!(HybridCiphertext::from_bytes(&bytes[..10]).is_none());
+    }
+
+    #[test]
+    fn a_low_order_x25519_ephemeral_is_rejected_on_decapsulate() {
+        // B5 defense-in-depth (X-Wing guidance): the classic low-order-point attack replaces the
+        // ephemeral X25519 public key with the all-zero point (a valid Curve25519 encoding), which
+        // forces the X25519 leg's DH output to the fixed identity value for *any* recipient secret
+        // scalar. The ML-KEM leg alone would still secure the combiner, but a conformant hybrid KEM
+        // must reject the ciphertext outright rather than silently degrade to single-primitive
+        // security.
+        let mut rng = SeedRng::from_seed(b"kem-low-order");
+        let (secret, public) = HybridKemSecret::generate(&mut rng);
+        let (mut ciphertext, _) = public.encapsulate(&mut rng).expect("honest keys contribute");
+        ciphertext.x25519_ephemeral = [0u8; 32]; // the canonical low-order (identity) point
+        assert!(
+            secret.decapsulate(&ciphertext).is_none(),
+            "a non-contributory X25519 ephemeral must be rejected, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn encapsulating_to_a_low_order_x25519_recipient_key_is_rejected() {
+        // The symmetric direction: a malformed/malicious *recipient* key that is itself the
+        // low-order identity point must be rejected at encapsulate time too — a fresh random
+        // ephemeral scalar cannot rescue a degenerate peer key (any scalar times a low-order point
+        // stays low-order), so the rejection is deterministic in the recipient key alone.
+        let mut rng = SeedRng::from_seed(b"kem-low-order-encaps");
+        let (_secret, mut public) = HybridKemSecret::generate(&mut rng);
+        public.x25519 = PublicKey::from([0u8; 32]);
+        assert!(
+            public.encapsulate(&mut rng).is_none(),
+            "encapsulating to a non-contributory X25519 recipient key must be rejected"
+        );
     }
 
     #[test]

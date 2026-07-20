@@ -769,6 +769,7 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "fanos-onoma",
+ "fanos-pqcrypto",
  "fanos-primitives",
  "fanos-wire",
  "fanos-wire-derive",
@@ -888,6 +889,7 @@ dependencies = [
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-session",
+ "fanos-vrf",
  "fanos-wire",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
@@ -1097,6 +1099,7 @@ dependencies = [
  "fanos-geometry",
  "fanos-wire-derive",
  "proptest",
+ "serde_json",
 ]
 
 [[package]]

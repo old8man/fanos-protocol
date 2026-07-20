@@ -17,6 +17,10 @@ fanos-primitives = { workspace = true, features = ["aead", "wire"] }
 fanos-wire.workspace = true
 fanos-wire-derive.workspace = true
 fanos-onoma.workspace = true
+# The hybrid KEM (X25519 + ML-KEM-768) that seals threshold-hosting shares to each service-line
+# member (spec §12.3): fanos-pqcrypto is the one implementation of that primitive — no_std/alloc
+# itself, so it does not change fanos-calypso's own no_std profile.
+fanos-pqcrypto.workspace = true
 # The DIAKRISIS spectral gap Δ = (G − max_k T_k)/6 (T-226(v)) that the admission controller's
 # relaxation rate is derived from — one Δ for healing and for admission (derive, don't tune).
 fanos-diakrisis.workspace = true

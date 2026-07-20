@@ -145,9 +145,11 @@ impl Identity {
     }
 
     /// Decapsulate a hybrid ciphertext sealed to this node's KEM public key, yielding the 32-byte shared
-    /// session key (spec §7.1 receive path). The matching public key is `self.public()`.
+    /// session key (spec §7.1 receive path). The matching public key is `self.public()`. `None` if the
+    /// ciphertext's X25519 leg is non-contributory (audit B5 — see
+    /// [`HybridKemSecret::decapsulate`](crate::kem::HybridKemSecret::decapsulate)).
     #[must_use]
-    pub fn decapsulate(&self, ciphertext: &HybridCiphertext) -> SessionKey {
+    pub fn decapsulate(&self, ciphertext: &HybridCiphertext) -> Option<SessionKey> {
         self.kem.decapsulate(ciphertext)
     }
 
@@ -192,15 +194,22 @@ mod tests {
         // `decapsulate` recovers the shared key — proving the held KEM secret is live, not dead weight.
         let mut rng = SeedRng::from_seed(b"id-kem");
         let node = Identity::generate(&mut rng);
-        let (ciphertext, sender_key) = node.public().kem().encapsulate(&mut rng);
+        let (ciphertext, sender_key) = node
+            .public()
+            .kem()
+            .encapsulate(&mut rng)
+            .unwrap();
         assert_eq!(
             node.decapsulate(&ciphertext),
-            sender_key,
+            Some(sender_key),
             "the node recovers the sender's session key"
         );
         // A different node's secret must NOT recover it.
         let other = Identity::generate(&mut rng);
-        assert_ne!(other.decapsulate(&ciphertext), sender_key);
+        assert_ne!(
+            other.decapsulate(&ciphertext).unwrap(),
+            sender_key
+        );
     }
 
     #[test]

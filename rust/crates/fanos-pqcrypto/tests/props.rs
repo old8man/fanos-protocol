@@ -15,8 +15,8 @@ proptest! {
     fn kem_encapsulation_agrees(seed in proptest::collection::vec(any::<u8>(), 1..48)) {
         let mut rng = SeedRng::from_seed(&seed);
         let (secret, public) = HybridKemSecret::generate(&mut rng);
-        let (ciphertext, sender_key) = public.encapsulate(&mut rng);
-        prop_assert_eq!(secret.decapsulate(&ciphertext), sender_key);
+        let (ciphertext, sender_key) = public.encapsulate(&mut rng).unwrap();
+        prop_assert_eq!(secret.decapsulate(&ciphertext), Some(sender_key));
     }
 
     /// Hybrid signature: a valid signature verifies; a tampered message does not.

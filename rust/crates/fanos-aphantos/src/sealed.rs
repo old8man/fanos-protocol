@@ -80,6 +80,9 @@ pub enum SealedError {
     KeyMismatch,
     /// The built onion would exceed the fixed [`ONION_LEN`] bucket (path too long / payload too big).
     TooLong,
+    /// The hybrid KEM's X25519 leg produced a non-contributory (low-order-point) shared secret —
+    /// a malformed or malicious relay key (audit B5, defense-in-depth per X-Wing guidance).
+    NonContributory,
 }
 
 impl core::fmt::Display for SealedError {
@@ -90,6 +93,7 @@ impl core::fmt::Display for SealedError {
             Self::Aead => "AEAD authentication failed (wrong relay or tampered layer)",
             Self::KeyMismatch => "circuit and relay-key list length mismatch",
             Self::TooLong => "onion exceeds the fixed length bucket",
+            Self::NonContributory => "hybrid KEM X25519 leg was non-contributory (low-order key)",
         })
     }
 }
@@ -180,7 +184,7 @@ pub fn build<F: Field>(
         let mut hop_seed = seed.to_vec();
         hop_seed.extend_from_slice(&(k as u32).to_be_bytes());
         let mut rng = SeedRng::from_seed(&hop_seed);
-        let (kem_ct, session) = public.encapsulate(&mut rng);
+        let (kem_ct, session) = public.encapsulate(&mut rng).ok_or(SealedError::NonContributory)?;
         outer_session = session;
         let nonce_full = hash_labeled("FANOS-v1/aphantos-nonce", &hop_seed);
         let mut nonce = [0u8; NONCE_LEN];
@@ -249,7 +253,9 @@ pub fn peel(onion: &[u8], kem_secret: &HybridKemSecret) -> Result<PeelOutcome, S
     let len_ct = slice_at(onion, OFF_LEN_CT, LEN_CT_LEN)?;
 
     let kem_ct = HybridCiphertext::from_bytes(kem_ct_bytes).ok_or(SealedError::Kem)?;
-    let session = kem_secret.decapsulate(&kem_ct);
+    let session = kem_secret
+        .decapsulate(&kem_ct)
+        .ok_or(SealedError::NonContributory)?;
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(nonce_bytes);
 

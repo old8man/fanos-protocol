@@ -167,11 +167,17 @@ pub struct ClientHandshake {
 
 impl ClientHandshake {
     /// Begin a handshake to a service whose static public key is `service_public`. Returns the state
-    /// to keep and the `ClientHello` bytes ([`CLIENT_HELLO_LEN`] long) to send.
+    /// to keep and the `ClientHello` bytes ([`CLIENT_HELLO_LEN`] long) to send, or `None` if
+    /// `service_public`'s X25519 leg is non-contributory (audit B5) — a malformed or malicious
+    /// service key, which no choice of ephemeral secret can rescue (see
+    /// [`HybridKemPublic::encapsulate`](fanos_pqcrypto::kem::HybridKemPublic::encapsulate)).
     #[must_use]
-    pub fn start<R: CryptoRng>(service_public: &HybridKemPublic, rng: &mut R) -> (Self, Vec<u8>) {
+    pub fn start<R: CryptoRng>(
+        service_public: &HybridKemPublic,
+        rng: &mut R,
+    ) -> Option<(Self, Vec<u8>)> {
         let (ephemeral_secret, ephemeral_public) = HybridKemSecret::generate(rng);
-        let (ct_static, ss_static) = service_public.encapsulate(rng);
+        let (ct_static, ss_static) = service_public.encapsulate(rng)?;
 
         let mut hello = Vec::with_capacity(CLIENT_HELLO_LEN);
         hello.extend_from_slice(&ephemeral_public.encode());
@@ -181,25 +187,26 @@ impl ClientHandshake {
         transcript_pre.extend_from_slice(&service_public.encode());
         transcript_pre.extend_from_slice(&hello);
 
-        (
+        Some((
             Self {
                 ephemeral_secret,
                 ss_static: Zeroizing::new(ss_static),
                 transcript_pre,
             },
             hello,
-        )
+        ))
     }
 
     /// Complete the handshake from the received `ServerHello`. Returns the session keys, or `None` if
-    /// the `ServerHello` is malformed.
+    /// the `ServerHello` is malformed or its X25519 leg is non-contributory (audit B5) — e.g. a
+    /// tampered or malicious ciphertext forcing the ephemeral decapsulation to the degenerate result.
     #[must_use]
     pub fn finish(self, server_hello: &[u8]) -> Option<SessionKeys> {
         if server_hello.len() != SERVER_HELLO_LEN {
             return None;
         }
         let ct_ephemeral = HybridCiphertext::from_bytes(server_hello)?;
-        let ss_ephemeral = self.ephemeral_secret.decapsulate(&ct_ephemeral);
+        let ss_ephemeral = self.ephemeral_secret.decapsulate(&ct_ephemeral)?;
         let mut transcript = self.transcript_pre;
         transcript.extend_from_slice(server_hello);
         Some(derive_keys(&self.ss_static, &ss_ephemeral, &transcript))
@@ -213,7 +220,8 @@ pub struct ServerHandshake;
 impl ServerHandshake {
     /// Respond to a `ClientHello` with the service's static identity. Returns the session keys and the
     /// `ServerHello` bytes ([`SERVER_HELLO_LEN`] long) to send back, or `None` if the hello is
-    /// malformed.
+    /// malformed, or either KEM leg's X25519 component is non-contributory (audit B5) — a tampered
+    /// `ct_static` or a malformed client ephemeral key, neither of which can be rescued by re-trying.
     #[must_use]
     pub fn respond<R: CryptoRng>(
         keypair: &StaticKeypair,
@@ -227,9 +235,9 @@ impl ServerHandshake {
         let ct_static = HybridCiphertext::from_bytes(client_hello.get(PUBLIC_LEN..)?)?;
 
         // Only the holder of the static secret derives this — the client's assurance of *who* it is.
-        let ss_static = keypair.secret.decapsulate(&ct_static);
+        let ss_static = keypair.secret.decapsulate(&ct_static)?;
         // Encapsulate to the client's ephemeral key for forward secrecy.
-        let (ct_ephemeral, ss_ephemeral) = ephemeral_public.encapsulate(rng);
+        let (ct_ephemeral, ss_ephemeral) = ephemeral_public.encapsulate(rng)?;
         let server_hello = ct_ephemeral.to_bytes();
 
         let mut transcript = Vec::with_capacity(PUBLIC_LEN + CLIENT_HELLO_LEN + SERVER_HELLO_LEN);
@@ -261,10 +269,10 @@ mod tests {
         bundle.extend_from_slice(&public.encode());
         let extracted = service_public_from_bundle(&bundle).expect("valid bundle");
         // The extracted key is the service's — it encapsulates to the same secret.
-        let (ct, k) = extracted.encapsulate(&mut rng);
+        let (ct, k) = extracted.encapsulate(&mut rng).expect("honest keys contribute");
         assert_eq!(
             secret.decapsulate(&ct),
-            k,
+            Some(k),
             "extracted the service's real KEM key"
         );
         // A truncated bundle is rejected.
@@ -282,8 +290,8 @@ mod tests {
         let bundle = bundle_from_kem_public(&public);
         let extracted = service_public_from_bundle(&bundle).expect("valid KEM-only bundle");
         // The extracted key is the same one — it encapsulates to the same secret.
-        let (ct, k) = extracted.encapsulate(&mut rng);
-        assert_eq!(secret.decapsulate(&ct), k, "round-trips the KEM key");
+        let (ct, k) = extracted.encapsulate(&mut rng).expect("honest keys contribute");
+        assert_eq!(secret.decapsulate(&ct), Some(k), "round-trips the KEM key");
     }
 
     #[test]
@@ -293,7 +301,8 @@ mod tests {
 
         // 1-RTT: client sends hello, service responds, client finishes.
         let mut crng = SeedRng::from_seed(b"diaulos-hs-client");
-        let (client_hs, client_hello) = ClientHandshake::start(&service.public, &mut crng);
+        let (client_hs, client_hello) =
+            ClientHandshake::start(&service.public, &mut crng).expect("honest keys contribute");
         assert_eq!(client_hello.len(), CLIENT_HELLO_LEN);
 
         let mut rrng = SeedRng::from_seed(b"diaulos-hs-respond");
@@ -340,7 +349,8 @@ mod tests {
         let real = StaticKeypair::generate(&mut rng);
         let impostor = StaticKeypair::generate(&mut rng);
 
-        let (client_hs, client_hello) = ClientHandshake::start(&real.public, &mut rng);
+        let (client_hs, client_hello) =
+            ClientHandshake::start(&real.public, &mut rng).expect("honest keys contribute");
         // The impostor answers with its own secret (it cannot decapsulate ct→real).
         let (impostor_keys, server_hello) =
             ServerHandshake::respond(&impostor, &client_hello, &mut rng).unwrap();
@@ -356,7 +366,8 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"diaulos-hs-malformed");
         let service = StaticKeypair::generate(&mut rng);
         assert!(ServerHandshake::respond(&service, &[0u8; 10], &mut rng).is_none());
-        let (client_hs, _) = ClientHandshake::start(&service.public, &mut rng);
+        let (client_hs, _) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         assert!(client_hs.finish(&[0u8; 10]).is_none());
     }
 
@@ -373,9 +384,11 @@ mod tests {
             ServerHandshake::respond(&service, &vec![0u8; CLIENT_HELLO_LEN + 1], &mut rng)
                 .is_none()
         );
-        let (hs_short, _) = ClientHandshake::start(&service.public, &mut rng);
+        let (hs_short, _) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         assert!(hs_short.finish(&vec![0u8; SERVER_HELLO_LEN - 1]).is_none());
-        let (hs_long, _) = ClientHandshake::start(&service.public, &mut rng);
+        let (hs_long, _) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         assert!(hs_long.finish(&vec![0u8; SERVER_HELLO_LEN + 1]).is_none());
     }
 
@@ -386,7 +399,8 @@ mod tests {
         // the client's), so the two sides never land on the same key. Fail-closed.
         let mut rng = SeedRng::from_seed(b"diaulos-hs-tamper-ch");
         let service = StaticKeypair::generate(&mut rng);
-        let (client_hs, mut client_hello) = ClientHandshake::start(&service.public, &mut rng);
+        let (client_hs, mut client_hello) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         client_hello[PUBLIC_LEN + 5] ^= 0xFF;
         let (server_keys, server_hello) =
             ServerHandshake::respond(&service, &client_hello, &mut rng).unwrap();
@@ -403,7 +417,8 @@ mod tests {
         // ss_ephemeral, so it cannot match the service's keys.
         let mut rng = SeedRng::from_seed(b"diaulos-hs-tamper-sh");
         let service = StaticKeypair::generate(&mut rng);
-        let (client_hs, client_hello) = ClientHandshake::start(&service.public, &mut rng);
+        let (client_hs, client_hello) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         let (server_keys, mut server_hello) =
             ServerHandshake::respond(&service, &client_hello, &mut rng).unwrap();
         server_hello[3] ^= 0xFF;
@@ -424,11 +439,13 @@ mod tests {
         let service = StaticKeypair::generate(&mut srng);
         let mut rng = SeedRng::from_seed(b"diaulos-hs-distinct");
 
-        let (hs1, ch1) = ClientHandshake::start(&service.public, &mut rng);
+        let (hs1, ch1) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         let (k1, sh1) = ServerHandshake::respond(&service, &ch1, &mut rng).unwrap();
         let ck1 = hs1.finish(&sh1).unwrap();
 
-        let (hs2, ch2) = ClientHandshake::start(&service.public, &mut rng);
+        let (hs2, ch2) =
+            ClientHandshake::start(&service.public, &mut rng).expect("honest keys contribute");
         let (k2, sh2) = ServerHandshake::respond(&service, &ch2, &mut rng).unwrap();
         let ck2 = hs2.finish(&sh2).unwrap();
 

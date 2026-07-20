@@ -162,13 +162,14 @@ mod tests {
         // Relay at epoch 0. A client seals an onion layer to its epoch-0 public key.
         let mut relay = OnionKeyRatchet::new([7u8; 32], Epoch::ZERO);
         let epoch0_public = relay.public().clone();
-        let (ciphertext, sealed_key) =
-            epoch0_public.encapsulate(&mut SeedRng::from_seed(b"client"));
+        let (ciphertext, sealed_key) = epoch0_public
+            .encapsulate(&mut SeedRng::from_seed(b"client"))
+            .unwrap();
 
         // At epoch 0 the relay decapsulates it correctly.
         assert_eq!(
             relay.secret().decapsulate(&ciphertext),
-            sealed_key,
+            Some(sealed_key),
             "the current-epoch relay peels a current-epoch onion"
         );
 
@@ -183,7 +184,7 @@ mod tests {
         assert!(
             !relay
                 .secrets()
-                .any(|s| s.decapsulate(&ciphertext) == sealed_key),
+                .any(|s| s.decapsulate(&ciphertext) == Some(sealed_key)),
             "a past-epoch onion is unrecoverable after the ratchet advances (relay forward secrecy)"
         );
         // And the published key genuinely rotated.
@@ -216,25 +217,27 @@ mod tests {
         // epoch 0 has fallen out of the window and its secret is gone (forward secrecy).
         let mut relay = OnionKeyRatchet::new([0x11; 32], Epoch::ZERO);
         let epoch0_public = relay.public().clone();
-        let (ct, key) = epoch0_public.encapsulate(&mut SeedRng::from_seed(b"grace-client"));
+        let (ct, key) = epoch0_public
+            .encapsulate(&mut SeedRng::from_seed(b"grace-client"))
+            .unwrap();
 
         // Rotate once: epoch 0 is now the retained previous epoch, so some live relay secret still decaps.
         assert!(relay.advance_to(Epoch::new(1)));
         assert!(
-            relay.secrets().any(|s| s.decapsulate(&ct) == key),
+            relay.secrets().any(|s| s.decapsulate(&ct) == Some(key)),
             "an onion in flight across one rotation still peels (grace window)"
         );
         // The CURRENT secret alone does not — only the retained one does, so the window is doing the work.
         assert_ne!(
             relay.secret().decapsulate(&ct),
-            key,
+            Some(key),
             "the current epoch's key is a fresh key, not the epoch-0 one"
         );
 
         // Rotate again: epoch 0 falls outside the retain=1 window and is dropped — nothing decaps it now.
         assert!(relay.advance_to(Epoch::new(2)));
         assert!(
-            !relay.secrets().any(|s| s.decapsulate(&ct) == key),
+            !relay.secrets().any(|s| s.decapsulate(&ct) == Some(key)),
             "past the grace window the onion is unrecoverable (forward secrecy)"
         );
     }
@@ -247,10 +250,11 @@ mod tests {
         let (ct, key) = relay
             .public()
             .clone()
-            .encapsulate(&mut SeedRng::from_seed(b"fc-client"));
+            .encapsulate(&mut SeedRng::from_seed(b"fc-client"))
+            .unwrap();
         assert!(relay.advance_to(Epoch::new(1)));
         assert!(
-            !relay.secrets().any(|s| s.decapsulate(&ct) == key),
+            !relay.secrets().any(|s| s.decapsulate(&ct) == Some(key)),
             "with retain=0 even a single rotation drops the previous epoch's onion"
         );
         // `secrets()` yields exactly the current key — no retained entries.
@@ -266,10 +270,11 @@ mod tests {
         let (ct, key) = relay
             .public()
             .clone()
-            .encapsulate(&mut SeedRng::from_seed(b"jump-client"));
+            .encapsulate(&mut SeedRng::from_seed(b"jump-client"))
+            .unwrap();
         assert!(relay.advance_to(Epoch::new(4))); // jump 0 → 4 in one call
         assert!(
-            !relay.secrets().any(|s| s.decapsulate(&ct) == key),
+            !relay.secrets().any(|s| s.decapsulate(&ct) == Some(key)),
             "a multi-epoch jump retains no key older than the window"
         );
         assert_eq!(

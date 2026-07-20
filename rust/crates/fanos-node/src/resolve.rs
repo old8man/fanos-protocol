@@ -250,10 +250,10 @@ mod tests {
         let resolved = verify_descriptor(&address, Epoch::new(9), &blob, 0).unwrap();
         assert_eq!(decode_coord(&resolved.metadata), Some(coord));
         let extracted = service_public_from_bundle(&resolved.bundle).unwrap();
-        let (ct, k) = extracted.encapsulate(&mut rng);
+        let (ct, k) = extracted.encapsulate(&mut rng).unwrap();
         assert_eq!(
             secret.decapsulate(&ct),
-            k,
+            Some(k),
             "resolved the service's real KEM key"
         );
     }

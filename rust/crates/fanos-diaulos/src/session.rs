@@ -25,7 +25,13 @@ use crate::handshake::{
 /// A dial in flight: the `ClientHello` has been produced; hold this until the `ServerHello` arrives,
 /// then [`establish`](PendingDial::establish) it.
 pub struct PendingDial {
-    handshake: ClientHandshake,
+    /// `None` only when [`dial`] was given a service key whose X25519 leg is non-contributory (audit
+    /// B5) — a malformed or malicious key no ephemeral choice can rescue. [`dial`] stays infallible
+    /// (its `ClientHello` is then empty, a no-op on the wire) so a caller always gets a `PendingDial`
+    /// to hold; [`establish`](Self::establish) fails closed on it, exactly as it already does for a
+    /// malformed `ServerHello` — this is not a new failure *shape*, just one more cause of the
+    /// existing one.
+    handshake: Option<ClientHandshake>,
 }
 
 /// A client's established session: a live [`Connection`] and the primary stream opened on it.
@@ -38,11 +44,20 @@ pub struct Dialed {
 
 /// Begin dialing a service by its static public key ([`HybridKemPublic`], from its ONOMA descriptor).
 /// Returns the pending dial and the `ClientHello` bytes to deliver to the service (via the
-/// rendezvous).
+/// rendezvous). Infallible in shape: a non-contributory `service_public` (audit B5) yields a
+/// [`PendingDial`] that can never [`establish`](PendingDial::establish) — see its doc — rather than
+/// `None` here, so every caller keeps a single, uniform dial/establish flow.
 #[must_use]
 pub fn dial<R: CryptoRng>(service_public: &HybridKemPublic, rng: &mut R) -> (PendingDial, Vec<u8>) {
-    let (handshake, hello) = ClientHandshake::start(service_public, rng);
-    (PendingDial { handshake }, hello)
+    match ClientHandshake::start(service_public, rng) {
+        Some((handshake, hello)) => (
+            PendingDial {
+                handshake: Some(handshake),
+            },
+            hello,
+        ),
+        None => (PendingDial { handshake: None }, Vec::new()),
+    }
 }
 
 /// Begin dialing straight from a service's canonical identity bundle (the `bundle` a `.fanos`
@@ -56,10 +71,11 @@ pub fn dial_bundle<R: CryptoRng>(bundle: &[u8], rng: &mut R) -> Option<(PendingD
 
 impl PendingDial {
     /// Finish the dial from the received `ServerHello`: derive keys, build the connection, and open
-    /// the primary stream. `None` if the `ServerHello` is malformed.
+    /// the primary stream. `None` if the `ServerHello` is malformed or non-contributory (audit B5), or
+    /// if [`dial`] itself never had a usable handshake to begin with (a non-contributory service key).
     #[must_use]
     pub fn establish(self, server_hello: &[u8]) -> Option<Dialed> {
-        let keys = self.handshake.finish(server_hello)?;
+        let keys = self.handshake?.finish(server_hello)?;
         let mut conn = keys.client_connection();
         let primary = conn.open_stream();
         Some(Dialed { conn, primary })
@@ -150,5 +166,27 @@ mod tests {
         let service = StaticKeypair::generate(&mut rng);
         let (pending, _hello) = dial(service.public(), &mut rng);
         assert!(pending.establish(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn dial_and_establish_fail_closed_on_a_non_contributory_service_key() {
+        // B5: a service key whose X25519 leg is the low-order identity point must never let a client
+        // land on a live session. `dial` stays infallible in *shape* — a caller always gets a
+        // `PendingDial` and some `ClientHello` bytes — but that `PendingDial` can never `establish`,
+        // exactly like a malformed `ServerHello` already fails closed (no new failure mode, just one
+        // more cause of the existing one).
+        let mut rng = SeedRng::from_seed(b"diaulos-session-non-contributory");
+        let service = StaticKeypair::generate(&mut rng);
+        let mut bad_bytes = service.public().encode();
+        bad_bytes[..32].copy_from_slice(&[0u8; 32]); // the canonical low-order (identity) X25519 point
+        let bad_public = HybridKemPublic::decode(&bad_bytes).expect("still a validly-shaped key");
+
+        let (pending, client_hello) = dial(&bad_public, &mut rng);
+        assert!(
+            client_hello.is_empty(),
+            "no usable ClientHello can be built from a non-contributory service key"
+        );
+        // No `ServerHello`, however well-formed, can complete a handshake that never began.
+        assert!(pending.establish(&vec![0u8; crate::handshake::SERVER_HELLO_LEN]).is_none());
     }
 }
