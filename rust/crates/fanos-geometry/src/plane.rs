@@ -13,7 +13,7 @@ use crate::element::{Triple, canonicalize, dot, is_valid};
 /// projective equality.
 ///
 /// `Clone`/`Copy` are derived (`Field: Copy` guarantees them with no extra bound); the other
-/// traits are implemented by hand over `coords` only, so `F` needs no `Eq`/`Hash`/`Debug`.
+/// traits (`Eq`/`Hash`/`Ord`/`Debug`) are implemented by hand over `coords` only, so `F` needs none.
 #[derive(Clone, Copy)]
 pub struct Point<F: Field> {
     coords: Triple,
@@ -45,6 +45,21 @@ macro_rules! impl_projective_traits {
             #[inline]
             fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
                 self.coords.hash(state);
+            }
+        }
+        // Total order over the canonical `coords` (consistent with `Eq`): lets a `Point`/`Line` key an
+        // ordered collection directly, instead of the wrapper being discarded for a raw `[u32; 3]` the
+        // moment state needs a `BTreeMap` (audit #126).
+        impl<F: Field> PartialOrd for $t<F> {
+            #[inline]
+            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl<F: Field> Ord for $t<F> {
+            #[inline]
+            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+                self.coords.cmp(&other.coords)
             }
         }
         impl<F: Field> core::fmt::Debug for $t<F> {
