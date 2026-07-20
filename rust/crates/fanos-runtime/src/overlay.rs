@@ -47,6 +47,13 @@ const BEHAVIOR_WINDOW: usize = 8;
 const DECOUPLE_STEP: f64 = 0.25;
 const DECOUPLE_MAX: f64 = 0.6;
 const DECOUPLE_DECAY: f64 = 0.5;
+/// Hysteresis dwell for the over-coupling shed (audit #122). The measured `Γ_net` must read over-coupled
+/// for this many *consecutive* self-driven diagnoses before `Decouple` actuates. Diagnosis now runs every
+/// heartbeat (not a one-shot injected command), so a single transient over-threshold reading — e.g. a
+/// coincidental correlation inside an otherwise decorrelated burst flood — must not trigger a shed: the
+/// DDoS response acts on *sustained* over-coupling (structure), never momentary load. Crash/Byzantine
+/// healing is unaffected — this gates only the `Decouple` action.
+const DECOUPLE_DWELL: u32 = 3;
 
 /// DoS backstops on the DHT slice (audit A4). The distributed store and the in-flight-read table both
 /// accept adversary-supplied keys, so without a cap a peer that floods `Publish`/`Get` with distinct
@@ -273,6 +280,10 @@ pub struct OverlayNode<F: Field> {
     decoupled: bool,
     /// Dedup: currently escalated on a coherence collapse — so `Escalated` fires once on entry.
     escalated_coherence: bool,
+    /// Consecutive self-driven diagnoses that read over-coupled (`Verdict::Systemic`); resets to 0 on any
+    /// non-over-coupled diagnosis. The `Decouple` shed only actuates once this reaches [`DECOUPLE_DWELL`]
+    /// — the hysteresis that keeps the now-continuous reflex from shedding on a transient reading (#122).
+    overcoupling_streak: u32,
 }
 
 /// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
@@ -375,6 +386,7 @@ impl<F: Field> OverlayNode<F> {
             decoupling: 0.0,
             decoupled: false,
             escalated_coherence: false,
+            overcoupling_streak: 0,
         }
     }
 
@@ -456,6 +468,13 @@ impl<F: Field> OverlayNode<F> {
         self.sweep_pending_gets(now, &mut effects);
         // Fold this window's relay activity into the behavioural coherence self-model.
         self.sample_behavior();
+        // Close the reflex loop (audit #122): having sensed this window (liveness, behaviour, and the
+        // peers' gossiped attestations accumulated since the last beat), run DIAKRISIS diagnosis and
+        // actuate any healing — every heartbeat. This makes the self-healing layer self-driving off the
+        // engine's own cadence under ANY driver; before this it depended on a `Command::Diagnose` no
+        // production driver ever sends, so a deployed node's namesake reflex (reroute/repair/quarantine/
+        // decouple/escalate) was inert. `Command::Diagnose` remains for an out-of-band forced diagnosis.
+        effects.extend(self.on_diagnose(now));
         effects.push(Effect::ArmTimer {
             token: HEARTBEAT,
             after: self.config.heartbeat,
@@ -1287,6 +1306,15 @@ impl<F: Field> OverlayNode<F> {
             ..Default::default()
         });
 
+        // Hysteresis for the over-coupling shed (audit #122): count consecutive over-coupled diagnoses,
+        // resetting on any non-over-coupled one. `Decouple` actuates only once this reaches DECOUPLE_DWELL,
+        // so the now-continuous reflex sheds on *sustained* over-coupling, not a single transient reading.
+        self.overcoupling_streak = if matches!(verdict, fanos_diakrisis::Verdict::Systemic) {
+            self.overcoupling_streak.saturating_add(1)
+        } else {
+            0
+        };
+
         let mut effects = alloc::vec![Effect::Notify(Notification::Verdict(verdict.clone()))];
         if self.config.self_healing {
             // Φ from the cell's live membership on the equicorrelated stratum, at the *effective*
@@ -1297,9 +1325,11 @@ impl<F: Field> OverlayNode<F> {
             if !plan.is_empty() {
                 self.observer.note_healing();
             }
-            // Over-coupling actuation (`Decouple`) flows through this verdict→plan path: `apply_healing_plan`
-            // now raises the mutable decoupling state and dedups the notification (audit C6).
-            effects.extend(self.apply_healing_plan(now, &plan));
+            // Over-coupling actuation (`Decouple`) flows through this verdict→plan path, gated by the dwell
+            // hysteresis above; `apply_healing_plan` raises the mutable decoupling state and dedups the
+            // notification (audit C6/#122). Crash/Byzantine actions in the plan are never gated.
+            let decouple_ready = self.overcoupling_streak >= DECOUPLE_DWELL;
+            effects.extend(self.apply_healing_plan(now, &plan, decouple_ready));
 
             // The homeostat covers the bands the Systemic verdict does not: **re-integration** once the
             // measured `Γ_net` is back in (or below) the band (Bind/Hold — decay the shed), and
@@ -1348,6 +1378,7 @@ impl<F: Field> OverlayNode<F> {
         &mut self,
         now: Instant,
         plan: &fanos_diakrisis::HealingPlan,
+        decouple_ready: bool,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         for action in &plan.actions {
@@ -1376,13 +1407,16 @@ impl<F: Field> OverlayNode<F> {
                     }
                 }
                 HealingAction::Decouple => {
-                    // Real correlation-shedding (audit C6): raise the mutable decoupling factor (capped),
-                    // which lowers the effective correlation feeding `Φ` next round — the loop actually
-                    // restores headroom. Notify once on *entering* the shed regime (dedup), not each round.
-                    self.decoupling = (self.decoupling + DECOUPLE_STEP).min(DECOUPLE_MAX);
-                    if !self.decoupled {
-                        self.decoupled = true;
-                        effects.push(Effect::Notify(Notification::Decoupled));
+                    // Real correlation-shedding (audit C6), gated by the dwell hysteresis (#122): only once
+                    // over-coupling has held for DECOUPLE_DWELL consecutive diagnoses do we raise the
+                    // mutable decoupling factor (capped), lowering the effective correlation feeding `Φ`
+                    // next round. Notify once on *entering* the shed regime (dedup), not each round.
+                    if decouple_ready {
+                        self.decoupling = (self.decoupling + DECOUPLE_STEP).min(DECOUPLE_MAX);
+                        if !self.decoupled {
+                            self.decoupled = true;
+                            effects.push(Effect::Notify(Notification::Decoupled));
+                        }
                     }
                 }
                 HealingAction::Escalate { unrecoverable } => {
@@ -1823,6 +1857,7 @@ mod tests {
         node.step(Instant(0), Input::Command(Command::StartHeartbeat));
 
         let mut t = 1u64;
+        let mut decoupled = false;
         for w in 0..(BEHAVIOR_WINDOW + 2) {
             let bursts = (w % 3) + 1; // varying, but identical across all peers → correlated in lockstep
             for i in 1..7usize {
@@ -1838,18 +1873,18 @@ mod tests {
                     t += 1;
                 }
             }
-            // Fire the heartbeat: it takes this window's behavioural sample into the coherence monitor.
-            node.step(Instant(t), Input::Timer(HEARTBEAT));
+            // Fire the heartbeat: it folds this window's behavioural sample into the coherence monitor AND
+            // runs the diagnosis reflex (audit #122) — after the dwell hysteresis confirms SUSTAINED
+            // over-coupling in the measured Γ_net it sheds correlation right here, no explicit Diagnose.
+            let hb = node.step(Instant(t), Input::Timer(HEARTBEAT));
+            decoupled |= hb
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled)));
             t += 1;
         }
-
-        // Diagnose: the homeostat sees over-coupling in the measured Γ_net and sheds correlation.
-        let effects = node.step(Instant(t), Input::Command(Command::Diagnose));
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
-            "behavioural over-coupling drives the live homeostat to Decouple"
+            decoupled,
+            "sustained over-coupling drives the live homeostat to Decouple on its heartbeat reflex"
         );
     }
 
@@ -1861,6 +1896,9 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         node.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let mut t = 1u64;
+        let base = node.effective_correlation(); // healthy_correlation, before any shed
+        let mut decoupled_beats = 0usize;
+        let mut systemic_seen = false;
         for w in 0..(BEHAVIOR_WINDOW + 2) {
             let bursts = (w % 3) + 1; // common-mode: every peer relays in lockstep
             for i in 1..7usize {
@@ -1876,26 +1914,36 @@ mod tests {
                     t += 1;
                 }
             }
-            node.step(Instant(t), Input::Timer(HEARTBEAT));
+            // The heartbeat folds in this window's behaviour AND runs the diagnosis reflex (audit #122):
+            // it emits a Systemic verdict on the measured over-coupling immediately, and once the dwell
+            // hysteresis confirms it is SUSTAINED, sheds correlation — no explicit Diagnose needed.
+            let hb = node.step(Instant(t), Input::Timer(HEARTBEAT));
+            if hb.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Notify(Notification::Verdict(fanos_diakrisis::Verdict::Systemic))
+                )
+            }) {
+                systemic_seen = true;
+            }
+            if hb
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled)))
+            {
+                decoupled_beats += 1;
+            }
             t += 1;
         }
-        assert!(node.decoupling.abs() < 1e-12, "no shed before diagnosis");
-        let base = node.effective_correlation();
-
-        let d1 = node.step(Instant(t), Input::Command(Command::Diagnose));
-        t += 1;
-        // Unified detection: the verdict is Systemic (from the measured Γ_net, not a dormant proxy).
+        // Unified detection (#74): the verdict is Systemic, from the measured Γ_net, not a dormant proxy.
         assert!(
-            d1.iter().any(|e| matches!(
-                e,
-                Effect::Notify(Notification::Verdict(fanos_diakrisis::Verdict::Systemic))
-            )),
-            "diagnose's verdict is driven by the measured over-coupling (#74 unification)"
+            systemic_seen,
+            "diagnosis's verdict is driven by the measured over-coupling (#74 unification)"
         );
-        assert!(
-            d1.iter()
-                .any(|e| matches!(e, Effect::Notify(Notification::Decoupled))),
-            "over-coupling decouples"
+        // Decoupled fires exactly ONCE — on crossing the dwell into the shed regime — then is deduped on
+        // every later beat even though the reflex keeps running each heartbeat (audit C6 dedup / #122).
+        assert_eq!(
+            decoupled_beats, 1,
+            "over-coupling decouples once on entering the shed regime, not on every beat"
         );
         assert!(
             node.decoupling > 0.0,
@@ -1913,7 +1961,7 @@ mod tests {
                 < 1e-12
         );
 
-        // Dedup: a second over-coupled diagnose keeps shedding but does NOT re-fire the notification.
+        // Dedup holds under an explicit diagnose too: it keeps shedding but does NOT re-fire.
         let d2 = node.step(Instant(t), Input::Command(Command::Diagnose));
         assert!(
             !d2.iter()

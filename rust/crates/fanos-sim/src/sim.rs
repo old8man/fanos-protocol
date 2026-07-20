@@ -431,4 +431,13 @@ impl Sim {
     pub fn report(&self) -> &Report {
         &self.report
     }
+
+    /// Clear the accumulated report (counters + notifications). DIAKRISIS diagnosis is now a self-driving
+    /// reflex on every heartbeat (audit #122), so a run accumulates verdicts/healing continuously; call
+    /// this after staging a scenario to read only what happens from this point on — e.g. reset, then a
+    /// final `inject_all(&Command::Diagnose)` + `settle()`, so the report reflects the cell's *current*
+    /// diagnosis rather than its whole history (including a since-crashed node's earlier healthy verdicts).
+    pub fn clear_report(&mut self) {
+        self.report = Report::default();
+    }
 }

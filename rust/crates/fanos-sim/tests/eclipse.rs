@@ -295,6 +295,7 @@ fn a_forged_frame_flood_does_not_eclipse_the_target_from_its_live_neighbours() {
         sim.run_for(Duration::from_millis(200));
     }
 
+    sim.clear_report(); // read only this final round, not the reflex's running diagnosis (#122)
     sim.inject(target, Command::Diagnose);
     sim.settle();
     assert_eq!(
@@ -331,6 +332,7 @@ fn a_targeted_link_cut_is_defeated_by_quorum_witness_corroboration() {
         sim.run_for(Duration::from_millis(300));
     }
 
+    sim.clear_report(); // read only this final round, not the reflex's running diagnosis (#122)
     sim.inject(target, Command::Diagnose);
     sim.settle();
     assert_eq!(
@@ -352,6 +354,7 @@ fn severing_a_true_neighbour_requires_seizing_its_coordinate() {
     sim.crash(cell[3]); // seize / kill the co-linear coordinate at Fano index 3
     sim.run_for(Duration::from_millis(3000)); // now no node hears it → no quorum can corroborate
 
+    sim.clear_report(); // read only this final round, not the reflex's running diagnosis (#122)
     sim.inject(target, Command::Diagnose);
     sim.settle();
     assert_eq!(

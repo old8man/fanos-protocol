@@ -39,6 +39,7 @@ fn a_child_escalation_is_consumed_and_healed_by_the_parent_tier() {
         }
     }
     sim.run_for(Duration::from_millis(3000));
+    sim.clear_report(); // read only this final round, not the reflex's running diagnosis (#122)
     sim.inject_all(&Command::Diagnose);
     sim.settle();
 

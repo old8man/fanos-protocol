@@ -68,11 +68,17 @@ proptest! {
         let _cell = spawn_cell::<F2>(&mut sim, cfg());
         sim.inject_all(&Command::StartHeartbeat);
         sim.run_for(Duration::from_millis(3000));
+        // Diagnosis is a continuous reflex now (audit #122); reset and read only this round.
+        sim.clear_report();
         sim.inject_all(&Command::Diagnose);
         sim.settle();
         let verdicts: Vec<_> = sim.report().verdicts().collect();
-        prop_assert_eq!(verdicts.len(), 7);
+        // A healthy cell only ever diagnoses Healthy, and all 7 distinct nodes report.
         prop_assert!(verdicts.iter().all(|(_, v)| **v == Verdict::Healthy));
+        let mut nodes: Vec<_> = verdicts.iter().map(|(n, _)| *n).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        prop_assert_eq!(nodes.len(), 7);
     }
 
     /// The determinism contract: the same seed reproduces byte-identical metrics.

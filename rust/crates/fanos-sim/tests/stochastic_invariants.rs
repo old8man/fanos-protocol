@@ -168,6 +168,9 @@ fn i2_syndrome_never_blames_a_live_node() {
         }
         // Generous multiple of the liveness timeout so every crash is fully observed.
         sim.run_for(Duration::from_millis(4000));
+        // Read only this final round; the continuous reflex (#122) has been diagnosing throughout, so a
+        // since-crashed node's earlier verdicts would otherwise pollute the "crashed node is silent" check.
+        sim.clear_report();
         sim.inject_all(&Command::Diagnose);
         sim.settle();
 

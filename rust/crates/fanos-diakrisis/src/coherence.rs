@@ -245,7 +245,9 @@ impl CoherenceMatrix {
     /// [`is_overcoupled`](Self::is_overcoupled)).
     #[must_use]
     pub fn is_systemic(&self) -> bool {
-        self.mean_correlation() > systemic_correlation(self.n) + 1e-12
+        // A degenerate (<2-node) cell has no inter-node correlation — `r*` is undefined and it is
+        // never systemic (audit #122: a collapsed cell must be readable, not a panic).
+        self.n >= 2 && self.mean_correlation() > systemic_correlation(self.n) + 1e-12
     }
 
     /// Whether the cell is **over-coupled** (`r > √(2/(N−1))`, equivalently `R < 1/3`):

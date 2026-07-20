@@ -89,12 +89,16 @@ mod scenarios {
     #[test]
     fn healthy_cell_diagnoses_healthy() {
         let (mut sim, _cell) = established_cell(1);
+        // Diagnosis is a continuous reflex now (audit #122), so the run has been diagnosing all along;
+        // reset and read just this round to check the cell's *current* verdict.
+        sim.clear_report();
         sim.inject_all(&Command::Diagnose);
         sim.settle();
-        // Every node that reports, reports healthy.
+        // A healthy cell only ever diagnoses Healthy, and all 7 nodes report.
         let verdicts: Vec<_> = sim.report().verdicts().collect();
-        assert_eq!(verdicts.len(), 7);
         assert!(verdicts.iter().all(|(_, v)| **v == Verdict::Healthy));
+        let reporters: BTreeSet<_> = verdicts.iter().map(|(n, _)| *n).collect();
+        assert_eq!(reporters.len(), 7, "every node reports a verdict");
     }
 
     #[test]
@@ -102,6 +106,9 @@ mod scenarios {
         let (mut sim, cell) = established_cell(2);
         sim.crash(cell[5]); // node at Fano index 5 dies
         sim.run_for(Duration::from_millis(3000)); // its heartbeats time out
+        // Reset before the final round so the report reflects the post-crash cell, not the healthy
+        // verdicts the (now-crashed) node emitted while the continuous reflex was still running (#122).
+        sim.clear_report();
         sim.inject_all(&Command::Diagnose);
         sim.settle();
         // Surviving nodes pin the culprit to index 5 via the 3-bit syndrome (spec §6.3).
@@ -109,7 +116,7 @@ mod scenarios {
             sim.report()
                 .any_verdict(&Verdict::Localized(Fault::Single(5)))
         );
-        // The dead node does not report.
+        // The dead node does not report (it is crashed — silent in this round).
         assert!(sim.report().verdicts().all(|(who, _)| who != cell[5]));
     }
 

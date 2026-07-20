@@ -67,7 +67,10 @@ fn observe_is_sense_only_no_verdict_no_healing() {
     sim.run_for(Duration::from_millis(2000));
     sim.crash(cell[3]); // a real fault is present...
     sim.run_for(Duration::from_millis(3000));
-    // ...but a passive monitor only *observes* — it must not diagnose or heal.
+    // ...but a passive monitor only *observes* — it must not diagnose or heal. Reset first so this
+    // measures ONLY the Observe round, not the heartbeat reflex's running diagnosis/healing (#122):
+    // Observe stays strictly sense-only, exactly what the assertions below pin.
+    sim.clear_report();
     sim.inject_all(&Command::Observe);
     sim.settle();
 

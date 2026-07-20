@@ -65,6 +65,7 @@ fn the_old_any_witness_rule_would_be_fooled_by_one_liar() {
         sim.inject_frame(cell[1], cell[0], forged_liveness_for(5));
         sim.run_for(Duration::from_millis(200));
     }
+    sim.clear_report(); // read only this final round, not the reflex's running diagnosis (#122)
     sim.inject(cell[0], Command::Diagnose);
     sim.settle();
     // Node 0 was fooled: it does not localize node 5 as a single fault.
@@ -95,6 +96,7 @@ fn byzantine_tolerance_is_exactly_quorum_minus_one_distinct_witnesses() {
             let _ = round;
             sim.run_for(Duration::from_millis(200));
         }
+        sim.clear_report(); // read only this final round, not the reflex's running diagnosis (#122)
         sim.inject(cell[0], Command::Diagnose);
         sim.settle();
         // "Defeated" = the crash is still localized despite the lie (the honest node was not fooled).

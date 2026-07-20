@@ -74,6 +74,14 @@ pub fn leading_alarm(gamma: &[f64], n: usize) -> Alarm {
 /// V19). Below it the collective is a mere aggregate; above it, over-coupled (groupthink).
 #[must_use]
 pub fn collective_subject_window(n: usize) -> (f64, f64) {
+    // A cell with fewer than two live nodes has no inter-node correlation window — `r* = 1/√(n−1)` is
+    // undefined. Return an unreachable window so a degenerate/collapsed cell classifies as `Aggregate`
+    // (trivially diversified) and is never read as over-coupled, rather than panicking on the
+    // `n >= 2` precondition — a real deployment can collapse to a lone survivor that still self-observes
+    // and diagnoses every heartbeat (audit #122).
+    if n < 2 {
+        return (f64::INFINITY, f64::INFINITY);
+    }
     (systemic_correlation(n), sqrt(2.0 / (n - 1) as f64))
 }
 

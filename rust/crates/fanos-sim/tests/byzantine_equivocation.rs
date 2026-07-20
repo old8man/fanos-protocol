@@ -111,27 +111,27 @@ fn an_equivocating_mediator_is_localized_by_the_live_polar_check() {
     // spec §6.4) before diagnosis.
     sim.run_for(Duration::from_millis(4000));
 
+    // The reflex diagnoses every heartbeat (audit #122); by now the forged DiagAttest has propagated
+    // cell-wide. We keep the FULL report — the quarantine/escalation actuations below fire once, during
+    // the run — and read each node's LATEST verdict for its current view.
     sim.inject_all(&Command::Diagnose);
     sim.settle();
 
     let report = sim.report();
-    let verdicts: Vec<_> = report.verdicts().map(|(who, v)| (who, v.clone())).collect();
-
-    // Every HONEST observer localizes the liar's own polar class — not merely "some node".
-    for (who, v) in &verdicts {
-        if *who == cell[liar] {
-            continue; // the liar's self-diagnosis is covered separately below
-        }
-        assert_eq!(
-            *v,
-            Verdict::Structural(vec![liar]),
-            "node {who:?} must localize the equivocator to its polar point {liar}; all verdicts: {verdicts:?}"
-        );
-    }
+    // The reflex diagnoses continuously (audit #122): each honest observer localizes the equivocator to
+    // its polar class the round the forgery is detected, then quarantines it and moves on — after which
+    // the liar drops out of that observer's attestation matrix and it reads healthy again. So assert that
+    // every one of the 6 honest observers reported Structural([liar]) *at some point*, not that it is
+    // their latest verdict.
+    let localizers: std::collections::BTreeSet<Triple> = report
+        .verdicts()
+        .filter(|&(who, v)| who != cell[liar] && *v == Verdict::Structural(vec![liar]))
+        .map(|(who, _)| who)
+        .collect();
     assert_eq!(
-        verdicts.iter().filter(|(who, _)| *who != cell[liar]).count(),
+        localizers.len(),
         6,
-        "all 6 honest observers reported a verdict"
+        "all 6 honest observers localize the equivocator to its polar point {liar}"
     );
 
     // The actuation fires end-to-end (spec §6.4 + §6.3): the liar is quarantined AND escalated,
@@ -141,7 +141,7 @@ fn an_equivocating_mediator_is_localized_by_the_live_polar_check() {
             .notifications
             .iter()
             .any(|o| matches!(&o.note, Notification::Quarantined(c) if *c == cell[liar])),
-        "the equivocator is locally quarantined: {verdicts:?}"
+        "the equivocator is locally quarantined: {localizers:?}"
     );
     assert!(
         report
@@ -156,15 +156,26 @@ fn an_equivocating_mediator_is_localized_by_the_live_polar_check() {
         forged.load(Ordering::Relaxed) >= 1,
         "the equivocator forged at least one DiagAttest (else the test proves nothing)"
     );
-    // The liar is heartbeat-green throughout: this is invisible to liveness, unlike byzantine.rs —
-    // only the structural check catches it.
-    assert!(
-        !report
-            .notifications
-            .iter()
-            .any(|o| matches!(&o.note, Notification::PeerDown(c) if *c == cell[liar])),
-        "the equivocator never goes heartbeat-down — this is not a liveness fault"
-    );
+    // Caught by the STRUCTURAL check FIRST, not by liveness (the distinguishing point vs byzantine.rs): the
+    // equivocator answers every ping, so liveness alone would never flag it. Under the continuous reflex it
+    // does eventually read heartbeat-down — but only as a *consequence* of being structurally quarantined
+    // and dropped. Prove the ordering: its first structural Quarantine precedes any liveness PeerDown.
+    let first_quarantine = report
+        .notifications
+        .iter()
+        .position(|o| matches!(&o.note, Notification::Quarantined(c) if *c == cell[liar]));
+    let first_peerdown = report
+        .notifications
+        .iter()
+        .position(|o| matches!(&o.note, Notification::PeerDown(c) if *c == cell[liar]));
+    match (first_quarantine, first_peerdown) {
+        (Some(q), Some(p)) => assert!(
+            q < p,
+            "the structural quarantine (#{q}) must precede any liveness removal (#{p}): the polar check catches the liar, liveness does not"
+        ),
+        (Some(_), None) => {} // quarantined and never even went down — the strongest form
+        _ => panic!("the equivocator was never structurally quarantined"),
+    }
 }
 
 #[test]
@@ -175,6 +186,7 @@ fn an_honest_cell_never_raises_a_structural_verdict() {
     let cell = spawn_cell::<F2>(&mut sim, Config::default());
     sim.inject_all(&Command::StartHeartbeat);
     sim.run_for(Duration::from_millis(4000));
+    sim.clear_report(); // read only this diagnosis round, not the reflex's running history (#122)
     sim.inject_all(&Command::Diagnose);
     sim.settle();
 
