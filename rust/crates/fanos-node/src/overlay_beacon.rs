@@ -200,7 +200,7 @@ mod tests {
         // kickoff: AdvanceEpoch drives each composite's beacon to flood its partial. The ONLY frames a
         // composite emits are the beacon's — the overlay's competing seedless Beacon flood is stripped.
         let mut bus: Vec<(usize, Vec<u8>)> = Vec::new();
-        for c in cell.iter_mut() {
+        for c in &mut cell {
             for e in c.step(Instant(0), Input::Command(Command::AdvanceEpoch)) {
                 if let Effect::Send { to, frame } = e {
                     assert!(
