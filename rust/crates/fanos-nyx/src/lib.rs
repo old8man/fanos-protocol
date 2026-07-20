@@ -33,7 +33,7 @@ pub mod tessera;
 
 pub use path::{Circuit, build_circuit, build_circuit_via_guard};
 pub use profile::{MixConfig, NyxConfig, Profile};
-pub use ratchet::{Ratchet, circuit_holonomy};
+pub use ratchet::{Ratchet, circuit_holonomy, verify_holonomy};
 pub use sheaf::{NyxError, ThresholdLayer};
 pub use tessera::{PeelResult, Tessera};
 

@@ -84,6 +84,17 @@ pub fn circuit_holonomy<F: Field>(circuit: &Circuit<F>, seed: &[u8; 32]) -> [u8;
     ratchet.holonomy()
 }
 
+/// Verify a `claimed` holonomy against the circuit and seed the verifying party independently
+/// knows (spec §5.4) — `true` iff it matches [`circuit_holonomy`] recomputed from `circuit`/`seed`.
+/// Meaningful only for a verifier who already has legitimate knowledge of `circuit` (it built the
+/// circuit, or was told it end-to-end) — see `fanos_aphantos::sealed::verify_delivery` for why that
+/// precondition matters and where it holds in practice. Any inserted or substituted hop moves an
+/// `A_k` in [`circuit_holonomy`]'s chain and so is caught here.
+#[must_use]
+pub fn verify_holonomy<F: Field>(circuit: &Circuit<F>, seed: &[u8; 32], claimed: [u8; 32]) -> bool {
+    circuit_holonomy(circuit, seed) == claimed
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -100,6 +111,24 @@ mod tests {
         let sender = circuit_holonomy(&circuit, &seed);
         let receiver = circuit_holonomy(&circuit, &seed);
         assert_eq!(sender, receiver);
+    }
+
+    #[test]
+    fn verify_holonomy_accepts_the_honest_circuit_and_rejects_a_substituted_one() {
+        // The verification primitive itself, in both directions: the exact circuit the tag was
+        // computed under passes; a different (substituted-hop) circuit under the SAME seed fails.
+        let seed = [5u8; 32];
+        let honest = build_circuit(Point::<F31>::at(0), Point::<F31>::at(500), 3, b"c").unwrap();
+        let substituted = build_circuit(Point::<F31>::at(0), Point::<F31>::at(500), 3, b"c2").unwrap();
+        let claimed = circuit_holonomy(&honest, &seed);
+        assert!(
+            verify_holonomy(&honest, &seed, claimed),
+            "the circuit the tag was built under verifies"
+        );
+        assert!(
+            !verify_holonomy(&substituted, &seed, claimed),
+            "a substituted circuit does not"
+        );
     }
 
     #[test]

@@ -9,13 +9,13 @@ use alloc::vec::Vec;
 
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
-use fanos_nyx::{build_circuit, build_circuit_via_guard};
+use fanos_nyx::{Circuit, build_circuit, build_circuit_via_guard};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::hash::hash_xof;
 use fanos_primitives::hash_labeled;
 use fanos_primitives::map_to_point;
 use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
-use fanos_wire::{FrameType, decode_frame, encode_frame};
+use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame};
 
 use crate::sealed::{self, PeelOutcome};
 
@@ -294,22 +294,35 @@ impl<F: Field> NyxNode<F> {
         self.coord // astronomically unlikely; `build_circuit_via_guard` then falls back to guardless
     }
 
+    /// A fresh, monotonically-distinct per-circuit seed derived from this node's own entropy.
+    /// Shared by every circuit-building path ([`next_circuit`](Self::next_circuit) and
+    /// [`build_verifiable_circuit`](Self::build_verifiable_circuit)), so `circuit_counter` is
+    /// consumed exactly once per circuit however it is built.
+    fn next_seed(&mut self) -> Vec<u8> {
+        self.circuit_counter += 1;
+        let mut circuit_seed = self.seed.to_vec();
+        circuit_seed.extend_from_slice(&self.circuit_counter.to_be_bytes());
+        circuit_seed
+    }
+
+    /// Build a fresh **outbound** circuit `self.coord → … → dest` — guard-anchored
+    /// (predecessor-attack bound), falling back to a fully derived circuit only for a 1-hop path or
+    /// the rare guard/source/dest collision. Used by [`originate`](Self::originate); `None` on a
+    /// degenerate request (see [`build_circuit`]).
+    fn next_circuit(&mut self, dest: Point<F>) -> Option<(Circuit<F>, Vec<u8>)> {
+        let circuit_seed = self.next_seed();
+        let guard = self.guard();
+        let circuit = build_circuit_via_guard(self.coord, guard, dest, self.path_len, &circuit_seed)
+            .or_else(|| build_circuit(self.coord, dest, self.path_len, &circuit_seed))?;
+        Some((circuit, circuit_seed))
+    }
+
     /// Originate an anonymous circuit to `dest` carrying `payload`.
     fn originate(&mut self, dest: Triple, payload: &[u8]) -> Vec<Effect> {
         let Some(destination) = Point::<F>::new(dest) else {
             return Vec::new();
         };
-        self.circuit_counter += 1;
-        let mut circuit_seed = self.seed.to_vec();
-        circuit_seed.extend_from_slice(&self.circuit_counter.to_be_bytes());
-
-        // Enter through the stable guard (predecessor-attack bound); fall back to a fully derived
-        // circuit only for a 1-hop path or the rare guard/source/dest collision.
-        let guard = self.guard();
-        let Some(circuit) =
-            build_circuit_via_guard(self.coord, guard, destination, self.path_len, &circuit_seed)
-                .or_else(|| build_circuit(self.coord, destination, self.path_len, &circuit_seed))
-        else {
+        let Some((circuit, circuit_seed)) = self.next_circuit(destination) else {
             return Vec::new();
         };
         let relays = circuit.relays();
@@ -332,6 +345,86 @@ impl<F: Field> NyxNode<F> {
             to: first_relay.coords(),
             frame: Self::nyx_frame(&onion),
         }]
+    }
+
+    /// Build a fresh **reply** circuit `launch → … → self.coord` — the mirror image of
+    /// [`next_circuit`](Self::next_circuit): it ends AT this node rather than starting from it, so
+    /// this node's own KEM secret is the one that peels the final `Deliver` layer. `launch` is a
+    /// nominal entry label (folded into the holonomy chain like any other hop
+    /// — see [`fanos_nyx::ratchet::circuit_holonomy`] — but never a real routing step *this* node
+    /// takes: whoever seals a reply onto this circuit launches it at `circuit.relays()[1]`'s
+    /// combiner directly, the same way [`originate`](Self::originate) does for a forward circuit).
+    /// Retained (never sent) so the caller can hold `(circuit, seed)` and later verify a delivery's
+    /// holonomy against it via [`verified_deliver`](Self::verified_deliver) (spec §5.4).
+    ///
+    /// This is the "reply circuit" half of NYX path-integrity verification. Recomputing a
+    /// delivery's expected holonomy needs the *exact* circuit and seed it was built under; no relay
+    /// or third party is ever given enough to do that (the tag rides encrypted end-to-end — see
+    /// [`crate::sealed`]'s module doc), and a destination cannot honestly reconstruct an
+    /// *originator's* outbound circuit either — that would require learning who built it, breaking
+    /// the "receiver never learns the originator" property this engine exists to uphold
+    /// ([`ANONYMOUS`]). The one party who can soundly verify is whoever built the circuit in the
+    /// first place: a caller retains `(circuit, seed)` from this call, hands the routing info
+    /// (circuit + relay keys) to a peer end-to-end encrypted (inside a request payload — an
+    /// application-layer concern above this engine) so the peer can address a reply through it, and
+    /// checks the reply it eventually receives with [`verified_deliver`](Self::verified_deliver).
+    #[must_use]
+    pub fn build_verifiable_circuit(&mut self, launch: Triple) -> Option<(Circuit<F>, Vec<u8>)> {
+        let launch_point = Point::<F>::new(launch)?;
+        let circuit_seed = self.next_seed();
+        let circuit = build_circuit(launch_point, self.coord, self.path_len, &circuit_seed)?;
+        Some((circuit, circuit_seed))
+    }
+
+    /// Peel `frame`, expecting it to be the **final delivery** of a circuit this node itself built
+    /// (see [`build_verifiable_circuit`](Self::build_verifiable_circuit)) — the same peel
+    /// [`step`](Engine::step) drives, but additionally verifying the accumulated holonomy against
+    /// `circuit`/`seed` before accepting the payload (spec §5.4). `Ok(payload)` only for a
+    /// genuinely verified, in-order delivery; every other outcome is rejected, never handed to the
+    /// caller:
+    /// * a malformed frame or wrong frame type — [`ProtocolError::Malformed`];
+    /// * `Forward` (not yet at the destination — `circuit` does not match what actually
+    ///   happened) — [`ProtocolError::PathBroken`];
+    /// * a peel failure (wrong relay layer / tampered / replay) — [`ProtocolError::Malformed`];
+    /// * a holonomy mismatch (an inserted or substituted hop) — [`ProtocolError::HolonomyFail`].
+    pub fn verified_deliver(
+        &mut self,
+        frame: &[u8],
+        circuit: &Circuit<F>,
+        seed: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let Ok((decoded, _)) = decode_frame(frame) else {
+            return Err(ProtocolError::Malformed);
+        };
+        if decoded.frame_type() != Some(FrameType::Tessera) {
+            return Err(ProtocolError::Malformed);
+        }
+        // The same replay defense `on_frame` applies: a cell whose tag we have already accepted
+        // (forwarded or delivered) here is a replay, dropped before it can be re-verified.
+        let tag = sealed::replay_tag(decoded.body);
+        if let Some(tag) = tag
+            && self.replay_seen.contains(&tag)
+        {
+            return Err(ProtocolError::Malformed);
+        }
+        match sealed::peel(decoded.body, &self.kem_secret) {
+            Ok(PeelOutcome::Deliver { payload, holonomy }) => {
+                // Record the tag on any successful peel — same rule as `on_frame` — before acting
+                // on the outcome, so a holonomy failure still marks this exact cell seen.
+                if let Some(tag) = tag {
+                    self.note_replay(tag);
+                }
+                sealed::verify_delivery(circuit, seed, holonomy)?;
+                Ok(payload)
+            }
+            Ok(PeelOutcome::Forward { .. }) => {
+                if let Some(tag) = tag {
+                    self.note_replay(tag);
+                }
+                Err(ProtocolError::PathBroken)
+            }
+            Err(_) => Err(ProtocolError::Malformed),
+        }
     }
 
     /// Handle an incoming frame: peel our hop and forward (with mixing) or deliver.

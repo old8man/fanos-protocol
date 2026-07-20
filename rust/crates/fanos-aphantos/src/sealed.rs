@@ -36,7 +36,12 @@ use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
 use fanos_primitives::hash::hash_xof;
 use fanos_primitives::hash_labeled;
+use fanos_wire::error::ProtocolError;
 use fanos_wire::tessera;
+
+/// Domain label for the holonomy seed derived from a build/verify `seed` — one source of truth so
+/// [`build`] and [`verify_delivery`] can never silently drift onto different derivations.
+const HOLOSEED_LABEL: &str = "FANOS-v1/aphantos-holoseed";
 
 // The onion's byte layout has a single source of truth — the canonical `fanos_wire::tessera`. These are
 // aliases so the sealing/peeling logic reads naturally, while any drift from the canonical reference is a
@@ -172,7 +177,7 @@ pub fn build<F: Field>(
         return Err(SealedError::KeyMismatch);
     }
     let relays = circuit.relays();
-    let holonomy = circuit_holonomy(circuit, &hash_labeled("FANOS-v1/aphantos-holoseed", seed));
+    let holonomy = circuit_holonomy(circuit, &hash_labeled(HOLOSEED_LABEL, seed));
 
     // `inner` is the *unpadded* nested onion built so far (innermost first); `outer_session` is the
     // outermost hop's key, used to pad the final packet to the bucket.
@@ -220,6 +225,35 @@ pub fn build<F: Field>(
 
     // Pad the outermost packet to the constant bucket (the receiver ignores the filler).
     pad_to_bucket(inner, &outer_session)
+}
+
+/// Verify a delivered onion's holonomy against the circuit and seed the **verifying party**
+/// independently knows (spec §5.4) — e.g. a client checking that a service's reply travelled the
+/// exact reply circuit it constructed, not a substituted or tampered path. `circuit`/`seed` here
+/// must be the SAME ones [`build`] was (or would be) called with for this delivery.
+///
+/// This is the only sound place to verify: the caller must already have legitimate, independent
+/// knowledge of `circuit` — because it built it, or was told it end-to-end (inside a payload only
+/// the intended recipient can read). Recomputing from an *assumed* circuit for an arbitrary
+/// anonymous delivery is not meaningful, and worse, would require learning who built the circuit —
+/// breaking the "receiver never learns the originator" property [`crate::node::NyxNode`] exists to
+/// uphold (module doc, [`ANONYMOUS`](crate::node::ANONYMOUS)). A reply circuit sidesteps this: the
+/// verifier (the original sender) is the one who built it, so no one learns anything new.
+///
+/// `Err(`[`ProtocolError::HolonomyFail`]`)` on a mismatch — an inserted or substituted hop, or any
+/// tamper of the accumulated path — never `Ok`; the caller MUST reject the payload, never hand it
+/// to the application.
+pub fn verify_delivery<F: Field>(
+    circuit: &Circuit<F>,
+    seed: &[u8],
+    delivered_holonomy: [u8; 32],
+) -> Result<(), ProtocolError> {
+    let holoseed = hash_labeled(HOLOSEED_LABEL, seed);
+    if fanos_nyx::verify_holonomy(circuit, &holoseed, delivered_holonomy) {
+        Ok(())
+    } else {
+        Err(ProtocolError::HolonomyFail)
+    }
 }
 
 /// Length of a [`replay_tag`].
@@ -411,5 +445,79 @@ mod tests {
         let onion = build(&circuit, &pubkeys, b"x", b"s").unwrap();
         // The second relay's key cannot peel the first hop.
         assert_eq!(peel(&onion, &keypairs[1].0), Err(SealedError::Aead));
+    }
+
+    /// Route `onion` (built for `circuit`) through every relay's real secret, returning the
+    /// delivered `(payload, holonomy)`. Panics if it never reaches `Deliver` (test helper only).
+    fn route_to_delivery<F: Field>(
+        circuit: &Circuit<F>,
+        onion: &[u8],
+        keypairs: &[(HybridKemSecret, HybridKemPublic)],
+    ) -> (Vec<u8>, [u8; 32]) {
+        let _ = circuit; // the routing itself is proven elsewhere; kept for a clear call site
+        let mut onion = onion.to_vec();
+        for (secret, _) in keypairs {
+            match peel(&onion, secret).unwrap() {
+                PeelOutcome::Forward { onion: inner, .. } => onion = inner,
+                PeelOutcome::Deliver { payload, holonomy } => return (payload, holonomy),
+            }
+        }
+        panic!("onion never delivered");
+    }
+
+    #[test]
+    fn an_honest_delivery_verifies_against_the_circuit_it_was_built_for() {
+        // §5.4: the verifying party (here, holding the exact circuit/seed `build` used — e.g. a
+        // client checking its own reply circuit) accepts a genuinely untampered delivery.
+        let circuit =
+            build_circuit(Point::<F31>::at(2), Point::<F31>::at(600), 3, b"honest-path").unwrap();
+        let keypairs = relays(circuit.hop_count(), 9);
+        let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
+        let seed = b"honest-reply-seed";
+        let payload = b"the response";
+        let onion = build(&circuit, &pubkeys, payload, seed).unwrap();
+
+        let (delivered_payload, holonomy) = route_to_delivery(&circuit, &onion, &keypairs);
+        assert_eq!(delivered_payload, payload, "the payload arrives unchanged");
+        assert_eq!(
+            verify_delivery(&circuit, seed, holonomy),
+            Ok(()),
+            "the exact circuit/seed the onion was built under verifies"
+        );
+    }
+
+    #[test]
+    fn a_substituted_hop_fails_verification_and_must_be_rejected() {
+        // The onion is built (and genuinely delivered) over one circuit, but the verifying party's
+        // own expectation names a DIFFERENT circuit (same source/dest, a substituted interior hop —
+        // exactly what an on-path attacker redirecting the packet, or a confused/stale verifier,
+        // would produce). The accumulated holonomy cannot match: HolonomyFail, and the caller must
+        // never accept the payload on this outcome.
+        let actual =
+            build_circuit(Point::<F31>::at(2), Point::<F31>::at(600), 3, b"honest-path").unwrap();
+        let substituted =
+            build_circuit(Point::<F31>::at(2), Point::<F31>::at(600), 3, b"attacker-path").unwrap();
+        assert_ne!(
+            actual.relays(),
+            substituted.relays(),
+            "the two circuits genuinely differ (test precondition)"
+        );
+
+        let keypairs = relays(actual.hop_count(), 9);
+        let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
+        let seed = b"honest-reply-seed";
+        let onion = build(&actual, &pubkeys, b"the response", seed).unwrap();
+
+        // The onion still genuinely routes and delivers — per-hop AEAD alone has no opinion on
+        // *which* circuit was intended, only that each layer opened under the right relay key.
+        let (delivered_payload, holonomy) = route_to_delivery(&actual, &onion, &keypairs);
+        assert_eq!(delivered_payload, b"the response");
+
+        // But verifying against the substituted circuit — what the caller actually expected — fails.
+        assert_eq!(
+            verify_delivery(&substituted, seed, holonomy),
+            Err(ProtocolError::HolonomyFail),
+            "a substituted hop must be caught and rejected, not silently accepted"
+        );
     }
 }
