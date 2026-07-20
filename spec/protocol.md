@@ -216,6 +216,8 @@ Hence `Φ = 1 ⟺ P = 2/7 ⟺ r = 1/√6`: the integration and structure thresho
 
 This is Discovery 9 of the UHM engineering catalogue (systemic risk of an equicorrelated 7-portfolio) redeployed as a **reliability early-warning**: a monitor that watches mean behavioural correlation crossing `0.408` sees an incipient cascade a full regime ahead of any liveness alarm. No DHT or onion overlay exposes such a quantity, because none carries a coherence matrix.
 
+*(§18.2 sharpens the `r > 1/√6` systemic side into a two-sided **window**: past a second threshold `r > 1/√3` the cell is not just systemic but* **over-coupled** *— it has lost its own self-model — so the live monitor distinguishes "moves as one" from "moves as one and can no longer see itself." That window is the fuller live reading this early-warning is the near edge of.)*
+
 :::note Why this is not available to Kademlia/Tor
 Their state is a routing table — a *graph*, whose only spectral invariant is connectivity. A coherence matrix is a *density operator*: it has purity, integration, a self-model, and a critical correlation. The third-order principle (§2.5, §2.8) is what makes these invariants meaningful — they read the triple-structure the graph cannot see.
 :::
@@ -317,7 +319,7 @@ The eight layers L0–L7 are the *forward* stack (how a message gets built, rout
 
 ## L0. Identity and addressing
 
-- **Key pair:** hybrid Ed25519 + ML-DSA-65 (signature), X25519 + ML-KEM-768 (KEM). The long-term identifier = hash of the bundle of public keys.
+- **Key pair:** hybrid Ed25519 + ML-DSA-65 (signature), X25519 + ML-KEM-768 (KEM), **and the coordinate-VRF public key** (§L6). The long-term identifier = `BLAKE3` of the canonical bundle `sig ‖ kem ‖ vrf` — all three public keys, not just sig+kem. Binding the VRF key into the identifier means the node-ID itself commits to the key that earns the node's coordinate, so a `HELLO` proof-of-coordinate (§7.3) is checked against a key the identity cannot swap out unnoticed.
 - **Node coordinate:** `coord = MapToPoint( VRF_beacon(pubkey, epoch) )` — the VRF binds the point to the epoch, with a reshuffle at epoch change. `MapToPoint` is a uniform map of the 256-bit output into `[x:y:z] ∈ PG(2,q)` (discard the zero vector, normalise the first nonzero to 1).
 - **Content addressing:** a resource key `k` maps to a point `MapToPoint(H(k))`; the responsible node is the nearest occupied point (consistent hashing on projective coordinates). Replicas are the q+1 nodes of the lines through that point (LRC, L4).
 
@@ -380,17 +382,27 @@ All primitives are **vetted and post-quantum/hybrid**. The novelty is in the com
 
 | Purpose | Primitive | Status |
 |---|---|---|
-| KEM (key exchange) | X25519 **+** ML-KEM-768 (hybrid, KDF combiner SHAKE256) | standard/PQ |
+| KEM (key exchange) | X25519 **+** ML-KEM-768 (hybrid, combiner SHAKE256 over the **full transcript** — both shared secrets ‖ the ciphertext ‖ the recipient's static key, X-Wing/MAL-BIND-style — stronger than a bare concatenation) | standard/PQ |
 | Signature | Ed25519 **+** ML-DSA-65; conservative opt. SLH-DSA (SPHINCS+) | standard/PQ |
 | AEAD | ChaCha20-Poly1305 (portability) / AES-256-GCM (HW) | standard |
 | Hash/XOF | BLAKE3 (speed) + SHAKE256 (PQ-KDF) | standard |
-| VRF | ECVRF-Edwards25519 (RFC 9381); PQ-VRF | standard / [P] |
-| Beacon | threshold BLS (drand); PQ beacon | standard / [P] |
+| VRF | `vrf-r255`: RFC-9381-*style* on ristretto255 (pairing-free); PQ-VRF | standard / [P] |
+| Beacon | pairing-free threshold DVRF (ristretto255 + Chaum–Pedersen DLEQ); PQ beacon | standard / [P] |
 | Threshold sharing | Shamir SSS + Feldman/Pedersen VSS; DKG (GJKR) | standard |
 | Threshold decryption | threshold KEM/ElGamal, non-interactive share combination | standard |
 | Verifiable shuffle | Bayer–Groth argument (classical); PQ shuffle | standard / [P] |
-| Anonymous credits | VOPRF Privacy Pass (RFC 9578) / BBS+ | standard |
+| Anonymous credits | bespoke VOPRF (ristretto255, BLAKE3-XOF hash-to-curve + DLEQ) / BBS+ | standard |
 | Packet | Tessera (Sphinx-derived, threshold, PQ) | **[P] needs audit** |
+
+:::note Interop deviations — one pairing-free curve, not two trust bases
+Three rows above are deliberate departures from the RFC/protocol literally named, chosen to keep the whole suite on the single pairing-free curve (ristretto255, the same group as the KEM/signature Curve25519 family) rather than introduce a second, pairing-friendly trust base for BLS alone:
+
+- **VRF** is `vrf-r255` — an RFC 9381-*style* construction on ristretto255, not the RFC's own `ECVRF-EDWARDS25519-SHA512` ciphersuite, and not byte-compatible with it (§L0, §7.1).
+- **Beacon** (§L3, §7.6) is a pairing-free threshold DVRF — ristretto255 Diffie–Hellman partials, each with a Chaum–Pedersen DLEQ proof — not threshold-BLS.
+- **Anonymous credits** (§L7) are a bespoke VOPRF on ristretto255 (BLAKE3-XOF hash-to-curve, bespoke Chaum–Pedersen DLEQ): Privacy Pass *in spirit*, but not RFC 9497/9578 wire-compatible.
+
+**Canonical FANOS choice is the ristretto255 pairing-free suite above; conformant implementations MUST use it** for wire interoperability — a clean-room implementation coded to the literal RFC 9381 / threshold-BLS / RFC 9497-9578 citations will not interoperate. None of the three substitutions weakens the security property the original citation was chosen for.
+:::
 
 ## L7. Incentives (optional)
 
@@ -413,7 +425,11 @@ In Tor a message M is encrypted layer by layer with the hop keys `H₁…H_L`: `
 
 **Idea.** Each onion layer is peeled not by a single node but by a **threshold t of q+1** members of a line. No single node can peel a layer alone (below threshold it knows *nothing*). The term "sheaf" is doubly apt: it is both a mathematical sheaf over the line and the "splitting" of a message, like light through a prism.
 
-**Mechanism.** At cell formation the members of each line run a DKG (distributed key generation, GJKR) ⇒ the line has a public key `PK_L` and each member holds a share of the secret `sk_i` (Shamir). The sender encrypts a layer to `PK_L`. To peel a layer, ≥ t members publish partial decryptions that are non-interactively combined (a threshold KEM). The routing information "where next" is revealed only when the threshold is reached.
+**Mechanism.** The canonical construction is **sender-dealt, per-member-sealed**, not a line DKG to a single `PK_L`: for each layer the sender draws a fresh symmetric key `K`, AEAD-encrypts the routing command under `K`, Shamir-splits `K` into `q+1` shares (threshold `t`), and **hybrid-KEM-seals each share individually** to the corresponding line member's public key — a **forward-secure, per-epoch onion key** the member rotates independently of its long-term identity KEM key. To peel a layer, ≥ t members each decapsulate their own sealed share (no other member's share is ever exposed, even to a holder of the whole packet) and the shares are combined to reconstruct `K`; below threshold, `K` is unrecoverable — genuine zero-knowledge, not merely information-theoretic secrecy among cooperating members.
+
+:::note Interop deviation — no line DKG, no single `PK_L`
+This is a **deliberate divergence from a single-`PK_L`-per-line design**, and the better one: it needs no line-wide DKG round (no liveness dependency on the whole line agreeing a joint key), it has no long-lived line secret whose theft compromises every past and future onion through that line, and each Shamir share rides a fresh KEM encapsulation, so a later compromise of the sender's build randomness reveals nothing. The cost is that a client must know all `q+1` current member keys per hop rather than one `PK_L`. The threshold-`t`-of-`q+1` security property this section sells — endpoint linkage `P_link = P_hop²` below — is fully achieved either way; **canonical FANOS conformant implementations MUST use the sender-dealt, per-member-KEM-sealed construction**, not a line-DKG'd `PK_L`, for wire interoperability.
+:::
 
 **What it buys [T, curve computed]:** an adversary owning a fraction *f* of nodes (randomly placed) breaks one hop with probability `P_hop = P(Binom(q+1, f) ≥ t)` — a binomial tail. Endpoint linkage (like Tor's guard+exit) requires breaking the first AND last hop: `P_link = P_hop²`.
 
@@ -452,7 +468,7 @@ The threshold t requires t honest members online (availability is the binomial-c
 Mechanically the ratchet reduces to a geometry-organised chain of Diffie-Hellman-like blinding factors (as in Sphinx), which grounds forward secrecy and path integrity. However, **a rigorous cryptographic formalisation (model, reduction, a PQ version of the blinding) is [P]**: a formal analysis is needed before production. We honestly mark this as a research construction, not as ready-proven security.
 :::
 
-## 5.5 NYX innovation 4 — structurally-balanced cover traffic and the λ dial
+## 5.5 NYX innovation 4 — structurally-balanced cover traffic and the λ (μ) dial
 
 - **Cover traffic [T uniformity]:** every node emits a constant stream of cover on each of its q+1 lines. By the plane's regularity the load is **identical** across all nodes ⇒ zero volume fingerprint. This is a theorem about point-regularity, not a policy (verified V8).
 - **Poisson mixing (Loopix-class):** exponential delays with mean 1/μ per hop; mean path latency = L/μ; the anonymity set size ≈ packets in the mixing window (Little's law). The μ dial leads continuously from "Tor-class" to "Nym+":
@@ -687,14 +703,15 @@ frame = type:varint  ‖  length:varint  ‖  body:bytes[length]
 | Range | Group | Types |
 |---|---|---|
 | `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `GOAWAY`, `ERROR` |
-| `0x1*` | Membership | `JOIN`, `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*` |
+| `0x1*` | Membership | `JOIN`, `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*`, `BEACON_PARTIAL` |
 | `0x2*` | Overlay/storage | `LOOKUP`, `VALUE`, `PUBLISH`, `ACK`, `BRIDGE` |
-| `0x3*` | Direct route | `ROUTE`, `STREAM_OPEN`, `STREAM_DATA`, `STREAM_FIN` |
+| `0x3*` | Direct route | `ROUTE`, `STREAM_OPEN`, `STREAM_DATA`, `STREAM_FIN`, `ROUTE_HIER` |
 | `0x4*` | APHANTOS/NYX | `TESSERA`, `PARTIAL_DEC`, `COVER` |
-| `0x5*` | Rendezvous / CALYPSO | `RDV_INTRO`, `RDV_REPLY`, `SVC_ANNOUNCE` |
+| `0x5*` | Rendezvous / CALYPSO | `RDV_INTRO`, `RDV_REPLY`, `SVC_ANNOUNCE`, `RDV_REGISTER` |
 | `0x6*` | DIAKRISIS | `DIAG_GOSSIP`, `DIAG_SYNDROME`, `DIAG_VERDICT` |
+| `0x7*` | Application | `APP` |
 
-The registry is versioned (§7.4); new types are added by IANA-style allocation without breaking old decoders.
+The registry is versioned (§7.4); new types are added by IANA-style allocation without breaking old decoders. Four entries above are forward-compatible additions beyond the base set: `BEACON_PARTIAL` carries one anchor's distributed-VRF beacon partial for an epoch (a threshold of them assemble a `BEACON` round, §L3); `ROUTE_HIER` carries a hierarchical route (`HierAddr(dst) ‖ payload`) forwarded cell-to-cell toward a multi-level destination (§L1), degenerating to `ROUTE` at hierarchy depth 1; `RDV_REGISTER` lets a client register its coordinate with a rendezvous relay so anonymous replies assembled at the relay's combiner reach it; `APP` (group `0x7*`) is a length-skippable outer type multiplexing application-overlay protocols above the FANOS core, so a decoder unaware of a given overlay still forward-compatibly skips it.
 
 ## 7.3 Session handshake and state machine {#wire-handshake}
 
@@ -748,15 +765,21 @@ A shipped bootstrap *list* is exactly what a censor blocks. When PROTEUS (Part X
 | Field | Size | Purpose |
 |---|---|---|
 | `version` | 1 B | format version |
-| `epoch` | 4 B | epoch (for verifying coordinates/beacon) |
-| `group_element` | 32 B (X25519) + 1088 B (ML-KEM-768 ct) | hybrid element to derive the hop key and the β-ratchet |
-| `routing_cmd` (encrypted) | 32 B | next line / delivery (peeled by threshold) |
-| `header_mac` | 16 B | integrity of the current hop's header |
-| `holonomy_tag` | 32 B | accumulated `Hol` — the path authenticator |
-| `payload` (AEAD) | fixed (e.g. 2 KB) | payload, re-encrypted per hop |
-| `padding` | up to fixed total size | length indistinguishability |
+| `kem_ct` | 1120 B (32 B X25519 ephemeral + 1088 B ML-KEM-768 ct) | hybrid per-hop KEM ciphertext; derives this hop's AEAD keys |
+| `nonce` | 12 B | AEAD nonce for `len_ct` and `body_ct` |
+| `len_ct` (AEAD) | 18 B | the real body length (`u16`), encrypted — no cleartext length field |
+| `body_ct` (AEAD) | variable, up to the remaining budget | the routing command, encrypted: `DELIVER ‖ holonomy(32 B)` or `NEXT ‖ next_coord(12 B)` |
+| `padding` | up to fixed total size | keystream-derived padding, indistinguishable from ciphertext |
 
-The total packet size is a constant (e.g. 4 KB) regardless of path length and hop position — the fixed size is a wire-level requirement, not an implementation detail.
+Cleartext header = `version ‖ kem_ct ‖ nonce ‖ len_ct` = 1151 B; everything from `body_ct` onward is opaque to every relay but the one peeling that layer. The total packet size is a constant **8192 B**, regardless of path length or hop position — the fixed size is a wire-level requirement, not an implementation detail.
+
+:::warning Interop deviation from an earlier revision — no cleartext `header_mac`, `holonomy_tag`, or in-band `epoch`
+This layout is the **canonical FANOS choice**; conformant implementations MUST use it for the §7.9 wire KATs to interoperate. It differs from an earlier draft of this table in three deliberate ways:
+
+- **No cleartext `header_mac`.** Per-hop integrity rides the AEAD tags already folded into `len_ct` and `body_ct` (ChaCha20-Poly1305); a separate MAC field is redundant.
+- **The holonomy path-authenticator (§5.4) is never a cleartext header field.** It travels only inside the encrypted `body_ct`, as the `holonomy(32 B)` payload of the innermost `DELIVER` command — visible solely to the endpoint. A constant-offset cleartext `holonomy_tag` would be a **cross-hop correlator**: any two relays, or any observer of a single un-encrypted hop, could link entry to exit by matching it, collapsing the threshold endpoint-unlinkability `P_hop^L` (§5.2) to `1`. Removing it from the header closes a real deanonymization vector; it is a security fix, not a simplification.
+- **No in-band `epoch` field.** Coordinate/epoch verification happens once, at the membership layer (`HELLO`, §7.3), and per-hop keys are drawn from the relay's forward-secure per-epoch onion key window rather than an epoch tag carried in every packet.
+:::
 
 ## 7.8 Core protocol flows {#wire-flows}
 
