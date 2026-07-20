@@ -604,7 +604,8 @@ impl Engine for GreyNode {
         let mut out = Vec::new();
         for e in self.node.step(now, input) {
             if self.drops(&e) {
-                self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 out.push(e);
             }
@@ -686,7 +687,13 @@ fn loss_matrix(log: &LossLog) -> [[f64; N]; N] {
         }
     };
     core::array::from_fn(|a| {
-        core::array::from_fn(|b| if a == b { 0.0 } else { loss(a, b).max(loss(b, a)) })
+        core::array::from_fn(|b| {
+            if a == b {
+                0.0
+            } else {
+                loss(a, b).max(loss(b, a))
+            }
+        })
     })
 }
 
@@ -710,7 +717,10 @@ fn build_loss_probed_cell(
             }),
             _ => Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default())),
         };
-        sim.add(Box::new(LossProbe { inner, log: log.clone() }));
+        sim.add(Box::new(LossProbe {
+            inner,
+            log: log.clone(),
+        }));
     }
     sim.inject_all(&Command::StartHeartbeat);
     (sim, log, dropped)
@@ -735,7 +745,10 @@ fn grey_endpoint_localizes_a_lossy_node_from_measured_loss() {
         let (mut sim, log, dropped) =
             build_loss_probed_cell(0x_6E_A1 + grey as u64, net, Some((grey, 500)));
         sim.run_for(Duration::from_millis(12000));
-        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed) > 0, "the grey node dropped pongs");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the grey node dropped pongs"
+        );
         assert_eq!(
             polar::grey_endpoint(&loss_matrix(&log), GREY_TOL),
             Some(grey),
@@ -756,6 +769,88 @@ fn grey_endpoint_is_silent_on_a_fair_lossy_cell() {
             polar::grey_endpoint(&loss_matrix(&log), GREY_TOL),
             None,
             "seed {seed}: a fair lossy cell (uniform 15% loss) has no grey node"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// End-to-end: the §6.3 grey sensor WIRED into the production engine (per-Peer loss EWMA → DiagLoss gossip →
+// matrix assembly → polar::grey_endpoint in OverlayNode::on_diagnose). The sim exercises the real reflex.
+// ---------------------------------------------------------------------------------------------------------
+
+/// The REAL engine runs the grey sensor: a node dropping half its pongs is localized and REPORTED
+/// (`Notification::Grey`) by honest nodes — never quarantined (grey is degradation, not a lie). Full cohesion:
+/// the verified localizer actuated through the production `OverlayNode`, from its own measured loss.
+#[test]
+fn the_wired_engine_reports_a_grey_node() {
+    let grey = 4usize;
+    for seed in 0..4u64 {
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(8), 0.03);
+        let mut sim = Sim::with_network(0x_9E_A1 ^ seed, net);
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..N {
+            let node: Box<dyn Engine> = if i == grey {
+                Box::new(GreyNode {
+                    node: OverlayNode::<F2>::new(fano::point(i), Config::default()),
+                    drop_permille: 500,
+                    counter: 0,
+                    dropped: dropped.clone(),
+                })
+            } else {
+                Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default()))
+            };
+            sim.add(node);
+        }
+        sim.inject_all(&Command::StartHeartbeat);
+        sim.run_for(Duration::from_millis(12000));
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the grey node dropped pongs"
+        );
+        let grey_c = fano::point(grey).coords();
+        let honest: Vec<Triple> = (0..N)
+            .filter(|&i| i != grey)
+            .map(|i| fano::point(i).coords())
+            .collect();
+        let reported = sim.report().notifications.iter().any(|o| {
+            honest.contains(&o.node) && matches!(&o.note, Notification::Grey(c) if *c == grey_c)
+        });
+        assert!(
+            reported,
+            "seed {seed}: an honest node reports the grey node"
+        );
+        let quarantined = sim
+            .report()
+            .notifications
+            .iter()
+            .any(|o| matches!(&o.note, Notification::Quarantined(_)));
+        assert!(
+            !quarantined,
+            "seed {seed}: a grey node is reported, never quarantined"
+        );
+    }
+}
+
+/// The live grey false-positive guard: an honest cell (uniform 10 % loss, no grey) reports NO grey node.
+#[test]
+fn the_wired_engine_reports_no_grey_on_an_honest_cell() {
+    for seed in 0..6u64 {
+        let byz = [NONE_POLICY; N];
+        let net = NetworkModel::new(Duration::from_millis(20), Duration::from_millis(10), 0.10);
+        let (mut sim, _log, _) = build_cell(0x_9EEE ^ seed, net, &byz);
+        sim.run_for(Duration::from_millis(12000));
+        let grey = sim
+            .report()
+            .notifications
+            .iter()
+            .find_map(|o| match &o.note {
+                Notification::Grey(c) => Some(*c),
+                _ => None,
+            });
+        assert!(
+            grey.is_none(),
+            "seed {seed}: an honest cell reports no grey node, got {grey:?}"
         );
     }
 }

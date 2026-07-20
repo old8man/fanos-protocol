@@ -194,6 +194,11 @@ pub enum Notification {
     Repaired(Triple),
     /// Self-healing: a structurally inconsistent (Byzantine) member was excluded (spec §6.2).
     Quarantined(Triple),
+    /// Diagnosis: a **grey** member (spec §6.3) — heartbeat-present but lossy/slow on *all* its channels —
+    /// was localized from the polar minimum-incident reading of the cell's measured per-channel loss. Grey is
+    /// degradation, not a lie, so it is *reported* for observability (and left to higher-layer rerouting),
+    /// never quarantined — a possibly-honest slow node must not be punished.
+    Grey(Triple),
     /// Self-healing: the local cell could not recover the listed Fano nodes (a hyperoval stopping
     /// set, or beyond the `Φ`-budget) and escalated them to the parent cell (spec §6.3, §6.7).
     Escalated(u8),

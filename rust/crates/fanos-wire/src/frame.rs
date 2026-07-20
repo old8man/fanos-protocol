@@ -76,6 +76,12 @@ pub enum FrameType {
     /// alarms (§6.2) live — an equivocating mediator's own report disagrees with itself and is
     /// localized by [`fanos_diakrisis::polar::violated_classes`].
     DiagAttest = 0x63,
+    /// A node's measured **per-neighbour loss vector** (spec §6.3 grey detection, #106): the fraction of its
+    /// pings to each Fano point that went unanswered, one `u8` per point (`loss × 255`), flooded on the
+    /// heartbeat like [`DiagGossip`](Self::DiagGossip). Assembled cell-wide into a channel-rate matrix whose
+    /// polar minimum-incident reading (`fanos_diakrisis::polar::grey_endpoint`) localizes a grey node — one
+    /// heartbeat-present but lossy on every channel, which the liveness and equivocation checks cannot see.
+    DiagLoss = 0x64,
     // 0x7* Application overlays (Kernel/Protocol split, design-platform.md §Kernel): a system Protocol
     // runs on port 0 and application overlays multiplex under one length-skippable outer type.
     App = 0x70,
@@ -130,6 +136,7 @@ impl FrameType {
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
             0x63 => Self::DiagAttest,
+            0x64 => Self::DiagLoss,
             0x70 => Self::App,
             _ => return None,
         })

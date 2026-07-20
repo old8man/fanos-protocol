@@ -54,6 +54,7 @@ fn note_desc(note: &Notification) -> String {
         }
         Notification::Repaired(c) => format!("Repaired {}", fmt_coord(*c)),
         Notification::Quarantined(c) => format!("Quarantined {}", fmt_coord(*c)),
+        Notification::Grey(c) => format!("Grey {}", fmt_coord(*c)),
         Notification::Escalated(mask) => format!("Escalated {mask:#09b}"),
         Notification::Decoupled => "Decoupled".to_owned(),
         Notification::Bound => "Bound".to_owned(),

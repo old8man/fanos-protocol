@@ -65,6 +65,17 @@ const DECOUPLE_DWELL: u32 = 3;
 const ENDPOINT_WINDOW: usize = 5;
 const ENDPOINT_MIN_STALE: usize = 3;
 
+/// §6.3 grey-detection loss EWMA smoothing factor. Each heartbeat folds one per-neighbour ping-answered
+/// sample; `0.25` averages over ~4 rounds (~2 s at the default heartbeat), enough to distinguish a grey
+/// node's sustained drop rate from a single lost `Pong` without lagging a real onset.
+const LOSS_EWMA_ALPHA: f64 = 0.25;
+/// §6.3 grey-localization tolerance, pinned by the simulator sweep
+/// (`fanos-sim/tests/endpoint_attestation_research.rs`): the minimum by which a grey node's WORST incident
+/// channel loss must exceed the cell's baseline (median channel loss) for `polar::grey_endpoint` to localize
+/// it. A grey node's minimum incident loss runs above baseline (every channel degraded); an honest node's runs
+/// below it (its worst channel is a good honest link), so `0.10` sits in a wide separation.
+const GREY_TOL: f64 = 0.10;
+
 /// DoS backstops on the DHT slice (audit A4). The distributed store and the in-flight-read table both
 /// accept adversary-supplied keys, so without a cap a peer that floods `Publish`/`Get` with distinct
 /// digests exhausts memory. These are *safety* ceilings far above any legitimate working set — a
@@ -230,6 +241,14 @@ impl Store {
 struct Peer {
     last_seen: Option<Instant>,
     reported_down: bool,
+    /// EWMA of this channel's per-round **loss** (spec §6.3 grey detection): each heartbeat samples whether
+    /// last round's `Ping` was answered (0) or not (1) and folds it at [`LOSS_EWMA_ALPHA`]. A grey neighbour —
+    /// heartbeat-present but dropping a fraction of its `Pong`s — settles at an elevated loss while an honest
+    /// one stays near the network floor; gossiped as `DiagLoss` and localized by `polar::grey_endpoint`.
+    loss: f64,
+    /// Whether this round's `Ping` is still outstanding (no `Pong` seen since it was sent) — the per-round
+    /// loss sample the heartbeat folds into [`loss`](Self::loss).
+    awaiting_pong: bool,
 }
 
 /// The forwarding decision for a `RouteHier` frame at a node (see [`Router::route`]).
@@ -873,6 +892,14 @@ pub struct OverlayNode<F: Field> {
     /// cannot forge a false liveness either — a peer is believed alive on gossip only when a
     /// **quorum** of distinct witnesses vouch for it, so `quorum − 1` liars are outvoted.
     witnessed: BTreeMap<Triple, BTreeMap<Triple, Instant>>,
+    /// §6.3 grey detection: the freshest `DiagLoss` row each cell member gossiped — its measured per-neighbour
+    /// loss vector (`[u8; 7]`, `loss × 255`) and when it arrived. Assembled with this node's own row into the
+    /// symmetric channel-rate matrix `polar::grey_endpoint` localizes a grey node from (a lossy node lifts
+    /// every channel incident to it). Bounded by the cell size.
+    loss_reports: BTreeMap<Triple, ([u8; 7], Instant)>,
+    /// Dedup for the grey diagnosis: the grey node currently reported, so `Notification::Grey` fires once on
+    /// onset (and again only if a *different* node goes grey), cleared when the cell reads grey-free.
+    grey_reported: Option<Triple>,
     /// The DHT-storage concern — this node's local store slice + read-repair bookkeeping (spec §L4). A
     /// value lives on its responsible content point and is cell-replicated for LRC availability, so any
     /// survivor answers a lookup (a lookup to a *down* primary reroutes through the self-healing table,
@@ -936,6 +963,8 @@ impl<F: Field> OverlayNode<F> {
                     peers.entry(member.coords()).or_insert(Peer {
                         last_seen: None,
                         reported_down: false,
+                        loss: 0.0,
+                        awaiting_pong: false,
                     });
                 }
             }
@@ -963,6 +992,8 @@ impl<F: Field> OverlayNode<F> {
             self_index,
             healer: Healer::new(observer),
             witnessed: BTreeMap::new(),
+            loss_reports: BTreeMap::new(),
+            grey_reported: None,
             store: Store::default(),
             epoch: Epoch::ZERO,
         }
@@ -1003,10 +1034,21 @@ impl<F: Field> OverlayNode<F> {
     fn on_heartbeat(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         let ping = encode(FrameType::Ping, &[]);
-        // A health-view (how stale this node's direct observation of each cell point is) and a
-        // polar cross-attestation (this node's honest per-channel rate report for the 3 channels
-        // it mediates): both base-cell-only, and read from the SAME corroborated liveness snapshot
-        // this window, so the two stay consistent with each other (spec §6.4, §6.8, §6.2).
+        let neighbours: Vec<Triple> = self.peers.keys().copied().collect();
+        // §6.3 grey detection: fold last round's per-neighbour ping outcome into the loss EWMA, then mark this
+        // round's ping outstanding (the loop below pings every neighbour). Done before building the gossip so
+        // the `DiagLoss` row carries this round's fresh loss estimate.
+        for coord in &neighbours {
+            if let Some(peer) = self.peers.get_mut(coord) {
+                let miss = f64::from(u8::from(peer.awaiting_pong));
+                peer.loss = LOSS_EWMA_ALPHA * miss + (1.0 - LOSS_EWMA_ALPHA) * peer.loss;
+                peer.awaiting_pong = true;
+            }
+        }
+        // A health-view (how stale this node's direct observation of each cell point is), a polar
+        // cross-attestation (its honest per-channel rate report for the 3 channels it mediates), and its
+        // measured per-neighbour loss vector (§6.3 grey): all base-cell-only, read from the SAME snapshot this
+        // window, so the three stay mutually consistent (spec §6.4, §6.8, §6.2, §6.3).
         let gossip_attest = self.cell_liveness(now).map(|(self_index, degraded, _)| {
             (
                 encode(FrameType::DiagGossip, &self.health_view(now)),
@@ -1014,10 +1056,10 @@ impl<F: Field> OverlayNode<F> {
                     FrameType::DiagAttest,
                     &encode_diag_attest(self_index, degraded),
                 ),
+                encode(FrameType::DiagLoss, &self.loss_view()),
             )
         });
         // Detect newly-down peers (by the corroborated view), and (re-)ping + gossip everyone.
-        let neighbours: Vec<Triple> = self.peers.keys().copied().collect();
         for coord in neighbours {
             let alive = self.coord_alive(coord, now);
             if let Some(peer) = self.peers.get_mut(&coord)
@@ -1031,7 +1073,7 @@ impl<F: Field> OverlayNode<F> {
                 to: coord,
                 frame: ping.clone(),
             });
-            if let Some((gossip, attest)) = &gossip_attest {
+            if let Some((gossip, attest, loss)) = &gossip_attest {
                 effects.push(Effect::Send {
                     to: coord,
                     frame: gossip.clone(),
@@ -1039,6 +1081,10 @@ impl<F: Field> OverlayNode<F> {
                 effects.push(Effect::Send {
                     to: coord,
                     frame: attest.clone(),
+                });
+                effects.push(Effect::Send {
+                    to: coord,
+                    frame: loss.clone(),
                 });
             }
         }
@@ -1098,6 +1144,36 @@ impl<F: Field> OverlayNode<F> {
         body
     }
 
+    /// This node's measured **per-neighbour loss** row (§6.3 grey), one `u8` per Fano point (`loss × 255`,
+    /// saturating). Self reads `0`; a point this node does not neighbour reads `0` (no measurement). The body
+    /// of the `DiagLoss` frame flooded each heartbeat.
+    fn loss_view(&self) -> Vec<u8> {
+        let self_c = self.coord.coords();
+        (0..7usize)
+            .map(|i| {
+                let coord = Point::<F>::at(i).coords();
+                if coord == self_c {
+                    0
+                } else {
+                    self.peers
+                        .get(&coord)
+                        .map_or(0, |p| (p.loss.clamp(0.0, 1.0) * 255.0) as u8)
+                }
+            })
+            .collect()
+    }
+
+    /// Store witness `from`'s gossiped `DiagLoss` row — its measured loss toward each cell point — for the
+    /// grey-detection matrix assembly ([`grey_rate_matrix`](Self::grey_rate_matrix)). Malformed (short) bodies
+    /// are ignored.
+    fn apply_diag_loss(&mut self, now: Instant, from: Triple, body: &[u8]) {
+        if let Some(slice) = body.get(..7)
+            && let Ok(row) = <[u8; 7]>::try_from(slice)
+        {
+            self.loss_reports.insert(from, (row, now));
+        }
+    }
+
     /// Fold witness `from`'s health-view into the corroborated `witnessed` map: for each cell point
     /// the gossip reports a fresh direct observation of, remember the freshest time *this witness*
     /// vouched for it. Keeping witnesses distinct is what makes the quorum Byzantine-robust — a lone
@@ -1144,6 +1220,7 @@ impl<F: Field> OverlayNode<F> {
                 if let Some(peer) = self.peers.get_mut(&from) {
                     peer.last_seen = Some(now);
                     peer.reported_down = false;
+                    peer.awaiting_pong = false; // this round's ping was answered — a loss-sample "hit" (§6.3)
                 }
                 // A recovered node no longer needs rerouting/repair (churn rejoin, spec §3.3).
                 self.healer.clear_healing(from);
@@ -1179,6 +1256,16 @@ impl<F: Field> OverlayNode<F> {
                 }
                 self.healer.clear_healing(from);
                 self.healer.apply_diag_attest(now, from, frame.body);
+                Vec::new()
+            }
+            Some(FrameType::DiagLoss) => {
+                // The sender's measured per-neighbour loss row (spec §6.3 grey); stored for the grey-detection
+                // matrix. Also a direct observation of the sender's liveness, like the other diagnostics.
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.last_seen = Some(now);
+                    peer.reported_down = false;
+                }
+                self.apply_diag_loss(now, from, frame.body);
                 Vec::new()
             }
             Some(FrameType::Publish) => self.on_publish(from, frame.body),
@@ -1727,6 +1814,8 @@ impl<F: Field> OverlayNode<F> {
                     peers.entry(member.coords()).or_insert(Peer {
                         last_seen: None,
                         reported_down: false,
+                        loss: 0.0,
+                        awaiting_pong: false,
                     });
                 }
             }
@@ -1896,7 +1985,60 @@ impl<F: Field> OverlayNode<F> {
         let round = self.endpoint_round_mask(now);
         let subjects = !self.own_fresh_mask(now) & 0x7F;
         effects.extend(self.healer.attest_endpoints::<F>(now, round, subjects));
+        // §6.3 grey detection (#106): localize a grey node — heartbeat-present but lossy on every channel —
+        // from the assembled measured-loss matrix, and report it (observability only; grey is degradation, not
+        // a lie, so it is never quarantined). Deduped to fire once per grey episode.
+        effects.extend(self.detect_grey(now));
         effects
+    }
+
+    /// Assemble the symmetric measured-loss channel-rate matrix (§6.3): `rate[a][b] = max(a's loss toward b,
+    /// b's loss toward a)` — a channel is only as good as its worst direction, so a grey node (lossy only
+    /// *outbound*) still lifts every channel incident to it. Rows come from freshly-gossiped `DiagLoss`
+    /// (`loss_reports`), plus this node's own directly-measured row (`peers[*].loss`).
+    fn grey_rate_matrix(&self, now: Instant) -> [[f64; 7]; 7] {
+        let timeout = self.config.liveness_timeout;
+        let point_index = |c: &Triple| (0..7).find(|&i| Point::<F>::at(i).coords() == *c);
+        let mut directional = [[0.0f64; 7]; 7]; // directional[a][b] = a's loss toward b
+        for (coord, (row, seen)) in &self.loss_reports {
+            if now.since(*seen) <= timeout
+                && let Some(a) = point_index(coord)
+                && let Some(dst) = directional.get_mut(a)
+            {
+                for (cell, &byte) in dst.iter_mut().zip(row.iter()) {
+                    *cell = f64::from(byte) / 255.0;
+                }
+            }
+        }
+        if let Some(me) = self.self_index
+            && let Some(dst) = directional.get_mut(me)
+        {
+            for (b, cell) in dst.iter_mut().enumerate() {
+                let coord = Point::<F>::at(b).coords();
+                *cell = self.peers.get(&coord).map_or(0.0, |p| p.loss);
+            }
+        }
+        let at = |a: usize, b: usize| directional.get(a).and_then(|r| r.get(b)).copied().unwrap_or(0.0);
+        core::array::from_fn(|a| {
+            core::array::from_fn(|b| if a == b { 0.0 } else { at(a, b).max(at(b, a)) })
+        })
+    }
+
+    /// Localize a grey node from the measured-loss matrix ([`polar::grey_endpoint`]) and emit
+    /// `Notification::Grey` on onset (deduped by [`grey_reported`](Self::grey_reported)); clears the latch when
+    /// the cell reads grey-free. Base cell only — off it there is no index-addressed loss geometry.
+    fn detect_grey(&mut self, now: Instant) -> Vec<Effect> {
+        if self.self_index.is_none() {
+            return Vec::new();
+        }
+        let matrix = self.grey_rate_matrix(now);
+        let grey = polar::grey_endpoint(&matrix, GREY_TOL).map(|i| Point::<F>::at(i).coords());
+        if grey == self.grey_reported {
+            return Vec::new();
+        }
+        self.grey_reported = grey;
+        grey.map(|g| alloc::vec![Effect::Notify(Notification::Grey(g))])
+            .unwrap_or_default()
     }
 
     /// The current self-healing reroute table (down node → co-linear survivor), for observation.
@@ -2297,12 +2439,14 @@ mod tests {
         let mut pings = 0;
         let mut gossips = 0;
         let mut attests = 0;
+        let mut losses = 0;
         for e in &effects {
             if let Effect::Send { frame, .. } = e {
                 match decode_frame(frame).unwrap().0.frame_type() {
                     Some(FrameType::Ping) => pings += 1,
                     Some(FrameType::DiagGossip) => gossips += 1,
                     Some(FrameType::DiagAttest) => attests += 1,
+                    Some(FrameType::DiagLoss) => losses += 1,
                     other => panic!("unexpected heartbeat frame {other:?}"),
                 }
             }
@@ -2316,6 +2460,10 @@ mod tests {
         assert_eq!(
             attests, 6,
             "attests its polar cross-attestation to all 6 neighbours"
+        );
+        assert_eq!(
+            losses, 6,
+            "gossips its measured loss vector to all 6 neighbours (§6.3)"
         );
         assert_eq!(arms, 1, "re-arms the heartbeat");
     }

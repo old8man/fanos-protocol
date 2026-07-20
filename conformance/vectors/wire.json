@@ -51,7 +51,8 @@
       { "name": "TESSERA", "code": "0x40", "group": 4 },
       { "name": "RDV_INTRO", "code": "0x50", "group": 5 },
       { "name": "DIAG_VERDICT", "code": "0x62", "group": 6 },
-      { "name": "DIAG_ATTEST", "code": "0x63", "group": 6 }
+      { "name": "DIAG_ATTEST", "code": "0x63", "group": 6 },
+      { "name": "DIAG_LOSS", "code": "0x64", "group": 6 }
     ],
     "examples": [
       { "type": "0x22", "body_utf8": "payload", "hex": "22077061796c6f6164" }
