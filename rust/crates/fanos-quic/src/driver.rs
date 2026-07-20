@@ -33,10 +33,10 @@ use fanos_wire::{FrameType, ProtocolError, encode_frame};
 use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
-use crate::identity::{HelloResult, hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello};
-use crate::tls::{
-    NodeCredentials, TlsError, node_configs, node_configs_mutual_from,
+use crate::identity::{
+    HelloResult, hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello,
 };
+use crate::tls::{NodeCredentials, TlsError, node_configs, node_configs_mutual_from};
 
 /// Production transport tuning: a keep-alive so idle overlay links survive NAT/firewall timeouts,
 /// and a bounded idle timeout so a dead peer's connection is reaped rather than lingering.
@@ -637,7 +637,12 @@ async fn reshuffle_loop<F: Field>(
                     *b = seed;
                 }
                 if let Ok(mut h) = hello.write() {
-                    *h = Arc::new(hello_bytes::<F>(epoch, coord.coords(), &proof, capabilities));
+                    *h = Arc::new(hello_bytes::<F>(
+                        epoch,
+                        coord.coords(),
+                        &proof,
+                        capabilities,
+                    ));
                 }
             }
             // Some other notification, or we fell behind the broadcast — keep following either way.
@@ -945,7 +950,12 @@ async fn send_framed(conn: &Connection, shaper: &Shaper, ty: FrameType, body: &[
 /// on. Fire-and-forget: each side computes the SAME deterministic negotiation independently from
 /// the peer's HELLO, so establishing the session never blocks waiting to read the peer's ack back
 /// (a peer that never sends one — e.g. a future build that dropped HelloAck — cannot wedge us).
-async fn send_hello_ack(conn: &Connection, shaper: &Shaper, version: u16, capabilities: Capabilities) {
+async fn send_hello_ack(
+    conn: &Connection,
+    shaper: &Shaper,
+    version: u16,
+    capabilities: Capabilities,
+) {
     let mut body = Vec::with_capacity(6);
     body.extend_from_slice(&version.to_be_bytes());
     body.extend_from_slice(&capabilities.bits().to_be_bytes());
@@ -1003,7 +1013,10 @@ async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Op
             Some(coord)
         }
         HelloResult::Incompatible(err) => {
-            tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
+            tracing::warn!(
+                ?err,
+                "HELLO negotiation incompatible; sending ERROR and aborting"
+            );
             send_error(conn, shaper, err).await;
             None
         }
@@ -1057,12 +1070,20 @@ mod tests {
         let genesis_coord = genesis.coords();
 
         // The epoch-1 beacon and the coordinate it deterministically yields — what the loop must land on.
+        // Choose a seed that ACTUALLY moves this (randomly-generated) node's coordinate: a fixed seed would
+        // collide with genesis ~1/7 of the time (7 Fano points) and flake the precondition. Deterministic
+        // given `creds` — the first byte-fill seed whose epoch-1 VRF coordinate differs from genesis.
         let epoch = Epoch::ZERO.next();
-        let seed = [0x5Au8; 32];
-        let expected = verifiable_coordinate::<F2>(&creds, epoch, &BeaconSeed::new(seed))
-            .0
-            .coords();
-        assert_ne!(expected, genesis_coord, "the beacon must actually move the coordinate for this test");
+        let (seed, expected) = (0u8..=255)
+            .map(|b| {
+                let s = [b; 32];
+                let coord = verifiable_coordinate::<F2>(&creds, epoch, &BeaconSeed::new(s))
+                    .0
+                    .coords();
+                (s, coord)
+            })
+            .find(|(_, coord)| *coord != genesis_coord)
+            .expect("some beacon seed moves the coordinate off genesis");
 
         // Shared cells + a directory pre-bound at the genesis coordinate.
         let hello = Arc::new(RwLock::new(Arc::new(vec![0u8]))); // sentinel: rewritten on reshuffle
@@ -1112,11 +1133,19 @@ mod tests {
         // The directory + published cells follow (the loop writes them right after the command). Poll
         // briefly: those writes happen on the loop's task, concurrent with ours.
         let rebound = await_until(|| {
-            directory.resolve(expected) == Some(local_addr) && directory.resolve(genesis_coord).is_none()
+            directory.resolve(expected) == Some(local_addr)
+                && directory.resolve(genesis_coord).is_none()
         })
         .await;
-        assert!(rebound, "the new coordinate is bound to our address and the vacated one is cleared");
-        assert_eq!(*beacon.read().unwrap(), BeaconSeed::new(seed), "the verifier's beacon advanced");
+        assert!(
+            rebound,
+            "the new coordinate is bound to our address and the vacated one is cleared"
+        );
+        assert_eq!(
+            *beacon.read().unwrap(),
+            BeaconSeed::new(seed),
+            "the verifier's beacon advanced"
+        );
         assert_ne!(
             **hello.read().unwrap(),
             vec![0u8],
@@ -1164,8 +1193,12 @@ mod tests {
                 seed: *BeaconSeed::GENESIS.as_bytes(),
             })
             .expect("subscriber listening");
-        let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), input_rx.recv()).await;
-        assert!(quiet.is_err(), "no re-seat command when the coordinate does not move");
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(300), input_rx.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "no re-seat command when the coordinate does not move"
+        );
     }
 
     /// Poll `cond` up to ~2s, yielding between checks; returns whether it became true.
@@ -1195,19 +1228,33 @@ mod tests {
         // (b) fresh timestamp but the client already dropped its receiver → evicted (is_closed).
         let (tx_abandoned, rx_abandoned) = oneshot::channel::<()>();
         drop(rx_abandoned);
-        puts.entry([2u8; 32]).or_default().push((later, tx_abandoned));
+        puts.entry([2u8; 32])
+            .or_default()
+            .push((later, tx_abandoned));
         // (c) receiver still held but the waiter has outlived REQUEST_TIMEOUT → evicted (age).
         let (tx_expired, mut rx_expired) = oneshot::channel::<()>();
         puts.entry([3u8; 32]).or_default().push((t0, tx_expired));
 
         evict_stale(&mut puts, later);
 
-        assert!(puts.contains_key(&[1u8; 32]), "a fresh, still-awaited waiter survives");
-        assert!(!puts.contains_key(&[2u8; 32]), "a waiter whose receiver was abandoned is evicted");
-        assert!(!puts.contains_key(&[3u8; 32]), "a waiter older than REQUEST_TIMEOUT is evicted");
+        assert!(
+            puts.contains_key(&[1u8; 32]),
+            "a fresh, still-awaited waiter survives"
+        );
+        assert!(
+            !puts.contains_key(&[2u8; 32]),
+            "a waiter whose receiver was abandoned is evicted"
+        );
+        assert!(
+            !puts.contains_key(&[3u8; 32]),
+            "a waiter older than REQUEST_TIMEOUT is evicted"
+        );
         // Evicting (c) dropped its sender, so the client's receiver now resolves to Err → it sees `false`.
         assert!(
-            matches!(rx_expired.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+            matches!(
+                rx_expired.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
             "the expired client's receiver is closed by the eviction (it will observe a failed put)",
         );
     }
