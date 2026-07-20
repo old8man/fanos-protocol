@@ -285,6 +285,52 @@ impl<F: Field> Router<F> {
     }
 }
 
+/// The membership concern factored out of [`OverlayNode`] (audit #125 decompose): this node's own
+/// long-term **credentials** for joining a cell — its identity bundle, signed descriptor, and Sybil
+/// admission proof — plus the [`AdmissionPolicy`] it checks *others* against, and the learned **key view**
+/// of who else is in the cell. The facade orchestrates the JOIN/Announce frame flow (flood, self-cert,
+/// re-flood); this owns the credential/view state and the invariant that must not be got wrong — the
+/// fail-closed admission check ([`admits`](Membership::admits)).
+#[derive(Default)]
+struct Membership {
+    /// This node's long-term identity bytes (spec §L0): its hybrid **signature public-key bundle**
+    /// `Ed25519(32) ‖ ML-DSA-65(1952)`, which both derives its self-certifying address (`MapToPoint`) and
+    /// verifies its descriptor signature. Carried in this node's `Announce`. Empty when self-certification
+    /// is not in use (the address is trusted without proof).
+    identity: Vec<u8>,
+    /// The signature over this node's descriptor `coord ‖ hier ‖ id`, produced once by its hybrid signing
+    /// key at deployment (the secret never enters the engine). Carried in the `Announce` and checked by
+    /// peers under self-certified membership, so an attacker cannot announce a *different* transport
+    /// coordinate for an identity's address without that identity's private key (§79/§80, the
+    /// transport-hijack defence). Empty when unsigned.
+    descriptor_sig: Vec<u8>,
+    /// This node's own Sybil-admission proof (spec §L3), attached to its `Announce` when it joins. Empty
+    /// when admission is not in use for this deployment — a peer that requires admission then rejects it
+    /// (fail closed), exactly as an empty `identity`/`descriptor_sig` is rejected under
+    /// `require_self_certified_membership`.
+    admission_proof: Vec<u8>,
+    /// This node's Sybil admission policy (spec §L3): checked against a peer's announced proof when
+    /// `config.require_admission` is set. `None` even with the flag set means this node enforces the check
+    /// but has no policy to check *against* — it then rejects every peer (fail closed, never fail open)
+    /// rather than silently admitting for want of configuration.
+    admission_policy: Option<Box<dyn AdmissionPolicy>>,
+    /// The membership view: cell coordinate → announced info (public keys, capabilities), learned by
+    /// flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
+    members: BTreeMap<Triple, Vec<u8>>,
+}
+
+impl Membership {
+    /// Whether an announced `proof` admits a joiner under this node's installed policy (spec §L3, §7.8).
+    /// **Fails closed**: with no policy installed this returns `false`, so a node that *requires* admission
+    /// but was handed no policy rejects every peer rather than silently admitting for want of
+    /// configuration. The caller gates this on `config.require_admission`.
+    fn admits(&self, challenge: &[u8], proof: &[u8]) -> bool {
+        self.admission_policy
+            .as_deref()
+            .is_some_and(|policy| policy.admits(challenge, proof))
+    }
+}
+
 /// The base overlay node engine, generic over the cell's field `F`.
 pub struct OverlayNode<F: Field> {
     coord: Point<F>,
@@ -292,27 +338,11 @@ pub struct OverlayNode<F: Field> {
     /// table (§L1). Factored into a [`Router`] collaborator (audit #125 decompose); the facade orchestrates
     /// the frame flow, the router owns the addressing state and the `RouteHier` forwarding decision.
     router: Router<F>,
-    /// This node's long-term identity bytes (spec §L0): its hybrid **signature public-key bundle**
-    /// `Ed25519(32) ‖ ML-DSA-65(1952)`, which both derives its self-certifying address `hier`
-    /// (`MapToPoint`) and verifies its descriptor signature. Carried in this node's `Announce`. Empty
-    /// when self-certification is not in use (the address is trusted without proof).
-    identity: Vec<u8>,
-    /// The signature over this node's descriptor `coord ‖ hier ‖ id`, produced once by its hybrid
-    /// signing key at deployment (the secret never enters the engine). Carried in the `Announce` and
-    /// checked by peers under self-certified membership, so an attacker cannot announce a *different*
-    /// transport coordinate for an identity's address without that identity's private key (§79/§80,
-    /// the transport-hijack defence). Empty when unsigned.
-    descriptor_sig: Vec<u8>,
-    /// This node's own Sybil-admission proof (spec §L3), attached to its `Announce` when it
-    /// joins. Empty when admission is not in use for this deployment — a peer that requires
-    /// admission then rejects it (fail closed), exactly as an empty `identity`/`descriptor_sig`
-    /// is rejected under `require_self_certified_membership`.
-    admission_proof: Vec<u8>,
-    /// This node's Sybil admission policy (spec §L3): checked against a peer's announced proof
-    /// when `config.require_admission` is set. `None` even with the flag set means this node
-    /// enforces the check but has no policy to check *against* — it then rejects every peer
-    /// (fail closed, never fail open) rather than silently admitting for want of configuration.
-    admission_policy: Option<Box<dyn AdmissionPolicy>>,
+    /// The membership concern — this node's own join credentials (identity bundle, signed descriptor,
+    /// admission proof), the [`AdmissionPolicy`] it checks others against, and the learned key view of the
+    /// cell. Factored into a [`Membership`] collaborator (audit #125 decompose); the facade orchestrates
+    /// the JOIN/Announce frame flow.
+    membership: Membership,
     config: Config,
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
@@ -348,9 +378,6 @@ pub struct OverlayNode<F: Field> {
     /// survivor answers a lookup (a lookup to a *down* primary reroutes through the self-healing table,
     /// §6.7). Factored into a [`Store`] collaborator (audit #125 decompose); the facade orchestrates.
     store: Store,
-    /// The membership view: cell coordinate → announced info (public keys, capabilities), learned
-    /// by flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
-    members: BTreeMap<Triple, Vec<u8>>,
     /// The current epoch, driven by the flooded beacon (adopt-max, spec §L3). Epoch-derived
     /// rendezvous/shapes rotate as it advances.
     epoch: Epoch,
@@ -457,10 +484,7 @@ impl<F: Field> OverlayNode<F> {
         Self {
             coord,
             router: Router::new(coord),
-            identity: Vec::new(),
-            descriptor_sig: Vec::new(),
-            admission_proof: Vec::new(),
-            admission_policy: None,
+            membership: Membership::default(),
             config,
             started_at: Instant::default(),
             peers,
@@ -472,7 +496,6 @@ impl<F: Field> OverlayNode<F> {
             witnessed: BTreeMap::new(),
             attested: BTreeMap::new(),
             store: Store::default(),
-            members: BTreeMap::new(),
             epoch: Epoch::ZERO,
             observer,
             activity: BTreeMap::new(),
@@ -781,7 +804,7 @@ impl<F: Field> OverlayNode<F> {
     /// actually `id`'s descent chain ([`fanos_primitives::address_point`]); a deployment sets both together.
     #[must_use]
     pub fn with_identity(mut self, id: Vec<u8>) -> Self {
-        self.identity = id;
+        self.membership.identity = id;
         self
     }
 
@@ -793,8 +816,8 @@ impl<F: Field> OverlayNode<F> {
     /// once and installs the result here.
     #[must_use]
     pub fn with_signed_descriptor(mut self, id: Vec<u8>, sig: Vec<u8>) -> Self {
-        self.identity = id;
-        self.descriptor_sig = sig;
+        self.membership.identity = id;
+        self.membership.descriptor_sig = sig;
         self
     }
 
@@ -807,7 +830,7 @@ impl<F: Field> OverlayNode<F> {
     /// peer still accepts.
     #[must_use]
     pub fn with_admission_proof(mut self, proof: Vec<u8>) -> Self {
-        self.admission_proof = proof;
+        self.membership.admission_proof = proof;
         self
     }
 
@@ -817,7 +840,7 @@ impl<F: Field> OverlayNode<F> {
     /// need not install a policy, only [`with_admission_proof`](Self::with_admission_proof).
     #[must_use]
     pub fn with_admission_policy(mut self, policy: Box<dyn AdmissionPolicy>) -> Self {
-        self.admission_policy = Some(policy);
+        self.membership.admission_policy = Some(policy);
         self
     }
 
@@ -948,7 +971,8 @@ impl<F: Field> OverlayNode<F> {
             .filter(|(_, p)| p.last_seen.is_some())
             .filter_map(|(&c, _)| Point::<F>::new(c).map(|pt| pt.index()))
             .chain(
-                self.members
+                self.membership
+                    .members
                     .keys()
                     .filter_map(|&c| Point::<F>::new(c).map(|pt| pt.index())),
             )
@@ -1149,14 +1173,14 @@ impl<F: Field> OverlayNode<F> {
             &announce_body(
                 coord,
                 &self.router.address,
-                &self.identity,
-                &self.descriptor_sig,
-                &self.admission_proof,
+                &self.membership.identity,
+                &self.membership.descriptor_sig,
+                &self.membership.admission_proof,
                 &info,
             ),
         );
         let effects = self.flood(&frame);
-        self.members.insert(coord, info);
+        self.membership.members.insert(coord, info);
         effects
     }
 
@@ -1183,11 +1207,7 @@ impl<F: Field> OverlayNode<F> {
         // `Announce` is flooded, so whoever forwarded it to us need not be the joiner itself.
         if self.config.require_admission {
             let challenge = admission_challenge(coord, self.epoch);
-            let admitted = self
-                .admission_policy
-                .as_deref()
-                .is_some_and(|policy| policy.admits(&challenge, &proof));
-            if !admitted {
+            if !self.membership.admits(&challenge, &proof) {
                 return alloc::vec![Effect::Send {
                     to: coord,
                     frame: encode_error(ProtocolError::SybilReject),
@@ -1211,10 +1231,10 @@ impl<F: Field> OverlayNode<F> {
         // First sight only. A repeat must NOT overwrite the stored key bundle — otherwise any peer
         // could silently replace a member's advertised keys in our local view (and suppress the
         // re-flood, diverging the cell). Ignore repeats entirely; the monotone guard ends the flood.
-        if self.members.contains_key(&coord) {
+        if self.membership.members.contains_key(&coord) {
             return Vec::new();
         }
-        self.members.insert(coord, info.clone());
+        self.membership.members.insert(coord, info.clone());
         // Seed the hierarchical routing table: this overlay address is reachable via `coord`. A
         // descended sub-cell member thus becomes routable cell-wide from its announcement alone (§L1);
         // a depth-1 announcer adds its own direct entry, so `send_hier` also delivers within one plane.
@@ -1257,7 +1277,7 @@ impl<F: Field> OverlayNode<F> {
 
     /// The current membership view (coordinate → announced info), for onion routing / observation.
     pub fn members(&self) -> impl Iterator<Item = (Triple, &[u8])> + '_ {
-        self.members.iter().map(|(&c, i)| (c, i.as_slice()))
+        self.membership.members.iter().map(|(&c, i)| (c, i.as_slice()))
     }
 
     /// The current beacon epoch.
