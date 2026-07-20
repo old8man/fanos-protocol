@@ -844,11 +844,50 @@ impl<F: Field> OverlayNode<F> {
         Effect::Send { to: actual, frame }
     }
 
-    /// The DHT storage address of `key`: the digest and the responsible point (spec §L4).
+    /// The DHT storage address of `key`: the digest and the **ideal** responsible point (spec §L4). The
+    /// *actual* responsible node is [`responsible_point`](Self::responsible_point) applied to this ideal —
+    /// the nearest occupied point — since a real cell rarely occupies every point exactly.
     fn address_of(key: &[u8]) -> ([u8; DIGEST], Triple) {
         // The one storage-address rule (`fanos_primitives`): digest keys the store, point routes to it —
         // both on the STORAGE domain, so they can never drift to different hashes (audit C7).
         (storage_digest(key), storage_point::<F>(key).coords())
+    }
+
+    /// The node responsible for an ideal storage point: the nearest **occupied** point at or after
+    /// `ideal`'s canonical index, wrapping the ring — consistent hashing on projective coordinates
+    /// (spec §L0 "the responsible node is the nearest occupied point"). On a full cell this is `ideal`
+    /// itself; on a sparse or churning cell — the *normal* condition, since independent VRF placement
+    /// covers only a fraction of a plane's points — it routes the key to a live member instead of a
+    /// never-occupied point where a `Put`/`Get` would be a silent send-to-nobody (audit #123). The
+    /// occupied set is this node plus every announced member, so all nodes sharing a membership view
+    /// resolve the same responsible node.
+    fn responsible_point(&self, ideal: Triple) -> Triple {
+        let Some(ideal_pt) = Point::<F>::new(ideal) else {
+            return ideal; // not a canonical point — route as-is
+        };
+        let ideal_idx = ideal_pt.index();
+        // Occupied points by canonical index: this node, every cell peer we have heard from (its
+        // algebraic slot is actually filled by a live node — liveness populates this even before any
+        // JOIN/Announce), and every announced member. A NEVER-occupied point is simply absent, so it
+        // is skipped; a heard-then-crashed occupant is handled downstream by `routed_send`'s reroute.
+        let mut occupied: BTreeSet<usize> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.last_seen.is_some())
+            .filter_map(|(&c, _)| Point::<F>::new(c).map(|pt| pt.index()))
+            .chain(
+                self.members
+                    .keys()
+                    .filter_map(|&c| Point::<F>::new(c).map(|pt| pt.index())),
+            )
+            .collect();
+        occupied.insert(self.coord.index());
+        // Successor on the index ring: the smallest occupied index >= ideal, else wrap to the smallest.
+        occupied
+            .range(ideal_idx..)
+            .next()
+            .or_else(|| occupied.iter().next())
+            .map_or(ideal, |&i| Point::<F>::at(i).coords())
     }
 
     /// Whether the local DHT slice will admit `(digest, value_len)` under the A4 DoS caps: the value is
@@ -863,7 +902,8 @@ impl<F: Field> OverlayNode<F> {
 
     /// `Command::Put` — store a value at its responsible point and replicate it across the cell.
     fn on_put(&mut self, key: &[u8], value: Vec<u8>) -> Vec<Effect> {
-        let (digest, primary) = Self::address_of(key);
+        let (digest, ideal) = Self::address_of(key);
+        let primary = self.responsible_point(ideal);
         if primary == self.coord.coords() {
             // We are the responsible node. Refuse (over cap / over-size) without replicating or claiming
             // it stored; otherwise replicate to the cell, ack ourselves, and store (moving the value in).
@@ -890,7 +930,8 @@ impl<F: Field> OverlayNode<F> {
     /// empty after churn while replicas still hold it. The in-flight query is tracked in
     /// [`pending_gets`](Self::pending_gets); [`on_value`](Self::on_value) and the heartbeat sweep drive it.
     fn on_get(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
-        let (digest, primary) = Self::address_of(key);
+        let (digest, ideal) = Self::address_of(key);
+        let primary = self.responsible_point(ideal);
         if let Some(value) = self.store.get(&digest) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,

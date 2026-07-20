@@ -7,7 +7,7 @@
 use fanos_field::F2;
 use fanos_geometry::fano;
 use fanos_primitives::{hash::label, map_to_point};
-use fanos_runtime::{Command, Config, Duration};
+use fanos_runtime::{Command, Config, Duration, OverlayNode};
 use fanos_sim::{Sim, spawn_cell};
 
 /// The responsible point index and coordinate for `key` (the `MapToPoint(H(key))` address).
@@ -23,6 +23,64 @@ fn established(seed: u64) -> (Sim, Vec<[u32; 3]>) {
     sim.inject_all(&Command::StartHeartbeat);
     sim.run_for(Duration::from_millis(2000));
     (sim, cell)
+}
+
+#[test]
+fn a_put_to_an_unoccupied_ideal_point_still_routes_and_is_retrievable() {
+    // #123: independent VRF placement rarely fills every projective point, so a key's ideal storage
+    // point MapToPoint(H(k)) is frequently UNOCCUPIED. With the old exact-match responsibility, such a
+    // Put/Get was a silent send-to-nobody; with nearest-occupied resolution (consistent hashing on the
+    // point index, spec §L0) it routes to a live member and round-trips. Spawn a SPARSE cell — 3 of the
+    // 7 Fano points — and round-trip a batch of keys, proving (a) at least one key's ideal point is
+    // unoccupied, and (b) every key is still retrievable (the old code would have lost exactly those).
+    const N: usize = 24;
+    let occupied_idx = [0usize, 2, 5];
+    let mut sim = Sim::new(123);
+    let nodes: Vec<[u32; 3]> = occupied_idx
+        .iter()
+        .map(|&i| sim.add(Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default()))))
+        .collect();
+    sim.inject_all(&Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(2000)); // liveness: each occupant hears the other two
+
+    let keys: Vec<Vec<u8>> = (0..N).map(|k| format!("resource-{k}").into_bytes()).collect();
+    let unoccupied_ideals = keys
+        .iter()
+        .filter(|k| !occupied_idx.contains(&map_to_point::<F2>(label::STORAGE, k).index()))
+        .count();
+
+    let putter = nodes[0];
+    for (k, key) in keys.iter().enumerate() {
+        sim.inject(
+            putter,
+            Command::Put {
+                key: key.clone(),
+                value: format!("payload-{k}").into_bytes(),
+            },
+        );
+    }
+    sim.run_for(Duration::from_millis(3000)); // every Put routes to its nearest occupant + replicates
+
+    let getter = nodes[1];
+    for key in &keys {
+        sim.inject(getter, Command::Get { key: key.clone() });
+    }
+    sim.run_for(Duration::from_millis(3000));
+
+    let retrieved = sim
+        .report()
+        .retrievals()
+        .filter(|(_, _, v)| v.is_some())
+        .count();
+    assert!(
+        unoccupied_ideals > 0,
+        "non-vacuity: at least one key's ideal point must be unoccupied (got {unoccupied_ideals}/{N})"
+    );
+    assert_eq!(
+        retrieved, N,
+        "every key round-trips despite {unoccupied_ideals} unoccupied ideal points — the old exact-match \
+         would have lost exactly those (retrieved {retrieved}/{N})"
+    );
 }
 
 #[test]
