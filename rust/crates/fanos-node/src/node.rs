@@ -283,15 +283,14 @@ mod tests {
             b.shutdown();
             b = make_b().await.unwrap();
         }
-        // b learned a via bootstrap; a learns b's address when b dials (the driver registers it).
-        a.directory().insert(b.address(), b.local_addr());
 
         b.command(Command::Send {
             to: a_addr,
             payload: b"hello over quic".to_vec(),
         });
 
-        // a should observe the delivery.
+        // a should observe the delivery. (No manual directory insert of b: b dialed in, and under
+        // self-certification a's accept loop registered b's proven coordinate → source address itself.)
         let mut a = a;
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -305,6 +304,73 @@ mod tests {
         .await
         .expect("timed out waiting for delivery");
         assert_eq!(delivered.as_deref(), Some(b"hello over quic".as_slice()));
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_dialed_in_peer_is_routable_in_reverse_via_self_certifying_discovery() {
+        // The reachability property (#119): a node that only ever *received* a connection can originate
+        // traffic BACK to that peer, because under self-certification its accept loop registers the peer's
+        // VRF-proven coordinate → source address (no shared directory, no manual insert). Without that
+        // reverse discovery a real deployment forms a star — a dialled-in peer is unreachable in reverse.
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut a = Node::start::<F2>(NodeConfig { listen: loopback, ..NodeConfig::default() })
+            .await
+            .unwrap();
+        let a_addr = a.address();
+        let a_net = a.local_addr();
+
+        // b bootstraps ONLY a; a is given nothing about b.
+        let make_b = || {
+            Node::start::<F2>(NodeConfig {
+                listen: loopback,
+                bootstrap: vec![crate::config::Peer { coord: a_addr, addr: a_net }],
+                ..NodeConfig::default()
+            })
+        };
+        let mut b = make_b().await.unwrap();
+        while b.address() == a_addr {
+            b.shutdown();
+            b = make_b().await.unwrap();
+        }
+        let b_addr = b.address();
+
+        // b dials in (its first Send establishes the connection a learns it on). Drain a's notification of
+        // that inbound payload so we know the connection — and thus the reverse registration — is in place.
+        b.command(Command::Send { to: a_addr, payload: b"knock".to_vec() });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match a.next_notification().await {
+                    Some(Notification::Delivered { .. }) | None => break,
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("a received b's inbound knock");
+
+        // Now the reverse direction: a originates to b. a never bootstrapped b — it can only route there
+        // if it learned b's address from the inbound connection.
+        a.command(Command::Send { to: b_addr, payload: b"reply over quic".to_vec() });
+        let mut b = b;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match b.next_notification().await {
+                    Some(Notification::Delivered { payload, .. }) => break Some(payload),
+                    Some(_) => {}
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the reverse delivery");
+        assert_eq!(
+            got.as_deref(),
+            Some(b"reply over quic".as_slice()),
+            "a routed back to a peer it only ever received a connection from (self-certifying reverse discovery)"
+        );
 
         a.shutdown();
         b.shutdown();

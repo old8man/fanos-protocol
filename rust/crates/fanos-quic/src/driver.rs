@@ -740,13 +740,20 @@ async fn transport_loop(
     mut send_rx: mpsc::UnboundedReceiver<SendRequest>,
 ) {
     while let Some(SendRequest { to, frame }) = send_rx.recv().await {
-        // Unresolved coordinate → drop, exactly as the simulator drops to an unknown node — but count
-        // and log it so the drop is observable, not silent (a symptom of a stale/colliding address).
-        let Some(addr) = directory.resolve(to) else {
+        // Resolve `to` to a live connection. If the directory knows an address, reuse-or-dial it; otherwise
+        // fall back to a connection the peer already dialed IN on — a live cached connection *is*
+        // reachability, so a peer we never learned an address for is still routable in reverse (#119). Only
+        // when neither exists is the coordinate genuinely unroutable: drop, counted + logged so the drop is
+        // observable (a symptom of a stale/colliding address), never silent.
+        let conn = if let Some(addr) = directory.resolve(to) {
+            get_or_connect(&t, to, addr).await
+        } else if let Some(cached_conn) = cached(&t.conns, to) {
+            Some(cached_conn)
+        } else {
             directory.note_unresolved_drop(to);
-            continue;
+            None
         };
-        let Some(conn) = get_or_connect(&t, to, addr).await else {
+        let Some(conn) = conn else {
             continue;
         };
         if let Ok(mut stream) = conn.open_uni().await
@@ -851,6 +858,12 @@ async fn accept_loop(
                 };
                 coord
             };
+            // Cache the connection keyed by the peer's coordinate. This is what makes a dialed-in peer
+            // routable in reverse (#119): the transport reuses this live connection to originate traffic
+            // back to `from`, even though we never learned its listen address (its HELLO/source address is
+            // an ephemeral client port, not where it accepts). No directory entry is written — a live
+            // connection *is* the reachability, and inventing a directory address from the source port
+            // would be wrong (and, in a shared directory, would clobber the peer's real listen address).
             if let Ok(mut map) = conns.lock() {
                 map.insert(from, conn.clone());
             }
