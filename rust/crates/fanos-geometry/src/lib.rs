@@ -17,8 +17,9 @@
 //! The base cell `PG(2, 2)` (the Fano plane) has a dedicated [`fano`] module whose incidence
 //! and mediator tables are computed at compile time.
 //!
-//! The crate is `#![no_std]`; the `alloc`/`std` features currently only gate downstream
-//! conveniences and are off the arithmetic path.
+//! The crate is `#![no_std]` and its arithmetic core (points, lines, incidence, mediator tables)
+//! needs no allocator. The `alloc` feature gates the heap-backed [`hierarchy`] module — its
+//! `HierAddr` is a `Vec`-of-points path — so a pure `--no-default-features` build stays allocator-free.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -29,6 +30,9 @@ extern crate alloc;
 pub mod element;
 pub mod fano;
 mod flag;
+/// The recursive cell hierarchy (spec §L1). Heap-backed (`HierAddr` is a `Vec` path), so it is
+/// gated behind the `alloc` feature — a pure `--no-default-features` build excludes it.
+#[cfg(feature = "alloc")]
 pub mod hierarchy;
 mod plane;
 
@@ -36,6 +40,7 @@ pub use element::{
     TRIPLE_WIRE_LEN, Triple, canonicalize, cross, decode_triple, dot, encode_triple,
 };
 pub use flag::Flag;
+#[cfg(feature = "alloc")]
 pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, next_hop, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};
 
