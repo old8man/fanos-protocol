@@ -62,6 +62,69 @@ impl fmt::Debug for ServiceParams {
     }
 }
 
+/// The clearnet-exit parameters a node needs to run the `exit` role (roadmap §3): the DIAULOS service
+/// identity clients dial the exit at, plus the [`ExitPolicy`](crate::ExitPolicy) bounding what it relays
+/// to. Like a service member's key ([`ServiceParams`]) the identity is carried as a **seed** — the exit
+/// regenerates its `StaticKeypair` in memory from it, deterministically, so its published public stays
+/// stable across restarts (clients dial a fixed identity). `allowed_ports` empty means any port — an open
+/// relay, which the operator opts into explicitly rather than by default.
+#[derive(Clone)]
+pub struct ExitParams {
+    /// The seed the exit regenerates its DIAULOS service `StaticKeypair` from. Secret material.
+    pub seed: [u8; 32],
+    /// The destination ports this exit will relay to; empty = any port.
+    pub allowed_ports: Vec<u16>,
+}
+
+// The seed regenerates the exit's service key, so it is redacted from `Debug` (which `NodeConfig` derives).
+impl fmt::Debug for ExitParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExitParams")
+            .field("seed", &"<redacted>")
+            .field("allowed_ports", &self.allowed_ports)
+            .finish()
+    }
+}
+
+impl ExitParams {
+    /// Parse exit parameters from a `key = value` text file: `seed` (64 hex chars, the service-key seed)
+    /// and `ports` (comma-separated destination ports; omitted or empty = any port).
+    ///
+    /// # Errors
+    /// [`NodeError::Config`] on a malformed line, an unknown key, or a bad value.
+    pub fn from_config_str(text: &str) -> Result<Self, NodeError> {
+        let mut seed: Option<[u8; 32]> = None;
+        let mut allowed_ports: Vec<u16> = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let l = raw.split('#').next().unwrap_or("").trim();
+            if l.is_empty() {
+                continue;
+            }
+            let (key, value) = l.split_once('=').ok_or_else(|| {
+                NodeError::Config(format!("exit config line {}: expected `key = value`", n + 1))
+            })?;
+            match key.trim() {
+                "seed" => seed = Some(parse_seed_hex(value.trim())?),
+                "ports" => {
+                    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                        allowed_ports.push(part.parse().map_err(|_| {
+                            NodeError::Config(format!("bad exit port '{part}'"))
+                        })?);
+                    }
+                }
+                other => {
+                    return Err(NodeError::Config(format!("unknown exit config key '{other}'")));
+                }
+            }
+        }
+        let seed = seed.ok_or_else(|| NodeError::Config("exit config missing `seed`".to_owned()))?;
+        Ok(Self {
+            seed,
+            allowed_ports,
+        })
+    }
+}
+
 impl ServiceParams {
     /// Parse service parameters from a `key = value` text file — the out-of-band provisioning a service
     /// operator hands each line member. Recognised keys: `seed` (64 hex chars: the 32-byte member-key
@@ -276,6 +339,10 @@ pub struct NodeConfig {
     /// composes a [`ServiceNode`](crate::ServiceNode) hosting one member of a service line — see
     /// [`ServiceParams`]. `None` (the default) hosts no service.
     pub service: Option<ServiceParams>,
+    /// The clearnet-exit parameters. Required by (and only used with) the `exit` role: `Some(..)` runs a
+    /// [`serve_exit`](crate::serve_exit) relay under a stable service identity — see [`ExitParams`]. `None`
+    /// (the default) runs no exit.
+    pub exit: Option<ExitParams>,
     /// PROTEUS censorship-resistance (§13.4). `Some(secret)` shapes every wire frame with the shared
     /// community secret so the transport carries no static FANOS signature, and the shape **rotates each
     /// epoch** (the moving-target defence); `None` (the default) is plaintext QUIC. All peers that must
@@ -293,6 +360,7 @@ impl Default for NodeConfig {
             start_heartbeat: true,
             beacon: None,
             service: None,
+            exit: None,
             proteus_secret: None,
         }
     }
@@ -405,6 +473,30 @@ mod tests {
         // The seed is redacted from Debug (it regenerates the member secret).
         assert!(format!("{p:?}").contains("<redacted>"));
         assert!(!format!("{p:?}").contains("0011"));
+    }
+
+    #[test]
+    fn parses_exit_params_from_a_config() {
+        let p = ExitParams::from_config_str(&format!(
+            "# a web-only exit\nseed = {}\nports = 80, 443\n",
+            "cd".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(p.seed[0], 0xcd);
+        assert_eq!(p.allowed_ports, vec![80, 443]);
+        assert!(format!("{p:?}").contains("<redacted>"));
+        // `ports` omitted = any port (empty list).
+        let open = ExitParams::from_config_str(&format!("seed = {}", "ab".repeat(32))).unwrap();
+        assert!(open.allowed_ports.is_empty());
+        // Missing seed / bad port / unknown key rejected.
+        assert!(ExitParams::from_config_str("ports = 80").is_err());
+        assert!(
+            ExitParams::from_config_str(&format!("seed = {}\nports = notaport", "ab".repeat(32)))
+                .is_err()
+        );
+        assert!(
+            ExitParams::from_config_str(&format!("seed = {}\nbogus = 1", "ab".repeat(32))).is_err()
+        );
     }
 
     #[test]

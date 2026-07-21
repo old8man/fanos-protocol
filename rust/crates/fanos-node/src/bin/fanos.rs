@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use fanos_field::F2;
 use fanos_node::{
-    AnonRouteParams, BeaconSeed, Epoch, FanosDialer, Node, NodeConfig, NodeError, NodeResolver,
-    Peer, RoleSet, ServiceParams, build_cell_mix_directory, identity, serve_proxy,
+    AnonRouteParams, BeaconSeed, Epoch, ExitParams, FanosDialer, Node, NodeConfig, NodeError,
+    NodeResolver, Peer, RoleSet, ServiceParams, build_cell_mix_directory, identity, serve_proxy,
 };
 use fanos_runtime::Notification;
 use tokio::net::TcpListener;
@@ -77,6 +77,11 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         // imply the `service` role — providing service parameters is the operator asking to host it.
         config.service = Some(ServiceParams::from_config_str(&std::fs::read_to_string(path)?)?);
         config.roles.service = true;
+    }
+    if let Some(path) = flag(args, "--exit") {
+        // Provision the clearnet exit (service-key seed + optional port policy) and imply the `exit` role.
+        config.exit = Some(ExitParams::from_config_str(&std::fs::read_to_string(path)?)?);
+        config.roles.exit = true;
     }
     if has_flag(args, "--no-heartbeat") {
         config.start_heartbeat = false;
@@ -452,8 +457,8 @@ fn print_help() {
          \n\
          USAGE:\n\
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
-         \x20             [--role relay,storage,service,exit] [--service FILE] [--no-heartbeat] \\\n\
-         \x20             [--proteus-secret SECRET]\n\
+         \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
+         \x20             [--no-heartbeat] [--proteus-secret SECRET]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
@@ -472,6 +477,11 @@ fn print_help() {
          \x20 line = x:y:z,x:y:z,...     the line's member coordinates, in seal order\n\
          \x20 threshold = T             members that must cooperate to serve an intro\n\
          \x20 (providing it implies the `service` role)\n\
+         \n\
+         EXIT FILE (--exit, clearnet exit relay): a `key = value` file with\n\
+         \x20 seed = <64 hex>            the exit's service-identity seed (secret; clients dial this key)\n\
+         \x20 ports = 80,443            destination ports to allow (omit = ANY port — an open relay)\n\
+         \x20 (providing it implies the `exit` role)\n\
          \n\
          EXAMPLES:\n\
          \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\
@@ -510,5 +520,20 @@ mod tests {
         let sp = config.service.expect("service parameters were read");
         assert_eq!(sp.line, vec![[1, 0, 0], [0, 1, 0]]);
         assert_eq!(sp.threshold, 1);
+    }
+
+    #[test]
+    fn exit_flag_provisions_the_exit_role() {
+        // `--exit <file>` reads the exit parameters and implies the `exit` role.
+        let path = std::env::temp_dir().join(format!("fanos-exit-{}.conf", std::process::id()));
+        std::fs::write(&path, format!("seed = {}\nports = 80, 443\n", "ab".repeat(32))).unwrap();
+
+        let args = vec!["--exit".to_owned(), path.to_string_lossy().into_owned()];
+        let config = node_config_from_args(&args).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(config.roles.exit, "--exit implies the exit role");
+        let ep = config.exit.expect("exit parameters were read");
+        assert_eq!(ep.allowed_ports, vec![80, 443]);
     }
 }

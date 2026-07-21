@@ -35,7 +35,7 @@ pub mod service_node;
 pub mod threshold_service;
 
 pub use cell_node::CellNode;
-pub use config::{BeaconParams, NodeConfig, Peer, RoleSet, ServiceParams};
+pub use config::{BeaconParams, ExitParams, NodeConfig, Peer, RoleSet, ServiceParams};
 pub use diaulos::{
     AnonRouteParams, FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service,
     serve, serve_rpc,

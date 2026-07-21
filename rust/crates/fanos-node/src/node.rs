@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 
 use fanos_aphantos::ThresholdRouter;
+use fanos_diaulos::StaticKeypair;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_onoma::{Address, Epoch, lookup_key};
@@ -18,7 +19,10 @@ use fanos_keygen::BeaconNode;
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
 use tokio::task::JoinHandle;
 
-use crate::{CellNode, OverlayBeaconNode, ServiceNode, ThresholdService, spawn_mix_publisher};
+use crate::{
+    CellNode, ExitPolicy, OverlayBeaconNode, ServiceNode, ThresholdService, serve_exit,
+    spawn_mix_publisher,
+};
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::error::NodeError;
@@ -64,6 +68,24 @@ fn service_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<Triple>, 
         )));
     }
     Ok(Some((params.seed, params.line.clone(), params.threshold)))
+}
+
+/// Validate the `exit` role's parameters, returning the service-key seed and allowed-port list to run
+/// [`serve_exit`] — or `None` when the role is off. The role requires its parameters (there is no service
+/// identity to run without them). Validated here so bad provisioning fails [`Node::start`].
+#[allow(clippy::type_complexity)]
+fn exit_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<u16>)>, NodeError> {
+    if !config.roles.exit {
+        return Ok(None);
+    }
+    let params = config.exit.as_ref().ok_or_else(|| {
+        NodeError::Config(
+            "the exit role bridges to the clearnet and needs exit parameters (a service-key seed and \
+             optional port policy)"
+                .to_owned(),
+        )
+    })?;
+    Ok(Some((params.seed, params.allowed_ports.clone())))
 }
 
 /// A running FANOS node.
@@ -133,6 +155,8 @@ impl Node {
         // bad provisioning fails `start` here rather than inside the infallible engine builder; the member
         // key seed is then carried into the builder (the secret is regenerated there, in memory).
         let service = service_params(&config)?;
+        // Validate the exit role's parameters up front too (it spawns its relay after the node is up).
+        let exit = exit_params(&config)?;
         let handle = spawn_self_certifying_persistent_on::<F>(
             config.listen,
             &credentials,
@@ -197,6 +221,20 @@ impl Node {
         // Keep the relay's onion key live in the mix directory for as long as it runs: publish the genesis
         // key at once, then republish each epoch the beacon advances to (audit #54; E4∩E5).
         let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), address, onion_seed));
+
+        // The exit role runs a clearnet relay on this node's client: a stable, seed-derived DIAULOS service
+        // identity anonymous clients dial to reach the ordinary internet, bounded by the port policy. The
+        // per-session handshake keys are fresh OS entropy (forward-secure); only the service identity is
+        // pinned to the seed so its published public stays stable across restarts.
+        if let Some((seed, allowed_ports)) = exit {
+            let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(&seed));
+            serve_exit(
+                handle.client(),
+                keypair,
+                SeedRng::from_seed(&os_entropy_32()?),
+                ExitPolicy::new(allowed_ports),
+            );
+        }
 
         if config.start_heartbeat {
             handle.command(Command::StartHeartbeat);
@@ -301,7 +339,7 @@ impl Node {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::config::{BeaconParams, NodeConfig, ServiceParams};
+    use crate::config::{BeaconParams, ExitParams, NodeConfig, ServiceParams};
     use fanos_field::F2;
 
     #[tokio::test]
@@ -448,6 +486,47 @@ mod tests {
         })
         .await
         .expect("a service node with valid parameters starts");
+        assert!(node.health().local_addr.port() > 0, "endpoint bound");
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_exit_role_requires_exit_parameters() {
+        // The exit role bridges to the clearnet under a service identity; without its parameters there is
+        // nothing to run, so the role is refused rather than silently doing nothing.
+        let started = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            roles: RoleSet {
+                exit: true,
+                ..RoleSet::default()
+            },
+            ..NodeConfig::default()
+        })
+        .await;
+        assert!(
+            matches!(started, Err(NodeError::Config(_))),
+            "the exit role without exit parameters is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_node_starts_and_runs_the_relay() {
+        // Valid exit parameters bring the node up and spawn its clearnet relay (the serve_exit/dial_exit
+        // data path is exercised over real QUIC in `tests/exit_quic.rs`).
+        let node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            roles: RoleSet {
+                exit: true,
+                ..RoleSet::default()
+            },
+            exit: Some(ExitParams {
+                seed: [0xe0; 32],
+                allowed_ports: vec![80, 443],
+            }),
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("an exit node with valid parameters starts");
         assert!(node.health().local_addr.port() > 0, "endpoint bound");
         node.shutdown();
     }
