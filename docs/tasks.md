@@ -18,9 +18,6 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **C ABI — service hosting** (#113, M9) — the last §11.2 surface: `fanos_service_host` + an accept model
-  (`fanos_service_accept`) over the closure-based `serve`, so an embedder can *host* a `.fanos` service (not
-  just dial one) across the blocking FFI boundary.
 - **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP (OS TUN device; verification needs a TUN harness).
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
@@ -34,6 +31,13 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**C ABI — service hosting → the §11.2 surface is COMPLETE** (#113, M9) — `fanos_service_host(node, seed,
+addr_out, cap)` derives a stable service identity from a seed, hosts it (forwarding each accepted DIAULOS
+session onto an accept queue over the closure-based `serve`), publishes its descriptor, and returns the
+`.fanos` name; `fanos_service_accept` blocks for the next incoming `FanosStream*`; `fanos_service_free`.
+Verified over **real QUIC**: A hosts a service through the C ABI, B dials it by name, and a payload
+round-trips client→host→client entirely across the FFI. The C ABI now covers all §11.2 operations
+(lifecycle, storage, health, client streams, service hosting). ·
 **C ABI — hidden-service client streams** (#113, M9, §11.2) — `fanos_service_connect(node, "<addr>.fanos")`
 resolves the name over the overlay (`NodeResolver`) and dials a DIAULOS byte stream, returning an opaque
 owning `FanosStream*`; `fanos_stream_read`/`_write` (blocking, driving the async stream on the node's

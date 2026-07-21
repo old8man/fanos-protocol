@@ -31,6 +31,9 @@ typedef struct FanosNode FanosNode;
 /* Opaque hidden-service byte-stream handle. Must be freed before its node. */
 typedef struct FanosStream FanosStream;
 
+/* Opaque hosted-service handle. Must be freed before its node. */
+typedef struct FanosService FanosService;
+
 /* A node health/identity snapshot (spec §11.2 fanos_diagnose). */
 typedef struct FanosHealth {
     uint32_t coord[3];   /* the node's overlay coordinate [x, y, z] */
@@ -70,6 +73,20 @@ int fanos_stream_write(FanosStream *stream, const uint8_t *buf, size_t len);
 
 /* Close and free a stream (safe on NULL). Call before freeing the node. */
 void fanos_stream_free(FanosStream *stream);
+
+/* Host a hidden service whose identity derives from `seed` (seed_len bytes). Writes the service's
+ * "<addr>.fanos" name (NUL-terminated) into `addr_out` (capacity addr_out_cap, >= ~70). Returns an owning
+ * service handle, or NULL (bad argument / addr_out too small / publish failed). Free with
+ * fanos_service_free, before fanos_free. */
+FanosService *fanos_service_host(FanosNode *node, const uint8_t *seed, size_t seed_len,
+                                 char *addr_out, size_t addr_out_cap);
+
+/* Accept the next incoming client stream (blocking). Returns an owning stream, or NULL if the service
+ * stopped. Free the returned stream with fanos_stream_free. */
+FanosStream *fanos_service_accept(FanosService *service);
+
+/* Stop hosting and free a service (safe on NULL). Call before freeing the node. */
+void fanos_service_free(FanosService *service);
 
 /* Shut the node down and free its handle (safe on NULL). */
 void fanos_free(FanosNode *node);

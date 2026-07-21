@@ -23,11 +23,16 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::{ptr, slice};
 
+use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
 use fanos_field::F2;
-use fanos_node::{Epoch, Node, NodeConfig, NodeResolver, ServiceResolver, dial_service};
+use fanos_node::{
+    Epoch, Node, NodeConfig, NodeResolver, ServiceResolver, dial_service, publish_service, serve,
+};
+use fanos_onoma::Address;
 use fanos_pqcrypto::rng::SeedRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::{Handle, Runtime};
+use tokio::sync::mpsc;
 
 /// Success.
 pub const FANOS_OK: c_int = 0;
@@ -263,6 +268,132 @@ pub unsafe extern "C" fn fanos_service_connect(
         handle: handle.rt.handle().clone(),
         stream,
     }))
+}
+
+/// An owning handle to a hosted hidden service: the accept channel its incoming client streams arrive on,
+/// plus a runtime [`Handle`] to block on. Opaque to C. Its `.fanos` address is returned by
+/// [`fanos_service_host`]. Free with [`fanos_service_free`] (before its node).
+pub struct FanosService {
+    handle: Handle,
+    incoming: mpsc::Receiver<DuplexStream>,
+}
+
+/// Capacity of a hosted service's accept queue — incoming client streams buffer here until
+/// [`fanos_service_accept`] drains them.
+const ACCEPT_QUEUE: usize = 64;
+
+/// Host a CALYPSO hidden service on `node` (spec §11.2 `fanos_service_host`). The service identity is
+/// derived deterministically from `seed` (so its `.fanos` name is stable across restarts); the name is
+/// written NUL-terminated into `addr_out` (capacity `addr_out_cap` — at least ~70 bytes). The service's
+/// descriptor is published to the overlay so clients can [`fanos_service_connect`] to it by name. Returns an
+/// owning [`FanosService`] handle whose incoming streams are taken with [`fanos_service_accept`], or null on
+/// failure (null argument, `addr_out` too small, or the descriptor publish failed).
+///
+/// # Safety
+/// `node` must be a live [`fanos_open`] handle; `seed` must point to `seed_len` readable bytes; `addr_out`
+/// must point to `addr_out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_service_host(
+    node: *mut FanosNode,
+    seed: *const u8,
+    seed_len: usize,
+    addr_out: *mut c_char,
+    addr_out_cap: usize,
+) -> *mut FanosService {
+    // SAFETY: guarded by the null checks; the caller guarantees the buffer lengths.
+    let Some(handle) = (unsafe { node.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    let Some(seed_bytes) = (unsafe { as_slice(seed, seed_len) }) else {
+        return ptr::null_mut();
+    };
+    if addr_out.is_null() {
+        return ptr::null_mut();
+    }
+    // The deterministic service identity and its self-certifying `.fanos` name.
+    let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(seed_bytes));
+    let bundle = bundle_from_kem_public(keypair.public());
+    let name = Address::from_bundle(&bundle).to_name();
+    let name_bytes = name.as_bytes();
+    // Write the name plus a NUL terminator into the caller's buffer, or fail if it doesn't fit.
+    if name_bytes.len() + 1 > addr_out_cap {
+        return ptr::null_mut();
+    }
+    // SAFETY: `addr_out` has `addr_out_cap > name_bytes.len()` writable bytes; the source is a distinct str.
+    unsafe {
+        ptr::copy_nonoverlapping(name_bytes.as_ptr(), addr_out.cast::<u8>(), name_bytes.len());
+        *addr_out.add(name_bytes.len()) = 0;
+    }
+
+    // Host the service: each accepted client session is forwarded onto the accept queue (its own fresh OS
+    // entropy seeds every session's ephemeral keys), and the descriptor is published for name resolution.
+    let (tx, rx) = mpsc::channel::<DuplexStream>(ACCEPT_QUEUE);
+    let mut serve_seed = [0u8; 32];
+    if getrandom::fill(&mut serve_seed).is_err() {
+        return ptr::null_mut();
+    }
+    {
+        let _guard = handle.rt.enter();
+        serve(
+            handle.node.client(),
+            keypair,
+            SeedRng::from_seed(&serve_seed),
+            move |stream| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(stream).await;
+                }
+            },
+        );
+    }
+    let published = handle.rt.block_on(publish_service(
+        &handle.node.client(),
+        &bundle,
+        handle.node.address(),
+        Epoch::ZERO,
+        0,
+        &[],
+    ));
+    if published.is_err() {
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(FanosService {
+        handle: handle.rt.handle().clone(),
+        incoming: rx,
+    }))
+}
+
+/// Accept the next incoming client stream on a hosted `service`, blocking until one arrives. Returns an
+/// owning [`FanosStream`] handle, or null if the service has stopped (its node freed) or on a null argument.
+///
+/// # Safety
+/// `service` must be a live [`fanos_service_host`] handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_service_accept(service: *mut FanosService) -> *mut FanosStream {
+    // SAFETY: the caller guarantees `service` is null or a live handle.
+    let Some(service) = (unsafe { service.as_mut() }) else {
+        return ptr::null_mut();
+    };
+    match service.handle.block_on(service.incoming.recv()) {
+        Some(stream) => Box::into_raw(Box::new(FanosStream {
+            handle: service.handle.clone(),
+            stream,
+        })),
+        None => ptr::null_mut(),
+    }
+}
+
+/// Stop hosting and free a service handle (safe on null). Must be called before the owning node is freed.
+///
+/// # Safety
+/// `service` must be null or a handle from [`fanos_service_host`] that has not already been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_service_free(service: *mut FanosService) {
+    if service.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees `service` is a live, not-yet-freed handle.
+    drop(unsafe { Box::from_raw(service) });
 }
 
 /// Read up to `len` bytes from `stream` into `buf`, blocking until some data arrives. Returns the number of
@@ -573,6 +704,92 @@ mod tests {
             fanos_stream_free(ptr::null_mut()); // no-op
             let addr = CString::new("x.fanos").unwrap();
             assert!(fanos_service_connect(ptr::null_mut(), addr.as_ptr()).is_null());
+            // Host/accept/free also reject null, never deref.
+            let mut out = [0u8; 16];
+            assert!(
+                fanos_service_host(ptr::null_mut(), ptr::null(), 0, out.as_mut_ptr().cast::<c_char>(), out.len())
+                    .is_null()
+            );
+            assert!(fanos_service_accept(ptr::null_mut()).is_null());
+            fanos_service_free(ptr::null_mut()); // no-op
+        }
+    }
+
+    #[test]
+    fn host_a_service_and_serve_a_client_over_the_c_abi() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let _serial = serial();
+
+        // Node A hosts a service entirely through the C ABI.
+        let a = open_loopback();
+        // SAFETY: `a` is live.
+        let a_health = unsafe { fanos_diagnose(a) };
+        let [x, y, z] = a_health.coord;
+        let a_port = a_health.port;
+
+        let seed = b"ffi-host-seed-0123456789abcdef01"; // a stable service identity
+        let mut addr = [0u8; 128];
+        // SAFETY: `a` is live; `seed`/`addr` are valid for the call.
+        let service = unsafe {
+            fanos_service_host(a, seed.as_ptr(), seed.len(), addr.as_mut_ptr().cast::<c_char>(), addr.len())
+        };
+        assert!(!service.is_null(), "the service is hosted and its descriptor published");
+        // SAFETY: `fanos_service_host` wrote a NUL-terminated name into `addr`.
+        let name = unsafe { CStr::from_ptr(addr.as_ptr().cast::<c_char>()) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(name.rsplit_once('.').map(|(_, tld)| tld), Some("fanos"), "a .fanos name: {name}");
+
+        // Node B, bootstrapped to A, dials the hosted service by name.
+        let b_cfg = CString::new(format!(
+            "listen = 127.0.0.1:0\nbootstrap = {x}:{y}:{z}@127.0.0.1:{a_port}"
+        ))
+        .unwrap();
+        // SAFETY: `b_cfg` outlives the call.
+        let b = unsafe { fanos_open(b_cfg.as_ptr()) };
+        assert!(!b.is_null());
+
+        let cname = CString::new(name).unwrap();
+        let mut client = ptr::null_mut();
+        for _ in 0..20 {
+            // SAFETY: `b` is live; `cname` outlives the call.
+            client = unsafe { fanos_service_connect(b, cname.as_ptr()) };
+            if !client.is_null() {
+                break;
+            }
+            sleep(Duration::from_millis(250));
+        }
+        assert!(!client.is_null(), "B dialed the hosted service");
+
+        let msg = b"c-abi service host echo";
+        // SAFETY: all handles are live; the buffers are valid for each call.
+        unsafe {
+            // B writes; A accepts the incoming stream and echoes it; B reads it back.
+            assert_eq!(fanos_stream_write(client, msg.as_ptr(), msg.len()), msg.len() as c_int);
+            let incoming = fanos_service_accept(service);
+            assert!(!incoming.is_null(), "A accepted the client's stream");
+            let mut buf = [0u8; 64];
+            let n = fanos_stream_read(incoming, buf.as_mut_ptr(), buf.len());
+            assert!(n > 0, "the host received the client's bytes");
+            assert_eq!(&buf[..n as usize], msg);
+            assert_eq!(
+                fanos_stream_write(incoming, buf.as_ptr(), n as usize),
+                n,
+                "the host echoes the bytes back"
+            );
+            let mut out = [0u8; 64];
+            let m = fanos_stream_read(client, out.as_mut_ptr(), out.len());
+            assert!(m > 0, "the echo came back to the client");
+            assert_eq!(&out[..m as usize], msg, "the payload round-trips client → host → client");
+
+            fanos_stream_free(incoming);
+            fanos_stream_free(client);
+            fanos_service_free(service);
+            fanos_free(b);
+            fanos_free(a);
         }
     }
 }
