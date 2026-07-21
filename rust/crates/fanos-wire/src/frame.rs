@@ -34,6 +34,11 @@ pub enum FrameType {
     /// open (NAT traversal #119): body is `peer_coord(12B) ‖ family(1B) ‖ ip(4|16) ‖ port(2B BE)`. Both
     /// endpoints dial at once, so each NAT sees an outbound packet first and admits the inbound reply.
     PunchTo = 0x08,
+    /// A node asks a **common hub** to forward an inner frame to a `target` it cannot reach directly — the
+    /// symmetric-NAT relay fallback (NAT traversal #119): body is `target_coord(12B) ‖ inner frame`. The
+    /// hub, reachable from both ends (each dialed in), writes the inner frame on to the target. Used only
+    /// when a direct connection / hole-punch cannot be made, so any pair behind NAT can still communicate.
+    Relay = 0x09,
     // 0x1* Membership
     Join = 0x10,
     Announce = 0x11,
@@ -128,6 +133,7 @@ impl FrameType {
             0x06 => Self::ObservedAddr,
             0x07 => Self::ConnectReq,
             0x08 => Self::PunchTo,
+            0x09 => Self::Relay,
             0x10 => Self::Join,
             0x11 => Self::Announce,
             0x12 => Self::BeaconReq,

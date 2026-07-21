@@ -9,14 +9,23 @@
 //! peer at is exactly that peer's listener, so the punched dial reaches it (over loopback the NAT is
 //! absent, but the coordination mechanism exercised is identical to the deployed one).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use fanos_field::F2;
 use fanos_geometry::Point;
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_runtime::{Command, Config, Notification, OverlayNode, Triple};
+
+/// Real-QUIC tests each bring up several loopback nodes; run them one at a time to avoid overloading the
+/// transport (see `diaulos_quic.rs`).
+static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Bring up an overlay node at `point` on its own directory (default config, HELLO-mode transport).
 async fn node(point: usize, dir: &Directory) -> NodeHandle {
@@ -59,6 +68,7 @@ async fn await_resolved(dir: &Directory, coord: Triple, secs: u64) -> bool {
 
 #[tokio::test]
 async fn a_hub_brokers_a_direct_hole_punched_connection() {
+    let _serial = serial();
     // Three nodes, each on its OWN directory: A and B know only the hub H, never each other.
     let dir_a = Directory::new();
     let dir_b = Directory::new();
@@ -112,6 +122,68 @@ async fn a_hub_brokers_a_direct_hole_punched_connection() {
         await_delivery(&mut b, a.address(), 5).await,
         payload,
         "B receives A's payload over the hole-punched connection"
+    );
+
+    a.shutdown();
+    b.shutdown();
+    h.shutdown();
+}
+
+#[tokio::test]
+async fn a_hub_relays_between_peers_that_cannot_reach_each_other() {
+    let _serial = serial();
+    // Symmetric-NAT fallback: A and B can each reach a hub H but NOT each other (separate directories, no
+    // cross-address, no hole-punch here). A's traffic to B is relayed transparently through H — and B's
+    // reply routes back the same way, because the relay carries the origin (a bidirectional relay).
+    let dir_a = Directory::new();
+    let dir_b = Directory::new();
+    let dir_h = Directory::new();
+    let mut a = node(0, &dir_a).await;
+    let mut b = node(1, &dir_b).await;
+    let h = node(2, &dir_h).await;
+
+    // A and B each know only the hub, and each opens a connection to it (a Send warms it): the hub then
+    // holds a connection to both, and A/B each hold one to the hub to relay through.
+    dir_a.insert(h.address(), h.local_addr());
+    dir_b.insert(h.address(), h.local_addr());
+    a.command(Command::Send {
+        to: h.address(),
+        payload: vec![0xAA],
+    });
+    b.command(Command::Send {
+        to: h.address(),
+        payload: vec![0xBB],
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Precondition: A and B have no path to each other — only the relay can carry it.
+    assert!(
+        dir_a.resolve(b.address()).is_none() && dir_b.resolve(a.address()).is_none(),
+        "A and B must not know each other's address"
+    );
+
+    // A → B, relayed through H, delivered attributed to A (not the hub).
+    let fwd = b"A to B through the relay hub".to_vec();
+    a.command(Command::Send {
+        to: b.address(),
+        payload: fwd.clone(),
+    });
+    assert_eq!(
+        await_delivery(&mut b, a.address(), 5).await,
+        fwd,
+        "B received A's message via the relay, attributed to A"
+    );
+
+    // B → A, relayed back the same way — the bidirectional property the origin tag buys.
+    let rev = b"B back to A through the relay hub".to_vec();
+    b.command(Command::Send {
+        to: a.address(),
+        payload: rev.clone(),
+    });
+    assert_eq!(
+        await_delivery(&mut a, b.address(), 5).await,
+        rev,
+        "A received B's reply via the relay, attributed to B"
     );
 
     a.shutdown();

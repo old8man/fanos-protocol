@@ -885,29 +885,70 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedRecei
     while let Some(frame) = rx.recv().await {
         // Resolve `to` to a live connection. If the directory knows an address, reuse-or-dial it; otherwise
         // fall back to a connection the peer already dialed IN on — a live cached connection *is*
-        // reachability, so a peer we never learned an address for is still routable in reverse (#119). Only
-        // when neither exists is the coordinate genuinely unroutable: drop, counted + logged so the drop is
-        // observable (a symptom of a stale/colliding address), never silent.
-        let conn = if let Some(addr) = t.directory.resolve(to) {
+        // reachability, so a peer we never learned an address for is still routable in reverse (#119).
+        let direct = if let Some(addr) = t.directory.resolve(to) {
             get_or_connect(&t, to, addr).await
-        } else if let Some(cached_conn) = cached(&t.conns, to) {
-            Some(cached_conn)
         } else {
+            cached(&t.conns, to)
+        };
+        if let Some(conn) = direct {
+            send_uni(&conn, &t.shaper, &frame).await;
+        } else if let Some(hub) = pick_relay_hub(&t.conns, to) {
+            // Symmetric-NAT relay fallback (#119): `to` is unreachable directly (no address, no cached
+            // connection — the case a symmetric NAT leaves after even a hole-punch fails). Wrap the frame
+            // (with ourselves as origin, so `to`'s reply routes back the same way) and ask a hub we CAN
+            // reach to forward it, so any pair behind NAT still communicates. The hub forwards only to a
+            // peer it already holds a connection to, so this reaches `to` iff some common node connects both
+            // ends — exactly the topology the overlay's cell membership creates.
+            send_uni(&hub, &t.shaper, &encode_relay(to, t.me, &frame)).await;
+        } else {
+            // Genuinely unroutable (no direct path and no hub): drop, counted + logged so it is observable.
             t.directory.note_unresolved_drop(to);
-            None
-        };
-        let Some(conn) = conn else {
-            continue;
-        };
-        if let Ok(mut stream) = conn.open_uni().await
-            && stream
-                .write_all(&shape_out(&t.shaper, &frame))
-                .await
-                .is_ok()
-        {
-            let _ = stream.finish();
         }
     }
+}
+
+/// Write one frame as a single shaped uni-stream on `conn` (the shared send primitive).
+async fn send_uni(conn: &Connection, shaper: &Shaper, frame: &[u8]) {
+    if let Ok(mut stream) = conn.open_uni().await
+        && stream.write_all(&shape_out(shaper, frame)).await.is_ok()
+    {
+        let _ = stream.finish();
+    }
+}
+
+/// A live cached connection to any peer other than `exclude` — a hub to relay through when `exclude` is
+/// not directly reachable (#119). `None` if this node has no other live connection to relay via.
+fn pick_relay_hub(conns: &ConnMap, exclude: Triple) -> Option<Connection> {
+    let map = conns.lock().ok()?;
+    for (&peer, conn) in map.iter() {
+        if peer != exclude && conn.close_reason().is_none() {
+            return Some(conn.clone());
+        }
+    }
+    None
+}
+
+/// Encode a [`Relay`](FrameType::Relay) frame asking a hub to forward `inner` to `target` on behalf of
+/// `origin`: `target_coord(12B) ‖ origin_coord(12B) ‖ inner`. Carrying the origin lets the target attribute
+/// the delivered frame to `origin` (not the hub), so its reply routes back the same way — a bidirectional
+/// relay, not a one-shot forward. The origin is as trustworthy as the forwarding hub; the target's engine
+/// validates the frame content regardless.
+fn encode_relay(target: Triple, origin: Triple, inner: &[u8]) -> Vec<u8> {
+    let mut body = encode_triple(target).to_vec();
+    body.extend_from_slice(&encode_triple(origin));
+    body.extend_from_slice(inner);
+    let mut frame = Vec::new();
+    encode_frame(FrameType::Relay.code(), &body, &mut frame);
+    frame
+}
+
+/// Decode a [`Relay`](FrameType::Relay) body into `(target, origin, inner frame)`.
+fn decode_relay(body: &[u8]) -> Option<(Triple, Triple, &[u8])> {
+    let target = decode_triple(body.get(..TRIPLE_WIRE_LEN)?)?;
+    let origin = decode_triple(body.get(TRIPLE_WIRE_LEN..2 * TRIPLE_WIRE_LEN)?)?;
+    let inner = body.get(2 * TRIPLE_WIRE_LEN..)?;
+    Some((target, origin, inner))
 }
 
 /// Reuse a cached connection to `to`, or dial one, establish identity (HELLO or self-certifying
@@ -1185,6 +1226,30 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                     accept_holepunch(&t, decoded.body);
                     continue;
                 }
+                // A relayed frame (symmetric-NAT fallback, #119). If we are the target, deliver the inner
+                // frame to our engine attributed to its ORIGIN (not the hop `from`), so a request's reply
+                // routes back the same way. Otherwise we are the hub: forward the whole `Relay` on to the
+                // target if we hold a live connection to it (our own peer, reachable in reverse). The inner
+                // is a plain overlay frame the target's engine validates, so a hub only reaches its peers.
+                Some(FrameType::Relay) => {
+                    if let Some((target, origin, inner)) = decode_relay(decoded.body) {
+                        if target == t.me {
+                            // The inner is a plain (unshaped) overlay frame — it rode inside the shaped
+                            // Relay wrapper, so hand it to the engine as-is, attributed to its origin.
+                            if t.input_tx
+                                .send(Input::Message { from: origin, frame: inner.to_vec() })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if let Some(hub_conn) = cached(&t.conns, target) {
+                            // We are the hub: pass the whole Relay on to the target (re-shaped for that hop).
+                            send_uni(&hub_conn, &t.shaper, &frame).await;
+                        }
+                    }
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -1273,6 +1338,18 @@ fn decode_punch(body: &[u8]) -> Option<(Triple, SocketAddr)> {
 mod tests {
     use super::*;
     use fanos_field::F2;
+
+    #[test]
+    fn relay_frame_round_trips_target_origin_and_inner() {
+        let (target, origin) = ([1, 2, 3], [4, 5, 6]);
+        let inner = b"the inner overlay frame".as_slice();
+        let relay = encode_relay(target, origin, inner);
+        let (decoded, _) = decode_frame(&relay).expect("a well-formed frame");
+        assert_eq!(decoded.frame_type(), Some(FrameType::Relay));
+        assert_eq!(decode_relay(decoded.body), Some((target, origin, inner)));
+        // A body too short for both coordinates is rejected, not mis-parsed.
+        assert_eq!(decode_relay(&[0u8; 2 * TRIPLE_WIRE_LEN - 1]), None);
+    }
 
     /// The per-epoch reshuffle driver (#102): a `BeaconReady` re-derives this node's VRF coordinate for
     /// the new epoch, re-seats the engine to it, and rebinds its directory coordinate. Driven with a
