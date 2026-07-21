@@ -18,11 +18,18 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
+- **C ABI** (#113, M9) — the stable embedding surface (spec §11.2): `extern "C"` over the node so any
+  language reuses the core. `docs/implementations.md` lists it *planned*.
+- **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP (OS TUN device; verification needs a TUN harness).
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
-- **VOPRF credit settlement** (Phase 4) — anonymous relay payment.
-- **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP.
-- **C ABI** (#113) — embedding surface.
+
+> **VOPRF credit settlement** (Phase 4) is **already implemented + tested**, not a gap: the ristretto255
+> VOPRF primitive (`fanos-incentives`: blind→DLEQ→unblind, context-bound redemption B8, deterministic nonce
+> B4, double-spend) and its concrete settlement use — anonymous credits paying for a CALYPSO introduction
+> exactly once (`sim/tests/paid_intro.rs`). Mix-relay *forwarding* payment is the L7-opt / economically-open
+> part (§16 "L7 gives the mechanics, not an equilibrium guarantee"), deliberately not invented (no magic
+> pricing).
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
