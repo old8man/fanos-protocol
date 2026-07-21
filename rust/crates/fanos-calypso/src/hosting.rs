@@ -49,6 +49,7 @@
 
 use alloc::vec::Vec;
 
+use fanos_geometry::Triple;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
 use fanos_primitives::aead;
 use fanos_primitives::hash_labeled;
@@ -334,6 +335,61 @@ impl SealedIntro {
     }
 }
 
+/// One member of a threshold service-line as published in its roster (spec §12.3): the member's hybrid-KEM
+/// public — what a client seals its Shamir share to — and the overlay `coordinate` where the client routes
+/// to reach it. Public data only; a roster carries no secret.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
+pub struct LineMember {
+    /// The member's hybrid-KEM public key ([`HybridKemPublic::encode`]).
+    pub member_pubkey: Vec<u8>,
+    /// The member's overlay coordinate.
+    pub coordinate: Triple,
+}
+
+/// The published **roster** of a threshold-hosted service-line — its members in **seal order** (a member's
+/// position is its Shamir share index) and the cooperation `threshold`. A client discovers this
+/// (root-signed, e.g. carried in a CALYPSO descriptor's metadata), verifies it, and seals its intro to the
+/// whole line with [`seal_intro`](Self::seal_intro) — so it can contact a threshold-hosted service knowing
+/// only public keys and coordinates, and no single member ever reads the intro. Wire-serializable; carries
+/// no secret.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
+pub struct ServiceLine {
+    /// How many members must cooperate to threshold-decrypt an intro (`t` of `members.len()`).
+    pub threshold: u8,
+    /// The line's members, in the exact order their keys were dealt — index = share index.
+    pub members: Vec<LineMember>,
+}
+
+impl ServiceLine {
+    /// The designated combiner a client sends its sealed intro to: the first member, by convention
+    /// (mirroring `ThresholdRouter`'s canonical combiner). `None` for an empty roster.
+    #[must_use]
+    pub fn combiner(&self) -> Option<Triple> {
+        self.members.first().map(|m| m.coordinate)
+    }
+
+    /// Decode the members' public keys in roster order; `None` if any is malformed.
+    fn member_keys(&self) -> Option<Vec<HybridKemPublic>> {
+        self.members
+            .iter()
+            .map(|m| HybridKemPublic::decode(&m.member_pubkey))
+            .collect()
+    }
+
+    /// Seal `payload` (the `RDV_INTRO` body: cookie + reply circuit + `ClientHello`) to this line at its
+    /// `threshold`, so any `threshold` of its members jointly recover it and none alone can. `seed` supplies
+    /// all key material (a CSPRNG draw in production; a fixed seed under the deterministic simulator).
+    ///
+    /// # Errors
+    /// [`HostingError::Malformed`] if the roster holds a malformed member key; otherwise the errors of
+    /// [`SealedIntro::seal`] (a bad `threshold`/member count).
+    pub fn seal_intro(&self, payload: &[u8], seed: &[u8]) -> Result<SealedIntro, HostingError> {
+        let keys = self.member_keys().ok_or(HostingError::Malformed)?;
+        let refs: Vec<&HybridKemPublic> = keys.iter().collect();
+        SealedIntro::seal(payload, self.threshold, &refs, seed)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -459,5 +515,42 @@ mod tests {
         let intro = SealedIntro::seal(b"x", 2, &pubs, b"s").unwrap();
         // Member 0's slot does not open under member 1's secret.
         assert!(intro.member_partial(0, &members[1].0).is_none());
+    }
+
+    #[test]
+    fn a_service_line_roster_wire_round_trips_and_seals_an_openable_intro() {
+        // The published roster a client discovers: 5 members (seal order), threshold 3.
+        let members = member_keys(5, 0x77);
+        let line = ServiceLine {
+            threshold: 3,
+            members: members
+                .iter()
+                .enumerate()
+                .map(|(i, (_, p))| LineMember {
+                    member_pubkey: p.encode(),
+                    coordinate: [i as u32 + 1, 0, 0],
+                })
+                .collect(),
+        };
+        // Public wire data — it round-trips byte-exact, and its combiner is the first member.
+        let wire = line.to_wire();
+        assert_eq!(ServiceLine::from_wire(&wire).unwrap(), line);
+        assert_eq!(line.combiner(), Some([1, 0, 0]));
+
+        // A client holding only the roster seals an intro to the whole line; any 3 members open it.
+        let payload = b"cookie + reply-circuit + ClientHello";
+        let intro = line.seal_intro(payload, b"roster-seal-seed").unwrap();
+        assert_eq!(intro.member_count(), 5);
+        let partials: Vec<Share> = [1usize, 3, 4]
+            .iter()
+            .map(|&i| intro.member_partial(i, &members[i].0).unwrap())
+            .collect();
+        assert_eq!(intro.open(&partials).unwrap(), payload);
+        // Below threshold, still 0-knowledge.
+        let too_few: Vec<Share> = [1usize, 3]
+            .iter()
+            .map(|&i| intro.member_partial(i, &members[i].0).unwrap())
+            .collect();
+        assert_eq!(intro.open(&too_few), Err(HostingError::Aead));
     }
 }

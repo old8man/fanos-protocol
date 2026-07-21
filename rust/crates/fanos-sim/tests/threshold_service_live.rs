@@ -11,13 +11,14 @@
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use fanos_calypso::hosting::SealedIntro;
+use fanos_calypso::hosting::{LineMember, SealedIntro, ServiceLine};
 use fanos_field::F2;
 use fanos_geometry::{Point, Triple};
 use fanos_node::{ThresholdService, intro_frame};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
+use fanos_wire::Wire;
 
 /// The anonymous-source sentinel a surfaced request carries (the service never learns the deliverer).
 const ANON: Triple = [0, 0, 0];
@@ -139,6 +140,45 @@ fn concurrent_intros_are_multiplexed_by_id() {
         .collect();
     assert!(served.contains(&req_a), "the first concurrent intro was served");
     assert!(served.contains(&req_b), "the second concurrent intro was served");
+}
+
+#[test]
+fn a_client_discovers_the_roster_and_seals_an_openable_intro() {
+    // The full discovery -> seal -> serve loop: a client that holds only the line's published roster
+    // (round-tripped through the wire, as it would be resolved from a descriptor) seals its intro to the
+    // whole line via `ServiceLine::seal_intro`, sends it to the roster's combiner, and the line serves it.
+    let mut sim = Sim::new(0x9906);
+    let (line, pubs) = spawn_line(&mut sim, 5, 3);
+    let client = Point::<F2>::at(5).coords();
+
+    // Publish the roster (member keys + coordinates + threshold) and re-decode it client-side.
+    let roster = ServiceLine {
+        threshold: 3,
+        members: pubs
+            .iter()
+            .zip(&line)
+            .map(|(p, &coord)| LineMember {
+                member_pubkey: p.encode(),
+                coordinate: coord,
+            })
+            .collect(),
+    };
+    let resolved = ServiceLine::from_wire(&roster.to_wire()).unwrap();
+
+    let request = b"served from a discovered roster".to_vec();
+    let intro = resolved.seal_intro(&request, b"roster-live-seed").unwrap();
+    let combiner = resolved.combiner().unwrap();
+    assert_eq!(combiner, line[0]);
+
+    sim.inject_frame(client, combiner, intro_frame(&intro));
+    sim.run_for(Duration::from_millis(2000));
+
+    assert!(
+        sim.report()
+            .deliveries()
+            .any(|(recv, from, bytes)| recv == combiner && from == ANON && bytes == request.as_slice()),
+        "a client with only the roster reached and was served by the threshold line"
+    );
 }
 
 #[test]
