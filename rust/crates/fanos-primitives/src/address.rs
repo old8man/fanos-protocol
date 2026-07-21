@@ -19,7 +19,7 @@
 use alloc::vec::Vec;
 
 use fanos_field::Field;
-use fanos_geometry::{HierAddr, Point};
+use fanos_geometry::{HierAddr, Point, derive_address};
 
 use crate::hash::label;
 use crate::maptopoint::map_to_point;
@@ -69,6 +69,51 @@ pub fn address_matches_identity_from<F: Field>(
         .all(|(level, &p)| p == address_point::<F>(id, level))
 }
 
+/// Derive a node's **live** hierarchical address by occupancy-driven descent (spec §L1, #95) — the
+/// distributed, self-organizing counterpart to the static [`address_point`] chain. A node's level-0 point
+/// is `own_point` (its live VRF transport coordinate under §A7, or its hash level-0 point); each deeper
+/// level is the identity-hash sub-cell point [`address_point(own_id, level)`]. At each level, if a
+/// **higher-priority already-seated member holds this exact position**, the node descends past it into its
+/// own sub-cell point — priority being the strict total order on identity bytes (the numerically-smaller
+/// `id` keeps the shallower seat). `seated` is the `(member_id, member_address)` set a node has learned
+/// from `Announce`.
+///
+/// **Why this is conflict-free and needs no negotiation.** Every node runs the *same* pure function over
+/// the *same* membership, and the priority is a strict total order, so of any set of identities contesting
+/// a position exactly one — the minimum id — keeps it and the rest descend, recursively. No two nodes ever
+/// converge on the same address; a non-colliding node keeps its depth-1 seat; and each deeper collision
+/// requires an additional `id`-hash-point match (probability `≈ N^-level`), so the recursion terminates
+/// well within [`HierAddr`]'s `MAX_DEPTH`. This is the missing *live* half of the hierarchy: `address_point`
+/// gives the candidate chain, this resolves it against who is actually seated — so a cell of more than `N`
+/// nodes self-organizes into sub-cells deterministically, the recursion-of-cells of §L1.
+///
+/// **Anti-eclipse.** Under VRF coordinates (§A7) `own_point` reshuffles every epoch, so which identities
+/// share a level-0 point — hence the whole sub-cell membership — churns each epoch; an adversary cannot
+/// pre-settle a deep position, and grinding a `k`-level prefix against a target still costs `≈ N^k`. The
+/// deeper levels stay hash-derived (epoch-stable within a sub-cell), so no per-sub-cell beacon is needed.
+#[must_use]
+pub fn derive_hierarchical_address<F: Field>(
+    own_id: &[u8],
+    own_point: Point<F>,
+    seated: &[(&[u8], HierAddr<F>)],
+) -> HierAddr<F> {
+    derive_address::<F>(
+        |level| {
+            if level == 0 {
+                own_point
+            } else {
+                address_point::<F>(own_id, level)
+            }
+        },
+        |path| {
+            seated
+                .iter()
+                .any(|(mid, maddr)| *mid < own_id && maddr.points() == path)
+        },
+    )
+    .unwrap_or_else(|| HierAddr::root(own_point))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -111,6 +156,100 @@ mod tests {
         // Whichever way the two roots landed, each identity verifies its OWN root.
         assert!(address_matches_identity::<F2>(other, &other_root));
         assert!(address_matches_identity::<F2>(id, &id_root));
+    }
+
+    #[test]
+    fn a_non_colliding_node_keeps_its_depth_one_seat() {
+        let p = Point::<F2>::at(3);
+        // No member is seated anywhere: the node keeps its own level-0 point.
+        assert_eq!(
+            derive_hierarchical_address::<F2>(b"solo", p, &[]),
+            HierAddr::root(p),
+        );
+    }
+
+    #[test]
+    fn the_higher_priority_identity_keeps_the_seat_and_the_other_descends() {
+        let p = Point::<F2>::at(2);
+        let root = HierAddr::<F2>::root(p);
+        // "aaa" < "bbb" numerically, so aaa has priority for the shallow seat.
+        // bbb has learned aaa is seated at [p]; a higher-priority holder → bbb descends into its own point.
+        let bbb = derive_hierarchical_address::<F2>(b"bbb", p, &[(b"aaa", root.clone())]);
+        assert_eq!(
+            bbb,
+            root.descended(address_point::<F2>(b"bbb", 1)).unwrap(),
+            "the lower-priority node descends into its own sub-cell point",
+        );
+        // aaa has (transiently) learned bbb at [p], but bbb does NOT outrank aaa → aaa keeps [p].
+        let aaa = derive_hierarchical_address::<F2>(b"aaa", p, &[(b"bbb", root.clone())]);
+        assert_eq!(aaa, root, "the higher-priority node keeps the shallow seat");
+    }
+
+    /// Converge a set of identities all contesting the same level-0 `point` to their fixed-point layout,
+    /// by iterating the live derivation until no address changes (the distributed self-organization).
+    fn converge(ids: &[&[u8]], point: Point<F2>) -> Vec<HierAddr<F2>> {
+        let mut seats: Vec<HierAddr<F2>> = ids.iter().map(|_| HierAddr::root(point)).collect();
+        for _ in 0..16 {
+            let mut changed = false;
+            for i in 0..ids.len() {
+                let others: Vec<(&[u8], HierAddr<F2>)> = ids
+                    .iter()
+                    .zip(&seats)
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, (&id, a))| (id, a.clone()))
+                    .collect();
+                let a = derive_hierarchical_address::<F2>(ids[i], point, &others);
+                if a != seats[i] {
+                    seats[i] = a;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return seats;
+            }
+        }
+        seats
+    }
+
+    #[test]
+    fn a_cell_self_organizes_into_a_conflict_free_layout() {
+        // Five identities all VRF'd to the same level-0 point (a sub-cell of five). Running the live
+        // descent to convergence must give every node a DISTINCT address (no two collide), the
+        // minimum-id node the shallow seat, and a bounded depth — the recursion-of-cells forming itself.
+        let p = Point::<F2>::at(4);
+        let ids: [&[u8]; 5] = [b"id-e", b"id-a", b"id-c", b"id-b", b"id-d"];
+        let seats = converge(&ids, p);
+
+        // No two nodes share an address.
+        for i in 0..seats.len() {
+            for j in (i + 1)..seats.len() {
+                assert_ne!(seats[i], seats[j], "nodes {i} and {j} converged on the same address");
+            }
+        }
+        // The minimum id ("id-a") holds the shallow seat [p]; everyone shares p as their level-0 point.
+        let min_idx = ids.iter().enumerate().min_by_key(|(_, id)| **id).unwrap().0;
+        assert_eq!(seats[min_idx], HierAddr::root(p), "the minimum-id node keeps the shallow seat");
+        for (i, seat) in seats.iter().enumerate() {
+            assert_eq!(seat.point_at(0), Some(p), "node {i} keeps the shared level-0 point");
+            assert!(seat.depth() <= 3, "node {i} descent stays bounded (depth {})", seat.depth());
+        }
+    }
+
+    #[test]
+    fn the_layout_is_a_pure_function_of_membership_not_arrival_order() {
+        // Determinism: converging the SAME identity set in a different presentation order yields the
+        // identical layout — the self-organization has no race, so the cell is eventually consistent.
+        let p = Point::<F2>::at(5);
+        let a: [&[u8]; 4] = [b"w", b"x", b"y", b"z"];
+        let b: [&[u8]; 4] = [b"z", b"y", b"x", b"w"];
+        let sa = converge(&a, p);
+        let sb = converge(&b, p);
+        // Compare per-identity (reorder b's result back to a's order).
+        for (i, id) in a.iter().enumerate() {
+            let j = b.iter().position(|x| x == id).unwrap();
+            assert_eq!(sa[i], sb[j], "identity {id:?} lands at the same address regardless of order");
+        }
     }
 
     #[test]
