@@ -1033,7 +1033,7 @@ This is a *public* function of the service identity and the epoch — both sides
 
 ## 12.3 Threshold-hosted service — the core innovation [С] {#calypso-threshold}
 
-A classic hidden service runs on one host: seize that host and the service dies (and may be deanonymized). A CALYPSO service can instead be hosted **across the `q+1` members of a service-line** via DKG — the service secret is Shamir-shared, requests are threshold-decrypted, and state is LRC-replicated along the line. Consequences:
+A classic hidden service runs on one host: seize that host and the service dies (and may be deanonymized). A CALYPSO service can instead be hosted **across the `q+1` members of a service-line**: the service secret is Shamir-shared **dealt-and-sealed** — split by the operator and each share KEM-sealed to its member — requests are **threshold-decrypted** across the line, and state is LRC-replicated along it. Consequences:
 
 - **No single location.** The service *is the line*, not a machine — there is nothing to raid.
 - **Seizure-proof below threshold.** Fewer than `t` seized hosts learn **nothing** (0-knowledge — the same threshold guarantee as NYX §5.2 and DIAKRISIS §6).
@@ -1041,6 +1041,10 @@ A classic hidden service runs on one host: seize that host and the service dies 
 - **Byzantine-resistant.** A corrupt host is caught by the DIAKRISIS closure cross-check (§6.4) and repaired by LRC.
 
 This is a genuinely new object: **a hidden service with no host to raid** — Byzantine- and seizure-resistant by construction, and naturally replicated.
+
+> **Dealt-and-sealed, not DKG (design reconciliation, #99).** An earlier draft named a *line DKG*. A DKG's purpose is to generate a joint key *no party — including the dealer — ever learns*, which matters only when the members are mutually distrusting **at deal time**. That is not this threat model: a service's identity secret is generated **by its own operator, for their own service**, so the operator legitimately holds the whole secret before any sharing; a DKG buys nothing against the actual threat, a *later* seizure of `< t` hosts. What matters is that *after* dealing the secret exists **only** as `t`-of-`(q+1)` KEM-sealed shares (the operator then erases its copy) — exactly what dealt-and-sealed delivers, and the same trust model `fanos_aphantos::threshold` already uses for every NYX onion layer. This also keeps every primitive vetted: it needs no threshold-*decryption* to a DKG'd public key (an unbuilt lattice-threshold primitive), only Shamir sharing + per-member hybrid-KEM sealing.
+
+**Status (#99):** the per-intro **threshold-decryption is live-wired** — the production `ThresholdService` engine (`fanos-node`) runs the `t`-of-`(q+1)` PartialDec gather over the overlay (`RdvIntro`/`SvcShareReq`/`SvcPartial` frames) and surfaces the recovered request; verified over the sim (any threshold subset serves, `< t` is 0-knowledge, concurrent intros multiplex). Identity custody (`fanos_calypso::hosting::deal_service_key`) and the sharing/opening primitives are built and unit-tested. Remaining: a service-line roster descriptor for client discovery, composition with the anonymous transport (§12.4), and LRC-replicated service state.
 
 ## 12.4 The contact flow — double anonymity {#calypso-contact}
 
@@ -1087,7 +1091,7 @@ The trust chain is self-certifying end to end — **address → root → signing
 
 ## 12.8 Honest status and human-readable naming {#calypso-status}
 
-The rendezvous derivation is [Т]-structure + [С] on the beacon; threshold hosting is [С] (relies on line DKG and fewer than `t` corrupt members); every primitive is vetted — the novelty is architectural composition, as everywhere in FANOS. Self-certifying addresses are unmemorable; a **petname / naming-mapping layer** (à la Tor onion-names or ENS) can sit on top, deliberately **[P] and out of protocol scope** so that CALYPSO itself needs no naming authority.
+The rendezvous derivation is [Т]-structure + [С] on the beacon; threshold hosting's per-intro threshold-decryption is now [Т]-built (the live `ThresholdService` engine, #99) and secure while fewer than `t` hosts are corrupt — via dealt-and-sealed sharing, not a DKG (§12.3); its remaining deployment integration (roster descriptor, anonymous-transport composition, LRC state) is [С]. Every primitive is vetted — the novelty is architectural composition, as everywhere in FANOS. Self-certifying addresses are unmemorable; a **petname / naming-mapping layer** (à la Tor onion-names or ENS) can sit on top, deliberately **[P] and out of protocol scope** so that CALYPSO itself needs no naming authority.
 
 ---
 

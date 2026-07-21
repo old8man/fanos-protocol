@@ -141,6 +141,12 @@ feeds `Input`s and performs `Effect`s. **This phase turns a proven protocol into
 
 The node runs all three; the app picks. This is the concrete Tor↔Nym synthesis in one binary.
 
+*Status (#54): the **Full-class anonymous profile is now wired end-to-end** — `fanos proxy --profile
+anonymous` draws a FRESH, unlinkable threshold-onion rendezvous route per dial, and deployed `fanos node
+--role relay` nodes run the mixnet (a `CellNode` composite: overlay + beacon + mix router + rendezvous
+relay) and publish their onion keys. Client and service stay location-hidden; the reply returns via a
+cookie-registered rendezvous relay. Verified unit + sim + real-QUIC (`anonymous_quic.rs`).*
+
 ### 3.4 The application surface — SOCKS5, DNS, UDP (Phase 2)
 
 `fanos proxy` is the "use it from anything" surface (spec §11.3):
@@ -159,6 +165,13 @@ CALYPSO: self-certifying `<b32(H(pubkey))>.fanos`, per-epoch **computed** rendez
 enumerate), **threshold hosting** (no single host to raid), **CALYPSO-Balance** (offline-root →
 epoch-signing-key hierarchy, weighted-rendezvous-hashing load balancing, HA fleets), and **Lindbladian
 anti-DDoS**. A petname/naming layer sits on top, deliberately out of protocol scope.
+
+*Status (#99): the threshold-hosting core is now **live-wired** — a production `ThresholdService` engine
+(`fanos-node`) threshold-decrypts each intro across the service-line (`t`-of-`(q+1)` PartialDec gather over
+the `RdvIntro`/`SvcShareReq`/`SvcPartial` wire frames), so no single host reads an intro and `< t` seized
+hosts learn nothing; verified over the sim (`threshold_service_live.rs`). Remaining integration: a
+service-line roster descriptor for client discovery, composition with the anonymous transport (§12.4), and
+LRC-replicated service state.*
 
 ### 3.6 Censorship resistance & evolution (**[T]** core · Phase 3)
 
