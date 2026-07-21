@@ -237,11 +237,18 @@ impl ServiceResolver for StaticResolver {
 /// A SOCKS5 [`Dialer`] that reaches `.fanos` services over DIAULOS: resolve the name to a coordinate
 /// and static key, then dial a reliable, encrypted, hybrid-PQ session (an async byte stream) to it.
 /// Each dial seeds a fresh CSPRNG from OS entropy for its ephemeral handshake keys, so forward
-/// secrecy holds per connection. Non-`.fanos` targets are `Unsupported`.
+/// secrecy holds per connection.
+///
+/// A **clearnet** target (any non-`.fanos` name or IP) is reached through a configured **exit** node
+/// ([`with_exit`](Self::with_exit)): the dialer opens an exit session ([`dial_exit`]) and hands it the
+/// `host:port`, so the destination sees the exit rather than the client. Without an exit configured, a
+/// clearnet target is `Unsupported` (a `.fanos`-only proxy).
 pub struct FanosDialer<R: ServiceResolver> {
     client: Client,
     resolver: R,
     profile: Profile,
+    /// The exit node (coordinate + service key) clearnet targets are routed through, if any.
+    exit: Option<(Coord, HybridKemPublic)>,
 }
 
 /// Parameters to draw a **fresh unlinkable** rendezvous route *per dial* — the general anonymous proxy
@@ -283,7 +290,17 @@ impl<R: ServiceResolver> FanosDialer<R> {
             client,
             resolver,
             profile: Profile::Direct,
+            exit: None,
         }
+    }
+
+    /// Route **clearnet** targets (non-`.fanos` names and IPs) through the exit node at `coord` with static
+    /// key `public` — the dialer opens a [`dial_exit`] session and hands it the destination. Without this,
+    /// clearnet targets are `Unsupported`.
+    #[must_use]
+    pub fn with_exit(mut self, coord: Coord, public: HybridKemPublic) -> Self {
+        self.exit = Some((coord, public));
+        self
     }
 
     /// An **anonymous** dialer with a single fixed `route`: every dial rides threshold onions along it to
@@ -300,6 +317,7 @@ impl<R: ServiceResolver> FanosDialer<R> {
             client,
             resolver,
             profile: Profile::Fixed(route),
+            exit: None,
         }
     }
 
@@ -313,6 +331,7 @@ impl<R: ServiceResolver> FanosDialer<R> {
             client,
             resolver,
             profile: Profile::Fresh(params),
+            exit: None,
         }
     }
 }
@@ -331,9 +350,23 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
 
     async fn dial(&self, target: &Target) -> Result<DuplexStream, DialError> {
         if !target.is_fanos() {
-            return Err(DialError::Unsupported(
-                "the FANOS dialer reaches only .fanos targets".to_owned(),
-            ));
+            // A clearnet target rides the configured exit (which sees the exit, not the client); without
+            // one, this dialer is `.fanos`-only.
+            let Some((exit_coord, exit_public)) = &self.exit else {
+                return Err(DialError::Unsupported(
+                    "no exit configured — the FANOS dialer reaches only .fanos targets".to_owned(),
+                ));
+            };
+            let mut rng = SeedRng::from_seed(&os_entropy_32()?);
+            return crate::exit::dial_exit(
+                self.client.clone(),
+                *exit_coord,
+                exit_public,
+                &target.to_string(),
+                &mut rng,
+            )
+            .await
+            .map_err(DialError::Io);
         }
         let host = target.host();
         let (coord, service_public) = self

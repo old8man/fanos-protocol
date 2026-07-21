@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use fanos_field::F2;
+use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_node::{
     AnonRouteParams, BeaconSeed, Epoch, ExitParams, FanosDialer, Node, NodeConfig, NodeError,
     NodeResolver, Peer, RoleSet, ServiceParams, build_cell_mix_directory, identity, serve_proxy,
@@ -182,6 +183,9 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
             )));
         }
     };
+    // The clearnet exit to route non-`.fanos` targets through, if any (else those are refused).
+    let exit = parse_exit_via(args)?;
+    let exit_coord = exit.as_ref().map(|(coord, _)| *coord);
 
     let config = node_config_from_args(args)?;
     let mut node = Node::start::<F2>(config).await?;
@@ -190,7 +194,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     // `FanosDialer` is not `Clone`, so `serve_proxy` shares it behind an `Arc` (per-connection handlers need
     // only `&D`). The dialer holds its own `Client`; the node stays owned here for notification draining + a
     // clean shutdown.
-    let dialer = match build_proxy_dialer(&node, resolver, epoch, anon.as_ref()).await {
+    let dialer = match build_proxy_dialer(&node, resolver, epoch, anon.as_ref(), exit).await {
         Ok(dialer) => Arc::new(dialer),
         Err(e) => {
             node.shutdown();
@@ -214,8 +218,12 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
             cfg.threshold, cfg.fwd_depth, cfg.reply_depth
         ),
     };
+    let exit_line = exit_coord.map_or_else(
+        || "\n  Clearnet: refused (.fanos-only — pass --exit-via to enable)".to_owned(),
+        |[a, b, c]| format!("\n  Clearnet: via exit {a}:{b}:{c}"),
+    );
     eprintln!(
-        "fanos proxy up — coordinate {x}:{y}:{z} on {}\n  SOCKS5:  socks5://{socks_listen}{http_line}{profile_line}",
+        "fanos proxy up — coordinate {x}:{y}:{z} on {}\n  SOCKS5:  socks5://{socks_listen}{http_line}{profile_line}{exit_line}",
         health.local_addr,
     );
     info!(coord = ?health.address, %socks_listen, ?http_listen, "fanos proxy up");
@@ -245,35 +253,42 @@ async fn build_proxy_dialer(
     resolver: NodeResolver,
     epoch: Epoch,
     anon: Option<&AnonConfig>,
+    exit: Option<([u32; 3], HybridKemPublic)>,
 ) -> Result<FanosDialer<NodeResolver>, NodeError> {
-    let Some(cfg) = anon else {
-        return Ok(FanosDialer::new(node.client(), resolver));
+    let base = if let Some(cfg) = anon {
+        let directory = build_cell_mix_directory::<F2>(&node.client(), epoch).await;
+        let need = usize::from(cfg.threshold) + 1;
+        if directory.len() < need {
+            return Err(NodeError::Config(format!(
+                "anonymous profile needs at least threshold+1={need} live mix relays for epoch {}, \
+                 found {} — start relays that publish mix keys or lower --threshold",
+                epoch.get(),
+                directory.len(),
+            )));
+        }
+        info!(
+            relays = directory.len(),
+            threshold = cfg.threshold,
+            fwd_depth = cfg.fwd_depth,
+            reply_depth = cfg.reply_depth,
+            "anonymous profile: fresh per-dial rendezvous routes over the live mix directory"
+        );
+        let params = AnonRouteParams {
+            directory,
+            threshold: cfg.threshold,
+            epoch,
+            beacon: cfg.beacon,
+            depths: (cfg.fwd_depth, cfg.reply_depth),
+        };
+        FanosDialer::anonymous_fresh(node.client(), resolver, params)
+    } else {
+        FanosDialer::new(node.client(), resolver)
     };
-    let directory = build_cell_mix_directory::<F2>(&node.client(), epoch).await;
-    let need = usize::from(cfg.threshold) + 1;
-    if directory.len() < need {
-        return Err(NodeError::Config(format!(
-            "anonymous profile needs at least threshold+1={need} live mix relays for epoch {}, found \
-             {} — start relays that publish mix keys or lower --threshold",
-            epoch.get(),
-            directory.len(),
-        )));
-    }
-    info!(
-        relays = directory.len(),
-        threshold = cfg.threshold,
-        fwd_depth = cfg.fwd_depth,
-        reply_depth = cfg.reply_depth,
-        "anonymous profile: fresh per-dial rendezvous routes over the live mix directory"
-    );
-    let params = AnonRouteParams {
-        directory,
-        threshold: cfg.threshold,
-        epoch,
-        beacon: cfg.beacon,
-        depths: (cfg.fwd_depth, cfg.reply_depth),
-    };
-    Ok(FanosDialer::anonymous_fresh(node.client(), resolver, params))
+    // With an exit configured, clearnet (non-`.fanos`) targets ride it; without one they are refused.
+    Ok(match exit {
+        Some((coord, public)) => base.with_exit(coord, public),
+        None => base,
+    })
 }
 
 /// The parsed knobs of the `--profile anonymous` proxy: how many relays per hop must cooperate to peel an
@@ -417,6 +432,76 @@ fn log_notification(note: &Notification) {
     }
 }
 
+/// Parse the exit descriptor for the proxy's clearnet path from `--exit-via <file>`: a `key = value` file
+/// with `coord = x:y:z` (the exit's overlay coordinate) and `key = <hex>` (its DIAULOS service public key,
+/// the hex of `HybridKemPublic::encode` — an exit logs this line at startup). `None` if the flag is absent,
+/// in which case the proxy stays `.fanos`-only.
+fn parse_exit_via(args: &[String]) -> Result<Option<([u32; 3], HybridKemPublic)>, NodeError> {
+    let Some(path) = flag(args, "--exit-via") else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path)?;
+    let mut coord: Option<[u32; 3]> = None;
+    let mut key: Option<HybridKemPublic> = None;
+    for (n, raw) in text.lines().enumerate() {
+        let l = raw.split('#').next().unwrap_or("").trim();
+        if l.is_empty() {
+            continue;
+        }
+        let (k, v) = l.split_once('=').ok_or_else(|| {
+            NodeError::Config(format!("exit-via line {}: expected `key = value`", n + 1))
+        })?;
+        match k.trim() {
+            "coord" => coord = Some(parse_coord_str(v.trim())?),
+            "key" => {
+                let bytes = decode_hex(v.trim())
+                    .ok_or_else(|| NodeError::Config("exit-via `key` is not valid hex".to_owned()))?;
+                key = Some(HybridKemPublic::decode(&bytes).ok_or_else(|| {
+                    NodeError::Config("exit-via `key` is not a valid hybrid public key".to_owned())
+                })?);
+            }
+            other => return Err(NodeError::Config(format!("unknown exit-via key '{other}'"))),
+        }
+    }
+    let coord = coord.ok_or_else(|| NodeError::Config("exit-via missing `coord`".to_owned()))?;
+    let key = key.ok_or_else(|| NodeError::Config("exit-via missing `key`".to_owned()))?;
+    Ok(Some((coord, key)))
+}
+
+/// Parse a `x:y:z` overlay coordinate.
+fn parse_coord_str(s: &str) -> Result<[u32; 3], NodeError> {
+    let mut it = s.split(':');
+    let mut next = || {
+        it.next()
+            .and_then(|p| p.trim().parse::<u32>().ok())
+            .ok_or_else(|| NodeError::Config(format!("bad coordinate '{s}' (expected x:y:z)")))
+    };
+    let c = [next()?, next()?, next()?];
+    if it.next().is_some() {
+        return Err(NodeError::Config(format!("coordinate '{s}' must be x:y:z")));
+    }
+    Ok(c)
+}
+
+/// Decode a hex string into bytes (`None` on an odd length or a non-hex character).
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for pair in b.chunks(2) {
+        match pair {
+            [h, l] => out.push((nib(*h)? << 4) | nib(*l)?),
+            _ => return None, // odd length
+        }
+    }
+    Some(out)
+}
+
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -461,7 +546,8 @@ fn print_help() {
          \x20             [--no-heartbeat] [--proteus-secret SECRET]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
-         \x20             [--beacon HEX64] [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
+         \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
+         \x20             [--bootstrap ...] [--listen ADDR]\n\
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos help\n\
@@ -481,7 +567,13 @@ fn print_help() {
          EXIT FILE (--exit, clearnet exit relay): a `key = value` file with\n\
          \x20 seed = <64 hex>            the exit's service-identity seed (secret; clients dial this key)\n\
          \x20 ports = 80,443            destination ports to allow (omit = ANY port — an open relay)\n\
-         \x20 (providing it implies the `exit` role)\n\
+         \x20 (providing it implies the `exit` role; the node logs its `coord`/`key` descriptor at startup)\n\
+         \n\
+         EXIT-VIA FILE (--exit-via, proxy's clearnet path): a `key = value` file with\n\
+         \x20 coord = x:y:z              the exit node's coordinate (from its startup log)\n\
+         \x20 key   = <hex>              the exit's service public key (from its startup log)\n\
+         \x20 with it, `fanos proxy` reaches clearnet (non-.fanos) targets via that exit; without it those\n\
+         \x20 targets are refused (a .fanos-only proxy)\n\
          \n\
          EXAMPLES:\n\
          \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\
@@ -535,5 +627,37 @@ mod tests {
         assert!(config.roles.exit, "--exit implies the exit role");
         let ep = config.exit.expect("exit parameters were read");
         assert_eq!(ep.allowed_ports, vec![80, 443]);
+    }
+
+    #[test]
+    fn exit_via_parses_an_exit_descriptor() {
+        use core::fmt::Write as _;
+
+        use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+        // Build a descriptor from a real public key (as an exit logs it) and parse it back.
+        let (_sk, pk) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xE1; 32]));
+        let mut key_hex = String::new();
+        for b in pk.encode() {
+            let _ = write!(key_hex, "{b:02x}");
+        }
+        let path = std::env::temp_dir().join(format!("fanos-exitvia-{}.conf", std::process::id()));
+        std::fs::write(&path, format!("coord = 1:2:3\nkey = {key_hex}\n")).unwrap();
+
+        let args = vec!["--exit-via".to_owned(), path.to_string_lossy().into_owned()];
+        let parsed = parse_exit_via(&args).unwrap().expect("descriptor present");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(parsed.0, [1, 2, 3], "coordinate parsed");
+        assert_eq!(parsed.1.encode(), pk.encode(), "the public key round-trips");
+        // No flag = no exit.
+        assert!(parse_exit_via(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_hex_round_trips() {
+        assert_eq!(decode_hex("00ff10ab").unwrap(), vec![0x00, 0xff, 0x10, 0xab]);
+        assert_eq!(decode_hex(""), Some(Vec::new()));
+        assert!(decode_hex("abc").is_none(), "odd length rejected");
+        assert!(decode_hex("zz").is_none(), "non-hex rejected");
     }
 }

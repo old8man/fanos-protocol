@@ -16,8 +16,11 @@ use std::time::Duration;
 
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
-use fanos_node::{ExitPolicy, Node, NodeConfig, Peer, dial_exit, serve_exit};
+use fanos_node::{
+    ExitPolicy, FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_exit, serve_exit,
+};
 use fanos_pqcrypto::rng::SeedRng;
+use fanos_proxy::{DialError, Dialer, Target};
 use fanos_runtime::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -198,6 +201,50 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
     assert!(
         TcpStream::connect(echo).await.is_ok(),
         "the echo server is still only reachable directly — the exit never dialed it"
+    );
+
+    e.shutdown();
+    c.shutdown();
+}
+
+#[tokio::test]
+async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
+    let _serial = serial();
+    // The full proxy path: a `FanosDialer` configured with an exit dials a CLEARNET target (the echo
+    // server) through it — the seam a SOCKS5/HTTP-CONNECT proxy uses for non-`.fanos` destinations.
+    let (e, c, keypair, echo) = exit_and_client().await;
+    let e_addr = e.address();
+    let e_public = keypair.public().clone();
+    serve_exit(
+        e.client(),
+        keypair,
+        SeedRng::from_seed(b"exit-dialer-svc"),
+        ExitPolicy::default(),
+    );
+
+    // A `.fanos`-resolving dialer (empty resolver — we only test clearnet) that routes clearnet via the exit.
+    let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, e_public);
+    let mut stream = dialer
+        .dial(&Target::Ip(echo))
+        .await
+        .expect("the dialer reached the clearnet target through the exit");
+
+    let sent = b"proxy dialer -> exit -> clearnet";
+    let echoed = tokio::time::timeout(Duration::from_secs(15), async {
+        stream.write_all(sent).await.unwrap();
+        let mut buf = vec![0u8; sent.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        buf
+    })
+    .await
+    .expect("round-trip through the dialer's exit path");
+    assert_eq!(echoed, sent, "clearnet round-trip via the proxy dialer's exit");
+
+    // Without an exit configured, the same clearnet target is refused (a `.fanos`-only dialer).
+    let no_exit = FanosDialer::new(c.client(), StaticResolver::new());
+    assert!(
+        matches!(no_exit.dial(&Target::Ip(echo)).await, Err(DialError::Unsupported(_))),
+        "a dialer with no exit refuses a clearnet target"
     );
 
     e.shutdown();

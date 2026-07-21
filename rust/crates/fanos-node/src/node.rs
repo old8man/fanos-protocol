@@ -42,6 +42,45 @@ fn os_entropy_32() -> Result<[u8; 32], NodeError> {
     Ok(bytes)
 }
 
+/// Lowercase-hex encode `bytes` — for logging the exit's public-key descriptor a proxy configures with.
+fn encode_hex(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Spawn the clearnet exit relay for the `exit` role (a no-op when off): a stable, seed-derived DIAULOS
+/// service identity on `handle`'s client that anonymous clients dial to reach the ordinary internet,
+/// bounded by the port policy. Per-session handshake keys are fresh OS entropy (forward-secure); only the
+/// identity is pinned to the seed so its published public stays stable across restarts. Logs the descriptor
+/// a proxy needs (`--exit-via`) — the public is safe to publish, only the seed is secret.
+fn spawn_exit_role(
+    handle: &NodeHandle,
+    address: Triple,
+    exit: Option<([u8; 32], Vec<u16>)>,
+) -> Result<(), NodeError> {
+    let Some((seed, allowed_ports)) = exit else {
+        return Ok(());
+    };
+    let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(&seed));
+    let [x, y, z] = address;
+    tracing::info!(
+        coord = ?address,
+        key = %encode_hex(&keypair.public().encode()),
+        "exit descriptor — proxy `--exit-via` file: coord = {x}:{y}:{z}, key = <the `key=` value above>"
+    );
+    serve_exit(
+        handle.client(),
+        keypair,
+        SeedRng::from_seed(&os_entropy_32()?),
+        ExitPolicy::new(allowed_ports),
+    );
+    Ok(())
+}
+
 /// Validate the `service` role's parameters, returning the member-key seed, line roster, and threshold to
 /// compose into a [`ServiceNode`] — or `None` when the role is off. The role requires its parameters (there
 /// is no line to serve without them) and a threshold in `1..=line.len()` (zero would serve every intro from
@@ -222,19 +261,8 @@ impl Node {
         // key at once, then republish each epoch the beacon advances to (audit #54; E4∩E5).
         let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), address, onion_seed));
 
-        // The exit role runs a clearnet relay on this node's client: a stable, seed-derived DIAULOS service
-        // identity anonymous clients dial to reach the ordinary internet, bounded by the port policy. The
-        // per-session handshake keys are fresh OS entropy (forward-secure); only the service identity is
-        // pinned to the seed so its published public stays stable across restarts.
-        if let Some((seed, allowed_ports)) = exit {
-            let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(&seed));
-            serve_exit(
-                handle.client(),
-                keypair,
-                SeedRng::from_seed(&os_entropy_32()?),
-                ExitPolicy::new(allowed_ports),
-            );
-        }
+        // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
+        spawn_exit_role(&handle, address, exit)?;
 
         if config.start_heartbeat {
             handle.command(Command::StartHeartbeat);
