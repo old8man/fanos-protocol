@@ -7,7 +7,9 @@
 //!
 //! * [`morph`] — the obfuscation modes and per-environment fallback policy (§13.3, §13.7).
 //! * [`shape`] — beacon-rotating shape `θ_epoch` (§13.4).
-//! * [`obfuscate`] — the `polymorph` transform (§13.2).
+//! * [`obfuscate`] — the `polymorph` codec (§13.2).
+//! * [`profile`] — the traffic-shaper: per-morph size + timing targets (§13.3, §13.1).
+//! * [`shaper`] — the driver-facing [`ProteusShaper`]: morph-dispatched codec + shaping.
 //! * [`bridge`] — moving-target bridges, no static list to block (§13.6).
 //!
 //! This layer does not end the arms race (spec §13.8); it makes the censor's cost recur every
@@ -22,6 +24,7 @@ extern crate alloc;
 pub mod bridge;
 pub mod morph;
 pub mod obfuscate;
+pub mod profile;
 pub mod shape;
 pub mod shaper;
 
@@ -29,8 +32,9 @@ pub use bridge::{bridge_line, client_bridge_lines, reachable_fraction};
 pub use fanos_primitives::Epoch;
 pub use morph::{Environment, Morph};
 pub use obfuscate::{deobfuscate, obfuscate};
+pub use profile::ShapingProfile;
 pub use shape::{ShapeParams, epoch_shape};
-pub use shaper::ProteusShaper;
+pub use shaper::{ProteusShaper, Shaped};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

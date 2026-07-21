@@ -14,11 +14,15 @@ categories = ["network-programming", "cryptography"]
 fanos-field.workspace = true
 fanos-geometry.workspace = true
 fanos-primitives.workspace = true
+libm = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
 std = ["fanos-geometry/std", "fanos-primitives/std"]
 alloc = ["fanos-geometry/alloc", "fanos-primitives/alloc"]
+# Supplies the natural-log backend for exponential timing shaping on no_std (std uses the hardware
+# intrinsic). Timing is sender-local, so without this a no_std build simply paces at zero.
+libm = ["dep:libm"]
 
 [dev-dependencies]
 proptest.workspace = true

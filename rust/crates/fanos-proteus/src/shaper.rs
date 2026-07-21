@@ -9,20 +9,37 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 
 use fanos_primitives::Epoch;
 use fanos_primitives::hash::hash_xof;
 
+use crate::morph::Morph;
 use crate::obfuscate::{NONCE_LEN, deobfuscate, obfuscate};
+use crate::profile::ShapingProfile;
 use crate::shape::{ShapeParams, epoch_shape};
 
 const NONCE_LABEL: &str = "FANOS-v1/proteus-packet-nonce";
 
-/// A stateful per-connection shaper: the community secret, the current epoch's shape, and a
-/// monotonic packet counter that diversifies each packet's junk (interior-mutable, so the shaper
-/// can be shared `&self` behind an `Arc` across a connection's concurrent sends).
+/// A shaped outbound frame: the wire bytes, and the [`Duration`] the driver should pace before putting them
+/// on the wire (the traffic-shaper's timing directive — `Duration::ZERO` for morphs that do not time-shape).
+/// The clock lives in the driver, never here, so PROTEUS stays below the sans-I/O boundary.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Shaped {
+    /// The wire bytes to transmit.
+    pub wire: Vec<u8>,
+    /// How long to wait before transmitting `wire` (traffic-shaping pace).
+    pub delay: Duration,
+}
+
+/// A stateful per-connection shaper: the selected [`Morph`] and its traffic-shaping profile, the community
+/// secret, the current epoch's shape, and a monotonic packet counter that diversifies each packet's junk,
+/// size, and timing (interior-mutable, so the shaper can be shared `&self` behind an `Arc` across a
+/// connection's concurrent sends).
 pub struct ProteusShaper {
     secret: Vec<u8>,
+    morph: Morph,
+    profile: ShapingProfile,
     epoch: Epoch,
     shape: ShapeParams,
     counter: AtomicU64,
@@ -34,23 +51,41 @@ impl core::fmt::Debug for ProteusShaper {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ProteusShaper")
             .field("secret", &"<redacted>")
+            .field("morph", &self.morph)
             .field("epoch", &self.epoch)
             .finish_non_exhaustive()
     }
 }
 
 impl ProteusShaper {
-    /// A shaper for `epoch`, keyed by the shared `community_secret`.
+    /// A shaper for `epoch`, keyed by the shared `community_secret`, using the flagship [`Morph::Polymorph`]
+    /// ("look like nothing"). Use [`with_morph`](Self::with_morph) to select another morph.
     #[must_use]
     pub fn new(community_secret: impl Into<Vec<u8>>, epoch: Epoch) -> Self {
+        Self::with_morph(community_secret, epoch, Morph::Polymorph)
+    }
+
+    /// A shaper for `epoch` under `morph`, keyed by the shared `community_secret`. The morph selects both the
+    /// codec ([`Morph::Plain`] is identity; every other morph applies the polymorph codec) and the
+    /// traffic-shaping [`ShapingProfile`] (size + timing).
+    #[must_use]
+    pub fn with_morph(community_secret: impl Into<Vec<u8>>, epoch: Epoch, morph: Morph) -> Self {
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
         Self {
             secret,
+            morph,
+            profile: ShapingProfile::for_morph(morph),
             epoch,
             shape,
             counter: AtomicU64::new(0),
         }
+    }
+
+    /// The active morph.
+    #[must_use]
+    pub fn morph(&self) -> Morph {
+        self.morph
     }
 
     /// Advance to a new epoch: the shape rotates, so the wire signature moves (§13.4, V22).
@@ -65,14 +100,29 @@ impl ProteusShaper {
         self.epoch
     }
 
-    /// Wrap an outbound frame for the wire — junk-padded and shaped so it carries no static
-    /// signature, with **per-packet** junk so even identical frames shape to different bytes
-    /// (§13.2–§13.4). Each call consumes one packet-counter value, PRF'd into a random-looking
-    /// nonce that seeds this packet's junk/padding keystream.
+    /// Shape an outbound frame: the wire bytes **and** the timing directive (§13.3 — a morph is a codec *and*
+    /// a traffic-shaper). Every morph but [`Morph::Plain`] applies the polymorph codec (junk-padded, no
+    /// static signature, per-packet-diversified so even identical frames differ, §13.2–§13.4), then the
+    /// morph's [`ShapingProfile`] pads the wire toward its size band and returns the inter-packet delay.
+    /// `Plain` is identity with zero delay (the zero-overhead open-network path). Each call consumes one
+    /// packet-counter value, seeding this packet's nonce, size, and timing.
+    #[must_use]
+    pub fn shape(&self, frame: &[u8]) -> Shaped {
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+        if self.morph == Morph::Plain {
+            return Shaped { wire: frame.to_vec(), delay: Duration::ZERO };
+        }
+        let mut wire = obfuscate(&self.shape, frame, &self.packet_nonce(seq));
+        self.profile.pad_to_target(&mut wire, &self.shape.scramble_seed, seq);
+        let delay = self.profile.packet_delay(&self.shape.scramble_seed, seq);
+        Shaped { wire, delay }
+    }
+
+    /// Wrap an outbound frame for the wire, discarding the timing directive — [`shape`](Self::shape) without
+    /// the delay, for call sites (handshake/control frames) that do not pace.
     #[must_use]
     pub fn outbound(&self, frame: &[u8]) -> Vec<u8> {
-        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        obfuscate(&self.shape, frame, &self.packet_nonce(seq))
+        self.shape(frame).wire
     }
 
     /// Derive a random-looking per-packet nonce from the sequence counter — so the cleartext front
@@ -86,9 +136,14 @@ impl ProteusShaper {
     }
 
     /// Recover an inbound frame, or `None` if it was not shaped by the same secret and epoch —
-    /// a peer without the community secret cannot produce a frame this shaper will accept.
+    /// a peer without the community secret cannot produce a frame this shaper will accept. [`Morph::Plain`]
+    /// is identity (the frame passed through unshaped). Size-shaping padding on the wire is transparent here:
+    /// the codec's length field bounds the payload, so trailing pad is ignored.
     #[must_use]
     pub fn inbound(&self, wire: &[u8]) -> Option<Vec<u8>> {
+        if self.morph == Morph::Plain {
+            return Some(wire.to_vec());
+        }
         deobfuscate(&self.shape, wire)
     }
 }
