@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use fanos_field::Field;
 use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
-use fanos_proteus::{Environment, Morph, MorphController, ProteusShaper};
+use fanos_proteus::{Environment, Morph, MorphCodec, MorphController, ProteusShaper};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
@@ -71,20 +71,28 @@ pub struct ProteusConfig {
     /// The shared community secret keying the beacon-rotating shape.
     pub secret: Vec<u8>,
     /// The obfuscation morph (defaults to the flagship [`Morph::Polymorph`]). When `environment` is set the
-    /// starting morph is the environment's preferred morph instead.
+    /// starting morph is the environment's preferred morph instead; when `codec` is set the morph is
+    /// [`Morph::Pluggable`].
     pub morph: Morph,
     /// The environment policy for morph auto-fallback (§13.7). `Some(env)` rotates through `env`'s morph
     /// chain when the current morph starts failing; `None` (the default) pins the fixed `morph`.
     pub environment: Option<Environment>,
+    /// A pluggable-transport codec (the §13.3 SPI). `Some(codec)` runs the [`Morph::Pluggable`] morph with
+    /// this custom codec instead of the built-in polymorph transform (and takes precedence over
+    /// `environment`/`morph`); an embedder sets it programmatically — it has no config-file/CLI surface,
+    /// since a codec is code, not configuration.
+    pub codec: Option<Arc<dyn MorphCodec>>,
 }
 
-/// Redacted `Debug`: never render the community secret (secret hygiene, audit D) — only the morph/env.
+/// Redacted `Debug`: never render the community secret (secret hygiene, audit D) — the morph/env, and only
+/// whether a pluggable codec is present.
 impl std::fmt::Debug for ProteusConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProteusConfig")
             .field("secret", &"<redacted>")
             .field("morph", &self.morph)
             .field("environment", &self.environment)
+            .field("codec", &self.codec.as_ref().map(|_| "<plugged>"))
             .finish()
     }
 }
@@ -93,25 +101,42 @@ impl ProteusConfig {
     /// A config for the flagship [`Morph::Polymorph`] ("look like nothing") under `secret`, fixed morph.
     #[must_use]
     pub fn polymorph(secret: impl Into<Vec<u8>>) -> Self {
-        Self { secret: secret.into(), morph: Morph::Polymorph, environment: None }
+        Self { secret: secret.into(), morph: Morph::Polymorph, environment: None, codec: None }
     }
 
     /// A config under an explicit fixed `morph`.
     #[must_use]
     pub fn with_morph(secret: impl Into<Vec<u8>>, morph: Morph) -> Self {
-        Self { secret: secret.into(), morph, environment: None }
+        Self { secret: secret.into(), morph, environment: None, codec: None }
     }
 
     /// A config with **auto-fallback** under `environment`: the morph starts at the environment's preferred
     /// morph and rotates through its chain as morphs fail (§13.7).
     #[must_use]
     pub fn auto(secret: impl Into<Vec<u8>>, environment: Environment) -> Self {
-        Self { secret: secret.into(), morph: environment.preferred_morph(), environment: Some(environment) }
+        Self {
+            secret: secret.into(),
+            morph: environment.preferred_morph(),
+            environment: Some(environment),
+            codec: None,
+        }
     }
 
-    /// Build the shared shaper and (when auto-fallback is configured) its controller, seeded at `epoch`. With
-    /// an environment the shaper starts at the environment's preferred morph; otherwise the fixed `morph`.
+    /// A config driven by a **pluggable** [`MorphCodec`] (the §13.3 SPI) instead of the built-in transform —
+    /// the honest home for a real cover-protocol tunnel or a third-party morph.
+    #[must_use]
+    pub fn pluggable(secret: impl Into<Vec<u8>>, codec: Arc<dyn MorphCodec>) -> Self {
+        Self { secret: secret.into(), morph: Morph::Pluggable, environment: None, codec: Some(codec) }
+    }
+
+    /// Build the shared shaper and (when auto-fallback is configured) its controller, seeded at `epoch`. A
+    /// pluggable codec wins; else an environment starts the shaper at its preferred morph with a controller;
+    /// else the fixed `morph` with no controller.
     fn build(self, epoch: Epoch) -> (Arc<RwLock<ProteusShaper>>, MaybeController) {
+        if let Some(codec) = self.codec {
+            let shaper = ProteusShaper::with_codec(self.secret, epoch, codec);
+            return (Arc::new(RwLock::new(shaper)), None);
+        }
         match self.environment {
             Some(env) => {
                 let controller = MorphController::new(env);

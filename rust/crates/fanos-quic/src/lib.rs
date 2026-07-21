@@ -42,7 +42,7 @@ pub use driver::{
     spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,
     spawn_self_certifying_with_capabilities, spawn_shaped,
 };
-pub use fanos_proteus::{Environment, Morph};
+pub use fanos_proteus::{Environment, Morph, MorphCodec};
 pub use harness::{Cell, DEFAULT_GRIND_LIMIT, credentials_for_point, spawn_cell, spawn_pinned};
 pub use identity::{
     coordinate_at_level, coordinate_from_cert, hierarchical_coordinate, verifiable_coordinate,

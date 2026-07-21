@@ -7,10 +7,29 @@
 
 use std::time::Duration as StdDuration;
 
+use std::sync::Arc;
+
 use fanos_field::F2;
 use fanos_geometry::Point;
-use fanos_quic::{Directory, Morph, ProteusConfig, spawn_shaped};
+use fanos_quic::{Directory, Morph, MorphCodec, ProteusConfig, spawn_shaped};
 use fanos_runtime::{Command, Config, Notification, OverlayNode};
+
+/// A trivial reversible pluggable codec standing in for a real cover-protocol transport (a real one tunnels
+/// TLS/MASQUE/etc.): reverse the bytes and append a marker. Proves the SPI carries traffic over the wire.
+#[derive(Debug)]
+struct ReverseCodec;
+
+impl MorphCodec for ReverseCodec {
+    fn encode(&self, frame: &[u8], _seq: u64) -> Vec<u8> {
+        let mut v: Vec<u8> = frame.iter().rev().copied().collect();
+        v.push(0xC0);
+        v
+    }
+    fn decode(&self, wire: &[u8]) -> Option<Vec<u8>> {
+        let (&marker, body) = wire.split_last()?;
+        (marker == 0xC0).then(|| body.iter().rev().copied().collect())
+    }
+}
 
 /// Bring up two shaped nodes under `proteus`, send one payload A→B, and assert it is delivered through the
 /// shaped transport within the timeout.
@@ -69,6 +88,17 @@ async fn shaped_nodes_deliver_under_a_timing_and_size_morph() {
     deliver_under(ProteusConfig::with_morph(
         b"community-transport-secret".to_vec(),
         Morph::TlsTunnel,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn shaped_nodes_deliver_under_a_pluggable_codec() {
+    // The pluggable-transport SPI (§13.3): a custom `MorphCodec` fully replaces the built-in transform on the
+    // wire, and two nodes running it still deliver application traffic end to end over a real socket.
+    deliver_under(ProteusConfig::pluggable(
+        b"community-transport-secret".to_vec(),
+        Arc::new(ReverseCodec),
     ))
     .await;
 }

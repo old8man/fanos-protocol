@@ -7,6 +7,7 @@
 //! observer sees only shaped bytes with no fixed signature, and the shape **rotates every epoch**
 //! (§13.4), so a classifier trained on one epoch is stale the next.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
@@ -14,6 +15,7 @@ use core::time::Duration;
 use fanos_primitives::Epoch;
 use fanos_primitives::hash::hash_xof;
 
+use crate::codec::MorphCodec;
 use crate::morph::Morph;
 use crate::obfuscate::{NONCE_LEN, deobfuscate, obfuscate};
 use crate::profile::ShapingProfile;
@@ -40,6 +42,9 @@ pub struct ProteusShaper {
     secret: Vec<u8>,
     morph: Morph,
     profile: ShapingProfile,
+    /// A pluggable codec (the `pluggable` morph, §13.3 SPI); when set it replaces the built-in polymorph
+    /// transform in [`shape`](Self::shape)/[`inbound`](Self::inbound).
+    codec: Option<Arc<dyn MorphCodec>>,
     epoch: Epoch,
     shape: ShapeParams,
     counter: AtomicU64,
@@ -76,6 +81,30 @@ impl ProteusShaper {
             secret,
             morph,
             profile: ShapingProfile::for_morph(morph),
+            codec: None,
+            epoch,
+            shape,
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// A shaper driven by a **pluggable** [`MorphCodec`] (§13.3 SPI) instead of the built-in codec — the
+    /// [`Morph::Pluggable`] mode. The custom codec fully handles encode/decode; the size/timing profile is
+    /// the (identity) `Pluggable` default, so the codec owns the wire. The community secret still seeds the
+    /// epoch shape (so a codec MAY consult it), and the epoch still rotates via [`rotate`](Self::rotate).
+    #[must_use]
+    pub fn with_codec(
+        community_secret: impl Into<Vec<u8>>,
+        epoch: Epoch,
+        codec: Arc<dyn MorphCodec>,
+    ) -> Self {
+        let secret = community_secret.into();
+        let shape = epoch_shape(&secret, epoch);
+        Self {
+            secret,
+            morph: Morph::Pluggable,
+            profile: ShapingProfile::for_morph(Morph::Pluggable),
+            codec: Some(codec),
             epoch,
             shape,
             counter: AtomicU64::new(0),
@@ -96,6 +125,9 @@ impl ProteusShaper {
     pub fn set_morph(&mut self, morph: Morph) {
         self.morph = morph;
         self.profile = ShapingProfile::for_morph(morph);
+        // Switching to a built-in morph drops any pluggable codec: a shaper is either codec-driven or
+        // built-in-morph-driven, never both.
+        self.codec = None;
     }
 
     /// Advance to a new epoch: the shape rotates, so the wire signature moves (§13.4, V22).
@@ -119,10 +151,15 @@ impl ProteusShaper {
     #[must_use]
     pub fn shape(&self, frame: &[u8]) -> Shaped {
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        if self.morph == Morph::Plain {
-            return Shaped { wire: frame.to_vec(), delay: Duration::ZERO };
-        }
-        let mut wire = obfuscate(&self.shape, frame, &self.packet_nonce(seq));
+        // A pluggable codec (the SPI, §13.3) replaces the built-in transform; the profile still applies (it
+        // is the identity `Pluggable` default unless the codec's shaper set otherwise).
+        let mut wire = match &self.codec {
+            Some(codec) => codec.encode(frame, seq),
+            None if self.morph == Morph::Plain => {
+                return Shaped { wire: frame.to_vec(), delay: Duration::ZERO };
+            }
+            None => obfuscate(&self.shape, frame, &self.packet_nonce(seq)),
+        };
         self.profile.pad_to_target(&mut wire, &self.shape.scramble_seed, seq);
         let delay = self.profile.packet_delay(&self.shape.scramble_seed, seq);
         Shaped { wire, delay }
@@ -151,6 +188,9 @@ impl ProteusShaper {
     /// the codec's length field bounds the payload, so trailing pad is ignored.
     #[must_use]
     pub fn inbound(&self, wire: &[u8]) -> Option<Vec<u8>> {
+        if let Some(codec) = &self.codec {
+            return codec.decode(wire);
+        }
         if self.morph == Morph::Plain {
             return Some(wire.to_vec());
         }
@@ -208,6 +248,46 @@ mod tests {
             Some(&b"post-rotation frame"[..]),
             "a peer on the old morph still decodes — the codec is shared"
         );
+    }
+
+    /// A trivial reversible codec standing in for a real pluggable transport: reverse the bytes and append a
+    /// marker. Enough to prove the SPI dispatches (a real codec tunnels a cover protocol).
+    struct MockCodec;
+    impl MorphCodec for MockCodec {
+        fn encode(&self, frame: &[u8], _seq: u64) -> Vec<u8> {
+            let mut v: Vec<u8> = frame.iter().rev().copied().collect();
+            v.push(0xAB);
+            v
+        }
+        fn decode(&self, wire: &[u8]) -> Option<Vec<u8>> {
+            let (&marker, body) = wire.split_last()?;
+            (marker == 0xAB).then(|| body.iter().rev().copied().collect())
+        }
+    }
+
+    #[test]
+    fn a_pluggable_codec_replaces_the_builtin_transform() {
+        let shaper = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec));
+        assert_eq!(shaper.morph(), Morph::Pluggable);
+        let shaped = shaper.shape(b"hello");
+        assert!(shaped.wire.ends_with(&[0xAB]), "the custom codec produced the wire, not obfuscate");
+
+        // A peer running the same codec recovers it; the built-in polymorph decode does NOT.
+        let receiver = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec));
+        assert_eq!(receiver.inbound(&shaped.wire).as_deref(), Some(&b"hello"[..]));
+        let builtin = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
+        assert_ne!(builtin.inbound(&shaped.wire).as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn set_morph_off_pluggable_restores_the_builtin_codec() {
+        let mut shaper = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec));
+        shaper.set_morph(Morph::Polymorph);
+        assert_eq!(shaper.morph(), Morph::Polymorph);
+        // The built-in codec is back: a plain Polymorph shaper decodes the frame (the mock codec would not).
+        let shaped = shaper.shape(b"builtin again");
+        let rx = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
+        assert_eq!(rx.inbound(&shaped.wire).as_deref(), Some(&b"builtin again"[..]));
     }
 
     #[test]

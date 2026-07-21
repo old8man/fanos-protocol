@@ -47,7 +47,7 @@ pub use exit::{
     spawn_exit_publisher,
 };
 pub use fanos_onoma::Epoch;
-pub use fanos_quic::{Environment, Morph};
+pub use fanos_quic::{Environment, Morph, MorphCodec};
 pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;
 pub use mixdir::{

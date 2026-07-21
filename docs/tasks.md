@@ -18,9 +18,6 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **PROTEUS pluggable-transport SPI** (§13.3 `pluggable`, M10) — a `MorphCodec` trait extension point so
-  third-party morphs (and real cover-protocol tunnels: tls-tunnel/masque/fronted, which need external
-  stacks per §13.8) plug in without touching the core shaper.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 - **VOPRF credit settlement** (Phase 4) — anonymous relay payment.
@@ -29,6 +26,12 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**PROTEUS pluggable-transport SPI** (§13.3 `pluggable`, M10) — `MorphCodec` trait: an embedder's custom
+codec fully replaces the built-in transform (`ProteusShaper::with_codec`, `ProteusConfig::pluggable`), the
+honest home for real cover-protocol tunnels (tls-tunnel/masque/fronted need external stacks, §13.8 — never
+faked). `set_morph` back to a built-in morph restores the built-in codec. Verified at the crate level (a
+mock codec round-trips, the built-in decode rejects it) and over **real QUIC** (two nodes deliver under a
+pluggable codec). This completes the PROTEUS morph catalogue (codec + traffic-shaper + auto-fallback + SPI). ·
 **PROTEUS morph auto-fallback — live** (§13.7) — `MorphController` circuit breaker (K consecutive connect
 failures trip a rotation through the environment chain, a success resets it) + `ProteusShaper::set_morph`
 (runtime profile swap; the codec-using morphs share a codec, so rotation is decode-compatible and local —
