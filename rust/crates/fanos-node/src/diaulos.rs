@@ -22,9 +22,48 @@ use rand_core::CryptoRng;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+/// Cap on the client sessions a service accept loop tracks concurrently. A client dialing the service is
+/// not admission-gated (unlike overlay membership, §L3), so without a cap a flood of distinct source
+/// coordinates — or handlers that never finish — would grow the peer map without bound (audit A4). At the
+/// cap, the least-recently-active session is evicted (its handler aborted) to admit a new one.
+const MAX_SESSIONS: usize = 1024;
+
+/// A session with no traffic for this long is evicted — its inbound channel closed and its handler task
+/// aborted — reclaiming a wedged or abandoned handler that never signals completion (audit A4).
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the accept loop sweeps for idle sessions to evict.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One live client session in the service accept loop: the channel feeding it inbound datagrams, its
+/// handler task (aborted on idle/cap eviction, so a wedged handler is reclaimed, not merely detached), and
+/// its last-activity time (for idle and LRU eviction).
+struct Session {
+    in_tx: UnboundedSender<Vec<u8>>,
+    task: JoinHandle<()>,
+    last_active: Instant,
+}
+
+/// Evict the least-recently-active session (called when the map is at [`MAX_SESSIONS`]), aborting its
+/// handler task so a stuck session cannot hold a slot against a live client.
+fn evict_lru(peers: &mut HashMap<Coord, Session>) {
+    let victim = peers
+        .iter()
+        .min_by_key(|(_, s)| s.last_active)
+        .map(|(&coord, _)| coord);
+    if let Some(coord) = victim
+        && let Some(session) = peers.remove(&coord)
+    {
+        session.task.abort();
+    }
+}
 
 /// An [`OverlayTransport`] over a node's [`Client`]: outbound payloads become `Command::Send`, and the
 /// node's `Notification::Delivered` events become inbound datagrams.
@@ -93,20 +132,28 @@ where
     let keypair = Arc::new(keypair);
     tokio::spawn(async move {
         let mut deliveries = client.subscribe();
-        let mut peers: HashMap<Coord, UnboundedSender<Vec<u8>>> = HashMap::new();
+        let mut peers: HashMap<Coord, Session> = HashMap::new();
         // A session task signals its client coordinate here when its handler completes, so the demux reaps
-        // it — bounding the map to live clients (a step toward the audit-A4 back-pressure hygiene).
+        // it. The map is also capped ([`MAX_SESSIONS`], LRU-evicted) and idle-swept, so neither a flood of
+        // distinct client coordinates nor a wedged handler can grow it without bound (audit A4).
         let (done_tx, mut done_rx) = unbounded_channel::<Coord>();
+        let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         loop {
             tokio::select! {
                 event = deliveries.recv() => match event {
                     Ok(Notification::Delivered { from, payload }) => {
-                        // Spin up a session on first contact, or if the previous one finished (its inbound
-                        // channel closed), so a reconnecting client starts clean.
-                        if peers.get(&from).is_none_or(UnboundedSender::is_closed) {
+                        // Reuse a live session, or spin up a fresh one — on first contact or when the
+                        // previous one finished (its inbound channel closed), so a reconnecting client
+                        // starts clean. At the cap, evict the least-recently-active session first.
+                        let live = peers.get(&from).is_some_and(|s| !s.in_tx.is_closed());
+                        if !live {
+                            peers.remove(&from); // drop a finished/closed session before replacing it
+                            if peers.len() >= MAX_SESSIONS {
+                                evict_lru(&mut peers);
+                            }
                             let mut seed = [0u8; 32];
                             rng.fill_bytes(&mut seed);
-                            let in_tx = spawn_client_session(
+                            let (in_tx, task) = spawn_client_session(
                                 client.clone(),
                                 keypair.clone(),
                                 SeedRng::from_seed(&seed),
@@ -114,10 +161,11 @@ where
                                 handler.clone(),
                                 done_tx.clone(),
                             );
-                            peers.insert(from, in_tx);
+                            peers.insert(from, Session { in_tx, task, last_active: Instant::now() });
                         }
-                        if let Some(tx) = peers.get(&from) {
-                            let _ = tx.send(payload);
+                        if let Some(session) = peers.get_mut(&from) {
+                            session.last_active = Instant::now();
+                            let _ = session.in_tx.send(payload);
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -127,9 +175,24 @@ where
                     // Reap a finished session, but only if a reconnect has not already replaced it with a
                     // fresh (still-open) one — a race-free drop keyed on the sender being closed.
                     if let Some(from) = reaped
-                        && peers.get(&from).is_some_and(UnboundedSender::is_closed)
+                        && peers.get(&from).is_some_and(|s| s.in_tx.is_closed())
                     {
                         peers.remove(&from);
+                    }
+                }
+                _ = sweep.tick() => {
+                    // Evict sessions idle past the timeout: close their inbound channel and abort the
+                    // handler task, reclaiming a wedged handler that never signalled completion.
+                    let now = Instant::now();
+                    let idle: Vec<Coord> = peers
+                        .iter()
+                        .filter(|(_, s)| now.duration_since(s.last_active) >= SESSION_IDLE_TIMEOUT)
+                        .map(|(&coord, _)| coord)
+                        .collect();
+                    for coord in idle {
+                        if let Some(session) = peers.remove(&coord) {
+                            session.task.abort();
+                        }
                     }
                 }
             }
@@ -171,7 +234,7 @@ fn spawn_client_session<H, Fut>(
     from: Coord,
     handler: Arc<H>,
     done_tx: UnboundedSender<Coord>,
-) -> UnboundedSender<Vec<u8>>
+) -> (UnboundedSender<Vec<u8>>, JoinHandle<()>)
 where
     H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -192,11 +255,11 @@ where
             inbound: in_rx,
         },
     );
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         handler(stream).await;
         let _ = done_tx.send(from);
     });
-    in_tx
+    (in_tx, task)
 }
 
 /// Resolves a `.fanos` host to the service's overlay coordinate and static KEM public key — the two
@@ -420,5 +483,43 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session whose last activity was `age` ago (a still-live but idle handler task).
+    fn idle_session(age: Duration) -> Session {
+        let (in_tx, _in_rx) = unbounded_channel::<Vec<u8>>();
+        let task = tokio::spawn(std::future::pending::<()>());
+        Session {
+            in_tx,
+            task,
+            last_active: Instant::now() - age,
+        }
+    }
+
+    /// The cap-eviction victim is always the *least-recently-active* session — so a stalled/idle session
+    /// is shed before a live client's, bounding the map (audit A4).
+    #[tokio::test]
+    async fn evict_lru_drops_the_least_recently_active_session() {
+        let mut peers: HashMap<Coord, Session> = HashMap::new();
+        peers.insert([1, 1, 1], idle_session(Duration::from_secs(1))); // newest
+        peers.insert([2, 2, 2], idle_session(Duration::from_secs(30))); // oldest — the LRU victim
+        peers.insert([3, 3, 3], idle_session(Duration::from_secs(5)));
+
+        evict_lru(&mut peers);
+
+        assert_eq!(peers.len(), 2, "exactly one session is evicted");
+        assert!(
+            !peers.contains_key(&[2, 2, 2]),
+            "the least-recently-active session is the one evicted"
+        );
+        assert!(
+            peers.contains_key(&[1, 1, 1]) && peers.contains_key(&[3, 3, 3]),
+            "the more-recently-active sessions are kept"
+        );
     }
 }

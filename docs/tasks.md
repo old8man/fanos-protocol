@@ -29,6 +29,8 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+Tier-2 hardening: DIAULOS `serve` session-map bounded (audit A4) — `MAX_SESSIONS` LRU-evicted + idle sweep
+aborting wedged handler tasks; a flood of client coords / a never-finishing handler can't grow it ·
 **PRODUCTION Blocker 3 — PoW Sybil admission live-wired** (`NodeConfig.admission_difficulty` →
 `OverlayNode::with_admission_pow`: prices every join, rejects proof-less announces with SYBIL_REJECT, and
 re-solves the `(coord,epoch)` proof each epoch on reshuffle — the Blocker-1 coupling; verified incl. a
