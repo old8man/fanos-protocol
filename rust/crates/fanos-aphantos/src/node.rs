@@ -9,11 +9,10 @@ use alloc::vec::Vec;
 
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
-use fanos_nyx::{Circuit, build_circuit, build_circuit_via_guard};
+use fanos_nyx::{Circuit, GuardSet, build_circuit};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::hash::hash_xof;
 use fanos_primitives::hash_labeled;
-use fanos_primitives::map_to_point;
 use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame};
 
@@ -25,6 +24,12 @@ pub const ANONYMOUS: Triple = [0, 0, 0];
 
 /// The cover-traffic timer token (distinct from the per-hop mix-delay tokens, which are `1 + id`).
 const COVER_TIMER: TimerToken = TimerToken(0);
+
+/// The size of this client's ordered guard set (C10): the primary plus backups it enters through, in
+/// priority order. A small set keeps predecessor exposure at ≈`f` (the primary carries every circuit
+/// while it is up) while surviving a down/unknown primary via a stable backup — not the `1−(1−f)^k` union
+/// bound a "any of k" set would suffer.
+const GUARD_SET_SIZE: usize = 3;
 
 /// A membership directory mapping node coordinates to their hybrid KEM public keys. In
 /// production this is learned via authenticated line announcements (spec §7.8 JOIN); here it
@@ -275,25 +280,6 @@ impl<F: Field> NyxNode<F> {
         effects
     }
 
-    /// The node's stable **guard**: a fixed first-hop relay derived from the node seed alone — not the
-    /// destination, not the circuit counter — so the client always enters through the same relay. A
-    /// fixed entry bounds the predecessor attack (Wright et al., NDSS'02): with a rotating first hop an
-    /// adversary holding a fraction `f` of relays is the initiator's direct successor on ~`f` of every
-    /// circuit and identifies it after ~`1/f` rounds; with a guard it sees the initiator only if it
-    /// controls that one guard (probability ~`f`, once), independent of the round count. Derived by
-    /// rejection so it never coincides with the node itself (a self-loop is no guard).
-    fn guard(&self) -> Point<F> {
-        for i in 0..8u8 {
-            let mut data = self.seed.to_vec();
-            data.push(i);
-            let g = map_to_point::<F>("FANOS-v1/nyx-guard", &data);
-            if g != self.coord {
-                return g;
-            }
-        }
-        self.coord // astronomically unlikely; `build_circuit_via_guard` then falls back to guardless
-    }
-
     /// A fresh, monotonically-distinct per-circuit seed derived from this node's own entropy.
     /// Shared by every circuit-building path ([`next_circuit`](Self::next_circuit) and
     /// [`build_verifiable_circuit`](Self::build_verifiable_circuit)), so `circuit_counter` is
@@ -305,14 +291,24 @@ impl<F: Field> NyxNode<F> {
         circuit_seed
     }
 
-    /// Build a fresh **outbound** circuit `self.coord → … → dest` — guard-anchored
-    /// (predecessor-attack bound), falling back to a fully derived circuit only for a 1-hop path or
-    /// the rare guard/source/dest collision. Used by [`originate`](Self::originate); `None` on a
-    /// degenerate request (see [`build_circuit`]).
+    /// Build a fresh **outbound** circuit `self.coord → … → dest`, entering through this client's stable
+    /// **guard set** (C10, `fanos_nyx::GuardSet`): the highest-priority guard that is currently *sealable*
+    /// (present in the mix directory) carries the circuit, so a down or unknown primary guard falls back to
+    /// a **stable backup** rather than to a guardless (predecessor-vulnerable) circuit — the availability a
+    /// single guard lacks. The set is derived from the node seed alone (not the destination or the circuit
+    /// counter), so the entry is fixed across circuits while the interior still rotates. Falls back to a
+    /// fully derived (guardless) circuit only when NO guard is sealable, or for a 1-hop / degenerate
+    /// request. Used by [`originate`](Self::originate); `None` on a degenerate request.
     fn next_circuit(&mut self, dest: Point<F>) -> Option<(Circuit<F>, Vec<u8>)> {
         let circuit_seed = self.next_seed();
-        let guard = self.guard();
-        let circuit = build_circuit_via_guard(self.coord, guard, dest, self.path_len, &circuit_seed)
+        // A fixed-window guard set: the standalone engine has no epoch source, so slow rotation is inert
+        // here — the ordered SET plus the sealable-guard failover is the live improvement over a single
+        // guard. A guard is usable iff we can seal an onion layer to it (its key is in the mix directory).
+        let guards = GuardSet::derive(&self.seed, 0, u64::MAX, GUARD_SET_SIZE, self.coord);
+        let circuit = guards
+            .build_circuit(self.coord, dest, self.path_len, &circuit_seed, |g| {
+                self.directory.get(&g.coords()).is_some()
+            })
             .or_else(|| build_circuit(self.coord, dest, self.path_len, &circuit_seed))?;
         Some((circuit, circuit_seed))
     }
@@ -553,6 +549,49 @@ mod tests {
             derived([5u8; 32]),
             "same seed+boot is deterministic"
         );
+    }
+
+    /// C10 live actuation: the outbound circuit enters through this client's stable **guard set**, and
+    /// when the primary guard is not sealable (absent from the mix directory) the entry falls back to a
+    /// stable **backup** — not to a guardless (predecessor-vulnerable) circuit, which is the availability
+    /// the single-guard design lacked.
+    #[test]
+    #[allow(clippy::expect_used, clippy::indexing_slicing)]
+    fn the_guard_set_falls_back_to_a_stable_backup_when_the_primary_is_unsealable() {
+        use fanos_field::F2;
+
+        let coord = Point::<F2>::at(0);
+        let secret = || HybridKemSecret::generate(&mut SeedRng::from_seed(b"guard-failover")).0;
+        // A throwaway node reveals the derived seed → the guard set (deterministic from the boot material),
+        // exactly as `next_circuit` derives it.
+        let probe = NyxNode::<F2>::new(coord, secret(), Directory::new(), [7u8; 32], [0u8; 32], 3);
+        let guards = GuardSet::derive(&probe.seed, 0, u64::MAX, GUARD_SET_SIZE, coord);
+        assert!(guards.guards().len() >= 2, "the guard set has a primary and a backup");
+        let primary = guards.guards()[0];
+        let backup = guards.guards()[1];
+
+        // A directory with every cell point sealable EXCEPT the primary guard: a circuit can still form,
+        // but the primary cannot be sealed to.
+        let mut directory = Directory::new();
+        for i in 0..7usize {
+            let point = Point::<F2>::at(i);
+            if point == primary {
+                continue;
+            }
+            let (_, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD1, i as u8]));
+            directory.insert(point.coords(), public);
+        }
+        let mut node = NyxNode::<F2>::new(coord, secret(), directory, [7u8; 32], [0u8; 32], 3);
+
+        let (circuit, _) = node
+            .next_circuit(Point::<F2>::at(5))
+            .expect("a circuit forms through a live guard");
+        assert_eq!(
+            circuit.relays()[1],
+            backup,
+            "the entry falls back to the stable backup guard, not a guardless circuit"
+        );
+        assert_ne!(circuit.relays()[1], primary, "the unsealable primary guard is skipped");
     }
 
     /// A cover cell must be byte-indistinguishable from a real onion: the same `Tessera` frame type,

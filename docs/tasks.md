@@ -29,6 +29,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+C10 guard-set LIVE actuation — `NyxNode::next_circuit` now enters through the guard SET (sealable-guard
+failover: a down/unknown primary falls to a stable backup, not guardless); validated with a partial mix
+directory. (Residual: slow rotation inert — the standalone engine has no epoch source) ·
 DoS-via-healing cost bound (`healing.rs`: a flapping node keeps reroutes/repairs linear in churn — the
 `⌊log₉Φ⌋` blast-radius budget — no cascade; bounded transient escalations; reconverges to health) ·
 C9 onion-replay over the running mixnet (`sim/tests/replay.rs`: a captured forwarded onion re-injected to
