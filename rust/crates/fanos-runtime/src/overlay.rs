@@ -10,6 +10,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
+use fanos_code::erasure;
 use fanos_core::AdmissionPolicy;
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
@@ -22,10 +23,15 @@ use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, ProtocolError, Wire, decode_frame, encode_frame};
 
-/// Storage `Publish` sub-type: the responsible node fans out replicas; a replica just stores.
+/// Storage `Publish` sub-type: the **full value**, sent origin → responsible node, which then
+/// erasure-codes it and distributes the shards. Carries no meaningful shard index (`0`).
 const PUBLISH_ORIGIN: u8 = 0;
-/// Storage `Publish` sub-type: a replica copy — store it, do not re-fan-out.
-const PUBLISH_REPLICA: u8 = 1;
+/// Storage `Publish` sub-type: a single **erasure shard** for the point named by the frame's shard-index
+/// byte — the receiver (its shard home) stores it under that index (spec §L4 projective LRC, #115). This is
+/// what replaces full replication: a value is `erasure::encode`d into `N=7` shards, one per Fano point, each
+/// placed at the point's [`nearest_occupied`](OverlayNode::nearest_occupied) home, so the cell holds the
+/// value at `N/K ≈ 2.33×` redundancy (vs `N×` full replication) while any `≤3`-point loss still recovers it.
+const PUBLISH_SHARD: u8 = 2;
 /// The DHT key-digest / storage-address length (BLAKE3-256) — the one canonical digest width.
 const DIGEST: usize = fanos_primitives::DIGEST_LEN;
 
@@ -175,11 +181,21 @@ impl Default for Config {
 #[derive(Clone, Debug)]
 struct PendingGet {
     issued: Instant,
-    remaining: Vec<Triple>,
+    /// The erasure shards gathered so far, indexed by Fano point (`None` = not yet received). A read
+    /// fans a `Lookup` out to every shard home at once and accumulates their replies here; as soon as the
+    /// present set is [`erasure::reconstruct`]-able the value is delivered (spec §L4). Replaces the old
+    /// one-replica-at-a-time walk — under erasure no single node holds the value, so the read must gather.
+    shards: [Option<Vec<u8>>; erasure::N],
     /// The per-request nonce this read is correlated on: a `Value` reply resolves it only if the reply
     /// echoes this exact nonce, so a stale/replayed reply from a prior get for the same key cannot drain
     /// it with an old value (audit C4).
     nonce: u64,
+    /// How many `Lookup`s this read fanned out — the peers it is awaiting shard replies from.
+    queried: u16,
+    /// How many of those peers have replied `found=false` (they hold no shard for this key). Once this
+    /// reaches [`queried`](Self::queried) and the gathered shards still do not reconstruct, the value is
+    /// concluded absent immediately — a fast miss, instead of waiting out the read timeout.
+    negatives: u16,
 }
 
 /// The DHT-storage concern factored out of [`OverlayNode`] (audit #125 decompose): this node's local
@@ -188,51 +204,44 @@ struct PendingGet {
 /// `OverlayNode`, which owns the membership view; this owns the local state and the read-repair walk.
 #[derive(Default)]
 struct Store {
-    /// Key digest → value. A value lives on its responsible content point and is replicated across the
-    /// cell for LRC availability, so any survivor answers a lookup (spec §L4).
-    entries: BTreeMap<[u8; DIGEST], Vec<u8>>,
-    /// In-flight `Get`s awaiting a `Value`, keyed by digest — the read-repair walk down the replica line.
+    /// Key digest → this node's held **erasure shards** for that key: `point index → shard bytes`. A value
+    /// is `erasure::encode`d into `N=7` point-shards and each placed at its point's nearest-occupied home
+    /// (spec §L4 projective LRC, #115); on a full Fano cell a node holds exactly one shard (its own point),
+    /// on a sparse cell it may hold several (the shards of the points it is nearest-occupied for). A lookup
+    /// returns every shard here; a read gathers a recoverable set across the cell and reconstructs.
+    entries: BTreeMap<[u8; DIGEST], BTreeMap<u8, Vec<u8>>>,
+    /// In-flight `Get`s awaiting shards, keyed by digest — the gather-and-reconstruct accumulator.
     pending: BTreeMap<[u8; DIGEST], PendingGet>,
     /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
     seq: u64,
 }
 
 impl Store {
-    /// Whether the local slice admits `(digest, value_len)` under the A4 DoS caps: within
-    /// [`MAX_VALUE_LEN`], and either the key already exists (an overwrite — no growth) or the store is
-    /// below [`MAX_STORE_ENTRIES`] — so a `Publish` flood cannot displace already-stored replicas, while
-    /// updates to existing keys always pass.
-    fn admits(&self, digest: &[u8; DIGEST], value_len: usize) -> bool {
-        value_len <= MAX_VALUE_LEN
+    /// Whether the local slice admits a shard of `shard_len` for `digest` under the A4 DoS caps: within
+    /// [`MAX_VALUE_LEN`], and either the key already exists (adding/overwriting a shard of a held key — no
+    /// key growth) or the store is below [`MAX_STORE_ENTRIES`] — so a `Publish` flood of distinct digests
+    /// cannot displace already-stored shards, while shards of already-held keys always pass.
+    fn admits(&self, digest: &[u8; DIGEST], shard_len: usize) -> bool {
+        shard_len <= MAX_VALUE_LEN
             && (self.entries.len() < MAX_STORE_ENTRIES || self.entries.contains_key(digest))
     }
 
-    /// Advance an in-flight read to the next replica on its line, or conclude `Retrieved(None)` once the
-    /// replicas are exhausted (spec §L4 read repair). The next replica comes from the read's own
-    /// `remaining` list, so this needs no membership view.
-    fn advance_pending_get(
-        &mut self,
-        now: Instant,
-        digest: [u8; DIGEST],
-        effects: &mut Vec<Effect>,
-    ) {
-        let Some(pending) = self.pending.get_mut(&digest) else {
-            return;
-        };
-        if let Some(next) = pending.remaining.pop() {
-            pending.issued = now;
-            let nonce = pending.nonce;
-            effects.push(Effect::Send {
-                to: next,
-                frame: encode_lookup(&digest, nonce),
-            });
-        } else {
-            self.pending.remove(&digest);
-            effects.push(Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            }));
+    /// Store one erasure shard for `digest` at Fano point `index` (idempotent overwrite).
+    fn insert_shard(&mut self, digest: [u8; DIGEST], index: u8, shard: Vec<u8>) {
+        self.entries.entry(digest).or_default().insert(index, shard);
+    }
+
+    /// This node's held shards for `digest` as a `reconstruct`-shaped accumulator (absent points `None`).
+    fn shard_accumulator(&self, digest: &[u8; DIGEST]) -> [Option<Vec<u8>>; erasure::N] {
+        let mut acc: [Option<Vec<u8>>; erasure::N] = Default::default();
+        if let Some(held) = self.entries.get(digest) {
+            for (&i, shard) in held {
+                if let Some(slot) = acc.get_mut(i as usize) {
+                    *slot = Some(shard.clone());
+                }
+            }
         }
+        acc
     }
 }
 
@@ -1106,9 +1115,10 @@ impl<F: Field> OverlayNode<F> {
         effects
     }
 
-    /// Advance reads whose outstanding replica has not answered within `read_timeout`: try the next
-    /// replica on the line, or conclude `Retrieved(None)` once they are exhausted (spec §L4). This
-    /// is the backstop for a *crashed* replica (a live one answers `found=false` immediately).
+    /// Conclude reads that have not assembled a reconstructable shard-set within `read_timeout` as
+    /// `Retrieved(None)` (spec §L4). Under erasure the read fans out to every shard home at once, so a
+    /// timeout means too few shards came back to recover the value (enough nodes down / withholding, or the
+    /// key was never stored) — there is no further replica to walk.
     fn sweep_pending_gets(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         let timeout = self.config.read_timeout;
         let stale: Vec<[u8; DIGEST]> = self
@@ -1119,7 +1129,11 @@ impl<F: Field> OverlayNode<F> {
             .map(|(digest, _)| *digest)
             .collect();
         for digest in stale {
-            self.store.advance_pending_get(now, digest, effects);
+            self.store.pending.remove(&digest);
+            effects.push(Effect::Notify(Notification::Retrieved {
+                key: digest,
+                value: None,
+            }));
         }
     }
 
@@ -1456,11 +1470,14 @@ impl<F: Field> OverlayNode<F> {
     /// plus every announced member, so all nodes sharing a membership view resolve the same responsible
     /// node.
     fn responsible_point(&self, ideal: ContentPoint<F>) -> Triple {
-        let ideal_idx = ideal.0.index();
-        // Occupied points by canonical index: this node, every cell peer we have heard from (its
-        // algebraic slot is actually filled by a live node — liveness populates this even before any
-        // JOIN/Announce), and every announced member. A NEVER-occupied point is simply absent, so it
-        // is skipped; a heard-then-crashed occupant is handled downstream by `routed_send`'s reroute.
+        self.nearest_occupied(ideal.0.index())
+    }
+
+    /// The occupied points of this cell, by canonical index: this node, every cell peer we have heard from
+    /// (its algebraic slot is filled by a live node — liveness populates this even before any JOIN/Announce),
+    /// and every announced member. A never-occupied point is simply absent; a heard-then-crashed occupant is
+    /// handled downstream by `routed_send`'s reroute. Always contains this node.
+    fn occupied_points(&self) -> BTreeSet<usize> {
         let mut occupied: BTreeSet<usize> = self
             .peers
             .iter()
@@ -1474,58 +1491,70 @@ impl<F: Field> OverlayNode<F> {
             )
             .collect();
         occupied.insert(self.coord.index());
-        // Successor on the index ring: the smallest occupied index >= ideal, else wrap to the smallest.
-        // The occupied set always contains this node, so the `.or_else` fallback never yields `None` and
-        // the `map_or` default (the ideal point itself) is unreachable — kept only for totality.
+        occupied
+    }
+
+    /// The consistent-hashing home of the point at canonical index `ideal_idx`: the smallest occupied index
+    /// `>= ideal_idx`, else wrap to the smallest occupied (successor on the index ring). This is the seam
+    /// both content-routing ([`responsible_point`](Self::responsible_point)) and erasure shard-placement
+    /// ([`distribute_shards`](Self::distribute_shards)) share — a shard for a point lands at that point when
+    /// occupied, else its nearest-occupied successor. The occupied set always contains this node, so this is
+    /// total (the `map_or` default is unreachable, kept only for totality).
+    fn nearest_occupied(&self, ideal_idx: usize) -> Triple {
+        let occupied = self.occupied_points();
         occupied
             .range(ideal_idx..)
             .next()
             .or_else(|| occupied.iter().next())
-            .map_or(ideal.0.coords(), |&i| Point::<F>::at(i).coords())
+            .map_or_else(
+                || Point::<F>::at(ideal_idx).coords(),
+                |&i| Point::<F>::at(i).coords(),
+            )
     }
 
-    /// `Command::Put` — store a value at its responsible point and replicate it across the cell.
-    fn on_put(&mut self, key: &[u8], value: Vec<u8>) -> Vec<Effect> {
+    /// `Command::Put` — erasure-code the value and distribute its shards across the cell (spec §L4).
+    fn on_put(&mut self, key: &[u8], value: &[u8]) -> Vec<Effect> {
         let (digest, ideal) = Self::address_of(key);
         let primary = self.responsible_point(ideal);
         if primary == self.coord.coords() {
-            // We are the responsible node. Refuse (over cap / over-size) without replicating or claiming
-            // it stored; otherwise replicate to the cell, ack ourselves, and store (moving the value in).
-            if !self.store.admits(&digest, value.len()) {
+            // We are the responsible node: refuse an over-size value without distributing or claiming it
+            // stored; otherwise erasure-code it into per-point shards, place each at its home, and ack.
+            if value.len() > MAX_VALUE_LEN {
                 return Vec::new();
             }
-            let mut effects = self.replicate(&digest, &value);
+            let mut effects = self.distribute_shards(&digest, value);
             effects.push(Effect::Notify(Notification::Stored(digest)));
-            self.store.entries.insert(digest, value);
             effects
         } else {
-            alloc::vec![self.routed_send(primary, encode_publish(PUBLISH_ORIGIN, &digest, &value))]
+            alloc::vec![
+                self.routed_send(primary, encode_publish(PUBLISH_ORIGIN, 0, &digest, value))
+            ]
         }
     }
 
-    /// `Command::Get` — answer from the local replica if present, else read-repair across the
-    /// responsible point's replica line (spec §L4).
+    /// `Command::Get` — gather a recoverable erasure shard-set from the cell and reconstruct (spec §L4).
     ///
-    /// A `Put` replicates to every cell member, so any survivor holds the value. The read queries
-    /// the responsible primary first (rerouted to a co-linear survivor if it is *down*, §6.7) and,
-    /// on a `found=false` reply or a silent-replica timeout, falls back through the remaining
-    /// replicas — concluding `Retrieved(None)` only once they are exhausted. This makes the LRC
-    /// availability guarantee hold on *read* too: a value is found even when the primary recovered
-    /// empty after churn while replicas still hold it. The in-flight query is tracked in the
-    /// [`Store`]'s `pending` map; [`on_value`](Self::on_value) and the heartbeat sweep drive it.
+    /// Under the projective LRC no single node holds the value: it lives as `N=7` shards, one per point.
+    /// The read seeds any shards THIS node holds, and if they alone reconstruct (a small/degenerate cell)
+    /// answers at once; otherwise it fans a `Lookup` out to *every* cell peer simultaneously and accumulates
+    /// their shards ([`on_value`](Self::on_value)) until the present set is [`erasure::reconstruct`]-able —
+    /// which tolerates any `≤3`-point loss, so the read succeeds even with several nodes down or withholding.
+    /// The heartbeat sweep concludes `Retrieved(None)` if a recoverable set never assembles within the read
+    /// timeout. The in-flight accumulator is tracked in the [`Store`]'s `pending` map.
     fn on_get(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
-        let (digest, ideal) = Self::address_of(key);
-        let primary = self.responsible_point(ideal);
-        if let Some(value) = self.store.entries.get(&digest) {
+        let (digest, _ideal) = Self::address_of(key);
+        // Seed the accumulator with any shards this node already holds; short-circuit if they reconstruct.
+        let acc = self.store.shard_accumulator(&digest);
+        if let Some(value) = erasure::reconstruct(&acc) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
-                value: Some(value.clone()),
+                value: Some(value),
             })];
         }
-        // Cap in-flight reads (A4 DoS backstop): once [`MAX_PENDING_GETS`] distinct reads are
-        // outstanding, refuse a *new* one — concluding `Retrieved(None)` — rather than track it, so a
-        // flood of distinct-key `Get`s cannot grow the pending map without bound. A repeat Get for an
-        // already-pending digest is allowed through (it refreshes the existing entry, no growth).
+        // Cap in-flight reads (A4 DoS backstop): once [`MAX_PENDING_GETS`] distinct reads are outstanding,
+        // refuse a *new* one — concluding `Retrieved(None)` — rather than track it, so a flood of
+        // distinct-key `Get`s cannot grow the pending map without bound. A repeat Get for an already-pending
+        // digest is allowed through (it refreshes the existing entry, no growth).
         if self.store.pending.len() >= MAX_PENDING_GETS && !self.store.pending.contains_key(&digest)
         {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
@@ -1533,14 +1562,16 @@ impl<F: Field> OverlayNode<F> {
                 value: None,
             })];
         }
-        // Fallback replicas: every other cell member could hold a replica; query the primary now
-        // and keep the rest (live ones first) for read repair. A repeat Get simply refreshes them.
-        let remaining: Vec<Triple> = self
-            .peers
-            .keys()
-            .copied()
-            .filter(|&c| c != primary)
-            .collect();
+        // Fan a `Lookup` out to every cell peer at once — each is a potential shard home. Sent directly
+        // (not rerouted): a down peer simply does not reply, and the erasure redundancy tolerates it.
+        let peers: Vec<Triple> = self.peers.keys().copied().collect();
+        if peers.is_empty() {
+            // No peer to gather from and the local shards did not reconstruct — the value is unreachable.
+            return alloc::vec![Effect::Notify(Notification::Retrieved {
+                key: digest,
+                value: None,
+            })];
+        }
         // A fresh per-request nonce correlates this read's replies (audit C4); a repeat Get for the same
         // key supersedes the old one with a new nonce, so the old read's in-flight replies go stale.
         self.store.seq = self.store.seq.wrapping_add(1);
@@ -1549,48 +1580,79 @@ impl<F: Field> OverlayNode<F> {
             digest,
             PendingGet {
                 issued: now,
-                remaining,
+                shards: acc,
                 nonce,
+                queried: u16::try_from(peers.len()).unwrap_or(u16::MAX),
+                negatives: 0,
             },
         );
-        alloc::vec![self.routed_send(primary, encode_lookup(&digest, nonce))]
-    }
-
-    /// Fan a value out to every cell member as a replica (LRC availability, spec §L4).
-    fn replicate(&self, digest: &[u8; DIGEST], value: &[u8]) -> Vec<Effect> {
-        self.peers
-            .keys()
-            .map(|&peer| Effect::Send {
+        peers
+            .into_iter()
+            .map(|peer| Effect::Send {
                 to: peer,
-                frame: encode_publish(PUBLISH_REPLICA, digest, value),
+                frame: encode_lookup(&digest, nonce),
             })
             .collect()
+    }
+
+    /// Erasure-code `value` into `N=7` point-shards and place each at its point's nearest-occupied home
+    /// (spec §L4 projective LRC): shard `i` → [`nearest_occupied`](Self::nearest_occupied)`(i)`. Shards homed
+    /// at this node are stored locally; the rest are sent as `PUBLISH_SHARD` frames carrying the point index.
+    /// On a full Fano cell this is shard `i` → point `i` (one shard per node, `N/K ≈ 2.33×` redundancy vs
+    /// `N×` full replication); on a sparse cell several shards may share a home (graceful degradation — the
+    /// cell simply has fewer independent failure domains).
+    fn distribute_shards(&mut self, digest: &[u8; DIGEST], value: &[u8]) -> Vec<Effect> {
+        let me = self.coord.coords();
+        let shards = erasure::encode(value);
+        let mut effects = Vec::new();
+        for (i, shard) in shards.into_iter().enumerate() {
+            let home = self.nearest_occupied(i);
+            #[allow(clippy::cast_possible_truncation)] // i < N = 7
+            let index = i as u8;
+            if home == me {
+                self.store.insert_shard(*digest, index, shard);
+            } else {
+                effects.push(Effect::Send {
+                    to: home,
+                    frame: encode_publish(PUBLISH_SHARD, index, digest, &shard),
+                });
+            }
+        }
+        effects
     }
 
     fn on_publish(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(&flag) = body.first() else {
             return Vec::new();
         };
-        let Some(digest) = parse_digest(body.get(1..1 + DIGEST)) else {
+        let Some(&index) = body.get(1) else {
             return Vec::new();
         };
-        let value = body.get(1 + DIGEST..).unwrap_or(&[]).to_vec();
-        // Store under the A4 DoS caps. A refused publish (over cap / over-size) is dropped without an
-        // Ack or replication — a relayed flood of distinct digests cannot exhaust this node's memory.
-        if !self.store.admits(&digest, value.len()) {
+        let Some(digest) = parse_digest(body.get(2..2 + DIGEST)) else {
+            return Vec::new();
+        };
+        let payload = body.get(2 + DIGEST..).unwrap_or(&[]);
+        // A4 DoS caps: a refused publish (over-size, or a new key over the store cap) is dropped without an
+        // Ack or distribution — a relayed flood of distinct digests cannot exhaust this node's memory.
+        if !self.store.admits(&digest, payload.len()) {
             return Vec::new();
         }
-        self.store.entries.insert(digest, value.clone());
-        if flag == PUBLISH_ORIGIN {
-            // We are the responsible node: replicate across the cell and acknowledge the origin.
-            let mut effects = self.replicate(&digest, &value);
-            effects.push(Effect::Send {
-                to: from,
-                frame: encode(FrameType::Ack, &digest),
-            });
-            effects
-        } else {
-            Vec::new()
+        match flag {
+            PUBLISH_ORIGIN => {
+                // We are the responsible node: erasure-distribute the full value and acknowledge the origin.
+                let mut effects = self.distribute_shards(&digest, payload);
+                effects.push(Effect::Send {
+                    to: from,
+                    frame: encode(FrameType::Ack, &digest),
+                });
+                effects
+            }
+            PUBLISH_SHARD => {
+                // A single shard for Fano point `index` — store it under that index (idempotent).
+                self.store.insert_shard(digest, index, payload.to_vec());
+                Vec::new()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1599,50 +1661,75 @@ impl<F: Field> OverlayNode<F> {
         let Ok(LookupBody { key: digest, nonce }) = LookupBody::from_wire(body) else {
             return Vec::new();
         };
-        let (found, value): (bool, &[u8]) = match self.store.entries.get(&digest) {
-            Some(v) => (true, v),
-            None => (false, &[]),
-        };
-        alloc::vec![Effect::Send {
-            to: from,
-            frame: encode_value(&digest, found, value, nonce),
-        }]
+        // Return EVERY shard this node holds for the key, one `Value` each (the reader accumulates them by
+        // point index). A node holding no shard answers a single `found=false` — an explicit "not here".
+        match self.store.entries.get(&digest) {
+            Some(held) if !held.is_empty() => held
+                .iter()
+                .map(|(&index, shard)| Effect::Send {
+                    to: from,
+                    frame: encode_value(&digest, true, index, shard, nonce),
+                })
+                .collect(),
+            _ => alloc::vec![Effect::Send {
+                to: from,
+                frame: encode_value(&digest, false, 0, &[], nonce),
+            }],
+        }
     }
 
-    /// A `Value` reply to one of our lookups (spec §L4). `found=true` resolves the pending read
-    /// with the value; `found=false` advances to the next replica on the line, or concludes
-    /// `Retrieved(None)` once the replicas are exhausted (read repair).
-    fn on_value(&mut self, now: Instant, body: &[u8]) -> Vec<Effect> {
+    /// A `Value` reply carrying one erasure shard (spec §L4). Accumulate it into the in-flight read's
+    /// shard-set and, once that set is [`erasure::reconstruct`]-able, deliver the value and retire the read.
+    /// A `found=false` reply (the peer holds no shard) is simply not accumulated; the heartbeat sweep
+    /// concludes `Retrieved(None)` if a recoverable set never assembles before the read timeout.
+    fn on_value(&mut self, _now: Instant, body: &[u8]) -> Vec<Effect> {
         let Some(digest) = parse_digest(body.get(..DIGEST)) else {
             return Vec::new();
         };
         let found = body.get(DIGEST).copied().unwrap_or(0) != 0;
-        let Some(nonce) = parse_u64(body, DIGEST + 1) else {
+        let index = body.get(DIGEST + 1).copied().unwrap_or(0);
+        let Some(nonce) = parse_u64(body, DIGEST + 2) else {
             return Vec::new();
         };
-        // Correlate on the per-request nonce, NOT merely the key: a reply resolves a read only if it
-        // matches the read currently in flight for this key. A stale/replayed `Value` from a prior get
-        // (old nonce), or one with no in-flight read at all, is ignored — so it emits no spurious
-        // `Retrieved` and can never drain a later same-key get with an old value (read-your-writes,
-        // audit C4). The value bytes follow the nonce.
-        match self.store.pending.get(&digest) {
-            Some(p) if p.nonce == nonce => {}
-            _ => return Vec::new(),
+        // Correlate on the per-request nonce, NOT merely the key: a reply is accepted only for the read
+        // currently in flight for this key. A stale/replayed `Value` from a prior get (old nonce), or one
+        // with no in-flight read at all, is ignored — so it can never drain a later same-key get with an old
+        // shard (read-your-writes, audit C4).
+        let Some(pending) = self.store.pending.get_mut(&digest) else {
+            return Vec::new();
+        };
+        if pending.nonce != nonce {
+            return Vec::new();
         }
-        if found {
-            // A survivor has it. Deliver once and retire the pending read (later dup replies no longer
-            // match — the entry is gone).
+        if !found {
+            // A peer holds no shard for this key. Once every queried peer has said so and the shards still
+            // do not reconstruct, conclude the value absent immediately (a fast miss, not a timeout wait).
+            pending.negatives = pending.negatives.saturating_add(1);
+            if pending.negatives >= pending.queried
+                && erasure::reconstruct(&pending.shards).is_none()
+            {
+                self.store.pending.remove(&digest);
+                return alloc::vec![Effect::Notify(Notification::Retrieved {
+                    key: digest,
+                    value: None,
+                })];
+            }
+            return Vec::new();
+        }
+        let shard = body.get(DIGEST + 2 + 8..).unwrap_or(&[]).to_vec();
+        if let Some(slot) = pending.shards.get_mut(index as usize) {
+            *slot = Some(shard);
+        }
+        // Try to reconstruct with everything gathered so far; `reconstruct` returns `Some` exactly when the
+        // present shard-set is recoverable (any `≤3`-point loss), so this fires as soon as enough arrive.
+        if let Some(value) = erasure::reconstruct(&pending.shards) {
             self.store.pending.remove(&digest);
-            let value = Some(body.get(DIGEST + 1 + 8..).unwrap_or(&[]).to_vec());
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
-                value
+                value: Some(value),
             })];
         }
-        // A negative reply for the in-flight read: advance to the next replica, or conclude it absent.
-        let mut effects = Vec::new();
-        self.store.advance_pending_get(now, digest, &mut effects);
-        effects
+        Vec::new()
     }
 
     fn on_ack(body: &[u8]) -> Vec<Effect> {
@@ -2018,7 +2105,13 @@ impl<F: Field> OverlayNode<F> {
                 *cell = self.peers.get(&coord).map_or(0.0, |p| p.loss);
             }
         }
-        let at = |a: usize, b: usize| directional.get(a).and_then(|r| r.get(b)).copied().unwrap_or(0.0);
+        let at = |a: usize, b: usize| {
+            directional
+                .get(a)
+                .and_then(|r| r.get(b))
+                .copied()
+                .unwrap_or(0.0)
+        };
         core::array::from_fn(|a| {
             core::array::from_fn(|b| if a == b { 0.0 } else { at(a, b).max(at(b, a)) })
         })
@@ -2061,7 +2154,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Send { to, payload }) => self.on_send(to, &payload),
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Observe) => self.on_observe(now),
-            Input::Command(Command::Put { key, value }) => self.on_put(&key, value),
+            Input::Command(Command::Put { key, value }) => self.on_put(&key, &value),
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
@@ -2085,11 +2178,12 @@ fn encode(ty: FrameType, body: &[u8]) -> Vec<u8> {
 }
 
 /// A `Publish` frame: `flag(1) ‖ key(32) ‖ value` (spec §L4).
-fn encode_publish(flag: u8, digest: &[u8; DIGEST], value: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(1 + DIGEST + value.len());
+fn encode_publish(flag: u8, index: u8, digest: &[u8; DIGEST], payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + DIGEST + payload.len());
     body.push(flag);
+    body.push(index); // the shard's Fano point index (0 for a PUBLISH_ORIGIN full value)
     body.extend_from_slice(digest);
-    body.extend_from_slice(value);
+    body.extend_from_slice(payload);
     encode(FrameType::Publish, &body)
 }
 
@@ -2128,13 +2222,22 @@ fn encode_lookup(digest: &[u8; DIGEST], nonce: u64) -> Vec<u8> {
     )
 }
 
-/// A `Value` reply: `key(32) ‖ found(1) ‖ nonce(8) ‖ value` (spec §L4) — the nonce echoes the `Lookup`'s.
-fn encode_value(digest: &[u8; DIGEST], found: bool, value: &[u8], nonce: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(DIGEST + 1 + 8 + value.len());
+/// A `Value` reply: `key(32) ‖ found(1) ‖ shard_index(1) ‖ nonce(8) ‖ shard` (spec §L4) — the nonce echoes
+/// the `Lookup`'s, and `shard_index` names which Fano point's erasure shard this reply carries so the reader
+/// accumulates it into the right slot (#115). A `found=false` reply carries index `0` and an empty shard.
+fn encode_value(
+    digest: &[u8; DIGEST],
+    found: bool,
+    index: u8,
+    shard: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(DIGEST + 2 + 8 + shard.len());
     body.extend_from_slice(digest);
     body.push(u8::from(found));
+    body.push(index);
     body.extend_from_slice(&nonce.to_be_bytes());
-    body.extend_from_slice(value);
+    body.extend_from_slice(shard);
     encode(FrameType::Value, &body)
 }
 
@@ -2765,7 +2868,7 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let from = Point::<F2>::at(1).coords();
         for i in 0..(MAX_STORE_ENTRIES as u32 + 500) {
-            let frame = encode_publish(PUBLISH_REPLICA, &flood_digest(i), b"v");
+            let frame = encode_publish(PUBLISH_SHARD, 0, &flood_digest(i), b"v");
             node.step(Instant(1), Input::Message { from, frame });
         }
         assert!(
@@ -2785,7 +2888,7 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_REPLICA, &digest, &too_big),
+                frame: encode_publish(PUBLISH_SHARD, 0, &digest, &too_big),
             },
         );
         assert!(
@@ -2798,7 +2901,7 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_REPLICA, &digest, &at_limit),
+                frame: encode_publish(PUBLISH_SHARD, 0, &digest, &at_limit),
             },
         );
         assert!(
@@ -2814,7 +2917,7 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let from = Point::<F2>::at(1).coords();
         for i in 0..MAX_STORE_ENTRIES as u32 {
-            let frame = encode_publish(PUBLISH_REPLICA, &flood_digest(i), b"a");
+            let frame = encode_publish(PUBLISH_SHARD, 0, &flood_digest(i), b"a");
             node.step(Instant(1), Input::Message { from, frame });
         }
         assert_eq!(
@@ -2828,20 +2931,24 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_REPLICA, &existing, b"updated"),
+                frame: encode_publish(PUBLISH_SHARD, 0, &existing, b"updated"),
             },
         );
         assert_eq!(
-            node.store.entries.get(&existing).map(Vec::as_slice),
+            node.store
+                .entries
+                .get(&existing)
+                .and_then(|shards| shards.get(&0))
+                .map(Vec::as_slice),
             Some(&b"updated"[..]),
-            "an existing key still updates when the store is full"
+            "an existing key's shard still updates when the store is full"
         );
         // A brand-new key is refused, and the cap is never exceeded.
         node.step(
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_REPLICA, &[0xABu8; DIGEST], b"x"),
+                frame: encode_publish(PUBLISH_SHARD, 0, &[0xABu8; DIGEST], b"x"),
             },
         );
         assert!(
@@ -2877,9 +2984,9 @@ mod tests {
 
     #[test]
     fn a_stale_value_reply_cannot_resolve_a_read_it_does_not_belong_to() {
-        // C4. A `Value` correlates on the read's per-request nonce, not just the key. A reply with no
-        // in-flight read, or a stale/replayed reply from a superseded prior get (old nonce), is ignored —
-        // so it emits no spurious Retrieved and never drains a later same-key get with an old value.
+        // C4. A `Value` shard correlates on the read's per-request nonce, not just the key. A shard with no
+        // in-flight read, or a stale/replayed one from a superseded prior get (old nonce), is ignored — so it
+        // is never accumulated and can never resolve a later same-key get with an old value.
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let key = b"k";
         let (digest, _) = OverlayNode::<F2>::address_of(key);
@@ -2889,18 +2996,28 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::Notify(Notification::Retrieved { .. })))
         };
+        // Real erasure shards of a known value — the only bytes that actually reconstruct. Feed the whole
+        // set (all 7 point-shards) at a given nonce, collecting the effects.
+        let shards = erasure::encode(b"the-fresh-value");
+        let feed = |node: &mut OverlayNode<F2>, t: u64, nonce: u64| -> Vec<Effect> {
+            let mut out = Vec::new();
+            for (i, shard) in shards.iter().enumerate() {
+                out.extend(node.step(
+                    Instant(t),
+                    Input::Message {
+                        from: peer,
+                        frame: encode_value(&digest, true, u8::try_from(i).unwrap(), shard, nonce),
+                    },
+                ));
+            }
+            out
+        };
 
-        // A found=true Value with NO in-flight read is ignored (no spurious Retrieved).
-        let stray = node.step(
-            Instant(1),
-            Input::Message {
-                from: peer,
-                frame: encode_value(&digest, true, b"ghost", 999),
-            },
-        );
+        // A full shard-set with NO in-flight read is ignored (no spurious Retrieved).
+        let stray = feed(&mut node, 1, 999);
         assert!(
             !has_retrieved(&stray),
-            "a Value with no in-flight read emits no Retrieved"
+            "shards with no in-flight read emit no Retrieved"
         );
 
         // Issue read #1 (nonce 1), then supersede it with read #2 (nonce 2) for the same key.
@@ -2913,34 +3030,22 @@ mod tests {
             Input::Command(Command::Get { key: key.to_vec() }),
         );
 
-        // A delayed reply from read #1 (old nonce 1) carrying a stale value must be ignored.
-        let stale = node.step(
-            Instant(4),
-            Input::Message {
-                from: peer,
-                frame: encode_value(&digest, true, b"old", 1),
-            },
-        );
+        // A delayed full shard-set from read #1 (old nonce 1) must be ignored — it never resolves read #2.
+        let stale = feed(&mut node, 4, 1);
         assert!(
             !has_retrieved(&stale),
-            "a stale reply (old nonce) does not resolve the newer read"
+            "a stale shard-set (old nonce) does not resolve the newer read"
         );
 
-        // The reply matching the in-flight nonce (2) resolves the read with the fresh value.
-        let fresh = node.step(
-            Instant(5),
-            Input::Message {
-                from: peer,
-                frame: encode_value(&digest, true, b"new", 2),
-            },
-        );
+        // The shard-set matching the in-flight nonce (2) reconstructs and resolves the read.
+        let fresh = feed(&mut node, 5, 2);
         assert!(
             fresh.iter().any(|e| matches!(
                 e,
                 Effect::Notify(Notification::Retrieved { key: k, value: Some(v) })
-                    if *k == digest && v.as_slice() == b"new"
+                    if *k == digest && v.as_slice() == b"the-fresh-value"
             )),
-            "the reply matching the in-flight nonce resolves the read with the fresh value"
+            "the shard-set matching the in-flight nonce reconstructs and resolves the read"
         );
     }
 

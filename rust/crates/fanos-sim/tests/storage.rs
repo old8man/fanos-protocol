@@ -38,12 +38,19 @@ fn a_put_to_an_unoccupied_ideal_point_still_routes_and_is_retrievable() {
     let mut sim = Sim::new(123);
     let nodes: Vec<[u32; 3]> = occupied_idx
         .iter()
-        .map(|&i| sim.add(Box::new(OverlayNode::<F2>::new(fano::point(i), Config::default()))))
+        .map(|&i| {
+            sim.add(Box::new(OverlayNode::<F2>::new(
+                fano::point(i),
+                Config::default(),
+            )))
+        })
         .collect();
     sim.inject_all(&Command::StartHeartbeat);
     sim.run_for(Duration::from_millis(2000)); // liveness: each occupant hears the other two
 
-    let keys: Vec<Vec<u8>> = (0..N).map(|k| format!("resource-{k}").into_bytes()).collect();
+    let keys: Vec<Vec<u8>> = (0..N)
+        .map(|k| format!("resource-{k}").into_bytes())
+        .collect();
     let unoccupied_ideals = keys
         .iter()
         .filter(|k| !occupied_idx.contains(&map_to_point::<F2>(label::STORAGE, k).index()))
@@ -129,7 +136,8 @@ fn a_missing_key_retrieves_nothing() {
 
 #[test]
 fn the_value_is_replicated_across_the_cell() {
-    // After a put settles, every live node can answer a Get from its own replica (LRC availability).
+    // After a put settles, every live node can answer a Get (LRC availability) — under erasure by gathering
+    // a recoverable shard-set from the cell and reconstructing, not from a full local copy.
     let (mut sim, cell) = established(3);
     sim.inject(
         cell[0],
@@ -259,4 +267,86 @@ fn a_get_through_a_crashed_primary_reroutes_to_a_replica() {
     );
     // Sanity: the reroute target really is the co-linear survivor mediator(querier, primary).
     assert!(fano::mediator(querier_idx, primary_idx).is_some());
+}
+
+/// **§L4 erasure-resilience research (#115).** The load-bearing property: on a full Fano cell a value is
+/// `erasure::encode`d into 7 point-shards (shard `i` at point `i`), so a `Get` reconstructs from the
+/// surviving shards **iff** the crashed set is `is_recoverable_fano` — exactly the codec's guarantee, now
+/// delivered end-to-end through the live engine (not just the unit codec). We crash every boundary-relevant
+/// subset and assert read-success matches the oracle, hitting the decisive 4-loss hyperoval boundary (a
+/// hyperoval — 4 points, no 3 collinear — is the first unrecoverable pattern).
+#[test]
+fn a_read_reconstructs_iff_the_surviving_shards_are_recoverable() {
+    use fanos_code::is_recoverable_fano;
+
+    // Boundary-complete masks: no loss, every single, every 4-subset (the hyperoval boundary), some 5-sets.
+    let mut masks: Vec<u8> = alloc_masks();
+    masks.sort_unstable();
+    masks.dedup();
+
+    for &crashed in &masks {
+        let (mut sim, _cell) = established(0x5E_ED ^ u64::from(crashed));
+        // Store BEFORE any crash so all 7 shards are distributed (shard i → point i on the full cell).
+        let putter = fano::point(0).coords();
+        sim.inject(
+            putter,
+            Command::Put {
+                key: b"resilience-key".to_vec(),
+                value: b"erasure-coded across the projective plane".to_vec(),
+            },
+        );
+        sim.run_for(Duration::from_millis(1500));
+
+        // Crash the masked points; read from the lowest-index survivor.
+        for i in 0..7usize {
+            if crashed & (1u8 << i) != 0 {
+                sim.crash(fano::point(i).coords());
+            }
+        }
+        let reader_idx = (0..7usize).find(|i| crashed & (1u8 << i) == 0).unwrap();
+        let reader = fano::point(reader_idx).coords();
+        sim.inject(
+            reader,
+            Command::Get {
+                key: b"resilience-key".to_vec(),
+            },
+        );
+        // Long enough for reconstruction (fast) OR the read timeout to conclude a miss (~1600 ms).
+        sim.run_for(Duration::from_millis(2500));
+
+        let got = sim
+            .report()
+            .retrievals()
+            .filter(|(who, _, _)| *who == reader)
+            .last()
+            .is_some_and(|(_, _, v)| v.is_some());
+        assert_eq!(
+            got,
+            is_recoverable_fano(crashed),
+            "crashed mask {crashed:#09b}: read success must match is_recoverable_fano"
+        );
+    }
+}
+
+/// The boundary-relevant crash masks: `0`, all singletons, all 4-subsets (hyperoval vs not — the decisive
+/// boundary), and a few 5-subsets (always unrecoverable). Kept off the hot path for readability.
+fn alloc_masks() -> Vec<u8> {
+    let mut masks = vec![0u8];
+    for i in 0..7u8 {
+        masks.push(1 << i);
+    }
+    // All 4-subsets of the 7 points.
+    for a in 0..7u8 {
+        for b in (a + 1)..7 {
+            for c in (b + 1)..7 {
+                for d in (c + 1)..7 {
+                    masks.push((1 << a) | (1 << b) | (1 << c) | (1 << d));
+                }
+            }
+        }
+    }
+    // A few 5-subsets (always beyond the code's tolerance).
+    masks.push(0b001_1111);
+    masks.push(0b111_0100);
+    masks
 }

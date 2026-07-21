@@ -34,6 +34,8 @@ fanos-aphantos.workspace = true
 fanos-pqcrypto.workspace = true
 # For the L4 storage scenarios (computing a key's responsible node, MapToPoint).
 fanos-primitives = { workspace = true, features = ["std"] }
+# For the L4 erasure-resilience scenario (the is_recoverable_fano oracle the read must match, #115).
+fanos-code = { workspace = true, features = ["std"] }
 # For the hierarchy scenario (feeding a child cell's escalation to the parent tier).
 fanos-core = { workspace = true, features = ["std"] }
 # For the CALYPSO hidden-service flow (address, per-epoch rendezvous, PoW) over the overlay.
