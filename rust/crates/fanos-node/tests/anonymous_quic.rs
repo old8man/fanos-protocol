@@ -18,10 +18,15 @@ use fanos_aphantos::ThresholdRouter;
 use fanos_diaulos::{ServerSession, StaticKeypair};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
-use fanos_node::{FanosDialer, RendezvousRoute, StaticResolver};
+use fanos_keygen::BeaconNode;
+use fanos_node::{
+    AnonRouteParams, CellNode, FanosDialer, OverlayBeaconNode, RendezvousRoute, StaticResolver,
+};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
 use fanos_quic::{Directory, NodeHandle, spawn};
+use fanos_runtime::{Config as OverlayConfig, OverlayNode};
+use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, MixDirectory, RendezvousService, SessionId, combiner_for, meeting_line,
     seal_forward,
@@ -195,9 +200,12 @@ async fn anonymous_service(
             };
             for payload in payloads {
                 if let Some(fwd) = rservice.seal_reply(&ck, &payload) {
-                    node.command(Command::Send {
+                    // Raw-emit the reply onion at its first combiner (a CellNode service would otherwise
+                    // wrap it in a routed Route frame the mixnet cannot peel); a router node treats Emit
+                    // and Send identically.
+                    node.command(Command::Emit {
                         to: fwd.combiner,
-                        payload: fwd.frame,
+                        frame: fwd.frame,
                     });
                 }
             }
@@ -288,6 +296,112 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     assert_eq!(
         response, b"anon-quic-200:GET /anon",
         "a full anonymous DIAULOS request/response completed over the real-QUIC mixnet"
+    );
+    drop(nodes);
+    drop(client_node);
+}
+
+/// Spawn one QUIC [`CellNode`] at Fano point `i` — a **full cell participant**: overlay + a consumer
+/// beacon (`commitment`, no share) + a threshold-onion mix router. Returns its handle and its published
+/// onion key. This is the deployed node shape (unlike [`router`], a bare `ThresholdRouter`): it can peel
+/// rendezvous hops *and* run the overlay that surfaces a forwarded `RdvReply`.
+async fn spawn_composite(
+    i: usize,
+    dir: &Directory,
+    onion_t: usize,
+    commitment: &VssCommitment,
+    beacon_t: usize,
+) -> (NodeHandle, HybridKemPublic) {
+    let coord = Point::<F2>::at(i);
+    let mut rng = SeedRng::from_seed(&[0xD0, i as u8]);
+    let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+    let mut onion_seed = [0xC4u8; 32];
+    onion_seed[31] = i as u8;
+    let onion_public = OnionKeyRatchet::new(onion_seed, fanos_rendezvous::Epoch::ZERO)
+        .public()
+        .clone();
+    let overlay = OverlayNode::<F2>::new(coord, OverlayConfig::default());
+    let beacon = BeaconNode::<F2>::new(coord, None, commitment.clone(), beacon_t);
+    let router = ThresholdRouter::<F2>::new(coord, &secret, onion_t, onion_seed);
+    let engine = CellNode::new(OverlayBeaconNode::new(overlay, beacon), router);
+    let handle = spawn(Box::new(engine), dir.clone())
+        .await
+        .expect("spawn cell node");
+    (handle, onion_public)
+}
+
+#[tokio::test]
+async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
+    // The full deployed shape: a Fano cell of `CellNode`s (each overlay + beacon + mix router), an
+    // anonymous service on one, and a DIFFERENT cell node dialing it with a FRESH per-dial route via
+    // `FanosDialer::anonymous_fresh`. Unlike the fixed-route test above, the client is a real overlay
+    // node: it launches onions with `Command::Emit`, its reply returns through a rendezvous **relay** that
+    // forwards an `RdvReply` to it (registered by cookie), and its overlay surfaces that as the anonymous
+    // reply. This exercises the whole general anonymous-proxy stack end-to-end over real QUIC.
+    let dir = Directory::new();
+    let t = 2usize; // 2-of-3 per Fano line
+    let beacon_t = 4usize; // 4-of-7 consumer beacon (commitment only; genesis epoch, no rotation)
+    let (_shares, commitment) = deal(
+        &[0xB7; 32],
+        beacon_t,
+        7,
+        &mut DeterministicRng::new(b"anon-quic-cell"),
+    )
+    .unwrap();
+
+    let mut nodes: Vec<Option<NodeHandle>> = Vec::new();
+    let mut mix = MixDirectory::new();
+    for i in 0..7usize {
+        let (handle, public) = spawn_composite(i, &dir, t, &commitment, beacon_t).await;
+        mix.insert(Point::<F2>::at(i).coords(), public);
+        nodes.push(Some(handle));
+    }
+
+    // The service and its rotating meeting line (genesis epoch), and the cell node that hosts its combiner.
+    let mut skp = SeedRng::from_seed(b"anon-cell-svc");
+    let service = StaticKeypair::generate(&mut skp);
+    let service_public = service.public().clone();
+    let epoch = fanos_rendezvous::Epoch::ZERO;
+    let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
+    let l_combiner = combiner_for::<F2>(meeting).unwrap();
+    let l_index = Point::<F2>::new(l_combiner).unwrap().index();
+
+    let service_node = nodes[l_index].take().unwrap();
+    let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"anon-cell-svc-secret");
+    tokio::spawn(anonymous_service(service, service_node, rservice));
+
+    // A different cell node is the anonymous client. Its coordinate is not the service's combiner, so its
+    // fresh reply rendezvous (drawn at random) is served by a relay that forwards the reply to it.
+    let client_index = (0..7).find(|&i| i != l_index).unwrap();
+    let client_node = nodes[client_index].take().unwrap();
+
+    let params = AnonRouteParams {
+        directory: mix,
+        threshold: t as u8,
+        epoch,
+        beacon: TEST_BEACON,
+        depths: (1, 1),
+    };
+    let resolver = StaticResolver::new().with("cell.fanos", meeting, service_public);
+    let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
+    let mut stream = dialer
+        .dial(&Target::Name("cell.fanos".to_owned(), 80))
+        .await
+        .expect("fresh anonymous dial by name");
+
+    let response = tokio::time::timeout(StdDuration::from_secs(45), async {
+        stream.write_all(b"GET /cell").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        resp
+    })
+    .await
+    .expect("the fresh anonymous session completed in time");
+
+    assert_eq!(
+        response, b"anon-quic-200:GET /cell",
+        "a fresh unlinkable anonymous session completed end-to-end over a cell of composite nodes"
     );
     drop(nodes);
     drop(client_node);

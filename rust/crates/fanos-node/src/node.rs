@@ -8,19 +8,35 @@
 
 use std::net::SocketAddr;
 
+use fanos_aphantos::ThresholdRouter;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_onoma::{Address, Epoch, lookup_key};
+use fanos_pqcrypto::{HybridKemSecret, SeedRng};
 use fanos_quic::{Client, Directory, NodeHandle, spawn_self_certifying_persistent_on};
 use fanos_keygen::BeaconNode;
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
+use tokio::task::JoinHandle;
 
-use crate::OverlayBeaconNode;
+use crate::{CellNode, OverlayBeaconNode, spawn_mix_publisher};
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::error::NodeError;
 use crate::identity;
 use crate::resolve::{ResolvedService, verify_descriptor};
+
+/// The mixnet's per-hop cooperation threshold — how many of a Fano line's three members must combine to
+/// peel one onion layer (2-of-3). A relay's [`ThresholdRouter`] gathers this many partials; an anonymous
+/// client's `--threshold` MUST match, since it seals each layer for exactly this many members.
+const MIX_THRESHOLD: usize = 2;
+
+/// 32 fresh bytes of OS entropy — the mix router's per-run key seeds (a relay node only).
+fn os_entropy_32() -> Result<[u8; 32], NodeError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| NodeError::Config(format!("OS entropy failed: {e}")))?;
+    Ok(bytes)
+}
 
 /// A running FANOS node.
 pub struct Node {
@@ -29,6 +45,10 @@ pub struct Node {
     address: Triple,
     local_addr: SocketAddr,
     roles: RoleSet,
+    /// The background task republishing this node's mix onion key each epoch — present only for a relay
+    /// node (which runs the mixnet role). Held so it lives as long as the node; it ends when the node's
+    /// notification stream closes on shutdown.
+    _mix_publisher: Option<JoinHandle<()>>,
 }
 
 /// A point-in-time health snapshot of a node.
@@ -63,6 +83,24 @@ impl Node {
         // pure consumer (`share = None`) only needs the group commitment + threshold to verify and adopt
         // the rounds anchors flood; an anchor also contributes partials.
         let beacon = config.beacon.clone();
+        // A relay node also runs the anonymity mixnet: its engine is a [`CellNode`] (overlay + beacon +
+        // threshold-onion router), and it republishes its onion key each epoch so anonymous clients can
+        // seal to it. The router's key material is fresh OS entropy per run — forward-secure, since a
+        // restart cannot peel onions sealed to the old key. A relay needs the beacon to lock its onion-key
+        // rotation to the cell epoch (E4∩E5), so require beacon parameters for the role.
+        let relay = config.roles.relay;
+        if relay && beacon.is_none() {
+            return Err(NodeError::Config(
+                "the relay role runs the anonymity mixnet and needs beacon parameters (configure the \
+                 beacon commitment and threshold)"
+                    .to_owned(),
+            ));
+        }
+        let (onion_seed, kem_seed) = if relay {
+            (os_entropy_32()?, os_entropy_32()?)
+        } else {
+            ([0u8; 32], [0u8; 32])
+        };
         let handle = spawn_self_certifying_persistent_on::<F>(
             config.listen,
             &credentials,
@@ -75,10 +113,22 @@ impl Node {
                 let overlay_config = OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() };
                 let overlay = OverlayNode::<F>::new(coord, overlay_config);
                 match beacon {
-                    Some(bp) => Box::new(OverlayBeaconNode::new(
-                        overlay,
-                        BeaconNode::<F>::new(coord, bp.share, bp.commitment, bp.threshold),
-                    )),
+                    Some(bp) => {
+                        let obn = OverlayBeaconNode::new(
+                            overlay,
+                            BeaconNode::<F>::new(coord, bp.share, bp.commitment, bp.threshold),
+                        );
+                        if relay {
+                            // Compose the mixnet router at the same coordinate → a full cell participant.
+                            let (secret, _identity) =
+                                HybridKemSecret::generate(&mut SeedRng::from_seed(&kem_seed));
+                            let router =
+                                ThresholdRouter::<F>::new(coord, &secret, MIX_THRESHOLD, onion_seed);
+                            Box::new(CellNode::new(obn, router))
+                        } else {
+                            Box::new(obn)
+                        }
+                    }
                     None => Box::new(overlay),
                 }
             },
@@ -91,6 +141,9 @@ impl Node {
 
         let address = handle.address();
         let local_addr = handle.local_addr();
+        // Keep the relay's onion key live in the mix directory for as long as it runs: publish the genesis
+        // key at once, then republish each epoch the beacon advances to (audit #54; E4∩E5).
+        let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), address, onion_seed));
 
         if config.start_heartbeat {
             handle.command(Command::StartHeartbeat);
@@ -108,6 +161,7 @@ impl Node {
             address,
             local_addr,
             roles: config.roles,
+            _mix_publisher: mix_publisher,
         })
     }
 
@@ -254,6 +308,73 @@ mod tests {
         let health = node.health();
         assert_eq!(health.address, node.address());
         assert!(health.local_addr.port() > 0, "endpoint bound");
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_relay_role_requires_beacon_parameters() {
+        // A relay runs the anonymity mixnet, whose onion-key rotation locks to the beacon epoch — so the
+        // role is refused without beacon parameters rather than silently running an un-rotating mixnet.
+        let started = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            roles: RoleSet {
+                relay: true,
+                ..RoleSet::default()
+            },
+            ..NodeConfig::default()
+        })
+        .await;
+        assert!(
+            matches!(started, Err(NodeError::Config(_))),
+            "the relay role without beacon parameters is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_node_publishes_its_mix_key_to_the_directory() {
+        // The Node::start relay wiring end-to-end: a relay composes a CellNode (overlay + beacon + mix
+        // router) AND spawns the publisher that keeps its onion key live in the cell directory — so a
+        // client's `build_cell_mix_directory` surfaces it, i.e. the anonymity mixnet is actually reachable.
+        use std::time::Duration;
+
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        use crate::build_cell_mix_directory;
+
+        let (_shares, commitment) =
+            deal(&[0xB6; 32], 2, 3, &mut DeterministicRng::new(b"relay-mix")).unwrap();
+        let mut node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams {
+                commitment,
+                threshold: 2,
+                share: None,
+            }),
+            roles: RoleSet {
+                relay: true,
+                ..RoleSet::default()
+            },
+            start_heartbeat: true,
+            ..NodeConfig::default()
+        })
+        .await
+        .unwrap();
+
+        // The publisher republishes asynchronously; poll the directory (draining notifications so the
+        // engine makes progress) until the relay's own onion key appears.
+        let client = node.client();
+        let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO).await;
+        for _ in 0..30 {
+            if !dir.is_empty() {
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(100), node.next_notification()).await;
+            dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO).await;
+        }
+        assert!(
+            !dir.is_empty(),
+            "the relay published its mix onion key to the cell directory"
+        );
         node.shutdown();
     }
 

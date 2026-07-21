@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cell_node;
 pub mod config;
 pub mod diaulos;
 pub mod epoch_driver;
@@ -30,13 +31,16 @@ pub mod rendezvous;
 pub mod rendezvous_relay;
 pub mod resolve;
 
+pub use cell_node::CellNode;
 pub use config::{NodeConfig, Peer, RoleSet};
 pub use diaulos::{
-    FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service, serve, serve_rpc,
+    AnonRouteParams, FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service,
+    serve, serve_rpc,
 };
 pub use epoch_driver::EpochDriver;
 pub use error::NodeError;
 pub use fanos_onoma::Epoch;
+pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;
 pub use mixdir::{
     build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,

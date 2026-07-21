@@ -31,10 +31,15 @@ use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notificatio
 
 use crate::threshold::{self, ThresholdPeel};
 
-/// Internal frame tags (the onion travels as opaque overlay bytes; these are its sub-types).
-const TAG_ONION: u8 = 0;
-const TAG_REQ: u8 = 1;
-const TAG_REP: u8 = 2;
+/// Internal frame tags (the onion travels as opaque overlay bytes; these are its sub-types). They live in
+/// the **0xE0–0xEF range, deliberately outside the wire [`FrameType`](fanos_wire::FrameType) code space
+/// (0x00–0x70)**: a node that composes the router with the overlay engine on one coordinate (the deployed
+/// cell node) must tell an onion frame apart from an overlay wire frame by inspection alone, so an onion
+/// tag must never alias a `FrameType` code (`Hello`/`HelloAck`/`Ping` used to sit at 0/1/2 and collided).
+/// An onion frame therefore decodes to *no* `FrameType`, which is the composite's signal to route it here.
+const TAG_ONION: u8 = 0xE0;
+const TAG_REQ: u8 = 0xE1;
+const TAG_REP: u8 = 0xE2;
 
 /// The anonymous-source sentinel in a delivery notification (the endpoint learns no originator).
 pub const ANONYMOUS: Triple = [0, 0, 0];
@@ -541,10 +546,12 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                     Vec::new()
                 }
             }
-            // A node may also *originate* onions as a client: `Command::Send { to, payload }` launches
-            // the already-sealed frame `payload` to `to` verbatim (the combiner of its first hop), so
-            // the same node that peels replies here can inject its own launch frames. Other commands do
-            // not apply to a router.
+            // A node may also *originate* onions as a client: it launches an already-sealed frame to `to`
+            // verbatim (the combiner of its first hop), so the same node that peels replies here can inject
+            // its own launch frames. `Command::Emit` is the raw-emit primitive shared with the overlay
+            // composite; `Command::Send` is accepted equivalently for a standalone router client. Other
+            // commands do not apply to a router.
+            Input::Command(Command::Emit { to, frame }) => alloc::vec![Effect::Send { to, frame }],
             Input::Command(Command::Send { to, payload }) => {
                 alloc::vec![Effect::Send { to, frame: payload }]
             }

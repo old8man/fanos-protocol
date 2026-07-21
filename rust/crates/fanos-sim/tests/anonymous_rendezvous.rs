@@ -337,9 +337,11 @@ fn drain(
             if let Some((_cookie, payload)) = rservice.ingest(&bytes) {
                 server.handle_payload(keypair, &payload, srng);
             }
-        } else if recv == rp_combiner {
-            // A service reply arriving at the client's rendezvous: feed the client.
-            client.handle_payload(&bytes);
+        } else if recv == rp_combiner && let Some(cell) = bytes.get(16..) {
+            // A service reply arriving at the client's rendezvous: strip the 16-byte session-cookie prefix
+            // the service tags every reply with (a shared relay uses it to demultiplex clients), then feed
+            // the client's DIAULOS session the cell.
+            client.handle_payload(cell);
         }
     }
 }
@@ -462,10 +464,11 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
                             .or_default()
                             .handle_payload(&service, &payload, &mut srng);
                     }
-                } else if recv == rp_a_comb {
-                    client_a.handle_payload(&bytes);
-                } else if recv == rp_b_comb {
-                    client_b.handle_payload(&bytes);
+                } else if recv == rp_a_comb && let Some(cell) = bytes.get(16..) {
+                    // Strip the 16-byte session-cookie prefix the service tags replies with, then feed A.
+                    client_a.handle_payload(cell);
+                } else if recv == rp_b_comb && let Some(cell) = bytes.get(16..) {
+                    client_b.handle_payload(cell);
                 }
             }
 

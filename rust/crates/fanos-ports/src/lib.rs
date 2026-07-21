@@ -83,6 +83,18 @@ pub enum Command {
         /// Application payload.
         payload: Vec<u8>,
     },
+    /// Put a **verbatim** frame on the wire to coordinate `to`, with no overlay framing — the raw-emit
+    /// primitive an anonymous client uses to launch a threshold onion at a mixnet combiner or to register
+    /// with a rendezvous relay (an `RdvRegister` frame). Unlike [`Send`](Self::Send), which the overlay
+    /// wraps in a routed `Route` frame, this leaves `frame` untouched, so the receiving mix/rendezvous
+    /// engine sees the exact bytes the client sealed. (A dedicated router node overloads `Send` for this; a
+    /// node that also runs the overlay needs the two kept distinct.)
+    Emit {
+        /// Destination coordinate.
+        to: Triple,
+        /// The exact frame bytes to put on the wire.
+        frame: Vec<u8>,
+    },
     /// Run one round of local self-diagnosis and report the verdict (spec §6.9).
     Diagnose,
     /// Emit the cell's current coherence self-observation **without acting** — a sense-only read for

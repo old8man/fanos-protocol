@@ -501,6 +501,8 @@ impl<F: Field> Engine for NyxNode<F> {
             // signal starts its steady cover emission (spec §L5, V8).
             Input::Command(Command::StartHeartbeat) => self.start_cover(),
             Input::Command(Command::Send { to, payload }) => self.originate(to, &payload),
+            // Raw-emit puts the frame on the wire verbatim (the shared launch primitive).
+            Input::Command(Command::Emit { to, frame }) => alloc::vec![Effect::Send { to, frame }],
             Input::Timer(token) => self.on_timer(token),
             Input::Message { frame, .. } => self.on_frame(&frame),
             // A NYX node ignores the overlay's diagnose/observe/storage/membership commands.

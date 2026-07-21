@@ -19,9 +19,11 @@ use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_line,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, SessionId, combiner_for, meeting_line,
 };
 use fanos_runtime::{Command, Notification};
+
+use crate::rendezvous_relay::register_frame;
 use fanos_session::{ChannelTransport, stream_over_channels_paced};
 use rand_core::{CryptoRng, Rng};
 use std::time::Duration;
@@ -58,7 +60,13 @@ async fn rendezvous_bridge<F, S>(
         loop {
             match deliveries.recv().await {
                 Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
-                    if app_in.send(payload).is_err() {
+                    // Every reply is tagged with this session's 16-byte cookie (so a shared rendezvous
+                    // relay can route it here); the DIAULOS session sees only its cell, so strip the
+                    // prefix. A delivery too short to hold a cookie is malformed — drop it.
+                    let Some(cell) = payload.get(size_of::<SessionId>()..) else {
+                        continue;
+                    };
+                    if app_in.send(cell.to_vec()).is_err() {
                         break; // the stream driver is gone
                     }
                 }
@@ -94,12 +102,28 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
     let (out_tx, out_rx) = unbounded_channel();
     let (in_tx, in_rx) = unbounded_channel();
     let deliveries = client.subscribe();
+    // Engage the rendezvous relay at the reply combiner unless this node *is* that combiner (the
+    // co-located case, where it peels its own replies): register this session's cookie so the relay
+    // forwards the cookie-tagged replies here (audit #54, item 3). This is the general path — a proxy runs
+    // only an overlay node and cannot peel onions itself, and its coordinate reshuffles each epoch, so it
+    // relies on the cell relay sitting at the drawn reply combiner. Sent before the first onion launches,
+    // so the binding is in place well before the service's first reply completes the multi-round return.
+    if let Some(reply_combiner) = rclient.reply_combiner()
+        && reply_combiner != client.address()
+    {
+        client.command(Command::Emit {
+            to: reply_combiner,
+            frame: register_frame(rclient.cookie()),
+        });
+    }
     tokio::spawn(rendezvous_bridge(
         rclient,
         out_rx,
         in_tx,
-        move |to, payload| {
-            client.command(Command::Send { to, payload });
+        // Onion launches go out **raw** (`Emit`), not `Send` — the overlay would otherwise wrap them in a
+        // routed `Route` frame the mixnet combiner cannot peel.
+        move |to, frame| {
+            client.command(Command::Emit { to, frame });
         },
         deliveries,
     ));
@@ -158,10 +182,14 @@ impl RendezvousRoute {
         rng: &mut R,
     ) -> Self {
         let meeting_combiner = combiner_for::<F>(service_meeting);
-        // The client's reply rendezvous: a random line distinct from the meeting line AND with a distinct
-        // combiner. Falls back to the meeting line only on a degenerate plane that has no such line.
+        // The client's reply rendezvous: a random line distinct from the meeting line AND whose combiner is
+        // a distinct, *live* relay present in the directory — that relay peels the reply and forwards it to
+        // this client (audit #54, item 3), so it must be reachable to serve as the rendezvous point. Falls
+        // back to the meeting line only on a degenerate plane that offers no such line.
         let reply_rendezvous = draw_line::<F, R>(rng, |l| {
-            l != service_meeting && combiner_for::<F>(l) != meeting_combiner
+            l != service_meeting
+                && combiner_for::<F>(l)
+                    .is_some_and(|c| Some(c) != meeting_combiner && directory.get(&c).is_some())
         })
         .unwrap_or(service_meeting);
         let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting], rng);
@@ -386,24 +414,29 @@ mod tests {
         );
         assert!(!frame.is_empty());
 
-        // A non-anonymous delivery is filtered; the following anonymous one is surfaced verbatim. Since
-        // the driver's next read is the anonymous reply, the non-anonymous delivery was indeed dropped.
+        // A non-anonymous delivery is filtered; the following anonymous one is surfaced with its 16-byte
+        // session-cookie prefix stripped. Since the driver's next read is the anonymous reply's cell, the
+        // non-anonymous delivery was indeed dropped.
         deliv_tx
             .send(Notification::Delivered {
                 from: [9, 9, 9],
                 payload: b"noise".to_vec(),
             })
             .unwrap();
+        // The service tags every reply with the session cookie (a shared relay uses it to route the reply
+        // here); the bridge strips those 16 bytes before the session sees the cell.
+        let mut tagged = vec![0u8; size_of::<SessionId>()];
+        tagged.extend_from_slice(b"reply");
         deliv_tx
             .send(Notification::Delivered {
                 from: ANONYMOUS,
-                payload: b"reply".to_vec(),
+                payload: tagged,
             })
             .unwrap();
         assert_eq!(
             in_rx.recv().await.unwrap(),
             b"reply",
-            "only the anonymous reply reaches the session"
+            "only the anonymous reply reaches the session, cookie-prefix stripped"
         );
     }
 }

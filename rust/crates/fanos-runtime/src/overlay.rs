@@ -1399,6 +1399,20 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::Ack) => Self::on_ack(frame.body),
             Some(FrameType::Announce) => self.on_announce(frame.body),
             Some(FrameType::EpochAgree) => self.on_epoch_agree(frame.body),
+            Some(FrameType::RdvReply) => {
+                // A rendezvous relay forwarded a peeled anonymous reply to us (audit #54, item 3): this
+                // node is the registered client for the session cookie the reply carries. Surface it as an
+                // anonymous delivery — identical to a reply we would have peeled ourselves had we been the
+                // reply combiner — so the anonymous-session bridge consumes both paths uniformly. `from` is
+                // the anonymous sentinel [0, 0, 0], never the relay, so no consumer learns which relay
+                // carried it. The 16-byte cookie prefix stays on the payload; the session bridge strips it.
+                // A forged RdvReply is inert: the inner bytes are an authenticated DIAULOS cell, so a wrong
+                // or replayed one fails the session MAC and is dropped there.
+                alloc::vec![Effect::Notify(Notification::Delivered {
+                    from: [0, 0, 0],
+                    payload: frame.body.to_vec(),
+                })]
+            }
             _ => Vec::new(),
         }
     }
@@ -2427,6 +2441,9 @@ impl<F: Field> Engine for OverlayNode<F> {
                 }]
             }
             Input::Command(Command::Send { to, payload }) => self.on_send(to, &payload),
+            // Raw-emit: put the frame on the wire verbatim (no `Route` wrapping) — an anonymous client
+            // launching a threshold onion at a combiner or registering with a rendezvous relay (audit #54).
+            Input::Command(Command::Emit { to, frame }) => alloc::vec![Effect::Send { to, frame }],
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Observe) => self.on_observe(now),
             Input::Command(Command::Put { key, value }) => self.on_put(now, &key, &value),

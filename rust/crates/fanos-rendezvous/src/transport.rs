@@ -162,12 +162,22 @@ impl<F: Field> RendezvousService<F> {
 
     /// Seal `payload` back through `cookie`'s recorded reply circuit. `None` if the cookie is unknown,
     /// a member key is missing, or sealing fails.
+    ///
+    /// The reply is **tagged** with the session cookie (a 16-byte prefix): the reply circuit ends at a
+    /// combiner that may be a *shared* rendezvous relay serving many clients, and the peeled reply carries
+    /// no other demultiplexer, so the relay reads this prefix to forward the reply to the client that
+    /// registered that cookie (the rendezvous-relay path in `fanos-node`). A co-located client — one
+    /// listening at the combiner itself — simply strips the prefix. Either way the client's driver drops
+    /// these 16 bytes before handing the cell to its DIAULOS session.
     #[must_use]
     pub fn seal_reply(&mut self, cookie: &SessionId, payload: &[u8]) -> Option<Forward> {
         let circuit = self.routes.get(cookie)?.clone();
         let mut seed = [0u8; 32];
         self.rng.fill(&mut seed);
-        seal_forward::<F>(&circuit, &self.directory, self.threshold, payload, &seed)
+        let mut tagged = Vec::with_capacity(cookie.len() + payload.len());
+        tagged.extend_from_slice(cookie);
+        tagged.extend_from_slice(payload);
+        seal_forward::<F>(&circuit, &self.directory, self.threshold, &tagged, &seed)
     }
 
     /// The number of distinct client sessions (cookies) this service is currently tracking.

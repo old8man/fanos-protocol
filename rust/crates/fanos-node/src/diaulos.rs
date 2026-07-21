@@ -9,10 +9,13 @@
 //! a different transport under the identical stream.
 
 use fanos_diaulos::{ClientSession, Coord, StaticKeypair};
+use fanos_field::F2;
+use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
 use fanos_quic::Client;
+use fanos_rendezvous::{BeaconSeed, MixDirectory, meeting_line};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, OverlayTransport, dial_over_transport, serve_over_channels};
 use rand_core::CryptoRng;
@@ -238,10 +241,37 @@ impl ServiceResolver for StaticResolver {
 pub struct FanosDialer<R: ServiceResolver> {
     client: Client,
     resolver: R,
-    /// The rendezvous route for the **anonymous** profile; `None` selects the Direct profile (dial by
-    /// coordinate). When set, dials carry the same DIAULOS session over threshold onions instead, so
-    /// neither party learns the other's location.
-    anonymous: Option<crate::rendezvous::RendezvousRoute>,
+    profile: Profile,
+}
+
+/// Parameters to draw a **fresh unlinkable** rendezvous route *per dial* — the general anonymous proxy
+/// profile (spec §L5, #54). Each connection gets new random forward/reply hops drawn from the live mix
+/// `directory`, so an observer cannot link successive dials by their shared path (the fixed-route
+/// [`FanosDialer::anonymous`] reuses one path across dials and is linkable — a real proxy must use this).
+pub struct AnonRouteParams {
+    /// The live mixnet key directory (e.g. from [`build_cell_mix_directory`](crate::build_cell_mix_directory)).
+    pub directory: MixDirectory,
+    /// How many of each hop line's members must cooperate to peel an onion.
+    pub threshold: u8,
+    /// The rendezvous epoch (the meeting line and placement rotate with it).
+    pub epoch: Epoch,
+    /// The epoch's beacon seed (folds into the meeting-line derivation).
+    pub beacon: BeaconSeed,
+    /// `(forward, reply)` intermediate-hop depths for each freshly-drawn circuit.
+    pub depths: (usize, usize),
+}
+
+/// The dialer's routing profile.
+enum Profile {
+    /// Direct: reach services by coordinate (fast, but reveals *where* each party is).
+    Direct,
+    /// Anonymous with **one fixed** rendezvous route reused across dials (the meeting line is still
+    /// per-target). Simple, but successive dials share the same intermediate hops — an observer can LINK
+    /// them; kept for the single-service test path.
+    Fixed(crate::rendezvous::RendezvousRoute),
+    /// Anonymous with a **fresh unlinkable** route drawn per dial from the live directory — the general
+    /// proxy profile.
+    Fresh(AnonRouteParams),
 }
 
 impl<R: ServiceResolver> FanosDialer<R> {
@@ -252,14 +282,14 @@ impl<R: ServiceResolver> FanosDialer<R> {
         Self {
             client,
             resolver,
-            anonymous: None,
+            profile: Profile::Direct,
         }
     }
 
-    /// An **anonymous** dialer: every dial rides threshold onions along `route` to the service's
-    /// computed meeting line, hiding both parties' locations. `route` supplies the mixnet directory,
-    /// threshold, epoch, and the client's forward/reply circuits (the per-target meeting line is
-    /// derived from the resolved service key at dial time).
+    /// An **anonymous** dialer with a single fixed `route`: every dial rides threshold onions along it to
+    /// the service's computed meeting line (per-target), hiding both parties' locations. Successive dials
+    /// share the route's intermediate hops, so they are linkable — for a general proxy use
+    /// [`anonymous_fresh`](Self::anonymous_fresh), which draws a new path per dial.
     #[must_use]
     pub fn anonymous(
         client: Client,
@@ -269,7 +299,20 @@ impl<R: ServiceResolver> FanosDialer<R> {
         Self {
             client,
             resolver,
-            anonymous: Some(route),
+            profile: Profile::Fixed(route),
+        }
+    }
+
+    /// A **general anonymous** dialer that draws a **fresh, unlinkable** rendezvous route for *every* dial
+    /// from `params`' live mix directory (spec §L5, #54): each connection gets new random forward/reply
+    /// hops, so an observer cannot link a client's successive connections by their path — the property a
+    /// real anonymity proxy needs. The per-target meeting line is derived from the resolved service key.
+    #[must_use]
+    pub fn anonymous_fresh(client: Client, resolver: R, params: AnonRouteParams) -> Self {
+        Self {
+            client,
+            resolver,
+            profile: Profile::Fresh(params),
         }
     }
 }
@@ -300,20 +343,45 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
             .ok_or(DialError::Unreachable)?;
         // A fresh CSPRNG seeded from OS entropy for this dial's ephemeral keys.
         let mut rng = SeedRng::from_seed(&os_entropy_32()?);
-        match &self.anonymous {
-            None => Ok(dial_service(
+        match &self.profile {
+            Profile::Direct => Ok(dial_service(
                 self.client.clone(),
                 coord,
                 &service_public,
                 &mut rng,
             )),
-            Some(route) => {
+            Profile::Fixed(route) => {
                 // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
                 let secret = os_entropy_32()?;
                 Ok(crate::rendezvous::anonymous_dial(
                     self.client.clone(),
                     &service_public,
                     route,
+                    &secret,
+                    &mut rng,
+                ))
+            }
+            Profile::Fresh(params) => {
+                // The general anonymous profile: derive the service's per-target meeting line, DRAW A FRESH
+                // route (new random forward/reply hops so this connection is unlinkable to the client's
+                // others), then ride the DIAULOS session over it. `draw` and `anonymous_dial` re-derive the
+                // same meeting line from the service key, so they agree.
+                let meeting =
+                    meeting_line::<F2>(&service_public.encode(), params.epoch, &params.beacon).coords();
+                let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
+                    params.directory.clone(),
+                    params.threshold,
+                    params.epoch,
+                    params.beacon,
+                    meeting,
+                    params.depths,
+                    &mut rng,
+                );
+                let secret = os_entropy_32()?;
+                Ok(crate::rendezvous::anonymous_dial(
+                    self.client.clone(),
+                    &service_public,
+                    &route,
                     &secret,
                     &mut rng,
                 ))

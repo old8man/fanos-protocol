@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use fanos_field::F2;
 use fanos_node::{
-    Epoch, FanosDialer, Node, NodeConfig, NodeError, NodeResolver, Peer, RoleSet, identity,
-    serve_proxy,
+    AnonRouteParams, BeaconSeed, Epoch, FanosDialer, Node, NodeConfig, NodeError, NodeResolver,
+    Peer, RoleSet, build_cell_mix_directory, identity, serve_proxy,
 };
 use fanos_runtime::Notification;
 use tokio::net::TcpListener;
@@ -122,6 +122,14 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
 /// byte-stream to it. The local SOCKS/HTTP hop answers `.fanos` addressing itself, so names never reach the
 /// system resolver. Clearnet targets are refused today (a `.fanos`-only surface — no exit dialer yet), as are
 /// UDP ASSOCIATE / BIND.
+///
+/// Two routing profiles (`--profile`): **direct** (default) opens the DIAULOS stream straight to the service
+/// coordinate — fast, but an observer sees which coordinate the client talks to. **anonymous** draws a
+/// *fresh, unlinkable* threshold-onion rendezvous route for every dial from the cell's live mix directory
+/// (`build_cell_mix_directory` — the relays that published an onion key this epoch), so neither party's
+/// location is revealed and an observer cannot link one client's successive connections by their path. It
+/// refuses to start unless at least `threshold + 1` relays are live, and takes the epoch's public `--beacon`
+/// so its drawn meeting line matches the service's.
 async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
 
@@ -151,6 +159,18 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
             .map_err(|_| NodeError::Config(format!("bad --min-pow '{s}'")))?,
         None => 0,
     };
+    // Routing profile: `direct` (default) reaches services by coordinate; `anonymous` draws a fresh,
+    // unlinkable threshold-onion rendezvous route per dial from the live cell mix directory (spec §L5,
+    // #54). Parse its knobs up front so bad arguments fail before we join the overlay.
+    let anon = match flag(args, "--profile").unwrap_or("direct") {
+        "direct" => None,
+        "anonymous" => Some(parse_anon_config(args)?),
+        other => {
+            return Err(NodeError::Config(format!(
+                "unknown --profile '{other}' (expected 'direct' or 'anonymous')"
+            )));
+        }
+    };
 
     let config = node_config_from_args(args)?;
     let mut node = Node::start::<F2>(config).await?;
@@ -159,7 +179,13 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     // `FanosDialer` is not `Clone`, so `serve_proxy` shares it behind an `Arc` (per-connection handlers need
     // only `&D`). The dialer holds its own `Client`; the node stays owned here for notification draining + a
     // clean shutdown.
-    let dialer = Arc::new(FanosDialer::new(node.client(), resolver));
+    let dialer = match build_proxy_dialer(&node, resolver, epoch, anon.as_ref()).await {
+        Ok(dialer) => Arc::new(dialer),
+        Err(e) => {
+            node.shutdown();
+            return Err(e);
+        }
+    };
 
     let socks = TcpListener::bind(socks_listen).await?;
     let http = match http_listen {
@@ -170,8 +196,15 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     let http_line = http_listen.map_or_else(String::new, |a| {
         format!("\n  HTTP:    http://{a} (CONNECT)")
     });
+    let profile_line = match &anon {
+        None => "\n  Profile: direct (by-coordinate)".to_owned(),
+        Some(cfg) => format!(
+            "\n  Profile: anonymous (fresh per-dial routes, threshold {}, depths {}/{})",
+            cfg.threshold, cfg.fwd_depth, cfg.reply_depth
+        ),
+    };
     eprintln!(
-        "fanos proxy up — coordinate {x}:{y}:{z} on {}\n  SOCKS5:  socks5://{socks_listen}{http_line}",
+        "fanos proxy up — coordinate {x}:{y}:{z} on {}\n  SOCKS5:  socks5://{socks_listen}{http_line}{profile_line}",
         health.local_addr,
     );
     info!(coord = ?health.address, %socks_listen, ?http_listen, "fanos proxy up");
@@ -189,6 +222,108 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     node.shutdown();
     eprintln!("fanos proxy down");
     Ok(())
+}
+
+/// Build the proxy's [`FanosDialer`] for the chosen routing profile. `direct` (when `anon` is `None`)
+/// reaches services by coordinate; `anonymous` reads the cell's live mix directory for `epoch` (every
+/// relay that published an onion key) and draws a *fresh, unlinkable* route per dial over it. Fails —
+/// leaving the node for the caller to shut down — if too few relays are live to draw a threshold circuit,
+/// since silently degrading anonymity would be worse than a clear refusal.
+async fn build_proxy_dialer(
+    node: &Node,
+    resolver: NodeResolver,
+    epoch: Epoch,
+    anon: Option<&AnonConfig>,
+) -> Result<FanosDialer<NodeResolver>, NodeError> {
+    let Some(cfg) = anon else {
+        return Ok(FanosDialer::new(node.client(), resolver));
+    };
+    let directory = build_cell_mix_directory::<F2>(&node.client(), epoch).await;
+    let need = usize::from(cfg.threshold) + 1;
+    if directory.len() < need {
+        return Err(NodeError::Config(format!(
+            "anonymous profile needs at least threshold+1={need} live mix relays for epoch {}, found \
+             {} — start relays that publish mix keys or lower --threshold",
+            epoch.get(),
+            directory.len(),
+        )));
+    }
+    info!(
+        relays = directory.len(),
+        threshold = cfg.threshold,
+        fwd_depth = cfg.fwd_depth,
+        reply_depth = cfg.reply_depth,
+        "anonymous profile: fresh per-dial rendezvous routes over the live mix directory"
+    );
+    let params = AnonRouteParams {
+        directory,
+        threshold: cfg.threshold,
+        epoch,
+        beacon: cfg.beacon,
+        depths: (cfg.fwd_depth, cfg.reply_depth),
+    };
+    Ok(FanosDialer::anonymous_fresh(node.client(), resolver, params))
+}
+
+/// The parsed knobs of the `--profile anonymous` proxy: how many relays per hop must cooperate to peel an
+/// onion (`threshold`), the forward/reply intermediate-hop depths, and the epoch's public beacon seed.
+struct AnonConfig {
+    threshold: u8,
+    fwd_depth: usize,
+    reply_depth: usize,
+    beacon: BeaconSeed,
+}
+
+/// Parse the `--profile anonymous` knobs from the proxy arguments, with defaults tuned for the base Fano
+/// cell: `--threshold 2` (2-of-line onion peeling), `--fwd-depth 2` / `--reply-depth 2` intermediate hops,
+/// and `--beacon` the epoch's public randomness (defaults to genesis).
+fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
+    let usize_flag = |name: &str, default: usize| -> Result<usize, NodeError> {
+        match flag(args, name) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| NodeError::Config(format!("bad {name} '{s}'"))),
+            None => Ok(default),
+        }
+    };
+    let threshold: u8 = match flag(args, "--threshold") {
+        Some(s) => s
+            .parse()
+            .map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
+        None => 2,
+    };
+    if threshold == 0 {
+        return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
+    }
+    Ok(AnonConfig {
+        threshold,
+        fwd_depth: usize_flag("--fwd-depth", 2)?,
+        reply_depth: usize_flag("--reply-depth", 2)?,
+        beacon: match flag(args, "--beacon") {
+            Some(s) => parse_beacon_hex(s)?,
+            None => BeaconSeed::GENESIS,
+        },
+    })
+}
+
+/// Parse a 64-hex-char (32-byte) epoch beacon seed. The beacon is *public* per-epoch randomness (the
+/// rendezvous DVRF output) shared by every party on the epoch — a client obtains it out-of-band or from
+/// the overlay and passes it so its drawn meeting line matches the service's. Accepts an optional `0x`
+/// prefix; avoids slice indexing (a hard-denied lint here) by consuming nibbles through an iterator.
+fn parse_beacon_hex(s: &str) -> Result<BeaconSeed, NodeError> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    let err = || NodeError::Config("bad --beacon: expected 64 hex chars (32 bytes)".to_owned());
+    if hex.len() != 64 {
+        return Err(err());
+    }
+    let mut nibbles = hex.chars().map(|c| c.to_digit(16));
+    let mut bytes = [0u8; 32];
+    for byte in &mut bytes {
+        let hi = nibbles.next().flatten().ok_or_else(err)?;
+        let lo = nibbles.next().flatten().ok_or_else(err)?;
+        *byte = (hi * 16 + lo) as u8;
+    }
+    Ok(BeaconSeed::new(bytes))
 }
 
 /// Print (and optionally persist) a node's self-certifying coordinate.
@@ -313,10 +448,17 @@ fn print_help() {
          \x20 fanos node  [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--no-heartbeat] [--proteus-secret SECRET]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
-         \x20             [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
+         \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
+         \x20             [--beacon HEX64] [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos help\n\
+         \n\
+         PROXY PROFILES:\n\
+         \x20 direct     reach services by coordinate — fast, but reveals where each party is (default)\n\
+         \x20 anonymous  draw a FRESH threshold-onion rendezvous route per dial from the live mix\n\
+         \x20            directory, so successive connections are unlinkable (needs live relays; the\n\
+         \x20            --beacon is the epoch's public randomness, shared by the service)\n\
          \n\
          EXAMPLES:\n\
          \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\
@@ -324,6 +466,8 @@ fn print_help() {
          \x20            --bootstrap 1:0:0@seed.example:9000 --role relay,storage\n\
          \x20 fanos proxy --socks-listen 127.0.0.1:1080 --bootstrap 1:0:0@seed.example:9000\n\
          \x20            # then: curl --socks5-hostname 127.0.0.1:1080 http://<pubkey>.fanos/\n\
+         \x20 fanos proxy --profile anonymous --threshold 2 --bootstrap 1:0:0@seed.example:9000\n\
+         \x20            # unlinkable per-dial routes over the cell mixnet\n\
          \n\
          Set RUST_LOG=debug for verbose logs."
     );

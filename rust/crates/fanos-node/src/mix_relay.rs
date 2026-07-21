@@ -25,19 +25,29 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame};
 
-/// A mix-relay hosting a threshold-onion [`ThresholdRouter`] and a distributed-beacon [`BeaconNode`] as
-/// one engine, unifying the E4 onion-key rotation with the E5 beacon epoch (see the module docs). The
+use crate::rendezvous_relay::RendezvousRelay;
+
+/// A mix-relay hosting a threshold-onion router and a distributed-beacon [`BeaconNode`] as one engine,
+/// unifying the E4 onion-key rotation with the E5 beacon epoch (see the module docs). The router is
+/// wrapped in a [`RendezvousRelay`] so the same coordinate also serves as a rendezvous point — forwarding
+/// each anonymous reply it peels to the client that registered that session's cookie (audit #54, item 3),
+/// which is what lets a general anonymous client receive replies without being a combiner itself. The
 /// router and beacon MUST be constructed at the **same** coordinate.
 pub struct MixRelay<F: Field> {
-    router: ThresholdRouter<F>,
+    relay: RendezvousRelay<F>,
     beacon: BeaconNode<F>,
 }
 
 impl<F: Field> MixRelay<F> {
-    /// Compose a `router` and a `beacon` (both at this relay's coordinate) into one mix-relay engine.
+    /// Compose a `router` and a `beacon` (both at this relay's coordinate) into one mix-relay engine. The
+    /// router is wrapped in a [`RendezvousRelay`], so the relay also forwards cookie-tagged replies to
+    /// registered clients.
     #[must_use]
     pub fn new(router: ThresholdRouter<F>, beacon: BeaconNode<F>) -> Self {
-        Self { router, beacon }
+        Self {
+            relay: RendezvousRelay::new(router),
+            beacon,
+        }
     }
 
     /// The current beacon seed — fold into `meeting_line` for the rendezvous this relay serves (E5).
@@ -56,14 +66,14 @@ impl<F: Field> MixRelay<F> {
     /// [`step`](Engine::step): it equals [`epoch`](Self::epoch) — the beacon and the router are locked.
     #[must_use]
     pub fn router_onion_epoch(&self) -> Epoch {
-        self.router.onion_epoch()
+        self.relay.router().onion_epoch()
     }
 
     /// The router's current-epoch onion public — what a driver republishes at the `(coord, epoch)` mixdir
     /// slot so clients seal to a key the relay can still peel with (E4).
     #[must_use]
     pub fn onion_public(&self) -> &HybridKemPublic {
-        self.router.onion_public()
+        self.relay.router().onion_public()
     }
 
     /// Whether `frame` is a beacon control frame (routed to the beacon; everything else is the router's
@@ -88,8 +98,13 @@ impl<F: Field> MixRelay<F> {
             })
             .max();
         if let Some(epoch) = target {
-            while self.router.onion_epoch() < epoch {
-                let rotation = self.router.step(now, Input::Command(Command::AdvanceEpoch));
+            // Rotate the wrapped router directly (an epoch tick is not onion traffic, so it bypasses the
+            // rendezvous-relay forwarding rule).
+            while self.relay.router().onion_epoch() < epoch {
+                let rotation = self
+                    .relay
+                    .router_mut()
+                    .step(now, Input::Command(Command::AdvanceEpoch));
                 effects.extend(rotation);
             }
         }
@@ -107,7 +122,9 @@ impl<F: Field> Engine for MixRelay<F> {
                     let effects = self.beacon.step(now, input);
                     self.drive_router(now, effects)
                 } else {
-                    self.router.step(now, input)
+                    // Onion traffic and rendezvous registrations go to the wrapped relay (which peels
+                    // hops and forwards cookie-tagged replies to registered clients).
+                    self.relay.step(now, input)
                 }
             }
             // The external epoch tick drives the BEACON; the beacon adopting an epoch rotates the router.
@@ -115,14 +132,14 @@ impl<F: Field> Engine for MixRelay<F> {
                 let effects = self.beacon.step(now, Input::Command(Command::AdvanceEpoch));
                 self.drive_router(now, effects)
             }
-            // Only the router arms timers.
-            Input::Timer(_) => self.router.step(now, input),
+            // Only the router arms timers (a firing gather timer may complete a peel → the relay forwards).
+            Input::Timer(_) => self.relay.step(now, input),
             // StartHeartbeat (cover), Send (launch), and every other command go to the router.
-            Input::Command(cmd) => self.router.step(now, Input::Command(cmd)),
+            Input::Command(cmd) => self.relay.step(now, Input::Command(cmd)),
         }
     }
 
     fn address(&self) -> Triple {
-        self.router.address()
+        self.relay.address()
     }
 }
