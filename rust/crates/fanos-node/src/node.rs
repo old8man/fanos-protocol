@@ -7,6 +7,7 @@
 //! wires identity, bootstrap, and the engine together and exposes control.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_diaulos::StaticKeypair;
@@ -40,6 +41,28 @@ fn os_entropy_32() -> Result<[u8; 32], NodeError> {
     getrandom::fill(&mut bytes)
         .map_err(|e| NodeError::Config(format!("OS entropy failed: {e}")))?;
     Ok(bytes)
+}
+
+/// Spawn the wall-clock **epoch driver**: the root tick that periodically issues `Command::AdvanceEpoch`,
+/// so the beacon anchors emit their partials, a threshold round assembles, `Notification::BeaconReady`
+/// fires, and the reshuffle loop rotates the VRF coordinate, the PROTEUS wire shape, and the forward-secure
+/// onion keys (§L3, §7.6). Without this nothing advances the epoch and the whole moving-target defence stays
+/// pinned at genesis for the node's entire life. Only spawned when beacon params are configured (a bare
+/// overlay has no clock to drive). The task ends when the engine stops (`command` returns `false`).
+fn spawn_epoch_driver(client: Client, period: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        // If a tick is missed under load, fire once and carry on — never burst a backlog of epoch advances.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate tick so the node has a full period to connect and sync before its first advance.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if !client.command(Command::AdvanceEpoch) {
+                break; // the engine actor has stopped
+            }
+        }
+    })
 }
 
 /// Lowercase-hex encode `bytes` — for logging the exit's public-key descriptor a proxy configures with.
@@ -143,6 +166,9 @@ pub struct Node {
     /// node (which runs the mixnet role). Held so it lives as long as the node; it ends when the node's
     /// notification stream closes on shutdown.
     _mix_publisher: Option<JoinHandle<()>>,
+    /// The background task issuing the wall-clock `AdvanceEpoch` tick — present only when a beacon is
+    /// configured (the live epoch clock). Held for the node's lifetime; it ends when the engine stops.
+    _epoch_driver: Option<JoinHandle<()>>,
 }
 
 /// A point-in-time health snapshot of a node.
@@ -177,6 +203,8 @@ impl Node {
         // pure consumer (`share = None`) only needs the group commitment + threshold to verify and adopt
         // the rounds anchors flood; an anchor also contributes partials.
         let beacon = config.beacon.clone();
+        // Whether to run the live epoch clock (captured before `beacon` is moved into the engine builder).
+        let has_beacon = beacon.is_some();
         // A relay node also runs the anonymity mixnet: its engine is a [`CellNode`] (overlay + beacon +
         // threshold-onion router), and it republishes its onion key each epoch so anonymous clients can
         // seal to it. The router's key material is fresh OS entropy per run — forward-secure, since a
@@ -266,6 +294,10 @@ impl Node {
         // key at once, then republish each epoch the beacon advances to (audit #54; E4∩E5).
         let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), address, onion_seed));
 
+        // The root epoch tick: drive the live beacon clock so the coordinate / PROTEUS shape / onion keys
+        // rotate each epoch (§L3, §7.6). Only when a beacon is configured — a bare overlay has no clock.
+        let epoch_driver = has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
+
         // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
         spawn_exit_role(&handle, address, exit)?;
 
@@ -286,6 +318,7 @@ impl Node {
             local_addr,
             roles: config.roles,
             _mix_publisher: mix_publisher,
+            _epoch_driver: epoch_driver,
         })
     }
 
@@ -656,7 +689,7 @@ mod tests {
         // a should observe the delivery. (No manual directory insert of b: b dialed in, and under
         // self-certification a's accept loop registered b's proven coordinate → source address itself.)
         let mut a = a;
-        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let delivered = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match a.next_notification().await {
                     Some(Notification::Delivered { payload, .. }) => break Some(payload),
@@ -704,7 +737,7 @@ mod tests {
         // b dials in (its first Send establishes the connection a learns it on). Drain a's notification of
         // that inbound payload so we know the connection — and thus the reverse registration — is in place.
         b.command(Command::Send { to: a_addr, payload: b"knock".to_vec() });
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match a.next_notification().await {
                     Some(Notification::Delivered { .. }) | None => break,
@@ -719,7 +752,7 @@ mod tests {
         // if it learned b's address from the inbound connection.
         a.command(Command::Send { to: b_addr, payload: b"reply over quic".to_vec() });
         let mut b = b;
-        let got = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match b.next_notification().await {
                     Some(Notification::Delivered { payload, .. }) => break Some(payload),

@@ -3,11 +3,19 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fanos_geometry::Triple;
 use fanos_vrf::vss::{VssCommitment, VssShare};
 
 use crate::error::NodeError;
+
+/// The default beacon epoch period (§7.6). Ten minutes is a conservative moving-target cadence: long
+/// enough that per-epoch coordinate reshuffle + re-handshake churn is modest, short enough that a
+/// grinded seat or a censor's traffic-shape classifier is invalidated well within an attack window.
+/// A deployment tunes it via [`NodeConfig::epoch_period`]; all nodes on a network should share it so
+/// their epochs stay aligned.
+pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
 /// `beacon = Some(..)` the node composes an [`OverlayBeaconNode`](crate::OverlayBeaconNode): it
@@ -335,6 +343,12 @@ pub struct NodeConfig {
     /// The distributed-beacon parameters. `Some(..)` runs the live epoch clock (§7.6); `None` (the
     /// default) runs a bare overlay pinned at genesis — see [`BeaconParams`].
     pub beacon: Option<BeaconParams>,
+    /// How often the node issues the root `AdvanceEpoch` tick that drives the live epoch clock: each
+    /// period the beacon advances a round, rotating the VRF coordinate, the PROTEUS wire shape, and the
+    /// forward-secure onion keys (the moving-target defence, §L3/§7.6). Only used when `beacon` is
+    /// `Some` (a bare overlay has no clock to drive). Network-wide — all nodes should share it so their
+    /// epochs stay aligned. Default: [`DEFAULT_EPOCH_PERIOD`].
+    pub epoch_period: Duration,
     /// The threshold-hosting parameters. Required by (and only used with) the `service` role: `Some(..)`
     /// composes a [`ServiceNode`](crate::ServiceNode) hosting one member of a service line — see
     /// [`ServiceParams`]. `None` (the default) hosts no service.
@@ -359,6 +373,7 @@ impl Default for NodeConfig {
             roles: RoleSet::default(),
             start_heartbeat: true,
             beacon: None,
+            epoch_period: DEFAULT_EPOCH_PERIOD,
             service: None,
             exit: None,
             proteus_secret: None,

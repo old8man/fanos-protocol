@@ -29,6 +29,11 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**PRODUCTION Blocker 1 — the live epoch clock now ticks** (`Node` spawns `spawn_epoch_driver` issuing the
+wall-clock `AdvanceEpoch`; `NodeConfig.epoch_period`) — the whole moving-target defence (VRF coord / PROTEUS
+shape / onion-key rotation) was inert/genesis-pinned in a deployed node; verified E2E that the beacon
+advances across epochs (`tests/epoch_clock.rs`) ·
+C8 tagging over the running mixnet (`sim/tests/tagging.rs`: AEAD drops tampered onions, tagging can't trace) ·
 beacon active-anchor adversary (`sim/tests/beacon_adversary.rs`: forged biased-σ partial DLEQ-rejected,
 silent anchor can't block — beacon integrity proven over the running cell, not just unit-level) ·
 C10 predecessor guard-SET (`fanos-nyx::GuardSet`: primary-first, slow-rotation window, backup failover —

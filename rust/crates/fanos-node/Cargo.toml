@@ -65,6 +65,10 @@ tokio = { workspace = true, features = [
     "macros",
     "time",
 ] }
+# The live-epoch-clock test builds a 1-of-1 beacon group and reads BeaconReady notifications.
+fanos-field = { workspace = true }
+fanos-runtime = { workspace = true }
+fanos-vrf = { workspace = true }
 
 [lints]
 workspace = true
