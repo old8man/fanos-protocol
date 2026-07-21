@@ -26,6 +26,14 @@ pub enum FrameType {
     /// `family(1B: 4|6) ‖ ip(4|16) ‖ port(2B BE)`. A node aggregates these across peers
     /// (`fanos_quic::ReflexiveAddr`) to learn the address it should advertise / be reached at.
     ObservedAddr = 0x06,
+    /// A client asks a **common hub** to coordinate a hole-punch to a peer it cannot reach directly
+    /// (NAT traversal #119): body is the target's coordinate (12B). The hub — which observed both
+    /// parties' public addresses when they dialed in — replies to *both* with a [`PunchTo`](Self::PunchTo).
+    ConnectReq = 0x07,
+    /// A hub tells a node to dial a peer at its observed public address, for a coordinated simultaneous
+    /// open (NAT traversal #119): body is `peer_coord(12B) ‖ family(1B) ‖ ip(4|16) ‖ port(2B BE)`. Both
+    /// endpoints dial at once, so each NAT sees an outbound packet first and admits the inbound reply.
+    PunchTo = 0x08,
     // 0x1* Membership
     Join = 0x10,
     Announce = 0x11,
@@ -118,6 +126,8 @@ impl FrameType {
             0x04 => Self::Goaway,
             0x05 => Self::Error,
             0x06 => Self::ObservedAddr,
+            0x07 => Self::ConnectReq,
+            0x08 => Self::PunchTo,
             0x10 => Self::Join,
             0x11 => Self::Announce,
             0x12 => Self::BeaconReq,

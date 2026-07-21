@@ -23,7 +23,7 @@ use quinn::{Connection, Endpoint};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 
 use fanos_field::Field;
-use fanos_geometry::{Point, Triple, decode_triple, encode_triple};
+use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
 use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
@@ -100,7 +100,7 @@ fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// Bytes of a HELLO: three little-endian `u32`s (a projective coordinate).
-const HELLO_LEN: usize = fanos_geometry::TRIPLE_WIRE_LEN;
+const HELLO_LEN: usize = TRIPLE_WIRE_LEN;
 /// Per-frame receive cap. Onion/Tessera frames are far smaller; this only bounds abuse.
 const MAX_FRAME: usize = 1 << 20;
 /// Cap on **concurrent inbound connection-handler tasks** (audit C3): each accepted connection spawns a
@@ -124,6 +124,12 @@ type ConnMap = Arc<Mutex<HashMap<Triple, Connection>>>;
 /// Shared reflexive-address discovery state — peers' observations of this node's public address (#119).
 type Reflexive = Arc<Mutex<ReflexiveAddr>>;
 
+/// This node's record of the public source address each peer was observed dialing in from — the raw
+/// material a **hub** needs to broker a hole-punch (#119). A node that accepts a connection sees the
+/// dialer's NAT-mapped public endpoint (`conn.remote_address()`); remembering it, keyed by the dialer's
+/// proven coordinate, lets this node later tell a third party where to reach that peer.
+type PeerAddrs = Arc<Mutex<HashMap<Triple, SocketAddr>>>;
+
 /// How many distinct peers must independently report the same observed address before this node trusts
 /// it as its public address (see [`ReflexiveAddr`]). Two, so one lying/misconfigured peer cannot move it.
 const REFLEXIVE_QUORUM: usize = 2;
@@ -134,7 +140,7 @@ struct SendRequest {
     frame: Vec<u8>,
 }
 
-/// The transport's shared context: everything the send path needs besides the destination.
+/// The transport's shared context: everything the send and receive paths need besides the destination.
 #[derive(Clone)]
 struct Transport {
     endpoint: Endpoint,
@@ -144,6 +150,11 @@ struct Transport {
     identity: Identity,
     me: Triple,
     reflexive: Reflexive,
+    /// Public addresses this node has observed peers dialing in from — the hub's hole-punch table (#119).
+    peer_addrs: PeerAddrs,
+    /// The address book, so the receive path can register a peer's punched address and the send path can
+    /// resolve a destination coordinate to a socket.
+    directory: Directory,
 }
 
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
@@ -198,6 +209,18 @@ impl NodeHandle {
     /// `false` if the engine actor has stopped.
     pub fn command(&self, cmd: Command) -> bool {
         self.input_tx.try_send(Input::Command(cmd)).is_ok()
+    }
+
+    /// Request a NAT hole-punch to `target`, brokered by `via` (#119) — a hub both this node and `target`
+    /// have a live connection to. Emits a `ConnectReq`; the hub, which observed each party's public
+    /// address, replies to both ends with a `PunchTo`, and the two nodes dial each other simultaneously so
+    /// their NAT mappings open. Once it succeeds the target's address is in this node's directory, so
+    /// subsequent overlay traffic routes to it directly without the hub. Returns `false` if the engine
+    /// actor has stopped. Best-effort: reachability then depends on the NATs actually admitting the punch.
+    pub fn hole_punch(&self, via: Triple, target: Triple) -> bool {
+        let mut frame = Vec::new();
+        encode_frame(FrameType::ConnectReq.code(), &encode_triple(target), &mut frame);
+        self.command(Command::Emit { to: via, frame })
     }
 
     /// Await the next application notification the engine emits, or `None` once it stops. Backed by a
@@ -760,15 +783,9 @@ fn spawn_inner(
     let (events_tx, events_rx) = broadcast::channel::<Notification>(4096);
     let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(REFLEXIVE_QUORUM)));
+    let peer_addrs: PeerAddrs = Arc::new(Mutex::new(HashMap::new()));
 
-    tokio::spawn(accept_loop(
-        endpoint.clone(),
-        conns.clone(),
-        input_tx.clone(),
-        shaper.clone(),
-        identity.clone(),
-        reflexive.clone(),
-    ));
+    // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
         endpoint: endpoint.clone(),
         conns,
@@ -777,8 +794,11 @@ fn spawn_inner(
         identity,
         me: addr,
         reflexive: reflexive.clone(),
+        peer_addrs,
+        directory,
     };
-    tokio::spawn(transport_loop(transport, directory, send_rx));
+    tokio::spawn(accept_loop(transport.clone()));
+    tokio::spawn(transport_loop(transport, send_rx));
     tokio::spawn(engine_loop(
         engine,
         input_rx,
@@ -843,11 +863,7 @@ async fn fire_timer(tx: mpsc::Sender<Input>, token: TimerToken, delay: std::time
 /// `Lookup`s to the survivors (which, by the erasure redundancy, suffice to reconstruct). Because there is
 /// exactly one worker per coordinate, there is also exactly one in-flight dial per coordinate — the
 /// duplicate-dial race a naive per-frame spawn would suffer cannot arise.
-async fn transport_loop(
-    t: Transport,
-    directory: Directory,
-    mut send_rx: mpsc::UnboundedReceiver<SendRequest>,
-) {
+async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendRequest>) {
     let mut workers: HashMap<Triple, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
     while let Some(SendRequest { to, frame }) = send_rx.recv().await {
         // Reuse the peer's worker, or start one. Workers live for the dispatcher's lifetime (bounded by the
@@ -855,7 +871,7 @@ async fn transport_loop(
         // channel a frame is handed to always has a live receiver draining it.
         let worker = workers.entry(to).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            tokio::spawn(peer_send_worker(t.clone(), directory.clone(), to, rx));
+            tokio::spawn(peer_send_worker(t.clone(), to, rx));
             tx
         });
         let _ = worker.send(frame);
@@ -865,24 +881,19 @@ async fn transport_loop(
 /// A single peer's send worker: resolve the destination to a connection (dial once, then reuse the cached
 /// connection), then write each queued frame as its own QUIC uni-stream, in order. Scoped to one peer so a
 /// slow dial or a broken connection cannot delay any other peer's traffic (#129).
-async fn peer_send_worker(
-    t: Transport,
-    directory: Directory,
-    to: Triple,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(frame) = rx.recv().await {
         // Resolve `to` to a live connection. If the directory knows an address, reuse-or-dial it; otherwise
         // fall back to a connection the peer already dialed IN on — a live cached connection *is*
         // reachability, so a peer we never learned an address for is still routable in reverse (#119). Only
         // when neither exists is the coordinate genuinely unroutable: drop, counted + logged so the drop is
         // observable (a symptom of a stale/colliding address), never silent.
-        let conn = if let Some(addr) = directory.resolve(to) {
+        let conn = if let Some(addr) = t.directory.resolve(to) {
             get_or_connect(&t, to, addr).await
         } else if let Some(cached_conn) = cached(&t.conns, to) {
             Some(cached_conn)
         } else {
-            directory.note_unresolved_drop(to);
+            t.directory.note_unresolved_drop(to);
             None
         };
         let Some(conn) = conn else {
@@ -945,13 +956,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     // becoming usable. Our own reflexive address arrives symmetrically on the peer's `ObservedAddr`.
     spawn_observed_addr(conn.clone(), t.shaper.clone());
     // The dialer knows the peer identity intrinsically (it chose `to`): tag replies with it.
-    tokio::spawn(read_frames(
-        conn.clone(),
-        to,
-        t.input_tx.clone(),
-        t.shaper.clone(),
-        t.reflexive.clone(),
-    ));
+    tokio::spawn(read_frames(conn.clone(), to, t.clone()));
     if let Ok(mut map) = t.conns.lock() {
         map.insert(to, conn.clone());
     }
@@ -971,27 +976,16 @@ fn cached(conns: &ConnMap, peer: Triple) -> Option<Connection> {
 
 /// The accept loop: for each inbound connection, learn the peer identity from its HELLO and then
 /// serve its frames.
-async fn accept_loop(
-    endpoint: Endpoint,
-    conns: ConnMap,
-    input_tx: mpsc::Sender<Input>,
-    shaper: Shaper,
-    identity: Identity,
-    reflexive: Reflexive,
-) {
+async fn accept_loop(t: Transport) {
     let inbound_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
-    while let Some(incoming) = endpoint.accept().await {
+    while let Some(incoming) = t.endpoint.accept().await {
         // Take a connection slot before handling this one; at the cap, this awaits — back-pressuring
         // accepts so a connection-flood cannot spawn unbounded handler tasks (audit C3). `Err` only if the
         // semaphore was closed (never, it lives as long as the loop), so a failure just ends the loop.
         let Ok(permit) = inbound_slots.clone().acquire_owned().await else {
             break;
         };
-        let conns = conns.clone();
-        let input_tx = input_tx.clone();
-        let shaper = shaper.clone();
-        let identity = identity.clone();
-        let reflexive = reflexive.clone();
+        let t = t.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for this handler's lifetime; released to free the slot on return
             let Ok(conn) = incoming.await else {
@@ -999,8 +993,8 @@ async fn accept_loop(
             };
             // Learn the peer's coordinate: exchange + negotiate proof-of-coordinate HELLOs (self-
             // certifying), or read its unauthenticated HELLO (directory-trust mode).
-            let from = if let Some(id) = &identity {
-                let Some(coord) = hello_exchange(&conn, &shaper, id).await else {
+            let from = if let Some(id) = &t.identity {
+                let Some(coord) = hello_exchange(&conn, &t.shaper, id).await else {
                     tracing::debug!(
                         "inbound HELLO rejected (bad proof or negotiation incompatible); dropping"
                     );
@@ -1008,7 +1002,7 @@ async fn accept_loop(
                 };
                 coord
             } else {
-                let Some(coord) = read_hello(&conn, &shaper).await else {
+                let Some(coord) = read_hello(&conn, &t.shaper).await else {
                     return;
                 };
                 coord
@@ -1019,15 +1013,22 @@ async fn accept_loop(
             // an ephemeral client port, not where it accepts). No directory entry is written — a live
             // connection *is* the reachability, and inventing a directory address from the source port
             // would be wrong (and, in a shared directory, would clobber the peer's real listen address).
-            if let Ok(mut map) = conns.lock() {
+            if let Ok(mut map) = t.conns.lock() {
                 map.insert(from, conn.clone());
+            }
+            // Remember the public source address this peer dialed in from, keyed by its proven coordinate:
+            // the hub's hole-punch table (#119). When a third party later asks us to broker a connection to
+            // `from`, this is the address we hand it — the peer's NAT-mapped endpoint, which its NAT admits
+            // a return packet to once the peer has itself punched outward.
+            if let Ok(mut map) = t.peer_addrs.lock() {
+                map.insert(from, conn.remote_address());
             }
             // Tell the dialing peer the source address we observe it at — its reflexive/public address
             // for NAT traversal (#119), the STUN-like feedback — on a spawned task so it never delays
             // reading this peer's frames (a blocking send here can stall a busy cell, worsening #129).
-            spawn_observed_addr(conn.clone(), shaper.clone());
+            spawn_observed_addr(conn.clone(), t.shaper.clone());
             // Subsequent uni-streams are this peer's frames.
-            read_frames(conn, from, input_tx, shaper, reflexive).await;
+            read_frames(conn, from, t).await;
         });
     }
 }
@@ -1149,44 +1150,122 @@ async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
 }
 
 /// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
-async fn read_frames(
-    conn: Connection,
-    from: Triple,
-    input_tx: mpsc::Sender<Input>,
-    shaper: Shaper,
-    reflexive: Reflexive,
-) {
+async fn read_frames(conn: Connection, from: Triple, t: Transport) {
     // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
     // wrongly-shaped stream is skipped without sinking the connection.
     while let Ok(mut stream) = conn.accept_uni().await {
         let Ok(raw) = stream.read_to_end(MAX_FRAME).await else {
             continue;
         };
-        let Some(frame) = shape_in(&shaper, raw) else {
+        let Some(frame) = shape_in(&t.shaper, raw) else {
             continue;
         };
-        // Intercept transport-level `ObservedAddr` (a peer reporting our public address) before the engine
-        // sees it — reflexive-discovery signalling (#119), not overlay traffic. Attributed to `from`, the
-        // peer's cryptographically-proven coordinate, so a peer gets exactly one vote.
-        if let Ok((decoded, _)) = decode_frame(&frame)
-            && decoded.frame_type() == Some(FrameType::ObservedAddr)
-        {
-            if let Some(addr) = decode_addr(decoded.body)
-                && let Ok(mut r) = reflexive.lock()
-            {
-                r.observe(from, addr);
+        // Intercept transport-level signalling before the engine sees it — reflexive discovery and NAT
+        // hole-punch brokering (#119) are the driver's concern, not overlay traffic. Everything is
+        // attributed to `from`, the peer's cryptographically-proven coordinate.
+        if let Ok((decoded, _)) = decode_frame(&frame) {
+            match decoded.frame_type() {
+                // A peer reporting the public address it observes us at — one vote toward our reflexive
+                // address (a peer gets exactly one, keyed by its coordinate).
+                Some(FrameType::ObservedAddr) => {
+                    if let Some(addr) = decode_addr(decoded.body)
+                        && let Ok(mut r) = t.reflexive.lock()
+                    {
+                        r.observe(from, addr);
+                    }
+                    continue;
+                }
+                // `from` asks us (a common hub) to broker a hole-punch to a third peer it cannot reach.
+                Some(FrameType::ConnectReq) => {
+                    broker_holepunch(&t, from, &conn, decoded.body).await;
+                    continue;
+                }
+                // A hub tells us to dial a peer at its observed public address for a simultaneous open.
+                Some(FrameType::PunchTo) => {
+                    accept_holepunch(&t, decoded.body);
+                    continue;
+                }
+                _ => {}
             }
-            continue;
         }
-        if input_tx.send(Input::Message { from, frame }).await.is_err() {
+        if t.input_tx.send(Input::Message { from, frame }).await.is_err() {
             break; // engine actor gone (or, while it drains a flood, back-pressured here — bounded)
         }
     }
     // The connection ended: drop this peer's reflexive vote so a departed observer stops propping up a
     // possibly-stale address.
-    if let Ok(mut r) = reflexive.lock() {
+    if let Ok(mut r) = t.reflexive.lock() {
         r.forget(from);
     }
+}
+
+/// Broker a hole-punch (#119). `requester` (reached on `req_conn`) asked us — a hub both parties have a
+/// live connection to — to introduce it to `target` (the coordinate in `body`). We observed each party's
+/// public address when it dialed in, so we tell **both** to dial the **other**: `target` learns where
+/// `requester` is, `requester` learns where `target` is, and each dials at once. Each NAT then sees an
+/// outbound packet before the peer's inbound arrives, so both mappings open and the direct connection
+/// forms. We broker only what we can attribute — if we never observed the target, we cannot help.
+async fn broker_holepunch(t: &Transport, requester: Triple, req_conn: &Connection, body: &[u8]) {
+    let Some(target) = decode_triple(body) else {
+        return;
+    };
+    let (target_addr, requester_addr) = match t.peer_addrs.lock() {
+        Ok(map) => (map.get(&target).copied(), map.get(&requester).copied()),
+        Err(_) => return,
+    };
+    let Some(target_addr) = target_addr else {
+        return; // the target never dialed in to us — nothing to broker
+    };
+    // The requester is on this very connection, so its remote address is authoritative even if it also
+    // dialed in earlier under a since-rebound mapping.
+    let requester_addr = requester_addr.unwrap_or_else(|| req_conn.remote_address());
+    // Tell the target to dial the requester (over our cached connection to the target)…
+    if let Some(target_conn) = cached(&t.conns, target) {
+        send_framed(
+            &target_conn,
+            &t.shaper,
+            FrameType::PunchTo,
+            &encode_punch(requester, requester_addr),
+        )
+        .await;
+    }
+    // …and tell the requester to dial the target (over the connection it reached us on).
+    send_framed(
+        req_conn,
+        &t.shaper,
+        FrameType::PunchTo,
+        &encode_punch(target, target_addr),
+    )
+    .await;
+}
+
+/// Act on a hub's `PunchTo` (#119): learn where `peer` is and dial it at once, punching our NAT open for
+/// the peer's simultaneous inbound. Recording the address in the directory also makes future overlay
+/// sends to `peer` resolve directly, no longer needing the hub. The dial runs on a spawned task so a slow
+/// or filtered punch never blocks this connection's frame loop.
+fn accept_holepunch(t: &Transport, body: &[u8]) {
+    let Some((peer, addr)) = decode_punch(body) else {
+        return;
+    };
+    t.directory.insert(peer, addr);
+    let t = t.clone();
+    tokio::spawn(async move {
+        let _ = get_or_connect(&t, peer, addr).await;
+    });
+}
+
+/// Encode a [`PunchTo`](FrameType::PunchTo) body: `peer_coord(12B) ‖ family(1B) ‖ ip(4|16) ‖ port(2B BE)`.
+fn encode_punch(peer: Triple, addr: SocketAddr) -> Vec<u8> {
+    let mut out = encode_triple(peer).to_vec();
+    out.extend_from_slice(&encode_addr(addr));
+    out
+}
+
+/// Decode a [`PunchTo`](FrameType::PunchTo) body into `(peer coordinate, its public address)`.
+fn decode_punch(body: &[u8]) -> Option<(Triple, SocketAddr)> {
+    let peer = decode_triple(body.get(..TRIPLE_WIRE_LEN)?)?;
+    let addr = decode_addr(body.get(TRIPLE_WIRE_LEN..)?)?;
+    Some((peer, addr))
 }
 
 #[cfg(test)]
