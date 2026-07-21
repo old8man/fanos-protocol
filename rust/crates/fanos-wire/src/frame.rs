@@ -21,6 +21,11 @@ pub enum FrameType {
     Pong = 0x03,
     Goaway = 0x04,
     Error = 0x05,
+    /// A peer reports the source address it **observes** this node's connection arriving from — the
+    /// reflexive/public address for NAT traversal (#119). Body: the observed [`SocketAddr`] encoded as
+    /// `family(1B: 4|6) ‖ ip(4|16) ‖ port(2B BE)`. A node aggregates these across peers
+    /// (`fanos_quic::ReflexiveAddr`) to learn the address it should advertise / be reached at.
+    ObservedAddr = 0x06,
     // 0x1* Membership
     Join = 0x10,
     Announce = 0x11,
@@ -112,6 +117,7 @@ impl FrameType {
             0x03 => Self::Pong,
             0x04 => Self::Goaway,
             0x05 => Self::Error,
+            0x06 => Self::ObservedAddr,
             0x10 => Self::Join,
             0x11 => Self::Announce,
             0x12 => Self::BeaconReq,

@@ -32,9 +32,11 @@ mod directory;
 mod driver;
 mod harness;
 mod identity;
+mod reflexive;
 mod tls;
 
 pub use directory::Directory;
+pub use reflexive::ReflexiveAddr;
 pub use driver::{
     Client, NodeHandle, QuicError, spawn, spawn_self_certifying,
     spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,

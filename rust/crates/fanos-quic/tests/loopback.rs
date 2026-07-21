@@ -85,6 +85,49 @@ async fn delivery_is_bidirectional_and_reuses_the_connection() {
 }
 
 #[tokio::test]
+async fn a_node_learns_its_public_address_from_a_quorum_of_peers() {
+    // NAT traversal #119, reflexive discovery: a node does not know the address remote peers reach it at.
+    // Here A dials B and C; each, on accepting, reports back the source address it observes A arriving from
+    // (an `ObservedAddr` frame). Once a quorum (2) of peers agree, A confirms its public address. Over
+    // loopback there is no NAT, so that observed address is A's own endpoint — the mechanism is identical
+    // under a real NAT, where it would instead be the NAT-mapped public endpoint.
+    let dir = Directory::new();
+    let a = node(0, &dir, Config::default()).await;
+    let b = node(1, &dir, Config::default()).await;
+    let c = node(2, &dir, Config::default()).await;
+
+    assert_eq!(a.public_addr(), None, "A knows no public address before any peer reports one");
+
+    // A dials both peers (triggering the connections whose accept-side sends the ObservedAddr back).
+    a.command(Command::Send {
+        to: b.address(),
+        payload: b"hi-b".to_vec(),
+    });
+    a.command(Command::Send {
+        to: c.address(),
+        payload: b"hi-c".to_vec(),
+    });
+
+    let confirmed = tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            if let Some(addr) = a.public_addr() {
+                return addr;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A never confirmed a public address from a quorum of peers");
+
+    assert_eq!(
+        confirmed,
+        a.local_addr(),
+        "A's reflexive address is where its peers observe it (its own endpoint, over loopback)"
+    );
+    drop((b, c));
+}
+
+#[tokio::test]
 async fn heartbeat_keeps_a_live_peer_up_then_detects_its_death() {
     // Full liveness loop over QUIC: ping → pong keeps B alive; killing B makes A report it down.
     let dir = Directory::new();

@@ -29,10 +29,11 @@ use fanos_proteus::ProteusShaper;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
-use fanos_wire::{FrameType, ProtocolError, encode_frame};
+use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame};
 use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
+use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
 use crate::identity::{
     HelloResult, hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello,
 };
@@ -120,6 +121,13 @@ const INPUT_CAP: usize = 1024;
 /// A coordinate → live connection cache. A `Connection` is a cheap handle (an `Arc` inside).
 type ConnMap = Arc<Mutex<HashMap<Triple, Connection>>>;
 
+/// Shared reflexive-address discovery state — peers' observations of this node's public address (#119).
+type Reflexive = Arc<Mutex<ReflexiveAddr>>;
+
+/// How many distinct peers must independently report the same observed address before this node trusts
+/// it as its public address (see [`ReflexiveAddr`]). Two, so one lying/misconfigured peer cannot move it.
+const REFLEXIVE_QUORUM: usize = 2;
+
 /// An internal request from the engine actor to the transport loop.
 struct SendRequest {
     to: Triple,
@@ -135,6 +143,7 @@ struct Transport {
     shaper: Shaper,
     identity: Identity,
     me: Triple,
+    reflexive: Reflexive,
 }
 
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
@@ -154,6 +163,7 @@ pub struct NodeHandle {
     events_tx: broadcast::Sender<Notification>,
     events_rx: broadcast::Receiver<Notification>,
     endpoint: Endpoint,
+    reflexive: Reflexive,
 }
 
 impl NodeHandle {
@@ -167,6 +177,15 @@ impl NodeHandle {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// This node's **public (reflexive) address** as learned from peers — the address remote peers
+    /// observe this node's connections arriving from, once at least [`REFLEXIVE_QUORUM`] of them agree
+    /// (NAT traversal #119). `None` until enough peers have reported. Unlike [`local_addr`](Self::local_addr)
+    /// (the possibly-private/wildcard bind), this is what the node should advertise to be reachable.
+    #[must_use]
+    pub fn public_addr(&self) -> Option<SocketAddr> {
+        self.reflexive.lock().map_or(None, |r| r.confirmed())
     }
 
     /// Inject an application command (delivered to the engine as `Input::Command`). Returns
@@ -734,6 +753,7 @@ fn spawn_inner(
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Control>();
     let (events_tx, events_rx) = broadcast::channel::<Notification>(4096);
     let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+    let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(REFLEXIVE_QUORUM)));
 
     tokio::spawn(accept_loop(
         endpoint.clone(),
@@ -741,6 +761,7 @@ fn spawn_inner(
         input_tx.clone(),
         shaper.clone(),
         identity.clone(),
+        reflexive.clone(),
     ));
     let transport = Transport {
         endpoint: endpoint.clone(),
@@ -749,6 +770,7 @@ fn spawn_inner(
         shaper,
         identity,
         me: addr,
+        reflexive: reflexive.clone(),
     };
     tokio::spawn(transport_loop(transport, directory, send_rx));
     tokio::spawn(engine_loop(
@@ -769,6 +791,7 @@ fn spawn_inner(
         events_tx,
         events_rx,
         endpoint,
+        reflexive,
     })
 }
 
@@ -874,12 +897,23 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             }
         }
     }
+    // Tell the peer the address we observe its connection arriving from — its reflexive/public address
+    // for NAT traversal (#119). Our own reflexive address arrives symmetrically on the frames the peer
+    // sends back, intercepted in `read_frames`.
+    send_framed(
+        &conn,
+        &t.shaper,
+        FrameType::ObservedAddr,
+        &encode_addr(conn.remote_address()),
+    )
+    .await;
     // The dialer knows the peer identity intrinsically (it chose `to`): tag replies with it.
     tokio::spawn(read_frames(
         conn.clone(),
         to,
         t.input_tx.clone(),
         t.shaper.clone(),
+        t.reflexive.clone(),
     ));
     if let Ok(mut map) = t.conns.lock() {
         map.insert(to, conn.clone());
@@ -906,6 +940,7 @@ async fn accept_loop(
     input_tx: mpsc::Sender<Input>,
     shaper: Shaper,
     identity: Identity,
+    reflexive: Reflexive,
 ) {
     let inbound_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
     while let Some(incoming) = endpoint.accept().await {
@@ -919,6 +954,7 @@ async fn accept_loop(
         let input_tx = input_tx.clone();
         let shaper = shaper.clone();
         let identity = identity.clone();
+        let reflexive = reflexive.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for this handler's lifetime; released to free the slot on return
             let Ok(conn) = incoming.await else {
@@ -949,8 +985,18 @@ async fn accept_loop(
             if let Ok(mut map) = conns.lock() {
                 map.insert(from, conn.clone());
             }
+            // Tell the dialing peer the source address we observe it at — its reflexive/public address
+            // for NAT traversal (#119). This is the STUN-like feedback: a node behind NAT learns the
+            // NAT-mapped endpoint remote peers actually reach it at from the peers it dials.
+            send_framed(
+                &conn,
+                &shaper,
+                FrameType::ObservedAddr,
+                &encode_addr(conn.remote_address()),
+            )
+            .await;
             // Subsequent uni-streams are this peer's frames.
-            read_frames(conn, from, input_tx, shaper).await;
+            read_frames(conn, from, input_tx, shaper, reflexive).await;
         });
     }
 }
@@ -1067,6 +1113,7 @@ async fn read_frames(
     from: Triple,
     input_tx: mpsc::Sender<Input>,
     shaper: Shaper,
+    reflexive: Reflexive,
 ) {
     // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
     // wrongly-shaped stream is skipped without sinking the connection.
@@ -1077,9 +1124,27 @@ async fn read_frames(
         let Some(frame) = shape_in(&shaper, raw) else {
             continue;
         };
+        // Intercept transport-level `ObservedAddr` (a peer reporting our public address) before the engine
+        // sees it — reflexive-discovery signalling (#119), not overlay traffic. Attributed to `from`, the
+        // peer's cryptographically-proven coordinate, so a peer gets exactly one vote.
+        if let Ok((decoded, _)) = decode_frame(&frame)
+            && decoded.frame_type() == Some(FrameType::ObservedAddr)
+        {
+            if let Some(addr) = decode_addr(decoded.body)
+                && let Ok(mut r) = reflexive.lock()
+            {
+                r.observe(from, addr);
+            }
+            continue;
+        }
         if input_tx.send(Input::Message { from, frame }).await.is_err() {
             break; // engine actor gone (or, while it drains a flood, back-pressured here — bounded)
         }
+    }
+    // The connection ended: drop this peer's reflexive vote so a departed observer stops propping up a
+    // possibly-stale address.
+    if let Ok(mut r) = reflexive.lock() {
+        r.forget(from);
     }
 }
 
