@@ -2097,8 +2097,10 @@ impl<F: Field> OverlayNode<F> {
 
     /// `Command::Reseat` — re-seat this node at `new_coord` for the per-epoch reshuffle (spec §L3 "epoch
     /// reshuffle", §3.2). The driver supplies the new VRF-derived coordinate (the engine is crypto-free and
-    /// cannot compute it); this re-derives the node's cell neighbours, Fano index, and hierarchical address
-    /// for the new placement, re-announces so the cell relearns how to route to it, and emits
+    /// cannot compute it); this re-derives the node's cell neighbours and Fano index for the new placement,
+    /// moves the level-0 of its hierarchical address to `new_coord` while **preserving the deeper descent
+    /// levels** (identity-hash, epoch-stable — §L1), re-announces so the cell relearns how to route to it, and
+    /// emits
     /// [`Notification::Reseated`] (a driver rebuilds its HELLO proof-of-coordinate; the simulator re-keys
     /// the node). The unpredictable reshuffle is the load-bearing anti-eclipse / anti-path-prediction
     /// defence (§3.2 assumption 2), the one q=2 grinding does not provide.
@@ -2143,7 +2145,22 @@ impl<F: Field> OverlayNode<F> {
             None
         };
         self.coord = new_pt;
+        // Preserve the hierarchical DESCENT chain across the reshuffle (spec §L1): only the level-0 VRF
+        // transport coordinate moves each epoch; the deeper sub-cell levels are identity-hash-derived
+        // (`fanos_primitives::address_point`, epoch-INDEPENDENT), so a descended node keeps its sub-cell
+        // placement. Resetting to a bare `root(new_pt)` here would silently drop a multi-level node's descent
+        // chain every epoch (the depth-1 case is unchanged — its path is just `[new_pt]`). Learned peers ARE
+        // cleared (via `Router::new`): every other node reshuffled too, so the transport-coord-keyed routing
+        // table is stale and re-learns from the fresh `Announce`s below.
+        let mut path: Vec<Point<F>> = self.router.address.points().to_vec();
+        match path.first_mut() {
+            Some(level0) => *level0 = new_pt,
+            None => path.push(new_pt),
+        }
         self.router = Router::new(new_pt);
+        if let Some(addr) = HierAddr::from_path(path) {
+            self.router.address = addr;
+        }
         // Drop our now-stale self-entry at the old coordinate and re-announce at the new one (spec §7.8), so
         // the cell relearns our placement; then signal the reshuffle for the driver (rebuild HELLO) and the
         // simulator (re-key routing). The store, membership view of others, witnessed liveness, and epoch
@@ -2752,6 +2769,40 @@ mod tests {
             Some(Point::<F2>::at(5).coords()),
             "an ancestor descends one level toward the destination",
         );
+    }
+
+    #[test]
+    fn a_reshuffle_preserves_the_hierarchical_descent_chain() {
+        // §L1/§95: an epoch reshuffle (`Command::Reseat`) moves only the level-0 VRF transport coordinate; the
+        // deeper sub-cell levels are identity-hash-derived (epoch-stable), so a descended node keeps its
+        // sub-cell placement. Before the fix, `on_reseat` reset the router to depth-1 `root(new_pt)`, silently
+        // dropping the descent chain every epoch.
+        let mut node = OverlayNode::<F2>::new(Point::at(3), Config::default())
+            .with_hier_address(
+                HierAddr::from_path(alloc::vec![Point::<F2>::at(3), Point::<F2>::at(5)]).unwrap(),
+            );
+        assert_eq!(node.hier_address().depth(), 2, "seated at a depth-2 address [3,5]");
+        // Reshuffle the level-0 transport coordinate 3 → 1.
+        node.step(
+            Instant(0),
+            Input::Command(Command::Reseat {
+                coord: Point::<F2>::at(1).coords(),
+            }),
+        );
+        assert_eq!(
+            node.hier_address().points(),
+            &[Point::<F2>::at(1), Point::<F2>::at(5)],
+            "level 0 moved to the new coordinate; the deeper descent level 5 is preserved",
+        );
+        // The depth-1 case is unchanged: a plain node reseats to a plain `root(new)`.
+        let mut plain = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        plain.step(
+            Instant(0),
+            Input::Command(Command::Reseat {
+                coord: Point::<F2>::at(6).coords(),
+            }),
+        );
+        assert_eq!(plain.hier_address().points(), &[Point::<F2>::at(6)]);
     }
 
     #[test]
