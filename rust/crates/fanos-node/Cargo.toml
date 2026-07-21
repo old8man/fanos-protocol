@@ -34,6 +34,8 @@ fanos-primitives.workspace = true
 # The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
 # is the integration point that provides a Dialer).
 fanos-proxy.workspace = true
+# The VPN datapath (`run_vpn` + the TUN device seam); the real TUN device is behind the `vpn` feature below.
+fanos-vpn.workspace = true
 # The threshold-onion router and the distributed-beacon engine the MixRelay composite hosts (E4∩E5).
 fanos-aphantos.workspace = true
 fanos-keygen.workspace = true
@@ -58,6 +60,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "ansi",
     "env-filter",
 ] }
+
+[features]
+# `fanos vpn` with a real TUN device (enables the fanos-vpn `device` adapter, pulling in the platform `tun`
+# crate). Off by default: without it, `fanos vpn` reports that the build lacks VPN support. Build a VPN-
+# capable binary with `cargo build -p fanos-node --features vpn`.
+vpn = ["fanos-vpn/device"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

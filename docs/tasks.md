@@ -18,10 +18,10 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **`fanos vpn` / TUN — driver + TCP mode** (Phase 5) — the whole *verifiable* UDP/DNS datapath has landed
-  (crate `fanos-vpn`: codec + flow engine + multiplexer). Remaining: the thin TUN driver (copy packets
-  between `/dev/net/tun` / `utun` and the multiplexer's channels + supply a real exit `UdpDialer` — the
-  untestable-in-CI OS I/O shell) and full-tunnel **TCP mode** (a userspace TCP/IP stack — the large piece).
+- **`fanos vpn` / TUN — TCP mode** (Phase 5) — **UDP mode is runnable** (`fanos vpn --features vpn`: crate
+  `fanos-vpn` codec/engine/mux/driver + a real `tun` device adapter + the CLI wiring a `FanosDialer`-with-
+  exit). Remaining: full-tunnel **TCP mode** — a userspace TCP/IP stack (smoltcp-class) to bridge TUN TCP
+  packets ↔ an exit byte-stream (`dial_exit`); a major subsystem (tun2socks-class), not a quick slice.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 
@@ -41,7 +41,10 @@ engine (`engine.rs`: `classify` an inbound TUN packet → `VpnAction::RelayUdp{f
 the 4-tuple, or `Drop` for TCP/IPv6/malformed; `response_packet` rebuilds an exit response into a TUN packet
 with endpoints swapped). "UDP mode" (design.md §11) needs no userspace TCP stack — this tunnels DNS + UDP
 (QUIC/…). Verified with synthetic packets: checksums verify, build↔parse round-trips, classify/drop, and a
-swapped-endpoint response round-trip. Plus the **multiplexer** (`mux.rs`, `run_udp_datapath`) — the driver's
+swapped-endpoint response round-trip. **Runnable end to end**: a real `tun` device adapter (feature `device`)
++ the `fanos vpn` CLI (feature `vpn`, wiring device ↔ `run_vpn` ↔ a `FanosDialer`-with-exit) — the OS device
+I/O is runtime-only-verified, the rest compiles/lints clean both with and without the feature. Plus the
+**multiplexer** (`mux.rs`, `run_udp_datapath`) — the driver's
 stateful core: relay each flow over a per-destination exit tunnel via the **shared `UdpDialer`/`UdpTunnel`
 seam** the SOCKS5 UDP-ASSOCIATE relay uses (so VPN + proxy share one exit-UDP abstraction, same `FanosDialer`
 impl), and pump responses back as TUN packets. Verified with a mock dialer: a DNS query and a QUIC flow each

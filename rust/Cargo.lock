@@ -971,6 +971,7 @@ dependencies = [
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-session",
+ "fanos-vpn",
  "fanos-vrf",
  "fanos-wire",
  "getrandom 0.4.3",

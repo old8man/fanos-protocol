@@ -18,6 +18,9 @@ use fanos_node::{
     NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
     build_cell_mix_directory, identity, serve_proxy,
 };
+// Only the (feature-gated) `fanos vpn` command dials clearnet by IP with an empty resolver.
+#[cfg(feature = "vpn")]
+use fanos_node::StaticResolver;
 use fanos_runtime::Notification;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -38,6 +41,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
     match args.get(1).map(String::as_str) {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
+        Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
@@ -271,6 +275,84 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     node.shutdown();
     eprintln!("fanos proxy down");
     Ok(())
+}
+
+/// Run a full-tunnel VPN (spec §11.4, "UDP mode"): capture packets at a TUN device and relay UDP/DNS flows
+/// through a FANOS exit, so system-wide DNS and UDP (QUIC, WebRTC, …) ride the overlay without per-app proxy
+/// config. TCP is not yet tunnelled (a userspace TCP/IP stack is a separate mode) and non-UDP packets are
+/// dropped. Requires an exit (`--exit-via FILE`, or a discoverable one) since every flow leaves through it,
+/// and root / `CAP_NET_ADMIN` for the TUN device. The device is brought up; the operator assigns its address
+/// and route so the kernel steers traffic to it.
+#[cfg(feature = "vpn")]
+async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
+    init_tracing();
+
+    let tun_name = flag(args, "--tun").unwrap_or("").to_owned();
+    let epoch = match flag(args, "--epoch") {
+        Some(s) => Epoch::new(
+            s.parse()
+                .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
+        ),
+        None => Epoch::ZERO,
+    };
+    let exit_via = parse_exit_via(args)?;
+
+    let config = node_config_from_args(args)?;
+    let mut node = Node::start::<F2>(config).await?;
+    // Every UDP flow leaves via the exit; without one the datapath could relay nothing.
+    let exit = match exit_via {
+        Some(e) => Some(e),
+        None => discover_exit(&node, epoch).await,
+    };
+    let Some((exit_coord, exit_public)) = exit else {
+        node.shutdown();
+        return Err(NodeError::Config(
+            "fanos vpn needs a clearnet exit (--exit-via FILE, or a discoverable exit) — every UDP flow \
+             leaves through it"
+                .to_owned(),
+        ));
+    };
+    // The datapath dials clearnet destinations by IP through the exit's UDP tunnels; it never resolves
+    // `.fanos` names, so an empty resolver suffices.
+    let dialer =
+        FanosDialer::new(node.client(), StaticResolver::new()).with_exit(exit_coord, exit_public);
+
+    let (reader, writer) = fanos_vpn::device::open(&tun_name).map_err(|e| {
+        NodeError::Config(format!(
+            "opening the TUN device failed ({e}) — root / CAP_NET_ADMIN is required"
+        ))
+    })?;
+
+    let [x, y, z] = node.address();
+    let [ex, ey, ez] = exit_coord;
+    let tun_shown = if tun_name.is_empty() { "<auto>" } else { &tun_name };
+    eprintln!(
+        "fanos vpn up — coordinate {x}:{y}:{z}, TUN '{tun_shown}', UDP/DNS via exit {ex}:{ey}:{ez}\n  \
+         (UDP mode: TCP is dropped; assign the TUN an address + route to capture traffic)"
+    );
+    info!(coord = ?node.address(), tun = %tun_name, "fanos vpn up");
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal received");
+    };
+    tokio::select! {
+        () = fanos_vpn::run_vpn(reader, writer, dialer) => {}
+        () = shutdown => {}
+        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+    }
+    node.shutdown();
+    eprintln!("fanos vpn down");
+    Ok(())
+}
+
+/// Without the `vpn` feature the binary has no TUN device support; report it rather than silently missing.
+#[cfg(not(feature = "vpn"))]
+#[allow(clippy::unused_async)] // async to match the command dispatch (`cmd_vpn(..).await`)
+async fn cmd_vpn(_args: &[String]) -> Result<(), NodeError> {
+    Err(NodeError::Config(
+        "this build has no VPN support — rebuild with `cargo build -p fanos-node --features vpn`".to_owned(),
+    ))
 }
 
 /// Build the proxy's [`FanosDialer`] for the chosen routing profile. `direct` (when `anon` is `None`)
@@ -597,6 +679,8 @@ fn print_help() {
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
          \x20             [--bootstrap ...] [--listen ADDR]\n\
+         \x20 fanos vpn   [--tun NAME] [--exit-via FILE] [--epoch N] [--config FILE] [--bootstrap ...]\n\
+         \x20             (UDP mode: tunnels DNS/UDP through an exit; needs --features vpn + root)\n\
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos help\n\
