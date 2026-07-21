@@ -195,3 +195,56 @@ fn is_hyperoval(mask: u8) -> bool {
     }
     true
 }
+
+#[test]
+fn sustained_churn_keeps_the_healing_cost_bounded() {
+    // A flapping adversary crashes and recovers one node over many cycles, forcing the reflex to heal
+    // repeatedly. The `⌊log₉Φ⌋` reroute-depth budget (spec §6.7) bounds each crash's blast radius, so the
+    // cumulative healing work is LINEAR in the churn count — a cascade (super-linear reroutes) or an
+    // escalation storm would be the DoS-via-healing failure this rules out.
+    const CYCLES: u64 = 12;
+    let cfg = healing_config();
+    let mut sim = Sim::new(0xF1A9);
+    let cell = spawn_cell::<F2>(&mut sim, cfg);
+    sim.inject_all(&Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(2000));
+
+    let victim = cell[3];
+    for _ in 0..CYCLES {
+        sim.crash(victim);
+        sim.run_for(Duration::from_millis(2500));
+        sim.inject_all(&Command::Diagnose);
+        sim.settle();
+        sim.recover(victim);
+        sim.run_for(Duration::from_millis(2500));
+    }
+
+    let (reroutes, repairs, escalations) = {
+        let m = &sim.report().metrics;
+        (m.reroutes, m.repairs, m.escalations)
+    };
+    // The cost is LINEAR in churn, not a cascade: each crash reroutes only the victim's `N−1` co-linear
+    // survivors and repairs its one shard (≈ N−1 each per crash), because the `⌊log₉Φ⌋` reroute-depth
+    // budget (spec §6.7) bounds each crash's blast radius. Over CYCLES crashes that is `O(N·CYCLES)`, well
+    // below the super-linear reroute count a cascade would produce.
+    assert!(
+        reroutes <= 10 * CYCLES && repairs <= 10 * CYCLES,
+        "healing work is bounded per crash (linear in churn): reroutes={reroutes} repairs={repairs} over {CYCLES} cycles"
+    );
+    // Escalations are the transient corroboration-disruption of a *fresh* crash — liveness corroboration
+    // flows through the same links, so a just-crashed node briefly makes the syndrome over-count until the
+    // survivors re-corroborate directly (they are all mutually adjacent in a Fano cell). It self-corrects
+    // and is bounded at ≤ 1 per crash: a flapping node cannot trigger an unbounded escalation storm.
+    assert!(
+        escalations <= CYCLES,
+        "escalations are bounded (≤ 1 per crash, transient), not a storm: {escalations} over {CYCLES} cycles"
+    );
+
+    // After the churn stops, the cell converges back to health — the flapping left no persistent damage.
+    sim.inject_all(&Command::Diagnose);
+    sim.settle();
+    assert!(
+        sim.report().any_verdict(&Verdict::Healthy),
+        "the cell converges back to health once the churn stops"
+    );
+}

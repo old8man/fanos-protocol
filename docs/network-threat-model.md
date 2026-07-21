@@ -110,7 +110,7 @@ structure, which is why the answers compose instead of conflicting:
 |---|---|---|---|---|
 | G1 | **Active probing / DPI fingerprinting** | PROTEUS adaptive camouflage; indistinguishable cover cells | 🟡 | design; morph-negotiation impl later |
 | G2 | **Entry-point enumeration & blocking** | Geometric membership (no public bridge list); capability-negotiated morphs | 🟡 | design |
-| G3 | **Total-control / global adversary** | Bounded blast radius: per-cell ISS + `⌊log₉Φ⌋` containment; no operator, no seizable center | ✅ | `ddos-homeostasis.md §7`; `sim/tests/global_adversary.rs` (local footprint, finite tier depth, `⌊log₉Φ⌋` gate) |
+| G3 | **Total-control / global adversary** | Bounded blast radius: per-cell ISS + `⌊log₉Φ⌋` containment; no operator, no seizable center | ✅ | `ddos-homeostasis.md §7`; `sim/tests/global_adversary.rs` (local footprint, finite tier depth, `⌊log₉Φ⌋` gate) + **DoS-via-healing cost bound** (`healing.rs::sustained_churn_keeps_the_healing_cost_bounded`): a flapping node over many crash/recover cycles keeps reroutes/repairs **linear** in the churn count (≈ `N−1` per crash — the `⌊log₉Φ⌋` blast-radius budget), with only bounded, self-correcting transient escalations (a fresh crash briefly disrupts corroboration, which self-heals) — no cascade, and the cell reconverges to health |
 
 ---
 
