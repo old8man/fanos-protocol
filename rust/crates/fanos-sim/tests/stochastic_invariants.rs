@@ -278,8 +278,12 @@ fn i4_a_replicated_value_survives_random_node_loss() {
             "seed {seed}: the put must be acknowledged before we test survival"
         );
 
-        // Crash a random minority (up to N-2), always leaving a distinct reader alive.
-        let crash_count = rng.below((N - 1) as u64) as usize; // 0..=5
+        // Crash a random tolerable-loss set. The `[7,3,4]` projective LRC (§L4) recovers a value from ANY
+        // ≤3 simultaneous point losses (K=3 of N=7 shards suffice), so crash up to 3, always leaving a
+        // distinct reader alive. (A 4-loss survives too UNLESS it is a hyperoval stopping set; ≤3 is the
+        // clean always-recoverable bound this invariant asserts — crashing 4+ would exceed the code's
+        // designed tolerance and legitimately lose the value.)
+        let crash_count = rng.below(4) as usize; // 0..=3, the LRC's always-recoverable loss count
         let crashed = distinct_indices(&mut rng, crash_count);
         for &i in &crashed {
             sim.crash(cell[i]);
