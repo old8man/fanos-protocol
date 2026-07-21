@@ -216,3 +216,83 @@ fn admission_is_opt_in_a_default_config_admits_without_any_proof() {
     );
     assert_eq!(sybil_rejected.load(Ordering::Relaxed), 0);
 }
+
+/// A different Fano point the joiner reshuffles to — any point is a direct peer of [`RECEIVER_POINT`].
+const RESHUFFLE_POINT: usize = 3;
+
+#[test]
+fn with_admission_pow_solves_a_valid_genesis_proof_that_is_admitted() {
+    // The one-call `with_admission_pow` setup (the live node's path) produces a valid genesis proof — no
+    // hand-solved `with_admission_proof`. A receiver requiring admission admits it.
+    let receiver_config = Config {
+        require_admission: true,
+        ..Config::default()
+    };
+    let joiner = OverlayNode::<F2>::new(Point::at(JOINER_POINT), Config::default())
+        .with_admission_pow(DIFFICULTY);
+    let (mut sim, joiner_coord, joined, sybil_rejected) = spawn_pair(8, receiver_config, joiner);
+
+    sim.inject(
+        joiner_coord,
+        Command::Join {
+            info: b"pow-built".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(500));
+
+    assert!(
+        joined.load(Ordering::Relaxed) >= 1,
+        "with_admission_pow produces a valid genesis proof — the joiner is admitted"
+    );
+    assert_eq!(sybil_rejected.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_reshuffled_joiner_re_solves_its_proof_and_stays_admitted() {
+    // The coupling with the epoch clock (Blocker 1): the admission challenge binds `(coord, epoch)`, and
+    // the coordinate reshuffles every epoch — so the proof MUST be re-solved on reseat or a peer's
+    // per-epoch check would reject the node after the first epoch. `on_reseat` re-solves it; this proves
+    // the reshuffled joiner is still admitted at its NEW coordinate.
+    let receiver_config = Config {
+        require_admission: true,
+        ..Config::default()
+    };
+    let joiner = OverlayNode::<F2>::new(Point::at(JOINER_POINT), Config::default())
+        .with_admission_pow(DIFFICULTY);
+    let (mut sim, joiner_coord, joined, sybil_rejected) = spawn_pair(9, receiver_config, joiner);
+    let receiver_coord = Point::<F2>::at(RECEIVER_POINT).coords();
+
+    // Genesis join at epoch 0: admitted by the valid genesis proof.
+    sim.inject(
+        joiner_coord,
+        Command::Join {
+            info: b"genesis".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(500));
+    let joined_at_genesis = joined.load(Ordering::Relaxed);
+    assert!(joined_at_genesis >= 1, "the genesis join is admitted");
+    assert_eq!(sybil_rejected.load(Ordering::Relaxed), 0, "the genesis proof is not rejected");
+
+    // Advance the receiver to epoch 1; its EpochAgree flood carries the joiner to epoch 1 too, so both
+    // solve/check the admission challenge at the same epoch.
+    sim.inject(receiver_coord, Command::AdvanceEpoch);
+    sim.run_for(Duration::from_millis(500));
+
+    // Reshuffle the joiner to a new coordinate: `on_reseat` re-solves its proof for `(new coord, epoch 1)`
+    // and re-announces. The receiver (now epoch 1) checks `admission_challenge(new coord, 1)` against it.
+    let new_coord = Point::<F2>::at(RESHUFFLE_POINT).coords();
+    sim.inject(joiner_coord, Command::Reseat { coord: new_coord });
+    sim.run_for(Duration::from_millis(500));
+
+    assert!(
+        joined.load(Ordering::Relaxed) > joined_at_genesis,
+        "the reshuffled joiner is admitted at its NEW coordinate — the proof was re-solved for the new \
+         (coord, epoch), so the per-epoch admission cost was re-paid"
+    );
+    assert_eq!(
+        sybil_rejected.load(Ordering::Relaxed),
+        0,
+        "the re-solved proof is never SYBIL_REJECTed: a fixed genesis proof would fail the epoch-1 check"
+    );
+}

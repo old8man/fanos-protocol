@@ -205,6 +205,8 @@ impl Node {
         let beacon = config.beacon.clone();
         // Whether to run the live epoch clock (captured before `beacon` is moved into the engine builder).
         let has_beacon = beacon.is_some();
+        // PoW Sybil-admission difficulty, if any — moved into the engine builder to price every join (§L3).
+        let admission = config.admission_difficulty;
         // A relay node also runs the anonymity mixnet: its engine is a [`CellNode`] (overlay + beacon +
         // threshold-onion router), and it republishes its onion key each epoch so anonymous clients can
         // seal to it. The router's key material is fresh OS entropy per run — forward-secure, since a
@@ -240,6 +242,12 @@ impl Node {
                 // (which would reject every legitimate VRF announcement, audit C3).
                 let overlay_config = OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() };
                 let overlay = OverlayNode::<F>::new(coord, overlay_config);
+                // PoW Sybil admission (§L3): price every join and re-solve the proof each epoch as the
+                // coordinate reshuffles — closes the free-identity gap self-certifying coords leave open.
+                let overlay = match admission {
+                    Some(difficulty) => overlay.with_admission_pow(difficulty),
+                    None => overlay,
+                };
                 let base: Box<dyn Engine + Send> = match beacon {
                     Some(bp) => {
                         let obn = OverlayBeaconNode::new(

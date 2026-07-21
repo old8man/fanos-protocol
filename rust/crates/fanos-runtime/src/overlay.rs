@@ -11,7 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_code::{da, erasure};
-use fanos_core::AdmissionPolicy;
+use fanos_core::{AdmissionPolicy, PowAdmission};
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
@@ -433,6 +433,13 @@ struct Membership {
     /// but has no policy to check *against* — it then rejects every peer (fail closed, never fail open)
     /// rather than silently admitting for want of configuration.
     admission_policy: Option<Box<dyn AdmissionPolicy>>,
+    /// The PoW difficulty this node solves its OWN admission proof at (spec §L3). `Some(d)` when the node
+    /// runs PoW admission via [`OverlayNode::with_admission_pow`]: its proof is then **re-solved for the
+    /// new `(coordinate, epoch)` on every reshuffle** ([`on_reseat`](OverlayNode::on_reseat)), so a peer's
+    /// per-epoch admission check keeps passing as the coordinate rotates — the "re-paid every epoch" cost
+    /// that makes a grinded seat un-maintainable (`anti_eclipse_reshuffle`). `None` = the proof is fixed
+    /// (set once via [`with_admission_proof`](OverlayNode::with_admission_proof)) or absent.
+    admission_difficulty: Option<u32>,
     /// The membership view: cell coordinate → announced info (public keys, capabilities), learned by
     /// flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
     members: BTreeMap<Triple, Vec<u8>>,
@@ -1481,6 +1488,24 @@ impl<F: Field> OverlayNode<F> {
         self
     }
 
+    /// Enable **PoW Sybil admission** at `difficulty` in one call (spec §L3): install a [`PowAdmission`]
+    /// policy to verify *others*, `require` admission of peers, solve this node's OWN genesis proof for
+    /// `(coordinate, epoch 0)`, and remember the difficulty so the proof is **re-solved on every reshuffle**
+    /// ([`on_reseat`](Self::on_reseat)) — keeping it valid for a peer's per-epoch check as the coordinate
+    /// rotates, which is the "re-paid every epoch" cost that makes a grinded seat un-maintainable. This is
+    /// the complete "join under a per-admission cost" setup; a deployment picks `difficulty` to price a join
+    /// at ~`2^difficulty` hashes. Prefer this to wiring [`with_admission_policy`](Self::with_admission_policy)
+    /// + [`with_admission_proof`](Self::with_admission_proof) by hand when the policy is PoW.
+    #[must_use]
+    pub fn with_admission_pow(mut self, difficulty: u32) -> Self {
+        self.config.require_admission = true;
+        self.membership.admission_difficulty = Some(difficulty);
+        self.membership.admission_policy = Some(Box::new(PowAdmission::new(difficulty)));
+        self.membership.admission_proof =
+            PowAdmission::new(difficulty).solve(&admission_challenge(self.coord.coords(), self.epoch));
+        self
+    }
+
     /// Register a hierarchical peer reachable in one hop — the transport coordinate that reaches it and
     /// the overlay [`HierAddr`] it serves — replacing any existing address for that coordinate. This *is*
     /// the hierarchical routing table: `RouteHier` frames are forwarded greedily over it. A single-plane
@@ -2159,6 +2184,16 @@ impl<F: Field> OverlayNode<F> {
             None
         };
         self.coord = new_pt;
+        // Re-solve our Sybil-admission proof for the NEW `(coordinate, epoch)` (spec §L3), so a peer's
+        // per-epoch admission check keeps passing as we reshuffle: seizing a coordinate costs a fresh PoW
+        // *each epoch*, never a one-time grind (the "re-paid every epoch" cost of `anti_eclipse_reshuffle`).
+        // `self.epoch` is already the new epoch here — the composite drives the overlay to the beacon epoch
+        // before issuing this `Reseat`. Only when PoW admission is in use (`with_admission_pow`); cheap at a
+        // modest difficulty, and deterministic (sans-I/O replay is preserved).
+        if let Some(difficulty) = self.membership.admission_difficulty {
+            self.membership.admission_proof =
+                PowAdmission::new(difficulty).solve(&admission_challenge(new_coord, self.epoch));
+        }
         // Preserve the hierarchical DESCENT chain across the reshuffle (spec §L1): only the level-0 VRF
         // transport coordinate moves each epoch; the deeper sub-cell levels are identity-hash-derived
         // (`fanos_primitives::address_point`, epoch-INDEPENDENT), so a descended node keeps its sub-cell

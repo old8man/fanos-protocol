@@ -349,6 +349,13 @@ pub struct NodeConfig {
     /// `Some` (a bare overlay has no clock to drive). Network-wide — all nodes should share it so their
     /// epochs stay aligned. Default: [`DEFAULT_EPOCH_PERIOD`].
     pub epoch_period: Duration,
+    /// PoW **Sybil-admission** difficulty (spec §L3). `Some(d)` makes the node run proof-of-work admission:
+    /// it prices every join at ~`2^d` hashes (re-paid each epoch as the coordinate reshuffles), rejects an
+    /// announcing peer with no valid proof (`SYBIL_REJECT`), and attaches its own solved proof — closing the
+    /// free-identity gap that self-certifying coordinates alone leave open (`sybil_cost`). `None` (the
+    /// default) charges no admission cost, backward-compatible with the pre-admission behaviour. Pick `d`
+    /// for the deployment's join-latency vs Sybil-cost trade-off; it must match across the network.
+    pub admission_difficulty: Option<u32>,
     /// The threshold-hosting parameters. Required by (and only used with) the `service` role: `Some(..)`
     /// composes a [`ServiceNode`](crate::ServiceNode) hosting one member of a service line — see
     /// [`ServiceParams`]. `None` (the default) hosts no service.
@@ -374,6 +381,7 @@ impl Default for NodeConfig {
             start_heartbeat: true,
             beacon: None,
             epoch_period: DEFAULT_EPOCH_PERIOD,
+            admission_difficulty: None,
             service: None,
             exit: None,
             proteus_secret: None,
