@@ -95,6 +95,11 @@ const MAX_STORE_ENTRIES: usize = 4096;
 const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
 const MAX_PENDING_GETS: usize = 1024;
+/// The most distinct shard-versions a single in-flight read accumulates before evicting the lowest (#115
+/// Phase B). A read groups gathered shards by their write-version and reconstructs the highest recoverable
+/// one (last-writer-wins); honestly there are only a handful in flight (the cell converges to one version),
+/// so this bounds a Byzantine peer that sprays fabricated versions to grow the accumulator (A4 DoS).
+const MAX_READ_VERSIONS: usize = 8;
 
 /// How long a locally-distrusted (Byzantine) member stays quarantined before it is re-admitted for
 /// re-evaluation. Quarantine is an *operational* safeguard, not a proven permanent exclusion (spec §6.2):
@@ -175,17 +180,25 @@ impl Default for Config {
     }
 }
 
-/// An in-flight `Get` awaiting a replica's answer: the replica candidates not yet tried (the
-/// primary is queried first, these are the LRC fallbacks) and when the current query was issued
-/// (for the silent-replica timeout). Read repair across the responsible line (spec §L4).
+/// A key's held erasure shards at this node: Fano point index → (write-version, shard bytes) — §L4.
+type HeldShards = BTreeMap<u8, (u64, Vec<u8>)>;
+/// A [`erasure::reconstruct`]-shaped accumulator: one optional shard per Fano point.
+type ShardAccumulator = [Option<Vec<u8>>; erasure::N];
+/// Shards gathered during a read, grouped by their write-version (highest recoverable one wins).
+type VersionedShards = BTreeMap<u64, ShardAccumulator>;
+
+/// An in-flight `Get` gathering erasure shards from the cell (spec §L4). No single node holds the value, so
+/// the read fans a `Lookup` to every shard home and accumulates their replies — grouped by write-version, so
+/// shards of two concurrent writes are never mixed into one (garbage) reconstruction — until the highest
+/// recoverable version delivers (last-writer-wins), or the read times out / all peers report a miss.
 #[derive(Clone, Debug)]
 struct PendingGet {
     issued: Instant,
-    /// The erasure shards gathered so far, indexed by Fano point (`None` = not yet received). A read
-    /// fans a `Lookup` out to every shard home at once and accumulates their replies here; as soon as the
-    /// present set is [`erasure::reconstruct`]-able the value is delivered (spec §L4). Replaces the old
-    /// one-replica-at-a-time walk — under erasure no single node holds the value, so the read must gather.
-    shards: [Option<Vec<u8>>; erasure::N],
+    /// Gathered shards grouped by write-version: `version → [shard per Fano point]`. A write stamps all its
+    /// shards with one version, so grouping keeps a reconstruction internally consistent even while two
+    /// writers race; the read reconstructs the **highest** version whose shard-set is recoverable
+    /// ([`reconstruct_highest`]). Bounded by [`MAX_READ_VERSIONS`] (evict lowest) against version-spray DoS.
+    by_version: VersionedShards,
     /// The per-request nonce this read is correlated on: a `Value` reply resolves it only if the reply
     /// echoes this exact nonce, so a stale/replayed reply from a prior get for the same key cannot drain
     /// it with an old value (audit C4).
@@ -198,18 +211,26 @@ struct PendingGet {
     negatives: u16,
 }
 
+/// Reconstruct the **highest** write-version whose gathered shard-set is recoverable (spec §L4
+/// last-writer-wins): iterate versions descending, returning the first that [`erasure::reconstruct`]s — so a
+/// stale version that happens to complete first can never mask a fresher one, and mixed-version shards are
+/// never combined into one (garbage) value. `None` until some version's set is recoverable.
+fn reconstruct_highest(by_version: &VersionedShards) -> Option<Vec<u8>> {
+    by_version.values().rev().find_map(erasure::reconstruct)
+}
+
 /// The DHT-storage concern factored out of [`OverlayNode`] (audit #125 decompose): this node's local
 /// slice of the cell's distributed store plus its in-flight read-repair bookkeeping. The *orchestration*
 /// of a Put/Get — resolving the responsible cell member, replicating across the cell — stays on
 /// `OverlayNode`, which owns the membership view; this owns the local state and the read-repair walk.
 #[derive(Default)]
 struct Store {
-    /// Key digest → this node's held **erasure shards** for that key: `point index → shard bytes`. A value
-    /// is `erasure::encode`d into `N=7` point-shards and each placed at its point's nearest-occupied home
-    /// (spec §L4 projective LRC, #115); on a full Fano cell a node holds exactly one shard (its own point),
-    /// on a sparse cell it may hold several (the shards of the points it is nearest-occupied for). A lookup
-    /// returns every shard here; a read gathers a recoverable set across the cell and reconstructs.
-    entries: BTreeMap<[u8; DIGEST], BTreeMap<u8, Vec<u8>>>,
+    /// Key digest → this node's held **erasure shards** for that key: `point index → (write-version, shard
+    /// bytes)`. A value is `erasure::encode`d into `N=7` point-shards, each stamped with the write's version
+    /// and placed at its point's nearest-occupied home (spec §L4 projective LRC, #115); on a full Fano cell a
+    /// node holds one shard (its own point), on a sparse cell several. Each index keeps the **highest**
+    /// version seen (last-writer-wins), so a lookup returns each point's freshest shard.
+    entries: BTreeMap<[u8; DIGEST], HeldShards>,
     /// In-flight `Get`s awaiting shards, keyed by digest — the gather-and-reconstruct accumulator.
     pending: BTreeMap<[u8; DIGEST], PendingGet>,
     /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
@@ -226,22 +247,33 @@ impl Store {
             && (self.entries.len() < MAX_STORE_ENTRIES || self.entries.contains_key(digest))
     }
 
-    /// Store one erasure shard for `digest` at Fano point `index` (idempotent overwrite).
-    fn insert_shard(&mut self, digest: [u8; DIGEST], index: u8, shard: Vec<u8>) {
-        self.entries.entry(digest).or_default().insert(index, shard);
+    /// Store one erasure shard for `digest` at Fano point `index`, keeping the **higher** write-version if
+    /// this point already holds one (last-writer-wins) — so a stale replayed shard never overwrites a fresh
+    /// one, and the store converges to the newest write's shards.
+    fn insert_shard(&mut self, digest: [u8; DIGEST], index: u8, version: u64, shard: Vec<u8>) {
+        let per_index = self.entries.entry(digest).or_default();
+        if per_index
+            .get(&index)
+            .is_none_or(|(held, _)| version >= *held)
+        {
+            per_index.insert(index, (version, shard));
+        }
     }
 
-    /// This node's held shards for `digest` as a `reconstruct`-shaped accumulator (absent points `None`).
-    fn shard_accumulator(&self, digest: &[u8; DIGEST]) -> [Option<Vec<u8>>; erasure::N] {
-        let mut acc: [Option<Vec<u8>>; erasure::N] = Default::default();
+    /// Seed this node's held shards for `digest` into a read's version-grouped accumulator (each point's
+    /// shard into its version's slot) — the local contribution before the network replies arrive.
+    fn seed_versions(
+        &self,
+        digest: &[u8; DIGEST],
+        by_version: &mut VersionedShards,
+    ) {
         if let Some(held) = self.entries.get(digest) {
-            for (&i, shard) in held {
-                if let Some(slot) = acc.get_mut(i as usize) {
+            for (&i, (version, shard)) in held {
+                if let Some(slot) = by_version.entry(*version).or_default().get_mut(i as usize) {
                     *slot = Some(shard.clone());
                 }
             }
         }
-        acc
     }
 }
 
@@ -1282,7 +1314,7 @@ impl<F: Field> OverlayNode<F> {
                 self.apply_diag_loss(now, from, frame.body);
                 Vec::new()
             }
-            Some(FrameType::Publish) => self.on_publish(from, frame.body),
+            Some(FrameType::Publish) => self.on_publish(now, from, frame.body),
             Some(FrameType::Lookup) => self.on_lookup(from, frame.body),
             Some(FrameType::Value) => self.on_value(now, frame.body),
             Some(FrameType::Ack) => Self::on_ack(frame.body),
@@ -1512,8 +1544,10 @@ impl<F: Field> OverlayNode<F> {
             )
     }
 
-    /// `Command::Put` — erasure-code the value and distribute its shards across the cell (spec §L4).
-    fn on_put(&mut self, key: &[u8], value: &[u8]) -> Vec<Effect> {
+    /// `Command::Put` — erasure-code the value and distribute its shards across the cell (spec §L4). The
+    /// write is stamped with a version (the responsible node's `now`) so a later write supersedes it
+    /// (last-writer-wins) and a reader never mixes two writes' shards.
+    fn on_put(&mut self, now: Instant, key: &[u8], value: &[u8]) -> Vec<Effect> {
         let (digest, ideal) = Self::address_of(key);
         let primary = self.responsible_point(ideal);
         if primary == self.coord.coords() {
@@ -1522,13 +1556,15 @@ impl<F: Field> OverlayNode<F> {
             if value.len() > MAX_VALUE_LEN {
                 return Vec::new();
             }
-            let mut effects = self.distribute_shards(&digest, value);
+            let mut effects = self.distribute_shards(&digest, value, now.as_nanos());
             effects.push(Effect::Notify(Notification::Stored(digest)));
             effects
         } else {
-            alloc::vec![
-                self.routed_send(primary, encode_publish(PUBLISH_ORIGIN, 0, &digest, value))
-            ]
+            // Route the full value to the responsible node, which stamps the version and distributes shards.
+            alloc::vec![self.routed_send(
+                primary,
+                encode_publish(PUBLISH_ORIGIN, 0, 0, &digest, value)
+            )]
         }
     }
 
@@ -1543,9 +1579,11 @@ impl<F: Field> OverlayNode<F> {
     /// timeout. The in-flight accumulator is tracked in the [`Store`]'s `pending` map.
     fn on_get(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
         let (digest, _ideal) = Self::address_of(key);
-        // Seed the accumulator with any shards this node already holds; short-circuit if they reconstruct.
-        let acc = self.store.shard_accumulator(&digest);
-        if let Some(value) = erasure::reconstruct(&acc) {
+        // Seed the accumulator with any shards this node already holds (grouped by write-version); short-
+        // circuit if the highest recoverable version reconstructs from local shards alone.
+        let mut by_version = BTreeMap::new();
+        self.store.seed_versions(&digest, &mut by_version);
+        if let Some(value) = reconstruct_highest(&by_version) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value: Some(value),
@@ -1580,7 +1618,7 @@ impl<F: Field> OverlayNode<F> {
             digest,
             PendingGet {
                 issued: now,
-                shards: acc,
+                by_version,
                 nonce,
                 queried: u16::try_from(peers.len()).unwrap_or(u16::MAX),
                 negatives: 0,
@@ -1601,7 +1639,12 @@ impl<F: Field> OverlayNode<F> {
     /// On a full Fano cell this is shard `i` → point `i` (one shard per node, `N/K ≈ 2.33×` redundancy vs
     /// `N×` full replication); on a sparse cell several shards may share a home (graceful degradation — the
     /// cell simply has fewer independent failure domains).
-    fn distribute_shards(&mut self, digest: &[u8; DIGEST], value: &[u8]) -> Vec<Effect> {
+    fn distribute_shards(
+        &mut self,
+        digest: &[u8; DIGEST],
+        value: &[u8],
+        version: u64,
+    ) -> Vec<Effect> {
         let me = self.coord.coords();
         let shards = erasure::encode(value);
         let mut effects = Vec::new();
@@ -1610,28 +1653,31 @@ impl<F: Field> OverlayNode<F> {
             #[allow(clippy::cast_possible_truncation)] // i < N = 7
             let index = i as u8;
             if home == me {
-                self.store.insert_shard(*digest, index, shard);
+                self.store.insert_shard(*digest, index, version, shard);
             } else {
                 effects.push(Effect::Send {
                     to: home,
-                    frame: encode_publish(PUBLISH_SHARD, index, digest, &shard),
+                    frame: encode_publish(PUBLISH_SHARD, index, version, digest, &shard),
                 });
             }
         }
         effects
     }
 
-    fn on_publish(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+    fn on_publish(&mut self, now: Instant, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(&flag) = body.first() else {
             return Vec::new();
         };
         let Some(&index) = body.get(1) else {
             return Vec::new();
         };
-        let Some(digest) = parse_digest(body.get(2..2 + DIGEST)) else {
+        let Some(version) = parse_u64(body, 2) else {
             return Vec::new();
         };
-        let payload = body.get(2 + DIGEST..).unwrap_or(&[]);
+        let Some(digest) = parse_digest(body.get(10..10 + DIGEST)) else {
+            return Vec::new();
+        };
+        let payload = body.get(10 + DIGEST..).unwrap_or(&[]);
         // A4 DoS caps: a refused publish (over-size, or a new key over the store cap) is dropped without an
         // Ack or distribution — a relayed flood of distinct digests cannot exhaust this node's memory.
         if !self.store.admits(&digest, payload.len()) {
@@ -1639,8 +1685,9 @@ impl<F: Field> OverlayNode<F> {
         }
         match flag {
             PUBLISH_ORIGIN => {
-                // We are the responsible node: erasure-distribute the full value and acknowledge the origin.
-                let mut effects = self.distribute_shards(&digest, payload);
+                // We are the responsible node: stamp this write's version (our distribution time),
+                // erasure-distribute the full value across the cell, and acknowledge the origin.
+                let mut effects = self.distribute_shards(&digest, payload, now.as_nanos());
                 effects.push(Effect::Send {
                     to: from,
                     frame: encode(FrameType::Ack, &digest),
@@ -1648,8 +1695,9 @@ impl<F: Field> OverlayNode<F> {
                 effects
             }
             PUBLISH_SHARD => {
-                // A single shard for Fano point `index` — store it under that index (idempotent).
-                self.store.insert_shard(digest, index, payload.to_vec());
+                // A single versioned shard for Fano point `index` — store it, keeping the higher version.
+                self.store
+                    .insert_shard(digest, index, version, payload.to_vec());
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1661,34 +1709,37 @@ impl<F: Field> OverlayNode<F> {
         let Ok(LookupBody { key: digest, nonce }) = LookupBody::from_wire(body) else {
             return Vec::new();
         };
-        // Return EVERY shard this node holds for the key, one `Value` each (the reader accumulates them by
-        // point index). A node holding no shard answers a single `found=false` — an explicit "not here".
+        // Return EVERY shard this node holds for the key, one `Value` each carrying its write-version (the
+        // reader groups by version, then point index). No shard → a single `found=false` "not here".
         match self.store.entries.get(&digest) {
             Some(held) if !held.is_empty() => held
                 .iter()
-                .map(|(&index, shard)| Effect::Send {
+                .map(|(&index, (version, shard))| Effect::Send {
                     to: from,
-                    frame: encode_value(&digest, true, index, shard, nonce),
+                    frame: encode_value(&digest, true, index, *version, shard, nonce),
                 })
                 .collect(),
             _ => alloc::vec![Effect::Send {
                 to: from,
-                frame: encode_value(&digest, false, 0, &[], nonce),
+                frame: encode_value(&digest, false, 0, 0, &[], nonce),
             }],
         }
     }
 
-    /// A `Value` reply carrying one erasure shard (spec §L4). Accumulate it into the in-flight read's
-    /// shard-set and, once that set is [`erasure::reconstruct`]-able, deliver the value and retire the read.
-    /// A `found=false` reply (the peer holds no shard) is simply not accumulated; the heartbeat sweep
-    /// concludes `Retrieved(None)` if a recoverable set never assembles before the read timeout.
+    /// A `Value` reply carrying one versioned erasure shard (spec §L4). Accumulate it into the in-flight
+    /// read's version-grouped shard-set and, once the **highest** recoverable version reconstructs, deliver
+    /// that value (last-writer-wins) and retire the read. A `found=false` reply (the peer holds no shard) is
+    /// not accumulated; once every queried peer has said so, or the read times out, the value is absent.
     fn on_value(&mut self, _now: Instant, body: &[u8]) -> Vec<Effect> {
         let Some(digest) = parse_digest(body.get(..DIGEST)) else {
             return Vec::new();
         };
         let found = body.get(DIGEST).copied().unwrap_or(0) != 0;
         let index = body.get(DIGEST + 1).copied().unwrap_or(0);
-        let Some(nonce) = parse_u64(body, DIGEST + 2) else {
+        let Some(version) = parse_u64(body, DIGEST + 2) else {
+            return Vec::new();
+        };
+        let Some(nonce) = parse_u64(body, DIGEST + 10) else {
             return Vec::new();
         };
         // Correlate on the per-request nonce, NOT merely the key: a reply is accepted only for the read
@@ -1702,11 +1753,11 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         }
         if !found {
-            // A peer holds no shard for this key. Once every queried peer has said so and the shards still
-            // do not reconstruct, conclude the value absent immediately (a fast miss, not a timeout wait).
+            // A peer holds no shard for this key. Once every queried peer has said so and no version's shards
+            // reconstruct, conclude the value absent immediately (a fast miss, not a timeout wait).
             pending.negatives = pending.negatives.saturating_add(1);
             if pending.negatives >= pending.queried
-                && erasure::reconstruct(&pending.shards).is_none()
+                && reconstruct_highest(&pending.by_version).is_none()
             {
                 self.store.pending.remove(&digest);
                 return alloc::vec![Effect::Notify(Notification::Retrieved {
@@ -1716,13 +1767,26 @@ impl<F: Field> OverlayNode<F> {
             }
             return Vec::new();
         }
-        let shard = body.get(DIGEST + 2 + 8..).unwrap_or(&[]).to_vec();
-        if let Some(slot) = pending.shards.get_mut(index as usize) {
+        // shard bytes follow: digest(32) ‖ found(1) ‖ index(1) ‖ version(8) ‖ nonce(8) ‖ shard.
+        let shard = body.get(DIGEST + 18..).unwrap_or(&[]).to_vec();
+        if let Some(slot) = pending
+            .by_version
+            .entry(version)
+            .or_default()
+            .get_mut(index as usize)
+        {
             *slot = Some(shard);
         }
-        // Try to reconstruct with everything gathered so far; `reconstruct` returns `Some` exactly when the
-        // present shard-set is recoverable (any `≤3`-point loss), so this fires as soon as enough arrive.
-        if let Some(value) = erasure::reconstruct(&pending.shards) {
+        // Bound the version-grouped accumulator against a Byzantine peer spraying fabricated versions: keep
+        // only the highest [`MAX_READ_VERSIONS`] (the freshest are what last-writer-wins wants anyway).
+        while pending.by_version.len() > MAX_READ_VERSIONS {
+            if let Some(&lowest) = pending.by_version.keys().next() {
+                pending.by_version.remove(&lowest);
+            }
+        }
+        // Deliver the highest write-version whose shard-set is now recoverable (a stale version completing
+        // first can never mask a fresher one; mixed-version shards are never combined into a garbage value).
+        if let Some(value) = reconstruct_highest(&pending.by_version) {
             self.store.pending.remove(&digest);
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
@@ -2154,7 +2218,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Send { to, payload }) => self.on_send(to, &payload),
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Observe) => self.on_observe(now),
-            Input::Command(Command::Put { key, value }) => self.on_put(&key, &value),
+            Input::Command(Command::Put { key, value }) => self.on_put(now, &key, &value),
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
@@ -2177,11 +2241,20 @@ fn encode(ty: FrameType, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A `Publish` frame: `flag(1) ‖ key(32) ‖ value` (spec §L4).
-fn encode_publish(flag: u8, index: u8, digest: &[u8; DIGEST], payload: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(2 + DIGEST + payload.len());
+/// A `Publish` frame: `flag(1) ‖ shard_index(1) ‖ version(8) ‖ key(32) ‖ payload` (spec §L4). For a
+/// `PUBLISH_SHARD` the payload is one erasure shard for `shard_index` at write-`version`; for a
+/// `PUBLISH_ORIGIN` it is the full value and index/version are `0` (the responsible node assigns the version).
+fn encode_publish(
+    flag: u8,
+    index: u8,
+    version: u64,
+    digest: &[u8; DIGEST],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + 8 + DIGEST + payload.len());
     body.push(flag);
-    body.push(index); // the shard's Fano point index (0 for a PUBLISH_ORIGIN full value)
+    body.push(index);
+    body.extend_from_slice(&version.to_be_bytes());
     body.extend_from_slice(digest);
     body.extend_from_slice(payload);
     encode(FrameType::Publish, &body)
@@ -2222,20 +2295,23 @@ fn encode_lookup(digest: &[u8; DIGEST], nonce: u64) -> Vec<u8> {
     )
 }
 
-/// A `Value` reply: `key(32) ‖ found(1) ‖ shard_index(1) ‖ nonce(8) ‖ shard` (spec §L4) — the nonce echoes
-/// the `Lookup`'s, and `shard_index` names which Fano point's erasure shard this reply carries so the reader
-/// accumulates it into the right slot (#115). A `found=false` reply carries index `0` and an empty shard.
+/// A `Value` reply: `key(32) ‖ found(1) ‖ shard_index(1) ‖ version(8) ‖ nonce(8) ‖ shard` (spec §L4) — the
+/// nonce echoes the `Lookup`'s; `shard_index` names which Fano point's erasure shard this carries and
+/// `version` its write-version, so the reader groups shards by version and reconstructs the highest recoverable
+/// one (#115). A `found=false` reply carries index/version `0` and an empty shard.
 fn encode_value(
     digest: &[u8; DIGEST],
     found: bool,
     index: u8,
+    version: u64,
     shard: &[u8],
     nonce: u64,
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(DIGEST + 2 + 8 + shard.len());
+    let mut body = Vec::with_capacity(DIGEST + 2 + 16 + shard.len());
     body.extend_from_slice(digest);
     body.push(u8::from(found));
     body.push(index);
+    body.extend_from_slice(&version.to_be_bytes());
     body.extend_from_slice(&nonce.to_be_bytes());
     body.extend_from_slice(shard);
     encode(FrameType::Value, &body)
@@ -2868,7 +2944,7 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let from = Point::<F2>::at(1).coords();
         for i in 0..(MAX_STORE_ENTRIES as u32 + 500) {
-            let frame = encode_publish(PUBLISH_SHARD, 0, &flood_digest(i), b"v");
+            let frame = encode_publish(PUBLISH_SHARD, 0, 1, &flood_digest(i), b"v");
             node.step(Instant(1), Input::Message { from, frame });
         }
         assert!(
@@ -2888,7 +2964,7 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_SHARD, 0, &digest, &too_big),
+                frame: encode_publish(PUBLISH_SHARD, 0, 1, &digest, &too_big),
             },
         );
         assert!(
@@ -2901,7 +2977,7 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_SHARD, 0, &digest, &at_limit),
+                frame: encode_publish(PUBLISH_SHARD, 0, 1, &digest, &at_limit),
             },
         );
         assert!(
@@ -2917,7 +2993,7 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let from = Point::<F2>::at(1).coords();
         for i in 0..MAX_STORE_ENTRIES as u32 {
-            let frame = encode_publish(PUBLISH_SHARD, 0, &flood_digest(i), b"a");
+            let frame = encode_publish(PUBLISH_SHARD, 0, 1, &flood_digest(i), b"a");
             node.step(Instant(1), Input::Message { from, frame });
         }
         assert_eq!(
@@ -2931,7 +3007,7 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_SHARD, 0, &existing, b"updated"),
+                frame: encode_publish(PUBLISH_SHARD, 0, 1, &existing, b"updated"),
             },
         );
         assert_eq!(
@@ -2939,7 +3015,7 @@ mod tests {
                 .entries
                 .get(&existing)
                 .and_then(|shards| shards.get(&0))
-                .map(Vec::as_slice),
+                .map(|(_version, shard)| shard.as_slice()),
             Some(&b"updated"[..]),
             "an existing key's shard still updates when the store is full"
         );
@@ -2948,7 +3024,7 @@ mod tests {
             Instant(1),
             Input::Message {
                 from,
-                frame: encode_publish(PUBLISH_SHARD, 0, &[0xABu8; DIGEST], b"x"),
+                frame: encode_publish(PUBLISH_SHARD, 0, 1, &[0xABu8; DIGEST], b"x"),
             },
         );
         assert!(
@@ -3006,7 +3082,14 @@ mod tests {
                     Instant(t),
                     Input::Message {
                         from: peer,
-                        frame: encode_value(&digest, true, u8::try_from(i).unwrap(), shard, nonce),
+                        frame: encode_value(
+                            &digest,
+                            true,
+                            u8::try_from(i).unwrap(),
+                            1,
+                            shard,
+                            nonce,
+                        ),
                     },
                 ));
             }

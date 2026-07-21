@@ -157,7 +157,7 @@ fn the_value_is_replicated_across_the_cell() {
     assert_eq!(
         sim.report().metrics.retrieval_hits - before,
         7,
-        "all seven nodes answer from a local replica"
+        "all seven nodes answer — each reconstructs the value from a gathered shard-set"
     );
 }
 
@@ -349,4 +349,50 @@ fn alloc_masks() -> Vec<u8> {
     masks.push(0b001_1111);
     masks.push(0b111_0100);
     masks
+}
+
+/// **§L4 last-writer-wins / no-garbage (#115 Phase B).** Two writes to the same key at different times: each
+/// stamps its shards with the responsible node's write-version, and a read reconstructs the *highest*
+/// recoverable version — so the later write supersedes the earlier, and shards of the two writes are never
+/// mixed into one (garbage) reconstruction. This is the correctness the version tag adds over plain erasure.
+#[test]
+fn a_later_write_supersedes_an_earlier_one_last_writer_wins() {
+    let (mut sim, cell) = established(77);
+    let key = b"mutable-key".to_vec();
+
+    // Write v1 and let it settle across the cell (all shards distributed at version 1).
+    sim.inject(
+        cell[0],
+        Command::Put {
+            key: key.clone(),
+            value: b"first-value".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(1500));
+
+    // Write v2 LATER — a higher version, superseding v1's shards at every point.
+    sim.inject(
+        cell[0],
+        Command::Put {
+            key: key.clone(),
+            value: b"second-value-is-newer".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(1500));
+
+    // A read from a different node reconstructs the LATEST value — never a mix of the two writes.
+    sim.inject(cell[3], Command::Get { key: key.clone() });
+    sim.run_for(Duration::from_millis(2500));
+
+    let got = sim
+        .report()
+        .retrievals()
+        .filter(|(who, _, _)| *who == cell[3])
+        .last()
+        .map(|(_, _, v)| v.map(<[u8]>::to_vec));
+    assert_eq!(
+        got,
+        Some(Some(b"second-value-is-newer".to_vec())),
+        "the later write wins (last-writer-wins by version); shards are never mixed into garbage"
+    );
 }
