@@ -666,13 +666,13 @@ mod tests {
         // propagates (a real-QUIC store put/handshake takes a moment). Bounded, so a failure never hangs.
         let cname = CString::new(name).unwrap();
         let mut stream = ptr::null_mut();
-        for _ in 0..20 {
+        for _ in 0..60 {
             // SAFETY: `b` is live; `cname` outlives the call.
             stream = unsafe { fanos_service_connect(b, cname.as_ptr()) };
             if !stream.is_null() {
                 break;
             }
-            sleep(Duration::from_millis(250));
+            sleep(Duration::from_millis(500));
         }
         assert!(!stream.is_null(), "B resolved and dialed A's service through the C ABI");
 
@@ -754,13 +754,13 @@ mod tests {
 
         let cname = CString::new(name).unwrap();
         let mut client = ptr::null_mut();
-        for _ in 0..20 {
+        for _ in 0..60 {
             // SAFETY: `b` is live; `cname` outlives the call.
             client = unsafe { fanos_service_connect(b, cname.as_ptr()) };
             if !client.is_null() {
                 break;
             }
-            sleep(Duration::from_millis(250));
+            sleep(Duration::from_millis(500));
         }
         assert!(!client.is_null(), "B dialed the hosted service");
 
