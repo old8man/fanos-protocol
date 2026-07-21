@@ -14,9 +14,9 @@ use std::sync::Arc;
 use fanos_field::F2;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_node::{
-    AnonRouteParams, BeaconSeed, Epoch, ExitParams, FanosDialer, Morph, Node, NodeConfig, NodeError,
-    NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory, build_cell_mix_directory,
-    identity, serve_proxy,
+    AnonRouteParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node, NodeConfig,
+    NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
+    build_cell_mix_directory, identity, serve_proxy,
 };
 use fanos_runtime::Notification;
 use tokio::net::TcpListener;
@@ -101,6 +101,16 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
                  fronted, webrtc, pluggable)"
             ))
         })?;
+    }
+    if let Some(e) = flag(args, "--proteus-environment") {
+        // Enable morph auto-fallback (§13.7) under this environment policy: open, dpi-corporate,
+        // sni-filter, deep-censorship. Overrides --proteus-morph (the environment picks the morph).
+        config.proteus_environment = Some(Environment::from_name(e).ok_or_else(|| {
+            NodeError::Config(format!(
+                "unknown --proteus-environment '{e}' (expected: open, dpi-corporate, sni-filter, \
+                 deep-censorship)"
+            ))
+        })?);
     }
     Ok(config)
 }
@@ -581,7 +591,8 @@ fn print_help() {
          USAGE:\n\
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
-         \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH]\n\
+         \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
+         \x20             [--proteus-environment ENV]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\

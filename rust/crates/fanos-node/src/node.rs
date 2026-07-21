@@ -292,13 +292,14 @@ impl Node {
                 }
             },
             directory.clone(),
-            // PROTEUS (§13.4): when a community secret is configured, every frame is shaped under the chosen
-            // morph and the shape rotates each epoch (driven by the same beacon that reshuffles the
-            // coordinate). No secret ⇒ plaintext QUIC.
-            config
-                .proteus_secret
-                .clone()
-                .map(|secret| ProteusConfig::with_morph(secret, config.proteus_morph)),
+            // PROTEUS (§13.4): when a community secret is configured, every frame is shaped and the shape
+            // rotates each epoch (driven by the same beacon that reshuffles the coordinate). An environment
+            // policy enables morph auto-fallback (§13.7); otherwise the fixed morph is used. No secret ⇒
+            // plaintext QUIC.
+            config.proteus_secret.clone().map(|secret| match config.proteus_environment {
+                Some(env) => ProteusConfig::auto(secret, env),
+                None => ProteusConfig::with_morph(secret, config.proteus_morph),
+            }),
         )
         .await?;
 

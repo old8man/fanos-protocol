@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use fanos_field::Field;
 use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
-use fanos_proteus::{Morph, ProteusShaper};
+use fanos_proteus::{Environment, Morph, MorphController, ProteusShaper};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
@@ -58,43 +58,83 @@ fn tuned_transport() -> Arc<quinn::TransportConfig> {
 /// counter), so concurrent sends never serialize on each other.
 type Shaper = Option<Arc<RwLock<ProteusShaper>>>;
 
+/// The optional morph auto-fallback controller shared across a node's send path: when set, connection
+/// outcomes are recorded into it ([`apply_outcome`]) and a trip rotates the shaper's morph (§13.7).
+type MaybeController = Option<Arc<Mutex<MorphController>>>;
+
 /// PROTEUS transport configuration (spec §13): the shared community `secret` every frame is shaped under,
-/// and the [`Morph`] selecting the codec and traffic-shaping profile (size + timing). Peers must share the
-/// secret to interoperate; the morph is a local wire-shaping choice.
+/// the [`Morph`] selecting the codec and traffic-shaping profile (size + timing), and an optional
+/// [`Environment`] enabling **morph auto-fallback** (§13.7 — rotate the morph on a connection-failure spike).
+/// Peers must share the secret to interoperate; the morph and fallback are local wire-shaping choices.
 #[derive(Clone)]
 pub struct ProteusConfig {
     /// The shared community secret keying the beacon-rotating shape.
     pub secret: Vec<u8>,
-    /// The obfuscation morph (defaults to the flagship [`Morph::Polymorph`]).
+    /// The obfuscation morph (defaults to the flagship [`Morph::Polymorph`]). When `environment` is set the
+    /// starting morph is the environment's preferred morph instead.
     pub morph: Morph,
+    /// The environment policy for morph auto-fallback (§13.7). `Some(env)` rotates through `env`'s morph
+    /// chain when the current morph starts failing; `None` (the default) pins the fixed `morph`.
+    pub environment: Option<Environment>,
 }
 
-/// Redacted `Debug`: never render the community secret (secret hygiene, audit D) — only the morph.
+/// Redacted `Debug`: never render the community secret (secret hygiene, audit D) — only the morph/env.
 impl std::fmt::Debug for ProteusConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProteusConfig")
             .field("secret", &"<redacted>")
             .field("morph", &self.morph)
+            .field("environment", &self.environment)
             .finish()
     }
 }
 
 impl ProteusConfig {
-    /// A config for the flagship [`Morph::Polymorph`] ("look like nothing") under `secret`.
+    /// A config for the flagship [`Morph::Polymorph`] ("look like nothing") under `secret`, fixed morph.
     #[must_use]
     pub fn polymorph(secret: impl Into<Vec<u8>>) -> Self {
-        Self { secret: secret.into(), morph: Morph::Polymorph }
+        Self { secret: secret.into(), morph: Morph::Polymorph, environment: None }
     }
 
-    /// A config under an explicit `morph`.
+    /// A config under an explicit fixed `morph`.
     #[must_use]
     pub fn with_morph(secret: impl Into<Vec<u8>>, morph: Morph) -> Self {
-        Self { secret: secret.into(), morph }
+        Self { secret: secret.into(), morph, environment: None }
     }
 
-    /// Build the shared shaper this config describes, seeded at `epoch`.
-    fn into_shaper(self, epoch: Epoch) -> Arc<RwLock<ProteusShaper>> {
-        Arc::new(RwLock::new(ProteusShaper::with_morph(self.secret, epoch, self.morph)))
+    /// A config with **auto-fallback** under `environment`: the morph starts at the environment's preferred
+    /// morph and rotates through its chain as morphs fail (§13.7).
+    #[must_use]
+    pub fn auto(secret: impl Into<Vec<u8>>, environment: Environment) -> Self {
+        Self { secret: secret.into(), morph: environment.preferred_morph(), environment: Some(environment) }
+    }
+
+    /// Build the shared shaper and (when auto-fallback is configured) its controller, seeded at `epoch`. With
+    /// an environment the shaper starts at the environment's preferred morph; otherwise the fixed `morph`.
+    fn build(self, epoch: Epoch) -> (Arc<RwLock<ProteusShaper>>, MaybeController) {
+        match self.environment {
+            Some(env) => {
+                let controller = MorphController::new(env);
+                let shaper = ProteusShaper::with_morph(self.secret, epoch, controller.current());
+                (Arc::new(RwLock::new(shaper)), Some(Arc::new(Mutex::new(controller))))
+            }
+            None => (
+                Arc::new(RwLock::new(ProteusShaper::with_morph(self.secret, epoch, self.morph))),
+                None,
+            ),
+        }
+    }
+}
+
+/// Record a connection outcome into the auto-fallback controller (if any) and, when it trips a rotation,
+/// install the new morph on the shaper — the live half of §13.7 morph auto-fallback. A no-op without a
+/// controller (fixed morph). Extracted so the record→rotate→`set_morph` glue is unit-testable off the
+/// network (a censored morph otherwise only manifests as slow connect timeouts).
+fn apply_outcome(shaper: &Shaper, controller: &MaybeController, success: bool) {
+    let Some(ctl) = controller else { return };
+    let rotated = ctl.lock().unwrap_or_else(PoisonError::into_inner).record(success);
+    if let (Some(morph), Some(s)) = (rotated, shaper) {
+        s.write().unwrap_or_else(PoisonError::into_inner).set_morph(morph);
     }
 }
 
@@ -217,6 +257,9 @@ struct Transport {
     conns: ConnMap,
     input_tx: mpsc::Sender<Input>,
     shaper: Shaper,
+    /// Morph auto-fallback controller (§13.7), when a PROTEUS environment policy is configured; the send
+    /// path records connection outcomes into it and rotates the shaper's morph on a trip.
+    controller: MaybeController,
     identity: Identity,
     me: Triple,
     reflexive: Reflexive,
@@ -559,8 +602,9 @@ pub async fn spawn(
     spawn_inner(
         engine,
         directory,
-        None,
-        None,
+        None, // shaper
+        None, // controller
+        None, // identity
         server,
         client,
         default_bind(),
@@ -684,7 +728,13 @@ where
     // configured morph's codec + traffic-shaper) so the transport carries no static FANOS signature and the
     // shape moves each epoch. The shaper starts at the genesis epoch and the `reshuffle_loop` rotates it as
     // the beacon advances (below).
-    let shaper: Shaper = proteus.map(|cfg| cfg.into_shaper(Epoch::ZERO));
+    let (shaper, controller): (Shaper, MaybeController) = match proteus {
+        Some(cfg) => {
+            let (s, c) = cfg.build(Epoch::ZERO);
+            (Some(s), c)
+        }
+        None => (None, None),
+    };
     // The node's verifiable coordinate for the genesis epoch: MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS)),
     // with the proof it announces so peers can verify it (spec §L0/§7.3).
     let (coord, proof) = verifiable_coordinate::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
@@ -708,7 +758,8 @@ where
         }),
     });
     let dir_for_reshuffle = directory.clone();
-    let handle = spawn_inner(engine, directory, shaper.clone(), identity, server, client, bind)?;
+    let handle =
+        spawn_inner(engine, directory, shaper.clone(), controller, identity, server, client, bind)?;
     // Drive the per-epoch coordinate reshuffle off the live beacon (spec §L3, §3.2): on each `BeaconReady`
     // the loop re-derives this node's VRF coordinate for the new epoch, re-seats the engine, rebinds its
     // directory coordinate, and publishes the fresh HELLO + beacon so subsequent connections prove/verify
@@ -809,13 +860,14 @@ pub async fn spawn_shaped(
     proteus: ProteusConfig,
     epoch: Epoch,
 ) -> Result<NodeHandle, QuicError> {
-    let shaper = proteus.into_shaper(epoch);
+    let (shaper, controller) = proteus.build(epoch);
     let (server, client) = node_configs()?;
     spawn_inner(
         engine,
         directory,
         Some(shaper),
-        None,
+        controller,
+        None, // identity
         server,
         client,
         default_bind(),
@@ -824,10 +876,12 @@ pub async fn spawn_shaped(
 
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
 /// `tokio::spawn`s tasks); the public wrappers stay `async` for API stability.
+#[allow(clippy::too_many_arguments)]
 fn spawn_inner(
     engine: Box<dyn Engine + Send>,
     directory: Directory,
     shaper: Shaper,
+    controller: MaybeController,
     identity: Identity,
     mut server_cfg: ServerConfig,
     mut client_cfg: ClientConfig,
@@ -860,6 +914,7 @@ fn spawn_inner(
         conns,
         input_tx: input_tx.clone(),
         shaper,
+        controller,
         identity,
         me: addr,
         reflexive: reflexive.clone(),
@@ -1036,11 +1091,21 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     // loop for the full QUIC handshake timeout. That stall is the #129 availability bug — a `get`'s
     // `Lookup`s to live shard-homes were blocked behind a dead peer's dial, so the erasure shards never
     // gathered even though the redundancy tolerates the loss. A real peer answers in well under this.
-    let connecting = t.endpoint.connect(addr, "fanos.node").ok()?;
-    let conn = tokio::time::timeout(DIAL_TIMEOUT, connecting)
-        .await
-        .ok()?
-        .ok()?;
+    // A connect failure (the transport refused/timed out) feeds the morph auto-fallback breaker: a censored
+    // morph manifests exactly as connects that never complete (§13.7). A completed handshake resets it — the
+    // shaped transport is getting through, whatever the peer's identity check below concludes.
+    let established = match t.endpoint.connect(addr, "fanos.node") {
+        Ok(connecting) => tokio::time::timeout(DIAL_TIMEOUT, connecting)
+            .await
+            .ok()
+            .and_then(Result::ok),
+        Err(_) => None,
+    };
+    let Some(conn) = established else {
+        apply_outcome(&t.shaper, &t.controller, false);
+        return None;
+    };
+    apply_outcome(&t.shaper, &t.controller, true);
 
     match &t.identity {
         // HELLO mode: announce our coordinate as the first uni-stream.
@@ -1722,6 +1787,48 @@ mod tests {
                 Err(oneshot::error::TryRecvError::Closed)
             ),
             "the expired client's receiver is closed by the eviction (it will observe a failed put)",
+        );
+    }
+
+    /// The live morph-auto-fallback glue (§13.7): a failure trip drives the controller, which rotates the
+    /// real driver shaper's morph in place — verified off the network (the connect path calls this exact
+    /// function; a censored morph would otherwise only surface as slow connect timeouts).
+    #[test]
+    fn apply_outcome_rotates_the_shaper_morph_on_a_failure_trip() {
+        let shaper: Shaper = Some(Arc::new(RwLock::new(ProteusShaper::with_morph(
+            b"s".to_vec(),
+            Epoch::ZERO,
+            Morph::Polymorph,
+        ))));
+        let controller: MaybeController = Some(Arc::new(Mutex::new(MorphController::with_trip(
+            Environment::DeepCensorship,
+            1,
+        ))));
+        let morph = || shaper.as_ref().unwrap().read().unwrap().morph();
+
+        // A success is a breaker reset — the morph is unchanged.
+        apply_outcome(&shaper, &controller, true);
+        assert_eq!(morph(), Morph::Polymorph);
+        // Each failure (trip = 1) walks the DeepCensorship chain, installing the new morph on the shaper.
+        apply_outcome(&shaper, &controller, false);
+        assert_eq!(morph(), Morph::Fronted, "Polymorph → Fronted");
+        apply_outcome(&shaper, &controller, false);
+        assert_eq!(morph(), Morph::Webrtc, "Fronted → Webrtc");
+    }
+
+    #[test]
+    fn apply_outcome_is_a_noop_without_a_controller() {
+        // Fixed-morph mode (no environment): outcomes are never recorded, the morph never changes.
+        let shaper: Shaper = Some(Arc::new(RwLock::new(ProteusShaper::with_morph(
+            b"s".to_vec(),
+            Epoch::ZERO,
+            Morph::Polymorph,
+        ))));
+        apply_outcome(&shaper, &None, false);
+        assert_eq!(
+            shaper.as_ref().unwrap().read().unwrap().morph(),
+            Morph::Polymorph,
+            "a fixed morph never rotates"
         );
     }
 }

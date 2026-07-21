@@ -18,9 +18,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **PROTEUS auto-fallback + pluggable SPI** (§13.7, M10) — rotate morph on a connection-failure spike
-  (a local decision: the shaping morphs share the codec, so rotating the size/timing profile needs no
-  peer renegotiation); a `MorphCodec` SPI for the `pluggable` morph and real cover-protocol tunnels.
+- **PROTEUS pluggable-transport SPI** (§13.3 `pluggable`, M10) — a `MorphCodec` trait extension point so
+  third-party morphs (and real cover-protocol tunnels: tls-tunnel/masque/fronted, which need external
+  stacks per §13.8) plug in without touching the core shaper.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 - **VOPRF credit settlement** (Phase 4) — anonymous relay payment.
@@ -29,6 +29,13 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**PROTEUS morph auto-fallback — live** (§13.7) — `MorphController` circuit breaker (K consecutive connect
+failures trip a rotation through the environment chain, a success resets it) + `ProteusShaper::set_morph`
+(runtime profile swap; the codec-using morphs share a codec, so rotation is decode-compatible and local —
+no peer renegotiation). Wired into the fanos-quic driver: `ProteusConfig::auto(secret, env)`, connect
+outcomes recorded in `get_or_connect` (a censored morph surfaces as connect timeouts), rotation installs
+the new morph on the live shaper (`apply_outcome`, unit-tested off the network). Node knob
+`proteus_environment` / `--proteus-environment` (open, dpi-corporate, sni-filter, deep-censorship). ·
 **PROTEUS traffic-shaping morph transforms** (§13.3/§13.7) — a morph is "codec + traffic-shaper", but only
 the polymorph codec existed and ran for every morph. Added `profile::ShapingProfile` — the per-morph,
 θ_epoch-derived traffic-shaper: packet-SIZE (pad up to a sampled band) + inter-packet TIMING (exponential

@@ -111,6 +111,25 @@ impl Environment {
         let idx = chain.iter().position(|&m| m == failed)?;
         chain.get(idx + 1).copied()
     }
+
+    /// The canonical lowercase config/CLI name of this environment.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::DpiCorporate => "dpi-corporate",
+            Self::SniFilter => "sni-filter",
+            Self::DeepCensorship => "deep-censorship",
+        }
+    }
+
+    /// Parse an environment from its canonical [`name`](Self::name); `None` if unrecognised.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Open, Self::DpiCorporate, Self::SniFilter, Self::DeepCensorship]
+            .into_iter()
+            .find(|e| e.name() == name)
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +166,19 @@ mod tests {
             assert_eq!(Morph::from_name(m.name()), Some(m), "{m:?} name round-trips");
         }
         assert_eq!(Morph::from_name("nonsense"), None);
+    }
+
+    #[test]
+    fn environment_names_round_trip() {
+        for e in [
+            Environment::Open,
+            Environment::DpiCorporate,
+            Environment::SniFilter,
+            Environment::DeepCensorship,
+        ] {
+            assert_eq!(Environment::from_name(e.name()), Some(e), "{e:?} name round-trips");
+        }
+        assert_eq!(Environment::from_name("nonsense"), None);
     }
 
     #[test]

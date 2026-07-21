@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fanos_geometry::Triple;
-use fanos_quic::Morph;
+use fanos_quic::{Environment, Morph};
 use fanos_vrf::vss::{VssCommitment, VssShare};
 
 use crate::error::NodeError;
@@ -372,8 +372,13 @@ pub struct NodeConfig {
     pub proteus_secret: Option<Vec<u8>>,
     /// The PROTEUS morph selecting the wire codec and traffic-shaping profile (§13.3): the flagship
     /// [`Morph::Polymorph`] ("look like nothing", the default) or an explicit shaping morph. Only takes
-    /// effect when [`proteus_secret`](Self::proteus_secret) is set.
+    /// effect when [`proteus_secret`](Self::proteus_secret) is set, and is ignored when
+    /// [`proteus_environment`](Self::proteus_environment) enables auto-fallback (which picks the morph).
     pub proteus_morph: Morph,
+    /// The PROTEUS environment policy enabling **morph auto-fallback** (§13.7): `Some(env)` rotates through
+    /// the environment's morph chain when the current morph starts failing (a connection-failure spike);
+    /// `None` (the default) pins the fixed [`proteus_morph`](Self::proteus_morph). Only with a secret set.
+    pub proteus_environment: Option<Environment>,
 }
 
 impl Default for NodeConfig {
@@ -391,6 +396,7 @@ impl Default for NodeConfig {
             exit: None,
             proteus_secret: None,
             proteus_morph: Morph::Polymorph,
+            proteus_environment: None,
         }
     }
 }
@@ -450,6 +456,14 @@ impl NodeConfig {
                              tls-tunnel, masque-h3, fronted, webrtc, pluggable)"
                         ))
                     })?;
+                }
+                "proteus_environment" => {
+                    config.proteus_environment = Some(Environment::from_name(value).ok_or_else(|| {
+                        NodeError::Config(format!(
+                            "unknown proteus_environment '{value}' (expected one of: open, \
+                             dpi-corporate, sni-filter, deep-censorship)"
+                        ))
+                    })?);
                 }
                 other => {
                     return Err(NodeError::Config(format!(
@@ -619,5 +633,14 @@ mod tests {
         let cfg = NodeConfig::from_config_str("proteus_morph = tls-tunnel").unwrap();
         assert_eq!(cfg.proteus_morph, Morph::TlsTunnel);
         assert!(NodeConfig::from_config_str("proteus_morph = nonsense").is_err());
+    }
+
+    #[test]
+    fn proteus_environment_enables_auto_fallback() {
+        // Off by default (fixed morph); a valid environment enables auto-fallback; a bad name errors.
+        assert!(NodeConfig::default().proteus_environment.is_none());
+        let cfg = NodeConfig::from_config_str("proteus_environment = deep-censorship").unwrap();
+        assert_eq!(cfg.proteus_environment, Some(Environment::DeepCensorship));
+        assert!(NodeConfig::from_config_str("proteus_environment = nowhere").is_err());
     }
 }
