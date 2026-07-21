@@ -18,7 +18,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP (OS TUN device; verification needs a TUN harness).
+- **`fanos vpn` / TUN — driver + TCP mode** (Phase 5) — the datapath *engine* (UDP/DNS) has landed (crate
+  `fanos-vpn`); remaining: the thin TUN driver (`/dev/net/tun` / `utun` ↔ engine ↔ `dial_exit_udp` tunnels,
+  the untestable-in-CI I/O shell) and full-tunnel **TCP mode** (a userspace TCP/IP stack — the large piece).
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 
@@ -31,6 +33,14 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**VPN datapath engine — the UDP/DNS mode** (Phase 5, §11.4) — NEW crate `fanos-vpn`: the sans-I/O routing
+brain of `fanos vpn`, following the node's engine/driver split. An IPv4/UDP packet codec (`packet.rs`:
+parse + build with valid IPv4-header and pseudo-header UDP checksums, index-free parsing) and the flow
+engine (`engine.rs`: `classify` an inbound TUN packet → `VpnAction::RelayUdp{flow,payload,is_dns}` keyed on
+the 4-tuple, or `Drop` for TCP/IPv6/malformed; `response_packet` rebuilds an exit response into a TUN packet
+with endpoints swapped). "UDP mode" (design.md §11) needs no userspace TCP stack — this tunnels DNS + UDP
+(QUIC/…). Verified with synthetic packets: checksums verify, build↔parse round-trips, classify/drop, and a
+swapped-endpoint response round-trip. The TUN driver + TCP mode are the next slices. ·
 **C ABI — service hosting → the §11.2 surface is COMPLETE** (#113, M9) — `fanos_service_host(node, seed,
 addr_out, cap)` derives a stable service identity from a seed, hosts it (forwarding each accepted DIAULOS
 session onto an accept queue over the closure-based `serve`), publishes its descriptor, and returns the

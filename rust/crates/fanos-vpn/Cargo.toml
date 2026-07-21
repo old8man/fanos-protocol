@@ -1,0 +1,18 @@
+[package]
+name = "fanos-vpn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS VPN datapath (spec §11.4): a sans-I/O IPv4/UDP flow engine that tunnels UDP/DNS through a FANOS exit; the TUN driver and userspace-TCP mode layer on top."
+keywords = ["vpn", "tun", "dns", "anonymity", "fanos"]
+categories = ["network-programming"]
+
+[dependencies]
+# Slice 1 (the UDP/DNS packet codec + flow engine) is pure std — no fanos or async deps. The TUN driver and
+# exit wiring (fanos-node, tokio) land in later slices.
+
+[lints]
+workspace = true
