@@ -71,12 +71,17 @@ mod tests {
     use fanos_proxy::dialer::EchoDialer;
     use tokio::time::timeout;
 
-    use super::*;
-    use crate::packet::{build_ipv4_udp, parse_ipv4_udp};
+    use std::net::IpAddr;
 
-    const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
-    const RESOLVER: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
-    const HOST: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+    use super::*;
+    use crate::packet::{build_ipv4_udp, parse_udp};
+
+    const CLIENT4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const RESOLVER4: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
+    const HOST4: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+    const CLIENT: IpAddr = IpAddr::V4(CLIENT4);
+    const RESOLVER: IpAddr = IpAddr::V4(RESOLVER4);
+    const HOST: IpAddr = IpAddr::V4(HOST4);
 
     #[tokio::test]
     async fn a_udp_flow_relays_out_and_the_response_returns_as_a_tun_packet() {
@@ -86,7 +91,7 @@ mod tests {
         tokio::spawn(run_udp_datapath(EchoDialer, in_rx, out_tx));
 
         // A DNS query captured at the TUN.
-        let query = build_ipv4_udp((CLIENT, 5555), (RESOLVER, 53), b"dns-query");
+        let query = build_ipv4_udp((CLIENT4, 5555), (RESOLVER4, 53), b"dns-query");
         in_tx.send(query).await.unwrap();
 
         // It round-trips: the response comes back as a TUN packet from the resolver to the client.
@@ -94,19 +99,19 @@ mod tests {
             .await
             .expect("no timeout")
             .expect("a reply packet");
-        let dg = parse_ipv4_udp(&reply).unwrap();
+        let dg = parse_udp(&reply).unwrap();
         assert_eq!(dg.src, (RESOLVER, 53), "reply is from the resolver");
         assert_eq!(dg.dst, (CLIENT, 5555), "back to the client");
         assert_eq!(dg.payload, b"dns-query");
 
         // A second, different flow (QUIC to a web host) opens its own tunnel and also round-trips.
-        let quic = build_ipv4_udp((CLIENT, 6000), (HOST, 443), b"quic-initial");
+        let quic = build_ipv4_udp((CLIENT4, 6000), (HOST4, 443), b"quic-initial");
         in_tx.send(quic).await.unwrap();
         let reply2 = timeout(Duration::from_secs(2), out_rx.recv())
             .await
             .expect("no timeout")
             .expect("a reply packet");
-        let dg2 = parse_ipv4_udp(&reply2).unwrap();
+        let dg2 = parse_udp(&reply2).unwrap();
         assert_eq!(dg2.src, (HOST, 443));
         assert_eq!(dg2.dst, (CLIENT, 6000));
         assert_eq!(dg2.payload, b"quic-initial");
@@ -118,7 +123,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
         tokio::spawn(run_udp_datapath(EchoDialer, in_rx, out_tx));
 
-        let mut tcp = build_ipv4_udp((CLIENT, 1), (HOST, 80), b"x");
+        let mut tcp = build_ipv4_udp((CLIENT4, 1), (HOST4, 80), b"x");
         tcp[9] = 6; // protocol → TCP
         in_tx.send(tcp).await.unwrap();
         // Nothing is relayed, so nothing comes back (a short wait times out).

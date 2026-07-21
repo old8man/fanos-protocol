@@ -66,17 +66,19 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
     use fanos_proxy::dialer::EchoDialer;
     use tokio::time::timeout;
 
     use super::*;
-    use crate::packet::{build_ipv4_udp, parse_ipv4_udp};
+    use crate::packet::{build_ipv4_udp, parse_udp};
 
-    const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
-    const RESOLVER: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
+    const CLIENT4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const RESOLVER4: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
+    const CLIENT: IpAddr = IpAddr::V4(CLIENT4);
+    const RESOLVER: IpAddr = IpAddr::V4(RESOLVER4);
 
     /// An in-memory TUN device: `recv_packet` drains a channel the test feeds; `send_packet` forwards to a
     /// channel the test reads. Standing in for the real `/dev/net/tun` fd.
@@ -106,13 +108,13 @@ mod tests {
 
         // A DNS query "arrives" at the TUN; it must come back out of the TUN as a reply packet from the
         // resolver to the client (the echo dialer stands in for the exit).
-        let query = build_ipv4_udp((CLIENT, 5555), (RESOLVER, 53), b"dns-query");
+        let query = build_ipv4_udp((CLIENT4, 5555), (RESOLVER4, 53), b"dns-query");
         feed_tx.send(query).await.unwrap();
         let out = timeout(Duration::from_secs(2), sent_rx.recv())
             .await
             .expect("no timeout")
             .expect("a packet is written back to the device");
-        let dg = parse_ipv4_udp(&out).unwrap();
+        let dg = parse_udp(&out).unwrap();
         assert_eq!(dg.src, (RESOLVER, 53));
         assert_eq!(dg.dst, (CLIENT, 5555));
         assert_eq!(dg.payload, b"dns-query");

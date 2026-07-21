@@ -27,4 +27,7 @@ pub mod packet;
 pub use driver::{TunReader, TunWriter, run_vpn};
 pub use engine::{DNS_PORT, FlowKey, VpnAction, classify, response_packet};
 pub use mux::run_udp_datapath;
-pub use packet::{IPPROTO_UDP, UdpDatagram, build_ipv4_udp, parse_ipv4_udp};
+pub use packet::{
+    IPPROTO_UDP, UdpDatagram, build_ipv4_udp, build_ipv6_udp, build_udp, parse_ipv4_udp,
+    parse_ipv6_udp, parse_udp,
+};
