@@ -102,6 +102,14 @@ pub enum Command {
         /// The application key.
         key: Vec<u8>,
     },
+    /// **Data-availability sample** `key` (spec §L4.3): probe a few unpredictable Fano *lines* to confirm
+    /// the value's erasure shards are present, without downloading it — a cheap availability check for a
+    /// light client. Produces a [`Notification::Availability`]. By the Steiner soundness (`fanos_code::da`)
+    /// two distinct passing line-samples certify availability against any withholding adversary.
+    SampleAvailability {
+        /// The application key to sample.
+        key: Vec<u8>,
+    },
     /// Announce this node's presence and `info` (e.g. its public key) to the cell; the
     /// announcement floods so every member learns it (spec §7.8 JOIN).
     Join {
@@ -216,6 +224,15 @@ pub enum Notification {
         key: [u8; 32],
         /// The retrieved value, or `None` if the cell held no value for the key.
         value: Option<Vec<u8>>,
+    },
+    /// A [`Command::SampleAvailability`] completed (spec §L4.3): whether the sampled Fano lines were all
+    /// present. `available = true` certifies the value is retrievable (Steiner soundness, `fanos_code::da`);
+    /// `false` means a sampled line was incomplete — inconclusive, retry or fall back to a full read.
+    Availability {
+        /// The 32-byte key digest sampled.
+        key: [u8; 32],
+        /// Whether every sampled line's shards were present.
+        available: bool,
     },
     /// A cell member announced itself (spec §7.8 JOIN): its coordinate and info (e.g. public key).
     MemberJoined {

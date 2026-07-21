@@ -7,8 +7,20 @@
 use fanos_field::F2;
 use fanos_geometry::fano;
 use fanos_primitives::{hash::label, map_to_point};
-use fanos_runtime::{Command, Config, Duration, OverlayNode};
+use fanos_runtime::{Command, Config, Duration, Notification, OverlayNode};
 use fanos_sim::{Sim, spawn_cell};
+
+/// The latest `Availability` verdict `node` observed, if any.
+fn availability(sim: &Sim, node: [u32; 3]) -> Option<bool> {
+    sim.report()
+        .notifications
+        .iter()
+        .rev()
+        .find_map(|o| match &o.note {
+            Notification::Availability { available, .. } if o.node == node => Some(*available),
+            _ => None,
+        })
+}
 
 /// The responsible point index and coordinate for `key` (the `MapToPoint(H(key))` address).
 fn responsible(key: &[u8], cell: &[[u32; 3]]) -> (usize, [u32; 3]) {
@@ -394,5 +406,74 @@ fn a_later_write_supersedes_an_earlier_one_last_writer_wins() {
         got,
         Some(Some(b"second-value-is-newer".to_vec())),
         "the later write wins (last-writer-wins by version); shards are never mixed into garbage"
+    );
+}
+
+/// **§L4.3 DA sampling — available (#115 Phase C).** After a value settles, a light-client DA sample
+/// (probing a few unpredictable Fano lines) certifies it available without downloading it.
+#[test]
+fn da_sampling_certifies_an_available_value() {
+    let (mut sim, cell) = established(200);
+    sim.inject(
+        cell[0],
+        Command::Put {
+            key: b"da-key".to_vec(),
+            value: b"available-payload".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(1500));
+
+    sim.inject(
+        cell[3],
+        Command::SampleAvailability {
+            key: b"da-key".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(1500));
+
+    assert_eq!(
+        availability(&sim, cell[3]),
+        Some(true),
+        "an intact value samples available (all sampled lines present)"
+    );
+}
+
+/// **§L4.3 DA sampling — unavailable.** Crashing a hyperoval (4 points, no 3 collinear) makes the value
+/// unrecoverable; by the Steiner soundness (`fanos_code::da`) a DA sample of distinct lines detects it — the
+/// sampled lines cannot all be present when a hyperoval is missing (≤1 external line).
+#[test]
+fn da_sampling_detects_an_unavailable_value() {
+    use fanos_code::is_hyperoval_fano;
+    let hyperoval = (0u8..=0x7F).find(|&m| is_hyperoval_fano(m)).unwrap();
+
+    let (mut sim, _cell) = established(201);
+    sim.inject(
+        fano::point(0).coords(),
+        Command::Put {
+            key: b"da-key2".to_vec(),
+            value: b"about-to-be-unavailable".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(1500));
+
+    // Crash the hyperoval's points — the value is now unrecoverable (is_recoverable_fano false).
+    for i in 0..7usize {
+        if hyperoval & (1u8 << i) != 0 {
+            sim.crash(fano::point(i).coords());
+        }
+    }
+    let reader = fano::point((0..7).find(|i| hyperoval & (1u8 << i) == 0).unwrap()).coords();
+    sim.inject(
+        reader,
+        Command::SampleAvailability {
+            key: b"da-key2".to_vec(),
+        },
+    );
+    sim.run_for(Duration::from_millis(2500)); // conclude on the read timeout
+
+    assert_eq!(
+        availability(&sim, reader),
+        Some(false),
+        "a hyperoval-withheld (unrecoverable) value samples unavailable"
     );
 }

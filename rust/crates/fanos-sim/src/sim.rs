@@ -36,6 +36,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Observe => "Observe",
         Command::Put { .. } => "Put",
         Command::Get { .. } => "Get",
+        Command::SampleAvailability { .. } => "SampleAvailability",
         Command::Join { .. } => "Join",
         Command::AdvanceEpoch => "AdvanceEpoch",
         Command::Reseat { .. } => "Reseat",
@@ -63,6 +64,15 @@ fn note_desc(note: &Notification) -> String {
             "Retrieved {} ({})",
             short_digest(key),
             value.as_ref().map_or("miss", |_| "hit")
+        ),
+        Notification::Availability { key, available } => format!(
+            "Availability {} ({})",
+            short_digest(key),
+            if *available {
+                "available"
+            } else {
+                "unavailable"
+            }
         ),
         Notification::MemberJoined { coord, .. } => format!("MemberJoined {}", fmt_coord(*coord)),
         Notification::EpochAdvanced(e) => format!("EpochAdvanced {e}"),

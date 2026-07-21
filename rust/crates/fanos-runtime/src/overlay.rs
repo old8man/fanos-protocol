@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_code::erasure;
+use fanos_code::{da, erasure};
 use fanos_core::AdmissionPolicy;
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
@@ -100,6 +100,10 @@ const MAX_PENDING_GETS: usize = 1024;
 /// one (last-writer-wins); honestly there are only a handful in flight (the cell converges to one version),
 /// so this bounds a Byzantine peer that sprays fabricated versions to grow the accumulator (A4 DoS).
 const MAX_READ_VERSIONS: usize = 8;
+/// How many distinct Fano lines a [`Command::SampleAvailability`] probes (spec §L4.3). `3` gives an
+/// independent-sampling false-available bound of `(1/7)³ ≈ 0.3%`, and — since `≥2` distinct passing samples
+/// certify availability against any withholding adversary (`fanos_code::da`) — a comfortable margin.
+const DA_SAMPLES: usize = 3;
 
 /// How long a locally-distrusted (Byzantine) member stays quarantined before it is re-admitted for
 /// re-evaluation. Quarantine is an *operational* safeguard, not a proven permanent exclusion (spec §6.2):
@@ -211,6 +215,21 @@ struct PendingGet {
     negatives: u16,
 }
 
+/// An in-flight [`Command::SampleAvailability`] (spec §L4.3): the distinct Fano lines being sampled and the
+/// mask of points confirmed present so far. The sample probes only the sampled lines' shard homes (a cheap
+/// availability check, not a full download); it concludes **available** as soon as every sampled line is
+/// fully present, else the read-timeout sweep concludes it unavailable.
+#[derive(Clone, Debug)]
+struct PendingSample {
+    issued: Instant,
+    /// The per-request nonce correlating probe replies (shared with the read path's `Value` frames, C4).
+    nonce: u64,
+    /// The distinct Fano lines this sample is checking (from `da::sample_lines`).
+    lines: Vec<usize>,
+    /// Points confirmed present (bit `i` ⇒ point `i`'s shard was returned): the DA `present` mask.
+    present: u8,
+}
+
 /// Reconstruct the **highest** write-version whose gathered shard-set is recoverable (spec §L4
 /// last-writer-wins): iterate versions descending, returning the first that [`erasure::reconstruct`]s — so a
 /// stale version that happens to complete first can never mask a fresher one, and mixed-version shards are
@@ -233,6 +252,8 @@ struct Store {
     entries: BTreeMap<[u8; DIGEST], HeldShards>,
     /// In-flight `Get`s awaiting shards, keyed by digest — the gather-and-reconstruct accumulator.
     pending: BTreeMap<[u8; DIGEST], PendingGet>,
+    /// In-flight DA samples ([`Command::SampleAvailability`]), keyed by digest (spec §L4.3).
+    pending_samples: BTreeMap<[u8; DIGEST], PendingSample>,
     /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
     seq: u64,
 }
@@ -262,11 +283,7 @@ impl Store {
 
     /// Seed this node's held shards for `digest` into a read's version-grouped accumulator (each point's
     /// shard into its version's slot) — the local contribution before the network replies arrive.
-    fn seed_versions(
-        &self,
-        digest: &[u8; DIGEST],
-        by_version: &mut VersionedShards,
-    ) {
+    fn seed_versions(&self, digest: &[u8; DIGEST], by_version: &mut VersionedShards) {
         if let Some(held) = self.entries.get(digest) {
             for (&i, (version, shard)) in held {
                 if let Some(slot) = by_version.entry(*version).or_default().get_mut(i as usize) {
@@ -1167,6 +1184,23 @@ impl<F: Field> OverlayNode<F> {
                 value: None,
             }));
         }
+        // Conclude timed-out DA samples (§L4.3): a sample that never saw every sampled line present within the
+        // timeout is inconclusive → `available = false` (a passing sample would have concluded early).
+        let stale_samples: Vec<[u8; DIGEST]> = self
+            .store
+            .pending_samples
+            .iter()
+            .filter(|(_, s)| now.since(s.issued) > timeout)
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in stale_samples {
+            if let Some(sample) = self.store.pending_samples.remove(&digest) {
+                effects.push(Effect::Notify(Notification::Availability {
+                    key: digest,
+                    available: da::samples_pass(sample.present, &sample.lines),
+                }));
+            }
+        }
     }
 
     /// Encode this node's direct-observation ages over the Fano cell: `7 × u16` little-endian
@@ -1633,6 +1667,74 @@ impl<F: Field> OverlayNode<F> {
             .collect()
     }
 
+    /// `Command::SampleAvailability` — the light-client DA sample (spec §L4.3): probe a few unpredictable
+    /// Fano lines to certify the value's shards are present, without downloading it. Seeds the `present` mask
+    /// from local shards, picks `DA_SAMPLES` distinct lines ([`da::sample_lines`]) from an unpredictable seed
+    /// (fold of the digest ⊕ a fresh nonce — so a withholding adversary cannot pre-position the lone external
+    /// line), and probes only the sampled points' shard homes. Concludes `available` as soon as every sampled
+    /// line is fully present ([`da::samples_pass`]); the sweep concludes it (unavailable) after the timeout.
+    fn on_sample(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
+        let (digest, _ideal) = Self::address_of(key);
+        self.store.seq = self.store.seq.wrapping_add(1);
+        let nonce = self.store.seq;
+        let lines = da::sample_lines(fold_seed(&digest) ^ nonce, DA_SAMPLES);
+        // Seed the DA `present` mask from any shards this node itself holds.
+        let mut present = 0u8;
+        if let Some(held) = self.store.entries.get(&digest) {
+            for &i in held.keys() {
+                if usize::from(i) < erasure::N {
+                    present |= 1 << i;
+                }
+            }
+        }
+        // Probe the distinct shard homes of the sampled lines' points (self is already seeded).
+        let me = self.coord.coords();
+        let mut targets: BTreeSet<Triple> = BTreeSet::new();
+        for &l in &lines {
+            let Some(points) = fano::LINE_POINTS.get(l) else {
+                continue;
+            };
+            for &p in points {
+                let home = self.nearest_occupied(usize::from(p));
+                if home != me {
+                    targets.insert(home);
+                }
+            }
+        }
+        // Already satisfied locally, or nobody else to probe — conclude now.
+        if da::samples_pass(present, &lines) || targets.is_empty() {
+            return alloc::vec![Effect::Notify(Notification::Availability {
+                key: digest,
+                available: da::samples_pass(present, &lines),
+            })];
+        }
+        // A4 DoS cap (shared spirit with reads): bound the in-flight sample map.
+        if self.store.pending_samples.len() >= MAX_PENDING_GETS
+            && !self.store.pending_samples.contains_key(&digest)
+        {
+            return alloc::vec![Effect::Notify(Notification::Availability {
+                key: digest,
+                available: false,
+            })];
+        }
+        self.store.pending_samples.insert(
+            digest,
+            PendingSample {
+                issued: now,
+                nonce,
+                lines,
+                present,
+            },
+        );
+        targets
+            .into_iter()
+            .map(|t| Effect::Send {
+                to: t,
+                frame: encode_lookup(&digest, nonce),
+            })
+            .collect()
+    }
+
     /// Erasure-code `value` into `N=7` point-shards and place each at its point's nearest-occupied home
     /// (spec §L4 projective LRC): shard `i` → [`nearest_occupied`](Self::nearest_occupied)`(i)`. Shards homed
     /// at this node are stored locally; the rest are sent as `PUBLISH_SHARD` frames carrying the point index.
@@ -1742,8 +1844,26 @@ impl<F: Field> OverlayNode<F> {
         let Some(nonce) = parse_u64(body, DIGEST + 10) else {
             return Vec::new();
         };
-        // Correlate on the per-request nonce, NOT merely the key: a reply is accepted only for the read
-        // currently in flight for this key. A stale/replayed `Value` from a prior get (old nonce), or one
+        // A `Value` may answer an in-flight DA sample (§L4.3) rather than a read — the distinct per-request
+        // nonce disambiguates. Route it there first: mark the point present and, once every sampled line is
+        // present, conclude the value available.
+        if let Some(sample) = self.store.pending_samples.get_mut(&digest)
+            && sample.nonce == nonce
+        {
+            if found && usize::from(index) < erasure::N {
+                sample.present |= 1u8 << index;
+            }
+            if da::samples_pass(sample.present, &sample.lines) {
+                self.store.pending_samples.remove(&digest);
+                return alloc::vec![Effect::Notify(Notification::Availability {
+                    key: digest,
+                    available: true,
+                })];
+            }
+            return Vec::new();
+        }
+        // Otherwise correlate on the per-request nonce, NOT merely the key: a reply is accepted only for the
+        // read currently in flight for this key. A stale/replayed `Value` from a prior get (old nonce), or one
         // with no in-flight read at all, is ignored — so it can never drain a later same-key get with an old
         // shard (read-your-writes, audit C4).
         let Some(pending) = self.store.pending.get_mut(&digest) else {
@@ -2220,6 +2340,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Observe) => self.on_observe(now),
             Input::Command(Command::Put { key, value }) => self.on_put(now, &key, &value),
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
+            Input::Command(Command::SampleAvailability { key }) => self.on_sample(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
@@ -2315,6 +2436,17 @@ fn encode_value(
     body.extend_from_slice(&nonce.to_be_bytes());
     body.extend_from_slice(shard);
     encode(FrameType::Value, &body)
+}
+
+/// Fold a key digest into a `u64` seed for DA line-sampling (§L4.3): the first 8 digest bytes. The digest is a
+/// hash, so this is unpredictable to anyone who does not know the key — which is what denies a withholding
+/// adversary the chance to pre-position the lone external line.
+fn fold_seed(digest: &[u8; DIGEST]) -> u64 {
+    let mut head = [0u8; 8];
+    for (h, &b) in head.iter_mut().zip(digest.iter()) {
+        *h = b;
+    }
+    u64::from_le_bytes(head)
 }
 
 /// Parse a big-endian `u64` at byte offset `off` from `body`, or `None` if it is too short.

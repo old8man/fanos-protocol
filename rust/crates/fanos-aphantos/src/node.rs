@@ -509,6 +509,7 @@ impl<F: Field> Engine for NyxNode<F> {
                 | Command::Observe
                 | Command::Put { .. }
                 | Command::Get { .. }
+                | Command::SampleAvailability { .. }
                 | Command::Join { .. }
                 | Command::AdvanceEpoch
                 | Command::Reseat { .. },

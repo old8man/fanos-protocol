@@ -28,12 +28,16 @@ pub mod lrc;
 pub mod syndrome;
 
 #[cfg(feature = "alloc")]
+pub mod da;
+#[cfg(feature = "alloc")]
 pub mod erasure;
 
 pub use hamming::{LINE_CODEWORDS, point_address, syndrome as hamming_syndrome};
 pub use lrc::{is_hyperoval_fano, is_recoverable_fano, peel_fano};
 pub use syndrome::{Fault, Sector, decode_themes, locate, syndrome3, theme_flags};
 
+#[cfg(feature = "alloc")]
+pub use da::{false_available_bound, line_present, sample_lines, samples_pass};
 #[cfg(feature = "alloc")]
 pub use erasure::{encode, reconstruct};
 
