@@ -14,6 +14,7 @@ use fanos_code::{da, erasure};
 use fanos_core::AdmissionPolicy;
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
+use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
@@ -70,6 +71,18 @@ const DECOUPLE_DWELL: u32 = 3;
 /// colluder minority (tolerates up to 3 vouch-fabricators, exceeding the plain `corroboration_quorum`).
 const ENDPOINT_WINDOW: usize = 5;
 const ENDPOINT_MIN_STALE: usize = 3;
+
+/// §6.5 partition sensor (V14). A cell **line** counts as carrying live connectivity iff its worst pairwise
+/// channel loss (measured, the #106 grey substrate) is below this — a fully-cut channel (`loss → 1`) or a
+/// heavily-grey one drops the line, while honest jitter (`loss ≈ 0.05–0.15`) keeps it. Pinned by the sim
+/// sweep (`coherence_live` / partition tests): it sits well above the jitter floor and below a cut/grey line.
+const LINE_CUT_LOSS: f64 = 0.5;
+/// §6.5 persistence: a partition candidate (the loss-weighted line graph disconnects, [`partition::is_connected`]
+/// false) must hold this many consecutive diagnoses before `Verdict::Partition` is trusted. A recovery
+/// transient — a just-healed node whose loss EWMA still lags, so its `q+1` lines read cut for a round or two
+/// while it reads alive — does not persist, so it never false-fires; only a sustained lossy line-cover (a real
+/// incipient split with nodes still alive) survives. `4` heartbeats > the EWMA recovery window.
+const PARTITION_DWELL: u32 = 4;
 
 /// §6.3 grey-detection loss EWMA smoothing factor. Each heartbeat folds one per-neighbour ping-answered
 /// sample; `0.25` averages over ~4 rounds (~2 s at the default heartbeat), enough to distinguish a grey
@@ -506,6 +519,10 @@ struct Healer {
     /// node believed-alive — the third-order fault the plain corroboration quorum, which only *counts*
     /// vouchers, cannot see. Bounded (`≤ ENDPOINT_WINDOW` tiny arrays), so it adds no unbounded state.
     endpoint_window: VecDeque<[Option<u8>; 7]>,
+    /// §6.5 partition-sensor hysteresis: consecutive diagnoses whose loss-weighted line graph is
+    /// disconnected. `Verdict::Partition` is trusted only once this reaches [`PARTITION_DWELL`], so a
+    /// recovery-loss transient never false-fires (resets to 0 on any connected reading).
+    partition_streak: u32,
 }
 
 impl Healer {
@@ -529,6 +546,7 @@ impl Healer {
             last_sample: [0.0; 7],
             rebalancing: false,
             endpoint_window: VecDeque::new(),
+            partition_streak: 0,
         }
     }
 
@@ -692,12 +710,14 @@ impl Healer {
     /// behavioural `Γ_net` (the #74 unification) plus the live polar cross-attestation into `diagnose`,
     /// runs the verdict→plan→actuate path (over-coupling gated by the [`DECOUPLE_DWELL`] hysteresis, #122),
     /// then the homeostat's re-integration/escalation bands, and finally the mandatory self-observation.
+    #[allow(clippy::too_many_arguments)] // the sensed cell snapshot: index, degraded, alive, lines, config, epoch
     fn diagnose<F: Field>(
         &mut self,
         now: Instant,
         self_index: usize,
         degraded: u8,
         alive_count: usize,
+        healthy_lines: Option<u8>,
         config: &Config,
         epoch: Epoch,
     ) -> Vec<Effect> {
@@ -714,11 +734,36 @@ impl Healer {
         // so this never pre-empts the ordinary crash/churn path below, however many members are down.
         let pairwise_rates =
             self.attested_pairwise_rates::<F>(now, degraded, config.liveness_timeout);
+        // §6.5 partition sensor (V14): `healthy_lines` names which cell lines carry live inter-node
+        // connectivity, derived from the *measured* per-channel loss (the #106 grey substrate) — an
+        // INDEPENDENT signal, not the node-liveness `degraded` mask (that would be redundant with the crash
+        // path). Persistence guard: a disconnected loss-weighted graph is only trusted after
+        // [`PARTITION_DWELL`] consecutive readings, so a recovery-loss transient (a just-healed node whose
+        // lines still read cut for a round) never false-fires; below the dwell we present the cell as fully
+        // connected so no premature `Verdict::Partition` escapes. Partition-resistance (one lossy line still
+        // reads λ₂=4) means only a sustained lossy line-COVER — a real incipient split, nodes still alive —
+        // ever reaches the verdict.
+        // A partition candidate is only meaningful when the cell is ALL-ALIVE: if any node is down
+        // (`degraded != 0`) the disconnection is explained by the crash and handled by the node-fault path, so
+        // it must NOT build the partition streak (else a crash+recovery churn would accumulate the streak and
+        // false-fire on the recovery transient). Only a sustained *all-alive* disconnection — a real incipient
+        // split, nodes still up — accumulates.
+        let disconnected =
+            degraded == 0 && healthy_lines.is_some_and(|h| !partition::is_connected(h));
+        self.partition_streak = if disconnected {
+            self.partition_streak.saturating_add(1)
+        } else {
+            0
+        };
+        let trusted_lines = match healthy_lines {
+            Some(_) if disconnected && self.partition_streak < PARTITION_DWELL => Some(0x7F),
+            other => other,
+        };
         let verdict = diagnose(&Observation {
             degraded,
             pairwise_rates: Some(pairwise_rates),
             coherence: measured.clone(),
-            ..Default::default()
+            healthy_lines: trusted_lines,
         });
 
         // Hysteresis for the over-coupling shed (audit #122): count consecutive over-coupled diagnoses,
@@ -2239,11 +2284,16 @@ impl<F: Field> OverlayNode<F> {
         let Some((self_index, degraded, alive_count)) = self.cell_liveness(now) else {
             return Vec::new();
         };
+        // §6.5 partition sensor: the loss-derived healthy-line mask (independent of node liveness). `diagnose`
+        // consults it only in the all-alive branch and behind a persistence dwell, so this is safe to pass
+        // every round.
+        let healthy_lines = self.partition_healthy_lines(now);
         let mut effects = self.healer.diagnose::<F>(
             now,
             self_index,
             degraded,
             alive_count,
+            Some(healthy_lines),
             &self.config,
             self.epoch,
         );
@@ -2261,6 +2311,30 @@ impl<F: Field> OverlayNode<F> {
         // a lie, so it is never quarantined). Deduped to fire once per grey episode.
         effects.extend(self.detect_grey(now));
         effects
+    }
+
+    /// The §6.5 healthy-line mask: bit `l` set ⇔ Fano line `l` carries live connectivity, i.e. its **worst**
+    /// pairwise channel loss (from the measured [`grey_rate_matrix`](Self::grey_rate_matrix)) is below
+    /// [`LINE_CUT_LOSS`]. A line is only as good as its worst channel, so a line whose crossing channel is
+    /// cut/grey reads unhealthy even if its other channels are fine — exactly the signal an incipient split
+    /// (a lossy line-cover, nodes alive) presents. Feeds `partition::is_connected` inside `diagnose`.
+    fn partition_healthy_lines(&self, now: Instant) -> u8 {
+        let loss = self.grey_rate_matrix(now);
+        let at = |a: usize, b: usize| loss.get(a).and_then(|r| r.get(b)).copied().unwrap_or(0.0);
+        let mut healthy = 0u8;
+        for l in 0..7usize {
+            let Some(points) = fano::LINE_POINTS.get(l) else {
+                continue;
+            };
+            let [a, b, c]: [usize; 3] =
+                core::array::from_fn(|i| points.get(i).map_or(0, |&p| usize::from(p)));
+            // The line's worst pairwise channel loss among its three points.
+            let worst = at(a, b).max(at(a, c)).max(at(b, c));
+            if worst < LINE_CUT_LOSS {
+                healthy |= 1u8 << l;
+            }
+        }
+        healthy
     }
 
     /// Assemble the symmetric measured-loss channel-rate matrix (§6.3): `rate[a][b] = max(a's loss toward b,

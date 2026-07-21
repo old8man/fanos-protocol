@@ -28,6 +28,13 @@ pub struct NetworkModel {
     pub loss: f64,
     /// If non-empty, a complete partition of nodes into groups that can only reach within.
     partitions: Vec<BTreeSet<Triple>>,
+    /// A **soft** partition (§6.5 incipient-split research): messages *crossing* between these groups are
+    /// dropped with probability [`cross_loss`](Self::cross_loss) instead of hard-cut, so the far side stays
+    /// (marginally) reachable and corroborated-alive while the crossing lines read lossy — the exact regime
+    /// the loss-weighted Fiedler partition sensor must catch that liveness monitoring cannot.
+    soft_partitions: Vec<BTreeSet<Triple>>,
+    /// Extra drop probability applied to a message crossing [`soft_partitions`](Self::soft_partitions).
+    cross_loss: f64,
 }
 
 impl Default for NetworkModel {
@@ -37,6 +44,8 @@ impl Default for NetworkModel {
             jitter: Duration::from_millis(10),
             loss: 0.0,
             partitions: Vec::new(),
+            soft_partitions: Vec::new(),
+            cross_loss: 0.0,
         }
     }
 }
@@ -50,6 +59,8 @@ impl NetworkModel {
             jitter,
             loss,
             partitions: Vec::new(),
+            soft_partitions: Vec::new(),
+            cross_loss: 0.0,
         }
     }
 
@@ -73,6 +84,11 @@ impl NetworkModel {
         if self.loss > 0.0 && rng.chance(self.loss) {
             return None;
         }
+        // A soft partition: a message crossing between two soft groups is dropped with `cross_loss` — a lossy
+        // but not fully-cut bisection (§6.5 incipient split).
+        if self.cross_loss > 0.0 && self.crosses_soft(from, to) && rng.chance(self.cross_loss) {
+            return None;
+        }
         let jitter = (rng.unit() * self.jitter.as_nanos() as f64) as u64;
         Some(Duration(
             self.base_latency.as_nanos().saturating_add(jitter),
@@ -87,9 +103,34 @@ impl NetworkModel {
         self.partitions = groups.into_iter().collect();
     }
 
-    /// Heal any partition (fully connect).
+    /// Impose a **soft** partition (§6.5): messages crossing between `groups` are dropped with probability
+    /// `cross_loss` (a lossy, not fully-cut, bisection), while intra-group traffic is unaffected. Models an
+    /// incipient split — the far side stays marginally reachable/alive while the crossing lines read lossy.
+    pub fn soft_partition<I>(&mut self, groups: I, cross_loss: f64)
+    where
+        I: IntoIterator<Item = BTreeSet<Triple>>,
+    {
+        self.soft_partitions = groups.into_iter().collect();
+        self.cross_loss = cross_loss;
+    }
+
+    /// Whether `from` and `to` lie in different soft-partition groups (so a message between them crosses).
+    fn crosses_soft(&self, from: Triple, to: Triple) -> bool {
+        if from == to || self.soft_partitions.is_empty() {
+            return false;
+        }
+        let group_of = |n: Triple| self.soft_partitions.iter().position(|g| g.contains(&n));
+        match (group_of(from), group_of(to)) {
+            (Some(a), Some(b)) => a != b,
+            _ => false, // a node in no soft group is unaffected
+        }
+    }
+
+    /// Heal any partition (fully connect), hard or soft.
     pub fn heal(&mut self) {
         self.partitions.clear();
+        self.soft_partitions.clear();
+        self.cross_loss = 0.0;
     }
 
     /// Whether the network is currently partitioned.
