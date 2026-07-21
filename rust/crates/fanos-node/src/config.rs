@@ -62,6 +62,109 @@ impl fmt::Debug for ServiceParams {
     }
 }
 
+impl ServiceParams {
+    /// Parse service parameters from a `key = value` text file — the out-of-band provisioning a service
+    /// operator hands each line member. Recognised keys: `seed` (64 hex chars: the 32-byte member-key
+    /// seed), `line` (comma-separated `x:y:z` member coordinates, in the client's seal order), and
+    /// `threshold` (the reconstruction `t`). All three are required; an unrecognised key is an error.
+    ///
+    /// # Errors
+    /// [`NodeError::Config`] on a malformed line, an unknown key, a bad value, or a missing key.
+    pub fn from_config_str(text: &str) -> Result<Self, NodeError> {
+        let mut seed: Option<[u8; 32]> = None;
+        let mut line: Vec<Triple> = Vec::new();
+        let mut threshold: Option<usize> = None;
+        for (n, raw) in text.lines().enumerate() {
+            let l = raw.split('#').next().unwrap_or("").trim();
+            if l.is_empty() {
+                continue;
+            }
+            let (key, value) = l.split_once('=').ok_or_else(|| {
+                NodeError::Config(format!("service config line {}: expected `key = value`", n + 1))
+            })?;
+            match key.trim() {
+                "seed" => seed = Some(parse_seed_hex(value.trim())?),
+                "line" => {
+                    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                        line.push(parse_coord(part)?);
+                    }
+                }
+                "threshold" => {
+                    threshold = Some(value.trim().parse().map_err(|_| {
+                        NodeError::Config(format!("bad service threshold '{}'", value.trim()))
+                    })?);
+                }
+                other => {
+                    return Err(NodeError::Config(format!(
+                        "unknown service config key '{other}'"
+                    )));
+                }
+            }
+        }
+        let seed = seed.ok_or_else(|| NodeError::Config("service config missing `seed`".to_owned()))?;
+        let threshold =
+            threshold.ok_or_else(|| NodeError::Config("service config missing `threshold`".to_owned()))?;
+        if line.is_empty() {
+            return Err(NodeError::Config(
+                "service config `line` must list at least one member coordinate".to_owned(),
+            ));
+        }
+        Ok(Self {
+            seed,
+            line,
+            threshold,
+        })
+    }
+}
+
+/// Parse a `x:y:z` projective coordinate into a [`Triple`].
+fn parse_coord(s: &str) -> Result<Triple, NodeError> {
+    let mut it = s.split(':');
+    let mut next = || {
+        it.next()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .ok_or_else(|| NodeError::Config(format!("bad coordinate '{s}' (expected x:y:z)")))
+    };
+    let coord = [next()?, next()?, next()?];
+    if it.next().is_some() {
+        return Err(NodeError::Config(format!(
+            "coordinate '{s}' must be exactly x:y:z"
+        )));
+    }
+    Ok(coord)
+}
+
+/// Decode exactly 64 hex characters into a 32-byte seed.
+fn parse_seed_hex(s: &str) -> Result<[u8; 32], NodeError> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return Err(NodeError::Config(format!(
+            "service seed must be 64 hex characters (got {})",
+            bytes.len()
+        )));
+    }
+    let nibble = |c: u8| -> Result<u8, NodeError> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err(NodeError::Config(
+                "service seed contains a non-hex character".to_owned(),
+            )),
+        }
+    };
+    let mut seed = [0u8; 32];
+    // 64 even bytes → exactly 32 two-byte chunks, zipped 1:1 with the 32 seed slots. The slice pattern
+    // binds each pair without indexing; the `_` arm is unreachable given the length check.
+    for (slot, pair) in seed.iter_mut().zip(bytes.chunks(2)) {
+        match pair {
+            [hi, lo] => *slot = (nibble(*hi)? << 4) | nibble(*lo)?,
+            _ => return Err(NodeError::Config("service seed has an odd length".to_owned())),
+        }
+    }
+    Ok(seed)
+}
+
 /// A bootstrap peer: a known overlay coordinate bound to a network address. The overlay routes on
 /// coordinates; a fresh node seeds its address book with these so it can dial into the network
 /// (`docs/design.md` §9 — derivation/seed, not a central directory).
@@ -283,6 +386,62 @@ mod tests {
         assert!(r.any());
         assert!(RoleSet::parse("bogus").is_err());
         assert!(!RoleSet::default().any());
+    }
+
+    #[test]
+    fn parses_service_params_from_a_config() {
+        let p = ServiceParams::from_config_str(
+            "# a 3-of-3 service line\n\
+             seed = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             line = 1:0:0, 0:1:0, 0:0:1\n\
+             threshold = 2\n",
+        )
+        .unwrap();
+        assert_eq!(p.seed[0], 0x00);
+        assert_eq!(p.seed[1], 0x11);
+        assert_eq!(p.seed[31], 0xff);
+        assert_eq!(p.line, vec![[1, 0, 0], [0, 1, 0], [0, 0, 1]]);
+        assert_eq!(p.threshold, 2);
+        // The seed is redacted from Debug (it regenerates the member secret).
+        assert!(format!("{p:?}").contains("<redacted>"));
+        assert!(!format!("{p:?}").contains("0011"));
+    }
+
+    #[test]
+    fn rejects_malformed_service_params() {
+        // Missing keys.
+        assert!(ServiceParams::from_config_str("line = 1:0:0\nthreshold = 1").is_err()); // no seed
+        assert!(
+            ServiceParams::from_config_str(&format!("seed = {}\nthreshold = 1", "ab".repeat(32)))
+                .is_err(),
+            "empty line rejected"
+        );
+        // Bad seed length / hex.
+        assert!(ServiceParams::from_config_str("seed = abcd\nline = 1:0:0\nthreshold = 1").is_err());
+        assert!(
+            ServiceParams::from_config_str(&format!(
+                "seed = {}\nline = 1:0:0\nthreshold = 1",
+                "zz".repeat(32)
+            ))
+            .is_err(),
+            "non-hex seed rejected"
+        );
+        // Unknown key and bad coordinate.
+        assert!(
+            ServiceParams::from_config_str(&format!(
+                "seed = {}\nline = 1:0:0\nthreshold = 1\nbogus = 1",
+                "ab".repeat(32)
+            ))
+            .is_err()
+        );
+        assert!(
+            ServiceParams::from_config_str(&format!(
+                "seed = {}\nline = 1:0\nthreshold = 1",
+                "ab".repeat(32)
+            ))
+            .is_err(),
+            "two-component coordinate rejected"
+        );
     }
 
     #[test]

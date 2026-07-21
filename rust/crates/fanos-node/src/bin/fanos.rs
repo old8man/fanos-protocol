@@ -14,7 +14,7 @@ use std::sync::Arc;
 use fanos_field::F2;
 use fanos_node::{
     AnonRouteParams, BeaconSeed, Epoch, FanosDialer, Node, NodeConfig, NodeError, NodeResolver,
-    Peer, RoleSet, build_cell_mix_directory, identity, serve_proxy,
+    Peer, RoleSet, ServiceParams, build_cell_mix_directory, identity, serve_proxy,
 };
 use fanos_runtime::Notification;
 use tokio::net::TcpListener;
@@ -71,6 +71,12 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     }
     if let Some(s) = flag(args, "--role") {
         config.roles = RoleSet::parse(s)?;
+    }
+    if let Some(path) = flag(args, "--service") {
+        // Provision the threshold-hosting line (seed, roster, threshold) from an out-of-band file, and
+        // imply the `service` role — providing service parameters is the operator asking to host it.
+        config.service = Some(ServiceParams::from_config_str(&std::fs::read_to_string(path)?)?);
+        config.roles.service = true;
     }
     if has_flag(args, "--no-heartbeat") {
         config.start_heartbeat = false;
@@ -445,8 +451,9 @@ fn print_help() {
         "fanos — the FANOS node\n\
          \n\
          USAGE:\n\
-         \x20 fanos node  [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
-         \x20             [--role relay,storage,service,exit] [--no-heartbeat] [--proteus-secret SECRET]\n\
+         \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
+         \x20             [--role relay,storage,service,exit] [--service FILE] [--no-heartbeat] \\\n\
+         \x20             [--proteus-secret SECRET]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
@@ -460,6 +467,12 @@ fn print_help() {
          \x20            directory, so successive connections are unlinkable (needs live relays; the\n\
          \x20            --beacon is the epoch's public randomness, shared by the service)\n\
          \n\
+         SERVICE FILE (--service, threshold-hosted CALYPSO §12.3): a `key = value` file with\n\
+         \x20 seed = <64 hex>            this member's key seed (secret; the operator hands it out)\n\
+         \x20 line = x:y:z,x:y:z,...     the line's member coordinates, in seal order\n\
+         \x20 threshold = T             members that must cooperate to serve an intro\n\
+         \x20 (providing it implies the `service` role)\n\
+         \n\
          EXAMPLES:\n\
          \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\
          \x20 fanos node --listen 0.0.0.0:9000 --identity ~/.fanos/id.bin \\\n\
@@ -471,4 +484,31 @@ fn print_help() {
          \n\
          Set RUST_LOG=debug for verbose logs."
     );
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_flag_provisions_the_service_role() {
+        // `--service <file>` reads the threshold-hosting parameters and implies the `service` role.
+        let path =
+            std::env::temp_dir().join(format!("fanos-svc-{}.conf", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("seed = {}\nline = 1:0:0, 0:1:0\nthreshold = 1\n", "ab".repeat(32)),
+        )
+        .unwrap();
+
+        let args = vec!["--service".to_owned(), path.to_string_lossy().into_owned()];
+        let config = node_config_from_args(&args).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(config.roles.service, "--service implies the service role");
+        let sp = config.service.expect("service parameters were read");
+        assert_eq!(sp.line, vec![[1, 0, 0], [0, 1, 0]]);
+        assert_eq!(sp.threshold, 1);
+    }
 }
