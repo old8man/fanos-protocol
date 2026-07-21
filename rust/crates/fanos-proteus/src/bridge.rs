@@ -2,7 +2,7 @@
 //!
 //! The plain bootstrap is a blockable static list. PROTEUS replaces it with the same
 //! computed-rendezvous trick as CALYPSO: a client holding a community bridge-secret `s` derives
-//! the current entry set from the beacon, `bridge = MapToLine(VRF(s, epoch))`, which **rotates
+//! the current entry set from the beacon, `bridge = MapToLine(H(s ‖ epoch ‖ beacon))`, which **rotates
 //! every epoch**. A censor who enumerates and blocks this epoch's bridges finds the list decayed
 //! next epoch, and to block a client's entry in a single epoch must cover **all `q+1`** of its
 //! bridge-lines (anti-eclipse) — which differ the following epoch.

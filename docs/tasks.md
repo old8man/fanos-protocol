@@ -22,13 +22,13 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 - **DNS-over-FANOS · UDP-ASSOCIATE** (Phase 2 app surface) — complete the proxy beyond TCP CONNECT.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
-- **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
-  consistent reads).
 - **VOPRF credit settlement** (Phase 4) — anonymous relay payment.
 - **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP.
 - **C ABI** (#113) — embedding surface.
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+spec↔impl reconciliation (protocol.md, 4-agent audit: beacon-DVRF, per-member-sealed onion, hash-to-line
+rendezvous, [7,3,4] LRC, node-keyed coord-VRF, NAT stack, field_q+CORE caps, DIAKRISIS 3-verdict split) ·
 NAT reachability complete (relay fallback) · exit discovery (auto) · proxy→exit clearnet path · clearnet
 exit role · DIAULOS interactive-streaming fix · threshold-CALYPSO `service` role · #129 DHT durability

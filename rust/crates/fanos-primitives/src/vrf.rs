@@ -1,9 +1,10 @@
 //! The VRF surface for epoch-bound coordinate assignment (spec §L0, §L3).
 //!
-//! A node's coordinate is `MapToPoint(VRF(pubkey, epoch))`: the VRF binds the coordinate to
-//! the epoch (so it reshuffles when the beacon advances) and is verifiable and not cheaply
-//! grindable. The production instantiation is **ECVRF-Edwards25519** (RFC 9381), which needs
-//! elliptic-curve crypto and so lives in its own crate.
+//! A node's coordinate is `MapToPoint(VRF(sk, node ‖ epoch ‖ beacon))`: the VRF folds the epoch's
+//! beacon seed into its input (so the coordinate reshuffles *unpredictably* when the beacon advances,
+//! not merely epoch-indexed) and is verifiable and not cheaply grindable. The production instantiation
+//! is a ristretto255 RFC 9381-*style* VRF (`vrf-r255`, pairing-free), which needs elliptic-curve crypto
+//! and so lives in its own crate (`fanos-vrf`).
 //!
 //! This module exposes a *deterministic* coordinate derivation that binds `(bundle, epoch)` exactly
 //! as production does, so no_std addressing is testable end to end. It has no keyed proof and so is

@@ -155,7 +155,7 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 }
 
 /// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch_low32_be ‖ beacon_seed`
-/// (spec §L0/§L3 `VRF_beacon`). Folding the epoch's **beacon seed** is what makes the coordinate
+/// (spec §L0/§L3, `VRF(sk, id ‖ epoch ‖ SEED(epoch))`). Folding the epoch's **beacon seed** is what makes the coordinate
 /// *unpredictable ahead of the epoch* — an adversary cannot grind for a future placement it cannot yet
 /// compute (§3.2 assumption 2), the load-bearing anti-pre-settling defence on the base cell.
 fn beacon_alpha(node_id: &[u8], epoch: Epoch, beacon: &BeaconSeed) -> Vec<u8> {

@@ -10,7 +10,7 @@ description: "Reference specification of FANOS: a projective-plane-addressed ove
 > — the working third-order principle (UHM)
 
 :::info Document status
-**Version 0.1** (reference architecture). Result statuses use the corpus discipline **[T]** / **[C]** / **[H]** / **[P]** (see the block below). **Origin:** UHM, Discovery 7 (projectively-structured distributed system) + the Serre bundle ([gap-thermodynamics](/docs/core/dynamics/gap-thermodynamics)) + the Σ-calculus (Steiner/Steane). **License** (intended open): CERN-OHL-S v2 (hardware profiles) + Apache-2.0/MIT (code) + CC-BY-SA (document). **Interactive:** [live Fano plane and security calculator](pathname:///fanos/fanos-playground.html) (a site page, works offline). **Verifier:** [`/fanos/fanos_verify.py`](pathname:///fanos/fanos_verify.py).
+**Version 0.1** (reference architecture). Result statuses use the corpus discipline **[T]** / **[C]** / **[H]** / **[P]** (see the block below). **Origin:** UHM, Discovery 7 (projectively-structured distributed system) + the Serre bundle ([gap-thermodynamics](/docs/core/dynamics/gap-thermodynamics)) + the Σ-calculus (Steiner/Steane). **License** (intended open): CERN-OHL-S v2 (hardware profiles) + Apache-2.0/MIT (code) + CC-BY-SA (document). **Interactive:** [live Fano plane and security calculator](pathname:///fanos/fanos-playground.html) (a site page, works offline). **Verifiers:** the Rust reference suite `cargo run -p fanos-cli` (reproduces the numeric claims end-to-end against the committed `conformance/vectors/*.json` KATs, CI-enforced, §7.9), with the standalone math companion [`/fanos/fanos_verify.py`](pathname:///fanos/fanos_verify.py).
 :::
 
 ## Naming and the thematic triad
@@ -56,7 +56,7 @@ The public layer "shines" (routes are verifiable and efficient); with APHANTOS e
 As in the main UHM corpus, every nontrivial claim is tagged: **[T]** — theorem (rigorously proven, often verified by computation); **[C]** — conditional (true under an explicitly named assumption); **[H]** — hypothesis (formulated, needs proof/audit); **[P]** — program (a direction of work). Cryptographic honesty: **the novelty of FANOS is the architectural composition of vetted primitives, not new hardness assumptions.** The single genuinely new construction (the NYX threshold-sheaf Tessera packet, §V) is tagged **[P]** — it needs formal cryptanalysis before production. We do NOT invent new mathematical hardness "from scratch": that would be irresponsible for a real-world protocol.
 :::
 
-Every quantitative claim in this document is reproduced by the verifier [`/fanos/fanos_verify.py`](pathname:///fanos/fanos_verify.py) (V1–V10: projective geometry, quorums, the security curve, scaling; **V11–V22: DIAKRISIS self-diagnosis, the collective-subject window, multi-fault resolution, and PROTEUS censorship resistance** — first-order blindness, the mediator map, syndrome localization, partition-resistance, the coherence-matrix health metrics, the `1/9` integration budget, the leading-indicator containment, the collective-subject window (V19), and multi-fault resolution — crashes to 3, Byzantine to 2 (V20–V21), and moving-target bridges vs a censor (V22)). The numbers in the tables are computed, not illustrative.
+Every quantitative claim in this document is reproduced by the Rust reference suite (`cargo run -p fanos-cli`, against the committed `conformance/vectors/*.json` KATs and asserted in CI, §7.9), with a standalone math companion [`/fanos/fanos_verify.py`](pathname:///fanos/fanos_verify.py) (V1–V10: projective geometry, quorums, the security curve, scaling; **V11–V22: DIAKRISIS self-diagnosis, the collective-subject window, multi-fault resolution, and PROTEUS censorship resistance** — first-order blindness, the mediator map, syndrome localization, partition-resistance, the coherence-matrix health metrics, the `1/9` integration budget, the leading-indicator containment, the collective-subject window (V19), and multi-fault resolution — crashes to 3, Byzantine to 2 (V20–V21), and moving-target bridges vs a censor (V22)). The numbers in the tables are computed, not illustrative.
 
 ---
 
@@ -169,7 +169,7 @@ The collineations of PG(2,q) form the group PGL(3,q) (for prime q; in general P�
 The smallest cell q=2 — the Fano plane — **coincides** with the Hamming(7,4) code: 16 codewords, exactly 7 words of weight 3 = the 7 Fano lines (verified V10, and earlier in `uhm_discoveries.py` S6). The Steane quantum code = CSS(Hamming, Hamming), distance 3. Hence:
 
 - **[T]** any FANOS cell carries innate syndrome diagnostics (the Σ-calculus pyramid of the corpus: 21 links → 7 line-checks → 3 syndrome bits → 1 verdict);
-- **[T]** the projective plane yields a locally recoverable code (LRC): a lost node (point) is recovered from any of its q+1 lines. Locality r = q reads, number of independent repair groups = q+1, redundancy ≈ (q+1)/q (verified V9: for q=31 this is 1.032×).
+- **[T]** the projective plane yields a locally recoverable code (LRC): a lost node (point) is recovered from any of its q+1 lines. Locality r = q reads, number of independent repair groups = q+1, redundancy ≈ (q+1)/q for the availability-1 variant (verified V9: for q=31 this is 1.032×). The **deployed** store (§L4) takes the stronger availability-(q+1) variant — at the base cell the `[7,3,4]` projective LRC, redundancy N/K = 7/3, tolerating any ≤3 simultaneous losses — trading the (q+1)/q floor for that guarantee.
 
 ## 2.5 The third-order principle and the mediator map (import from UHM)
 
@@ -248,7 +248,7 @@ The structure first appears at **third order** (orbit of pairs is single; two or
 
 | Entity | Definition |
 |---|---|
-| **Node (point)** | A participant with a key pair; the coordinate `[x:y:z] ∈ PG(2,q)` is assigned by a VRF of the public key |
+| **Node (point)** | A participant with a key pair; the coordinate `[x:y:z] ∈ PG(2,q)` is set by the node's own coordinate-VRF, bound to the epoch beacon and verifiable against its public key (§L0) |
 | **Line (quorum/bus)** | A group of q+1 nodes; carries a multicast bus, a quorum vote, a threshold group |
 | **Cell** | One plane PG(2,q), N = q²+q+1 nodes; the unit of locality |
 | **Hierarchy** | Recursive composition of cells; a cell = a "point" of the parent cell |
@@ -319,9 +319,9 @@ The eight layers L0–L7 are the *forward* stack (how a message gets built, rout
 
 ## L0. Identity and addressing
 
-- **Key pair:** hybrid Ed25519 + ML-DSA-65 (signature), X25519 + ML-KEM-768 (KEM), **and the coordinate-VRF public key** (§L6). The long-term identifier = `BLAKE3` of the canonical bundle `sig ‖ kem ‖ vrf` — all three public keys, not just sig+kem. Binding the VRF key into the identifier means the node-ID itself commits to the key that earns the node's coordinate, so a `HELLO` proof-of-coordinate (§7.3) is checked against a key the identity cannot swap out unnoticed.
-- **Node coordinate:** `coord = MapToPoint( VRF_beacon(pubkey, epoch) )` — the VRF binds the point to the epoch, with a reshuffle at epoch change. `MapToPoint` is a uniform map of the 256-bit output into `[x:y:z] ∈ PG(2,q)` (discard the zero vector, normalise the first nonzero to 1).
-- **Content addressing:** a resource key `k` maps to a point `MapToPoint(H(k))`; the responsible node is the nearest occupied point (consistent hashing on projective coordinates). Replicas are the q+1 nodes of the lines through that point (LRC, L4).
+- **Key pair:** hybrid Ed25519 + ML-DSA-65 (signature), X25519 + ML-KEM-768 (KEM), **and the coordinate-VRF public key** (§L6). The long-term identifier = `BLAKE3` under a dedicated node-id domain (`"FANOS-v1/node-id"`) of the canonical bundle `sig ‖ kem ‖ vrf` — all three public keys, not just sig+kem. Binding the VRF key into the identifier means the node-ID itself commits to the key that earns the node's coordinate, so a `HELLO` proof-of-coordinate (§7.3) is checked against a key the identity cannot swap out unnoticed.
+- **Node coordinate:** `coord = MapToPoint( VRF(vrf_sk, id ‖ epoch ‖ SEED(epoch)) )` — the node's **own** coordinate-VRF secret keys the function (each node proves its own placement, Algorand-sortition style), and the epoch's **beacon seed is folded into the input**, so the point is unpredictable until the beacon is revealed, not merely epoch-indexed (this is what §L3's "a VRF of the new seed" requires). `id` is the node's identity anchor — its node-ID, or over the wire the TLS certificate DER, which commits the VRF public key. The node emits a VRF **proof** with the coordinate; any peer verifies it against the node's VRF public key (the `HELLO` proof-of-coordinate, §7.3). `MapToPoint` reads a domain-separated `BLAKE3` XOF over the VRF output (a 64-byte β), sampling field coordinates by **rejection** (avoiding modulo bias on prime fields; bit-masking on binary fields), discarding the zero triple and normalising the first nonzero coordinate to 1.
+- **Content addressing:** a resource key `k` maps to a point `MapToPoint(H("FANOS-v1/storage" ‖ k))` under a **dedicated storage domain** separator (distinct from the node-id domain, so a resource point and a node point are never confused); the responsible node is the nearest occupied point (consistent hashing on projective coordinates). The value is **erasure-coded**, not plainly replicated: its shards live on the q+1 nodes of the lines through that point (the `[7,3,4]` projective LRC, §L4) — any k of them reconstruct.
 
 ## L1. Overlay and routing
 
@@ -345,14 +345,14 @@ We do **not** claim O(√n) routing state for a single plane — the collinearit
 ## L2. Transport
 
 - **QUIC (RFC 9000/9001)** in userspace: 0-RTT resumption, built-in encryption, stream multiplexing without head-of-line blocking.
-- **Multipath QUIC:** q+1 near-disjoint paths between cells (members of a common line) → bandwidth aggregation and instant failover.
-- **MASQUE (RFC 9298)** for proxying/NAT traversal; ICE-like hole-punching through bridge nodes.
+- **Multipath (overlay-level):** the q+1 near-disjoint paths between cells (members of a common line) are realised at the **overlay** layer over ordinary QUIC connections — bandwidth aggregation and instant failover come from the algebraic path diversity of the plane, *not* from the (still-draft) Multipath-QUIC transport extension. FANOS needs no MP-QUIC dependency to get q+1 disjoint paths.
+- **NAT traversal:** quorum-corroborated **reflexive-address discovery** (each node learns its public address from a quorum of peers — a STUN-equivalent needing no STUN server), **bridge-node-brokered hole-punching** (a common hub relays each party's observed address so both dial simultaneously), and a **relay fallback through a hub** (origin-preserving, bidirectional) for symmetric NAT where a direct punch cannot form. `MASQUE (RFC 9298)` is retained only as an *optional* PROTEUS obfuscation morph (Part XIII), not the baseline traversal mechanism.
 - **PROTEUS (optional, Part XIII):** under censorship the plain QUIC wire is swapped for a polymorphic obfuscated transport (DPI/blocking resistance). Off by default; orthogonal to the overlay above.
 - **Fully userspace, no kernel** ⇒ multiplatform (Part XI).
 
 ## L3. Membership, epochs, beacon, Sybil admission
 
-- **Randomness beacon [T under threshold BLS]:** drand-class, honest-majority threshold across "anchor" lines; emits a public unpredictable seed per epoch. A post-quantum variant is [P] (hash/lattice VRF beacons — an active direction).
+- **Randomness beacon [T under a pairing-free threshold DVRF]:** drand-class, honest-majority threshold across "anchor" lines; emits a public unpredictable seed per epoch. The primitive is a **pairing-free threshold DVRF** — ristretto255 Diffie–Hellman partials, each carrying a Chaum–Pedersen DLEQ proof — **not threshold-BLS**, keeping the whole suite on one pairing-free curve (see the interop-deviations note in §L6). A post-quantum variant is [P] (hash/lattice VRF beacons — an active direction).
 - **Epoch reshuffle:** coordinates are recomputed by a VRF of the new seed ⇒ the adversary cannot pre-occupy a target line (defence against path prediction and guard discovery).
 - **Sybil admission (pluggable):** three profiles — (a) **PoW admission** (memory-hard, for open networks); (b) **stake/bond** (for the blockchain overlay); (c) **web-of-trust** (for federations). Independently of the profile, a structural cap operates:
 - **Structural centrality cap [T]** (verified V3): every node is on exactly q+1 of N lines = a fixed fraction (q=31 → 3.22%). **Centrality cannot be "bought"** — line membership is fixed by coordinates. Sybil nodes do not become supernodes.
@@ -360,7 +360,7 @@ We do **not** claim O(√n) routing state for a single plane — the collinearit
 
 ## L4. Storage and replication
 
-- **Projective LRC [T]:** a point's data is erasure-coded across its q+1 lines; a lost node is recovered from any single line (locality q, availability q+1). Redundancy (q+1)/q → 1 as q grows.
+- **Projective LRC [T]:** a point's data is erasure-coded across its q+1 lines; a lost node recovers from **any one** of those lines, reading only that line's q other members — locality q, availability q+1. The base-cell code is the `[7,3,4]` projective LRC (the simplex dual of Hamming(7,4), rate K/N = 3/7), so redundancy is **N/K = 7/3 ≈ 2.33×** — the true cost of the availability-(q+1) guarantee, well below 7× full replication. It tolerates **any ≤3 simultaneous point losses** cell-wide (and every 4-loss except a hyperoval). (The often-quoted `(q+1)/q → 1` is the storage floor of the weaker *availability-1* scheme — one loss per line and nothing more — not of the availability-(q+1) code deployed here.)
 - **Quorum consistency [T]:** write to a quorum-line W, read from a quorum-line R; `W ∩ R ≠ ∅` is guaranteed (Maekawa) ⇒ linearisability with no separate coordinator.
 - **DA sampling (data availability):** for the blockchain overlay — sampled availability checks along lines (each line = a sample); Steiner guarantees coverage.
 
@@ -388,7 +388,7 @@ All primitives are **vetted and post-quantum/hybrid**. The novelty is in the com
 | Hash/XOF | BLAKE3 (speed) + SHAKE256 (PQ-KDF) | standard |
 | VRF | `vrf-r255`: RFC-9381-*style* on ristretto255 (pairing-free); PQ-VRF | standard / [P] |
 | Beacon | pairing-free threshold DVRF (ristretto255 + Chaum–Pedersen DLEQ); PQ beacon | standard / [P] |
-| Threshold sharing | Shamir SSS + Feldman/Pedersen VSS; DKG (GJKR) | standard |
+| Threshold sharing | Shamir SSS + **Feldman VSS**; multi-dealer **DKG (Feldman, with dealer disqualification)** | standard |
 | Threshold decryption | threshold KEM/ElGamal, non-interactive share combination | standard |
 | Verifiable shuffle | Bayer–Groth argument (classical); PQ shuffle | standard / [P] |
 | Anonymous credits | bespoke VOPRF (ristretto255, BLAKE3-XOF hash-to-curve + DLEQ) / BBS+ | standard |
@@ -404,9 +404,13 @@ Three rows above are deliberate departures from the RFC/protocol literally named
 **Canonical FANOS choice is the ristretto255 pairing-free suite above; conformant implementations MUST use it** for wire interoperability — a clean-room implementation coded to the literal RFC 9381 / threshold-BLS / RFC 9497-9578 citations will not interoperate. None of the three substitutions weakens the security property the original citation was chosen for.
 :::
 
+:::note DKG — Feldman multi-dealer, not GJKR (and why that suffices)
+An earlier draft named **GJKR**, the Pedersen-commitment DKG whose extra commitment layer exists solely to remove the *rushing-adversary key-bias* that a plain Feldman-DKG admits. FANOS deploys a **Feldman-VSS multi-dealer DKG with dealer disqualification** — and the omission of GJKR's anti-bias layer is sound rather than a shortfall, because the DKG's **only** consumer is the epoch beacon (§L3, §7.6), which is **unbiasable by construction**: the combined output `x·M` is *unique* for a fixed group key `Y` and epoch input `M`, so there is nothing for a rushing adversary to grind — the property GJKR buys is not one this system can spend. Should a future consumer require an unbiasable *distributed key* (as opposed to an unbiasable *output*), the DKG would be upgraded to Pedersen/GJKR at that point; for the present threat model Feldman-with-disqualification is the minimal sufficient construction.
+:::
+
 ## L7. Incentives (optional)
 
-- **Anonymous relay credits:** blind tokens (Privacy Pass VOPRF) ⇒ payment does not deanonymise (unlike staking, which binds identity to capital).
+- **Anonymous relay credits:** blind tokens (Privacy Pass VOPRF) ⇒ payment does not deanonymise (unlike staking, which binds identity to capital). Redemption presents a **context-bound proof** (RFC-9578-style): the secret token output never travels, so a credit shown for one context is invalid under another — blocking cross-context replay and front-running. Issuance signs with a **synthetic deterministic DLEQ nonce** (RFC-6979-style), so a weak or reused RNG cannot leak the issuer key.
 - **Blockchain substrate:** see Part X — quorum-lines as validator committees with guaranteed intersection.
 
 ---
@@ -486,11 +490,11 @@ Mechanically the ratchet reduces to a geometry-organised chain of Diffie-Hellman
 
 **The problem of Tor onion services / Lokinet:** separate infrastructure of introduction points and rendezvous points, plus HSDir — known deanonymisation vectors.
 
-**The NYX solution [H→C]:** two parties sharing a secret `s` (from a previous contact or a PAKE) deterministically derive a common **meeting line** `L_rdv = MapToLine( VRF_beacon(s, epoch) )` and meet on it — with no directory, no introduction points. The line rotates each epoch together with the beacon ⇒ no long-term target for attack. The initiator posts a request encrypted to `PK_{L_rdv}`; the responder, listening on its lines, replies. Anonymity of both parties is protected by the threshold layer of the same line.
+**The NYX solution [H→C]:** two parties sharing a secret `s` (from a previous contact or a PAKE) deterministically derive a common **meeting line** `L_rdv = MapToLine( H(s ‖ epoch ‖ SEED(epoch)) )` — a plain hash-to-line that folds in the per-epoch beacon `SEED(epoch)`, so the line is unpredictable to outsiders yet needs no per-pair VRF key (a VRF would demand a keypair per shared secret, which does not scale) — and meet on it, with no directory, no introduction points. The line rotates each epoch together with the beacon ⇒ no long-term target for attack. The initiator posts a request **threshold-sealed to `L_rdv`'s members** (a per-member hybrid-KEM seal of each Shamir share, §5.2 — there is no single line key to compromise); the responder, listening on its lines, replies. Anonymity of both parties is protected by the threshold layer of the same line.
 
 ## 5.7 The Tessera packet (summary; wire format in §VII)
 
-Fixed size (indistinguishability), Sphinx-derived, with two extensions: a **PQ-hybrid** header (X25519+ML-KEM per hop) and **threshold addressing** of a layer (encryption to a line's `PK_L` instead of a node's `PK`). The size is constant along the path (re-encryption per hop), metadata leakage is minimal.
+Fixed size (indistinguishability), Sphinx-derived, with two extensions: a **PQ-hybrid** header (X25519+ML-KEM per hop) and **threshold addressing** of a layer — the layer key is Shamir-split and each share is **per-member hybrid-KEM-sealed** to the t-of-(q+1) members of the line (§5.2), so *no single line key `PK_L`* exists to seize; a layer is peeled only when t members each contribute a partial decryption. The size is constant along the path (re-encryption per hop), metadata leakage is minimal.
 
 ```mermaid
 sequenceDiagram
@@ -498,7 +502,7 @@ sequenceDiagram
     participant L1 as Line L₁ (t of q+1)
     participant L2 as Line L₂ (t of q+1)
     participant R as Receiver
-    S->>L1: Tessera packet (layers on PK_L1, PK_L2, PK_R · β-ratchet)
+    S->>L1: Tessera packet (layers threshold-sealed to L₁, L₂, R members · β-ratchet)
     Note over L1: t members publish partial decryptions
     L1->>L1: threshold assembled → layer 1 peeled, L₂ known
     L1->>L2: re-encrypted packet (constant size) + Poisson delay
@@ -584,6 +588,8 @@ Why the geometry helps: a Byzantine node cannot lie "locally". Because every pai
 
 **Status [С].** The localization arithmetic is [Т] (it is §6.3 applied to attestation bits). The end-to-end Byzantine guarantee is **conditional** on the attestation channel being authenticated (L6 signatures) and on fewer than the threshold of colluding members per line — stated plainly rather than assumed away.
 
+**Live cross-attestation is directional [С].** The symmetric closure check above is exact only when every honest member shares one liveness view; on a live network they do not — an honest node has *asymmetric* direct visibility of its peers, so a naive symmetric-ρ reconstruction false-positives on honest link failures. The deployed detector therefore separates a positive **VOUCH** (an unforgeable freshness claim) from a mere **DENY** (the *absence* of a claim — indistinguishable from an honest link failure, and so never acted upon). Only a *fresh*-vouch that a **firm honest-majority stale-consensus** contradicts, **sustained across a whole observation window**, is an attributable lie; this tolerates up to `⌈(N−1)/2⌉` colluding vouch-fabricators — strictly stronger than a plain corroboration quorum that merely counts vouchers. A companion **grey-endpoint** localizer ranks links by minimum incident loss-rate, resolving the cases where the raw symmetric sum-rule signature is ambiguous under *uneven* grey loss.
+
 ## 6.5 Segment and partition diagnosis — a partition-resistance theorem [Т] {#diakrisis-partition}
 
 A whole line or sub-cell can drop. Here the projective structure gives a hard guarantee that graph overlays cannot:
@@ -592,8 +598,8 @@ A whole line or sub-cell can drop. Here the projective structure gives a hard gu
 
 When degradation is graded rather than binary, two continuous readings localize and rank it:
 
-- **Algebraic connectivity (Fiedler value `λ₂`)** of the health-weighted line graph. `λ₂ > 0 ⟺ connected`; the Fiedler vector's sign pattern names the two sides of an incipient split. For a full cell `λ₂ = 7`; with one line down, `λ₂ = 4` (verified V14) — still comfortably intact.
-- **Integration `Φ_net`** (§2.7): `Φ < 1` is the "the cell is no longer one integrated whole" alarm, and the **mean-correlation early-warning** `r → 1/√6 ≈ 0.408` flags a cascade regime *before* any node fails (V15). A monitor watching `r` cross `0.408` sees systemic fragility a full phase ahead of any liveness signal — a quantity no DHT/onion overlay exposes, because none carries a coherence matrix.
+- **Algebraic connectivity (Fiedler value `λ₂`)** of the health-weighted line graph. `λ₂ > 0 ⟺ connected`; the Fiedler vector's sign pattern names the two sides of an incipient split. For a full cell `λ₂ = 7`; with one line down, `λ₂ = 4` (verified V14) — still comfortably intact. The **live** sensor weights each line by its *measured* per-channel loss (grey-aware and continuous, not a binary up/down), and declares a partition only on a **sustained, all-nodes-alive** disconnection: a persistence dwell filters recovery transients (a just-healed node's lagging loss estimate never false-fires), and a disconnection explained by a down node is routed to the crash/localization path (§6.3), never counted as a partition.
+- **Integration `Φ_net`** (§2.7): `Φ < 1` is the "the cell is no longer one integrated whole" alarm, and the **mean-correlation early-warning** `r → 1/√6 ≈ 0.408` flags a cascade regime *before* any node fails (V15). A monitor watching `r` cross `0.408` sees systemic fragility a full phase ahead of any liveness signal — a quantity no DHT/onion overlay exposes, because none carries a coherence matrix. Crossing `1/√6` is a **forecast, not a trigger**: the band `(1/√6, 1/√3]` is still a *healthy* integrated collective (§2.7). The **actionable** over-coupling verdict — the Decouple response — fires only past the second threshold `r > 1/√3 ≈ 0.577` (`R < 1/3`), per §18.2; below it DIAKRISIS only raises the observatory's early-warning, it does not intervene.
 
 Segment *loss* (as opposed to split) is then repaired by the projective LRC (§L4, §6.8): the lost nodes are reconstructed from any surviving line through them.
 
@@ -628,9 +634,9 @@ How much of a cell's capacity should go to diagnosis? Not a matter of taste: the
 
 1. **Observe.** Each line aggregates authenticated health gossip from its q+1 members into its theme observable `T_ℓ`; the cell assembles `Γ_net` from behavioural correlations.
 2. **Detect.** Check the 14 polar sum-rules (T-226) and the global monitors `Φ_net`, mean-correlation `r`. If all clean and `Φ ≥ 1`: report healthy, sleep.
-3. **Localize.** Compute the 3-bit syndrome `σ` (§6.3). If `σ = 0` but a global monitor fired, treat as a partition/systemic event (§6.5); else `σ` is the address of the degraded node.
+3. **Localize.** Compute the 3-bit syndrome `σ` (§6.3). If `σ = 0` but a global monitor fired, distinguish two **distinct** verdicts (not one lumped event): a **partition** — a genuine connectivity cut, `Fiedler λ₂ = 0` on the loss-weighted graph, all nodes alive (§6.5) — versus a **systemic** over-coupling, `r > 1/√3` (`R < 1/3`, §18.2); weak correlation short of `1/√3` is the resilient/diversified regime and is *not* a fault. Otherwise `σ` is the address of the degraded node.
 4. **Discern.** If the fault is grey/Byzantine, run closure cross-attestation on the localized node's q+1 lines (§6.4) to separate crash from lie.
-5. **Heal.** Reroute via mediators, LRC-repair the node, and let the cell reintegrate; if ≥2 faults are detected, escalate to the parent cell.
+5. **Heal.** Reroute via mediators, LRC-repair the node, and let the cell reintegrate. Heal locally *everything the peeling code recovers* — any ≤3 simultaneous crashes, i.e. every non-hyperoval loss set (§6.3) — and escalate to the parent cell only the **irrecoverable residue**: a hyperoval stopping set, or ≥3 Byzantine faults that saturate the theme layer. (Syndrome saturation is the *verdict* to attempt escalation; the parent handoff is the *action*, taken only for the residue that remains after local repair.)
 </details>
 
 ```mermaid
@@ -643,9 +649,9 @@ sequenceDiagram
     Lines->>Lines: 14 polar sum-rules (free consistency alarms)
     Lines->>Synd: binarize + 3 Fano parities
     Synd->>Synd: σ = address of degraded node (distance-3)
-    Synd->>Heal: verdict (crash / grey / Byzantine / partition)
+    Synd->>Heal: verdict (crash / grey / Byzantine / partition / systemic)
     Heal->>Cell: reroute via k* · LRC repair · reintegrate (gap 2/3)
-    Note over Cell,Heal: Φ_net is the leading alarm · ≥2 faults → escalate to parent cell
+    Note over Cell,Heal: Φ_net is the leading alarm · heal ≤3 losses locally · escalate only the irrecoverable residue (hyperoval / ≥3 Byzantine)
 ```
 
 ## 6.10 What the coherence matrix gives — synthesis, and honest limits {#diakrisis-synthesis}
@@ -702,16 +708,16 @@ frame = type:varint  ‖  length:varint  ‖  body:bytes[length]
 
 | Range | Group | Types |
 |---|---|---|
-| `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `GOAWAY`, `ERROR` |
-| `0x1*` | Membership | `JOIN`, `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*`, `BEACON_PARTIAL` |
+| `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `GOAWAY`, `ERROR`, `OBSERVED_ADDR`, `CONNECT_REQ`, `PUNCH_TO`, `RELAY` |
+| `0x1*` | Membership | `JOIN`, `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*`, `BEACON_PARTIAL`, `EPOCH_AGREE` |
 | `0x2*` | Overlay/storage | `LOOKUP`, `VALUE`, `PUBLISH`, `ACK`, `BRIDGE` |
 | `0x3*` | Direct route | `ROUTE`, `STREAM_OPEN`, `STREAM_DATA`, `STREAM_FIN`, `ROUTE_HIER` |
 | `0x4*` | APHANTOS/NYX | `TESSERA`, `PARTIAL_DEC`, `COVER` |
-| `0x5*` | Rendezvous / CALYPSO | `RDV_INTRO`, `RDV_REPLY`, `SVC_ANNOUNCE`, `RDV_REGISTER` |
-| `0x6*` | DIAKRISIS | `DIAG_GOSSIP`, `DIAG_SYNDROME`, `DIAG_VERDICT` |
+| `0x5*` | Rendezvous / CALYPSO | `RDV_INTRO`, `RDV_REPLY`, `SVC_ANNOUNCE`, `RDV_REGISTER`, `SVC_SHARE_REQ`, `SVC_PARTIAL` |
+| `0x6*` | DIAKRISIS | `DIAG_GOSSIP`, `DIAG_SYNDROME`, `DIAG_VERDICT`, `DIAG_ATTEST`, `DIAG_LOSS` |
 | `0x7*` | Application | `APP` |
 
-The registry is versioned (§7.4); new types are added by IANA-style allocation without breaking old decoders. Four entries above are forward-compatible additions beyond the base set: `BEACON_PARTIAL` carries one anchor's distributed-VRF beacon partial for an epoch (a threshold of them assemble a `BEACON` round, §L3); `ROUTE_HIER` carries a hierarchical route (`HierAddr(dst) ‖ payload`) forwarded cell-to-cell toward a multi-level destination (§L1), degenerating to `ROUTE` at hierarchy depth 1; `RDV_REGISTER` lets a client register its coordinate with a rendezvous relay so anonymous replies assembled at the relay's combiner reach it; `APP` (group `0x7*`) is a length-skippable outer type multiplexing application-overlay protocols above the FANOS core, so a decoder unaware of a given overlay still forward-compatibly skips it.
+The registry is versioned (§7.4); new types are added by IANA-style allocation without breaking old decoders. The following forward-compatible additions extend the base set, each wired to a live subsystem: `BEACON_PARTIAL` carries one anchor's distributed-VRF beacon partial for an epoch (a threshold of them assemble a `BEACON` round, §L3); `EPOCH_AGREE` gossips the epoch **ordinal** for membership agreement — distinct from the `BEACON` randomness round; `ROUTE_HIER` carries a hierarchical route (`HierAddr(dst) ‖ payload`) forwarded cell-to-cell toward a multi-level destination (§L1), degenerating to `ROUTE` at hierarchy depth 1; the NAT-traversal session sub-group `OBSERVED_ADDR` / `CONNECT_REQ` / `PUNCH_TO` / `RELAY` carries reflexive-address reports, hole-punch brokering, and the symmetric-NAT relay fallback (§L2); `RDV_REGISTER` lets a client register its coordinate with a rendezvous relay so anonymous replies assembled at the relay's combiner reach it; `SVC_SHARE_REQ` / `SVC_PARTIAL` carry the CALYPSO threshold-hosting share request and partial decryption (§12.3); `DIAG_ATTEST` / `DIAG_LOSS` carry DIAKRISIS cross-attestation (§6.4) and grey-loss reports (§6.3); `APP` (group `0x7*`) is a length-skippable outer type multiplexing application-overlay protocols above the FANOS core, so a decoder unaware of a given overlay still forward-compatibly skips it. A separate **inner** `SessionFrameType` registry (`PADDING` / `DATA` / `ACK` / `RESET`) numbers the intra-cell DIAULOS stream frames; `fanos-wire` is the single frame-numbering authority for both layers.
 
 ## 7.3 Session handshake and state machine {#wire-handshake}
 
@@ -727,11 +733,11 @@ stateDiagram-v2
     ESTABLISHED --> CLOSED: GOAWAY / idle timeout
 ```
 
-`HELLO` carries: `version`, `capability bitfield`, the sender's `epoch` and `coord`, and a signed proof-of-coordinate (`VRF(pubkey, epoch)` output + proof), so the peer verifies the coordinate is not forged (ties into the §3.2 assumption 1). Mismatched epoch triggers a `BEACON` sync before retry. The handshake adds **zero extra round trips** beyond QUIC (HELLO piggybacks on the first flight; 0-RTT resumption re-uses the cached HELLO).
+`HELLO` carries: `version`, `capability bitfield`, the sender's `epoch` and `coord`, and a signed proof-of-coordinate (the coordinate-VRF output over `id ‖ epoch ‖ SEED(epoch)` + its proof, keyed by the sender's coordinate-VRF secret, §L0), so the peer verifies the coordinate is not forged (ties into the §3.2 assumption 1). Mismatched epoch triggers a `BEACON` sync before retry. The handshake adds **zero extra round trips** beyond QUIC (HELLO piggybacks on the first flight; 0-RTT resumption re-uses the cached HELLO).
 
 ## 7.4 Versioning and capability negotiation {#wire-versioning}
 
-`version` is a single monotonically-increasing profile number; `capabilities` is a bitfield (e.g. `APHANTOS_FULL`, `CALYPSO`, `BLOCKCHAIN`, `PQ_ONLY`, `GF_2^m`, cell size `q`). Two peers operate at `min(version)` and the **intersection** of capabilities — a minimal FANOS node (DHT-only, Direct profile) interoperates with a full node; the full node simply does not offer NYX/CALYPSO frames to it. This is how "assemble only DHT" or "DHT+VPN" builds (§XI) stay wire-compatible.
+`version` is a single monotonically-increasing profile number; `capabilities` is a bitfield (`CORE`, `APHANTOS_LITE`, `APHANTOS_FULL`, `CALYPSO`, `PQ_ONLY`, `GF_2^m`, `BLOCKCHAIN`). Every conformant node sets the mandatory `CORE` bit (baseline DHT + Direct profile), so an **empty** capability intersection is precisely the capability-incompatibility signal — distinct from a version mismatch. The plane order `q` is deliberately **not** a capability bit — a scalar order cannot be AND-negotiated the way a boolean feature can (an intersection is meaningless for a scalar) — so it travels as a separate scalar field `field_q` in `HELLO`; only `GF_2^m` (binary-vs-prime field) remains a boolean bit. Two peers operate at `min(version)` and the **intersection** of capabilities — a minimal FANOS node (DHT-only, Direct profile) interoperates with a full node; the full node simply does not offer NYX/CALYPSO frames to it. This is how "assemble only DHT" or "DHT+VPN" builds (§XI) stay wire-compatible.
 
 ## 7.5 Error taxonomy {#wire-errors}
 
@@ -750,8 +756,8 @@ Errors are a `varint code` + optional UTF-8 reason, grouped so a caller can reac
 A node with zero state joins deterministically:
 
 1. **Find any peer.** From a configured **bootstrap set** — a small list of `(node-ID, address)` shipped with the client, resolvable also via DNS seeds or a `.well-known` record — or a LAN mDNS/DHT rendezvous. One reachable bootstrap peer suffices (its centrality is capped, §L3, so bootstraps are not privileged trust roots).
-2. **Sync the beacon.** `BEACON_REQ` → `BEACON` returns the current epoch seed with its threshold-BLS proof; the node verifies it (no trust in the bootstrap peer — the proof is self-authenticating).
-3. **Compute placement.** `coord = MapToPoint(VRF(pubkey, epoch))` fixes the node's cell and lines.
+2. **Sync the beacon.** `BEACON_REQ` → `BEACON` returns the current epoch seed with its threshold-DVRF proof (the combined ristretto255 output with its Chaum–Pedersen DLEQ, per §L6 — not a BLS signature); the node verifies it (no trust in the bootstrap peer — the proof is self-authenticating).
+3. **Compute placement.** `coord = MapToPoint(VRF(vrf_sk, id ‖ epoch ‖ SEED(epoch)))` fixes the node's cell and lines (§L0).
 4. **JOIN** (§7.8) into that cell; participate in line DKG. From here everything is algebraic — no further discovery walk.
 
 Bootstrap is the *only* trust-on-first-use surface, and it is minimised: the beacon proof and coordinate VRF make even a malicious bootstrap unable to misplace a node or forge randomness.
@@ -789,7 +795,7 @@ This layout is the **canonical FANOS choice**; conformant implementations MUST u
 1. Generate a key pair (hybrid).
 2. Pass Sybil admission (PoW/stake/WoT).
 3. Obtain the current `beacon_seed` of the epoch.
-4. Compute `coord = MapToPoint(VRF(pubkey, epoch))`.
+4. Compute `coord = MapToPoint(VRF(vrf_sk, id ‖ epoch ‖ SEED(epoch)))` (§L0).
 5. Occupy the point (consistent hashing); announce along its q+1 lines (authenticated gossip).
 6. Participate in the DKG of its lines (obtain the shares `sk_i`).
 </details>
@@ -814,7 +820,7 @@ This layout is the **canonical FANOS choice**; conformant implementations MUST u
 <summary><b>NYX-ROUTE (APHANTOS-Full) — anonymous delivery</b></summary>
 
 1. Choose a geometric flag-path of length L (uniformly, PGL transitivity).
-2. Assemble the Tessera packet: layers on `PK_{L_k}`, the β-ratchet from the connection.
+2. Assemble the Tessera packet: each layer **threshold-sealed to `L_k`'s members** (per-member KEM-sealed shares, §5.2 — no single `PK_{L_k}`), the β-ratchet from the connection.
 3. At each hop the line assembles a threshold t, peels a layer, applies a Poisson delay, re-encrypts.
 4. The receiver verifies the `holonomy_tag`.
 </details>
@@ -822,8 +828,8 @@ This layout is the **canonical FANOS choice**; conformant implementations MUST u
 <details>
 <summary><b>RENDEZVOUS — a private meeting by a shared secret</b></summary>
 
-1. Both parties: `L_rdv = MapToLine(VRF(s, epoch))`.
-2. The initiator posts a request encrypted to `PK_{L_rdv}`.
+1. Both parties: `L_rdv = MapToLine(H(s ‖ epoch ‖ SEED(epoch)))` — a hash-to-line folding the per-epoch beacon seed (no per-pair VRF key).
+2. The initiator posts a request **threshold-sealed to `L_rdv`'s members** (§5.2 — no single `PK_{L_rdv}`).
 3. The responder replies via NYX-ROUTE; rotation every epoch. (Full hidden-service flow: CALYPSO, Part XII.)
 </details>
 
@@ -831,7 +837,7 @@ This layout is the **canonical FANOS choice**; conformant implementations MUST u
 
 Interoperability is enforced by a **conformance suite**, not by prose. Two classes of vector:
 
-- **Algebra KATs** — the projective operations (`cross`, `MapToPoint`, `MapToLine`, syndrome, mediator), produced and checked by [`fanos_verify.py`](pathname:///fanos/fanos_verify.py) (V1–V22). Any implementation must reproduce them bit-for-bit.
+- **Algebra KATs** — the projective operations (`cross`, `MapToPoint`, `MapToLine`, syndrome, mediator), pinned as committed language-agnostic vectors in [`conformance/vectors/*.json`](pathname:///fanos/conformance/) (`algebra.json`, `wire.json`, `diakrisis.json`, `services.json`, …) and reproduced end-to-end (V1–V22) by the Rust reference verifier `cargo run -p fanos-cli`; `wire_kat.rs` / `conformance_vectors.rs` assert the vectors in CI so they cannot drift silently. The math-only V-vectors also have a companion script [`fanos_verify.py`](pathname:///fanos/fanos_verify.py). Any implementation must reproduce the vectors bit-for-bit.
 - **Wire KATs** — canonical encodings of each frame and of the Tessera packet, plus the handshake transcript hash, as `(input, expected-bytes)` pairs. A new implementation passes iff it encodes to exactly these bytes and rejects the listed non-canonical inputs.
 
 A node advertises `conformance-level` in `HELLO`; two nodes only enable a feature both have certified. This is the mechanism that makes "any language, any platform" concrete: pass the KATs and you interoperate, whatever the language.
@@ -869,12 +875,12 @@ To show the specification covers all layers, here is an adversarial sweep — on
 | Attack | Layer | Structural mitigation | Status |
 |---|---|---|---|
 | Key forgery / impersonation | L0 | hybrid PQ signatures (Ed25519+ML-DSA-65) bound to node-ID | [T] std |
-| Coordinate grinding (pick your cell) | L0/L3 | `coord = VRF(pubkey, epoch)`; beacon unpredictable → cannot pre-aim | [C] beacon |
+| Coordinate grinding (pick your cell) | L0/L3 | `coord = MapToPoint(VRF(vrf_sk, id‖epoch‖SEED))`; beacon seed unpredictable → cannot pre-aim | [C] beacon |
 | Sybil flooding | L3 | admission (PoW/stake/WoT) **and** structural centrality cap `(q+1)/N` | [T]+[C] |
 | Eclipse a node | L1 | anti-eclipse: must own all `q+1` lines simultaneously | [T] (V14) |
 | Supernode / centrality capture | L1 | centrality is geometry-fixed, cannot be bought | [T] (V3) |
 | Routing-table poisoning | L1 | there are no routing tables — routes are `u × v` | [T] |
-| Beacon bias / grinding | L3 | threshold-BLS honest-majority beacon (drand-class) | [C] threshold |
+| Beacon bias / grinding | L3 | pairing-free threshold-DVRF honest-majority beacon (drand-class, DLEQ-verified) | [C] threshold |
 | Transport downgrade / harvest-now | L2/L6 | PQ-hybrid from day one; `PQ_ONLY` capability | [T] std |
 | Amplification / reflection DoS | L2 | QUIC address validation + retry token | [T] std |
 | Endpoint correlation (deanon) | L5 | threshold hop, `P_link = P_hop² ≪ f²` | [T] (V5) |
@@ -907,7 +913,7 @@ To show the specification covers all layers, here is an adversarial sweep — on
 | Quorum-intersection guarantee | no | no | no | **yes** (Maekawa) [T] |
 | Centrality cap | no | no | partial | **(q+1)/N** [T] |
 | Multipath out of the box | no | no | no | **q+1 paths** [T] |
-| Storage redundancy | varies | — | — | (q+1)/q → 1 [T] |
+| Storage redundancy | varies | — | — | **N/K = 7/3 ≈ 2.33×**, availability-3 (any ≤3 losses) [T] |
 | Latency (public) | — | medium | high | **QUIC-class** (Direct) |
 | Latency (anon) | — | ~1 s | 3–25 s | **1.5–25 s by dial** [T] |
 | Post-quantum | no | partial | partial | **hybrid via L6** |
@@ -1026,10 +1032,10 @@ A CALYPSO address is `` `<base32(BLAKE3(service_pubkey))>.fanos` `` — self-cer
 Client and service **independently derive** their meeting line from the beacon:
 
 ```
-L_rdv = MapToLine( VRF_beacon( H("FANOS-v1/calypso" ‖ service_pubkey), epoch ) )
+L_rdv = MapToLine( H("FANOS-v1/calypso" ‖ service_pubkey ‖ epoch ‖ SEED(epoch)) )
 ```
 
-This is a *public* function of the service identity and the epoch — both sides compute it with no lookup, so there is **no HSDir to enumerate, block, or seize** (a real, exploited Tor weakness). Because it is keyed by the epoch beacon, `L_rdv` **rotates every epoch** — there is no long-term target to surveil or attack. The rendezvous point of Tor becomes a theorem of the plane.
+This is a *public* hash-to-line function of the service identity and the epoch — folding in the per-epoch beacon seed `SEED(epoch)` (not a per-service VRF, which would need a keypair per service and defeat the "both sides compute it" property). Both sides compute it with no lookup, so there is **no HSDir to enumerate, block, or seize** (a real, exploited Tor weakness). Because it folds in the epoch beacon, `L_rdv` **rotates every epoch** — there is no long-term target to surveil or attack. The rendezvous point of Tor becomes a theorem of the plane.
 
 ## 12.3 Threshold-hosted service — the core innovation [С] {#calypso-threshold}
 
@@ -1053,7 +1059,7 @@ sequenceDiagram
     participant C as Client (anonymous)
     participant Lrdv as Rendezvous line L_rdv (rotates per epoch)
     participant Svc as Service-line (t of q+1, no single host)
-    C->>Lrdv: RDV_INTRO enc to PK_L_rdv (cookie + first NYX hop) + PoW
+    C->>Lrdv: RDV_INTRO threshold-sealed to L_rdv members (cookie + first NYX hop) + PoW
     Note over Lrdv,Svc: service listens on its lines · threshold-decrypts the intro
     Svc->>C: RDV_REPLY via NYX-ROUTE to the client cookie
     Note over C,Svc: both build an APHANTOS-Full circuit meeting at a NYX node
@@ -1136,7 +1142,7 @@ Morphs **compose** (e.g. `polymorph` inside `webrtc`). Because FANOS is already 
 
 ## 13.4 Beacon-rotating polymorphism (FANOS-native) [С] {#proteus-rotation}
 
-Static AmneziaWG picks its junk/padding parameters once. PROTEUS derives them from the epoch beacon: `θ_epoch = KDF("FANOS-v1/proteus-shape" ‖ community_secret ‖ epoch)` — junk-count, junk-size range, header-scramble seed, padding profile. **The wire signature therefore changes every epoch** (verified illustratively, `fanos_verify.py` V22: `θ(e0) ≠ θ(e1) ≠ θ(e2)`, unpredictable without the beacon). A censor's ML classifier trained on this epoch's flows has stale features next epoch — the moving-target discipline of CALYPSO (§12.2) applied to *traffic shape* rather than rendezvous.
+Static AmneziaWG picks its junk/padding parameters once. PROTEUS derives them from the epoch beacon: `θ_epoch = KDF("FANOS-v1/proteus-shape" ‖ community_secret ‖ epoch)` — junk-count, junk-size range, header-scramble seed, padding profile. **The wire signature therefore changes every epoch** (verified illustratively, `fanos_verify.py` V22: `θ(e0) ≠ θ(e1) ≠ θ(e2)`, unpredictable without the beacon). A censor's ML classifier trained on this epoch's flows has stale features next epoch — the moving-target discipline of CALYPSO (§12.2) applied to *traffic shape* rather than rendezvous. The shape is further diversified **per-packet**: the junk/padding keystream is drawn from a PRF over `θ_epoch` and a fresh cleartext **nonce** (a monotonic per-packet counter), so even two sends of an *identical* frame within one epoch shape to different bytes — closing the fixed intra-epoch prefix and the equal-frame linkability a purely per-epoch shaper would leave open.
 
 ## 13.5 Active-probing resistance {#proteus-probing}
 
@@ -1147,7 +1153,7 @@ A censor that suspects a bridge connects to it to confirm. A PROTEUS endpoint mu
 
 ## 13.6 Moving-target bridges — the censored bootstrap {#proteus-bridges}
 
-The plain bootstrap (§7.6) is a *blockable static list* — useless under censorship. PROTEUS replaces it with the same computed-rendezvous trick as CALYPSO: a client holding a **community bridge-secret `s`** derives the current entry set from the beacon, `bridge = MapToLine(VRF(s, epoch))`, which **rotates every epoch**. Consequences (verified V22):
+The plain bootstrap (§7.6) is a *blockable static list* — useless under censorship. PROTEUS replaces it with the same computed-rendezvous trick as CALYPSO: a client holding a **community bridge-secret `s`** derives the current entry set from the beacon, `bridge = MapToLine(H(s ‖ epoch ‖ SEED(epoch)))` — a hash-to-line folding the per-epoch beacon seed (no per-secret VRF key) — which **rotates every epoch**. Consequences (verified V22):
 
 - A censor who enumerates and blocks this epoch's bridges finds the list **decayed** next epoch — blocking 184 of 993 lines still leaves a client reachable in ~80% of future epochs; a fixed blocklist never persists, so the censor must **re-enumerate every epoch**.
 - To block a client's entry in a single epoch a censor must cover **all `q+1`** of its bridge-lines (anti-eclipse, §6.5 / V14) — and next epoch they differ.
@@ -1355,7 +1361,7 @@ The substrate for distributed cognition is therefore not an add-on to SYNARC —
 | **Partition-resistance** | no single-line failure disconnects a cell; isolating a node needs all its q+1 lines |
 | **Integration monitor `Φ_net`** | `Φ<1` = the cell is fragmenting; the earliest failure alarm |
 | **CALYPSO** | anonymous hidden services; Greek Καλυψώ "the concealer" (Part XII) |
-| **Computed rendezvous** | the meeting line `L_rdv = MapToLine(VRF(service_pubkey, epoch))` — no HSDir, rotates per epoch |
+| **Computed rendezvous** | the meeting line `L_rdv = MapToLine(H("FANOS-v1/calypso" ‖ service_pubkey ‖ epoch ‖ SEED(epoch)))` — a hash-to-line, no HSDir, rotates per epoch |
 | **Threshold-hosted service** | a service hosted across a line's `q+1` members; `< t` seized hosts learn nothing |
 | **`.fanos` address** | `<base32(BLAKE3(service_pubkey))>.fanos`, self-certifying and post-quantum |
 | **Collective-subject window** | `r ∈ (1/√6, 1/√3]` — a 7-agent cell is a candidate unified subject (V19) |
@@ -1363,7 +1369,7 @@ The substrate for distributed cognition is therefore not an add-on to SYNARC —
 | **PROTEUS** | optional polymorphic transport / censorship & DPI resistance; Greek Πρωτεύς "the shape-shifter" (Part XIII) |
 | **Morph** | a configurable obfuscation mode = codec + traffic-shaper + bridge-discovery (`polymorph`, `tls-tunnel`, `webrtc`, …) |
 | **`polymorph`** | the flagship morph: "look like nothing", configurable junk/padding, per-deployment + beacon-rotating parameters (AmneziaWG-class) |
-| **Moving-target bridge** | entry point `bridge = MapToLine(VRF(s, epoch))` that rotates each epoch — no static list for a censor to block (V22) |
+| **Moving-target bridge** | entry point `bridge = MapToLine(H(s ‖ epoch ‖ SEED(epoch)))` that rotates each epoch — no static list for a censor to block (V22) |
 
 ## B. Pseudocode of rendezvous and a hop (reference)
 

@@ -1,7 +1,7 @@
 //! `MapToPoint` / `MapToLine` — uniform hashing into `PG(2, q)` (spec §7.1, L0).
 //!
-//! A node coordinate is `MapToPoint(VRF(pubkey, epoch))`; a content key maps to
-//! `MapToPoint(H(k))`; a rendezvous line is `MapToLine(VRF(secret, epoch))`. All three need a
+//! A node coordinate is `MapToPoint(VRF(sk, node ‖ epoch ‖ beacon))`; a content key maps to
+//! `MapToPoint(H(k))`; a rendezvous line is `MapToLine(H(secret ‖ epoch ‖ beacon))`. All three need a
 //! *uniform* projective element deterministically derived from a label and some bytes. The
 //! construction draws field coordinates from the domain-separated BLAKE3 XOF stream — masked
 //! for binary fields, rejection-sampled for prime fields to avoid modulo bias — discards the

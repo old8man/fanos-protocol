@@ -31,8 +31,9 @@
 //! * **Verifiable:** each partial carries a DLEQ proof checkable against the public `Y_i`; the combined
 //!   `σ` is exactly `x·M`, so a client re-deriving its meeting line trusts algebra, not a beacon operator.
 //! * **Pairing-free & curve-coherent:** built on ristretto255 — the curve FANOS already fixes for its
-//!   coordinate VRF (spec §L6) — rather than the spec's nominal threshold-BLS, avoiding a second
-//!   (pairing) trust base. A post-quantum beacon remains the spec's `[P]` research direction.
+//!   coordinate VRF (spec §L6) — rather than the pairing-based threshold-BLS an earlier draft named,
+//!   avoiding a second (pairing) trust base. The spec (§L3/§L6/§7.6) now specifies exactly this
+//!   pairing-free threshold DVRF; a post-quantum beacon remains the spec's `[P]` research direction.
 
 use alloc::vec::Vec;
 

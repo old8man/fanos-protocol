@@ -11,7 +11,7 @@ pub const DIGEST_LEN: usize = 32;
 
 /// A FANOS domain-separation label (spec §7.1).
 pub mod label {
-    /// Coordinate derivation `MapToPoint(VRF(pubkey, epoch))`.
+    /// Coordinate derivation `MapToPoint(VRF(sk, node ‖ epoch ‖ beacon))`.
     pub const COORD: &str = "FANOS-v1/coord";
     /// Private rendezvous line derivation.
     pub const RDV: &str = "FANOS-v1/rdv";
