@@ -128,8 +128,11 @@ RUST_LOG=info fanos node --config /etc/fanos/node.conf
 * **Open the UDP port.** The `listen` port must be reachable from the internet. Example firewall
   rule: `ufw allow 9000/udp`.
 * **NAT / port-forward.** Behind NAT, forward the same UDP port to the host and advertise the
-  *public* `host:port` in your bootstrap seed. Direct hole-punching for non-forwarded nodes is
-  tracked separately (NAT traversal, #119); until then a server needs a reachable UDP port.
+  *public* `host:port` in your bootstrap seed. A node now **auto-discovers** the public address its
+  peers observe it at (reflexive / STUN-like: peers report it, and a node trusts it once a quorum
+  agree — `fanos_quic::ReflexiveAddr`, NAT traversal #119). Direct **hole-punching** for
+  non-forwarded nodes is the remaining piece; until it lands a server still needs a reachable UDP
+  port (forwarded or firewall-opened).
 * **Pin the port.** Set `listen` to a fixed port (not `:0`) so the seed you hand out stays valid.
 
 ---
