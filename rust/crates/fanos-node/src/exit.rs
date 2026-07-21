@@ -25,8 +25,10 @@ use fanos_quic::Client;
 use fanos_rendezvous::Epoch;
 use fanos_runtime::Notification;
 use rand_core::CryptoRng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::net::TcpStream;
+use std::net::Ipv4Addr;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -36,6 +38,30 @@ use crate::resolve::RESOLVE_TIMEOUT;
 /// Upper bound on the target header length (`host:port`) — bounds the read a malicious client can force
 /// before it has connected anywhere.
 const MAX_TARGET_LEN: usize = 256;
+
+/// The maximum UDP datagram payload the exit tunnel carries (a `u16` length prefix bounds it; comfortably
+/// above a jumbo DNS response).
+pub const MAX_DATAGRAM_LEN: usize = 65535;
+
+/// The transport an exit session relays: a TCP byte stream (the default) or UDP datagrams. Selected by an
+/// optional scheme prefix on the target header (`udp:host:port`; a bare or `tcp:`-prefixed `host:port` is
+/// TCP — backward-compatible with the original TCP-only exit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Protocol {
+    Tcp,
+    Udp,
+}
+
+/// Parse an exit target header into `(protocol, host, port)`: a leading `udp:` selects UDP; a leading
+/// `tcp:` or no scheme selects TCP. `None` if the `host:port` remainder is malformed.
+fn parse_target(target: &str) -> Option<(Protocol, &str, u16)> {
+    let (proto, rest) = match target.strip_prefix("udp:") {
+        Some(rest) => (Protocol::Udp, rest),
+        None => (Protocol::Tcp, target.strip_prefix("tcp:").unwrap_or(target)),
+    };
+    let (host, port) = split_host_port(rest)?;
+    Some((proto, host, port))
+}
 
 /// What clearnet targets an exit will relay to. A first cut gates on the destination **port** (the common
 /// abuse lever — mail relays, scanning); an empty allow-list means any port, which the operator opts into
@@ -81,22 +107,75 @@ where
     });
 }
 
-/// Serve one exit session: read its target, enforce the policy, dial TCP, and splice both ways. Any error
-/// (bad header, denied target, unreachable host) simply ends the session — the stream drops, closing it.
+/// Serve one exit session: read its target, enforce the policy, then splice it — a TCP byte stream or a
+/// UDP datagram relay — until either side closes. Any error (bad header, denied target, unreachable host)
+/// simply ends the session; the stream drops, closing it.
 async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy) {
     let Some(target) = read_target(&mut stream).await else {
         return;
     };
-    let Some((host, port)) = split_host_port(&target) else {
+    let Some((proto, host, port)) = parse_target(&target) else {
         return;
     };
     if !policy.allows_port(port) {
         return;
     }
-    let Ok(mut tcp) = TcpStream::connect((host, port)).await else {
+    match proto {
+        Protocol::Tcp => {
+            let Ok(mut tcp) = TcpStream::connect((host, port)).await else {
+                return;
+            };
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+        }
+        Protocol::Udp => relay_udp(stream, host, port).await,
+    }
+}
+
+/// Relay UDP datagrams for one exit session: bind an ephemeral socket **connected** to `(host, port)`, and
+/// shuttle length-framed datagrams (`len(2 BE) ‖ payload`) between the session stream and that socket in
+/// both directions until either closes. A connected socket keeps this a one-target tunnel (the UDP analog
+/// of `CONNECT`) — the target sees the exit's address, never the client's. This serves DNS-over-FANOS (a
+/// resolver at `udp:host:53`) and any single-destination UDP flow.
+async fn relay_udp(stream: DuplexStream, host: &str, port: u16) {
+    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
         return;
     };
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+    if socket.connect((host, port)).await.is_err() {
+        return;
+    }
+    let socket = Arc::new(socket);
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    // Session → target: each framed datagram off the stream is one UDP send.
+    let up = {
+        let socket = Arc::clone(&socket);
+        async move {
+            while let Some(payload) = read_datagram(&mut reader).await {
+                if socket.send(&payload).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+    // Target → session: each UDP datagram received is framed back onto the stream.
+    let down = async move {
+        let mut buf = vec![0u8; MAX_DATAGRAM_LEN];
+        loop {
+            let Ok(n) = socket.recv(&mut buf).await else {
+                break;
+            };
+            if write_datagram(&mut writer, buf.get(..n).unwrap_or(&[]))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = up => {}
+        () = down => {}
+    }
 }
 
 /// Read the length-prefixed target header `len(2 BE) ‖ host:port` from the stream.
@@ -110,6 +189,26 @@ async fn read_target(stream: &mut DuplexStream) -> Option<String> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await.ok()?;
     String::from_utf8(buf).ok()
+}
+
+/// Read one length-framed datagram (`len(2 BE) ‖ payload`) from a UDP-tunnel stream. `None` on EOF or a
+/// short read; a zero length is a valid empty datagram.
+pub async fn read_datagram<R: AsyncRead + Unpin>(reader: &mut R) -> Option<Vec<u8>> {
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len).await.ok()?;
+    let mut buf = vec![0u8; usize::from(u16::from_be_bytes(len))];
+    reader.read_exact(&mut buf).await.ok()?;
+    Some(buf)
+}
+
+/// Write one length-framed datagram (`len(2 BE) ‖ payload`) to a UDP-tunnel stream. Errors if `payload`
+/// exceeds [`MAX_DATAGRAM_LEN`].
+pub async fn write_datagram<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
+    let len = u16::try_from(payload.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "datagram exceeds the tunnel frame size")
+    })?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(payload).await
 }
 
 /// Split a `host:port` target, taking the port after the LAST colon (so IPv6 literals like `[::1]:443` and
@@ -143,6 +242,24 @@ pub async fn dial_exit<R: CryptoRng>(
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(bytes).await?;
     Ok(stream)
+}
+
+/// Client side: dial the exit and open a **UDP** tunnel to `(host, port)`. The returned stream carries
+/// length-framed datagrams ([`write_datagram`] / [`read_datagram`]) — each frame written is one UDP send at
+/// the exit, each frame read is one datagram the target sent back. Serves DNS-over-FANOS (`host:53`) and
+/// any single-destination UDP; see [`dial_exit`] for the TCP form.
+///
+/// # Errors
+/// An I/O error if the target header is too long or the initial write fails.
+pub async fn dial_exit_udp<R: CryptoRng>(
+    client: Client,
+    service: Coord,
+    service_public: &HybridKemPublic,
+    host: &str,
+    port: u16,
+    rng: &mut R,
+) -> io::Result<DuplexStream> {
+    dial_exit(client, service, service_public, &format!("udp:{host}:{port}"), rng).await
 }
 
 // --- Exit discovery: exits advertise themselves through the overlay store (mirroring the mix directory),
@@ -251,5 +368,49 @@ mod tests {
         assert_eq!(split_host_port("no-port"), None);
         assert_eq!(split_host_port(":443"), None, "empty host rejected");
         assert_eq!(split_host_port("host:not-a-port"), None);
+    }
+
+    #[test]
+    fn parse_target_selects_the_protocol() {
+        assert_eq!(parse_target("example.com:443"), Some((Protocol::Tcp, "example.com", 443)));
+        assert_eq!(parse_target("tcp:example.com:80"), Some((Protocol::Tcp, "example.com", 80)));
+        assert_eq!(parse_target("udp:9.9.9.9:53"), Some((Protocol::Udp, "9.9.9.9", 53)));
+        assert_eq!(parse_target("udp:[::1]:53"), Some((Protocol::Udp, "::1", 53)));
+        assert_eq!(parse_target("udp:no-port"), None, "a malformed udp target is rejected");
+    }
+
+    #[tokio::test]
+    async fn the_udp_relay_tunnels_datagrams_to_a_target_and_back() {
+        use std::time::Duration;
+
+        // A UDP echo server: whatever it receives, it sends straight back to the sender.
+        let echo = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(buf.get(..n).unwrap_or(&[]), src).await;
+            }
+        });
+
+        // The exit's UDP relay, connected to the echo server, over one half of an in-memory duplex.
+        let (client, exit) = tokio::io::duplex(64 * 1024);
+        let host = echo_addr.ip().to_string();
+        let port = echo_addr.port();
+        let relay = tokio::spawn(async move { relay_udp(exit, &host, port).await });
+
+        let (mut rd, mut wr) = tokio::io::split(client);
+        // Two distinct framed datagrams each round-trip through the exit and the echo server.
+        for expected in [b"dns-query".as_slice(), b"a second datagram".as_slice()] {
+            write_datagram(&mut wr, expected).await.unwrap();
+            let echoed = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut rd))
+                .await
+                .expect("no timeout")
+                .expect("a datagram comes back");
+            assert_eq!(echoed, expected, "the UDP relay tunnels the datagram to the target and back");
+        }
+
+        drop(wr); // closing the tunnel ends the relay
+        let _ = tokio::time::timeout(Duration::from_secs(2), relay).await;
     }
 }
