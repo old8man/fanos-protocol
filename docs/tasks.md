@@ -29,6 +29,8 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+C9 onion-replay over the running mixnet (`sim/tests/replay.rs`: a captured forwarded onion re-injected to
+the hop that saw it is dropped by the replay cache — no path confirmation; distinct onion still routes) ·
 Tier-2 hardening: DIAULOS `serve` session-map bounded (audit A4) — `MAX_SESSIONS` LRU-evicted + idle sweep
 aborting wedged handler tasks; a flood of client coords / a never-finishing handler can't grow it ·
 **PRODUCTION Blocker 3 — PoW Sybil admission live-wired** (`NodeConfig.admission_difficulty` →
