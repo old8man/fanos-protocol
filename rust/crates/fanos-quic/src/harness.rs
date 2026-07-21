@@ -17,7 +17,7 @@
 use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_primitives::{BeaconSeed, Epoch};
-use fanos_runtime::{Command, Engine};
+use fanos_runtime::{Command, Engine, Notification};
 
 use crate::directory::Directory;
 use crate::driver::{NodeHandle, QuicError, spawn_self_certifying_persistent};
@@ -104,35 +104,57 @@ pub async fn spawn_cell<F: Field + 'static>(
     for i in 0..n {
         nodes.push(spawn_pinned::<F>(Point::at(i), &make_engine, directory.clone()).await?);
     }
-    establish_membership(&nodes).await;
+    establish_membership(&mut nodes).await;
     Ok(Cell { nodes, directory })
 }
 
-/// How long to let the assembly-time membership announcements propagate over QUIC before the cell is
-/// handed back. A full cell is a complete mesh, so one direct `Announce` round (dial + deliver) reaches
-/// every member; this budget covers that round plus the lazy first-contact handshakes it triggers.
-const MEMBERSHIP_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+/// A backstop on membership convergence: if some announcement is lost, assembly proceeds best-effort
+/// rather than hanging. Generously wide because this is real QUIC on a machine shared with the whole test
+/// suite — convergence is normally sub-second, but a saturated host must not spuriously trip it.
+const MEMBERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Bring the freshly assembled cell to an *established* state: every node announces itself, so every
-/// member's `members` view — and hence the occupied-point set that shard placement and content routing
-/// read — is populated before any `Put`/`Get` runs.
+/// Bring the freshly assembled cell to an *established* state: every node announces itself and the call
+/// returns only once every member's `members` view — and hence the occupied-point set that shard
+/// placement and content routing read — is fully populated.
 ///
 /// This is load-bearing, not cosmetic. A node's occupancy set is filled by membership/liveness traffic,
 /// **not** by the static peer seeding it starts with (an unheard-from neighbour is a known *slot*, not a
-/// known *occupant*). Skip this and a fresh cell has every node believing it is the sole occupant, so a
+/// known *occupant*). Skip it and a fresh cell has every node believing it is the sole occupant, so a
 /// `Put`'s responsible node places all `N` erasure shards on *itself* instead of one per point — the
-/// value is then held by a single node, and losing that node loses the value, silently defeating the
-/// LRC availability guarantee (spec §L4). Issuing a `Join` on each node floods an `Announce` carrying
-/// its coordinate; on receipt every peer records the member, so the cell converges to a full occupied
-/// set. This mirrors the simulator fixture's `inject_all(StartHeartbeat) + run_for(..)` establishment
-/// step (see `fanos-sim` `tests/storage.rs::established`), realised here over real QUIC.
-async fn establish_membership(nodes: &[NodeHandle]) {
-    for node in nodes {
+/// value is then held by a single node, and losing that node loses the value, silently defeating the LRC
+/// availability guarantee (spec §L4). Issuing a `Join` on each node floods an `Announce` carrying its
+/// coordinate; on receipt every peer records the member and emits `MemberJoined`. This mirrors the
+/// simulator fixture's `inject_all(StartHeartbeat) + run_for(..)` establishment step (see `fanos-sim`
+/// `tests/storage.rs::established`), realised here over real QUIC.
+///
+/// Convergence is awaited on the actual `MemberJoined` stream rather than a fixed sleep, so it is both
+/// deterministic and load-adaptive: under a saturated host it waits exactly as long as the announcements
+/// take, instead of racing a too-short timer (a fixed settle let the occupancy establishment lose that
+/// race under parallel load, silently reintroducing the local-only-placement failure above).
+async fn establish_membership(nodes: &mut [NodeHandle]) {
+    // Each node learns the other `n − 1` members; `MemberJoined` fires once per first-seen peer.
+    let expected = nodes.len().saturating_sub(1);
+    for node in nodes.iter() {
         // Empty application info: the cell fixture needs only the coordinate each announcement carries,
         // which the membership layer fills in from the announcing node's own identity.
         node.command(Command::Join { info: Vec::new() });
     }
-    tokio::time::sleep(MEMBERSHIP_SETTLE).await;
+    // Announcements flood concurrently and each node buffers its own notification stream, so draining the
+    // nodes one after another never misses an event — a peer's `MemberJoined` is already queued by the
+    // time we poll it. Bounded by `MEMBERSHIP_TIMEOUT` so a dropped announcement degrades to best-effort.
+    let _ = tokio::time::timeout(MEMBERSHIP_TIMEOUT, async {
+        for node in nodes.iter_mut() {
+            let mut learned = 0;
+            while learned < expected {
+                match node.next_notification().await {
+                    Some(Notification::MemberJoined { .. }) => learned += 1,
+                    Some(_) => {}
+                    None => return, // this node's engine stopped — abandon the wait
+                }
+            }
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]
