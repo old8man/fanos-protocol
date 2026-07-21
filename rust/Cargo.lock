@@ -982,6 +982,7 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "fanos-primitives",
+ "libm",
  "proptest",
 ]
 

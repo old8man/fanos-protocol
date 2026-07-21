@@ -38,6 +38,37 @@ impl Morph {
             Self::TlsTunnel | Self::MasqueH3 | Self::Fronted | Self::Webrtc
         )
     }
+
+    /// The canonical lowercase config/CLI name of this morph.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Polymorph => "polymorph",
+            Self::TlsTunnel => "tls-tunnel",
+            Self::MasqueH3 => "masque-h3",
+            Self::Fronted => "fronted",
+            Self::Webrtc => "webrtc",
+            Self::Pluggable => "pluggable",
+        }
+    }
+
+    /// Parse a morph from its canonical [`name`](Self::name) (as written in config/CLI); `None` if the name
+    /// is unrecognised.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::Plain,
+            Self::Polymorph,
+            Self::TlsTunnel,
+            Self::MasqueH3,
+            Self::Fronted,
+            Self::Webrtc,
+            Self::Pluggable,
+        ]
+        .into_iter()
+        .find(|m| m.name() == name)
+    }
 }
 
 /// A named environment policy (spec §13.7): each selects a morph fallback chain.
@@ -100,6 +131,22 @@ mod tests {
             Environment::DeepCensorship.preferred_morph(),
             Morph::Polymorph
         );
+    }
+
+    #[test]
+    fn morph_names_round_trip() {
+        for m in [
+            Morph::Plain,
+            Morph::Polymorph,
+            Morph::TlsTunnel,
+            Morph::MasqueH3,
+            Morph::Fronted,
+            Morph::Webrtc,
+            Morph::Pluggable,
+        ] {
+            assert_eq!(Morph::from_name(m.name()), Some(m), "{m:?} name round-trips");
+        }
+        assert_eq!(Morph::from_name("nonsense"), None);
     }
 
     #[test]

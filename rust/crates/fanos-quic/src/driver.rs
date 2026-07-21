@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use fanos_field::Field;
 use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
-use fanos_proteus::ProteusShaper;
+use fanos_proteus::{Morph, ProteusShaper};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
@@ -58,6 +58,46 @@ fn tuned_transport() -> Arc<quinn::TransportConfig> {
 /// counter), so concurrent sends never serialize on each other.
 type Shaper = Option<Arc<RwLock<ProteusShaper>>>;
 
+/// PROTEUS transport configuration (spec §13): the shared community `secret` every frame is shaped under,
+/// and the [`Morph`] selecting the codec and traffic-shaping profile (size + timing). Peers must share the
+/// secret to interoperate; the morph is a local wire-shaping choice.
+#[derive(Clone)]
+pub struct ProteusConfig {
+    /// The shared community secret keying the beacon-rotating shape.
+    pub secret: Vec<u8>,
+    /// The obfuscation morph (defaults to the flagship [`Morph::Polymorph`]).
+    pub morph: Morph,
+}
+
+/// Redacted `Debug`: never render the community secret (secret hygiene, audit D) — only the morph.
+impl std::fmt::Debug for ProteusConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProteusConfig")
+            .field("secret", &"<redacted>")
+            .field("morph", &self.morph)
+            .finish()
+    }
+}
+
+impl ProteusConfig {
+    /// A config for the flagship [`Morph::Polymorph`] ("look like nothing") under `secret`.
+    #[must_use]
+    pub fn polymorph(secret: impl Into<Vec<u8>>) -> Self {
+        Self { secret: secret.into(), morph: Morph::Polymorph }
+    }
+
+    /// A config under an explicit `morph`.
+    #[must_use]
+    pub fn with_morph(secret: impl Into<Vec<u8>>, morph: Morph) -> Self {
+        Self { secret: secret.into(), morph }
+    }
+
+    /// Build the shared shaper this config describes, seeded at `epoch`.
+    fn into_shaper(self, epoch: Epoch) -> Arc<RwLock<ProteusShaper>> {
+        Arc::new(RwLock::new(ProteusShaper::with_morph(self.secret, epoch, self.morph)))
+    }
+}
+
 /// A self-certifying node's authenticated-identity handling (VRF-coordinate mode): the HELLO it
 /// announces on a fresh connection — its negotiation parameters and `epoch ‖ coordinate ‖
 /// proof-of-coordinate` (spec §7.3/§7.4) — and a verifier that checks a peer's HELLO against the
@@ -88,6 +128,20 @@ fn shape_out(shaper: &Shaper, frame: &[u8]) -> Vec<u8> {
     match shaper {
         Some(s) => s.read().unwrap_or_else(PoisonError::into_inner).outbound(frame),
         None => frame.to_vec(),
+    }
+}
+
+/// Shape an outbound frame for the wire **and** its traffic-shaping pace: the [`std::time::Duration`] the
+/// data path waits before transmitting (`ZERO` when no shaper is set or the morph does not time-shape). The
+/// clock stays in the driver — the shaper only computes the delay — keeping PROTEUS below the sans-I/O
+/// boundary. Used on the data path (`send_uni`); control frames keep the untimed [`shape_out`].
+fn shape_out_timed(shaper: &Shaper, frame: &[u8]) -> (Vec<u8>, std::time::Duration) {
+    match shaper {
+        Some(s) => {
+            let shaped = s.read().unwrap_or_else(PoisonError::into_inner).shape(frame);
+            (shaped.wire, shaped.delay)
+        }
+        None => (frame.to_vec(), std::time::Duration::ZERO),
     }
 }
 
@@ -590,14 +644,14 @@ pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
 /// Like [`spawn_self_certifying_persistent`], but binds the QUIC endpoint to an explicit address
 /// (e.g. `0.0.0.0:9000` for a publicly reachable node) instead of an ephemeral localhost port. This
 /// is the production entry point a node binary uses; the coordinate stays cert-derived and stable.
-/// `community_secret` enables PROTEUS (§13.4): when `Some`, every frame is polymorph-shaped with that shared
-/// secret and the shape rotates each epoch; `None` is plaintext QUIC. Peers must share the secret to interop.
+/// `proteus` enables PROTEUS (§13.4): when `Some`, every frame is shaped with that shared secret under the
+/// chosen morph and the shape rotates each epoch; `None` is plaintext QUIC. Peers must share the secret.
 pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
     bind: SocketAddr,
     credentials: &NodeCredentials,
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
-    community_secret: Option<Vec<u8>>,
+    proteus: Option<ProteusConfig>,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, _cert) = node_configs_mutual_from(credentials)?;
     self_certifying_inner::<F, _>(
@@ -608,7 +662,7 @@ pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
         directory,
         bind,
         Capabilities::CORE,
-        community_secret,
+        proteus,
     )
 }
 
@@ -621,16 +675,16 @@ fn self_certifying_inner<F: Field + 'static, M>(
     directory: Directory,
     bind: SocketAddr,
     capabilities: Capabilities,
-    community_secret: Option<Vec<u8>>,
+    proteus: Option<ProteusConfig>,
 ) -> Result<NodeHandle, QuicError>
 where
     M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
 {
-    // PROTEUS enablement (§13.4): with a community secret, wrap every frame in the beacon-rotating polymorph
-    // shape so the transport carries no static FANOS signature and the shape moves each epoch. The shaper
-    // starts at the genesis epoch and the `reshuffle_loop` rotates it as the beacon advances (below).
-    let shaper: Shaper = community_secret
-        .map(|secret| Arc::new(RwLock::new(ProteusShaper::new(secret, Epoch::ZERO))));
+    // PROTEUS enablement (§13.4): with a community secret, wrap every frame in the beacon-rotating shape (the
+    // configured morph's codec + traffic-shaper) so the transport carries no static FANOS signature and the
+    // shape moves each epoch. The shaper starts at the genesis epoch and the `reshuffle_loop` rotates it as
+    // the beacon advances (below).
+    let shaper: Shaper = proteus.map(|cfg| cfg.into_shaper(Epoch::ZERO));
     // The node's verifiable coordinate for the genesis epoch: MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS)),
     // with the proof it announces so peers can verify it (spec §L0/§7.3).
     let (coord, proof) = verifiable_coordinate::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
@@ -746,17 +800,16 @@ async fn reshuffle_loop<F: Field>(
     }
 }
 
-/// Like [`spawn`], but every frame on the wire is PROTEUS-shaped with the shared `community_secret`
-/// for `epoch` (spec §13.2): the transport carries no static FANOS signature, and a peer without
-/// the secret cannot produce frames this node will accept. The engine is unchanged — shaping lives
-/// entirely in the driver, below the sans-I/O boundary.
+/// Like [`spawn`], but every frame on the wire is PROTEUS-shaped by `proteus` for `epoch` (spec §13.2): the
+/// transport carries no static FANOS signature, and a peer without the secret cannot produce frames this node
+/// will accept. The engine is unchanged — shaping lives entirely in the driver, below the sans-I/O boundary.
 pub async fn spawn_shaped(
     engine: Box<dyn Engine + Send>,
     directory: Directory,
-    community_secret: Vec<u8>,
+    proteus: ProteusConfig,
     epoch: Epoch,
 ) -> Result<NodeHandle, QuicError> {
-    let shaper = Arc::new(RwLock::new(ProteusShaper::new(community_secret, epoch)));
+    let shaper = proteus.into_shaper(epoch);
     let (server, client) = node_configs()?;
     spawn_inner(
         engine,
@@ -924,10 +977,16 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedRecei
     }
 }
 
-/// Write one frame as a single shaped uni-stream on `conn` (the shared send primitive).
+/// Write one frame as a single shaped uni-stream on `conn` (the shared send primitive). When the active
+/// morph time-shapes (§13.3), the frame is paced by the shaper's per-packet delay first — the traffic-shaper
+/// applied at the one point every data frame passes through.
 async fn send_uni(conn: &Connection, shaper: &Shaper, frame: &[u8]) {
+    let (wire, delay) = shape_out_timed(shaper, frame);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     if let Ok(mut stream) = conn.open_uni().await
-        && stream.write_all(&shape_out(shaper, frame)).await.is_ok()
+        && stream.write_all(&wire).await.is_ok()
     {
         let _ = stream.finish();
     }

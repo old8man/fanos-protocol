@@ -18,8 +18,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **PROTEUS morph transforms** (§13.7) — real TLS / MASQUE-H3 / fronted traffic shaping (only `Polymorph`
-  is live today).
+- **PROTEUS auto-fallback + pluggable SPI** (§13.7, M10) — rotate morph on a connection-failure spike
+  (a local decision: the shaping morphs share the codec, so rotating the size/timing profile needs no
+  peer renegotiation); a `MorphCodec` SPI for the `pluggable` morph and real cover-protocol tunnels.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 - **VOPRF credit settlement** (Phase 4) — anonymous relay payment.
@@ -28,6 +29,16 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**PROTEUS traffic-shaping morph transforms** (§13.3/§13.7) — a morph is "codec + traffic-shaper", but only
+the polymorph codec existed and ran for every morph. Added `profile::ShapingProfile` — the per-morph,
+θ_epoch-derived traffic-shaper: packet-SIZE (pad up to a sampled band) + inter-packet TIMING (exponential
+`−mean·ln u`, the Poisson model, sender-local so float divergence is wire-harmless), both rotating per epoch
+and per packet, bands/means cited to the real protocol (TLS/MASQUE MTU-fill, WebRTC ~50 pkt/s). Wired the
+`Morph` through the shaper (`with_morph`, `shape()->Shaped{wire,delay}`, `Plain`=identity), the fanos-quic
+driver (`ProteusConfig{secret,morph}`, `send_uni` paces the timing directive — clock stays in the driver),
+and node config/CLI (`proteus_morph` / `--proteus-morph`). Polymorph default stays zero-cost (codec-only);
+shaping morphs add size+timing. Verified: profile math (size band, exponential mean, tail-cap, rotation),
+morph name round-trip, config parse, and a **real-QUIC** delivery under the TLS-tunnel size+timing morph. ·
 **DNS-over-FANOS · SOCKS5 UDP ASSOCIATE** (Phase 2 app surface, RFC 1928 §7) — the proxy now speaks the
 whole SOCKS5 protocol, not just CONNECT. Exit side: a `udp:host:port` target opens a connected UDP relay
 (`relay_udp`) carrying length-framed datagrams over the DIAULOS stream. Proxy side: `UdpDialer`/`UdpTunnel`

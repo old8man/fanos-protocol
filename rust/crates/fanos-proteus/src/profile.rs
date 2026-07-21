@@ -48,16 +48,22 @@ pub struct ShapingProfile {
 impl ShapingProfile {
     /// The default shaping target for `morph` — each band/mean cited to the morph's real-world statistical
     /// profile (see the module docs); all are overridable via [`custom`](Self::custom).
+    // Several morphs coincide on `none()` for *distinct* documented reasons (Plain is off by design,
+    // Polymorph's defense is the codec, Pluggable supplies its own via the SPI); the arms are kept separate
+    // for that clarity rather than merged.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub fn for_morph(morph: Morph) -> Self {
         match morph {
-            // No shaping. `Plain` is zero-overhead by design (the open-network path); `Pluggable` supplies
-            // its own profile through the SPI, so its built-in default is likewise identity.
-            Morph::Plain | Morph::Pluggable => Self::none(),
-            // The flagship's size defense is the codec's junk/padding, so no extra size band; add only a
-            // light sub-millisecond timing jitter to decorrelate FANOS's native send bursts without a
-            // material latency cost — the λ-dial at its minimum (§13.7).
-            Morph::Polymorph => Self { size_floor: 0, size_ceil: 0, mean_gap_us: 250 },
+            // Zero overhead by design: the open-network path adds neither padding nor delay.
+            Morph::Plain => Self::none(),
+            // The flagship's defense is the codec (entropy + junk/padding), which costs nothing on the wire.
+            // Timing pacing is a latency/throughput cost, so the default keeps it OFF ("costs nothing when
+            // the network is open", §13); an operator dials it up with a shaping morph or a `custom` profile
+            // (the λ-dial, §13.7) when a deep-censorship environment needs timing-classifier resistance.
+            Morph::Polymorph => Self::none(),
+            // A pluggable third-party transport supplies its own profile through the SPI; default to none.
+            Morph::Pluggable => Self::none(),
             // TLS-1.3 / Reality: records MTU-fill; a browsing flow paces at roughly a millisecond apart.
             Morph::TlsTunnel => Self { size_floor: 1200, size_ceil: 1400, mean_gap_us: 1000 },
             // MASQUE / HTTP-3 CONNECT-UDP: H3 DATAGRAM-sized, similar pacing.
@@ -188,8 +194,10 @@ mod tests {
     const SEED: [u8; 32] = [0x5a; 32];
 
     #[test]
-    fn plain_and_pluggable_do_not_shape() {
-        for m in [Morph::Plain, Morph::Pluggable] {
+    fn zero_cost_morphs_do_not_shape() {
+        // Plain (off by design), Polymorph (codec-only defense), and Pluggable (SPI-supplied) all default to
+        // an identity profile — no size padding, no timing pacing.
+        for m in [Morph::Plain, Morph::Polymorph, Morph::Pluggable] {
             let p = ShapingProfile::for_morph(m);
             assert!(!p.shapes_size() && !p.shapes_timing(), "{m:?} is identity");
         }
@@ -237,13 +245,14 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn timing_delay_is_exponential_and_capped() {
-        let poly = ShapingProfile::for_morph(Morph::Polymorph);
-        assert!(poly.shapes_timing());
+        // A custom timing profile (Polymorph itself no longer paces — the flagship default is zero-cost).
+        let paced = ShapingProfile::custom(0, 0, 250);
+        assert!(paced.shapes_timing());
         let mean = 250.0_f64;
         let mut sum = 0.0;
         let n: u32 = 4000;
         for seq in 0..n {
-            let d = poly.packet_delay(&SEED, u64::from(seq));
+            let d = paced.packet_delay(&SEED, u64::from(seq));
             // Every sample is capped at TAIL_CAP × mean.
             assert!(d.as_micros() as f64 <= mean * TAIL_CAP + 1.0, "capped tail");
             sum += d.as_micros() as f64;

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fanos_geometry::Triple;
+use fanos_quic::Morph;
 use fanos_vrf::vss::{VssCommitment, VssShare};
 
 use crate::error::NodeError;
@@ -369,6 +370,10 @@ pub struct NodeConfig {
     /// epoch** (the moving-target defence); `None` (the default) is plaintext QUIC. All peers that must
     /// interoperate share the same secret — it is a bridge/community password, not a per-node key.
     pub proteus_secret: Option<Vec<u8>>,
+    /// The PROTEUS morph selecting the wire codec and traffic-shaping profile (§13.3): the flagship
+    /// [`Morph::Polymorph`] ("look like nothing", the default) or an explicit shaping morph. Only takes
+    /// effect when [`proteus_secret`](Self::proteus_secret) is set.
+    pub proteus_morph: Morph,
 }
 
 impl Default for NodeConfig {
@@ -385,6 +390,7 @@ impl Default for NodeConfig {
             service: None,
             exit: None,
             proteus_secret: None,
+            proteus_morph: Morph::Polymorph,
         }
     }
 }
@@ -436,6 +442,14 @@ impl NodeConfig {
                         ));
                     }
                     config.proteus_secret = Some(value.as_bytes().to_vec());
+                }
+                "proteus_morph" => {
+                    config.proteus_morph = Morph::from_name(value).ok_or_else(|| {
+                        NodeError::Config(format!(
+                            "unknown proteus_morph '{value}' (expected one of: plain, polymorph, \
+                             tls-tunnel, masque-h3, fronted, webrtc, pluggable)"
+                        ))
+                    })?;
                 }
                 other => {
                     return Err(NodeError::Config(format!(
@@ -596,5 +610,14 @@ mod tests {
         assert_eq!(cfg.proteus_secret.as_deref(), Some(&b"a-shared-bridge-secret"[..]));
         // An empty secret is a configuration error, not a silent no-op.
         assert!(NodeConfig::from_config_str("proteus_secret =").is_err());
+    }
+
+    #[test]
+    fn proteus_morph_selects_the_shaping_profile() {
+        // Defaults to the flagship polymorph; a valid name selects a shaping morph; a bad name errors.
+        assert_eq!(NodeConfig::default().proteus_morph, Morph::Polymorph);
+        let cfg = NodeConfig::from_config_str("proteus_morph = tls-tunnel").unwrap();
+        assert_eq!(cfg.proteus_morph, Morph::TlsTunnel);
+        assert!(NodeConfig::from_config_str("proteus_morph = nonsense").is_err());
     }
 }

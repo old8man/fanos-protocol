@@ -9,19 +9,19 @@ use std::time::Duration as StdDuration;
 
 use fanos_field::F2;
 use fanos_geometry::Point;
-use fanos_quic::{Directory, spawn_shaped};
+use fanos_quic::{Directory, Morph, ProteusConfig, spawn_shaped};
 use fanos_runtime::{Command, Config, Notification, OverlayNode};
 
-#[tokio::test]
-async fn shaped_nodes_deliver_over_a_polymorph_transport() {
-    let secret = b"community-transport-secret".to_vec();
+/// Bring up two shaped nodes under `proteus`, send one payload A→B, and assert it is delivered through the
+/// shaped transport within the timeout.
+async fn deliver_under(proteus: ProteusConfig) {
     let epoch = fanos_proteus::Epoch::new(11);
     let dir = Directory::new();
 
     let a = spawn_shaped(
         Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
         dir.clone(),
-        secret.clone(),
+        proteus.clone(),
         epoch,
     )
     .await
@@ -29,13 +29,13 @@ async fn shaped_nodes_deliver_over_a_polymorph_transport() {
     let mut b = spawn_shaped(
         Box::new(OverlayNode::<F2>::new(Point::at(1), Config::default())),
         dir.clone(),
-        secret,
+        proteus,
         epoch,
     )
     .await
     .expect("spawn shaped B");
 
-    let payload = b"delivered through the polymorph".to_vec();
+    let payload = b"delivered through the shaped transport".to_vec();
     a.command(Command::Send {
         to: b.address(),
         payload: payload.clone(),
@@ -53,4 +53,22 @@ async fn shaped_nodes_deliver_over_a_polymorph_transport() {
     .await
     .expect("delivery through the shaped transport timed out");
     assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn shaped_nodes_deliver_over_a_polymorph_transport() {
+    // The flagship codec: no static signature, no size/timing shaping (zero-cost default).
+    deliver_under(ProteusConfig::polymorph(b"community-transport-secret".to_vec())).await;
+}
+
+#[tokio::test]
+async fn shaped_nodes_deliver_under_a_timing_and_size_morph() {
+    // A shaping morph (TLS-tunnel profile): every data frame is padded up into the MTU band AND paced by an
+    // exponential inter-packet delay. Delivery must still round-trip — size padding is transparent to decode
+    // and the pacing only delays. This exercises the driver's morph dispatch + `send_uni` pacing end to end.
+    deliver_under(ProteusConfig::with_morph(
+        b"community-transport-secret".to_vec(),
+        Morph::TlsTunnel,
+    ))
+    .await;
 }

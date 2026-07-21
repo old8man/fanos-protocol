@@ -14,7 +14,7 @@ use std::sync::Arc;
 use fanos_field::F2;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_node::{
-    AnonRouteParams, BeaconSeed, Epoch, ExitParams, FanosDialer, Node, NodeConfig, NodeError,
+    AnonRouteParams, BeaconSeed, Epoch, ExitParams, FanosDialer, Morph, Node, NodeConfig, NodeError,
     NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory, build_cell_mix_directory,
     identity, serve_proxy,
 };
@@ -91,6 +91,16 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     if let Some(s) = flag(args, "--proteus-secret") {
         // Enable PROTEUS: shape every frame with this shared community secret, rotating per epoch (§13.4).
         config.proteus_secret = Some(s.as_bytes().to_vec());
+    }
+    if let Some(m) = flag(args, "--proteus-morph") {
+        // The morph selecting the codec + traffic-shaper (§13.3): plain, polymorph (default), tls-tunnel,
+        // masque-h3, fronted, webrtc, pluggable. Only takes effect with a --proteus-secret.
+        config.proteus_morph = Morph::from_name(m).ok_or_else(|| {
+            NodeError::Config(format!(
+                "unknown --proteus-morph '{m}' (expected: plain, polymorph, tls-tunnel, masque-h3, \
+                 fronted, webrtc, pluggable)"
+            ))
+        })?;
     }
     Ok(config)
 }
@@ -571,7 +581,7 @@ fn print_help() {
          USAGE:\n\
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
-         \x20             [--no-heartbeat] [--proteus-secret SECRET]\n\
+         \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\

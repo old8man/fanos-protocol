@@ -15,7 +15,9 @@ use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_pqcrypto::{HybridKemSecret, SeedRng};
-use fanos_quic::{Client, Directory, NodeHandle, spawn_self_certifying_persistent_on};
+use fanos_quic::{
+    Client, Directory, NodeHandle, ProteusConfig, spawn_self_certifying_persistent_on,
+};
 use fanos_keygen::BeaconNode;
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
 use tokio::task::JoinHandle;
@@ -290,9 +292,13 @@ impl Node {
                 }
             },
             directory.clone(),
-            // PROTEUS (§13.4): when a community secret is configured, every frame is polymorph-shaped and the
-            // shape rotates each epoch (driven by the same beacon that reshuffles the coordinate).
-            config.proteus_secret.clone(),
+            // PROTEUS (§13.4): when a community secret is configured, every frame is shaped under the chosen
+            // morph and the shape rotates each epoch (driven by the same beacon that reshuffles the
+            // coordinate). No secret ⇒ plaintext QUIC.
+            config
+                .proteus_secret
+                .clone()
+                .map(|secret| ProteusConfig::with_morph(secret, config.proteus_morph)),
         )
         .await?;
 
