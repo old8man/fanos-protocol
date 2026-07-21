@@ -898,15 +898,9 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
         }
     }
     // Tell the peer the address we observe its connection arriving from — its reflexive/public address
-    // for NAT traversal (#119). Our own reflexive address arrives symmetrically on the frames the peer
-    // sends back, intercepted in `read_frames`.
-    send_framed(
-        &conn,
-        &t.shaper,
-        FrameType::ObservedAddr,
-        &encode_addr(conn.remote_address()),
-    )
-    .await;
+    // for NAT traversal (#119) — on a spawned task, so this side-channel never delays the connection
+    // becoming usable. Our own reflexive address arrives symmetrically on the peer's `ObservedAddr`.
+    spawn_observed_addr(conn.clone(), t.shaper.clone());
     // The dialer knows the peer identity intrinsically (it chose `to`): tag replies with it.
     tokio::spawn(read_frames(
         conn.clone(),
@@ -986,15 +980,9 @@ async fn accept_loop(
                 map.insert(from, conn.clone());
             }
             // Tell the dialing peer the source address we observe it at — its reflexive/public address
-            // for NAT traversal (#119). This is the STUN-like feedback: a node behind NAT learns the
-            // NAT-mapped endpoint remote peers actually reach it at from the peers it dials.
-            send_framed(
-                &conn,
-                &shaper,
-                FrameType::ObservedAddr,
-                &encode_addr(conn.remote_address()),
-            )
-            .await;
+            // for NAT traversal (#119), the STUN-like feedback — on a spawned task so it never delays
+            // reading this peer's frames (a blocking send here can stall a busy cell, worsening #129).
+            spawn_observed_addr(conn.clone(), shaper.clone());
             // Subsequent uni-streams are this peer's frames.
             read_frames(conn, from, input_tx, shaper, reflexive).await;
         });
@@ -1008,6 +996,16 @@ async fn send_hello(conn: &Connection, shaper: &Shaper, hello: &[u8]) {
         let _ = stream.write_all(&shape_out(shaper, hello)).await;
         let _ = stream.finish();
     }
+}
+
+/// Fire-and-forget a reflexive-address report to `conn`'s peer (the source address we observe it at,
+/// #119) on a spawned task, so this side-channel never blocks the connection's critical path — reading
+/// the peer's frames or completing setup. A blocking send here can stall a busy cell (worsening #129).
+fn spawn_observed_addr(conn: Connection, shaper: Shaper) {
+    let observed = conn.remote_address();
+    tokio::spawn(async move {
+        send_framed(&conn, &shaper, FrameType::ObservedAddr, &encode_addr(observed)).await;
+    });
 }
 
 /// Write one framed message as a fresh uni-stream, shaped like any frame — the shared send
