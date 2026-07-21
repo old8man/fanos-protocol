@@ -29,6 +29,8 @@ fanos-session.workspace = true
 # line (the sans-I/O RendezvousClient core, wrapped as an async transport under the identical stream).
 fanos-rendezvous.workspace = true
 fanos-pqcrypto.workspace = true
+# BLAKE3 labeled hashing for the threshold-service intro id (audit #99).
+fanos-primitives.workspace = true
 # The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
 # is the integration point that provides a Dialer).
 fanos-proxy.workspace = true

@@ -885,6 +885,7 @@ dependencies = [
  "fanos-keygen",
  "fanos-onoma",
  "fanos-pqcrypto",
+ "fanos-primitives",
  "fanos-proxy",
  "fanos-quic",
  "fanos-rendezvous",

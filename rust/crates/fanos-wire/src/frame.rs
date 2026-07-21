@@ -66,6 +66,13 @@ pub enum FrameType {
     /// A client registers its coordinate with a [rendezvous relay] so the relay forwards anonymous
     /// replies delivered at its combiner to the client (audit #54; the sender is the client).
     RdvRegister = 0x53,
+    /// A threshold-hosted service's combiner asks a co-line member for its PartialDec of an intro
+    /// (spec §12.3, audit #99): body is the `SealedIntro` bytes (from `fanos_calypso::hosting`); the
+    /// member replies with a [`SvcPartial`](Self::SvcPartial). No single host reads an intro alone.
+    SvcShareReq = 0x54,
+    /// A service-line member's PartialDec reply to its combiner (spec §12.3, audit #99): body is the
+    /// 32-byte intro id ‖ the member's Shamir share (`x(1B) ‖ y`). The combiner Lagrange-combines `t`.
+    SvcPartial = 0x55,
     // 0x6* DIAKRISIS
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
@@ -132,6 +139,8 @@ impl FrameType {
             0x51 => Self::RdvReply,
             0x52 => Self::SvcAnnounce,
             0x53 => Self::RdvRegister,
+            0x54 => Self::SvcShareReq,
+            0x55 => Self::SvcPartial,
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
