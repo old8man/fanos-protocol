@@ -11,16 +11,20 @@
 //!   an exit response into a packet for the TUN.
 //! * [`mux`] — [`run_udp_datapath`], the driver's stateful core: relay flows over per-destination exit
 //!   tunnels (the shared `UdpDialer` seam) and pump responses back, testable with a mock dialer.
+//! * [`driver`] — [`run_vpn`] over a [`TunReader`]/[`TunWriter`] device seam: the full bridge, testable with
+//!   an in-memory device; a real TUN device is a thin adapter implementing those two traits.
 //!
-//! The TUN device driver (copying packets between `/dev/net/tun` / `utun` and the multiplexer's channels)
-//! and the userspace-TCP full-tunnel mode are the thin/remaining layers on top.
+//! Remaining: the real TUN device adapter (behind a safe `tun`-crate wrapper in the binary — the OS I/O
+//! shell) and the userspace-TCP full-tunnel mode.
 
 #![forbid(unsafe_code)]
 
+pub mod driver;
 pub mod engine;
 pub mod mux;
 pub mod packet;
 
+pub use driver::{TunReader, TunWriter, run_vpn};
 pub use engine::{DNS_PORT, FlowKey, VpnAction, classify, response_packet};
 pub use mux::run_udp_datapath;
 pub use packet::{IPPROTO_UDP, UdpDatagram, build_ipv4_udp, parse_ipv4_udp};
