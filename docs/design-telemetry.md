@@ -211,12 +211,18 @@ minimal one:
   cell's exact health, so any frame observer learns which node is down and how the cell is doing.
 - **Third-order only.** By sightedness (§1.2.2), anything finer than the cell aggregate is *both* blind
   *and* forbidden — the minimal report is also the maximal safe one. The interests coincide.
-- **DP-noised exports — DESIGN, not yet implemented (audit C7).** The intended floor for a *shareable*
-  export is differential-privacy noise on the scalars, with favorable sensitivity (`r` is a mean over
-  `21` pairs, one flow's marginal effect `O(1/21)`) so a small ε budget hides any single flow while
-  preserving the cell signal — plus coarsening/withholding the exact syndrome. **The current
-  `fanos-telemetry` build has no DP machinery** (no noise, no ε budget): an emitted `CoherenceFrame`
-  carries the exact syndrome and scalars and must NOT be treated as anonymized until this is built.
+- **DP-noised exports — IMPLEMENTED (audit C7, `fanos-telemetry::dp`).** The shareable-export floor is
+  ε-differential privacy: `CoherenceFrame::privatize` Laplace-noises the cell's sufficient statistic `r`
+  at the *derived* sensitivity `Δr = 1/21` (one flow is one of the `C(7,2) = 21` cell pairs, so a mean
+  over them has marginal sensitivity `1/21` — the favorable sensitivity that lets a small ε hide any
+  single flow), re-derives `Φ = 6r̃²`, `P`, `R`, and the regime/alarm verdict from the noised `r` by
+  post-processing (no extra ε budget, by the post-processing theorem), and **withholds** the exact
+  syndrome, spectral gap, heal-event counter, and forecast (the cell-granular floor). Verified in
+  `telemetry/tests/differential_privacy.rs`: a raw frame is a deanonymization oracle (advantage ≈ 1),
+  while the private frame's optimal distinguishing advantage collapses to the analytic Laplace bound
+  `1 − e^{−ε/2}`, and the noised statistic is unbiased so the cell signal survives. **Only `privatize`
+  crosses the export boundary** — the full-resolution frame stays internal for self-healing, and an
+  emitted raw `CoherenceFrame` must still never be treated as anonymized.
 - **Full-domain frames carry no timing.** For a `Full`-privacy cell, the frame excludes schedule-derived
   fields (constant-rate cover makes them information-free anyway); a `Direct` cell may expose more.
 - **Per-PID `Γ_app`.** An overlay's own coherence is a first-class scope, so app developers watch *their*

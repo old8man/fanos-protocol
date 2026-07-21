@@ -18,6 +18,11 @@ fanos-code = { workspace = true }
 # Canonical wire codec: the CoherenceFrame's byte layout is a derived Wire (audit A1).
 fanos-wire = { workspace = true, features = ["alloc"] }
 fanos-wire-derive = { workspace = true }
+# The noise source for the differentially-private export boundary (audit C7). `RngCore` only — the
+# caller injects entropy (a node's CSPRNG in production, a seeded RNG in tests), keeping `dp` sans-I/O.
+rand_core = { workspace = true }
+# no_std float backend for the DP Laplace sampler's `ln` (std builds use `f64::ln` directly).
+libm = { workspace = true, optional = true }
 # Optional cross-platform metric backend (macOS/Windows/etc.); Linux prefers the direct /proc probe.
 # Its internal FFI/unsafe lives in the dependency — this crate stays `forbid(unsafe_code)`.
 sysinfo = { version = "0.39", default-features = false, features = [
@@ -28,6 +33,10 @@ sysinfo = { version = "0.39", default-features = false, features = [
 [dev-dependencies]
 # Fuzz the untrusted-input decoders (frame / snapshot) — they must reject, never panic.
 proptest.workspace = true
+# The DP validation test builds input frames from equicorrelated matrices and drives `privatize` with a
+# seeded RNG (deterministic Monte-Carlo over the ε-DP guarantee).
+fanos-diakrisis = { workspace = true }
+rand_core = { workspace = true }
 
 [features]
 default = ["std"]
@@ -36,7 +45,7 @@ default = ["std"]
 # A no_std embedded monitor selects `alloc` + `libm` (the float backend).
 std = ["alloc", "fanos-diakrisis/std", "fanos-code/std", "fanos-wire/std"]
 alloc = ["fanos-diakrisis/alloc", "fanos-code/alloc", "fanos-wire/alloc"]
-libm = ["fanos-diakrisis/libm"]
+libm = ["dep:libm", "fanos-diakrisis/libm"]
 # The cross-platform system-metric backend (implies std).
 sysinfo = ["std", "dep:sysinfo"]
 

@@ -7,9 +7,10 @@
 //! mean `r`, spectral gap) are a convenience for humans and cross-cell roll-up. Per-node raw signals
 //! never *leave their node* — only this cell-level fold does. Note this is data *minimization*, not
 //! anonymization: the frame still names the faulted point (the exact 3-bit syndrome) and the cell's
-//! exact scalars, so a frame observer learns which node is down and the cell's health. Differential
-//! privacy (calibrated noise + an ε budget) or coarsening/withholding the syndrome before export is
-//! future work — do not treat an emitted frame as anonymized (audit C7, design-telemetry.md §5).
+//! exact scalars, so a frame observer learns which node is down and the cell's health. **Do not export a
+//! raw frame** — cross the anonymity boundary through [`CoherenceFrame::privatize`](crate::dp), which
+//! Laplace-noises the scalars at the derived sensitivity `Δr = 1/21` and withholds the exact syndrome for
+//! an ε-DP export (audit C7, `design-telemetry.md` §5).
 
 use fanos_code::syndrome::syndrome3;
 use fanos_diakrisis::coherence::{CoherenceMatrix, PHI_TH};

@@ -14,7 +14,11 @@
 //!   a cell's health at a window (3-bit syndrome + coherence scalars), with a canonical KAT-pinned
 //!   encoding. The load-bearing signal is 3 bits. The fold *minimizes* data (per-node raw signals stay
 //!   local), but is **not** anonymization — the frame still names the faulted point and the cell's exact
-//!   health; differential privacy is future work (audit C7).
+//!   health, so an internal frame must never be exported raw (audit C7).
+//! * [`dp`] — the **differentially-private export boundary** (audit C7): [`CoherenceFrame::privatize`]
+//!   Laplace-noises the cell's sufficient statistic at the derived sensitivity `Δr = 1/21`, re-derives
+//!   the scalars/verdict by post-processing, and withholds the exact syndrome — an ε-DP frame safe to
+//!   share, while the full-resolution frame stays internal for self-healing.
 //! * [`sysmetrics`] — platform-optimal acquisition of a node's raw vitals (CPU/memory/disk/network),
 //!   the sensory input whose [`pressure`](sysmetrics::SystemSample::pressure) becomes each node's
 //!   scalar in the cell correlation. Pure, tested parsers plus a cached-handle Linux `/proc` probe.
@@ -27,6 +31,10 @@
 
 extern crate alloc;
 
+// The DP export boundary (audit C7) rebuilds the equicorrelated coherence matrix (needs `alloc`) and
+// samples Laplace noise (needs a float `ln` — `std` or `libm`).
+#[cfg(all(feature = "alloc", any(feature = "std", feature = "libm")))]
+pub mod dp;
 pub mod frame;
 pub mod history;
 pub mod observer;
@@ -35,6 +43,8 @@ pub mod persist;
 pub mod snapshot;
 pub mod sysmetrics;
 
+#[cfg(all(feature = "alloc", any(feature = "std", feature = "libm")))]
+pub use dp::{PrivacyBudget, R_SENSITIVITY};
 pub use frame::{AlarmLevel, CellId, CoherenceFrame, FRAME_LEN, Regime};
 pub use history::{Bucket, HistoryConfig, MetricId, MetricStore, Series};
 pub use observer::SelfObserver;

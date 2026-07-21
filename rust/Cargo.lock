@@ -1095,7 +1095,9 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-wire",
  "fanos-wire-derive",
+ "libm",
  "proptest",
+ "rand_core 0.10.1",
  "sysinfo",
 ]
 

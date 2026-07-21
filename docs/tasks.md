@@ -29,6 +29,8 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+C7 telemetry differential-privacy export (ε-DP `CoherenceFrame::privatize`, Laplace at Δr=1/21, exact
+syndrome withheld — verified vs the analytic `1−e^{−ε/2}` bound) ·
 spec↔impl reconciliation (protocol.md, 4-agent audit: beacon-DVRF, per-member-sealed onion, hash-to-line
 rendezvous, [7,3,4] LRC, node-keyed coord-VRF, NAT stack, field_q+CORE caps, DIAKRISIS 3-verdict split) ·
 NAT reachability complete (relay fallback) · exit discovery (auto) · proxy→exit clearnet path · clearnet
