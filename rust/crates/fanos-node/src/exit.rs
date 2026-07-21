@@ -11,15 +11,8 @@
 //!
 //! Wire framing on the DIAULOS stream: the client first sends `len(2 BE) ‖ host:port` (UTF-8), then relays
 //! its connection's bytes; the exit splices those to the TCP target and the target's bytes back. The exit
-//! is protocol-agnostic — it moves raw bytes, whatever the client and destination speak.
-//!
-//! **Session shape (current):** the underlying DIAULOS session completes and delivers the client's bytes
-//! once the client half-closes its send side — the *request → response* shape (HTTP/1.0, DNS-over-TCP, and
-//! any protocol where the client's request is bounded before it reads the reply). Fully-interactive
-//! bidirectional streaming (the client sending and receiving with no half-close, as an HTTPS CONNECT
-//! tunnel needs) additionally requires the reliable-stream layer to surface received bytes before the
-//! peer's FIN — a DIAULOS-layer enhancement tracked separately, not a property of this relay, which is
-//! already byte-transparent. The relay mechanism here is unchanged either way.
+//! is protocol-agnostic and fully interactive — it moves raw bytes both ways with no half-close required
+//! (an HTTPS CONNECT tunnel works), whatever the client and destination speak.
 
 use std::io;
 use std::sync::Arc;

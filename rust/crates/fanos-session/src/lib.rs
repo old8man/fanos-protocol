@@ -172,6 +172,9 @@ trait SessionStream: Send + 'static {
     fn is_live(&self) -> bool;
     /// Queue application bytes to send to the peer.
     fn write(&mut self, data: &[u8]);
+    /// Seal any buffered partial (sub-segment) write so it is sent promptly, rather than held until it
+    /// fills a whole segment or the stream is `finish`ed — what interactive streaming needs.
+    fn flush(&mut self);
     /// Take the application bytes received from the peer.
     fn read(&mut self) -> Vec<u8>;
     /// Signal end-of-stream (FIN) to the peer.
@@ -204,6 +207,9 @@ impl SessionStream for ClientSession {
     }
     fn write(&mut self, data: &[u8]) {
         ClientSession::write(self, data);
+    }
+    fn flush(&mut self) {
+        ClientSession::flush(self);
     }
     fn read(&mut self) -> Vec<u8> {
         ClientSession::read(self)
@@ -247,6 +253,11 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
     fn write(&mut self, data: &[u8]) {
         if let Some(sid) = self.stream_id {
             self.server.write(sid, data);
+        }
+    }
+    fn flush(&mut self) {
+        if let Some(sid) = self.stream_id {
+            self.server.flush(sid);
         }
     }
     fn read(&mut self) -> Vec<u8> {
@@ -343,6 +354,7 @@ async fn drive<S: SessionStream>(
         if session.is_live() {
             if !pending.is_empty() {
                 session.write(&pending);
+                session.flush(); // seal the buffered partial so it ships now, not only on close
                 pending.clear();
                 emit.mark_reactive();
             }
@@ -402,6 +414,7 @@ async fn drive<S: SessionStream>(
                     let chunk = buf.get(..n).unwrap_or(&[]);
                     if session.is_live() {
                         session.write(chunk);
+                        session.flush(); // seal the partial so a sub-segment write ships now, not on close
                         emit = Emit::Reactive; // new app data to send now
                     } else {
                         pending.extend_from_slice(chunk);

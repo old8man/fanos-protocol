@@ -100,6 +100,15 @@ impl Connection {
         }
     }
 
+    /// Seal `stream_id`'s buffered partial tail into a (non-final) segment so it is sent promptly rather
+    /// than waiting to fill a whole segment — the flush an interactive stream needs after a write it will
+    /// not immediately close. No-op for an unknown stream or an empty tail.
+    pub fn flush(&mut self, stream_id: u32) {
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.sender.flush();
+        }
+    }
+
     /// Close the send side of `stream_id`.
     pub fn finish(&mut self, stream_id: u32) {
         if let Some(s) = self.streams.get_mut(&stream_id) {

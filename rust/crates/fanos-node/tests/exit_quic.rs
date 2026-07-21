@@ -4,9 +4,9 @@
 //! reached through the overlay. Proves the `exit` role's data path: `dial_exit` → `serve_exit` →
 //! `TcpStream::connect` → `copy_bidirectional`, and that the [`ExitPolicy`] gates the destination.
 //!
-//! The client sends its request and half-closes its send side, then reads the reply — the request →
-//! response shape the DIAULOS session delivers today (see `exit.rs` "Session shape"); the relay itself is
-//! byte-transparent.
+//! The relay is byte-transparent and fully interactive: the client here streams — writes then reads with
+//! no half-close, as an HTTPS-CONNECT tunnel would — which the DIAULOS session now supports (the
+//! flush-on-write fix in `fanos-session`/`fanos-diaulos`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
@@ -134,12 +134,14 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
         .await
         .expect("dial the exit");
 
+    // Interactive streaming: the client writes and reads with NO half-close (as an HTTPS-CONNECT tunnel
+    // does), so this also exercises the DIAULOS flush-on-write fix — without it a sub-segment write is
+    // never shipped until the stream closes and this would hang.
     let sent = b"through the exit to the clearnet";
     let echoed = tokio::time::timeout(Duration::from_secs(15), async {
         stream.write_all(sent).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
+        let mut buf = vec![0u8; sent.len()];
+        stream.read_exact(&mut buf).await.unwrap();
         buf
     })
     .await

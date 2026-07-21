@@ -182,6 +182,16 @@ impl ClientSession {
         }
     }
 
+    /// Flush the primary stream's buffered partial tail so written bytes are sent promptly, without
+    /// closing the stream (no-op until live) — what an interactive client needs after a write it will not
+    /// immediately half-close.
+    pub fn flush(&mut self) {
+        if let ClientState::Live { dialed } = &mut self.state {
+            let primary = dialed.primary;
+            dialed.conn.flush(primary);
+        }
+    }
+
     /// Close the primary send side (no-op until live).
     pub fn finish(&mut self) {
         if let ClientState::Live { dialed } = &mut self.state {
@@ -389,6 +399,14 @@ impl ServerSession {
     pub fn write(&mut self, stream_id: u32, bytes: &[u8]) {
         if let Some(conn) = &mut self.conn {
             conn.write(stream_id, bytes);
+        }
+    }
+
+    /// Flush `stream_id`'s buffered partial tail so written bytes are sent promptly, without closing it —
+    /// what a full-duplex service handler needs after a write it will not immediately finish.
+    pub fn flush(&mut self, stream_id: u32) {
+        if let Some(conn) = &mut self.conn {
+            conn.flush(stream_id);
         }
     }
 
