@@ -88,6 +88,16 @@ impl ProteusShaper {
         self.morph
     }
 
+    /// Switch to a different morph at runtime (the auto-fallback [`MorphController`](crate::MorphController)
+    /// drives this, §13.7). The codec-using morphs (everything but [`Morph::Plain`]) share one wire codec, so
+    /// switching *among* them changes only the size/timing profile — a peer keeps decoding with no
+    /// renegotiation. Switching to or from `Plain` changes the codec itself and needs both ends to agree
+    /// (§7.4 HELLO capability negotiation). The packet counter and epoch shape are unchanged.
+    pub fn set_morph(&mut self, morph: Morph) {
+        self.morph = morph;
+        self.profile = ShapingProfile::for_morph(morph);
+    }
+
     /// Advance to a new epoch: the shape rotates, so the wire signature moves (§13.4, V22).
     pub fn rotate(&mut self, epoch: Epoch) {
         self.epoch = epoch;
@@ -181,6 +191,33 @@ mod tests {
         shaper.rotate(Epoch::new(1));
         let w1 = shaper.outbound(b"same payload");
         assert_ne!(w0, w1, "the same frame shapes differently each epoch");
+    }
+
+    #[test]
+    fn set_morph_swaps_the_profile_but_still_decodes() {
+        // Rotating among codec-using morphs (the auto-fallback path) keeps a peer decoding: a frame shaped
+        // after a switch to the size+timing TLS morph still strips back under the original Polymorph shaper.
+        let mut sender = ProteusShaper::new(b"s".to_vec(), Epoch::new(4));
+        let receiver = ProteusShaper::new(b"s".to_vec(), Epoch::new(4));
+        sender.set_morph(Morph::TlsTunnel);
+        assert_eq!(sender.morph(), Morph::TlsTunnel);
+        let shaped = sender.shape(b"post-rotation frame");
+        assert!(shaped.wire.len() >= 1200, "the TLS profile pads into its size band");
+        assert_eq!(
+            receiver.inbound(&shaped.wire).as_deref(),
+            Some(&b"post-rotation frame"[..]),
+            "a peer on the old morph still decodes — the codec is shared"
+        );
+    }
+
+    #[test]
+    fn switching_to_plain_is_identity() {
+        let mut shaper = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
+        shaper.set_morph(Morph::Plain);
+        let frame = b"unshaped";
+        let shaped = shaper.shape(frame);
+        assert_eq!(shaped.wire, frame, "Plain passes the frame through unshaped");
+        assert_eq!(shaper.inbound(frame).as_deref(), Some(&frame[..]));
     }
 
     #[test]

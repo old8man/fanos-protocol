@@ -10,6 +10,7 @@
 //! * [`obfuscate`] — the `polymorph` codec (§13.2).
 //! * [`profile`] — the traffic-shaper: per-morph size + timing targets (§13.3, §13.1).
 //! * [`shaper`] — the driver-facing [`ProteusShaper`]: morph-dispatched codec + shaping.
+//! * [`controller`] — morph auto-fallback ([`MorphController`], §13.7).
 //! * [`bridge`] — moving-target bridges, no static list to block (§13.6).
 //!
 //! This layer does not end the arms race (spec §13.8); it makes the censor's cost recur every
@@ -22,6 +23,7 @@
 extern crate alloc;
 
 pub mod bridge;
+pub mod controller;
 pub mod morph;
 pub mod obfuscate;
 pub mod profile;
@@ -29,6 +31,7 @@ pub mod shape;
 pub mod shaper;
 
 pub use bridge::{bridge_line, client_bridge_lines, reachable_fraction};
+pub use controller::MorphController;
 pub use fanos_primitives::Epoch;
 pub use morph::{Environment, Morph};
 pub use obfuscate::{deobfuscate, obfuscate};
