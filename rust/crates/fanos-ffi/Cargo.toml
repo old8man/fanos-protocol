@@ -1,0 +1,24 @@
+[package]
+name = "fanos-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The stable C ABI for FANOS (spec §11.2) — an `extern \"C\"` embedding surface over the node so any language reuses the core: lifecycle, storage, and DIAKRISIS health."
+keywords = ["ffi", "c-abi", "embedding", "anonymity", "fanos"]
+categories = ["api-bindings", "network-programming"]
+
+[lib]
+# `staticlib`/`cdylib` are the C-linkable artifacts; `rlib` lets the crate's own tests (and Rust embedders)
+# call the ABI directly.
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-node.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync"] }
+
+[lints]
+workspace = true

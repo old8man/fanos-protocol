@@ -18,8 +18,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **C ABI** (#113, M9) — the stable embedding surface (spec §11.2): `extern "C"` over the node so any
-  language reuses the core. `docs/implementations.md` lists it *planned*.
+- **C ABI — streams & services** (#113, M9) — extend `fanos-ffi` beyond lifecycle/storage/health to
+  `fanos_dial`/`fanos_stream_read`/`_write` and `fanos_service_host`/`_connect` (spec §11.2): bridge the
+  async DIAULOS byte-stream over the blocking FFI boundary (opaque `fanos_stream*` handles).
 - **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP (OS TUN device; verification needs a TUN harness).
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
@@ -33,6 +34,13 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**C ABI — the embedding foundation** (#113, M9, spec §11.2) — NEW crate `fanos-ffi`: a stable `extern "C"`
+surface (`crate-type = staticlib/cdylib/rlib`, hand-synced `include/fanos.h`) over the node so any language
+reuses the core. Slice 1: lifecycle (`fanos_open` from a config string / `fanos_join` / `fanos_free` — an
+owning tokio-runtime+node handle), storage (`fanos_publish`/`fanos_lookup` with the buffer-too-small
+retry convention), and `fanos_diagnose` health. Every deref is null-guarded with a `# Safety` contract.
+Verified: a publish→lookup value round-trips through the C ABI (+ short-buffer path), bad config → null,
+null handles rejected, all off-network. Streams/services are the next slice. ·
 **PROTEUS pluggable-transport SPI** (§13.3 `pluggable`, M10) — `MorphCodec` trait: an embedder's custom
 codec fully replaces the built-in transform (`ProteusShaper::with_codec`, `ProteusConfig::pluggable`), the
 honest home for real cover-protocol tunnels (tls-tunnel/masque/fronted need external stacks, §13.8 — never

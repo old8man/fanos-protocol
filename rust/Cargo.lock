@@ -837,6 +837,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-ffi"
+version = "0.1.0"
+dependencies = [
+ "fanos-field",
+ "fanos-node",
+ "tokio",
+]
+
+[[package]]
 name = "fanos-field"
 version = "0.1.0"
 dependencies = [
