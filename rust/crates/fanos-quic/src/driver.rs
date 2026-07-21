@@ -15,7 +15,7 @@
 //! so virtual [`Instant`]s here are elapsed nanoseconds since the node started.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant as StdInstant;
 
@@ -109,6 +109,22 @@ const MAX_FRAME: usize = 1 << 20;
 /// the task's life, so once this many are in flight, new accepts back-pressure (QUIC queues/rejects) until
 /// one finishes. Generous next to a cell's `N-1` real neighbours; it only bounds abuse.
 const MAX_INBOUND_CONNECTIONS: usize = 512;
+
+/// Per-source-IP inbound cap (audit A6, #69). A single host can hold at most this many of the
+/// [`MAX_INBOUND_CONNECTIONS`] slots, so monopolizing the accept path — a slowloris / connection-pinning
+/// DoS — takes many distinct source IPs, which QUIC's address-validated handshake makes hard to spoof,
+/// while still admitting the many nodes that can sit behind one shared NAT (a source may hold up to
+/// `512/32 = 1/16` of the slots). The global cap alone is not enough: without this, one host mints 512
+/// valid connections and pins every slot.
+const MAX_INBOUND_PER_SOURCE: usize = 32;
+
+/// How long a newly-accepted connection has to *establish and identify itself* (QUIC handshake + HELLO)
+/// before it is dropped (audit A6, #69). A legitimate peer finishes in a few round trips; a connection
+/// that stalls mid-handshake — holding a slot without ever proving a coordinate — is reclaimed rather than
+/// pinned indefinitely. This is deliberately a **handshake** deadline, not an idle deadline on an
+/// established link: an established connection may stay legitimately silent for a long time (it backs the
+/// #119 reverse-reachability path), so it must never be reclaimed for inactivity.
+const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The bound on the engine's inbound `Input` queue. The per-connection frame readers feed this channel and
 /// **await** when it is full, so a peer flooding frames is back-pressured through QUIC's own flow control
@@ -1015,38 +1031,97 @@ fn cached(conns: &ConnMap, peer: Triple) -> Option<Connection> {
     }
 }
 
-/// The accept loop: for each inbound connection, learn the peer identity from its HELLO and then
-/// serve its frames.
+/// Whether a new inbound connection from `ip` is admitted under the per-source cap
+/// ([`MAX_INBOUND_PER_SOURCE`]), incrementing that source's live-connection count if so. Returns `false`
+/// — without incrementing — when the source already holds the cap. Paired with [`SourceGuard`], which
+/// decrements the count when the connection's handler ends.
+fn admit_source(counts: &Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) -> bool {
+    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
+    let n = counts.entry(ip).or_insert(0);
+    if *n >= MAX_INBOUND_PER_SOURCE {
+        false
+    } else {
+        *n += 1;
+        true
+    }
+}
+
+/// Decrements a source IP's live inbound-connection count when its accept handler ends (RAII), so the
+/// per-source cap tracks *live* connections rather than cumulative accepts. Removes the entry at zero, so
+/// the table stays bounded by the number of currently-connected sources.
+struct SourceGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = counts.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Resolve a peer's coordinate from a freshly-established connection: a proof-of-coordinate HELLO exchange
+/// (self-certifying mode) or an unauthenticated HELLO read (directory-trust mode). `None` if the HELLO is
+/// rejected (bad proof / incompatible negotiation) or unreadable.
+async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
+    match &t.identity {
+        Some(id) => hello_exchange(conn, &t.shaper, id).await,
+        None => read_hello(conn, &t.shaper).await,
+    }
+}
+
+/// The accept loop: for each inbound connection, learn the peer identity from its HELLO and then serve its
+/// frames — bounded globally ([`MAX_INBOUND_CONNECTIONS`]), per source ([`admit_source`]), and in handshake
+/// time ([`HELLO_DEADLINE`]) so no peer can pin the accept path (audit A6/C3).
 async fn accept_loop(t: Transport) {
     let inbound_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
+    let per_source: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     while let Some(incoming) = t.endpoint.accept().await {
-        // Take a connection slot before handling this one; at the cap, this awaits — back-pressuring
-        // accepts so a connection-flood cannot spawn unbounded handler tasks (audit C3). `Err` only if the
-        // semaphore was closed (never, it lives as long as the loop), so a failure just ends the loop.
+        // Per-source cap FIRST: the source IP is known before the handshake, so an over-cap connection is
+        // refused without spending a global slot or a handshake — one host cannot monopolize accepts (A6).
+        let src_ip = incoming.remote_address().ip();
+        if !admit_source(&per_source, src_ip) {
+            incoming.refuse();
+            continue;
+        }
+        // Take a global connection slot; at the cap this awaits — back-pressuring accepts so a
+        // connection-flood cannot spawn unbounded handler tasks (audit C3). `Err` only if the semaphore was
+        // closed (only at shutdown), so a failure ends the loop; the per-source table drops with it.
         let Ok(permit) = inbound_slots.clone().acquire_owned().await else {
             break;
         };
         let t = t.clone();
+        let source_guard = SourceGuard { counts: per_source.clone(), ip: src_ip };
         tokio::spawn(async move {
-            let _permit = permit; // held for this handler's lifetime; released to free the slot on return
-            let Ok(conn) = incoming.await else {
-                return;
-            };
-            // Learn the peer's coordinate: exchange + negotiate proof-of-coordinate HELLOs (self-
-            // certifying), or read its unauthenticated HELLO (directory-trust mode).
-            let from = if let Some(id) = &t.identity {
-                let Some(coord) = hello_exchange(&conn, &t.shaper, id).await else {
+            let _permit = permit; // held for this handler's lifetime; released to free the global slot on return
+            let _source_guard = source_guard; // decrements this source's live count when the handler ends
+            // Establish + identify within the handshake deadline: a connection that stalls before proving a
+            // coordinate is dropped, not held (audit A6). This is a HANDSHAKE deadline only — an established
+            // link is never reclaimed for silence, since it may back the #119 reverse-reachability path.
+            let established = tokio::time::timeout(HELLO_DEADLINE, async {
+                let conn = incoming.await.ok()?;
+                let from = resolve_peer_hello(&conn, &t).await?;
+                Some((conn, from))
+            })
+            .await;
+            let (conn, from) = match established {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
                     tracing::debug!(
                         "inbound HELLO rejected (bad proof or negotiation incompatible); dropping"
                     );
                     return;
-                };
-                coord
-            } else {
-                let Some(coord) = read_hello(&conn, &t.shaper).await else {
+                }
+                Err(_) => {
+                    tracing::debug!("inbound connection did not establish + HELLO within the deadline; dropping");
                     return;
-                };
-                coord
+                }
             };
             // Cache the connection keyed by the peer's coordinate. This is what makes a dialed-in peer
             // routable in reverse (#119): the transport reuses this live connection to originate traffic
@@ -1349,6 +1424,37 @@ mod tests {
         assert_eq!(decode_relay(decoded.body), Some((target, origin, inner)));
         // A body too short for both coordinates is rejected, not mis-parsed.
         assert_eq!(decode_relay(&[0u8; 2 * TRIPLE_WIRE_LEN - 1]), None);
+    }
+
+    /// The per-source inbound cap (audit A6/#69): one host cannot pin more than
+    /// [`MAX_INBOUND_PER_SOURCE`] slots, the cap is per-IP, and the RAII [`SourceGuard`] frees a slot when a
+    /// handler ends — so the table tracks *live* connections and stays bounded.
+    #[test]
+    fn the_per_source_cap_bounds_one_ip_and_the_guard_frees_slots() {
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let ip: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+        let other: IpAddr = Ipv4Addr::new(198, 51, 100, 1).into();
+
+        // One source is admitted up to the cap, then refused: a single host cannot pin more than the cap.
+        for _ in 0..MAX_INBOUND_PER_SOURCE {
+            assert!(admit_source(&counts, ip));
+        }
+        assert!(!admit_source(&counts, ip), "a source at the cap is refused");
+        // The cap is per-IP: a different source is admitted independently.
+        assert!(admit_source(&counts, other), "a different source is admitted independently");
+
+        // A handler ending (SourceGuard drop) frees exactly one slot for that source, so it accepts again.
+        drop(SourceGuard { counts: counts.clone(), ip });
+        assert!(admit_source(&counts, ip), "a freed slot admits the next connection from that source");
+        assert!(!admit_source(&counts, ip), "and the source is capped again");
+
+        // The table stays bounded: draining a source to zero live connections forgets it entirely.
+        for _ in 0..MAX_INBOUND_PER_SOURCE {
+            drop(SourceGuard { counts: counts.clone(), ip });
+        }
+        let map = counts.lock().unwrap();
+        assert!(!map.contains_key(&ip), "a source with no live connections is removed from the table");
+        assert!(map.contains_key(&other), "the other source's live connection is still tracked");
     }
 
     /// The per-epoch reshuffle driver (#102): a `BeaconReady` re-derives this node's VRF coordinate for

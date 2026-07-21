@@ -29,6 +29,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**PRODUCTION Blocker 2 — QUIC connection-pinning bounded** (`fanos-quic` accept loop: per-source-IP inbound
+cap + handshake deadline; established links never reclaimed for silence — #69/A6; unit-tested + real-QUIC
+suite unaffected) ·
 **PRODUCTION Blocker 1 — the live epoch clock now ticks** (`Node` spawns `spawn_epoch_driver` issuing the
 wall-clock `AdvanceEpoch`; `NodeConfig.epoch_period`) — the whole moving-target defence (VRF coord / PROTEUS
 shape / onion-key rotation) was inert/genesis-pinned in a deployed node; verified E2E that the beacon
