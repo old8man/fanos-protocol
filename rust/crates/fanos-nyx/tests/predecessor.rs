@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use fanos_field::F7;
 use fanos_geometry::{Point, Triple};
-use fanos_nyx::build_circuit;
+use fanos_nyx::{GuardSet, build_circuit};
 
 const N: usize = 57; // points/relays in PG(2,7) = Plane::<F7>::N
 const HOPS: usize = 4;
@@ -140,6 +140,37 @@ fn exposure_rate(guarded: bool, f: f64, trials: u32, rounds: u32, seed: u64) -> 
     f64::from(exposed) / f64::from(trials)
 }
 
+/// Exposure with the slowly-rotating **guard set** (`GuardSet`) as the entry policy: the circuit enters
+/// through the highest-priority reachable guard. `primary_down` marks the primary unreachable, so the
+/// entry falls back to a stable backup — the availability-under-churn case.
+fn guard_set_exposure_rate(primary_down: bool, f: f64, trials: u32, rounds: u32, seed: u64) -> f64 {
+    let client = Point::<F7>::at(0);
+    let dest = Point::<F7>::at(30);
+    let client_seed = b"initiator-secret-seed";
+    let size = ((N as f64) * f) as usize;
+    // One stable guard set (slow rotation: a long period, so it never re-draws over these rounds).
+    let set = GuardSet::<F7>::derive(client_seed, 0, 1000, 3, client);
+    let primary = set.primary().expect("guard set non-empty");
+
+    let mut lcg = Lcg(seed);
+    let mut exposed = 0u32;
+    for _ in 0..trials {
+        let adv = adversary_set(&mut lcg, size, client.coords());
+        let identified = initiator_is_identified(client.coords(), rounds, &adv, |c| {
+            set.build_circuit(client, dest, HOPS, &circuit_seed(client_seed, c), |g| {
+                !(primary_down && g == primary)
+            })
+            .expect("guard-set circuit")
+            .relays()
+            .iter()
+            .map(Point::coords)
+            .collect()
+        });
+        exposed += u32::from(identified);
+    }
+    f64::from(exposed) / f64::from(trials)
+}
+
 /// The threat is real: without guards the rotating first hop lets the predecessor attack identify the
 /// initiator in essentially every adversary trial — exposure does not depend on how few relays the
 /// adversary holds, only on running enough rounds.
@@ -187,5 +218,46 @@ fn a_stable_guard_bounds_predecessor_exposure_to_guard_compromise() {
     assert!(
         rate < 0.4,
         "a stable guard must bound exposure to ~f (got {rate:.3}), not the guardless ~1.0"
+    );
+}
+
+/// A guard **set** used primary-first is no worse than a single guard: because the primary carries every
+/// circuit while it is up, exposure stays ≈ `f` — it does **not** grow to the union bound
+/// `1 − (1−f)^k ≈ 0.49` a naive "any of k guards" set would suffer.
+#[test]
+fn a_primary_first_guard_set_keeps_single_guard_exposure_not_the_union_bound() {
+    let f = 0.2;
+    let single = exposure_rate(true, f, 40, 300, 0x9E37);
+    let set = guard_set_exposure_rate(false, f, 40, 300, 0x9E37);
+    let union_bound = 1.0 - (1.0 - f).powi(3);
+    eprintln!(
+        "[predecessor] single-guard={single:.3}  guard-set={set:.3}  (union bound ≈ {union_bound:.3})"
+    );
+    assert!(
+        set < 0.4,
+        "a primary-first guard set stays in the ≈f regime (got {set:.3}), well below the union bound {union_bound:.3}"
+    );
+    assert!(
+        (set - single).abs() < 0.2,
+        "the guard set tracks the single-guard rate (set {set:.3} vs single {single:.3}), not the union bound"
+    );
+}
+
+/// The set's payoff over a single guard is **availability**: when the primary goes down the entry falls to
+/// a *stable* backup, so the predecessor bound survives guard churn — unlike a per-circuit re-pick, which
+/// would rotate the entry back to the guardless ≈1.
+#[test]
+fn a_guard_set_survives_primary_churn_without_reopening_the_attack() {
+    let f = 0.2;
+    let churned = guard_set_exposure_rate(true, f, 40, 300, 0x9E37);
+    let guardless = exposure_rate(false, f, 40, 300, 0x9E37);
+    eprintln!("[predecessor] guard-set(primary down)={churned:.3}  guardless={guardless:.3}");
+    assert!(
+        churned < 0.4,
+        "with the primary down the entry must stay pinned to a stable backup (exposure {churned:.3})"
+    );
+    assert!(
+        churned < guardless - 0.4,
+        "the churn-resilient set ({churned:.3}) stays far below the guardless rate ({guardless:.3})"
     );
 }

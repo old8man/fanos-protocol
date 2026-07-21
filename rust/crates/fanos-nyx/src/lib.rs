@@ -23,6 +23,7 @@ extern crate alloc;
 
 mod mathfns;
 
+pub mod guard;
 pub mod mixing;
 pub mod path;
 pub mod profile;
@@ -31,6 +32,7 @@ pub mod security;
 pub mod sheaf;
 pub mod tessera;
 
+pub use guard::GuardSet;
 pub use path::{Circuit, build_circuit, build_circuit_via_guard};
 pub use profile::{MixConfig, NyxConfig, Profile};
 pub use ratchet::{Ratchet, circuit_holonomy, verify_holonomy};

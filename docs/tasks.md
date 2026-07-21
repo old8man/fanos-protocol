@@ -29,6 +29,8 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+C10 predecessor guard-SET (`fanos-nyx::GuardSet`: primary-first, slow-rotation window, backup failover —
+proven ≈f not the union bound; live NyxNode actuation is the residual) ·
 C7 telemetry differential-privacy export (ε-DP `CoherenceFrame::privatize`, Laplace at Δr=1/21, exact
 syndrome withheld — verified vs the analytic `1−e^{−ε/2}` bound) ·
 spec↔impl reconciliation (protocol.md, 4-agent audit: beacon-DVRF, per-member-sealed onion, hash-to-line

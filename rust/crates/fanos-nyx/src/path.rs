@@ -39,8 +39,9 @@ fn draw_index(reader: &mut OutputReader, n: u64) -> u64 {
     }
 }
 
-/// Draw a uniform point satisfying `accept`, or `None` after too many rejections.
-fn draw_point<F: Field>(
+/// Draw a uniform point satisfying `accept`, or `None` after too many rejections. Shared with the guard
+/// module, which draws a distinct guard set from the same rejection-sampled stream.
+pub(crate) fn draw_point<F: Field>(
     reader: &mut OutputReader,
     accept: impl Fn(&Point<F>) -> bool,
 ) -> Option<Point<F>> {
