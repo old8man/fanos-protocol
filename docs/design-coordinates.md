@@ -153,6 +153,40 @@ the live path; demotes `coordinate_for` to what its doc already calls it — the
 Level A closes the A7 defect (forgeable/dead/unverified coordinate) completely and correctly; Level B is
 the operational completion of the same design.
 
+### Level B, resolved (#95, 2026-07-21)
+
+The **placement scheme is settled** and matches the design above: a node's hierarchical address is
+`level 0 = the live VRF transport coordinate` (§A7, reshuffling every epoch, anti-eclipse) then
+`level ≥ 1 = address_point(id, level)` (identity-hash sub-cell points, epoch-stable). `on_reseat` already
+preserves the hash-chain deep levels across the reshuffle (`a_reshuffle_preserves_the_hierarchical_descent_chain`),
+and `address_matches_identity_from(min_level = 1)` verifies the descent while skipping the externally-proven
+VRF level 0. **Anti-eclipse for deep levels is free**: because level 0 reshuffles, *which identities share a
+level-0 point — hence the whole sub-cell membership — churns every epoch*, so no deep position can be
+pre-settled and **no per-sub-cell beacon is needed**. (Resolves design decisions 1–2 of #95.)
+
+The **missing live core** was not the placement math but a deterministic, occupancy-driven **descent
+policy** — who yields when two identities contest a point — and that is now built and verified:
+`fanos_primitives::derive_hierarchical_address(own_id, own_point, seated)` (commit `cc2f393`). Every node
+runs the same pure function over the same membership; priority is the strict total order on identity bytes,
+so of any identities contesting a position exactly one (the minimum id) keeps it and the rest descend,
+recursively and conflict-free, with no negotiation. A 5-way contention converges to a distinct address per
+node (proven by fixed-point iteration) and is order-independent.
+
+**Remaining to make the hierarchy fully live (the large follow-on).** (a) **Transport addressing keyed by
+the hierarchical address.** The base cell conflates the transport coordinate with the level-0 point; that
+is correct only at depth 1, because two identities that VRF to the same level-0 point then collide on one
+transport coordinate. A genuine multi-cell topology must reach a node by *routing to its sub-cell then its
+leaf* (`RouteHier`, already built), so the physical/Directory key must be the full `HierAddr` (or a unique
+flattening), not the level-0 point — this is the foundational change the deep hierarchy waits on. (b) A
+**multi-cell simulator**: the sim is one node per transport `Triple` in a single plane; a real deep
+hierarchy needs a multi-cell container that seats sub-cells and routes cell-to-cell (the descent policy +
+`RouteHier` are ready; the harness is not). (c) **Live descent actuation**: wire
+`derive_hierarchical_address` into `OverlayNode::on_announce` (re-derive on membership change, re-seat,
+re-announce), which unblocks once (a) lands. (d) **Parent-observes-child**: route a child's
+`Notification::Escalated` to a live `ParentCell` (today fed only by hand in `hierarchy.rs`). (e)
+**Cross-cell content placement**: `MapToPoint(H(key))` is single-plane full-cell today; the hierarchy needs
+a cross-cell key-placement rule. The descent policy is the verified keystone the rest of this composes on.
+
 ## 5. A2 — the large-`q` scaling decision (recorded)
 
 Audit A2 asks for an explicit, recorded decision on the general-`q` story, because DIAKRISIS and the whole
