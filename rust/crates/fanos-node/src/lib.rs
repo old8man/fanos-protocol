@@ -21,6 +21,7 @@ pub mod config;
 pub mod diaulos;
 pub mod epoch_driver;
 pub mod error;
+pub mod exit;
 pub mod identity;
 pub mod mix_relay;
 pub mod mixdir;
@@ -41,6 +42,7 @@ pub use diaulos::{
 };
 pub use epoch_driver::EpochDriver;
 pub use error::NodeError;
+pub use exit::{ExitPolicy, dial_exit, serve_exit};
 pub use fanos_onoma::Epoch;
 pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;
