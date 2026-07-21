@@ -169,8 +169,10 @@ anti-DDoS**. A petname/naming layer sits on top, deliberately out of protocol sc
 *Status (#99): the threshold-hosting core is now **live-wired** — a production `ThresholdService` engine
 (`fanos-node`) threshold-decrypts each intro across the service-line (`t`-of-`(q+1)` PartialDec gather over
 the `RdvIntro`/`SvcShareReq`/`SvcPartial` wire frames), so no single host reads an intro and `< t` seized
-hosts learn nothing; verified over the sim (`threshold_service_live.rs`). Remaining integration: a
-service-line roster descriptor for client discovery, composition with the anonymous transport (§12.4), and
+hosts learn nothing, and a client discovers the line through a wire-serialized `ServiceLine` roster
+(`fanos-calypso::hosting`) and seals its intro to it — the full discover → seal → serve loop, verified over
+the sim (`threshold_service_live.rs`). Remaining integration: composition with the anonymous transport
+(§12.4, so the intro rides the rendezvous onion and the reply returns over the client's reply circuit) and
 LRC-replicated service state.*
 
 ### 3.6 Censorship resistance & evolution (**[T]** core · Phase 3)
