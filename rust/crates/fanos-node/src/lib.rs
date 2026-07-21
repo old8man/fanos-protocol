@@ -30,10 +30,11 @@ pub mod proxy;
 pub mod rendezvous;
 pub mod rendezvous_relay;
 pub mod resolve;
+pub mod service_node;
 pub mod threshold_service;
 
 pub use cell_node::CellNode;
-pub use config::{NodeConfig, Peer, RoleSet};
+pub use config::{BeaconParams, NodeConfig, Peer, RoleSet, ServiceParams};
 pub use diaulos::{
     AnonRouteParams, FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service,
     serve, serve_rpc,
@@ -52,5 +53,6 @@ pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
 pub use rendezvous_relay::{RendezvousRelay, register_frame};
+pub use service_node::ServiceNode;
 pub use threshold_service::{ThresholdService, intro_frame};
 pub use resolve::{NodeResolver, ResolvedService, publish_service, verify_descriptor};

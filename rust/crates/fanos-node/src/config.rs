@@ -1,5 +1,6 @@
 //! Node configuration: listen address, persistent identity, bootstrap peers, and roles.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -24,6 +25,41 @@ pub struct BeaconParams {
     pub threshold: usize,
     /// This node's beacon share if it is an anchor; `None` for a pure consumer.
     pub share: Option<VssShare>,
+}
+
+/// The threshold-hosting parameters a node needs to serve a CALYPSO service line (spec §12.3, #99). With
+/// `service = Some(..)` **and** the `service` role, the node composes a [`ServiceNode`](crate::ServiceNode):
+/// it holds one member key of the service line, joins the line's threshold gather on each intro, and
+/// surfaces the recovered request — no single host reads an intro alone.
+///
+/// The member key is carried as a **seed**, not the secret itself: a member's hybrid KEM secret is
+/// deliberately non-serializable (it must not be spilled un-zeroized to a `Vec`; audit #124), so the node
+/// regenerates it in memory from this seed via
+/// [`HybridKemSecret::generate`](fanos_pqcrypto::HybridKemSecret::generate) — deterministically, so the
+/// member's published public key stays stable across restarts (unlike a relay's forward-secure onion key,
+/// which is fresh per run). Provisioned out-of-band, exactly like the beacon share: the operator generates
+/// each member's seed, collects the derived publics into the published [`ServiceLine`], and hands each
+/// member its own seed. Set programmatically, not from the config file.
+#[derive(Clone)]
+pub struct ServiceParams {
+    /// The seed this node regenerates its service-line member KEM keypair from. Secret material.
+    pub seed: [u8; 32],
+    /// The service line's member coordinates, in the client's seal order.
+    pub line: Vec<Triple>,
+    /// The reconstruction threshold `t` — how many members must cooperate to serve an intro.
+    pub threshold: usize,
+}
+
+// The seed regenerates the member secret, so it is itself key material — redacted from `Debug` (which
+// `NodeConfig` derives) so a config can be logged without leaking a service's hosting key.
+impl fmt::Debug for ServiceParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceParams")
+            .field("seed", &"<redacted>")
+            .field("line", &self.line)
+            .field("threshold", &self.threshold)
+            .finish()
+    }
 }
 
 /// A bootstrap peer: a known overlay coordinate bound to a network address. The overlay routes on
@@ -133,6 +169,10 @@ pub struct NodeConfig {
     /// The distributed-beacon parameters. `Some(..)` runs the live epoch clock (§7.6); `None` (the
     /// default) runs a bare overlay pinned at genesis — see [`BeaconParams`].
     pub beacon: Option<BeaconParams>,
+    /// The threshold-hosting parameters. Required by (and only used with) the `service` role: `Some(..)`
+    /// composes a [`ServiceNode`](crate::ServiceNode) hosting one member of a service line — see
+    /// [`ServiceParams`]. `None` (the default) hosts no service.
+    pub service: Option<ServiceParams>,
     /// PROTEUS censorship-resistance (§13.4). `Some(secret)` shapes every wire frame with the shared
     /// community secret so the transport carries no static FANOS signature, and the shape **rotates each
     /// epoch** (the moving-target defence); `None` (the default) is plaintext QUIC. All peers that must
@@ -149,6 +189,7 @@ impl Default for NodeConfig {
             roles: RoleSet::default(),
             start_heartbeat: true,
             beacon: None,
+            service: None,
             proteus_secret: None,
         }
     }

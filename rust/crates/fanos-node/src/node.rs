@@ -18,7 +18,7 @@ use fanos_keygen::BeaconNode;
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
 use tokio::task::JoinHandle;
 
-use crate::{CellNode, OverlayBeaconNode, spawn_mix_publisher};
+use crate::{CellNode, OverlayBeaconNode, ServiceNode, ThresholdService, spawn_mix_publisher};
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::error::NodeError;
@@ -36,6 +36,34 @@ fn os_entropy_32() -> Result<[u8; 32], NodeError> {
     getrandom::fill(&mut bytes)
         .map_err(|e| NodeError::Config(format!("OS entropy failed: {e}")))?;
     Ok(bytes)
+}
+
+/// Validate the `service` role's parameters, returning the member-key seed, line roster, and threshold to
+/// compose into a [`ServiceNode`] — or `None` when the role is off. The role requires its parameters (there
+/// is no line to serve without them) and a threshold in `1..=line.len()` (zero would serve every intro from
+/// a single host; above the line size can never be met). Validated here so bad provisioning fails
+/// [`Node::start`] rather than the infallible engine builder.
+#[allow(clippy::type_complexity)]
+fn service_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<Triple>, usize)>, NodeError> {
+    if !config.roles.service {
+        return Ok(None);
+    }
+    let params = config.service.as_ref().ok_or_else(|| {
+        NodeError::Config(
+            "the service role hosts a threshold CALYPSO line and needs service parameters (the line \
+             roster, threshold, and this node's member key seed)"
+                .to_owned(),
+        )
+    })?;
+    if params.threshold == 0 || params.threshold > params.line.len() {
+        return Err(NodeError::Config(format!(
+            "the service threshold {} must be in 1..={} (the line has {} members)",
+            params.threshold,
+            params.line.len(),
+            params.line.len(),
+        )));
+    }
+    Ok(Some((params.seed, params.line.clone(), params.threshold)))
 }
 
 /// A running FANOS node.
@@ -101,6 +129,10 @@ impl Node {
         } else {
             ([0u8; 32], [0u8; 32])
         };
+        // The service role hosts one member of a threshold CALYPSO line. Validate its parameters up front so
+        // bad provisioning fails `start` here rather than inside the infallible engine builder; the member
+        // key seed is then carried into the builder (the secret is regenerated there, in memory).
+        let service = service_params(&config)?;
         let handle = spawn_self_certifying_persistent_on::<F>(
             config.listen,
             &credentials,
@@ -112,7 +144,7 @@ impl Node {
                 // (which would reject every legitimate VRF announcement, audit C3).
                 let overlay_config = OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() };
                 let overlay = OverlayNode::<F>::new(coord, overlay_config);
-                match beacon {
+                let base: Box<dyn Engine + Send> = match beacon {
                     Some(bp) => {
                         let obn = OverlayBeaconNode::new(
                             overlay,
@@ -120,16 +152,37 @@ impl Node {
                         );
                         if relay {
                             // Compose the mixnet router at the same coordinate → a full cell participant.
-                            let (secret, _identity) =
+                            let (router_secret, _identity) =
                                 HybridKemSecret::generate(&mut SeedRng::from_seed(&kem_seed));
-                            let router =
-                                ThresholdRouter::<F>::new(coord, &secret, MIX_THRESHOLD, onion_seed);
+                            let router = ThresholdRouter::<F>::new(
+                                coord,
+                                &router_secret,
+                                MIX_THRESHOLD,
+                                onion_seed,
+                            );
                             Box::new(CellNode::new(obn, router))
                         } else {
                             Box::new(obn)
                         }
                     }
                     None => Box::new(overlay),
+                };
+                // The service role composes a threshold-hosting engine OVER whatever cell engine the other
+                // roles produced (overlay, beacon, and/or the mixnet relay), so the one coordinate also
+                // serves its CALYPSO line — an intro reaching it is dispatched to the service, everything
+                // else to the cell engine (see [`ServiceNode`]).
+                match service {
+                    Some((seed, line, threshold)) => {
+                        // Regenerate the member secret in memory from its seed (never serialized, audit
+                        // #124); its public is the one the operator collected into the published line.
+                        let (secret, _public) =
+                            HybridKemSecret::generate(&mut SeedRng::from_seed(&seed));
+                        Box::new(ServiceNode::new(
+                            base,
+                            ThresholdService::new(coord.coords(), secret, line, threshold),
+                        ))
+                    }
+                    None => base,
                 }
             },
             directory.clone(),
@@ -248,7 +301,7 @@ impl Node {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::config::{BeaconParams, NodeConfig};
+    use crate::config::{BeaconParams, NodeConfig, ServiceParams};
     use fanos_field::F2;
 
     #[tokio::test]
@@ -328,6 +381,75 @@ mod tests {
             matches!(started, Err(NodeError::Config(_))),
             "the relay role without beacon parameters is refused"
         );
+    }
+
+    #[tokio::test]
+    async fn a_service_role_requires_service_parameters() {
+        // The service role hosts a threshold CALYPSO line; without the line roster + member key there is
+        // nothing to serve, so the role is refused rather than silently running as a bare overlay.
+        let started = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            roles: RoleSet {
+                service: true,
+                ..RoleSet::default()
+            },
+            ..NodeConfig::default()
+        })
+        .await;
+        assert!(
+            matches!(started, Err(NodeError::Config(_))),
+            "the service role without service parameters is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_role_rejects_an_out_of_range_threshold() {
+        // A threshold above the line size can never be met, and zero would serve every intro from a single
+        // host — both defeat the hosting guarantee, so provisioning is rejected at start.
+        for threshold in [0usize, 3] {
+            let started = Node::start::<F2>(NodeConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                roles: RoleSet {
+                    service: true,
+                    ..RoleSet::default()
+                },
+                service: Some(ServiceParams {
+                    seed: [0x5e; 32],
+                    line: vec![[1, 0, 0], [0, 1, 0]],
+                    threshold,
+                }),
+                ..NodeConfig::default()
+            })
+            .await;
+            assert!(
+                matches!(started, Err(NodeError::Config(_))),
+                "threshold {threshold} (line size 2) is refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_node_starts_and_composes_the_hosting_engine() {
+        // Valid service parameters compose a ServiceNode over the overlay and bind real QUIC — the wiring
+        // path the intro-serving behaviour (unit-tested in `service_node`, sim-tested in
+        // `threshold_service_live`) then runs on.
+        let node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            roles: RoleSet {
+                service: true,
+                ..RoleSet::default()
+            },
+            service: Some(ServiceParams {
+                seed: [0x5e; 32],
+                line: vec![[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                threshold: 2,
+            }),
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("a service node with valid parameters starts");
+        assert!(node.health().local_addr.port() > 0, "endpoint bound");
+        node.shutdown();
     }
 
     #[tokio::test]
