@@ -83,6 +83,9 @@ impl Node {
                 }
             },
             directory.clone(),
+            // PROTEUS (§13.4): when a community secret is configured, every frame is polymorph-shaped and the
+            // shape rotates each epoch (driven by the same beacon that reshuffles the coordinate).
+            config.proteus_secret.clone(),
         )
         .await?;
 

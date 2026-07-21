@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant as StdInstant;
 
 use quinn::{Connection, Endpoint};
@@ -50,8 +50,12 @@ fn tuned_transport() -> Arc<quinn::TransportConfig> {
 }
 
 /// An optional PROTEUS transport shaper, shared across a node's connections. When present, every
-/// frame (including the identity HELLO) is polymorph-obfuscated on the wire (spec §13.2).
-type Shaper = Option<Arc<ProteusShaper>>;
+/// frame (including the identity HELLO) is polymorph-obfuscated on the wire (spec §13.2). Behind an
+/// `RwLock` so the [`reshuffle_loop`] can **rotate** the shape when the beacon advances the epoch (§13.4,
+/// V22 — the moving-target defence): sends take a read lock (shared, uncontended), the once-per-epoch
+/// rotation a brief write lock. The inner `outbound`/`inbound` are `&self` (interior-mutable packet
+/// counter), so concurrent sends never serialize on each other.
+type Shaper = Option<Arc<RwLock<ProteusShaper>>>;
 
 /// A self-certifying node's authenticated-identity handling (VRF-coordinate mode): the HELLO it
 /// announces on a fresh connection — its negotiation parameters and `epoch ‖ coordinate ‖
@@ -77,17 +81,19 @@ struct SelfCert {
 /// self-certifying, exchanging + verifying VRF proof-of-coordinate HELLOs.
 type Identity = Option<SelfCert>;
 
-/// Shape an outbound frame for the wire (identity when no shaper is configured).
+/// Shape an outbound frame for the wire (identity when no shaper is configured). A poisoned lock (a panic
+/// during a rotation) recovers the guard rather than fall back to plaintext — never leak an unshaped frame.
 fn shape_out(shaper: &Shaper, frame: &[u8]) -> Vec<u8> {
-    shaper
-        .as_ref()
-        .map_or_else(|| frame.to_vec(), |s| s.outbound(frame))
+    match shaper {
+        Some(s) => s.read().unwrap_or_else(PoisonError::into_inner).outbound(frame),
+        None => frame.to_vec(),
+    }
 }
 
 /// Recover an inbound frame from the wire, or `None` if it wasn't shaped by our secret+epoch.
 fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
     match shaper {
-        Some(s) => s.inbound(&wire),
+        Some(s) => s.read().unwrap_or_else(PoisonError::into_inner).inbound(&wire),
         None => Some(wire),
     }
 }
@@ -470,6 +476,7 @@ pub async fn spawn_self_certifying<F: Field + 'static>(
         directory,
         default_bind(),
         Capabilities::CORE,
+        None,
     )
 }
 
@@ -492,6 +499,7 @@ pub async fn spawn_self_certifying_with_capabilities<F: Field + 'static>(
         directory,
         default_bind(),
         capabilities,
+        None,
     )
 }
 
@@ -511,17 +519,21 @@ pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
         directory,
         default_bind(),
         Capabilities::CORE,
+        None,
     )
 }
 
 /// Like [`spawn_self_certifying_persistent`], but binds the QUIC endpoint to an explicit address
 /// (e.g. `0.0.0.0:9000` for a publicly reachable node) instead of an ephemeral localhost port. This
 /// is the production entry point a node binary uses; the coordinate stays cert-derived and stable.
+/// `community_secret` enables PROTEUS (§13.4): when `Some`, every frame is polymorph-shaped with that shared
+/// secret and the shape rotates each epoch; `None` is plaintext QUIC. Peers must share the secret to interop.
 pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
     bind: SocketAddr,
     credentials: &NodeCredentials,
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
+    community_secret: Option<Vec<u8>>,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, _cert) = node_configs_mutual_from(credentials)?;
     self_certifying_inner::<F, _>(
@@ -532,6 +544,7 @@ pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
         directory,
         bind,
         Capabilities::CORE,
+        community_secret,
     )
 }
 
@@ -544,10 +557,16 @@ fn self_certifying_inner<F: Field + 'static, M>(
     directory: Directory,
     bind: SocketAddr,
     capabilities: Capabilities,
+    community_secret: Option<Vec<u8>>,
 ) -> Result<NodeHandle, QuicError>
 where
     M: FnOnce(Point<F>) -> Box<dyn Engine + Send>,
 {
+    // PROTEUS enablement (§13.4): with a community secret, wrap every frame in the beacon-rotating polymorph
+    // shape so the transport carries no static FANOS signature and the shape moves each epoch. The shaper
+    // starts at the genesis epoch and the `reshuffle_loop` rotates it as the beacon advances (below).
+    let shaper: Shaper = community_secret
+        .map(|secret| Arc::new(RwLock::new(ProteusShaper::new(secret, Epoch::ZERO))));
     // The node's verifiable coordinate for the genesis epoch: MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS)),
     // with the proof it announces so peers can verify it (spec §L0/§7.3).
     let (coord, proof) = verifiable_coordinate::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
@@ -571,7 +590,7 @@ where
         }),
     });
     let dir_for_reshuffle = directory.clone();
-    let handle = spawn_inner(engine, directory, None, identity, server, client, bind)?;
+    let handle = spawn_inner(engine, directory, shaper.clone(), identity, server, client, bind)?;
     // Drive the per-epoch coordinate reshuffle off the live beacon (spec §L3, §3.2): on each `BeaconReady`
     // the loop re-derives this node's VRF coordinate for the new epoch, re-seats the engine, rebinds its
     // directory coordinate, and publishes the fresh HELLO + beacon so subsequent connections prove/verify
@@ -585,6 +604,7 @@ where
         dir_for_reshuffle,
         hello_cell,
         beacon_cell,
+        shaper,
         handle.subscribe(),
         handle.client(),
     ));
@@ -606,6 +626,7 @@ async fn reshuffle_loop<F: Field>(
     directory: Directory,
     hello: Arc<RwLock<Arc<Vec<u8>>>>,
     beacon: Arc<RwLock<BeaconSeed>>,
+    shaper: Shaper,
     mut events: broadcast::Receiver<Notification>,
     client: Client,
 ) {
@@ -613,6 +634,15 @@ async fn reshuffle_loop<F: Field>(
     loop {
         match events.recv().await {
             Ok(Notification::BeaconReady { epoch, seed }) => {
+                // Rotate the PROTEUS wire shape to the new epoch FIRST (§13.4 moving target): the polymorphism
+                // moves every epoch so a censor's classifier trained on the old shape is stale. Independent of
+                // whether the VRF coordinate also moves below — the shape rotates on every beacon round. A
+                // poisoned lock recovers the guard (the shape is still consistent) rather than skip the rotation.
+                if let Some(s) = &shaper {
+                    s.write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .rotate(epoch);
+                }
                 let seed = BeaconSeed::new(seed);
                 let (coord, proof) = verifiable_coordinate::<F>(&creds, epoch, &seed);
                 let new_coord = coord.coords();
@@ -662,7 +692,7 @@ pub async fn spawn_shaped(
     community_secret: Vec<u8>,
     epoch: Epoch,
 ) -> Result<NodeHandle, QuicError> {
-    let shaper = Arc::new(ProteusShaper::new(community_secret, epoch));
+    let shaper = Arc::new(RwLock::new(ProteusShaper::new(community_secret, epoch)));
     let (server, client) = node_configs()?;
     spawn_inner(
         engine,
@@ -1103,6 +1133,8 @@ mod tests {
             events_tx: events_tx.clone(),
         };
 
+        // A PROTEUS shaper started at genesis — the reshuffle must rotate its shape to the new epoch (§13.4).
+        let shaper = Arc::new(RwLock::new(ProteusShaper::new(b"test-secret".to_vec(), Epoch::ZERO)));
         tokio::spawn(reshuffle_loop::<F2>(
             creds,
             Capabilities::CORE,
@@ -1111,6 +1143,7 @@ mod tests {
             directory.clone(),
             hello.clone(),
             beacon.clone(),
+            Some(shaper.clone()),
             events_tx.subscribe(),
             client,
         ));
@@ -1151,6 +1184,11 @@ mod tests {
             vec![0u8],
             "the published HELLO was rewritten for the new coordinate"
         );
+        assert_eq!(
+            shaper.read().unwrap().epoch(),
+            epoch,
+            "the PROTEUS wire shape rotated to the new epoch (§13.4 moving target)"
+        );
     }
 
     /// A beacon whose VRF lands the node back on its current point is a no-op: no re-seat command.
@@ -1182,6 +1220,7 @@ mod tests {
             directory,
             hello,
             beacon,
+            None,
             events_tx.subscribe(),
             client,
         ));

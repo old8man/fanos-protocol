@@ -21,12 +21,22 @@ const NONCE_LABEL: &str = "FANOS-v1/proteus-packet-nonce";
 /// A stateful per-connection shaper: the community secret, the current epoch's shape, and a
 /// monotonic packet counter that diversifies each packet's junk (interior-mutable, so the shaper
 /// can be shared `&self` behind an `Arc` across a connection's concurrent sends).
-#[derive(Debug)]
 pub struct ProteusShaper {
     secret: Vec<u8>,
     epoch: Epoch,
     shape: ShapeParams,
     counter: AtomicU64,
+}
+
+/// Redacted `Debug`: never render the community secret (which now lives in a production node once PROTEUS is
+/// enabled) — a `{:?}` on the driver's transport state must not leak it (secret hygiene, audit D).
+impl core::fmt::Debug for ProteusShaper {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProteusShaper")
+            .field("secret", &"<redacted>")
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProteusShaper {

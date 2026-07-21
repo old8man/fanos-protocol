@@ -133,6 +133,11 @@ pub struct NodeConfig {
     /// The distributed-beacon parameters. `Some(..)` runs the live epoch clock (§7.6); `None` (the
     /// default) runs a bare overlay pinned at genesis — see [`BeaconParams`].
     pub beacon: Option<BeaconParams>,
+    /// PROTEUS censorship-resistance (§13.4). `Some(secret)` shapes every wire frame with the shared
+    /// community secret so the transport carries no static FANOS signature, and the shape **rotates each
+    /// epoch** (the moving-target defence); `None` (the default) is plaintext QUIC. All peers that must
+    /// interoperate share the same secret — it is a bridge/community password, not a per-node key.
+    pub proteus_secret: Option<Vec<u8>>,
 }
 
 impl Default for NodeConfig {
@@ -144,6 +149,7 @@ impl Default for NodeConfig {
             roles: RoleSet::default(),
             start_heartbeat: true,
             beacon: None,
+            proteus_secret: None,
         }
     }
 }
@@ -187,6 +193,14 @@ impl NodeConfig {
                     config.start_heartbeat = value.parse().map_err(|_| {
                         NodeError::Config(format!("bad heartbeat '{value}' (expected true/false)"))
                     })?;
+                }
+                "proteus_secret" => {
+                    if value.is_empty() {
+                        return Err(NodeError::Config(
+                            "proteus_secret must be non-empty (a shared community secret)".to_owned(),
+                        ));
+                    }
+                    config.proteus_secret = Some(value.as_bytes().to_vec());
                 }
                 other => {
                     return Err(NodeError::Config(format!(
@@ -257,5 +271,15 @@ mod tests {
         assert!(cfg.start_heartbeat); // the default is preserved
         assert!(cfg.bootstrap.is_empty());
         assert!(cfg.identity_path.is_none());
+    }
+
+    #[test]
+    fn proteus_secret_enables_shaping_and_is_off_by_default() {
+        // PROTEUS (§13.4) is opt-in: default off (plaintext QUIC), enabled by a non-empty shared secret.
+        assert!(NodeConfig::default().proteus_secret.is_none(), "off by default");
+        let cfg = NodeConfig::from_config_str("proteus_secret = a-shared-bridge-secret").unwrap();
+        assert_eq!(cfg.proteus_secret.as_deref(), Some(&b"a-shared-bridge-secret"[..]));
+        // An empty secret is a configuration error, not a silent no-op.
+        assert!(NodeConfig::from_config_str("proteus_secret =").is_err());
     }
 }

@@ -75,6 +75,10 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     if has_flag(args, "--no-heartbeat") {
         config.start_heartbeat = false;
     }
+    if let Some(s) = flag(args, "--proteus-secret") {
+        // Enable PROTEUS: shape every frame with this shared community secret, rotating per epoch (§13.4).
+        config.proteus_secret = Some(s.as_bytes().to_vec());
+    }
     Ok(config)
 }
 
@@ -307,7 +311,7 @@ fn print_help() {
          \n\
          USAGE:\n\
          \x20 fanos node  [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
-         \x20             [--role relay,storage,service,exit] [--no-heartbeat]\n\
+         \x20             [--role relay,storage,service,exit] [--no-heartbeat] [--proteus-secret SECRET]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--config FILE] [--identity PATH] [--bootstrap ...] [--listen ADDR]\n\
          \x20 fanos id    [--identity PATH]\n\
