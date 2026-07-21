@@ -18,7 +18,14 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [dependencies]
 fanos-field.workspace = true
 fanos-node.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync"] }
+fanos-pqcrypto.workspace = true
+getrandom = "0.4.3"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
+
+[dev-dependencies]
+# The stream tests host a DIAULOS echo service and publish its ONOMA descriptor to dial by name.
+fanos-diaulos.workspace = true
+fanos-onoma.workspace = true
 
 [lints]
 workspace = true

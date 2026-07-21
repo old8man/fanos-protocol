@@ -18,9 +18,9 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **C ABI — streams & services** (#113, M9) — extend `fanos-ffi` beyond lifecycle/storage/health to
-  `fanos_dial`/`fanos_stream_read`/`_write` and `fanos_service_host`/`_connect` (spec §11.2): bridge the
-  async DIAULOS byte-stream over the blocking FFI boundary (opaque `fanos_stream*` handles).
+- **C ABI — service hosting** (#113, M9) — the last §11.2 surface: `fanos_service_host` + an accept model
+  (`fanos_service_accept`) over the closure-based `serve`, so an embedder can *host* a `.fanos` service (not
+  just dial one) across the blocking FFI boundary.
 - **`fanos vpn` / TUN** (Phase 5) — full-tunnel TCP+UDP (OS TUN device; verification needs a TUN harness).
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
@@ -34,6 +34,13 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**C ABI — hidden-service client streams** (#113, M9, §11.2) — `fanos_service_connect(node, "<addr>.fanos")`
+resolves the name over the overlay (`NodeResolver`) and dials a DIAULOS byte stream, returning an opaque
+owning `FanosStream*`; `fanos_stream_read`/`_write` (blocking, driving the async stream on the node's
+runtime via a cloned `Handle`) / `_free`. The dial runs inside the runtime context (`Runtime::enter`) so its
+`tokio::spawn` bridge lands correctly. Verified over **real QUIC**: node B resolves + dials node A's
+published echo service by name and a payload round-trips through the C-ABI stream (2-node, serialized +
+retry-bounded). Header + null-safety extended. Service *hosting* is the last surface. ·
 **C ABI — the embedding foundation** (#113, M9, spec §11.2) — NEW crate `fanos-ffi`: a stable `extern "C"`
 surface (`crate-type = staticlib/cdylib/rlib`, hand-synced `include/fanos.h`) over the node so any language
 reuses the core. Slice 1: lifecycle (`fanos_open` from a config string / `fanos_join` / `fanos_free` — an

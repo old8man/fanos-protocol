@@ -840,8 +840,12 @@ dependencies = [
 name = "fanos-ffi"
 version = "0.1.0"
 dependencies = [
+ "fanos-diaulos",
  "fanos-field",
  "fanos-node",
+ "fanos-onoma",
+ "fanos-pqcrypto",
+ "getrandom 0.4.3",
  "tokio",
 ]
 

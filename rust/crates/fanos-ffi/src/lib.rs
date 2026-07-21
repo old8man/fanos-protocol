@@ -24,8 +24,10 @@ use std::ffi::{CStr, c_char, c_int};
 use std::{ptr, slice};
 
 use fanos_field::F2;
-use fanos_node::{Node, NodeConfig};
-use tokio::runtime::Runtime;
+use fanos_node::{Epoch, Node, NodeConfig, NodeResolver, ServiceResolver, dial_service};
+use fanos_pqcrypto::rng::SeedRng;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::runtime::{Handle, Runtime};
 
 /// Success.
 pub const FANOS_OK: c_int = 0;
@@ -209,6 +211,133 @@ pub unsafe extern "C" fn fanos_free(node: *mut FanosNode) {
     // `handle` (and its runtime) drop here, tearing the node down.
 }
 
+/// An owning handle to a DIAULOS byte stream to a hidden service. Holds a runtime [`Handle`] so the blocking
+/// read/write can drive the async stream. Opaque to C.
+///
+/// **Lifetime**: a stream borrows its node's runtime, so every `fanos_stream*` must be freed *before* the
+/// [`fanos_free`] that closes its node.
+pub struct FanosStream {
+    handle: Handle,
+    stream: DuplexStream,
+}
+
+/// Connect to a CALYPSO hidden service by its `.fanos` `addr` (spec §11.2 `fanos_service_connect`): resolve
+/// the name to the service's `(coordinate, key)` through the overlay, then open a DIAULOS byte stream to it.
+/// Returns an owning [`FanosStream`] handle, or null if the argument is bad, the name does not resolve, or
+/// the dial fails. Free it with [`fanos_stream_free`] (before freeing the node).
+///
+/// # Safety
+/// `node` must be a live [`fanos_open`] handle; `addr` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_service_connect(
+    node: *mut FanosNode,
+    addr: *const c_char,
+) -> *mut FanosStream {
+    // SAFETY: guarded by the null checks; the caller guarantees a valid `addr` string.
+    let Some(handle) = (unsafe { node.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    if addr.is_null() {
+        return ptr::null_mut();
+    }
+    let Ok(name) = unsafe { CStr::from_ptr(addr) }.to_str() else {
+        return ptr::null_mut();
+    };
+    // Resolve the `.fanos` name to the service coordinate + KEM key (min_pow 0 — the caller's descriptor
+    // policy is a higher-level concern), then dial a DIAULOS session with fresh per-dial ephemeral keys.
+    let resolver = NodeResolver::new(handle.node.client(), Epoch::ZERO, 0);
+    let Some((coord, public)) = handle.rt.block_on(resolver.resolve(name)) else {
+        return ptr::null_mut();
+    };
+    let mut seed = [0u8; 32];
+    if getrandom::fill(&mut seed).is_err() {
+        return ptr::null_mut();
+    }
+    let mut rng = SeedRng::from_seed(&seed);
+    // `dial_service` spawns the session's transport bridge, so it must run inside the runtime context.
+    let stream = {
+        let _guard = handle.rt.enter();
+        dial_service(handle.node.client(), coord, &public, &mut rng)
+    };
+    Box::into_raw(Box::new(FanosStream {
+        handle: handle.rt.handle().clone(),
+        stream,
+    }))
+}
+
+/// Read up to `len` bytes from `stream` into `buf`, blocking until some data arrives. Returns the number of
+/// bytes read (`>= 0`; `0` means the stream closed / EOF), [`FANOS_ERR_IO`] on a transport error, or
+/// [`FANOS_ERR_NULL`] on a null argument.
+///
+/// # Safety
+/// `stream` must be a live [`fanos_service_connect`] handle; `buf` must point to `len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_stream_read(
+    stream: *mut FanosStream,
+    buf: *mut u8,
+    len: usize,
+) -> c_int {
+    // SAFETY: guarded by the null check; the caller guarantees `buf` has `len` writable bytes.
+    let Some(stream) = (unsafe { stream.as_mut() }) else {
+        return FANOS_ERR_NULL;
+    };
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return FANOS_ERR_NULL;
+    }
+    let cap = len.min(i32::MAX as usize);
+    // SAFETY: `buf` is non-null with `cap <= len` writable bytes.
+    let dst = unsafe { slice::from_raw_parts_mut(buf, cap) };
+    match stream.handle.block_on(stream.stream.read(dst)) {
+        Ok(n) => n as c_int, // n <= cap <= i32::MAX
+        Err(_) => FANOS_ERR_IO,
+    }
+}
+
+/// Write all `len` bytes of `buf` to `stream`, blocking until sent (and flushed). Returns `len` on success,
+/// [`FANOS_ERR_IO`] on a transport error, or [`FANOS_ERR_NULL`] on a null argument. `len` must not exceed
+/// `INT_MAX`.
+///
+/// # Safety
+/// `stream` must be a live [`fanos_service_connect`] handle; `buf` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_stream_write(
+    stream: *mut FanosStream,
+    buf: *const u8,
+    len: usize,
+) -> c_int {
+    // SAFETY: guarded by the null checks; the caller guarantees `buf` has `len` readable bytes.
+    let Some(stream) = (unsafe { stream.as_mut() }) else {
+        return FANOS_ERR_NULL;
+    };
+    let Some(src) = (unsafe { as_slice(buf, len) }) else {
+        return FANOS_ERR_NULL;
+    };
+    let result = stream.handle.block_on(async {
+        stream.stream.write_all(src).await?;
+        stream.stream.flush().await
+    });
+    match result {
+        Ok(()) => len.min(i32::MAX as usize) as c_int,
+        Err(_) => FANOS_ERR_IO,
+    }
+}
+
+/// Close and free a stream handle (safe on null). Must be called before the owning node is freed.
+///
+/// # Safety
+/// `stream` must be null or a handle from [`fanos_service_connect`] that has not already been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fanos_stream_free(stream: *mut FanosStream) {
+    if stream.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees `stream` is a live, not-yet-freed handle. Dropping it closes the stream.
+    drop(unsafe { Box::from_raw(stream) });
+}
+
 /// Borrow `[ptr, ptr+len)` as a slice, or `None` if `ptr` is null with a non-zero length. A null pointer
 /// with a zero length is an empty slice (valid).
 ///
@@ -227,6 +356,16 @@ unsafe fn as_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+
+    // Each test that opens a node stands up a real QUIC endpoint; running several at once overloads the
+    // loopback transport and stalls handshakes. Serialize them behind one lock (as the node crate's
+    // real-QUIC suites do).
+    static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     /// Open a node on an ephemeral loopback port for a test; free with [`fanos_free`].
     fn open_loopback() -> *mut FanosNode {
@@ -239,6 +378,7 @@ mod tests {
 
     #[test]
     fn open_diagnose_join_and_free() {
+        let _serial = serial();
         let node = open_loopback();
         // SAFETY: `node` is a live handle for each of these calls.
         unsafe {
@@ -283,6 +423,7 @@ mod tests {
 
     #[test]
     fn lookup_of_a_missing_key_is_not_found_and_reports_length() {
+        let _serial = serial();
         let node = open_loopback();
         let key = b"no-such-key";
         let mut out = [0u8; 8];
@@ -298,6 +439,7 @@ mod tests {
 
     #[test]
     fn publish_then_lookup_round_trips_through_the_c_abi() {
+        let _serial = serial();
         // A value published through the C ABI is recovered through it — the full store path (put → get)
         // driven entirely across the FFI boundary on a live node.
         let node = open_loopback();
@@ -331,6 +473,106 @@ mod tests {
             assert_eq!(&out[..out_len], val, "the value round-trips through the C ABI");
 
             fanos_free(node);
+        }
+    }
+
+    #[test]
+    fn connect_to_a_hosted_service_and_echo_over_the_c_abi() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
+        use fanos_node::{publish_service, serve};
+        use fanos_onoma::Address;
+
+        let _serial = serial();
+        // Node A hosts the echo service; node B (bootstrapped to A) dials it by name — a hidden-service dial
+        // is between two nodes (a node does not self-deliver to its own coordinate).
+        let a = open_loopback();
+        // SAFETY: `a` is a live handle the test owns.
+        let a_handle = unsafe { &*a };
+        // SAFETY: `a` is live.
+        let a_health = unsafe { fanos_diagnose(a) };
+        let [x, y, z] = a_health.coord;
+        let a_port = a_health.port;
+
+        let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(b"ffi-svc-key"));
+        let bundle = bundle_from_kem_public(keypair.public());
+        let name = Address::from_bundle(&bundle).to_name();
+        let a_coord = a_handle.node.address();
+        {
+            let _guard = a_handle.rt.enter();
+            serve(
+                a_handle.node.client(),
+                keypair,
+                SeedRng::from_seed(b"ffi-svc-rng"),
+                |mut stream: DuplexStream| async move {
+                    let mut buf = vec![0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buf).await
+                        && n > 0
+                    {
+                        let _ = stream.write_all(&buf[..n]).await;
+                        let _ = stream.flush().await;
+                    }
+                },
+            );
+        }
+        a_handle
+            .rt
+            .block_on(publish_service(&a_handle.node.client(), &bundle, a_coord, Epoch::ZERO, 0, &[]))
+            .expect("publish the service descriptor");
+
+        // Node B, bootstrapped to A.
+        let b_cfg = CString::new(format!(
+            "listen = 127.0.0.1:0\nbootstrap = {x}:{y}:{z}@127.0.0.1:{a_port}"
+        ))
+        .unwrap();
+        // SAFETY: `b_cfg` is a valid string alive across the call.
+        let b = unsafe { fanos_open(b_cfg.as_ptr()) };
+        assert!(!b.is_null(), "node B opened and bootstrapped");
+
+        // Resolve+dial by name through the C ABI, retrying while the overlay connects and the descriptor
+        // propagates (a real-QUIC store put/handshake takes a moment). Bounded, so a failure never hangs.
+        let cname = CString::new(name).unwrap();
+        let mut stream = ptr::null_mut();
+        for _ in 0..20 {
+            // SAFETY: `b` is live; `cname` outlives the call.
+            stream = unsafe { fanos_service_connect(b, cname.as_ptr()) };
+            if !stream.is_null() {
+                break;
+            }
+            sleep(Duration::from_millis(250));
+        }
+        assert!(!stream.is_null(), "B resolved and dialed A's service through the C ABI");
+
+        let msg = b"hello over the c abi";
+        // SAFETY: `stream` is live; the buffers are valid for each call.
+        unsafe {
+            assert_eq!(
+                fanos_stream_write(stream, msg.as_ptr(), msg.len()),
+                msg.len() as c_int,
+                "wrote the whole message"
+            );
+            let mut out = [0u8; 64];
+            let n = fanos_stream_read(stream, out.as_mut_ptr(), out.len());
+            assert!(n > 0, "the echo came back");
+            assert_eq!(&out[..n as usize], msg, "the payload round-trips through the C-ABI stream");
+            fanos_stream_free(stream);
+            fanos_free(b);
+            fanos_free(a);
+        }
+    }
+
+    #[test]
+    fn stream_functions_reject_null() {
+        let mut buf = [0u8; 4];
+        // SAFETY: all handles null; the functions must return error codes, never deref.
+        unsafe {
+            assert_eq!(fanos_stream_read(ptr::null_mut(), buf.as_mut_ptr(), buf.len()), FANOS_ERR_NULL);
+            assert_eq!(fanos_stream_write(ptr::null_mut(), buf.as_ptr(), buf.len()), FANOS_ERR_NULL);
+            fanos_stream_free(ptr::null_mut()); // no-op
+            let addr = CString::new("x.fanos").unwrap();
+            assert!(fanos_service_connect(ptr::null_mut(), addr.as_ptr()).is_null());
         }
     }
 }
