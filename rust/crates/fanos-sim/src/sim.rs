@@ -157,6 +157,22 @@ struct Slot {
     status: Status,
 }
 
+/// One frame as a **global passive adversary** (GPA) observes it on the wire: when, between whom, and how
+/// big — never the (encrypted) content. This is exactly a traffic-analysis adversary's observable, so a test
+/// can drive the real routed/mixed/cover network and then evaluate what a GPA could infer from the metadata
+/// alone (spec §8.1 endpoint correlation, C1 flow correlation). Recorded only when [`Sim::observe_frames`] is on.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameObs {
+    /// Delivery time, in milliseconds of virtual time.
+    pub t_ms: u64,
+    /// The sending coordinate (the transport authenticates it, so a GPA sees it).
+    pub from: Triple,
+    /// The receiving coordinate.
+    pub to: Triple,
+    /// The frame size in bytes (constant-size cells hide the payload length; a GPA still sees the count).
+    pub len: usize,
+}
+
 /// The simulator. Add engines, inject commands, inject faults, run the clock, read the report.
 pub struct Sim {
     clock: Instant,
@@ -167,6 +183,8 @@ pub struct Sim {
     rng: Rng,
     report: Report,
     trace: Trace,
+    /// The global passive observer's tape (frame metadata), when [`observe_frames`](Sim::observe_frames) is on.
+    frame_tap: Option<Vec<FrameObs>>,
 }
 
 impl Sim {
@@ -188,12 +206,27 @@ impl Sim {
             rng: Rng::new(seed),
             report: Report::default(),
             trace: Trace::new(),
+            frame_tap: None,
         }
     }
 
     /// Turn the event trace on or off (off by default; see [`Sim::trace`]).
     pub fn enable_trace(&mut self, on: bool) {
         self.trace.enable(on);
+    }
+
+    /// Enable the **global passive observer**: from now on every delivered frame's metadata `(t, from, to,
+    /// len)` is recorded on a tape a traffic-analysis adversary could read ([`observed_frames`](Sim::observed_frames)).
+    /// The affordance for modeling a GPA over the running network (spec §8.1, C1) — the adversary sees only
+    /// metadata, never the encrypted content.
+    pub fn observe_frames(&mut self) {
+        self.frame_tap.get_or_insert_with(Vec::new);
+    }
+
+    /// The global passive observer's tape (empty unless [`observe_frames`](Sim::observe_frames) was enabled).
+    #[must_use]
+    pub fn observed_frames(&self) -> &[FrameObs] {
+        self.frame_tap.as_deref().unwrap_or(&[])
     }
 
     /// The recorded event trace — the inspectable log of the run.
@@ -337,6 +370,15 @@ impl Sim {
                 let name = frame_name(&frame);
                 if self.is_alive(to) {
                     self.report.metrics.frames_delivered += 1;
+                    // Feed the global passive observer's tape (metadata only — a GPA never sees content).
+                    if let Some(tap) = self.frame_tap.as_mut() {
+                        tap.push(FrameObs {
+                            t_ms: self.clock.as_nanos() / 1_000_000,
+                            from,
+                            to,
+                            len: frame.len(),
+                        });
+                    }
                     self.log(format!(
                         "deliver {name} {}→{}",
                         fmt_coord(from),

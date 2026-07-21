@@ -41,7 +41,7 @@ pub use observatory::{
     lag1_autocorrelation, read, windowed_variance,
 };
 pub use rng::Rng;
-pub use sim::Sim;
+pub use sim::{FrameObs, Sim};
 pub use trace::{Trace, fmt_coord};
 
 use fanos_field::Field;
