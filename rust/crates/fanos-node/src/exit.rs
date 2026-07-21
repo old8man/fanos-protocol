@@ -18,13 +18,20 @@ use std::io;
 use std::sync::Arc;
 
 use fanos_diaulos::{Coord, StaticKeypair};
+use fanos_field::Field;
+use fanos_geometry::{Plane, Point};
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
+use fanos_rendezvous::Epoch;
+use fanos_runtime::Notification;
 use rand_core::CryptoRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use crate::diaulos::{dial_service, serve};
+use crate::resolve::RESOLVE_TIMEOUT;
 
 /// Upper bound on the target header length (`host:port`) — bounds the read a malicious client can force
 /// before it has connected anywhere.
@@ -138,6 +145,83 @@ pub async fn dial_exit<R: CryptoRng>(
     Ok(stream)
 }
 
+// --- Exit discovery: exits advertise themselves through the overlay store (mirroring the mix directory),
+// so a proxy finds one without a hand-configured descriptor. -----------------------------------------------
+
+/// The overlay store slot an exit publishes its service public key at — domain-separated, keyed by the
+/// exit's coordinate **and the epoch**. The epoch tag makes the directory *live*: an exit republishes each
+/// epoch, so one that has gone away simply stops appearing (best-effort roster, as with the mix directory).
+fn exit_key_slot(coord: Coord, epoch: Epoch) -> Vec<u8> {
+    let mut key = b"FANOS-v1/exit-key/".to_vec();
+    key.extend_from_slice(&fanos_geometry::encode_triple(coord));
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// Publish this exit's stable service public key for `epoch` at its coordinate slot, so a proxy resolving
+/// exits for that epoch discovers it. `false` if the store rejected the write.
+pub async fn publish_exit_key(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+    public: &HybridKemPublic,
+) -> bool {
+    client.put(exit_key_slot(coord, epoch), public.encode()).await
+}
+
+/// Resolve the exit service key published by the node at `coord` for `epoch`, or `None` if none is
+/// published, the lookup times out, or the stored bytes are not a valid key.
+pub async fn resolve_exit_key(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+) -> Option<HybridKemPublic> {
+    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(exit_key_slot(coord, epoch)))
+        .await
+        .ok()??;
+    HybridKemPublic::decode(&bytes)
+}
+
+/// Assemble the **live** exit directory of the base cell of plane `F` for `epoch`: resolve every cell
+/// point's published exit key and keep those currently answering — a best-effort roster of exits the proxy
+/// can route clearnet traffic through (no central directory; the cell advertises itself through the store).
+pub async fn build_cell_exit_directory<F: Field>(
+    client: &Client,
+    epoch: Epoch,
+) -> Vec<(Coord, HybridKemPublic)> {
+    let mut exits = Vec::new();
+    for i in 0..Plane::<F>::N as usize {
+        let coord = Point::<F>::at(i).coords();
+        if let Some(public) = resolve_exit_key(client, coord, epoch).await {
+            exits.push((coord, public));
+        }
+    }
+    exits
+}
+
+/// Keep an exit **discoverable**: spawn the task that (re)publishes the exit at `coord` its stable service
+/// public key each epoch, so [`build_cell_exit_directory`] always sees it while the node runs. Publishes
+/// the genesis-epoch key at once, then follows the node's `BeaconReady` stream (the exit's identity is
+/// seed-pinned, so the same key is refreshed at each new epoch's slot). Ends when the node shuts down.
+#[must_use]
+pub fn spawn_exit_publisher(client: Client, coord: Coord, public: HybridKemPublic) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut events = client.subscribe();
+        let mut epoch = Epoch::ZERO;
+        publish_exit_key(&client, coord, epoch, &public).await;
+        loop {
+            match events.recv().await {
+                Ok(Notification::BeaconReady { epoch: reached, .. }) if reached > epoch => {
+                    epoch = reached;
+                    publish_exit_key(&client, coord, epoch, &public).await;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -149,6 +233,14 @@ mod tests {
         assert!(web.allows_port(443) && web.allows_port(80));
         assert!(!web.allows_port(25), "SMTP is not in the web policy");
         assert!(ExitPolicy::default().allows_port(9999), "empty allow-list = any port");
+    }
+
+    #[test]
+    fn exit_key_slots_are_distinct_and_domain_separated() {
+        let a = exit_key_slot([1, 0, 0], Epoch::ZERO);
+        assert!(a.starts_with(b"FANOS-v1/exit-key/"), "domain-separated slot");
+        assert_ne!(a, exit_key_slot([0, 1, 0], Epoch::ZERO), "coord changes the slot");
+        assert_ne!(a, exit_key_slot([1, 0, 0], Epoch::new(1)), "epoch changes the slot");
     }
 
     #[test]

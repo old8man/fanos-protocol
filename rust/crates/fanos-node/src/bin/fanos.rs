@@ -15,7 +15,8 @@ use fanos_field::F2;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_node::{
     AnonRouteParams, BeaconSeed, Epoch, ExitParams, FanosDialer, Node, NodeConfig, NodeError,
-    NodeResolver, Peer, RoleSet, ServiceParams, build_cell_mix_directory, identity, serve_proxy,
+    NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory, build_cell_mix_directory,
+    identity, serve_proxy,
 };
 use fanos_runtime::Notification;
 use tokio::net::TcpListener;
@@ -183,13 +184,20 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
             )));
         }
     };
-    // The clearnet exit to route non-`.fanos` targets through, if any (else those are refused).
-    let exit = parse_exit_via(args)?;
-    let exit_coord = exit.as_ref().map(|(coord, _)| *coord);
+    // A hand-configured clearnet exit (`--exit-via`) overrides auto-discovery; parsed up front so a bad
+    // file fails before we join the overlay.
+    let exit_via = parse_exit_via(args)?;
 
     let config = node_config_from_args(args)?;
     let mut node = Node::start::<F2>(config).await?;
     let health = node.health();
+    // The clearnet exit to route non-`.fanos` targets through: the `--exit-via` override, else an exit
+    // discovered from the live cell directory (none ⇒ clearnet targets are refused).
+    let exit = match exit_via {
+        Some(e) => Some(e),
+        None => discover_exit(&node, epoch).await,
+    };
+    let exit_coord = exit.as_ref().map(|(coord, _)| *coord);
     let resolver = NodeResolver::new(node.client(), epoch, min_pow);
     // `FanosDialer` is not `Clone`, so `serve_proxy` shares it behind an `Arc` (per-connection handlers need
     // only `&D`). The dialer holds its own `Client`; the node stays owned here for notification draining + a
@@ -219,7 +227,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
         ),
     };
     let exit_line = exit_coord.map_or_else(
-        || "\n  Clearnet: refused (.fanos-only — pass --exit-via to enable)".to_owned(),
+        || "\n  Clearnet: refused (no exit discovered — start an exit node, or pass --exit-via)".to_owned(),
         |[a, b, c]| format!("\n  Clearnet: via exit {a}:{b}:{c}"),
     );
     eprintln!(
@@ -432,6 +440,24 @@ fn log_notification(note: &Notification) {
     }
 }
 
+/// Discover a clearnet exit from the live cell exit directory for `epoch` — the best-effort roster the
+/// cell advertises through the overlay store (each exit republishes per epoch). Picks one at random, so a
+/// proxy restart spreads load across the available exits. `None` if none is currently published (clearnet
+/// targets are then refused).
+async fn discover_exit(node: &Node, epoch: Epoch) -> Option<([u32; 3], HybridKemPublic)> {
+    let mut exits = build_cell_exit_directory::<F2>(&node.client(), epoch).await;
+    let n = exits.len();
+    if n == 0 {
+        return None;
+    }
+    let mut buf = [0u8; 1];
+    getrandom::fill(&mut buf).ok()?;
+    let [byte] = buf;
+    let picked = exits.swap_remove(usize::from(byte) % n);
+    info!(exit = ?picked.0, available = n, "discovered a clearnet exit from the live directory");
+    Some(picked)
+}
+
 /// Parse the exit descriptor for the proxy's clearnet path from `--exit-via <file>`: a `key = value` file
 /// with `coord = x:y:z` (the exit's overlay coordinate) and `key = <hex>` (its DIAULOS service public key,
 /// the hex of `HybridKemPublic::encode` — an exit logs this line at startup). `None` if the flag is absent,
@@ -569,11 +595,12 @@ fn print_help() {
          \x20 ports = 80,443            destination ports to allow (omit = ANY port — an open relay)\n\
          \x20 (providing it implies the `exit` role; the node logs its `coord`/`key` descriptor at startup)\n\
          \n\
-         EXIT-VIA FILE (--exit-via, proxy's clearnet path): a `key = value` file with\n\
+         CLEARNET (proxy): by default `fanos proxy` DISCOVERS an exit from the live cell directory (exits\n\
+         \x20 advertise themselves each epoch) and routes clearnet (non-.fanos) targets through it. Pin a\n\
+         \x20 specific exit with --exit-via FILE, a `key = value` file with\n\
          \x20 coord = x:y:z              the exit node's coordinate (from its startup log)\n\
          \x20 key   = <hex>              the exit's service public key (from its startup log)\n\
-         \x20 with it, `fanos proxy` reaches clearnet (non-.fanos) targets via that exit; without it those\n\
-         \x20 targets are refused (a .fanos-only proxy)\n\
+         \x20 If no exit is discovered and none is pinned, clearnet targets are refused (.fanos-only).\n\
          \n\
          EXAMPLES:\n\
          \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\

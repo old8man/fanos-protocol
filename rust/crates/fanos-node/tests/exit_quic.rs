@@ -17,7 +17,8 @@ use std::time::Duration;
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_node::{
-    ExitPolicy, FanosDialer, Node, NodeConfig, Peer, StaticResolver, dial_exit, serve_exit,
+    Epoch, ExitParams, ExitPolicy, FanosDialer, Node, NodeConfig, Peer, RoleSet, StaticResolver,
+    dial_exit, resolve_exit_key, serve_exit,
 };
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target};
@@ -205,6 +206,54 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
 
     e.shutdown();
     c.shutdown();
+}
+
+#[tokio::test]
+async fn an_exit_advertises_itself_and_is_discovered() {
+    let _serial = serial();
+    // An exit node publishes its descriptor to the overlay store on startup; the live exit directory
+    // discovers it — the auto-discovery half that lets a proxy find an exit with no hand-configured file.
+    let seed = [0x7e; 32];
+    let node = Node::start::<F2>(NodeConfig {
+        listen: LOOPBACK,
+        roles: RoleSet {
+            exit: true,
+            ..RoleSet::default()
+        },
+        exit: Some(ExitParams {
+            seed,
+            allowed_ports: Vec::new(),
+        }),
+        ..NodeConfig::default()
+    })
+    .await
+    .unwrap();
+
+    let expected = StaticKeypair::generate(&mut SeedRng::from_seed(&seed))
+        .public()
+        .clone();
+    // The publish is async (through the store); resolve the exit's own slot (which `build_cell_exit_
+    // directory` scans over the cell roster) until it appears. Resolving the node's own coordinate is a
+    // fast local store hit — unlike an empty peer slot on this lone node, which has no live responder.
+    let client = node.client();
+    let coord = node.address();
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(public) = resolve_exit_key(&client, coord, Epoch::ZERO).await {
+                return public;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the exit advertised its descriptor to the store");
+
+    assert_eq!(
+        found.encode(),
+        expected.encode(),
+        "the discovered key is the exit's seed-derived service public key"
+    );
+    node.shutdown();
 }
 
 #[tokio::test]

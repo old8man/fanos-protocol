@@ -42,7 +42,10 @@ pub use diaulos::{
 };
 pub use epoch_driver::EpochDriver;
 pub use error::NodeError;
-pub use exit::{ExitPolicy, dial_exit, serve_exit};
+pub use exit::{
+    ExitPolicy, build_cell_exit_directory, dial_exit, publish_exit_key, resolve_exit_key, serve_exit,
+    spawn_exit_publisher,
+};
 pub use fanos_onoma::Epoch;
 pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;

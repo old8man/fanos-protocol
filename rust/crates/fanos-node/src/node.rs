@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     CellNode, ExitPolicy, OverlayBeaconNode, ServiceNode, ThresholdService, serve_exit,
-    spawn_mix_publisher,
+    spawn_exit_publisher, spawn_mix_publisher,
 };
 
 use crate::config::{NodeConfig, RoleSet};
@@ -66,10 +66,11 @@ fn spawn_exit_role(
         return Ok(());
     };
     let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(&seed));
+    let public = keypair.public().clone();
     let [x, y, z] = address;
     tracing::info!(
         coord = ?address,
-        key = %encode_hex(&keypair.public().encode()),
+        key = %encode_hex(&public.encode()),
         "exit descriptor — proxy `--exit-via` file: coord = {x}:{y}:{z}, key = <the `key=` value above>"
     );
     serve_exit(
@@ -78,6 +79,10 @@ fn spawn_exit_role(
         SeedRng::from_seed(&os_entropy_32()?),
         ExitPolicy::new(allowed_ports),
     );
+    // Advertise the exit through the overlay store so a proxy discovers it automatically (each epoch, so a
+    // departed exit falls out of the live directory) — no hand-configured descriptor needed. The task runs
+    // until the node stops; its handle is not retained (like the mix publisher's).
+    let _publisher = spawn_exit_publisher(handle.client(), address, public);
     Ok(())
 }
 
