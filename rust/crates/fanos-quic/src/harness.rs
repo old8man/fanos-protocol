@@ -17,7 +17,7 @@
 use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_primitives::{BeaconSeed, Epoch};
-use fanos_runtime::Engine;
+use fanos_runtime::{Command, Engine};
 
 use crate::directory::Directory;
 use crate::driver::{NodeHandle, QuicError, spawn_self_certifying_persistent};
@@ -104,7 +104,35 @@ pub async fn spawn_cell<F: Field + 'static>(
     for i in 0..n {
         nodes.push(spawn_pinned::<F>(Point::at(i), &make_engine, directory.clone()).await?);
     }
+    establish_membership(&nodes).await;
     Ok(Cell { nodes, directory })
+}
+
+/// How long to let the assembly-time membership announcements propagate over QUIC before the cell is
+/// handed back. A full cell is a complete mesh, so one direct `Announce` round (dial + deliver) reaches
+/// every member; this budget covers that round plus the lazy first-contact handshakes it triggers.
+const MEMBERSHIP_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Bring the freshly assembled cell to an *established* state: every node announces itself, so every
+/// member's `members` view — and hence the occupied-point set that shard placement and content routing
+/// read — is populated before any `Put`/`Get` runs.
+///
+/// This is load-bearing, not cosmetic. A node's occupancy set is filled by membership/liveness traffic,
+/// **not** by the static peer seeding it starts with (an unheard-from neighbour is a known *slot*, not a
+/// known *occupant*). Skip this and a fresh cell has every node believing it is the sole occupant, so a
+/// `Put`'s responsible node places all `N` erasure shards on *itself* instead of one per point — the
+/// value is then held by a single node, and losing that node loses the value, silently defeating the
+/// LRC availability guarantee (spec §L4). Issuing a `Join` on each node floods an `Announce` carrying
+/// its coordinate; on receipt every peer records the member, so the cell converges to a full occupied
+/// set. This mirrors the simulator fixture's `inject_all(StartHeartbeat) + run_for(..)` establishment
+/// step (see `fanos-sim` `tests/storage.rs::established`), realised here over real QUIC.
+async fn establish_membership(nodes: &[NodeHandle]) {
+    for node in nodes {
+        // Empty application info: the cell fixture needs only the coordinate each announcement carries,
+        // which the membership layer fills in from the announcing node's own identity.
+        node.command(Command::Join { info: Vec::new() });
+    }
+    tokio::time::sleep(MEMBERSHIP_SETTLE).await;
 }
 
 #[cfg(test)]

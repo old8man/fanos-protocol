@@ -151,6 +151,12 @@ struct Transport {
 /// caller's task forever (audit C1).
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long to wait for a dial to complete before abandoning it (#129). A peer that has gone away must
+/// fail fast so it cannot stall the send loop behind it — the erasure store fans reads to every cell
+/// point and a dead point's dial would otherwise block the live ones. A reachable peer's QUIC handshake
+/// completes in a small fraction of this even under load.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A running QUIC-backed node: the handle an application uses to drive it and hear from it.
 ///
 /// Dropping the handle (or calling [`NodeHandle::shutdown`]) closes the endpoint and lets the
@@ -830,13 +836,42 @@ async fn fire_timer(tx: mpsc::Sender<Input>, token: TimerToken, delay: std::time
     let _ = tx.send(Input::Timer(token)).await;
 }
 
-/// The transport loop: performs `Effect::Send` by writing one QUIC uni-stream per frame.
+/// The transport dispatcher: routes each [`Effect::Send`] to a per-destination worker. One worker owns the
+/// dial-once-then-drain sequence for a single peer, so sends to DIFFERENT peers proceed concurrently while a
+/// slow or dead peer stalls only its own queue — never the sends to live peers. This is the #129 fix: a
+/// read fans a `Lookup` to every cell point at once, and a single down shard-home must not block the
+/// `Lookup`s to the survivors (which, by the erasure redundancy, suffice to reconstruct). Because there is
+/// exactly one worker per coordinate, there is also exactly one in-flight dial per coordinate — the
+/// duplicate-dial race a naive per-frame spawn would suffer cannot arise.
 async fn transport_loop(
     t: Transport,
     directory: Directory,
     mut send_rx: mpsc::UnboundedReceiver<SendRequest>,
 ) {
+    let mut workers: HashMap<Triple, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
     while let Some(SendRequest { to, frame }) = send_rx.recv().await {
+        // Reuse the peer's worker, or start one. Workers live for the dispatcher's lifetime (bounded by the
+        // node's peer set, exactly like the connection cache), so no per-peer teardown race exists: the
+        // channel a frame is handed to always has a live receiver draining it.
+        let worker = workers.entry(to).or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            tokio::spawn(peer_send_worker(t.clone(), directory.clone(), to, rx));
+            tx
+        });
+        let _ = worker.send(frame);
+    }
+}
+
+/// A single peer's send worker: resolve the destination to a connection (dial once, then reuse the cached
+/// connection), then write each queued frame as its own QUIC uni-stream, in order. Scoped to one peer so a
+/// slow dial or a broken connection cannot delay any other peer's traffic (#129).
+async fn peer_send_worker(
+    t: Transport,
+    directory: Directory,
+    to: Triple,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    while let Some(frame) = rx.recv().await {
         // Resolve `to` to a live connection. If the directory knows an address, reuse-or-dial it; otherwise
         // fall back to a connection the peer already dialed IN on — a live cached connection *is*
         // reachability, so a peer we never learned an address for is still routable in reverse (#119). Only
@@ -870,7 +905,15 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     if let Some(conn) = cached(&t.conns, to) {
         return Some(conn);
     }
-    let conn = t.endpoint.connect(addr, "fanos.node").ok()?.await.ok()?;
+    // Bound the dial: a peer that has gone away (shut down, NAT-dropped) must fail FAST, not hang the send
+    // loop for the full QUIC handshake timeout. That stall is the #129 availability bug — a `get`'s
+    // `Lookup`s to live shard-homes were blocked behind a dead peer's dial, so the erasure shards never
+    // gathered even though the redundancy tolerates the loss. A real peer answers in well under this.
+    let connecting = t.endpoint.connect(addr, "fanos.node").ok()?;
+    let conn = tokio::time::timeout(DIAL_TIMEOUT, connecting)
+        .await
+        .ok()?
+        .ok()?;
 
     match &t.identity {
         // HELLO mode: announce our coordinate as the first uni-stream.
