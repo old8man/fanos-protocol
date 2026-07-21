@@ -1,17 +1,18 @@
 # FANOS — active task list
 
-> **▶ RIGHT NOW: NYX-Lite dialer wiring** — expose the low-latency (Tor-class) anonymity profile in the
-> proxy. `NyxNode` (single-node Sphinx onion hops) is built + sim-tested but unwired into the proxy dialer,
-> which today offers only `direct` (fast, no anonymity) and `anonymous` (Nym-class threshold mixing). This
-> needs a design call: bridge the NyxNode Sphinx path, or a Lite preset over the existing rendezvous.
+> **▶ RIGHT NOW: THREAT catalog — industrial attack-class modeling in the simulator.** Model every
+> real-world attack class (calibrated to industrial grade) against the live engine in `fanos-sim`, per the
+> standing threat-modeling directive; `docs/network-threat-model.md` is the living catalog. Survey current
+> coverage → implement each missing class as a sim adversary affordance + a test that asserts the defence
+> holds (or documents the residual). Closing the fundamental layers sequentially.
 
 This file is kept current: the task above is committed **before** I start it and marked done (then pruned)
 when it lands. Completed tasks are removed — full history is in `git log`. Legend: ⬜ next up.
 
-> Note: a separate **GitHub Project board** also tracks tasks; I can't read/edit it without the
-> `read:project`/`project` gh scope. If you run `gh auth refresh -s project`, I can sync it directly;
-> otherwise this file is the source of truth for what I'm doing. **NAT traversal / reachability is now
-> fully DONE** (relay fallback landed) — it can be marked done on the board.
+> Note: the **Claude Code todo panel** in the terminal (`◼/◻`, "N completed") is a *separate* list from
+> this file. This session's toolset does **not** include the todo-editing tool (confirmed by search), so I
+> can't rewrite that panel — it froze showing tasks that are already done. Treat **this file as the accurate
+> status**. Stale-but-DONE on the panel: **NAT traversal** (`6de9760`), **L4 storage** (#115).
 
 ---
 
