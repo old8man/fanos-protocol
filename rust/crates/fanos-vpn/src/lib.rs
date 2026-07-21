@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "device")]
+pub mod device;
 pub mod driver;
 pub mod engine;
 pub mod mux;

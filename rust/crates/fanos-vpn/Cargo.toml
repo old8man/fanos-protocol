@@ -15,6 +15,14 @@ categories = ["network-programming"]
 # (`UdpDialer`/`UdpTunnel`) so the VPN and the proxy share one exit-UDP-tunnel abstraction.
 fanos-proxy.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+# The real OS TUN device adapter, behind the `device` feature (off by default): a safe wrapper over the
+# platform TUN device. The datapath core stays device-agnostic and fully testable without it.
+tun = { version = "0.8", optional = true, features = ["async"] }
+
+[features]
+# Compile the real TUN device adapter (`device` module) for a runnable `fanos vpn`. Its device syscalls need
+# root / a TUN and so are runtime-verified only — the datapath core is verified without this feature.
+device = ["dep:tun"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
