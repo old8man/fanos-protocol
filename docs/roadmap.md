@@ -235,6 +235,9 @@ UHM dynamics, not tuned.** That is what keeps the platform coherent as it evolve
 
 ## 6. The phased roadmap
 
+> This table is the strategic view. For the **live, granular task list** — what is in progress right now and
+> what is next — see [`tasks.md`](tasks.md).
+
 | Phase | Deliverable | State | Proves |
 |---|---|---|---|
 | **0 — Coherent core** | 27 crates, 4 engines + DIAULOS streams, sim + quic drivers, verifier, ~700 tests | **[T] done** | the protocol works in simulation & loopback |
