@@ -1118,6 +1118,10 @@ dependencies = [
 [[package]]
 name = "fanos-vpn"
 version = "0.1.0"
+dependencies = [
+ "fanos-proxy",
+ "tokio",
+]
 
 [[package]]
 name = "fanos-vrf"

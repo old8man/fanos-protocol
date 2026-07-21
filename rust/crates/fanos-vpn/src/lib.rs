@@ -9,16 +9,18 @@
 //! * [`packet`] — an IPv4/UDP codec (parse + build, with valid checksums).
 //! * [`engine`] — [`classify`] an inbound TUN packet into a [`VpnAction`], and [`response_packet`] to rebuild
 //!   an exit response into a packet for the TUN.
+//! * [`mux`] — [`run_udp_datapath`], the driver's stateful core: relay flows over per-destination exit
+//!   tunnels (the shared `UdpDialer` seam) and pump responses back, testable with a mock dialer.
 //!
-//! The TUN device driver (wiring this to `/dev/net/tun` / `utun` and to [`dial_exit_udp`] tunnels) and the
-//! userspace-TCP full-tunnel mode are layered on top in later slices.
-//!
-//! [`dial_exit_udp`]: https://docs.rs/fanos-node
+//! The TUN device driver (copying packets between `/dev/net/tun` / `utun` and the multiplexer's channels)
+//! and the userspace-TCP full-tunnel mode are the thin/remaining layers on top.
 
 #![forbid(unsafe_code)]
 
 pub mod engine;
+pub mod mux;
 pub mod packet;
 
 pub use engine::{DNS_PORT, FlowKey, VpnAction, classify, response_packet};
+pub use mux::run_udp_datapath;
 pub use packet::{IPPROTO_UDP, UdpDatagram, build_ipv4_udp, parse_ipv4_udp};

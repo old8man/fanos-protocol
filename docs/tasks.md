@@ -18,9 +18,10 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **`fanos vpn` / TUN — driver + TCP mode** (Phase 5) — the datapath *engine* (UDP/DNS) has landed (crate
-  `fanos-vpn`); remaining: the thin TUN driver (`/dev/net/tun` / `utun` ↔ engine ↔ `dial_exit_udp` tunnels,
-  the untestable-in-CI I/O shell) and full-tunnel **TCP mode** (a userspace TCP/IP stack — the large piece).
+- **`fanos vpn` / TUN — driver + TCP mode** (Phase 5) — the whole *verifiable* UDP/DNS datapath has landed
+  (crate `fanos-vpn`: codec + flow engine + multiplexer). Remaining: the thin TUN driver (copy packets
+  between `/dev/net/tun` / `utun` and the multiplexer's channels + supply a real exit `UdpDialer` — the
+  untestable-in-CI OS I/O shell) and full-tunnel **TCP mode** (a userspace TCP/IP stack — the large piece).
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 
@@ -40,7 +41,11 @@ engine (`engine.rs`: `classify` an inbound TUN packet → `VpnAction::RelayUdp{f
 the 4-tuple, or `Drop` for TCP/IPv6/malformed; `response_packet` rebuilds an exit response into a TUN packet
 with endpoints swapped). "UDP mode" (design.md §11) needs no userspace TCP stack — this tunnels DNS + UDP
 (QUIC/…). Verified with synthetic packets: checksums verify, build↔parse round-trips, classify/drop, and a
-swapped-endpoint response round-trip. The TUN driver + TCP mode are the next slices. ·
+swapped-endpoint response round-trip. Plus the **multiplexer** (`mux.rs`, `run_udp_datapath`) — the driver's
+stateful core: relay each flow over a per-destination exit tunnel via the **shared `UdpDialer`/`UdpTunnel`
+seam** the SOCKS5 UDP-ASSOCIATE relay uses (so VPN + proxy share one exit-UDP abstraction, same `FanosDialer`
+impl), and pump responses back as TUN packets. Verified with a mock dialer: a DNS query and a QUIC flow each
+relay out and round-trip back as TUN packets; TCP drops. The thin TUN device driver + TCP mode remain. ·
 **C ABI — service hosting → the §11.2 surface is COMPLETE** (#113, M9) — `fanos_service_host(node, seed,
 addr_out, cap)` derives a stable service identity from a seed, hosts it (forwarding each accepted DIAULOS
 session onto an accept queue over the closure-based `serve`), publishes its descriptor, and returns the

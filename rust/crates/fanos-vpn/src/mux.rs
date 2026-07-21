@@ -1,0 +1,130 @@
+//! The VPN flow multiplexer — the driver's stateful core (spec §11.4).
+//!
+//! Route classified UDP flows over per-destination exit tunnels and pump responses back to the TUN, reusing
+//! the very same `UdpDialer` / `UdpTunnel` datagram seam the SOCKS5 UDP-ASSOCIATE relay uses (fanos-proxy) —
+//! the VPN and the proxy share one exit-UDP-tunnel abstraction, and the production impl (a `FanosDialer`
+//! with an exit) is the same. Given the TUN's two directions as channels, this is fully testable with a
+//! mock dialer; the real TUN device is a thin adapter that copies packets between the fd and these channels.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+
+use fanos_proxy::{Target, UdpDialer};
+use tokio::sync::mpsc;
+
+use crate::engine::{FlowKey, VpnAction, classify, response_packet};
+
+/// Run the UDP datapath: read IP packets from `inbound` (the TUN), relay each UDP flow over an exit tunnel
+/// obtained from `dialer`, and write response packets to `outbound` (the TUN). One tunnel per destination
+/// flow (opened on first sight, re-opened if it closes); each response is rebuilt into a TUN packet with the
+/// endpoints swapped so the client's socket accepts it. Non-UDP packets (TCP — a later mode — IPv6,
+/// malformed) are dropped. Returns when `inbound` closes.
+pub async fn run_udp_datapath<D: UdpDialer>(
+    dialer: D,
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    outbound: mpsc::Sender<Vec<u8>>,
+) {
+    // One outbound tunnel sender per flow the client has active.
+    let mut tunnels: HashMap<FlowKey, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    while let Some(packet) = inbound.recv().await {
+        let VpnAction::RelayUdp { flow, payload, .. } = classify(&packet) else {
+            continue; // Drop
+        };
+        // Open (or re-open) the exit tunnel for this destination flow on first sight.
+        if tunnels.get(&flow).is_none_or(mpsc::Sender::is_closed) {
+            let target = Target::Ip(SocketAddr::from((flow.dst.0, flow.dst.1)));
+            let Ok(tunnel) = dialer.dial_udp(&target).await else {
+                continue;
+            };
+            spawn_response_pump(tunnel.inbound, flow, outbound.clone());
+            tunnels.insert(flow, tunnel.outbound);
+        }
+        if let Some(tx) = tunnels.get(&flow) {
+            // UDP is lossy: drop if the tunnel is backed up rather than stall the whole datapath.
+            let _ = tx.try_send(payload);
+        }
+    }
+}
+
+/// Pump one flow's exit responses back to the TUN: each datagram becomes a TUN packet (from the flow's
+/// destination back to the client) written to `outbound`. Ends when the tunnel or the TUN sink closes.
+fn spawn_response_pump(
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    flow: FlowKey,
+    outbound: mpsc::Sender<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        while let Some(response) = inbound.recv().await {
+            if outbound.send(response_packet(flow, &response)).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use fanos_proxy::dialer::EchoDialer;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::packet::{build_ipv4_udp, parse_ipv4_udp};
+
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const RESOLVER: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
+    const HOST: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
+    #[tokio::test]
+    async fn a_udp_flow_relays_out_and_the_response_returns_as_a_tun_packet() {
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
+        // The echo dialer stands in for the exit: whatever is relayed comes straight back.
+        tokio::spawn(run_udp_datapath(EchoDialer, in_rx, out_tx));
+
+        // A DNS query captured at the TUN.
+        let query = build_ipv4_udp((CLIENT, 5555), (RESOLVER, 53), b"dns-query");
+        in_tx.send(query).await.unwrap();
+
+        // It round-trips: the response comes back as a TUN packet from the resolver to the client.
+        let reply = timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("a reply packet");
+        let dg = parse_ipv4_udp(&reply).unwrap();
+        assert_eq!(dg.src, (RESOLVER, 53), "reply is from the resolver");
+        assert_eq!(dg.dst, (CLIENT, 5555), "back to the client");
+        assert_eq!(dg.payload, b"dns-query");
+
+        // A second, different flow (QUIC to a web host) opens its own tunnel and also round-trips.
+        let quic = build_ipv4_udp((CLIENT, 6000), (HOST, 443), b"quic-initial");
+        in_tx.send(quic).await.unwrap();
+        let reply2 = timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("a reply packet");
+        let dg2 = parse_ipv4_udp(&reply2).unwrap();
+        assert_eq!(dg2.src, (HOST, 443));
+        assert_eq!(dg2.dst, (CLIENT, 6000));
+        assert_eq!(dg2.payload, b"quic-initial");
+    }
+
+    #[tokio::test]
+    async fn a_tcp_packet_is_dropped_not_relayed() {
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
+        tokio::spawn(run_udp_datapath(EchoDialer, in_rx, out_tx));
+
+        let mut tcp = build_ipv4_udp((CLIENT, 1), (HOST, 80), b"x");
+        tcp[9] = 6; // protocol → TCP
+        in_tx.send(tcp).await.unwrap();
+        // Nothing is relayed, so nothing comes back (a short wait times out).
+        assert!(
+            timeout(Duration::from_millis(300), out_rx.recv()).await.is_err(),
+            "a TCP packet produces no UDP relay"
+        );
+    }
+}

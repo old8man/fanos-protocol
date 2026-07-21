@@ -11,8 +11,13 @@ keywords = ["vpn", "tun", "dns", "anonymity", "fanos"]
 categories = ["network-programming"]
 
 [dependencies]
-# Slice 1 (the UDP/DNS packet codec + flow engine) is pure std — no fanos or async deps. The TUN driver and
-# exit wiring (fanos-node, tokio) land in later slices.
+# The packet codec + flow engine are pure std. The multiplexer reuses the SOCKS5 UDP-ASSOCIATE datagram seam
+# (`UdpDialer`/`UdpTunnel`) so the VPN and the proxy share one exit-UDP-tunnel abstraction.
+fanos-proxy.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 
 [lints]
 workspace = true
