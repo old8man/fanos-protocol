@@ -133,8 +133,10 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
 /// then its `Client` backs a [`FanosDialer`]: each accepted CONNECT resolves the `.fanos` name to a service
 /// coordinate (via the overlay descriptor store, [`NodeResolver`]) and opens an encrypted hybrid-PQ DIAULOS
 /// byte-stream to it. The local SOCKS/HTTP hop answers `.fanos` addressing itself, so names never reach the
-/// system resolver. Clearnet targets are refused today (a `.fanos`-only surface — no exit dialer yet), as are
-/// UDP ASSOCIATE / BIND.
+/// system resolver. **Clearnet** targets ride a configured or auto-discovered **exit** (`--exit-via`), which
+/// resolves and connects on the client's behalf — so DNS still never leaks. **SOCKS5 UDP ASSOCIATE** is
+/// served too: datagrams are relayed through the exit's UDP tunnel (DNS-over-FANOS and any single-destination
+/// UDP flow); only BIND remains unsupported.
 ///
 /// Two routing profiles (`--profile`): **direct** (default) opens the DIAULOS stream straight to the service
 /// coordinate — fast, but an observer sees which coordinate the client talks to. **anonymous** draws a

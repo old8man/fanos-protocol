@@ -21,10 +21,10 @@ use fanos_node::{
     dial_exit, resolve_exit_key, serve_exit,
 };
 use fanos_pqcrypto::rng::SeedRng;
-use fanos_proxy::{DialError, Dialer, Target};
+use fanos_proxy::{DialError, Dialer, Target, UdpDialer};
 use fanos_runtime::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 type Coord = [u32; 3];
 
@@ -92,6 +92,22 @@ async fn spawn_echo() -> SocketAddr {
                     }
                 }
             });
+        }
+    });
+    addr
+}
+
+/// A loopback UDP echo server standing in for a clearnet datagram destination (e.g. a DNS resolver);
+/// returns its bound address.
+async fn spawn_udp_echo() -> SocketAddr {
+    let socket = UdpSocket::bind(LOOPBACK).await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            if socket.send_to(buf.get(..n).unwrap_or(&[]), src).await.is_err() {
+                break;
+            }
         }
     });
     addr
@@ -294,6 +310,58 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
     assert!(
         matches!(no_exit.dial(&Target::Ip(echo)).await, Err(DialError::Unsupported(_))),
         "a dialer with no exit refuses a clearnet target"
+    );
+
+    e.shutdown();
+    c.shutdown();
+}
+
+#[tokio::test]
+async fn the_proxy_dialer_relays_udp_through_the_exit() {
+    let _serial = serial();
+    // The UDP counterpart of the clearnet path: a `FanosDialer` with an exit opens a datagram tunnel to a
+    // clearnet UDP target (a loopback echo standing in for a DNS resolver) — the seam SOCKS5 UDP ASSOCIATE
+    // and DNS-over-FANOS ride. Proves `dial_udp` → `dial_exit_udp` → `serve_exit`'s `relay_udp` → real UDP
+    // socket and back.
+    let (e, c, keypair, _tcp_echo) = exit_and_client().await;
+    let e_addr = e.address();
+    let e_public = keypair.public().clone();
+    serve_exit(
+        e.client(),
+        keypair,
+        SeedRng::from_seed(b"exit-udp-svc"),
+        ExitPolicy::default(),
+    );
+    let udp_echo = spawn_udp_echo().await;
+
+    let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, e_public);
+    let mut tunnel = tokio::time::timeout(Duration::from_secs(15), dialer.dial_udp(&Target::Ip(udp_echo)))
+        .await
+        .expect("open the UDP tunnel in time")
+        .expect("the dialer opened a UDP tunnel through the exit");
+
+    // Two datagrams each round-trip: client → exit → UDP echo → exit → client.
+    for payload in [b"a dns query".as_slice(), b"and a second datagram".as_slice()] {
+        tunnel.outbound.send(payload.to_vec()).await.unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(15), tunnel.inbound.recv())
+            .await
+            .expect("a datagram comes back in time")
+            .expect("the tunnel is still open");
+        assert_eq!(echoed, payload, "the datagram round-tripped through the exit's UDP relay");
+    }
+
+    // A `.fanos` name has no UDP form, and a dialer with no exit refuses clearnet UDP.
+    assert!(
+        matches!(
+            dialer.dial_udp(&Target::Name("svc.fanos".into(), 53)).await,
+            Err(DialError::Unsupported(_))
+        ),
+        ".fanos targets are byte-stream only — no UDP form"
+    );
+    let no_exit = FanosDialer::new(c.client(), StaticResolver::new());
+    assert!(
+        matches!(no_exit.dial_udp(&Target::Ip(udp_echo)).await, Err(DialError::Unsupported(_))),
+        "a dialer with no exit refuses clearnet UDP"
     );
 
     e.shutdown();

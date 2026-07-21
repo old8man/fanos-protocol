@@ -13,7 +13,7 @@ use fanos_field::F2;
 use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
-use fanos_proxy::{DialError, Dialer, Target};
+use fanos_proxy::{DialError, Dialer, Target, UdpDialer, UdpTunnel};
 use fanos_quic::Client;
 use fanos_rendezvous::{BeaconSeed, MixDirectory, meeting_line};
 use fanos_runtime::{Command, Notification};
@@ -483,6 +483,67 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
                 ))
             }
         }
+    }
+}
+
+/// Slack (datagrams per direction) a UDP tunnel buffers before UDP's lossy drop kicks in — a few
+/// in-flight datagrams smooth a burst without letting a stalled peer grow memory without bound.
+const UDP_TUNNEL_BUFFER: usize = 64;
+
+impl<R: ServiceResolver> UdpDialer for FanosDialer<R> {
+    /// Open a UDP tunnel to a **clearnet** `target` through the configured exit — the datagram counterpart
+    /// of [`dial`](Self::dial). Datagrams ride an exit session ([`dial_exit_udp`](crate::exit::dial_exit_udp))
+    /// as length framing on the DIAULOS stream, pumped both ways into the [`UdpTunnel`]'s channels. A
+    /// `.fanos` target is [`Unsupported`](DialError::Unsupported) (services are byte streams, not datagram
+    /// endpoints); without an exit, so is any clearnet UDP target.
+    async fn dial_udp(&self, target: &Target) -> Result<UdpTunnel, DialError> {
+        if target.is_fanos() {
+            return Err(DialError::Unsupported(
+                ".fanos names are byte-stream services; UDP targets need a clearnet exit".to_owned(),
+            ));
+        }
+        let Some((exit_coord, exit_public)) = &self.exit else {
+            return Err(DialError::Unsupported(
+                "no exit configured — the FANOS dialer relays UDP only through an exit".to_owned(),
+            ));
+        };
+        let mut rng = SeedRng::from_seed(&os_entropy_32()?);
+        let stream = crate::exit::dial_exit_udp(
+            self.client.clone(),
+            *exit_coord,
+            exit_public,
+            &target.host(),
+            target.port(),
+            &mut rng,
+        )
+        .await
+        .map_err(DialError::Io)?;
+
+        // Bridge the DIAULOS datagram stream to the tunnel's channels: outbound datagrams are length-framed
+        // onto the stream, inbound frames are lifted back off it. Either direction closing ends both.
+        let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(UDP_TUNNEL_BUFFER);
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let up = async move {
+                while let Some(datagram) = outbound_rx.recv().await {
+                    if crate::exit::write_datagram(&mut writer, &datagram).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let down = async move {
+                while let Some(datagram) = crate::exit::read_datagram(&mut reader).await {
+                    if inbound_tx.send(datagram).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                () = up => {}
+                () = down => {}
+            }
+        });
+        Ok(tunnel)
     }
 }
 

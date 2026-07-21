@@ -10,22 +10,27 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::dialer::Dialer;
+use crate::dialer::{Dialer, UdpDialer};
 use crate::target::Target;
 
-const VER: u8 = 5;
+pub(crate) const VER: u8 = 5;
 const CMD_CONNECT: u8 = 1;
-const ATYP_IPV4: u8 = 1;
-const ATYP_DOMAIN: u8 = 3;
-const ATYP_IPV6: u8 = 4;
-const REP_SUCCESS: u8 = 0x00;
+const CMD_UDP_ASSOCIATE: u8 = 3;
+pub(crate) const ATYP_IPV4: u8 = 1;
+pub(crate) const ATYP_DOMAIN: u8 = 3;
+pub(crate) const ATYP_IPV6: u8 = 4;
+pub(crate) const REP_SUCCESS: u8 = 0x00;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 const METHOD_NO_AUTH: u8 = 0x00;
 
-/// The outcome of reading a request: a target to connect, or a reply code to reject with.
+/// The outcome of reading a request: a target to connect, a UDP association to relay, or a reply code to
+/// reject with.
 enum Request {
     Connect(Target),
+    /// A UDP ASSOCIATE — the advertised source address is parsed for stream sync and discarded (the real
+    /// client source is latched from its first datagram, see [`crate::udp`]).
+    Associate,
     Reject(u8),
 }
 
@@ -66,7 +71,9 @@ async fn read_request(client: &mut TcpStream) -> std::io::Result<Request> {
             "not SOCKS5",
         ));
     }
-    if cmd != CMD_CONNECT {
+    // CONNECT and UDP ASSOCIATE both carry an address field; parse it for either (for ASSOCIATE it is the
+    // client's advertised source, which we discard). BIND and anything else is unsupported.
+    if cmd != CMD_CONNECT && cmd != CMD_UDP_ASSOCIATE {
         return Ok(Request::Reject(REP_CMD_NOT_SUPPORTED));
     }
     let target = match atyp {
@@ -96,7 +103,11 @@ async fn read_request(client: &mut TcpStream) -> std::io::Result<Request> {
         }
         _ => return Ok(Request::Reject(REP_ATYP_NOT_SUPPORTED)),
     };
-    Ok(Request::Connect(target))
+    Ok(if cmd == CMD_UDP_ASSOCIATE {
+        Request::Associate
+    } else {
+        Request::Connect(target)
+    })
 }
 
 /// Write a SOCKS5 reply with `code` and a null bound address (`0.0.0.0:0`).
@@ -111,12 +122,16 @@ async fn write_reply(client: &mut TcpStream, code: u8) -> std::io::Result<()> {
 /// # Errors
 /// Propagates I/O errors from the handshake; a failed *dial* is reported to the client as a SOCKS5
 /// reply, not an error return.
-pub async fn handle<D: Dialer>(mut client: TcpStream, dialer: &D) -> std::io::Result<()> {
+pub async fn handle<D: Dialer + UdpDialer>(
+    mut client: TcpStream,
+    dialer: &D,
+) -> std::io::Result<()> {
     if !negotiate(&mut client).await? {
         return Ok(()); // method rejected; connection closes
     }
     let target = match read_request(&mut client).await? {
         Request::Connect(t) => t,
+        Request::Associate => return crate::udp::associate(client, dialer).await,
         Request::Reject(code) => {
             write_reply(&mut client, code).await?;
             return Ok(());
@@ -143,7 +158,7 @@ pub async fn handle<D: Dialer>(mut client: TcpStream, dialer: &D) -> std::io::Re
 /// Returns an I/O error only if `accept` itself fails; per-connection errors are logged and dropped.
 pub async fn serve<D>(listener: TcpListener, dialer: D) -> std::io::Result<()>
 where
-    D: Dialer + Clone + Send + Sync + 'static,
+    D: Dialer + UdpDialer + Clone + Send + Sync + 'static,
 {
     loop {
         let (client, peer) = listener.accept().await?;

@@ -20,7 +20,6 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 - **PROTEUS morph transforms** (§13.7) — real TLS / MASQUE-H3 / fronted traffic shaping (only `Polymorph`
   is live today).
-- **DNS-over-FANOS · UDP-ASSOCIATE** (Phase 2 app surface) — complete the proxy beyond TCP CONNECT.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
   consistent reads).
 - **VOPRF credit settlement** (Phase 4) — anonymous relay payment.
@@ -29,6 +28,14 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**DNS-over-FANOS · SOCKS5 UDP ASSOCIATE** (Phase 2 app surface, RFC 1928 §7) — the proxy now speaks the
+whole SOCKS5 protocol, not just CONNECT. Exit side: a `udp:host:port` target opens a connected UDP relay
+(`relay_udp`) carrying length-framed datagrams over the DIAULOS stream. Proxy side: `UdpDialer`/`UdpTunnel`
+seam + a full UDP ASSOCIATE relay (`fanos-proxy::udp`) — binds the relay socket, parses per-datagram SOCKS5
+headers, multiplexes one exit tunnel per destination, latches the client source, drops fragments; DNS falls
+out for free (a query is a datagram to `resolver:53`). `FanosDialer` implements `UdpDialer` through the
+configured exit. Verified: header parse/encode round-trips, an echo-dialer associate E2E (two destinations),
+fragment-drop, and a **real-QUIC** `dial_udp → dial_exit_udp → serve_exit → UDP socket` round-trip. ·
 C10 guard-set LIVE actuation — `NyxNode::next_circuit` now enters through the guard SET (sealable-guard
 failover: a down/unknown primary falls to a stable backup, not guardless); validated with a partial mix
 directory. (Residual: slow rotation inert — the standalone engine has no epoch source) ·

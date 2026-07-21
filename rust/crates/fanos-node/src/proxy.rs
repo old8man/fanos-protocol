@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use fanos_proxy::Dialer;
+use fanos_proxy::{Dialer, UdpDialer};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::warn;
 
@@ -29,7 +29,7 @@ pub async fn serve_proxy<D>(
     dialer: Arc<D>,
     shutdown: impl Future<Output = ()> + Send,
 ) where
-    D: Dialer + Send + Sync + 'static,
+    D: Dialer + UdpDialer + Send + Sync + 'static,
 {
     tokio::pin!(shutdown);
     loop {
@@ -57,7 +57,7 @@ fn spawn_proxy_conn<D>(
     dialer: &Arc<D>,
     proxy: Proxy,
 ) where
-    D: Dialer + Send + Sync + 'static,
+    D: Dialer + UdpDialer + Send + Sync + 'static,
 {
     let (sock, _peer) = match accepted {
         Ok(pair) => pair,

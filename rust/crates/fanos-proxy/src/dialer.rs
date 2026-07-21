@@ -7,6 +7,7 @@
 use std::future::Future;
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
 use crate::target::Target;
 
@@ -65,6 +66,44 @@ pub trait Dialer {
     -> impl Future<Output = Result<Self::Stream, DialError>> + Send;
 }
 
+/// A bidirectional datagram channel to one fixed destination — the UDP analogue of a dialed byte stream.
+///
+/// A [`UdpDialer`] owns the underlying transport and its pump tasks; the proxy simply pushes outbound
+/// datagrams onto [`outbound`](Self::outbound) and pulls inbound ones from [`inbound`](Self::inbound).
+/// Dropping either end tears the tunnel down. A single SOCKS5 UDP association multiplexes many of these —
+/// one per distinct destination the client addresses (so DNS to `resolver:53` and QUIC to a web host each
+/// get their own tunnel).
+pub struct UdpTunnel {
+    /// Datagrams to transmit toward the destination (the payloads, unframed).
+    pub outbound: mpsc::Sender<Vec<u8>>,
+    /// Datagrams the destination sent back; yields `None` once the tunnel closes.
+    pub inbound: mpsc::Receiver<Vec<u8>>,
+}
+
+impl UdpTunnel {
+    /// Build a tunnel together with the transport-side channel ends a [`UdpDialer`] pumps: returns
+    /// `(tunnel, inbound_tx, outbound_rx)`. The dialer pushes datagrams it receives from the destination
+    /// into `inbound_tx`, and reads datagrams to transmit from `outbound_rx`; the proxy holds `tunnel`.
+    /// `buffer` bounds each direction's in-flight backlog (UDP is lossy: a full channel drops, never
+    /// blocks the association).
+    #[must_use]
+    pub fn pair(buffer: usize) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (outbound, outbound_rx) = mpsc::channel(buffer);
+        let (inbound_tx, inbound) = mpsc::channel(buffer);
+        (Self { outbound, inbound }, inbound_tx, outbound_rx)
+    }
+}
+
+/// Establishes a [`UdpTunnel`] to a UDP [`Target`] — the datagram analogue of [`Dialer`]. Implementors
+/// decide reachability policy (e.g. relay only through a configured clearnet exit; refuse `.fanos`, which
+/// names byte-stream services). A dialer that cannot serve a target returns [`DialError`], and the SOCKS5
+/// UDP relay silently drops datagrams to it (UDP's own failure model).
+pub trait UdpDialer {
+    /// Open a datagram tunnel to `target`.
+    fn dial_udp(&self, target: &Target)
+    -> impl Future<Output = Result<UdpTunnel, DialError>> + Send;
+}
+
 /// A loopback dialer whose stream echoes everything written to it — the SOCKS5 test fixture.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct EchoDialer;
@@ -86,6 +125,24 @@ impl Dialer for EchoDialer {
     }
 }
 
+impl UdpDialer for EchoDialer {
+    fn dial_udp(
+        &self,
+        _target: &Target,
+    ) -> impl Future<Output = Result<UdpTunnel, DialError>> + Send {
+        let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(64);
+        // Echo: every datagram sent toward the "destination" comes straight back.
+        tokio::spawn(async move {
+            while let Some(datagram) = outbound_rx.recv().await {
+                if inbound_tx.send(datagram).await.is_err() {
+                    break;
+                }
+            }
+        });
+        std::future::ready(Ok(tunnel))
+    }
+}
+
 /// A dialer that refuses every target — a safe default before any transport is wired.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct RefuseDialer;
@@ -97,6 +154,15 @@ impl Dialer for RefuseDialer {
         &self,
         _target: &Target,
     ) -> impl Future<Output = Result<Self::Stream, DialError>> + Send {
+        std::future::ready(Err(DialError::Refused))
+    }
+}
+
+impl UdpDialer for RefuseDialer {
+    fn dial_udp(
+        &self,
+        _target: &Target,
+    ) -> impl Future<Output = Result<UdpTunnel, DialError>> + Send {
         std::future::ready(Err(DialError::Refused))
     }
 }

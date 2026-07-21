@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 /// A CONNECT destination: either a name (kept unresolved — the whole point of DNS-leak-free
 /// proxying) or a literal socket address.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Target {
     /// A host name and port. `.fanos` names resolve in-network; others go to an exit.
     Name(String, u16),
