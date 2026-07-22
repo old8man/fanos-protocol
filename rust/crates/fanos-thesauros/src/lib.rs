@@ -20,5 +20,7 @@
 extern crate alloc;
 
 pub mod content;
+pub mod por;
 
 pub use content::{Cid, ChunkRef, Manifest, MerkleProof, MerkleStep, chunk_cid, verify_leaf};
+pub use por::{LeafProof, challenge, prove, verify};

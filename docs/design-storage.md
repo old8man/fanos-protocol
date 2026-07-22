@@ -152,8 +152,8 @@ count `k`):
 | `f_tol` | `λ = 20` | `λ = 30` | `λ = 40` |
 |---|---|---|---|
 | 10 % | 132 | 198 | 264 |
-| 1 % | 1 380 | 2 069 | 2 759 |
-| 0.1 % | 13 858 | 20 780 | 27 706 |
+| 1 % | 1 380 | 2 070 | 2 759 |
+| 0.1 % | 13 857 | 20 785 | 27 713 |
 
 **Two-tier audit (cost control).** Returning `k` full 4 KiB leaves is large (`k=198` ⇒ ~0.8 MiB). So audits
 are two-tier, both beacon-driven: frequent cheap **possession** checks return only leaf *hashes* + paths

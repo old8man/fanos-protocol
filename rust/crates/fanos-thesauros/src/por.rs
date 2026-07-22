@@ -1,0 +1,227 @@
+//! **Proof of retrievability** — the beacon-driven audit that a provider still holds a chunk it was paid to
+//! hold (`docs/design-storage.md` §5). The public PQ-VRF beacon seeds an unpredictable set of leaf challenges;
+//! the provider answers with those leaves and their Merkle paths against the committed [`Cid`]; anyone verifies
+//! the paths. Deleting data is caught because the challenges are unpredictable and position-bound.
+//!
+//! **Derived soundness (no magic constant).** If a cheating provider retains only a fraction `ρ` of a chunk's
+//! `m` leaves, each independent challenge lands on a retained leaf with probability `≤ ρ`, so it passes all `k`
+//! with probability `≤ ρ^k`. To catch any provider missing at least a tolerated fraction `f_tol`
+//! (`ρ ≤ 1 − f_tol`) with `λ` bits of audit-soundness, [`required_samples`] returns
+//! `k ≥ λ·ln2 / (−ln(1 − f_tol))` — computed from the security parameters, not chosen. `k` is a deal parameter;
+//! the runtime here only needs the agreed `k` to challenge and verify (so the core stays `no_std`; the
+//! derivation is a `std` tooling helper). A chunk with `m < k` leaves is fully audited — it can only afford the
+//! soundness its size permits, and the inherited erasure layer carries the rest of the durability.
+
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
+
+use fanos_primitives::hash_labeled;
+
+use crate::content::{Cid, MerkleProof, leaf_count, prove_leaf, verify_leaf};
+
+/// Label deriving the per-audit challenge seed from the chunk id and the beacon.
+const CHALLENGE_LABEL: &str = "FANOS-v1/thesauros-challenge";
+/// Label drawing successive candidate indices from the seed.
+const DRAW_LABEL: &str = "FANOS-v1/thesauros-draw";
+
+/// The number of leaf challenges needed to catch a provider missing a fraction `f_tol` of leaves with
+/// `lambda_bits` of audit-soundness: `⌈ λ·ln2 / (−ln(1 − f_tol)) ⌉`. A `std` tooling helper (uses `f64::ln`);
+/// the resulting `k` is carried as a deal parameter into the `no_std` challenge/verify path. Returns
+/// `usize::MAX` for a degenerate `f_tol ∉ (0, 1)`.
+#[cfg(feature = "std")]
+#[must_use]
+pub fn required_samples(lambda_bits: u32, f_tol: f64) -> usize {
+    if !(f_tol > 0.0 && f_tol < 1.0) {
+        return usize::MAX;
+    }
+    let k = f64::from(lambda_bits) * core::f64::consts::LN_2 / -(1.0 - f_tol).ln();
+    k.ceil() as usize
+}
+
+/// The seed for a chunk's audit at a given beacon value.
+#[must_use]
+fn challenge_seed(chunk: &Cid, beacon: &[u8]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(32 + beacon.len());
+    buf.extend_from_slice(chunk.as_bytes());
+    buf.extend_from_slice(beacon);
+    hash_labeled(CHALLENGE_LABEL, &buf)
+}
+
+/// Draw the `counter`-th candidate leaf index in `[0, m)` from the seed.
+#[must_use]
+fn draw(seed: &[u8; 32], counter: u64, m: usize) -> usize {
+    let mut buf = [0u8; 40];
+    let (s, c) = buf.split_at_mut(32);
+    s.copy_from_slice(seed);
+    c.copy_from_slice(&counter.to_le_bytes());
+    let h = hash_labeled(DRAW_LABEL, &buf);
+    let word = u64::from_le_bytes(h.first_chunk::<8>().copied().unwrap_or_default());
+    (word % m as u64) as usize
+}
+
+/// The set of leaf indices challenged for `chunk` at `beacon`, wanting `k` distinct samples out of `leaves`.
+/// Publicly derivable, so the verifier recomputes it rather than trusting the prover. If `k ≥ leaves`, the whole
+/// chunk is audited.
+#[must_use]
+pub fn challenge(chunk: &Cid, beacon: &[u8], k: usize, leaves: usize) -> Vec<usize> {
+    if leaves == 0 {
+        return Vec::new();
+    }
+    if k >= leaves {
+        return (0..leaves).collect();
+    }
+    let seed = challenge_seed(chunk, beacon);
+    let mut chosen = BTreeSet::new();
+    let mut counter = 0u64;
+    while chosen.len() < k {
+        chosen.insert(draw(&seed, counter, leaves));
+        counter = counter.saturating_add(1);
+    }
+    chosen.into_iter().collect()
+}
+
+/// One challenged leaf's answer: its index, bytes, and Merkle path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LeafProof {
+    /// The challenged leaf index.
+    pub index: usize,
+    /// The leaf bytes.
+    pub bytes: Vec<u8>,
+    /// The Merkle authentication path to the chunk's CID.
+    pub path: MerkleProof,
+}
+
+/// Build the audit response for `chunk`: the leaf + path for each challenged index. `None` if any index is out
+/// of range (the provider does not hold that leaf) — a provider missing challenged data cannot answer.
+#[must_use]
+pub fn prove(chunk: &[u8], indices: &[usize]) -> Option<Vec<LeafProof>> {
+    indices
+        .iter()
+        .map(|&index| {
+            let (bytes, path) = prove_leaf(chunk, index)?;
+            Some(LeafProof { index, bytes, path })
+        })
+        .collect()
+}
+
+/// Verify an audit `response` against the committed `chunk` id. Recomputes the challenge from
+/// `(chunk, beacon, k, leaves)` — so a provider cannot choose which leaves to answer — and checks the response
+/// covers exactly those indices, each leaf verifying against the CID (position-bound). `true` iff the provider
+/// demonstrably holds every challenged leaf.
+#[must_use]
+pub fn verify(chunk: &Cid, beacon: &[u8], k: usize, leaves: usize, response: &[LeafProof]) -> bool {
+    let expected = challenge(chunk, beacon, k, leaves);
+    if response.len() != expected.len() {
+        return false;
+    }
+    for &index in &expected {
+        let Some(lp) = response.iter().find(|lp| lp.index == index) else {
+            return false;
+        };
+        if !verify_leaf(chunk, index, &lp.bytes, &lp.path) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The number of leaves an object of `object_len` bytes exposes to the audit (its total leaf count across the
+/// chunking), a convenience for computing per-chunk audits.
+#[must_use]
+pub fn chunk_leaf_count(chunk: &[u8]) -> usize {
+    leaf_count(chunk)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    use crate::content::{LEAF, chunk_cid};
+
+    /// A chunk of `n` leaves (each leaf distinct so a swap is detectable).
+    fn chunk(n: usize) -> Vec<u8> {
+        (0..n * LEAF).map(|i| (i / LEAF + 1) as u8).collect()
+    }
+
+    #[test]
+    fn required_samples_matches_the_derived_table() {
+        // The worked points from docs/design-storage.md §5.
+        assert_eq!(required_samples(20, 0.10), 132);
+        assert_eq!(required_samples(30, 0.10), 198);
+        assert_eq!(required_samples(40, 0.10), 264);
+        assert_eq!(required_samples(30, 0.01), 2070);
+        assert_eq!(required_samples(30, 0.001), 20785);
+        // Degenerate f_tol is refused.
+        assert_eq!(required_samples(30, 0.0), usize::MAX);
+        assert_eq!(required_samples(30, 1.0), usize::MAX);
+    }
+
+    #[test]
+    fn an_honest_provider_passes_and_the_challenge_is_recomputable() {
+        let data = chunk(16);
+        let cid = chunk_cid(&data);
+        let leaves = chunk_leaf_count(&data);
+        let beacon = b"epoch-42-beacon";
+        let k = 5;
+        let indices = challenge(&cid, beacon, k, leaves);
+        assert_eq!(indices.len(), k, "k distinct indices");
+        // Recomputing the challenge is deterministic (the verifier does not trust the prover's index set).
+        assert_eq!(challenge(&cid, beacon, k, leaves), indices);
+        let response = prove(&data, &indices).expect("honest response");
+        assert!(verify(&cid, beacon, k, leaves, &response), "an honest provider passes");
+    }
+
+    #[test]
+    fn a_different_beacon_generally_challenges_different_leaves() {
+        let data = chunk(64);
+        let cid = chunk_cid(&data);
+        let leaves = chunk_leaf_count(&data);
+        let a = challenge(&cid, b"beacon-A", 8, leaves);
+        let b = challenge(&cid, b"beacon-B", 8, leaves);
+        assert_ne!(a, b, "the audit is unpredictable across beacons");
+    }
+
+    #[test]
+    fn a_small_chunk_is_fully_audited() {
+        let data = chunk(4);
+        let cid = chunk_cid(&data);
+        let leaves = chunk_leaf_count(&data);
+        // k larger than the leaf count → every leaf is challenged.
+        let indices = challenge(&cid, b"beacon", 1000, leaves);
+        assert_eq!(indices, (0..leaves).collect::<Vec<_>>());
+        assert!(verify(&cid, b"beacon", 1000, leaves, &prove(&data, &indices).unwrap()));
+    }
+
+    #[test]
+    fn a_provider_missing_a_challenged_leaf_fails() {
+        let full = chunk(16);
+        let cid = chunk_cid(&full);
+        let leaves = chunk_leaf_count(&full);
+        let beacon = b"epoch";
+        let k = 6;
+        let indices = challenge(&cid, beacon, k, leaves);
+        // The cheat holds only the first 8 leaves; any challenge to a higher leaf cannot be answered.
+        let held = &full[..8 * LEAF];
+        match prove(held, &indices) {
+            None => {} // a challenged leaf is missing → cannot answer at all
+            Some(resp) => assert!(!verify(&cid, beacon, k, leaves, &resp), "a partial answer does not verify"),
+        }
+    }
+
+    #[test]
+    fn a_swapped_leaf_fails_position_binding() {
+        let data = chunk(16);
+        let cid = chunk_cid(&data);
+        let leaves = chunk_leaf_count(&data);
+        let beacon = b"epoch";
+        let indices = challenge(&cid, beacon, 4, leaves);
+        let mut resp = prove(&data, &indices).unwrap();
+        // Answer the first challenged index with a *different* held leaf's bytes+path.
+        let victim = indices[0];
+        let other = (victim + 1) % leaves;
+        let (bytes, path) = prove_leaf(&data, other).unwrap();
+        resp[0] = LeafProof { index: victim, bytes, path };
+        assert!(!verify(&cid, beacon, 4, leaves, &resp), "a leaf answered at the wrong position is rejected");
+    }
+}

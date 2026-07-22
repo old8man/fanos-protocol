@@ -29,6 +29,20 @@
       "sibling0_on_right": false
     }
   },
+  "por": {
+    "comment": "Proof of retrievability. The audit challenge for a chunk at a beacon is publicly derivable: seed = hash_labeled('FANOS-v1/thesauros-challenge', cid(32) || beacon); successive candidate indices draw(counter) = u64_le(hash_labeled('FANOS-v1/thesauros-draw', seed(32) || counter_u64_le(8)))[0..8] mod leaves, taking the first k DISTINCT (ascending). If k >= leaves the whole chunk is audited. required_samples(lambda, f_tol) = ceil(lambda*ln2 / -ln(1-f_tol)) sets k off-chain. Here: a 16-leaf chunk (leaf i = the byte (i+1) repeated 4096 times), beacon 'epoch-42-beacon', k=5.",
+    "chunk_leaves": 16,
+    "beacon_utf8": "epoch-42-beacon",
+    "k": 5,
+    "chunk_cid_hex": "67dde567cf60cc8c1cf1fcfb0f275c381b0c8469cc33e14370d0fa2895a64605",
+    "challenge_indices": [2, 10, 11, 12, 13],
+    "required_samples_examples": {
+      "comment": "k = ceil(lambda*ln2 / -ln(1-f_tol))",
+      "lambda30_ftol0.10": 198,
+      "lambda30_ftol0.01": 2070,
+      "lambda30_ftol0.001": 20785
+    }
+  },
   "manifest": {
     "comment": "An object of CHUNK*2 + 500 bytes, byte i = (i*7) mod 256, split into 3 chunks (2 full + 1 partial). The manifest encodes count(4, LE) || [ cid(32) || len(4, LE) ] x count; its own CID is chunk_cid(manifest.encode()).",
     "object_len": 524788,

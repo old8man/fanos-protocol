@@ -60,3 +60,19 @@ fn manifest_addressing_matches_thesauros_json() {
     assert_eq!(m.chunks[0].cid, chunk_cid(chunk0));
     let _ = Cid::new([0u8; 32]); // Cid is constructible from raw bytes for decoders.
 }
+
+#[test]
+fn por_challenge_matches_thesauros_json() {
+    use fanos_thesauros::content::LEAF;
+    use fanos_thesauros::{challenge, prove, verify};
+    // A 16-leaf chunk (leaf i = byte i+1 repeated).
+    let data: Vec<u8> = (0..16 * LEAF).map(|i| (i / LEAF + 1) as u8).collect();
+    let cid = chunk_cid(&data);
+    assert_eq!(hex(cid.as_bytes()), "67dde567cf60cc8c1cf1fcfb0f275c381b0c8469cc33e14370d0fa2895a64605");
+    // The audit at beacon "epoch-42-beacon", k=5 of 16 leaves, challenges these indices.
+    let indices = challenge(&cid, b"epoch-42-beacon", 5, 16);
+    assert_eq!(indices, vec![2, 10, 11, 12, 13]);
+    // An honest provider's response verifies; the challenge is recomputed by the verifier.
+    let response = prove(&data, &indices).expect("honest response");
+    assert!(verify(&cid, b"epoch-42-beacon", 5, 16, &response));
+}
