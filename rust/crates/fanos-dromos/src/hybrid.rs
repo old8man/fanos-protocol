@@ -274,11 +274,17 @@ impl HybridLedger {
     /// Prove retrievability for a deal's current epoch: recompute the audit challenge from the block's beacon,
     /// verify the response against the committed CID, then — only on success — settle the epoch and release the
     /// slice from escrow to the provider (`move_system`, the proof-gated keyless-sink release).
-    fn prove_deal(&mut self, id: &[u8; 32], response_bytes: &[u8]) -> bool {
+    fn prove_deal(&mut self, id: &[u8; 32], prover_auth: &SignedTransfer, response_bytes: &[u8]) -> bool {
         let Some(params) = self.storage.deals.get(id).filter(|d| d.state() == DealState::Active).map(|d| *d.params())
         else {
             return false;
         };
+        // The proof must be authorised by the deal's provider (a signed transfer from the provider, to the deal
+        // id), so only the designated provider — which must hold the data to prove — can trigger its payment,
+        // not a third party replaying a valid proof off a public replica (audit AT-H1). The auth is never applied.
+        if !prover_auth.verify() || prover_auth.transfer.from != params.provider || prover_auth.transfer.to != *id {
+            return false;
+        }
         let Some(response) = decode_response(response_bytes) else {
             return false;
         };
@@ -304,7 +310,10 @@ impl HybridLedger {
         let Some(consumer) = self.storage.deals.get(id).map(|d| d.params().consumer) else {
             return false;
         };
-        if !auth.verify() || auth.transfer.from != consumer {
+        // The close authorisation must be signed by the consumer AND bound to this deal (to == deal id), so a
+        // historical signed transfer from the consumer cannot be replayed to force-close an active deal early
+        // (audit AT-M4). The auth is verified, never applied.
+        if !auth.verify() || auth.transfer.from != consumer || auth.transfer.to != *id {
             return false;
         }
         let Some(refund) = self.storage.deals.get_mut(id).map(Deal::close) else {
@@ -536,7 +545,9 @@ impl StateMachine for HybridLedger {
             },
             Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
                 Some(StorageTx::Open { params, payment }) => outcome(self.open_deal(&params, &payment)),
-                Some(StorageTx::Prove { deal_id, response }) => outcome(self.prove_deal(&deal_id, &response)),
+                Some(StorageTx::Prove { deal_id, prover_auth, response }) => {
+                    outcome(self.prove_deal(&deal_id, &prover_auth, &response))
+                }
                 Some(StorageTx::Close { deal_id, auth }) => outcome(self.close_deal(&deal_id, &auth)),
                 None => ExecOutcome::Malformed,
             },
@@ -749,7 +760,7 @@ mod tests {
         use fanos_thesauros::{DealParams, challenge, encode_response, prove};
 
         let (consumer_sk, consumer_vk, consumer) = account(1);
-        let (_p_sk, _p_vk, provider) = account(2);
+        let (provider_sk, provider_vk, provider) = account(2);
         let mut tokens = TokenLedger::new();
         tokens.credit(consumer, 1_000_000);
         let mut ledger = HybridLedger::new(tokens);
@@ -782,11 +793,14 @@ mod tests {
         assert_eq!(ledger.storage_escrow(), 400, "the price is escrowed");
         assert_eq!(ledger.tokens().balance(&consumer), 999_600);
         let id = deal_id(&params, 0);
+        // The proof must be authorised by the provider (a signed transfer from the provider, to the deal id).
+        let prover_auth =
+            SignedTransfer::sign(Transfer { from: provider, to: id, amount: 0, nonce: 0 }, &provider_sk, provider_vk);
 
         // Prove epoch 0: the provider answers the beacon's challenge → paid one slice (price/duration = 100).
         let indices = challenge(&cid, &beacon, 3, 8);
         let response = encode_response(&prove(&chunk, &indices).unwrap());
-        let prove_tx = StorageTx::Prove { deal_id: id, response };
+        let prove_tx = StorageTx::Prove { deal_id: id, prover_auth: prover_auth.clone(), response };
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&prove_tx))), ExecOutcome::Applied);
         assert_eq!(ledger.tokens().balance(&provider), 100, "the provider earned one slice from escrow");
         assert_eq!(ledger.storage_escrow(), 300);
@@ -797,13 +811,35 @@ mod tests {
         assert_eq!(ledger.storage_escrow(), 300, "the escrow is not drained by proof replay");
 
         // A garbage proof pays nothing.
-        let bad = StorageTx::Prove { deal_id: id, response: vec![0u8; 4] };
+        let bad = StorageTx::Prove { deal_id: id, prover_auth: prover_auth.clone(), response: vec![0u8; 4] };
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&bad))), ExecOutcome::Rejected);
         assert_eq!(ledger.tokens().balance(&provider), 100, "an unverifiable proof releases nothing");
 
-        // Close: the consumer reclaims the unproven 300 (an auth transfer from the consumer, never applied).
+        // AT-H1: a VALID proof not authorised by the provider is refused — a third party holding a replica of
+        // the public leaves cannot make the provider be paid. (Advance the height so only the signer check can
+        // reject it, not the per-height guard.)
+        ledger.begin_block(1);
+        let real_response = encode_response(&prove(&chunk, &challenge(&cid, &beacon, 3, 8)).unwrap());
+        let impostor_auth =
+            SignedTransfer::sign(Transfer { from: consumer, to: id, amount: 0, nonce: 2 }, &consumer_sk, consumer_vk.clone());
+        let impostor = StorageTx::Prove { deal_id: id, prover_auth: impostor_auth, response: real_response };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&impostor))), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&provider), 100, "a proof not signed by the provider pays nothing");
+
+        // AT-M4: a close authorisation NOT bound to the deal (to != deal id) is refused — a historical signed
+        // transfer from the consumer cannot be replayed to force-close the deal early.
+        let unbound = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 0, nonce: 3 },
+            &consumer_sk,
+            consumer_vk.clone(),
+        );
+        let bad_close = StorageTx::Close { deal_id: id, auth: unbound };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&bad_close))), ExecOutcome::Rejected);
+        assert_eq!(ledger.storage_escrow(), 300, "an unbound close does not touch the escrow");
+
+        // Close: the consumer reclaims the unproven 300 (an auth signed by the consumer, bound to the deal id).
         let auth = SignedTransfer::sign(
-            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 0, nonce: 1 },
+            Transfer { from: consumer, to: id, amount: 0, nonce: 1 },
             &consumer_sk,
             consumer_vk,
         );

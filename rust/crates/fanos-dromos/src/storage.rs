@@ -59,6 +59,10 @@ pub enum StorageTx {
     Prove {
         /// The deal being proven.
         deal_id: [u8; 32],
+        /// A signed transfer *from the provider, to the deal id* (verified, never applied) authorising the
+        /// proof — binds the payment-triggering proof to the designated provider, so a third party holding a
+        /// replica of the public leaves cannot make the provider be paid for data it deleted (audit AT-H1).
+        prover_auth: SignedTransfer,
         /// The encoded audit response.
         response: Vec<u8>,
     },
@@ -82,9 +86,10 @@ impl StorageTx {
                 out.extend_from_slice(&params.to_bytes());
                 out.extend_from_slice(&payment.to_bytes());
             }
-            StorageTx::Prove { deal_id, response } => {
+            StorageTx::Prove { deal_id, prover_auth, response } => {
                 out.push(OP_PROVE);
                 out.extend_from_slice(deal_id);
+                out.extend_from_slice(&prover_auth.to_bytes());
                 out.extend_from_slice(response);
             }
             StorageTx::Close { deal_id, auth } => {
@@ -106,10 +111,13 @@ impl StorageTx {
                 let payment = SignedTransfer::from_bytes(body.get(fanos_thesauros::DEAL_PARAMS_LEN..)?)?;
                 Some(StorageTx::Open { params, payment })
             }
-            OP_PROVE => Some(StorageTx::Prove {
-                deal_id: body.get(..32)?.try_into().ok()?,
-                response: body.get(32..)?.to_vec(),
-            }),
+            OP_PROVE => {
+                let deal_id = body.get(..32)?.try_into().ok()?;
+                let auth_end = 32usize.checked_add(SignedTransfer::WIRE_LEN)?;
+                let prover_auth = SignedTransfer::from_bytes(body.get(32..auth_end)?)?;
+                let response = body.get(auth_end..)?.to_vec();
+                Some(StorageTx::Prove { deal_id, prover_auth, response })
+            }
             OP_CLOSE => Some(StorageTx::Close {
                 deal_id: body.get(..32)?.try_into().ok()?,
                 auth: SignedTransfer::from_bytes(body.get(32..)?)?,
