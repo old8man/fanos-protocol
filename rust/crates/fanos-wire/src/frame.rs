@@ -59,6 +59,21 @@ pub enum FrameType {
     /// #102 — previously the overlay overloaded the `Beacon` code with this 4-byte payload, colliding with
     /// a real round on the wire).
     EpochAgree = 0x19,
+    /// A **beacon-resharing trigger** (audit R-C1): a coordinator (a parent cell, an operator rollover, or
+    /// the lowest live anchor over a committed membership snapshot) starts resharing generation `g`, moving
+    /// the beacon key to a fresh anchor set at a new threshold. Body: `gen(8B BE) ‖ new_threshold(1B) ‖
+    /// count(1B) ‖ new_index(count × 1B)`. Every anchor that adopts a strictly-newer generation deals its
+    /// verifiable contribution to that set — so a depleted anchor set is reconstituted from ≥ t survivors
+    /// **before** it drops below threshold, without ever assembling the secret or changing the group key.
+    BeaconReshareTrigger = 0x1A,
+    /// One anchor's **public resharing commitment** `Dᵢ` for a generation (audit R-C1): flooded so every
+    /// node derives the identical new group commitment `C' = Σ λᵢ(0)·Dᵢ` from public data alone. Body:
+    /// `gen(8B BE) ‖ old_index(1B) ‖ new_threshold(1B) ‖ VssCommitment(Dᵢ)`.
+    BeaconReshareCommit = 0x1B,
+    /// One anchor's **private resharing sub-share** `gᵢ(j)` for a specific new holder `j` (audit R-C1): sent
+    /// only to `j`, who checks it against the flooded `Dᵢ` and combines it into its new share. Body:
+    /// `gen(8B BE) ‖ old_index(1B) ‖ VssShare(gᵢ(j), 33B)`.
+    BeaconReshareShare = 0x1C,
     // 0x2* Overlay / storage
     Lookup = 0x20,
     Value = 0x21,
@@ -144,6 +159,9 @@ impl FrameType {
             0x17 => Self::DkgComplaint,
             0x18 => Self::BeaconPartial,
             0x19 => Self::EpochAgree,
+            0x1A => Self::BeaconReshareTrigger,
+            0x1B => Self::BeaconReshareCommit,
+            0x1C => Self::BeaconReshareShare,
             0x20 => Self::Lookup,
             0x21 => Self::Value,
             0x22 => Self::Publish,
@@ -278,7 +296,7 @@ mod tests {
 
     #[test]
     fn registry_round_trips() {
-        for code in [0x00u64, 0x05, 0x13, 0x24, 0x40, 0x62, 0x63] {
+        for code in [0x00u64, 0x05, 0x13, 0x1A, 0x1B, 0x1C, 0x24, 0x40, 0x62, 0x63] {
             let ft = FrameType::from_code(code).unwrap();
             assert_eq!(ft.code(), code);
         }
