@@ -824,6 +824,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-angelos"
+version = "0.1.0"
+dependencies = [
+ "fanos-pqcrypto",
+ "fanos-primitives",
+]
+
+[[package]]
 name = "fanos-aphantos"
 version = "0.1.0"
 dependencies = [

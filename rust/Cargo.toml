@@ -44,6 +44,7 @@ members = [
     "crates/fanos-taxis",
     "crates/fanos-obolos",
     "crates/fanos-dromos",
+    "crates/fanos-angelos",
     "crates/fanos-wasm",
 ]
 
@@ -120,6 +121,7 @@ fanos-incentives = { path = "crates/fanos-incentives", version = "0.1.0", defaul
 fanos-taxis = { path = "crates/fanos-taxis", version = "0.1.0" }
 fanos-obolos = { path = "crates/fanos-obolos", version = "0.1.0", default-features = false }
 fanos-dromos = { path = "crates/fanos-dromos", version = "0.1.0", default-features = false }
+fanos-angelos = { path = "crates/fanos-angelos", version = "0.1.0", default-features = false }
 fanos-aphantos = { path = "crates/fanos-aphantos", version = "0.1.0" }
 fanos-calypso = { path = "crates/fanos-calypso", version = "0.1.0" }
 fanos-diaulos = { path = "crates/fanos-diaulos", version = "0.1.0" }

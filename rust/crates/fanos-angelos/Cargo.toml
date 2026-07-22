@@ -1,0 +1,24 @@
+[package]
+name = "fanos-angelos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ANGELOS — the FANOS anonymous post-quantum messenger: forward-secret end-to-end sessions over the mixnet substrate (spec/platform.md §6)."
+keywords = ["messenger", "post-quantum", "end-to-end", "forward-secrecy", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+# Hybrid ML-KEM for the session handshake; the deterministic RNG for its encapsulation.
+fanos-pqcrypto.workspace = true
+# BLAKE3 KDF chains + ChaCha20-Poly1305 AEAD for the per-message keys.
+fanos-primitives = { workspace = true, default-features = false, features = ["aead"] }
+
+[features]
+default = ["std"]
+std = ["fanos-primitives/std"]
+
+[lints]
+workspace = true
