@@ -232,6 +232,80 @@ impl CoherenceMatrix {
         sum / (n * (n - 1) / 2) as f64
     }
 
+    /// Node `q`'s **coupling energy** `s_q = Σ_{j≠q} C_qj²` — the sum of its squared off-diagonal
+    /// correlations, i.e. how much of the cell's integration `q` accounts for. `0` for an out-of-range `q`.
+    /// The cell average is exactly `Φ` (each `C_ij²` appears in both `s_i` and `s_j`, so `Σ_q s_q = N·Φ`).
+    #[must_use]
+    pub fn coupling_energy(&self, q: usize) -> f64 {
+        if q >= self.n {
+            return 0.0;
+        }
+        let mut s = 0.0;
+        for j in 0..self.n {
+            if j != q {
+                let v = self.c.get(q * self.n + j).copied().unwrap_or(0.0);
+                s += v * v;
+            }
+        }
+        s
+    }
+
+    /// The cell integration **after quarantining node `q`** — closed form (the D6 quarantine theorem,
+    /// `docs/design-quarantine-theorem.md`): `Φ' = (N·Φ − 2·s_q)/(N−1)`, where `s_q` is `q`'s
+    /// [`coupling_energy`](Self::coupling_energy). `None` if `N < 2` (nothing left to bind after removing a
+    /// node). Excising `q` and recomputing [`phi`](Self::phi) yields the identical value (cross-checked in
+    /// the tests) — this form is O(N) rather than O(N²) and needs no reallocation.
+    #[must_use]
+    pub fn phi_after_quarantine(&self, q: usize) -> Option<f64> {
+        if self.n < 2 || q >= self.n {
+            return None;
+        }
+        let nf = self.n as f64;
+        Some((nf * self.phi() - 2.0 * self.coupling_energy(q)) / (nf - 1.0))
+    }
+
+    /// Whether quarantining node `q` **strictly lowers** the cell integration `Φ` — the D6 quarantine
+    /// theorem's exact condition `s_q > Φ/2`: quarantine is a valid Φ-reducing healing step iff the node's
+    /// coupling energy exceeds half the cell integration (a structurally-inconsistent / Byzantine node,
+    /// which injects spurious high correlation, satisfies this; an under-coupled silent node does not, and
+    /// quarantining it would *raise* Φ — the theorem forbids that). `false` for a degenerate cell.
+    #[must_use]
+    pub fn quarantine_lowers_phi(&self, q: usize) -> bool {
+        if self.n < 2 || q >= self.n {
+            return false;
+        }
+        self.coupling_energy(q) > self.phi() / 2.0
+    }
+
+    /// The `(N−1)×(N−1)` correlation matrix with node `q`'s row and column excised — the cell **after**
+    /// quarantining `q`. `None` if `q` is out of range or the result would be empty. Used to realize the
+    /// quarantine and to cross-validate [`phi_after_quarantine`](Self::phi_after_quarantine) against a full
+    /// recompute.
+    #[must_use]
+    pub fn excise(&self, q: usize) -> Option<Self> {
+        if q >= self.n || self.n <= 1 {
+            return None;
+        }
+        let m = self.n - 1;
+        let mut c = vec![0.0; m * m];
+        let mut ri = 0;
+        for i in 0..self.n {
+            if i == q {
+                continue;
+            }
+            let mut cj = 0;
+            for j in 0..self.n {
+                if j == q {
+                    continue;
+                }
+                *c.get_mut(ri * m + cj)? = self.c.get(i * self.n + j).copied().unwrap_or(0.0);
+                cj += 1;
+            }
+            ri += 1;
+        }
+        Some(Self { n: m, c })
+    }
+
     /// Whether the cell is integrated (`Φ ≥ 1`).
     #[must_use]
     pub fn is_integrated(&self) -> bool {
@@ -371,5 +445,115 @@ mod tests {
         let above = CoherenceMatrix::equicorrelated(7, 0.45);
         assert!(!below.is_systemic());
         assert!(above.is_systemic());
+    }
+}
+
+/// The **D6 quarantine-theorem experiment** (`docs/design-quarantine-theorem.md`): a deterministic
+/// simulation that the closed-form `Φ' = (N·Φ − 2·s_q)/(N−1)` matches a full recompute, that the condition
+/// `s_q > Φ/2` predicts the sign of `Φ'−Φ` exactly, and that a Byzantine (over-coupled) node is quarantinable
+/// while a silent (under-coupled) node is not (quarantining it would raise Φ).
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+mod quarantine_experiment {
+    use alloc::vec;
+
+    use super::CoherenceMatrix;
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A correlation value in `[-0.9, 0.9]`.
+    fn rand_corr(state: &mut u64) -> f64 {
+        let u = (splitmix(state) >> 11) as f64 / (1u64 << 53) as f64; // [0, 1)
+        u * 1.8 - 0.9
+    }
+
+    /// A random symmetric, unit-diagonal `n×n` correlation matrix.
+    fn random_matrix(seed: u64, n: usize) -> CoherenceMatrix {
+        let mut s = seed;
+        let mut c = vec![0.0; n * n];
+        for i in 0..n {
+            c[i * n + i] = 1.0;
+            for j in (i + 1)..n {
+                let v = rand_corr(&mut s);
+                c[i * n + j] = v;
+                c[j * n + i] = v;
+            }
+        }
+        CoherenceMatrix::from_correlation(c, n).unwrap()
+    }
+
+    #[test]
+    fn the_closed_form_equals_the_full_recompute() {
+        for seed in 0..300u64 {
+            let n = 3 + (seed % 6) as usize; // 3..=8
+            let m = random_matrix(seed, n);
+            for q in 0..n {
+                let closed = m.phi_after_quarantine(q).unwrap();
+                let recompute = m.excise(q).unwrap().phi();
+                assert!(
+                    (closed - recompute).abs() < 1e-9,
+                    "seed {seed} q {q}: closed-form Φ' {closed} ≠ recompute {recompute}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_condition_predicts_the_sign_of_the_change_exactly() {
+        for seed in 0..500u64 {
+            let n = 3 + (seed % 6) as usize;
+            let m = random_matrix(seed ^ 0xABCD, n);
+            let phi = m.phi();
+            for q in 0..n {
+                let phi_after = m.excise(q).unwrap().phi();
+                if (phi_after - phi).abs() < 1e-9 {
+                    continue; // the exact boundary s_q = Φ/2 — neither strictly wins
+                }
+                assert_eq!(
+                    m.quarantine_lowers_phi(q),
+                    phi_after < phi,
+                    "seed {seed} q {q}: predicted {} but Φ {phi} → {phi_after}",
+                    m.quarantine_lowers_phi(q)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_byzantine_node_is_quarantinable_and_a_silent_node_is_not() {
+        let n = 7;
+        // A "Byzantine" node 0: spuriously highly coupled to everyone (others only weakly correlated).
+        let mut c = vec![0.1; n * n];
+        for i in 0..n {
+            c[i * n + i] = 1.0;
+        }
+        for j in 1..n {
+            c[j] = 0.9; // row 0
+            c[j * n] = 0.9; // column 0
+        }
+        let byz = CoherenceMatrix::from_correlation(c, n).unwrap();
+        assert!(byz.coupling_energy(0) > byz.phi() / 2.0, "the Byzantine node's coupling exceeds Φ/2");
+        assert!(byz.quarantine_lowers_phi(0), "quarantining the Byzantine node lowers Φ");
+        assert!(byz.phi_after_quarantine(0).unwrap() < byz.phi(), "Φ strictly drops");
+
+        // A "silent" node 0: uncorrelated with everyone, while the rest are moderately coupled.
+        let mut c2 = vec![0.5; n * n];
+        for i in 0..n {
+            c2[i * n + i] = 1.0;
+        }
+        for j in 1..n {
+            c2[j] = 0.0;
+            c2[j * n] = 0.0;
+        }
+        let silent = CoherenceMatrix::from_correlation(c2, n).unwrap();
+        assert!(silent.coupling_energy(0) < silent.phi() / 2.0, "the silent node's coupling is below Φ/2");
+        assert!(!silent.quarantine_lowers_phi(0), "quarantining a silent node is forbidden — it would raise Φ");
+        assert!(silent.phi_after_quarantine(0).unwrap() > silent.phi(), "removing the silent node concentrates coupling");
     }
 }
