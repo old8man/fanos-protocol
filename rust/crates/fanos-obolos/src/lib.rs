@@ -36,6 +36,7 @@
 extern crate alloc;
 
 pub mod build;
+pub mod codec;
 pub mod commit;
 pub mod note;
 pub mod nullifier;

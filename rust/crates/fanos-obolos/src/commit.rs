@@ -140,6 +140,18 @@ impl Randomness {
         let coeffs = self.coeffs.iter().zip(&other.coeffs).map(|(a, b)| a - b).collect();
         Self { coeffs }
     }
+
+    /// The coefficient vector (for serialization).
+    #[must_use]
+    pub(crate) fn coeffs_ref(&self) -> &[i64] {
+        &self.coeffs
+    }
+
+    /// Reconstruct from a coefficient vector (from serialization); the caller guarantees length `L`.
+    #[must_use]
+    pub(crate) fn from_coeffs(coeffs: Vec<i64>) -> Self {
+        Self { coeffs }
+    }
 }
 
 /// A value commitment `(t0, t1)` — hiding the amount, binding, and additively homomorphic.
@@ -200,6 +212,12 @@ impl Commitment {
         }
         out.extend_from_slice(&self.t1.to_le_bytes());
         out
+    }
+
+    /// Reconstruct from its components (from serialization); the caller guarantees `t0.len() == N`.
+    #[must_use]
+    pub(crate) fn from_parts(t0: Vec<i64>, t1: i64) -> Self {
+        Self { t0, t1 }
     }
 }
 
