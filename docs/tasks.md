@@ -14,26 +14,44 @@
 
 ---
 
-## ⬜ What's left (all deliberately not auto-built)
+## ⬜ What's left
 
-### A · Optional application layers — a product/economics decision, not a protocol gap
-- **Part X.1 — the blockchain *application* on FANOS** (roadmap M7's application target): line-committee
-  consensus **ordering** + anti-MEV over data-availability-sampled blocks. The *substrate primitives* exist
-  and are tested — DA sampling (`fanos-code/src/da.rs`), the `[7,3,4]` erasure store, PoW admission, VOPRF
-  anonymous credits, the projective-line committee structure — but the consensus/ordering **ledger app** that
-  composes them is unbuilt (no consensus/committee/MEV/mempool module exists; verified). Needs a design
-  choice (which finality? ordering rule?) before any code. Spec marks L7 + Part X **optional**.
-- **L7 incentive *equilibrium*** — the VOPRF credit **mechanism** is built; a free-rider-resistant economic
-  **equilibrium** is an open economic problem (§16: "L7 gives the mechanics, not an equilibrium guarantee"),
-  not a coding task. No magic pricing invented.
+### A · Optional application layers — ✅ DONE (2026-07-22)
+- **Part X.1 — the blockchain application on FANOS** — ✅ **DONE**: new crate **`fanos-taxis`** (`854feef`),
+  the FANOS-native BFT blockchain. Projective-cell PBFT consensus (proved a masking-quorum system: `n=q²+q+1`,
+  `f=⌊(n−1)/3⌋`, `Q=⌈(n+f+1)/2⌉`; tight `n=3f+1` for `q≢1 mod 3`, incl. the Fano cell 7/2/5), beacon leader
+  election (cartel-proof by the `(q+1)/n` centrality cap), **anti-MEV** threshold-encrypted mempool (reuses
+  `ThresholdSealed`; proposer orders blind, keyper line reveals post-commit), **DA-sampled** blocks (projective
+  LRC + line sampling gates finality), sans-I/O engine, App-overlay wire. Verified by a 7-node BFT sim
+  (finality+execution, `f=2` crash-liveness, DA-withholding rejection, Byzantine safety). `docs/design-taxis.md`.
+- **L7 incentive equilibrium** — ✅ **DONE** (`a60ab73`): `fanos-taxis::incentive` + `docs/design-incentive-
+  equilibrium.md` close the §16 open problem — a machine-checked proof that honest validation is a Nash
+  equilibrium under C1 (`R=F/Q≥c`) ∧ C2 (`S>0`), clean because anti-MEV + BFT-safety + DA-gating zero the gain
+  of every deviation. Reward distribution, equivocation-slashing proofs, and context-bound VOPRF fee credits.
 
-### B · Research-gated — no theorem/proof exists yet (`[P]` in the spec's own honest list, Part XVI)
-- **Machine-checked formal proofs** of the Tessera packet and the holonomic ratchet (currently `[P]`
-  research constructions).
-- **PQ-VRF / PQ beacon / PQ verifiable shuffle** — classical variants are the honest interim (`[P]`).
-- **Deeper DIAKRISIS hierarchy** — parent-observes-child recursion *beyond* the built §6.5 partition sensor
-  (#95); and the **D6 quarantine theorem** (no proof exists in the UHM corpus — cannot be invented).
-- **GF(2^m) constant-time field arithmetic** for large-`q` profiles (side-channel hardening, §16).
+### B · Research-gated — ✅ fundamental theory closure DONE (2026-07-22); residuals noted
+- **Holonomic ratchet + Tessera security** — ✅ **DONE** (`08e07dd`): the ratchet was a front-keyed cascade
+  (length-extendable); added a length-binding NMAC finalization → a provable keyed MAC, EUF-CMA reducing to
+  BLAKE3-PRF, with a deterministic attack experiment over every tamper class (`docs/design-holonomy-security.md`).
+  Tessera onion confidentiality/integrity reduced to hybrid-KEM-IND-CCA + AEAD + BLAKE3 (`docs/design-tessera-
+  security.md`). Residual: only the *machine-checked mechanization* (proof-assistant artifact) — the reductions
+  are its spec.
+- **PQ-VRF / PQ beacon / PQ shuffle** — ✅ **DONE** (`fca1aad`): a hash-based **Merkle-VRF** over the bounded
+  epoch domain — PQ, unique, unbiasable (leaves pre-committed) — + a full-reveal PQ beacon, both implemented +
+  tested (`fanos-vrf::pqvrf`, `docs/design-pq-vrf.md`). PQ verifiable shuffle rigorously *designed* (sound
+  cut-and-choose), not implemented (no live consumer). Residual: DVRF-style threshold reconstruction-uniqueness
+  PQ (needs a PQ threshold primitive).
+- **D6 quarantine theorem** — ✅ **DONE** (`653a9c3`): derived `Φ' = (N·Φ − 2s_q)/(N−1)`, so quarantine lowers
+  Φ iff `s_q > Φ/2`; implemented the gate + simulation experiment (`docs/design-quarantine-theorem.md`).
+- **GF(2^m) constant-time** — ✅ **DONE** (`b563f9a`): mul is branchless, inv is fixed-exponent Fermat →
+  secret-independent; deterministic op-count experiment proves it (`docs/design-constant-time.md`).
+- Still genuinely open (deeper hierarchy recursion #95 §parent-observes-child) — research-gated, unchanged.
+
+### C · Honest fundamental limits (Part XVI) — not defects, not closeable
+- `f→0.5` endpoint-majority limit; single-cell DIAKRISIS localization stratification (crashes ≤3, Byzantine
+  ≤2); the coherence `[И]` axis↔sector dictionary is a self-checking *model*; third-order statistics are
+  data-hungrier; threshold↔availability is a calibration trade-off. All correctly stated in the spec; nothing
+  to "fix" — they are the honest boundaries of the design.
 
 ### C · Runtime-only verification — built + compiles/lints clean, but the OS-syscall shell can't run in CI
 - **TUN device I/O** (`fanos-vpn`, feature `device`; `fulltunnel.rs` + `device.rs`) — the datapath/engine/mux
