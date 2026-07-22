@@ -367,3 +367,133 @@ fn equivocating_proposals_cannot_split_agreement() {
         }
     }
 }
+
+// ---- randomized adversarial Monte-Carlo: BFT safety under random scheduling + Byzantine faults ----
+
+/// A tiny deterministic PRG (splitmix64) — reproducible adversarial schedules, no external rand.
+fn splitmix(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Over many random seeds: a random Byzantine subset (`≤ f = 2`) equivocates (injects conflicting prepare
+/// votes signed by its real key), and the network delivers every message in a **random order** (an adversarial
+/// asynchronous scheduler). BFT **safety** — no two honest validators ever finalize different blocks at the
+/// same height — must hold on *every* schedule (safety needs no synchrony). Liveness is checked softly in
+/// aggregate: under adversarial async scheduling FLP forbids guaranteed progress, but partial synchrony should
+/// let most trials advance.
+#[test]
+#[ignore = "heavy: hundreds of hybrid ML-DSA sign/verify per trial over a randomized Monte-Carlo (~140s); \
+            run in isolation with `cargo test -p fanos-taxis --test consensus_sim -- --ignored`"]
+fn randomized_scheduling_and_byzantine_faults_never_fork() {
+    use std::collections::BTreeMap;
+
+    use fanos_taxis::{Phase, SignedVote, Vote};
+
+    let trials = 12u64;
+    let mut progress_trials = 0u64;
+    for trial in 0..trials {
+        let mut rng = 0xD1CE_B00F_u64 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+        // A random Byzantine subset of size 0..=2 (f = 2).
+        let byz_count = (splitmix(&mut rng) % 3) as usize;
+        let mut byz: BTreeSet<u8> = BTreeSet::new();
+        while byz.len() < byz_count {
+            byz.insert((splitmix(&mut rng) % 7) as u8);
+        }
+
+        // Build the validators, RETAINING the Byzantine signing keys so they can be made to equivocate under
+        // their own (verifier-matching) identity. Byzantine engines get an unused dummy secret and are never
+        // stepped honestly.
+        let keys = gen_keys();
+        let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+        let mut engines = Vec::new();
+        let mut byz_sig: BTreeMap<u8, HybridSigSecret> = BTreeMap::new();
+        for (i, k) in keys.into_iter().enumerate() {
+            let idx = i as u8;
+            if byz.contains(&idx) {
+                byz_sig.insert(idx, k.sig);
+                let mut r = SeedRng::from_seed(&[0xDD, idx]);
+                let (dummy, _) = HybridSigSecret::generate(&mut r);
+                engines.push(ConsensusEngine::new(CellParams::FANO, idx, dummy, k.kem, verifiers.clone(), SEED, EPOCH, genesis()));
+            } else {
+                engines.push(ConsensusEngine::new(CellParams::FANO, idx, k.sig, k.kem, verifiers.clone(), SEED, EPOCH, genesis()));
+            }
+        }
+        let honest: Vec<usize> = (0..N).filter(|i| !byz.contains(&(*i as u8))).collect();
+
+        let mut bus: VecDeque<ConsensusMsg> = VecDeque::new();
+        let mut committed: Vec<Vec<(u64, [u8; 32])>> = vec![Vec::new(); N];
+
+        for step in 0..18u64 {
+            // Honest validators tick (leader proposes); a periodic timeout advances a round stuck behind a
+            // Byzantine or badly-scheduled leader.
+            for &i in &honest {
+                let input = if step % 3 == 2 { Input::Timeout } else { Input::Tick };
+                for o in engines[i].step(input) {
+                    match o {
+                        Output::Send(m) => bus.push_back(m),
+                        Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
+                    }
+                }
+            }
+            // Byzantine equivocation: at each height the honest set is currently deciding, every Byzantine node
+            // signs prepare votes for TWO conflicting bogus blocks.
+            let heights: BTreeSet<u64> = honest.iter().map(|&i| engines[i].height()).collect();
+            for &h in &heights {
+                for (&b, sk) in &byz_sig {
+                    for tag in [0xAAu8, 0xBB] {
+                        let vote = Vote { height: h, round: 0, block_hash: [tag; 32], phase: Phase::Prepare, voter: b };
+                        bus.push_back(ConsensusMsg::Vote(SignedVote::sign(vote, sk)));
+                    }
+                }
+            }
+            // Deliver the bus in RANDOM order (the adversarial async scheduler), to honest validators only.
+            let mut guard = 0;
+            while !bus.is_empty() {
+                let idx = (splitmix(&mut rng) as usize) % bus.len();
+                let Some(msg) = bus.remove(idx) else { break };
+                for &i in &honest {
+                    let input = match &msg {
+                        ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), present: 0x7F },
+                        ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
+                        ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
+                    };
+                    for o in engines[i].step(input) {
+                        match o {
+                            Output::Send(m) => bus.push_back(m),
+                            Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
+                        }
+                    }
+                }
+                guard += 1;
+                assert!(guard < 1_000_000, "trial {trial}: the bus did not quiesce");
+            }
+        }
+
+        // SAFETY (must hold on every schedule): honest validators never finalize two different blocks at one height.
+        let max_h = committed.iter().flatten().map(|&(h, _)| h).max().unwrap_or(0);
+        for h in 0..=max_h {
+            let hashes: BTreeSet<[u8; 32]> = honest
+                .iter()
+                .flat_map(|&i| committed[i].iter().filter(move |&&(hh, _)| hh == h).map(|&(_, hash)| hash))
+                .collect();
+            assert!(
+                hashes.len() <= 1,
+                "trial {trial} (byz {byz:?}): FORK at height {h} — honest validators finalized {} distinct blocks",
+                hashes.len()
+            );
+        }
+        if honest.iter().any(|&i| !committed[i].is_empty()) {
+            progress_trials += 1;
+        }
+    }
+    // Aggregate liveness (soft — FLP forbids a strict async guarantee): most trials make progress.
+    assert!(
+        progress_trials * 2 > trials,
+        "only {progress_trials}/{trials} trials progressed — liveness suspiciously low"
+    );
+}
