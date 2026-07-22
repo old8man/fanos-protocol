@@ -16,10 +16,19 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ---
 
-## ⬜ Next up (frontier, roughly by priority)
+## ⬜ Next up (frontier)
 
-- **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
-  consistent reads). The one remaining frontier item — and optional.
+**The roadmap frontier is complete** — every fundamental level (M0–M8) and integration surface (M9–M10) is
+implemented and verified. The two items that lingered here turned out to be **already-realized, not gaps**:
+
+> **Maekawa W∩R quorum** (L4-store quorum consistency, §L4 line-364) is **already realized + tested**, not a
+> gap. Its geometric foundation — any two lines meet in exactly one point (`W ∩ R ≠ ∅`) — is the exhaustive
+> `fanos-geometry::dual_any_two_lines_intersect` (V1). Its storage realization is the erasure store's
+> versioned **full-fan-out** read (a superset of any line-quorum → trivial intersection, plus LRC
+> durability): `sim/tests/storage.rs` verifies read-after-write, last-writer-wins-by-version, read-repair
+> across the replica line, crashed-primary reroute, and LRC reconstruction. A bare line-replication store
+> would be inferior (a 3-point line yields 3 shards; `[7,3,4]` needs 4) and strict *multi-writer*
+> linearisability (quorum locking) is unneeded — store keys are single-writer. See `routing.rs::replica_lines`.
 
 > **VOPRF credit settlement** (Phase 4) is **already implemented + tested**, not a gap: the ristretto255
 > VOPRF primitive (`fanos-incentives`: blind→DLEQ→unblind, context-bound redemption B8, deterministic nonce

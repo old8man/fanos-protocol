@@ -43,6 +43,18 @@ pub fn content_address<F: Field>(key: &[u8]) -> Point<F> {
 
 /// The `q + 1` replica lines that erasure-code a target point's data (spec §L4 projective
 /// LRC): the lines through the target.
+///
+/// These lines are the store's **Maekawa quorums** (spec §L4, line-364 "quorum consistency [T]"): any two
+/// distinct lines meet in exactly one point (the dual Steiner property, verified exhaustively by
+/// `fanos_geometry`'s `dual_any_two_lines_intersect`), so a write-line `W` and a read-line `R` always
+/// satisfy `W ∩ R ≠ ∅`. The overlay realizes the resulting linearisability *more strongly* than a bare
+/// line-quorum: a write erasure-codes across **all** shard homes and a read fans out to **all** of them,
+/// grouping by write-version and reconstructing the highest recoverable one — a full-set read that is a
+/// superset of any line-quorum, so it trivially intersects every write while also giving LRC durability
+/// (a bare 3-point line could not: `[7,3,4]` needs 4 shards to reconstruct). Strict *multi-writer*
+/// linearisability (quorum locking) is deliberately not added: store keys are single-writer (a service
+/// publishes its own descriptor, a node its own key), so last-writer-wins-by-version is the right,
+/// lock-free consistency, verified by the `fanos-sim` storage suite.
 pub fn replica_lines<F: Field>(target: &Point<F>) -> impl Iterator<Item = Line<F>> + Clone {
     Plane::<F>::lines_through(*target)
 }
