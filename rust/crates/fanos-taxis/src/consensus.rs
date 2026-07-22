@@ -874,6 +874,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 break;
             }
             self.exec_queue.remove(0);
+            self.chain.begin_block(block.header.height);
             for txn in &opened {
                 self.chain.execute(txn);
             }

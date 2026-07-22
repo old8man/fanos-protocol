@@ -72,6 +72,12 @@ impl<S: StateMachine> Chain<S> {
         self.headers.push(header);
     }
 
+    /// Begin executing the block at `height`: forward the per-block clock to the state machine before its
+    /// transactions (see [`StateMachine::begin_block`]).
+    pub fn begin_block(&mut self, height: u64) {
+        self.state.begin_block(height);
+    }
+
     /// Execute one transaction against the state (applied in committed order after its block finalizes).
     pub fn execute(&mut self, tx: &Transaction) {
         let _ = self.state.apply(tx);

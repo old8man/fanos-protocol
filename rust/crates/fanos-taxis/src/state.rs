@@ -37,6 +37,11 @@ pub enum ExecOutcome {
 /// A replicated state machine over which TAXIS provides ordered, final agreement. The consensus engine is
 /// generic over this trait, so the same consensus runs any application.
 pub trait StateMachine {
+    /// Begin executing the block at `height` — a per-block context hook the engine calls **once** before that
+    /// block's transactions, so a state machine with height-dependent rules (expiries, vesting, block rewards)
+    /// has a canonical, agreed clock. The default is a no-op; a plain ledger ignores it.
+    fn begin_block(&mut self, _height: u64) {}
+
     /// Apply one transaction (already reconstructed and in committed order) to the state.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome;
 
