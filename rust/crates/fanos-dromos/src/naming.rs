@@ -57,6 +57,9 @@ pub enum DescriptorKind {
     Service,
     /// An ANGELOS messaging identity (`data` is a messaging id).
     Messenger,
+    /// A THESAUROS stored object (`data` is a content id — a chunk or manifest CID; the storehouse resolves and
+    /// serves it). Names point at immutable content, mutably.
+    Storage,
     /// An opaque / application-defined target.
     Raw,
 }
@@ -69,6 +72,7 @@ impl DescriptorKind {
             DescriptorKind::Service => 1,
             DescriptorKind::Messenger => 2,
             DescriptorKind::Raw => 3,
+            DescriptorKind::Storage => 4,
         }
     }
 
@@ -79,6 +83,7 @@ impl DescriptorKind {
             1 => Some(DescriptorKind::Service),
             2 => Some(DescriptorKind::Messenger),
             3 => Some(DescriptorKind::Raw),
+            4 => Some(DescriptorKind::Storage),
             _ => None,
         }
     }
