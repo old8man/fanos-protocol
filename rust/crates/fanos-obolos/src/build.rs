@@ -10,6 +10,8 @@
 
 use alloc::vec::Vec;
 
+use rand_core::CryptoRng;
+
 use crate::commit::{Commitment, Params, Randomness};
 use crate::note::Note;
 use crate::note_cipher::{Address, NoteCipher};
@@ -106,24 +108,23 @@ pub fn build_unshield(
 
 /// Like [`build_transfer`], but each output is **delivered** to a recipient [`Address`]: its opening is sealed
 /// as a [`NoteCipher`] so the recipient can find and spend it on-chain (unlinkable delivery, [`crate::note_cipher`]).
-/// Each output's note must already be owned by its address (`note.owner == address.owner`); `cipher_seed` is the
-/// per-output encapsulation randomness (production: a fresh CSPRNG; tests: a fixed seed, varied by output index).
-/// The delivery cipher is ledger data-at-rest — it never affects the transaction's validity, only detectability.
+/// Each output's note must already be owned by its address (`note.owner == address.owner`); `rng` supplies the
+/// per-output encapsulation randomness (production: an OS CSPRNG; a test: a seeded RNG by `&mut`) — drawn fresh
+/// per seal, so no two note ciphers ever share a `(key, nonce)` (audit O-H2). The delivery cipher is ledger
+/// data-at-rest — it never affects the transaction's validity, only detectability.
 #[must_use]
-pub fn build_transfer_delivering(
+pub fn build_transfer_delivering<R: CryptoRng>(
     params: &Params,
     anchor: [u8; 32],
     inputs: &[SpendInput],
     outputs: &[(Note, Address)],
     fee: u64,
-    cipher_seed: &[u8],
+    rng: &mut R,
 ) -> (ShieldedTx, TransparentProof) {
     let notes: Vec<Note> = outputs.iter().map(|(n, _)| n.clone()).collect();
     let (mut tx, proof) = build_transfer(params, anchor, inputs, &notes, fee);
-    for (i, (out, (note, address))) in tx.outputs.iter_mut().zip(outputs).enumerate() {
-        let mut seed = cipher_seed.to_vec();
-        seed.extend_from_slice(&(i as u64).to_le_bytes());
-        out.cipher = NoteCipher::seal(address, note.value, &note.value_r, &note.rho, &seed);
+    for (out, (note, address)) in tx.outputs.iter_mut().zip(outputs) {
+        out.cipher = NoteCipher::seal(address, note.value, &note.value_r, &note.rho, rng);
     }
     (tx, proof)
 }

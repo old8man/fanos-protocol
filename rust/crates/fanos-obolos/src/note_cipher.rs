@@ -13,9 +13,9 @@
 
 use alloc::vec::Vec;
 
-use fanos_pqcrypto::SeedRng;
 use fanos_pqcrypto::kem::{CIPHERTEXT_LEN, HybridCiphertext, HybridKemPublic, HybridKemSecret};
 use fanos_primitives::{aead, hash_labeled};
+use rand_core::CryptoRng;
 
 use crate::commit::Randomness;
 use crate::note::Note;
@@ -87,13 +87,16 @@ fn decode_opening(bytes: &[u8]) -> Option<(u64, Randomness, [u8; 32])> {
 }
 
 impl NoteCipher {
-    /// Seal the opening of a note (`value`, `value_r`, `rho`) to `address`, using `rng_seed` for the KEM
-    /// encapsulation randomness (a fresh CSPRNG draw in production; a fixed seed under the deterministic tests).
-    /// `None` only if the KEM key is non-contributory or AEAD fails.
+    /// Seal the opening of a note (`value`, `value_r`, `rho`) to `address`, drawing the KEM encapsulation
+    /// randomness from `rng`. Taking a live [`CryptoRng`] (rather than a fixed seed) is the fix for audit O-H2:
+    /// the AEAD key **and** nonce are both derived from the KEM session secret, so reusing the encapsulation
+    /// randomness would reuse the `(key, nonce)` pair (a ChaCha20-Poly1305 two-time pad + Poly1305 forgery) and
+    /// produce an identical, linkable KEM ciphertext. A CSPRNG advances on every draw, so two seals never share
+    /// randomness — production passes an OS CSPRNG; a test passes a seeded RNG *by `&mut`* so it advances across
+    /// seals. `None` only if the KEM key is non-contributory or AEAD fails.
     #[must_use]
-    pub fn seal(address: &Address, value: u64, value_r: &Randomness, rho: &[u8; 32], rng_seed: &[u8]) -> Option<Self> {
-        let mut rng = SeedRng::from_seed(rng_seed);
-        let (kem_ct, session) = address.kem_public.encapsulate(&mut rng)?;
+    pub fn seal<R: CryptoRng>(address: &Address, value: u64, value_r: &Randomness, rho: &[u8; 32], rng: &mut R) -> Option<Self> {
+        let (kem_ct, session) = address.kem_public.encapsulate(rng)?;
         let (key, nonce) = derive_key_nonce(&session);
         let aead_ct = aead::seal(&key, &nonce, &encode_opening(value, value_r, rho))?;
         Some(Self { kem_ct: kem_ct.to_bytes(), aead_ct })
@@ -154,6 +157,7 @@ pub fn scan(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use fanos_pqcrypto::SeedRng;
     use crate::commit::Params;
     use crate::note::derive_owner_pk;
 
@@ -170,7 +174,7 @@ mod tests {
         let (addr, kem_secret) = recipient(&nsk, 1);
         let value_r = Randomness::from_seed(b"vr");
         let rho = [5u8; 32];
-        let cipher = NoteCipher::seal(&addr, 4242, &value_r, &rho, b"enc-seed").expect("seal");
+        let cipher = NoteCipher::seal(&addr, 4242, &value_r, &rho, &mut SeedRng::from_seed(b"enc-seed")).expect("seal");
 
         // The recipient opens it and recovers exactly the note.
         let note = cipher.open(&kem_secret, addr.owner).expect("the recipient recovers the note");
@@ -184,9 +188,27 @@ mod tests {
     }
 
     #[test]
+    fn two_seals_of_one_note_never_reuse_key_nonce_and_are_unlinkable() {
+        // Audit O-H2: the AEAD key and nonce both come from the KEM session, so a reused encapsulation would
+        // reuse the (key, nonce) pair and the KEM ciphertext. Drawing from an advancing CryptoRng makes every
+        // seal fresh — even the same note to the same recipient seals to distinct, unlinkable ciphers.
+        let nsk = [1u8; 32];
+        let (addr, kem_secret) = recipient(&nsk, 1);
+        let value_r = Randomness::from_seed(b"vr");
+        let rho = [7u8; 32];
+        let mut rng = SeedRng::from_seed(b"fresh");
+        let c1 = NoteCipher::seal(&addr, 100, &value_r, &rho, &mut rng).unwrap();
+        let c2 = NoteCipher::seal(&addr, 100, &value_r, &rho, &mut rng).unwrap();
+        assert_ne!(c1, c2, "two seals of the same note produce distinct, unlinkable ciphertexts");
+        // Both still open to the same note.
+        assert_eq!(c1.open(&kem_secret, addr.owner).unwrap().value, 100);
+        assert_eq!(c2.open(&kem_secret, addr.owner).unwrap().value, 100);
+    }
+
+    #[test]
     fn a_note_cipher_round_trips_through_bytes() {
         let (addr, _sk) = recipient(&[1u8; 32], 1);
-        let cipher = NoteCipher::seal(&addr, 1, &Randomness::from_seed(b"r"), &[0u8; 32], b"s").unwrap();
+        let cipher = NoteCipher::seal(&addr, 1, &Randomness::from_seed(b"r"), &[0u8; 32], &mut SeedRng::from_seed(b"s")).unwrap();
         let bytes = cipher.to_bytes();
         assert_eq!(NoteCipher::from_bytes(&bytes), Some(cipher));
         assert_eq!(NoteCipher::from_bytes(&bytes[..CIPHERTEXT_LEN - 1]), None, "a truncated cipher is rejected");
@@ -202,9 +224,9 @@ mod tests {
         let n_a = Note::new(100, addr.owner, Randomness::from_seed(b"a"), [1u8; 32]);
         let n_b = Note::new(200, addr.owner, Randomness::from_seed(b"b"), [2u8; 32]);
         let n_other = Note::new(300, other_addr.owner, Randomness::from_seed(b"c"), [3u8; 32]);
-        let c_a = NoteCipher::seal(&addr, n_a.value, &n_a.value_r, &n_a.rho, b"sa").unwrap();
-        let c_b = NoteCipher::seal(&addr, n_b.value, &n_b.value_r, &n_b.rho, b"sb").unwrap();
-        let c_other = NoteCipher::seal(&other_addr, n_other.value, &n_other.value_r, &n_other.rho, b"sc").unwrap();
+        let c_a = NoteCipher::seal(&addr, n_a.value, &n_a.value_r, &n_a.rho, &mut SeedRng::from_seed(b"sa")).unwrap();
+        let c_b = NoteCipher::seal(&addr, n_b.value, &n_b.value_r, &n_b.rho, &mut SeedRng::from_seed(b"sb")).unwrap();
+        let c_other = NoteCipher::seal(&other_addr, n_other.value, &n_other.value_r, &n_other.rho, &mut SeedRng::from_seed(b"sc")).unwrap();
         let (cm_a, cm_b, cm_other) = (n_a.commitment(&p), n_b.commitment(&p), n_other.commitment(&p));
         let outputs = [(&cm_a, &c_a), (&cm_other, &c_other), (&cm_b, &c_b)];
 

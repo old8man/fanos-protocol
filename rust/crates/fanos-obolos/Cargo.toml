@@ -16,6 +16,8 @@ fanos-primitives = { workspace = true, default-features = false, features = ["ae
 # Hybrid ML-KEM for note delivery: the sender encapsulates the note opening to the recipient's key so only
 # the recipient can detect and recover it (unlinkable delivery). no_std.
 fanos-pqcrypto.workspace = true
+# The `CryptoRng` bound for note-cipher sealing — callers supply fresh randomness per seal (no seed reuse).
+rand_core = { workspace = true }
 
 [features]
 default = ["std"]

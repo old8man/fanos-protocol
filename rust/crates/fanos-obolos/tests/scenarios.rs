@@ -235,7 +235,7 @@ fn a_recipient_finds_a_delivered_payment_and_an_observer_cannot() {
     // Alice pays Bob 1000, *delivering* the note (its opening sealed to Bob).
     let bob_note = Note::new(1000, bob_addr.owner, Randomness::from_seed(b"bobnote"), [4u8; 32]);
     let (tx, proof) =
-        build_transfer_delivering(&p, s.anchor(), &[sp], &[(bob_note.clone(), bob_addr.clone())], 0, b"deliver-seed");
+        build_transfer_delivering(&p, s.anchor(), &[sp], &[(bob_note.clone(), bob_addr.clone())], 0, &mut SeedRng::from_seed(b"deliver-seed"));
     assert_eq!(s.apply(&p, &tx, &proof), Ok(()), "the delivering transfer executes normally");
 
     // Bob scans the block's outputs and recovers exactly his note (so he can spend it next).
