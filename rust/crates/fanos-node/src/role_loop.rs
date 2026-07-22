@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::capdir::build_capability_directory;
+use crate::loaddir::build_cell_setpoint;
 
 /// A node's **sans-I/O** live role controller: it holds the epoch-persistent [`RoleController`] state and, for a
 /// given epoch's authenticated member set, beacon, and setpoint, produces *this* node's assigned [`RoleSet`].
@@ -62,16 +63,16 @@ impl LiveRoleController {
 
 /// Spawn the live role loop for a node on plane `F`. Returns the task handle and a `watch` receiver that
 /// carries this node's currently-assigned [`RoleSet`] — the node subscribes to it and starts/stops serving
-/// each role as the assignment rotates. `setpoint` is a `watch` receiver a load sensor drives (task A3); the
-/// loop reads its latest value each epoch. The loop assigns once immediately (the genesis epoch) and then on
-/// every real [`Notification::BeaconReady`]; it ends when the notification stream closes. Must run inside a
-/// tokio runtime.
+/// each role as the assignment rotates. `capacity` is the per-node capacity per role, from which the loop
+/// derives the cell-agreed setpoint out of the live load directory ([`crate::loaddir`]) each epoch. The loop
+/// assigns once immediately (the genesis epoch) and then on every real [`Notification::BeaconReady`]; it ends
+/// when the notification stream closes. Must run inside a tokio runtime.
 #[must_use]
 pub fn spawn_role_loop<F: Field>(
     client: Client,
     node_id: NodeId,
     controller: RoleController,
-    setpoint: watch::Receiver<Demand>,
+    capacity: Demand,
 ) -> (JoinHandle<()>, watch::Receiver<RoleSet>) {
     let (roles_tx, roles_rx) = watch::channel(RoleSet::EMPTY);
     let handle = tokio::spawn(async move {
@@ -79,12 +80,12 @@ pub fn spawn_role_loop<F: Field>(
         let mut events = client.subscribe();
         let mut cur = Epoch::ZERO;
         // Genesis-epoch assignment (before the first beacon) over whoever has published at genesis.
-        assign_epoch::<F>(&client, &mut live, Epoch::ZERO, &BeaconSeed::GENESIS, &setpoint, &roles_tx).await;
+        assign_epoch::<F>(&client, &mut live, Epoch::ZERO, &BeaconSeed::GENESIS, capacity, &roles_tx).await;
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch, seed }) if epoch > cur => {
                     cur = epoch;
-                    assign_epoch::<F>(&client, &mut live, epoch, &BeaconSeed::new(seed), &setpoint, &roles_tx).await;
+                    assign_epoch::<F>(&client, &mut live, epoch, &BeaconSeed::new(seed), capacity, &roles_tx).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -94,19 +95,20 @@ pub fn spawn_role_loop<F: Field>(
     (handle, roles_rx)
 }
 
-/// One epoch of the loop: build the live authenticated directory, step the controller, publish this node's
-/// roles. `send` only fails if every receiver has dropped, which means the node is shutting down — ignored.
+/// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
+/// the live load directory), step the controller, publish this node's roles. `send` only fails if every
+/// receiver has dropped (the node is shutting down) — ignored.
 async fn assign_epoch<F: Field>(
     client: &Client,
     live: &mut LiveRoleController,
     epoch: Epoch,
     beacon: &BeaconSeed,
-    setpoint: &watch::Receiver<Demand>,
+    capacity: Demand,
     roles_tx: &watch::Sender<RoleSet>,
 ) {
     let members = build_capability_directory::<F>(client, epoch).await;
-    let want = *setpoint.borrow();
-    let roles = live.step(&members, epoch, beacon, want);
+    let setpoint = build_cell_setpoint::<F>(client, epoch, capacity).await;
+    let roles = live.step(&members, epoch, beacon, setpoint);
     let _ = roles_tx.send(roles);
 }
 
