@@ -56,8 +56,17 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
 - [ ] Residual: dynamic actuation — Node::start behaviors react to the assigned `RoleSet` (start/stop as it
       rotates), replacing the fixed `config.roles` gating; feed reputation from the diagnosis.
 
-**B · L0 live multi-cell orchestration** — cross-cell relay (A→bridge→B) + parent attestation across real cells;
-executed-`state_root` history in the header for light clients.
+**B · L0 live multi-cell orchestration — live single-cell DONE (2026-07-22); multi-cell residual.**
+- [x] **Live TAXIS over real QUIC** (`3ac8cfc`) — `fanos_node::spawn_taxis`: side-car driver bridging the
+      sans-I/O `ConsensusEngine` to a node's `Client` (App-`0x70`-frame receive via the new `Notification::App`
+      seam `b7fb4e9`; broadcast fan-out + self-delivery; Tick/Timeout; ledger snapshot). A crypto-free drainer
+      task makes the lossy `subscribe()` broadcast lossless for the engine (fixed finality stalls). Real 7-node
+      QUIC test: seal→propose→prepare→commit→reveal→execute an anti-MEV tx to unanimous ledger agreement, ~2s.
+- [x] **Live checkpoint publishing** (`c97ddc6`) — `spawn_checkpoint_publisher` publishes each new
+      `ExecCertificate` to the cell's `crosscell_dir` slot; the test resolves + verifies it (cross-cell producer).
+- [ ] Residual: the full multi-cell loop (two real TAXIS cells, parent `attest_children` over live children);
+      `Node::start` config wiring (a runnable `fanos` consensus node); executed-`state_root` history in the header
+      for light clients; per-epoch committee rotation (the driver runs a fixed epoch — beacon sub is wired).
 **C · TAXIS residuals — ✅ DONE (2026-07-22).**
 - [x] Wire fee/reward distribution (`564c789`) — `Output::Reward`, `distribute` among commit-cert signers.
 - [x] In-engine DA sampling (`c9e5c63`) — `Input::Propose` carries sampled `DaShards`; `on_propose` verifies
