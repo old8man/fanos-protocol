@@ -25,6 +25,9 @@ extern crate alloc;
 
 pub mod beacon;
 pub mod dkg;
+/// A post-quantum, hash-based Merkle-VRF for the bounded epoch domain (spec §16 `[P]`, an alternative to the
+/// classical ristretto VRF above). See [`pqvrf`] and `docs/design-pq-vrf.md`.
+pub mod pqvrf;
 pub mod vss;
 
 use alloc::vec::Vec;
