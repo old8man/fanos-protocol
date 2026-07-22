@@ -1,0 +1,23 @@
+[package]
+name = "fanos-obolos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OBOLOS — the FANOS private, untraceable, post-quantum currency: a shielded note pool (SKIA) with lattice value commitments, a Merkle commitment tree, and nullifiers (spec/platform.md §4)."
+keywords = ["privacy", "post-quantum", "currency", "shielded", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+# BLAKE3 labeled hashing for the commitment tree, note commitments, and nullifiers.
+fanos-primitives = { workspace = true, default-features = false }
+
+[features]
+default = ["std"]
+std = ["alloc", "fanos-primitives/std"]
+alloc = ["fanos-primitives/alloc"]
+
+[lints]
+workspace = true
