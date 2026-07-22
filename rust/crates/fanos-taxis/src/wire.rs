@@ -57,8 +57,9 @@ mod tests {
         let msg = ConsensusMsg::Vote(SignedVote::sign(vote, &signer));
         assert_eq!(from_frame(&to_frame(&msg)), Some(msg));
 
-        // Reveal.
-        let reveal = ConsensusMsg::Reveal(RevealMsg { commit: [5u8; 32], member: 2, share: vec![7u8; 33] });
+        // Reveal (authenticated — signed by the revealing member's key).
+        let reveal =
+            ConsensusMsg::Reveal(RevealMsg::signed([5u8; 32], 2, vec![7u8; 33], &signer));
         assert_eq!(from_frame(&to_frame(&reveal)), Some(reveal));
     }
 

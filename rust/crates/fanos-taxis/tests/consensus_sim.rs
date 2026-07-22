@@ -15,8 +15,15 @@ use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::committee::{epoch_seal_line, leader, line_members};
-use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
+use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output, RevealMsg};
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
+
+/// A Shamir share serialized as the reveal wire carries it: `x(1) ‖ y`.
+fn share_bytes(x: u8, y: &[u8]) -> Vec<u8> {
+    let mut v = vec![x];
+    v.extend_from_slice(y);
+    v
+}
 
 const N: usize = 7;
 const SEED: BeaconSeed = BeaconSeed::new([0x11; 32]);
@@ -52,6 +59,10 @@ struct Cluster {
     committed: Vec<Vec<(u64, [u8; 32])>>,
     crashed: Vec<bool>,
     withholding: BTreeSet<u8>,
+    /// Validators that never receive block bodies (Propose), to exercise the commit-cert-before-body path.
+    deaf_propose: BTreeSet<usize>,
+    /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
+    proposed: Vec<Block>,
 }
 
 impl Cluster {
@@ -79,6 +90,8 @@ impl Cluster {
             committed: vec![Vec::new(); N],
             crashed: vec![false; N],
             withholding: BTreeSet::new(),
+            deaf_propose: BTreeSet::new(),
+            proposed: Vec::new(),
         }
     }
 
@@ -103,8 +116,18 @@ impl Cluster {
     }
 
     fn deliver(&mut self, msg: &ConsensusMsg) {
+        if let ConsensusMsg::Propose(b) = msg
+            && !self.proposed.iter().any(|p| p.hash() == b.hash())
+        {
+            self.proposed.push(b.clone());
+        }
         for i in 0..N {
             if self.crashed[i] {
+                continue;
+            }
+            // A validator deaf to proposals still receives votes/reveals — it can gather a commit certificate
+            // without ever seeing the body (the async case the wedge-fix must survive).
+            if matches!(msg, ConsensusMsg::Propose(_)) && self.deaf_propose.contains(&i) {
                 continue;
             }
             let input = match msg {
@@ -115,6 +138,12 @@ impl Cluster {
             let outs = self.engines[i].step(input);
             self.collect(i, outs);
         }
+    }
+
+    /// Push one message onto the bus and drain to quiescence (for injecting an adversary's message).
+    fn inject(&mut self, msg: ConsensusMsg) {
+        self.bus.push_back(msg);
+        self.run();
     }
 
     /// Drain the bus to quiescence.
@@ -496,4 +525,114 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
         progress_trials * 2 > trials,
         "only {progress_trials}/{trials} trials progressed — liveness suspiciously low"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Adversarial regression tests for the independent-audit fixes (anti-MEV execution layer).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Audit CRITICAL 1 (Attack A — censorship by reveal-poisoning): an unprivileged attacker broadcasts a garbage
+/// share for a transaction's commitment *before* it finalizes, trying to poison reconstruction so the validly
+/// ordered transfer is dropped from execution. Authenticated reveals defeat it — the forgery (signed by a
+/// non-committee key) is buffered, then rejected on finalize, and the transfer executes on every replica.
+#[test]
+fn a_forged_reveal_cannot_censor_a_finalized_transaction() {
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"censor");
+    let commit = tx.commit();
+    let members = line_members(epoch_seal_line(&SEED, EPOCH));
+    let keys = gen_keys();
+    // A validator NOT on the keyper line forges member 0's slot (x = 1) with garbage, signed by its own key.
+    let attacker = (0..N as u8).find(|v| !members.contains(&(*v as usize))).unwrap();
+    let forged = RevealMsg::signed(commit, members[0] as u8, share_bytes(1, &[0x55; 32]), &keys[attacker as usize].sig);
+    c.inject(ConsensusMsg::Reveal(forged)); // no block finalized yet ⇒ buffered as a pending reveal
+    c.submit_all(&tx);
+    c.tick();
+    // Not censored: every replica finalized and executed the transfer, and all agree on the state root.
+    assert_eq!(c.hashes_at(0).len(), 1, "agreement at height 0");
+    let root = c.engines[0].chain().state_root();
+    for e in &c.engines {
+        assert_eq!(e.chain().state().balance(&BOB), 100, "a forged reveal must not censor the transfer");
+        assert_eq!(e.chain().state_root(), root, "no executed-state fork");
+    }
+}
+
+/// Audit CRITICAL 1 (fix #3 — t-subset open): a genuine keyper committee member turns Byzantine and reveals a
+/// validly-signed but off-polynomial (garbage) share. Because reconstruction now tries t-subsets and accepts
+/// the first whose AEAD tag authenticates, the honest 2-of-3 subset still decrypts the transaction — the lone
+/// bad share cannot poison it.
+#[test]
+fn a_byzantine_committee_members_garbage_share_does_not_block_decryption() {
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 77, nonce: 0 }, b"byz-share");
+    let commit = tx.commit();
+    let members = line_members(epoch_seal_line(&SEED, EPOCH));
+    let keys = gen_keys();
+    // Keyper member 0 signs a GARBAGE share at its own correct x-coordinate (x = 1) — a well-formed forgery
+    // that authentication cannot catch, injected before finality so first-writer-wins records it at slot 0.
+    let byz = members[0] as u8;
+    let forged = RevealMsg::signed(commit, byz, share_bytes(1, &[0xAB; 32]), &keys[byz as usize].sig);
+    c.inject(ConsensusMsg::Reveal(forged));
+    c.submit_all(&tx);
+    c.tick();
+    // The honest {member 1, member 2} subset decrypts it on every replica.
+    let root = c.engines[0].chain().state_root();
+    for e in &c.engines {
+        assert_eq!(e.chain().state().balance(&BOB), 77, "the t-subset open must route around the bad share");
+        assert_eq!(e.chain().state_root(), root, "no fork");
+    }
+}
+
+/// Audit CRITICAL 2 (unvalidated seal → permanent halt): a client submits a transaction sealed to the WRONG
+/// committee line (not the epoch's beacon keyper line). It is refused admission at both `submit` and
+/// `on_propose`, so it can never be ordered into a block to stall execution behind an undecryptable tx.
+#[test]
+fn a_transaction_sealed_to_the_wrong_keyper_line_is_refused() {
+    let mut c = Cluster::new(&genesis());
+    let right = epoch_seal_line(&SEED, EPOCH);
+    let wrong = (0..7usize).find(|&l| l != right).unwrap();
+    let members = line_members(wrong);
+    let member_keys: Vec<&HybridKemPublic> = members.iter().map(|&m| &c.kem_dir[m]).collect();
+    let tx = SealedTx::seal(
+        &Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx(),
+        EPOCH,
+        wrong as u8,
+        &member_keys,
+        CellParams::FANO.seal_threshold(),
+        b"wrong-line",
+    )
+    .unwrap();
+    c.submit_all(&tx);
+    c.tick();
+    // The chain still advances (an empty block), but the malformed transaction never executes — no halt.
+    assert_eq!(c.honest_count_at(0), N, "the cluster still finalizes height 0");
+    for e in &c.engines {
+        assert_eq!(e.chain().state().balance(&BOB), 0, "a wrong-line seal must never execute");
+    }
+}
+
+/// Audit HIGH 3 (commit-cert-before-body wedge): a lagging validator gathers a full commit certificate for a
+/// height whose block body it never received (an async scheduler dropped the proposal to it). It must not wedge
+/// — it holds the decision and finalizes the instant the body is delivered.
+#[test]
+fn a_validator_finalizes_when_the_body_arrives_after_the_commit_certificate() {
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 5, nonce: 0 }, b"late-body");
+    // Pick an honest non-leader to be deaf to the height-0 proposal.
+    let ldr = leader(&SEED, 0, 0) as usize;
+    let deaf = (0..N).find(|&i| i != ldr).unwrap();
+    c.deaf_propose.insert(deaf);
+    c.submit_all(&tx);
+    c.tick();
+    // The deaf validator saw every vote (a commit certificate) but no body ⇒ it has NOT finalized height 0.
+    assert!(!c.committed[deaf].iter().any(|&(h, _)| h == 0), "deaf validator must be pending, not finalized");
+    assert_eq!(c.honest_count_at(0), N - 1, "the other six finalized");
+    // Now hand-deliver the withheld body; the deaf validator finalizes from its held certificate.
+    let body = c.proposed.iter().find(|b| b.header.height == 0).cloned().expect("a height-0 body was proposed");
+    let outs = c.engines[deaf].step(Input::Propose { block: body, present: 0x7F });
+    c.collect(deaf, outs);
+    c.run();
+    assert!(c.committed[deaf].iter().any(|&(h, _)| h == 0), "the body's arrival unblocks finalization");
+    assert_eq!(c.hashes_at(0).len(), 1, "it finalized the same block — no fork");
+    assert_eq!(c.engines[deaf].chain().state().balance(&BOB), 5, "and it executes the transfer");
 }
