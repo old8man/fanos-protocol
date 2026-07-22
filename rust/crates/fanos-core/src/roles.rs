@@ -177,24 +177,100 @@ impl Demand {
         }
     }
 
-    /// **Homeostatic rebalance** (self-balancing) — a proportional controller. `served[ρ]` is the load ratio
-    /// the cell's telemetry observed last epoch, in tenths (`10` = at capacity, `>10` = congested, `<10` =
-    /// slack); `eligible[ρ]` is how many nodes *can* serve `ρ` (the supply ceiling). Demand rises toward the
-    /// supply ceiling when a role is congested and relaxes toward a floor when it is slack, by the proportional
-    /// step `Dρ' = clamp(round(Dρ · served/10), floor, eligible)`. This mirrors the DDoS dissipation law: a
-    /// bounded, monotone response to a measured deficit, never an unbounded or oscillating one.
+    /// The per-role **eligible supply** — how many members can serve each role (the demand ceiling).
     #[must_use]
-    pub fn rebalance(self, served: Demand, eligible: Demand, floor: Demand) -> Demand {
-        let step = |d: u16, load: u16, elig: u16, fl: u16| -> u16 {
-            let scaled = (u32::from(d) * u32::from(load.max(1)) + 5) / 10; // round(d · load/10)
-            (scaled as u16).clamp(fl.min(elig), elig)
+    pub fn supply(members: &[(NodeId, Capability)]) -> Demand {
+        let count = |role: Role| members.iter().filter(|(_, c)| c.offered.has(role)).count() as u16;
+        Demand {
+            relay: count(Role::Relay),
+            storage: count(Role::Storage),
+            service: count(Role::Service),
+            exit: count(Role::Exit),
+        }
+    }
+
+    /// **Homeostatic rebalance** (self-balancing) — a **Lyapunov-descent** proportional controller, grounded in
+    /// the UHM viability dynamics (T-101 minimax under the T-104 ISS envelope; the same shape as the DDoS
+    /// dissipation homeostat). It steps the current demand toward a `setpoint` — the *desired* active count the
+    /// driver derives from telemetry (e.g. `⌈observed_load / per_node_capacity⌉`, the demand that would bring
+    /// each role to capacity). `gain_seventh` sets the loop gain `κ = gain_seventh/7`, **clamped to `[1, 7]` so
+    /// `κ ∈ [κ_bootstrap = 1/7, 1]`** — the UHM bound under which the pull toward the setpoint never vanishes and
+    /// never overshoots.
+    ///
+    /// The step is `D'ρ = Dρ + κ·(setpointρ − Dρ)` (rounded to at least ±1 of progress when `Dρ ≠ setpointρ`,
+    /// and never past it since `κ ≤ 1`), then floored at `floorρ`. Because the step lands strictly between `Dρ`
+    /// and the setpoint, the error `V = (Dρ − setpointρ)²` **contracts by `(1 − κ)²` per step** — a strict
+    /// Lyapunov descent to the setpoint (mirroring `fanos_diakrisis::stability::excursion_step`); with a moving
+    /// setpoint (changing load) it is the ISS envelope `√V' ≤ (1−κ)√V + ‖drift‖`. The demand is *not* capped at
+    /// the eligible supply — a setpoint above supply is a real, unmet want, surfaced as the deficit
+    /// ([`assign_report`]) the cell escalates to its parent.
+    #[must_use]
+    pub fn rebalance(self, setpoint: Demand, floor: Demand, gain_seventh: u8) -> Demand {
+        let k = i64::from(gain_seventh.clamp(1, 7)); // κ = k/7 ∈ [1/7, 1]
+        let step = |d: u16, target: u16, fl: u16| -> u16 {
+            let target = i64::from(target);
+            let d = i64::from(d);
+            // Proportional step κ(setpoint−D); rounds to at least ±1 of progress when D ≠ setpoint (κ ≤ 1 ⇒ no
+            // overshoot).
+            let mut delta = k * (target - d) / 7;
+            if delta == 0 && target != d {
+                delta = if target > d { 1 } else { -1 };
+            }
+            let next = (d + delta).clamp(0, i64::from(u16::MAX)) as u16;
+            next.max(fl)
         };
         Demand {
-            relay: step(self.relay, served.relay, eligible.relay, floor.relay),
-            storage: step(self.storage, served.storage, eligible.storage, floor.storage),
-            service: step(self.service, served.service, eligible.service, floor.service),
-            exit: step(self.exit, served.exit, eligible.exit, floor.exit),
+            relay: step(self.relay, setpoint.relay, floor.relay),
+            storage: step(self.storage, setpoint.storage, floor.storage),
+            service: step(self.service, setpoint.service, floor.service),
+            exit: step(self.exit, setpoint.exit, floor.exit),
         }
+    }
+}
+
+/// The UHM viability gain floor `κ_bootstrap = 1/7`, expressed in sevenths as `1` — the smallest loop gain the
+/// [`RoleController`] uses, under which the pull toward the demand setpoint never vanishes (T-59/T-104).
+pub const GAIN_BOOTSTRAP_SEVENTHS: u8 = 1;
+
+/// A **sans-I/O self-organizing role controller** — one per cell. Each epoch it rebalances its demand from the
+/// observed per-role load (the homeostatic, Lyapunov-descent [`Demand::rebalance`]) and re-assigns roles over
+/// the cell's current members ([`assign_report`]). It touches no clock, socket, or RNG — a driver feeds it the
+/// members, the beacon, and the load telemetry each beacon round, exactly like every other FANOS engine, so the
+/// identical controller runs under the simulator and a live node.
+#[derive(Clone, Debug)]
+pub struct RoleController {
+    demand: Demand,
+    floor: Demand,
+    gain_seventh: u8,
+}
+
+impl RoleController {
+    /// A controller starting at `initial` demand, never dropping a role below `floor`, with loop gain
+    /// `κ = gain_seventh/7` (clamped to `[1/7, 1]`).
+    #[must_use]
+    pub fn new(initial: Demand, floor: Demand, gain_seventh: u8) -> Self {
+        Self { demand: initial, floor, gain_seventh: gain_seventh.clamp(1, 7) }
+    }
+
+    /// The controller's current demand (its internal state).
+    #[must_use]
+    pub fn demand(&self) -> Demand {
+        self.demand
+    }
+
+    /// One epoch of the loop: step the demand toward the telemetry-derived `setpoint` (the Lyapunov-descent
+    /// [`Demand::rebalance`]), then assign roles over `members` for `(epoch, beacon)`. Returns the
+    /// [`AssignReport`] — each node's roles (`min(demand, eligible)` filled) plus the per-role deficit the cell
+    /// escalates to its parent when the demand exceeds the eligible supply. Pure, deterministic, sans-I/O.
+    pub fn step(
+        &mut self,
+        members: &[(NodeId, Capability)],
+        epoch: Epoch,
+        beacon: &BeaconSeed,
+        setpoint: Demand,
+    ) -> AssignReport {
+        self.demand = self.demand.rebalance(setpoint, self.floor, self.gain_seventh);
+        assign_report(members, epoch, beacon, self.demand)
     }
 }
 
@@ -417,16 +493,66 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_raises_congested_and_relaxes_slack_demand() {
+    fn rebalance_steps_toward_the_setpoint() {
         let d = Demand { relay: 4, storage: 4, ..Default::default() };
-        let eligible = Demand { relay: 10, storage: 10, service: 10, exit: 10 };
         let floor = Demand { relay: 1, storage: 1, service: 1, exit: 1 };
-        // Relay congested (load 20 = 2× capacity) → demand rises; storage slack (load 5) → demand falls.
-        let served = Demand { relay: 20, storage: 5, ..Default::default() };
-        let next = d.rebalance(served, eligible, floor);
-        assert!(next.relay > d.relay, "a congested role's demand rises ({} → {})", d.relay, next.relay);
-        assert!(next.storage < d.storage, "a slack role's demand relaxes ({} → {})", d.storage, next.storage);
-        // Never exceeds the eligible supply, never below the floor.
-        assert!(next.relay <= eligible.relay && next.storage >= floor.storage);
+        // Want more relays, fewer storage: at κ = 1 the demand jumps straight to the setpoint.
+        let setpoint = Demand { relay: 9, storage: 2, ..Default::default() };
+        let next = d.rebalance(setpoint, floor, 7);
+        assert_eq!(next.relay, 9, "κ=1 reaches the raised setpoint");
+        assert_eq!(next.storage, 2, "κ=1 reaches the lowered setpoint");
+        assert!(next.storage >= floor.storage, "never below the floor");
+    }
+
+    #[test]
+    fn the_demand_controller_is_a_lyapunov_contraction() {
+        // Under a FIXED setpoint, the error V = (D − setpoint)² must strictly decrease every step and converge
+        // to the setpoint — the T-104 ISS contraction the UHM viability theory requires (κ = k/7 ∈ [1/7, 1]).
+        let floor = Demand::default();
+        for k in [GAIN_BOOTSTRAP_SEVENTHS, 3, 7] {
+            let target = 50u16;
+            for &start in &[2u16, 400] {
+                // Approach the same setpoint from below and from above — both must contract monotonically.
+                let mut d = Demand { relay: start, ..Default::default() };
+                let setpoint = Demand { relay: target, ..Default::default() };
+                let mut prev_err = u64::MAX;
+                for _ in 0..256 {
+                    d = d.rebalance(setpoint, floor, k);
+                    let err = u64::from(d.relay.abs_diff(target)).pow(2);
+                    assert!(err <= prev_err, "κ={k}/7 from {start}: Lyapunov error must not increase ({prev_err}→{err})");
+                    prev_err = err;
+                }
+                assert_eq!(d.relay, target, "κ={k}/7 from {start}: converges to the setpoint, no overshoot");
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_controller_runs_the_live_loop() {
+        // The sans-I/O controller: each epoch it steps demand toward the telemetry setpoint and re-assigns
+        // roles. It converges its demand, assigns min(demand, supply), and escalates a genuine shortfall.
+        let members = cell(10, &[Role::Relay], 4); // 10 relay-capable nodes
+        let mut ctrl = RoleController::new(
+            Demand { relay: 2, ..Default::default() },
+            Demand { relay: 1, ..Default::default() },
+            3, // κ = 3/7
+        );
+        // The driver's setpoint: the load wants 6 relays (≤ supply). Demand converges up to 6, assigns 6.
+        let setpoint = Demand { relay: 6, ..Default::default() };
+        let mut last = ctrl.demand().relay;
+        for e in 0..40u64 {
+            let report = ctrl.step(&members, Epoch::new(e), &B, setpoint);
+            let active = report.roles.values().filter(|r| r.has(Role::Relay)).count();
+            assert_eq!(active as u16, ctrl.demand().relay.min(10), "assigns min(demand, supply)");
+            assert!(ctrl.demand().relay >= last, "demand rises monotonically toward the setpoint");
+            assert_eq!(report.deficit.relay, 0, "supply covers this setpoint — no deficit");
+            last = ctrl.demand().relay;
+        }
+        assert_eq!(ctrl.demand().relay, 6, "the controller settles at the setpoint");
+        // A setpoint BEYOND the eligible supply: demand climbs past supply, assigns all 10, escalates the rest.
+        let mut hungry = RoleController::new(Demand { relay: 8, ..Default::default() }, Demand::default(), 7);
+        let report = hungry.step(&members, Epoch::new(0), &B, Demand { relay: 15, ..Default::default() });
+        assert_eq!(report.roles.values().filter(|r| r.has(Role::Relay)).count(), 10, "assigns all it can");
+        assert_eq!(report.deficit.relay, 5, "the 5 relays it wants but cannot fill are escalated to the parent");
     }
 }
