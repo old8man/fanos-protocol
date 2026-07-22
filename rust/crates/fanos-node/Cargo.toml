@@ -81,6 +81,10 @@ tokio = { workspace = true, features = [
 fanos-field = { workspace = true }
 fanos-runtime = { workspace = true }
 fanos-vrf = { workspace = true }
+# The full-platform e2e (tests/dromos_quic.rs): a private OBOLOS transfer executing on the DROMOS hybrid
+# ledger over live TAXIS consensus over real QUIC.
+fanos-obolos = { workspace = true, features = ["std"] }
+fanos-dromos = { workspace = true }
 
 [lints]
 workspace = true
