@@ -15,14 +15,18 @@ categories = ["network-programming"]
 # (`UdpDialer`/`UdpTunnel`) so the VPN and the proxy share one exit-UDP-tunnel abstraction.
 fanos-proxy.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
-# The real OS TUN device adapter, behind the `device` feature (off by default): a safe wrapper over the
-# platform TUN device. The datapath core stays device-agnostic and fully testable without it.
+# The real OS TUN device adapter + the full-tunnel userspace TCP/IP stack, behind the `device` feature (off
+# by default): `tun` is a safe wrapper over the platform device, `ipstack` is the userspace stack that
+# terminates TCP/UDP so full-tunnel mode can bridge each flow to an exit. The lightweight UDP datapath core
+# stays device-/stack-agnostic and fully testable without either.
 tun = { version = "0.8", optional = true, features = ["async"] }
+ipstack = { version = "1.0.1", optional = true }
 
 [features]
-# Compile the real TUN device adapter (`device` module) for a runnable `fanos vpn`. Its device syscalls need
-# root / a TUN and so are runtime-verified only — the datapath core is verified without this feature.
-device = ["dep:tun"]
+# Compile the real TUN device adapter (`device`) and the full-tunnel stack (`fulltunnel`) for a runnable
+# `fanos vpn` (TCP + UDP). The device syscalls + stack are runtime-verified only (need root / a TUN); the
+# lightweight UDP datapath is verified without this feature.
+device = ["dep:tun", "dep:ipstack"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }

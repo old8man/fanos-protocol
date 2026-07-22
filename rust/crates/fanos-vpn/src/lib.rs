@@ -11,11 +11,13 @@
 //!   an exit response into a packet for the TUN.
 //! * [`mux`] — [`run_udp_datapath`], the driver's stateful core: relay flows over per-destination exit
 //!   tunnels (the shared `UdpDialer` seam) and pump responses back, testable with a mock dialer.
-//! * [`driver`] — [`run_vpn`] over a [`TunReader`]/[`TunWriter`] device seam: the full bridge, testable with
-//!   an in-memory device; a real TUN device is a thin adapter implementing those two traits.
+//! * [`driver`] — [`run_vpn`] over a [`TunReader`]/[`TunWriter`] device seam: the lightweight UDP-only
+//!   bridge, testable with an in-memory device (the stack-free option for embedders).
 //!
-//! Remaining: the real TUN device adapter (behind a safe `tun`-crate wrapper in the binary — the OS I/O
-//! shell) and the userspace-TCP full-tunnel mode.
+//! With the **`device`** feature (a runnable `fanos vpn`):
+//! * [`device`] — the real OS TUN adapter over the `tun` crate.
+//! * [`fulltunnel`] — [`run_fulltunnel`], the complete **TCP + UDP** full-tunnel: a userspace TCP/IP stack
+//!   (`ipstack`) terminates each flow and bridges it to an exit via the shared `Dialer`/`UdpDialer` seams.
 
 #![forbid(unsafe_code)]
 
@@ -23,8 +25,13 @@
 pub mod device;
 pub mod driver;
 pub mod engine;
+#[cfg(feature = "device")]
+pub mod fulltunnel;
 pub mod mux;
 pub mod packet;
+
+#[cfg(feature = "device")]
+pub use fulltunnel::run_fulltunnel;
 
 pub use driver::{TunReader, TunWriter, run_vpn};
 pub use engine::{DNS_PORT, FlowKey, VpnAction, classify, response_packet};

@@ -277,12 +277,12 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Run a full-tunnel VPN (spec §11.4, "UDP mode"): capture packets at a TUN device and relay UDP/DNS flows
-/// through a FANOS exit, so system-wide DNS and UDP (QUIC, WebRTC, …) ride the overlay without per-app proxy
-/// config. TCP is not yet tunnelled (a userspace TCP/IP stack is a separate mode) and non-UDP packets are
-/// dropped. Requires an exit (`--exit-via FILE`, or a discoverable one) since every flow leaves through it,
-/// and root / `CAP_NET_ADMIN` for the TUN device. The device is brought up; the operator assigns its address
-/// and route so the kernel steers traffic to it.
+/// Run a full-tunnel VPN (spec §11.4): capture traffic at a TUN device and tunnel every TCP and UDP flow
+/// through a FANOS exit, so system-wide traffic (DNS, QUIC, HTTPS, …) rides the overlay without per-app proxy
+/// config. A userspace TCP/IP stack terminates each flow at the TUN; TCP bridges to a byte-stream exit, UDP
+/// to the exit's UDP tunnel. Requires an exit (`--exit-via FILE`, or a discoverable one) since every flow
+/// leaves through it, and root / `CAP_NET_ADMIN` for the TUN device. The device is brought up; the operator
+/// assigns its address and route so the kernel steers traffic to it.
 #[cfg(feature = "vpn")]
 async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
@@ -312,12 +312,14 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
                 .to_owned(),
         ));
     };
-    // The datapath dials clearnet destinations by IP through the exit's UDP tunnels; it never resolves
-    // `.fanos` names, so an empty resolver suffices.
-    let dialer =
-        FanosDialer::new(node.client(), StaticResolver::new()).with_exit(exit_coord, exit_public);
+    // The datapath dials clearnet destinations by IP through the exit (TCP byte-streams and UDP tunnels); it
+    // never resolves `.fanos` names, so an empty resolver suffices. Shared behind an `Arc` — the full-tunnel
+    // stack spawns a per-flow bridge task, each needing `&D`.
+    let dialer = Arc::new(
+        FanosDialer::new(node.client(), StaticResolver::new()).with_exit(exit_coord, exit_public),
+    );
 
-    let (reader, writer) = fanos_vpn::device::open(&tun_name).map_err(|e| {
+    let device = fanos_vpn::device::open_tun(&tun_name).map_err(|e| {
         NodeError::Config(format!(
             "opening the TUN device failed ({e}) — root / CAP_NET_ADMIN is required"
         ))
@@ -327,8 +329,8 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
     let [ex, ey, ez] = exit_coord;
     let tun_shown = if tun_name.is_empty() { "<auto>" } else { &tun_name };
     eprintln!(
-        "fanos vpn up — coordinate {x}:{y}:{z}, TUN '{tun_shown}', UDP/DNS via exit {ex}:{ey}:{ez}\n  \
-         (UDP mode: TCP is dropped; assign the TUN an address + route to capture traffic)"
+        "fanos vpn up — coordinate {x}:{y}:{z}, TUN '{tun_shown}', TCP+UDP full-tunnel via exit \
+         {ex}:{ey}:{ez}\n  (assign the TUN an address + route so the kernel steers traffic to it)"
     );
     info!(coord = ?node.address(), tun = %tun_name, "fanos vpn up");
 
@@ -337,7 +339,7 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
         info!("shutdown signal received");
     };
     tokio::select! {
-        () = fanos_vpn::run_vpn(reader, writer, dialer) => {}
+        () = fanos_vpn::run_fulltunnel(device, dialer) => {}
         () = shutdown => {}
         () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
     }
@@ -680,7 +682,7 @@ fn print_help() {
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
          \x20             [--bootstrap ...] [--listen ADDR]\n\
          \x20 fanos vpn   [--tun NAME] [--exit-via FILE] [--epoch N] [--config FILE] [--bootstrap ...]\n\
-         \x20             (UDP mode: tunnels DNS/UDP through an exit; needs --features vpn + root)\n\
+         \x20             (full-tunnel: routes all TCP+UDP through an exit; needs --features vpn + root)\n\
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos help\n\

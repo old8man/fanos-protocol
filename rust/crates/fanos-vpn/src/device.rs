@@ -38,16 +38,26 @@ pub struct TunDeviceWriter {
 /// Propagates the device-creation error — most often insufficient privilege (needs root / `CAP_NET_ADMIN`),
 /// or the requested name is unavailable.
 pub fn open(name: &str) -> io::Result<(TunDeviceReader, TunDeviceWriter)> {
+    let device = Arc::new(open_tun(name)?);
+    Ok((
+        TunDeviceReader { device: Arc::clone(&device), buf: vec![0u8; MAX_PACKET] },
+        TunDeviceWriter { device },
+    ))
+}
+
+/// Open the raw async TUN device `name` (or OS-assigned when empty), brought up. The returned
+/// [`AsyncDevice`] is `AsyncRead + AsyncWrite`, ready to hand to the full-tunnel stack
+/// ([`run_fulltunnel`](crate::run_fulltunnel)). The caller assigns its address/route.
+///
+/// # Errors
+/// Propagates the device-creation error (typically insufficient privilege).
+pub fn open_tun(name: &str) -> io::Result<AsyncDevice> {
     let mut config = tun::Configuration::default();
     if !name.is_empty() {
         config.tun_name(name);
     }
     config.up();
-    let device = Arc::new(tun::create_as_async(&config).map_err(io::Error::other)?);
-    Ok((
-        TunDeviceReader { device: Arc::clone(&device), buf: vec![0u8; MAX_PACKET] },
-        TunDeviceWriter { device },
-    ))
+    tun::create_as_async(&config).map_err(io::Error::other)
 }
 
 impl TunReader for TunDeviceReader {

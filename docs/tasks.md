@@ -18,12 +18,8 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ⬜ Next up (frontier, roughly by priority)
 
-- **`fanos vpn` / TUN — TCP mode** (Phase 5) — **UDP mode is runnable** (`fanos vpn --features vpn`: crate
-  `fanos-vpn` codec/engine/mux/driver + a real `tun` device adapter + the CLI wiring a `FanosDialer`-with-
-  exit). Remaining: full-tunnel **TCP mode** — a userspace TCP/IP stack (smoltcp-class) to bridge TUN TCP
-  packets ↔ an exit byte-stream (`dial_exit`); a major subsystem (tun2socks-class), not a quick slice.
 - **Maekawa W∩R quorum** — strict linearizability over the L4 store (optional polish; LWW already gives
-  consistent reads).
+  consistent reads). The one remaining frontier item — and optional.
 
 > **VOPRF credit settlement** (Phase 4) is **already implemented + tested**, not a gap: the ristretto255
 > VOPRF primitive (`fanos-incentives`: blind→DLEQ→unblind, context-bound redemption B8, deterministic nonce
@@ -34,6 +30,13 @@ when it lands. Completed tasks are removed — full history is in `git log`. Leg
 
 ## ✅ Landed this session (2026-07-21) — pruned as they age
 
+**`fanos vpn` FULL-TUNNEL (TCP + UDP) — the VPN is complete** (Phase 5, §11.4) — `fulltunnel::run_fulltunnel`
+(feature `device`): a userspace TCP/IP stack (`ipstack`) terminates every TCP/UDP flow at the TUN and bridges
+it to a FANOS exit — TCP over `Dialer::dial` + `copy_bidirectional`, UDP over `dial_udp` — reusing the exact
+`Dialer`/`UdpDialer` seams the SOCKS5 proxy uses (same `FanosDialer`-with-exit). The `fanos vpn` CLI now runs
+full-tunnel; `--features vpn`. ipstack does the TCP state machine, so the bridge is thin glue; clean clippy
+both with and without the feature, default 13 tests unchanged. The hand-rolled UDP datapath stays as the
+stack-free lightweight alternative. Full-tunnel completes Phase 5. ·
 **VPN datapath engine — the UDP/DNS mode** (Phase 5, §11.4) — NEW crate `fanos-vpn`: the sans-I/O routing
 brain of `fanos vpn`, following the node's engine/driver split. An IPv4/UDP packet codec (`packet.rs`:
 parse + build with valid IPv4-header and pseudo-header UDP checksums, index-free parsing) and the flow
