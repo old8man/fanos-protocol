@@ -608,4 +608,50 @@ mod tests {
             "any t of the DKG group's partials yield the same beacon seed"
         );
     }
+
+    #[test]
+    fn the_beacon_is_continuous_across_a_verifiable_resharing() {
+        // The R-C1 recovery property: when a depleted anchor set is reconstituted by verifiable secret
+        // redistribution, the DVRF *output* is unchanged, so the epoch clock and every seed folded from it
+        // continue without a hiccup — no re-DKG, no seed discontinuity, no downstream re-derivation.
+        use crate::vss::{ReshareDealing, combine_reshares, reshare, verify_reshare};
+
+        // Original 4-of-7 anchor sharing; the epoch's beacon output is x·M(epoch).
+        let (old_shares, old_c, _) = shared(b"beacon-reshare", 4, 7);
+        let epoch = Epoch::new(5);
+        let seed_before = combine(
+            &old_shares
+                .iter()
+                .map(|s| partial_eval(s, epoch))
+                .collect::<Vec<_>>(),
+            4,
+        )
+        .unwrap()
+        .seed(epoch);
+
+        // A surviving quorum of exactly t = 4 anchors redistributes the key to a FRESH set of 5 anchors at a
+        // new threshold t' = 3 — the secret is never assembled, and each contribution binds to its real old
+        // share against the old commitment.
+        let new_indices = [20u8, 21, 22, 23, 24];
+        let dealings: Vec<ReshareDealing> = old_shares[..4]
+            .iter()
+            .map(|s| reshare(s, 3, &new_indices, &mut DeterministicRng::new(&[s.index()])).unwrap())
+            .collect();
+        assert!(dealings.iter().all(|d| verify_reshare(d, &old_c)));
+        let new: Vec<(VssShare, VssCommitment)> = new_indices
+            .iter()
+            .map(|&j| combine_reshares(j, &dealings).unwrap())
+            .collect();
+        let new_c = new[0].1.clone();
+
+        // The NEW anchors' partials verify against the NEW commitment, and any t' = 3 of them combine to the
+        // IDENTICAL beacon seed — the group key and the DVRF value are literally unchanged.
+        let new_partials: Vec<_> = new.iter().map(|(s, _)| partial_eval(s, epoch)).collect();
+        assert!(new_partials.iter().all(|p| verify_partial(p, epoch, &new_c)));
+        assert_eq!(
+            combine(&new_partials, 3).unwrap().seed(epoch),
+            seed_before,
+            "the beacon output is continuous across the verifiable reshare"
+        );
+    }
 }

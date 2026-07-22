@@ -237,12 +237,32 @@ pub fn deal<R: RngCore + CryptoRng>(
     shares: usize,
     rng: &mut R,
 ) -> Option<(Vec<VssShare>, VssCommitment)> {
-    if threshold == 0 || threshold > shares || shares > 255 {
+    if shares > 255 {
+        return None;
+    }
+    let indices: Vec<u8> = (1..=shares as u8).collect();
+    deal_scalar(Scalar::from_bytes_mod_order(*secret), threshold, &indices, rng)
+}
+
+/// Deal a secret **scalar** into shares at the given evaluation `indices`, any `threshold` of which
+/// reconstruct it — the shared core of [`deal`] (indices `1..=n`, secret reduced from bytes) and
+/// [`reshare`] (indices = the *new* holder set, secret = an *old* holder's share). Returns `None` on a
+/// nonsensical shape (`1 ≤ t ≤ |indices| ≤ 255`, and no index `0`, which would expose the secret directly).
+fn deal_scalar<R: RngCore + CryptoRng>(
+    secret: Scalar,
+    threshold: usize,
+    indices: &[u8],
+    rng: &mut R,
+) -> Option<(Vec<VssShare>, VssCommitment)> {
+    if threshold == 0 || threshold > indices.len() || indices.len() > 255 {
+        return None;
+    }
+    if indices.contains(&0) {
         return None;
     }
     // Polynomial f(x) = a_0 + a_1 x + … + a_{t-1} x^{t-1}, with a_0 = secret.
     let mut coeffs = Vec::with_capacity(threshold);
-    coeffs.push(Scalar::from_bytes_mod_order(*secret));
+    coeffs.push(secret);
     for _ in 1..threshold {
         coeffs.push(Scalar::random(rng));
     }
@@ -252,8 +272,9 @@ pub fn deal<R: RngCore + CryptoRng>(
             .map(|a| a * RISTRETTO_BASEPOINT_POINT)
             .collect(),
     };
-    let out = (1..=shares as u8)
-        .map(|index| {
+    let out = indices
+        .iter()
+        .map(|&index| {
             let x = Scalar::from(u64::from(index));
             // Horner evaluation of f(index).
             let mut acc = Scalar::ZERO;
@@ -314,6 +335,118 @@ pub fn reconstruct(shares: &[VssShare]) -> Option<[u8; 32]> {
         .map(|(s, c)| c * s.value)
         .sum();
     Some(secret.to_bytes())
+}
+
+/// One old holder's contribution to a **verifiable secret redistribution** (Desmedt–Jajodia / proactive
+/// VSS): a fresh degree-`(t'−1)` polynomial `gᵢ` with `gᵢ(0) = sᵢ` (the holder's own share), materialised as
+/// its public Feldman commitment `Dᵢ` and one sub-share `gᵢ(j)` for each new holder `j`. Redistributing the
+/// beacon key this way — from a depleted old anchor set to a fresh set at a new threshold — is what lets the
+/// epoch clock survive anchor churn without ever exposing the secret or changing the group key (audit R-C1).
+///
+/// **Not `Copy`, redacted `Debug`** (audit #124): it carries raw secret sub-shares.
+#[derive(Clone)]
+pub struct ReshareDealing {
+    old_index: u8,
+    commitment: VssCommitment,
+    subshares: Vec<VssShare>,
+}
+
+impl core::fmt::Debug for ReshareDealing {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReshareDealing")
+            .field("old_index", &self.old_index)
+            .field("commitment", &self.commitment)
+            .field("subshares", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ReshareDealing {
+    /// The old holder (evaluation index) that produced this contribution.
+    #[must_use]
+    pub fn old_index(&self) -> u8 {
+        self.old_index
+    }
+
+    /// The public Feldman commitment `Dᵢ` to `gᵢ` (its constant term is `sᵢ·G`). Broadcast; verifiable by all.
+    #[must_use]
+    pub fn commitment(&self) -> &VssCommitment {
+        &self.commitment
+    }
+
+    /// This contribution's sub-share for new holder `new_index` (`gᵢ(new_index)`), if present. Delivered
+    /// privately to that holder, who checks it against [`commitment`](Self::commitment) via [`verify_share`].
+    #[must_use]
+    pub fn subshare_for(&self, new_index: u8) -> Option<&VssShare> {
+        self.subshares.iter().find(|s| s.index == new_index)
+    }
+}
+
+/// An old holder re-shares its `share` to the `new_indices` holder set at a fresh `new_threshold`. The new
+/// polynomial's constant term is fixed to this share's value (`gᵢ(0) = sᵢ`), so the redistribution preserves
+/// the dealt secret. Returns `None` on a nonsensical shape (`1 ≤ t' ≤ |new_indices| ≤ 255`, indices non-zero).
+#[must_use]
+pub fn reshare<R: RngCore + CryptoRng>(
+    share: &VssShare,
+    new_threshold: usize,
+    new_indices: &[u8],
+    rng: &mut R,
+) -> Option<ReshareDealing> {
+    let (subshares, commitment) = deal_scalar(share.value, new_threshold, new_indices, rng)?;
+    Some(ReshareDealing {
+        old_index: share.index,
+        commitment,
+        subshares,
+    })
+}
+
+/// Verify a resharing contribution end to end: (1) `Dᵢ`'s constant term equals the old holder's public share
+/// `sᵢ·G` derived from the **old** commitment — binding `gᵢ(0)` to the real share, so a contributor cannot
+/// redistribute a *wrong* secret — and (2) every emitted sub-share verifies against `Dᵢ` (Feldman). A holder
+/// that only holds its own sub-share checks (1) here (`old_commitment`) and (2) via [`verify_share`] directly.
+#[must_use]
+pub fn verify_reshare(dealing: &ReshareDealing, old_commitment: &VssCommitment) -> bool {
+    dealing.commitment.commitment_point() == old_commitment.public_share(dealing.old_index)
+        && dealing
+            .subshares
+            .iter()
+            .all(|s| verify_share(s, &dealing.commitment))
+}
+
+/// Combine `≥ t` **validated** resharing contributions into new holder `new_index`'s share of the
+/// redistributed secret, and (identically, from public data) the new group commitment.
+///
+/// With `f'(x) = Σᵢ λᵢ(0)·gᵢ(x)` over the contributors' old indices, the new share is `f'(new_index)` and the
+/// new commitment is `Σᵢ λᵢ(0)·Dᵢ`. Because `Σᵢ λᵢ(0)·sᵢ = f(0)` (Lagrange interpolation of the *old* sharing
+/// at 0), the redistributed secret and the group key `C'₀ = f(0)·G` are **unchanged** — so a partial from the
+/// new share verifies against the new commitment and the beacon output is continuous across the reshare.
+///
+/// **Precondition:** the `dealings` must come from `≥` the old threshold `t` **distinct** old holders (else
+/// the interpolation does not recover `f(0)`), and every new holder must combine the **same** canonical
+/// contributor set (so all new shares lie on one `f'`). Returns `None` if the set is empty, has a duplicate
+/// old index, mixes commitment degrees, or is missing a sub-share for `new_index`.
+#[must_use]
+pub fn combine_reshares(
+    new_index: u8,
+    dealings: &[ReshareDealing],
+) -> Option<(VssShare, VssCommitment)> {
+    let old_indices: Vec<u8> = dealings.iter().map(|d| d.old_index).collect();
+    let lambdas = lagrange_coeffs_at_zero(&old_indices)?;
+    let new_threshold = dealings.first()?.commitment.coeffs.len();
+    let mut value = Scalar::ZERO;
+    let mut coeffs = Vec::with_capacity(new_threshold);
+    coeffs.resize(new_threshold, RistrettoPoint::identity());
+    for (d, &lambda) in dealings.iter().zip(&lambdas) {
+        if d.commitment.coeffs.len() != new_threshold {
+            return None; // all contributions must reshare at the same new threshold
+        }
+        let sub = d.subshare_for(new_index)?;
+        value += lambda * sub.value;
+        for (acc, c) in coeffs.iter_mut().zip(&d.commitment.coeffs) {
+            *acc += lambda * c;
+        }
+    }
+    Some((VssShare { index: new_index, value }, VssCommitment { coeffs }))
 }
 
 #[cfg(test)]
@@ -402,5 +535,74 @@ mod tests {
         let (_, c_lowdeg) = deal(&secret(), 2, 5, &mut DeterministicRng::new(b"agg-d3")).unwrap();
         assert!(VssCommitment::aggregate(&[&c1, &c_lowdeg]).is_none());
         assert!(VssCommitment::aggregate(&[]).is_none());
+    }
+
+    #[test]
+    fn resharing_preserves_the_secret_and_the_group_key() {
+        // An original 4-of-7 sharing.
+        let (old_shares, old_c) = deal(&secret(), 4, 7, &mut DeterministicRng::new(b"reshare-1")).unwrap();
+        let group_key = old_c.commitment_point();
+        let expected = Scalar::from_bytes_mod_order(secret()).to_bytes();
+
+        // A quorum of exactly t = 4 old holders redistribute to a FRESH, smaller anchor set (indices 10..=14)
+        // at a new threshold t' = 3 — the R-C1 move: reconstitute a depleted set from survivors, no secret
+        // ever exposed, no reconstruction of the key at any single point.
+        let new_indices = [10u8, 11, 12, 13, 14];
+        let dealings: Vec<ReshareDealing> = old_shares[..4]
+            .iter()
+            .map(|s| reshare(s, 3, &new_indices, &mut DeterministicRng::new(&[s.index])).unwrap())
+            .collect();
+
+        // Every contribution verifies against the OLD commitment (its g_i(0) is the real old share s_i).
+        assert!(dealings.iter().all(|d| verify_reshare(d, &old_c)));
+
+        // Each new holder combines the canonical quorum into its new share and the (public) new commitment.
+        let new: Vec<(VssShare, VssCommitment)> = new_indices
+            .iter()
+            .map(|&j| combine_reshares(j, &dealings).unwrap())
+            .collect();
+
+        // The new commitment is identical for every holder, and its constant term is the UNCHANGED group key.
+        let c0 = new[0].1.to_bytes();
+        for (s, c) in &new {
+            assert_eq!(c.to_bytes(), c0, "all new holders derive one shared new commitment");
+            assert_eq!(c.commitment_point(), group_key, "the redistribution preserves the group key");
+            assert!(verify_share(s, c), "each new share verifies against the new commitment");
+        }
+
+        // Any t' = 3 of the new shares reconstruct the ORIGINAL secret — continuity end to end.
+        let picked: Vec<VssShare> = new.iter().take(3).map(|(s, _)| s.clone()).collect();
+        assert_eq!(reconstruct(&picked), Some(expected), "the redistributed secret is the original");
+        // Two are not enough (the new threshold really is 3).
+        let two: Vec<VssShare> = new.iter().take(2).map(|(s, _)| s.clone()).collect();
+        assert_ne!(reconstruct(&two), Some(expected));
+    }
+
+    #[test]
+    fn a_reshare_that_lies_about_its_old_share_is_caught() {
+        let (old_shares, old_c) = deal(&secret(), 3, 5, &mut DeterministicRng::new(b"reshare-2")).unwrap();
+        let new_indices = [10u8, 11, 12, 13, 14];
+        // An honest reshare verifies against the old commitment.
+        let good = reshare(&old_shares[0], 3, &new_indices, &mut DeterministicRng::new(b"good")).unwrap();
+        assert!(verify_reshare(&good, &old_c));
+        // A contributor that reshares a DIFFERENT constant term (a wrong "share") is rejected: its D_i[0] no
+        // longer equals the old commitment's public share for its index — so it cannot inject a wrong secret.
+        let mut wrong = old_shares[0].clone();
+        wrong.corrupt(); // s_0 + 1
+        let bad = reshare(&wrong, 3, &new_indices, &mut DeterministicRng::new(b"bad")).unwrap();
+        assert!(!verify_reshare(&bad, &old_c));
+    }
+
+    #[test]
+    fn a_tampered_reshare_subshare_is_caught() {
+        let (old_shares, old_c) = deal(&secret(), 3, 5, &mut DeterministicRng::new(b"reshare-3")).unwrap();
+        let mut d = reshare(&old_shares[0], 3, &[10u8, 11, 12], &mut DeterministicRng::new(b"h")).unwrap();
+        assert!(verify_reshare(&d, &old_c));
+        // A sub-share inconsistent with the contributor's own commitment D_i fails the Feldman check.
+        d.subshares[1].value += Scalar::ONE;
+        assert!(!verify_reshare(&d, &old_c));
+        // The lone honest holder still checks its own sub-share directly (the receiver's view).
+        assert!(verify_share(&d.subshares[0], d.commitment()));
+        assert!(!verify_share(&d.subshares[1], d.commitment()));
     }
 }
