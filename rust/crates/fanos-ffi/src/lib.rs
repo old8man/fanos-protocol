@@ -176,8 +176,14 @@ pub unsafe extern "C" fn fanos_lookup(
     if value.len() > out_cap {
         return FANOS_ERR_BUFFER;
     }
-    // SAFETY: `out` has `out_cap >= value.len()` writable bytes (checked), and the source is a distinct Vec.
-    unsafe { ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+    // Only copy a non-empty value: an empty value with a size-probe call (`out` null, `out_cap` 0) would
+    // otherwise pass a null `dst` to `copy_nonoverlapping`, which is UB even for a zero count. When the value
+    // is empty there is nothing to write and `out_len` (0) already conveys it.
+    if !value.is_empty() {
+        // SAFETY: `out` has `out_cap >= value.len() > 0` writable bytes (checked), and the source is a
+        // distinct Vec — so `out` is non-null here.
+        unsafe { ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+    }
     FANOS_OK
 }
 
@@ -566,6 +572,28 @@ mod tests {
         assert_eq!(rc, FANOS_ERR_NOTFOUND, "an isolated node stores nothing to find");
         // SAFETY: `node` is still live.
         unsafe { fanos_free(node) };
+    }
+
+    #[test]
+    fn lookup_of_an_empty_value_with_a_size_probe_is_safe() {
+        // An empty value probed with a null buffer + zero capacity must not pass a null `dst` to
+        // `copy_nonoverlapping` (UB even for a zero count) — it returns OK with length 0, or NOTFOUND if the
+        // store doesn't serve an empty value; never a crash.
+        let _serial = serial();
+        let node = open_loopback();
+        let key = b"empty-value-key";
+        // SAFETY: `node` is live; `key` is valid; a null value pointer with length 0 is an empty value.
+        unsafe {
+            fanos_publish(node, key.as_ptr(), key.len(), ptr::null(), 0);
+            let mut out_len = usize::MAX;
+            let rc =
+                fanos_lookup(node, key.as_ptr(), key.len(), ptr::null_mut(), 0, &raw mut out_len);
+            assert!(rc == FANOS_OK || rc == FANOS_ERR_NOTFOUND, "a defined result, got {rc}");
+            if rc == FANOS_OK {
+                assert_eq!(out_len, 0, "an empty value reports length 0");
+            }
+            fanos_free(node);
+        }
     }
 
     #[test]
