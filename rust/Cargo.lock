@@ -1243,6 +1243,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-wasm"
+version = "0.1.0"
+dependencies = [
+ "fanos-field",
+ "fanos-geometry",
+ "fanos-primitives",
+ "fanos-vrf",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "fanos-wire"
 version = "0.1.0"
 dependencies = [
