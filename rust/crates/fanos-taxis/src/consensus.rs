@@ -32,6 +32,7 @@ use crate::block::Block;
 use crate::chain::Chain;
 use crate::checkpoint::{ExecCertificate, ExecVote};
 use crate::committee::{epoch_seal_line, leader, line_members};
+use crate::incentive::{detect_equivocation, SlashEvidence};
 use crate::params::CellParams;
 use crate::state::StateMachine;
 use crate::tx::{SealedTx, Transaction, TxCommit};
@@ -268,6 +269,9 @@ pub enum Output {
         /// The finalized block hash.
         block_hash: [u8; 32],
     },
+    /// A validator was caught **equivocating** — a self-contained, verifiable proof (two conflicting signed
+    /// votes at one slot). The driver applies the slash and can gossip the evidence; anyone can re-verify it.
+    Slash(SlashEvidence),
 }
 
 /// One validator's sans-I/O consensus engine over a state machine `S`.
@@ -507,7 +511,14 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if !sv.verify(verifier) {
             return Vec::new(); // bad / forged signature
         }
-        match v.phase {
+        // Equivocation slashing (incentive layer, now operational): if this voter already cast a conflicting
+        // vote at the same slot, surface the self-contained proof so the driver applies the slash `S > 0` the
+        // Nash equilibrium assumes. Both votes are kept (they differ in block_hash, so store_vote retains each).
+        let mut out = Vec::new();
+        if let Some(evidence) = self.find_equivocation(&sv) {
+            out.push(Output::Slash(evidence));
+        }
+        let transitions = match v.phase {
             Phase::Prepare => {
                 self.store_vote(sv);
                 self.check_prepared(v.block_hash, v.round)
@@ -516,7 +527,34 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 self.store_vote(sv);
                 self.check_committed(v.block_hash)
             }
-        }
+        };
+        out.extend(transitions);
+        out
+    }
+
+    /// Scan the vote's phase bucket for a **conflicting** vote from the same validator at the same
+    /// `(height, round, phase)` — an equivocation — and return the slashable proof if found. `None` if the
+    /// voter has not double-voted this slot (or the conflict does not verify).
+    fn find_equivocation(&self, sv: &SignedVote) -> Option<SlashEvidence> {
+        let v = &sv.vote;
+        let verifier = self.verifiers.get(usize::from(v.voter))?;
+        let bucket = match v.phase {
+            Phase::Prepare => &self.prepares,
+            Phase::Commit => &self.commits,
+        };
+        bucket.iter().find_map(|e| {
+            let ev = &e.vote;
+            if ev.voter == v.voter
+                && ev.height == v.height
+                && ev.round == v.round
+                && ev.phase == v.phase
+                && ev.block_hash != v.block_hash
+            {
+                detect_equivocation(e, sv, verifier)
+            } else {
+                None
+            }
+        })
     }
 
     /// Store a vote in its phase bucket unless an identical (voter, phase, round, block) vote is already

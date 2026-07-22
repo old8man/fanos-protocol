@@ -16,6 +16,7 @@ use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::committee::{epoch_seal_line, leader, line_members};
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output, RevealMsg};
+use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
 
 /// A Shamir share serialized as the reveal wire carries it: `x(1) ‖ y`.
@@ -63,6 +64,8 @@ struct Cluster {
     deaf_propose: BTreeSet<usize>,
     /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
     proposed: Vec<Block>,
+    /// Equivocation proofs the engines surfaced (the operational slashing signal).
+    slashes: Vec<SlashEvidence>,
 }
 
 impl Cluster {
@@ -92,6 +95,7 @@ impl Cluster {
             withholding: BTreeSet::new(),
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
+            slashes: Vec::new(),
         }
     }
 
@@ -111,6 +115,7 @@ impl Cluster {
             match o {
                 Output::Send(msg) => self.bus.push_back(msg),
                 Output::Committed { height, block_hash } => self.committed[idx].push((height, block_hash)),
+                Output::Slash(ev) => self.slashes.push(ev),
             }
         }
     }
@@ -467,6 +472,7 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                     match o {
                         Output::Send(m) => bus.push_back(m),
                         Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
+                        Output::Slash(_) => {} // equivocation is expected here; the focused test asserts on it
                     }
                 }
             }
@@ -497,6 +503,7 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                         match o {
                             Output::Send(m) => bus.push_back(m),
                             Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
+                            Output::Slash(_) => {} // equivocation is expected; safety is what this trial checks
                         }
                     }
                 }
@@ -662,4 +669,31 @@ fn honest_validators_certify_the_executed_state() {
         let bad = fanos_taxis::ExecVote::sign(0, [0xEE; 32], 6, &gen_keys()[6].sig);
         assert_eq!(cp.conflicting(&bad, &verifiers), Some(6), "a wrong-root execution is flagged, not silent");
     }
+}
+
+/// Incentive layer, now operational (audit MEDIUM 5): a validator that equivocates — signs two conflicting
+/// votes at one slot — is CAUGHT by the engine, which surfaces a self-contained, re-verifiable slash proof.
+/// The slashing the Nash-equilibrium proof assumes (S > 0) is now emitted, not merely provable in theory.
+#[test]
+fn an_equivocating_validator_is_caught_and_slashed() {
+    use fanos_taxis::{Phase, SignedVote, Vote};
+    let keys = gen_keys();
+    let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+    let mut c = Cluster::new(&genesis());
+    let byz = 3u8;
+    // Validator 3 signs two conflicting prepare votes at (height 0, round 0).
+    let v_a = Vote { height: 0, round: 0, block_hash: [0xAA; 32], phase: Phase::Prepare, voter: byz };
+    let v_b = Vote { height: 0, round: 0, block_hash: [0xBB; 32], phase: Phase::Prepare, voter: byz };
+    c.inject(ConsensusMsg::Vote(SignedVote::sign(v_a, &keys[byz as usize].sig)));
+    c.inject(ConsensusMsg::Vote(SignedVote::sign(v_b, &keys[byz as usize].sig)));
+
+    // The equivocation was caught and attributed to validator 3, and no honest validator was framed.
+    let ev = c.slashes.iter().find(|e| e.validator == byz).expect("the equivocator is caught");
+    assert_eq!(ev.height, 0);
+    assert!(!c.slashes.iter().any(|e| e.validator != byz), "no honest validator is ever framed");
+    // The proof is self-contained: anyone re-verifies it from its two votes under the validator's key.
+    assert!(
+        fanos_taxis::detect_equivocation(&ev.vote_a, &ev.vote_b, &verifiers[byz as usize]).is_some(),
+        "the slash evidence re-verifies independently"
+    );
 }
