@@ -15,6 +15,7 @@
 //! so virtual [`Instant`]s here are elapsed nanoseconds since the node started.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant as StdInstant;
@@ -35,7 +36,7 @@ use quinn::{ClientConfig, ServerConfig};
 use crate::directory::Directory;
 use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
 use crate::identity::{
-    HelloResult, hello_bytes, peer_cert_der, verifiable_coordinate, verify_hello,
+    HelloResult, hello_bytes, hello_epoch, peer_cert_der, verifiable_coordinate, verify_hello,
 };
 use crate::tls::{NodeCredentials, TlsError, node_configs, node_configs_mutual_from};
 
@@ -773,12 +774,18 @@ where
         &proof,
         capabilities,
     ))));
-    let beacon_cell = Arc::new(RwLock::new(BeaconSeed::GENESIS));
+    let beacon_cell = Arc::new(RwLock::new(BeaconWindow::genesis()));
     let verify_beacon = beacon_cell.clone();
     let identity: Identity = Some(SelfCert {
         hello: hello_cell.clone(),
         verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
-            let beacon = *verify_beacon.read().ok()?; // poisoned ⇒ reject (None), never verify on a stale seed
+            // Select the beacon for the epoch the peer proves — the current one, or a recent last-good epoch
+            // within the accepted window (safe-stall, R-C1). Outside the window ⇒ reject; poisoned ⇒ reject.
+            let epoch = hello_epoch(peer_hello)?;
+            let beacon = {
+                let window = verify_beacon.read().ok()?;
+                window.beacon_for(epoch)?
+            };
             verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities)
         }),
     });
@@ -805,6 +812,44 @@ where
     Ok(handle)
 }
 
+/// A bounded window of recent epoch beacons behind the HELLO verifier. The coordinate proof binds to a
+/// specific `(epoch, beacon)`; verifying only against the single newest beacon rejects a peer that proves the
+/// current-minus-one epoch — a normal transition race, and precisely the deadlock a beacon *stall* would
+/// otherwise cause (a lagging or recovering node can never present the frozen current epoch, so it is turned
+/// away as `EPOCH_STALE` and the cell becomes unjoinable). Remembering the last few epochs' beacons lets such
+/// a peer attach to the **last good epoch** instead (audit R-C1 safe-stall), while the bound stops a stale
+/// proof from being accepted indefinitely.
+struct BeaconWindow {
+    recent: VecDeque<(Epoch, BeaconSeed)>,
+}
+
+impl BeaconWindow {
+    /// Accept the current epoch plus this many previous epochs' beacons.
+    const DEPTH: usize = 3;
+
+    fn genesis() -> Self {
+        let mut recent = VecDeque::with_capacity(Self::DEPTH);
+        recent.push_back((Epoch::ZERO, BeaconSeed::GENESIS));
+        Self { recent }
+    }
+
+    /// Record a newly-adopted epoch beacon, evicting the oldest beyond [`DEPTH`].
+    fn adopt(&mut self, epoch: Epoch, beacon: BeaconSeed) {
+        if self.recent.iter().any(|&(e, _)| e == epoch) {
+            return;
+        }
+        self.recent.push_back((epoch, beacon));
+        while self.recent.len() > Self::DEPTH {
+            self.recent.pop_front();
+        }
+    }
+
+    /// The beacon this window remembers for `epoch`, if it is still within the accepted window.
+    fn beacon_for(&self, epoch: Epoch) -> Option<BeaconSeed> {
+        self.recent.iter().find(|&&(e, _)| e == epoch).map(|&(_, b)| b)
+    }
+}
+
 /// The per-epoch coordinate reshuffle driver (spec §L3 "epoch reshuffle", §3.2; task #102). It follows the
 /// engine's notification stream and, on each `BeaconReady { epoch, seed }`, re-derives this node's
 /// verifiable coordinate `MapToPoint(VRF(vrf_sk, cert ‖ epoch ‖ seed))`, re-seats the overlay engine to it
@@ -819,7 +864,7 @@ async fn reshuffle_loop<F: Field>(
     local_addr: SocketAddr,
     directory: Directory,
     hello: Arc<RwLock<Arc<Vec<u8>>>>,
-    beacon: Arc<RwLock<BeaconSeed>>,
+    beacon: Arc<RwLock<BeaconWindow>>,
     shaper: Shaper,
     mut events: broadcast::Receiver<Notification>,
     client: Client,
@@ -858,7 +903,7 @@ async fn reshuffle_loop<F: Field>(
                 // epoch mismatch, §7.3), and never the reverse (verifying against a stale beacon). A poisoned
                 // lock skips this rotation's publish; the next `BeaconReady` retries.
                 if let Ok(mut b) = beacon.write() {
-                    *b = seed;
+                    b.adopt(epoch, seed);
                 }
                 if let Ok(mut h) = hello.write() {
                     *h = Arc::new(hello_bytes::<F>(
@@ -1575,6 +1620,38 @@ mod tests {
         assert_eq!(decode_relay(&[0u8; 2 * TRIPLE_WIRE_LEN - 1]), None);
     }
 
+    #[test]
+    fn the_beacon_window_admits_recent_epochs_and_evicts_beyond_its_depth() {
+        // Safe-stall (R-C1): the HELLO verifier remembers the last DEPTH epochs' beacons, so a peer proving a
+        // recent last-good epoch is admitted (no EPOCH_STALE deadlock), while a truly stale epoch falls out.
+        let mut w = BeaconWindow::genesis();
+        assert_eq!(w.beacon_for(Epoch::ZERO), Some(BeaconSeed::GENESIS));
+
+        let b1 = BeaconSeed::new([1; 32]);
+        w.adopt(Epoch::new(1), b1);
+        assert_eq!(w.beacon_for(Epoch::new(1)), Some(b1), "the current epoch verifies");
+        assert_eq!(
+            w.beacon_for(Epoch::ZERO),
+            Some(BeaconSeed::GENESIS),
+            "a peer one epoch behind still attaches to its last-good epoch"
+        );
+
+        // Advance past the window depth: the oldest epoch is evicted, so a stale proof cannot live forever.
+        for e in 2..=(BeaconWindow::DEPTH as u64) {
+            w.adopt(Epoch::new(e), BeaconSeed::new([e as u8; 32]));
+        }
+        assert_eq!(w.beacon_for(Epoch::ZERO), None, "an epoch beyond the window is no longer admitted");
+        assert!(
+            w.beacon_for(Epoch::new(BeaconWindow::DEPTH as u64)).is_some(),
+            "the newest epoch is admitted"
+        );
+        assert_eq!(w.beacon_for(Epoch::new(999)), None, "an unseen epoch is rejected");
+
+        // Re-adopting a known epoch is idempotent — no duplicate, no eviction churn.
+        w.adopt(Epoch::new(BeaconWindow::DEPTH as u64), BeaconSeed::new([0xEE; 32]));
+        assert_eq!(w.recent.len(), BeaconWindow::DEPTH);
+    }
+
     /// The per-source inbound cap (audit A6/#69): one host cannot pin more than
     /// [`MAX_INBOUND_PER_SOURCE`] slots, the cap is per-IP, and the RAII [`SourceGuard`] frees a slot when a
     /// handler ends — so the table tracks *live* connections and stays bounded.
@@ -1634,7 +1711,7 @@ mod tests {
 
         // Shared cells + a directory pre-bound at the genesis coordinate.
         let hello = Arc::new(RwLock::new(Arc::new(vec![0u8]))); // sentinel: rewritten on reshuffle
-        let beacon = Arc::new(RwLock::new(BeaconSeed::GENESIS));
+        let beacon = Arc::new(RwLock::new(BeaconWindow::genesis()));
         let directory = Directory::new();
         let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_000).into();
         directory.insert(genesis_coord, local_addr);
@@ -1692,9 +1769,9 @@ mod tests {
             "the new coordinate is bound to our address and the vacated one is cleared"
         );
         assert_eq!(
-            *beacon.read().unwrap(),
-            BeaconSeed::new(seed),
-            "the verifier's beacon advanced"
+            beacon.read().unwrap().beacon_for(epoch),
+            Some(BeaconSeed::new(seed)),
+            "the verifier's window advanced to the new epoch beacon"
         );
         assert_ne!(
             **hello.read().unwrap(),
@@ -1716,7 +1793,7 @@ mod tests {
         let genesis_coord = genesis.coords();
 
         let hello = Arc::new(RwLock::new(Arc::new(vec![0u8])));
-        let beacon = Arc::new(RwLock::new(BeaconSeed::GENESIS));
+        let beacon = Arc::new(RwLock::new(BeaconWindow::genesis()));
         let directory = Directory::new();
         let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_001).into();
 

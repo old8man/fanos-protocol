@@ -203,6 +203,23 @@ pub(crate) fn verify_hello<F: Field>(
     })
 }
 
+/// Peek the epoch a HELLO proves its coordinate for, without verifying (the proof is bound to it). The
+/// verifier uses this to select the matching epoch beacon from its accepted window — so a peer proving for
+/// the current OR a recent last-good epoch is admitted rather than rejected as stale (audit R-C1 safe-stall).
+/// `None` if the frame is not a well-formed HELLO.
+#[must_use]
+pub(crate) fn hello_epoch(hello: &[u8]) -> Option<Epoch> {
+    let (frame, _) = decode_frame(hello).ok()?;
+    if frame.frame_type() != Some(FrameType::Hello) {
+        return None;
+    }
+    let body = frame.body;
+    if body.len() != HELLO_BODY_LEN {
+        return None;
+    }
+    Some(Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?)))
+}
+
 /// The peer's end-entity certificate DER from an established connection (its authenticated
 /// identity), or `None` if the peer presented no certificate.
 pub(crate) fn peer_cert_der(conn: &Connection) -> Option<Vec<u8>> {
@@ -261,6 +278,29 @@ mod tests {
             }),
             "negotiates the true intersection, not either side's full offer"
         );
+    }
+
+    #[test]
+    fn hello_epoch_reads_the_proven_epoch_for_the_safe_stall_window() {
+        // The verifier peeks the epoch a HELLO proves so it can select that epoch's beacon from its accepted
+        // window (safe-stall, R-C1) — a peer proving a recent last-good epoch is matched to the right beacon.
+        let creds = NodeCredentials::generate().unwrap();
+        let epoch = Epoch::new(7);
+        let beacon = BeaconSeed::new([0x77; 32]);
+        let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, Capabilities::CORE);
+
+        assert_eq!(hello_epoch(&hello), Some(epoch), "the proven epoch is recoverable without verifying");
+        // Selecting that epoch's beacon, the proof verifies even after the cell has moved on — the essence of
+        // safe-stall: an old-but-remembered epoch is admitted instead of being rejected as stale.
+        assert!(
+            matches!(
+                verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::CORE),
+                Some(HelloResult::Established { .. })
+            ),
+            "a proof for epoch 7 verifies against epoch 7's beacon"
+        );
+        assert_eq!(hello_epoch(b"not a hello frame"), None, "a non-HELLO yields no epoch");
     }
 
     #[test]
