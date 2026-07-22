@@ -349,6 +349,49 @@ mod tests {
     }
 
     #[test]
+    fn a_compromise_heals_after_one_kem_ratchet_step() {
+        // Post-compromise security (audit S-P0.2): an adversary that exfiltrates a party's ratchet state at
+        // time t reads the traffic at t, but ONE KEM ratchet step later it is locked out — the healing the
+        // double ratchet guarantees. DoubleRatchet is deliberately not Clone (no message-key reuse across
+        // copies), so the exfiltrated snapshot is modelled as a second responder built from the SAME seeded
+        // secret and driven in lockstep to time t — an identical state — then left behind while the real
+        // session ratchets forward.
+        let (bob_sk, bob_pk) = keypair(b"bob-kem");
+        let (adv_sk, _adv_pk) = keypair(b"bob-kem"); // the same seed ⇒ the adversary's captured secret
+        let (mut alice, handshake) = DoubleRatchet::initiate(&bob_pk, b"alice-init").expect("initiate");
+        let mut bob = DoubleRatchet::respond(bob_sk, &bob_pk, &handshake).expect("respond");
+        let mut adversary = DoubleRatchet::respond(adv_sk, &bob_pk, &handshake).expect("respond");
+        let mut ar = SeedRng::from_seed(b"alice-seal");
+        let mut br = SeedRng::from_seed(b"bob-seal");
+
+        // Time t: Alice sends. Both the real Bob and the adversary open it from the captured state — the
+        // compromise is real, the adversary reads the live traffic.
+        let m_t = alice.seal(&mut ar, b"pre-compromise secret").expect("seal");
+        assert_eq!(bob.open(&m_t).as_deref(), Some(&b"pre-compromise secret"[..]), "the real session reads it");
+        assert_eq!(
+            adversary.open(&m_t).as_deref(),
+            Some(&b"pre-compromise secret"[..]),
+            "the compromise is real: the adversary reads traffic while it holds the captured state"
+        );
+
+        // The healing step: Bob replies with a fresh KEM ratchet key; Alice ratchets to it. The adversary,
+        // holding only the pre-ratchet state, does not (and cannot) participate.
+        let reply = bob.seal(&mut br, b"bob reply").expect("seal");
+        assert_eq!(alice.open(&reply).as_deref(), Some(&b"bob reply"[..]));
+
+        // Post-healing: Alice sends a NEW message on the ratcheted chain (encapsulated to Bob's fresh key,
+        // generated only after the compromise). The real Bob opens it; the adversary — stuck one KEM step
+        // behind, without that key's secret — cannot.
+        let m_after = alice.seal(&mut ar, b"post-compromise secret").expect("seal");
+        assert_eq!(bob.open(&m_after).as_deref(), Some(&b"post-compromise secret"[..]), "the real session continues");
+        assert_eq!(
+            adversary.open(&m_after),
+            None,
+            "one KEM ratchet heals the compromise — the exfiltrated state cannot open post-ratchet messages"
+        );
+    }
+
+    #[test]
     fn the_same_plaintext_seals_differently_each_step() {
         let (mut a, mut b, mut ar, _br) = establish();
         let x0 = a.seal(&mut ar, b"x").expect("seal");
