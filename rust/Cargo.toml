@@ -42,6 +42,7 @@ members = [
     "crates/fanos-bench",
     "crates/fanos-observatory",
     "crates/fanos-taxis",
+    "crates/fanos-wasm",
 ]
 
 [workspace.package]

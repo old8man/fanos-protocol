@@ -1,0 +1,31 @@
+[package]
+name = "fanos-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FANOS browser/mobile client surface (WebAssembly): compute and verify a node's self-organizing coordinate, no directory, no authority."
+keywords = ["wasm", "webassembly", "p2p", "anonymity", "fanos"]
+categories = ["wasm", "cryptography"]
+
+# `cdylib` is the wasm artifact; `rlib` lets the crate's own (native) tests exercise the pure core.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry.workspace = true
+fanos-primitives.workspace = true
+fanos-vrf.workspace = true
+# Only the thin JS-facing layer needs wasm-bindgen; the pure client core (and its native tests) build without it.
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = []
+# Enable the `#[wasm_bindgen]` JS bindings — build with `--target wasm32-unknown-unknown --features wasm`.
+wasm = ["dep:wasm-bindgen"]
+
+[lints]
+workspace = true
