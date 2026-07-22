@@ -13,10 +13,11 @@
 //! | Signal double-ratchet | this crate's **post-quantum forward-secret session** ([`session`]) |
 //!
 //! The one genuinely new piece — everything else being composition — is the **end-to-end session**: a
-//! hybrid-ML-KEM handshake establishing a shared secret, then a BLAKE3 symmetric ratchet giving every message
-//! its own key. That delivers **forward secrecy** post-quantum: a compromised key never decrypts *past*
-//! messages, because the key chain is one-way. (Post-compromise security — healing after a compromise via a
-//! fresh KEM ratchet step — composes on top, the double-ratchet's asymmetric half.)
+//! hybrid-ML-KEM handshake establishing a shared secret, then a BLAKE3 symmetric ratchet ([`session`]) giving
+//! every message its own key. That delivers **forward secrecy** post-quantum: a compromised key never decrypts
+//! *past* messages, because the key chain is one-way. On top of it, the [`ratchet`] module adds the asymmetric
+//! half — a post-quantum **double ratchet** (a KEM in place of Signal's Diffie–Hellman) whose per-round-trip
+//! healing step gives **post-compromise security**: the session recovers *future* secrecy after a compromise.
 //!
 //! ## The single face of the platform
 //!
@@ -44,12 +45,14 @@ pub mod bot;
 pub mod group;
 pub mod media;
 pub mod message;
+pub mod ratchet;
 pub mod session;
 
 pub use bot::{Bot, Event, Outgoing, dispatch};
 pub use group::GroupSession;
 pub use media::{MediaKind, MediaSession};
 pub use message::{Command, Message, MessageKind};
+pub use ratchet::DoubleRatchet;
 pub use session::{Role, Session};
 
 /// A per-message/frame AEAD nonce from a counter. Each key seals a monotonically-numbered stream, so a
