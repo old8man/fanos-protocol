@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::commit::{Commitment, Randomness};
 use crate::note::Note;
+use crate::note_cipher::NoteCipher;
 use crate::nullifier::Nullifier;
 use crate::tree::{AuthPath, TREE_DEPTH};
 use crate::tx::{InputOpening, OutputNote, OutputOpening, ShieldedTx, TransparentProof};
@@ -33,6 +34,10 @@ impl<'a> Reader<'a> {
         Some(slice)
     }
 
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1)?.first().copied()
+    }
+
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
@@ -52,6 +57,13 @@ impl<'a> Reader<'a> {
     /// Whether the reader has consumed exactly all its bytes — a canonical encoding has no trailing garbage.
     fn is_exhausted(&self) -> bool {
         self.pos == self.buf.len()
+    }
+
+    /// The remaining unread bytes (consuming them).
+    fn rest(&mut self) -> &'a [u8] {
+        let s = self.buf.get(self.pos..).unwrap_or(&[]);
+        self.pos = self.buf.len();
+        s
     }
 }
 
@@ -175,6 +187,15 @@ impl ShieldedTx {
         for o in &self.outputs {
             out.extend_from_slice(&o.note_commitment);
             put_commitment(&mut out, &o.value_commitment);
+            match &o.cipher {
+                Some(c) => {
+                    let cb = c.to_bytes();
+                    out.push(1);
+                    out.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&cb);
+                }
+                None => out.push(0),
+            }
         }
         out.extend_from_slice(&self.fee.to_le_bytes());
         out
@@ -190,7 +211,15 @@ impl ShieldedTx {
         let outputs = read_vec(&mut r, |r| {
             let note_commitment = r.array32()?;
             let value_commitment = get_commitment(r)?;
-            Some(OutputNote { note_commitment, value_commitment })
+            let cipher = match r.u8()? {
+                0 => None,
+                1 => {
+                    let len = r.u32()? as usize;
+                    Some(NoteCipher::from_bytes(r.take(len)?)?)
+                }
+                _ => return None,
+            };
+            Some(OutputNote { note_commitment, value_commitment, cipher })
         })?;
         let fee = r.u64()?;
         r.is_exhausted().then_some(Self { anchor, nullifiers, input_values, outputs, fee })
@@ -233,6 +262,31 @@ impl TransparentProof {
         })?;
         r.is_exhausted().then_some(Self { inputs, outputs })
     }
+}
+
+/// Encode a shielded transaction together with its (transparent) proof as one ledger **submission payload**:
+/// `tx_len(u32) ‖ tx ‖ proof`. This is exactly what a TAXIS transaction carries; a DROMOS `StateMachine`
+/// decodes it with [`decode_submission`]. (When the zero-knowledge backend lands, the trailing `proof` becomes
+/// the succinct proof — the framing is unchanged.)
+#[must_use]
+pub fn encode_submission(tx: &ShieldedTx, proof: &TransparentProof) -> Vec<u8> {
+    let tx_bytes = tx.to_bytes();
+    let proof_bytes = proof.to_bytes();
+    let mut out = Vec::with_capacity(4 + tx_bytes.len() + proof_bytes.len());
+    out.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&tx_bytes);
+    out.extend_from_slice(&proof_bytes);
+    out
+}
+
+/// Decode a [`encode_submission`] payload back into `(transaction, proof)`, or `None` if malformed.
+#[must_use]
+pub fn decode_submission(bytes: &[u8]) -> Option<(ShieldedTx, TransparentProof)> {
+    let mut r = Reader::new(bytes);
+    let tx_len = r.u32()? as usize;
+    let tx = ShieldedTx::from_bytes(r.take(tx_len)?)?;
+    let proof = TransparentProof::from_bytes(r.rest())?;
+    Some((tx, proof))
 }
 
 /// Read a `u32`-length-prefixed vector, decoding each element with `f`.
@@ -298,6 +352,23 @@ mod tests {
         let decoded = ShieldedTx::from_bytes(&tx_bytes).unwrap();
         let decoded_proof = TransparentProof::from_bytes(&pf_bytes).unwrap();
         assert_eq!(s.apply(&p, &decoded, &decoded_proof), Ok(()), "a round-tripped tx applies");
+    }
+
+    #[test]
+    fn a_submission_payload_round_trips() {
+        let p = Params::standard();
+        let nsk = [1u8; 32];
+        let mut s = ShieldedState::new();
+        let n0 = note(1000, &nsk, b"n0");
+        let pos = s.mint(n0.commitment(&p)).unwrap();
+        let sp = SpendInput { note: n0, nsk, path: s.path(pos).unwrap() };
+        let (tx, proof) = build_transfer(&p, s.anchor(), &[sp], &[note(1000, &[2u8; 32], b"a")], 0);
+        let payload = encode_submission(&tx, &proof);
+        let (tx2, proof2) = decode_submission(&payload).expect("submission round-trips");
+        assert_eq!(tx2, tx);
+        assert_eq!(proof2, proof);
+        assert_eq!(s.apply(&p, &tx2, &proof2), Ok(()), "the decoded submission applies");
+        assert_eq!(decode_submission(&payload[..payload.len() - 1]), None, "a truncated submission is rejected");
     }
 
     #[test]

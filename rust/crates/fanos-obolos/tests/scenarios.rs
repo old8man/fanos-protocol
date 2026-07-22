@@ -12,8 +12,11 @@
 
 use fanos_obolos::commit::MAX_VALUE;
 use fanos_obolos::{
-    ApplyError, Note, Params, Randomness, ShieldedState, SpendInput, build_transfer, derive_owner_pk,
+    Address, ApplyError, Note, NoteCipher, Params, Randomness, ShieldedState, SpendInput, build_transfer,
+    build_transfer_delivering, derive_owner_pk, scan,
 };
+use fanos_pqcrypto::SeedRng;
+use fanos_pqcrypto::kem::HybridKemSecret;
 
 /// A note of `value` owned by `nsk`, with deterministic randomness from `tag`.
 fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
@@ -207,4 +210,45 @@ fn the_anonymity_set_is_the_entire_pool() {
         let path = s.path(*pos).expect("a path for each note");
         assert!(path.verify(&n.commitment(&p), &anchor), "note at {pos} is in the whole-pool anonymity set");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Scenario 7 — EXPERIMENT (unlinkability): a recipient finds a payment delivered to it on-chain and can spend
+// it, while an observer with the wrong key detects nothing — the ledger never reveals who a note is for.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+#[test]
+fn a_recipient_finds_a_delivered_payment_and_an_observer_cannot() {
+    let p = Params::standard();
+    let alice = [1u8; 32];
+    let mut s = ShieldedState::new();
+    let a0 = note(1000, &alice, b"g");
+    let sp = mint_spendable(&mut s, &p, &a0, &alice);
+
+    // Bob's receiving address (owner tag + KEM key), and the KEM secret behind it.
+    let bob_nsk = [2u8; 32];
+    let (bob_kem_secret, bob_kem_public) = {
+        let mut rng = SeedRng::from_seed(b"bob-kem");
+        HybridKemSecret::generate(&mut rng)
+    };
+    let bob_addr = Address::new(derive_owner_pk(&bob_nsk), bob_kem_public);
+
+    // Alice pays Bob 1000, *delivering* the note (its opening sealed to Bob).
+    let bob_note = Note::new(1000, bob_addr.owner, Randomness::from_seed(b"bobnote"), [4u8; 32]);
+    let (tx, proof) =
+        build_transfer_delivering(&p, s.anchor(), &[sp], &[(bob_note.clone(), bob_addr.clone())], 0, b"deliver-seed");
+    assert_eq!(s.apply(&p, &tx, &proof), Ok(()), "the delivering transfer executes normally");
+
+    // Bob scans the block's outputs and recovers exactly his note (so he can spend it next).
+    let outputs: Vec<(&[u8; 32], &NoteCipher)> =
+        tx.outputs.iter().filter_map(|o| o.cipher.as_ref().map(|c| (&o.note_commitment, c))).collect();
+    let found = scan(&bob_kem_secret, bob_addr.owner, &p, &outputs);
+    assert_eq!(found.len(), 1, "Bob finds his delivered note");
+    assert_eq!(found[0], bob_note, "and recovers it exactly");
+
+    // An observer with a different KEM key detects nothing — the payment is unlinkable to Bob on-chain.
+    let (eve_secret, _eve_pub) = {
+        let mut rng = SeedRng::from_seed(b"eve-kem");
+        HybridKemSecret::generate(&mut rng)
+    };
+    assert!(scan(&eve_secret, bob_addr.owner, &p, &outputs).is_empty(), "an observer cannot detect Bob's payment");
 }

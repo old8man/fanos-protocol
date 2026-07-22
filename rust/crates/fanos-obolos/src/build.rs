@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use crate::commit::Params;
 use crate::note::Note;
+use crate::note_cipher::{Address, NoteCipher};
 use crate::tree::AuthPath;
 use crate::tx::{InputOpening, OutputNote, OutputOpening, ShieldedTx, TransparentProof};
 
@@ -44,7 +45,11 @@ pub fn build_transfer(
     let input_values = inputs.iter().map(|i| i.note.value_commitment(params)).collect();
     let output_notes: Vec<OutputNote> = outputs
         .iter()
-        .map(|n| OutputNote { note_commitment: n.commitment(params), value_commitment: n.value_commitment(params) })
+        .map(|n| OutputNote {
+            note_commitment: n.commitment(params),
+            value_commitment: n.value_commitment(params),
+            cipher: None,
+        })
         .collect();
     let tx = ShieldedTx { anchor, nullifiers, input_values, outputs: output_notes, fee };
 
@@ -56,5 +61,29 @@ pub fn build_transfer(
         outputs.iter().map(|n| OutputOpening { value: n.value, value_r: n.value_r.clone() }).collect();
     let proof = TransparentProof { inputs: input_openings, outputs: output_openings };
 
+    (tx, proof)
+}
+
+/// Like [`build_transfer`], but each output is **delivered** to a recipient [`Address`]: its opening is sealed
+/// as a [`NoteCipher`] so the recipient can find and spend it on-chain (unlinkable delivery, [`crate::note_cipher`]).
+/// Each output's note must already be owned by its address (`note.owner == address.owner`); `cipher_seed` is the
+/// per-output encapsulation randomness (production: a fresh CSPRNG; tests: a fixed seed, varied by output index).
+/// The delivery cipher is ledger data-at-rest — it never affects the transaction's validity, only detectability.
+#[must_use]
+pub fn build_transfer_delivering(
+    params: &Params,
+    anchor: [u8; 32],
+    inputs: &[SpendInput],
+    outputs: &[(Note, Address)],
+    fee: u64,
+    cipher_seed: &[u8],
+) -> (ShieldedTx, TransparentProof) {
+    let notes: Vec<Note> = outputs.iter().map(|(n, _)| n.clone()).collect();
+    let (mut tx, proof) = build_transfer(params, anchor, inputs, &notes, fee);
+    for (i, (out, (note, address))) in tx.outputs.iter_mut().zip(outputs).enumerate() {
+        let mut seed = cipher_seed.to_vec();
+        seed.extend_from_slice(&(i as u64).to_le_bytes());
+        out.cipher = NoteCipher::seal(address, note.value, &note.value_r, &note.rho, &seed);
+    }
     (tx, proof)
 }

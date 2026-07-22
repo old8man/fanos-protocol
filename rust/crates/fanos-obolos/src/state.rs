@@ -184,8 +184,8 @@ mod tests {
             nullifiers: alloc::vec![input.nullifier(nsk, params)],
             input_values: alloc::vec![input.value_commitment(params)],
             outputs: alloc::vec![
-                OutputNote { note_commitment: out_a.commitment(params), value_commitment: out_a.value_commitment(params) },
-                OutputNote { note_commitment: out_b.commitment(params), value_commitment: out_b.value_commitment(params) },
+                OutputNote { note_commitment: out_a.commitment(params), value_commitment: out_a.value_commitment(params), cipher: None },
+                OutputNote { note_commitment: out_b.commitment(params), value_commitment: out_b.value_commitment(params), cipher: None },
             ],
             fee,
         };

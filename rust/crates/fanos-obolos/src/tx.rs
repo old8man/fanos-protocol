@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 
 use crate::commit::{Commitment, MAX_VALUE, Params, Randomness, sum, sum_randomness, verify_balance};
 use crate::note::Note;
+use crate::note_cipher::NoteCipher;
 use crate::nullifier::Nullifier;
 use crate::tree::AuthPath;
 
@@ -36,6 +37,11 @@ pub struct OutputNote {
     pub note_commitment: [u8; 32],
     /// The output amount's value commitment (hidden; a balance term).
     pub value_commitment: Commitment,
+    /// The note's opening, sealed to the recipient for unlinkable delivery ([`crate::note_cipher`]), or `None`
+    /// for an output the sender need not deliver (e.g. change to itself, which it can reconstruct). It is
+    /// *data at rest* on the ledger — the consensus relation ([`ShieldedProof`]) does not depend on it, so its
+    /// presence or contents can never affect a transaction's validity, only whether a recipient can find it.
+    pub cipher: Option<NoteCipher>,
 }
 
 /// A shielded transaction — the public object ordered by consensus and applied to the [`crate::state`].
