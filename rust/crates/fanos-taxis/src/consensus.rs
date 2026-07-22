@@ -30,6 +30,7 @@ use fanos_primitives::{BeaconSeed, Epoch};
 
 use crate::block::Block;
 use crate::chain::Chain;
+use crate::checkpoint::{ExecCertificate, ExecVote};
 use crate::committee::{epoch_seal_line, leader, line_members};
 use crate::params::CellParams;
 use crate::state::StateMachine;
@@ -187,6 +188,8 @@ pub enum ConsensusMsg {
     Vote(SignedVote),
     /// A sealing member's post-finality share opening.
     Reveal(RevealMsg),
+    /// A validator's execution attestation `(height, state_root)` — the executed-state checkpoint.
+    ExecVote(ExecVote),
 }
 
 impl ConsensusMsg {
@@ -208,6 +211,10 @@ impl ConsensusMsg {
                 out.push(2);
                 out.extend_from_slice(&r.to_bytes());
             }
+            Self::ExecVote(v) => {
+                out.push(3);
+                out.extend_from_slice(&v.to_bytes());
+            }
         }
         out
     }
@@ -220,6 +227,7 @@ impl ConsensusMsg {
             0 => Some(Self::Propose(Block::from_bytes(body)?)),
             1 => Some(Self::Vote(SignedVote::from_bytes(body)?)),
             2 => Some(Self::Reveal(RevealMsg::from_bytes(body)?)),
+            3 => Some(Self::ExecVote(ExecVote::from_bytes(body)?)),
             _ => None,
         }
     }
@@ -242,6 +250,8 @@ pub enum Input {
     Vote(SignedVote),
     /// A reveal received off the wire.
     Reveal(RevealMsg),
+    /// An execution attestation received off the wire.
+    ExecVote(ExecVote),
     /// The round timer fired (the proposer took too long) — advance the round and re-elect a leader.
     Timeout,
 }
@@ -293,6 +303,11 @@ pub struct ConsensusEngine<S: StateMachine> {
     // may deliver the CC before the proposal). We hold the CC and finalize the moment the body arrives, instead
     // of wedging the validator permanently at that height.
     pending_finalize: BTreeMap<u64, [u8; 32]>,
+    // Execution attestations, height → voter → vote (first-writer-wins per voter), and the latest execution
+    // certificate we have been able to form (a Q-quorum agreeing on a state root) — the executed-state
+    // checkpoint that makes divergence detectable and anchors cross-cell proofs.
+    exec_votes: BTreeMap<u64, BTreeMap<u8, ExecVote>>,
+    checkpoint: Option<ExecCertificate>,
 }
 
 impl<S: StateMachine> ConsensusEngine<S> {
@@ -331,6 +346,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             pending_reveals: BTreeMap::new(),
             exec_queue: Vec::new(),
             pending_finalize: BTreeMap::new(),
+            exec_votes: BTreeMap::new(),
+            checkpoint: None,
         }
     }
 
@@ -356,6 +373,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
     #[must_use]
     pub fn chain(&self) -> &Chain<S> {
         &self.chain
+    }
+
+    /// The latest **execution checkpoint** — a `Q`-quorum certificate of the cell's canonical executed state
+    /// `(height, state_root)`, or `None` before one forms. This is the portable proof of executed state that
+    /// a cross-cell transaction verifies against, and the anchor that makes an execution divergence a
+    /// detectable fault ([`ExecCertificate::conflicting`]) rather than a silent fork.
+    #[must_use]
+    pub fn latest_checkpoint(&self) -> Option<&ExecCertificate> {
+        self.checkpoint.as_ref()
     }
 
     /// Submit a sealed transaction into this validator's mempool (a client's `SubmitTx`). A transaction that
@@ -395,6 +421,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Input::Propose { block, present } => self.on_propose(block, present),
             Input::Vote(sv) => self.accept_vote(sv),
             Input::Reveal(r) => self.on_reveal(&r),
+            Input::ExecVote(v) => self.on_exec_vote(v),
             Input::Timeout => self.on_timeout(),
         }
     }
@@ -586,7 +613,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.exec_queue.push(block.clone());
         // Validate any reveals that arrived early for this block's transactions, now that we hold the committee.
         self.drain_pending_reveals(&block);
-        self.try_execute();
+        out.extend(self.try_execute());
 
         // Drop included transactions from the mempool and reset the per-height working state.
         self.mempool.retain(|t| !included.contains(&t.commit()));
@@ -635,8 +662,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // Buffer, first-writer-wins per member, so a flood cannot displace a genuine early reveal.
             self.pending_reveals.entry(r.commit).or_default().entry(r.member).or_insert_with(|| r.clone());
         }
-        self.try_execute();
-        Vec::new()
+        self.try_execute()
     }
 
     /// Find a finalized-but-unexecuted transaction by its commitment (searching the execution queue).
@@ -687,8 +713,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
 
     /// Execute finalized blocks from the front of the queue, in order, as soon as every transaction in a
     /// block has gathered its `t` share openings (anti-MEV: contents are revealed only after ordering).
-    fn try_execute(&mut self) {
+    fn try_execute(&mut self) -> Vec<Output> {
         let t = usize::from(self.params.seal_threshold());
+        let mut out = Vec::new();
         while let Some(block) = self.exec_queue.first().cloned() {
             let mut opened = Vec::new();
             let mut ready = true;
@@ -723,6 +750,61 @@ impl<S: StateMachine> ConsensusEngine<S> {
             self.exec_queue.remove(0);
             for txn in &opened {
                 self.chain.execute(txn);
+            }
+            // Attest the executed state at this height — the checkpoint that makes divergence detectable.
+            out.push(self.emit_exec_vote(block.header.height));
+        }
+        out
+    }
+
+    /// Sign and locally record this validator's execution attestation for `height` (the current state root),
+    /// returning the broadcast action. Recording our own vote lets a checkpoint form from our view too.
+    fn emit_exec_vote(&mut self, height: u64) -> Output {
+        let vote = ExecVote::sign(height, self.chain.state_root(), self.me, &self.signer);
+        self.record_exec_vote(vote.clone());
+        Output::Send(ConsensusMsg::ExecVote(vote))
+    }
+
+    /// Ingest an execution attestation off the wire: verify its signature, record it (first-writer-wins per
+    /// voter), and try to form/advance the execution checkpoint.
+    fn on_exec_vote(&mut self, vote: ExecVote) -> Vec<Output> {
+        let Some(verifier) = self.verifiers.get(usize::from(vote.voter)) else {
+            return Vec::new();
+        };
+        if !vote.verify(verifier) {
+            return Vec::new(); // forged / unauthenticated attestation
+        }
+        self.record_exec_vote(vote);
+        Vec::new()
+    }
+
+    /// Store an execution vote and, if a quorum now agrees on a root at that height, advance the checkpoint.
+    fn record_exec_vote(&mut self, vote: ExecVote) {
+        let height = vote.height;
+        self.exec_votes.entry(height).or_default().entry(vote.voter).or_insert(vote);
+        self.try_form_checkpoint(height);
+    }
+
+    /// If a `Q`-quorum of stored votes at `height` agree on one state root, form the [`ExecCertificate`] and
+    /// adopt it as the latest checkpoint (monotone in height). A minority (e.g. a divergent validator's) root
+    /// never forms a certificate — the divergence is visible, not silent.
+    fn try_form_checkpoint(&mut self, height: u64) {
+        if self.checkpoint.as_ref().is_some_and(|c| c.height >= height) {
+            return; // already checkpointed at least this far
+        }
+        let Some(by_voter) = self.exec_votes.get(&height) else {
+            return;
+        };
+        // Group votes by attested root; the first root reaching the quorum is canonical (two cannot, since a
+        // Q-quorum shares an honest validator that attests one root).
+        let mut by_root: BTreeMap<[u8; 32], Vec<ExecVote>> = BTreeMap::new();
+        for v in by_voter.values() {
+            by_root.entry(v.state_root).or_default().push(v.clone());
+        }
+        for (root, votes) in by_root {
+            if votes.len() >= self.params.quorum {
+                self.checkpoint = Some(ExecCertificate { height, state_root: root, votes });
+                return;
             }
         }
     }

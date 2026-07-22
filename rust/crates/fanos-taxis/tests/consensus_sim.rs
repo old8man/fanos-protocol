@@ -134,6 +134,7 @@ impl Cluster {
                 ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), present: self.present_for(b) },
                 ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                 ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
+                ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
             };
             let outs = self.engines[i].step(input);
             self.collect(i, outs);
@@ -490,6 +491,7 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                         ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), present: 0x7F },
                         ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
+                        ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
                     };
                     for o in engines[i].step(input) {
                         match o {
@@ -635,4 +637,29 @@ fn a_validator_finalizes_when_the_body_arrives_after_the_commit_certificate() {
     assert!(c.committed[deaf].iter().any(|&(h, _)| h == 0), "the body's arrival unblocks finalization");
     assert_eq!(c.hashes_at(0).len(), 1, "it finalized the same block — no fork");
     assert_eq!(c.engines[deaf].chain().state().balance(&BOB), 5, "and it executes the transfer");
+}
+
+/// Audit follow-up (executed-state checkpoint): after a block finalizes and executes, every honest validator
+/// emits a signed execution attestation, and a Q-quorum of matching attestations forms an ExecCertificate —
+/// a portable proof of the cell's canonical executed state that makes any divergence detectable, not silent.
+#[test]
+fn honest_validators_certify_the_executed_state() {
+    let verifiers: Vec<HybridVerifier> = gen_keys().into_iter().map(|k| k.sig_pub).collect();
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"chk");
+    c.submit_all(&tx);
+    c.tick();
+    // Sanity: it executed.
+    assert_eq!(c.engines[0].chain().state().balance(&BOB), 100);
+    let root = c.engines[0].chain().state_root();
+    // Every honest validator holds a checkpoint certifying height 0 at the agreed root.
+    for e in &c.engines {
+        let cp = e.latest_checkpoint().expect("an execution checkpoint formed");
+        assert_eq!(cp.height, 0, "checkpoint is at the executed height");
+        assert_eq!(cp.state_root, root, "checkpoint certifies the agreed executed state root");
+        assert!(cp.verify(CellParams::FANO.quorum, &verifiers), "it is a valid Q-quorum certificate");
+        // A divergent validator (a wrong root at the same height) would be detectable + attributable.
+        let bad = fanos_taxis::ExecVote::sign(0, [0xEE; 32], 6, &gen_keys()[6].sig);
+        assert_eq!(cp.conflicting(&bad, &verifiers), Some(6), "a wrong-root execution is flagged, not silent");
+    }
 }

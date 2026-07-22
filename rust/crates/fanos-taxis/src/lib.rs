@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub mod block;
 pub mod chain;
+pub mod checkpoint;
 pub mod committee;
 pub mod consensus;
 pub mod incentive;
@@ -36,6 +37,7 @@ pub mod wire;
 
 pub use block::{Block, BlockHeader, GENESIS_PARENT};
 pub use chain::Chain;
+pub use checkpoint::{ExecCertificate, ExecVote};
 pub use consensus::{ConsensusEngine, ConsensusMsg, Input, Output, RevealMsg};
 pub use incentive::{RewardParams, SlashEvidence, best_response_is_honest, detect_equivocation};
 pub use params::CellParams;
