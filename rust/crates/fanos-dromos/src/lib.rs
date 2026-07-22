@@ -16,8 +16,10 @@
 #![forbid(unsafe_code)]
 
 pub mod hybrid;
+pub mod token;
 
 pub use hybrid::{HybridLedger, TAG_SHIELDED, TAG_TRANSPARENT};
+pub use token::{SignedTransfer, TokenError, TokenLedger, Transfer, account_id};
 
 use std::sync::Arc;
 

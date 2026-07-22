@@ -18,6 +18,8 @@ fanos-taxis.workspace = true
 fanos-obolos = { workspace = true, features = ["std"] }
 # BLAKE3 labeled hashing for the hybrid state root (transparent ‖ shielded).
 fanos-primitives = { workspace = true, features = ["std"] }
+# Hybrid PQ signatures authenticating transparent transfers and name-registry operations.
+fanos-pqcrypto.workspace = true
 
 [lints]
 workspace = true
