@@ -15,10 +15,13 @@
 //! The one thing plain Shamir lacks is verifiability against a **malicious dealer** (shares off any degree-
 //! `t−1` polynomial make different `t`-subsets reconstruct different secrets). Feldman/Pedersen fix this with
 //! homomorphic (DL) commitments, which are not PQ. Here — because a *beacon's* secret is *revealed* anyway —
-//! consistency is enforced at reveal by a complete **all-`t`-subsets-agree** check: the dealing is accepted
-//! only if every `t`-subset of the verified shares reconstructs the identical secret, which holds iff the
-//! shares lie on one degree-`t−1` polynomial. An inconsistent dealer is thus detected and its contribution
-//! excluded; the honest contributions' sum is unbiased (each dealing is hash-committed *before* the epoch).
+//! consistency is enforced at reveal by a **collinearity check in `O(n·t²)`**: interpolate the polynomial `P`
+//! from the first `t` verified shares (`GF(256)` Lagrange, [`eval_at`] — the same field as
+//! [`fanos_primitives::shamir`]) and require *every* verified share to lie on `P`. An off-polynomial share —
+//! a malicious dealer, whether or not it sits in the interpolation basis — is detected and the dealing
+//! rejected; the honest contributions' sum is unbiased (each dealing is hash-committed *before* the epoch).
+//! (This replaces an earlier exhaustive `all-t-subsets` scan, which was `O(⌊n choose t⌋)` — exponential — and
+//! whose size guard even rejected valid large-cell dealings.)
 //!
 //! **Security reduction.** *Reconstruction-uniqueness*: information-theoretic Shamir + the all-subsets check.
 //! *Unbiasability*: the dealing commitment is a binding hash of all per-share commitments, published before the
@@ -30,6 +33,7 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use fanos_field::{F256, Field};
 use fanos_primitives::hash::hash_xof;
 use fanos_primitives::shamir::{self, Share};
 use fanos_primitives::{hash_labeled, Epoch};
@@ -120,14 +124,55 @@ pub fn verify_share(share: &Share, commitments: &[[u8; 32]]) -> bool {
     }
 }
 
+/// `a · b` in `GF(256)` (the shamir field, `fanos_field::F256`).
+fn mul8(a: u8, b: u8) -> u8 {
+    F256::mul(u32::from(a), u32::from(b)) as u8
+}
+
+/// Evaluate — per secret byte, over `GF(256)` — the degree-`(t−1)` polynomial interpolating `points` at the
+/// query point `x_q`: `P(x_q) = ⊕_j y_j · Π_{m≠j} (x_q ⊕ x_m)/(x_j ⊕ x_m)`. This matches
+/// [`fanos_primitives::shamir::reconstruct`] exactly at `x_q = 0` (its Lagrange-at-0), and generalizes it to
+/// any point so share collinearity can be checked. `None` on ragged or repeated-`x` points.
+fn eval_at(points: &[Share], x_q: u8) -> Option<Vec<u8>> {
+    let len = points.first()?.y().len();
+    if points.iter().any(|s| s.y().len() != len) {
+        return None;
+    }
+    let mut out = alloc::vec![0u8; len];
+    for sj in points {
+        let xj = sj.x();
+        let mut num = 1u8;
+        let mut den = 1u8;
+        for sm in points {
+            let xm = sm.x();
+            if xm != xj {
+                num = mul8(num, x_q ^ xm);
+                den = mul8(den, xj ^ xm);
+            }
+        }
+        if den == 0 {
+            return None; // a repeated x-coordinate — degenerate
+        }
+        let coeff = mul8(num, F256::inv(u32::from(den)) as u8);
+        for (slot, &yjb) in out.iter_mut().zip(sj.y()) {
+            *slot ^= mul8(coeff, yjb);
+        }
+    }
+    Some(out)
+}
+
 /// Reconstruct the dealt secret from `revealed` shares — **reconstruction-unique**: returns the secret only if
-/// every share verifies against `commitments` and **all `t`-subsets of the verified shares reconstruct the
-/// identical secret** (proving the shares lie on one degree-`t−1` polynomial — a consistent dealing). Returns
-/// `None` if fewer than `t` valid shares are present or the dealing is inconsistent (a malicious dealer,
-/// detected and rejected — never silently resolved to an arbitrary subset's value).
+/// every share verifies against `commitments` and they are **collinear on one degree-`t−1` polynomial** (a
+/// consistent dealing). Consistency is checked in `O(n·t²)` — interpolate `P` from the first `t` verified
+/// shares and require *every* verified share to lie on `P`; an off-polynomial share (a malicious dealer, in or
+/// out of the interpolation basis) makes some check fail and is rejected. Returns `None` on fewer than `t`
+/// valid shares or an inconsistent dealing (never silently resolved to an arbitrary subset's value).
 #[must_use]
 pub fn reconstruct(revealed: &[Share], t: u8, commitments: &[[u8; 32]]) -> Option<[u8; SECRET_LEN]> {
     let t = usize::from(t);
+    if t == 0 {
+        return None;
+    }
     // Keep only shares that verify, de-duplicated by their x-coordinate (one share per holder).
     let mut valid: Vec<Share> = Vec::new();
     let mut seen_x: BTreeSet<u8> = BTreeSet::new();
@@ -136,41 +181,15 @@ pub fn reconstruct(revealed: &[Share], t: u8, commitments: &[[u8; 32]]) -> Optio
             valid.push(s.clone());
         }
     }
-    if valid.len() < t || t == 0 {
-        return None;
-    }
-    // Every t-subset must reconstruct the SAME secret (⇔ the shares are collinear on one degree-(t−1) poly).
-    let mut secrets: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for subset in t_subsets(&valid, t) {
-        secrets.insert(shamir::reconstruct(&subset).ok()?);
-    }
-    if secrets.len() != 1 {
-        return None; // inconsistent dealing — reject (reconstruction is not unique)
-    }
-    secrets.into_iter().next()?.try_into().ok()
-}
-
-/// All `t`-element subsets of `items` (by value), enumerated over `⌊n choose t⌋` — cheap at cell scale
-/// (`n ≤ ~16`). Used to check reconstruction-uniqueness exhaustively.
-fn t_subsets(items: &[Share], t: usize) -> Vec<Vec<Share>> {
-    let n = items.len();
-    let mut out = Vec::new();
-    if t == 0 || t > n || n > 24 {
-        return out; // guard the bitmask enumeration
-    }
-    for mask in 0u32..(1u32 << n) {
-        if mask.count_ones() as usize != t {
-            continue;
+    let basis = valid.get(..t)?; // fewer than t valid shares ⇒ None
+    // The secret is P(0); every verified share must lie on that same P (collinearity ⇔ a consistent dealing).
+    let secret = eval_at(basis, 0)?;
+    for s in &valid {
+        if eval_at(basis, s.x())?.as_slice() != s.y() {
+            return None; // an off-polynomial share ⇒ inconsistent dealing, rejected
         }
-        let mut subset = Vec::with_capacity(t);
-        for (i, item) in items.iter().enumerate() {
-            if mask & (1 << i) != 0 {
-                subset.push(item.clone());
-            }
-        }
-        out.push(subset);
     }
-    out
+    secret.try_into().ok()
 }
 
 /// Combine the reconstructed secrets of the **consistent** dealings into the epoch's beacon seed:
@@ -281,5 +300,36 @@ mod tests {
         assert_eq!(sec1, [0xAB; 32]);
         assert_eq!(sec2, [0xCD; 32]);
         assert!(beacon_seed(Epoch::new(1), &[sec1, sec2]).is_some());
+    }
+
+    #[test]
+    fn eval_at_zero_matches_shamir_and_interpolates_basis_points() {
+        let d = Dealing::deal(&SECRET, 3, 5, b"cross").unwrap();
+        let shares: Vec<Share> = (0..5).map(|i| d.share(i).unwrap().clone()).collect();
+        // eval_at(·, 0) IS shamir's Lagrange-at-0 — the same secret, bit for bit.
+        assert_eq!(eval_at(&shares[..3], 0), Some(shamir::reconstruct(&shares[..3]).unwrap()));
+        // Interpolation property: P(x_j) = y_j at a basis point.
+        assert_eq!(eval_at(&shares[..3], shares[0].x()).unwrap().as_slice(), shares[0].y());
+    }
+
+    #[test]
+    fn a_larger_cell_reconstructs_and_catches_a_forgery_in_the_interpolation_basis() {
+        // n=20, t=8: the old all-`t`-subsets scan was C(20,8)=125970 (and its n>24 guard even rejected valid
+        // large dealings); the interpolate-and-evaluate check is O(n·t²) and correct at any cell size, and it
+        // catches an off-polynomial share even when the forgery sits INSIDE the interpolation basis.
+        let d = Dealing::deal(&SECRET, 8, 20, b"large").unwrap();
+        let mut commits = d.share_commitments().to_vec();
+        let mut shares: Vec<Share> = (0..20).map(|i| d.share(i).unwrap().clone()).collect();
+        assert_eq!(reconstruct(&shares[..8], 8, &commits), Some(SECRET), "any 8 reconstruct");
+        assert_eq!(reconstruct(&shares, 8, &commits), Some(SECRET), "all 20 reconstruct");
+
+        // Corrupt share 0 (in the first-t basis) off the polynomial, re-committed to look valid.
+        let mut y0 = shares[0].y().to_vec();
+        y0[0] ^= 0x01;
+        shares[0] = Share::new(shares[0].x(), y0);
+        commits[0] = commit_share(&shares[0]);
+        assert_eq!(reconstruct(&shares, 8, &commits), None, "an off-polynomial BASIS share is caught");
+        // The 8 honest shares (indices 1..=8) still reconstruct.
+        assert_eq!(reconstruct(&shares[1..9], 8, &commits), Some(SECRET));
     }
 }

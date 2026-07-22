@@ -132,9 +132,13 @@ for a first, un-audited PQ construction.
 ### 4.3 Honest limits
 
 - **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + BLAKE3
-  binding; the all-`t`-subsets check is a complete collinearity decision (no probabilistic gap). Limit: the
+  binding. Consistency is the **`O(n·t²)` interpolate-and-evaluate** collinearity check (interpolate `P` from
+  `t` verified shares over `GF(256)`, require all shares to lie on `P`) — a *complete* decision (no
+  probabilistic gap) that is robust to a forgery *inside* the interpolation basis and correct at any cell size
+  (the earlier `all-t-subsets` scan was exponential and mis-rejected large cells). Limit: the
   **detectable-abort** model (a malicious dealer can only exclude itself, never bias the honest sum) under an
-  honest dealer-majority. Tests cover forged shares, an off-polynomial-but-committed dealing, and sub-threshold reveals.
+  honest dealer-majority. Tests cover forged shares, an off-polynomial (in-basis and out-of-basis) dealing,
+  sub-threshold reveals, and a 20-node cell.
 - **`rlwe`** — the implementation is **not constant-time / NTT-hardened** (schoolbook `O(n²)` multiply, data-
   dependent nothing-special) and the security rests on the standard Ring-LWE assumption at the cited level.
 
