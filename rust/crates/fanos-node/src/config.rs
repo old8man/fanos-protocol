@@ -47,6 +47,73 @@ pub struct BeaconParams {
     pub share: Option<VssShare>,
 }
 
+impl BeaconParams {
+    /// Parse beacon provisioning from a `key = value` file (audit S1-H2), so a node can be handed its DKG
+    /// output and run the **live epoch clock** (§7.6) — turning on E4 forward secrecy and E5 rotation — instead
+    /// of pinning at genesis. Keys:
+    /// - `threshold = <t>` — the DVRF reconstruction threshold;
+    /// - `commitment = <hex>` — the group's public [`VssCommitment`] (network-wide genesis material);
+    /// - `share = <hex>` — THIS node's anchor [`VssShare`]; omit for a pure consumer (verifies + adopts only).
+    ///
+    /// The share is this node's secret — protect the file. The commitment/threshold are public and identical
+    /// network-wide. Generate a set with `fanos beacon-deal` (or an external DKG).
+    pub fn from_config_str(text: &str) -> Result<Self, NodeError> {
+        let mut threshold: Option<usize> = None;
+        let mut commitment: Option<VssCommitment> = None;
+        let mut share: Option<VssShare> = None;
+        for (n, raw) in text.lines().enumerate() {
+            let l = raw.split('#').next().unwrap_or("").trim();
+            if l.is_empty() {
+                continue;
+            }
+            let (key, value) = l.split_once('=').ok_or_else(|| {
+                NodeError::Config(format!("beacon config line {}: expected `key = value`", n + 1))
+            })?;
+            let value = value.trim();
+            match key.trim() {
+                "threshold" => {
+                    threshold = Some(value.parse().map_err(|_| {
+                        NodeError::Config(format!("bad beacon threshold '{value}'"))
+                    })?);
+                }
+                "commitment" => {
+                    commitment = Some(VssCommitment::from_bytes(&hex_decode(value)?).ok_or_else(|| {
+                        NodeError::Config("bad beacon commitment (not a valid VssCommitment)".to_owned())
+                    })?);
+                }
+                "share" => {
+                    share = Some(VssShare::from_bytes(&hex_decode(value)?).ok_or_else(|| {
+                        NodeError::Config("bad beacon share (not a valid VssShare)".to_owned())
+                    })?);
+                }
+                other => return Err(NodeError::Config(format!("unknown beacon config key '{other}'"))),
+            }
+        }
+        Ok(Self {
+            commitment: commitment
+                .ok_or_else(|| NodeError::Config("beacon config missing `commitment`".to_owned()))?,
+            threshold: threshold
+                .ok_or_else(|| NodeError::Config("beacon config missing `threshold`".to_owned()))?,
+            share,
+        })
+    }
+
+    /// Serialize to the `key = value` provisioning-file format ([`from_config_str`](Self::from_config_str) is
+    /// the inverse). A file carrying `share` holds this node's secret — protect it; the commitment/threshold
+    /// are public. A dealer writes one anchor file per share plus one share-less consumer file.
+    #[must_use]
+    pub fn to_config_string(&self) -> String {
+        use core::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "threshold = {}", self.threshold);
+        let _ = writeln!(s, "commitment = {}", hex_encode(&self.commitment.to_bytes()));
+        if let Some(share) = &self.share {
+            let _ = writeln!(s, "share = {}", hex_encode(&share.to_bytes()));
+        }
+        s
+    }
+}
+
 /// The threshold-hosting parameters a node needs to serve a CALYPSO service line (spec §12.3, #99). With
 /// `service = Some(..)` **and** the `service` role, the node composes a [`ServiceNode`](crate::ServiceNode):
 /// it holds one member key of the service line, joins the line's threshold gather on each intro, and
@@ -218,6 +285,37 @@ fn parse_coord(s: &str) -> Result<Triple, NodeError> {
 }
 
 /// Decode exactly 64 hex characters into a 32-byte seed.
+/// Hex-encode bytes (lower-case) — the inverse of [`hex_decode`], for writing beacon provisioning files.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0xF), 16).unwrap_or('0'));
+    }
+    s
+}
+
+/// Decode an even-length hex string to bytes — for the variable-length crypto objects (`VssCommitment`,
+/// `VssShare`) a beacon provisioning file carries (audit S1-H2).
+fn hex_decode(s: &str) -> Result<Vec<u8>, NodeError> {
+    let nibble = |c: u8| -> Result<u8, NodeError> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err(NodeError::Config("hex string contains a non-hex character".to_owned())),
+        }
+    };
+    let (pairs, rem) = s.as_bytes().as_chunks::<2>();
+    if !rem.is_empty() {
+        return Err(NodeError::Config("hex string has an odd length".to_owned()));
+    }
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Ok((nibble(hi)? << 4) | nibble(lo)?))
+        .collect()
+}
+
 fn parse_seed_hex(s: &str) -> Result<[u8; 32], NodeError> {
     let bytes = s.as_bytes();
     if bytes.len() != 64 {
@@ -506,6 +604,31 @@ mod tests {
         let p = Peer::parse("1:2:3@127.0.0.1:9000").unwrap();
         assert_eq!(p.coord, [1, 2, 3]);
         assert_eq!(p.addr, "127.0.0.1:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn beacon_params_round_trip_through_the_provisioning_file() {
+        // Audit S1-H2: a node must be provisionable with its DKG output so it runs the live epoch clock. Deal a
+        // 4-of-7 sharing, serialize each role's params to the file format, and parse them back byte-identically.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+        let (shares, commitment) = deal(&[0x7B; 32], 4, 7, &mut DeterministicRng::new(b"cfg-beacon")).unwrap();
+        let s2 = shares.get(2).unwrap();
+
+        // An ANCHOR's file carries the threshold, the public commitment, and its own share.
+        let anchor = BeaconParams { commitment: commitment.clone(), threshold: 4, share: Some(s2.clone()) };
+        let parsed = BeaconParams::from_config_str(&anchor.to_config_string()).unwrap();
+        assert_eq!(parsed.threshold, 4);
+        assert_eq!(parsed.commitment.to_bytes(), commitment.to_bytes(), "the group commitment round-trips");
+        assert_eq!(parsed.share.unwrap().to_bytes(), s2.to_bytes(), "the anchor's share round-trips");
+
+        // A pure CONSUMER's file omits the share (it verifies + adopts, never contributes).
+        let consumer = BeaconParams { commitment, threshold: 4, share: None };
+        let parsed = BeaconParams::from_config_str(&consumer.to_config_string()).unwrap();
+        assert!(parsed.share.is_none(), "a consumer has no share");
+
+        // Missing required fields, and a bad hex body, are rejected — not silently defaulted.
+        assert!(BeaconParams::from_config_str("threshold = 4\n").is_err(), "a missing commitment is rejected");
+        assert!(BeaconParams::from_config_str("threshold = 4\ncommitment = zz\n").is_err(), "bad hex is rejected");
     }
 
     #[test]

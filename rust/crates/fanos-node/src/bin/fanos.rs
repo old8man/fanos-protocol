@@ -14,7 +14,8 @@ use std::sync::Arc;
 use fanos_field::F2;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_node::{
-    AnonRouteParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node, NodeConfig,
+    AnonRouteParams, BeaconParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
+    NodeConfig,
     NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
     build_cell_mix_directory, identity, serve_proxy,
 };
@@ -22,6 +23,7 @@ use fanos_node::{
 #[cfg(feature = "vpn")]
 use fanos_node::StaticResolver;
 use fanos_runtime::Notification;
+use fanos_vrf::vss::{DeterministicRng, deal};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -43,6 +45,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
+        Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -125,6 +128,12 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         // A relay's mean cover-cell interval in ms (spec §L5/V8, audit S1-H1/E1); 0 disables cover traffic.
         let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --cover-interval-ms '{s}'")))?;
         config.cover_interval = std::time::Duration::from_millis(ms);
+    }
+    if let Some(path) = flag(args, "--beacon-params") {
+        // Provision the threshold-DVRF beacon so this node runs the live epoch clock (§7.6, audit S1-H2):
+        // its DKG output — group commitment, threshold, and (if an anchor) its share. Generate with
+        // `fanos beacon-deal`.
+        config.beacon = Some(BeaconParams::from_config_str(&std::fs::read_to_string(path)?)?);
     }
     Ok(config)
 }
@@ -496,6 +505,41 @@ fn cmd_id(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// `fanos beacon-deal <n> <t> [--out DIR]`: deal a `t`-of-`n` threshold-DVRF beacon key from OS entropy and
+/// write each anchor's provisioning file (`anchor-<i>.beacon`, `i = 1..=n`) plus a share-less
+/// `consumer.beacon` into `DIR` (default `.`). Provision a node with `fanos node --beacon-params
+/// anchor-<i>.beacon` so it runs the live epoch clock (audit S1-H2). A single-operator convenience — a
+/// trust-minimized deployment runs the networked DKG instead, so no one party ever holds the whole key.
+fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
+    let usage = || NodeError::Config("usage: fanos beacon-deal <n> <t> [--out DIR]".to_owned());
+    let n: usize = args.first().and_then(|s| s.parse().ok()).ok_or_else(usage)?;
+    let t: usize = args.get(1).and_then(|s| s.parse().ok()).ok_or_else(usage)?;
+    let out = flag(args, "--out").unwrap_or(".");
+
+    // The beacon secret and the polynomial RNG are both drawn from OS entropy — this tool holds the whole key
+    // for the moment of dealing (unlike the DKG), so it exists only to bootstrap a single-operator network.
+    let mut secret = [0u8; 32];
+    let mut rng_seed = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let (shares, commitment) = deal(&secret, t, n, &mut DeterministicRng::new(&rng_seed))
+        .ok_or_else(|| NodeError::Config(format!("cannot deal {t}-of-{n}: need 1 <= t <= n <= 255")))?;
+
+    for (i, share) in shares.iter().enumerate() {
+        let params =
+            BeaconParams { commitment: commitment.clone(), threshold: t, share: Some(share.clone()) };
+        let path = format!("{out}/anchor-{}.beacon", i + 1);
+        std::fs::write(&path, params.to_config_string())?;
+        println!("wrote {path}");
+    }
+    let consumer = BeaconParams { commitment, threshold: t, share: None };
+    let cpath = format!("{out}/consumer.beacon");
+    std::fs::write(&cpath, consumer.to_config_string())?;
+    println!("wrote {cpath}");
+    println!("dealt a {t}-of-{n} beacon; run each anchor with `fanos node --beacon-params anchor-<i>.beacon`");
+    Ok(())
+}
+
 /// Resolve a `.fanos` name against the network and print the authenticated result.
 async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
@@ -692,7 +736,8 @@ fn print_help() {
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
          \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
-         \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N]\n\
+         \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N] \\\n\
+         \x20             [--beacon-params FILE]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
@@ -701,6 +746,7 @@ fn print_help() {
          \x20             (full-tunnel: routes all TCP+UDP through an exit; needs --features vpn + root)\n\
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
+         \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
          \x20 fanos help\n\
          \n\
          PROXY PROFILES:\n\
