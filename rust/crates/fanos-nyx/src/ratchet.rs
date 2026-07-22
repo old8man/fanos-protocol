@@ -2,11 +2,17 @@
 //!
 //! On the incidence bundle a connection `A` is defined over each incident pair; the hop factor
 //! is `β_k = KDF(state ‖ A(p_{k-1}, p_k))`, a one-way KDF chain whose ordered composition along the
-//! path is the **holonomy** `Hol = state_L`. Both endpoints, knowing the algebraic path, compute the
-//! same `Hol`; inserting or substituting any hop changes an `A_k` and so breaks it, exactly as a
-//! nontrivial holonomy signals an incorrect contour in gap theory. The onion carries `Hol` as a
-//! compact tamper-evident tag — encrypted end-to-end in the innermost layer, so it is not a cleartext
-//! cross-hop correlator (see `fanos_aphantos::sealed`).
+//! path — followed by a **length-binding finalization** `Hol = H(state_L ‖ L)` — is the **holonomy**.
+//! Both endpoints, knowing the algebraic path, compute the same `Hol`; inserting or substituting any hop
+//! changes an `A_k` and so breaks it, exactly as a nontrivial holonomy signals an incorrect contour in gap
+//! theory. The onion carries `Hol` as a compact tamper-evident tag — encrypted end-to-end in the innermost
+//! layer, so it is not a cleartext cross-hop correlator (see `fanos_aphantos::sealed`).
+//!
+//! **Security (spec §5.4 `[P]`, closed).** The finalization turns the front-keyed cascade — a PRF only for a
+//! prefix-free message space, and hence length-extendable if the raw tag leaks — into an NMAC-style keyed
+//! MAC whose EUF-CMA security reduces to BLAKE3-as-a-PRF, *unconditionally* (no tag-secrecy caveat). The full
+//! reduction and a deterministic attack experiment covering every tamper class are in
+//! `docs/design-holonomy-security.md` and [`tests`]/[`attack_experiment`](self::attack_experiment).
 //!
 //! *Forward secrecy* of the routed onion comes from the per-hop **hybrid KEM** to the relay/line —
 //! recovering a hop key needs a relay's long-term secret, so the sender's build state does not — not
@@ -20,8 +26,10 @@ use fanos_primitives::hash_labeled;
 
 use crate::path::Circuit;
 
-/// The domain label for the ratchet KDF.
+/// The domain label for the ratchet KDF (the per-hop cascade step).
 const RATCHET_LABEL: &str = "FANOS-v1/nyx-ratchet";
+/// The domain label for the ratchet **finalization** — a length-binding outer step (see [`Ratchet::finalize`]).
+const RATCHET_FINAL_LABEL: &str = "FANOS-v1/nyx-ratchet-final";
 
 /// A one-way key ratchet advanced once per hop.
 #[derive(Clone, Debug)]
@@ -47,10 +55,25 @@ impl Ratchet {
         beta
     }
 
-    /// The current holonomy (accumulated state).
+    /// The current (non-finalized) cascade state — the accumulated hop chain so far. This is the raw
+    /// cascade output; a path authenticator should use [`finalize`](Self::finalize), which binds the length.
     #[must_use]
     pub fn holonomy(&self) -> [u8; 32] {
         self.state
+    }
+
+    /// The **finalized** holonomy: `H(FINAL ‖ state_L ‖ L)`, a length-binding outer step over the cascade of
+    /// `hops` hops. This turns the front-keyed cascade (a secure PRF only for a *prefix-free* / fixed-length
+    /// message space) into a full NMAC-style keyed MAC over an arbitrary-length hop sequence: because the
+    /// outer step folds in the hop count `L` and is one-way in the internal state, an adversary who learns a
+    /// finalized tag can neither recover `state_L` nor extend the chain to a longer path — closing the
+    /// cascade length-extension gap (spec §5.4 `[P]`, `docs/design-holonomy-security.md`).
+    #[must_use]
+    pub fn finalize(&self, hops: u32) -> [u8; 32] {
+        let mut input = [0u8; 32 + 4];
+        input[..32].copy_from_slice(&self.state);
+        input[32..].copy_from_slice(&hops.to_be_bytes());
+        hash_labeled(RATCHET_FINAL_LABEL, &input)
     }
 }
 
@@ -74,14 +97,18 @@ fn connection_bytes(from: Triple, to: Triple, line: Triple) -> [u8; 36] {
 pub fn circuit_holonomy<F: Field>(circuit: &Circuit<F>, seed: &[u8; 32]) -> [u8; 32] {
     let mut ratchet = Ratchet::new(seed);
     let relays = circuit.relays();
+    let mut hops = 0u32;
     for (k, hop) in circuit.hops().iter().enumerate() {
         let (Some(a), Some(b)) = (relays.get(k), relays.get(k + 1)) else {
             break;
         };
         let conn = connection_bytes(a.coords(), b.coords(), hop.coords());
         ratchet.advance(&conn);
+        hops += 1;
     }
-    ratchet.holonomy()
+    // Length-binding finalization (NMAC-style) — makes the tag a provable keyed MAC, not just a front-keyed
+    // cascade, so its security no longer rests on the tag being kept secret (spec §5.4, design-holonomy-security.md).
+    ratchet.finalize(hops)
 }
 
 /// Verify a `claimed` holonomy against the circuit and seed the verifying party independently
@@ -162,5 +189,183 @@ mod tests {
             circuit_holonomy(&circuit, &[7u8; 32]),
             circuit_holonomy(&circuit, &[8u8; 32])
         );
+    }
+
+    #[test]
+    fn the_finalization_binds_the_hop_count() {
+        // Two ratchets with the SAME accumulated state but different declared lengths finalize differently —
+        // the length-binding that defeats cascade length extension.
+        let mut r = Ratchet::new(&[3u8; 32]);
+        r.advance(b"only-hop");
+        assert_ne!(r.finalize(1), r.finalize(2), "the finalization folds in the hop count");
+        // And the finalized tag is not the raw cascade state (so exposing the tag reveals no cascade state).
+        assert_ne!(r.finalize(1), r.holonomy(), "the tag is finalized, not the raw cascade state");
+    }
+}
+
+/// The holonomy-authentication **attack experiment** (spec §5.4 `[P]`, `docs/design-holonomy-security.md` §5).
+///
+/// Deterministic — no timing, no RNG — so it is a stable CI guard, not a flaky measurement. Over many
+/// synthetic paths it applies every tamper class and asserts the finalized tag changes, checks
+/// forgery-without-seed fails, confirms the length-binding finalization blocks the classic cascade
+/// length-extension attack, and runs a collision Monte-Carlo plus an avalanche-diffusion check.
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+mod attack_experiment {
+    use alloc::collections::BTreeSet;
+    use alloc::vec::Vec;
+
+    use fanos_primitives::hash_labeled;
+
+    use super::{Ratchet, RATCHET_LABEL};
+
+    /// A tiny deterministic PRG (`splitmix64`) — reproducible synthetic connection bytes.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A distinct 36-byte connection block (the `A_k` width) derived from `tag`.
+    fn block(tag: u64) -> Vec<u8> {
+        let mut s = tag ^ 0x5DEE_CE66_D1CE_B00Bu64;
+        let mut v = Vec::with_capacity(36);
+        while v.len() < 36 {
+            v.extend_from_slice(&splitmix(&mut s).to_be_bytes());
+        }
+        v.truncate(36);
+        v
+    }
+
+    fn random_path(seed_val: u64, len: usize) -> Vec<Vec<u8>> {
+        (0..len as u64).map(|i| block(seed_val.wrapping_mul(1000).wrapping_add(i))).collect()
+    }
+
+    /// The finalized holonomy of a raw connection path (mirrors `circuit_holonomy` at the ratchet level).
+    fn tag(seed: &[u8; 32], path: &[Vec<u8>]) -> [u8; 32] {
+        let mut r = Ratchet::new(seed);
+        for a in path {
+            r.advance(a);
+        }
+        r.finalize(path.len() as u32)
+    }
+
+    const SEED: [u8; 32] = [0x42; 32];
+
+    #[test]
+    fn every_tamper_class_changes_the_tag() {
+        for trial in 0..300u64 {
+            let path = random_path(trial, 5);
+            let base = tag(&SEED, &path);
+            let fresh = block(0xF00D_0000 ^ trial);
+
+            // Substitute an interior hop.
+            let mut sub = path.clone();
+            sub[2] = fresh.clone();
+            assert_ne!(tag(&SEED, &sub), base, "substitution must break the tag (trial {trial})");
+
+            // Insert a hop.
+            let mut ins = path.clone();
+            ins.insert(2, fresh.clone());
+            assert_ne!(tag(&SEED, &ins), base, "insertion must break the tag");
+
+            // Delete a hop.
+            let mut del = path.clone();
+            del.remove(2);
+            assert_ne!(tag(&SEED, &del), base, "deletion must break the tag");
+
+            // Reorder two hops.
+            let mut ord = path.clone();
+            ord.swap(1, 3);
+            assert_ne!(tag(&SEED, &ord), base, "reordering must break the tag");
+
+            // Truncate the last hop (length attack).
+            assert_ne!(tag(&SEED, &path[..4]), base, "truncation must break the tag");
+
+            // Extend by a hop (length-extension attack surface).
+            let mut ext = path.clone();
+            ext.push(fresh.clone());
+            assert_ne!(tag(&SEED, &ext), base, "extension must break the tag");
+
+            // Flip a single bit of one hop.
+            let mut bit = path.clone();
+            bit[0][0] ^= 1;
+            assert_ne!(tag(&SEED, &bit), base, "a single-bit tamper must break the tag");
+        }
+    }
+
+    #[test]
+    fn forgery_without_the_seed_fails() {
+        // An adversary who does not hold `seed` cannot produce the tag for a target path: any wrong seed
+        // yields a different tag (the authenticator is keyed).
+        let path = random_path(7, 4);
+        let real = tag(&SEED, &path);
+        for k in 0..64u8 {
+            let mut guess = SEED;
+            guess[0] ^= k.wrapping_add(1); // any non-zero change → a different seed
+            assert_ne!(tag(&guess, &path), real, "a wrong seed must not forge the tag");
+        }
+    }
+
+    #[test]
+    fn the_finalization_blocks_cascade_length_extension() {
+        // The classic attack on the UN-finalized cascade: given the tag of an L-hop path (treated as the raw
+        // cascade state state_L), compute H("nyx-ratchet", tag ‖ A) to forge the (L+1)-hop tag WITHOUT the
+        // seed. With the length-binding finalization the real extended tag is independent of that value.
+        for trial in 0..100u64 {
+            let path = random_path(trial, 4);
+            let base = tag(&SEED, &path);
+            let a = block(0xBEEF ^ trial);
+
+            let mut extended = path.clone();
+            extended.push(a.clone());
+            let real_extended = tag(&SEED, &extended);
+
+            // What an attacker on the raw cascade would compute from the (finalized) tag it sees.
+            let mut naive_input = Vec::with_capacity(32 + a.len());
+            naive_input.extend_from_slice(&base);
+            naive_input.extend_from_slice(&a);
+            let naive_extension = hash_labeled(RATCHET_LABEL, &naive_input);
+
+            assert_ne!(
+                naive_extension, real_extended,
+                "the finalization must make the tag non-extendable from itself (trial {trial})"
+            );
+        }
+    }
+
+    #[test]
+    fn no_collisions_over_thousands_of_random_paths() {
+        // Monte-Carlo: many distinct random paths (varying length and content) yield distinct tags — the
+        // tamper-evidence claim's statistical face (a collision would be a 2^-256 event).
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut n = 0;
+        for seed_val in 0..1_500u64 {
+            let len = 2 + (seed_val % 6) as usize; // lengths 2..=7
+            let t = tag(&SEED, &random_path(seed_val, len));
+            assert!(seen.insert(t), "tag collision at seed {seed_val}");
+            n += 1;
+        }
+        assert_eq!(seen.len(), n, "every path produced a unique tag");
+    }
+
+    #[test]
+    fn a_single_bit_change_diffuses_across_the_tag() {
+        // Avalanche: flipping one bit of the path flips ≈ half the 256 tag bits (good diffusion, from BLAKE3).
+        let path = random_path(11, 5);
+        let base = tag(&SEED, &path);
+        let mut total_diff = 0u32;
+        let trials = 64u32;
+        for i in 0..trials {
+            let mut tampered = path.clone();
+            let byte = (i as usize) % tampered[0].len();
+            tampered[0][byte] ^= 1 << (i % 8);
+            let t = tag(&SEED, &tampered);
+            total_diff += base.iter().zip(t.iter()).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>();
+        }
+        let mean = f64::from(total_diff) / f64::from(trials);
+        assert!((96.0..160.0).contains(&mean), "avalanche mean {mean} bits is far from the ideal 128");
     }
 }
