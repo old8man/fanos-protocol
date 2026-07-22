@@ -28,6 +28,9 @@ pub enum MessageKind {
     PaymentRequest,
     /// A system/control notice.
     System,
+    /// An **attachment** — the content is a serialized [`crate::attachment::Attachment`] pointing at a file
+    /// stored in THESAUROS (a content id + the key to decrypt it). The file itself is fetched out of band.
+    Attachment,
 }
 
 impl MessageKind {
@@ -44,6 +47,7 @@ impl MessageKind {
             MessageKind::Payment => 6,
             MessageKind::PaymentRequest => 7,
             MessageKind::System => 8,
+            MessageKind::Attachment => 9,
         }
     }
 
@@ -60,6 +64,7 @@ impl MessageKind {
             6 => Some(MessageKind::Payment),
             7 => Some(MessageKind::PaymentRequest),
             8 => Some(MessageKind::System),
+            9 => Some(MessageKind::Attachment),
             _ => None,
         }
     }
@@ -91,6 +96,22 @@ impl Message {
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         core::str::from_utf8(&self.content).ok()
+    }
+
+    /// An attachment message to `channel` from `sender` — the file pointer travels inside the (E2E-encrypted)
+    /// message; the file itself is fetched from THESAUROS.
+    #[must_use]
+    pub fn attachment(channel: [u8; 32], sender: [u8; 32], seq: u64, attachment: &crate::attachment::Attachment) -> Self {
+        Self { channel, sender, seq, kind: MessageKind::Attachment, content: attachment.to_bytes() }
+    }
+
+    /// The message's content as an [`Attachment`](crate::attachment::Attachment), if it is an attachment message.
+    #[must_use]
+    pub fn as_attachment(&self) -> Option<crate::attachment::Attachment> {
+        if self.kind != MessageKind::Attachment {
+            return None;
+        }
+        crate::attachment::Attachment::from_bytes(&self.content)
     }
 
     /// Canonical bytes: `channel(32) ‖ sender(32) ‖ seq(8) ‖ kind(1) ‖ content_len(4) ‖ content`.

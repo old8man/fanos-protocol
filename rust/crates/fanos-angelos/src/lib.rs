@@ -43,6 +43,7 @@ extern crate alloc;
 
 mod chain;
 
+pub mod attachment;
 pub mod bot;
 pub mod call;
 pub mod group;
@@ -51,6 +52,7 @@ pub mod message;
 pub mod ratchet;
 pub mod session;
 
+pub use attachment::Attachment;
 pub use bot::{Bot, Event, Outgoing, dispatch};
 pub use call::{CallId, CallSignal};
 pub use group::GroupSession;

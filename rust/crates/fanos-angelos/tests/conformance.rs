@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 
 use fanos_angelos::call::{CallId, CallSignal, media_flags};
-use fanos_angelos::{Command, GroupSession, MediaKind, MediaSession, Message, MessageKind, Role, Session};
+use fanos_angelos::{Attachment, Command, GroupSession, MediaKind, MediaSession, Message, MessageKind, Role, Session};
 
 fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -30,12 +30,13 @@ fn message_kind_tags_match_angelos_json() {
         (MessageKind::Payment, 6),
         (MessageKind::PaymentRequest, 7),
         (MessageKind::System, 8),
+        (MessageKind::Attachment, 9),
     ];
     for (kind, tag) in table {
         assert_eq!(kind.tag(), tag, "tag of {kind:?}");
         assert_eq!(MessageKind::from_tag(tag), Some(kind), "from_tag({tag})");
     }
-    assert_eq!(MessageKind::from_tag(9), None, "an unknown tag is rejected");
+    assert_eq!(MessageKind::from_tag(10), None, "an unknown tag is rejected");
 }
 
 #[test]
@@ -75,6 +76,25 @@ fn command_grammar_matches_angelos_json() {
     assert!(ping.args.is_empty());
     assert!(Command::parse("hello", '/').is_none(), "no prefix → not a command");
     assert!(Command::parse("/", '/').is_none(), "empty name → not a command");
+}
+
+#[test]
+fn attachment_kat_matches_angelos_json() {
+    // A file pointer carried inside an (E2E-encrypted) message; its bytes are pinned in angelos.json.
+    let a = Attachment::new([0xAB; 32], [0xCD; 32], 0x0102, "video/mp4");
+    let mut expect = Vec::new();
+    expect.extend_from_slice(&[0xAB; 32]); // cid
+    expect.extend_from_slice(&[0xCD; 32]); // key
+    expect.extend_from_slice(&0x0102u64.to_le_bytes()); // size
+    expect.extend_from_slice(&9u16.to_le_bytes()); // media-type length
+    expect.extend_from_slice(b"video/mp4");
+    assert_eq!(a.to_bytes(), expect);
+    assert_eq!(hex(&a.to_bytes()).len(), 166, "83 bytes");
+    assert_eq!(Attachment::from_bytes(&a.to_bytes()), Some(a.clone()), "attachment round-trips");
+    // An attachment rides inside a message and is recovered by kind.
+    let m = Message::attachment([7; 32], [8; 32], 3, &a);
+    assert_eq!(m.kind, MessageKind::Attachment);
+    assert_eq!(m.as_attachment(), Some(a));
 }
 
 #[test]

@@ -16,7 +16,8 @@
       "CallSignal": 5,
       "Payment": 6,
       "PaymentRequest": 7,
-      "System": 8
+      "System": 8,
+      "Attachment": 9
     },
     "vectors": [
       {
@@ -48,6 +49,16 @@
       { "text": "hello", "is_command": false },
       { "text": "/", "is_command": false }
     ]
+  },
+  "attachment": {
+    "comment": "A file pointer carried as the content of an Attachment message (kind 9). The file is sealed and stored in THESAUROS; the descriptor rides inside the E2E-encrypted message, so the key is safe. Layout: cid(32) || key(32) || size(8, little-endian) || media_type_len(2, little-endian) || media_type(utf-8). A decoder rejects trailing bytes and non-UTF-8.",
+    "vector": {
+      "cid_hex": "abababababababababababababababababababababababababababababababab",
+      "key_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "size": 258,
+      "media_type": "video/mp4",
+      "bytes_hex": "ababababababababababababababababababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd02010000000000000900766964656f2f6d7034"
+    }
   },
   "call": {
     "comment": "Call signaling — the content of a CallSignal message that sets up a voice/video call. Canonical layout: tag(1) || call_id(16), and for an Invite || media_secret(32) || media_flags(1). The caller sends an Invite carrying a fresh media secret (the media session's epoch-0 key) and the offered media; both sides seed an identical media session from the secret. A decoder MUST reject an unknown tag, a short body, or trailing bytes.",
