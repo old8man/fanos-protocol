@@ -14,7 +14,7 @@
 //! coordination — the deterministic self-organization proven in `fanos-core/tests/self_organization.rs`, now
 //! over the live directory.
 
-use fanos_core::roles::{Demand, RoleController, RoleSet};
+use fanos_core::roles::{Capability, Demand, Reputation, RoleController, RoleSet};
 use fanos_field::Field;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
 use fanos_quic::Client;
@@ -32,13 +32,15 @@ use crate::loaddir::build_cell_setpoint;
 pub struct LiveRoleController {
     node_id: NodeId,
     controller: RoleController,
+    reputation: Reputation,
 }
 
 impl LiveRoleController {
-    /// Build a live controller for `node_id` over the demand controller `controller`.
+    /// Build a live controller for `node_id` over the demand controller `controller`, with a fresh reputation
+    /// (every node fully trusted until observed).
     #[must_use]
     pub fn new(node_id: NodeId, controller: RoleController) -> Self {
-        Self { node_id, controller }
+        Self { node_id, controller, reputation: Reputation::new() }
     }
 
     /// The controller's current demand (its internal state).
@@ -47,16 +49,26 @@ impl LiveRoleController {
         self.controller.demand()
     }
 
-    /// One epoch: rebalance the demand toward `setpoint`, assign roles over `members`, and return *this* node's
-    /// assigned roles for `(epoch, beacon)`. Deterministic given the same inputs on every node.
+    /// Record whether a node served its assigned role last epoch, from the cell's (agreed) coherence
+    /// self-diagnosis — a non-performer's effective weight decays, so the next assignment prefers performers
+    /// (task A4). Because every node feeds the same agreed diagnosis, the reputation is identical cell-wide and
+    /// the assignment stays deterministic.
+    pub fn observe(&mut self, node: NodeId, performed: bool) {
+        self.reputation.observe(node, performed);
+    }
+
+    /// One epoch: apply reputation to the members' weights, rebalance the demand toward `setpoint`, assign
+    /// roles, and return *this* node's assigned roles for `(epoch, beacon)`. Deterministic given the same
+    /// inputs (including the agreed reputation) on every node.
     pub fn step(
         &mut self,
-        members: &[(NodeId, fanos_core::roles::Capability)],
+        members: &[(NodeId, Capability)],
         epoch: Epoch,
         beacon: &BeaconSeed,
         setpoint: Demand,
     ) -> RoleSet {
-        let report = self.controller.step(members, epoch, beacon, setpoint);
+        let weighted = self.reputation.adjust(members);
+        let report = self.controller.step(&weighted, epoch, beacon, setpoint);
         report.roles.get(&self.node_id).copied().unwrap_or(RoleSet::EMPTY)
     }
 }

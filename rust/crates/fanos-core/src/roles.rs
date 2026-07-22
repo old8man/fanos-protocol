@@ -414,6 +414,71 @@ impl LoadMeter {
     }
 }
 
+/// Reputation fixed-point scale: a score of [`REP_SCALE`] is full (declared weight honored in full).
+pub const REP_SCALE: u16 = 256;
+/// Reputation floor: a persistently-non-performing node keeps `REP_FLOOR/REP_SCALE` of its declared weight —
+/// never fully excluded (it may recover, and exclusion would be a censorship lever), only de-prioritized.
+pub const REP_FLOOR: u16 = REP_SCALE / 8;
+
+/// A per-node **performance reputation** — the third bound on the "controlled freedom" of the self-organizing
+/// loop (`docs/design-self-organization.md` §5): a node declares capability freely, but an assignee that does
+/// not actually *serve* its role has its effective capacity weight decayed, so the assignment prefers nodes
+/// that perform. This prices the one freedom the signature and PoW cannot — over-declaring one's *own* weight.
+///
+/// The performance signal is an **agreed** one: it comes from the cell's coherence self-diagnosis
+/// (`fanos-diakrisis`) — a non-performing node shows as reduced coupling on its lines — which every node reads
+/// identically, so the reputation is the same on every node and the assignment stays deterministic. The model
+/// here is sans-I/O: it consumes performed/failed observations and produces a weight multiplier.
+#[derive(Clone, Debug, Default)]
+pub struct Reputation {
+    scores: BTreeMap<NodeId, u16>,
+}
+
+impl Reputation {
+    /// A fresh reputation (every node starts at full [`REP_SCALE`] until observed).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A node's current score (unseen nodes are trusted at full [`REP_SCALE`]).
+    #[must_use]
+    pub fn score(&self, node: &NodeId) -> u16 {
+        self.scores.get(node).copied().unwrap_or(REP_SCALE)
+    }
+
+    /// Record whether `node` served its assigned role this window. A success recovers the score additively
+    /// (by `REP_SCALE/8`, capped at full); a failure decays it multiplicatively (halved, floored at
+    /// [`REP_FLOOR`]) — fast to punish, slow to trust, the standard reputation asymmetry.
+    pub fn observe(&mut self, node: NodeId, performed: bool) {
+        let cur = self.score(&node);
+        let next = if performed {
+            cur.saturating_add(REP_SCALE / 8).min(REP_SCALE)
+        } else {
+            (cur / 2).max(REP_FLOOR)
+        };
+        self.scores.insert(node, next);
+    }
+
+    /// A node's **reputation-adjusted weight**: `declared × score / REP_SCALE`, clamped to `≥ 1` (a node in
+    /// good standing keeps its full declared weight; a failing one is de-weighted toward the floor).
+    #[must_use]
+    pub fn effective_weight(&self, node: &NodeId, declared: u16) -> u16 {
+        ((u32::from(declared) * u32::from(self.score(node)) / u32::from(REP_SCALE)) as u16).max(1)
+    }
+
+    /// Apply reputation to a member set for the assignment: each capability keeps its offered roles but its
+    /// weight becomes the [`effective_weight`](Self::effective_weight). Feed the result to [`assign`] /
+    /// [`RoleController::step`] so reputation shapes who wins scarce roles.
+    #[must_use]
+    pub fn adjust(&self, members: &[(NodeId, Capability)]) -> Vec<(NodeId, Capability)> {
+        members
+            .iter()
+            .map(|(id, cap)| (*id, Capability::new(cap.offered, self.effective_weight(id, cap.weight))))
+            .collect()
+    }
+}
+
 /// The UHM viability gain floor `κ_bootstrap = 1/7`, expressed in sevenths as `1` — the smallest loop gain the
 /// [`RoleController`] uses, under which the pull toward the demand setpoint never vanishes (T-59/T-104).
 pub const GAIN_BOOTSTRAP_SEVENTHS: u8 = 1;
@@ -800,5 +865,41 @@ mod tests {
         // reset clears the window for the next epoch.
         m.reset();
         assert_eq!(m.observed_load(), Demand::default());
+    }
+
+    #[test]
+    fn reputation_decays_a_non_performer_and_shapes_the_assignment() {
+        let mut rep = Reputation::new();
+        let bad = node(0);
+        assert_eq!(rep.score(&bad), REP_SCALE, "an unseen node is trusted at full");
+        assert_eq!(rep.effective_weight(&bad, 64), 64);
+        // Repeated failure decays fast (halving) to the floor, never to zero (it may recover).
+        for _ in 0..8 {
+            rep.observe(bad, false);
+        }
+        assert_eq!(rep.score(&bad), REP_FLOOR, "a persistent non-performer decays to the floor");
+        assert_eq!(rep.effective_weight(&bad, 64), 64 * REP_FLOOR / REP_SCALE, "its effective weight is de-weighted");
+        // Success recovers, slowly (additive).
+        let before = rep.score(&bad);
+        rep.observe(bad, true);
+        assert!(rep.score(&bad) > before, "success recovers");
+        // adjust() de-weights the failing node so the assignment favors performers.
+        let members = vec![
+            (bad, Capability::new(RoleSet::of(&[Role::Relay]), 64)),
+            (node(1), Capability::new(RoleSet::of(&[Role::Relay]), 64)),
+        ];
+        let adjusted = rep.adjust(&members);
+        let bad_w = adjusted.iter().find(|(id, _)| *id == bad).unwrap().1.weight;
+        let good_w = adjusted.iter().find(|(id, _)| *id == node(1)).unwrap().1.weight;
+        assert!(bad_w < good_w, "the non-performer is de-weighted vs a full-trust peer");
+        // Over many epochs the full-trust node wins a scarce role far more than the de-weighted failer.
+        let mut good_wins = 0u32;
+        for e in 0..200u64 {
+            let a = assign(&adjusted, Epoch::new(e), &B, Demand { relay: 1, ..Default::default() });
+            if a.get(&node(1)).is_some_and(|r| r.has(Role::Relay)) {
+                good_wins += 1;
+            }
+        }
+        assert!(good_wins > 130, "the full-trust node wins the scarce role far more often, got {good_wins}/200");
     }
 }
