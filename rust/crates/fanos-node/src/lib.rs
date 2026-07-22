@@ -23,6 +23,7 @@ pub mod epoch_driver;
 pub mod error;
 pub mod exit;
 pub mod capdir;
+pub mod role_loop;
 pub mod identity;
 pub mod mix_relay;
 pub mod mixdir;
