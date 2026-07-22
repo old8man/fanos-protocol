@@ -145,14 +145,15 @@ fn group_post_kat_matches_angelos_json() {
 
 #[test]
 fn media_frame_kat_matches_angelos_json() {
-    // Epoch-0 frames over a fixed call secret.
-    let mut tx = MediaSession::new(&[0x33; 32]);
-    assert_eq!(hex(&tx.seal_frame(MediaKind::Audio, b"audio0")), "000000000000000000000000020e097db880b46b33d05a25b200f715de9c928d2d62f5");
-    assert_eq!(hex(&tx.seal_frame(MediaKind::Video, b"video1")), "000000000100000000000000bcb21d09770aa5d025f1b5658276b40d71198e37bb733d");
+    use fanos_angelos::MediaRole;
+    // Epoch-0 caller-direction frames over a fixed call secret.
+    let mut tx = MediaSession::new(&[0x33; 32], MediaRole::Caller);
+    assert_eq!(hex(&tx.seal_frame(MediaKind::Audio, b"audio0")), "000000000000000000000000fa2b86644730e4c9a651251600c5f018509ec40c813691");
+    assert_eq!(hex(&tx.seal_frame(MediaKind::Video, b"video1")), "00000000010000000000000095ea39401655376b71218f34f5c85e6cfb4e137222aa2c");
 
-    // The receiver opens either frame independently (loss-tolerant, order-independent).
-    let mut tx2 = MediaSession::new(&[0x33; 32]);
-    let rx = MediaSession::new(&[0x33; 32]);
-    let a = tx2.seal_frame(MediaKind::Audio, b"audio0");
-    assert_eq!(rx.open_frame(&a), Some((0, MediaKind::Audio, b"audio0".to_vec())));
+    // The callee opens the caller's frame (cross-direction, loss-tolerant, order-independent).
+    let mut caller = MediaSession::new(&[0x33; 32], MediaRole::Caller);
+    let callee = MediaSession::new(&[0x33; 32], MediaRole::Callee);
+    let a = caller.seal_frame(MediaKind::Audio, b"audio0");
+    assert_eq!(callee.open_frame(&a), Some((0, MediaKind::Audio, b"audio0".to_vec())));
 }

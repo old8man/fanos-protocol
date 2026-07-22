@@ -110,18 +110,20 @@
     }
   },
   "media": {
-    "comment": "The real-time voice/video session — loss-tolerant per-frame AEAD under a per-call epoch key. epoch-0 key = H('FANOS-angelos-v1/media-epoch0', call_secret); a rekey advances key' = H('FANOS-angelos-v1/media-next-epoch', key) for forward secrecy across epochs (not packets — you cannot ratchet at 50 pkt/s). Each frame: inner = kind(1) || payload; wire = epoch(4, little-endian) || seq(8, little-endian) || AEAD(epoch_key, nonce(seq), inner). Any frame of the current epoch opens on its own, in any order, so loss and reordering are fine; a stale-epoch frame is dropped.",
+    "comment": "The real-time voice/video session — loss-tolerant per-frame AEAD under a per-call, PER-DIRECTION epoch key. The two ends derive DISTINCT send keys so their seq=0 frames never collide on a (key, nonce) pair (sharing one key across both directions is a ChaCha20-Poly1305 nonce reuse — a two-time pad). caller epoch-0 key = H('FANOS-angelos-v1/media-epoch0-caller', call_secret); callee epoch-0 key = H('FANOS-angelos-v1/media-epoch0-callee', call_secret); each party seals under its own direction's key and opens under the peer's. A rekey advances each key' = H('FANOS-angelos-v1/media-next-epoch', key) for forward secrecy across epochs. Each frame: inner = kind(1) || payload; wire = epoch(4, little-endian) || seq(8, little-endian) || AEAD(dir_key, nonce(seq), inner). Any frame of the current epoch opens on its own, in any order.",
     "labels": {
-      "epoch0": "FANOS-angelos-v1/media-epoch0",
+      "epoch0_caller": "FANOS-angelos-v1/media-epoch0-caller",
+      "epoch0_callee": "FANOS-angelos-v1/media-epoch0-callee",
       "next_epoch": "FANOS-angelos-v1/media-next-epoch"
     },
     "kind_tags": { "Audio": 0, "Video": 1, "Data": 2 },
     "wire_layout": "epoch(4, little-endian) || seq(8, little-endian) || ciphertext",
     "vector": {
-      "comment": "Epoch 0 over call secret = 0x33 repeated 32 times: an audio frame at seq 0, then a video frame at seq 1.",
+      "comment": "Epoch 0, CALLER direction, over call secret = 0x33 repeated 32 times: an audio frame at seq 0, then a video frame at seq 1 (opened by the callee under the caller's key). Distinct per-direction keys mean the callee's seq-0 frame differs, so the two directions never reuse a (key, nonce).",
       "call_secret_hex": "3333333333333333333333333333333333333333333333333333333333333333",
-      "audio_seq0_hex": "000000000000000000000000020e097db880b46b33d05a25b200f715de9c928d2d62f5",
-      "video_seq1_hex": "000000000100000000000000bcb21d09770aa5d025f1b5658276b40d71198e37bb733d"
+      "role": "Caller",
+      "audio_seq0_hex": "000000000000000000000000fa2b86644730e4c9a651251600c5f018509ec40c813691",
+      "video_seq1_hex": "00000000010000000000000095ea39401655376b71218f34f5c85e6cfb4e137222aa2c"
     }
   }
 }

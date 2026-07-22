@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 
-use crate::media::MediaSession;
+use crate::media::{MediaRole, MediaSession};
 
 /// The length of a call identifier.
 pub const CALL_ID_LEN: usize = 16;
@@ -79,7 +79,7 @@ impl CallSignal {
     /// to send (sealed over the session) and the caller's local [`MediaSession`] seeded by the secret.
     #[must_use]
     pub fn invite(call: CallId, media_secret: [u8; 32], media: u8) -> (Self, MediaSession) {
-        (Self::Invite { call, media_secret, media }, MediaSession::new(&media_secret))
+        (Self::Invite { call, media_secret, media }, MediaSession::new(&media_secret, MediaRole::Caller))
     }
 
     /// Accept a received invite: return the accept to send and the callee's [`MediaSession`] — identical to the
@@ -88,7 +88,7 @@ impl CallSignal {
     pub fn accept(&self) -> Option<(Self, MediaSession)> {
         match self {
             Self::Invite { call, media_secret, .. } => {
-                Some((Self::Accept { call: *call }, MediaSession::new(media_secret)))
+                Some((Self::Accept { call: *call }, MediaSession::new(media_secret, MediaRole::Callee)))
             }
             _ => None,
         }
