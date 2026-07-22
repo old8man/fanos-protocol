@@ -1,0 +1,22 @@
+[package]
+name = "fanos-hermes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HERMES — the FANOS post-quantum threshold cross-chain: PQ hash-locked atomic swaps and threshold-attested custody (spec/platform.md §8)."
+keywords = ["cross-chain", "atomic-swap", "htlc", "post-quantum", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+# BLAKE3 domain-separated hashing for the post-quantum hashlock (a hash-preimage lock is PQ-secure).
+fanos-primitives = { workspace = true, default-features = false, features = ["alloc"] }
+
+[features]
+default = ["std"]
+std = ["fanos-primitives/std"]
+
+[lints]
+workspace = true

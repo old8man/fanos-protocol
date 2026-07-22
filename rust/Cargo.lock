@@ -973,6 +973,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-hermes"
+version = "0.1.0"
+dependencies = [
+ "fanos-primitives",
+]
+
+[[package]]
 name = "fanos-incentives"
 version = "0.1.0"
 dependencies = [

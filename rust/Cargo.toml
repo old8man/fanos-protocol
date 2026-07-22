@@ -46,6 +46,7 @@ members = [
     "crates/fanos-dromos",
     "crates/fanos-angelos",
     "crates/fanos-thesauros",
+    "crates/fanos-hermes",
     "crates/fanos-wasm",
 ]
 
@@ -124,6 +125,7 @@ fanos-obolos = { path = "crates/fanos-obolos", version = "0.1.0", default-featur
 fanos-dromos = { path = "crates/fanos-dromos", version = "0.1.0", default-features = false }
 fanos-angelos = { path = "crates/fanos-angelos", version = "0.1.0", default-features = false }
 fanos-thesauros = { path = "crates/fanos-thesauros", version = "0.1.0", default-features = false }
+fanos-hermes = { path = "crates/fanos-hermes", version = "0.1.0", default-features = false }
 fanos-aphantos = { path = "crates/fanos-aphantos", version = "0.1.0" }
 fanos-calypso = { path = "crates/fanos-calypso", version = "0.1.0" }
 fanos-diaulos = { path = "crates/fanos-diaulos", version = "0.1.0" }
