@@ -100,9 +100,9 @@ structure, which is why the answers compose instead of conflicting:
 
 | # | Threat / attack surface | FANOS fundamental answer | Status | Verified / owned by |
 |---|---|---|---|---|
-| F1 | **Split-brain / CAP** | Partition detection + degraded operation + escalation; no global lock on the hot path | 🟡 | `partition.rs`; consensus phase later |
+| F1 | **Split-brain / CAP** | Partition detection + degraded operation + escalation; **and at the consensus layer, safety under a hard netsplit**: on a 7-node cell the commit quorum is `2f+1 = 5`, so neither side of a `4 \| 3` split can finalize — no conflicting block can be committed while the network is cut — and liveness returns on heal | ✅ 🟡 | `partition.rs` (overlay Fiedler `λ₂` detection); **`fanos-taxis/tests/consensus_sim.rs::a_network_partition_cannot_split_agreement_and_heals`** — a split cell finalizes nothing (sub-quorum), no fork at any height, and the reunited cell finalizes across a supermajority. 🟡 residual: overlay live cross-cell repair path (R-C2, hierarchical) |
 | F2 | **Convergence without a rate bound** (CRDT-style) | Relaxation with a *derived* spectral gap `Δ` (bounded convergence time `τ = 1/Δ`) | ✅ | `regeneration::spectral_gap`, `loadbalance` λ₂ |
-| F3 | **Agreement under Byzantine** | Consensus-via-coherence: agreement = `Φ ≥ 1`; Byzantine exclusion = polar quarantine | ⬜ | consensus phase (roadmap) |
+| F3 | **Agreement under Byzantine** | The **TAXIS BFT blockchain** (`fanos-taxis`): a projective-cell PBFT-class consensus with an anti-MEV encrypted mempool (keyper-line reveal) and DA-verified proposals — safety holds under `f = 2` Byzantine validators on the 7-node cell, and equivocation surfaces slashing evidence. (The coherence layer's `Φ ≥ 1` + polar quarantine is the *self-healing* substrate below it, not the agreement primitive.) | ✅ | **`fanos-taxis/tests/consensus_sim.rs`**: `randomized_scheduling_and_byzantine_faults_never_fork` (a random ≤`f` Byzantine subset equivocates under an adversarial async scheduler over a Monte-Carlo — no two honest validators ever finalize different blocks at a height), `forged_votes_cannot_forge_a_certificate`, `equivocating_proposals_cannot_split_agreement`, and the netsplit case (F1). Parallel execution is deterministic + serial-equivalent (`fanos-dromos`), so agreement on the ordered block ⇒ agreement on the executed state |
 
 ## G. Censorship & blocking resistance
 
@@ -142,6 +142,12 @@ deserve their own verified treatment, tracked as new tasks:
   node; a tier reroutes only around attacked cells), the escalation depth is finite (one tier for a
   within-decoder attack, one more for an irrecoverable stopping set, no further), and the reroute budget
   gate is exactly the analytic `⌊log₉Φ⌋`.
+- ~~**Consensus agreement under Byzantine + partition (F1/F3):**~~ **done** — `fanos-taxis/tests/consensus_sim.rs`
+  proves BFT safety over an adversarial async scheduler with a random `≤ f` Byzantine subset (never a fork),
+  against forged votes and equivocating proposals, and under a hard `4 | 3` network partition (sub-quorum ⇒ no
+  fork; liveness heals on reunion). Deterministic serial-equivalent parallel execution (`fanos-dromos`) carries
+  agreement on the ordered block through to agreement on the executed state, and same-nullifier shielded spends
+  are serialized so exactly one wins (`fanos-obolos` money safety survives the scheduler).
 
 Each follows the same discipline: derive the bound, implement the minimal mechanism, validate on
 `fanos-sim`, and only then mark it ✅.
