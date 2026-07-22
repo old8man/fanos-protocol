@@ -234,7 +234,10 @@ impl HybridLedger {
     /// Atomic: the pool must back the exit before anything mutates, and the shielded spend leaves token balances
     /// untouched, so the transparent move always completes.
     fn apply_shielded(&mut self, stx: &ShieldedTx, proof: &TransparentProof) -> bool {
-        if stx.public_value > 0 && self.pool_backing() < stx.public_value {
+        // Both the public output and the fee are clear value LEAVING the shielded pool (the balance law is
+        // Σ inputs = Σ shielded outputs + fee + public_value), so the pool sink must back their sum.
+        let leaving = stx.public_value.saturating_add(stx.fee);
+        if leaving > 0 && self.pool_backing() < leaving {
             return false;
         }
         if self.shielded.apply(&self.params, stx, proof).is_err() {
@@ -242,6 +245,12 @@ impl HybridLedger {
         }
         if stx.public_value > 0 {
             let _ = self.tokens.move_system(&POOL_SINK, stx.public_recipient, stx.public_value);
+        }
+        // The fee leaves the pool to the treasury (audit O-H1): otherwise it silently reduces the shielded
+        // supply while staying stranded in the pool sink, breaking the `POOL_SINK == Σ unspent notes` invariant
+        // and paying no one — now the fee is collected and validator-distributable.
+        if stx.fee > 0 {
+            let _ = self.tokens.move_system(&POOL_SINK, TREASURY, stx.fee);
         }
         true
     }
@@ -985,6 +994,34 @@ mod tests {
         let waves = schedule(&parallel.access_lists(&txs));
         assert_eq!(crate::scheduler::width(&waves), 3, "the three independent transfers run in parallel");
         assert_eq!(waves.len(), 2, "the conflicting fourth transfer is a second wave");
+    }
+
+    #[test]
+    fn a_shielded_fee_is_collected_to_the_treasury_and_the_pool_invariant_holds() {
+        // Audit O-H1: the fee is clear value leaving the pool; it must be debited from the pool sink (else the
+        // POOL_SINK == Σ unspent-notes invariant drifts) and credited to the treasury (else no one is paid).
+        let (alice_sk, alice_vk, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Alice shields 1000.
+        let nsk = [7u8; 32];
+        let shield_note = Note::new(1000, derive_owner_pk(&nsk), Randomness::from_seed(b"o"), [1u8; 32]);
+        let sx = ShieldTx {
+            payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 1000, nonce: 0 }, &alice_sk, alice_vk),
+            note: shield_note.clone(),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shield_payload(&sx))), ExecOutcome::Applied);
+        assert_eq!(ledger.pool_backing(), 1000);
+
+        // A shielded transfer paying a fee of 100: 1000 = 900 (shielded output) + 100 (fee).
+        let path = ledger.shielded().path(0).unwrap();
+        let sp = SpendInput { note: shield_note, nsk, path };
+        let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(900, &[2u8; 32], b"out")], 100);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&TREASURY), 100, "the shielded fee is collected to the treasury");
+        assert_eq!(ledger.pool_backing(), 900, "the pool sink backs exactly the unspent shielded value (invariant holds)");
     }
 
     #[test]
