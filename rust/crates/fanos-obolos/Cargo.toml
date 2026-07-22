@@ -11,8 +11,11 @@ keywords = ["privacy", "post-quantum", "currency", "shielded", "fanos"]
 categories = ["cryptography", "no-std"]
 
 [dependencies]
-# BLAKE3 labeled hashing for the commitment tree, note commitments, and nullifiers.
-fanos-primitives = { workspace = true, default-features = false }
+# BLAKE3 labeled hashing + AEAD for the commitment tree, note commitments, nullifiers, and note delivery.
+fanos-primitives = { workspace = true, default-features = false, features = ["aead"] }
+# Hybrid ML-KEM for note delivery: the sender encapsulates the note opening to the recipient's key so only
+# the recipient can detect and recover it (unlinkable delivery). no_std.
+fanos-pqcrypto.workspace = true
 
 [features]
 default = ["std"]

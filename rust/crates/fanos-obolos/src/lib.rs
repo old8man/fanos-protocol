@@ -39,14 +39,17 @@ pub mod build;
 pub mod codec;
 pub mod commit;
 pub mod note;
+pub mod note_cipher;
 pub mod nullifier;
 pub mod state;
 pub mod tree;
 pub mod tx;
 
 pub use build::{SpendInput, build_transfer};
+pub use codec::{decode_submission, encode_submission};
 pub use commit::{Commitment, Params, Randomness, sum, sum_randomness, verify_balance};
 pub use note::{Note, derive_owner_pk};
+pub use note_cipher::{Address, NoteCipher, scan};
 pub use nullifier::{Nullifier, NullifierSet};
 pub use state::{ApplyError, ShieldedState};
 pub use tree::{AuthPath, CommitmentTree, TREE_DEPTH};
