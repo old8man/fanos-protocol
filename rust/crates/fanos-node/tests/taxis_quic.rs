@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use fanos_field::F2;
 use fanos_geometry::Point;
-use fanos_node::{TaxisEvent, TaxisParams, spawn_taxis};
+use fanos_node::crosscell_dir::resolve_checkpoint;
+use fanos_node::{TaxisEvent, TaxisParams, spawn_checkpoint_publisher, spawn_taxis};
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
@@ -29,6 +30,8 @@ const ALICE: [u8; 32] = [0xA1; 32];
 const BOB: [u8; 32] = [0xB0; 32];
 const SEED: BeaconSeed = BeaconSeed::new([0x11; 32]);
 const EPOCH: Epoch = Epoch::new(1);
+/// The logical cell id this cell publishes its execution checkpoints under (a parent attests them).
+const CELL_ID: u32 = 0;
 
 /// The production overlay engine, seated at a pinned point — the same `OverlayNode` that ships, so the cell
 /// carries App-overlay (`0x70`) frames (the TAXIS receive seam) and routes by coordinate.
@@ -92,6 +95,13 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
         handles.push(spawn_taxis::<F2, Accounts>(cell.nodes[i].client(), params));
     }
 
+    // The live producer side of cross-cell shared security: every validator publishes its execution
+    // checkpoints to the cell's slot in the overlay store, where a parent cell would attest them.
+    let mut publishers = Vec::with_capacity(N);
+    for (i, h) in handles.iter().enumerate() {
+        publishers.push(spawn_checkpoint_publisher(cell.nodes[i].client(), CELL_ID, EPOCH, h));
+    }
+
     // Watch node 0's finalization stream — a direct witness that blocks actually commit over the wire.
     let mut events = handles[0].subscribe();
 
@@ -147,5 +157,26 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
         assert!(height >= 1, "every node advanced past genesis");
         assert_eq!(state.balance(&BOB), 100, "BOB credited exactly once on every node");
         assert_eq!(state.balance(&ALICE), 900, "ALICE debited exactly once on every node");
+    }
+
+    // Cross-cell producer side: a *different* node resolves the cell's published execution checkpoint from the
+    // store, and it is a valid Q-quorum certificate over the executed state — exactly what a parent cell attests
+    // for hierarchical shared security (`crosscell_dir::attest_children`).
+    let reader = cell.nodes[1].client();
+    let ckpt_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let cert = loop {
+        assert!(tokio::time::Instant::now() <= ckpt_deadline, "the cell published no execution checkpoint in time");
+        if let Some(cert) = resolve_checkpoint(&reader, CELL_ID, EPOCH).await {
+            break cert;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        cert.verify(CellParams::FANO.quorum, &verifiers),
+        "the published checkpoint is a valid Q-quorum certificate over the executed state",
+    );
+
+    for p in publishers {
+        p.abort();
     }
 }

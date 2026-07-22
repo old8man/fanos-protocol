@@ -30,6 +30,7 @@ use fanos_pqcrypto::{HybridSigSecret, HybridVerifier};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
+use fanos_taxis::checkpoint::ExecCertificate;
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
 use fanos_taxis::state::StateMachine;
 use fanos_taxis::wire::to_frame;
@@ -37,6 +38,8 @@ use fanos_taxis::{CellParams, SealedTx, SlashEvidence};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, interval};
+
+use crate::crosscell_dir::publish_checkpoint;
 
 /// How often the driver ticks the engine — the leader proposes on a tick, so this bounds block time.
 const TICK_PERIOD: Duration = Duration::from_millis(150);
@@ -87,6 +90,9 @@ pub enum TaxisEvent {
     },
     /// A finalized block's reward split among its commit-certificate signers (`(validator, amount)`).
     Rewarded(Vec<(u8, u64)>),
+    /// The cell's **execution checkpoint** advanced: a fresh `Q`-quorum [`ExecCertificate`] over the executed
+    /// state at a new height — the artifact a parent cell attests for shared security ([`spawn_checkpoint_publisher`]).
+    Checkpointed(ExecCertificate),
 }
 
 /// A handle to a running TAXIS driver: submit sealed transactions, observe [`TaxisEvent`]s, snapshot the ledger.
@@ -98,7 +104,7 @@ pub struct TaxisHandle<S> {
     query: mpsc::Sender<oneshot::Sender<(u64, S)>>,
 }
 
-impl<S: Clone> TaxisHandle<S> {
+impl<S> TaxisHandle<S> {
     /// Submit a sealed transaction into this validator's mempool. `false` if the driver has stopped.
     pub async fn submit(&self, tx: SealedTx) -> bool {
         self.submit.send(tx).await.is_ok()
@@ -177,16 +183,18 @@ where
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut timeout = interval(TIMEOUT_PERIOD);
         timeout.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The height of the last execution checkpoint we surfaced, so each is emitted exactly once.
+        let mut last_ckpt: Option<u64> = None;
 
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     let outs = engine.step(Input::Tick);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
                 }
                 _ = timeout.tick() => {
                     let outs = engine.step(Input::Timeout);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
                 }
                 Some(tx) = submit_rx.recv() => {
                     engine.submit(tx);
@@ -198,7 +206,7 @@ where
                     Some(Notification::App { body, .. }) => {
                         if let Some(msg) = ConsensusMsg::from_bytes(&body) {
                             let outs = step_msg(&mut engine, &msg);
-                            drive(&mut engine, &client, &coords, me, outs, &events_for_task);
+                            drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
                         }
                     }
                     // Fixed-epoch cell: the seed/epoch are pinned at construction. A future rotation policy
@@ -235,6 +243,7 @@ fn drive<S: StateMachine>(
     me: u8,
     outs: Vec<Output>,
     events: &broadcast::Sender<TaxisEvent>,
+    last_ckpt: &mut Option<u64>,
 ) {
     let mut queue: VecDeque<Output> = outs.into_iter().collect();
     while let Some(out) = queue.pop_front() {
@@ -264,6 +273,41 @@ fn drive<S: StateMachine>(
             }
         }
     }
+    // A fresh execution checkpoint may have formed as ExecVotes reached a quorum during this batch; surface it
+    // exactly once per height (the artifact `spawn_checkpoint_publisher` anchors for cross-cell shared security).
+    if let Some(cert) = engine.latest_checkpoint()
+        && last_ckpt.is_none_or(|h| cert.height > h)
+    {
+        *last_ckpt = Some(cert.height);
+        let _ = events.send(TaxisEvent::Checkpointed(cert.clone()));
+    }
+}
+
+/// Spawn a **cross-cell checkpoint publisher** for a running cell: subscribe to `handle`'s events and, for each
+/// new [`TaxisEvent::Checkpointed`], publish the [`ExecCertificate`] to the cell's checkpoint slot in the
+/// overlay store ([`crate::crosscell_dir::publish_checkpoint`]) under `cell_id` and `epoch` — where a parent
+/// cell reads and attests it ([`crate::crosscell_dir::attest_children`]). This is the live producer side of
+/// hierarchical shared security; a node that is not a cross-cell bridge simply does not spawn it. Must run in a
+/// tokio runtime.
+#[must_use]
+pub fn spawn_checkpoint_publisher<S>(
+    client: Client,
+    cell_id: u32,
+    epoch: Epoch,
+    handle: &TaxisHandle<S>,
+) -> JoinHandle<()> {
+    let mut events = handle.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(TaxisEvent::Checkpointed(cert)) => {
+                    let _ = publish_checkpoint(&client, cell_id, epoch, &cert).await;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 /// The equivocating validator named by a slash proof.

@@ -60,7 +60,9 @@ pub use mixdir::{
     resolve_mix_key, spawn_mix_publisher,
 };
 pub use node::{Health, Node};
-pub use taxis_driver::{TaxisEvent, TaxisHandle, TaxisParams, spawn_taxis};
+pub use taxis_driver::{
+    TaxisEvent, TaxisHandle, TaxisParams, spawn_checkpoint_publisher, spawn_taxis,
+};
 pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
