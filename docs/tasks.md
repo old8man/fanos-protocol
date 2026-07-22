@@ -35,10 +35,14 @@ Roadmap (`spec/platform.md` §8), sequential + verified:
       - [ ] Residual: the PQ **zero-knowledge** proof backend (the one frontier [P]/[H]); ML-KEM stealth
             addresses + note ciphertexts; calibrate the lattice params + audit.
 - [~] **T3 · DROMOS (L9)** — crate `fanos-dromos` (crate 37):
-      - [x] `ShieldedLedger` — the OBOLOS pool as a TAXIS `StateMachine` (shielded transfers execute on-chain;
-            Applied/Rejected/Malformed; deterministic root). **The private currency now runs on the blockchain.**
-      - [ ] Residual: the transparent-account half of the hybrid state machine (one state_root); the parallel
-            post-reveal scheduler (proven-deterministic serialization) for Solana-class throughput.
+      - [x] `ShieldedLedger` — the OBOLOS pool as a TAXIS `StateMachine` (shielded transfers execute on-chain).
+      - [x] `HybridLedger` — transparent accounts + shielded pool under ONE `state_root` (tagged txs dispatch to
+            each half). **Public value and private value coexist on one chain.**
+      - [x] **FULL-PLATFORM e2e** (`fanos-node/tests/dromos_quic.rs`) — a PRIVATE OBOLOS transfer executes over
+            live TAXIS BFT consensus over real QUIC (7 nodes converge: note nullified + created, ~2.2s). The
+            E∧L composition proven runnable end-to-end.
+      - [ ] Residual: the parallel post-reveal scheduler (proven-deterministic serialization) for Solana-class
+            throughput; transparent-tx wallet/CLI ergonomics.
 - [ ] **T4 · ONOMA-domains + ANGELOS (L11)** — currency-bought private naming; the anonymous PQ messenger.
 - [ ] **T5 · HERMES (L12)** — PQ threshold cross-chain (atomic-swap mode first, custody second).
 - [ ] **ХОЛАРХ gate** — a Γ-calculator that CI-checks the platform's P/R/Φ/D viability verdict.
