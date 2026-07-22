@@ -1,0 +1,40 @@
+[package]
+name = "fanos-taxis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "TAXIS — the FANOS-native BFT blockchain: projective-cell PBFT consensus, beacon leader election, threshold-encrypted anti-MEV mempool, DA-sampled blocks (spec Part X.1, M7)."
+keywords = ["blockchain", "bft", "consensus", "anti-mev", "fanos"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+fanos-field.workspace = true
+fanos-geometry = { workspace = true, features = ["std"] }
+# The projective erasure codec + DA sampler for block payload availability (spec §L4.3, §10.1).
+fanos-code = { workspace = true, features = ["std"] }
+# hash / Epoch (Wire) / BeaconSeed — the epoch-beacon leader-election seed and canonical hashing.
+fanos-primitives = { workspace = true, features = ["std", "wire"] }
+# The threshold KEM-seal (Shamir t-of-(q+1), per-member hybrid-KEM) that the anti-MEV encrypted
+# mempool seals each transaction under — reused verbatim, no new crypto (spec §5.2, §10.1 anti-MEV).
+fanos-aphantos.workspace = true
+# Hybrid PQ signatures (Ed25519+ML-DSA-65) for votes/blocks, and the hybrid KEM for mempool sealing.
+fanos-pqcrypto.workspace = true
+# Anonymous VOPRF credits: block-inclusion fees paid without deanonymising (spec §L7, task A2).
+fanos-incentives.workspace = true
+fanos-wire = { workspace = true, features = ["std"] }
+fanos-wire-derive.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# The end-to-end 7-node BFT simulation (tests/consensus_sim.rs) builds validator identities and seals
+# transactions, so it links the identity/KEM, epoch/beacon, and erasure crates directly.
+fanos-pqcrypto.workspace = true
+fanos-primitives = { workspace = true, features = ["std", "wire"] }
+fanos-code = { workspace = true, features = ["std"] }
+fanos-geometry = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

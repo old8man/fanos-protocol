@@ -41,6 +41,7 @@ members = [
     "crates/fanos-cli",
     "crates/fanos-bench",
     "crates/fanos-observatory",
+    "crates/fanos-taxis",
 ]
 
 [workspace.package]
@@ -111,6 +112,9 @@ fanos-telemetry = { path = "crates/fanos-telemetry", version = "0.1.0", default-
 fanos-proteus = { path = "crates/fanos-proteus", version = "0.1.0", default-features = false }
 fanos-vrf = { path = "crates/fanos-vrf", version = "0.1.0", default-features = false }
 fanos-incentives = { path = "crates/fanos-incentives", version = "0.1.0", default-features = false }
+# TAXIS — the FANOS-native BFT blockchain (spec Part X.1 / M7): projective-cell PBFT consensus,
+# beacon leader election, threshold-encrypted anti-MEV mempool, DA-sampled blocks.
+fanos-taxis = { path = "crates/fanos-taxis", version = "0.1.0" }
 fanos-aphantos = { path = "crates/fanos-aphantos", version = "0.1.0" }
 fanos-calypso = { path = "crates/fanos-calypso", version = "0.1.0" }
 fanos-diaulos = { path = "crates/fanos-diaulos", version = "0.1.0" }
