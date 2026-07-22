@@ -20,8 +20,11 @@ use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
 
+use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, verify};
+
 use crate::bridge::{POOL_SINK, ShieldTx};
 use crate::naming::{NameRegistry, NameTx};
+use crate::storage::{STORAGE_ESCROW, StorageMarket, StorageTx, deal_id, leaves_for_size};
 use crate::token::{SignedTransfer, TokenLedger};
 
 /// Transaction-type tag: an authenticated transparent transfer.
@@ -32,6 +35,8 @@ pub const TAG_SHIELDED: u8 = 0x01;
 pub const TAG_NAME: u8 = 0x02;
 /// Transaction-type tag: a shield (transparent → private pool).
 pub const TAG_SHIELD: u8 = 0x03;
+/// Transaction-type tag: a THESAUROS storage-market operation (open/prove/close).
+pub const TAG_STORAGE: u8 = 0x04;
 
 /// Domain-separation label for the hybrid state root.
 const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
@@ -43,8 +48,10 @@ pub struct HybridLedger {
     tokens: TokenLedger,
     shielded: ShieldedState,
     names: NameRegistry,
+    storage: StorageMarket,
     params: Arc<Params>,
     height: u64,
+    audit_beacon: [u8; 32],
 }
 
 impl HybridLedger {
@@ -55,9 +62,37 @@ impl HybridLedger {
             tokens: genesis_tokens,
             shielded: ShieldedState::new(),
             names: NameRegistry::new(),
+            storage: StorageMarket::default(),
             params: Arc::new(Params::standard()),
             height: 0,
+            audit_beacon: [0u8; 32],
         }
+    }
+
+    /// Set the block's **audit beacon** — the unpredictable PQ-VRF value the storage market's retrievability
+    /// challenges are drawn from. The consensus driver calls this each block (alongside
+    /// [`begin_block`](StateMachine::begin_block)); the beacon's unpredictability is what makes the audit
+    /// ungrindable (`crate::storage`).
+    pub fn set_audit_beacon(&mut self, beacon: [u8; 32]) {
+        self.audit_beacon = beacon;
+    }
+
+    /// The storage market sub-state (read-only).
+    #[must_use]
+    pub fn storage(&self) -> &StorageMarket {
+        &self.storage
+    }
+
+    /// The balance held in the storage-escrow sink (the sum of unreleased deal escrow by construction).
+    #[must_use]
+    pub fn storage_escrow(&self) -> u64 {
+        self.tokens.balance(&STORAGE_ESCROW)
+    }
+
+    /// Wrap a storage-market operation as a DROMOS transaction payload.
+    #[must_use]
+    pub fn storage_payload(tx: &StorageTx) -> Vec<u8> {
+        Self::tagged(TAG_STORAGE, &tx.to_bytes())
     }
 
     /// The authenticated transparent token ledger (read-only).
@@ -142,6 +177,73 @@ impl HybridLedger {
         true
     }
 
+    /// Open a storage deal: the consumer's `payment` must fund the escrow sink with exactly the price. Validates
+    /// the transfer binds the consumer and targets the sink, opens the deal (a fresh id), then settles the
+    /// payment — so a rejected open never moves money (the naming registry's validate→settle ordering).
+    fn open_deal(&mut self, params: &DealParams, payment: &SignedTransfer) -> bool {
+        if !payment.verify()
+            || payment.transfer.from != params.consumer
+            || payment.transfer.to != STORAGE_ESCROW
+            || payment.transfer.amount != params.price
+        {
+            return false;
+        }
+        let id = deal_id(params, payment.transfer.nonce);
+        if self.storage.deals.contains_key(&id) {
+            return false;
+        }
+        let Some(deal) = Deal::open(*params) else {
+            return false;
+        };
+        if self.tokens.apply(payment).is_err() {
+            return false;
+        }
+        self.storage.deals.insert(id, deal);
+        true
+    }
+
+    /// Prove retrievability for a deal's current epoch: recompute the audit challenge from the block's beacon,
+    /// verify the response against the committed CID, then — only on success — settle the epoch and release the
+    /// slice from escrow to the provider (`move_system`, the proof-gated keyless-sink release).
+    fn prove_deal(&mut self, id: &[u8; 32], response_bytes: &[u8]) -> bool {
+        let Some(params) = self.storage.deals.get(id).filter(|d| d.state() == DealState::Active).map(|d| *d.params())
+        else {
+            return false;
+        };
+        let Some(response) = decode_response(response_bytes) else {
+            return false;
+        };
+        let leaves = leaves_for_size(params.size);
+        if !verify(&params.cid, &self.audit_beacon, params.k as usize, leaves, &response) {
+            return false;
+        }
+        let Some(settlement) = self.storage.deals.get_mut(id).and_then(|d| d.settle_epoch(true)) else {
+            return false;
+        };
+        if let Settlement::Pay { provider, amount } = settlement {
+            let _ = self.tokens.move_system(&STORAGE_ESCROW, provider, amount);
+        }
+        true
+    }
+
+    /// Close a deal early: `auth` must be a valid signed transfer *from the consumer* (checked, never applied).
+    /// Refunds the unreleased escrow to the consumer.
+    fn close_deal(&mut self, id: &[u8; 32], auth: &SignedTransfer) -> bool {
+        let Some(consumer) = self.storage.deals.get(id).map(|d| d.params().consumer) else {
+            return false;
+        };
+        if !auth.verify() || auth.transfer.from != consumer {
+            return false;
+        }
+        let Some(refund) = self.storage.deals.get_mut(id).map(Deal::close) else {
+            return false;
+        };
+        if refund > 0 {
+            let _ = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
+        }
+        true
+    }
+
     /// Wrap a signed transparent transfer as a DROMOS transaction payload.
     #[must_use]
     pub fn transparent_payload(transfer: &SignedTransfer) -> Vec<u8> {
@@ -195,17 +297,24 @@ impl StateMachine for HybridLedger {
                 Some(sx) => outcome(self.shield(&sx)),
                 None => ExecOutcome::Malformed,
             },
+            Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
+                Some(StorageTx::Open { params, payment }) => outcome(self.open_deal(&params, &payment)),
+                Some(StorageTx::Prove { deal_id, response }) => outcome(self.prove_deal(&deal_id, &response)),
+                Some(StorageTx::Close { deal_id, auth }) => outcome(self.close_deal(&deal_id, &auth)),
+                None => ExecOutcome::Malformed,
+            },
             _ => ExecOutcome::Malformed,
         }
     }
 
-    /// `H(tokens_root ‖ shielded_root ‖ names_root)` — one commitment over transparent balances, shielded
-    /// notes, and names, for the block's executed-state checkpoint.
+    /// `H(tokens_root ‖ shielded_root ‖ names_root ‖ storage_root)` — one commitment over transparent balances,
+    /// shielded notes, names, and storage deals, for the block's executed-state checkpoint.
     fn state_root(&self) -> [u8; 32] {
-        let mut buf = [0u8; 96];
+        let mut buf = [0u8; 128];
         buf[..32].copy_from_slice(&self.tokens.state_root());
         buf[32..64].copy_from_slice(&self.shielded.root());
-        buf[64..].copy_from_slice(&self.names.state_root());
+        buf[64..96].copy_from_slice(&self.names.state_root());
+        buf[96..].copy_from_slice(&self.storage.state_root());
         hash_labeled(HYBRID_ROOT_LABEL, &buf)
     }
 }
@@ -388,6 +497,103 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shield_payload(&wrong_sink))), ExecOutcome::Rejected);
         assert_eq!(ledger.pool_backing(), 0, "no value entered the pool on a refused shield");
         assert_eq!(ledger.tokens().balance(&alice), 10_000, "no funds moved");
+    }
+
+    #[test]
+    fn a_storage_deal_pays_per_verified_proof_and_refunds_on_close() {
+        use fanos_thesauros::content::{LEAF, chunk_cid};
+        use fanos_thesauros::{DealParams, challenge, encode_response, prove};
+
+        let (consumer_sk, consumer_vk, consumer) = account(1);
+        let (_p_sk, _p_vk, provider) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        let beacon = [0x5Au8; 32];
+        ledger.set_audit_beacon(beacon); // the block's VRF beacon (fixed here for the test)
+
+        // An 8-leaf chunk and the deal storing it for 4 audit epochs at price 400.
+        let chunk: Vec<u8> = (0..8 * LEAF).map(|i| (i / LEAF + 1) as u8).collect();
+        let cid = chunk_cid(&chunk);
+        let params = DealParams {
+            cid,
+            size: chunk.len() as u64,
+            duration: 4,
+            replication: 3,
+            lambda_bits: 10,
+            f_tol_permille: 100,
+            k: 3,
+            price: 400,
+            provider,
+            consumer,
+        };
+        // Open: escrow 400 from the consumer into the sink.
+        let payment = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 400, nonce: 0 },
+            &consumer_sk,
+            consumer_vk.clone(),
+        );
+        let open = StorageTx::Open { params, payment };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&open))), ExecOutcome::Applied);
+        assert_eq!(ledger.storage_escrow(), 400, "the price is escrowed");
+        assert_eq!(ledger.tokens().balance(&consumer), 999_600);
+        let id = deal_id(&params, 0);
+
+        // Prove epoch 0: the provider answers the beacon's challenge → paid one slice (price/duration = 100).
+        let indices = challenge(&cid, &beacon, 3, 8);
+        let response = encode_response(&prove(&chunk, &indices).unwrap());
+        let prove_tx = StorageTx::Prove { deal_id: id, response };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&prove_tx))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&provider), 100, "the provider earned one slice from escrow");
+        assert_eq!(ledger.storage_escrow(), 300);
+
+        // A garbage proof pays nothing.
+        let bad = StorageTx::Prove { deal_id: id, response: vec![0u8; 4] };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&bad))), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&provider), 100, "an unverifiable proof releases nothing");
+
+        // Close: the consumer reclaims the unproven 300 (an auth transfer from the consumer, never applied).
+        let auth = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 0, nonce: 1 },
+            &consumer_sk,
+            consumer_vk,
+        );
+        let close = StorageTx::Close { deal_id: id, auth };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&close))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&consumer), 999_900, "the consumer recovered the unproven escrow");
+        assert_eq!(ledger.storage_escrow(), 0, "the escrow sink is drained");
+    }
+
+    #[test]
+    fn a_storage_open_with_the_wrong_escrow_amount_is_rejected() {
+        use fanos_thesauros::DealParams;
+        let (consumer_sk, consumer_vk, consumer) = account(1);
+        let (_p, _pv, provider) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        let params = DealParams {
+            cid: fanos_thesauros::Cid::new([1u8; 32]),
+            size: 4096,
+            duration: 4,
+            replication: 3,
+            lambda_bits: 10,
+            f_tol_permille: 100,
+            k: 3,
+            price: 400,
+            provider,
+            consumer,
+        };
+        // Payment is 300, but the price is 400 — refused, no money moves.
+        let payment = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 300, nonce: 0 },
+            &consumer_sk,
+            consumer_vk,
+        );
+        let open = StorageTx::Open { params, payment };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&open))), ExecOutcome::Rejected);
+        assert_eq!(ledger.storage_escrow(), 0, "nothing was escrowed on a refused open");
+        assert_eq!(ledger.tokens().balance(&consumer), 1000, "the consumer's funds are untouched");
     }
 
     #[test]

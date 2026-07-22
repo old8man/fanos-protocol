@@ -20,6 +20,8 @@ fanos-obolos = { workspace = true, features = ["std"] }
 fanos-primitives = { workspace = true, features = ["std"] }
 # Hybrid PQ signatures authenticating transparent transfers and name-registry operations.
 fanos-pqcrypto.workspace = true
+# THESAUROS — the content-storage market engine (deals + proof-of-retrievability) the TAG_STORAGE arm drives.
+fanos-thesauros = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

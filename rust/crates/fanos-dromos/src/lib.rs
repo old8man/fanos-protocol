@@ -18,6 +18,7 @@
 pub mod bridge;
 pub mod hybrid;
 pub mod naming;
+pub mod storage;
 pub mod token;
 
 pub use bridge::{POOL_SINK, ShieldTx};

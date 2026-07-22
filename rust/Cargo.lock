@@ -941,6 +941,7 @@ dependencies = [
  "fanos-pqcrypto",
  "fanos-primitives",
  "fanos-taxis",
+ "fanos-thesauros",
 ]
 
 [[package]]
