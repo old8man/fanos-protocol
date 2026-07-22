@@ -28,7 +28,7 @@ use crate::bridge::{POOL_SINK, ShieldTx};
 use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
 use crate::naming::{NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
-use crate::storage::{STORAGE_ESCROW, StorageMarket, StorageTx, deal_id, leaves_for_size};
+use crate::storage::{AUDIT_PERIOD, STORAGE_ESCROW, StorageMarket, StorageTx, deal_id, leaves_for_size};
 use crate::token::{SignedTransfer, TokenLedger};
 
 /// The shared state key every shielded operation touches — so shielded spends serialize against each other
@@ -270,7 +270,9 @@ impl HybridLedger {
         if self.storage.deals.contains_key(&id) {
             return false;
         }
-        let Some(deal) = Deal::open(*params) else {
+        // Anchor the audit deadline at the current height so the deal can auto-complete + refund if the provider
+        // stops proving (audit AT-H2), rather than sitting Active forever awaiting a manual close.
+        let Some(deal) = Deal::open_at(*params, self.height) else {
             return false;
         };
         if self.tokens.apply(payment).is_err() {
@@ -332,6 +334,25 @@ impl HybridLedger {
             let _ = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
         }
         true
+    }
+
+    /// Finalize storage deals whose audit deadline has lapsed at the current height: each auto-completes and its
+    /// unproven escrow is refunded to the consumer (audit AT-H2), so a provider that stops proving stops being
+    /// paid without the consumer having to close manually. Linear in the open-deal count per block — a
+    /// deadline-ordered index is the scaling refinement.
+    fn finalize_lapsed_deals(&mut self) {
+        let height = self.height;
+        let mut refunds: Vec<([u8; 32], u64)> = Vec::new();
+        for deal in self.storage.deals.values_mut() {
+            if let Some(refund) = deal.finalize_if_lapsed(height, AUDIT_PERIOD)
+                && refund > 0
+            {
+                refunds.push((deal.params().consumer, refund));
+            }
+        }
+        for (consumer, refund) in refunds {
+            let _ = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
+        }
     }
 
     /// Execute a block's ordered transactions with DROMOS's **parallel scheduler** (`spec/platform.md` §3.1):
@@ -519,9 +540,11 @@ impl HybridLedger {
 }
 
 impl StateMachine for HybridLedger {
-    /// Set the registry's clock to the block being executed.
+    /// Set the registry's clock to the block being executed, and finalize any storage deals whose audit deadline
+    /// has now lapsed (auto-refunding the consumer — audit AT-H2).
     fn begin_block(&mut self, height: u64) {
         self.height = height;
+        self.finalize_lapsed_deals();
     }
 
     /// Adopt the block's audit beacon (the parent hash) — the storage market's retrievability challenges are
@@ -994,6 +1017,49 @@ mod tests {
         let waves = schedule(&parallel.access_lists(&txs));
         assert_eq!(crate::scheduler::width(&waves), 3, "the three independent transfers run in parallel");
         assert_eq!(waves.len(), 2, "the conflicting fourth transfer is a second wave");
+    }
+
+    #[test]
+    fn a_stalled_storage_deal_auto_refunds_at_the_audit_deadline() {
+        use crate::storage::AUDIT_PERIOD;
+        use fanos_thesauros::{Cid, DealParams};
+        // Audit AT-H2: a provider that never proves must not leave the deal Active forever; at the audit
+        // deadline begin_block auto-completes the deal and refunds the consumer, with no manual close.
+        let (consumer_sk, consumer_vk, consumer) = account(1);
+        let (_p, _pv, provider) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.begin_block(10); // the deal opens at height 10
+        let params = DealParams {
+            cid: Cid::new([1u8; 32]),
+            size: 4096,
+            duration: 4,
+            replication: 3,
+            lambda_bits: 10,
+            f_tol_permille: 100,
+            k: 3,
+            price: 400,
+            provider,
+            consumer,
+        };
+        let payment = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 400, nonce: 0 },
+            &consumer_sk,
+            consumer_vk,
+        );
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&StorageTx::Open { params, payment }))), ExecOutcome::Applied);
+        assert_eq!(ledger.storage_escrow(), 400);
+
+        // The provider never proves. The deadline is open_height(10) + duration(4)·AUDIT_PERIOD.
+        let deadline = 10 + 4 * AUDIT_PERIOD;
+        ledger.begin_block(deadline - 1);
+        assert_eq!(ledger.storage_escrow(), 400, "not yet lapsed");
+        assert_eq!(ledger.tokens().balance(&consumer), 999_600);
+        // At the deadline the deal auto-completes and the full unproven escrow refunds to the consumer.
+        ledger.begin_block(deadline);
+        assert_eq!(ledger.storage_escrow(), 0, "the lapsed deal's escrow left the sink");
+        assert_eq!(ledger.tokens().balance(&consumer), 1_000_000, "the consumer got the full unproven escrow back");
     }
 
     #[test]

@@ -26,6 +26,12 @@ use crate::token::SignedTransfer;
 /// gated on a verified retrievability proof (or a consumer-authorised close).
 pub const STORAGE_ESCROW: [u8; 32] = *b"FANOS-thesauros-storage-escrow!!";
 
+/// The storage-audit cadence: blocks per audit epoch. A deal's audit deadline is
+/// `open_height + duration · AUDIT_PERIOD`; at that height an un-proven deal auto-completes and its unproven
+/// escrow refunds to the consumer (audit AT-H2), so a stalled deal never sits `Active` forever awaiting a manual
+/// close. A protocol parameter (like the block time), not a per-deal secret.
+pub const AUDIT_PERIOD: u64 = 64;
+
 /// Domain label for a deal identifier.
 const DEAL_ID_LABEL: &str = "FANOS-dromos-v1/storage-deal";
 /// Domain label for the storage-market sub-state root.

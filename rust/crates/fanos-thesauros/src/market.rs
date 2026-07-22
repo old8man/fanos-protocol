@@ -122,17 +122,40 @@ pub struct Deal {
     /// The block height of the last settlement — settlements must strictly increase in height, so a single
     /// proof cannot be replayed within one block to advance (and pay) the deal many times.
     last_height: Option<u64>,
+    /// The block height the deal opened at (`None` if opened without a clock), from which its audit deadline is
+    /// measured, so an un-proven deal auto-completes and refunds instead of sitting `Active` forever.
+    open_height: Option<u64>,
 }
 
 impl Deal {
-    /// Open a deal (its escrow is assumed funded by the caller). `None` if the duration is zero (a deal must run
-    /// at least one epoch).
+    /// Open a deal without a clock (engine use / tests). `None` if the duration is zero (a deal must run at least
+    /// one epoch). Such a deal never auto-lapses; see [`open_at`](Self::open_at) for the ledger path.
     #[must_use]
     pub fn open(params: DealParams) -> Option<Self> {
+        Self::open_inner(params, None)
+    }
+
+    /// Open a deal at block `open_height` (the ledger path), so its audit deadline is anchored and
+    /// [`finalize_if_lapsed`](Self::finalize_if_lapsed) can auto-complete it.
+    #[must_use]
+    pub fn open_at(params: DealParams, open_height: u64) -> Option<Self> {
+        Self::open_inner(params, Some(open_height))
+    }
+
+    #[must_use]
+    fn open_inner(params: DealParams, open_height: Option<u64>) -> Option<Self> {
         if params.duration == 0 {
             return None;
         }
-        Some(Self { params, epoch: 0, passed: 0, released: 0, state: DealState::Active, last_height: None })
+        Some(Self {
+            params,
+            epoch: 0,
+            passed: 0,
+            released: 0,
+            state: DealState::Active,
+            last_height: None,
+            open_height,
+        })
     }
 
     /// The deal parameters.
@@ -221,6 +244,34 @@ impl Deal {
         self.released = self.params.price;
         self.state = DealState::Closed;
         refund
+    }
+
+    /// The number of unproven audit epochs (`duration − passed`) — a corroborated non-performance count the role
+    /// layer can feed to the provider's reputation.
+    #[must_use]
+    pub fn missed(&self) -> u64 {
+        self.params.duration.saturating_sub(self.passed)
+    }
+
+    /// Auto-complete the deal if its audit deadline has passed with epochs still unproven. At
+    /// `open_height + duration·audit_period` an `Active` deal is marked `Completed` and its unproven escrow (the
+    /// slices for epochs never proven) is returned to the consumer — so a provider that stops proving stops
+    /// being paid and the consumer is refunded *without a manual close* (audit AT-H2). Returns the refund owed
+    /// to the consumer, or `None` if the deal has no clock, is not active, or the deadline has not passed.
+    #[must_use]
+    pub fn finalize_if_lapsed(&mut self, height: u64, audit_period: u64) -> Option<u64> {
+        if self.state != DealState::Active {
+            return None;
+        }
+        let open_height = self.open_height?;
+        let deadline = open_height.saturating_add(self.params.duration.saturating_mul(audit_period));
+        if height < deadline {
+            return None;
+        }
+        let refund = self.params.price.saturating_sub(self.released);
+        self.released = self.params.price;
+        self.state = DealState::Completed;
+        Some(refund)
     }
 }
 
@@ -342,6 +393,28 @@ mod tests {
         }
         assert_eq!(cheat_earned, 0);
         assert!(honest_payoff > 0, "honest storage strictly dominates cheating");
+    }
+
+    #[test]
+    fn a_lapsed_deal_auto_completes_and_refunds_the_unproven_epochs() {
+        // Audit AT-H2: a provider that stops proving must not leave the deal Active forever; at the audit
+        // deadline the deal auto-completes and the unproven escrow refunds to the consumer without a manual close.
+        let period = 5u64;
+        let mut deal = Deal::open_at(params(1000, 10), 100).unwrap();
+        // The provider proves 3 of 10 epochs, then stops.
+        let _ = deal.settle_epoch(101, true);
+        let _ = deal.settle_epoch(102, true);
+        let _ = deal.settle_epoch(103, true);
+        assert_eq!(deal.released(), 300);
+        // Before the deadline (open 100 + duration 10 · period 5 = 150) nothing happens.
+        assert_eq!(deal.finalize_if_lapsed(149, period), None, "not lapsed before the deadline");
+        // At the deadline the deal auto-completes and refunds the 7 unproven epochs (700).
+        assert_eq!(deal.finalize_if_lapsed(150, period), Some(700), "lapsed → refund the unproven epochs");
+        assert_eq!(deal.state(), DealState::Completed);
+        assert_eq!(deal.missed(), 7, "seven epochs were never proven");
+        assert_eq!(deal.finalize_if_lapsed(160, period), None, "already completed — no double refund");
+        // A deal opened without a clock never lapses.
+        assert_eq!(Deal::open(params(1000, 10)).unwrap().finalize_if_lapsed(99_999, period), None, "no clock → no lapse");
     }
 
     #[test]
