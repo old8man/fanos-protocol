@@ -32,8 +32,12 @@ Roadmap (`spec/platform.md` §8), sequential + verified:
       - [x] Wallet `build_transfer` + **SecOps scenario suite** (conservation, tampering sweep, wraparound
             inflation, cross-tx double-spend, consolidation, whole-pool anonymity set).
       - [x] Canonical wire codec (ShieldedTx + proof + submission payload) — unblocks the chain integration.
-      - [ ] Residual: the PQ **zero-knowledge** proof backend (the one frontier [P]/[H]); ML-KEM stealth
-            addresses + note ciphertexts; calibrate the lattice params + audit.
+      - [x] **Unlinkable delivery** (`note_cipher`): ML-KEM note ciphertexts, on-chain (`OutputNote.cipher`) +
+            `build_transfer_delivering` + `scan`. All THREE privacy properties now hold: confidentiality
+            (homomorphic commitment) ∧ untraceability (whole-pool + nullifiers) ∧ unlinkability (hidden-owner
+            commitments + fresh-KEM delivery — no key-blinding needed, Zcash-Sapling model).
+      - [ ] Residual: the PQ **zero-knowledge** proof backend (the one frontier [P]/[H]); calibrate the lattice
+            params + external audit.
 - [~] **T3 · DROMOS (L9)** — crate `fanos-dromos` (crate 37):
       - [x] `ShieldedLedger` — the OBOLOS pool as a TAXIS `StateMachine` (shielded transfers execute on-chain).
       - [x] `HybridLedger` — transparent accounts + shielded pool under ONE `state_root` (tagged txs dispatch to
