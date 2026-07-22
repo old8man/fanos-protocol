@@ -129,8 +129,15 @@ impl Randomness {
     /// the number of terms (a transaction's input+output count), which is exactly the shortness the frontier
     /// range proof bounds, and keeps `A₁·r` well within `i128` during commitment.
     #[must_use]
-    fn add(&self, other: &Self) -> Self {
+    pub(crate) fn add(&self, other: &Self) -> Self {
         let coeffs = self.coeffs.iter().zip(&other.coeffs).map(|(a, b)| a + b).collect();
+        Self { coeffs }
+    }
+
+    /// The centered difference `r₁ − r₂` — the other half of a transaction's balance randomness.
+    #[must_use]
+    pub(crate) fn sub(&self, other: &Self) -> Self {
+        let coeffs = self.coeffs.iter().zip(&other.coeffs).map(|(a, b)| a - b).collect();
         Self { coeffs }
     }
 }
@@ -181,6 +188,18 @@ impl Commitment {
     #[must_use]
     pub fn opens_to(&self, params: &Params, value: u64, r: &Randomness) -> bool {
         self == &Self::commit(params, value, r)
+    }
+
+    /// Canonical bytes: `t0` (`N` little-endian `i64`) followed by `t1`. Used to bind a value commitment into a
+    /// note commitment and to carry it on the wire.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity((N + 1) * 8);
+        for &x in &self.t0 {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.extend_from_slice(&self.t1.to_le_bytes());
+        out
     }
 }
 

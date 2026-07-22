@@ -36,9 +36,15 @@
 extern crate alloc;
 
 pub mod commit;
+pub mod note;
 pub mod nullifier;
+pub mod state;
 pub mod tree;
+pub mod tx;
 
 pub use commit::{Commitment, Params, Randomness, sum, sum_randomness, verify_balance};
+pub use note::{Note, derive_owner_pk};
 pub use nullifier::{Nullifier, NullifierSet};
+pub use state::{ApplyError, ShieldedState};
 pub use tree::{AuthPath, CommitmentTree, TREE_DEPTH};
+pub use tx::{InputOpening, OutputNote, OutputOpening, ShieldedProof, ShieldedTx, TransparentProof};
