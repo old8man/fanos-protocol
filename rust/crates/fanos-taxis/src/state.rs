@@ -40,7 +40,11 @@ pub trait StateMachine {
     /// Apply one transaction (already reconstructed and in committed order) to the state.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome;
 
-    /// A binding 32-byte commitment to the entire current state — the ledger's verifiable summary.
+    /// A binding 32-byte commitment to the entire current state — the ledger's verifiable summary, and what
+    /// the execution checkpoint ([`crate::checkpoint`]) certifies. A **cross-cell-aware** state machine folds
+    /// its cross-cell outbox in here — `crate::crosscell::compose_state_root(app_root, outbox.root())` — so the
+    /// same certificate that proves its balances also proves the messages it emitted to other cells; a plain
+    /// state machine commits only its application state.
     fn state_root(&self) -> [u8; 32];
 }
 
