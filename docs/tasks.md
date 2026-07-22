@@ -58,8 +58,15 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
 
 **B · L0 live multi-cell orchestration** — cross-cell relay (A→bridge→B) + parent attestation across real cells;
 executed-`state_root` history in the header for light clients.
-**C · TAXIS residuals** — on-chain decryption-key commitment; wire fee/reward distribution; in-engine DA sampling;
-extend the equilibrium model (coalitional + censorship terms).
+**C · TAXIS residuals — ✅ DONE (2026-07-22).**
+- [x] Wire fee/reward distribution (`564c789`) — `Output::Reward`, `distribute` among commit-cert signers.
+- [x] In-engine DA sampling (`c9e5c63`) — `Input::Propose` carries sampled `DaShards`; `on_propose` verifies
+      availability by `reconstruct_payload` vs `da_commit` instead of trusting a driver bit.
+- [x] On-chain decryption-key commitment (`3757192`) — `keyper::{KeyperKeyCert, KeyperRegistry,
+      seal_to_keyper_line}`: self-certified KEM keys, `commit()` (agreed genesis constant), engine
+      `accepts_keyper_registry`; the Shutter/Ferveo on-chain key, PQ-native (authority, not pre-open verifiability).
+- [x] Extend the equilibrium model (`fd56942`) — coalitional (≤ f) + censorship: `blocking_threshold`,
+      `can_permanently_censor`, `coalition_best_response_is_honest`; machine-checked exhaustively; design §4.
 **D · PQ shuffle** — splitting-ring NIZK (eprint 2025/658) or a re-parameterized worst-case-sound RLWE backend.
 **E · WASM/mobile** — wasm-pack build + browser demo; extend the wasm surface; a real client (WebSocket/WebRTC).
 **F · Architecture refactor** (#73) — split fanos-runtime; decompose OverlayNode; typed StorageAddress; secret-field encapsulation.
