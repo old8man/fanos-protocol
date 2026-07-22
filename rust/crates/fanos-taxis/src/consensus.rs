@@ -43,6 +43,14 @@ use crate::vote::{Certificate, Phase, SignedVote, Vote};
 /// combination count is already bounded by the cell; this only guards against a pathological configuration.
 const MAX_REVEAL_SUBSETS: usize = 4096;
 
+/// The most distinct not-yet-finalized transactions for which authenticated-but-unvalidatable reveals are
+/// buffered ([`ConsensusEngine::pending_reveals`]). Reveals are only buffered here after a signature check
+/// binds them to a real committee member (audit B1), and this cap bounds the memory even a Byzantine member
+/// can force by streaming distinct commits: at most `MAX_PENDING_REVEAL_COMMITS × committee` reveal messages.
+/// The oldest-keyed commit is evicted past this; a genuine buffered reveal is drained the moment its block
+/// finalizes (well within the reveal window), so eviction almost never touches one.
+const MAX_PENDING_REVEAL_COMMITS: usize = 4096;
+
 /// The **reveal window** (in finalized heights): how long a finalized block's execution waits for the anti-MEV
 /// reveals before dropping any still-undecryptable transaction. This is the **deterministic clock** that makes
 /// execution converge without coupling ordering to reveal timing: a transaction still short of `t` valid
@@ -777,11 +785,29 @@ impl<S: StateMachine> ConsensusEngine<S> {
     fn on_reveal(&mut self, r: &RevealMsg) -> Vec<Output> {
         if self.sealed_tx_for(&r.commit).is_some() {
             self.validate_and_record(r);
-        } else {
+        } else if self.verifiers.get(usize::from(r.member)).is_some_and(|vk| r.verify(vk)) {
+            // Authenticate before buffering (audit B1): a reveal for a not-yet-finalized tx must still be signed
+            // by a real committee member, so an attacker with no member key cannot flood the map with
+            // attacker-keyed garbage. (The member-on-the-right-line check needs the tx, and runs in
+            // `validate_and_record` once the block finalizes.) Bound the buffer so even a Byzantine member
+            // streaming distinct commits cannot grow it without limit — evict the oldest commit past the cap.
+            if !self.pending_reveals.contains_key(&r.commit)
+                && self.pending_reveals.len() >= MAX_PENDING_REVEAL_COMMITS
+                && let Some((&oldest, _)) = self.pending_reveals.iter().next()
+            {
+                self.pending_reveals.remove(&oldest);
+            }
             // Buffer, first-writer-wins per member, so a flood cannot displace a genuine early reveal.
             self.pending_reveals.entry(r.commit).or_default().entry(r.member).or_insert_with(|| r.clone());
         }
         self.try_execute()
+    }
+
+    /// The number of not-yet-finalized transactions with buffered reveals — observability, and a witness to the
+    /// bounded-buffer DoS defence (audit B1): this never exceeds [`MAX_PENDING_REVEAL_COMMITS`].
+    #[must_use]
+    pub fn pending_reveal_count(&self) -> usize {
+        self.pending_reveals.len()
     }
 
     /// Find a finalized-but-unexecuted transaction by its commitment (searching the execution queue).

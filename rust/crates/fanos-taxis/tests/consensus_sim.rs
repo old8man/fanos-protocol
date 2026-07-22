@@ -804,3 +804,31 @@ fn the_agreed_keyper_registry_is_the_only_accepted_decryption_authority() {
         assert!(!eng.accepts_keyper_registry(&foreign), "a substituted decryption authority is refused");
     }
 }
+
+// Audit B1: only authenticated reveals are buffered, and the buffer is bounded — no attacker-keyed OOM.
+#[test]
+fn b1_only_authenticated_reveals_are_buffered() {
+    let mut keys = gen_keys();
+    let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+    let registry = KeyperRegistry::new(
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+    );
+    let keyper_commit = registry.commit();
+    // An engine for validator 1; validator 0's key stays available to sign a genuine reveal.
+    let k1 = keys.remove(1);
+    let mut engine =
+        ConsensusEngine::new(CellParams::FANO, 1, k1.sig, k1.kem, verifiers, keyper_commit, SEED, EPOCH, genesis());
+
+    let commit: [u8; 32] = [0x42; 32]; // a commitment naming no finalized tx → the buffering path
+
+    // A reveal signed by a NON-committee key, claiming to be member 0, is rejected and NOT buffered.
+    let (attacker_sig, _) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"b1-attacker"));
+    let forged = RevealMsg::signed(commit, 0, share_bytes(1, &[0x55; 32]), &attacker_sig);
+    let _ = engine.step(Input::Reveal(forged));
+    assert_eq!(engine.pending_reveal_count(), 0, "an unauthenticated reveal is not buffered (B1)");
+
+    // A reveal genuinely signed by committee member 0 is authenticated and buffered.
+    let genuine = RevealMsg::signed(commit, 0, share_bytes(1, &[0x66; 32]), &keys[0].sig);
+    let _ = engine.step(Input::Reveal(genuine));
+    assert_eq!(engine.pending_reveal_count(), 1, "a member-signed reveal is buffered");
+}
