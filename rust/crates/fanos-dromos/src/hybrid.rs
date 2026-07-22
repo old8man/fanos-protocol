@@ -20,6 +20,7 @@ use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
 
+use crate::bridge::{POOL_SINK, ShieldTx};
 use crate::naming::{NameRegistry, NameTx};
 use crate::token::{SignedTransfer, TokenLedger};
 
@@ -29,6 +30,8 @@ pub const TAG_TRANSPARENT: u8 = 0x00;
 pub const TAG_SHIELDED: u8 = 0x01;
 /// Transaction-type tag: a name-registry operation.
 pub const TAG_NAME: u8 = 0x02;
+/// Transaction-type tag: a shield (transparent → private pool).
+pub const TAG_SHIELD: u8 = 0x03;
 
 /// Domain-separation label for the hybrid state root.
 const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
@@ -92,6 +95,35 @@ impl HybridLedger {
         self.shielded.mint(note_commitment)
     }
 
+    /// The public total backing the shielded pool (the pool-sink balance) — equals the sum of unspent shielded
+    /// note values by construction (every shield credits it, every unshield debits it).
+    #[must_use]
+    pub fn pool_backing(&self) -> u64 {
+        self.tokens.balance(&POOL_SINK)
+    }
+
+    /// Wrap a shield operation as a DROMOS transaction payload.
+    #[must_use]
+    pub fn shield_payload(sx: &ShieldTx) -> Vec<u8> {
+        Self::tagged(TAG_SHIELD, &sx.to_bytes())
+    }
+
+    /// Shield public tokens into the private pool: settle the payment to the pool sink and mint the note. The
+    /// amount and the note's opening are public at entry; the note is privately spendable thereafter.
+    fn shield(&mut self, sx: &ShieldTx) -> bool {
+        if sx.payment.transfer.to != POOL_SINK || sx.payment.transfer.amount != sx.note.value {
+            return false;
+        }
+        // Capacity guard so the (atomic) payment is never applied without the mint following.
+        if self.shielded.note_count() >= (1u64 << fanos_obolos::TREE_DEPTH) {
+            return false;
+        }
+        if self.tokens.apply(&sx.payment).is_err() {
+            return false;
+        }
+        self.shielded.mint(sx.note.commitment(&self.params)).is_some()
+    }
+
     /// Wrap a signed transparent transfer as a DROMOS transaction payload.
     #[must_use]
     pub fn transparent_payload(transfer: &SignedTransfer) -> Vec<u8> {
@@ -139,6 +171,10 @@ impl StateMachine for HybridLedger {
             },
             Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
                 Some(name_tx) => outcome(self.names.apply(&name_tx, &mut self.tokens, self.height).is_ok()),
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_SHIELD, body)) => match ShieldTx::from_bytes(body) {
+                Some(sx) => outcome(self.shield(&sx)),
                 None => ExecOutcome::Malformed,
             },
             _ => ExecOutcome::Malformed,
@@ -256,6 +292,56 @@ mod tests {
         let forged = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 100, nonce: 0 }, &mallory_sk, mallory_vk);
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::transparent_payload(&forged))), ExecOutcome::Rejected);
         assert_eq!(ledger.tokens().balance(&alice), 1000, "Alice's funds are untouched");
+    }
+
+    #[test]
+    fn shielding_moves_public_tokens_into_a_spendable_private_note() {
+        let (alice_sk, alice_vk, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Alice shields 500 into a note she owns.
+        let nsk = [7u8; 32];
+        let shield_note = Note::new(500, derive_owner_pk(&nsk), Randomness::from_seed(b"shield"), [1u8; 32]);
+        let sx = ShieldTx {
+            payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 500, nonce: 0 }, &alice_sk, alice_vk),
+            note: shield_note.clone(),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shield_payload(&sx))), ExecOutcome::Applied);
+        assert_eq!(ledger.pool_backing(), 500, "the pool sink backs the shielded value");
+        assert_eq!(ledger.tokens().balance(&alice), 9_500, "Alice's public balance dropped by the shielded amount");
+        assert_eq!(ledger.shielded().note_count(), 1, "the note entered the pool");
+
+        // The shielded note is now privately spendable: Alice → Bob (shielded).
+        let path = ledger.shielded().path(0).unwrap();
+        let sp = SpendInput { note: shield_note, nsk, path };
+        let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"bob")], 0);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied, "the shielded note spends privately");
+        assert_eq!(ledger.shielded().spent_count(), 1, "the shielded-from-transparent note was spent");
+    }
+
+    #[test]
+    fn a_shield_with_a_mismatched_amount_or_wrong_sink_is_refused() {
+        let (alice_sk, alice_vk, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+        let n = Note::new(500, derive_owner_pk(&[7u8; 32]), Randomness::from_seed(b"s"), [1u8; 32]);
+        // Payment amount (400) ≠ note value (500) — you can't mint more private value than you paid.
+        let mismatch = ShieldTx {
+            payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 400, nonce: 0 }, &alice_sk, alice_vk.clone()),
+            note: n.clone(),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shield_payload(&mismatch))), ExecOutcome::Rejected);
+        // Payment not to the pool sink.
+        let wrong_sink = ShieldTx {
+            payment: SignedTransfer::sign(Transfer { from: alice, to: [0u8; 32], amount: 500, nonce: 0 }, &alice_sk, alice_vk),
+            note: n,
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shield_payload(&wrong_sink))), ExecOutcome::Rejected);
+        assert_eq!(ledger.pool_backing(), 0, "no value entered the pool on a refused shield");
+        assert_eq!(ledger.tokens().balance(&alice), 10_000, "no funds moved");
     }
 
     #[test]

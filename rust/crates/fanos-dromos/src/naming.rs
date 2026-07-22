@@ -12,13 +12,12 @@
 
 use std::collections::BTreeMap;
 
-use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
 use fanos_primitives::hash_labeled;
 
 use crate::token::{SignedTransfer, TokenError, TokenLedger};
 
-/// The fixed serialized length of a [`SignedTransfer`] (`from ‖ to ‖ amount ‖ nonce ‖ key ‖ sig`).
-const SIGNED_TRANSFER_LEN: usize = 80 + HYBRID_VK_LEN + HYBRID_SIG_LEN;
+/// The fixed serialized length of a [`SignedTransfer`].
+const SIGNED_TRANSFER_LEN: usize = SignedTransfer::WIRE_LEN;
 
 /// The treasury account that registration/renewal fees flow to (a fixed, keyless sink — its balance is the
 /// accrued naming revenue, spendable only by a future governance rule, never by a signature).

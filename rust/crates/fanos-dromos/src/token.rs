@@ -70,6 +70,9 @@ pub struct SignedTransfer {
 }
 
 impl SignedTransfer {
+    /// The fixed serialized length: `from(32) ‖ to(32) ‖ amount(8) ‖ nonce(8) ‖ key(VK) ‖ sig(SIG)`.
+    pub const WIRE_LEN: usize = 80 + HYBRID_VK_LEN + HYBRID_SIG_LEN;
+
     /// Sign `transfer` under `signer`, whose public key `from_key` must hash to `transfer.from` (the caller's
     /// responsibility; a mismatch produces a transfer that will fail [`verify`](Self::verify)).
     #[must_use]
