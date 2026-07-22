@@ -24,5 +24,5 @@ pub mod market;
 pub mod por;
 
 pub use content::{Cid, ChunkRef, Manifest, MerkleProof, MerkleStep, chunk_cid, verify_leaf};
-pub use market::{Deal, DealParams, DealState, Settlement};
-pub use por::{LeafProof, challenge, prove, verify};
+pub use market::{DEAL_PARAMS_LEN, Deal, DealParams, DealState, Settlement};
+pub use por::{LeafProof, challenge, decode_response, encode_response, prove, verify};

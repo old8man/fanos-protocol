@@ -11,7 +11,12 @@
 //! `move_system`, and feed the reputation observation to the role layer. The ledger integration (a
 //! `TAG_STORAGE` arm on `HybridLedger`) drives this engine; the engine itself holds only accounting.
 
+use alloc::vec::Vec;
+
 use crate::content::Cid;
+
+/// The fixed wire length of an encoded [`DealParams`].
+pub const DEAL_PARAMS_LEN: usize = 32 + 8 + 8 + 1 + 4 + 4 + 4 + 8 + 32 + 32;
 
 /// The on-record parameters of a storage deal — the commitment a consumer and provider agree to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,6 +41,45 @@ pub struct DealParams {
     pub provider: [u8; 32],
     /// The consumer's account id (refunded any unproven escrow at close).
     pub consumer: [u8; 32],
+}
+
+impl DealParams {
+    /// Canonical bytes: `cid(32) ‖ size(8) ‖ duration(8) ‖ replication(1) ‖ lambda_bits(4) ‖ f_tol_permille(4)
+    /// ‖ k(4) ‖ price(8) ‖ provider(32) ‖ consumer(32)`, all integers little-endian ([`DEAL_PARAMS_LEN`] bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(DEAL_PARAMS_LEN);
+        out.extend_from_slice(self.cid.as_bytes());
+        out.extend_from_slice(&self.size.to_le_bytes());
+        out.extend_from_slice(&self.duration.to_le_bytes());
+        out.push(self.replication);
+        out.extend_from_slice(&self.lambda_bits.to_le_bytes());
+        out.extend_from_slice(&self.f_tol_permille.to_le_bytes());
+        out.extend_from_slice(&self.k.to_le_bytes());
+        out.extend_from_slice(&self.price.to_le_bytes());
+        out.extend_from_slice(&self.provider);
+        out.extend_from_slice(&self.consumer);
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if the length is wrong.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != DEAL_PARAMS_LEN {
+            return None;
+        }
+        let cid = Cid::new(bytes.get(..32)?.try_into().ok()?);
+        let size = u64::from_le_bytes(bytes.get(32..40)?.try_into().ok()?);
+        let duration = u64::from_le_bytes(bytes.get(40..48)?.try_into().ok()?);
+        let replication = *bytes.get(48)?;
+        let lambda_bits = u32::from_le_bytes(bytes.get(49..53)?.try_into().ok()?);
+        let f_tol_permille = u32::from_le_bytes(bytes.get(53..57)?.try_into().ok()?);
+        let k = u32::from_le_bytes(bytes.get(57..61)?.try_into().ok()?);
+        let price = u64::from_le_bytes(bytes.get(61..69)?.try_into().ok()?);
+        let provider = bytes.get(69..101)?.try_into().ok()?;
+        let consumer = bytes.get(101..133)?.try_into().ok()?;
+        Some(Self { cid, size, duration, replication, lambda_bits, f_tol_permille, k, price, provider, consumer })
+    }
 }
 
 /// The lifecycle state of a deal.
@@ -170,7 +214,7 @@ impl Deal {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -192,6 +236,15 @@ mod tests {
     #[test]
     fn a_zero_duration_deal_is_refused() {
         assert!(Deal::open(params(1000, 0)).is_none());
+    }
+
+    #[test]
+    fn deal_params_round_trip_on_the_wire() {
+        let p = params(123_456, 30);
+        let bytes = p.to_bytes();
+        assert_eq!(bytes.len(), DEAL_PARAMS_LEN);
+        assert_eq!(DealParams::from_bytes(&bytes), Some(p));
+        assert_eq!(DealParams::from_bytes(&bytes[..bytes.len() - 1]), None, "wrong length rejected");
     }
 
     #[test]
