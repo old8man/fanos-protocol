@@ -1,0 +1,104 @@
+{
+  "description": "ANGELOS messenger known-answer tests (design: spec/platform.md §6). ANGELOS is the platform's single-face app — chat, calls, communities, and the in-conversation wallet. These vectors pin the language-agnostic wire formats every per-language messaging-bot SDK must reproduce byte-for-byte to interoperate: the content-plane message envelope, the bot command grammar, and the three crypto planes (1:1 session, sender-key group, real-time media). All seals are the one shared ChaCha20-Poly1305 AEAD (wire.json / spec §7.1) under a 32-byte key and a counter-derived 12-byte nonce; all key derivations are BLAKE3 under the domain labels below (hash_labeled(label, input) = BLAKE3 keyed by the 32-byte BLAKE3 hash of the ASCII label). Pinned by the Rust reference suite (fanos-angelos/tests/conformance.rs); change the implementation and the tests fail, so the vectors cannot drift. Byte strings are lower-case hex; integers are decimal unless noted.",
+  "nonce": {
+    "comment": "Every ANGELOS AEAD nonce is a per-key monotonic counter n placed little-endian in the low 8 bytes of the 12-byte nonce, the high 4 bytes zero. Each key seals a single numbered stream, so (key, nonce) is unique — the AEAD safety requirement.",
+    "len": 12,
+    "layout": "u64 counter little-endian in bytes 0..8, bytes 8..12 = 0x00"
+  },
+  "message": {
+    "comment": "The plaintext content-plane envelope an SDK sees after decryption. Canonical layout: channel(32) || sender(32) || seq(8, little-endian) || kind(1) || content_len(4, little-endian u32) || content. A decoder MUST reject trailing bytes past content_len and any unknown kind tag.",
+    "kind_tags": {
+      "Text": 0,
+      "Command": 1,
+      "Join": 2,
+      "Leave": 3,
+      "Reaction": 4,
+      "CallSignal": 5,
+      "Payment": 6,
+      "PaymentRequest": 7,
+      "System": 8
+    },
+    "vectors": [
+      {
+        "comment": "A text post. seq shown to exercise the little-endian width.",
+        "channel_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sender_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "seq": 72623859790382856,
+        "kind": "Text",
+        "content_utf8": "hi",
+        "bytes_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb080706050403020100020000006869"
+      },
+      {
+        "comment": "A payment carried in-chat (the wallet lives in the conversation): kind=Payment(6), content is a serialized value transfer the app's wallet built (a stub 'pay:100' here).",
+        "channel_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "sender_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "seq": 3,
+        "kind": "Payment",
+        "content_utf8": "pay:100",
+        "bytes_hex": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd030000000000000006070000007061793a313030"
+      }
+    ]
+  },
+  "command": {
+    "comment": "A bot command is a text message whose UTF-8 body starts with the command prefix (default '/'). The first whitespace token (sans prefix) is the name; the rest are whitespace-separated args. A prefix with no name, or text without the prefix, is not a command.",
+    "prefix": "/",
+    "vectors": [
+      { "text": "/tip alice 100", "name": "tip", "args": ["alice", "100"] },
+      { "text": "/ping", "name": "ping", "args": [] },
+      { "text": "hello", "is_command": false },
+      { "text": "/", "is_command": false }
+    ]
+  },
+  "session": {
+    "comment": "The 1:1 forward-secret ratchet. From a 32-byte shared secret (agreed by the KEM handshake, a group rekey, or a PSK): root = H('FANOS-angelos-v1/root', shared); a2b = H('FANOS-angelos-v1/a2b', root); b2a = H('FANOS-angelos-v1/b2a', root). The initiator sends on a2b, the responder on b2a. Each message: mk = H('FANOS-angelos-v1/mk', chain); chain' = H('FANOS-angelos-v1/next', chain); wire = n(8, little-endian) || AEAD(mk, nonce(n), plaintext). The chain is one-way, so a compromised key never opens past messages.",
+    "labels": {
+      "root": "FANOS-angelos-v1/root",
+      "a2b": "FANOS-angelos-v1/a2b",
+      "b2a": "FANOS-angelos-v1/b2a",
+      "mk": "FANOS-angelos-v1/mk",
+      "next": "FANOS-angelos-v1/next"
+    },
+    "wire_layout": "n(8, little-endian) || ciphertext",
+    "vector": {
+      "comment": "Initiator over shared secret = 0x01 repeated 32 times, sealing 'gm' twice; the same plaintext seals differently as the send chain (a2b) ratchets.",
+      "shared_secret_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "role": "Initiator",
+      "plaintext_utf8": "gm",
+      "seal_n0_hex": "0000000000000000c0cb8122c87945ea433bed88baaa74687cdf",
+      "seal_n1_hex": "0100000000000000d863f3c43e5e65ca6e3310e3123d6b4866ae"
+    }
+  },
+  "group": {
+    "comment": "The sender-key group session (an O(1) post to a channel). Each member derives their own sender chain from the shared group key and their public member id: sender_chain = H('FANOS-angelos-v1/group-sender', group_key(32) || member_id(4, little-endian)). A post advances the poster's chain: mk = H('FANOS-angelos-v1/group-mk', chain); chain' = H('FANOS-angelos-v1/group-next', chain); wire = n(8, little-endian) || AEAD(mk, nonce(n), plaintext). Every other member reproduces the poster's chain from the group key and opens with it.",
+    "labels": {
+      "sender": "FANOS-angelos-v1/group-sender",
+      "mk": "FANOS-angelos-v1/group-mk",
+      "next": "FANOS-angelos-v1/group-next"
+    },
+    "wire_layout": "n(8, little-endian) || ciphertext",
+    "vector": {
+      "comment": "Member id 1 in roster [1,2,3] over group key = 0x42 repeated 32 times, posting 'hello channel' twice.",
+      "group_key_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "member_id": 1,
+      "roster": [1, 2, 3],
+      "plaintext_utf8": "hello channel",
+      "post_n0_hex": "00000000000000004b13f534da5fb2ab8458a032166e303c289ebb9616fb8da3310a18bc58",
+      "post_n1_hex": "010000000000000070d8f717394e162e5e08f5dc84ea4d3437f5f2d8288537f9cfb568dfc3"
+    }
+  },
+  "media": {
+    "comment": "The real-time voice/video session — loss-tolerant per-frame AEAD under a per-call epoch key. epoch-0 key = H('FANOS-angelos-v1/media-epoch0', call_secret); a rekey advances key' = H('FANOS-angelos-v1/media-next-epoch', key) for forward secrecy across epochs (not packets — you cannot ratchet at 50 pkt/s). Each frame: inner = kind(1) || payload; wire = epoch(4, little-endian) || seq(8, little-endian) || AEAD(epoch_key, nonce(seq), inner). Any frame of the current epoch opens on its own, in any order, so loss and reordering are fine; a stale-epoch frame is dropped.",
+    "labels": {
+      "epoch0": "FANOS-angelos-v1/media-epoch0",
+      "next_epoch": "FANOS-angelos-v1/media-next-epoch"
+    },
+    "kind_tags": { "Audio": 0, "Video": 1, "Data": 2 },
+    "wire_layout": "epoch(4, little-endian) || seq(8, little-endian) || ciphertext",
+    "vector": {
+      "comment": "Epoch 0 over call secret = 0x33 repeated 32 times: an audio frame at seq 0, then a video frame at seq 1.",
+      "call_secret_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "audio_seq0_hex": "000000000000000000000000020e097db880b46b33d05a25b200f715de9c928d2d62f5",
+      "video_seq1_hex": "000000000100000000000000bcb21d09770aa5d025f1b5658276b40d71198e37bb733d"
+    }
+  }
+}

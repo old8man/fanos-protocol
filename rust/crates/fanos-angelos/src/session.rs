@@ -57,7 +57,7 @@ impl Session {
     pub fn initiate(recipient_kem: &HybridKemPublic, rng_seed: &[u8]) -> Option<(Self, Vec<u8>)> {
         let mut rng = SeedRng::from_seed(rng_seed);
         let (ct, shared) = recipient_kem.encapsulate(&mut rng)?;
-        Some((Self::from_shared(&shared, Role::Initiator), ct.to_bytes()))
+        Some((Self::from_shared_secret(&shared, Role::Initiator), ct.to_bytes()))
     }
 
     /// **Respond** to a handshake: decapsulate it with the recipient's KEM secret, deriving the mirror session.
@@ -66,12 +66,17 @@ impl Session {
     pub fn respond(kem_secret: &HybridKemSecret, handshake: &[u8]) -> Option<Self> {
         let ct = HybridCiphertext::from_bytes(handshake)?;
         let shared = kem_secret.decapsulate(&ct)?;
-        Some(Self::from_shared(&shared, Role::Responder))
+        Some(Self::from_shared_secret(&shared, Role::Responder))
     }
 
-    /// Derive a session's two directional chains from the shared secret and this party's role.
+    /// Open a session directly over an already-agreed 32-byte `shared` secret — the **seam** between key
+    /// agreement and the symmetric ratchet. The KEM handshake ([`initiate`](Self::initiate)/
+    /// [`respond`](Self::respond)) is one way to reach a shared secret; a group rekey, a pre-shared key, or the
+    /// asymmetric KEM-ratchet step (post-compromise security) are others — all feed the same ratchet through
+    /// here. Both parties must pass the same secret and *opposite* [`Role`]s. This mirrors the raw-secret
+    /// constructors of [`crate::group`] and [`crate::media`], and is the construction the conformance KAT pins.
     #[must_use]
-    fn from_shared(shared: &[u8; 32], role: Role) -> Self {
+    pub fn from_shared_secret(shared: &[u8; 32], role: Role) -> Self {
         let root = hash_labeled(ROOT_LABEL, shared);
         let a2b = hash_labeled(A2B_LABEL, &root);
         let b2a = hash_labeled(B2A_LABEL, &root);

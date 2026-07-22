@@ -16,6 +16,10 @@ everything else.
 | [`vectors/wire.json`](vectors/wire.json) | canonical varints, field-element widths, point/line encodings, frame types, and non-canonical inputs to reject | §7.1–§7.5 |
 | [`vectors/diakrisis.json`](vectors/diakrisis.json) | coherence-measure thresholds and the health-monitor constants | §2.7, §6 |
 | [`vectors/services.json`](vectors/services.json) | L4 storage addressing, CALYPSO `.fanos` addresses, PROTEUS epoch shaping, health-view gossip layout | §L4, XII, §13, §6.4 |
+| [`vectors/diaulos.json`](vectors/diaulos.json) | DIAULOS connection-layer frames, the constant-size AEAD cell, and the 1-RTT hybrid-KEM handshake derivation | §7, XII |
+| [`vectors/names.json`](vectors/names.json) | ONOMA addresses (bech32m PQ commitments), mnemonics, and per-epoch descriptor derivations | §L-pet |
+| [`vectors/telemetry.json`](vectors/telemetry.json) | the canonical `CoherenceFrame` wire format and the 3-bit Fano/Hamming syndrome | §2.7, §6 |
+| [`vectors/angelos.json`](vectors/angelos.json) | ANGELOS messenger wire formats: the message envelope, the bot command grammar, and the session/group/media crypto planes | platform §6 |
 
 ## Provenance
 
