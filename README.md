@@ -116,7 +116,7 @@ open (`docs/design-*.md`), each with a derivation and a reproducible experiment:
 
 ## The Rust reference implementation
 
-A `#![no_std]`-friendly Cargo workspace of **34 crates** mirroring the protocol's layers. Grouped by theme:
+A `#![no_std]`-friendly Cargo workspace of **35 crates** mirroring the protocol's layers. Grouped by theme:
 
 **Foundation** — `fanos-field` (`GF(2^m)`/`GF(p)`, zero-dep), `fanos-geometry` (`PG(2,q)` points/lines, cross
 rendezvous, the Fano cell), `fanos-code` (projective LRC, hyperoval peeling, data-availability sampling),
@@ -142,8 +142,9 @@ cells), `fanos-stream` (the reliability layer), `fanos-session` (async `AsyncRea
 
 **Node, runtime & apps** — `fanos-core` (coordinates, quorums, the `Node` API), `fanos-runtime` (the sans-I/O
 `OverlayNode`), `fanos-sim` (the deterministic simulator + cascade-forecasting observatory), `fanos-node` (the
-`fanos` daemon), `fanos-proxy` (SOCKS5), `fanos-vpn` (the TUN datapath), `fanos-ffi` (the C ABI), **`fanos-taxis`
-(the BFT blockchain)**, `fanos-cli` / `fanos-bench` (the verifier and benchmarks).
+`fanos` daemon), `fanos-proxy` (SOCKS5), `fanos-vpn` (the TUN datapath), `fanos-ffi` (the C ABI), `fanos-wasm`
+(the browser/mobile client surface), **`fanos-taxis` (the BFT blockchain)**, `fanos-cli` / `fanos-bench` (the
+verifier and benchmarks).
 
 ### Build, verify, and simulate
 
@@ -152,7 +153,7 @@ $ cd rust
 $ cargo run -p fanos-cli --bin fanos-verify   # reference verifier — the headline claims (V1–V22, T-226)
 $ cargo run -p fanos-sim --bin demo           # drive a real cell: crash, partition, rendezvous
 $ cargo run -p fanos-sim --example forecast   # forecast a cascade a regime before it collapses
-$ cargo test --workspace                      # 1,100+ tests across 34 crates
+$ cargo test --workspace                      # 1,100+ tests across 35 crates
 $ cargo clippy --all-targets -- -D warnings   # pedantic lints, zero warnings (CI gate)
 ```
 

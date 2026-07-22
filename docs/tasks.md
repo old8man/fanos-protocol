@@ -29,9 +29,16 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
       ExecCertificate + state_root opening + Merkle inclusion; no bridge trust.
 - [x] **Parent-attests-child-finality** (L0 shared security) — `fanos-taxis::hierarchy`: verify + anchor child
       ExecCertificates, DA-gated, with child-equivocation detection.
-- [ ] **Remaining TAXIS residuals** — wire equivocation-detection → slash into `accept_vote`; on-chain
-      decryption-key commitment for the mempool.
-- [ ] **WASM/mobile client surface** — close the usability gap the Veilid comparison exposed.
+- [x] **TAXIS residuals** — equivocation-detection → `Output::Slash` wired into `accept_vote` (the S>0 the
+      Nash proof assumes is now operational); deterministic anti-MEV execution via a finalized-height-keyed
+      `REVEAL_WINDOW` drop (undecryptable/withheld tx dropped uniformly, checkpoint catches any divergence).
+- [x] **WASM/mobile client surface** — new `fanos-wasm` crate (35th): compute + verify a node's self-organizing
+      coordinate in the browser; native-tested + builds to wasm32-unknown-unknown warning-free.
+
+**Deepening pass COMPLETE (2026-07-22).** All items above ✅. Residual (documented, not blocking): the thin
+`fanos-node` driver that runs the RoleController live each beacon round (capability-descriptor advertisement +
+per-role load metering in `fanos-telemetry`), and a live multi-cell orchestration driver for cross-cell relay /
+parent attestation. Full workspace test green; clippy `--all-targets -D warnings` clean across all 35 crates.
 
 ### A · Optional application layers — ✅ DONE (2026-07-22)
 - **Part X.1 — the blockchain application on FANOS** — ✅ **DONE**: new crate **`fanos-taxis`** (`854feef`),
