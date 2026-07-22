@@ -8,11 +8,14 @@
 > market** (providers earn OBOLOS currency by serving the `Storage` role; consumers pay to store) — and
 > wires them to the messenger, whose attachments and mailboxes are its first tenant.
 >
-> Status: **accepted design, implementation in progress.** The L4 substrate it builds on is `[T]`
-> (`spec/protocol.md` §L4); the content model and market state machine are `[C]` (compose built
-> primitives); the proof-of-retrievability soundness is `[T]` (a derived bound, below); the shielded
-> payment path inherits OBOLOS's `[P]` frontier. Ontologically an **O — Foundation** organ, per
-> `spec/platform.md` §1.1.
+> Status: **built and verified** (`fanos-thesauros` + the DROMOS `TAG_STORAGE` arm), the crate's wire formats
+> pinned in `conformance/vectors/thesauros.json` and the market's audit/incentive dynamics exercised in
+> `fanos-sim/tests/thesauros_market.rs`. The L4 substrate it builds on is `[T]` (`spec/protocol.md` §L4); the
+> content model, proof-of-retrievability, and market state machine are **built** (the PoR soundness is `[T]`, a
+> derived bound, §5); the transparent-token market is live on the ledger; **shielded-payment** deals inherit
+> OBOLOS's `[P]` frontier. Ontologically an **O — Foundation** organ, per `spec/platform.md` §1.1. Residual
+> hardening is called out in §10 (the scheduled-audit policy against prover inclusion-timing is the one that
+> touches soundness).
 
 ## 1. The problem and the goals
 
@@ -271,9 +274,16 @@ A `no_std` core crate, sans-I/O like `ConsensusEngine`/`HybridLedger`:
 ## 10. Honest limits, falsifiers, status
 
 - **PoR proves possession of committed bytes, not global retrievability** `[T→C]`: the `k(λ,f_tol)` bound is
-  exact for the spot-check, but end-to-end "the object can be reconstructed" rests on the inherited LRC loss
-  budget; `f_tol` must be set against the LRC's ≤3-loss tolerance (the redundancy-headline caveat in
-  `erasure.rs` must be reconciled first).
+  exact for the spot-check (and holds empirically — `fanos-sim/tests/thesauros_market.rs` measures a
+  >10%-missing provider caught >95% of the time, on the hypergeometric theory), but end-to-end "the object can
+  be reconstructed" rests on the inherited LRC loss budget; `f_tol` must be set against the LRC's ≤3-loss
+  tolerance (the redundancy-headline caveat in `erasure.rs` must be reconciled first).
+- **Scheduled audits vs prover inclusion-timing** `[C]` — the one built-path soundness residual: the audit beacon
+  is now the consensus-committed parent hash (ungrindable by the proposer, wired through
+  `StateMachine::set_audit_beacon`), but a *provider* still chooses when to submit its `Prove`, so it could wait
+  for a beacon that happens to challenge only leaves it kept. Closing it fully means binding each epoch to a
+  **scheduled height** and requiring the proof for that height's beacon (a market-policy layer over the built
+  arm), so the provider cannot choose the challenge.
 - **Deal-graph privacy is weaker than content privacy** `[C]` (§6.3): shield the payment; bulk content is
   the strong guarantee.
 - **Shielded payment inherits OBOLOS's `[P]` frontier**: transparent-token deals work today; shielded deals
