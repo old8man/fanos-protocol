@@ -139,8 +139,10 @@ for a first, un-audited PQ construction.
   **detectable-abort** model (a malicious dealer can only exclude itself, never bias the honest sum) under an
   honest dealer-majority. Tests cover forged shares, an off-polynomial (in-basis and out-of-basis) dealing,
   sub-threshold reveals, and a 20-node cell.
-- **`rlwe`** — the implementation is **not constant-time / NTT-hardened** (schoolbook `O(n²)` multiply, data-
-  dependent nothing-special) and the security rests on the standard Ring-LWE assumption at the cited level.
+- **`rlwe`** — the polynomial multiply is **branch-free / data-independent** (the secret-dependent zero-skip
+  that would leak the secret's Hamming weight was removed), but the backend is **not fully constant-time /
+  NTT-hardened** (the modular reduction uses `%`; sampling is not rejection-free); security rests on the
+  standard Ring-LWE assumption at the cited level.
 
 **What genuinely remains is not design or implementation** but two *external* processes: independent
 cryptanalysis of `pqvss`/`shuffle`, and swapping the reference `rlwe` for a **vetted, constant-time, NTT** RLWE

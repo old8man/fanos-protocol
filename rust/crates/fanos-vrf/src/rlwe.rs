@@ -3,8 +3,9 @@
 //!
 //! > **NOVEL, UNAUDITED.** A from-scratch Ring-LWE implementation with a security reduction to decisional
 //! > Ring-LWE, **literature-calibrated parameters** (below), and a Monte-Carlo decryption-failure experiment.
-//! > It has **not** had external cryptanalysis and is not constant-time/side-channel-hardened; deploy only
-//! > after an audit and a hardened (NTT, CT) backend.
+//! > The polynomial multiply is **branch-free / data-independent** (no secret-dependent control flow), but it
+//! > is not *fully* constant-time (the modular reduction uses `%`, and sampling is not rejection-free), and it
+//! > has **not** had external cryptanalysis. Deploy only after an audit and a hardened (NTT, fully-CT) backend.
 //!
 //! **Parameters — NewHope-512-grounded (`docs/design-pq-vrf.md` §4).** `n = 512`, `q = 12289`, centered-
 //! binomial noise `η = 8` (stddev `σ = √(η/2) = 2`): the canonical single-ring RLWE set of NewHope
@@ -67,13 +68,12 @@ impl Poly {
     }
 
     /// Negacyclic multiplication in `Z_q[X]/(X^n + 1)` (schoolbook; `X^n = −1` folds the high half back with a
-    /// sign flip).
+    /// sign flip). The nested loops run a **data-independent** `n²` iterations — no secret-dependent branch —
+    /// so the multiply's control flow leaks nothing about a secret operand's coefficients (a zero-skip
+    /// optimization would have leaked the secret's Hamming weight through timing).
     fn mul(&self, o: &Self) -> Self {
         let mut acc = [0i64; 2 * N];
         for (i, &ai) in self.0.iter().enumerate() {
-            if ai == 0 {
-                continue;
-            }
             for (j, &oj) in o.0.iter().enumerate() {
                 acc[i + j] += ai * oj;
             }
