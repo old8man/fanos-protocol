@@ -40,6 +40,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_primitives::{hash_labeled, BeaconSeed, Epoch, NodeId};
+use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
 
 /// The functional roles a cell provides. Extensible; the four base roles mirror the node's advertised
 /// capability set (relay traffic, store L4 shards, host CALYPSO services, bridge to the clear net).
@@ -148,6 +149,70 @@ impl Capability {
     fn tickets(self) -> u16 {
         self.weight.clamp(1, MAX_WEIGHT)
     }
+}
+
+/// A node's **signed capability advertisement** for an epoch — the authenticated input the role assignment
+/// consumes. It is signed with the node's **coordinate-VRF key**: the same key that earns the node its
+/// coordinate (`membership::Member::assign`) also attests what it can do, so one self-certifying identity
+/// binds both *where* a node is and *what* it offers, and a peer authenticates the declaration (a node cannot
+/// forge another's capabilities). A VRF proof over the capability bytes is an unforgeable signature on them.
+///
+/// A node may still over-declare its *own* `weight`; that is caught not here but by the performance-reputation
+/// loop (`docs/design-self-organization.md` §4/§5): an assignee that cannot serve its role shows up as a
+/// coherence deficit and has its effective weight slashed. Signing binds the declaration to the identity;
+/// reputation prices honesty.
+#[derive(Clone, Debug)]
+pub struct CapabilityDescriptor {
+    /// The advertising node's identity.
+    pub node_id: NodeId,
+    /// The epoch this advertisement is valid for (it is re-issued each epoch, like the coordinate).
+    pub epoch: Epoch,
+    /// The advertised capability (offered roles + capacity weight).
+    pub capability: Capability,
+    /// The VRF-proof signature over [`signable`](CapabilityDescriptor::signable).
+    proof: VrfProof,
+}
+
+impl CapabilityDescriptor {
+    /// The signed content: `node_id(32) ‖ epoch(8) ‖ offered(1) ‖ weight(2)`.
+    #[must_use]
+    fn signable(node_id: &NodeId, epoch: Epoch, capability: Capability) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 8 + 1 + 2);
+        buf.extend_from_slice(&node_id.0);
+        buf.extend_from_slice(&epoch.to_be_bytes());
+        buf.push(capability.offered.bits());
+        buf.extend_from_slice(&capability.weight.to_be_bytes());
+        buf
+    }
+
+    /// Sign a capability advertisement with the node's coordinate-VRF secret.
+    #[must_use]
+    pub fn sign(node_id: NodeId, epoch: Epoch, capability: Capability, vrf_secret: &VrfSecret) -> Self {
+        let (proof, _) = vrf_secret.prove(&Self::signable(&node_id, epoch, capability));
+        Self { node_id, epoch, capability, proof }
+    }
+
+    /// Whether the advertisement is authentic under `vrf_public` (which must be the node's coordinate-VRF key,
+    /// the one its identity commits). A forged or tampered advertisement is rejected.
+    #[must_use]
+    pub fn verify(&self, vrf_public: &VrfPublic) -> bool {
+        vrf_public.verify(&Self::signable(&self.node_id, self.epoch, self.capability), &self.proof).is_some()
+    }
+}
+
+/// Gather **verified** capability advertisements for `epoch` into the `members` list [`assign`] consumes. Each
+/// descriptor is paired with the advertising node's VRF public key (from its identity), and only those that are
+/// for this epoch and pass [`CapabilityDescriptor::verify`] are admitted — so the assignment runs over an
+/// authenticated capability set, and a forged or stale advertisement cannot steer it.
+#[must_use]
+pub fn verified_members<'a>(
+    descriptors: impl IntoIterator<Item = (&'a CapabilityDescriptor, &'a VrfPublic)>,
+    epoch: Epoch,
+) -> Vec<(NodeId, Capability)> {
+    descriptors
+        .into_iter()
+        .filter_map(|(d, pk)| (d.epoch == epoch && d.verify(pk)).then_some((d.node_id, d.capability)))
+        .collect()
 }
 
 /// Per-role **demand**: how many active nodes the cell wants serving each role this epoch. Structural roles
@@ -554,5 +619,37 @@ mod tests {
         let report = hungry.step(&members, Epoch::new(0), &B, Demand { relay: 15, ..Default::default() });
         assert_eq!(report.roles.values().filter(|r| r.has(Role::Relay)).count(), 10, "assigns all it can");
         assert_eq!(report.deficit.relay, 5, "the 5 relays it wants but cannot fill are escalated to the parent");
+    }
+
+    #[test]
+    fn a_signed_capability_advertisement_authenticates_the_assignment_input() {
+        let sk = VrfSecret::from_seed([0x4A; 32]);
+        let pk = sk.public();
+        let cap = Capability::new(RoleSet::of(&[Role::Relay, Role::Storage]), 6);
+        let desc = CapabilityDescriptor::sign(node(1), E, cap, &sk);
+        // Authentic under the node's own key.
+        assert!(desc.verify(&pk), "an honestly-signed advertisement verifies");
+        // Rejected under a different key (a node cannot forge another's capabilities).
+        assert!(!desc.verify(&VrfSecret::from_seed([0x99; 32]).public()), "a wrong key is rejected");
+        // Tampering the declared capability breaks the signature.
+        let mut tampered = desc.clone();
+        tampered.capability = Capability::new(RoleSet::of(&[Role::Relay, Role::Storage, Role::Exit]), 63);
+        assert!(!tampered.verify(&pk), "an altered capability is rejected");
+    }
+
+    #[test]
+    fn verified_members_admits_only_authentic_current_epoch_advertisements() {
+        let sk0 = VrfSecret::from_seed([1; 32]);
+        let sk1 = VrfSecret::from_seed([2; 32]);
+        let (pk0, pk1) = (sk0.public(), sk1.public());
+        let good = CapabilityDescriptor::sign(node(0), E, Capability::new(RoleSet::of(&[Role::Relay]), 4), &sk0);
+        let stale = CapabilityDescriptor::sign(node(1), Epoch::new(99), Capability::new(RoleSet::of(&[Role::Exit]), 4), &sk1);
+        // `good` is admitted; `stale` (wrong epoch) is dropped; a descriptor checked under the wrong key is dropped.
+        let members = verified_members([(&good, &pk0), (&stale, &pk1)], E);
+        assert_eq!(members.len(), 1, "only the current-epoch, authentic advertisement is admitted");
+        assert_eq!(members[0].0, node(0));
+        // The same descriptors, but `good` paired with the WRONG key, admits nothing valid for node 0.
+        let none = verified_members([(&good, &pk1)], E);
+        assert!(none.is_empty(), "a descriptor checked under the wrong key is not admitted");
     }
 }
