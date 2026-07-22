@@ -1191,6 +1191,22 @@ name = "fanos-stream"
 version = "0.1.0"
 
 [[package]]
+name = "fanos-taxis"
+version = "0.1.0"
+dependencies = [
+ "fanos-aphantos",
+ "fanos-code",
+ "fanos-field",
+ "fanos-geometry",
+ "fanos-incentives",
+ "fanos-pqcrypto",
+ "fanos-primitives",
+ "fanos-wire",
+ "fanos-wire-derive",
+ "proptest",
+]
+
+[[package]]
 name = "fanos-telemetry"
 version = "0.1.0"
 dependencies = [
