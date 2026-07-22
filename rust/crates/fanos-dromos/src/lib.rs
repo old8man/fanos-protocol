@@ -15,6 +15,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod hybrid;
+
+pub use hybrid::{HybridLedger, TAG_SHIELDED, TAG_TRANSPARENT};
+
 use std::sync::Arc;
 
 use fanos_obolos::{Params, ShieldedState, decode_submission};

@@ -929,6 +929,7 @@ name = "fanos-dromos"
 version = "0.1.0"
 dependencies = [
  "fanos-obolos",
+ "fanos-primitives",
  "fanos-taxis",
 ]
 

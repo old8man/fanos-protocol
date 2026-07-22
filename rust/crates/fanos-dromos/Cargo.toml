@@ -11,10 +11,13 @@ keywords = ["blockchain", "execution", "state-machine", "privacy", "fanos"]
 categories = ["cryptography"]
 
 [dependencies]
-# The consensus StateMachine trait + Transaction/ExecOutcome DROMOS executes for.
+# The consensus StateMachine trait + Transaction/ExecOutcome DROMOS executes for, and the transparent
+# `Accounts` ledger the hybrid state machine composes with the shielded pool.
 fanos-taxis.workspace = true
 # The OBOLOS shielded-pool state machine DROMOS drives, and its submission codec.
 fanos-obolos = { workspace = true, features = ["std"] }
+# BLAKE3 labeled hashing for the hybrid state root (transparent ‖ shielded).
+fanos-primitives = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true
