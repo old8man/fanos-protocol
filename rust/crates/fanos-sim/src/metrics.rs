@@ -34,6 +34,9 @@ pub struct Metrics {
     pub retrieval_hits: u64,
     /// DHT `Get` completions that found nothing.
     pub retrieval_misses: u64,
+    /// Values accounted **permanently lost** — a held key became unrecoverable past the erasure tolerance
+    /// (audit R-C3): durable loss made visible, distinct from a transient/never-stored miss.
+    pub data_losses: u64,
     /// Mandatory self-observations emitted (one `CoherenceFrame` per node per diagnosis).
     pub observations: u64,
 }

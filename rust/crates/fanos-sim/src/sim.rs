@@ -72,6 +72,9 @@ fn note_desc(note: &Notification) -> String {
             short_digest(key),
             value.as_ref().map_or("miss", |_| "hit")
         ),
+        Notification::DataLost { key, epoch } => {
+            format!("DataLost {} @{epoch}", short_digest(key))
+        }
         Notification::Availability { key, available } => format!(
             "Availability {} ({})",
             short_digest(key),
@@ -513,6 +516,7 @@ impl Sim {
                         Notification::Stored(_) => m.stores += 1,
                         Notification::Retrieved { value: Some(_), .. } => m.retrieval_hits += 1,
                         Notification::Retrieved { value: None, .. } => m.retrieval_misses += 1,
+                        Notification::DataLost { .. } => m.data_losses += 1,
                         Notification::Observed(_) => m.observations += 1,
                         _ => {}
                     }

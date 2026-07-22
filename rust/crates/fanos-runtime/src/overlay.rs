@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_code::{da, erasure};
+use fanos_code::{da, erasure, lrc};
 use fanos_core::{AdmissionPolicy, PowAdmission};
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
@@ -267,6 +267,11 @@ struct Store {
     pending: BTreeMap<[u8; DIGEST], PendingGet>,
     /// In-flight DA samples ([`Command::SampleAvailability`]), keyed by digest (spec §L4.3).
     pending_samples: BTreeMap<[u8; DIGEST], PendingSample>,
+    /// The **durable loss ledger** (audit R-C3): digests this node held a shard of that became permanently
+    /// unrecoverable — more shard-homes gone than the `[7,3,4]` code tolerates — and the epoch each loss was
+    /// accounted. Bounded by the store's own [`MAX_STORE_ENTRIES`] (it is a subset of held keys). Makes loss
+    /// visible and auditable instead of silent; a production node persists it. Append-only (an audit trail).
+    loss_ledger: BTreeMap<[u8; DIGEST], Epoch>,
     /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
     seq: u64,
 }
@@ -1216,10 +1221,37 @@ impl<F: Field> OverlayNode<F> {
         effects
     }
 
+    /// Account a permanent data loss (audit R-C3) for `digest` at a read's `Retrieved(None)` conclusion: if
+    /// this node PROVABLY held a shard of it (so the value was stored) **and** the down shard-homes form a
+    /// stopping set the `[7,3,4]` code cannot tolerate — so the corroborated-alive points can no longer
+    /// reconstruct it — record it in the durable [`loss_ledger`] and emit [`Notification::DataLost`]. This
+    /// turns silent permanent loss into accounted, visible loss.
+    ///
+    /// Timing-safe and R-H1-immune: it keys off the **corroborated-liveness** `degraded` mask (spec §6.4), not
+    /// response latency or the append-only membership set — a slow peer never triggers a false loss, and a
+    /// crashed peer that lingers in `members` is still counted down. Base `N = 7` cell only (where the code
+    /// lives); off it the fine-grained placement is out of scope. Idempotent per key (the ledger is append-only).
+    fn account_data_loss(&mut self, now: Instant, digest: [u8; DIGEST], effects: &mut Vec<Effect>) {
+        if !self.store.entries.contains_key(&digest) || self.store.loss_ledger.contains_key(&digest) {
+            return; // never held a shard (cannot attest the key was stored), or already accounted
+        }
+        // The shard-homes that are down (not corroborated-alive). If they form a stopping set the [7,3,4] code
+        // cannot recover, the value is gone for good — no future read completes.
+        let Some((_, degraded, _)) = self.cell_liveness(now) else {
+            return; // off the base Fano cell — not this layer's placement domain
+        };
+        if !lrc::is_recoverable_fano(degraded) {
+            let epoch = self.epoch();
+            self.store.loss_ledger.insert(digest, epoch);
+            effects.push(Effect::Notify(Notification::DataLost { key: digest, epoch }));
+        }
+    }
+
     /// Conclude reads that have not assembled a reconstructable shard-set within `read_timeout` as
     /// `Retrieved(None)` (spec §L4). Under erasure the read fans out to every shard home at once, so a
     /// timeout means too few shards came back to recover the value (enough nodes down / withholding, or the
-    /// key was never stored) — there is no further replica to walk.
+    /// key was never stored) — there is no further replica to walk. A held key whose live shard-homes can no
+    /// longer reconstruct is additionally accounted a permanent loss ([`account_data_loss`], R-C3).
     fn sweep_pending_gets(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         let timeout = self.config.read_timeout;
         let stale: Vec<[u8; DIGEST]> = self
@@ -1231,6 +1263,7 @@ impl<F: Field> OverlayNode<F> {
             .collect();
         for digest in stale {
             self.store.pending.remove(&digest);
+            self.account_data_loss(now, digest, effects); // R-C3: a held-but-unrecoverable key is accounted lost
             effects.push(Effect::Notify(Notification::Retrieved {
                 key: digest,
                 value: None,
@@ -1932,7 +1965,7 @@ impl<F: Field> OverlayNode<F> {
     /// read's version-grouped shard-set and, once the **highest** recoverable version reconstructs, deliver
     /// that value (last-writer-wins) and retire the read. A `found=false` reply (the peer holds no shard) is
     /// not accumulated; once every queried peer has said so, or the read times out, the value is absent.
-    fn on_value(&mut self, _now: Instant, body: &[u8]) -> Vec<Effect> {
+    fn on_value(&mut self, now: Instant, body: &[u8]) -> Vec<Effect> {
         let Some(digest) = parse_digest(body.get(..DIGEST)) else {
             return Vec::new();
         };
@@ -1980,10 +2013,10 @@ impl<F: Field> OverlayNode<F> {
                 && reconstruct_highest(&pending.by_version).is_none()
             {
                 self.store.pending.remove(&digest);
-                return alloc::vec![Effect::Notify(Notification::Retrieved {
-                    key: digest,
-                    value: None,
-                })];
+                let mut effects = alloc::vec![];
+                self.account_data_loss(now, digest, &mut effects); // R-C3: all peers answered, none can supply it
+                effects.push(Effect::Notify(Notification::Retrieved { key: digest, value: None }));
+                return effects;
             }
             return Vec::new();
         }
@@ -2261,6 +2294,15 @@ impl<F: Field> OverlayNode<F> {
     #[must_use]
     pub fn epoch(&self) -> Epoch {
         self.epoch
+    }
+
+    /// The durable **loss ledger** (audit R-C3): the digests this node has accounted permanently lost — a
+    /// held key whose live shard-homes can no longer reconstruct it — each with the epoch it was accounted.
+    /// Empty in a healthy cell; a non-empty ledger is visible, auditable evidence of data that fell past the
+    /// erasure tolerance, rather than the silent `Retrieved(None)` miss it used to be indistinguishable from.
+    #[must_use]
+    pub fn lost_keys(&self) -> Vec<([u8; DIGEST], Epoch)> {
+        self.store.loss_ledger.iter().map(|(k, e)| (*k, *e)).collect()
     }
 
     /// This node's cell-liveness view (base Fano cell only): `(self_index, degraded_mask,

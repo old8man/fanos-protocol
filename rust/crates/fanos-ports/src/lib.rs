@@ -247,6 +247,19 @@ pub enum Notification {
         /// The retrieved value, or `None` if the cell held no value for the key.
         value: Option<Vec<u8>>,
     },
+    /// A DHT value was determined **permanently unrecoverable** (audit R-C3). A node that holds a shard of
+    /// `key` — so the value provably WAS stored — gathered every available shard from the cell and the
+    /// present set is a stopping set: more shard-homes than the `[7,3,4]` erasure code tolerates (`> 3`
+    /// points, or a hyperoval) have been lost. Distinct from a `Retrieved { value: None }` miss (transient,
+    /// or a never-stored key): this is durable, accounted loss, recorded in the node's loss ledger at `epoch`
+    /// so it is visible rather than silent. A hierarchical cross-cell reconstruction path (R-C3 full) would
+    /// consume this to attempt a parent-tier repair.
+    DataLost {
+        /// The 32-byte digest of the lost key.
+        key: [u8; 32],
+        /// The epoch at which the loss was accounted.
+        epoch: Epoch,
+    },
     /// A [`Command::SampleAvailability`] completed (spec §L4.3): whether the sampled Fano lines were all
     /// present. `available = true` certifies the value is retrievable (Steiner soundness, `fanos_code::da`);
     /// `false` means a sampled line was incomplete — inconclusive, retry or fall back to a full read.
