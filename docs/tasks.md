@@ -47,7 +47,16 @@ Roadmap (`spec/platform.md` §8), sequential + verified:
             E∧L composition proven runnable end-to-end.
       - [ ] Residual: the parallel post-reveal scheduler (proven-deterministic serialization) for Solana-class
             throughput; transparent-tx wallet/CLI ergonomics.
-- [ ] **T4 · ONOMA-domains + ANGELOS (L11)** — currency-bought private naming; the anonymous PQ messenger.
+- [~] **T4 · ONOMA-domains + ANGELOS (L11)**:
+      - [x] **Authenticated token ledger** (`dromos::token`) — signed transfers, key-bound accounts (the
+            payment substrate the reference Accounts omits). A `begin_block` clock hook was added to the TAXIS
+            `StateMachine` (default no-op) to give height-dependent rules a canonical clock.
+      - [x] **Currency-bought naming** (`dromos::naming`) — `NameRegistry`: register/renew/update/transfer,
+            each a signed fee-paying op to a treasury; length-tiered price + expiry = anti-squatting.
+      - [x] **Full hybrid ledger** — `HybridLedger` now carries tokens + shielded pool + names under one
+            `state_root`, names buyable over LIVE consensus (dromos_quic e2e). Public + private + naming on one chain.
+      - [ ] Residual: ANGELOS (anonymous PQ messenger — compose NYX/CALYPSO/DIAULOS/ONOMA); name→descriptor
+            resolution wired to CALYPSO/OBOLOS/ANGELOS endpoints.
 - [ ] **T5 · HERMES (L12)** — PQ threshold cross-chain (atomic-swap mode first, custody second).
 - [ ] **ХОЛАРХ gate** — a Γ-calculator that CI-checks the platform's P/R/Φ/D viability verdict.
 
