@@ -55,8 +55,16 @@ pub struct ShieldedTx {
     pub input_values: Vec<Commitment>,
     /// The created notes.
     pub outputs: Vec<OutputNote>,
-    /// The public fee (paid to validators; the only cleartext amount).
+    /// The public fee (paid to validators; a cleartext balance term).
     pub fee: u64,
+    /// A **public output value** — an amount leaving the shielded pool to a transparent account (an *unshield*).
+    /// `0` for a pure shielded transfer. Like the fee, it is a cleartext balance term: the proof enforces
+    /// `Σ inputs = Σ shielded outputs + fee + public_value`, so value cannot be conjured on exit. The transparent
+    /// crediting of [`public_recipient`](Self::public_recipient) is the enclosing ledger's job, not the pool's.
+    pub public_value: u64,
+    /// The transparent account credited with [`public_value`](Self::public_value) on an unshield (ignored when
+    /// `public_value == 0`).
+    pub public_recipient: [u8; 32],
 }
 
 /// A proof that a [`ShieldedTx`] satisfies the shielded-transfer relation. The production implementation is a
@@ -147,7 +155,8 @@ impl ShieldedProof for TransparentProof {
         let output_r: Vec<Randomness> = self.outputs.iter().map(|o| o.value_r.clone()).collect();
         let balance_r = sum_randomness(&input_r).sub(&sum_randomness(&output_r));
         let output_values: Vec<Commitment> = tx.outputs.iter().map(|o| o.value_commitment.clone()).collect();
-        verify_balance(params, &tx.input_values, &output_values, tx.fee, &balance_r)
+        // The clear balance term is the fee plus any public (unshielded) output — both leave the shielded value.
+        verify_balance(params, &tx.input_values, &output_values, tx.fee.saturating_add(tx.public_value), &balance_r)
     }
 }
 

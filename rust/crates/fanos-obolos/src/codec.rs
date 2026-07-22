@@ -198,6 +198,8 @@ impl ShieldedTx {
             }
         }
         out.extend_from_slice(&self.fee.to_le_bytes());
+        out.extend_from_slice(&self.public_value.to_le_bytes());
+        out.extend_from_slice(&self.public_recipient);
         out
     }
 
@@ -222,7 +224,10 @@ impl ShieldedTx {
             Some(OutputNote { note_commitment, value_commitment, cipher })
         })?;
         let fee = r.u64()?;
-        r.is_exhausted().then_some(Self { anchor, nullifiers, input_values, outputs, fee })
+        let public_value = r.u64()?;
+        let public_recipient = r.array32()?;
+        r.is_exhausted()
+            .then_some(Self { anchor, nullifiers, input_values, outputs, fee, public_value, public_recipient })
     }
 }
 

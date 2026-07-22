@@ -51,7 +51,8 @@ pub fn build_transfer(
             cipher: None,
         })
         .collect();
-    let tx = ShieldedTx { anchor, nullifiers, input_values, outputs: output_notes, fee };
+    let tx =
+        ShieldedTx { anchor, nullifiers, input_values, outputs: output_notes, fee, public_value: 0, public_recipient: [0u8; 32] };
 
     let input_openings = inputs
         .iter()
@@ -61,6 +62,26 @@ pub fn build_transfer(
         outputs.iter().map(|n| OutputOpening { value: n.value, value_r: n.value_r.clone() }).collect();
     let proof = TransparentProof { inputs: input_openings, outputs: output_openings };
 
+    (tx, proof)
+}
+
+/// Build an **unshield**: a shielded spend whose value partly (or wholly) *exits* the pool to a transparent
+/// account. `public_value` leaves to `public_recipient`; any remainder stays shielded in `outputs`. The proof
+/// enforces `Σ inputs = Σ shielded outputs + fee + public_value`, so value cannot be conjured on exit. The
+/// transparent crediting of `public_recipient` is the enclosing ledger's responsibility (`fanos-dromos`).
+#[must_use]
+pub fn build_unshield(
+    params: &Params,
+    anchor: [u8; 32],
+    inputs: &[SpendInput],
+    outputs: &[Note],
+    public_value: u64,
+    public_recipient: [u8; 32],
+    fee: u64,
+) -> (ShieldedTx, TransparentProof) {
+    let (mut tx, proof) = build_transfer(params, anchor, inputs, outputs, fee);
+    tx.public_value = public_value;
+    tx.public_recipient = public_recipient;
     (tx, proof)
 }
 

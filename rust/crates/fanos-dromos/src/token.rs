@@ -188,6 +188,21 @@ impl TokenLedger {
         Ok(())
     }
 
+    /// A **system** move — no signature, no nonce — from `from` to `to`, authorised by the caller rather than a
+    /// key (e.g. an unshield's credit, authorised by a shielded proof; the keyless pool sink can only move this
+    /// way). `false` (and unchanged) if `from` lacks `amount`. Not exposed outside the crate: only the bridge
+    /// may mint transparent value against a verified shielded spend.
+    pub(crate) fn move_system(&mut self, from: &[u8; 32], to: [u8; 32], amount: u64) -> bool {
+        if self.balance(from) < amount {
+            return false;
+        }
+        if let Some(bal) = self.balances.get_mut(from) {
+            *bal -= amount;
+        }
+        self.credit(to, amount);
+        true
+    }
+
     /// A binding commitment to the whole ledger — the sorted `(account, balance, nonce)` triples, hashed.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {

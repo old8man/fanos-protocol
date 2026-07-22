@@ -188,6 +188,8 @@ mod tests {
                 OutputNote { note_commitment: out_b.commitment(params), value_commitment: out_b.value_commitment(params), cipher: None },
             ],
             fee,
+            public_value: 0,
+            public_recipient: [0u8; 32],
         };
         let proof = TransparentProof {
             inputs: alloc::vec![InputOpening { note: input.clone(), path, nsk: *nsk }],

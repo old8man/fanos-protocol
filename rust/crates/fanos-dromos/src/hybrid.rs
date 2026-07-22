@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use fanos_obolos::{Params, ShieldedState, decode_submission};
+use fanos_obolos::{Params, ShieldedState, ShieldedTx, TransparentProof, decode_submission};
 use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
@@ -124,6 +124,24 @@ impl HybridLedger {
         self.shielded.mint(sx.note.commitment(&self.params)).is_some()
     }
 
+    /// Apply a shielded submission, handling an **unshield**: after the shielded spend verifies and applies, any
+    /// `public_value` exiting the pool is moved from the pool sink to the `public_recipient` on the token ledger
+    /// (authorised by the shielded proof, which enforced `Σ inputs = Σ shielded outputs + fee + public_value`).
+    /// Atomic: the pool must back the exit before anything mutates, and the shielded spend leaves token balances
+    /// untouched, so the transparent move always completes.
+    fn apply_shielded(&mut self, stx: &ShieldedTx, proof: &TransparentProof) -> bool {
+        if stx.public_value > 0 && self.pool_backing() < stx.public_value {
+            return false;
+        }
+        if self.shielded.apply(&self.params, stx, proof).is_err() {
+            return false;
+        }
+        if stx.public_value > 0 {
+            let _ = self.tokens.move_system(&POOL_SINK, stx.public_recipient, stx.public_value);
+        }
+        true
+    }
+
     /// Wrap a signed transparent transfer as a DROMOS transaction payload.
     #[must_use]
     pub fn transparent_payload(transfer: &SignedTransfer) -> Vec<u8> {
@@ -166,7 +184,7 @@ impl StateMachine for HybridLedger {
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
-                Some((shielded_tx, proof)) => outcome(self.shielded.apply(&self.params, &shielded_tx, &proof).is_ok()),
+                Some((shielded_tx, proof)) => outcome(self.apply_shielded(&shielded_tx, &proof)),
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
@@ -204,7 +222,7 @@ mod tests {
     use super::*;
     use crate::naming::{NameOp, TREASURY, price};
     use crate::token::{Transfer, account_id};
-    use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, derive_owner_pk, encode_submission};
+    use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, build_unshield, derive_owner_pk, encode_submission};
     use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 
     fn account(tag: u8) -> (HybridSigSecret, HybridVerifier, [u8; 32]) {
@@ -319,6 +337,34 @@ mod tests {
         let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"bob")], 0);
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied, "the shielded note spends privately");
         assert_eq!(ledger.shielded().spent_count(), 1, "the shielded-from-transparent note was spent");
+    }
+
+    #[test]
+    fn unshielding_moves_private_value_back_to_a_transparent_account() {
+        let (alice_sk, alice_vk, alice) = account(1);
+        let (_b, _bv, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Alice shields 1000 into a private note.
+        let nsk = [7u8; 32];
+        let shielded_note = Note::new(1000, derive_owner_pk(&nsk), Randomness::from_seed(b"u"), [1u8; 32]);
+        let sx = ShieldTx {
+            payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 1000, nonce: 0 }, &alice_sk, alice_vk),
+            note: shielded_note.clone(),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shield_payload(&sx))), ExecOutcome::Applied);
+        assert_eq!(ledger.pool_backing(), 1000);
+
+        // Alice unshields the whole 1000 to Bob's transparent account (spend the note, all value exits public).
+        let path = ledger.shielded().path(0).unwrap();
+        let sp = SpendInput { note: shielded_note, nsk, path };
+        let (stx, proof) = build_unshield(ledger.params(), ledger.shielded().anchor(), &[sp], &[], 1000, bob, 0);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 1000, "the value exited the pool to Bob's public account");
+        assert_eq!(ledger.pool_backing(), 0, "the pool sink was drained by the unshield");
+        assert_eq!(ledger.shielded().spent_count(), 1, "the note was nullified");
     }
 
     #[test]
