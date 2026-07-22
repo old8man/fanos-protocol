@@ -44,7 +44,10 @@ pub use checkpoint::{ExecCertificate, ExecVote};
 pub use crosscell::{compose_state_root, CrossCellReceipt, CrossMsg, Outbox};
 pub use hierarchy::{ChildCommittee, ChildRegistry};
 pub use consensus::{ConsensusEngine, ConsensusMsg, Input, Output, RevealMsg};
-pub use incentive::{RewardParams, SlashEvidence, best_response_is_honest, detect_equivocation};
+pub use incentive::{
+    RewardParams, SlashEvidence, best_response_is_honest, blocking_threshold, can_permanently_censor,
+    coalition_best_response_is_honest, detect_equivocation,
+};
 pub use keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 pub use params::CellParams;
 pub use state::{Accounts, ExecOutcome, StateMachine, Transfer};

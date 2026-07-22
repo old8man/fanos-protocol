@@ -89,16 +89,59 @@ the faintest incentive to participate (C1) and the faintest penalty for provable
 the equilibrium guarantee §16 asked for, and it is a *consequence* of the anti-MEV + BFT design, not a bolted-on
 economic assumption.
 
-**Honest scope.** This is the single-cell stage game with a *unilateral* deviator and provable faults. It does
-**not** claim collusion-proofness against a `≥ f+1` cartel (excluded by the anti-Sybil centrality cap and the
-beacon committee rotation, but a coalition of that size breaks BFT itself — a separate, acknowledged limit),
-nor does it model the credit *issuance* economy (who funds fees) — that remains the genuinely open
-macro-economic question of §16. What is now closed is the micro-equilibrium: **given** fees exist, honest
-validation is the rational strategy.
+**Honest scope.** This is the single-cell stage game with a *unilateral* deviator and provable faults. §4
+strengthens it to a *coalitional* guarantee up to the BFT bound `f` (including the censorship deviation a
+coalition unlocks); beyond `f` a cartel breaks BFT itself, the acknowledged structural limit. It does not model
+the credit *issuance* economy (who funds fees) — that remains the genuinely open macro-economic question of §16.
+What is now closed is the micro-equilibrium: **given** fees exist, honest validation is the rational strategy,
+individually and in coalition up to `f`.
 
 ---
 
-## 4. What is implemented (`fanos-taxis::incentive`)
+## 4. Coalitional deviations and censorship resistance
+
+The stage game of §1–§3 has a *unilateral* deviator. The natural strengthening is coalition-proofness: no group
+of up to the BFT fault bound `f` can jointly deviate and come out ahead. Scaling the §3 deviations to a coalition
+of size `k ≤ f` is immediate — each member's individual payoff is unchanged (the others are still honest), so a
+`k`-coalition playing Abstain/Equivocate/MEV/Withhold earns `k` times the per-member payoff, and the sign of the
+comparison against honest `k(R − c)` is exactly §3's. Safety is intact for `k ≤ f` (two `Q`-quorums still share
+an honest validator, `CellParams::is_safe`), so the coalitional equivocation gain is still `0` — just `k` slashes.
+
+**The one deviation a coalition unlocks is censorship.** No individual can prevent a transaction from being
+decrypted, but a coalition holding enough of a keyper line can. A transaction is sealed `t`-of-`(q+1)` to the
+epoch's keyper line (`docs/design-taxis.md` §5), so **denying** its decryption requires
+
+> `block = (q + 1) − t + 1`
+
+of *that line's* members to withhold their reveals — a line minority large enough that fewer than `t` honest
+members remain. For the Fano line (`q+1 = 3`, `t = 2`) that is `block = 2`. A coalition that holds a blocking
+subset of the epoch's keyper line can censor any transaction sealed in that epoch, for an external bribe `b`.
+
+**Why the bribe is uncollectable within `f`.** The keyper line is chosen by the unbiasable epoch beacon and
+**rotates every epoch** (`crate::committee::epoch_seal_line`), and a client simply re-seals in the next epoch.
+So censoring a transaction *permanently* requires the coalition to hold a blocking subset of **every** line at
+once. In `PG(2, 2)` a set that meets all seven lines in `≥ 2` points is the complement of a set meeting every
+line in `≤ 1` point; but any two points already share a line, so that complement has at most one point — the
+covering coalition has size `n − 1 = 6`. Permanent censorship therefore needs `6 ≫ f = 2` validators. More
+generally the covering coalition exceeds `f` for the reference cell, so:
+
+> **Censorship-resistance lemma.** No coalition of size `≤ f` can block a reveal on every keyper line; a
+> re-sealing client's transaction is decrypted within `O(1)` expected epochs. *(Machine-checked exhaustively
+> over all `2ⁿ` coalitions: `no_coalition_within_the_bft_bound_can_permanently_censor`.)*
+
+**Theorem (coalitional equilibrium).** Under **C1 ∧ C2**, for every coalition of size `k ≤ f` the honest
+cooperative payoff `k(R − c)` is `≥` every joint deviation's — Abstain, Equivocate, MEV-reorder, Withhold-data,
+Withhold-reveal, **and Censor** — for any bribe `b`. The Censor arm pays `k(R − c) + [permanent] · b`, and by
+the lemma `[permanent] = 0` for `k ≤ f`, so it collapses to honest cooperation: the bribe is never collected. ∎
+
+This is verified by `coalition_best_response_is_honest`, checked exhaustively over every coalition of size `≤ f`
+against a large bribe (`honest_cooperation_beats_every_coalitional_deviation_up_to_f`). The model also reports,
+honestly, that a `> f` covering coalition *can* extract the bribe — censorship-resistance is a consequence of the
+BFT bound, not an unconditional guarantee.
+
+---
+
+## 5. What is implemented (`fanos-taxis::incentive`)
 
 - `RewardParams` and `reward_per_participant` (`R = F/Q`), with `covers_cost` (**C1**) and `honest_is_nash`
   checking the theorem's hypotheses.
@@ -107,4 +150,8 @@ validation is the rational strategy.
   the penalty.
 - `best_response_is_honest` — a machine-checked enumeration of §3: for the derived params, the honest payoff
   is `≥` every deviation payoff (and `>` for the detectable ones).
+- `blocking_threshold` / `can_permanently_censor` — the §4 censorship geometry: the line minority `(q+1)−t+1`
+  that denies a reveal, and whether a coalition blocks *every* keyper line (the covering condition).
+- `coalition_payoff` / `coalition_best_response_is_honest` — the §4 coalitional stage game (with a `Censor` arm
+  and an external bribe), machine-checked exhaustively over every coalition of size `≤ f`.
 - Fees are the existing anonymous VOPRF credit (`fanos-incentives`), context-bound to `(cell, epoch, height)`.

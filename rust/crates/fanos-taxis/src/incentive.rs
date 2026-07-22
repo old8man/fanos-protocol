@@ -13,10 +13,13 @@
 
 use alloc::vec::Vec;
 
+use fanos_geometry::fano;
 use fanos_incentives::{CreditIssuer, RedeemProof, Redemption};
 use fanos_pqcrypto::HybridVerifier;
 use fanos_primitives::Epoch;
 
+use crate::committee::line_members;
+use crate::params::CellParams;
 use crate::vote::{Phase, SignedVote};
 
 const FEE_CONTEXT_LABEL: &[u8] = b"FANOS-v1/taxis-fee";
@@ -170,6 +173,10 @@ pub enum Strategy {
     WithholdData,
     /// As a sealing member, refuse to reveal (forfeits the reveal-gated share).
     WithholdReveal,
+    /// Withhold reveals to **censor** a targeted transaction for an external bribe. A lone validator cannot
+    /// reach a keyper line's blocking threshold, so unilaterally this censors nothing (gain `0`); it becomes a
+    /// coalitional deviation ([`coalition_payoff`]) that still fails below a covering coalition.
+    Censor,
 }
 
 /// The payoff of a strategy for a validator, given all others honest — the model of
@@ -198,16 +205,19 @@ pub fn payoff(params: &RewardParams, strategy: Strategy) -> i128 {
         Strategy::WithholdData => 0,
         // Reveal-gated payment → forfeits the share; gain 0.
         Strategy::WithholdReveal => 0,
+        // A lone validator cannot reach a keyper line's blocking threshold (≥ 2), so it censors nothing.
+        Strategy::Censor => 0,
     }
 }
 
 /// Every unilateral deviation from a strategy set — the model's full deviation space.
-pub const DEVIATIONS: [Strategy; 5] = [
+pub const DEVIATIONS: [Strategy; 6] = [
     Strategy::Abstain,
     Strategy::Equivocate,
     Strategy::MevReorder,
     Strategy::WithholdData,
     Strategy::WithholdReveal,
+    Strategy::Censor,
 ];
 
 /// The equilibrium theorem, machine-checked: under **C1 ∧ C2** the honest payoff is `≥` every deviation's,
@@ -219,6 +229,97 @@ pub fn best_response_is_honest(params: &RewardParams) -> bool {
     }
     let honest = payoff(params, Strategy::Honest);
     DEVIATIONS.iter().all(|&d| honest >= payoff(params, d))
+}
+
+// ── Coalitional deviations & censorship resistance (`docs/design-incentive-equilibrium.md` §4) ──────────────
+//
+// The theorem above assumes a lone deviator. A stronger guarantee rules out a *coalition* of up to the BFT bound
+// `f` jointly deviating — including the one deviation a coalition unlocks that no individual can: **censorship**
+// of a targeted transaction by withholding a keyper line's reveals. The anti-MEV line is `t`-of-`(q+1)`, so
+// blocking a transaction's decryption needs `(q+1) − t + 1` of *that line's* members to withhold. The line is
+// chosen by the unbiasable epoch beacon and rotates every epoch (`crate::committee`), and a client re-seals each
+// epoch — so *permanent* censorship demands the coalition block **every** line at once, a covering coalition far
+// larger than `f`. The functions below make that precise; the tests machine-check it exhaustively over the cell.
+
+/// The number of withholders needed to block a keyper line's `t`-of-`(q+1)` reveal reconstruction:
+/// `(q+1) − t + 1`. Below this the honest remainder still reaches the threshold and the transaction decrypts.
+#[must_use]
+pub fn blocking_threshold(cell: CellParams) -> usize {
+    cell.line_size().saturating_sub(usize::from(cell.seal_threshold())) + 1
+}
+
+/// Whether `coalition` holds a blocking subset (≥ [`blocking_threshold`]) of Fano line `line`'s seats — enough
+/// of that line's keyper members to deny the `t` honest reveals a transaction sealed to it needs.
+#[must_use]
+fn blocks_line(coalition: &[u8], line: usize, cell: CellParams) -> bool {
+    let held = line_members(line).into_iter().filter(|&m| coalition.contains(&(m as u8))).count();
+    held >= blocking_threshold(cell)
+}
+
+/// Whether `coalition` can **permanently** censor a transaction: it blocks a reveal on *every* one of the `N`
+/// keyper lines, so no epoch's beacon-chosen line escapes it and re-sealing never gets the transaction through.
+/// (Reference Fano cell — the lines are `committee::line_members(0..N)`.) For a coalition within the BFT bound
+/// `f` this is always `false` (machine-checked in the tests) — the censorship-resistance guarantee.
+#[must_use]
+pub fn can_permanently_censor(coalition: &[u8], cell: CellParams) -> bool {
+    (0..fano::N).all(|l| blocks_line(coalition, l, cell))
+}
+
+/// The total payoff of a `coalition` jointly playing `strategy` while every non-member stays honest — the
+/// coalitional extension of [`payoff`]. Each member earns/forfeits as in the unilateral game (so `k` members
+/// scale the per-member payoff), and the coalition additionally collects the external `bribe` **iff** it can
+/// permanently censor a targeted transaction (the [`Strategy::Censor`] arm gated by [`can_permanently_censor`]).
+///
+/// The point of the model: for any coalition within the fault bound `f`, `can_permanently_censor` is `false`, so
+/// `Censor` collapses to honest cooperation — the bribe is uncollectable and adds no payoff.
+#[allow(clippy::match_same_arms)]
+#[must_use]
+pub fn coalition_payoff(
+    params: &RewardParams,
+    cell: CellParams,
+    coalition: &[u8],
+    bribe: u64,
+    strategy: Strategy,
+) -> i128 {
+    let k = i128::from(u64::try_from(coalition.len()).unwrap_or(u64::MAX));
+    let r = i128::from(params.reward_per_participant());
+    let c = i128::from(params.vote_cost);
+    let s = i128::from(params.slash);
+    match strategy {
+        // Every member earns the reward and pays the cost; blind ordering leaves MEV-reordering identical.
+        Strategy::Honest | Strategy::MevReorder => k * (r - c),
+        // Excluded / unrewarded joint deviations: each member nets 0.
+        Strategy::Abstain | Strategy::WithholdData | Strategy::WithholdReveal => 0,
+        // Each member is individually slashed; safety is unbroken for `k ≤ f`, so there is no offsetting gain.
+        Strategy::Equivocate => -k * s,
+        // Members still validate honestly (earning `k(R−c)`) and withhold on the target line; the bribe is
+        // collected only if the coalition blocks every line — impossible within the fault bound.
+        Strategy::Censor => {
+            k * (r - c) + if can_permanently_censor(coalition, cell) { i128::from(bribe) } else { 0 }
+        }
+    }
+}
+
+/// Every coalitional deviation — the unilateral space plus the coalition-only [`Strategy::Censor`].
+pub const COALITION_DEVIATIONS: [Strategy; 6] = DEVIATIONS;
+
+/// The **coalitional** equilibrium theorem, machine-checked: for the given `coalition`, under **C1 ∧ C2** the
+/// honest cooperative payoff is `≥` every joint deviation's — censorship included. A caller proves
+/// coalition-proofness up to the BFT bound by checking this for every coalition of size `≤ f` (the tests do so
+/// exhaustively, together with the lemma that no such coalition can [`can_permanently_censor`]). Returns `false`
+/// if the hypotheses fail.
+#[must_use]
+pub fn coalition_best_response_is_honest(
+    params: &RewardParams,
+    cell: CellParams,
+    coalition: &[u8],
+    bribe: u64,
+) -> bool {
+    if !params.honest_is_nash() {
+        return false;
+    }
+    let honest = coalition_payoff(params, cell, coalition, bribe, Strategy::Honest);
+    COALITION_DEVIATIONS.iter().all(|&d| honest >= coalition_payoff(params, cell, coalition, bribe, d))
 }
 
 #[cfg(test)]
@@ -332,5 +433,79 @@ mod tests {
         // honest validator by fabricating a second vote.
         let framed = SignedVote::sign(Vote { block_hash: [8u8; 32], ..base }, &other_sk);
         assert!(detect_equivocation(&a, &framed, &vk).is_none(), "a forged second vote cannot slash validator 4");
+    }
+
+    #[test]
+    fn the_blocking_threshold_is_the_line_minority_that_denies_the_honest_reveal_quorum() {
+        // The Fano keyper line is 2-of-3, so blocking its reconstruction needs (q+1) − t + 1 = 3 − 2 + 1 = 2
+        // withholders — a majority of the 3-member line. A single withholder (< 2) is tolerated.
+        let cell = CellParams::FANO;
+        assert_eq!(cell.line_size(), 3);
+        assert_eq!(cell.seal_threshold(), 2);
+        assert_eq!(blocking_threshold(cell), 2);
+        // One validator on a keyper line never blocks it (the theorem's unilateral base case).
+        for line in 0..fano::N {
+            let m = line_members(line);
+            assert!(!blocks_line(&[m[0] as u8], line, cell), "a lone member cannot block line {line}");
+            assert!(blocks_line(&[m[0] as u8, m[1] as u8], line, cell), "two members block line {line}");
+        }
+    }
+
+    #[test]
+    fn no_coalition_within_the_bft_bound_can_permanently_censor() {
+        // Machine-checked censorship-resistance lemma: exhaustively over every coalition of the Fano cell, none
+        // of size ≤ f can block a reveal on *every* keyper line (so re-sealing across epochs always gets through).
+        let cell = CellParams::FANO; // f = 2
+        for mask in 0u16..(1 << fano::N) {
+            let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
+            if c.len() <= cell.f {
+                assert!(!can_permanently_censor(&c, cell), "coalition {c:?} (≤ f={}) must not censor every line", cell.f);
+            }
+        }
+        // The smallest coalition that CAN permanently censor is n − 1 = 6 — its complement is the single point no
+        // line can avoid — far beyond the tolerated f = 2.
+        let min_censor = (0u16..(1 << fano::N))
+            .filter_map(|mask| {
+                let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
+                can_permanently_censor(&c, cell).then_some(c.len())
+            })
+            .min()
+            .expect("some coalition censors");
+        assert_eq!(min_censor, fano::N - 1, "permanent censorship needs n−1 validators");
+        assert!(min_censor > cell.f, "the censoring coalition exceeds the BFT fault bound f={}", cell.f);
+    }
+
+    #[test]
+    fn honest_cooperation_beats_every_coalitional_deviation_up_to_f() {
+        // The coalitional equilibrium: exhaustively over every non-empty coalition of size ≤ f, honest
+        // cooperation is a best response to every joint deviation — censorship included, even against a large
+        // external bribe, because no tolerated coalition can permanently censor (the lemma above).
+        let cell = CellParams::FANO;
+        let bribe = 1_000; // a large censorship bribe — still uncollectable within the fault bound
+        for mask in 1u16..(1 << fano::N) {
+            let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
+            if c.len() <= cell.f {
+                assert!(
+                    coalition_best_response_is_honest(&P, cell, &c, bribe),
+                    "coalition {c:?} (≤ f) cannot profit by any joint deviation"
+                );
+            }
+        }
+        // Beyond tolerance a covering coalition (n − 1) CAN collect the bribe: the model reports honestly that
+        // censorship-resistance is a consequence of the BFT bound, not an unconditional guarantee.
+        let covering: Vec<u8> = (0..(fano::N as u8 - 1)).collect();
+        assert!(can_permanently_censor(&covering, cell), "n−1 validators block every line");
+        assert!(
+            coalition_payoff(&P, cell, &covering, bribe, Strategy::Censor)
+                > coalition_payoff(&P, cell, &covering, bribe, Strategy::Honest),
+            "a coalition exceeding f extracts censorship value — outside the BFT guarantee"
+        );
+        // A tolerated coalition's censor payoff, by contrast, is exactly its honest payoff (no bribe collected).
+        let tolerated: Vec<u8> = alloc::vec![0, 1]; // size 2 = f, shares one line only
+        assert_eq!(
+            coalition_payoff(&P, cell, &tolerated, bribe, Strategy::Censor),
+            coalition_payoff(&P, cell, &tolerated, bribe, Strategy::Honest),
+            "within the fault bound, attempting censorship pays exactly what honest cooperation does"
+        );
     }
 }
