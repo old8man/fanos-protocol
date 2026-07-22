@@ -60,6 +60,9 @@ impl ExecVote {
         verifier.verify(&Self::signable(self.height, &self.state_root, self.voter), &sig)
     }
 
+    /// The fixed byte length of an execution attestation's [`to_bytes`](Self::to_bytes).
+    pub const LEN: usize = 8 + 32 + 1 + HYBRID_SIG_LEN;
+
     /// Canonical bytes: `height(8) ‖ state_root(32) ‖ voter(1) ‖ signature`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -141,6 +144,40 @@ impl ExecCertificate {
         let verifier = verifiers.get(usize::from(vote.voter))?;
         vote.verify(verifier).then_some(vote.voter)
     }
+
+    /// Canonical bytes: `height(8) ‖ state_root(32) ‖ vote_count(2) ‖ votes*` (each vote fixed-width
+    /// [`ExecVote::LEN`]) — the portable form a cell publishes so a parent (or a cross-cell peer) can verify its
+    /// finality over the overlay.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 32 + 2 + self.votes.len() * ExecVote::LEN);
+        out.extend_from_slice(&self.height.to_be_bytes());
+        out.extend_from_slice(&self.state_root);
+        out.extend_from_slice(&(self.votes.len() as u16).to_be_bytes());
+        for v in &self.votes {
+            out.extend_from_slice(&v.to_bytes());
+        }
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed. The recovered certificate still needs
+    /// [`verify`](Self::verify) against the cell's committee keys before it is trusted.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let height = u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+        let state_root = bytes.get(8..40)?.try_into().ok()?;
+        let count = usize::from(u16::from_be_bytes(bytes.get(40..42)?.try_into().ok()?));
+        let body = bytes.get(42..)?;
+        if body.len() != count * ExecVote::LEN {
+            return None;
+        }
+        let mut votes = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = i * ExecVote::LEN;
+            votes.push(ExecVote::from_bytes(body.get(start..start + ExecVote::LEN)?)?);
+        }
+        Some(Self { height, state_root, votes })
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +250,18 @@ mod tests {
         let v = ExecVote::sign(42, [0x7E; 32], 0, &ks[0].0);
         assert_eq!(ExecVote::from_bytes(&v.to_bytes()), Some(v.clone()));
         assert!(v.verify(&ks[0].1));
+    }
+
+    #[test]
+    fn an_exec_certificate_round_trips_and_still_verifies() {
+        let ks = keys(7);
+        let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
+        let root = [0x9A; 32];
+        let votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(4, root, i as u8, &ks[i].0)).collect();
+        let cert = ExecCertificate { height: 4, state_root: root, votes };
+        let rt = ExecCertificate::from_bytes(&cert.to_bytes()).unwrap();
+        assert_eq!(rt, cert, "the certificate round-trips through bytes");
+        assert!(rt.verify(5, &verifiers), "a decoded certificate still verifies");
+        assert!(ExecCertificate::from_bytes(&cert.to_bytes()[..30]).is_none(), "a truncated certificate is rejected");
     }
 }

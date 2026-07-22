@@ -58,6 +58,28 @@ impl CrossMsg {
         buf.extend_from_slice(&self.payload);
         hash_labeled(LEAF_LABEL, &buf)
     }
+
+    /// Canonical bytes: `dest_cell(4) ‖ nonce(8) ‖ payload_len(4) ‖ payload`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 8 + 4 + self.payload.len());
+        out.extend_from_slice(&self.dest_cell.to_be_bytes());
+        out.extend_from_slice(&self.nonce.to_be_bytes());
+        out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), returning the message and the byte count consumed, or `None`
+    /// if malformed. (The count lets a container decode a message followed by more fields.)
+    #[must_use]
+    pub fn from_prefix(bytes: &[u8]) -> Option<(Self, usize)> {
+        let dest_cell = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
+        let nonce = u64::from_be_bytes(bytes.get(4..12)?.try_into().ok()?);
+        let plen = usize::try_from(u32::from_be_bytes(bytes.get(12..16)?.try_into().ok()?)).ok()?;
+        let payload = bytes.get(16..16 + plen)?.to_vec();
+        Some((Self { dest_cell, nonce, payload }, 16 + plen))
+    }
 }
 
 /// Hash two Merkle children into their parent (domain-separated from leaves).
@@ -250,6 +272,44 @@ impl CrossCellReceipt {
         let idx = usize::try_from(self.index).ok()?;
         merkle_verify(self.msg.leaf(), idx, &self.proof, &self.outbox_root).then_some(&self.msg)
     }
+
+    /// Canonical bytes: `msg ‖ index(8) ‖ proof_count(2) ‖ proof(32·count) ‖ accounts_root(32) ‖
+    /// outbox_root(32) ‖ cert` — the portable form a source cell publishes to a destination cell's inbox.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.msg.to_bytes();
+        out.extend_from_slice(&self.index.to_be_bytes());
+        out.extend_from_slice(&(self.proof.len() as u16).to_be_bytes());
+        for sib in &self.proof {
+            out.extend_from_slice(sib);
+        }
+        out.extend_from_slice(&self.accounts_root);
+        out.extend_from_slice(&self.outbox_root);
+        out.extend_from_slice(&self.cert.to_bytes());
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed. The recovered receipt still needs
+    /// [`verify`](Self::verify) against the source cell's committee keys before it is applied.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (msg, mut off) = CrossMsg::from_prefix(bytes)?;
+        let index = u64::from_be_bytes(bytes.get(off..off + 8)?.try_into().ok()?);
+        off += 8;
+        let count = usize::from(u16::from_be_bytes(bytes.get(off..off + 2)?.try_into().ok()?));
+        off += 2;
+        let mut proof = Vec::with_capacity(count);
+        for _ in 0..count {
+            proof.push(bytes.get(off..off + 32)?.try_into().ok()?);
+            off += 32;
+        }
+        let accounts_root = bytes.get(off..off + 32)?.try_into().ok()?;
+        off += 32;
+        let outbox_root = bytes.get(off..off + 32)?.try_into().ok()?;
+        off += 32;
+        let cert = ExecCertificate::from_bytes(bytes.get(off..)?)?;
+        Some(Self { msg, index, proof, accounts_root, outbox_root, cert })
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +399,16 @@ mod tests {
         let (verifiers, receipt) = certified_outbox(&msgs, [0x55; 32], 0, 4);
         assert!(receipt.verify(&verifiers, 5).is_none(), "fewer than Q attestations does not certify");
         assert!(receipt.verify(&verifiers, 4).is_some(), "the matching quorum verifies");
+    }
+
+    #[test]
+    fn a_receipt_round_trips_and_still_verifies() {
+        let msgs = [CrossMsg::new(2, 0, b"mint 10 to bob".to_vec()), CrossMsg::new(3, 1, b"note".to_vec())];
+        let (verifiers, receipt) = certified_outbox(&msgs, [0x66; 32], 1, 5);
+        let rt = CrossCellReceipt::from_bytes(&receipt.to_bytes()).unwrap();
+        assert_eq!(rt, receipt, "the receipt round-trips through bytes (message, proof, opening, certificate)");
+        assert_eq!(rt.verify(&verifiers, 5), Some(&msgs[1]), "a decoded receipt still verifies against the source committee");
+        assert!(CrossCellReceipt::from_bytes(&receipt.to_bytes()[..20]).is_none(), "a truncated receipt is rejected");
     }
 
     #[test]
