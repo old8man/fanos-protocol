@@ -13,6 +13,7 @@
 //! The registry's expiry rules read the block height, which the engine feeds via [`begin_block`](StateMachine::begin_block).
 //! The hybrid `state_root` is `H(tokens ‖ shielded ‖ names)` — one binding commitment over the entire ledger.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fanos_obolos::{Params, ShieldedState, ShieldedTx, TransparentProof, decode_submission};
@@ -23,9 +24,16 @@ use fanos_taxis::tx::Transaction;
 use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, verify};
 
 use crate::bridge::{POOL_SINK, ShieldTx};
-use crate::naming::{NameRegistry, NameTx};
+use crate::naming::{NameRegistry, NameTx, TREASURY};
+use crate::scheduler::{AccessList, schedule};
 use crate::storage::{STORAGE_ESCROW, StorageMarket, StorageTx, deal_id, leaves_for_size};
 use crate::token::{SignedTransfer, TokenLedger};
+
+/// The shared state key every shielded operation touches — so shielded spends serialize against each other
+/// (they mutate the one nullifier set / commitment tree) while parallelizing against disjoint transparent work.
+const SHIELDED_MARKER: [u8; 32] = *b"FANOS-dromos-shielded-pool-mark!";
+/// Domain label deriving a name's scheduler key from its bytes.
+const NAME_KEY_LABEL: &str = "FANOS-dromos-v1/name-key";
 
 /// Transaction-type tag: an authenticated transparent transfer.
 pub const TAG_TRANSPARENT: u8 = 0x00;
@@ -236,6 +244,116 @@ impl HybridLedger {
         true
     }
 
+    /// Execute a block's ordered transactions with DROMOS's **parallel scheduler** (`spec/platform.md` §3.1):
+    /// derive each transaction's [`AccessList`], partition into conflict-free waves, and execute wave-by-wave.
+    /// The scheduler guarantees the outcome is independent of intra-wave order and identical to serial execution
+    /// (`crate::scheduler`) — so every validator reaches the same state, and a production executor may run a
+    /// wave's transactions across a thread pool where this reference runs them in index order. Returns each
+    /// transaction's [`ExecOutcome`] in the original order.
+    #[must_use]
+    pub fn execute_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
+        let access = self.access_lists(txs);
+        let waves = schedule(&access);
+        let mut outcomes = vec![ExecOutcome::Malformed; txs.len()];
+        for wave in &waves {
+            for &i in wave {
+                if let (Some(tx), Some(slot)) = (txs.get(i), outcomes.get_mut(i)) {
+                    *slot = self.apply(tx);
+                }
+            }
+        }
+        outcomes
+    }
+
+    /// Derive the access list of every transaction, in a single forward pass that also tracks deals **opened
+    /// earlier in the same block** — so a `Prove`/`Close` for a not-yet-committed deal still declares that deal's
+    /// provider/consumer, and cannot race a parallel transfer touching them.
+    #[must_use]
+    fn access_lists(&self, txs: &[Transaction]) -> Vec<AccessList> {
+        // deal_id -> (provider, consumer) for deals opened earlier in this block.
+        let mut pending: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])> = BTreeMap::new();
+        let mut out = Vec::with_capacity(txs.len());
+        for tx in txs {
+            out.push(self.access_of(tx, &pending));
+            if let Some((&TAG_STORAGE, body)) = tx.payload.split_first()
+                && let Some(StorageTx::Open { params, payment }) = StorageTx::from_bytes(body)
+            {
+                pending.insert(deal_id(&params, payment.transfer.nonce), (params.provider, params.consumer));
+            }
+        }
+        out
+    }
+
+    /// The state keys one transaction touches — a conservative superset (so the scheduler never lets two
+    /// genuinely-dependent transactions share a wave). A transaction that does not decode touches nothing (its
+    /// execution is a no-op). `pending` supplies deals opened earlier in the same block.
+    #[must_use]
+    fn access_of(&self, tx: &Transaction, pending: &BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>) -> AccessList {
+        match tx.payload.split_first() {
+            Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
+                Some(st) => AccessList::new([], [st.transfer.from, st.transfer.to]),
+                None => AccessList::default(),
+            },
+            Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
+                Some((stx, _)) => {
+                    let mut writes = vec![SHIELDED_MARKER, POOL_SINK];
+                    if stx.public_value > 0 {
+                        writes.push(stx.public_recipient);
+                    }
+                    AccessList::new([], writes)
+                }
+                None => AccessList::default(),
+            },
+            Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
+                Some(nt) => AccessList::new(
+                    [],
+                    [nt.payment.transfer.from, TREASURY, hash_labeled(NAME_KEY_LABEL, nt.op.name())],
+                ),
+                None => AccessList::default(),
+            },
+            Some((&TAG_SHIELD, body)) => match ShieldTx::from_bytes(body) {
+                Some(sx) => AccessList::new([], [sx.payment.transfer.from, POOL_SINK, SHIELDED_MARKER]),
+                None => AccessList::default(),
+            },
+            Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
+                Some(StorageTx::Open { params, payment }) => AccessList::new(
+                    [],
+                    [params.consumer, STORAGE_ESCROW, deal_id(&params, payment.transfer.nonce)],
+                ),
+                Some(StorageTx::Prove { deal_id: id, .. }) => {
+                    let mut writes = vec![STORAGE_ESCROW, id];
+                    if let Some(provider) = self.deal_party(&id, pending).map(|(p, _)| p) {
+                        writes.push(provider);
+                    }
+                    AccessList::new([], writes)
+                }
+                Some(StorageTx::Close { deal_id: id, .. }) => {
+                    let mut writes = vec![STORAGE_ESCROW, id];
+                    if let Some(consumer) = self.deal_party(&id, pending).map(|(_, c)| c) {
+                        writes.push(consumer);
+                    }
+                    AccessList::new([], writes)
+                }
+                None => AccessList::default(),
+            },
+            _ => AccessList::default(),
+        }
+    }
+
+    /// A deal's `(provider, consumer)` — from committed state, or a same-block pending open.
+    #[must_use]
+    fn deal_party(
+        &self,
+        id: &[u8; 32],
+        pending: &BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
+    ) -> Option<([u8; 32], [u8; 32])> {
+        if let Some(deal) = self.storage.deals.get(id) {
+            let p = deal.params();
+            return Some((p.provider, p.consumer));
+        }
+        pending.get(id).copied()
+    }
+
     /// Wrap a signed transparent transfer as a DROMOS transaction payload.
     #[must_use]
     pub fn transparent_payload(transfer: &SignedTransfer) -> Vec<u8> {
@@ -325,7 +443,7 @@ fn outcome(ok: bool) -> ExecOutcome {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::naming::{NameOp, TREASURY, price};
@@ -593,6 +711,49 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&open))), ExecOutcome::Rejected);
         assert_eq!(ledger.storage_escrow(), 0, "nothing was escrowed on a refused open");
         assert_eq!(ledger.tokens().balance(&consumer), 1000, "the consumer's funds are untouched");
+    }
+
+    #[test]
+    fn execute_block_matches_serial_execution_and_parallelizes_independent_work() {
+        // Six funded accounts.
+        let accts: Vec<_> = (0..6).map(account).collect();
+        let fund = || {
+            let mut t = TokenLedger::new();
+            for (_, _, id) in &accts {
+                t.credit(*id, 10_000);
+            }
+            t
+        };
+        let transfer = |from: &(HybridSigSecret, HybridVerifier, [u8; 32]),
+                        to: [u8; 32],
+                        amount: u64,
+                        nonce: u64| {
+            let st = SignedTransfer::sign(Transfer { from: from.2, to, amount, nonce }, &from.0, from.1.clone());
+            Transaction::new(HybridLedger::transparent_payload(&st))
+        };
+        // Three independent transfers, then one that conflicts with two of them (shared sender a, recipient c).
+        let txs = vec![
+            transfer(&accts[0], accts[1].2, 100, 0), // a -> b
+            transfer(&accts[2], accts[3].2, 200, 0), // c -> d   (independent)
+            transfer(&accts[4], accts[5].2, 300, 0), // e -> f   (independent)
+            transfer(&accts[0], accts[2].2, 50, 1),  // a -> c   (touches a and c)
+        ];
+
+        // Serial reference.
+        let mut serial = HybridLedger::new(fund());
+        let serial_outcomes: Vec<_> = txs.iter().map(|t| serial.apply(t)).collect();
+
+        // Parallel execution reproduces the outcomes and the state exactly.
+        let mut parallel = HybridLedger::new(fund());
+        let parallel_outcomes = parallel.execute_block(&txs);
+        assert_eq!(parallel_outcomes, serial_outcomes, "parallel outcomes match serial");
+        assert_eq!(parallel.state_root(), serial.state_root(), "parallel state matches serial");
+        assert!(serial_outcomes.iter().all(|o| *o == ExecOutcome::Applied), "all transfers applied");
+
+        // The first three transfers are independent → one parallel wave; the fourth waits (conflicts a and c).
+        let waves = schedule(&parallel.access_lists(&txs));
+        assert_eq!(crate::scheduler::width(&waves), 3, "the three independent transfers run in parallel");
+        assert_eq!(waves.len(), 2, "the conflicting fourth transfer is a second wave");
     }
 
     #[test]

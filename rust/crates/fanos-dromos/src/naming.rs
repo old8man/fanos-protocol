@@ -172,7 +172,7 @@ pub enum NameOp {
 impl NameOp {
     /// The name this operation acts on.
     #[must_use]
-    fn name(&self) -> &[u8] {
+    pub fn name(&self) -> &[u8] {
         match self {
             NameOp::Register { name, .. }
             | NameOp::Renew { name, .. }
