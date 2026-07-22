@@ -35,6 +35,7 @@
 
 extern crate alloc;
 
+pub mod build;
 pub mod commit;
 pub mod note;
 pub mod nullifier;
@@ -42,6 +43,7 @@ pub mod state;
 pub mod tree;
 pub mod tx;
 
+pub use build::{SpendInput, build_transfer};
 pub use commit::{Commitment, Params, Randomness, sum, sum_randomness, verify_balance};
 pub use note::{Note, derive_owner_pk};
 pub use nullifier::{Nullifier, NullifierSet};
