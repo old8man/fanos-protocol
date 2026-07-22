@@ -18,6 +18,8 @@ use fanos_pqcrypto::SeedRng;
 use fanos_pqcrypto::kem::{HybridCiphertext, HybridKemPublic, HybridKemSecret};
 use fanos_primitives::{aead, hash_labeled};
 
+use crate::nonce;
+
 /// Label deriving the root key from the KEM shared secret.
 const ROOT_LABEL: &str = "FANOS-angelos-v1/root";
 /// Label for the initiator→responder chain.
@@ -112,15 +114,6 @@ impl Session {
         self.recv_n = self.recv_n.saturating_add(1);
         Some(plaintext)
     }
-}
-
-/// A per-message AEAD nonce from its number (unique per key, so a counter nonce is safe).
-#[must_use]
-fn nonce(n: u64) -> [u8; aead::NONCE_LEN] {
-    let mut out = [0u8; aead::NONCE_LEN];
-    let (head, _) = out.split_at_mut(8);
-    head.copy_from_slice(&n.to_le_bytes());
-    out
 }
 
 #[cfg(test)]

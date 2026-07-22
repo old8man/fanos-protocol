@@ -26,6 +26,20 @@
 
 extern crate alloc;
 
+pub mod group;
+pub mod media;
 pub mod session;
 
+pub use group::GroupSession;
+pub use media::{MediaKind, MediaSession};
 pub use session::{Role, Session};
+
+/// A per-message/frame AEAD nonce from a counter. Each key seals a monotonically-numbered stream, so a
+/// counter-derived nonce is unique per (key, nonce) — the AEAD's safety requirement.
+#[must_use]
+pub(crate) fn nonce(n: u64) -> [u8; fanos_primitives::aead::NONCE_LEN] {
+    let mut out = [0u8; fanos_primitives::aead::NONCE_LEN];
+    let (head, _) = out.split_at_mut(8);
+    head.copy_from_slice(&n.to_le_bytes());
+    out
+}
