@@ -17,6 +17,7 @@ use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::committee::{epoch_seal_line, leader, line_members};
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
 use fanos_taxis::incentive::SlashEvidence;
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
 
 /// A Shamir share serialized as the reveal wire carries it: `x(1) ‖ y`.
@@ -56,6 +57,8 @@ fn gen_keys() -> Vec<Keys> {
 struct Cluster {
     engines: Vec<ConsensusEngine<Accounts>>,
     kem_dir: Vec<HybridKemPublic>,
+    /// The cell's agreed anti-MEV decryption authority (its `commit()` is the on-chain commitment every engine holds).
+    registry: KeyperRegistry,
     bus: VecDeque<ConsensusMsg>,
     committed: Vec<Vec<(u64, [u8; 32])>>,
     crashed: Vec<bool>,
@@ -75,6 +78,12 @@ impl Cluster {
         let keys = gen_keys();
         let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
         let kem_dir: Vec<HybridKemPublic> = keys.iter().map(|k| k.kem_pub.clone()).collect();
+        // The on-chain decryption-key commitment: each validator self-certifies its KEM key under its signing
+        // key, and every engine agrees on the resulting commitment (an agreed genesis constant).
+        let registry = KeyperRegistry::new(
+            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        );
+        let keyper_commit = registry.commit();
         let mut engines = Vec::new();
         for (i, k) in keys.into_iter().enumerate() {
             engines.push(ConsensusEngine::new(
@@ -83,6 +92,7 @@ impl Cluster {
                 k.sig,
                 k.kem,
                 verifiers.clone(),
+                keyper_commit,
                 SEED,
                 EPOCH,
                 genesis.clone(),
@@ -91,6 +101,7 @@ impl Cluster {
         Self {
             engines,
             kem_dir,
+            registry,
             bus: VecDeque::new(),
             committed: vec![Vec::new(); N],
             crashed: vec![false; N],
@@ -200,20 +211,10 @@ impl Cluster {
         }
     }
 
-    /// Seal a transfer to this epoch's beacon-selected keyper line (2-of-3 on the Fano cell).
+    /// Seal a transfer to this epoch's beacon-selected keyper line (2-of-3 on the Fano cell) — via the
+    /// committed decryption authority, exactly as a real client seals ([`seal_to_keyper_line`]).
     fn seal(&self, transfer: Transfer, tag: &[u8]) -> SealedTx {
-        let line = epoch_seal_line(&SEED, EPOCH);
-        let members = line_members(line);
-        let member_keys: Vec<&HybridKemPublic> = members.iter().map(|&m| &self.kem_dir[m]).collect();
-        SealedTx::seal(
-            &transfer.into_tx(),
-            EPOCH,
-            line as u8,
-            &member_keys,
-            CellParams::FANO.seal_threshold(),
-            tag,
-        )
-        .unwrap()
+        seal_to_keyper_line(&self.registry, &transfer.into_tx(), EPOCH, &SEED, CellParams::FANO, tag).unwrap()
     }
 
     /// The set of honest (non-crashed) validators that have finalized `height`, and the block hashes they
@@ -453,6 +454,12 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
         // stepped honestly.
         let keys = gen_keys();
         let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+        // The agreed decryption-key commitment binds each validator's genuine KEM key under its genuine signing
+        // key — a Byzantine validator misbehaves in consensus, not in key registration.
+        let keyper_commit = KeyperRegistry::new(
+            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        )
+        .commit();
         let mut engines = Vec::new();
         let mut byz_sig: BTreeMap<u8, HybridSigSecret> = BTreeMap::new();
         for (i, k) in keys.into_iter().enumerate() {
@@ -461,9 +468,9 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                 byz_sig.insert(idx, k.sig);
                 let mut r = SeedRng::from_seed(&[0xDD, idx]);
                 let (dummy, _) = HybridSigSecret::generate(&mut r);
-                engines.push(ConsensusEngine::new(CellParams::FANO, idx, dummy, k.kem, verifiers.clone(), SEED, EPOCH, genesis()));
+                engines.push(ConsensusEngine::new(CellParams::FANO, idx, dummy, k.kem, verifiers.clone(), keyper_commit, SEED, EPOCH, genesis()));
             } else {
-                engines.push(ConsensusEngine::new(CellParams::FANO, idx, k.sig, k.kem, verifiers.clone(), SEED, EPOCH, genesis()));
+                engines.push(ConsensusEngine::new(CellParams::FANO, idx, k.sig, k.kem, verifiers.clone(), keyper_commit, SEED, EPOCH, genesis()));
             }
         }
         let honest: Vec<usize> = (0..N).filter(|i| !byz.contains(&(*i as u8))).collect();
@@ -767,4 +774,33 @@ fn finalizing_a_block_rewards_its_commit_certificate_signers() {
     assert!(c.rewards.iter().all(|(_, amt)| (500 / 7..=500 / 5).contains(amt)), "each share is F/(signers) ∈ [71,100]");
     let rewarded: BTreeSet<u8> = c.rewards.iter().map(|(v, _)| *v).collect();
     assert!(rewarded.len() >= 5, "at least a Q-quorum of distinct signers were rewarded, got {}", rewarded.len());
+}
+
+/// The on-chain **decryption-key commitment** (anti-MEV `crate::keyper`): every validator agreed at genesis to
+/// the same commitment of the self-certified keyper registry, so it accepts *only* that registry as the cell's
+/// decryption authority — closing the key-substitution gap a client would otherwise face when it seals a tx.
+#[test]
+fn the_agreed_keyper_registry_is_the_only_accepted_decryption_authority() {
+    let c = Cluster::new(&genesis());
+    // Positive: every engine holds the agreed commitment and accepts the genuine, self-certified registry.
+    for eng in &c.engines {
+        assert_eq!(eng.keyper_commit(), c.registry.commit(), "every validator holds the agreed commitment");
+        assert!(eng.accepts_keyper_registry(&c.registry), "the genuine registry is the cell's decryption authority");
+    }
+    // Negative: a foreign registry (a different cell's independently-generated keys) is refused — its keys do
+    // not match the committed authority even though it is internally well-formed and self-consistent.
+    let foreign: KeyperRegistry = KeyperRegistry::new(
+        (0..N)
+            .map(|i| {
+                let mut rng = SeedRng::from_seed(&[0xF0, i as u8]);
+                let (sig, _sig_pub) = HybridSigSecret::generate(&mut rng);
+                let (_kem, kem_pub) = HybridKemSecret::generate(&mut rng);
+                KeyperKeyCert::register(i as u8, kem_pub, &sig)
+            })
+            .collect(),
+    );
+    assert_ne!(foreign.commit(), c.registry.commit(), "an independent cell has a distinct decryption authority");
+    for eng in &c.engines {
+        assert!(!eng.accepts_keyper_registry(&foreign), "a substituted decryption authority is refused");
+    }
 }

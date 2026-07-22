@@ -305,6 +305,10 @@ pub struct ConsensusEngine<S: StateMachine> {
     signer: HybridSigSecret,
     kem_secret: HybridKemSecret,
     verifiers: Vec<HybridVerifier>,
+    // The on-chain anti-MEV decryption-key commitment (`crate::keyper`): the agreed hash of every validator's
+    // self-certified KEM decryption key. An agreed genesis constant alongside `verifiers` and `seed`; a
+    // validator only serves clients a keyper registry that both verifies against `verifiers` and matches this.
+    keyper_commit: [u8; 32],
     seed: BeaconSeed,
     epoch: Epoch,
     round: u32,
@@ -343,7 +347,9 @@ pub struct ConsensusEngine<S: StateMachine> {
 
 impl<S: StateMachine> ConsensusEngine<S> {
     /// Build a validator's engine. `me` is its validator index; `verifiers[i]` is validator `i`'s signature
-    /// key; `seed` the epoch beacon (leader schedule); `genesis_state` the funded genesis ledger.
+    /// key; `keyper_commit` the agreed on-chain anti-MEV decryption-key commitment
+    /// ([`KeyperRegistry::commit`](crate::keyper::KeyperRegistry::commit)); `seed` the epoch beacon (leader
+    /// schedule); `genesis_state` the funded genesis ledger.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         params: CellParams,
@@ -351,6 +357,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         signer: HybridSigSecret,
         kem_secret: HybridKemSecret,
         verifiers: Vec<HybridVerifier>,
+        keyper_commit: [u8; 32],
         seed: BeaconSeed,
         epoch: Epoch,
         genesis_state: S,
@@ -361,6 +368,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             signer,
             kem_secret,
             verifiers,
+            keyper_commit,
             seed,
             epoch,
             round: 0,
@@ -387,6 +395,24 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// (`R = F/Q` per signer). Default `0` (no reward). A driver sets this from the fees it collects per block.
     pub fn set_reward_per_block(&mut self, reward: u64) {
         self.reward_per_block = reward;
+    }
+
+    /// The on-chain anti-MEV **decryption-key commitment** this validator agreed to at genesis — the canonical
+    /// hash of the keyper registry ([`crate::keyper`]). A light client or a sealing client uses it to check a
+    /// served registry names the real decryption authority.
+    #[must_use]
+    pub fn keyper_commit(&self) -> [u8; 32] {
+        self.keyper_commit
+    }
+
+    /// Whether `registry` is the cell's agreed anti-MEV decryption authority: it must both **verify** against
+    /// the committed consensus identities ([`KeyperRegistry::verify`](crate::keyper::KeyperRegistry::verify) —
+    /// each decryption key self-certified by its owner) **and** match this validator's agreed
+    /// [`keyper_commit`](Self::keyper_commit). Only such a registry may be used to seal transactions to this
+    /// cell — closing the key-substitution gap ([`crate::keyper`]).
+    #[must_use]
+    pub fn accepts_keyper_registry(&self, registry: &crate::keyper::KeyperRegistry) -> bool {
+        registry.commit() == self.keyper_commit && registry.verify(&self.verifiers)
     }
 
     /// The height currently being decided (the chain's next height).

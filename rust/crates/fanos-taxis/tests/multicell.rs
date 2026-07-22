@@ -22,6 +22,7 @@ use fanos_taxis::committee::{epoch_seal_line, line_members};
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
 use fanos_taxis::crosscell::{compose_state_root, CrossMsg, Outbox};
 use fanos_taxis::hierarchy::{ChildCommittee, ChildRegistry};
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry};
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::{Accounts, CellParams, SealedTx, Transaction, Transfer};
 
@@ -108,11 +109,26 @@ impl<S: StateMachine + Clone> Cell<S> {
         let keys = gen_keys(key_tag);
         let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
         let kem_dir: Vec<HybridKemPublic> = keys.iter().map(|k| k.kem_pub.clone()).collect();
+        // The on-chain anti-MEV decryption-key commitment (each validator self-certifies its KEM key).
+        let keyper_commit = KeyperRegistry::new(
+            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        )
+        .commit();
         let engines = keys
             .into_iter()
             .enumerate()
             .map(|(i, k)| {
-                ConsensusEngine::new(CellParams::FANO, i as u8, k.sig, k.kem, verifiers.clone(), SEED, EPOCH, genesis.clone())
+                ConsensusEngine::new(
+                    CellParams::FANO,
+                    i as u8,
+                    k.sig,
+                    k.kem,
+                    verifiers.clone(),
+                    keyper_commit,
+                    SEED,
+                    EPOCH,
+                    genesis.clone(),
+                )
             })
             .collect();
         Self { engines, kem_dir, verifiers, bus: VecDeque::new() }
