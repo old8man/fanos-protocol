@@ -8,11 +8,32 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use fanos_proxy::{Target, UdpDialer};
 use tokio::sync::mpsc;
 
 use crate::engine::{FlowKey, VpnAction, classify, response_packet};
+
+/// Cap on the distinct destination flows the datapath tunnels concurrently (audit A4: bound every per-flow
+/// map). Traffic to many destinations (a scan, a peer-to-peer swarm) would otherwise grow the tunnel map —
+/// and its exit dials — without limit; at the cap the least-recently-used flow is evicted (dropping its
+/// sender tears the tunnel down). Matches the DIAULOS `MAX_SESSIONS` discipline.
+const MAX_UDP_FLOWS: usize = 4096;
+
+/// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
+struct Flow {
+    outbound: mpsc::Sender<Vec<u8>>,
+    last_used: Instant,
+}
+
+/// Evict the least-recently-used flow (called when the map is at [`MAX_UDP_FLOWS`]); dropping its sender
+/// closes the exit tunnel and ends its reply pump.
+fn evict_lru(tunnels: &mut HashMap<FlowKey, Flow>) {
+    if let Some(victim) = tunnels.iter().min_by_key(|(_, f)| f.last_used).map(|(&k, _)| k) {
+        tunnels.remove(&victim);
+    }
+}
 
 /// Run the UDP datapath: read IP packets from `inbound` (the TUN), relay each UDP flow over an exit tunnel
 /// obtained from `dialer`, and write response packets to `outbound` (the TUN). One tunnel per destination
@@ -24,24 +45,29 @@ pub async fn run_udp_datapath<D: UdpDialer>(
     mut inbound: mpsc::Receiver<Vec<u8>>,
     outbound: mpsc::Sender<Vec<u8>>,
 ) {
-    // One outbound tunnel sender per flow the client has active.
-    let mut tunnels: HashMap<FlowKey, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    // One outbound tunnel per flow the client has active (bounded, LRU-evicted).
+    let mut tunnels: HashMap<FlowKey, Flow> = HashMap::new();
     while let Some(packet) = inbound.recv().await {
         let VpnAction::RelayUdp { flow, payload, .. } = classify(&packet) else {
             continue; // Drop
         };
-        // Open (or re-open) the exit tunnel for this destination flow on first sight.
-        if tunnels.get(&flow).is_none_or(mpsc::Sender::is_closed) {
+        // Open (or re-open) the exit tunnel for this destination flow on first sight, evicting the
+        // least-recently-used flow first if the map is at its cap.
+        if tunnels.get(&flow).is_none_or(|f| f.outbound.is_closed()) {
             let target = Target::Ip(SocketAddr::from((flow.dst.0, flow.dst.1)));
             let Ok(tunnel) = dialer.dial_udp(&target).await else {
                 continue;
             };
+            if tunnels.len() >= MAX_UDP_FLOWS {
+                evict_lru(&mut tunnels);
+            }
             spawn_response_pump(tunnel.inbound, flow, outbound.clone());
-            tunnels.insert(flow, tunnel.outbound);
+            tunnels.insert(flow, Flow { outbound: tunnel.outbound, last_used: Instant::now() });
         }
-        if let Some(tx) = tunnels.get(&flow) {
+        if let Some(f) = tunnels.get_mut(&flow) {
+            f.last_used = Instant::now();
             // UDP is lossy: drop if the tunnel is backed up rather than stall the whole datapath.
-            let _ = tx.try_send(payload);
+            let _ = f.outbound.try_send(payload);
         }
     }
 }
@@ -131,5 +157,25 @@ mod tests {
             timeout(Duration::from_millis(300), out_rx.recv()).await.is_err(),
             "a TCP packet produces no UDP relay"
         );
+    }
+
+    #[test]
+    fn evict_lru_drops_the_least_recently_used_flow() {
+        let now = Instant::now();
+        let mk = |secs_ago| Flow {
+            outbound: mpsc::channel::<Vec<u8>>(1).0,
+            last_used: now.checked_sub(Duration::from_secs(secs_ago)).unwrap(),
+        };
+        let key = |port| FlowKey { client: (CLIENT, port), dst: (RESOLVER, 53) };
+        let mut tunnels: HashMap<FlowKey, Flow> = HashMap::new();
+        tunnels.insert(key(1), mk(1)); // newest
+        tunnels.insert(key(2), mk(30)); // oldest — the LRU victim
+        tunnels.insert(key(3), mk(5));
+
+        evict_lru(&mut tunnels);
+
+        assert_eq!(tunnels.len(), 2, "exactly one flow is evicted");
+        assert!(!tunnels.contains_key(&key(2)), "the least-recently-used flow is evicted");
+        assert!(tunnels.contains_key(&key(1)) && tunnels.contains_key(&key(3)), "newer flows kept");
     }
 }

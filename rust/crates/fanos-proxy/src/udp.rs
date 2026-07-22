@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -39,6 +40,30 @@ use crate::target::Target;
 /// The largest datagram the relay socket reads — the SOCKS5 header plus payload. A UDP datagram carries at
 /// most 65535 bytes total, so this bounds the whole wrapped frame.
 const MAX_UDP: usize = 65535;
+
+/// Cap on the distinct destinations one association relays to concurrently (audit A4: bound every per-flow
+/// map). A client addressing many destinations (a UDP scanner, a DHT) would otherwise grow the tunnel map —
+/// and its exit dials — without limit; at the cap the least-recently-used tunnel is evicted (dropping its
+/// sender tears it down). Matches the DIAULOS `MAX_SESSIONS` discipline.
+const MAX_UDP_FLOWS: usize = 1024;
+
+/// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
+struct Flow {
+    outbound: mpsc::Sender<Vec<u8>>,
+    last_used: Instant,
+}
+
+/// Evict the least-recently-used flow (called when the map is at [`MAX_UDP_FLOWS`]); dropping its sender
+/// closes the exit tunnel and ends its reply pump.
+fn evict_lru(tunnels: &mut HashMap<Target, Flow>) {
+    if let Some(victim) = tunnels
+        .iter()
+        .min_by_key(|(_, f)| f.last_used)
+        .map(|(t, _)| t.clone())
+    {
+        tunnels.remove(&victim);
+    }
+}
 
 /// Run one SOCKS5 UDP association on its already-negotiated control connection, relaying datagrams through
 /// `dialer` until the control connection closes.
@@ -53,8 +78,8 @@ pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::
     let relay = Arc::new(UdpSocket::bind((local_ip, 0)).await?);
     write_associate_reply(&mut control, relay.local_addr()?).await?;
 
-    // One outbound tunnel per distinct destination the client addresses.
-    let mut tunnels: HashMap<Target, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    // One outbound tunnel per distinct destination the client addresses (bounded, LRU-evicted).
+    let mut tunnels: HashMap<Target, Flow> = HashMap::new();
     // The client's UDP source, latched on its first datagram (a local proxy serves one client per assoc).
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = vec![0u8; MAX_UDP];
@@ -80,15 +105,20 @@ pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::
                 let Some((target, payload)) = parse_request(buf.get(..n).unwrap_or(&[])) else {
                     continue;
                 };
-                // Open a tunnel to this destination on first sight (and re-open if a prior one closed).
-                if tunnels.get(&target).is_none_or(mpsc::Sender::is_closed) {
+                // Open a tunnel to this destination on first sight (and re-open if a prior one closed),
+                // evicting the least-recently-used tunnel first if the map is at its cap.
+                if tunnels.get(&target).is_none_or(|f| f.outbound.is_closed()) {
                     let Ok(tunnel) = dialer.dial_udp(&target).await else { continue };
+                    if tunnels.len() >= MAX_UDP_FLOWS {
+                        evict_lru(&mut tunnels);
+                    }
                     spawn_reply_pump(Arc::clone(&relay), tunnel.inbound, target.clone(), client);
-                    tunnels.insert(target.clone(), tunnel.outbound);
+                    tunnels.insert(target.clone(), Flow { outbound: tunnel.outbound, last_used: Instant::now() });
                 }
-                if let Some(tx) = tunnels.get(&target) {
+                if let Some(flow) = tunnels.get_mut(&target) {
+                    flow.last_used = Instant::now();
                     // UDP is lossy: if the tunnel is backed up, drop rather than stall the association.
-                    let _ = tx.try_send(payload);
+                    let _ = flow.outbound.try_send(payload);
                 }
             }
         }
@@ -262,5 +292,31 @@ mod tests {
         let (target, payload) = parse_request(&framed).unwrap();
         assert_eq!(target, source);
         assert_eq!(payload, b"answer");
+    }
+
+    #[test]
+    fn evict_lru_drops_the_least_recently_used_flow() {
+        use std::time::Duration;
+
+        let now = Instant::now();
+        let mk = |secs_ago| Flow {
+            outbound: mpsc::channel::<Vec<u8>>(1).0,
+            last_used: now.checked_sub(Duration::from_secs(secs_ago)).unwrap(),
+        };
+        let (a, b, c) = (
+            Target::Ip("1.1.1.1:1".parse().unwrap()),
+            Target::Ip("2.2.2.2:2".parse().unwrap()),
+            Target::Ip("3.3.3.3:3".parse().unwrap()),
+        );
+        let mut tunnels: HashMap<Target, Flow> = HashMap::new();
+        tunnels.insert(a.clone(), mk(1)); // newest
+        tunnels.insert(b.clone(), mk(30)); // oldest — the LRU victim
+        tunnels.insert(c.clone(), mk(5));
+
+        evict_lru(&mut tunnels);
+
+        assert_eq!(tunnels.len(), 2, "exactly one flow is evicted");
+        assert!(!tunnels.contains_key(&b), "the least-recently-used flow is evicted");
+        assert!(tunnels.contains_key(&a) && tunnels.contains_key(&c), "the newer flows are kept");
     }
 }
