@@ -19,6 +19,8 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 # The self-organizing role assignment (capability descriptors + the RoleController) the live role loop drives.
 fanos-core = { workspace = true, features = ["std"] }
+# TAXIS L0 primitives (ExecCertificate, CrossCellReceipt, ChildRegistry) the cross-cell directories transport.
+fanos-taxis.workspace = true
 fanos-runtime = { workspace = true, features = ["std"] }
 fanos-quic.workspace = true
 # For `.fanos` name resolution: ONOMA addresses/derivations + CALYPSO descriptors.

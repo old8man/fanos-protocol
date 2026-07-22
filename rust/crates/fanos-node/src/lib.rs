@@ -23,6 +23,7 @@ pub mod epoch_driver;
 pub mod error;
 pub mod exit;
 pub mod capdir;
+pub mod crosscell_dir;
 pub mod loaddir;
 pub mod role_loop;
 pub mod identity;

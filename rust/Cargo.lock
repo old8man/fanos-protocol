@@ -993,6 +993,7 @@ dependencies = [
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-session",
+ "fanos-taxis",
  "fanos-vpn",
  "fanos-vrf",
  "fanos-wire",
