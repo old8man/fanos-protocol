@@ -14,14 +14,30 @@
 //! The proof — a **Sako–Kilian cut-and-choose** — is fully generic over [`ReRandomizable`]. Two backends are
 //! provided: [`ElGamal`] (ristretto255, the group FANOS's VRF/DKG/VOPRF already use — **classical**, discrete
 //! log) and [`crate::rlwe`]'s `Rlwe` (**post-quantum**, Ring-LWE). The *same* [`prove`]/[`verify`] run over
-//! either; the cut-and-choose soundness is unconditional, so the shuffle is post-quantum iff its backend is.
+//! either.
 //!
 //! **Security reduction.** *Soundness*: each shadow `M_j` is committed before the Fiat–Shamir challenge; if the
 //! output multiset ≠ the input multiset, `M_j` cannot be **both** a re-randomization of the inputs (`b=0`) and
 //! the outputs a re-randomization of `M_j` (`b=1`) — so one challenge branch fails, caught with probability
-//! `≥ 1/2` per shadow, `1 − 2^-k` over `k` shadows. *Hiding*: only re-randomization factors are ever revealed
-//! (checked homomorphically), one branch per shadow, so the composed permutation `π` is never revealed — each
-//! opened `σ_j` is random and each `τ_j = π∘σ_j^{-1}` is masked by the hidden, random `σ_j`.
+//! `≥ 1/2` per shadow, `1 − 2^-k` over `k` shadows (`k ≥` [`MIN_ROUNDS`], enforced). The challenge is a single
+//! joint hash over the public key, `(n, k)`, and *all* shadow ciphertexts, so a shadow cannot be re-ground
+//! independently and a proof cannot be replayed across keys. *Hiding*: only re-randomization factors are ever
+//! revealed (checked homomorphically), one branch per shadow, so the composed permutation `π` is never
+//! revealed — each opened `σ_j` is random and each `τ_j = π∘σ_j^{-1}` is masked by the hidden, random `σ_j`
+//! (which requires a **secret, high-entropy `seed`**: `seed` determines `π` and every factor, so a guessed or
+//! reused `seed` de-anonymizes the batch — callers MUST pass a fresh CSPRNG draw).
+//!
+//! **Soundness scope — read before relying on the PQ backend.** The reduction above is exact **only when the
+//! backend's re-randomization is plaintext-preserving and [`verify_rerandomization`](ReRandomizable::verify_rerandomization)
+//! *enforces* that** (else a plaintext-changing factor satisfies whichever branch the challenge demands). The
+//! [`ElGamal`] backend meets this **unconditionally** — its factor is one scalar tying both ciphertext
+//! components, leaving no free translation — so the ElGamal shuffle is genuinely `1 − 2^-k` sound and is the
+//! backend to rely on. The lattice [`crate::rlwe`] backend enforces a **shortness** gate that closes the
+//! trivial free-translation forgery an independent audit found, but at `n = 512` a norm bound alone does *not*
+//! give worst-case soundness (the verifier cannot bound the unknown `s·e1'` term below `q/4`); a
+//! production-sound PQ shuffle needs a splitting-ring-aware NIZK (eprint 2025/658) or a re-parameterization.
+//! **Treat the RLWE backend as an experimental research scaffold, not a sound PQ shuffle** (see its module doc
+//! and `docs/design-pq-vrf.md` §4.2).
 
 use alloc::vec::Vec;
 
@@ -33,6 +49,11 @@ use fanos_primitives::hash::hash_xof;
 const SCALAR_LABEL: &str = "FANOS-v1/shuffle-scalar";
 const PERM_LABEL: &str = "FANOS-v1/shuffle-perm";
 const CHALLENGE_LABEL: &str = "FANOS-v1/shuffle-challenge";
+
+/// The minimum number of cut-and-choose rounds. Soundness is `2^-k`, so `k` is a security parameter and must
+/// not be caller-tunable below the standard `128`-bit floor — a low `k` (or a grindable `k` like 32) is
+/// otherwise a real forgery budget (audit fix). [`prove`]/[`verify`] reject any `k < MIN_ROUNDS`.
+pub const MIN_ROUNDS: usize = 128;
 
 /// A **re-randomizable public-key cryptosystem** — the homomorphic seam a verifiable shuffle needs. A
 /// re-randomization must (i) preserve the plaintext, (ii) compose additively
@@ -49,7 +70,12 @@ pub trait ReRandomizable {
 
     /// Re-randomize `ct` by `r` — same plaintext, fresh ciphertext.
     fn rerandomize(key: &Self::Key, ct: &Self::Ct, r: &Self::Rand) -> Self::Ct;
-    /// Whether `ct2 == ReRand(ct1, r)`, checkable from `r` without the plaintext.
+    /// Whether `ct2 == ReRand(ct1, r)` **for a valid `r`**, checkable from `r` without the plaintext. This
+    /// MUST encode a validity/shortness predicate on `r`, not merely the syntactic relation: if any `r`
+    /// (however large) is accepted, an additive-homomorphic backend admits a plaintext-*changing* factor that
+    /// carries any `ct1` to any `ct2` (a free translation), and the cut-and-choose soundness collapses. ElGamal
+    /// ties both ciphertext components through one scalar (no free translation); the lattice backend must
+    /// additionally reject non-short factors.
     fn verify_rerandomization(key: &Self::Key, ct1: &Self::Ct, ct2: &Self::Ct, r: &Self::Rand) -> bool;
     /// `a − b` in the re-randomness group (`ReRand(ct, a−b)` takes `ReRand(ct, b)` to `ReRand(ct, a)`).
     fn sub_rand(a: &Self::Rand, b: &Self::Rand) -> Self::Rand;
@@ -57,6 +83,9 @@ pub trait ReRandomizable {
     fn derive_rand(seed: &[u8], idx: u64) -> Self::Rand;
     /// Canonical bytes of a ciphertext, for the Fiat–Shamir transcript.
     fn ct_bytes(ct: &Self::Ct) -> Vec<u8>;
+    /// Canonical bytes of the public key, bound into the Fiat–Shamir challenge so a proof cannot be replayed
+    /// across keys/instances (weak-FS hardening).
+    fn key_bytes(key: &Self::Key) -> Vec<u8>;
 }
 
 // ---- ristretto255 ElGamal backend (classical) --------------------------------------------------------------
@@ -107,6 +136,10 @@ impl ReRandomizable for ElGamal {
     fn derive_rand(seed: &[u8], idx: u64) -> Scalar {
         derive_scalar(seed, idx)
     }
+    fn key_bytes(key: &RistrettoPoint) -> Vec<u8> {
+        key.compress().as_bytes().to_vec()
+    }
+
     fn ct_bytes(ct: &ElGamalCt) -> Vec<u8> {
         ct.to_bytes().to_vec()
     }
@@ -205,9 +238,19 @@ impl<C: ReRandomizable> ShuffleProof<C> {
     }
 }
 
-/// Fiat–Shamir challenge bits — one per shadow — from `H(inputs ‖ outputs ‖ shadows)`.
-fn challenge_bits<C: ReRandomizable>(inputs: &[C::Ct], outputs: &[C::Ct], shadows: &[Vec<C::Ct>]) -> Vec<bool> {
-    let mut buf = Vec::new();
+/// Fiat–Shamir challenge bits — one per shadow — from `H(key ‖ n ‖ k ‖ inputs ‖ outputs ‖ shadows)`. Every
+/// shadow ciphertext is committed *before* the challenge, and the public key and the shape `(n, k)` are bound
+/// in, so a proof cannot be replayed across keys/instances and no single shadow can be re-ground independently
+/// (changing any shadow re-rolls all `k` bits — the cut-and-choose grinding cost stays `2^k`, not `k·2`).
+fn challenge_bits<C: ReRandomizable>(
+    key: &C::Key,
+    inputs: &[C::Ct],
+    outputs: &[C::Ct],
+    shadows: &[Vec<C::Ct>],
+) -> Vec<bool> {
+    let mut buf = C::key_bytes(key);
+    buf.extend_from_slice(&(inputs.len() as u64).to_be_bytes());
+    buf.extend_from_slice(&(shadows.len() as u64).to_be_bytes());
     for ct in inputs.iter().chain(outputs).chain(shadows.iter().flatten()) {
         buf.extend_from_slice(&C::ct_bytes(ct));
     }
@@ -227,6 +270,9 @@ pub fn prove<C: ReRandomizable>(
     seed: &[u8],
     k: usize,
 ) -> Option<(Vec<C::Ct>, ShuffleProof<C>)> {
+    if k < MIN_ROUNDS {
+        return None; // soundness parameter floor — a low k is a real forgery budget
+    }
     let n = inputs.len();
     let first = inputs.first()?.clone(); // n >= 1
     // Real shuffle: out[pi[i]] = ReRand(in[i], rho[i]).
@@ -262,7 +308,7 @@ pub fn prove<C: ReRandomizable>(
         esses.push(s);
     }
 
-    let bits = challenge_bits::<C>(inputs, &outputs, &shadows);
+    let bits = challenge_bits::<C>(key, inputs, &outputs, &shadows);
     let mut openings = Vec::with_capacity(k);
     for j in 0..k {
         let (sigma, s) = (sigmas.get(j)?, esses.get(j)?);
@@ -297,13 +343,13 @@ pub fn verify<C: ReRandomizable>(
     proof: &ShuffleProof<C>,
 ) -> bool {
     let n = inputs.len();
-    if outputs.len() != n || proof.shadows.len() != proof.openings.len() || proof.shadows.is_empty() {
-        return false;
+    if outputs.len() != n || proof.shadows.len() != proof.openings.len() || proof.shadows.len() < MIN_ROUNDS {
+        return false; // reject under-parameterized proofs (soundness floor)
     }
     if proof.shadows.iter().any(|m| m.len() != n) {
         return false;
     }
-    let bits = challenge_bits::<C>(inputs, outputs, &proof.shadows);
+    let bits = challenge_bits::<C>(key, inputs, outputs, &proof.shadows);
     for (j, (m, opening)) in proof.shadows.iter().zip(&proof.openings).enumerate() {
         if opening.perm.len() != n || opening.factors.len() != n || !is_permutation(&opening.perm) {
             return false;
@@ -358,9 +404,9 @@ mod tests {
     fn an_honest_shuffle_verifies_and_actually_permutes() {
         let (_sk, pk) = keypair(1);
         let ins = inputs(&pk, 6, b"A");
-        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"shuffle-seed", 32).unwrap();
+        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"shuffle-seed", MIN_ROUNDS).unwrap();
         assert!(verify::<ElGamal>(&pk, &ins, &outs, &proof), "an honest shuffle verifies");
-        assert_eq!(proof.rounds(), 32, "32 rounds → 2^-32 soundness");
+        assert_eq!(proof.rounds(), MIN_ROUNDS, "128 rounds → 2^-128 soundness");
         assert!(ins.iter().zip(&outs).any(|(a, b)| a != b), "the shuffle re-randomizes");
     }
 
@@ -368,7 +414,7 @@ mod tests {
     fn re_randomization_preserves_the_plaintext() {
         let (sk, pk) = keypair(2);
         let ins = inputs(&pk, 5, b"A");
-        let (outs, _proof) = prove::<ElGamal>(&pk, &ins, b"s", 8).unwrap();
+        let (outs, _proof) = prove::<ElGamal>(&pk, &ins, b"s", MIN_ROUNDS).unwrap();
         let decrypt = |ct: &ElGamalCt| ct.b - sk * ct.a;
         let mut in_msgs: Vec<[u8; 32]> = ins.iter().map(|c| decrypt(c).compress().to_bytes()).collect();
         let mut out_msgs: Vec<[u8; 32]> = outs.iter().map(|c| decrypt(c).compress().to_bytes()).collect();
@@ -381,7 +427,7 @@ mod tests {
     fn a_dropped_added_or_altered_ciphertext_is_rejected() {
         let (_sk, pk) = keypair(3);
         let ins = inputs(&pk, 6, b"A");
-        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"seed", 24).unwrap();
+        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"seed", MIN_ROUNDS).unwrap();
 
         let mut tampered = outs.clone();
         tampered[2] = ElGamalCt::encrypt(&pk, &(Scalar::from(999u64) * RISTRETTO_BASEPOINT_POINT), &Scalar::from(7u64));
@@ -389,29 +435,45 @@ mod tests {
         assert!(!verify::<ElGamal>(&pk, &ins, &outs[..5], &proof), "a dropped output is rejected");
 
         let other = inputs(&pk, 6, b"B");
-        let (other_outs, other_proof) = prove::<ElGamal>(&pk, &other, b"seed2", 24).unwrap();
+        let (other_outs, other_proof) = prove::<ElGamal>(&pk, &other, b"seed2", MIN_ROUNDS).unwrap();
         assert!(!verify::<ElGamal>(&pk, &ins, &other_outs, &other_proof), "a shuffle of a different set does not verify against `ins`");
     }
 
     #[test]
-    fn soundness_scales_with_the_round_count() {
+    fn the_round_count_floor_is_enforced() {
+        // Soundness is 2^-k, so k is a hard security parameter: prove refuses k < MIN_ROUNDS, and verify
+        // refuses an under-parameterized proof even if one is hand-truncated (audit fix — no grindable low k).
         let (_sk, pk) = keypair(4);
         let ins = inputs(&pk, 4, b"A");
-        let other = inputs(&pk, 4, b"B");
-        for k in [1usize, 4, 16] {
-            let (bad_outs, bad_proof) = prove::<ElGamal>(&pk, &other, b"x", k).unwrap();
-            assert!(!verify::<ElGamal>(&pk, &ins, &bad_outs, &bad_proof), "k={k}: a mismatched shuffle is rejected");
-            let (good_outs, good_proof) = prove::<ElGamal>(&pk, &ins, b"y", k).unwrap();
-            assert!(verify::<ElGamal>(&pk, &ins, &good_outs, &good_proof), "k={k}: an honest shuffle verifies");
+        for k in [1usize, 32, MIN_ROUNDS - 1] {
+            assert!(prove::<ElGamal>(&pk, &ins, b"x", k).is_none(), "k={k} < floor must be refused");
         }
+        // A valid proof, then truncate its rounds below the floor → verify rejects.
+        let (outs, mut proof) = prove::<ElGamal>(&pk, &ins, b"y", MIN_ROUNDS).unwrap();
+        assert!(verify::<ElGamal>(&pk, &ins, &outs, &proof), "the floor-parameterized proof verifies");
+        proof.shadows.truncate(64);
+        proof.openings.truncate(64);
+        assert!(!verify::<ElGamal>(&pk, &ins, &outs, &proof), "a proof truncated below the floor is rejected");
+    }
+
+    #[test]
+    fn the_challenge_binds_the_public_key() {
+        // A proof made under one key must not verify under another (weak-FS hardening): the key is in the
+        // Fiat–Shamir transcript, so a different key recomputes different challenge bits.
+        let (_sk, pk) = keypair(6);
+        let (_sk2, pk2) = keypair(7);
+        let ins = inputs(&pk, 5, b"A");
+        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"bind", MIN_ROUNDS).unwrap();
+        assert!(verify::<ElGamal>(&pk, &ins, &outs, &proof));
+        assert!(!verify::<ElGamal>(&pk2, &ins, &outs, &proof), "the proof must not verify under a different key");
     }
 
     #[test]
     fn the_opened_branches_never_reveal_the_full_permutation() {
         let (_sk, pk) = keypair(5);
         let ins = inputs(&pk, 5, b"A");
-        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"hide", 40).unwrap();
-        let bits = challenge_bits::<ElGamal>(&ins, &outs, &proof.shadows);
+        let (outs, proof) = prove::<ElGamal>(&pk, &ins, b"hide", MIN_ROUNDS).unwrap();
+        let bits = challenge_bits::<ElGamal>(&pk, &ins, &outs, &proof.shadows);
         assert_eq!(proof.openings.len(), bits.len());
         for opening in &proof.openings {
             assert_eq!(opening.perm.len(), 5);

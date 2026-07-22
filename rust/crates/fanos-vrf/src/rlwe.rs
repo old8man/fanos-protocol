@@ -1,11 +1,23 @@
 //! A **post-quantum re-randomizable encryption** — Ring-LWE (Regev-style) additive ElGamal — the lattice
-//! backend that makes [`crate::shuffle`] genuinely post-quantum (spec §16 `[P]`; Hand-roll full).
+//! backend for [`crate::shuffle`] (spec §16 `[P]`; Hand-roll full).
 //!
-//! > **NOVEL, UNAUDITED.** A from-scratch Ring-LWE implementation with a security reduction to decisional
-//! > Ring-LWE, **literature-calibrated parameters** (below), and a Monte-Carlo decryption-failure experiment.
-//! > The polynomial multiply is **branch-free / data-independent** (no secret-dependent control flow), but it
-//! > is not *fully* constant-time (the modular reduction uses `%`, and sampling is not rejection-free), and it
-//! > has **not** had external cryptanalysis. Deploy only after an audit and a hardened (NTT, fully-CT) backend.
+//! > **NOVEL, UNAUDITED — EXPERIMENTAL RESEARCH SCAFFOLD, not a sound PQ shuffle.** A from-scratch Ring-LWE
+//! > implementation with a security reduction to decisional Ring-LWE, **literature-calibrated parameters**
+//! > (below), and a Monte-Carlo decryption-failure experiment. The polynomial multiply is **branch-free /
+//! > data-independent**, but it is not *fully* constant-time (`%` reduction; sampling is not rejection-free for
+//! > the noise), and it has **not** had external cryptanalysis.
+//! >
+//! > **Soundness scope (audit).** An independent review broke an earlier `verify_rerandomization` that checked
+//! > only the syntactic relation `ct2 == ReRand(ct1, r)`: with `r' = 0` and `(e1', e2') = (ct2.u − ct1.u,
+//! > ct2.v − ct1.v)` the factor is a *free additive translation* carrying any `ct1` to any `ct2`, so it
+//! > verified for arbitrary plaintext-changing outputs — a total shuffle-soundness break. The fix here rejects
+//! > **non-short** factors ([`RlweRand::is_short`]), which closes that trivial forgery. **But it does not make
+//! > the RLWE shuffle worst-case sound at `n = 512`:** the decryption shift includes `s·e1'` with the *secret*
+//! > `s` unknown to the verifier, and the only bound it can enforce, `‖s·e1'‖∞ ≤ n·η·B`, exceeds `q/4` for any
+//! > `B` large enough to admit honest factors. A production-sound PQ shuffle needs a splitting-ring-aware NIZK
+//! > (eprint 2025/658 / Aranha et al.) or a re-parameterization to a regime where opened-factor norm bounds
+//! > provably keep the shift `< q/4`. **Rely on the classical [`crate::shuffle::ElGamal`] backend for
+//! > soundness; treat this one as a research scaffold.** See `docs/design-pq-vrf.md` §4.2.
 //!
 //! **Parameters — NewHope-512-grounded (`docs/design-pq-vrf.md` §4).** `n = 512`, `q = 12289`, centered-
 //! binomial noise `η = 8` (stddev `σ = √(η/2) = 2`): the canonical single-ring RLWE set of NewHope
@@ -46,11 +58,22 @@ const ETA: usize = 8;
 const _: () = assert!(ETA == 8, "cbd_poly's per-byte popcount hardcodes η = 8");
 /// The message scaling `⌊q/2⌋` (a `0` bit encodes near `0`, a `1` bit near `q/2`).
 const HALF_Q: i64 = Q / 2;
+/// The largest multiple of `q` that fits a `u16` (`⌊2^16/q⌋·q = 5·q = 61445`) — the rejection-sampling bound
+/// for `uniform_poly` that makes every residue in `[0, q)` exactly equiprobable.
+const UNIFORM_LIMIT: u16 = (5 * Q) as u16;
 
 /// Reduce into the canonical range `[0, q)`.
 #[inline]
 fn rem(x: i64) -> i64 {
     ((x % Q) + Q) % Q
+}
+
+/// The magnitude of a coefficient in **centered** representation: `min(|c|, q − |c|)`, so a value just below
+/// `q` counts as a small negative. Used by the re-randomization-factor shortness check.
+#[inline]
+fn centered_abs(c: i64) -> i64 {
+    let r = rem(c);
+    r.min(Q - r)
 }
 
 /// An element of `R_q` — `n` coefficients in `[0, q)`.
@@ -110,16 +133,20 @@ fn cbd_poly(seed: &[u8], tag: &str, idx: u64) -> Poly {
     }))
 }
 
-/// Derive a **uniform** polynomial (coefficients in `[0, q)`) from `(seed, tag)` — the public `a`.
-#[allow(clippy::indexing_slicing)]
+/// Derive a **uniform** polynomial (coefficients in `[0, q)`) from `(seed, tag)` — the public `a`. Uses
+/// **rejection sampling** (audit fix): a raw `u16` is in `[0, 65535]` and `65536 = 5·q + 3491`, so a plain
+/// `% q` over-weights `[0, 3490]` by `6/65536` vs `5/65536` — a `~2^-14` bias in `a`. Values `≥ 5·q = 61445`
+/// are rejected instead, leaving each residue exactly equiprobable, as a vetted (NTT) sampler would.
 fn uniform_poly(seed: &[u8], tag: &str) -> Poly {
-    let mut bytes = alloc::vec![0u8; N * 2];
+    // A generous XOF stream so rejection almost never exhausts it (expected ~1.06 draws/coeff; 8× is ample).
+    let mut bytes = alloc::vec![0u8; N * 16];
     hash_xof(tag, seed, &mut bytes);
-    Poly(core::array::from_fn(|k| {
-        let lo = bytes.get(2 * k).copied().unwrap_or(0);
-        let hi = bytes.get(2 * k + 1).copied().unwrap_or(0);
-        i64::from(u16::from_le_bytes([lo, hi])) % Q
-    }))
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let mut it = pairs.iter().filter_map(|&w| {
+        let v = u16::from_le_bytes(w);
+        (v < UNIFORM_LIMIT).then_some(i64::from(v % Q as u16))
+    });
+    Poly(core::array::from_fn(|_| it.next().unwrap_or(0)))
 }
 
 /// A Ring-LWE public key `(a, b = a·s + e)`.
@@ -198,6 +225,11 @@ pub fn decrypt(sk: &RlweSecret, ct: &RlweCt) -> Vec<u8> {
 }
 
 impl RlweRand {
+    /// The centered-magnitude bound a genuine re-randomization factor obeys. A fresh factor is a CBD draw
+    /// (`[−η, η]`); the shuffle's `b = 1` factor `ρ − s` is a difference of two CBD draws (`[−2η, 2η]`). `2η`
+    /// bounds both. **This bound is the load-bearing soundness fix** — see [`is_short`](Self::is_short).
+    const SHORT_BOUND: i64 = 2 * ETA as i64;
+
     /// Derive `(r, e1, e2)` small polynomials from `(seed, idx)`.
     #[must_use]
     fn derive(seed: &[u8], idx: u64) -> Self {
@@ -206,6 +238,19 @@ impl RlweRand {
             e1: cbd_poly(seed, "FANOS-v1/rlwe-rand-e1", idx),
             e2: cbd_poly(seed, "FANOS-v1/rlwe-rand-e2", idx),
         }
+    }
+
+    /// Whether every coefficient of `(r, e1, e2)` — in centered representation — has magnitude ≤
+    /// [`SHORT_BOUND`](Self::SHORT_BOUND). A re-randomization is only plaintext-preserving when its factor is
+    /// **short**; without this check `verify_rerandomization` was a tautology — a factor with `r' = 0` and
+    /// `(e1', e2') = (ct2.u − ct1.u, ct2.v − ct1.v)` is a free additive translation that carries *any* `ct1` to
+    /// *any* `ct2`, so an unbounded factor would verify for arbitrary (plaintext-changing) outputs and break
+    /// shuffle soundness. See the module-level "soundness scope" note for why, at `n = 512`, this bound closes
+    /// the trivial forgery but is not by itself a full worst-case-soundness guarantee.
+    fn is_short(&self) -> bool {
+        [&self.r, &self.e1, &self.e2]
+            .iter()
+            .all(|p| p.0.iter().all(|&c| centered_abs(c) <= Self::SHORT_BOUND))
     }
 }
 
@@ -226,7 +271,9 @@ impl ReRandomizable for Rlwe {
     }
 
     fn verify_rerandomization(pk: &RlwePublic, ct1: &RlweCt, ct2: &RlweCt, r: &RlweRand) -> bool {
-        *ct2 == Self::rerandomize(pk, ct1, r)
+        // The factor MUST be short (audit fix): otherwise the syntactic relation below is a tautology an
+        // adversary satisfies for any (ct1, ct2) with r' = 0 and an arbitrary (e1', e2') translation.
+        r.is_short() && *ct2 == Self::rerandomize(pk, ct1, r)
     }
 
     fn sub_rand(a: &RlweRand, b: &RlweRand) -> RlweRand {
@@ -243,6 +290,12 @@ impl ReRandomizable for Rlwe {
 
     fn ct_bytes(ct: &RlweCt) -> Vec<u8> {
         ct.to_bytes()
+    }
+
+    fn key_bytes(pk: &RlwePublic) -> Vec<u8> {
+        let mut out = pk.a.to_bytes();
+        out.extend_from_slice(&pk.b.to_bytes());
+        out
     }
 }
 
@@ -295,24 +348,46 @@ mod tests {
     }
 
     #[test]
-    fn the_same_shuffle_proof_runs_post_quantum_over_rlwe() {
-        // The whole point: the generic Sako–Kilian shuffle, unchanged, over the PQ Ring-LWE backend.
-        let (sk, pk) = keygen(b"rlwe-shuffle");
-        let ins: Vec<RlweCt> = (0..4).map(|i| encrypt(&pk, &message(10 + i as u8), b"in", i)).collect();
-        let (outs, proof) = shuffle::prove::<Rlwe>(&pk, &ins, b"pq-shuffle-seed", 16).unwrap();
-        assert!(shuffle::verify::<Rlwe>(&pk, &ins, &outs, &proof), "the PQ shuffle verifies");
+    fn a_non_short_translation_factor_is_rejected() {
+        // The audit's tautology break (Finding 1): with r' = 0 and (e1', e2') = (ct2.u − ct1.u, ct2.v − ct1.v),
+        // the "factor" is a free additive translation carrying ct1 to an UNRELATED ct2 (a different plaintext).
+        // The syntactic relation ct2 == ReRand(ct1, factor) holds by construction — so without a shortness
+        // check verify_rerandomization would accept it and shuffle soundness would collapse. The is_short gate
+        // rejects it.
+        let (sk, pk) = keygen(b"rlwe-forge");
+        let ct1 = encrypt(&pk, &message(1), b"e", 0);
+        let ct2 = encrypt(&pk, &message(2), b"e", 1); // a genuinely different message
+        assert_ne!(decrypt(&sk, &ct1), decrypt(&sk, &ct2), "the two ciphertexts hold different plaintexts");
+        let forged = RlweRand { r: Poly([0; N]), e1: ct2.u.sub(&ct1.u), e2: ct2.v.sub(&ct1.v) };
+        assert_eq!(Rlwe::rerandomize(&pk, &ct1, &forged), ct2, "the free-translation relation holds by construction");
+        assert!(!forged.is_short(), "the translation factor is not short");
+        assert!(
+            !Rlwe::verify_rerandomization(&pk, &ct1, &ct2, &forged),
+            "a non-short (plaintext-changing) factor must be rejected — this is the soundness fix"
+        );
+    }
 
-        // The shuffled plaintext multiset equals the input multiset (order hidden, contents preserved).
+    #[test]
+    fn the_generic_shuffle_machinery_runs_over_the_rlwe_backend() {
+        // The generic Sako–Kilian shuffle, unchanged, runs over the Ring-LWE backend at the k = MIN_ROUNDS
+        // soundness floor. NOTE: this exercises the MECHANISM (honest shuffle verifies, plaintext multiset
+        // preserved, a tampered short-factor output is rejected). Worst-case PQ SOUNDNESS is *not* claimed at
+        // n = 512 — see the module-level "soundness scope" note; the shortness gate here closes only the
+        // trivial free-translation forgery.
+        let (sk, pk) = keygen(b"rlwe-shuffle");
+        let ins: Vec<RlweCt> = (0..3).map(|i| encrypt(&pk, &message(10 + i as u8), b"in", i)).collect();
+        let (outs, proof) = shuffle::prove::<Rlwe>(&pk, &ins, b"pq-shuffle-seed", shuffle::MIN_ROUNDS).unwrap();
+        assert!(shuffle::verify::<Rlwe>(&pk, &ins, &outs, &proof), "the shuffle verifies over RLWE");
+
         let mut in_msgs: Vec<Vec<u8>> = ins.iter().map(|c| decrypt(&sk, c)).collect();
         let mut out_msgs: Vec<Vec<u8>> = outs.iter().map(|c| decrypt(&sk, c)).collect();
         in_msgs.sort();
         out_msgs.sort();
-        assert_eq!(in_msgs, out_msgs, "the PQ shuffle preserves the plaintext multiset");
+        assert_eq!(in_msgs, out_msgs, "the shuffle preserves the plaintext multiset");
 
-        // A tampered output multiset is rejected (soundness over the PQ backend).
         let mut bad = outs.clone();
         bad[1] = encrypt(&pk, &message(99), b"forge", 0);
-        assert!(!shuffle::verify::<Rlwe>(&pk, &ins, &bad, &proof), "a tampered PQ shuffle is rejected");
+        assert!(!shuffle::verify::<Rlwe>(&pk, &ins, &bad, &proof), "a tampered output is rejected");
     }
 }
 
