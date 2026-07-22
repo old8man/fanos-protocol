@@ -18,6 +18,17 @@ other networks round trips and routing tables cost FANOS a **single arithmetic s
 
 One substrate, one codebase. From it we build a whole stack — and it is **built and tested**, not sketched.
 
+**Honest comparison (Tor · Nym · I2P · Lokinet · Veilid).** The closest prior art is **Lokinet** (onion +
+blockchain + incentivized nodes — but staking makes influence *purchasable* and its crypto is classical) and
+**Veilid** (a zero-config, mobile-first, no-blockchain framework — but with *no* Sybil resistance, no
+post-quantum, and roles that are opt-in flags rather than assigned). FANOS differs fundamentally on three axes —
+**post-quantum from day one** (alone in that set), **non-plutocratic structural Sybil resistance** (the `(q+1)/N`
+centrality cap is identical for every node, not stake-bought), and **self-organization *by capability*** (the
+network *assigns* roles to the fittest nodes, it does not just let them opt in). But the honest bottom line comes
+first: **FANOS has no users, no deployment, and no external audit**, and anonymity is a property of the live
+crowd, not the routing math — a truth every deployed rival concedes about itself. The full, concessions-first
+analysis is [`docs/comparison.md`](docs/comparison.md).
+
 ---
 
 ## What you can do with it
@@ -57,6 +68,16 @@ but as a **perturbation of the network's coherence**, answered by dissipation wi
 the stability theorem the cell returns exponentially to its healthy attractor as long as the aggregate
 decoherence stays under `1/14`. This recurses *up the hierarchy* — a parent cell diagnoses its child cells by
 the same math.
+
+**It organizes itself.** A node's *position* is already computed, not chosen — `coord = MapToPoint(VRF(sk, id ‖
+epoch ‖ beacon))`, verifiable and un-aimable. FANOS extends the same principle to a node's *function*: the
+operator declares only **capability** (what a node can do, and how much), and the network **assigns** its active
+roles — relay, storage, service host, exit — as a deterministic, verifiable, capacity-weighted function of the
+beacon and the cell's live demand, rotating every epoch. Anyone starts a node with an identity and a list of
+capabilities; the cell computes the rest, with *controlled freedom* — offer what you can, the network decides
+what you do, and no node can forge a role, monopolize one, or aim at one. A homeostatic controller raises a
+congested role's demand and relaxes a slack one; a cell that cannot self-provision escalates to its parent. See
+[`docs/design-self-organization.md`](docs/design-self-organization.md).
 
 **One engine, two drivers.** Every node behaviour is written **sans-I/O** — it reacts to inputs and returns
 effects, touching no clock, socket, or RNG. A **deterministic simulator** fault-tests the *byte-for-byte* same
@@ -183,4 +204,7 @@ The cryptographic claim is the *composition* of vetted post-quantum primitives, 
 
 Code is MIT-licensed (see [`LICENSE`](LICENSE)). The specification (`spec/protocol.md`) is the source of truth;
 the strategic vision is in [`docs/roadmap.md`](docs/roadmap.md), the architecture in
-[`docs/architecture.md`](docs/architecture.md), and the load-bearing derivations in `docs/design-*.md`.
+[`docs/architecture.md`](docs/architecture.md), the honest landscape comparison in
+[`docs/comparison.md`](docs/comparison.md), the self-organization + L0 design in
+[`docs/design-self-organization.md`](docs/design-self-organization.md), and the load-bearing derivations in
+`docs/design-*.md`.
