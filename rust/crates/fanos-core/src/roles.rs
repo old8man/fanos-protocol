@@ -460,6 +460,24 @@ impl Reputation {
         self.scores.insert(node, next);
     }
 
+    /// Record a node's role performance this window, **excusing a corroborated-down node** (audit R-H2). A
+    /// node the cell corroborates as unreachable (`reachable = false`) is neither rewarded nor slashed: it is
+    /// not punished for an outage outside its control, so a node knocked offline by a mass failure does not
+    /// decay toward the floor and forfeit its role on return. A reachable node is scored exactly as
+    /// [`observe`](Self::observe).
+    ///
+    /// This is the churn-safety the mass-recovery scenario needs: reputation must track *shirking* (reachable
+    /// but not serving), never *outage* (down through no fault of its own). The reachability corroboration
+    /// (spec §6.4 witnessed liveness) is the cell-agreed signal separating the two, so every node excuses the
+    /// identical set and the assignment stays deterministic.
+    pub fn observe_reachable(&mut self, node: NodeId, performed: bool, reachable: bool) {
+        if reachable {
+            self.observe(node, performed);
+        }
+        // A corroborated-down node is excused: its score is held — neither decayed (it is not shirking) nor
+        // recovered (it is not serving) — so an outage is invisible to reputation, exactly as it must be.
+    }
+
     /// A node's **reputation-adjusted weight**: `declared × score / REP_SCALE`, clamped to `≥ 1` (a node in
     /// good standing keeps its full declared weight; a failing one is de-weighted toward the floor).
     #[must_use]
@@ -901,5 +919,27 @@ mod tests {
             }
         }
         assert!(good_wins > 130, "the full-trust node wins the scarce role far more often, got {good_wins}/200");
+    }
+
+    #[test]
+    fn a_corroborated_down_node_is_excused_not_slashed() {
+        // Audit R-H2: a node knocked offline by a mass failure must not be punished for the outage — else it
+        // decays to the floor and forfeits its role on return, the exact self-organization failure under
+        // churn. Non-performance while corroborated-DOWN is excused; while REACHABLE (shirking) it decays.
+        let (offline, shirker) = (node(9), node(8));
+        let mut rep = Reputation::new();
+        // Many windows of non-performance while corroborated down: excused — the score never moves.
+        for _ in 0..8 {
+            rep.observe_reachable(offline, false, false);
+        }
+        assert_eq!(rep.score(&offline), REP_SCALE, "an outage is invisible to reputation");
+        // The identical non-performance while reachable is slashed to the floor (it is genuinely shirking).
+        for _ in 0..8 {
+            rep.observe_reachable(shirker, false, true);
+        }
+        assert_eq!(rep.score(&shirker), REP_FLOOR, "a reachable non-performer is slashed as before");
+        // The returned node that serves recovers exactly as usual — the excuse changed nothing but the outage.
+        rep.observe_reachable(offline, true, true);
+        assert_eq!(rep.score(&offline), REP_SCALE, "serving keeps full standing");
     }
 }

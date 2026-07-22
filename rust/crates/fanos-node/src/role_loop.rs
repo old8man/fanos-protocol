@@ -53,10 +53,12 @@ impl LiveRoleController {
 
     /// Record whether a node served its assigned role last epoch, from the cell's (agreed) coherence
     /// self-diagnosis — a non-performer's effective weight decays, so the next assignment prefers performers
-    /// (task A4). Because every node feeds the same agreed diagnosis, the reputation is identical cell-wide and
-    /// the assignment stays deterministic.
-    pub fn observe(&mut self, node: NodeId, performed: bool) {
-        self.reputation.observe(node, performed);
+    /// (task A4). A node the cell corroborates as **unreachable** (`reachable = false`) is excused rather than
+    /// slashed (audit R-H2): an outage from a mass failure must not cost a node its role on return. Because
+    /// every node feeds the same agreed diagnosis *and* reachability (spec §6.4 witnessed liveness), the
+    /// reputation is identical cell-wide and the assignment stays deterministic.
+    pub fn observe(&mut self, node: NodeId, performed: bool, reachable: bool) {
+        self.reputation.observe_reachable(node, performed, reachable);
     }
 
     /// One epoch: apply reputation to the members' weights, rebalance the demand toward `setpoint`, assign
