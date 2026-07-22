@@ -412,58 +412,41 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
     type Stream = DuplexStream;
 
     async fn dial(&self, target: &Target) -> Result<DuplexStream, DialError> {
-        if !target.is_fanos() {
-            // A clearnet target rides the configured exit (which sees the exit, not the client); without
-            // one, this dialer is `.fanos`-only.
+        // Resolve where to route, plus (for a clearnet target) the destination the exit must be handed. A
+        // clearnet target rides the configured EXIT — but through the **same anonymity profile** as a `.fanos`
+        // service (the exit is just a service, reached by its service key), so an anonymous profile never sends
+        // clearnet by-coordinate Direct, which would leak the client's coordinate to the exit (audit S1-C1).
+        let (coord, service_public, exit_target): (Coord, HybridKemPublic, Option<String>) = if target.is_fanos()
+        {
+            let host = target.host();
+            let (coord, service_public) = self.resolver.resolve(&host).await.ok_or(DialError::Unreachable)?;
+            (coord, service_public, None)
+        } else {
             let Some((exit_coord, exit_public)) = &self.exit else {
                 return Err(DialError::Unsupported(
                     "no exit configured — the FANOS dialer reaches only .fanos targets".to_owned(),
                 ));
             };
-            let mut rng = SeedRng::from_seed(&os_entropy_32()?);
-            return crate::exit::dial_exit(
-                self.client.clone(),
-                *exit_coord,
-                exit_public,
-                &target.to_string(),
-                &mut rng,
-            )
-            .await
-            .map_err(DialError::Io);
-        }
-        let host = target.host();
-        let (coord, service_public) = self
-            .resolver
-            .resolve(&host)
-            .await
-            .ok_or(DialError::Unreachable)?;
+            (*exit_coord, exit_public.clone(), Some(target.to_string()))
+        };
+
         // A fresh CSPRNG seeded from OS entropy for this dial's ephemeral keys.
         let mut rng = SeedRng::from_seed(&os_entropy_32()?);
-        match &self.profile {
-            Profile::Direct => Ok(dial_service(
-                self.client.clone(),
-                coord,
-                &service_public,
-                &mut rng,
-            )),
+
+        // Establish the session per the anonymity profile.
+        let stream = match &self.profile {
+            Profile::Direct => dial_service(self.client.clone(), coord, &service_public, &mut rng),
             Profile::Fixed(route) => {
                 // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
                 let secret = os_entropy_32()?;
-                Ok(crate::rendezvous::anonymous_dial(
-                    self.client.clone(),
-                    &service_public,
-                    route,
-                    &secret,
-                    &mut rng,
-                ))
+                crate::rendezvous::anonymous_dial(self.client.clone(), &service_public, route, &secret, &mut rng)
             }
             Profile::Fresh(params) => {
                 // The general anonymous profile: derive the service's per-target meeting line, DRAW A FRESH
                 // route (new random forward/reply hops so this connection is unlinkable to the client's
                 // others), then ride the DIAULOS session over it. `draw` and `anonymous_dial` re-derive the
                 // same meeting line from the service key, so they agree.
-                let meeting =
-                    meeting_line::<F2>(&service_public.encode(), params.epoch, &params.beacon).coords();
+                let meeting = meeting_line::<F2>(&service_public.encode(), params.epoch, &params.beacon).coords();
                 let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
                     params.directory.clone(),
                     params.threshold,
@@ -474,14 +457,15 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
                     &mut rng,
                 );
                 let secret = os_entropy_32()?;
-                Ok(crate::rendezvous::anonymous_dial(
-                    self.client.clone(),
-                    &service_public,
-                    &route,
-                    &secret,
-                    &mut rng,
-                ))
+                crate::rendezvous::anonymous_dial(self.client.clone(), &service_public, &route, &secret, &mut rng)
             }
+        };
+
+        // For a clearnet target, hand the exit its destination over the (Direct or anonymous) session it now
+        // rides — the exit still learns only the target, never the client's coordinate.
+        match exit_target {
+            Some(t) => crate::exit::exit_send_target(stream, &t).await.map_err(DialError::Io),
+            None => Ok(stream),
         }
     }
 }

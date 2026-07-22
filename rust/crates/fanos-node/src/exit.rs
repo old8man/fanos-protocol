@@ -233,12 +233,19 @@ pub async fn dial_exit<R: CryptoRng>(
     target: &str,
     rng: &mut R,
 ) -> io::Result<DuplexStream> {
+    exit_send_target(dial_service(client, service, service_public, rng), target).await
+}
+
+/// Send the exit its destination `target` over an **already-established** session (the client→exit protocol:
+/// `len(2, big-endian) ‖ target`). The session may be Direct *or* anonymous — the exit only ever learns the
+/// target, never the client's coordinate — so the caller chooses the transport per the anonymity profile
+/// (audit S1-C1: an anonymous profile routes this over the rendezvous, not a Direct by-coordinate dial).
+pub async fn exit_send_target(mut stream: DuplexStream, target: &str) -> io::Result<DuplexStream> {
     let bytes = target.as_bytes();
     let len = u16::try_from(bytes.len())
         .ok()
         .filter(|&n| usize::from(n) <= MAX_TARGET_LEN)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "exit target too long"))?;
-    let mut stream = dial_service(client, service, service_public, rng);
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(bytes).await?;
     Ok(stream)

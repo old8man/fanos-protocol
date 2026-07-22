@@ -254,7 +254,13 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     };
     let exit_line = exit_coord.map_or_else(
         || "\n  Clearnet: refused (no exit discovered — start an exit node, or pass --exit-via)".to_owned(),
-        |[a, b, c]| format!("\n  Clearnet: via exit {a}:{b}:{c}"),
+        |[a, b, c]| {
+            // The clearnet path now rides the *same* profile as a .fanos dial: anonymous → onion-routed to the
+            // exit's service key (the exit learns only the target); direct → by-coordinate (the exit learns
+            // your coordinate). State which, so the guarantee is never overclaimed (audit S1-C1).
+            let how = if anon.is_some() { "anonymous (onion-routed to the exit)" } else { "direct — the exit learns your coordinate" };
+            format!("\n  Clearnet: via exit {a}:{b}:{c} — {how}")
+        },
     );
     eprintln!(
         "fanos proxy up — coordinate {x}:{y}:{z} on {}\n  SOCKS5:  socks5://{socks_listen}{http_line}{profile_line}{exit_line}",
