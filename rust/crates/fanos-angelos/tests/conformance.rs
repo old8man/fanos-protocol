@@ -131,16 +131,26 @@ fn session_ratchet_kat_matches_angelos_json() {
 
 #[test]
 fn group_post_kat_matches_angelos_json() {
-    // Member 1 posting to roster [1,2,3] over a fixed group key.
-    let mut g = GroupSession::new(&[0x42; 32], 1, &[1, 2, 3]);
-    assert_eq!(hex(&g.send(b"hello channel")), "00000000000000004b13f534da5fb2ab8458a032166e303c289ebb9616fb8da3310a18bc58");
-    assert_eq!(hex(&g.send(b"hello channel")), "010000000000000070d8f717394e162e5e08f5dc84ea4d3437f5f2d8288537f9cfb568dfc3");
+    use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+    // Deterministic per-member signing keys. A post is n ‖ ct ‖ signature(HYBRID_SIG_LEN); the n‖ct ciphertext
+    // prefix is the language-agnostic KAT (the signature depends on the impl's key derivation).
+    let kp = |t: u8| HybridSigSecret::generate(&mut SeedRng::from_seed(&[0x60, t]));
+    let (sk1, vk1) = kp(1);
+    let (sk2, vk2) = kp(2);
+    let (_sk3, vk3) = kp(3);
+    let roster = [(1u32, vk1), (2, vk2), (3, vk3)];
 
-    // Another member reproduces the poster's chain from the group key and opens it.
-    let mut a = GroupSession::new(&[0x42; 32], 1, &[1, 2, 3]);
-    let mut b = GroupSession::new(&[0x42; 32], 2, &[1, 2, 3]);
-    let post = a.send(b"hello channel");
-    assert_eq!(b.recv(1, &post).as_deref(), Some(&b"hello channel"[..]), "a peer opens the post");
+    // Member 1 posting over a fixed group key: the ciphertext prefix is pinned.
+    let mut g = GroupSession::new(&[0x42; 32], 1, sk1, &roster);
+    let post0 = g.send(b"hello channel");
+    let post1 = g.send(b"hello channel");
+    assert!(hex(&post0).starts_with("00000000000000004b13f534da5fb2ab8458a032166e303c289ebb9616fb8da3310a18bc58"));
+    assert!(hex(&post1).starts_with("010000000000000070d8f717394e162e5e08f5dc84ea4d3437f5f2d8288537f9cfb568dfc3"));
+
+    // A peer (member 2) authenticates the signature and opens the post.
+    let mut b = GroupSession::new(&[0x42; 32], 2, sk2, &roster);
+    assert_eq!(b.recv(1, &post0).as_deref(), Some(&b"hello channel"[..]), "a peer verifies + opens the post");
+    assert_eq!(b.recv(1, &post1).as_deref(), Some(&b"hello channel"[..]));
 }
 
 #[test]

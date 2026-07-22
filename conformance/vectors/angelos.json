@@ -92,7 +92,7 @@
     }
   },
   "group": {
-    "comment": "The sender-key group session (an O(1) post to a channel). Each member derives their own sender chain from the shared group key and their public member id: sender_chain = H('FANOS-angelos-v1/group-sender', group_key(32) || member_id(4, little-endian)). A post advances the poster's chain: mk = H('FANOS-angelos-v1/group-mk', chain); chain' = H('FANOS-angelos-v1/group-next', chain); wire = n(8, little-endian) || AEAD(mk, nonce(n), plaintext). Every other member reproduces the poster's chain from the group key and opens with it.",
+    "comment": "The sender-key group session (an O(1) post to a channel). Each member derives their own sender chain from the shared group key and their public member id: sender_chain = H('FANOS-angelos-v1/group-sender', group_key(32) || member_id(4, little-endian)). A post advances the poster's chain: mk = H('FANOS-angelos-v1/group-mk', chain); chain' = H('FANOS-angelos-v1/group-next', chain); wire = n(8, little-endian) || AEAD(mk, nonce(n), plaintext) || signature(HYBRID_SIG_LEN). Because every member can derive every other's chain, the chain cannot AUTHENTICATE a post; so each member also holds a per-sender signing key and signs sender_id(4, LE) || n(8, LE) || ciphertext (Signal Sender-Keys), which a receiver verifies BEFORE touching the chain. The pinned vector is the n||ciphertext prefix (deterministic); the trailing signature depends on the implementation's key derivation.",
     "labels": {
       "sender": "FANOS-angelos-v1/group-sender",
       "mk": "FANOS-angelos-v1/group-mk",
@@ -105,8 +105,9 @@
       "member_id": 1,
       "roster": [1, 2, 3],
       "plaintext_utf8": "hello channel",
-      "post_n0_hex": "00000000000000004b13f534da5fb2ab8458a032166e303c289ebb9616fb8da3310a18bc58",
-      "post_n1_hex": "010000000000000070d8f717394e162e5e08f5dc84ea4d3437f5f2d8288537f9cfb568dfc3"
+      "ct_prefix_n0_hex": "00000000000000004b13f534da5fb2ab8458a032166e303c289ebb9616fb8da3310a18bc58",
+      "ct_prefix_n1_hex": "010000000000000070d8f717394e162e5e08f5dc84ea4d3437f5f2d8288537f9cfb568dfc3",
+      "note": "each post's full wire form appends a HYBRID_SIG_LEN signature over sender_id||n||ciphertext after this prefix"
     }
   },
   "media": {
