@@ -22,6 +22,8 @@ fanos-primitives = { workspace = true, features = ["std"] }
 fanos-pqcrypto.workspace = true
 # THESAUROS — the content-storage market engine (deals + proof-of-retrievability) the TAG_STORAGE arm drives.
 fanos-thesauros = { workspace = true, features = ["std"] }
+# HERMES — the hash time-locked contract engine the TAG_HTLC (atomic-swap) arm drives.
+fanos-hermes = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

@@ -21,9 +21,11 @@ use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
 
+use fanos_hermes::{Htlc, HtlcTerms, Resolution};
 use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, verify};
 
 use crate::bridge::{POOL_SINK, ShieldTx};
+use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
 use crate::naming::{NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
 use crate::storage::{STORAGE_ESCROW, StorageMarket, StorageTx, deal_id, leaves_for_size};
@@ -45,6 +47,8 @@ pub const TAG_NAME: u8 = 0x02;
 pub const TAG_SHIELD: u8 = 0x03;
 /// Transaction-type tag: a THESAUROS storage-market operation (open/prove/close).
 pub const TAG_STORAGE: u8 = 0x04;
+/// Transaction-type tag: a HERMES atomic-swap operation (lock/claim/refund).
+pub const TAG_HTLC: u8 = 0x05;
 
 /// Domain-separation label for the hybrid state root.
 const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
@@ -57,6 +61,7 @@ pub struct HybridLedger {
     shielded: ShieldedState,
     names: NameRegistry,
     storage: StorageMarket,
+    htlcs: HtlcBook,
     params: Arc<Params>,
     height: u64,
     audit_beacon: [u8; 32],
@@ -71,6 +76,7 @@ impl HybridLedger {
             shielded: ShieldedState::new(),
             names: NameRegistry::new(),
             storage: StorageMarket::default(),
+            htlcs: HtlcBook::default(),
             params: Arc::new(Params::standard()),
             height: 0,
             audit_beacon: [0u8; 32],
@@ -93,6 +99,69 @@ impl HybridLedger {
     #[must_use]
     pub fn storage_payload(tx: &StorageTx) -> Vec<u8> {
         Self::tagged(TAG_STORAGE, &tx.to_bytes())
+    }
+
+    /// The HTLC book (read-only).
+    #[must_use]
+    pub fn htlcs(&self) -> &HtlcBook {
+        &self.htlcs
+    }
+
+    /// The balance held in the HTLC escrow sink (the sum of unresolved locked contracts by construction).
+    #[must_use]
+    pub fn htlc_escrow(&self) -> u64 {
+        self.tokens.balance(&HTLC_ESCROW)
+    }
+
+    /// Wrap a HERMES atomic-swap operation as a DROMOS transaction payload.
+    #[must_use]
+    pub fn htlc_payload(tx: &HtlcTx) -> Vec<u8> {
+        Self::tagged(TAG_HTLC, &tx.to_bytes())
+    }
+
+    /// Lock an HTLC: the sender's `payment` must fund the escrow with exactly the contract amount. Validates,
+    /// opens the contract (a fresh id), then settles the payment (validate-then-settle, so a rejected lock moves
+    /// no money).
+    fn lock_htlc(&mut self, terms: &HtlcTerms, payment: &SignedTransfer) -> bool {
+        if !payment.verify()
+            || payment.transfer.from != terms.sender
+            || payment.transfer.to != HTLC_ESCROW
+            || payment.transfer.amount != terms.amount
+        {
+            return false;
+        }
+        let id = htlc_id(terms, payment.transfer.nonce);
+        if self.htlcs.htlcs.contains_key(&id) {
+            return false;
+        }
+        if self.tokens.apply(payment).is_err() {
+            return false;
+        }
+        self.htlcs.htlcs.insert(id, Htlc::new(*terms));
+        true
+    }
+
+    /// Claim an HTLC by revealing `preimage`: the contract's state machine checks the hashlock and the timeout
+    /// (against the block-height clock); on success the escrow is released to the recipient.
+    fn claim_htlc(&mut self, id: &[u8; 32], preimage: &[u8; 32]) -> bool {
+        let height = self.height;
+        let Some(Resolution::Pay { to, amount }) =
+            self.htlcs.htlcs.get_mut(id).and_then(|h| h.claim(preimage, height))
+        else {
+            return false;
+        };
+        let _ = self.tokens.move_system(&HTLC_ESCROW, to, amount);
+        true
+    }
+
+    /// Refund a timed-out HTLC to its sender (the state machine enforces the timeout against the height clock).
+    fn refund_htlc(&mut self, id: &[u8; 32]) -> bool {
+        let height = self.height;
+        let Some(Resolution::Pay { to, amount }) = self.htlcs.htlcs.get_mut(id).and_then(|h| h.refund(height)) else {
+            return false;
+        };
+        let _ = self.tokens.move_system(&HTLC_ESCROW, to, amount);
+        true
     }
 
     /// The authenticated transparent token ledger (read-only).
@@ -270,15 +339,24 @@ impl HybridLedger {
     /// provider/consumer, and cannot race a parallel transfer touching them.
     #[must_use]
     fn access_lists(&self, txs: &[Transaction]) -> Vec<AccessList> {
-        // deal_id -> (provider, consumer) for deals opened earlier in this block.
-        let mut pending: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])> = BTreeMap::new();
+        // Deals / contracts opened earlier in this block: id -> the two parties whose balances they may move.
+        let mut deals: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])> = BTreeMap::new();
+        let mut htlcs: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])> = BTreeMap::new();
         let mut out = Vec::with_capacity(txs.len());
         for tx in txs {
-            out.push(self.access_of(tx, &pending));
-            if let Some((&TAG_STORAGE, body)) = tx.payload.split_first()
-                && let Some(StorageTx::Open { params, payment }) = StorageTx::from_bytes(body)
-            {
-                pending.insert(deal_id(&params, payment.transfer.nonce), (params.provider, params.consumer));
+            out.push(self.access_of(tx, &deals, &htlcs));
+            match tx.payload.split_first() {
+                Some((&TAG_STORAGE, body)) => {
+                    if let Some(StorageTx::Open { params, payment }) = StorageTx::from_bytes(body) {
+                        deals.insert(deal_id(&params, payment.transfer.nonce), (params.provider, params.consumer));
+                    }
+                }
+                Some((&TAG_HTLC, body)) => {
+                    if let Some(HtlcTx::Lock { terms, payment }) = HtlcTx::from_bytes(body) {
+                        htlcs.insert(htlc_id(&terms, payment.transfer.nonce), (terms.sender, terms.recipient));
+                    }
+                }
+                _ => {}
             }
         }
         out
@@ -288,7 +366,12 @@ impl HybridLedger {
     /// genuinely-dependent transactions share a wave). A transaction that does not decode touches nothing (its
     /// execution is a no-op). `pending` supplies deals opened earlier in the same block.
     #[must_use]
-    fn access_of(&self, tx: &Transaction, pending: &BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>) -> AccessList {
+    fn access_of(
+        &self,
+        tx: &Transaction,
+        pending: &BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
+        pending_htlc: &BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
+    ) -> AccessList {
         match tx.payload.split_first() {
             Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
                 Some(st) => AccessList::new([], [st.transfer.from, st.transfer.to]),
@@ -336,8 +419,42 @@ impl HybridLedger {
                 }
                 None => AccessList::default(),
             },
+            Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
+                Some(HtlcTx::Lock { terms, payment }) => {
+                    AccessList::new([], [terms.sender, HTLC_ESCROW, htlc_id(&terms, payment.transfer.nonce)])
+                }
+                Some(HtlcTx::Claim { htlc_id: id, .. }) => {
+                    let mut writes = vec![HTLC_ESCROW, id];
+                    if let Some(recipient) = self.htlc_party(&id, pending_htlc).map(|(_, r)| r) {
+                        writes.push(recipient);
+                    }
+                    AccessList::new([], writes)
+                }
+                Some(HtlcTx::Refund { htlc_id: id }) => {
+                    let mut writes = vec![HTLC_ESCROW, id];
+                    if let Some(sender) = self.htlc_party(&id, pending_htlc).map(|(s, _)| s) {
+                        writes.push(sender);
+                    }
+                    AccessList::new([], writes)
+                }
+                None => AccessList::default(),
+            },
             _ => AccessList::default(),
         }
+    }
+
+    /// An HTLC's `(sender, recipient)` — from committed state, or a same-block pending lock.
+    #[must_use]
+    fn htlc_party(
+        &self,
+        id: &[u8; 32],
+        pending: &BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
+    ) -> Option<([u8; 32], [u8; 32])> {
+        if let Some(htlc) = self.htlcs.htlcs.get(id) {
+            let t = htlc.terms();
+            return Some((t.sender, t.recipient));
+        }
+        pending.get(id).copied()
     }
 
     /// A deal's `(provider, consumer)` — from committed state, or a same-block pending open.
@@ -420,18 +537,25 @@ impl StateMachine for HybridLedger {
                 Some(StorageTx::Close { deal_id, auth }) => outcome(self.close_deal(&deal_id, &auth)),
                 None => ExecOutcome::Malformed,
             },
+            Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
+                Some(HtlcTx::Lock { terms, payment }) => outcome(self.lock_htlc(&terms, &payment)),
+                Some(HtlcTx::Claim { htlc_id, preimage }) => outcome(self.claim_htlc(&htlc_id, &preimage)),
+                Some(HtlcTx::Refund { htlc_id }) => outcome(self.refund_htlc(&htlc_id)),
+                None => ExecOutcome::Malformed,
+            },
             _ => ExecOutcome::Malformed,
         }
     }
 
-    /// `H(tokens_root ‖ shielded_root ‖ names_root ‖ storage_root)` — one commitment over transparent balances,
-    /// shielded notes, names, and storage deals, for the block's executed-state checkpoint.
+    /// `H(tokens ‖ shielded ‖ names ‖ storage ‖ htlc)` — one commitment over transparent balances, shielded
+    /// notes, names, storage deals, and atomic-swap contracts, for the block's executed-state checkpoint.
     fn state_root(&self) -> [u8; 32] {
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 160];
         buf[..32].copy_from_slice(&self.tokens.state_root());
         buf[32..64].copy_from_slice(&self.shielded.root());
         buf[64..96].copy_from_slice(&self.names.state_root());
-        buf[96..].copy_from_slice(&self.storage.state_root());
+        buf[96..128].copy_from_slice(&self.storage.state_root());
+        buf[128..].copy_from_slice(&self.htlcs.state_root());
         hash_labeled(HYBRID_ROOT_LABEL, &buf)
     }
 }
@@ -711,6 +835,69 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&open))), ExecOutcome::Rejected);
         assert_eq!(ledger.storage_escrow(), 0, "nothing was escrowed on a refused open");
         assert_eq!(ledger.tokens().balance(&consumer), 1000, "the consumer's funds are untouched");
+    }
+
+    #[test]
+    fn an_htlc_pays_the_recipient_on_reveal_and_a_second_claim_does_nothing() {
+        use fanos_hermes::hashlock;
+
+        let (alice_sk, alice_vk, alice) = account(1);
+        let (_b, _bv, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.begin_block(50); // current height 50, before the timeout
+
+        let secret = [0x5E; 32];
+        let terms = HtlcTerms { sender: alice, recipient: bob, amount: 1000, hashlock: hashlock(&secret), timeout: 100 };
+        let id = htlc_id(&terms, 0);
+
+        // Lock 1000 behind the hashlock.
+        let payment = SignedTransfer::sign(Transfer { from: alice, to: HTLC_ESCROW, amount: 1000, nonce: 0 }, &alice_sk, alice_vk);
+        let lock = HtlcTx::Lock { terms, payment: Box::new(payment) };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&lock))), ExecOutcome::Applied);
+        assert_eq!(ledger.htlc_escrow(), 1000, "the amount is escrowed");
+        assert_eq!(ledger.tokens().balance(&alice), 9_000);
+
+        // A wrong preimage does not release the funds.
+        let bad = HtlcTx::Claim { htlc_id: id, preimage: [0; 32] };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&bad))), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&bob), 0);
+
+        // The correct preimage before the timeout pays the recipient.
+        let claim = HtlcTx::Claim { htlc_id: id, preimage: secret };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&claim))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 1000, "the recipient was paid on reveal");
+        assert_eq!(ledger.htlc_escrow(), 0);
+        // A second claim (or a refund) is a no-op — the contract is resolved.
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&claim))), ExecOutcome::Rejected);
+    }
+
+    #[test]
+    fn an_htlc_refunds_the_sender_after_the_timeout() {
+        use fanos_hermes::hashlock;
+
+        let (alice_sk, alice_vk, alice) = account(1);
+        let (_b, _bv, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.begin_block(50);
+
+        let terms = HtlcTerms { sender: alice, recipient: bob, amount: 1000, hashlock: hashlock(&[0x11; 32]), timeout: 100 };
+        let id = htlc_id(&terms, 0);
+        let payment = SignedTransfer::sign(Transfer { from: alice, to: HTLC_ESCROW, amount: 1000, nonce: 0 }, &alice_sk, alice_vk);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&HtlcTx::Lock { terms, payment: Box::new(payment) }))), ExecOutcome::Applied);
+
+        // Before the timeout there is no refund.
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&HtlcTx::Refund { htlc_id: id }))), ExecOutcome::Rejected);
+        assert_eq!(ledger.htlc_escrow(), 1000);
+
+        // Advance past the timeout: the sender may refund.
+        ledger.begin_block(100);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&HtlcTx::Refund { htlc_id: id }))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&alice), 10_000, "the sender recovered the locked funds");
+        assert_eq!(ledger.htlc_escrow(), 0);
     }
 
     #[test]

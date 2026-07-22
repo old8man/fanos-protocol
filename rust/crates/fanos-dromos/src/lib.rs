@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod hermes;
 pub mod hybrid;
 pub mod naming;
 pub mod scheduler;
