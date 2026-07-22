@@ -16,6 +16,23 @@
 
 ## ⬜ What's left
 
+### 0 · Fundamental deepening pass — IN PROGRESS (2026-07-22, grounded in UHM/holon theory)
+Post independent-crypto-audit + honest-landscape-comparison. Implementing the best fundamental solution at
+every level, verified against the UHM coherence/viability/holarchy theory. Sequential:
+- [x] **Self-organizing role assignment** — `fanos-core::roles` (network assigns *function*, not just position).
+- [x] **Live role loop** — sans-I/O `RoleController` with a UHM-grounded Lyapunov-descent demand controller
+      (κ ∈ [1/7, 1], V=(D−setpoint)² contracts (1−κ)² per step, proved in code) + deficit→parent escalation.
+      Residual: the thin `fanos-node` driver (capability-descriptor advertisement + per-role load metering).
+- [x] **Executed-state checkpoint** — `fanos-taxis::checkpoint`: Q-quorum ExecCertificate over (height,
+      state_root); divergence is now detectable (`conflicting`), not a silent fork.
+- [x] **Cross-cell transaction proofs** (L0) — `fanos-taxis::crosscell`: destination verifies source
+      ExecCertificate + state_root opening + Merkle inclusion; no bridge trust.
+- [x] **Parent-attests-child-finality** (L0 shared security) — `fanos-taxis::hierarchy`: verify + anchor child
+      ExecCertificates, DA-gated, with child-equivocation detection.
+- [ ] **Remaining TAXIS residuals** — wire equivocation-detection → slash into `accept_vote`; on-chain
+      decryption-key commitment for the mempool.
+- [ ] **WASM/mobile client surface** — close the usability gap the Veilid comparison exposed.
+
 ### A · Optional application layers — ✅ DONE (2026-07-22)
 - **Part X.1 — the blockchain application on FANOS** — ✅ **DONE**: new crate **`fanos-taxis`** (`854feef`),
   the FANOS-native BFT blockchain. Projective-cell PBFT consensus (proved a masking-quorum system: `n=q²+q+1`,

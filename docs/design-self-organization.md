@@ -95,24 +95,37 @@ Why this exact rule, and not a heuristic:
 ## 4. Homeostatic self-balancing
 
 Self-organization without self-balancing is brittle: a fixed demand vector cannot follow a changing cell. The
-demand `Dρ` is therefore itself a controlled variable.
+demand `Dρ` is therefore itself a controlled variable, driven by a **Lyapunov-descent controller grounded in the
+UHM viability dynamics** (T-101 minimax under the T-104 ISS envelope — the same theory `fanos-diakrisis`'s DDoS
+homeostat realizes).
 
-- **The control law.** `Demand::rebalance` is a proportional controller: from the cell's telemetry it reads,
-  per role, a load ratio (observed load ÷ capacity of the currently-active nodes) and steps demand toward the
-  eligible-supply ceiling when the role is congested, toward a floor when it is slack —
-  `Dρ' = clamp(round(Dρ · load/capacity), floorρ, |Eρ|)`. This is the **same shape** as the DDoS dissipation
-  law that answers a decoherence perturbation (`fanos-diakrisis`): a bounded, monotone response to a *measured*
-  deficit, so it converges rather than oscillates. There is no magic constant — the target is "match provision
-  to observed demand," and the gain is the one control parameter.
-- **The sensor.** The load ratios come from the cell's coherence self-scan (`fanos-telemetry`) and DIAKRISIS
-  (`fanos-diakrisis`): the same third-order self-diagnosis that detects a failing node also measures whether a
-  role is over- or under-provisioned. Self-diagnosis and self-provisioning are one loop.
-- **Escalation, never silent failure.** When `Dρ > |Eρ|` — the cell genuinely lacks enough capable nodes — the
-  shortfall is surfaced by `roles::assign_report` as a per-role **deficit**, not swallowed. That deficit is the
-  signal the cell escalates to its **parent cell** (`fanos-core::hierarchy`, the recursion-of-cells): the
-  parent can recruit a capable node from a sibling cell, or lower the cell's advertised service level. A cell
-  that cannot self-provision a role asks the level above, exactly as a node that cannot self-heal escalates its
-  DIAKRISIS verdict upward. The hierarchy is the overflow path for both health and provisioning.
+- **The control law.** `Demand::rebalance` steps the current demand toward a telemetry-derived setpoint
+  `sρ = ⌈observed_loadρ / per_node_capacity⌉` (the active count that would bring role `ρ` to capacity):
+  `Dρ' = Dρ + κ·(sρ − Dρ)`, with the loop gain **`κ ∈ [κ_bootstrap = 1/7, 1]`** — the UHM viability floor
+  (T-59/T-104) below which the pull toward health can vanish, up to the unit jump. Because `κ ≤ 1` the step
+  never overshoots and lands strictly between `Dρ` and `sρ`, so the error `V = (Dρ − sρ)²` **contracts by
+  `(1 − κ)²` each step** — a strict Lyapunov descent, the identical contraction as `stability::excursion_step`,
+  and under a moving setpoint the ISS envelope `√V' ≤ (1−κ)√V + ‖drift‖`. This is *derived*, not tuned: the
+  contraction is proved in code (`roles::tests::the_demand_controller_is_a_lyapunov_contraction`, verified from
+  both above and below the setpoint at `κ ∈ {1/7, 3/7, 1}`), exactly as the UHM `calib.rs` battery asserts each
+  viability law numerically.
+- **The engine.** `RoleController` packages this as a **sans-I/O** loop: one per cell, it holds the demand
+  state and, each beacon round, `step(members, epoch, beacon, setpoint)` rebalances the demand (Lyapunov) then
+  re-assigns roles — touching no clock, socket, or RNG, so the identical controller runs under the simulator
+  and a live node, like every other FANOS engine. A future learnable module may tune the setpoint or the gain
+  *within* `[κ_bootstrap, 1]`, but — exactly as the UHM T-155 consciousness-preserving-learning bound requires —
+  it can never move the attractor, leave the viability band, or break the T-104 contraction: the envelope is a
+  hard invariant the reflex layer enforces around any cognitive tuning (the SYNARC node model).
+- **The sensor.** The setpoint's load figures come from the cell's coherence self-scan (`fanos-telemetry`) and
+  DIAKRISIS (`fanos-diakrisis`): the same third-order self-diagnosis that detects a failing node also measures
+  whether a role is over- or under-provisioned. Self-diagnosis and self-provisioning are one loop.
+- **Escalation, never silent failure.** The demand is *not* capped at the eligible supply — a setpoint above
+  supply is a real, unmet want. When `Dρ > |Eρ|`, `roles::assign_report` surfaces the shortfall as a per-role
+  **deficit** (assigning `min(Dρ, |Eρ|)` and reporting the rest), the signal the cell escalates to its **parent
+  cell** (`fanos-core::hierarchy`): the parent recruits a capable node from a sibling cell, or lowers the cell's
+  advertised service level. A cell that cannot self-provision a role asks the level above — precisely the UHM
+  holarchic recovery protocol (T-148), where a collapsed cell that cannot self-heal hands its residue up for
+  external regeneration. The hierarchy is the overflow path for both health and provisioning.
 
 ## 5. Controlled freedom — the boundary between choice and control
 
@@ -182,18 +195,24 @@ a separate chain that must be secured and becomes a bottleneck.
 ## 7. Honest limits & what remains
 
 - **Implemented now** — the deterministic, verifiable, capability-weighted, rotating role assignment
-  (`roles`), the homeostatic demand controller, and the deficit/escalation signal; on the substrate side, the
-  coordinate VRF, the beacon, the cell-as-BFT-quorum-system, the projective LRC + DA sampling, the Maekawa
-  bridge selection, and the parent-observes-child recursion all exist and are tested.
-- **Design-complete, wiring outstanding** — the *live control loop* (telemetry load ratios → `rebalance` →
-  `assign` each epoch) is specified and its pieces exist, but the end-to-end driver that runs it every beacon
-  round is not yet wired into `fanos-node`; the capability descriptor is advertised but the performance-slash
-  reputation feedback is described, not yet closed in code.
-- **L0 primitives still to harden** — cross-cell transaction *proofs* (a destination cell verifying a source
-  cell's finalized-header + Merkle inclusion via the bridge, rather than trusting the bridge node) and
-  *parent-attests-child-finality* (the parent sampling a child's DA + checking its finality certificates to
-  extend shared security) are designed but not fully built. These are the genuine frontier, tracked with the
-  hierarchy work (§L1).
+  (`roles::assign`), the **Lyapunov-descent `RoleController`** (sans-I/O, UHM-grounded, with the contraction
+  proved in code), and the deficit/escalation signal; on the substrate side, the coordinate VRF, the beacon,
+  the cell-as-BFT-quorum-system, the projective LRC + DA sampling, the Maekawa bridge selection, and the
+  parent-observes-child coherence recursion. On the L0 side, the **executed-state checkpoint**
+  (`fanos-taxis::checkpoint` — divergence is now a detectable fault, not a silent fork), **trust-minimized
+  cross-cell messaging** (`fanos-taxis::crosscell` — a destination cell verifies a source cell's ExecCertificate
+  + Merkle inclusion, no bridge trust), and **parent-attests-child-finality** (`fanos-taxis::hierarchy` — a
+  parent anchors a child's finality, availability-gated, with child-equivocation detection) are all built and
+  tested.
+- **Design-complete, wiring outstanding** — the *live control loop*'s **core is now the sans-I/O
+  `RoleController`**; what remains is the thin driver that feeds it each beacon round inside `fanos-node`: a
+  signed capability-descriptor advertisement (a wire type over the overlay store, like the mix directory) and
+  per-role **load metering** in `fanos-telemetry` to derive the setpoint. The performance-slash reputation
+  feedback (a non-performing assignee's `weight` decays) is specified, not yet closed in code.
+- **L0 frontier** — a live *multi-cell* driver that runs cross-cell relay and parent attestation end-to-end
+  across real cells (the primitives are built and unit-proven; the multi-cell orchestration is the residual),
+  and folding an executed `state_root` history into the block header so a light client can follow finality
+  without the full checkpoint stream. These are tracked with the hierarchy work (§L1).
 - **The crowd caveat (inherited honestly).** Self-organization makes a node *join and serve* with zero touch;
   it does **not** manufacture the anonymity set. As every deployed peer network concedes, anonymity is a
   property of the live crowd, not of the routing mathematics — a self-organizing topology that is empty is
