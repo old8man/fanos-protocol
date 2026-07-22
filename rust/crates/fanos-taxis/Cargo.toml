@@ -35,6 +35,8 @@ fanos-pqcrypto.workspace = true
 fanos-primitives = { workspace = true, features = ["std", "wire"] }
 fanos-code = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
+# The multi-cell L0 test (tests/multicell.rs) decodes a Transfer in its cross-cell-aware state machine.
+fanos-wire = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true
