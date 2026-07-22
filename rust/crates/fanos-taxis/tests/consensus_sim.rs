@@ -59,7 +59,12 @@ struct Cluster {
     kem_dir: Vec<HybridKemPublic>,
     /// The cell's agreed anti-MEV decryption authority (its `commit()` is the on-chain commitment every engine holds).
     registry: KeyperRegistry,
-    bus: VecDeque<ConsensusMsg>,
+    /// The broadcast bus, each message tagged with its SENDER index so a network partition can drop messages
+    /// that cross between groups (an injected adversary message uses `usize::MAX` — it reaches everyone).
+    bus: VecDeque<(usize, ConsensusMsg)>,
+    /// Partition group per validator (all equal ⇒ fully connected). A message from `from` reaches `i` only when
+    /// `partition[from] == partition[i]` — a hard network split, the T-H1/T-H2 split-brain condition (§6.5).
+    partition: Vec<u8>,
     committed: Vec<Vec<(u64, [u8; 32])>>,
     crashed: Vec<bool>,
     withholding: BTreeSet<u8>,
@@ -103,6 +108,7 @@ impl Cluster {
             kem_dir,
             registry,
             bus: VecDeque::new(),
+            partition: vec![0; N],
             committed: vec![Vec::new(); N],
             crashed: vec![false; N],
             withholding: BTreeSet::new(),
@@ -131,7 +137,7 @@ impl Cluster {
     fn collect(&mut self, idx: usize, outs: Vec<Output>) {
         for o in outs {
             match o {
-                Output::Send(msg) => self.bus.push_back(msg),
+                Output::Send(msg) => self.bus.push_back((idx, msg)),
                 Output::Committed { height, block_hash } => self.committed[idx].push((height, block_hash)),
                 Output::Slash(ev) => self.slashes.push(ev),
                 Output::Reward(split) => self.rewards.extend(split),
@@ -139,7 +145,7 @@ impl Cluster {
         }
     }
 
-    fn deliver(&mut self, msg: &ConsensusMsg) {
+    fn deliver(&mut self, from: usize, msg: &ConsensusMsg) {
         if let ConsensusMsg::Propose(b) = msg
             && !self.proposed.iter().any(|p| p.hash() == b.hash())
         {
@@ -147,6 +153,11 @@ impl Cluster {
         }
         for i in 0..N {
             if self.crashed[i] {
+                continue;
+            }
+            // A hard partition drops any message crossing between groups (an injected `usize::MAX` sender is
+            // exempt — it models an adversary that can reach the whole cluster).
+            if from != usize::MAX && self.partition[from] != self.partition[i] {
                 continue;
             }
             // A validator deaf to proposals still receives votes/reveals — it can gather a commit certificate
@@ -165,17 +176,28 @@ impl Cluster {
         }
     }
 
-    /// Push one message onto the bus and drain to quiescence (for injecting an adversary's message).
+    /// Push one message onto the bus and drain to quiescence (for injecting an adversary's message — it reaches
+    /// every group, `usize::MAX` sender).
     fn inject(&mut self, msg: ConsensusMsg) {
-        self.bus.push_back(msg);
+        self.bus.push_back((usize::MAX, msg));
         self.run();
+    }
+
+    /// Split the cluster: the listed validators become group 1, the rest group 0 — messages no longer cross.
+    fn split(&mut self, group_b: &[usize]) {
+        self.partition = (0..N).map(|i| u8::from(group_b.contains(&i))).collect();
+    }
+
+    /// Heal the partition — every validator rejoins one fully-connected group.
+    fn heal_partition(&mut self) {
+        self.partition = vec![0; N];
     }
 
     /// Drain the bus to quiescence.
     fn run(&mut self) {
         let mut guard = 0;
-        while let Some(msg) = self.bus.pop_front() {
-            self.deliver(&msg);
+        while let Some((from, msg)) = self.bus.pop_front() {
+            self.deliver(from, &msg);
             guard += 1;
             assert!(guard < 200_000, "the message bus did not quiesce");
         }
@@ -373,7 +395,7 @@ fn forged_votes_cannot_forge_a_certificate() {
         let last = sv_bytes.len() - 1;
         sv_bytes[last] ^= 0xFF;
         let forged = SignedVote::from_bytes(&sv_bytes).unwrap();
-        c.bus.push_back(ConsensusMsg::Vote(forged));
+        c.bus.push_back((usize::MAX, ConsensusMsg::Vote(forged)));
     }
     c.run();
     assert_eq!(c.honest_count_at(0), 0, "forged-signature votes cannot finalize anything");
@@ -396,8 +418,8 @@ fn equivocating_proposals_cannot_split_agreement() {
     assert_ne!(block_a.hash(), block_b.hash(), "the two proposals genuinely conflict");
 
     // Inject both proposals; deliver A first, then B.
-    c.bus.push_back(ConsensusMsg::Propose(block_a));
-    c.bus.push_back(ConsensusMsg::Propose(block_b));
+    c.bus.push_back((usize::MAX, ConsensusMsg::Propose(block_a)));
+    c.bus.push_back((usize::MAX, ConsensusMsg::Propose(block_b)));
     c.run();
 
     // Safety: at most ONE block is finalized at height 0 across all honest validators (agreement), never two.
@@ -421,6 +443,43 @@ fn splitmix(s: &mut u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// A hard **network partition** — the split-brain condition the audit's S-P0.4 targets (§6.5, T-H1/T-H2). On
+/// a 7-node cell the commit quorum is `2f + 1 = 5`, so neither side of a `4 | 3` split can finalize alone: no
+/// conflicting block can be committed, so no fork is even possible while the network is cut — and once the
+/// partition heals the reunited cell reaches quorum and finalizes. BFT safety holds across the whole run, and
+/// liveness returns on heal.
+#[test]
+fn a_network_partition_cannot_split_agreement_and_heals() {
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }, b"p0");
+    c.submit_all(&tx);
+
+    // Cut the cell 4 | 3 and drive many rounds. Each minority proposes and votes within itself but can never
+    // gather the 5-vote quorum, so nothing finalizes — the two sides cannot commit conflicting blocks.
+    c.split(&[4, 5, 6]);
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+    assert_eq!(c.honest_count_at(0), 0, "no validator can finalize while cut into sub-quorum groups");
+
+    // Heal: the reunited 7 nodes reach quorum and finalize.
+    c.heal_partition();
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+
+    // SAFETY across the WHOLE run: no two validators ever finalized different blocks at any height — a partition
+    // could not, and did not, split agreement.
+    let max_h = (0..N).flat_map(|i| c.committed[i].iter().map(|&(h, _)| h)).max().unwrap_or(0);
+    for h in 0..=max_h {
+        assert!(c.hashes_at(h).len() <= 1, "FORK at height {h}: the cell finalized {} distinct blocks", c.hashes_at(h).len());
+    }
+    // LIVENESS restored: the healed cell finalized height 0 across a supermajority.
+    assert!(c.honest_count_at(0) >= 5, "the healed cell finalizes across a quorum, got {}", c.honest_count_at(0));
 }
 
 /// Over many random seeds: a random Byzantine subset (`≤ f = 2`) equivocates (injects conflicting prepare
