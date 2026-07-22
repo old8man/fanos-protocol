@@ -739,7 +739,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         out.extend(self.emit_reveals(&block));
         self.exec_queue.push(block.clone());
         // Validate any reveals that arrived early for this block's transactions, now that we hold the committee.
-        self.drain_pending_reveals(&block);
+        out.extend(self.drain_pending_reveals(&block));
         out.extend(self.try_execute());
 
         // Drop included transactions from the mempool and reset the per-height working state.
@@ -783,8 +783,11 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// transaction is already finalized we validate it against the committee immediately; otherwise we buffer
     /// the authenticated reveal until we finalize that block (so a slower validator does not drop what it needs).
     fn on_reveal(&mut self, r: &RevealMsg) -> Vec<Output> {
+        let mut out = Vec::new();
         if self.sealed_tx_for(&r.commit).is_some() {
-            self.validate_and_record(r);
+            if self.validate_and_record(r) {
+                out.push(Self::regossip(r));
+            }
         } else if self.verifiers.get(usize::from(r.member)).is_some_and(|vk| r.verify(vk)) {
             // Authenticate before buffering (audit B1): a reveal for a not-yet-finalized tx must still be signed
             // by a real committee member, so an attacker with no member key cannot flood the map with
@@ -800,7 +803,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // Buffer, first-writer-wins per member, so a flood cannot displace a genuine early reveal.
             self.pending_reveals.entry(r.commit).or_default().entry(r.member).or_insert_with(|| r.clone());
         }
-        self.try_execute()
+        out.extend(self.try_execute());
+        out
     }
 
     /// The number of not-yet-finalized transactions with buffered reveals — observability, and a witness to the
@@ -818,7 +822,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Validate a reveal against its transaction's keyper committee and record the share (first-writer-wins per
     /// member). Rejects, in order: an unknown transaction, a sender not on the transaction's line, a bad
     /// signature, a malformed share, or a share whose x-coordinate is not the sender's committee position — so
-    /// a forged or misplaced share can never enter reconstruction. Returns whether a share was recorded.
+    /// a forged or misplaced share can never enter reconstruction. Returns whether a share was **newly** recorded
+    /// (false on a duplicate), so the caller re-gossips each share exactly once (no amplification loop).
     fn validate_and_record(&mut self, r: &RevealMsg) -> bool {
         let Some(tx) = self.sealed_tx_for(&r.commit) else {
             return false;
@@ -841,19 +846,35 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if usize::from(share.x()) != pos + 1 {
             return false;
         }
-        self.reveals.entry(r.commit).or_default().entry(r.member).or_insert(share);
+        let members = self.reveals.entry(r.commit).or_default();
+        if members.contains_key(&r.member) {
+            return false; // already recorded (first-writer-wins) — not newly recorded, so not re-gossiped
+        }
+        members.insert(r.member, share);
         true
     }
 
-    /// Move any buffered early reveals for a just-finalized block's transactions into the validated set.
-    fn drain_pending_reveals(&mut self, block: &Block) {
+    /// Re-gossip a newly-recorded reveal so every honest validator converges on the SAME share set before the
+    /// deterministic reveal window — a Byzantine keyper that reveals to only a subset of validators can then no
+    /// longer make them decrypt (and execute) different transaction sets and fork intra-cell state (audit T-H1).
+    fn regossip(r: &RevealMsg) -> Output {
+        Output::Send(ConsensusMsg::Reveal(r.clone()))
+    }
+
+    /// Move any buffered early reveals for a just-finalized block's transactions into the validated set,
+    /// re-gossiping each newly-recorded one so the share set converges across validators.
+    fn drain_pending_reveals(&mut self, block: &Block) -> Vec<Output> {
+        let mut out = Vec::new();
         for tx in &block.sealed_txs {
             if let Some(early) = self.pending_reveals.remove(&tx.commit()) {
                 for r in early.values() {
-                    self.validate_and_record(r);
+                    if self.validate_and_record(r) {
+                        out.push(Self::regossip(r));
+                    }
                 }
             }
         }
+        out
     }
 
     /// Execute finalized blocks from the front of the queue, in order, as soon as every transaction in a
@@ -888,7 +909,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
                         // give up while any committee member is still outstanding; we wait until every member
                         // has revealed. Once all `member_count` shares are in and none opens (malformed), OR the
                         // reveal window has passed, the transaction is dropped (not stalled) — later
-                        // transactions and blocks still execute, and the drop is identical on every validator.
+                        // transactions and blocks still execute. Because every validator re-gossips each reveal
+                        // it records ([`regossip`], audit T-H1), the honest share sets converge well within the
+                        // window, so this drop decision agrees across validators under partial synchrony; the
+                        // executed-state checkpoint ([`crate::checkpoint`]) detects any residual async divergence.
                         if shares.len() < tx.member_count() && !past_window {
                             ready = false;
                             break;
