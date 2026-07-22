@@ -1017,6 +1017,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-obolos"
+version = "0.1.0"
+dependencies = [
+ "fanos-primitives",
+]
+
+[[package]]
 name = "fanos-observatory"
 version = "0.1.0"
 dependencies = [
