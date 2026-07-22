@@ -65,8 +65,12 @@ async fn bridge_udp<D: UdpDialer>(mut udp: IpStackUdpStream, dialer: Arc<D>) {
                 if n == 0 {
                     break;
                 }
-                if tunnel.outbound.send(buf.get(..n).unwrap_or(&[]).to_vec()).await.is_err() {
-                    break;
+                // Non-blocking, UDP-lossy (matching the mux): a blocking `send().await` here would stall the
+                // whole select — and so the reply direction — whenever the exit tunnel is backed up. Drop on
+                // a full tunnel; stop only when it has closed.
+                match tunnel.outbound.try_send(buf.get(..n).unwrap_or(&[]).to_vec()) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             reply = tunnel.inbound.recv() => {
