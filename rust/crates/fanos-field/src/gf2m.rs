@@ -156,3 +156,68 @@ mod tests {
         assert_eq!(cur, 1, "x^(q-1) = 1");
     }
 }
+
+/// The constant-time experiment (spec §16, `docs/design-constant-time.md`): a deterministic proof that the
+/// `GF(2^m)` inversion ladder performs a **secret-independent** number of field multiplications, so it leaks
+/// nothing about the secret operand through timing. Non-flaky (an operation-count invariant, not a timing
+/// measurement).
+#[cfg(test)]
+#[allow(clippy::indexing_slicing)]
+mod ct_experiment {
+    use core::cell::Cell;
+
+    use crate::{Field, FieldKind, F256};
+
+    std::thread_local! {
+        /// Counts field multiplications performed by the [`Counting`] field.
+        static MULS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// A field that delegates to `GF(256)` but tallies every multiplication — an instrument to measure the
+    /// inversion ladder's multiply-count, a deterministic proxy for constant-timeness.
+    #[derive(Clone, Copy, Debug)]
+    struct Counting;
+
+    impl Field for Counting {
+        const Q: u32 = F256::Q;
+        const P: u32 = 2;
+        const M: u32 = 8;
+        const KIND: FieldKind = FieldKind::Binary;
+
+        fn add(a: u32, b: u32) -> u32 {
+            F256::add(a, b)
+        }
+        fn sub(a: u32, b: u32) -> u32 {
+            F256::sub(a, b)
+        }
+        fn neg(a: u32) -> u32 {
+            F256::neg(a)
+        }
+        fn mul(a: u32, b: u32) -> u32 {
+            MULS.with(|c| c.set(c.get() + 1));
+            F256::mul(a, b)
+        }
+        fn reduce(x: u64) -> u32 {
+            F256::reduce(x)
+        }
+    }
+
+    #[test]
+    fn the_inversion_ladder_is_secret_independent() {
+        let mut counts = Vec::with_capacity((F256::Q - 1) as usize);
+        for a in 1..F256::Q {
+            MULS.with(|c| c.set(0));
+            let inv = Counting::inv(a);
+            // The counting wrapper computes the genuine inverse (it exercises the real algorithm).
+            assert_eq!(F256::mul(a, inv), 1, "the instrumented field still inverts a={a}");
+            counts.push(MULS.with(Cell::get));
+        }
+        // The load-bearing constant-time property: EVERY one of the 255 secret inputs drives exactly the
+        // same number of field multiplications, because the a^(q−2) square-and-multiply ladder branches only
+        // on the PUBLIC exponent (q−2 = 254), never on the secret base `a`.
+        let first = counts[0];
+        assert!(counts.iter().all(|&c| c == first), "inv multiply-count varies with the secret: {counts:?}");
+        // For e = 254 = 0b1111_1110 the fixed ladder is 8 squarings + 7 conditional multiplies = 15.
+        assert_eq!(first, 15, "the secret-independent ladder performs the fixed 15 multiplications");
+    }
+}
