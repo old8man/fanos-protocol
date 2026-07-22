@@ -25,7 +25,7 @@ use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_quic::spawn_cell;
 use fanos_runtime::{Config, Engine, OverlayNode};
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
-use fanos_taxis::state::Accounts;
+use fanos_dromos::TokenLedger;
 use fanos_taxis::{CellParams, Transaction};
 
 const N: usize = 7;
@@ -63,7 +63,7 @@ fn alice_note() -> Note {
 
 /// The genesis hybrid ledger: an empty transparent tree, and a shielded pool holding Alice's one note.
 fn genesis_ledger() -> HybridLedger {
-    let mut ledger = HybridLedger::new(Accounts::new());
+    let mut ledger = HybridLedger::new(TokenLedger::new());
     let n = alice_note();
     ledger.mint_shielded(n.commitment(ledger.params())).expect("mint Alice's genesis note");
     ledger

@@ -12,9 +12,13 @@
 
 use std::collections::BTreeMap;
 
+use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
 use fanos_primitives::hash_labeled;
 
 use crate::token::{SignedTransfer, TokenError, TokenLedger};
+
+/// The fixed serialized length of a [`SignedTransfer`] (`from ‖ to ‖ amount ‖ nonce ‖ key ‖ sig`).
+const SIGNED_TRANSFER_LEN: usize = 80 + HYBRID_VK_LEN + HYBRID_SIG_LEN;
 
 /// The treasury account that registration/renewal fees flow to (a fixed, keyless sink — its balance is the
 /// accrued naming revenue, spendable only by a future governance rule, never by a signature).
@@ -238,6 +242,98 @@ impl NameRegistry {
             buf.extend_from_slice(&rec.target);
         }
         hash_labeled(ROOT_LABEL, &buf)
+    }
+}
+
+impl NameOp {
+    /// Canonical bytes: a 1-byte variant tag then the variant's length-prefixed fields.
+    #[must_use]
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let put = |out: &mut Vec<u8>, b: &[u8]| {
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        };
+        match self {
+            NameOp::Register { name, target, duration } => {
+                out.push(0);
+                put(&mut out, name);
+                put(&mut out, target);
+                out.extend_from_slice(&duration.to_le_bytes());
+            }
+            NameOp::Renew { name, duration } => {
+                out.push(1);
+                put(&mut out, name);
+                out.extend_from_slice(&duration.to_le_bytes());
+            }
+            NameOp::Update { name, target } => {
+                out.push(2);
+                put(&mut out, name);
+                put(&mut out, target);
+            }
+            NameOp::Transfer { name, new_owner } => {
+                out.push(3);
+                put(&mut out, name);
+                out.extend_from_slice(new_owner);
+            }
+        }
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes).
+    #[must_use]
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (&tag, mut rest) = bytes.split_first()?;
+        let mut take_bytes = || -> Option<Vec<u8>> {
+            let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+            let b = rest.get(4..4 + len)?.to_vec();
+            rest = rest.get(4 + len..)?;
+            Some(b)
+        };
+        let op = match tag {
+            0 => {
+                let name = take_bytes()?;
+                let target = take_bytes()?;
+                let duration = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+                NameOp::Register { name, target, duration }
+            }
+            1 => {
+                let name = take_bytes()?;
+                let duration = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+                NameOp::Renew { name, duration }
+            }
+            2 => {
+                let name = take_bytes()?;
+                let target = take_bytes()?;
+                NameOp::Update { name, target }
+            }
+            3 => {
+                let name = take_bytes()?;
+                let new_owner = rest.get(..32)?.try_into().ok()?;
+                NameOp::Transfer { name, new_owner }
+            }
+            _ => return None,
+        };
+        Some(op)
+    }
+}
+
+impl NameTx {
+    /// Canonical bytes: the operation, then the fixed-width payment (so decoding splits it off the end).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.op.to_bytes();
+        out.extend_from_slice(&self.payment.to_bytes());
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let split = bytes.len().checked_sub(SIGNED_TRANSFER_LEN)?;
+        let op = NameOp::from_bytes(bytes.get(..split)?)?;
+        let payment = SignedTransfer::from_bytes(bytes.get(split..)?)?;
+        Some(Self { op, payment })
     }
 }
 

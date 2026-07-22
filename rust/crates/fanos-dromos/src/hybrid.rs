@@ -1,51 +1,66 @@
-//! The **hybrid ledger** — the DROMOS state that carries *both* halves of the platform under one `state_root`
-//! (`spec/platform.md` §3.3): a **transparent** account tree (public smart-contract/staking/naming state, the
-//! TAXIS [`Accounts`] model) and the **shielded** OBOLOS pool (`fanos-obolos`). Public value and private value
-//! coexist on one chain, and the *same* execution checkpoint certifies both.
+//! The **hybrid ledger** — the DROMOS state that carries the whole platform under one `state_root`
+//! (`spec/platform.md` §3.3, §5): an **authenticated transparent** token ledger (public balances that move
+//! under a PQ signature — [`TokenLedger`]), the **shielded** OBOLOS pool (private value — `fanos-obolos`), and
+//! the **name registry** (currency-bought names — [`NameRegistry`]). Public value, private value, and names
+//! coexist on one chain, and the *same* execution checkpoint certifies all three.
 //!
-//! A DROMOS transaction is a tagged payload — a leading byte selects which half executes it:
+//! A DROMOS transaction is a tagged payload — a leading byte selects which subsystem executes it:
 //!
-//! - `0x00` **transparent** — the body is a TAXIS transfer (`Accounts::apply`);
-//! - `0x01` **shielded** — the body is an OBOLOS submission (`fanos_obolos::decode_submission`).
+//! - `0x00` **transparent** — a [`SignedTransfer`] on the token ledger;
+//! - `0x01` **shielded** — an OBOLOS submission (`fanos_obolos::decode_submission`);
+//! - `0x02` **name** — a [`NameTx`] (register/renew/update/transfer, paid on the token ledger).
 //!
-//! The hybrid `state_root` is `H(accounts_root ‖ shielded_root)`, so one binding commitment covers the entire
-//! ledger — transparent balances and shielded notes alike — and any divergence in either half is caught by the
-//! same checkpoint (the ХОЛАРХ **LU — Consistency** invariant, over public and private state at once).
+//! The registry's expiry rules read the block height, which the engine feeds via [`begin_block`](StateMachine::begin_block).
+//! The hybrid `state_root` is `H(tokens ‖ shielded ‖ names)` — one binding commitment over the entire ledger.
 
 use std::sync::Arc;
 
 use fanos_obolos::{Params, ShieldedState, decode_submission};
 use fanos_primitives::hash_labeled;
-use fanos_taxis::state::{Accounts, ExecOutcome, StateMachine};
+use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
 
-/// Transaction-type tag: a transparent TAXIS transfer.
+use crate::naming::{NameRegistry, NameTx};
+use crate::token::{SignedTransfer, TokenLedger};
+
+/// Transaction-type tag: an authenticated transparent transfer.
 pub const TAG_TRANSPARENT: u8 = 0x00;
 /// Transaction-type tag: a shielded OBOLOS submission.
 pub const TAG_SHIELDED: u8 = 0x01;
+/// Transaction-type tag: a name-registry operation.
+pub const TAG_NAME: u8 = 0x02;
 
 /// Domain-separation label for the hybrid state root.
 const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
 
-/// The DROMOS hybrid ledger: a transparent account tree and a shielded note pool under one `state_root`.
+/// The DROMOS hybrid ledger: an authenticated token ledger, a shielded pool, and a name registry under one
+/// `state_root`, with a block-height clock for the registry's expiries.
 #[derive(Clone, Debug)]
 pub struct HybridLedger {
-    accounts: Accounts,
+    tokens: TokenLedger,
     shielded: ShieldedState,
+    names: NameRegistry,
     params: Arc<Params>,
+    height: u64,
 }
 
 impl HybridLedger {
-    /// A hybrid ledger over a funded genesis account set and an empty shielded pool (canonical parameters).
+    /// A hybrid ledger over a funded genesis token ledger, an empty shielded pool, and an empty name registry.
     #[must_use]
-    pub fn new(genesis_accounts: Accounts) -> Self {
-        Self { accounts: genesis_accounts, shielded: ShieldedState::new(), params: Arc::new(Params::standard()) }
+    pub fn new(genesis_tokens: TokenLedger) -> Self {
+        Self {
+            tokens: genesis_tokens,
+            shielded: ShieldedState::new(),
+            names: NameRegistry::new(),
+            params: Arc::new(Params::standard()),
+            height: 0,
+        }
     }
 
-    /// The transparent account state (read-only).
+    /// The authenticated transparent token ledger (read-only).
     #[must_use]
-    pub fn accounts(&self) -> &Accounts {
-        &self.accounts
+    pub fn tokens(&self) -> &TokenLedger {
+        &self.tokens
     }
 
     /// The shielded pool state (read-only).
@@ -54,77 +69,113 @@ impl HybridLedger {
         &self.shielded
     }
 
+    /// The name registry (read-only).
+    #[must_use]
+    pub fn names(&self) -> &NameRegistry {
+        &self.names
+    }
+
     /// The commitment parameters the shielded half verifies against.
     #[must_use]
     pub fn params(&self) -> &Params {
         &self.params
     }
 
-    /// Issuance into the shielded pool (genesis allocation or block reward); returns the note position.
+    /// The current block height (the registry's clock), as fed by [`begin_block`](StateMachine::begin_block).
+    #[must_use]
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+
+    /// Issuance into the shielded pool; returns the note position.
     pub fn mint_shielded(&mut self, note_commitment: [u8; 32]) -> Option<u64> {
         self.shielded.mint(note_commitment)
     }
 
-    /// Wrap a transparent transfer's wire bytes as a DROMOS transaction payload.
+    /// Wrap a signed transparent transfer as a DROMOS transaction payload.
     #[must_use]
-    pub fn transparent_payload(transfer_wire: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + transfer_wire.len());
-        out.push(TAG_TRANSPARENT);
-        out.extend_from_slice(transfer_wire);
-        out
+    pub fn transparent_payload(transfer: &SignedTransfer) -> Vec<u8> {
+        Self::tagged(TAG_TRANSPARENT, &transfer.to_bytes())
     }
 
     /// Wrap an OBOLOS submission (`fanos_obolos::encode_submission`) as a DROMOS transaction payload.
     #[must_use]
     pub fn shielded_payload(submission: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + submission.len());
-        out.push(TAG_SHIELDED);
-        out.extend_from_slice(submission);
+        Self::tagged(TAG_SHIELDED, submission)
+    }
+
+    /// Wrap a name operation as a DROMOS transaction payload.
+    #[must_use]
+    pub fn name_payload(name_tx: &NameTx) -> Vec<u8> {
+        Self::tagged(TAG_NAME, &name_tx.to_bytes())
+    }
+
+    fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + body.len());
+        out.push(tag);
+        out.extend_from_slice(body);
         out
     }
 }
 
 impl StateMachine for HybridLedger {
-    /// Execute one committed transaction by dispatching on its type tag to the transparent or shielded half.
-    /// An unknown tag or an empty payload is [`ExecOutcome::Malformed`].
+    /// Set the registry's clock to the block being executed.
+    fn begin_block(&mut self, height: u64) {
+        self.height = height;
+    }
+
+    /// Execute one committed transaction by dispatching on its type tag. An unknown tag or empty payload is
+    /// [`ExecOutcome::Malformed`]; a well-formed-but-invalid transaction (bad signature, double-spend, taken
+    /// name, insufficient funds) is [`ExecOutcome::Rejected`]; success is [`ExecOutcome::Applied`].
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome {
         match tx.payload.split_first() {
-            Some((&TAG_TRANSPARENT, body)) => self.accounts.apply(&Transaction::new(body.to_vec())),
+            Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
+                Some(st) => outcome(self.tokens.apply(&st).is_ok()),
+                None => ExecOutcome::Malformed,
+            },
             Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
-                Some((shielded_tx, proof)) => match self.shielded.apply(&self.params, &shielded_tx, &proof) {
-                    Ok(()) => ExecOutcome::Applied,
-                    Err(_) => ExecOutcome::Rejected,
-                },
+                Some((shielded_tx, proof)) => outcome(self.shielded.apply(&self.params, &shielded_tx, &proof).is_ok()),
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
+                Some(name_tx) => outcome(self.names.apply(&name_tx, &mut self.tokens, self.height).is_ok()),
                 None => ExecOutcome::Malformed,
             },
             _ => ExecOutcome::Malformed,
         }
     }
 
-    /// `H(accounts_root ‖ shielded_root)` — one binding commitment over the whole ledger, transparent and
-    /// shielded, for the block's executed-state checkpoint.
+    /// `H(tokens_root ‖ shielded_root ‖ names_root)` — one commitment over transparent balances, shielded
+    /// notes, and names, for the block's executed-state checkpoint.
     fn state_root(&self) -> [u8; 32] {
-        let mut buf = [0u8; 64];
-        buf[..32].copy_from_slice(&self.accounts.state_root());
-        buf[32..].copy_from_slice(&self.shielded.root());
+        let mut buf = [0u8; 96];
+        buf[..32].copy_from_slice(&self.tokens.state_root());
+        buf[32..64].copy_from_slice(&self.shielded.root());
+        buf[64..].copy_from_slice(&self.names.state_root());
         hash_labeled(HYBRID_ROOT_LABEL, &buf)
     }
+}
+
+/// Map an apply result to the coarse execution outcome (`Applied` on success, `Rejected` on a valid-but-refused
+/// transaction — recorded as included-but-rejected, never a consensus failure).
+fn outcome(ok: bool) -> ExecOutcome {
+    if ok { ExecOutcome::Applied } else { ExecOutcome::Rejected }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::naming::{NameOp, TREASURY, price};
+    use crate::token::{Transfer, account_id};
     use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, derive_owner_pk, encode_submission};
-    use fanos_taxis::Transfer;
+    use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 
-    const ALICE: [u8; 32] = [0xA1; 32];
-    const BOB: [u8; 32] = [0xB0; 32];
-
-    fn genesis() -> Accounts {
-        let mut a = Accounts::new();
-        a.credit(ALICE, 1000);
-        a
+    fn account(tag: u8) -> (HybridSigSecret, HybridVerifier, [u8; 32]) {
+        let mut rng = SeedRng::from_seed(&[0xC0, tag]);
+        let (signer, verifier) = HybridSigSecret::generate(&mut rng);
+        let id = account_id(&verifier);
+        (signer, verifier, id)
     }
 
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
@@ -132,53 +183,86 @@ mod tests {
     }
 
     #[test]
-    fn transparent_and_shielded_transactions_execute_on_one_ledger() {
-        let mut ledger = HybridLedger::new(genesis());
+    fn transparent_shielded_and_name_transactions_execute_on_one_ledger() {
+        let (alice_sk, alice_vk, alice) = account(1);
+        let (_bob_sk, _bob_vk, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
         let root0 = ledger.state_root();
 
-        // A transparent transfer Alice → Bob 100.
-        let transfer = Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 };
-        let tx_t = Transaction::new(HybridLedger::transparent_payload(&transfer.into_tx().payload));
-        assert_eq!(ledger.apply(&tx_t), ExecOutcome::Applied, "the transparent transfer executes");
-        assert_eq!(ledger.accounts().balance(&BOB), 100, "Bob's public balance updated");
+        // (1) A signed transparent transfer Alice → Bob 100.
+        let st = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 100, nonce: 0 }, &alice_sk, alice_vk.clone());
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::transparent_payload(&st))), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 100);
         let root1 = ledger.state_root();
-        assert_ne!(root1, root0, "the hybrid root reflects the transparent change");
+        assert_ne!(root1, root0);
 
-        // A shielded transfer of a freshly-minted note.
-        let nsk = [1u8; 32];
+        // (2) A shielded transfer of a minted note.
+        let nsk = [9u8; 32];
         let n0 = note(500, &nsk, b"n0");
         let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
         let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
-        let (stx, proof) =
-            build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 0);
-        let tx_s = Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)));
-        assert_eq!(ledger.apply(&tx_s), ExecOutcome::Applied, "the shielded transfer executes on the same ledger");
-        assert_ne!(ledger.state_root(), root1, "the hybrid root reflects the shielded change too");
-        // The transparent half is untouched by the shielded transaction.
-        assert_eq!(ledger.accounts().balance(&BOB), 100, "public balances are unaffected by shielded activity");
+        let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 0);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied);
+        let root2 = ledger.state_root();
+        assert_ne!(root2, root1);
+
+        // (3) A name registration paid from Alice's transparent funds.
+        let name = b"alice.fanos".to_vec();
+        let fee = price(&name, 10);
+        let name_tx = NameTx {
+            op: NameOp::Register { name: name.clone(), target: b"addr".to_vec(), duration: 10 },
+            payment: SignedTransfer::sign(Transfer { from: alice, to: TREASURY, amount: fee, nonce: 1 }, &alice_sk, alice_vk),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::name_payload(&name_tx))), ExecOutcome::Applied);
+        assert_eq!(ledger.names().resolve(&name, 0).unwrap().owner, alice, "the name is Alice's");
+        assert_ne!(ledger.state_root(), root2, "the name registration moved the hybrid root");
     }
 
     #[test]
-    fn the_hybrid_root_binds_both_halves() {
-        // Two ledgers that differ only in the shielded half have different hybrid roots (and vice versa) — the
-        // root commits to public AND private state.
-        let mut only_transparent = HybridLedger::new(genesis());
-        let mut also_shielded = HybridLedger::new(genesis());
-        assert_eq!(only_transparent.state_root(), also_shielded.state_root(), "identical genesis ⇒ identical root");
-        also_shielded.mint_shielded(note(1, &[1u8; 32], b"x").commitment(also_shielded.params())).unwrap();
-        assert_ne!(only_transparent.state_root(), also_shielded.state_root(), "a shielded-only change moves the hybrid root");
-        // Now diverge the transparent half of the first.
-        let transfer = Transfer { from: ALICE, to: BOB, amount: 1, nonce: 0 };
-        only_transparent.apply(&Transaction::new(HybridLedger::transparent_payload(&transfer.into_tx().payload)));
-        assert_ne!(only_transparent.state_root(), also_shielded.state_root(), "divergent halves ⇒ divergent roots");
+    fn the_block_clock_governs_name_expiry() {
+        let (sk, vk, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // At height 0, register for duration 10 → expiry 10.
+        ledger.begin_block(0);
+        let name = b"clock.fanos".to_vec();
+        let fee = price(&name, 10);
+        let tx = NameTx {
+            op: NameOp::Register { name: name.clone(), target: vec![1], duration: 10 },
+            payment: SignedTransfer::sign(Transfer { from: alice, to: TREASURY, amount: fee, nonce: 0 }, &sk, vk),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::name_payload(&tx))), ExecOutcome::Applied);
+        assert!(ledger.names().resolve(&name, ledger.height()).is_some(), "resolves at height 0");
+
+        // Advance the clock past expiry: the engine's begin_block sets it, and the name no longer resolves.
+        ledger.begin_block(11);
+        assert_eq!(ledger.height(), 11);
+        assert!(ledger.names().resolve(&name, ledger.height()).is_none(), "the name has expired by height 11");
+    }
+
+    #[test]
+    fn an_unsigned_transparent_transfer_is_rejected_not_applied() {
+        let (_alice_sk, _alice_vk, alice) = account(1);
+        let (mallory_sk, mallory_vk, _m) = account(9);
+        let (_b, _bv, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        // Mallory signs a transfer of Alice's funds with her own key → not authorised.
+        let forged = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 100, nonce: 0 }, &mallory_sk, mallory_vk);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::transparent_payload(&forged))), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&alice), 1000, "Alice's funds are untouched");
     }
 
     #[test]
     fn an_unknown_tag_or_empty_payload_is_malformed() {
-        let mut ledger = HybridLedger::new(genesis());
-        assert_eq!(ledger.apply(&Transaction::new(Vec::new())), ExecOutcome::Malformed, "empty payload");
-        assert_eq!(ledger.apply(&Transaction::new(vec![0x7F, 1, 2, 3])), ExecOutcome::Malformed, "unknown tag");
-        // A shielded tag with garbage body is malformed (not a valid submission).
-        assert_eq!(ledger.apply(&Transaction::new(vec![TAG_SHIELDED, 0xFF])), ExecOutcome::Malformed);
+        let mut ledger = HybridLedger::new(TokenLedger::new());
+        assert_eq!(ledger.apply(&Transaction::new(Vec::new())), ExecOutcome::Malformed);
+        assert_eq!(ledger.apply(&Transaction::new(vec![0x7F, 1, 2, 3])), ExecOutcome::Malformed);
+        assert_eq!(ledger.apply(&Transaction::new(vec![TAG_NAME, 0xFF])), ExecOutcome::Malformed);
     }
 }

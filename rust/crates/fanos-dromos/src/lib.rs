@@ -19,7 +19,7 @@ pub mod hybrid;
 pub mod naming;
 pub mod token;
 
-pub use hybrid::{HybridLedger, TAG_SHIELDED, TAG_TRANSPARENT};
+pub use hybrid::{HybridLedger, TAG_NAME, TAG_SHIELDED, TAG_TRANSPARENT};
 pub use naming::{NameError, NameOp, NameRecord, NameRegistry, NameTx, TREASURY, price};
 pub use token::{SignedTransfer, TokenError, TokenLedger, Transfer, account_id};
 
