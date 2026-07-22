@@ -35,10 +35,20 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
 - [x] **WASM/mobile client surface** — new `fanos-wasm` crate (35th): compute + verify a node's self-organizing
       coordinate in the browser; native-tested + builds to wasm32-unknown-unknown warning-free.
 
-**Deepening pass COMPLETE (2026-07-22).** All items above ✅. Residual (documented, not blocking): the thin
-`fanos-node` driver that runs the RoleController live each beacon round (capability-descriptor advertisement +
-per-role load metering in `fanos-telemetry`), and a live multi-cell orchestration driver for cross-cell relay /
-parent attestation. Full workspace test green; clippy `--all-targets -D warnings` clean across all 35 crates.
+**Deepening pass COMPLETE (2026-07-22).** All items above ✅, plus proven end-to-end in the simulator:
+- [x] **Self-organization end-to-end sim** (`fanos-core/tests/self_organization.rs`) — a 13-node cell where
+      every node runs its own controller in LOCKSTEP (deterministic role consensus, no coordination),
+      homeostatic convergence, rotation, capability-honesty, and deficit→parent escalation.
+- [x] **Multi-cell L0 end-to-end sim** (`fanos-taxis/tests/multicell.rs`) — a burn-and-mint cross-cell transfer
+      through REAL consensus: cell A certifies + emits, cell B verifies the receipt (no bridge trust) + mints,
+      a parent anchors both finalities.
+- [x] **Signed capability descriptor** (`roles::CapabilityDescriptor`) — the authenticated self-org loop input
+      (VRF-signed), so a node cannot forge another's capabilities.
+
+Residual (documented, not blocking): the thin `fanos-node` transport driver that runs the RoleController live
+over the real overlay each beacon round (advertise `CapabilityDescriptor` via the overlay store + per-role load
+metering in `fanos-telemetry`), and `wasm-pack` + a browser demo over `fanos-wasm`. Full workspace test green;
+clippy `--all-targets -D warnings` clean across all 35 crates.
 
 ### A · Optional application layers — ✅ DONE (2026-07-22)
 - **Part X.1 — the blockchain application on FANOS** — ✅ **DONE**: new crate **`fanos-taxis`** (`854feef`),
