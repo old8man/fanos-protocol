@@ -47,6 +47,77 @@ pub fn price(name: &[u8], duration: u64) -> u64 {
     base.saturating_mul(tier).saturating_mul(duration.max(1))
 }
 
+/// The kind of endpoint a name resolves to (`spec/platform.md` §5) — one human-memorable name, several private
+/// endpoints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DescriptorKind {
+    /// An OBOLOS payment address (`data` is a serialized receiving address).
+    Payment,
+    /// A CALYPSO anonymous hidden service (`data` is a service address).
+    Service,
+    /// An ANGELOS messaging identity (`data` is a messaging id).
+    Messenger,
+    /// An opaque / application-defined target.
+    Raw,
+}
+
+impl DescriptorKind {
+    #[must_use]
+    fn tag(self) -> u8 {
+        match self {
+            DescriptorKind::Payment => 0,
+            DescriptorKind::Service => 1,
+            DescriptorKind::Messenger => 2,
+            DescriptorKind::Raw => 3,
+        }
+    }
+
+    #[must_use]
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(DescriptorKind::Payment),
+            1 => Some(DescriptorKind::Service),
+            2 => Some(DescriptorKind::Messenger),
+            3 => Some(DescriptorKind::Raw),
+            _ => None,
+        }
+    }
+}
+
+/// A **typed pointer** a name resolves to: a kind and its payload. A [`NameRecord`]'s `target` is a
+/// `Descriptor`'s bytes, so resolving `alice.fanos` yields, say, her OBOLOS payment address or her ANGELOS id.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Descriptor {
+    /// What kind of endpoint this points at.
+    pub kind: DescriptorKind,
+    /// The endpoint payload (interpreted per `kind`).
+    pub data: Vec<u8>,
+}
+
+impl Descriptor {
+    /// A descriptor from its parts.
+    #[must_use]
+    pub fn new(kind: DescriptorKind, data: Vec<u8>) -> Self {
+        Self { kind, data }
+    }
+
+    /// Canonical bytes: `kind(1) ‖ data` — exactly what a name registration stores as its `target`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.data.len());
+        out.push(self.kind.tag());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    /// Decode a descriptor from a name's `target` bytes, or `None` if the kind tag is unknown.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (&tag, data) = bytes.split_first()?;
+        Some(Self { kind: DescriptorKind::from_tag(tag)?, data: data.to_vec() })
+    }
+}
+
 /// A registered name's on-chain record.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NameRecord {
@@ -152,6 +223,13 @@ impl NameRegistry {
     #[must_use]
     pub fn resolve(&self, name: &[u8], now: u64) -> Option<&NameRecord> {
         self.records.get(name).filter(|r| now <= r.expiry)
+    }
+
+    /// Resolve `name` to its typed [`Descriptor`] as of `now` — the endpoint (payment address, service,
+    /// messaging id) it points at. `None` if unregistered, expired, or the target is not a valid descriptor.
+    #[must_use]
+    pub fn resolve_descriptor(&self, name: &[u8], now: u64) -> Option<Descriptor> {
+        self.resolve(name, now).and_then(|r| Descriptor::from_bytes(&r.target))
     }
 
     /// The number of names on record (including expired-but-not-reclaimed ones).
@@ -395,6 +473,28 @@ mod tests {
         assert_eq!(rec.expiry, 10);
         assert_eq!(tokens.balance(&TREASURY), fee, "the fee flowed to the treasury");
         assert_eq!(tokens.balance(&alice), 100_000 - fee);
+    }
+
+    #[test]
+    fn a_name_resolves_to_its_typed_endpoint() {
+        let (sk, vk, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        fund(&mut tokens, alice, 100_000);
+        let mut reg = NameRegistry::new();
+        // Register alice.fanos pointing at an OBOLOS payment endpoint.
+        let name = b"alice.fanos".to_vec();
+        let descriptor = Descriptor::new(DescriptorKind::Payment, b"her-payment-address".to_vec());
+        let fee = price(&name, 10);
+        let tx = NameTx {
+            op: NameOp::Register { name: name.clone(), target: descriptor.to_bytes(), duration: 10 },
+            payment: pay(&sk, &vk, alice, fee, 0),
+        };
+        assert_eq!(reg.apply(&tx, &mut tokens, 0), Ok(()));
+        let resolved = reg.resolve_descriptor(&name, 5).expect("resolves to a descriptor");
+        assert_eq!(resolved, descriptor, "the name resolves to exactly the registered endpoint");
+        assert_eq!(resolved.kind, DescriptorKind::Payment);
+        // An unregistered name resolves to nothing.
+        assert!(reg.resolve_descriptor(b"nobody.fanos", 5).is_none());
     }
 
     #[test]

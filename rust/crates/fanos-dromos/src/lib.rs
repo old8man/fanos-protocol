@@ -22,7 +22,9 @@ pub mod token;
 
 pub use bridge::{POOL_SINK, ShieldTx};
 pub use hybrid::{HybridLedger, TAG_NAME, TAG_SHIELD, TAG_SHIELDED, TAG_TRANSPARENT};
-pub use naming::{NameError, NameOp, NameRecord, NameRegistry, NameTx, TREASURY, price};
+pub use naming::{
+    Descriptor, DescriptorKind, NameError, NameOp, NameRecord, NameRegistry, NameTx, TREASURY, price,
+};
 pub use token::{SignedTransfer, TokenError, TokenLedger, Transfer, account_id};
 
 use std::sync::Arc;
