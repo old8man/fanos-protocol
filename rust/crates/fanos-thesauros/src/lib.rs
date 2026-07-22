@@ -21,8 +21,10 @@ extern crate alloc;
 
 pub mod content;
 pub mod market;
+pub mod object;
 pub mod por;
 
 pub use content::{Cid, ChunkRef, Manifest, MerkleProof, MerkleStep, chunk_cid, verify_leaf};
 pub use market::{DEAL_PARAMS_LEN, Deal, DealParams, DealState, Settlement};
+pub use object::{SealedObject, open_object, seal_object};
 pub use por::{LeafProof, challenge, decode_response, encode_response, prove, verify};

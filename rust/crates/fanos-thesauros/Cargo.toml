@@ -11,9 +11,9 @@ keywords = ["storage", "content-addressed", "merkle", "post-quantum", "fanos"]
 categories = ["cryptography", "no-std"]
 
 [dependencies]
-# BLAKE3 domain-separated hashing for the Merkle content tree (the CID) and, later, the PoR challenge.
-# `alloc` is always on (the content model builds Vec-backed Merkle trees); `std` layers on top by default.
-fanos-primitives = { workspace = true, default-features = false, features = ["alloc"] }
+# BLAKE3 domain-separated hashing for the Merkle content tree (the CID) + the PoR challenge, and the shared
+# ChaCha20-Poly1305 AEAD for edge encryption (the `object` module). `aead` pulls `alloc`; `std` layers on by default.
+fanos-primitives = { workspace = true, default-features = false, features = ["aead"] }
 
 [features]
 default = ["std"]
