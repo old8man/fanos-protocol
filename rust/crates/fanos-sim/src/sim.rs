@@ -48,6 +48,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
 fn note_desc(note: &Notification) -> String {
     match note {
         Notification::Delivered { from, .. } => format!("Delivered from {}", fmt_coord(*from)),
+        Notification::App { from, .. } => format!("App from {}", fmt_coord(*from)),
         Notification::RendezvousLine(l) => format!("RendezvousLine {}", fmt_coord(*l)),
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
         Notification::Verdict(v) => format!("Verdict {v:?}"),

@@ -190,6 +190,16 @@ pub enum Notification {
         /// The payload.
         payload: Vec<u8>,
     },
+    /// An **App-overlay** frame (`FrameType::App`, `0x7*`, spec §7.2) arrived from `from` — the receive path
+    /// for an application protocol layered on the overlay (e.g. the TAXIS consensus engine driven as a side-car
+    /// task). Distinct from [`Delivered`](Self::Delivered), which is a `Route` payload: an `App` body is the raw
+    /// application frame (`fanos_taxis::wire`), dispatched to the app engine rather than surfaced as user data.
+    App {
+        /// Source coordinate (the sending validator's overlay coordinate).
+        from: Triple,
+        /// The raw application-frame body.
+        body: Vec<u8>,
+    },
     /// The rendezvous line computed for a send (for observation, spec §L1).
     RendezvousLine(Triple),
     /// A peer was observed to go down (heartbeat timeout).

@@ -1367,6 +1367,22 @@ impl<F: Field> OverlayNode<F> {
                     payload: frame.body.to_vec(),
                 })]
             }
+            Some(FrameType::App) => {
+                // An App-overlay frame (0x70, spec §7.2): the receive seam for an application protocol driven
+                // as a side-car on the overlay — today the TAXIS consensus engine (`fanos_taxis::wire`). Like a
+                // Route delivery it is direct evidence of the sender's liveness and counts as behavioural load;
+                // the raw body is surfaced as `Notification::App` for the app engine to decode and step. A frame
+                // for an app this node does not run is inert — the driver simply has no consumer for it.
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.last_seen = Some(now);
+                    peer.reported_down = false;
+                }
+                self.healer.record_relay(from);
+                alloc::vec![Effect::Notify(Notification::App {
+                    from,
+                    body: frame.body.to_vec(),
+                })]
+            }
             Some(FrameType::RouteHier) => self.on_route_hier(from, frame.body),
             Some(FrameType::DiagGossip) => {
                 // Receiving the gossip is itself a direct observation of the sender; its body
@@ -2808,6 +2824,28 @@ mod tests {
                 |e| matches!(e, Effect::Send { to, .. } if *to == Point::<F2>::at(2).coords())
             ),
             "emits a RouteHier toward point 2",
+        );
+    }
+
+    #[test]
+    fn an_app_overlay_frame_surfaces_as_an_app_notification() {
+        // The App-overlay (0x70) receive seam: an application frame (e.g. a TAXIS `ConsensusMsg`) delivered to
+        // a node is surfaced verbatim as `Notification::App` for the app engine to decode — not dropped by the
+        // catch-all, and distinct from a Route `Delivered`.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let from = Point::<F2>::at(1).coords();
+        let frame = encode(FrameType::App, b"consensus-msg-bytes");
+        let effects = node.step(Instant::default(), Input::Message { from, frame });
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                Effect::Notify(Notification::App { body, from: src })
+                    if body == b"consensus-msg-bytes" && *src == from)),
+            "an App frame is surfaced as Notification::App with its raw body and sender",
+        );
+        // It is NOT surfaced as a Route delivery (the two paths stay distinct).
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Delivered { .. }))),
+            "an App frame is not a Route delivery",
         );
     }
 
