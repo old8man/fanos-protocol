@@ -14,7 +14,34 @@
 
 ---
 
-## ⬜ What's left
+## 🏛 PLATFORM TRANSFORMATION — IN PROGRESS (2026-07-22, user directive)
+
+**FANOS is now a holonic PLATFORM, not just a protocol** — a maximal-anonymity mixnet (E-machine) composed
+with a high-speed private post-quantum L1 blockchain (L-machine) into one meta-holon, grounded in ХОЛАРХ.
+Design authority: **`spec/platform.md`** (the E∧L synthesis, the 4 viability invariants as release gates, the
+subsystem specs). `protocol.md` reframed; all docs made consistent (FANOS=platform).
+
+Roadmap (`spec/platform.md` §8), sequential + verified:
+- [x] **T1 · TAXIS live (L8)** — consensus over real QUIC, App-overlay receive seam, live checkpoint publishing
+      (this session). Residual: two-cell parent-attests-child loop; `Node::start` config.
+- [~] **T2 · OBOLOS (L10) — the untraceable PQ currency (crown jewel)** — crate `fanos-obolos` (crate 36):
+      - [x] Untraceability accounting — commitment tree (whole-pool membership) + nullifiers (`fb0…`/tree+nf).
+      - [x] Confidentiality — BDLOP-style homomorphic lattice value commitment (balance without revealing amounts).
+      - [x] Shielded tx + verified state machine — `ShieldedProof` interface ([P] ZK seam) + `TransparentProof`
+            reference; `ShieldedState::apply` gates (anchor/double-spend/proof); mint issuance.
+      - [x] Wallet `build_transfer` + **SecOps scenario suite** (conservation, tampering sweep, wraparound
+            inflation, cross-tx double-spend, consolidation, whole-pool anonymity set).
+      - [ ] Residual: the PQ **zero-knowledge** proof backend (the one frontier [P]/[H]); ML-KEM stealth
+            addresses + note ciphertexts; calibrate the lattice params + audit.
+- [ ] **T3 · DROMOS (L9)** — the hybrid state machine (transparent accounts + OBOLOS pool under one state_root)
+      as a TAXIS `StateMachine`; then the parallel post-reveal scheduler (proven-deterministic serialization).
+- [ ] **T4 · ONOMA-domains + ANGELOS (L11)** — currency-bought private naming; the anonymous PQ messenger.
+- [ ] **T5 · HERMES (L12)** — PQ threshold cross-chain (atomic-swap mode first, custody second).
+- [ ] **ХОЛАРХ gate** — a Γ-calculator that CI-checks the platform's P/R/Φ/D viability verdict.
+
+---
+
+## ⬜ What's left (anonymity substrate)
 
 ### 0 · Fundamental deepening pass — IN PROGRESS (2026-07-22, grounded in UHM/holon theory)
 Post independent-crypto-audit + honest-landscape-comparison. Implementing the best fundamental solution at
