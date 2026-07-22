@@ -980,6 +980,7 @@ version = "0.1.0"
 dependencies = [
  "fanos-aphantos",
  "fanos-calypso",
+ "fanos-core",
  "fanos-diaulos",
  "fanos-field",
  "fanos-geometry",

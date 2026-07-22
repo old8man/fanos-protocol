@@ -17,6 +17,8 @@ path = "src/bin/fanos.rs"
 [dependencies]
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
+# The self-organizing role assignment (capability descriptors + the RoleController) the live role loop drives.
+fanos-core = { workspace = true, features = ["std"] }
 fanos-runtime = { workspace = true, features = ["std"] }
 fanos-quic.workspace = true
 # For `.fanos` name resolution: ONOMA addresses/derivations + CALYPSO descriptors.
