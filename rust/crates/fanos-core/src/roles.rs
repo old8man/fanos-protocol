@@ -327,6 +327,93 @@ impl Demand {
     }
 }
 
+impl Demand {
+    /// Add `units` of load to one role (saturating).
+    fn add_role(&mut self, role: Role, units: u16) {
+        let slot = match role {
+            Role::Relay => &mut self.relay,
+            Role::Storage => &mut self.storage,
+            Role::Service => &mut self.service,
+            Role::Exit => &mut self.exit,
+        };
+        *slot = slot.saturating_add(units);
+    }
+
+    /// Per-role saturating sum with `other`.
+    #[must_use]
+    fn saturating_sum(self, other: Demand) -> Demand {
+        Demand {
+            relay: self.relay.saturating_add(other.relay),
+            storage: self.storage.saturating_add(other.storage),
+            service: self.service.saturating_add(other.service),
+            exit: self.exit.saturating_add(other.exit),
+        }
+    }
+}
+
+/// The demand **setpoint** implied by an observed `load` against a per-node `capacity`: per role, the number
+/// of active nodes that would bring it to capacity, `⌈loadρ / capacityρ⌉` (capacity clamped to `≥ 1`). This is
+/// the target the [`RoleController`]'s Lyapunov rebalance tracks.
+#[must_use]
+pub fn setpoint_from(load: Demand, capacity: Demand) -> Demand {
+    let ceil_div = |l: u16, c: u16| -> u16 { l.div_ceil(c.max(1)) };
+    Demand {
+        relay: ceil_div(load.relay, capacity.relay),
+        storage: ceil_div(load.storage, capacity.storage),
+        service: ceil_div(load.service, capacity.service),
+        exit: ceil_div(load.exit, capacity.exit),
+    }
+}
+
+/// The **cell-agreed setpoint** from every node's observed load: sum the per-node loads (the same summed value
+/// on every node, since each reads the same advertised loads — the design's agreed-input requirement), then
+/// [`setpoint_from`] the total against the per-node `capacity`. This is what a driver feeds the controller so
+/// the whole cell tracks the *same* target and its assignment stays deterministic.
+#[must_use]
+pub fn cell_setpoint(node_loads: &[Demand], capacity: Demand) -> Demand {
+    let total = node_loads.iter().copied().fold(Demand::default(), Demand::saturating_sum);
+    setpoint_from(total, capacity)
+}
+
+/// A node's **per-role load meter**: it records how much each role was exercised over a window and reports the
+/// observed load (for cell-wide aggregation) and the local setpoint. Sans-I/O — a driver records events on it
+/// and reads its load each epoch; the cell agrees on the aggregate via [`cell_setpoint`].
+#[derive(Clone, Debug)]
+pub struct LoadMeter {
+    load: Demand,
+    capacity: Demand,
+}
+
+impl LoadMeter {
+    /// A meter with the given per-node `capacity` per role and zero observed load.
+    #[must_use]
+    pub fn new(capacity: Demand) -> Self {
+        Self { load: Demand::default(), capacity }
+    }
+
+    /// Record `units` of load exercised on `role` this window (saturating).
+    pub fn record(&mut self, role: Role, units: u16) {
+        self.load.add_role(role, units);
+    }
+
+    /// The load observed this window (the value a node advertises for cell-wide aggregation).
+    #[must_use]
+    pub fn observed_load(&self) -> Demand {
+        self.load
+    }
+
+    /// This node's *local* setpoint from its own observed load (before cell aggregation).
+    #[must_use]
+    pub fn local_setpoint(&self) -> Demand {
+        setpoint_from(self.load, self.capacity)
+    }
+
+    /// Clear the observed load for the next window.
+    pub fn reset(&mut self) {
+        self.load = Demand::default();
+    }
+}
+
 /// The UHM viability gain floor `κ_bootstrap = 1/7`, expressed in sevenths as `1` — the smallest loop gain the
 /// [`RoleController`] uses, under which the pull toward the demand setpoint never vanishes (T-59/T-104).
 pub const GAIN_BOOTSTRAP_SEVENTHS: u8 = 1;
@@ -690,5 +777,28 @@ mod tests {
         // The same descriptors, but `good` paired with the WRONG key, admits nothing valid for node 0.
         let none = verified_members([(&good, &pk1)], E);
         assert!(none.is_empty(), "a descriptor checked under the wrong key is not admitted");
+    }
+
+    #[test]
+    fn the_load_meter_derives_a_setpoint_and_the_cell_agrees_on_the_aggregate() {
+        let capacity = Demand { relay: 10, storage: 5, ..Default::default() };
+        let mut m = LoadMeter::new(capacity);
+        m.record(Role::Relay, 20);
+        m.record(Role::Relay, 5); // 25 relay-units observed
+        m.record(Role::Storage, 3);
+        assert_eq!(m.observed_load(), Demand { relay: 25, storage: 3, ..Default::default() });
+        // Local setpoint: ⌈25/10⌉ = 3 relays, ⌈3/5⌉ = 1 storage.
+        assert_eq!(m.local_setpoint(), Demand { relay: 3, storage: 1, ..Default::default() });
+        // The whole cell agrees on the aggregate: sum every node's observed load, then ⌈total / capacity⌉.
+        let loads = [
+            Demand { relay: 25, storage: 3, ..Default::default() },
+            Demand { relay: 40, ..Default::default() },
+            Demand { relay: 15, storage: 7, ..Default::default() },
+        ];
+        // relay total 80 → ⌈80/10⌉ = 8; storage total 10 → ⌈10/5⌉ = 2.
+        assert_eq!(cell_setpoint(&loads, capacity), Demand { relay: 8, storage: 2, ..Default::default() });
+        // reset clears the window for the next epoch.
+        m.reset();
+        assert_eq!(m.observed_load(), Demand::default());
     }
 }
