@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::commit::Randomness;
     use crate::note::{Note, derive_owner_pk};
-    use crate::tx::{InputOpening, OutputNote, OutputOpening, ShieldedTx, TransparentProof};
+    use crate::tx::{ShieldedTx, TransparentProof};
 
     /// A note of `value` owned by `nsk`, with deterministic randomness from `tag`.
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
@@ -179,26 +179,14 @@ mod tests {
         out_b: &Note,
         fee: u64,
     ) -> (ShieldedTx, TransparentProof) {
-        let tx = ShieldedTx {
+        // Delegate to the builder so the input value commitment is re-randomised the same way (audit O-C2).
+        crate::build::build_transfer(
+            params,
             anchor,
-            nullifiers: alloc::vec![input.nullifier(nsk, params)],
-            input_values: alloc::vec![input.value_commitment(params)],
-            outputs: alloc::vec![
-                OutputNote { note_commitment: out_a.commitment(params), value_commitment: out_a.value_commitment(params), cipher: None },
-                OutputNote { note_commitment: out_b.commitment(params), value_commitment: out_b.value_commitment(params), cipher: None },
-            ],
+            &[crate::build::SpendInput { note: input.clone(), nsk: *nsk, path }],
+            &[out_a.clone(), out_b.clone()],
             fee,
-            public_value: 0,
-            public_recipient: [0u8; 32],
-        };
-        let proof = TransparentProof {
-            inputs: alloc::vec![InputOpening { note: input.clone(), path, nsk: *nsk }],
-            outputs: alloc::vec![
-                OutputOpening { value: out_a.value, value_r: out_a.value_r.clone() },
-                OutputOpening { value: out_b.value, value_r: out_b.value_r.clone() },
-            ],
-        };
-        (tx, proof)
+        )
     }
 
     #[test]

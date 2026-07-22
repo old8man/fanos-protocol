@@ -252,3 +252,59 @@ fn a_recipient_finds_a_delivered_payment_and_an_observer_cannot() {
     };
     assert!(scan(&eve_secret, bob_addr.owner, &p, &outputs).is_empty(), "an observer cannot detect Bob's payment");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Scenario — audit O-C1: modular-wraparound inflation must be impossible.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+#[test]
+fn an_out_of_range_input_is_rejected() {
+    // O-C1: inputs — not only outputs — must be range-checked, or a value >= MAX_VALUE contributes a wrapping
+    // term to the homomorphic balance sum. Here the input is exactly MAX_VALUE (out of range) while the two
+    // outputs (MAX_VALUE/2 each) are in range and balance it — so only the INPUT range guard can catch it.
+    let p = Params::standard();
+    let alice = [1u8; 32];
+    let mut s = ShieldedState::new();
+    let huge = note(MAX_VALUE, &alice, b"huge");
+    let spend = mint_spendable(&mut s, &p, &huge, &alice);
+    let half = 1u64 << 50;
+    let (tx, pf) = build_transfer(&p, s.anchor(), &[spend], &[note(half, &alice, b"oa"), note(half, &alice, b"ob")], 0);
+    assert!(s.apply(&p, &tx, &pf).is_err(), "an out-of-range input is rejected (O-C1)");
+}
+
+#[test]
+fn a_transaction_exceeding_the_note_cap_is_rejected() {
+    // O-C1: the number of value terms is capped so the balance sums cannot wrap modulo q. Padding a valid tx's
+    // outputs past MAX_NOTES_PER_TX is refused before any sum could reach q.
+    use fanos_obolos::commit::MAX_NOTES_PER_TX;
+    let p = Params::standard();
+    let alice = [1u8; 32];
+    let mut s = ShieldedState::new();
+    let a0 = note(1000, &alice, b"genesis");
+    let spend = mint_spendable(&mut s, &p, &a0, &alice);
+    let (mut tx, mut pf) = build_transfer(&p, s.anchor(), &[spend], &[note(950, &alice, b"change")], 50);
+    let (filler_out, filler_open) = (tx.outputs[0].clone(), pf.outputs[0].clone());
+    while tx.nullifiers.len() + tx.outputs.len() <= MAX_NOTES_PER_TX {
+        tx.outputs.push(filler_out.clone());
+        pf.outputs.push(filler_open.clone());
+    }
+    assert!(s.apply(&p, &tx, &pf).is_err(), "a tx exceeding the note cap is rejected (O-C1)");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Scenario — audit O-C2: a spend must not republish the note's creation value commitment (untraceability).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+#[test]
+fn a_spend_does_not_republish_the_notes_creation_commitment() {
+    let p = Params::standard();
+    let alice = [1u8; 32];
+    let mut s = ShieldedState::new();
+    let a0 = note(1000, &alice, b"genesis");
+    let creation_vc = a0.value_commitment(&p); // public when the note was created as an output
+    let spend = mint_spendable(&mut s, &p, &a0, &alice);
+    let (tx, pf) = build_transfer(&p, s.anchor(), &[spend], &[note(950, &alice, b"change")], 50);
+    // The public input value commitment is a fresh re-randomisation — it cannot be matched to the creation
+    // commitment, so an observer cannot identify which note was spent (O-C2).
+    assert_ne!(tx.input_values[0], creation_vc, "the spend re-randomises the value commitment (O-C2)");
+    // ...and the transaction is still valid: the re-randomised commitment binds to the note's amount.
+    assert_eq!(s.apply(&p, &tx, &pf), Ok(()), "the re-randomised spend still verifies");
+}

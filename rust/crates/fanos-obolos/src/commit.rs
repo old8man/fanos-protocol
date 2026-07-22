@@ -48,6 +48,14 @@ pub const L: usize = 256;
 /// transaction's balance check forms. A range proof (the frontier ZK component) enforces `v < MAX_VALUE`.
 pub const MAX_VALUE: u64 = 1 << 51;
 
+/// The maximum number of value-bearing notes (inputs + outputs) in one transaction. It is **derived, not
+/// chosen**: the balance law holds mod `q`, so it is only sound if every homomorphic sum stays below `q` over
+/// the integers (otherwise a set of in-range amounts summing to `q + v ≡ v (mod q)` forges value — audit O-C1).
+/// Each of the `inputs + outputs` value terms, plus the `fee` and `public_value` clear terms, is `< MAX_VALUE`,
+/// so bounding `inputs + outputs + 2 ≤ ⌊q / MAX_VALUE⌋` keeps both sides of the balance under `q`. With
+/// `q = 2⁶¹−1` and `MAX_VALUE = 2⁵¹`, `⌊q / MAX_VALUE⌋ = 1023`, leaving `1021`.
+pub const MAX_NOTES_PER_TX: usize = ((Q as u64 / MAX_VALUE) - 2) as usize;
+
 /// The domain-separation seed for the canonical common reference string (the public `A₁`, `a₂`).
 const CRS_LABEL: &str = "FANOS-obolos-v1/commit-crs";
 /// The domain-separation label for deriving commitment randomness from a seed.

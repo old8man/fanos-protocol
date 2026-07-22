@@ -241,6 +241,7 @@ impl TransparentProof {
             put_note(&mut out, &i.note);
             put_auth_path(&mut out, &i.path);
             out.extend_from_slice(&i.nsk);
+            put_randomness(&mut out, &i.value_r_in);
         }
         out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for o in &self.outputs {
@@ -258,7 +259,8 @@ impl TransparentProof {
             let note = get_note(r)?;
             let path = get_auth_path(r)?;
             let nsk = r.array32()?;
-            Some(InputOpening { note, path, nsk })
+            let value_r_in = get_randomness(r)?;
+            Some(InputOpening { note, path, nsk, value_r_in })
         })?;
         let outputs = read_vec(&mut r, |r| {
             let value = r.u64()?;

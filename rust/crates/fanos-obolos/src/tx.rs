@@ -9,9 +9,12 @@
 //!
 //! 1. **membership** — each input's note commitment is a leaf under `anchor` (whole-pool untraceability);
 //! 2. **ownership + nullifier** — the spender knows each input's spending key, and its nullifier is correct;
-//! 3. **value binding** — each input value commitment commits to the spent note's amount;
-//! 4. **balance** — `Σ inputs = Σ outputs + fee` on the value commitments (confidential amounts);
-//! 5. **range** — every output amount is in `[0, MAX_VALUE)` (no modular-wraparound inflation).
+//! 3. **value binding** — each input value commitment is a *freshly re-randomised* commitment to the spent
+//!    note's amount — never the note's *creation* commitment, so a spend is unlinkable to the note that made it;
+//! 4. **balance** — `Σ inputs = Σ outputs + fee + public_value` on the value commitments (confidential amounts);
+//! 5. **range + bound** — every input *and* output amount, the fee, and the public value are in `[0, MAX_VALUE)`,
+//!    and the number of value terms is bounded (`≤ MAX_NOTES_PER_TX`) so no homomorphic sum wraps modulo `q` — the
+//!    two constraints that together make modular-wraparound inflation impossible.
 //!
 //! [`ShieldedProof`] is the seam. The production backend is a lattice/STARK zero-knowledge proof of exactly
 //! this relation — the single frontier **[P]** component (`spec/platform.md` §4.3). The [`TransparentProof`]
@@ -22,7 +25,7 @@
 
 use alloc::vec::Vec;
 
-use crate::commit::{Commitment, MAX_VALUE, Params, Randomness, sum, sum_randomness, verify_balance};
+use crate::commit::{Commitment, MAX_NOTES_PER_TX, MAX_VALUE, Params, Randomness, sum, sum_randomness, verify_balance};
 use crate::note::Note;
 use crate::note_cipher::NoteCipher;
 use crate::nullifier::Nullifier;
@@ -79,7 +82,8 @@ pub trait ShieldedProof {
 }
 
 /// The opening of one spent input, revealed by a [`TransparentProof`]: the note, its authentication path to the
-/// anchor, and the secret spending key that authorises the spend.
+/// anchor, the secret spending key that authorises the spend, and the **fresh randomness** re-randomising the
+/// input's value commitment.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InputOpening {
     /// The spent note.
@@ -88,6 +92,10 @@ pub struct InputOpening {
     pub path: AuthPath,
     /// The owner's secret spending key.
     pub nsk: [u8; 32],
+    /// The randomness of the **re-randomised** input value commitment `com(value; value_r_in)` published on the
+    /// public tx — distinct from the note's creation randomness `note.value_r`, so the spend's public
+    /// `input_value` cannot be matched to the note's creation commitment (audit O-C2, the Zcash-Orchard pattern).
+    pub value_r_in: Randomness,
 }
 
 /// The opening of one output, revealed by a [`TransparentProof`]: the amount and its commitment randomness (so
@@ -121,8 +129,14 @@ impl ShieldedProof for TransparentProof {
         if self.outputs.len() != tx.outputs.len() {
             return false;
         }
+        // Bound the number of value terms so the homomorphic balance sums cannot wrap modulo q (audit O-C1) —
+        // and bound the two clear terms (fee, public_value) below MAX_VALUE, which the loops below enforce for
+        // every input and output amount. Together these keep both sides of the balance law under q.
+        if n_in + tx.outputs.len() > MAX_NOTES_PER_TX || tx.fee >= MAX_VALUE || tx.public_value >= MAX_VALUE {
+            return false;
+        }
 
-        // Per-input: membership under the anchor, ownership, correct nullifier, and value-commitment binding.
+        // Per-input: membership under the anchor, ownership, correct nullifier, range, and value-commitment binding.
         for ((opening, nf), input_value) in self.inputs.iter().zip(&tx.nullifiers).zip(&tx.input_values) {
             let cm = opening.note.commitment(params);
             if !opening.path.verify(&cm, &tx.anchor) {
@@ -134,8 +148,14 @@ impl ShieldedProof for TransparentProof {
             if &Nullifier::derive(&opening.nsk, &cm) != nf {
                 return false; // the nullifier is not the note's (no forged/mismatched nullifier)
             }
-            if &opening.note.value_commitment(params) != input_value {
-                return false; // the input value commitment does not match the spent note's amount
+            if opening.note.value >= MAX_VALUE {
+                return false; // O-C1: an out-of-range INPUT could forge value via q-wraparound in the sum
+            }
+            // O-C2: the public input value commitment is a fresh re-randomisation com(value; value_r_in), bound
+            // here to the spent note's amount — NOT the note's creation value_commitment, which would let anyone
+            // match the spend to the note that created it.
+            if &Commitment::commit(params, opening.note.value, &opening.value_r_in) != input_value {
+                return false; // the re-randomised input value commitment does not commit to the note's amount
             }
         }
 
@@ -150,8 +170,8 @@ impl ShieldedProof for TransparentProof {
         }
 
         // Balance on the value commitments alone: Σ inputs = Σ outputs + fee. The balance randomness is
-        // recomputed from the revealed openings (Σ input_r − Σ output_r), so it cannot be gamed.
-        let input_r: Vec<Randomness> = self.inputs.iter().map(|i| i.note.value_r.clone()).collect();
+        // recomputed from the revealed openings (Σ input value_r_in − Σ output value_r), so it cannot be gamed.
+        let input_r: Vec<Randomness> = self.inputs.iter().map(|i| i.value_r_in.clone()).collect();
         let output_r: Vec<Randomness> = self.outputs.iter().map(|o| o.value_r.clone()).collect();
         let balance_r = sum_randomness(&input_r).sub(&sum_randomness(&output_r));
         let output_values: Vec<Commitment> = tx.outputs.iter().map(|o| o.value_commitment.clone()).collect();

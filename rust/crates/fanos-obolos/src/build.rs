@@ -10,7 +10,7 @@
 
 use alloc::vec::Vec;
 
-use crate::commit::Params;
+use crate::commit::{Commitment, Params, Randomness};
 use crate::note::Note;
 use crate::note_cipher::{Address, NoteCipher};
 use crate::tree::AuthPath;
@@ -42,7 +42,25 @@ pub fn build_transfer(
     fee: u64,
 ) -> (ShieldedTx, TransparentProof) {
     let nullifiers = inputs.iter().map(|i| i.note.nullifier(&i.nsk, params)).collect();
-    let input_values = inputs.iter().map(|i| i.note.value_commitment(params)).collect();
+    // O-C2: each public input value commitment is a FRESH re-randomisation of the note's amount, so it cannot be
+    // matched to the note's creation commitment. The randomness is derived per-input from spender-secret
+    // material (production: a CSPRNG); it is revealed to the verifier in the input opening, never on the tx.
+    let input_r: Vec<Randomness> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, inp)| {
+            let mut seed = Vec::with_capacity(32 + 32 + 8);
+            seed.extend_from_slice(&inp.nsk);
+            seed.extend_from_slice(&inp.note.rho);
+            seed.extend_from_slice(&(i as u64).to_le_bytes());
+            Randomness::from_seed(&seed)
+        })
+        .collect();
+    let input_values = inputs
+        .iter()
+        .zip(&input_r)
+        .map(|(inp, r)| Commitment::commit(params, inp.note.value, r))
+        .collect();
     let output_notes: Vec<OutputNote> = outputs
         .iter()
         .map(|n| OutputNote {
@@ -56,7 +74,8 @@ pub fn build_transfer(
 
     let input_openings = inputs
         .iter()
-        .map(|i| InputOpening { note: i.note.clone(), path: i.path.clone(), nsk: i.nsk })
+        .zip(input_r)
+        .map(|(i, value_r_in)| InputOpening { note: i.note.clone(), path: i.path.clone(), nsk: i.nsk, value_r_in })
         .collect();
     let output_openings =
         outputs.iter().map(|n| OutputOpening { value: n.value, value_r: n.value_r.clone() }).collect();
