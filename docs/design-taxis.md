@@ -137,6 +137,38 @@ openings for any line it does not `t`-dominate; the anti-Sybil centrality cap bo
 `q+1` members any coalition holds; therefore ordering is content-blind whenever the sealing line has `< t`
 adversarial members — the same `t`-of-`(q+1)` trust already assumed for onion layers. Formalized in §5 tests.
 
+### 5.1 Audit hardening & honest limits (execution layer)
+
+An adversarial review found the *ordering* core sound but the *execution* (REVEAL) path broken; the fixes and
+remaining honest limits:
+
+- **Authenticated reveals (fixed CRITICAL).** A `REVEAL` was unauthenticated — anyone could inject a garbage
+  share for any `tx_commit`, and reconstruction interpolated through *all* collected shares, so one bad share
+  produced a wrong key: an attacker could **censor** a finalized tx (drop it from execution everywhere) or
+  **fork executed state** (race which share wins a slot; undetected, since the header carries no state root).
+  Now each reveal is **hybrid-PQ-signed** by the member; a receiver verifies the signature, pins the sender to
+  the tx's keyper line and its share `x` to the member's committee position, records first-writer-wins per
+  member, and **opens from a `t`-subset whose AEAD tag authenticates** — so a lone Byzantine member's
+  validly-signed garbage share cannot poison decryption, and a tx is only skipped once *every* member has
+  revealed and none opens.
+- **Enforced keyper line (fixed CRITICAL).** "The sender cannot choose a committee it controls" was *described*
+  but not *checked*: a tx sealed to the wrong line (or no real committee) could be ordered and then never
+  decrypt, stalling execution. Admission now **enforces** `epoch == current`, `line == epoch_seal_line`, and a
+  full committee size at both `submit` and `on_propose`.
+- **No finalization wedge (fixed HIGH).** A validator that gathered a commit certificate but not the block body
+  (async delivery) previously wedged at that height forever. It now records the pending decision and finalizes
+  the instant the body arrives.
+- **Honest limit — undecryptable-tx liveness.** A tx sealed to the right line but to *garbage* KEM slots yields
+  no honest shares (the slots aren't ciphertext-verifiable without opening), so its block's execution pends.
+  Ordering/consensus is unaffected; fully-robust deterministic execution under adversarial reveal-withholding
+  needs **on-chain decryption-key commitment** (Shutter/Ferveo-style) — a planned upgrade, not yet built. The
+  keyper line also tolerates only `t−1` faulty members for anti-MEV *liveness* (2-of-3 ⇒ ≤ 1 on the Fano cell),
+  narrower than the cell's `f`.
+- **Honest limit — no executed state root.** Consensus commits to block *order*, not to executed *state* (the
+  vote/header carry no `state_root`). Adding an executed-state commitment to a later header — so any execution
+  divergence becomes a consensus fault rather than a silent fork — is the highest-value structural hardening and
+  is future work.
+
 ---
 
 ## 6. Data availability — sampling gates finality
@@ -149,6 +181,14 @@ theorem (`da.rs`): an unavailable value has **≤ 1 external line**, so **two di
 withheld block with certainty**, and `k` independent samples bound the false-available probability by `(1/7)^k`.
 A block that fails sampling gets no PREPARE from honest validators ⇒ cannot reach a `PC` ⇒ cannot finalize.
 Availability is thus a *precondition of finality*, proven at the cell, not an afterthought.
+
+**Audit note (assurance gap).** In the reference engine the availability bit-mask is supplied by the *driver*
+(`on_propose(block, present)`); the engine gates on it but does not itself sample, and the reference wire ships
+the whole payload inside the proposal, so real withholding is not yet modelled end-to-end. The header↔payload
+binding via the DA commitment is sound (a proposer cannot swap payloads), but the *gating* currently reduces to
+"the driver sampled honestly." Making the engine perform/verify sampling itself (or verify a signed
+DA-attestation quorum) and shipping headers + sampled shards rather than the whole payload is required to make
+withholding a real, in-engine-defeated threat.
 
 ---
 
@@ -171,6 +211,16 @@ Block inclusion is paid with an **anonymous VOPRF credit** (`fanos-incentives`),
 implemented). The **incentive *equilibrium*** — proving honest proposing/voting is a Nash equilibrium given
 the anti-MEV design removes the MEV profit term — is derived and implemented in the companion note
 `docs/design-incentive-equilibrium.md` (task A2). TAXIS exposes the fee/credit hook; A2 supplies the game.
+
+**Audit note (wiring & model scope).** The incentive module is currently an accounting/detection **library**,
+not yet wired into the consensus loop: `detect_equivocation`→`SlashEvidence` is sound and unforgeable (you
+cannot frame an honest validator), and `collect_fee`/`distribute` are reveal-gated, but the engine's
+`accept_vote` does not yet scan stored votes for equivocation, emit slash evidence, or apply fees — so the
+slashing the Nash proof assumes (`S>0`) is provable-but-not-operational until wired. The equilibrium model also
+scores only *unilateral* deviations against an honest majority; it does not yet cover the `≤ f` **coalition**
+the fault model tolerates, nor a **blind censorship-for-profit** term (accepting a bribe to omit a competitor's
+tx by omission, which §5's "Order" bullet acknowledges). Both are noted extensions, bounded in practice by
+beacon leader rotation and (future) force-inclusion / inclusion-list mechanisms.
 
 ---
 
