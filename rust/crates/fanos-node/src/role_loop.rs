@@ -15,15 +15,17 @@
 //! over the live directory.
 
 use fanos_core::roles::{Capability, Demand, Reputation, RoleController, RoleSet};
+use fanos_diaulos::Coord;
 use fanos_field::Field;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
 use fanos_quic::Client;
 use fanos_runtime::Notification;
+use fanos_vrf::VrfSecret;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::capdir::build_capability_directory;
-use crate::loaddir::build_cell_setpoint;
+use crate::capdir::{build_capability_directory, spawn_capability_publisher};
+use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
 /// A node's **sans-I/O** live role controller: it holds the epoch-persistent [`RoleController`] state and, for a
 /// given epoch's authenticated member set, beacon, and setpoint, produces *this* node's assigned [`RoleSet`].
@@ -122,6 +124,54 @@ async fn assign_epoch<F: Field>(
     let setpoint = build_cell_setpoint::<F>(client, epoch, capacity).await;
     let roles = live.step(&members, epoch, beacon, setpoint);
     let _ = roles_tx.send(roles);
+}
+
+/// The running self-organizing subsystem of a node: the three background tasks (capability publisher, load
+/// publisher, role loop) and the `watch` receiver carrying this node's currently-assigned roles.
+pub struct SelfOrganization {
+    /// Keeps the node's capability advertisement live each epoch.
+    pub capability_publisher: JoinHandle<()>,
+    /// Keeps the node's load report live each epoch.
+    pub load_publisher: JoinHandle<()>,
+    /// Runs the assignment each epoch.
+    pub role_loop: JoinHandle<()>,
+    /// This node's currently-assigned roles — the node subscribes and actuates its role behaviors from it.
+    pub assigned: watch::Receiver<RoleSet>,
+}
+
+/// A node's inputs to the self-organizing subsystem: its identity (`node_id`, `vrf_secret`), the `capability`
+/// it offers, its per-node `capacity` per role, and the demand `controller` (initial demand/floor/gain).
+pub struct SelfOrgConfig {
+    /// The node's identity.
+    pub node_id: NodeId,
+    /// The node's coordinate-VRF secret (signs its capability advertisement).
+    pub vrf_secret: VrfSecret,
+    /// The roles the node offers and its capacity weight.
+    pub capability: Capability,
+    /// The per-node capacity per role (the load one node absorbs) — the setpoint denominator.
+    pub capacity: Demand,
+    /// The demand controller (its initial demand, floor, and loop gain).
+    pub controller: RoleController,
+}
+
+/// Spawn a node's **entire self-organizing subsystem** on plane `F` — the single call `Node::start` makes to
+/// join the live role loop. It advertises the node's offered capability, reports its observed load
+/// (`load_source`), and runs its role loop, so the cell assigns and rotates the node's roles each epoch with no
+/// further input. The caller actuates the returned [`SelfOrganization::assigned`] roles (starting/stopping each
+/// behavior as the assignment changes). Must run inside a tokio runtime.
+#[must_use]
+pub fn spawn_self_organization<F: Field>(
+    client: Client,
+    coord: Coord,
+    config: SelfOrgConfig,
+    load_source: impl Fn() -> Demand + Send + 'static,
+) -> SelfOrganization {
+    let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller } = config;
+    let capability_publisher =
+        spawn_capability_publisher(client.clone(), coord, node_id, vrf_secret, capability);
+    let load_publisher = spawn_load_publisher(client.clone(), coord, load_source);
+    let (role_loop, assigned) = spawn_role_loop::<F>(client, node_id, controller, capacity);
+    SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
 }
 
 #[cfg(test)]
