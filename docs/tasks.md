@@ -36,16 +36,24 @@
   Tessera onion confidentiality/integrity reduced to hybrid-KEM-IND-CCA + AEAD + BLAKE3 (`docs/design-tessera-
   security.md`). Residual: only the *machine-checked mechanization* (proof-assistant artifact) — the reductions
   are its spec.
-- **PQ-VRF / PQ beacon / PQ shuffle** — ✅ **DONE** (`fca1aad`): a hash-based **Merkle-VRF** over the bounded
-  epoch domain — PQ, unique, unbiasable (leaves pre-committed) — + a full-reveal PQ beacon, both implemented +
-  tested (`fanos-vrf::pqvrf`, `docs/design-pq-vrf.md`). PQ verifiable shuffle rigorously *designed* (sound
-  cut-and-choose), not implemented (no live consumer). Residual: DVRF-style threshold reconstruction-uniqueness
-  PQ (needs a PQ threshold primitive).
+- **PQ-VRF / PQ beacon / PQ shuffle** — ✅ **DONE** (`fca1aad`, `1050711`, `bb429f0` Hand-roll-full): (1)
+  Merkle-VRF — PQ, unique, unbiasable — + full-reveal beacon (`pqvrf`); (2) **reconstruction-unique** threshold
+  beacon (`pqvss`): committed Shamir + all-`t`-subsets consistency, novel/unaudited; (3) **verifiable shuffle**
+  (`shuffle`): Sako–Kilian cut-and-choose **generic over a `ReRandomizable` trait** (hash-only proven
+  impossible), with TWO backends — `ElGamal` (ristretto, classical) and **`rlwe::Rlwe` (Ring-LWE,
+  post-quantum)**; the same proof runs over either. Novel/unaudited. `docs/design-pq-vrf.md`.
 - **D6 quarantine theorem** — ✅ **DONE** (`653a9c3`): derived `Φ' = (N·Φ − 2s_q)/(N−1)`, so quarantine lowers
   Φ iff `s_q > Φ/2`; implemented the gate + simulation experiment (`docs/design-quarantine-theorem.md`).
 - **GF(2^m) constant-time** — ✅ **DONE** (`b563f9a`): mul is branchless, inv is fixed-exponent Fermat →
   secret-independent; deterministic op-count experiment proves it (`docs/design-constant-time.md`).
-- Still genuinely open (deeper hierarchy recursion #95 §parent-observes-child) — research-gated, unchanged.
+- **Parent-observes-child hierarchy recursion (#95)** — ✅ **DONE** (`2b66064`): DIAKRISIS recurses up the
+  cell hierarchy (child cells as the parent's nodes) — `fanos-diakrisis::hierarchy` localizes a failing child
+  by the same §6.3 grey endpoint, the fault propagates up (`cell_loss`), the integration alarm recurses; a
+  2-level recursion experiment validates it. `docs/design-hierarchy-recursion.md`.
+- **Residual open pieces are now ONLY external processes, not design/implementation**: `pqvss`/`shuffle`/`rlwe`
+  external cryptanalysis and calibrating/adopting a *vetted, hardened* RLWE backend (the built one uses
+  illustrative params). Everything is built + reduced + tested; the RLWE proof is noise-agnostic so only the
+  backend needs hardening. External audit is, by definition, not an in-house task.
 
 ### C · Honest fundamental limits (Part XVI) — not defects, not closeable
 - `f→0.5` endpoint-majority limit; single-cell DIAKRISIS localization stratification (crashes ≤3, Byzantine
