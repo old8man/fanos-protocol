@@ -18,6 +18,17 @@ use crate::error::NodeError;
 /// their epochs stay aligned.
 pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 
+/// Default mean Poisson mixing delay a **relay** holds each forwarded onion hop for (spec §L5/V7): a batch of
+/// onions then leaves reordered, breaking the per-hop timing correlation a global passive adversary (T2) uses.
+/// Non-zero by default so the shipping relay actually defends (closing audit S1-H1); an operator trading
+/// anonymity for latency can lower it, and it is inert on a non-relay (only a relay runs the mixnet).
+pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
+
+/// Default mean interval between a **relay**'s constant-size **cover cells** (spec §L5/V8): the router's send
+/// rate and packet size then reveal nothing about whether it is carrying real traffic (audit E1/S1-H1). Non-zero
+/// by default so the GPA defence is on; an operator trading anonymity for bandwidth can raise or zero it.
+pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
 /// `beacon = Some(..)` the node composes an [`OverlayBeaconNode`](crate::OverlayBeaconNode): it
 /// verifies and adopts the threshold-DVRF rounds the anchors flood — needing only the public
@@ -339,6 +350,12 @@ pub struct NodeConfig {
     pub bootstrap: Vec<Peer>,
     /// The advertised role set.
     pub roles: RoleSet,
+    /// Mean Poisson mixing delay a **relay** holds each forwarded onion for (spec §L5/V7, audit S1-H1). Zero
+    /// forwards immediately (no mixing, no T2 defence). Inert on a non-relay. Default [`DEFAULT_MIX_DELAY`].
+    pub mix_mean_delay: Duration,
+    /// Mean interval a **relay** emits constant-size cover cells at (spec §L5/V8, audit S1-H1/E1). Zero disables
+    /// cover. Inert on a non-relay. Default [`DEFAULT_COVER_INTERVAL`].
+    pub cover_interval: Duration,
     /// Whether to begin liveness heartbeats on start.
     pub start_heartbeat: bool,
     /// The distributed-beacon parameters. `Some(..)` runs the live epoch clock (§7.6); `None` (the
@@ -388,6 +405,8 @@ impl Default for NodeConfig {
             identity_path: None,
             bootstrap: Vec::new(),
             roles: RoleSet::default(),
+            mix_mean_delay: DEFAULT_MIX_DELAY,
+            cover_interval: DEFAULT_COVER_INTERVAL,
             start_heartbeat: true,
             beacon: None,
             epoch_period: DEFAULT_EPOCH_PERIOD,
@@ -487,6 +506,18 @@ mod tests {
         let p = Peer::parse("1:2:3@127.0.0.1:9000").unwrap();
         assert_eq!(p.coord, [1, 2, 3]);
         assert_eq!(p.addr, "127.0.0.1:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn a_relays_gpa_defence_is_on_by_default() {
+        // Audit S1-H1: the shipping node must not run its mixnet with cover traffic and Poisson mixing off
+        // (no global-passive-adversary / T2 defence). The defaults enable both — an operator can zero them to
+        // trade anonymity for bandwidth/latency, but the safe default is defended.
+        let cfg = NodeConfig::default();
+        assert!(cfg.mix_mean_delay > Duration::ZERO, "Poisson mixing is on by default");
+        assert!(cfg.cover_interval > Duration::ZERO, "cover traffic is on by default");
+        assert_eq!(cfg.mix_mean_delay, DEFAULT_MIX_DELAY);
+        assert_eq!(cfg.cover_interval, DEFAULT_COVER_INTERVAL);
     }
 
     #[test]

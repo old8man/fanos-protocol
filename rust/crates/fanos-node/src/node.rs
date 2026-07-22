@@ -215,6 +215,9 @@ impl Node {
         // restart cannot peel onions sealed to the old key. A relay needs the beacon to lock its onion-key
         // rotation to the cell epoch (E4∩E5), so require beacon parameters for the role.
         let relay = config.roles.relay;
+        // Mixnet anonymity parameters, std→engine Duration, captured before the builder closure (audit S1-H1).
+        let ns = |d: Duration| fanos_runtime::Duration(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        let (mix_mean_delay, cover_interval) = (ns(config.mix_mean_delay), ns(config.cover_interval));
         if relay && beacon.is_none() {
             return Err(NodeError::Config(
                 "the relay role runs the anonymity mixnet and needs beacon parameters (configure the \
@@ -257,15 +260,15 @@ impl Node {
                             BeaconNode::<F>::new(coord, bp.share, bp.commitment, bp.threshold),
                         );
                         if relay {
-                            // Compose the mixnet router at the same coordinate → a full cell participant.
+                            // The mixnet router at this coordinate, with Poisson mixing + constant-rate cover
+                            // ON so the relay defends against a global passive adversary (T2) — the shipping
+                            // node ran both off (audit S1-H1). Zero values leave the respective behaviour off.
                             let (router_secret, _identity) =
                                 HybridKemSecret::generate(&mut SeedRng::from_seed(&kem_seed));
-                            let router = ThresholdRouter::<F>::new(
-                                coord,
-                                &router_secret,
-                                MIX_THRESHOLD,
-                                onion_seed,
-                            );
+                            let router =
+                                ThresholdRouter::<F>::new(coord, &router_secret, MIX_THRESHOLD, onion_seed)
+                                    .with_mixing(mix_mean_delay)
+                                    .with_cover(cover_interval);
                             Box::new(CellNode::new(obn, router))
                         } else {
                             Box::new(obn)

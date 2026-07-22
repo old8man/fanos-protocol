@@ -116,6 +116,16 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
             ))
         })?);
     }
+    if let Some(s) = flag(args, "--mix-delay-ms") {
+        // A relay's mean Poisson mixing delay in ms (spec §L5/V7, audit S1-H1); 0 disables mixing.
+        let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --mix-delay-ms '{s}'")))?;
+        config.mix_mean_delay = std::time::Duration::from_millis(ms);
+    }
+    if let Some(s) = flag(args, "--cover-interval-ms") {
+        // A relay's mean cover-cell interval in ms (spec §L5/V8, audit S1-H1/E1); 0 disables cover traffic.
+        let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --cover-interval-ms '{s}'")))?;
+        config.cover_interval = std::time::Duration::from_millis(ms);
+    }
     Ok(config)
 }
 
@@ -682,7 +692,7 @@ fn print_help() {
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
          \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
-         \x20             [--proteus-environment ENV]\n\
+         \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
