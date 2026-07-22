@@ -43,6 +43,18 @@ use crate::vote::{Certificate, Phase, SignedVote, Vote};
 /// combination count is already bounded by the cell; this only guards against a pathological configuration.
 const MAX_REVEAL_SUBSETS: usize = 4096;
 
+/// The **reveal window** (in finalized heights): how long a finalized block's execution waits for the anti-MEV
+/// reveals before dropping any still-undecryptable transaction. This is the **deterministic clock** that makes
+/// execution converge without coupling ordering to reveal timing: a transaction still short of `t` valid
+/// openings once consensus has finalized `REVEAL_WINDOW` heights past its block is dropped — a decision keyed to
+/// the *finalized height* (identical on every validator), not to local gossip arrival. Under the keyper-line
+/// liveness assumption (≥ `t` honest members reveal, and reveals are broadcast on finalization) every
+/// well-formed transaction is decrypted well within the window, so only genuinely undecryptable ones (a seal to
+/// non-committee keys, or a withholding keyper majority) are dropped; the execution checkpoint
+/// ([`crate::checkpoint`]) catches any residual divergence. A liveness parameter (like the round timeout),
+/// network-agreed, not a security threshold.
+pub const REVEAL_WINDOW: u64 = 4;
+
 /// Serialize a Shamir share as `x(1) ‖ y`.
 fn share_to_bytes(s: &Share) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + s.y().len());
@@ -755,12 +767,18 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let t = usize::from(self.params.seal_threshold());
         let mut out = Vec::new();
         while let Some(block) = self.exec_queue.first().cloned() {
+            // The reveal window has elapsed for this block once consensus has finalized REVEAL_WINDOW further
+            // heights — a deterministic, finalized-height-keyed signal that no more reveals will be waited for.
+            let past_window = self.chain.next_height() > block.header.height + REVEAL_WINDOW;
             let mut opened = Vec::new();
             let mut ready = true;
             for tx in &block.sealed_txs {
                 let shares: Vec<Share> =
                     self.reveals.get(&tx.commit()).map(|m| m.values().cloned().collect()).unwrap_or_default();
                 if shares.len() < t {
+                    if past_window {
+                        continue; // window elapsed ⇒ drop this undecryptable tx and keep executing the block
+                    }
                     ready = false;
                     break;
                 }
@@ -771,11 +789,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
                     Some(txn) => opened.push(txn),
                     None => {
                         // No t-subset opens yet. A Byzantine share among the ≥ t present can hide a decryptable
-                        // honest subset that needs one more reveal, so we do NOT give up while any committee
-                        // member is still outstanding — we wait until every member has revealed. Only once all
-                        // `member_count` shares are in and none opens is the transaction genuinely malformed
-                        // and skipped (not stalled) — later transactions and blocks still execute.
-                        if shares.len() < tx.member_count() {
+                        // honest subset that needs one more reveal, so — until the window elapses — we do NOT
+                        // give up while any committee member is still outstanding; we wait until every member
+                        // has revealed. Once all `member_count` shares are in and none opens (malformed), OR the
+                        // reveal window has passed, the transaction is dropped (not stalled) — later
+                        // transactions and blocks still execute, and the drop is identical on every validator.
+                        if shares.len() < tx.member_count() && !past_window {
                             ready = false;
                             break;
                         }

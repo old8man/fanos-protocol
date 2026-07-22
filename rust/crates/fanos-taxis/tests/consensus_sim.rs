@@ -697,3 +697,43 @@ fn an_equivocating_validator_is_caught_and_slashed() {
         "the slash evidence re-verifies independently"
     );
 }
+
+/// Audit residual closed (deterministic execution): a transaction sealed to the right keyper line + size (so it
+/// passes admission) but to KEM keys nobody on the committee holds is genuinely undecryptable — no honest keyper
+/// member can ever produce a share. It pends, then, once consensus finalizes REVEAL_WINDOW further heights, it is
+/// dropped UNIFORMLY on every validator (the drop is keyed to the finalized height, not local gossip), so
+/// execution converges: all replicas agree on the state root, and the block advances.
+#[test]
+fn an_undecryptable_transaction_is_deterministically_dropped_after_the_reveal_window() {
+    use fanos_taxis::consensus::REVEAL_WINDOW;
+    let mut c = Cluster::new(&genesis());
+    let line = epoch_seal_line(&SEED, EPOCH);
+    // Seal to 3 GARBAGE committee keys (random keypairs, not the real committee) — passes valid_seal, but no
+    // honest keyper member's secret opens any slot.
+    let garbage: Vec<(HybridKemSecret, HybridKemPublic)> =
+        (0..3u8).map(|i| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xDE, i]))).collect();
+    let member_keys: Vec<&HybridKemPublic> = garbage.iter().map(|(_, p)| p).collect();
+    let bad = SealedTx::seal(
+        &Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx(),
+        EPOCH,
+        line as u8,
+        &member_keys,
+        CellParams::FANO.seal_threshold(),
+        b"undecryptable",
+    )
+    .unwrap();
+    c.submit_all(&bad);
+    c.tick(); // height 0 finalizes with the undecryptable tx; its execution pends
+    assert_eq!(c.engines[0].chain().state().balance(&BOB), 0, "pending, not yet executed");
+    // Advance the chain past block 0's reveal window with empty blocks.
+    for _ in 0..=REVEAL_WINDOW {
+        c.tick();
+    }
+    // The undecryptable tx was dropped uniformly; every replica agrees on the executed state.
+    let root = c.engines[0].chain().state_root();
+    for e in &c.engines {
+        assert_eq!(e.chain().state().balance(&BOB), 0, "an undecryptable tx never executes");
+        assert_eq!(e.chain().state_root(), root, "the drop is deterministic — all replicas agree");
+    }
+    assert!(c.engines[0].latest_checkpoint().is_some(), "execution progressed past the dropped block");
+}
