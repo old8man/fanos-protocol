@@ -15,7 +15,7 @@ use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::committee::{epoch_seal_line, leader, line_members};
-use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output, RevealMsg};
+use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
 
@@ -102,15 +102,19 @@ impl Cluster {
         }
     }
 
-    /// The DA availability a validator samples for a block: full unless its proposer is withholding, in
-    /// which case a hyperoval's worth of shards are missing (the minimal unrecoverable pattern).
-    fn present_for(&self, block: &Block) -> u8 {
-        if self.withholding.contains(&block.header.proposer) {
+    /// The DA shards a validator samples for a block: the full shard set unless its proposer is withholding,
+    /// in which case a hyperoval's worth of shards go missing (the minimal unrecoverable erasure pattern).
+    /// The engine reconstructs the payload from these and checks it against `da_commit`, so a withheld block
+    /// fails to reconstruct and is refused — availability is verified in-engine, never a trusted bit.
+    fn shards_for(&self, block: &Block) -> DaShards {
+        let all = block.da_shards();
+        let present: u8 = if self.withholding.contains(&block.header.proposer) {
             let hyperoval = (0u8..=0x7F).find(|&m| !is_recoverable_fano(m)).unwrap();
             (!hyperoval) & 0x7F
         } else {
             0x7F
-        }
+        };
+        core::array::from_fn(|p| (present & (1 << p) != 0).then(|| all[p].clone()))
     }
 
     fn collect(&mut self, idx: usize, outs: Vec<Output>) {
@@ -140,7 +144,7 @@ impl Cluster {
                 continue;
             }
             let input = match msg {
-                ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), present: self.present_for(b) },
+                ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(self.shards_for(b)) },
                 ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                 ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
                 ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
@@ -498,7 +502,7 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                 let Some(msg) = bus.remove(idx) else { break };
                 for &i in &honest {
                     let input = match &msg {
-                        ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), present: 0x7F },
+                        ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(b.da_shards().map(Some)) },
                         ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
                         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
@@ -642,7 +646,8 @@ fn a_validator_finalizes_when_the_body_arrives_after_the_commit_certificate() {
     assert_eq!(c.honest_count_at(0), N - 1, "the other six finalized");
     // Now hand-deliver the withheld body; the deaf validator finalizes from its held certificate.
     let body = c.proposed.iter().find(|b| b.header.height == 0).cloned().expect("a height-0 body was proposed");
-    let outs = c.engines[deaf].step(Input::Propose { block: body, present: 0x7F });
+    let shards = Box::new(body.da_shards().map(Some));
+    let outs = c.engines[deaf].step(Input::Propose { block: body, shards });
     c.collect(deaf, outs);
     c.run();
     assert!(c.committed[deaf].iter().any(|&(h, _)| h == 0), "the body's arrival unblocks finalization");

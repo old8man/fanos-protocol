@@ -140,7 +140,7 @@ impl<S: StateMachine + Clone> Cell<S> {
         while let Some(msg) = self.bus.pop_front() {
             for i in 0..N {
                 let input = match &msg {
-                    ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), present: 0x7F },
+                    ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(b.da_shards().map(Some)) },
                     ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                     ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
                     ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),

@@ -21,7 +21,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use fanos_code::lrc::is_recoverable_fano;
+use fanos_code::erasure;
 use fanos_pqcrypto::kem::HybridKemSecret;
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
@@ -54,6 +54,11 @@ const MAX_REVEAL_SUBSETS: usize = 4096;
 /// ([`crate::checkpoint`]) catches any residual divergence. A liveness parameter (like the round timeout),
 /// network-agreed, not a security threshold.
 pub const REVEAL_WINDOW: u64 = 4;
+
+/// The DA shards a validator sampled for a proposal: `shards[p]` is point `p`'s payload shard, or `None` if it
+/// did not answer. The engine reconstructs the payload from these and checks it against `da_commit`, so
+/// availability is *verified* in-engine rather than trusted as a driver-supplied bit.
+pub type DaShards = [Option<Vec<u8>>; erasure::N];
 
 /// Serialize a Shamir share as `x(1) ‖ y`.
 fn share_to_bytes(s: &Share) -> Vec<u8> {
@@ -250,14 +255,17 @@ impl ConsensusMsg {
 pub enum Input {
     /// Drive the engine — propose if this validator is the current leader.
     Tick,
-    /// A proposal received off the wire, together with this validator's DA availability sample `present`
-    /// (bit `p` set ⇒ point `p`'s payload shard is retrievable network-wide). A withholding proposer leaves
-    /// too few bits set, so the payload is unavailable and the validator withholds PREPARE.
+    /// A proposal received off the wire, together with the payload **shards this validator sampled** from the
+    /// network ([`DaShards`]: `shards[p]` = point `p`'s shard, or `None` if it did not answer). The engine
+    /// reconstructs the payload from them and checks it against the block's `da_commit` in-engine — a withholding
+    /// proposer leaves too few shards to reconstruct (or they fail the commitment), and the validator withholds
+    /// PREPARE. This is verified, not a trusted availability bit.
     Propose {
         /// The proposed block.
         block: Block,
-        /// The DA availability bitmask sampled from the network.
-        present: u8,
+        /// The DA shards this validator sampled (`None` = the point did not answer). Boxed so that the
+        /// far more frequent small inputs (votes, reveals) stay cheap to move — a proposal is rare.
+        shards: Box<DaShards>,
     },
     /// A vote received off the wire.
     Vote(SignedVote),
@@ -448,7 +456,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     pub fn step(&mut self, input: Input) -> Vec<Output> {
         match input {
             Input::Tick => self.maybe_propose(),
-            Input::Propose { block, present } => self.on_propose(block, present),
+            Input::Propose { block, shards } => self.on_propose(block, &shards),
             Input::Vote(sv) => self.accept_vote(sv),
             Input::Reveal(r) => self.on_reveal(&r),
             Input::ExecVote(v) => self.on_exec_vote(v),
@@ -476,7 +484,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     }
 
     /// Validate a proposal and, if it is available and well-formed, prepare it.
-    fn on_propose(&mut self, block: Block, present: u8) -> Vec<Output> {
+    fn on_propose(&mut self, block: Block, shards: &DaShards) -> Vec<Output> {
         let height = self.height();
         let bh = block.hash();
         // Structural + leader + link checks.
@@ -493,10 +501,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if !block.sealed_txs.iter().all(|tx| self.valid_seal(tx)) {
             return Vec::new();
         }
-        // Data-availability gate (spec §L4.3 / §10.1): the payload must be retrievable. An unavailable
-        // payload (a withholding proposer) has too few shards present and fails to be recoverable.
-        let missing = (!present) & 0x7F;
-        if !is_recoverable_fano(missing) {
+        // Data-availability gate (spec §L4.3 / §10.1), verified IN-ENGINE: reconstruct the payload from the
+        // shards this validator sampled and check it against the header's `da_commit`. A withholding proposer
+        // leaves too few shards to reconstruct (an unrecoverable erasure pattern), or the reconstruction fails
+        // the commitment — either way `reconstruct_payload` returns `None` and the validator withholds PREPARE.
+        // The engine no longer trusts a driver-supplied availability bit; it checks the shards cryptographically.
+        if block.reconstruct_payload(shards).is_none() {
             return Vec::new();
         }
         // Remember the (valid, available) block body so we can finalize it later even if a conflicting
