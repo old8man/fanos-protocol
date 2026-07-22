@@ -74,16 +74,35 @@ from `r` without the plaintext). Hash commitments cannot re-randomize — so no 
 shuffle exists.
 
 The implemented construction is therefore a **Sako–Kilian cut-and-choose over a re-randomizable encryption**,
-with the proof logic **generic over the cryptosystem** (the sound, novel part) and the re-randomization
-isolated to one seam. It is instantiated over **ristretto ElGamal** (the group FANOS's VRF/DKG/VOPRF already
-use — architecturally coherent), giving a complete, tested verifiable mixnet proof. *Soundness* `1 − 2^-k`
-(each shadow is committed before the Fiat–Shamir challenge; a wrong output multiset fails one branch).
-*Hiding*: only re-randomization factors are ever revealed (checked homomorphically), one branch per shadow, so
-`π` stays hidden. Over ristretto it is **classical** (discrete log); **swapping the seam for a lattice/RLWE
-ElGamal makes the identical proof post-quantum** — the cut-and-choose soundness is unconditional. The PQ `[P]`
-thus reduces to "a PQ re-randomizable encryption" (a known lattice primitive), and the construction is ready
-for it. **Novel/unaudited.** (FANOS's live anonymity remains the threshold sheaf + cover + Poisson mixing; this
-is the verifiable-mixnet profile the spec aspires to, now built.)
+with the proof logic **generic over the cryptosystem** ([`shuffle::ReRandomizable`]) — the sound, novel part —
+and the re-randomization isolated to one seam. **Two backends are implemented**: ristretto ElGamal
+([`shuffle::ElGamal`], *classical*/discrete-log, coherent with FANOS's VRF/DKG/VOPRF group) and **Ring-LWE
+ElGamal** ([`rlwe::Rlwe`], *post-quantum*). The *same* `prove`/`verify` run over either — `the_same_shuffle_
+proof_runs_post_quantum_over_rlwe` exercises it end-to-end. *Soundness* `1 − 2^-k` (each shadow is committed
+before the Fiat–Shamir challenge; a wrong output multiset fails one branch); the cut-and-choose is
+unconditional, so the shuffle is post-quantum **iff its backend is** — and now it can be. **Novel/unaudited.**
+(FANOS's live anonymity remains the threshold sheaf + cover + Poisson mixing; this is the verifiable-mixnet
+profile the spec aspires to, now built and PQ-capable.)
+
+## 4. Self-cryptanalysis and honest limits
+
+The strongest verification achievable in-house (external cryptanalysis is, by definition, external):
+
+- **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + BLAKE3
+  binding, both standard; the all-`t`-subsets check is a complete decision procedure for collinearity (no
+  probabilistic gap). The honest limit is the **detectable-abort** model: a malicious *dealer* can get its own
+  contribution rejected (a liveness nuisance), never bias the honest sum — sound only under an honest majority
+  of *dealers*. Adversarial tests cover forged shares, an inconsistent (off-polynomial) but self-consistently
+  committed dealing, and below-threshold reveals.
+- **`shuffle` + `rlwe`** — soundness is unconditional (cut-and-choose); hiding reveals only re-rand factors,
+  one branch per shadow. The residual trust is the **backend's IND-CPA** and the RLWE **parameters**: `n=256,
+  q=12289`, ternary noise are *illustrative*, chosen so decryption survives one re-randomization (verified),
+  **not** a hardened, side-channel-resistant, constant-time production set. A deployment must calibrate
+  `(n, q, χ)` to a target security level and use a vetted RLWE implementation. The shuffle *proof* is
+  noise-agnostic (exact ciphertext equality), so only the backend needs hardening.
+
+**What genuinely remains** is therefore *not design or implementation* but **external cryptanalysis / adoption
+of a vetted RLWE backend** — an external process, not an in-house task.
 
 ## Summary
 
@@ -92,4 +111,6 @@ is the verifiable-mixnet profile the spec aspires to, now built.)
 | PQ-VRF (Merkle-committed PRF over epochs) | **Implemented + tested** (`pqvrf`), reduction to BLAKE3 |
 | PQ beacon — full-reveal | **Implemented + tested** (`pqvrf`), unbiasable |
 | PQ beacon — **reconstruction-unique** | **Implemented + tested** (`pqvss`): committed Shamir + all-`t`-subsets consistency. Novel/unaudited |
-| PQ verifiable shuffle | **Implemented + tested** (`shuffle`): Sako–Kilian over ristretto ElGamal, PQ via a lattice seam-swap. Novel/unaudited |
+| PQ verifiable shuffle (proof) | **Implemented + tested** (`shuffle`): Sako–Kilian, generic over the cryptosystem. Novel/unaudited |
+| — classical backend (ristretto ElGamal) | **Implemented + tested** (`shuffle::ElGamal`) |
+| — **post-quantum backend (Ring-LWE)** | **Implemented + tested** (`rlwe::Rlwe`) — same proof runs PQ. Illustrative params; needs a vetted backend |

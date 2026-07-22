@@ -35,6 +35,9 @@ pub mod pqvss;
 /// mixnet proof, generic over the cryptosystem so the ristretto instantiation PQ-swaps to lattice (spec §16
 /// `[P]`). NOVEL/UNAUDITED; see [`shuffle`].
 pub mod shuffle;
+/// A post-quantum Ring-LWE re-randomizable encryption — the lattice backend that makes [`shuffle`] run
+/// post-quantum with the identical proof (spec §16 `[P]`). NOVEL/UNAUDITED; see [`rlwe`].
+pub mod rlwe;
 pub mod vss;
 
 use alloc::vec::Vec;
