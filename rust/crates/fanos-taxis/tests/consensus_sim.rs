@@ -66,6 +66,8 @@ struct Cluster {
     proposed: Vec<Block>,
     /// Equivocation proofs the engines surfaced (the operational slashing signal).
     slashes: Vec<SlashEvidence>,
+    /// Block-reward splits the engines surfaced (validator, amount).
+    rewards: Vec<(u8, u64)>,
 }
 
 impl Cluster {
@@ -96,6 +98,7 @@ impl Cluster {
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
+            rewards: Vec::new(),
         }
     }
 
@@ -116,6 +119,7 @@ impl Cluster {
                 Output::Send(msg) => self.bus.push_back(msg),
                 Output::Committed { height, block_hash } => self.committed[idx].push((height, block_hash)),
                 Output::Slash(ev) => self.slashes.push(ev),
+                Output::Reward(split) => self.rewards.extend(split),
             }
         }
     }
@@ -472,7 +476,7 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                     match o {
                         Output::Send(m) => bus.push_back(m),
                         Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
-                        Output::Slash(_) => {} // equivocation is expected here; the focused test asserts on it
+                        Output::Slash(_) | Output::Reward(_) => {} // equivocation is expected; safety is what this checks
                     }
                 }
             }
@@ -503,7 +507,7 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
                         match o {
                             Output::Send(m) => bus.push_back(m),
                             Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
-                            Output::Slash(_) => {} // equivocation is expected; safety is what this trial checks
+                            Output::Slash(_) | Output::Reward(_) => {} // safety is what this trial checks
                         }
                     }
                 }
@@ -736,4 +740,26 @@ fn an_undecryptable_transaction_is_deterministically_dropped_after_the_reveal_wi
         assert_eq!(e.chain().state_root(), root, "the drop is deterministic — all replicas agree");
     }
     assert!(c.engines[0].latest_checkpoint().is_some(), "execution progressed past the dropped block");
+}
+
+/// Incentive layer, reward half now operational (audit MEDIUM 5): finalizing a block distributes its reward
+/// pool F among the commit-certificate signers (R = F/Q each) — the reward the Nash equilibrium assumes,
+/// surfaced as Output::Reward for the driver to credit, symmetric to the equivocation slash.
+#[test]
+fn finalizing_a_block_rewards_its_commit_certificate_signers() {
+    let mut c = Cluster::new(&genesis());
+    for e in &mut c.engines {
+        e.set_reward_per_block(500);
+    }
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"reward");
+    c.submit_all(&tx);
+    c.tick();
+    assert!(!c.rewards.is_empty(), "finalization surfaces a reward split");
+    // Each engine splits F = 500 evenly among the Q..N commit signers it certified, so every surfaced share is
+    // F/(signers) ∈ [F/N, F/Q] = [71, 100]. (The split is over each node's commit view; a canonical, cross-node-
+    // identical reward would record the commit certificate in the chain — the same refinement the execution
+    // checkpoint makes for state, tracked as future work.)
+    assert!(c.rewards.iter().all(|(_, amt)| (500 / 7..=500 / 5).contains(amt)), "each share is F/(signers) ∈ [71,100]");
+    let rewarded: BTreeSet<u8> = c.rewards.iter().map(|(v, _)| *v).collect();
+    assert!(rewarded.len() >= 5, "at least a Q-quorum of distinct signers were rewarded, got {}", rewarded.len());
 }

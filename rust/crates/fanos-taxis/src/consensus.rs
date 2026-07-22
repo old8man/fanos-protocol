@@ -32,7 +32,7 @@ use crate::block::Block;
 use crate::chain::Chain;
 use crate::checkpoint::{ExecCertificate, ExecVote};
 use crate::committee::{epoch_seal_line, leader, line_members};
-use crate::incentive::{detect_equivocation, SlashEvidence};
+use crate::incentive::{detect_equivocation, distribute, SlashEvidence};
 use crate::params::CellParams;
 use crate::state::StateMachine;
 use crate::tx::{SealedTx, Transaction, TxCommit};
@@ -284,6 +284,10 @@ pub enum Output {
     /// A validator was caught **equivocating** — a self-contained, verifiable proof (two conflicting signed
     /// votes at one slot). The driver applies the slash and can gossip the evidence; anyone can re-verify it.
     Slash(SlashEvidence),
+    /// The finalized block's reward split among its commit-certificate signers — `(validator, amount)` pairs
+    /// (`incentive::distribute`). The driver credits each validator; this operationalizes the reward `R = F/Q`
+    /// the Nash equilibrium assumes (symmetric to [`Slash`](Output::Slash)).
+    Reward(Vec<(u8, u64)>),
 }
 
 /// One validator's sans-I/O consensus engine over a state machine `S`.
@@ -324,6 +328,9 @@ pub struct ConsensusEngine<S: StateMachine> {
     // checkpoint that makes divergence detectable and anchors cross-cell proofs.
     exec_votes: BTreeMap<u64, BTreeMap<u8, ExecVote>>,
     checkpoint: Option<ExecCertificate>,
+    // The per-block reward pool `F` split among the commit-certificate signers on finalization (`R = F/Q`).
+    // Zero (the default) emits no reward — backward-compatible; a driver funds it from collected fees.
+    reward_per_block: u64,
 }
 
 impl<S: StateMachine> ConsensusEngine<S> {
@@ -364,7 +371,14 @@ impl<S: StateMachine> ConsensusEngine<S> {
             pending_finalize: BTreeMap::new(),
             exec_votes: BTreeMap::new(),
             checkpoint: None,
+            reward_per_block: 0,
         }
+    }
+
+    /// Set the per-block reward pool `F` distributed to a block's commit-certificate signers on finalization
+    /// (`R = F/Q` per signer). Default `0` (no reward). A driver sets this from the fees it collects per block.
+    pub fn set_reward_per_block(&mut self, reward: u64) {
+        self.reward_per_block = reward;
     }
 
     /// The height currently being decided (the chain's next height).
@@ -659,6 +673,25 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.chain.finalize(block.header.clone());
 
         let mut out = alloc::vec![Output::Committed { height, block_hash }];
+        // Distribute the block reward `F` among the distinct commit signers this validator certified (`R = F/Q`
+        // each) — the operational reward the Nash equilibrium assumes, symmetric to the equivocation slash. The
+        // split is over this node's commit view (≥ Q signers); a canonical, cross-node-identical reward would
+        // record the commit certificate in the chain (the same refinement the execution checkpoint makes for
+        // state) — future work.
+        if self.reward_per_block > 0 {
+            let mut signers: Vec<u8> = self
+                .commits
+                .iter()
+                .filter(|sv| sv.vote.phase == Phase::Commit && sv.vote.block_hash == block_hash)
+                .map(|sv| sv.vote.voter)
+                .collect();
+            signers.sort_unstable();
+            signers.dedup();
+            let split = distribute(self.reward_per_block, &signers);
+            if !split.is_empty() {
+                out.push(Output::Reward(split));
+            }
+        }
         out.extend(self.emit_reveals(&block));
         self.exec_queue.push(block.clone());
         // Validate any reveals that arrived early for this block's transactions, now that we hold the committee.
