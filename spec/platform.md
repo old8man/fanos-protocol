@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: "FANOS Platform — the holonic synthesis (E∧L meta-holon)"
-description: "The transformation of FANOS from an anonymity overlay into a full holonic platform: natively both a maximal-anonymity mixnet (E-machine) and a high-speed private post-quantum L1 blockchain (L-machine), with an untraceable currency (OBOLOS), a swift parallel execution fabric (DROMOS), currency-bought private naming (ONOMA), an anonymous PQ messenger (ANGELOS), and a threshold cross-chain (HERMES) — grounded in the ХОЛАРХ meta-specification and validated against its four viability invariants."
+description: "The transformation of FANOS from an anonymity overlay into a full holonic platform: natively both a maximal-anonymity mixnet (E-machine) and a high-speed private post-quantum L1 blockchain (L-machine), with an untraceable currency (OBOLOS), a swift parallel execution fabric (DROMOS), currency-bought private naming (ONOMA), an anonymous PQ messenger (ANGELOS), a monetized content-storage platform (THESAUROS), and a threshold cross-chain (HERMES) — grounded in the ХОЛАРХ meta-specification and validated against its four viability invariants."
 ---
 
 # FANOS Platform — the holonic synthesis
@@ -67,13 +67,13 @@ The anti-domination ceiling (V2 ≤ ~3/7) is the same *облик* (shape) of la
 
 - **Depth 0–1:** the single `PG(2,q)` cell (TAXIS) — an L1 shard.
 - **Depth 2 (L2):** the **recursion of cells** already specified in `protocol.md` §L1 and built in `fanos-taxis::hierarchy` — a parent cell whose "nodes" are child cells, attesting their finality (the checkpoints published live in the transformation so far). This is the *legitimate* one compounding of the scaling trick: L2 scales L1.
-- **Depth ≥ 3:** **forbidden as a scaling mechanism** — a third recursive tier does *not* compound (the compression does not stack twice). Beyond depth 2, FANOS **federates** (HERMES cross-chain, §7) rather than stacking another tier. The platform's shape obeys the theorem: *scale to depth 2, then federate.*
+- **Depth ≥ 3:** **forbidden as a scaling mechanism** — a third recursive tier does *not* compound (the compression does not stack twice). Beyond depth 2, FANOS **federates** (HERMES cross-chain, §8) rather than stacking another tier. The platform's shape obeys the theorem: *scale to depth 2, then federate.*
 
 ---
 
 ## §2. The platform stack {#stack}
 
-The `protocol.md` layer map (L0–L7) is preserved and extended; the platform adds a **value/application tier (L8–L12)** that composes onto the anonymity substrate. Every new tier names all seven aspects (ХОЛАРХ Ω2 gate: a zero is a decision, not an omission).
+The `protocol.md` layer map (L0–L7) is preserved and extended; the platform adds a **value/application tier (L8–L13)** that composes onto the anonymity substrate. Every new tier names all seven aspects (ХОЛАРХ Ω2 gate: a zero is a decision, not an omission).
 
 | Layer | Name | ХОЛАРХ породная сигнатура | Status |
 |---|---|---|---|
@@ -82,9 +82,10 @@ The `protocol.md` layer map (L0–L7) is preserved and extended; the platform ad
 | **L9** | **DROMOS** — the swift parallel execution fabric (the high-speed VM + the multi-cell parallel-shard scheduler) | D-dominant, DL/DU channels | **[P]** §3 |
 | **L10** | **OBOLOS** — the private untraceable post-quantum currency (the SKIA shielded pool) | **E∧L** — the composition made concrete | **[P]/[H]** §4 |
 | **L11** | **ONOMA-domains** (currency-bought private naming) · **ANGELOS** (anonymous PQ messenger) | U (naming) · A/E (messaging) | **[P]** §5, §6 |
-| **L12** | **HERMES** — post-quantum threshold cross-chain (federation, not a deeper tier) | O/L, cross-holon T-77 | **[P]** §7 |
+| **L12** | **HERMES** — post-quantum threshold cross-chain (federation, not a deeper tier) | O/L, cross-holon T-77 | **[P]** §8 |
+| **L13** | **THESAUROS** — the content-storage platform & capacity market (elevates the L4 store) | **O**-dominant, SD/SU/OU/SE channels | **[C]** §7 |
 
-The rest of this document specifies L9–L12. TAXIS (L8) is specified in `protocol.md` Part X.1 and `docs/design-taxis.md`; its live wiring is the current transformation.
+The rest of this document specifies L9–L13. TAXIS (L8) is specified in `protocol.md` Part X.1 and `docs/design-taxis.md`; its live wiring is the current transformation.
 
 ---
 
@@ -231,7 +232,23 @@ The decisive difference from Discord: **there is no company in the middle.** Com
 
 ---
 
-## §7. HERMES — post-quantum threshold cross-chain {#hermes}
+## §7. THESAUROS — the content-storage platform {#thesauros}
+
+*Name:* Greek **θησαυρός** (thesauros) — "storehouse, treasury"; the store that is also a market. It captures both duties at once, in the OBOLOS economic register.
+
+THESAUROS makes the **O — Foundation** store first-class: an advanced, monetized, post-quantum IPFS analog built *on top of* the L4 projective-LRC erasure store (`protocol.md` §L4), not beside it. It is the messenger's first tenant — "large blobs land in the L4 erasure store, retrieved anonymously" (§6.3) becomes a real subsystem — and the platform's capacity market: nodes **earn** OBOLOS by serving the `Storage` role, users **pay** for durability. It adds exactly three things the substrate lacks, all else being composition (Ω0):
+
+- **Immutable content addressing:** a chunk's `CID = MerkleRoot(leaves)` (BLAKE3, domain-separated) is content-addressed-by-value *and* the storage commitment at once; large objects are UnixFS-style Merkle-DAG manifests; a `DescriptorKind::Storage` name (`fanos-dromos::naming`) maps a mutable name → immutable CID. Content is **sealed at the edge** — the store holds only ciphertext (the E/privacy tint).
+- **Proof of retrievability [T]:** a cheap, *derived* audit — the PQ-VRF beacon seeds `k` unpredictable leaf challenges (reusing the `da` sampler), the provider returns leaves + Merkle paths against the committed CID. Soundness is not a constant: to catch any provider missing a fraction `f_tol` with `λ` bits, `k ≥ λ·ln2 / (−ln(1−f_tol))` — computed, not chosen. Storj/Sia-class spot-checks, *not* Filecoin's proving treadmill (the erasure layer already gives durability).
+- **The capacity market:** carried as a new `HybridLedger` tag `TAG_STORAGE`, a `Deal` state machine whose escrow releases the epoch slice **only when a proof verifies** — the exact `apply_shielded` "keyless sink released by a proof" idiom, via `move_system`. Enforcement is **pay-per-proof in arrears + reputation decay**, *not* bond-slashing: FANOS forbids capital staking (it deanonymizes), so a non-proving provider simply earns nothing and loses future assignments (`Reputation::observe`), the consumer is refunded, and honest storage strictly dominates whenever the slice `p` clears the cost `c` (the reused `covers_cost` condition). Price is derived (a utilization bonding curve; a double auction is the evolution), never a knob.
+
+*Породная сигнатура:* **O**-dominant, thick on **SD** (Persistence), **SU** (Symmetry / LRC replication), **OU** (Wholeness / data availability), **SE** (Representation / manifest index), with an **E/EO** tint (sealed, anonymously-retrieved content). It reuses the `[7,3,4]` codec, coordinate placement, DA sampler, `Role::Storage`/reputation, and the DROMOS payment rails verbatim; the one greenfield primitive is the proof of retrievability. Full design: `docs/design-storage.md`.
+
+**Status: [C]** for the composition (substrate, payments, roles, DA all built and strong); **[T]** for the PoR soundness bound; the content model + market state machine are the near-term build; shielded-payment deals inherit OBOLOS's **[P]** frontier (transparent-token deals work today).
+
+---
+
+## §8. HERMES — post-quantum threshold cross-chain {#hermes}
 
 *Name:* Greek **Ἑρμῆς** (Hermes) — god of boundaries, travel, commerce, and messengers; the crosser of thresholds.
 
@@ -243,7 +260,7 @@ Cross-chain is a **federation** (ХОЛАРХ §10: beyond depth 2, federate —
 
 ---
 
-## §8. The transformation roadmap — sequential, verified, exemplary {#roadmap}
+## §9. The transformation roadmap — sequential, verified, exemplary {#roadmap}
 
 The transformation proceeds in verified increments; each lands green (workspace tests + `clippy --all-targets -D warnings`) before the next, per the standing discipline. Ordered by *foundational leverage* (what the most other things need):
 
@@ -258,7 +275,7 @@ Every subsystem names all seven aspects (Ω2), declares its typed cross-block co
 
 ---
 
-## §9. Honest limits, falsifiers, and the single largest risk {#limits}
+## §10. Honest limits, falsifiers, and the single largest risk {#limits}
 
 Following ХОЛАРХ §19 — a specification that declares itself perfect refutes itself. The load-bearing honesty:
 
@@ -266,6 +283,6 @@ Following ХОЛАРХ §19 — a specification that declares itself perfect ref
 - **"High-speed L1" is a program, not a benchmark yet.** The parallel-execution determinism and cross-shard atomicity (§3.4) must be built and measured; the geometry *enables* Solana-class scaling but does not deliver it for free.
 - **The Γ-profile numbers (§1.2) are a [C] construction over declared budgets**, not a measurement of a running platform — exactly the ХОЛАРХ honesty class. The viability *thresholds* are theorems; that the platform's budgets deserve them is validated by coherence-of-consequences until there is field data.
 - **Aspect attributions are judgments [И].** Whether the OBOLOS proof is L-work or E-work, whether DROMOS's scheduler is D or DL, are arguable model decisions; the vocabulary makes them arguable, not certain.
-- **Falsifiers, as targets:** (1) exhibit a platform dependency no aspect-pair types (breaks §1); (2) exhibit a bona-fide Γ-assembly of the platform that is viable yet violates the four-invariant conjunction (breaks the gate); (3) demonstrate the PQ shielded pool is unrealizable at parameters giving both soundness and platform-scale performance (forces the §9 retreat, honestly).
+- **Falsifiers, as targets:** (1) exhibit a platform dependency no aspect-pair types (breaks §1); (2) exhibit a bona-fide Γ-assembly of the platform that is viable yet violates the four-invariant conjunction (breaks the gate); (3) demonstrate the PQ shielded pool is unrealizable at parameters giving both soundness and platform-scale performance (forces the §10 retreat, honestly).
 
 **What this document does not claim:** it does not claim the platform is built (it is the blueprint); it does not claim new cryptographic hardness (it composes vetted PQ primitives and isolates the one frontier proof); and it does not claim the ХОЛАРХ verdict is a measurement (it is a construction over declared budgets, to be recomputed as the code lands). The transformation is sequential, verified, and honest at every step — the standing discipline, applied to a platform.
