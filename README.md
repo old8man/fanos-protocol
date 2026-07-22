@@ -2,10 +2,14 @@
 
 > *"Structure lives not in pairs but in triples. A network that knows this does not search — it computes."*
 
-**FANOS is a post-quantum anonymity network** — Tor / Nym / I2P class — that replaces the search-based
-plumbing of peer-to-peer systems with **geometry**. Nodes are *points* of a finite projective plane
-`PG(2, q)`; quorums are its *lines*. Because the plane's algebra is fixed and total, the operations that cost
-other networks round trips and routing tables cost FANOS a **single arithmetic step**:
+**FANOS is a post-quantum holonic platform** — a maximal-anonymity network (Tor / Nym / I2P class) *and* a
+high-speed private L1 blockchain, composed into one system (the E∧L meta-holon, grounded in the corpus ХОЛАРХ
+meta-specification): an anonymity substrate carrying an untraceable currency (**OBOLOS**), swift consensus
+(**TAXIS**/**DROMOS**), private currency-bought naming (**ONOMA**), an anonymous messenger (**ANGELOS**), and
+cross-chain (**HERMES**) — see [`spec/platform.md`](spec/platform.md). It replaces the search-based plumbing of
+peer-to-peer systems with **geometry**. Nodes are *points* of a finite projective plane `PG(2, q)`; quorums are
+its *lines*. Because the plane's algebra is fixed and total, the operations that cost other networks round trips
+and routing tables cost FANOS a **single arithmetic step**:
 
 | The hard problem in Kademlia / Tor / Nym | The FANOS answer |
 |---|---|

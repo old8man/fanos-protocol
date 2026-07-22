@@ -1,7 +1,11 @@
 # FANOS in the landscape — an honest comparison (Tor · Nym · I2P · Lokinet · Veilid)
 
-This document compares FANOS to the anonymity networks it is closest to. It is written to be *useful*, which
-means it leads with the concessions, not the wins. Where a rival is ahead, it says so plainly.
+This document compares the **anonymity dimension** of FANOS to the networks it is closest to. FANOS is now a
+holonic *platform* (a maximal-anonymity mixnet composed with a high-speed private L1 blockchain — see
+[`../spec/platform.md`](../spec/platform.md)); anonymity is one axis of it, and the peers below are the right
+yardstick for that axis (the blockchain/currency peers — Monero, Zcash, Solana — are compared in
+`spec/platform.md`). It is written to be *useful*, which means it leads with the concessions, not the wins.
+Where a rival is ahead, it says so plainly.
 
 ## 0. The meta-caveat — read this first
 

@@ -17,10 +17,12 @@ code need entirely different review effort.
 
 ## 1. Purpose and scope
 
-FANOS is a projective-plane-addressed (`PG(2,q)`) overlay network in the Tor/Nym/I2P anonymity
-class, with an optional privacy layer (APHANTOS/NYX), hidden-service layer (CALYPSO), and
-censorship-resistance layer (PROTEUS). The full architecture is `spec/protocol.md`; this package
-concerns only its **cryptographic surface**.
+FANOS is a post-quantum **holonic platform** — a projective-plane-addressed (`PG(2,q)`) maximal-anonymity
+network (Tor/Nym/I2P class, with the APHANTOS/NYX privacy, CALYPSO hidden-service, and PROTEUS
+censorship-resistance layers) composed with a high-speed private L1 blockchain (TAXIS consensus, the OBOLOS
+untraceable currency, ONOMA naming, ANGELOS messaging, HERMES cross-chain). The anonymity substrate is
+`spec/protocol.md`; the platform tier is `spec/platform.md`; this package concerns only the **cryptographic
+surface** of the shipped substrate.
 
 ### The project's own cryptographic-honesty stance
 

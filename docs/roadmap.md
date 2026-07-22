@@ -29,8 +29,10 @@ The consequence is a single network that:
 - **observes and repairs** itself (reroute, regenerate, decouple, escalate) with no operator;
 - **stabilizes** under attack by formal dissipation, not bolt-on filters;
 - is **post-quantum** end to end from day one; and
-- is a **platform** — anyone can run a VPN, hidden service, web backend, or (future) a *coherent
-  blockchain* on top, because FANOS is a high-level transport, not a single application.
+- is a **platform** — natively both a maximal-anonymity mixnet and a high-speed private L1 blockchain (the
+  E∧L meta-holon, `spec/platform.md`): consensus (TAXIS/DROMOS), an untraceable currency (OBOLOS), naming
+  (ONOMA), and messaging (ANGELOS) are native tiers, and external products (VPN, hidden services, web
+  backends) ride the anonymity substrate — FANOS is the whole platform, not a single application.
 
 The end state is one binary — `fanos` — that runs nodes, exactly as `tor` does, but for a network that
 is coherent cybernetics made real.
@@ -195,7 +197,9 @@ signal. Together these target the free-rider problem the spec honestly marks ope
 
 ## 4. Products on the platform
 
-FANOS is a transport; products ride it.
+FANOS is a platform: its native tiers (consensus, the OBOLOS currency, ONOMA naming, ANGELOS messaging,
+HERMES cross-chain) *are* the platform, and external products (VPN, proxy, hidden services) ride the shared
+anonymity substrate.
 
 - **VPN (flagship, Phase 5).** Full-tunnel `fanos vpn` (TUN): all traffic — TCP *and* UDP — through
   Lite/Full onions, PROTEUS-obfuscated, provably anonymous. WireGuard-class UX, mixnet-class privacy,
@@ -214,7 +218,7 @@ FANOS is a transport; products ride it.
 
 ## 5. The UHM grounding — coherent cybernetics on every level
 
-FANOS is the network realization of the UHM (УГМ) ontology, and this is *why* it can self-observe:
+FANOS is the platform realization of the UHM (УГМ) ontology — the ХОЛАРХ meta-holon made runnable — and this is *why* it can self-observe:
 
 - **The reflexive plane.** DIAKRISIS is the network's self-model: a cell of seven reads its own
   coherence matrix `Γ_net`, the third-order statistic `Φ / P / R`. A network that measures itself can
