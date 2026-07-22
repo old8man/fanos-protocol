@@ -45,6 +45,7 @@ members = [
     "crates/fanos-obolos",
     "crates/fanos-dromos",
     "crates/fanos-angelos",
+    "crates/fanos-thesauros",
     "crates/fanos-wasm",
 ]
 

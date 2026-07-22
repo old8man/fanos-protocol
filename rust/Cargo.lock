@@ -1252,6 +1252,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-thesauros"
+version = "0.1.0"
+dependencies = [
+ "fanos-primitives",
+]
+
+[[package]]
 name = "fanos-vpn"
 version = "0.1.0"
 dependencies = [

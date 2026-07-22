@@ -1,0 +1,23 @@
+[package]
+name = "fanos-thesauros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "THESAUROS — the FANOS content-storage platform: content-addressed objects, proof of retrievability, and the capacity market over the L4 erasure store (docs/design-storage.md)."
+keywords = ["storage", "content-addressed", "merkle", "post-quantum", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+# BLAKE3 domain-separated hashing for the Merkle content tree (the CID) and, later, the PoR challenge.
+# `alloc` is always on (the content model builds Vec-backed Merkle trees); `std` layers on top by default.
+fanos-primitives = { workspace = true, default-features = false, features = ["alloc"] }
+
+[features]
+default = ["std"]
+std = ["fanos-primitives/std"]
+
+[lints]
+workspace = true

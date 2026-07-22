@@ -20,6 +20,7 @@ everything else.
 | [`vectors/names.json`](vectors/names.json) | ONOMA addresses (bech32m PQ commitments), mnemonics, and per-epoch descriptor derivations | §L-pet |
 | [`vectors/telemetry.json`](vectors/telemetry.json) | the canonical `CoherenceFrame` wire format and the 3-bit Fano/Hamming syndrome | §2.7, §6 |
 | [`vectors/angelos.json`](vectors/angelos.json) | ANGELOS messenger wire formats: the message envelope, the bot command grammar, and the session/group/media crypto planes | platform §6 |
+| [`vectors/thesauros.json`](vectors/thesauros.json) | THESAUROS content addressing: the position-bound Merkle CID, the retrievability proof, and the manifest layout | platform §7 |
 
 ## Provenance
 

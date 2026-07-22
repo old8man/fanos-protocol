@@ -1,0 +1,39 @@
+{
+  "description": "THESAUROS content-storage known-answer tests (design: docs/design-storage.md, spec/platform.md §7). THESAUROS is the platform's O-Foundation content-storage organ over the L4 erasure store. These vectors pin the language-agnostic content-addressing wire so any implementation reproduces content ids (CIDs) and proof-of-retrievability responses byte-for-byte. An object is split into LEAF-sized leaves; each leaf is hashed WITH ITS INDEX (position-bound) and a binary Merkle tree over those leaf hashes gives the CID = the root — the content address and the storage commitment at once. All hashes are BLAKE3 via hash_labeled (BLAKE3 keyed by the 32-byte BLAKE3 hash of the ASCII label). Pinned by the Rust reference suite (fanos-thesauros/tests/conformance.rs). Byte strings are lower-case hex; integers decimal.",
+  "params": {
+    "leaf_size": 4096,
+    "chunk_size": 262144,
+    "leaf_label": "FANOS-v1/thesauros-leaf",
+    "node_label": "FANOS-v1/thesauros-node",
+    "leaf_hash": "leaf_hash(index, bytes) = hash_labeled(leaf_label, index_as_u64_le(8) || bytes)",
+    "node_hash": "node_hash(left, right) = hash_labeled(node_label, left(32) || right(32))",
+    "root": "binary Merkle fold of the leaf hashes; a lone odd node at any level is promoted unchanged; empty object = one empty leaf, cid = leaf_hash(0, [])",
+    "cid": "the Merkle root (32 bytes)"
+  },
+  "single_leaf": {
+    "comment": "An object smaller than one leaf is a single leaf; its CID is that leaf's position-bound hash.",
+    "input_hex": "544845534155524f532d763120636f6e666f726d616e6365",
+    "input_utf8": "THESAUROS-v1 conformance",
+    "cid_hex": "08d188caddc77d94f74ffad43faf9dbfe30f580c7d0b7c6904fde7a9a1757352"
+  },
+  "two_leaf": {
+    "comment": "0xAB repeated 4096 (one full leaf) then 0xCD x100 (a partial second leaf). CID = node_hash(leaf_hash(0, leaf0), leaf_hash(1, leaf1)). The proof-of-retrievability response for leaf index 1 is the 100 leaf bytes plus a 1-step Merkle path whose sibling is leaf 0's hash (on the left).",
+    "leaf0_byte": 171,
+    "leaf0_len": 4096,
+    "leaf1_byte": 205,
+    "leaf1_len": 100,
+    "cid_hex": "ef5852c9ae5a18e782390d8a0390fcaeb24870b512f3f0a6cbf49a77ec5e4dab",
+    "leaf1_proof": {
+      "steps": 1,
+      "sibling0_hex": "42c328b17f0d442090c2fa24124d373b9d933bd561adfd3fc778ddc4faf65e62",
+      "sibling0_on_right": false
+    }
+  },
+  "manifest": {
+    "comment": "An object of CHUNK*2 + 500 bytes, byte i = (i*7) mod 256, split into 3 chunks (2 full + 1 partial). The manifest encodes count(4, LE) || [ cid(32) || len(4, LE) ] x count; its own CID is chunk_cid(manifest.encode()).",
+    "object_len": 524788,
+    "chunk_count": 3,
+    "chunk0_cid_hex": "acb392e6be89ba2603c51ff71585906947575f47c92329c0858499eafda29f08",
+    "manifest_cid_hex": "77bee73e33cd5dea7db2e1d4ecf960ff03389d29b3ffb09269e8b1df14647858"
+  }
+}
