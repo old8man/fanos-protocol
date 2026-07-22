@@ -1,43 +1,55 @@
-# FANOS — active task list
+# FANOS — task list
 
-> **▶ RIGHT NOW: THREAT catalog — industrial attack-class modeling in the simulator.** Model every
-> real-world attack class (calibrated to industrial grade) against the live engine in `fanos-sim`, per the
-> standing threat-modeling directive; `docs/network-threat-model.md` is the living catalog. Survey current
-> coverage → implement each missing class as a sim adversary affordance + a test that asserts the defence
-> holds (or documents the residual). Closing the fundamental layers sequentially.
+> **STATUS (2026-07-22): the protocol reference implementation is COMPLETE, verified, and hardened.**
+> Every roadmap milestone **M0–M10** (Part XV) is implemented across the 33 crates; the full workspace test
+> suite is green and every crate is clippy `--all-targets -D warnings` clean; a subsequent hardening pass
+> bounded all per-flow maps, closed a C-ABI UB edge, de-flaked the gate, and audited to correct code.
+> **What remains below is by design** — optional application layers, research-gated `[P]` theory, and an
+> OS-syscall shell that can't run in CI. None of it is a protocol gap; each needs a decision or research, not
+> autonomous grind. Full landed history: this file's lower section + `git log`.
 
-This file is kept current: the task above is committed **before** I start it and marked done (then pruned)
-when it lands. Completed tasks are removed — full history is in `git log`. Legend: ⬜ next up.
-
-> Note: the **Claude Code todo panel** in the terminal (`◼/◻`, "N completed") is a *separate* list from
-> this file. This session's toolset does **not** include the todo-editing tool (confirmed by search), so I
-> can't rewrite that panel — it froze showing tasks that are already done. Treat **this file as the accurate
-> status**. Stale-but-DONE on the panel: **NAT traversal** (`6de9760`), **L4 storage** (#115).
+> Note: the **Claude Code todo panel** (`◼/◻`) is a separate list; this session's toolset has **no**
+> todo-editing tool, so **this file is the accurate status**. There are **no** in-code `TODO`/`unimplemented!`
+> markers anywhere in `rust/crates` (verified) — the source carries no deferred work.
 
 ---
 
-## ⬜ Next up (frontier)
+## ⬜ What's left (all deliberately not auto-built)
 
-**The roadmap frontier is complete** — every fundamental level (M0–M8) and integration surface (M9–M10) is
-implemented and verified. The two items that lingered here turned out to be **already-realized, not gaps**:
+### A · Optional application layers — a product/economics decision, not a protocol gap
+- **Part X.1 — the blockchain *application* on FANOS** (roadmap M7's application target): line-committee
+  consensus **ordering** + anti-MEV over data-availability-sampled blocks. The *substrate primitives* exist
+  and are tested — DA sampling (`fanos-code/src/da.rs`), the `[7,3,4]` erasure store, PoW admission, VOPRF
+  anonymous credits, the projective-line committee structure — but the consensus/ordering **ledger app** that
+  composes them is unbuilt (no consensus/committee/MEV/mempool module exists; verified). Needs a design
+  choice (which finality? ordering rule?) before any code. Spec marks L7 + Part X **optional**.
+- **L7 incentive *equilibrium*** — the VOPRF credit **mechanism** is built; a free-rider-resistant economic
+  **equilibrium** is an open economic problem (§16: "L7 gives the mechanics, not an equilibrium guarantee"),
+  not a coding task. No magic pricing invented.
 
-> **Maekawa W∩R quorum** (L4-store quorum consistency, §L4 line-364) is **already realized + tested**, not a
-> gap. Its geometric foundation — any two lines meet in exactly one point (`W ∩ R ≠ ∅`) — is the exhaustive
-> `fanos-geometry::dual_any_two_lines_intersect` (V1). Its storage realization is the erasure store's
-> versioned **full-fan-out** read (a superset of any line-quorum → trivial intersection, plus LRC
-> durability): `sim/tests/storage.rs` verifies read-after-write, last-writer-wins-by-version, read-repair
-> across the replica line, crashed-primary reroute, and LRC reconstruction. A bare line-replication store
-> would be inferior (a 3-point line yields 3 shards; `[7,3,4]` needs 4) and strict *multi-writer*
-> linearisability (quorum locking) is unneeded — store keys are single-writer. See `routing.rs::replica_lines`.
+### B · Research-gated — no theorem/proof exists yet (`[P]` in the spec's own honest list, Part XVI)
+- **Machine-checked formal proofs** of the Tessera packet and the holonomic ratchet (currently `[P]`
+  research constructions).
+- **PQ-VRF / PQ beacon / PQ verifiable shuffle** — classical variants are the honest interim (`[P]`).
+- **Deeper DIAKRISIS hierarchy** — parent-observes-child recursion *beyond* the built §6.5 partition sensor
+  (#95); and the **D6 quarantine theorem** (no proof exists in the UHM corpus — cannot be invented).
+- **GF(2^m) constant-time field arithmetic** for large-`q` profiles (side-channel hardening, §16).
 
-> **VOPRF credit settlement** (Phase 4) is **already implemented + tested**, not a gap: the ristretto255
-> VOPRF primitive (`fanos-incentives`: blind→DLEQ→unblind, context-bound redemption B8, deterministic nonce
-> B4, double-spend) and its concrete settlement use — anonymous credits paying for a CALYPSO introduction
-> exactly once (`sim/tests/paid_intro.rs`). Mix-relay *forwarding* payment is the L7-opt / economically-open
-> part (§16 "L7 gives the mechanics, not an equilibrium guarantee"), deliberately not invented (no magic
-> pricing).
+### C · Runtime-only verification — built + compiles/lints clean, but the OS-syscall shell can't run in CI
+- **TUN device I/O** (`fanos-vpn`, feature `device`; `fulltunnel.rs` + `device.rs`) — the datapath/engine/mux
+  are unit-tested with mocks; the real `tun` syscalls are verified on a host, not in the gate.
+- **Real-NAT socket-filter test harness** — the NAT-traversal logic (#119) is complete and tested against
+  simulated NATs; a harness exercising real OS NAT/firewall filters is the only residual.
 
-## ✅ Landed this session (2026-07-21) — pruned as they age
+> **Two former "frontier" items were phantom gaps — already realized + tested, kept here as the record:**
+> **Maekawa W∩R quorum** is the erasure store's versioned full-fan-out read (a superset of any line-quorum →
+> trivial `W∩R≠∅`, plus LRC durability; `sim/tests/storage.rs`), founded on `fanos-geometry::
+> dual_any_two_lines_intersect` (V1) — strict multi-writer linearisability is unneeded (keys are
+> single-writer). **VOPRF credit settlement** is the ristretto255 primitive (`fanos-incentives`:
+> blind→DLEQ→unblind, B8 context binding, B4 nonce, double-spend) paying for a CALYPSO introduction exactly
+> once (`sim/tests/paid_intro.rs`); mix-relay forwarding payment is the L7-opt economically-open part above.
+
+## ✅ Landed (recent frontier history — full record in `git log`)
 
 **`fanos vpn` FULL-TUNNEL (TCP + UDP) — the VPN is complete** (Phase 5, §11.4) — `fulltunnel::run_fulltunnel`
 (feature `device`): a userspace TCP/IP stack (`ipstack`) terminates every TCP/UDP flow at the TUN and bridges
