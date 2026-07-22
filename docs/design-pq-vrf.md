@@ -52,38 +52,44 @@ the domain; proofs round-trip through bytes.
 
 *Honest status vs. the classical DVRF.* The interim beacon (`fanos-vrf::beacon`) is a threshold DVRF whose
 output is **unique under reconstruction**: any `t` of `n` shares recover the *same* value, so a `< t`
-withholding minority cannot stop or fork it. The PQ beacon here is a **full-reveal** composition — it combines
-the shares that appear, so a withholding anchor changes the value (a liveness/agreement dependency on all
-declared anchors for a given round). Recovering DVRF-style *reconstruction uniqueness* post-quantum needs a PQ
-threshold primitive (a lattice threshold PRF, or a hash-based threshold with a fixed reveal set) and is the
-residual open piece — but the per-anchor PQ-VRF and the unbiasable full-reveal beacon are concrete, tested
-advances over "classical only", and suffice for a synchronous anchor set.
+withholding minority cannot stop or fork it. The `pqvrf` beacon is a **full-reveal** composition. **The
+reconstruction-unique variant is now implemented** in [`fanos-vrf::pqvss`] (Hand-roll full): a threshold beacon
+from **plain Shamir over `GF(256)`** ([`fanos_primitives::shamir`], the existing threshold substrate), whose
+reconstruction is *information-theoretic* — hence PQ — and unique by interpolation. Malicious-dealer
+consistency, which Feldman/Pedersen buy with non-PQ homomorphic commitments, is instead enforced at reveal by
+a complete **all-`t`-subsets-agree** check (accept a dealing iff every `t`-subset reconstructs the identical
+secret ⇔ the shares lie on one degree-`t−1` polynomial); an inconsistent dealer is detected and excluded.
+Unbiasability comes from a binding hash commitment to all shares published before the epoch. This is
+**novel/unaudited** and detectable-abort (a malicious dealer can only get its own contribution rejected, never
+bias the honest sum), reduced in `pqvss`'s module docs.
 
-## 3. The PQ verifiable shuffle — design and honest status (designed, not implemented)
+## 3. The PQ verifiable shuffle — implemented ([`fanos-vrf::shuffle`], Hand-roll full)
 
-A verifiable shuffle proves that an output list is a secret permutation (+ re-randomization) of an input list.
-FANOS has **no classical shuffle implementation** either: its anonymity comes from the **threshold sheaf**
-onion + structurally-balanced cover + Poisson mixing (§5.2–§5.5), *not* from a Neff/Groth verifiable-mix proof,
-so this item is a spec *aspiration* for an alternative verifiable-mixnet profile, not a live dependency.
+A verifiable shuffle proves an output list is a secret permutation (+ re-randomization) of the inputs, so no
+output links to its submitter, *without revealing the permutation*. **Audit correction:** an earlier draft of
+this note claimed a *hash-only* cut-and-choose shuffle is sound — **it is not**. Proving a shadow re-commits
+the inputs forces opening the input commitments, which leaks the submitter↔value link; genuine unlinkability
+needs **re-randomization**, which needs a *homomorphic* cryptosystem (so a verifier checks `ct' = ReRand(ct,r)`
+from `r` without the plaintext). Hash commitments cannot re-randomize — so no sound hash-only linkage-hiding
+shuffle exists.
 
-**Recommended sound PQ construction (cut-and-choose permutation argument).** Commit each input with a
-hash commitment `c_i = H(m_i ‖ r_i)`. The mixer outputs re-committed values in permuted order and proves
-correctness by a `k`-round cut-and-choose: in each round it commits a fresh "shadow" permutation `σ_j` and its
-blinders; the verifier's challenge bit reveals either (a) `σ_j` and the input→shadow blinders, or (b) the
-shadow→output blinders — never both, so the permutation stays hidden while each round has soundness error
-`1/2`; `k` rounds give `2^-k`. Everything is hash commitments ⇒ post-quantum. Proof size is `O(k·n)`.
-(A lattice-based shuffle — RLWE re-encryption with a norm/permutation proof — is the smaller-proof alternative
-but a much larger implementation surface.)
-
-**Status.** Designed here with a soundness argument; **not implemented**, because (i) it has no live consumer
-in FANOS's current anonymity stack and (ii) a sound cut-and-choose implementation is a substantial standalone
-artifact whose value is a *different* mixnet profile than the one FANOS ships. It is recorded as the concrete
-next construction should a verifiable-mixnet profile be prioritized.
+The implemented construction is therefore a **Sako–Kilian cut-and-choose over a re-randomizable encryption**,
+with the proof logic **generic over the cryptosystem** (the sound, novel part) and the re-randomization
+isolated to one seam. It is instantiated over **ristretto ElGamal** (the group FANOS's VRF/DKG/VOPRF already
+use — architecturally coherent), giving a complete, tested verifiable mixnet proof. *Soundness* `1 − 2^-k`
+(each shadow is committed before the Fiat–Shamir challenge; a wrong output multiset fails one branch).
+*Hiding*: only re-randomization factors are ever revealed (checked homomorphically), one branch per shadow, so
+`π` stays hidden. Over ristretto it is **classical** (discrete log); **swapping the seam for a lattice/RLWE
+ElGamal makes the identical proof post-quantum** — the cut-and-choose soundness is unconditional. The PQ `[P]`
+thus reduces to "a PQ re-randomizable encryption" (a known lattice primitive), and the construction is ready
+for it. **Novel/unaudited.** (FANOS's live anonymity remains the threshold sheaf + cover + Poisson mixing; this
+is the verifiable-mixnet profile the spec aspires to, now built.)
 
 ## Summary
 
 | Item | Status |
 |---|---|
 | PQ-VRF (Merkle-committed PRF over epochs) | **Implemented + tested** (`pqvrf`), reduction to BLAKE3 |
-| PQ beacon (full-reveal anchor combination) | **Implemented + tested**, unbiasable; threshold-uniqueness residual noted |
-| PQ verifiable shuffle | **Designed** (cut-and-choose, sound, PQ); not implemented — no live consumer |
+| PQ beacon — full-reveal | **Implemented + tested** (`pqvrf`), unbiasable |
+| PQ beacon — **reconstruction-unique** | **Implemented + tested** (`pqvss`): committed Shamir + all-`t`-subsets consistency. Novel/unaudited |
+| PQ verifiable shuffle | **Implemented + tested** (`shuffle`): Sako–Kilian over ristretto ElGamal, PQ via a lattice seam-swap. Novel/unaudited |

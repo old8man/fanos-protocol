@@ -28,6 +28,13 @@ pub mod dkg;
 /// A post-quantum, hash-based Merkle-VRF for the bounded epoch domain (spec §16 `[P]`, an alternative to the
 /// classical ristretto VRF above). See [`pqvrf`] and `docs/design-pq-vrf.md`.
 pub mod pqvrf;
+/// A post-quantum threshold randomness beacon with reconstruction-uniqueness — committed Shamir + an
+/// all-`t`-subsets consistency check (spec §16 `[P]`). NOVEL/UNAUDITED; see [`pqvss`].
+pub mod pqvss;
+/// A verifiable shuffle (Sako–Kilian cut-and-choose over re-randomizable ElGamal) — sound, linkage-hiding
+/// mixnet proof, generic over the cryptosystem so the ristretto instantiation PQ-swaps to lattice (spec §16
+/// `[P]`). NOVEL/UNAUDITED; see [`shuffle`].
+pub mod shuffle;
 pub mod vss;
 
 use alloc::vec::Vec;
