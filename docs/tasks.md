@@ -36,6 +36,10 @@ Roadmap (`spec/platform.md` §8), sequential + verified:
             `build_transfer_delivering` + `scan`. All THREE privacy properties now hold: confidentiality
             (homomorphic commitment) ∧ untraceability (whole-pool + nullifiers) ∧ unlinkability (hidden-owner
             commitments + fresh-KEM delivery — no key-blinding needed, Zcash-Sapling model).
+      - [x] **Bidirectional shield/unshield bridge** (`dromos::bridge`, `ShieldedTx.public_value`) — value flows
+            both ways between the public token ledger and the private pool (a keyless POOL_SINK backs the pool;
+            shield = signed transfer→sink + mint; unshield = shielded spend with a public output → system move
+            from sink). Shield for privacy, unshield to pay public fees.
       - [ ] Residual: the PQ **zero-knowledge** proof backend (the one frontier [P]/[H]); calibrate the lattice
             params + external audit.
 - [~] **T3 · DROMOS (L9)** — crate `fanos-dromos` (crate 37):
