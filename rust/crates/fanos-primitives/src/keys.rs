@@ -100,8 +100,9 @@ pub struct HybridPublicKey {
     pub vrf: [u8; VRF_PK_LEN],
 }
 
-/// A 32-byte long-term node identifier (spec §L0).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+/// A 32-byte long-term node identifier (spec §L0). Totally ordered (by its bytes) so it can key the
+/// deterministic maps the self-organizing assignment and other consensus-critical code build.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct NodeId(pub [u8; DIGEST_LEN]);
 
 impl HybridPublicKey {

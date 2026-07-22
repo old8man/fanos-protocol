@@ -50,6 +50,7 @@ pub mod admission;
 pub mod hierarchy;
 pub mod membership;
 pub mod quorum;
+pub mod roles;
 pub mod routing;
 pub mod stratum;
 
