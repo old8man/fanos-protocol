@@ -55,13 +55,22 @@ output is **unique under reconstruction**: any `t` of `n` shares recover the *sa
 withholding minority cannot stop or fork it. The `pqvrf` beacon is a **full-reveal** composition. **The
 reconstruction-unique variant is now implemented** in [`fanos-vrf::pqvss`] (Hand-roll full): a threshold beacon
 from **plain Shamir over `GF(256)`** ([`fanos_primitives::shamir`], the existing threshold substrate), whose
-reconstruction is *information-theoretic* — hence PQ — and unique by interpolation. Malicious-dealer
-consistency, which Feldman/Pedersen buy with non-PQ homomorphic commitments, is instead enforced at reveal by
-a complete **all-`t`-subsets-agree** check (accept a dealing iff every `t`-subset reconstructs the identical
-secret ⇔ the shares lie on one degree-`t−1` polynomial); an inconsistent dealer is detected and excluded.
-Unbiasability comes from a binding hash commitment to all shares published before the epoch. This is
-**novel/unaudited** and detectable-abort (a malicious dealer can only get its own contribution rejected, never
-bias the honest sum), reduced in `pqvss`'s module docs.
+reconstruction is *information-theoretic* — hence PQ — and unique by interpolation.
+
+Malicious-dealer consistency, which Feldman/Pedersen buy with non-PQ homomorphic commitments, is instead
+enforced by **binding the sharing polynomial** (audit fix). An earlier design bound each share to itself with a
+per-share hash and checked, at reveal, that the *revealed* `t`-subset was self-consistent — but at exactly `t`
+shares that check is **vacuous** (interpolation is trivially self-consistent at `t` points), so a dealer could
+deal shares off any single degree-`t−1` polynomial and have different `t`-subsets reconstruct *different*
+secrets; per-share hash commitments fundamentally cannot give both withholding-tolerance and dealer-consistency.
+The fix: the dealer publishes, before the epoch, a commitment to the **polynomial itself** —
+`H(epoch ‖ dealer ‖ t ‖ P(0) ‖ … ‖ P(t−1))`, whose `t` canonical values uniquely determine the degree-`t−1`
+polynomial. At reveal, any `t` shares are interpolated, the reconstructed polynomial's canonical values are
+hashed, and compared to the commitment: a `t`-subset that reconstructs a *different* polynomial fails and is
+rejected, so **at most one secret is ever accepted** — reconstruction-unique *and* withholding-tolerant, with
+`t`, `epoch`, and `dealer` all bound (no wrong-`t` or cross-epoch/dealer replay). This is **novel/unaudited** and
+detectable-abort (a malicious dealer can only get its own contribution rejected, never bias the honest sum),
+reduced in `pqvss`'s module docs.
 
 ## 3. The PQ verifiable shuffle — implemented ([`fanos-vrf::shuffle`], Hand-roll full)
 
@@ -77,25 +86,35 @@ The implemented construction is therefore a **Sako–Kilian cut-and-choose over 
 with the proof logic **generic over the cryptosystem** ([`shuffle::ReRandomizable`]) — the sound, novel part —
 and the re-randomization isolated to one seam. **Two backends are implemented**: ristretto ElGamal
 ([`shuffle::ElGamal`], *classical*/discrete-log, coherent with FANOS's VRF/DKG/VOPRF group) and **Ring-LWE
-ElGamal** ([`rlwe::Rlwe`], *post-quantum*). The *same* `prove`/`verify` run over either — `the_same_shuffle_
-proof_runs_post_quantum_over_rlwe` exercises it end-to-end. *Soundness* `1 − 2^-k` (each shadow is committed
-before the Fiat–Shamir challenge; a wrong output multiset fails one branch); the cut-and-choose is
-unconditional, so the shuffle is post-quantum **iff its backend is** — and now it can be. **Novel/unaudited.**
-(FANOS's live anonymity remains the threshold sheaf + cover + Poisson mixing; this is the verifiable-mixnet
-profile the spec aspires to, now built and PQ-capable.)
+ElGamal** ([`rlwe::Rlwe`], *post-quantum*). The *same* `prove`/`verify` run over either. *Soundness* `1 − 2^-k`
+with `k ≥ 128` enforced (each shadow is committed before the Fiat–Shamir challenge, which is a single joint hash
+over the public key, `(n, k)`, and all shadows; a wrong output multiset fails one branch).
+
+**Audit correction — soundness is not backend-agnostic (see §4.2).** The reduction is exact **only when the
+backend's re-randomization is plaintext-preserving *and* `verify_rerandomization` enforces that.** The **ElGamal
+backend meets this unconditionally** (one scalar ties both ciphertext components — no free translation), so the
+classical shuffle is genuinely `1 − 2^-k` sound and is the backend to rely on. The **Ring-LWE backend does not**
+at `n = 512`: an independent review broke it (its check was a tautology admitting a plaintext-changing
+translation factor); a shortness gate now closes the trivial forgery, but a norm bound alone cannot give
+worst-case soundness there. Treat the RLWE backend as an **experimental research scaffold** (§4.2), not a sound
+PQ shuffle. **Novel/unaudited.** (FANOS's live anonymity remains the threshold sheaf + cover + Poisson mixing;
+this is the verifiable-mixnet profile the spec aspires to.)
 
 ## 4. Self-cryptanalysis and honest limits
 
 The strongest verification achievable in-house (external cryptanalysis is, by definition, external):
 
-- **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + BLAKE3
-  binding, both standard; the all-`t`-subsets check is a complete decision procedure for collinearity (no
-  probabilistic gap). The honest limit is the **detectable-abort** model: a malicious *dealer* can get its own
+- **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + a BLAKE3
+  **polynomial commitment** (the `t` canonical values `P(0..t−1)` bind the whole degree-`t−1` polynomial before
+  the epoch). The honest limit is the **detectable-abort** model: a malicious *dealer* can get its own
   contribution rejected (a liveness nuisance), never bias the honest sum — sound only under an honest majority
-  of *dealers*. Adversarial tests cover forged shares, an inconsistent (off-polynomial) but self-consistently
-  committed dealing, and below-threshold reveals.
-- **`shuffle`** — soundness is unconditional (combinatorial cut-and-choose, `1 − 2^-k`); hiding reveals only
-  re-randomization factors (checked homomorphically), one branch per shadow.
+  of *dealers*. Adversarial tests cover forged shares, an inconsistent (off-polynomial) dealing that yields two
+  different `t`-subset secrets (the attack an internal review used to break the earlier per-share-commitment
+  design — now rejected), wrong-`t`/epoch/dealer replays, and below-threshold reveals.
+- **`shuffle`** — the ElGamal backend's soundness is unconditional (combinatorial cut-and-choose, `1 − 2^-k`,
+  the plaintext-preserving factor is one scalar); the RLWE backend is not worst-case sound at `n = 512` (§4.2).
+  Hiding reveals only re-randomization factors (checked homomorphically), one branch per shadow, and requires a
+  secret high-entropy `seed`.
 
 ### 4.1 RLWE parameter calibration (rigorous)
 
@@ -115,39 +134,56 @@ coefficient is far below `q/4` (max `< 7σ` over ~51k samples), with correct dec
 shuffle **proof** is noise-agnostic (it checks *exact* ciphertext equality), so noise bounds bear only on
 decryption, never on soundness.
 
-### 4.2 Soundness in a splitting ring — why the cut-and-choose is the safe choice
+### 4.2 Soundness in a splitting ring — and why a naive cut-and-choose does **not** sidestep it (audit)
 
 The lattice-shuffle literature (Costa–Martínez–Morillo, *Proof of a Shuffle for Lattice-Based Cryptography*,
 2017; Aranha et al., CCS 2023; and **eprint 2025/658, *Efficient Verifiable Mixnets from Lattices, Revisited***,
 which *corrects a soundness gap* in prior work) shows that the *efficient, algebraic* (Neff/Bayer–Groth-style)
 shuffle proofs are subtle over `R_q`: because `q ≡ 1 (mod 2n)` makes `X^n+1` split completely, `R_q` has
-**zero-divisors**, so the Schwartz–Zippel argument those proofs rely on (a nonzero low-degree polynomial has
-few roots) **fails**, and soundness must be recovered with splitting-ring-aware machinery. Our **combinatorial
-cut-and-choose relies on no algebraic identity** — a wrong shuffle fails one of two challenge branches with
-probability `≥ 1/2` regardless of the ring — so it is **unconditionally sound over `R_q` for free**, sidestepping
-that entire subtlety. The honest cost is proof size: `O(k·n)` (with `k = 128` for `2^-128`) versus the
-algebraic `O(n)`. We trade succinctness for a soundness that needs no delicate ring analysis — the right default
-for a first, un-audited PQ construction.
+**zero-divisors**, so the Schwartz–Zippel argument those proofs rely on **fails**, and soundness must be
+recovered with splitting-ring-aware machinery.
+
+**An earlier draft of this note claimed our combinatorial cut-and-choose "relies on no algebraic identity" and
+is therefore "unconditionally sound over `R_q` for free," sidestepping the subtlety. An independent review
+proved that false.** The cut-and-choose's per-shadow trap — that a shadow cannot be *both* a re-randomization of
+the inputs (`b=0`) *and* have the outputs be a re-randomization of it (`b=1`) — holds **only if re-randomization
+preserves the plaintext**. The RLWE re-randomization opens its factor `(r', e1', e2')` in the clear, and if the
+verifier does not bound it, a factor with `r'=0` and an arbitrary `(e1', e2')` is a *free additive translation*
+that changes the plaintext, so a cheater answers whichever branch the challenge demands — a total soundness
+break (which the review demonstrated with a working forged shuffle). Enforcing a **shortness bound** on the
+opened factor closes that trivial forgery. But at NewHope-512 a norm bound alone is *not* enough for worst-case
+soundness: the decryption shift includes `s·e1'` with the **secret** `s` unknown to the verifier, and the only
+bound it can enforce, `‖s·e1'‖∞ ≤ n·η·B = 512·8·B`, exceeds `q/4 = 3072` for any `B` large enough to admit
+honest factors (`‖ρ−s‖∞ ≤ 2η = 16`). This is exactly the splitting-ring subtlety, and the naive cut-and-choose
+does not escape it — the dimension is too large relative to `q` for a clean opened-factor bound.
+
+**Honest resolution.** The **ElGamal (classical) backend is unconditionally sound** — its factor is a single
+scalar tying both ciphertext components, leaving no free translation — and is the shuffle to rely on. The
+**RLWE backend is an experimental research scaffold**: the shortness gate removes the trivial break, but a
+production-sound PQ shuffle needs the splitting-ring-aware NIZK of eprint 2025/658 / Aranha et al., or a
+re-parameterization to a regime (much larger `q`, or a gadget/rounding re-randomization) where opened-factor
+norm bounds provably keep the shift `< q/4`. This is the honest state after review, not a claim of PQ soundness.
 
 ### 4.3 Honest limits
 
-- **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + BLAKE3
-  binding. Consistency is the **`O(n·t²)` interpolate-and-evaluate** collinearity check (interpolate `P` from
-  `t` verified shares over `GF(256)`, require all shares to lie on `P`) — a *complete* decision (no
-  probabilistic gap) that is robust to a forgery *inside* the interpolation basis and correct at any cell size
-  (the earlier `all-t-subsets` scan was exponential and mis-rejected large cells). Limit: the
-  **detectable-abort** model (a malicious dealer can only exclude itself, never bias the honest sum) under an
-  honest dealer-majority. Tests cover forged shares, an off-polynomial (in-basis and out-of-basis) dealing,
-  sub-threshold reveals, and a 20-node cell.
+- **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + a BLAKE3
+  **polynomial commitment**. Consistency is decided by re-deriving the reconstructed polynomial's `t` canonical
+  values from any `t` verified shares and hashing them against the pre-epoch commitment `H(epoch ‖ dealer ‖ t ‖
+  P(0..t−1))` — `O(n·t²)`, and a *complete* decision that (unlike the earlier per-share-commitment / revealed-
+  subset check, which was **vacuous at exactly `t` shares** and let a dealer bias the beacon) binds the whole
+  polynomial before the epoch, so it is correct even when only a withholding minority's `t` shares are revealed.
+  Limit: the **detectable-abort** model (a malicious dealer can only exclude itself, never bias the honest sum)
+  under an honest dealer-majority. Tests cover forged shares, an off-polynomial dealing that would otherwise give
+  two different `t`-subset secrets, wrong-`t`/epoch/dealer replays, sub-threshold reveals, and a 20-node cell.
 - **`rlwe`** — the polynomial multiply is **branch-free / data-independent** (the secret-dependent zero-skip
   that would leak the secret's Hamming weight was removed), but the backend is **not fully constant-time /
   NTT-hardened** (the modular reduction uses `%`; sampling is not rejection-free); security rests on the
   standard Ring-LWE assumption at the cited level.
 
-**What genuinely remains is not design or implementation** but two *external* processes: independent
-cryptanalysis of `pqvss`/`shuffle`, and swapping the reference `rlwe` for a **vetted, constant-time, NTT** RLWE
-implementation at a deployment's target level (the calibration and the proof are done; only the backend crate
-is external).
+**What genuinely remains** after the internal review: external cryptanalysis of `pqvss` and the ElGamal
+`shuffle`; and, for a *sound* PQ shuffle, replacing the experimental RLWE cut-and-choose with a splitting-ring-
+aware NIZK (eprint 2025/658) or a re-parameterized, vetted constant-time NTT RLWE backend (§4.2). The classical
+shuffle and the `pqvss` polynomial-commitment beacon are complete and sound up to their stated models.
 
 Sources: [NewHope / lattice-estimator (malb)](https://github.com/malb/lattice-estimator),
 [CRYSTALS-Kyber spec](https://pq-crystals.org/kyber/data/kyber-specification-round3-20210131.pdf),
@@ -161,7 +197,7 @@ Sources: [NewHope / lattice-estimator (malb)](https://github.com/malb/lattice-es
 |---|---|
 | PQ-VRF (Merkle-committed PRF over epochs) | **Implemented + tested** (`pqvrf`), reduction to BLAKE3 |
 | PQ beacon — full-reveal | **Implemented + tested** (`pqvrf`), unbiasable |
-| PQ beacon — **reconstruction-unique** | **Implemented + tested** (`pqvss`): committed Shamir + all-`t`-subsets consistency. Novel/unaudited |
-| PQ verifiable shuffle (proof) | **Implemented + tested** (`shuffle`): Sako–Kilian, generic over the cryptosystem. Novel/unaudited |
-| — classical backend (ristretto ElGamal) | **Implemented + tested** (`shuffle::ElGamal`) |
-| — **post-quantum backend (Ring-LWE)** | **Implemented + tested** (`rlwe::Rlwe`) — same proof runs PQ. **NewHope-512** params (≈101-bit PQ), noise budget analyzed + Monte-Carlo-validated (§4.1). Needs a CT/NTT-hardened vetted crate |
+| PQ beacon — **reconstruction-unique** | **Implemented + tested** (`pqvss`): Shamir + **polynomial commitment** (binds `P(0..t−1)`), reconstruction-unique + withholding-tolerant. Novel/unaudited |
+| PQ verifiable shuffle (proof) | **Implemented + tested** (`shuffle`): Sako–Kilian, generic over the cryptosystem, `k ≥ 128`, key/`(n,k)`-bound FS. Novel/unaudited |
+| — classical backend (ristretto ElGamal) | **Implemented + tested** (`shuffle::ElGamal`) — **unconditionally `1−2^-k` sound**; the backend to rely on |
+| — post-quantum backend (Ring-LWE) | **Experimental research scaffold** (`rlwe::Rlwe`) — mechanism runs PQ; a shortness gate closes the trivial forgery but it is **not worst-case sound at NewHope-512** (§4.2). Needs a splitting-ring NIZK or re-parameterization + a vetted CT/NTT crate |

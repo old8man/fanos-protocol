@@ -85,9 +85,11 @@ open (`docs/design-*.md`), each with a derivation and a reproducible experiment:
 - **Constant-time `GF(2^m)`** — mask-based multiply, fixed-exponent Fermat inverse; a deterministic op-count
   experiment proves the inversion ladder is secret-independent.
 - **Post-quantum VRF, beacon, and verifiable shuffle** — a hash-based Merkle-VRF (unbiasable epoch randomness),
-  a reconstruction-unique threshold beacon, and a verifiable mixnet shuffle that runs post-quantum over a
-  Ring-LWE (NewHope-512) backend, with a noise budget analysis and a Monte-Carlo decryption-failure experiment.
-  *These three are novel, un-audited constructions — see their design notes and the honest-status section.*
+  a reconstruction-unique threshold beacon (binding the sharing *polynomial*, so no dealer can bias it), and a
+  verifiable mixnet shuffle that is unconditionally sound over its classical ristretto backend, with an
+  experimental Ring-LWE (NewHope-512) backend and a noise-budget + Monte-Carlo analysis.
+  *These are novel constructions; they have had an adversarial internal cryptographer review (which found and
+  fixed real breaks) but no external audit — see their design notes and the honest-status section.*
 
 ---
 
@@ -164,10 +166,16 @@ into the code, and we would rather under-claim than oversell:
   a loopback end-to-end suite.
 - **🟡 Landed, in-process tested** — the unified `fanos` daemon, the SOCKS5 proxy, and the VPN's OS-level TUN
   syscalls are verified on a host but **a live multi-machine deployment is not demonstrated here**.
-- **⚠️ Novel and un-audited** — the post-quantum threshold beacon (`pqvss`), the verifiable shuffle
-  (`shuffle`/`rlwe`), and the hardened path-authentication MAC are hand-rolled constructions with written
-  security reductions and extensive tests, **but no external cryptanalysis**. They must not be deployed as
-  sole security without an audit; their design notes state this plainly.
+- **⚠️ Novel, internally-reviewed, not externally audited** — the post-quantum threshold beacon (`pqvss`), the
+  verifiable shuffle (`shuffle`/`rlwe`), the anti-MEV encrypted-mempool execution path (`taxis`), and the
+  hardened path-authentication MAC are hand-rolled constructions with written security reductions and extensive
+  tests. They have had an **adversarial internal cryptographer review** — which found and fixed genuine breaks
+  (a beacon a malicious dealer could bias; a lattice re-randomization check that was a tautology; unauthenticated
+  anti-MEV reveals that let anyone censor or fork executed state) and left honest, documented scope limits (the
+  RLWE shuffle backend is an experimental research scaffold, **not** worst-case-sound at NewHope-512 — rely on
+  the classical backend; the encrypted-mempool needs on-chain key commitment for full robustness). But they have
+  had **no external cryptanalysis** and must not be deployed as sole security without one; each design note states
+  its status plainly.
 
 The cryptographic claim is the *composition* of vetted post-quantum primitives, not new hardness assumptions.
 

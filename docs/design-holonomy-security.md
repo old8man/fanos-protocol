@@ -42,17 +42,27 @@ that is a confidentiality caveat, not an unconditional MAC, which is exactly why
 
 ## 4. The fix and the reduction
 
-The length-binding finalization `Hol = H("…-final", state_L ‖ L)` turns the cascade into an **NMAC-style**
-construction: a keyed inner cascade followed by a keyed, length-bound outer application. Two consequences:
+The length-binding finalization `Hol = H("…-final", state_L ‖ L)` folds the exact hop count into a one-way
+outer step over the secret cascade state. **Audit correction on the model.** An earlier draft called this
+"NMAC" and claimed a "standard NMAC argument, unconditionally." That is over-stated: `hash_labeled` is
+**unkeyed** BLAKE3 with the key carried *in the message* (`H(label ‖ 0x1f ‖ seed ‖ A_1)`, …) — there is no
+independent outer key, so it is **not textbook NMAC**. The correct assumption is that **secret-prefix BLAKE3 is
+a PRF** (equivalently, a ROM argument), which is standard for BLAKE3 — its root-finalization flag kills length
+extension — but is stronger than a plain native-keyed-PRF assumption, and should be stated as such. With that
+assumption:
 
 - **No length extension.** The tag exposes `H(state_L ‖ L)`, not `state_L`. Recovering `state_L` from `Hol`
   contradicts the one-wayness of `H`; and even granting `state_L`, the outer step folds in the exact length
-  `L`, so the value for `L+1` is an independent PRF output. The extension attack is dead.
-- **EUF-CMA from a PRF (sketch).** By the cascade theorem, `state_L = Cascade_seed(A_1…A_L)` is a PRF on the
-  fixed-length hop space keyed by `seed`. Composing a PRF (the finalization keyed by `state_L`) over the
-  message length `L` yields a variable-input-length PRF over the whole hop space (the standard NMAC argument).
-  A PRF is a secure MAC, so no PPT adversary forges `Hol` for an unqueried path except with advantage
-  bounded by the PRF-distinguishing advantage of `H` plus the birthday term `q²/2^256`. ∎ (reduction)
+  `L`, so the value for `L+1` is an independent PRF output. The extension attack is dead — and, because BLAKE3
+  is not length-extendable in the first place (root flag), this holds without any tag-secrecy caveat.
+- **EUF-CMA from a (secret-prefix) PRF (sketch).** By the cascade theorem, `state_L = Cascade_seed(A_1…A_L)` is
+  a PRF on the fixed-length hop space keyed by `seed`. Composing the one-way, length-folding outer step over the
+  message length `L` yields a variable-input-length MAC over the whole hop space. A PRF is a secure MAC, so no
+  PPT adversary forges `Hol` for an unqueried path except with advantage bounded by the secret-prefix-PRF
+  advantage of `H` plus the birthday term `q²/2^256`. ∎ (reduction — modulo the secret-prefix-PRF assumption,
+  **not** a native-keyed reduction). A backend upgrade to `blake3::keyed_hash` with an independent outer key
+  would earn the stronger native-keyed reduction; the current construction is sound under the stated model, and
+  the review found no forgery in any tamper class (§5).
 
 Tamper-evidence (§2's second clause) is immediate: any changed `A_k`, changed order, or changed `L` changes a
 PRF input, so `Hol` changes unless a `H`-collision occurred (`≤ 2^-256`).
@@ -70,5 +80,6 @@ asserted to change —
   collision), and an **avalanche** check confirms a single-bit path change diffuses to ≈half the tag bits.
 
 Together the reduction (§4) and the experiment (§5) close the `[P]`: the holonomy is now a length-bound keyed
-MAC with EUF-CMA security reducing to BLAKE3-as-a-PRF, unconditionally (no tag-secrecy caveat), and every
+MAC with EUF-CMA security reducing to **secret-prefix BLAKE3-as-a-PRF** (no tag-secrecy caveat; not a native-
+keyed NMAC — see §4's correction), and every
 failure mode is exercised in the suite.
