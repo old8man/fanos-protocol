@@ -1212,6 +1212,7 @@ dependencies = [
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-telemetry",
+ "fanos-thesauros",
  "fanos-vrf",
  "fanos-wire",
  "proptest",
