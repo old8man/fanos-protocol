@@ -26,6 +26,7 @@ pub mod capdir;
 pub mod crosscell_dir;
 pub mod loaddir;
 pub mod role_loop;
+pub mod taxis_driver;
 pub mod identity;
 pub mod mix_relay;
 pub mod mixdir;
@@ -59,6 +60,7 @@ pub use mixdir::{
     resolve_mix_key, spawn_mix_publisher,
 };
 pub use node::{Health, Node};
+pub use taxis_driver::{TaxisEvent, TaxisHandle, TaxisParams, spawn_taxis};
 pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
