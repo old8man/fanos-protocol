@@ -41,6 +41,8 @@
 
 extern crate alloc;
 
+mod chain;
+
 pub mod bot;
 pub mod group;
 pub mod media;

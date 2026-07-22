@@ -6,11 +6,12 @@
 //! fresh **message key**; the plaintext is sealed under it with ChaCha20-Poly1305. Because the chain is one-way,
 //! a compromised chain (or message) key reveals only *current and future* keys, never *past* ones — **forward
 //! secrecy**. The AEAD tag authenticates each message, so a forged or tampered ciphertext fails to open and does
-//! not desync the chain; a replayed message number is refused.
+//! not desync the chain.
 //!
-//! *Scope:* this is the symmetric-ratchet half. In-order delivery is assumed (an out-of-order message number is
-//! refused rather than key-skipped); skipped-key handling and the asymmetric KEM ratchet (post-compromise
-//! security — the double-ratchet's healing step) compose on top.
+//! Delivery need not be in order: the receive chain is a [`crate::chain::RecvChain`], which opens a later message
+//! ahead of the ones it skipped (banking their keys) and a delayed one from its banked key — bounded, so a
+//! replay or a forgery is still refused and neither advances the chain. This is the symmetric-ratchet half; the
+//! asymmetric KEM ratchet (post-compromise security) builds on it in [`crate::ratchet`].
 
 use alloc::vec::Vec;
 
@@ -18,6 +19,7 @@ use fanos_pqcrypto::SeedRng;
 use fanos_pqcrypto::kem::{HybridCiphertext, HybridKemPublic, HybridKemSecret};
 use fanos_primitives::{aead, hash_labeled};
 
+use crate::chain::{ChainKdf, RecvChain, SendChain};
 use crate::nonce;
 
 /// Label deriving the root key from the KEM shared secret.
@@ -30,6 +32,8 @@ const B2A_LABEL: &str = "FANOS-angelos-v1/b2a";
 const MK_LABEL: &str = "FANOS-angelos-v1/mk";
 /// Label advancing a chain key.
 const NEXT_LABEL: &str = "FANOS-angelos-v1/next";
+/// The chain-stepping labels for a session's directional chains.
+const CHAIN_KDF: ChainKdf = ChainKdf { mk: MK_LABEL, next: NEXT_LABEL };
 
 /// Which end of the session this party is — it fixes which chain is *send* and which is *receive*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,13 +44,11 @@ pub enum Role {
     Responder,
 }
 
-/// A live end-to-end session: a send chain, a receive chain, and their message counters.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// A live end-to-end session: a send chain and a receive chain (out-of-order tolerant). Not `Clone` — cloning a
+/// live session would risk sealing two messages under the same key.
 pub struct Session {
-    send_chain: [u8; 32],
-    recv_chain: [u8; 32],
-    send_n: u64,
-    recv_n: u64,
+    send: SendChain,
+    recv: RecvChain,
 }
 
 impl Session {
@@ -80,21 +82,18 @@ impl Session {
         let root = hash_labeled(ROOT_LABEL, shared);
         let a2b = hash_labeled(A2B_LABEL, &root);
         let b2a = hash_labeled(B2A_LABEL, &root);
-        let (send_chain, recv_chain) = match role {
+        let (send_key, recv_key) = match role {
             Role::Initiator => (a2b, b2a),
             Role::Responder => (b2a, a2b),
         };
-        Self { send_chain, recv_chain, send_n: 0, recv_n: 0 }
+        Self { send: SendChain::new(send_key, CHAIN_KDF), recv: RecvChain::new(recv_key, CHAIN_KDF) }
     }
 
-    /// Seal `plaintext` as the next outgoing message: derive a fresh message key, advance the send chain, and
+    /// Seal `plaintext` as the next outgoing message: take a fresh message key, advance the send chain, and
     /// AEAD-encrypt. Returns `message_number(8) ‖ ciphertext`.
     #[must_use]
     pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        let mk = hash_labeled(MK_LABEL, &self.send_chain);
-        self.send_chain = hash_labeled(NEXT_LABEL, &self.send_chain);
-        let n = self.send_n;
-        self.send_n = self.send_n.saturating_add(1);
+        let (n, mk) = self.send.pop();
         let ciphertext = aead::seal(&mk, &nonce(n), plaintext).unwrap_or_default();
         let mut out = Vec::with_capacity(8 + ciphertext.len());
         out.extend_from_slice(&n.to_le_bytes());
@@ -102,22 +101,14 @@ impl Session {
         out
     }
 
-    /// Open the next incoming message ([`seal`](Self::seal) output). `None` if it is malformed, out of order
-    /// (its number is not the next expected — this core assumes in-order delivery), or fails authentication (a
-    /// forgery or tamper) — and in those cases the receive chain is **not** advanced, so the genuine next
-    /// message still opens.
+    /// Open an incoming message ([`seal`](Self::seal) output), in order, ahead of skipped messages, or behind
+    /// (from a banked key). `None` if it is malformed, skips too far ahead, is a replay/already-consumed number,
+    /// or fails authentication (a forgery or tamper) — and in those cases no state is advanced or consumed, so
+    /// the genuine message still opens.
     #[must_use]
     pub fn open(&mut self, sealed: &[u8]) -> Option<Vec<u8>> {
         let n = u64::from_le_bytes(sealed.get(..8)?.try_into().ok()?);
-        if n != self.recv_n {
-            return None;
-        }
-        let mk = hash_labeled(MK_LABEL, &self.recv_chain);
-        let plaintext = aead::open(&mk, &nonce(n), sealed.get(8..)?)?;
-        // Only advance on a successful open, so a forged message cannot desync the chain.
-        self.recv_chain = hash_labeled(NEXT_LABEL, &self.recv_chain);
-        self.recv_n = self.recv_n.saturating_add(1);
-        Some(plaintext)
+        self.recv.open(n, sealed.get(8..)?)
     }
 }
 
@@ -160,15 +151,10 @@ mod tests {
     #[test]
     fn each_message_gets_a_fresh_key_forward_secrecy() {
         let (sk, pk) = keypair(1);
+        // The same plaintext seals differently at each step — the send chain ratchets forward per message.
         let (mut alice, _bob) = establish(&sk, &pk);
-        let chain0 = alice.send_chain;
-        let _ = alice.seal(b"m0");
-        let chain1 = alice.send_chain;
-        assert_ne!(chain0, chain1, "the send chain ratchets forward per message");
-        // Two messages seal under different keys (different ciphertext for the same plaintext).
-        let (mut a2, _b2) = establish(&sk, &pk);
-        let c0 = a2.seal(b"same");
-        let c1 = a2.seal(b"same");
+        let c0 = alice.seal(b"same");
+        let c1 = alice.seal(b"same");
         assert_ne!(c0, c1, "the same plaintext seals differently at each ratchet step");
     }
 
@@ -188,29 +174,32 @@ mod tests {
     fn a_tampered_message_fails_to_open_without_desyncing() {
         let (sk, pk) = keypair(1);
         let (mut alice, mut bob) = establish(&sk, &pk);
-        let mut m1 = alice.seal(b"first");
-        let m2 = alice.seal(b"second");
-        // Tamper with the first message's ciphertext (flip a byte past the 8-byte number).
-        let last = m1.len() - 1;
-        m1[last] ^= 0xFF;
-        assert!(bob.open(&m1).is_none(), "a tampered message does not open");
-        // The chain did not advance, so Bob still expects message 0; the untampered `second` is message 1,
-        // hence out of order for this in-order core (skipped-key handling is the documented follow-up).
-        assert!(bob.open(&m2).is_none(), "message 1 is out of order while 0 is still pending (in-order core)");
+        let m0 = alice.seal(b"first");
+        let m1 = alice.seal(b"second");
+        // A tampered copy of message 0 does not open and does not disturb the chain.
+        let mut bad = m0.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        assert!(bob.open(&bad).is_none(), "a tampered message does not open");
+        // Message 1 still opens ahead of the missing 0 (banking 0's key)...
+        assert_eq!(bob.open(&m1).as_deref(), Some(&b"second"[..]), "a later message opens ahead of a gap");
+        // ...and the genuine message 0 then opens from its banked key — no desync.
+        assert_eq!(bob.open(&m0).as_deref(), Some(&b"first"[..]), "the delayed message opens from its banked key");
     }
 
     #[test]
-    fn out_of_order_and_replayed_messages_are_refused() {
+    fn out_of_order_is_tolerated_and_replays_refused() {
         let (sk, pk) = keypair(1);
         let (mut alice, mut bob) = establish(&sk, &pk);
         let m0 = alice.seal(b"zero");
         let m1 = alice.seal(b"one");
-        // Delivering message 1 before 0 is refused (in-order core).
-        assert!(bob.open(&m1).is_none(), "out-of-order is refused");
-        // In order works.
-        assert_eq!(bob.open(&m0).as_deref(), Some(&b"zero"[..]));
+        let m2 = alice.seal(b"two");
+        // Deliver out of order: 2, then 0, then 1 — all open.
+        assert_eq!(bob.open(&m2).as_deref(), Some(&b"two"[..]), "a message opens ahead of the ones it skips");
+        assert_eq!(bob.open(&m0).as_deref(), Some(&b"zero"[..]), "a skipped message opens from its banked key");
         assert_eq!(bob.open(&m1).as_deref(), Some(&b"one"[..]));
-        // Replaying message 0 (now behind the counter) is refused.
+        // Replaying any of them is refused — each banked key is consumed on use.
         assert!(bob.open(&m0).is_none(), "a replay is refused");
+        assert!(bob.open(&m2).is_none(), "a replay of the highest is refused");
     }
 }
