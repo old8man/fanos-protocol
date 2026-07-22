@@ -1098,6 +1098,9 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(vec![TAG_NAME, 0xFF])), ExecOutcome::Malformed);
     }
 
+    /// A signing account: `(secret, verifier, id)`.
+    type Account = (HybridSigSecret, HybridVerifier, [u8; 32]);
+
     /// A deterministic splitmix64 PRNG (reproducible, no wall-clock entropy) for building random blocks.
     fn splitmix(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1109,7 +1112,7 @@ mod tests {
 
     /// A fresh ledger with each account credited generously, so no transfer ever overspends and the block's
     /// accept/reject set is decided purely by the committed order, never by balance exhaustion.
-    fn ledger_with(accounts: &[(HybridSigSecret, HybridVerifier, [u8; 32])]) -> HybridLedger {
+    fn ledger_with(accounts: &[Account]) -> HybridLedger {
         let mut tokens = TokenLedger::new();
         for (_, _, id) in accounts {
             tokens.credit(*id, 1_000_000);
@@ -1123,7 +1126,7 @@ mod tests {
     /// scheduler must execute identically to serial.
     fn random_conflicting_block(
         seed: u64,
-    ) -> (Vec<(HybridSigSecret, HybridVerifier, [u8; 32])>, Vec<Transaction>) {
+    ) -> (Vec<Account>, Vec<Transaction>) {
         let mut st = seed.wrapping_add(1);
         let n_acct = 3 + (splitmix(&mut st) % 4) as usize; // 3..=6 accounts — a small pool forces conflicts
         let accounts: Vec<_> = (0..n_acct).map(|i| account(i as u8 + 1)).collect();
@@ -1169,7 +1172,7 @@ mod tests {
 
             // Determinism: an independent re-execution of the same block reaches the identical state.
             let mut again = ledger_with(&accounts);
-            again.execute_block(&txs);
+            let _ = again.execute_block(&txs);
             assert_eq!(again.state_root(), root_parallel, "execute_block is deterministic at seed {seed}");
         }
     }
@@ -1192,7 +1195,7 @@ mod tests {
             permuted.reverse();
 
             let mut par = ledger_with(&accounts);
-            par.execute_block(&permuted);
+            let _ = par.execute_block(&permuted);
             let mut ser = ledger_with(&accounts);
             for tx in &permuted {
                 ser.apply(tx);
@@ -1201,7 +1204,7 @@ mod tests {
 
             let root_original = {
                 let mut l = ledger_with(&accounts);
-                l.execute_block(&txs);
+                let _ = l.execute_block(&txs);
                 l.state_root()
             };
             if root_original != par.state_root() {
@@ -1209,5 +1212,57 @@ mod tests {
             }
         }
         assert!(diverged > 0, "reordering conflicting transactions changes the state — order is real (diverged on {diverged})");
+    }
+
+    #[test]
+    fn conflicting_shielded_spends_in_a_block_admit_exactly_one() {
+        // OBOLOS money-safety under DROMOS's parallel execution (audit S-P0.5, the L10 crown jewel): two spends
+        // of the SAME note reveal the same nullifier. They CONFLICT (both mutate the shared shielded pool), so
+        // the scheduler MUST serialize them — exactly one is admitted, the other rejected as a double-spend —
+        // whichever validator's block wins the merge. Were the scheduler to wrongly parallelize them, both
+        // could apply and mint value from nothing; this proves it does not, in either committed order.
+        fn minted() -> (HybridLedger, SpendInput) {
+            let mut ledger = HybridLedger::new(TokenLedger::new());
+            let nsk = [9u8; 32];
+            let n0 = note(500, &nsk, b"dbl");
+            let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
+            let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+            (ledger, sp)
+        }
+        fn spend(ledger: &HybridLedger, sp: &SpendInput, out_tag: &[u8], out_nsk: &[u8; 32]) -> Transaction {
+            let (stx, proof) = build_transfer(
+                ledger.params(),
+                ledger.shielded().anchor(),
+                std::slice::from_ref(sp),
+                &[note(500, out_nsk, out_tag)],
+                0,
+            );
+            Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))
+        }
+
+        // Both orders a merge could pick — the two partitioned validators' conflicting spends.
+        for first_is_a in [true, false] {
+            let (base, sp) = minted();
+            let tx_a = spend(&base, &sp, b"outA", &[1u8; 32]);
+            let tx_b = spend(&base, &sp, b"outB", &[2u8; 32]);
+            let block = if first_is_a { vec![tx_a, tx_b] } else { vec![tx_b, tx_a] };
+
+            let mut ledger = base.clone(); // the minted note, before either spend
+            let outcomes = ledger.execute_block(&block);
+            assert_eq!(
+                outcomes.iter().filter(|o| **o == ExecOutcome::Applied).count(),
+                1,
+                "exactly one conflicting spend is admitted (first_is_a = {first_is_a})"
+            );
+            assert_eq!(
+                outcomes.iter().filter(|o| **o == ExecOutcome::Rejected).count(),
+                1,
+                "the other is rejected as a double-spend (first_is_a = {first_is_a})"
+            );
+            // The winner is the first in the committed (merged) order — the consensus decision, applied
+            // deterministically by the scheduler's conflict serialization.
+            assert_eq!(outcomes[0], ExecOutcome::Applied, "the first-committed spend wins");
+            assert_eq!(outcomes[1], ExecOutcome::Rejected);
+        }
     }
 }
