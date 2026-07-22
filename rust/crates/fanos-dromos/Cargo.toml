@@ -1,0 +1,20 @@
+[package]
+name = "fanos-dromos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "DROMOS — the FANOS swift execution fabric (L9): the state machine wiring the OBOLOS private-currency pool onto TAXIS consensus, so shielded transfers execute on the blockchain (spec/platform.md §3)."
+keywords = ["blockchain", "execution", "state-machine", "privacy", "fanos"]
+categories = ["cryptography"]
+
+[dependencies]
+# The consensus StateMachine trait + Transaction/ExecOutcome DROMOS executes for.
+fanos-taxis.workspace = true
+# The OBOLOS shielded-pool state machine DROMOS drives, and its submission codec.
+fanos-obolos = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
