@@ -45,10 +45,25 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
 - [x] **Signed capability descriptor** (`roles::CapabilityDescriptor`) — the authenticated self-org loop input
       (VRF-signed), so a node cannot forge another's capabilities.
 
-Residual (documented, not blocking): the thin `fanos-node` transport driver that runs the RoleController live
-over the real overlay each beacon round (advertise `CapabilityDescriptor` via the overlay store + per-role load
-metering in `fanos-telemetry`), and `wasm-pack` + a browser demo over `fanos-wasm`. Full workspace test green;
-clippy `--all-targets -D warnings` clean across all 35 crates.
+### 1 · Full open-task programme (sequential, 2026-07-22)
+
+**A · Self-organization live wiring — ✅ DONE.**
+- [x] A1 `fanos-node::capdir` — publish/read signed `CapabilityDescriptor` over the overlay store (mirror mixdir).
+- [x] A2 `fanos-node::role_loop` — the live driver: each beacon, gather directory + step controller + assign.
+- [x] A3 `fanos-core::roles::{LoadMeter, cell_setpoint}` + `fanos-node::loaddir` — per-role load → agreed setpoint.
+- [x] A4 `fanos-core::roles::Reputation` — performance-decay of a non-performer's effective weight, wired in.
+- [x] `spawn_self_organization` — the single Node::start entry point (3 tasks + assigned-roles watch).
+- [ ] Residual: dynamic actuation — Node::start behaviors react to the assigned `RoleSet` (start/stop as it
+      rotates), replacing the fixed `config.roles` gating; feed reputation from the diagnosis.
+
+**B · L0 live multi-cell orchestration** — cross-cell relay (A→bridge→B) + parent attestation across real cells;
+executed-`state_root` history in the header for light clients.
+**C · TAXIS residuals** — on-chain decryption-key commitment; wire fee/reward distribution; in-engine DA sampling;
+extend the equilibrium model (coalitional + censorship terms).
+**D · PQ shuffle** — splitting-ring NIZK (eprint 2025/658) or a re-parameterized worst-case-sound RLWE backend.
+**E · WASM/mobile** — wasm-pack build + browser demo; extend the wasm surface; a real client (WebSocket/WebRTC).
+**F · Architecture refactor** (#73) — split fanos-runtime; decompose OverlayNode; typed StorageAddress; secret-field encapsulation.
+**G · Deployment & audit** — live multi-machine deployment; real-NAT harness; external crypto audit; E4∩E5 live driver (#54).
 
 ### A · Optional application layers — ✅ DONE (2026-07-22)
 - **Part X.1 — the blockchain application on FANOS** — ✅ **DONE**: new crate **`fanos-taxis`** (`854feef`),
