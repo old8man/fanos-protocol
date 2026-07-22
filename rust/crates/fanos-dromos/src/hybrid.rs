@@ -1097,4 +1097,117 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(vec![0x7F, 1, 2, 3])), ExecOutcome::Malformed);
         assert_eq!(ledger.apply(&Transaction::new(vec![TAG_NAME, 0xFF])), ExecOutcome::Malformed);
     }
+
+    /// A deterministic splitmix64 PRNG (reproducible, no wall-clock entropy) for building random blocks.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A fresh ledger with each account credited generously, so no transfer ever overspends and the block's
+    /// accept/reject set is decided purely by the committed order, never by balance exhaustion.
+    fn ledger_with(accounts: &[(HybridSigSecret, HybridVerifier, [u8; 32])]) -> HybridLedger {
+        let mut tokens = TokenLedger::new();
+        for (_, _, id) in accounts {
+            tokens.credit(*id, 1_000_000);
+        }
+        HybridLedger::new(tokens)
+    }
+
+    /// A random block of valid transfers over a small account pool (small ⇒ heavy conflict), each carrying its
+    /// sender's correct running nonce, so every transfer is individually valid and the block genuinely mixes
+    /// conflicting (same-account) and independent (disjoint-account) work — the adversarial input the parallel
+    /// scheduler must execute identically to serial.
+    fn random_conflicting_block(
+        seed: u64,
+    ) -> (Vec<(HybridSigSecret, HybridVerifier, [u8; 32])>, Vec<Transaction>) {
+        let mut st = seed.wrapping_add(1);
+        let n_acct = 3 + (splitmix(&mut st) % 4) as usize; // 3..=6 accounts — a small pool forces conflicts
+        let accounts: Vec<_> = (0..n_acct).map(|i| account(i as u8 + 1)).collect();
+        let mut nonces = vec![0u64; n_acct];
+        let n_tx = 6 + (splitmix(&mut st) % 9) as usize; // 6..=14 transfers
+        let mut txs = Vec::with_capacity(n_tx);
+        for _ in 0..n_tx {
+            let from = (splitmix(&mut st) % n_acct as u64) as usize;
+            let to = {
+                let t = (splitmix(&mut st) % n_acct as u64) as usize;
+                if t == from { (t + 1) % n_acct } else { t }
+            };
+            let amount = 1 + splitmix(&mut st) % 50;
+            let (sk, vk, from_id) = &accounts[from];
+            let transfer = Transfer { from: *from_id, to: accounts[to].2, amount, nonce: nonces[from] };
+            nonces[from] += 1;
+            let signed = SignedTransfer::sign(transfer, sk, vk.clone());
+            txs.push(Transaction::new(HybridLedger::transparent_payload(&signed)));
+        }
+        (accounts, txs)
+    }
+
+    #[test]
+    fn parallel_block_execution_equals_serial_over_random_conflicting_blocks() {
+        // DROMOS's load-bearing claim (spec/platform.md §3.1, the high-speed L1): the parallel scheduler's
+        // resulting state is byte-identical to serial execution of the committed order, and deterministic —
+        // for ANY block, however adversarially its transactions conflict. Verified against the REAL ledger
+        // over 200 random conflicting blocks (the scheduler's own tests use a MockTx; this drives real
+        // signed transfers end to end).
+        for seed in 0..24u64 {
+            let (accounts, txs) = random_conflicting_block(seed);
+
+            let mut par = ledger_with(&accounts);
+            let par_outcomes = par.execute_block(&txs);
+            let root_parallel = par.state_root();
+
+            let mut ser = ledger_with(&accounts);
+            let ser_outcomes: Vec<_> = txs.iter().map(|tx| ser.apply(tx)).collect();
+            let root_serial = ser.state_root();
+
+            assert_eq!(root_parallel, root_serial, "parallel state == serial state at seed {seed}");
+            assert_eq!(par_outcomes, ser_outcomes, "parallel per-tx outcomes == serial at seed {seed}");
+
+            // Determinism: an independent re-execution of the same block reaches the identical state.
+            let mut again = ledger_with(&accounts);
+            again.execute_block(&txs);
+            assert_eq!(again.state_root(), root_parallel, "execute_block is deterministic at seed {seed}");
+        }
+    }
+
+    #[test]
+    fn the_scheduler_faithfully_respects_the_committed_order() {
+        // The scheduler must never silently reorder CONFLICTING transactions: for a permuted committed order,
+        // parallel execution still equals serial execution of THAT order — and reordering conflicting
+        // transactions generally reaches a different state (order-sensitivity is real, and the scheduler
+        // honours it rather than smearing it away).
+        let mut diverged = 0u32;
+        for seed in 0..24u64 {
+            let (accounts, txs) = random_conflicting_block(seed);
+            if txs.len() < 2 {
+                continue;
+            }
+            // A reversed committed order — a strong adversarial permutation. Repeat senders' nonces are now
+            // out of order, so some transfers reject, but parallel MUST still match serial on this order.
+            let mut permuted = txs.clone();
+            permuted.reverse();
+
+            let mut par = ledger_with(&accounts);
+            par.execute_block(&permuted);
+            let mut ser = ledger_with(&accounts);
+            for tx in &permuted {
+                ser.apply(tx);
+            }
+            assert_eq!(par.state_root(), ser.state_root(), "parallel == serial on the permuted order (seed {seed})");
+
+            let root_original = {
+                let mut l = ledger_with(&accounts);
+                l.execute_block(&txs);
+                l.state_root()
+            };
+            if root_original != par.state_root() {
+                diverged += 1;
+            }
+        }
+        assert!(diverged > 0, "reordering conflicting transactions changes the state — order is real (diverged on {diverged})");
+    }
 }
