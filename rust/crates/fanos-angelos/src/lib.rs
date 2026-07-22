@@ -18,20 +18,38 @@
 //! messages, because the key chain is one-way. (Post-compromise security — healing after a compromise via a
 //! fresh KEM ratchet step — composes on top, the double-ratchet's asymmetric half.)
 //!
-//! This first increment is that session core, exact and unit-tested; the transport (NYX/DIAULOS), the rendezvous
-//! (CALYPSO), the ONOMA identity binding, and the offline mailbox protocol compose on top.
+//! ## The single face of the platform
+//!
+//! ANGELOS is not only a messenger — it is the platform's *one app*: chat, calls, communities, **and** the
+//! wallet, in one surface (`spec/platform.md` §6). So the model here spans three planes and a bot layer:
+//!
+//! - the **content plane** — [`message`]'s canonical, language-agnostic [`Message`] envelope (text, control,
+//!   presence, and in-chat **payments**: the wallet lives *in* the conversation);
+//! - the **crypto planes** — a forward-secret 1:1 [`session`], a sender-key [`group`] session that makes a large
+//!   channel `O(1)` per post, and a loss-tolerant real-time [`media`] session for voice/video;
+//! - the **bot layer** — a pure, transport-agnostic [`bot`] contract every per-language SDK implements, so a bot
+//!   written once runs anywhere the runtime carries it.
+//!
+//! Every wire format here is canonical and pinned by a known-answer test, so each language's SDK serializes it
+//! byte-for-byte identically — the discipline the network's `conformance/vectors` follow. The transport
+//! (NYX/DIAULOS), the rendezvous (CALYPSO), the ONOMA identity binding, and the offline mailbox protocol compose
+//! underneath these planes.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+pub mod bot;
 pub mod group;
 pub mod media;
+pub mod message;
 pub mod session;
 
+pub use bot::{Bot, Event, Outgoing, dispatch};
 pub use group::GroupSession;
 pub use media::{MediaKind, MediaSession};
+pub use message::{Command, Message, MessageKind};
 pub use session::{Role, Session};
 
 /// A per-message/frame AEAD nonce from a counter. Each key seals a monotonically-numbered stream, so a
