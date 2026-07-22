@@ -6,8 +6,9 @@
 //!   peels a layer and endpoint linkage drops to `P_hop²` ([`security`], [`sheaf`]);
 //! * a path is not a random chain but a **geometric flag**, uniform by `PGL` transitivity and
 //!   verifiable by algebra ([`path`]);
-//! * forward secrecy and path integrity come from a **holonomic ratchet** on the incidence
-//!   bundle ([`ratchet`]).
+//! * **path integrity** comes from a **holonomic ratchet** on the incidence bundle ([`ratchet`]) — a
+//!   path authenticator, not a source of forward secrecy (forward secrecy is a seed-hygiene property;
+//!   see the [`ratchet`] and `fanos_aphantos::threshold` module docs).
 //!
 //! [`tessera::Tessera`] assembles these into a nested onion; [`mixing`] and [`profile`] provide
 //! Poisson mixing and the configurable λ dial (one substrate, Tor-class to Nym+).

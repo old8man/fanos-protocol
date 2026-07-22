@@ -11,10 +11,10 @@
 //! below-threshold guarantee holds only when each share is delivered privately to its member. The
 //! **production form binds every share to its member cryptographically** — each Shamir share is
 //! hybrid-KEM-sealed to that member's public key, so an adversary holding the whole packet learns
-//! nothing below threshold and each hop is forward-secret — see
-//! `fanos_aphantos::threshold::ThresholdSealed` (which needs the post-quantum KEM and so lives above
-//! this `no_std` crate). AEAD and secret sharing are vetted primitives; the FANOS novelty is
-//! composing them so a *line* — not a node — is the unit of trust.
+//! nothing below threshold — see `fanos_aphantos::threshold::ThresholdSealed` (which needs the
+//! post-quantum KEM and so lives above this `no_std` crate; its module doc states the seed-hygiene
+//! contract that forward secrecy actually depends on). AEAD and secret sharing are vetted primitives;
+//! the FANOS novelty is composing them so a *line* — not a node — is the unit of trust.
 
 use alloc::vec::Vec;
 

@@ -1,5 +1,5 @@
 //! The **threshold-KEM-sealed** onion layer — a hop peeled by `t` of a line's `q+1` members, with
-//! real cryptographic zero-knowledge below threshold *and* forward secrecy (spec §5.2, §5.7).
+//! real cryptographic zero-knowledge below threshold (spec §5.2, §5.7).
 //!
 //! [`fanos_nyx::sheaf`] introduced the threshold-sheaf idea — AEAD a layer under a key `K`, then
 //! Shamir-share `K` across the line — but transported the shares *in the clear*, so any holder of
@@ -9,13 +9,22 @@
 //!
 //! * **below `t` members, `K` is unrecoverable even to an adversary holding the whole packet** — the
 //!   shares are ciphertext bound to members' long-term keys, not plaintext (true zero-knowledge,
-//!   not merely information-theoretic *among cooperating members*); and
-//! * **forward secrecy** — each share rides a fresh KEM encapsulation, so a later compromise of the
-//!   sender's build randomness reveals nothing (recovering a share needs a *member's* KEM secret).
+//!   not merely information-theoretic *among cooperating members*).
 //!
 //! A hop is thus genuinely a **line**, not a node: the unit of trust is a `t`-of-`q+1` group, and
 //! that is what drops endpoint linkage to `P_hop²` (spec §5.2). AEAD, Shamir sharing, and the hybrid
 //! KEM are all vetted primitives; the composition is the FANOS novelty.
+//!
+//! **Forward secrecy & nonce hygiene (audit correction).** Do **not** read "each share rides a fresh KEM
+//! encapsulation" as forward secrecy against a *sender* compromise: the layer key `K`, the KEM ephemerals, and
+//! the AEAD nonce are all derived deterministically from the per-onion **`seed`** ([`seal_onion`]), so the seed
+//! is a *universal trapdoor* while it lives — recovering `K` from it needs **no** member secret. Two operational
+//! requirements follow, and callers own them: (1) the per-onion `seed` MUST be a fresh CSPRNG draw and be
+//! **zeroized right after sealing** (forward secrecy is *seed-deletion* secrecy); and (2) a `seed` MUST NEVER
+//! repeat — the AEAD is a deterministic-nonce construction, so a repeated `(seed)` reuses a `(key, nonce)` pair
+//! and is catastrophic (keystream + one-time-authenticator reuse). What the KEM sealing *does* buy is the
+//! below-threshold zero-knowledge above (a packet-only adversary needs a member's KEM secret), **not** sender
+//! forward secrecy.
 
 use alloc::vec::Vec;
 
@@ -78,6 +87,16 @@ pub const THRESHOLD_ONION_LEN: usize = 20480;
 /// Pad a threshold onion to the constant [`THRESHOLD_ONION_LEN`] bucket with keystream filler that
 /// looks like ciphertext (the receiver's [`ThresholdSealed::from_bytes`] self-delimits and ignores
 /// it). Errors with [`ThresholdError::TooLong`] if the onion already exceeds the bucket.
+///
+/// **Length-hiding is weaker here than in [`crate::sealed`] (audit Finding 4).** This padding is a
+/// *public* deterministic function of the onion bytes (`hash_xof("…threshold-onion-pad", onion)`), and
+/// the header's `ct_len`/`members` are cleartext — so a party that sees the *decrypted* onion bytes (an
+/// on-path line member, or any observer of an un-encrypted hop) can read the exact layer length and even
+/// recompute the padding, learning hop position. The sealed onion, by contrast, encrypts its length and
+/// derives padding from a *secret* session key, so its length-indistinguishability is intrinsic. The
+/// threshold onion's therefore relies **entirely on the encrypting transport (QUIC/TLS)** — it has no
+/// defence-in-depth if that layer is stripped or downgraded. Callers that need parity must run it only
+/// under transport encryption (as the FANOS node does).
 pub fn pad_onion(onion: &[u8]) -> Result<Vec<u8>, ThresholdError> {
     if onion.len() > THRESHOLD_ONION_LEN {
         return Err(ThresholdError::TooLong);

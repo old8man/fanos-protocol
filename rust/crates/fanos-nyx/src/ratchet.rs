@@ -8,15 +8,27 @@
 //! theory. The onion carries `Hol` as a compact tamper-evident tag — encrypted end-to-end in the innermost
 //! layer, so it is not a cleartext cross-hop correlator (see `fanos_aphantos::sealed`).
 //!
-//! **Security (spec §5.4 `[P]`, closed).** The finalization turns the front-keyed cascade — a PRF only for a
-//! prefix-free message space, and hence length-extendable if the raw tag leaks — into an NMAC-style keyed
-//! MAC whose EUF-CMA security reduces to BLAKE3-as-a-PRF, *unconditionally* (no tag-secrecy caveat). The full
-//! reduction and a deterministic attack experiment covering every tamper class are in
+//! **Security (spec §5.4 `[P]`).** The finalization `Hol = H(FINAL ‖ state_L ‖ L)` folds in the hop count `L`
+//! and is one-way in the secret cascade state, so an adversary who sees a finalized tag can neither recover
+//! `state_L` nor extend the chain to a longer path. The precise EUF-CMA reduction is to **secret-prefix BLAKE3
+//! as a PRF**: the seed is the secret prefix of every keyed input (`H(label ‖ 0x1f ‖ seed ‖ A_1)`, …), and
+//! BLAKE3's root-finalization flag makes that construction **not** length-extendable — which is exactly why the
+//! naive extension `H("nyx-ratchet", Hol ‖ A)` is independent of the true extended tag. This is a *keyed-MAC*
+//! guarantee, but note it is **not textbook NMAC** — `hash_labeled` is unkeyed BLAKE3 with the key carried in
+//! the message (there is no independent outer key), so the assumption is secret-prefix-BLAKE3-PRF (equivalently
+//! a ROM argument), which is standard for BLAKE3 but stronger than a plain native-keyed-PRF assumption. The
+//! full reduction and a deterministic attack experiment covering every tamper class are in
 //! `docs/design-holonomy-security.md` and [`tests`]/[`attack_experiment`](self::attack_experiment).
 //!
-//! *Forward secrecy* of the routed onion comes from the per-hop **hybrid KEM** to the relay/line —
-//! recovering a hop key needs a relay's long-term secret, so the sender's build state does not — not
-//! from this ratchet (whose chain is entirely sender-derived). The ratchet's role is authentication.
+//! **On forward secrecy (audit correction).** The ratchet is a path *authenticator*, not a source of forward
+//! secrecy, and neither is "the per-hop KEM" on its own: every layer key, KEM ephemeral, and this holonomy key
+//! is derived deterministically from the sender's per-onion **build seed**, so that seed is a *universal
+//! trapdoor* while it lives — anyone who obtains it recovers the whole circuit (keys, path, holonomy). Forward
+//! secrecy therefore holds **only under the operational contract** that the per-onion seed is a fresh CSPRNG
+//! draw and is **zeroized immediately after the onion is built** (plus the relay ratcheting its own onion key);
+//! it does *not* come for free from "recovering a hop key needs a relay's long-term secret." The routed onion's
+//! confidentiality against a network adversary still reduces to the hybrid KEM (`fanos_aphantos::sealed`); the
+//! seed-hygiene requirement is the FS caveat.
 
 use alloc::vec::Vec;
 
@@ -64,10 +76,11 @@ impl Ratchet {
 
     /// The **finalized** holonomy: `H(FINAL ‖ state_L ‖ L)`, a length-binding outer step over the cascade of
     /// `hops` hops. This turns the front-keyed cascade (a secure PRF only for a *prefix-free* / fixed-length
-    /// message space) into a full NMAC-style keyed MAC over an arbitrary-length hop sequence: because the
-    /// outer step folds in the hop count `L` and is one-way in the internal state, an adversary who learns a
-    /// finalized tag can neither recover `state_L` nor extend the chain to a longer path — closing the
-    /// cascade length-extension gap (spec §5.4 `[P]`, `docs/design-holonomy-security.md`).
+    /// message space) into a length-bound keyed MAC over an arbitrary-length hop sequence: because the outer
+    /// step folds in the hop count `L` and is one-way in the internal state, an adversary who learns a
+    /// finalized tag can neither recover `state_L` nor extend the chain to a longer path — closing the cascade
+    /// length-extension gap. (The reduction is to secret-prefix BLAKE3-as-a-PRF, not textbook NMAC — the module
+    /// doc's "on forward secrecy / security" note is precise; spec §5.4 `[P]`, `docs/design-holonomy-security.md`.)
     #[must_use]
     pub fn finalize(&self, hops: u32) -> [u8; 32] {
         let mut input = [0u8; 32 + 4];
@@ -106,8 +119,8 @@ pub fn circuit_holonomy<F: Field>(circuit: &Circuit<F>, seed: &[u8; 32]) -> [u8;
         ratchet.advance(&conn);
         hops += 1;
     }
-    // Length-binding finalization (NMAC-style) — makes the tag a provable keyed MAC, not just a front-keyed
-    // cascade, so its security no longer rests on the tag being kept secret (spec §5.4, design-holonomy-security.md).
+    // Length-binding finalization — makes the tag a length-bound keyed MAC (secret-prefix BLAKE3-PRF), not just
+    // a front-keyed cascade, so its security no longer rests on the tag being kept secret (spec §5.4).
     ratchet.finalize(hops)
 }
 
@@ -177,7 +190,7 @@ mod tests {
         let b2 = r.advance(b"hop-2");
         assert_ne!(b1, b2);
         assert_eq!(r.holonomy(), b2);
-        // A different seed gives a different chain (forward-secret separation).
+        // A different seed gives a different chain (key-separation of the keyed cascade).
         let mut r2 = Ratchet::new(&[1u8; 32]);
         assert_ne!(r2.advance(b"hop-1"), b1);
     }
