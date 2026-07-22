@@ -18,6 +18,7 @@
 pub mod bridge;
 pub mod hybrid;
 pub mod naming;
+pub mod scheduler;
 pub mod storage;
 pub mod token;
 
