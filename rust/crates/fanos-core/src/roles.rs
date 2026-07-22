@@ -40,7 +40,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_primitives::{hash_labeled, BeaconSeed, Epoch, NodeId};
-use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
+use fanos_vrf::{VrfProof, VrfPublic, VrfSecret, PROOF_LEN};
 
 /// The functional roles a cell provides. Extensible; the four base roles mirror the node's advertised
 /// capability set (relay traffic, store L4 shards, host CALYPSO services, bridge to the clear net).
@@ -117,6 +117,12 @@ impl RoleSet {
     #[must_use]
     pub fn bits(self) -> u8 {
         self.0
+    }
+
+    /// Reconstruct a set from its [`bits`](Self::bits) encoding (unknown high bits are ignored).
+    #[must_use]
+    pub fn from_bits(bits: u8) -> Self {
+        Self(bits & ((1 << Role::ALL.len()) - 1))
     }
 }
 
@@ -197,6 +203,34 @@ impl CapabilityDescriptor {
     #[must_use]
     pub fn verify(&self, vrf_public: &VrfPublic) -> bool {
         vrf_public.verify(&Self::signable(&self.node_id, self.epoch, self.capability), &self.proof).is_some()
+    }
+
+    /// Canonical wire bytes: `node_id(32) ‖ epoch(8) ‖ offered(1) ‖ weight(2) ‖ proof(PROOF_LEN)` — the form a
+    /// node publishes to the overlay store each epoch (its coordinate slot), for peers to read and verify.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 8 + 1 + 2 + PROOF_LEN);
+        out.extend_from_slice(&self.node_id.0);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.push(self.capability.offered.bits());
+        out.extend_from_slice(&self.capability.weight.to_be_bytes());
+        out.extend_from_slice(&self.proof.to_bytes());
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if the wrong length or a malformed proof. The
+    /// recovered descriptor still needs [`verify`](Self::verify) against the node's VRF key before it is trusted.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 32 + 8 + 1 + 2 + PROOF_LEN {
+            return None;
+        }
+        let node_id = NodeId(bytes.get(..32)?.try_into().ok()?);
+        let epoch = Epoch::from_be_bytes(bytes.get(32..40)?.try_into().ok()?);
+        let offered = RoleSet::from_bits(*bytes.get(40)?);
+        let weight = u16::from_be_bytes(bytes.get(41..43)?.try_into().ok()?);
+        let proof = VrfProof::from_bytes(bytes.get(43..)?.try_into().ok()?)?;
+        Some(Self { node_id, epoch, capability: Capability::new(offered, weight), proof })
     }
 }
 
@@ -635,6 +669,11 @@ mod tests {
         let mut tampered = desc.clone();
         tampered.capability = Capability::new(RoleSet::of(&[Role::Relay, Role::Storage, Role::Exit]), 63);
         assert!(!tampered.verify(&pk), "an altered capability is rejected");
+        // The wire round-trip preserves an authentic, verifiable descriptor (the overlay-store form).
+        let rt = CapabilityDescriptor::from_bytes(&desc.to_bytes()).unwrap();
+        assert!(rt.verify(&pk), "a decoded descriptor still verifies");
+        assert_eq!((rt.node_id, rt.epoch, rt.capability), (desc.node_id, desc.epoch, desc.capability));
+        assert!(CapabilityDescriptor::from_bytes(&desc.to_bytes()[..40]).is_none(), "a truncated descriptor is rejected");
     }
 
     #[test]
