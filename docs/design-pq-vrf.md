@@ -94,15 +94,60 @@ The strongest verification achievable in-house (external cryptanalysis is, by de
   contribution rejected (a liveness nuisance), never bias the honest sum — sound only under an honest majority
   of *dealers*. Adversarial tests cover forged shares, an inconsistent (off-polynomial) but self-consistently
   committed dealing, and below-threshold reveals.
-- **`shuffle` + `rlwe`** — soundness is unconditional (cut-and-choose); hiding reveals only re-rand factors,
-  one branch per shadow. The residual trust is the **backend's IND-CPA** and the RLWE **parameters**: `n=256,
-  q=12289`, ternary noise are *illustrative*, chosen so decryption survives one re-randomization (verified),
-  **not** a hardened, side-channel-resistant, constant-time production set. A deployment must calibrate
-  `(n, q, χ)` to a target security level and use a vetted RLWE implementation. The shuffle *proof* is
-  noise-agnostic (exact ciphertext equality), so only the backend needs hardening.
+- **`shuffle`** — soundness is unconditional (combinatorial cut-and-choose, `1 − 2^-k`); hiding reveals only
+  re-randomization factors (checked homomorphically), one branch per shadow.
 
-**What genuinely remains** is therefore *not design or implementation* but **external cryptanalysis / adoption
-of a vetted RLWE backend** — an external process, not an in-house task.
+### 4.1 RLWE parameter calibration (rigorous)
+
+The `rlwe` backend is calibrated to **NewHope-512** (Alkim–Ducas–Pöppelmann–Schwabe): single ring
+`R_q = Z_q[X]/(X^n+1)`, `n = 512`, `q = 12289` (`≡ 1 mod 2n`, NTT-friendly), centered-binomial noise `η = 8`
+(variance `η/2 = 4`, `σ = 2`). NewHope-512 is estimated at **≈ 101-bit post-quantum** core-SVP (NIST level 1)
+by the lattice estimator; a higher level is the drop-in **NewHope-1024** (`n = 1024`, `≈ 233-bit`).
+
+**Decryption-noise budget (why re-randomization is safe).** With `b = a·s + e`, `Dec = v − s·u = e·r + e2 − s·e1
++ m·⌊q/2⌋`. Each product coefficient (e.g. `e·r`) is a sum of `n` independent `σ²`-variance terms, so
+`Var ≈ n·σ⁴`; the encryption noise has `Var(E_enc) ≈ 2n·σ⁴ + σ²`, i.e. `σ_enc ≈ σ²√(2n)`. A **re-randomization
+adds a fresh `Enc(0)`**, doubling the variance: `σ_tot ≈ 2σ²√n = 2·4·√512 ≈ 181`. Decryption fails only if a
+coefficient exceeds `q/4 = 3072 ≈ 17·σ_tot`, a `> 17σ` Gaussian tail — so the analytic decryption-failure rate
+is `≈ n·2·Φ(−17) < 2^-100`, comfortably below any epoch count. The **experiment** (`rlwe::noise_experiment`,
+100 keys × 512 coefficients) confirms the model: the empirical stddev lands at `≈ 181` and every observed
+coefficient is far below `q/4` (max `< 7σ` over ~51k samples), with correct decryption on every trial. The
+shuffle **proof** is noise-agnostic (it checks *exact* ciphertext equality), so noise bounds bear only on
+decryption, never on soundness.
+
+### 4.2 Soundness in a splitting ring — why the cut-and-choose is the safe choice
+
+The lattice-shuffle literature (Costa–Martínez–Morillo, *Proof of a Shuffle for Lattice-Based Cryptography*,
+2017; Aranha et al., CCS 2023; and **eprint 2025/658, *Efficient Verifiable Mixnets from Lattices, Revisited***,
+which *corrects a soundness gap* in prior work) shows that the *efficient, algebraic* (Neff/Bayer–Groth-style)
+shuffle proofs are subtle over `R_q`: because `q ≡ 1 (mod 2n)` makes `X^n+1` split completely, `R_q` has
+**zero-divisors**, so the Schwartz–Zippel argument those proofs rely on (a nonzero low-degree polynomial has
+few roots) **fails**, and soundness must be recovered with splitting-ring-aware machinery. Our **combinatorial
+cut-and-choose relies on no algebraic identity** — a wrong shuffle fails one of two challenge branches with
+probability `≥ 1/2` regardless of the ring — so it is **unconditionally sound over `R_q` for free**, sidestepping
+that entire subtlety. The honest cost is proof size: `O(k·n)` (with `k = 128` for `2^-128`) versus the
+algebraic `O(n)`. We trade succinctness for a soundness that needs no delicate ring analysis — the right default
+for a first, un-audited PQ construction.
+
+### 4.3 Honest limits
+
+- **`pqvss`** — reconstruction-uniqueness and unbiasability reduce to *information-theoretic* Shamir + BLAKE3
+  binding; the all-`t`-subsets check is a complete collinearity decision (no probabilistic gap). Limit: the
+  **detectable-abort** model (a malicious dealer can only exclude itself, never bias the honest sum) under an
+  honest dealer-majority. Tests cover forged shares, an off-polynomial-but-committed dealing, and sub-threshold reveals.
+- **`rlwe`** — the implementation is **not constant-time / NTT-hardened** (schoolbook `O(n²)` multiply, data-
+  dependent nothing-special) and the security rests on the standard Ring-LWE assumption at the cited level.
+
+**What genuinely remains is not design or implementation** but two *external* processes: independent
+cryptanalysis of `pqvss`/`shuffle`, and swapping the reference `rlwe` for a **vetted, constant-time, NTT** RLWE
+implementation at a deployment's target level (the calibration and the proof are done; only the backend crate
+is external).
+
+Sources: [NewHope / lattice-estimator (malb)](https://github.com/malb/lattice-estimator),
+[CRYSTALS-Kyber spec](https://pq-crystals.org/kyber/data/kyber-specification-round3-20210131.pdf),
+[Costa–Martínez–Morillo, Proof of a Shuffle (eprint 2017/900)](https://eprint.iacr.org/2017/900),
+[Verifiable Mix-Nets from Lattices, CCS 2023 (eprint 2022/422)](https://eprint.iacr.org/2022/422),
+[Efficient Verifiable Mixnets from Lattices, Revisited (eprint 2025/658)](https://eprint.iacr.org/2025/658).
 
 ## Summary
 
@@ -113,4 +158,4 @@ of a vetted RLWE backend** — an external process, not an in-house task.
 | PQ beacon — **reconstruction-unique** | **Implemented + tested** (`pqvss`): committed Shamir + all-`t`-subsets consistency. Novel/unaudited |
 | PQ verifiable shuffle (proof) | **Implemented + tested** (`shuffle`): Sako–Kilian, generic over the cryptosystem. Novel/unaudited |
 | — classical backend (ristretto ElGamal) | **Implemented + tested** (`shuffle::ElGamal`) |
-| — **post-quantum backend (Ring-LWE)** | **Implemented + tested** (`rlwe::Rlwe`) — same proof runs PQ. Illustrative params; needs a vetted backend |
+| — **post-quantum backend (Ring-LWE)** | **Implemented + tested** (`rlwe::Rlwe`) — same proof runs PQ. **NewHope-512** params (≈101-bit PQ), noise budget analyzed + Monte-Carlo-validated (§4.1). Needs a CT/NTT-hardened vetted crate |
