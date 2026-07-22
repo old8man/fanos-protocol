@@ -23,18 +23,22 @@
 //! invented** — OBOLOS composes vetted post-quantum primitives (BLAKE3 for the tree/nullifiers, a Module-SIS
 //! lattice commitment for value, ML-KEM for stealth keys) exactly as the rest of the platform does.
 //!
-//! This first landed increment is the **untraceability accounting**: the append-only commitment tree a spend
-//! proves membership in, and the nullifier set that makes a double-spend detectable while keeping the spent
-//! note unlinkable. Both are exact, deterministic, and unit-tested; the lattice value commitment, the note /
-//! stealth-address model, and the shielded transaction compose on top in the following increments.
+//! Landed so far: the **untraceability accounting** — the append-only commitment tree ([`tree`]) a spend
+//! proves membership in, and the nullifier set ([`nullifier`]) that makes a double-spend detectable while
+//! keeping the spent note unlinkable — and the **confidentiality** primitive: the additively-homomorphic
+//! lattice value [`commit`]ment that hides amounts while keeping the balance law checkable. All are exact,
+//! deterministic, and unit-tested; the note / stealth-address model and the shielded transaction (with the
+//! frontier zero-knowledge proof isolated behind a typed interface) compose on top in the following increments.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+pub mod commit;
 pub mod nullifier;
 pub mod tree;
 
+pub use commit::{Commitment, Params, Randomness, sum, sum_randomness, verify_balance};
 pub use nullifier::{Nullifier, NullifierSet};
 pub use tree::{AuthPath, CommitmentTree, TREE_DEPTH};
