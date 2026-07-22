@@ -75,7 +75,14 @@ impl<F: Field> OverlayBeaconNode<F> {
     fn is_beacon_frame(frame: &[u8]) -> bool {
         matches!(
             decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
-            Some(FrameType::BeaconPartial | FrameType::Beacon)
+            Some(
+                FrameType::BeaconPartial
+                    | FrameType::Beacon
+                    | FrameType::BeaconReq
+                    | FrameType::BeaconReshareTrigger
+                    | FrameType::BeaconReshareCommit
+                    | FrameType::BeaconReshareShare
+            )
         )
     }
 

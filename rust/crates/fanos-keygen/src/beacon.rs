@@ -148,6 +148,21 @@ impl<F: Field> BeaconNode<F> {
         self.share.is_some()
     }
 
+    /// Build a resharing-trigger frame for a coordinator to broadcast (audit R-C1): start generation
+    /// `generation`, redistributing the beacon key to the `new_indices` holder set at `new_threshold`, dealt
+    /// by the named live `contributors` (which must number ≥ the current threshold). In production a parent
+    /// cell or an operator issues this (authenticated over the parent link); the simulator's driver injects
+    /// it directly. The trigger is self-flooding (monotone), so it need only reach one live anchor.
+    #[must_use]
+    pub fn reshare_trigger(
+        generation: u64,
+        new_threshold: usize,
+        contributors: &[u8],
+        new_indices: &[u8],
+    ) -> Vec<u8> {
+        reshare_trigger_frame(generation, new_threshold, contributors, new_indices)
+    }
+
     /// This node's beacon holder index — its Fano point index `+ 1` (the [`VssShare`] convention: the anchor
     /// at point `i` holds share index `i + 1`). Used to tell whether this node is a target new holder of a
     /// reshare and to combine its own sub-shares. `0` if the coord is not a plane point (never, for a member).

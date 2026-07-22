@@ -13,6 +13,7 @@ mod common;
 
 use common::spawn_beacon_cell;
 use fanos_field::F2;
+use fanos_keygen::BeaconNode;
 use fanos_runtime::{Command, Config, Duration, Epoch};
 use fanos_sim::Sim;
 
@@ -67,4 +68,38 @@ fn the_epoch_clock_freezes_below_threshold_the_r_c1_cliff() {
         None,
         "and it stays frozen: the one-shot DKG left no path to reconstitute the anchor set (R-C1)"
     );
+}
+
+#[test]
+fn proactive_resharing_survives_the_r_c1_cliff() {
+    // The R-C1 fix, end to end: the SAME 4-of-7 cell and the SAME four-anchor loss that froze the clock above
+    // is now survived — because the beacon proactively re-shared its key to the survivors BEFORE the loss.
+    let mut sim = Sim::new(0x5EED);
+    let cell = spawn_beacon_cell::<F2>(&mut sim, Config::default(), 4, 7);
+    sim.inject_all(&Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(2000));
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(1)), "healthy: the clock starts");
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(2)), "and advances");
+
+    // PROACTIVELY reshare (generation 1) while all anchors are still up: move the beacon key to the four
+    // survivors {points 3,4,5,6} = holder indices {4,5,6,7} at a NEW threshold t' = 3. A coordinator
+    // broadcasts the trigger; it self-floods, so injecting it at one anchor reaches the cell.
+    let contributors = [4u8, 5, 6, 7];
+    let new_holders = [4u8, 5, 6, 7];
+    let trigger = BeaconNode::<F2>::reshare_trigger(1, 3, &contributors, &new_holders);
+    sim.inject_frame(cell[6], cell[6], trigger);
+    sim.run_for(Duration::from_millis(3000)); // the reshare deals, floods, and is adopted cell-wide
+
+    // Now cross the ORIGINAL n − t + 1 = 4-loss cliff: crash points {0,1,2,3}. Points 0,1,2 are now pure
+    // consumers; point 3 was a survivor anchor — so exactly 3 anchors {points 4,5,6} remain, precisely the
+    // new threshold. Where the un-reshared clock froze on this very loss, the reshared 3-of-4 beacon runs on.
+    for &i in &[0usize, 1, 2, 3] {
+        sim.crash(cell[i]);
+    }
+    assert_eq!(
+        sim.tick_epoch(),
+        Some(Epoch::new(3)),
+        "the reshared 3-of-4 beacon assembles where the original 4-of-7 would have frozen"
+    );
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(4)), "and the epoch clock keeps advancing");
 }
