@@ -42,6 +42,12 @@ pub trait StateMachine {
     /// has a canonical, agreed clock. The default is a no-op; a plain ledger ignores it.
     fn begin_block(&mut self, _height: u64) {}
 
+    /// Provide the block's **audit beacon** — an unpredictable, consensus-committed 32-byte value (the engine
+    /// passes the parent block hash), for state machines whose rules draw challenges from block randomness (e.g.
+    /// a storage market's proof-of-retrievability audit). Called once per block, before its transactions,
+    /// alongside [`begin_block`](Self::begin_block). The default is a no-op.
+    fn set_audit_beacon(&mut self, _beacon: [u8; 32]) {}
+
     /// Apply one transaction (already reconstructed and in committed order) to the state.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome;
 

@@ -875,6 +875,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
             self.exec_queue.remove(0);
             self.chain.begin_block(block.header.height);
+            // The parent hash is an unpredictable, consensus-committed value (fixed before this block's
+            // transactions), so a storage-market audit drawn from it cannot be pre-satisfied by the prover.
+            self.chain.set_audit_beacon(block.header.parent);
             for txn in &opened {
                 self.chain.execute(txn);
             }

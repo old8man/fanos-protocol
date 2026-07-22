@@ -78,6 +78,12 @@ impl<S: StateMachine> Chain<S> {
         self.state.begin_block(height);
     }
 
+    /// Forward the block's audit beacon (the parent hash) to the state machine before its transactions
+    /// (see [`StateMachine::set_audit_beacon`]).
+    pub fn set_audit_beacon(&mut self, beacon: [u8; 32]) {
+        self.state.set_audit_beacon(beacon);
+    }
+
     /// Execute one transaction against the state (applied in committed order after its block finalizes).
     pub fn execute(&mut self, tx: &Transaction) {
         let _ = self.state.apply(tx);

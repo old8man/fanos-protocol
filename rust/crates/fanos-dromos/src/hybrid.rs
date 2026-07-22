@@ -69,14 +69,6 @@ impl HybridLedger {
         }
     }
 
-    /// Set the block's **audit beacon** — the unpredictable PQ-VRF value the storage market's retrievability
-    /// challenges are drawn from. The consensus driver calls this each block (alongside
-    /// [`begin_block`](StateMachine::begin_block)); the beacon's unpredictability is what makes the audit
-    /// ungrindable (`crate::storage`).
-    pub fn set_audit_beacon(&mut self, beacon: [u8; 32]) {
-        self.audit_beacon = beacon;
-    }
-
     /// The storage market sub-state (read-only).
     #[must_use]
     pub fn storage(&self) -> &StorageMarket {
@@ -274,6 +266,13 @@ impl StateMachine for HybridLedger {
     /// Set the registry's clock to the block being executed.
     fn begin_block(&mut self, height: u64) {
         self.height = height;
+    }
+
+    /// Adopt the block's audit beacon (the parent hash) — the storage market's retrievability challenges are
+    /// drawn from it, so its consensus-committed unpredictability is what makes the audit ungrindable
+    /// (`crate::storage`).
+    fn set_audit_beacon(&mut self, beacon: [u8; 32]) {
+        self.audit_beacon = beacon;
     }
 
     /// Execute one committed transaction by dispatching on its type tag. An unknown tag or empty payload is
