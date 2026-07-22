@@ -192,7 +192,42 @@ FANOS already has every organ Session assembles, each stronger:
 | Signal double-ratchet | **DIAULOS** sessions + a **PQ double-ratchet** (hybrid X25519+ML-KEM, reusing `onion_ratchet`) | post-quantum forward secrecy |
 | — (online-ish) | **L4 store mailboxes** | store-and-forward offline delivery in the erasure-coded DHT, retrieved anonymously |
 
-ANGELOS is therefore an **application composition [C]**, not new cryptography: a PQ double-ratchet (A/E aspects — articulation of messages into sealed interiority, the **AE — Apperception** channel) carried over DIAULOS-over-NYX to a CALYPSO-computed rendezvous, addressed by an ONOMA name, with offline messages parked in L4 mailboxes and OBOLOS-payable premium features (storage, priority). Metadata privacy — the property Session most struggles with — is delivered by the mixnet substrate, not patched on. **[P]** is only the messenger *product* (UX, group messaging, the mailbox protocol); the anonymity is inherited.
+ANGELOS is therefore an **application composition [C]**, not new cryptography: the anonymity is inherited from the substrate; the new pieces are the session crypto and the product model. But the goal is larger than a 1:1 Session clone — it is a **Discord-class communications platform** (text *and* audio/video, communities and channels, presence and roles), carried over the *whole network*, at a performance the mixnet alone cannot give. That forces the one non-obvious architectural decision, and the rest follows from it.
+
+### §6.1 The two transport modes — the latency↔anonymity dial {#angelos-modes}
+
+The mixnet (NYX/APHANTOS) is deliberately **high-latency**: Poisson mixing and cover traffic are *why* metadata vanishes (the anonymity trilemma, `holarch.md` §15 — you pay latency or bandwidth for unlinkability). Real-time audio/video needs the opposite: **sub-150 ms** mouth-to-ear. A messenger that must do both cannot pick one transport. FANOS already resolves this with the **Direct / Lite / Full anonymity dial** (`docs/roadmap.md`, `docs/design.md` §6): the *same* engine offers a spectrum from a low-latency near-direct path to full mixnet mixing. ANGELOS makes the dial **per-flow**:
+
+- **Async / control plane — Full mixnet.** Text messages, mailbox delivery, presence, and signaling ride NYX-over-CALYPSO at full mixing: metadata-private, store-and-forward through L4 mailboxes (`OU — Wholeness`: the DHT feeds the offline recipient). This is where ANGELOS beats Discord *and* Signal — the network cannot see who talks to whom.
+- **Real-time media plane — Lite/Direct.** A call's audio/video rides a low-latency path (Lite: a short mixed route; Direct: a rendezvous-established near-direct path, still onion-wrapped for content secrecy). The user (or a room policy) sets the dial: a whistleblower's call pays latency for anonymity; a team standup takes Direct. The trade-off is **declared, not hidden** — the ХОЛАРХ **EO — Immanence** channel (the cover-traffic/latency budget, felt from inside).
+
+Both planes share one **coordinate/identity fabric** (the platform's `U — Unity`), so a call is *set up* over the anonymous control plane (exchanging the media session's keys and a rendezvous coordinate) and then *flows* over the media plane — SIP/WebRTC's "signaling vs. media" split, re-derived on the FANOS substrate.
+
+### §6.2 The session crypto — three ratchets {#angelos-crypto}
+
+- **1:1 text** — a **forward-secret PQ session** (`fanos-angelos::session`, built): hybrid-ML-KEM handshake → BLAKE3 symmetric ratchet, a fresh key per message. Post-compromise security (the asymmetric KEM ratchet) and skipped-key handling compose on top.
+- **Groups / channels** — a **sender-key group session**: each member derives a per-sender chain, so a channel of `k` members is `k` ratchets, and posting is `O(1)` (encrypt once to the channel key), not `O(k)` pairwise. Membership changes rekey. This is the crypto under a Discord *text channel*.
+- **Real-time media** — a **media session**: a per-call symmetric key (agreed over the control plane) keys an SRTP-like frame cipher (per-packet AEAD, sequence-numbered, loss-tolerant — you cannot ratchet per-packet at 50 packets/s, so media uses a periodically-rekeyed key, forward-secret across epochs not packets). Voice and video are just typed media streams over it.
+
+### §6.3 The Discord-class model {#angelos-product}
+
+Everything Discord assembles maps onto organs FANOS already has, made private and post-quantum:
+
+| Discord | ANGELOS |
+|---|---|
+| account / user id | **ONOMA** name → PQ identity (ledger-owned, human-memorable) |
+| servers (guilds) & channels | a **community**: a signed roster + channel set; ownership/roles on the ledger (a `dromos::naming` descriptor points a name at a community), so a community is *self-certifying*, not host-owned |
+| roles / permissions | capability tokens signed by the community key (post-quantum), checked at the channel boundary |
+| voice/video rooms | a media session (§6.2) over the Lite/Direct plane; the room's coordinate is CALYPSO-computed, so **no central media server** — an SFU role (selective forwarding) is a *cell* function, not a company's datacenter |
+| presence / typing | control-plane events over the mixnet (rate-shaped so presence itself leaks nothing) |
+| file / screen share | typed media/blob streams; large blobs land in the L4 erasure store, retrieved anonymously |
+| Nitro (paid features) | **OBOLOS**-payable premium (storage, larger uploads, priority) — private payment for a private service |
+
+The decisive difference from Discord: **there is no company in the middle.** Communities are self-certifying (ledger-owned identity + roles), media is forwarded by cell nodes (an SFU is a *role* the network assigns, `fanos-core::roles`), and metadata is mixnet-hidden. It is *no worse than Discord* on features and strictly better on sovereignty and privacy.
+
+### §6.4 Status {#angelos-status}
+
+**[C]** for the composition (the transport dial, rendezvous, identity, storage all exist and are strong). **Built:** the 1:1 forward-secret session. **[P]:** the group and media sessions, the community/role model, the signaling↔media call flow, and the product surface. The performance target (Discord-class real-time at scale) rides on the Lite/Direct plane + cell-forwarded media — the substrate supports it; delivering it at scale is the program.
 
 ---
 
