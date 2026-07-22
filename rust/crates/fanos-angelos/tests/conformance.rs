@@ -6,6 +6,7 @@
 
 use std::fmt::Write as _;
 
+use fanos_angelos::call::{CallId, CallSignal, media_flags};
 use fanos_angelos::{Command, GroupSession, MediaKind, MediaSession, Message, MessageKind, Role, Session};
 
 fn hex(b: &[u8]) -> String {
@@ -74,6 +75,24 @@ fn command_grammar_matches_angelos_json() {
     assert!(ping.args.is_empty());
     assert!(Command::parse("hello", '/').is_none(), "no prefix → not a command");
     assert!(Command::parse("/", '/').is_none(), "empty name → not a command");
+}
+
+#[test]
+fn call_signal_kat_matches_angelos_json() {
+    // An audio+video invite encodes to the pinned bytes.
+    let invite = CallSignal::Invite {
+        call: CallId::new([0xAB; 16]),
+        media_secret: [0xCD; 32],
+        media: media_flags::AUDIO | media_flags::VIDEO,
+    };
+    let want = "00ababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd03";
+    assert_eq!(hex(&invite.to_bytes()), want);
+    assert_eq!(CallSignal::from_bytes(&invite.to_bytes()), Some(invite), "invite round-trips");
+    // Invite → accept seeds interoperable media sessions.
+    let (offer, mut caller) = CallSignal::invite(CallId::new([1; 16]), [2; 32], media_flags::AUDIO);
+    let (_accept, callee) = CallSignal::from_bytes(&offer.to_bytes()).unwrap().accept().expect("accept");
+    let frame = caller.seal_frame(MediaKind::Audio, b"hi");
+    assert_eq!(callee.open_frame(&frame), Some((0, MediaKind::Audio, b"hi".to_vec())), "media interoperates");
 }
 
 #[test]

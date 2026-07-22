@@ -49,6 +49,18 @@
       { "text": "/", "is_command": false }
     ]
   },
+  "call": {
+    "comment": "Call signaling — the content of a CallSignal message that sets up a voice/video call. Canonical layout: tag(1) || call_id(16), and for an Invite || media_secret(32) || media_flags(1). The caller sends an Invite carrying a fresh media secret (the media session's epoch-0 key) and the offered media; both sides seed an identical media session from the secret. A decoder MUST reject an unknown tag, a short body, or trailing bytes.",
+    "tags": { "Invite": 0, "Accept": 1, "Decline": 2, "Hangup": 3 },
+    "media_flags": { "Audio": 1, "Video": 2, "Data": 4 },
+    "vector": {
+      "comment": "An audio+video invite (flags 0b011 = 3).",
+      "call_id_hex": "abababababababababababababababab",
+      "media_secret_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "media_flags": 3,
+      "bytes_hex": "00ababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd03"
+    }
+  },
   "session": {
     "comment": "The 1:1 forward-secret ratchet. From a 32-byte shared secret (agreed by the KEM handshake, a group rekey, or a PSK): root = H('FANOS-angelos-v1/root', shared); a2b = H('FANOS-angelos-v1/a2b', root); b2a = H('FANOS-angelos-v1/b2a', root). The initiator sends on a2b, the responder on b2a. Each message: mk = H('FANOS-angelos-v1/mk', chain); chain' = H('FANOS-angelos-v1/next', chain); wire = n(8, little-endian) || AEAD(mk, nonce(n), plaintext). The chain is one-way, so a compromised key never opens past messages.",
     "labels": {
