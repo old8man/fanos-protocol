@@ -8,13 +8,18 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
-use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken, Triple};
+use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification, TimerToken, Triple};
 use fanos_wire::decode_frame;
 
 use crate::metrics::{Observed, Report};
 use crate::network::NetworkModel;
 use crate::rng::Rng;
 use crate::trace::{Trace, fmt_coord};
+
+/// The settle window [`Sim::tick_epoch`] allows one beacon round to propagate and assemble, in ms. A DVRF
+/// round is ~2 broadcast hops; the default network is 20 ms + ≤10 ms jitter, so 2 s is ample (it matches the
+/// proven `beacon_node_e2e` idiom) while staying short enough that no realistic round is silently missed.
+const EPOCH_SETTLE_MS: u64 = 2000;
 
 /// A short human-readable name for a wire frame (its type), for the trace.
 fn frame_name(frame: &[u8]) -> String {
@@ -364,6 +369,32 @@ impl Sim {
     /// queue is never empty, so such a call would never return.
     pub fn settle(&mut self) {
         self.run_until(self.clock);
+    }
+
+    /// Drive one beacon epoch across the whole cell and report the newest epoch it adopted.
+    ///
+    /// Ticks `Command::AdvanceEpoch` into every node — an anchor floods its DVRF partial, a threshold `t` of
+    /// distinct partials assembles the round, and each node announces [`Notification::BeaconReady`] — then
+    /// settles the round. Returns the newest epoch **any** node adopted this tick, or `None` if no round
+    /// assembled: the beacon stalled because fewer than `t` anchors are live.
+    ///
+    /// Unlike injecting a `Command::Reseat` directly (which fakes the reshuffle), this drives the *real*
+    /// `beacon → BeaconReady → reshuffle` epoch clock over `OverlayBeaconNode`s, so a scenario can crash an
+    /// anchor batch and observe the clock freeze at the `n − t + 1` loss cliff (audit R-C1 / sim S-P0.0).
+    #[must_use]
+    pub fn tick_epoch(&mut self) -> Option<Epoch> {
+        let seen = self.report.notifications.len();
+        self.inject_all(&Command::AdvanceEpoch);
+        self.run_for(fanos_runtime::Duration::from_millis(EPOCH_SETTLE_MS));
+        self.report
+            .notifications
+            .iter()
+            .skip(seen)
+            .filter_map(|o| match o.note {
+                Notification::BeaconReady { epoch, .. } => Some(epoch),
+                _ => None,
+            })
+            .max()
     }
 
     fn dispatch(&mut self, event: Event) {
