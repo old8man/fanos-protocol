@@ -1,7 +1,7 @@
 ---
 sidebar_position: 0
-title: "FANOS — a next-generation distributed protocol"
-description: "Reference specification of FANOS: a projective-plane-addressed overlay network (Discovery 7), the APHANTOS anonymity layer, and NYX sheaf onion routing. O(1) rendezvous, Maekawa quorums, threshold security beating Tor/Nym, post-quantum crypto, with a live interactive and verifier."
+title: "FANOS — a next-generation distributed protocol and holonic platform"
+description: "Reference specification of FANOS: a projective-plane-addressed overlay network (Discovery 7), the APHANTOS anonymity layer, and NYX sheaf onion routing — composed into a full holonic platform that is natively both a maximal-anonymity mixnet (E-machine) and a high-speed private post-quantum L1 blockchain (L-machine): TAXIS consensus, the OBOLOS untraceable currency, DROMOS parallel execution, currency-bought ONOMA naming, the ANGELOS messenger, and HERMES cross-chain. O(1) rendezvous, Maekawa quorums, threshold security beating Tor/Nym, post-quantum crypto, with a live interactive and verifier."
 ---
 
 # FANOS
@@ -11,6 +11,10 @@ description: "Reference specification of FANOS: a projective-plane-addressed ove
 
 :::info Document status
 **Version 0.1** (reference architecture). Result statuses use the corpus discipline **[T]** / **[C]** / **[H]** / **[P]** (see the block below). **Origin:** UHM, Discovery 7 (projectively-structured distributed system) + the Serre bundle ([gap-thermodynamics](/docs/core/dynamics/gap-thermodynamics)) + the Σ-calculus (Steiner/Steane). **License** (intended open): CERN-OHL-S v2 (hardware profiles) + Apache-2.0/MIT (code) + CC-BY-SA (document). **Interactive:** [live Fano plane and security calculator](pathname:///fanos/fanos-playground.html) (a site page, works offline). **Verifiers:** the Rust reference suite `cargo run -p fanos-cli` (reproduces the numeric claims end-to-end against the committed `conformance/vectors/*.json` KATs, CI-enforced, §7.9), with the standalone math companion [`/fanos/fanos_verify.py`](pathname:///fanos/fanos_verify.py).
+:::
+
+:::tip This document specifies the anonymity substrate (L0–L7). The **platform** is one level up.
+FANOS has grown from an anonymity overlay into a **holonic platform** — natively both a maximal-anonymity mixnet (an *E-machine*) and a high-speed private post-quantum L1 blockchain (an *L-machine*), composed into one meta-holon per the corpus **ХОЛАРХ** meta-specification (`applied/research/holarch.md`). The platform architecture — TAXIS consensus (L8), DROMOS parallel execution (L9), the **OBOLOS** untraceable post-quantum currency (L10), currency-bought ONOMA naming and the ANGELOS anonymous messenger (L11), and HERMES cross-chain (L12) — is specified in the companion **[`platform.md`](./platform.md)**, the design authority for the blockchain-platform transformation. This document (`protocol.md`) remains the reference for the anonymity substrate those layers compose onto.
 :::
 
 ## Naming and the thematic triad
@@ -25,6 +29,17 @@ The protocol is named after the Greek root **φαν-** ("to bring to light, to a
 | **DIAKRISIS** | διάκρισις | "discernment; separating true from false" | Self-diagnosis and self-healing under node/segment failure (Part VI) |
 | **CALYPSO** | Καλυψώ | "the concealer" (the nymph who hid Odysseus) | Anonymous hidden services with no directory and no single host (Part XII) |
 | **PROTEUS** | Πρωτεύς | "the shape-shifter" (the god who changes form to escape capture) | Optional polymorphic transport / censorship & DPI resistance (Part XIII) |
+
+The **platform tier** ([`platform.md`](./platform.md)) extends the triad with the blockchain-platform components — the L-machine composed onto the E-machine above:
+
+| Component | Greek root | Meaning | Role in the platform |
+|---|---|---|---|
+| **TAXIS** | τάξις | "order, arrangement, battle-array" | Projective-cell BFT consensus + the cell hierarchy — the L1/L2 blockchain (L8) |
+| **DROMOS** | δρόμος | "running-course, racetrack" | The swift parallel execution fabric — high-speed L1 (L9) |
+| **OBOLOS** | ὀβολός | "an ancient coin" (its shielding: **SKIA**, σκιά, "shadow") | The private, untraceable, post-quantum currency (L10) |
+| **ONOMA** | ὄνομα | "name" | Self-certifying addresses + currency-bought private naming/domains (L0, L11) |
+| **ANGELOS** | ἄγγελος | "messenger" | The anonymous post-quantum messenger, beyond Session (L11) |
+| **HERMES** | Ἑρμῆς | "god of boundaries, travel, commerce, messengers" | Post-quantum threshold cross-chain — federation, not a deeper tier (L12) |
 
 The public layer "shines" (routes are verifiable and efficient); with APHANTOS enabled, traffic "vanishes" into structurally-balanced noise; NYX realises concealment as a composable sequence of threshold groups. DIAKRISIS is named for a *faculty*, not a lighting condition, because it is not one more way to route — it is the network turning its gaze on itself: after NYX hides the traffic, DIAKRISIS is what still tells a healthy cell from a corrupted one, a crash from a lie, churn from a partition. It shares its name with the corpus discernment theory *Diakrisis* (διάκρισις, the distinguishing of the genuine) deliberately: fault diagnosis *is* discernment, carried out on the same seven-fold structure.
 
