@@ -114,11 +114,11 @@ pub fn verify(chunk: &Cid, beacon: &[u8], k: usize, leaves: usize, response: &[L
     if response.len() != expected.len() {
         return false;
     }
-    for &index in &expected {
-        let Some(lp) = response.iter().find(|lp| lp.index == index) else {
-            return false;
-        };
-        if !verify_leaf(chunk, index, &lp.bytes, &lp.path) {
+    // The response must be exactly the challenged indices, in canonical ascending order — so there is a *single*
+    // valid byte encoding per (chunk, beacon), and a permuted/duplicated variant cannot pass as a distinct proof
+    // (which, without this, lets a provider replay one proof of holding many times against one settlement).
+    for (lp, &index) in response.iter().zip(&expected) {
+        if lp.index != index || !verify_leaf(chunk, index, &lp.bytes, &lp.path) {
             return false;
         }
     }

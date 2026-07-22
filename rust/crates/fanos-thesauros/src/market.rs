@@ -119,6 +119,9 @@ pub struct Deal {
     passed: u64,
     released: u64,
     state: DealState,
+    /// The block height of the last settlement — settlements must strictly increase in height, so a single
+    /// proof cannot be replayed within one block to advance (and pay) the deal many times.
+    last_height: Option<u64>,
 }
 
 impl Deal {
@@ -129,7 +132,7 @@ impl Deal {
         if params.duration == 0 {
             return None;
         }
-        Some(Self { params, epoch: 0, passed: 0, released: 0, state: DealState::Active })
+        Some(Self { params, epoch: 0, passed: 0, released: 0, state: DealState::Active, last_height: None })
     }
 
     /// The deal parameters.
@@ -178,14 +181,22 @@ impl Deal {
         u64::try_from(owed).unwrap_or(self.params.price)
     }
 
-    /// Settle one audit epoch against its verdict `proof_ok`. Advances the epoch, pays the provider **in
-    /// arrears** on a pass (the delta to its cumulative entitlement) and nothing on a miss, and completes the
-    /// deal after `duration` epochs. `None` if the deal is no longer active.
+    /// Settle one audit epoch at block `height` against its verdict `proof_ok`. Advances the epoch, pays the
+    /// provider **in arrears** on a pass (the delta to its cumulative entitlement) and nothing on a miss, and
+    /// completes the deal after `duration` epochs. `None` if the deal is no longer active **or `height` is not
+    /// strictly greater than the last settlement's height** — so a proof cannot be replayed within a block to
+    /// drain the escrow across many "epochs" at once (audit AT-C1).
     #[must_use]
-    pub fn settle_epoch(&mut self, proof_ok: bool) -> Option<Settlement> {
+    pub fn settle_epoch(&mut self, height: u64, proof_ok: bool) -> Option<Settlement> {
         if self.state != DealState::Active {
             return None;
         }
+        if let Some(last) = self.last_height
+            && height <= last
+        {
+            return None;
+        }
+        self.last_height = Some(height);
         self.epoch = self.epoch.saturating_add(1);
         let settlement = if proof_ok {
             self.passed = self.passed.saturating_add(1);
@@ -251,8 +262,8 @@ mod tests {
     fn an_honest_provider_earns_the_whole_price_over_the_duration() {
         let mut deal = Deal::open(params(1000, 10)).unwrap();
         let mut paid = 0u64;
-        for _ in 0..10 {
-            if let Some(Settlement::Pay { provider, amount }) = deal.settle_epoch(true) {
+        for h in 1..=10 {
+            if let Some(Settlement::Pay { provider, amount }) = deal.settle_epoch(h, true) {
                 assert_eq!(provider, [0xAA; 32]);
                 paid += amount;
             } else {
@@ -262,14 +273,26 @@ mod tests {
         assert_eq!(paid, 1000, "the provider earns exactly the price over the full duration");
         assert_eq!(deal.state(), DealState::Completed);
         assert_eq!(deal.refundable(), 0, "nothing is refundable — the provider earned it all");
-        assert!(deal.settle_epoch(true).is_none(), "a completed deal settles no further");
+        assert!(deal.settle_epoch(11, true).is_none(), "a completed deal settles no further");
+    }
+
+    #[test]
+    fn a_replayed_settlement_at_the_same_height_is_refused() {
+        // Audit AT-C1: a single proof must not settle (and pay) more than once within a block.
+        let mut deal = Deal::open(params(1000, 10)).unwrap();
+        assert!(matches!(deal.settle_epoch(5, true), Some(Settlement::Pay { .. })));
+        let released = deal.released();
+        assert_eq!(deal.settle_epoch(5, true), None, "a proof cannot settle twice at one height");
+        assert_eq!(deal.settle_epoch(4, true), None, "settlements must strictly increase in height");
+        assert_eq!(deal.released(), released, "no extra escrow was released by the replay");
+        assert!(matches!(deal.settle_epoch(6, true), Some(Settlement::Pay { .. })), "the next height still settles");
     }
 
     #[test]
     fn a_cheating_provider_earns_nothing_and_the_consumer_is_refunded() {
         let mut deal = Deal::open(params(1000, 10)).unwrap();
-        for _ in 0..10 {
-            assert_eq!(deal.settle_epoch(false), Some(Settlement::Miss { provider: [0xAA; 32] }));
+        for h in 1..=10 {
+            assert_eq!(deal.settle_epoch(h, false), Some(Settlement::Miss { provider: [0xAA; 32] }));
         }
         assert_eq!(deal.released(), 0, "a provider that never proves earns nothing");
         assert_eq!(deal.refundable(), 1000, "the whole escrow is refundable to the consumer");
@@ -282,8 +305,8 @@ mod tests {
         let mut deal = Deal::open(params(1000, 10)).unwrap();
         let verdicts = [true, false, true, true, false, true, true, false, true, true];
         let mut paid = 0u64;
-        for ok in verdicts {
-            match deal.settle_epoch(ok).unwrap() {
+        for (i, ok) in verdicts.into_iter().enumerate() {
+            match deal.settle_epoch(i as u64 + 1, ok).unwrap() {
                 Settlement::Pay { amount, .. } => paid += amount,
                 Settlement::Miss { .. } => {}
             }
@@ -302,8 +325,8 @@ mod tests {
         let cost_per_epoch = 80u64; // c, with slice p = 100 > c
         let mut honest = Deal::open(params(price, duration)).unwrap();
         let mut earned = 0u64;
-        for _ in 0..duration {
-            if let Some(Settlement::Pay { amount, .. }) = honest.settle_epoch(true) {
+        for h in 1..=duration {
+            if let Some(Settlement::Pay { amount, .. }) = honest.settle_epoch(h, true) {
                 earned += amount;
             }
         }
@@ -312,8 +335,8 @@ mod tests {
         // Cheating: earns nothing (no cost, but no income, and reputation decays — modeled by the role layer).
         let mut cheat = Deal::open(params(price, duration)).unwrap();
         let mut cheat_earned = 0u64;
-        for _ in 0..duration {
-            if let Some(Settlement::Pay { amount, .. }) = cheat.settle_epoch(false) {
+        for h in 1..=duration {
+            if let Some(Settlement::Pay { amount, .. }) = cheat.settle_epoch(h, false) {
                 cheat_earned += amount;
             }
         }
@@ -324,12 +347,12 @@ mod tests {
     #[test]
     fn closing_early_refunds_the_unreleased_escrow_once() {
         let mut deal = Deal::open(params(1000, 10)).unwrap();
-        let _ = deal.settle_epoch(true); // provider earned 100
-        let _ = deal.settle_epoch(true); // provider earned 200
+        let _ = deal.settle_epoch(1, true); // provider earned 100
+        let _ = deal.settle_epoch(2, true); // provider earned 200
         assert_eq!(deal.released(), 200);
         assert_eq!(deal.close(), 800, "the unreleased 800 is refunded to the consumer");
         assert_eq!(deal.state(), DealState::Closed);
         assert_eq!(deal.close(), 0, "closing again refunds nothing");
-        assert!(deal.settle_epoch(true).is_none(), "a closed deal settles no further");
+        assert!(deal.settle_epoch(3, true).is_none(), "a closed deal settles no further");
     }
 }

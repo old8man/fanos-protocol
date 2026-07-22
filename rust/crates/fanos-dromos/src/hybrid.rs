@@ -286,7 +286,10 @@ impl HybridLedger {
         if !verify(&params.cid, &self.audit_beacon, params.k as usize, leaves, &response) {
             return false;
         }
-        let Some(settlement) = self.storage.deals.get_mut(id).and_then(|d| d.settle_epoch(true)) else {
+        // Settle at this block height; the deal rejects a second settlement at the same height, so a provider
+        // cannot replay one proof many times within a block to drain the escrow (audit AT-C1).
+        let height = self.height;
+        let Some(settlement) = self.storage.deals.get_mut(id).and_then(|d| d.settle_epoch(height, true)) else {
             return false;
         };
         if let Settlement::Pay { provider, amount } = settlement {
@@ -787,6 +790,11 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&prove_tx))), ExecOutcome::Applied);
         assert_eq!(ledger.tokens().balance(&provider), 100, "the provider earned one slice from escrow");
         assert_eq!(ledger.storage_escrow(), 300);
+
+        // AT-C1: replaying the SAME proof at the same height pays nothing more (no escrow drain).
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&prove_tx))), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&provider), 100, "a replayed proof does not settle a second time");
+        assert_eq!(ledger.storage_escrow(), 300, "the escrow is not drained by proof replay");
 
         // A garbage proof pays nothing.
         let bad = StorageTx::Prove { deal_id: id, response: vec![0u8; 4] };

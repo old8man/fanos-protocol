@@ -123,7 +123,7 @@ fn honest_deals_pay_out_and_faulty_deals_refund() {
         let indices = challenge(&cid, &beacon(epoch), k as usize, leaves);
         let response = prove(&data, &indices).unwrap();
         let ok = verify(&cid, &beacon(epoch), k as usize, leaves, &response);
-        if let Some(Settlement::Pay { amount, .. }) = honest_deal.settle_epoch(ok) {
+        if let Some(Settlement::Pay { amount, .. }) = honest_deal.settle_epoch(epoch, ok) {
             earned += amount;
         }
     }
@@ -133,9 +133,9 @@ fn honest_deals_pay_out_and_faulty_deals_refund() {
 
     // A provider holding nothing cannot prove any epoch → earns nothing, and the consumer reclaims it all.
     let mut faulty_deal = Deal::open(params([0xA2; 32])).unwrap();
-    for _ in 0..duration {
+    for h in 0..duration {
         // No proof to submit → the epoch is a miss.
-        let _ = faulty_deal.settle_epoch(false);
+        let _ = faulty_deal.settle_epoch(h, false);
     }
     assert_eq!(faulty_deal.released(), 0, "a provider that never proves earns nothing");
     assert_eq!(faulty_deal.refundable(), price, "the whole escrow refunds to the consumer");
