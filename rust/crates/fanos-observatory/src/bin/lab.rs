@@ -42,6 +42,8 @@ enum Command {
     Watch(WatchArgs),
     /// Run a named stress experiment against a cluster and report the fleet's response.
     Experiment(ExperimentArgs),
+    /// Sweep across scales (1 → 10 000 nodes), reporting state at each — optionally under an experiment.
+    Sweep(SweepArgs),
     /// List the available stress experiments.
     Scenarios,
     /// Check the ХОЛАРХ architecture viability gate (V1–V4, σ-panel, Ω4 ablations).
@@ -93,6 +95,22 @@ struct RunArgs {
 }
 
 #[derive(Args)]
+struct SweepArgs {
+    /// RNG seed.
+    #[arg(long, short, default_value_t = 1)]
+    seed: u64,
+    /// The largest scale to reach (the ladder is 7, 70, 700, 7000, 10003 nodes, capped here).
+    #[arg(long, default_value_t = 10_003)]
+    max_nodes: usize,
+    /// Optionally run this experiment at every scale (see `fanos-lab scenarios`).
+    #[arg(long)]
+    experiment: Option<String>,
+    /// Experiment intensity (crash fraction / churn rate).
+    #[arg(long, default_value_t = 0.1)]
+    fraction: f64,
+}
+
+#[derive(Args)]
 struct WatchArgs {
     #[command(flatten)]
     shape: Shape,
@@ -123,6 +141,7 @@ fn main() {
     match Cli::parse().command {
         Command::Run(args) => cmd_run(&args),
         Command::Experiment(args) => cmd_experiment(&args),
+        Command::Sweep(args) => cmd_sweep(&args),
         Command::Scenarios => cmd_scenarios(),
         Command::Gate => cmd_gate(),
         Command::Watch(args) => {
@@ -137,6 +156,50 @@ fn main() {
 // ---------------------------------------------------------------------------------------------------
 // experiment / scenarios
 // ---------------------------------------------------------------------------------------------------
+
+fn cmd_sweep(args: &SweepArgs) {
+    // Full-cell scales (multiples of 7) so the sweep isolates the experiment's effect — a partial last
+    // cell would itself read degraded once its absent members time out, muddying the reading.
+    let ladder: Vec<usize> = [1usize, 10, 100, 1000, 1429]
+        .into_iter()
+        .map(|cells| cells * 7)
+        .filter(|&n| n <= args.max_nodes)
+        .collect();
+    if let Some(name) = &args.experiment {
+        println!("\nscale sweep under '{name}' (seed {}):", args.seed);
+        println!("  {:>7} {:>6} {:>8} {:>10} {:>8} {:>6} {:>10}", "nodes", "cells", "alive", "reporting", "min Φ", "peak", "outcome");
+        for n in ladder {
+            let mut cluster = Cluster::with_node_target(args.seed, lab_config(), n);
+            cluster.run_for(Duration::from_millis(1200));
+            let Some(exp) = Experiment::from_name(name, args.fraction, cluster.node_count()) else {
+                eprintln!("unknown experiment '{name}'. Try: {}", Experiment::NAMES.join(", "));
+                std::process::exit(2);
+            };
+            let r = run_experiment(&mut cluster, exp, 12, Duration::from_millis(700));
+            println!(
+                "  {:>7} {:>6} {:>8} {:>10} {:>8.3} {:>6} {:>10}",
+                r.after.total, cluster.cell_count(), r.after.alive, r.after.reporting,
+                r.min_mean_phi, r.peak_troubled_cells,
+                if r.ended_healthy { "recovered" } else { "degraded" },
+            );
+        }
+    } else {
+        println!("\nscale sweep (seed {}):", args.seed);
+        println!("  {:>7} {:>6} {:>8} {:>10} {:>8} {:>8}", "nodes", "cells", "alive", "reporting", "mean Φ", "troubled");
+        for n in ladder {
+            let mut cluster = Cluster::with_node_target(args.seed, lab_config(), n);
+            cluster.run_for(Duration::from_millis(1200));
+            cluster.refresh_telemetry();
+            let snap = cluster.snapshot();
+            let s = &snap.totals;
+            println!(
+                "  {:>7} {:>6} {:>8} {:>10} {:>8.3} {:>8}",
+                s.total, snap.cell_count(), s.alive, s.reporting, s.mean_phi, snap.troubled_cells().count(),
+            );
+        }
+    }
+    println!();
+}
 
 fn cmd_scenarios() {
     println!("\nStress experiments (fanos-lab experiment <name>):");
