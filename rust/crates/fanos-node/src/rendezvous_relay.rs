@@ -27,7 +27,7 @@
 //! (which composes this to make every cell relay a rendezvous point). It is *additive*: a client that
 //! already sits at a combiner keeps listening there directly; nothing in the sealing path changes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::threshold_router::ANONYMOUS;
@@ -47,7 +47,17 @@ pub struct RendezvousRelay<F: Field> {
     /// coordinate — the **bare-proxy fallback**; a full cell-node client uses NOSTOS instead and never
     /// registers here (its coordinate never leaves its node).
     registrations: BTreeMap<SessionId, Triple>,
+    /// FIFO insertion order of `registrations`' cookies, so the map can be **bounded** (audit robustness B2):
+    /// an `RdvRegister` carries an attacker-chosen 16-byte cookie, so an unbounded map is a single-peer remote
+    /// OOM. At [`MAX_REGISTRATIONS`] the oldest registration is evicted — a bound, not a leak (an evicted client
+    /// simply re-registers; the bare-proxy fallback is best-effort by design).
+    reg_order: VecDeque<SessionId>,
 }
+
+/// The cap on concurrently-registered bare-proxy client sessions (audit robustness B2). Beyond it, the
+/// oldest registration is evicted FIFO, so an attacker streaming distinct cookies cannot grow the map without
+/// bound. Generous enough for any real relay's concurrent fallback clients.
+const MAX_REGISTRATIONS: usize = 4096;
 
 impl<F: Field> RendezvousRelay<F> {
     /// A relay wrapping `router`. No client is registered until one sends an
@@ -57,6 +67,7 @@ impl<F: Field> RendezvousRelay<F> {
         Self {
             router,
             registrations: BTreeMap::new(),
+            reg_order: VecDeque::new(),
         }
     }
 
@@ -123,7 +134,18 @@ impl<F: Field> RendezvousRelay<F> {
         let Ok(cookie) = <SessionId>::try_from(body) else {
             return;
         };
-        self.registrations.insert(cookie, from);
+        // A re-registration of a known cookie just refreshes its coordinate (no new slot, no order change); a
+        // new cookie takes a fresh slot and pushes to the FIFO order. `reg_order` and `registrations` track
+        // exactly the same set (a cookie is enqueued when inserted-as-new and dequeued when evicted), so on
+        // overflow evicting the single oldest restores the bound (audit B2) — a bounded map, not a leak.
+        if self.registrations.insert(cookie, from).is_none() {
+            self.reg_order.push_back(cookie);
+            if self.registrations.len() > MAX_REGISTRATIONS
+                && let Some(oldest) = self.reg_order.pop_front()
+            {
+                self.registrations.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -175,6 +197,41 @@ mod tests {
     use fanos_geometry::{Line, Point};
     use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
     use fanos_runtime::Epoch;
+
+    #[test]
+    fn the_registration_map_is_bounded_against_a_cookie_flood() {
+        // Audit B2: an RdvRegister carries an attacker-chosen 16-byte cookie, so an unbounded map is a
+        // single-peer remote OOM. Streaming MAX_REGISTRATIONS + K distinct cookies must leave the map capped
+        // at MAX_REGISTRATIONS (the oldest evicted FIFO), and a re-registration must not grow it.
+        let line = Line::<F2>::at(0).coords();
+        let combiner = Point::<F2>::new(line_member_coords::<F2>(line)[0]).unwrap();
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"flood-id"));
+        let mut relay =
+            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, [0x5D; 32]));
+
+        let cookie_of = |i: u32| -> SessionId {
+            let mut c = [0u8; 16];
+            c[..4].copy_from_slice(&i.to_be_bytes());
+            c
+        };
+        let overflow = 50u32;
+        for i in 0..(MAX_REGISTRATIONS as u32 + overflow) {
+            relay.step(Instant(0), Input::Message { from: [1, 2, 3], frame: register_frame(cookie_of(i)) });
+        }
+        assert_eq!(relay.registrations(), MAX_REGISTRATIONS, "the map is capped, not unbounded");
+        // The oldest `overflow` cookies were evicted FIFO; the most recent are retained.
+        assert!(relay.client_for(&cookie_of(0)).is_none(), "the oldest registration was evicted");
+        assert_eq!(
+            relay.client_for(&cookie_of(MAX_REGISTRATIONS as u32 + overflow - 1)),
+            Some([1, 2, 3]),
+            "the newest registration is retained",
+        );
+        // A re-registration of a still-present cookie refreshes its coordinate without growing the map.
+        let recent = cookie_of(MAX_REGISTRATIONS as u32 + overflow - 1);
+        relay.step(Instant(0), Input::Message { from: [7, 7, 7], frame: register_frame(recent) });
+        assert_eq!(relay.registrations(), MAX_REGISTRATIONS, "a re-registration does not grow the bounded map");
+        assert_eq!(relay.client_for(&recent), Some([7, 7, 7]), "but it does refresh the coordinate");
+    }
 
     #[test]
     fn a_relay_forwards_anonymous_replies_to_the_registered_client() {
