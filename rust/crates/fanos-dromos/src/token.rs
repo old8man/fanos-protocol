@@ -123,6 +123,79 @@ impl SignedTransfer {
     }
 }
 
+/// The domain label for a proof-of-retrievability authorisation.
+const PROVER_AUTH_LABEL: &str = "FANOS-v1/dromos-prover-auth";
+
+/// A **fresh per-audit** authorisation proving the designated provider — and only it — produced *this* audit
+/// response (audit §3.6 / AT-H1). Where a static [`SignedTransfer`] auth is byte-identical every epoch (so it
+/// can be captured off the public ledger and replayed forever, letting a confederate holding a replica of the
+/// public leaves collect for data the provider deleted), this is the provider's hybrid-PQ signature over
+/// `deal_id ‖ H(response)` — bound to the exact response, which `por::verify` in turn binds to the block's
+/// audit beacon. So a captured auth cannot be replayed at a later epoch (the new beacon needs a new response,
+/// which the old auth does not cover) and a third party cannot forge the provider's signature over a fresh one.
+#[derive(Clone)]
+pub struct ProverAuth {
+    /// The provider's verifying key (hashes to the deal's `provider` account).
+    pub provider_key: HybridVerifier,
+    /// The signature over the [`challenge`](Self::challenge), `HYBRID_SIG_LEN` bytes.
+    sig: Vec<u8>,
+}
+
+impl ProverAuth {
+    /// The fixed serialized length: `provider_key(VK) ‖ sig(SIG)`.
+    pub const WIRE_LEN: usize = HYBRID_VK_LEN + HYBRID_SIG_LEN;
+
+    /// The signed challenge binding the authorisation to this exact deal + response.
+    fn challenge(deal_id: &[u8; 32], response: &[u8]) -> Vec<u8> {
+        let response_hash = hash_labeled(PROVER_AUTH_LABEL, response);
+        let mut msg = Vec::with_capacity(PROVER_AUTH_LABEL.len() + 64);
+        msg.extend_from_slice(PROVER_AUTH_LABEL.as_bytes());
+        msg.extend_from_slice(deal_id);
+        msg.extend_from_slice(&response_hash);
+        msg
+    }
+
+    /// Sign an authorisation for `deal_id` over `response` under the provider's key.
+    #[must_use]
+    pub fn sign(deal_id: &[u8; 32], response: &[u8], signer: &HybridSigSecret, provider_key: HybridVerifier) -> Self {
+        let sig = signer.sign(&Self::challenge(deal_id, response)).to_bytes();
+        Self { provider_key, sig }
+    }
+
+    /// Whether this authorises `response` for `deal_id` as the deal's `provider`: the key binds to the provider
+    /// account **and** the signature verifies over the fresh challenge.
+    #[must_use]
+    pub fn verify(&self, deal_id: &[u8; 32], response: &[u8], provider: &[u8; 32]) -> bool {
+        if &account_id(&self.provider_key) != provider {
+            return false;
+        }
+        let Some(sig) = HybridSignature::from_bytes(&self.sig) else {
+            return false;
+        };
+        self.provider_key.verify(&Self::challenge(deal_id, response), &sig)
+    }
+
+    /// Canonical bytes: `provider_key(VK) ‖ sig(SIG)`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&self.provider_key.encode());
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::WIRE_LEN {
+            return None;
+        }
+        let provider_key = HybridVerifier::decode(bytes.get(..HYBRID_VK_LEN)?)?;
+        let sig = bytes.get(HYBRID_VK_LEN..)?.to_vec();
+        Some(Self { provider_key, sig })
+    }
+}
+
 /// Why a transfer was refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TokenError {
@@ -311,5 +384,25 @@ mod tests {
         let st = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 100, nonce: 0 }, &alice_sk, alice_vk);
         a.apply(&st).unwrap();
         assert_ne!(a.state_root(), b.state_root(), "a transfer changes the root");
+    }
+
+    #[test]
+    fn a_prover_auth_binds_to_its_exact_deal_response_and_provider() {
+        // Audit §3.6: the authorisation is bound to `deal_id ‖ H(response)` under the provider's key, so it
+        // authorises exactly one (deal, response) as exactly one provider — a captured auth cannot be replayed
+        // over a different (later-epoch) response, a different deal, or on behalf of a different provider.
+        let (sk, vk, provider) = account(2);
+        let (_other_sk, _other_vk, other) = account(3);
+        let deal_id = [7u8; 32];
+        let auth = ProverAuth::sign(&deal_id, b"response-0", &sk, vk);
+        assert!(auth.verify(&deal_id, b"response-0", &provider), "authorises its own deal + response + provider");
+        assert!(!auth.verify(&deal_id, b"response-1", &provider), "does not authorise a different (fresh) response");
+        assert!(!auth.verify(&[8u8; 32], b"response-0", &provider), "does not authorise a different deal");
+        assert!(!auth.verify(&deal_id, b"response-0", &other), "does not authorise a different provider");
+        // The wire form round-trips, and a truncated one is refused.
+        let bytes = auth.to_bytes();
+        assert_eq!(bytes.len(), ProverAuth::WIRE_LEN);
+        assert!(ProverAuth::from_bytes(&bytes).unwrap().verify(&deal_id, b"response-0", &provider));
+        assert!(ProverAuth::from_bytes(&bytes[..bytes.len() - 1]).is_none());
     }
 }

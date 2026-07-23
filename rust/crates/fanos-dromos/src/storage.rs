@@ -20,7 +20,7 @@ use fanos_primitives::hash_labeled;
 use fanos_thesauros::content::LEAF;
 use fanos_thesauros::{Deal, DealParams, DealState};
 
-use crate::token::SignedTransfer;
+use crate::token::{ProverAuth, SignedTransfer};
 
 /// The keyless sink that holds deal escrow — funds enter by a signed transfer and leave only by `move_system`
 /// gated on a verified retrievability proof (or a consumer-authorised close).
@@ -75,10 +75,11 @@ pub enum StorageTx {
     Prove {
         /// The deal being proven.
         deal_id: [u8; 32],
-        /// A signed transfer *from the provider, to the deal id* (verified, never applied) authorising the
-        /// proof — binds the payment-triggering proof to the designated provider, so a third party holding a
-        /// replica of the public leaves cannot make the provider be paid for data it deleted (audit AT-H1).
-        prover_auth: SignedTransfer,
+        /// A **fresh per-audit** provider authorisation over `deal_id ‖ H(response)` (audit §3.6 / AT-H1) —
+        /// binds this specific proof to the designated provider's key. Because it commits to the exact response
+        /// (which `por::verify` binds to the block beacon), it cannot be captured off the ledger and replayed at
+        /// a later epoch, unlike the earlier static [`SignedTransfer`] auth.
+        prover_auth: ProverAuth,
         /// The encoded audit response.
         response: Vec<u8>,
     },
@@ -129,8 +130,8 @@ impl StorageTx {
             }
             OP_PROVE => {
                 let deal_id = body.get(..32)?.try_into().ok()?;
-                let auth_end = 32usize.checked_add(SignedTransfer::WIRE_LEN)?;
-                let prover_auth = SignedTransfer::from_bytes(body.get(32..auth_end)?)?;
+                let auth_end = 32usize.checked_add(ProverAuth::WIRE_LEN)?;
+                let prover_auth = ProverAuth::from_bytes(body.get(32..auth_end)?)?;
                 let response = body.get(auth_end..)?.to_vec();
                 Some(StorageTx::Prove { deal_id, prover_auth, response })
             }

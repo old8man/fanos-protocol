@@ -32,7 +32,7 @@ use crate::storage::{
     AUDIT_PERIOD, MAX_DEAL_DURATION, MAX_DEAL_SIZE, STORAGE_ESCROW, StorageMarket, StorageTx, deal_id,
     leaves_for_size,
 };
-use crate::token::{SignedTransfer, TokenLedger};
+use crate::token::{ProverAuth, SignedTransfer, TokenLedger};
 
 /// The shared state key every shielded operation touches — so shielded spends serialize against each other
 /// (they mutate the one nullifier set / commitment tree) while parallelizing against disjoint transparent work.
@@ -311,15 +311,17 @@ impl HybridLedger {
     /// Prove retrievability for a deal's current epoch: recompute the audit challenge from the block's beacon,
     /// verify the response against the committed CID, then — only on success — settle the epoch and release the
     /// slice from escrow to the provider (`move_system`, the proof-gated keyless-sink release).
-    fn prove_deal(&mut self, id: &[u8; 32], prover_auth: &SignedTransfer, response_bytes: &[u8]) -> bool {
+    fn prove_deal(&mut self, id: &[u8; 32], prover_auth: &ProverAuth, response_bytes: &[u8]) -> bool {
         let Some(params) = self.storage.deals.get(id).filter(|d| d.state() == DealState::Active).map(|d| *d.params())
         else {
             return false;
         };
-        // The proof must be authorised by the deal's provider (a signed transfer from the provider, to the deal
-        // id), so only the designated provider — which must hold the data to prove — can trigger its payment,
-        // not a third party replaying a valid proof off a public replica (audit AT-H1). The auth is never applied.
-        if !prover_auth.verify() || prover_auth.transfer.from != params.provider || prover_auth.transfer.to != *id {
+        // The proof must be authorised by the deal's provider — a FRESH per-audit signature over this exact
+        // `deal_id ‖ H(response)` (audit §3.6 / AT-H1). Only the designated provider's key can produce it, and it
+        // commits to the specific response (which `por::verify` binds to the block beacon), so a captured auth
+        // cannot be replayed at a later epoch and a third party holding a replica of the public leaves cannot
+        // forge it to be paid for data the provider deleted. The auth is verified, never applied.
+        if !prover_auth.verify(id, response_bytes, &params.provider) {
             return false;
         }
         let Some(response) = decode_response(response_bytes) else {
@@ -861,16 +863,15 @@ mod tests {
         assert_eq!(ledger.storage_escrow(), 400, "the price is escrowed");
         assert_eq!(ledger.tokens().balance(&consumer), 999_600);
         let id = deal_id(&params, 0);
-        // The proof must be authorised by the provider (a signed transfer from the provider, to the deal id).
-        let prover_auth =
-            SignedTransfer::sign(Transfer { from: provider, to: id, amount: 0, nonce: 0 }, &provider_sk, provider_vk);
 
         // Prove epoch 0 at the first audit boundary (§3.5 cadence: a settlement may land only one AUDIT_PERIOD
         // past the open) — the provider answers the beacon's challenge → paid one slice (price/duration = 100).
+        // The proof carries a FRESH per-audit provider authorisation over `deal_id ‖ H(response)` (§3.6).
         ledger.begin_block(AUDIT_PERIOD);
         let indices = challenge(&cid, &beacon, 3, 8);
         let response = encode_response(&prove(&chunk, &indices).unwrap());
-        let prove_tx = StorageTx::Prove { deal_id: id, prover_auth: prover_auth.clone(), response };
+        let prover_auth = ProverAuth::sign(&id, &response, &provider_sk, provider_vk.clone());
+        let prove_tx = StorageTx::Prove { deal_id: id, prover_auth, response };
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&prove_tx))), ExecOutcome::Applied);
         assert_eq!(ledger.tokens().balance(&provider), 100, "the provider earned one slice from escrow");
         assert_eq!(ledger.storage_escrow(), 300);
@@ -880,18 +881,19 @@ mod tests {
         assert_eq!(ledger.tokens().balance(&provider), 100, "a replayed proof does not settle a second time");
         assert_eq!(ledger.storage_escrow(), 300, "the escrow is not drained by proof replay");
 
-        // A garbage proof pays nothing.
-        let bad = StorageTx::Prove { deal_id: id, prover_auth: prover_auth.clone(), response: vec![0u8; 4] };
+        // A garbage response pays nothing — even with a valid provider auth over it, `por::verify` fails.
+        let bad_response = vec![0u8; 4];
+        let bad_auth = ProverAuth::sign(&id, &bad_response, &provider_sk, provider_vk.clone());
+        let bad = StorageTx::Prove { deal_id: id, prover_auth: bad_auth, response: bad_response };
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&bad))), ExecOutcome::Rejected);
         assert_eq!(ledger.tokens().balance(&provider), 100, "an unverifiable proof releases nothing");
 
-        // AT-H1: a VALID proof not authorised by the provider is refused — a third party holding a replica of
-        // the public leaves cannot make the provider be paid. (Advance past the next audit boundary so only the
-        // signer check can reject it, not the per-height cadence guard.)
+        // AT-H1/§3.6: a VALID response NOT authorised by the provider is refused — a third party holding a
+        // replica of the public leaves cannot forge the provider's per-audit signature to be paid. (Advance past
+        // the next audit boundary so only the auth check can reject it, not the per-height cadence guard.)
         ledger.begin_block(2 * AUDIT_PERIOD);
         let real_response = encode_response(&prove(&chunk, &challenge(&cid, &beacon, 3, 8)).unwrap());
-        let impostor_auth =
-            SignedTransfer::sign(Transfer { from: consumer, to: id, amount: 0, nonce: 2 }, &consumer_sk, consumer_vk.clone());
+        let impostor_auth = ProverAuth::sign(&id, &real_response, &consumer_sk, consumer_vk.clone());
         let impostor = StorageTx::Prove { deal_id: id, prover_auth: impostor_auth, response: real_response };
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&impostor))), ExecOutcome::Rejected);
         assert_eq!(ledger.tokens().balance(&provider), 100, "a proof not signed by the provider pays nothing");
