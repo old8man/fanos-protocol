@@ -8,6 +8,8 @@
 //! reproduces exactly (the determinism contract, lifted to the fleet). This is the substrate behind
 //! `fanos-lab experiment` and the live dashboard's fault controls.
 
+use std::collections::BTreeSet;
+
 use fanos_runtime::Duration;
 
 use crate::cluster::Cluster;
@@ -39,6 +41,16 @@ pub enum Experiment {
         /// The cell to collapse.
         target: usize,
     },
+    /// A **network partition**: bisect a `fraction` of cells (a 4|3 cut) at `t = 0`, then **heal** the cut
+    /// at `t = hold`. The nodes are never crashed — they stay alive but cannot reach across the cut, so the
+    /// self-model senses missing peers and the cell degrades (partition detection, B4); after the heal it
+    /// re-senses its peers and recovers. Measures detection *and* recovery, at scale.
+    Partition {
+        /// Fraction of cells to bisect, in `[0, 1]`.
+        fraction: f64,
+        /// The tick at which the partition heals.
+        hold: usize,
+    },
 }
 
 impl Experiment {
@@ -49,6 +61,7 @@ impl Experiment {
             Experiment::MassCrash { .. } => "mass-crash",
             Experiment::RollingChurn { .. } => "churn",
             Experiment::Cascade { .. } => "cascade",
+            Experiment::Partition { .. } => "partition",
         }
     }
 
@@ -59,14 +72,15 @@ impl Experiment {
             Experiment::MassCrash { .. } => "one-shot: crash a fraction of the fleet (whole cells first)",
             Experiment::RollingChurn { .. } => "continuous: crash and later recover a few nodes each tick",
             Experiment::Cascade { .. } => "crash one more node of a target cell each tick until it collapses",
+            Experiment::Partition { .. } => "bisect a fraction of cells (nodes stay up), then heal — detect + recover",
         }
     }
 
     /// The names of every built-in experiment (for `fanos-lab scenarios`).
-    pub const NAMES: [&'static str; 3] = ["mass-crash", "churn", "cascade"];
+    pub const NAMES: [&'static str; 4] = ["mass-crash", "churn", "cascade", "partition"];
 
-    /// Build an experiment from its name and a `fraction` parameter (reused as the churn rate / ignored
-    /// for cascade). `None` for an unknown name.
+    /// Build an experiment from its name and a `fraction` parameter (reused as the churn rate; ignored
+    /// by cascade). `None` for an unknown name.
     #[must_use]
     pub fn from_name(name: &str, fraction: f64, total_nodes: usize) -> Option<Self> {
         match name {
@@ -76,6 +90,7 @@ impl Experiment {
                 grace: 3,
             }),
             "cascade" => Some(Experiment::Cascade { target: 0 }),
+            "partition" => Some(Experiment::Partition { fraction, hold: 5 }),
             _ => None,
         }
     }
@@ -102,6 +117,26 @@ impl Experiment {
                         cell.fleet_snapshot().nodes.iter().find(|n| n.alive).map(|n| n.coord)
                 {
                     cell.crash(coord);
+                }
+            }
+            Experiment::Partition { fraction, hold } => {
+                let n = ((fraction * cluster.cell_count() as f64).round() as usize).max(1);
+                if t == 0 {
+                    for ci in 0..n {
+                        if let Some(cell) = cluster.cell_mut(ci) {
+                            let coords: Vec<_> = cell.nodes().collect();
+                            let (left, right) = coords.split_at(coords.len() / 2);
+                            let a: BTreeSet<_> = left.iter().copied().collect();
+                            let b: BTreeSet<_> = right.iter().copied().collect();
+                            cell.network_mut().partition([a, b]);
+                        }
+                    }
+                } else if t == hold {
+                    for ci in 0..n {
+                        if let Some(cell) = cluster.cell_mut(ci) {
+                            cell.network_mut().partition(core::iter::empty()); // heal the cut
+                        }
+                    }
                 }
             }
         }

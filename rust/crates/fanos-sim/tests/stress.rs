@@ -64,6 +64,22 @@ fn cascade_collapses_only_the_target_cell() {
 }
 
 #[test]
+fn partition_degrades_cells_without_crashing_them_then_heals() {
+    // 10 cells (70 nodes); bisect 30% (3 cells) at t=0, heal at t=5, run 14 ticks.
+    let mut cluster = Cluster::new(4, config(), 10);
+    cluster.run_for(Duration::from_millis(1200));
+    let report = run_experiment(&mut cluster, Experiment::Partition { fraction: 0.3, hold: 5 }, 14, step());
+
+    assert!(report.before.is_healthy(), "starts healthy");
+    // No node is ever crashed — a partition cuts reachability, it does not kill nodes.
+    assert_eq!(report.after.alive, 70, "every node stays alive throughout a partition");
+    // The cut is detected: the three bisected cells degrade at the worst moment.
+    assert!(report.peak_troubled_cells >= 3, "the 3 partitioned cells are detected as degraded: {}", report.peak_troubled_cells);
+    // After the heal + settle, the fleet recovers to healthy (nodes re-sense their peers).
+    assert!(report.ended_healthy, "the fleet recovers once the cut heals: {:?}", report.after);
+}
+
+#[test]
 fn an_experiment_run_is_deterministic_per_seed() {
     let run = || {
         let mut c = Cluster::new(9, config(), 12);
