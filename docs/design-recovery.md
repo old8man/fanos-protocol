@@ -98,6 +98,45 @@ re-genesis and the certified state together.
 | DVRF beacon / epoch clock | AP + deterministic reconciliation, generation-fenced | **yes** if survivors `≥ t`; below `t` the authority picks the one generation | competing fresh beacons converge to **highest generation**, tie-break = smallest beacon-round hash — at most one per generation |
 | Money/state ledger (OBOLOS, TAXIS) | strictly **CP** | **no** | halts below quorum `5` (safe by quorum intersection); resumes **only** under an authority `RGC` anchored on the last `ExecCertificate` |
 
+## 2a. Deployed-system corroboration & refinements (research 2026-07-23)
+
+A five-angle primary-source review (CAP/fencing, proactive/dynamic secret sharing, deployed DKG, censorship)
+confirmed the design and sharpened three points:
+
+- **Structural impossibility, not policy (CAP).** Gilbert–Lynch: with `≥ n/2` crash failures the *original*
+  configuration "can never again decide anything — only reconfiguration from outside can restore progress." So
+  a `≤ 3`-of-7 minority re-keying is Raft's Figure-10 disjoint-majorities fork (3+4 both act). Regime B must
+  therefore be *structurally* gated: no valid re-genesis certificate can form without the authority.
+  `BeaconNode::rebootstrap` enforces exactly this — it returns `false` unless a configured authority key verifies
+  the `RGC`, and the survivors do not hold that key, so they cannot self-authorize.
+- **IC CUP + NNS `RecoverSubnet` is the ~1:1 deployed reference.** A Catch-Up Package is a `(n−f)`-of-`n`
+  threshold-signed, unique-per-epoch checkpoint carrying "everything a replica needs to begin working, without
+  knowing anything about previous epochs" (state-root + beacon material + config). Recovery is an NNS proposal
+  pinning `(height, state_hash)` + optional `replacement_nodes`, which triggers `setup_initial_dkg` — a *fresh*
+  key on the certified state, never a recovery of the lost shares. FANOS's `ExecCertificate` ≙ CUP and the parent
+  `RGC` ≙ `RecoverSubnet`; we adopt the two CUP guarantees explicitly: **uniqueness per height** (the quorum
+  signature) and **self-contained resume** (a joiner needs zero history — provided by state-sync).
+- **`OldThreshold` downgrade guard (drand).** A resharing config must carry the *old* threshold "to avoid a
+  downgrade attack where the number of deals required is less than it should be." FANOS's reshare carries the
+  generation + the `contributors.len() ≥ threshold` gate + the `MIN_REGENESIS_THRESHOLD` floor (§3.1), which
+  closes the same class.
+
+Two refinements folded into the roadmap (not yet built — the mechanism is correct without them):
+
+1. **Delegation-chain re-keying (the hierarchy extension).** The IC lets a subnet swap 100 % of its nodes *and*
+   its key without breaking a client, because verifiers pin only the never-changing *root* key and every subnet
+   key is certified inside the root's state tree. FANOS should certify a child cell's new group key inside the
+   *parent's* certified state, recursively — so external verifiers pin only an ancestor key and re-genesis is
+   free for them. Today the `RGC` authority is a fixed key; the delegation chain is the `R-C2` parent-transport
+   work.
+2. **Explicit receiver-side generation fencing (defense-in-depth).** Today a returning old-generation node is
+   fenced *implicitly* — its rounds are signed under the old commitment and fail `verify_and_seed` against the
+   new one. That is sound (the commitment *is* generation-specific), but an explicit generation tag on every
+   beacon round/partial (rejected receiver-side when `< g`, per Kleppmann/Raft-term) would harden it. And the
+   **order of operations is load-bearing** (IC subnet-splitting ops): halt at the *next* `ExecCertificate` so the
+   re-genesis state is quorum-signed, *then* the authority references that exact `(height, state_root)`, then
+   nodes restart and state-sync — never re-genesis on an unsigned mid-flight state.
+
 ## 3. Censorship-resistant bootstrap (recovering/new nodes when seeds are state-blocked)
 
 A re-genesis is worthless if a recovered cell is unreachable. Fixed seed lists die to enumeration+blocking;
@@ -111,8 +150,13 @@ from a shared secret. FANOS realizes these by **reusing its own primitives**:
   bootstrap meeting point that rotates each epoch.
 - **Wire obfuscation:** PROTEUS polymorph as the obfs4 analog (look-like-nothing), under the Parrot-is-Dead rule
   (no faked TLS/MASQUE handshakes) — see [[proteus-morph-transforms]].
-- **Entry broker:** hands out a *few* rotating, PoW-gated, Sybil-bucketed entry descriptors (Snowflake-broker
-  analog); for hard-blocking regimes, an ECH-fronted or Conjure/refraction entry with no fixed IP to list.
+- **Entry broker:** hands out a *few* rotating, PoW-gated, Sybil-bucketed entry descriptors — the
+  Snowflake-broker + Tor **rdsys** model (BridgeDB was retired in Oct 2024 for exactly this: hand out `k` per
+  requester, rate-limited and bucketed, never the full set). Cap enumeration the way **Lox** (PETS 2023) does —
+  open-entry buckets of 1, invite-only buckets of 3, with anonymous credentials that *hide* the inviter/invitee
+  graph — so one enumerator learns `O(k)`, never `O(N)`. For hard-blocking regimes, an ECH-fronted or
+  Conjure/refraction entry with no fixed IP to list, and **diversify the ECH outer SNI**: a static public name
+  (e.g. `cloudflare-ech.com`) is itself the fingerprint Russia's TSPU began blocking in Nov 2024.
 - **Peer-exchange after first contact:** once one peer is reached, the rest bootstrap via signed-descriptor
   gossip over the overlay (existing poisoning defence, [[hierarchy-scaling]]).
 - **Irreducible residual (stated honestly):** a brand-new node with *no* peer and *no* seed needs **one**
