@@ -47,10 +47,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use fanos_calypso::hosting::{Share, combine_reshares, recover_service_key, shard_service_key};
+use fanos_calypso::hosting::{
+    SealedShare, Share, combine_reshares, deal_service_key, open_service_share, recover_service_key,
+    shard_service_key,
+};
 use fanos_calypso::pow;
 use fanos_field::Field;
 use fanos_geometry::{Line, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
+use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
@@ -265,6 +269,44 @@ pub fn reshare_descriptor_share(
 #[must_use]
 pub fn combine_descriptor_reshares(new_x: u8, contributions: &[Share], old_xs: &[u8]) -> Option<Share> {
     combine_reshares(new_x, contributions, old_xs).ok()
+}
+
+/// **Sealed** resharing contribution — the confidential form for the wire. An old member re-splits its OWN
+/// descriptor `share` over the new line and **KEM-seals each sub-share to the corresponding new member**
+/// (`new_member_keys` in new-line order), returning one [`SealedShare`] per new member. This is essential,
+/// not optional: an *unsealed* sub-share travelling the network would let an observer collect a threshold of
+/// them for one new member and reconstruct the descriptor — sealing keeps each sub-share readable only by its
+/// intended new member. `None` on invalid Shamir/KEM parameters. Pairs with [`open_and_combine_reshares`].
+#[must_use]
+pub fn seal_reshare_contribution(
+    share: &Share,
+    new_threshold: u8,
+    new_member_keys: &[&HybridKemPublic],
+    key_randomness: &[u8],
+    kem_seed: &[u8],
+) -> Option<Vec<SealedShare>> {
+    deal_service_key(share.y(), new_threshold, new_member_keys, key_randomness, kem_seed).ok()
+}
+
+/// The new member's side of sealed resharing: open the sealed sub-shares addressed to THIS member — one per
+/// old member in a threshold subset, `contributions[k] = (old_x_k, sealed_k)` from the old member at old
+/// `x`-coordinate `old_x_k` — with `member_secret`, then combine them into this member's rotated share at
+/// `new_x`. `None` if any sealed share was not addressed to `member_secret` (wrong slot / tamper) or fewer
+/// than the old threshold are supplied. The descriptor is never reconstructed, and a network observer without
+/// `member_secret` learns nothing from the sealed contributions.
+#[must_use]
+pub fn open_and_combine_reshares(
+    new_x: u8,
+    contributions: &[(u8, SealedShare)],
+    member_secret: &HybridKemSecret,
+) -> Option<Share> {
+    let mut old_xs = Vec::with_capacity(contributions.len());
+    let mut sub_shares = Vec::with_capacity(contributions.len());
+    for (old_x, sealed) in contributions {
+        sub_shares.push(open_service_share(sealed, member_secret)?);
+        old_xs.push(*old_x);
+    }
+    combine_reshares(new_x, &sub_shares, &old_xs).ok()
 }
 
 /// The bucket-ranking key for `peer` under a request — keyed on the requester coordinate *and* the
@@ -935,5 +977,63 @@ mod tests {
         // share is not a valid point of the fresh polynomial (proactive refresh).
         assert_ne!(recover_descriptor(&[new_shares[0].clone()]).as_ref(), Some(&desc), "one new share reveals nothing");
         assert_ne!(new_shares[0].y(), old_shares[0].y(), "the rotated share is on a fresh polynomial, not a copy");
+    }
+
+    #[test]
+    fn sealed_resharing_keeps_sub_shares_confidential_end_to_end() {
+        use fanos_pqcrypto::SeedRng;
+
+        // The wire-safe form: each reshare sub-share is KEM-SEALED to its target new member, so a network
+        // observer of the reshare traffic learns nothing. The new members open their sealed sub-shares and
+        // combine — recovering the SAME descriptor — while a wrong secret cannot open another member's slot.
+        let desc = descriptor(8);
+        let (old_t, old_n) = (2u8, 3u8);
+        let (new_t, new_n) = (2u8, 3usize);
+        let secret_len = desc.to_bytes().len();
+        let old_shares =
+            shard_descriptor(&desc, old_t, old_n, &vec![0x5Au8; secret_len * usize::from(old_t - 1) + 8]).unwrap();
+
+        // The new line's KEM keypairs (in new-line position order).
+        let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> = (0..new_n)
+            .map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xE1, j as u8])))
+            .collect();
+        let new_keys: Vec<&HybridKemPublic> = new_kp.iter().map(|(_, p)| p).collect();
+
+        // Each old member in the threshold subset seals a contribution to the new line's keys.
+        let old_subset = [&old_shares[0], &old_shares[1]];
+        let old_xs = [old_shares[0].x(), old_shares[1].x()];
+        let sealed_contribs: Vec<Vec<SealedShare>> = old_subset
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let key_rnd = vec![0x11u8 + k as u8; secret_len * usize::from(new_t - 1) + 8];
+                seal_reshare_contribution(s, new_t, &new_keys, &key_rnd, &[0xA0, k as u8]).expect("sealed contribution")
+            })
+            .collect();
+
+        // Each new member j opens the sealed sub-shares addressed to it (one from each old member) and combines.
+        let new_shares: Vec<Share> = (0..new_n)
+            .map(|j| {
+                let for_j: Vec<(u8, SealedShare)> =
+                    sealed_contribs.iter().enumerate().map(|(k, c)| (old_xs[k], c[j].clone())).collect();
+                open_and_combine_reshares(u8::try_from(j + 1).unwrap(), &for_j, &new_kp[j].0)
+                    .expect("new member opens and combines its sealed sub-shares")
+            })
+            .collect();
+
+        // The new line recovers the identical descriptor from a threshold of its rotated shares.
+        assert_eq!(
+            recover_descriptor(&[new_shares[0].clone(), new_shares[1].clone()]).as_ref(),
+            Some(&desc),
+            "the new line recovers the descriptor from sealed, never-in-clear sub-shares",
+        );
+        // The seal is real: new member 0's sub-shares cannot be opened with new member 1's secret.
+        let for_0: Vec<(u8, SealedShare)> =
+            sealed_contribs.iter().enumerate().map(|(k, c)| (old_xs[k], c[0].clone())).collect();
+        assert_eq!(
+            open_and_combine_reshares(1, &for_0, &new_kp[1].0),
+            None,
+            "another member's secret cannot open a sub-share sealed to member 0 (confidentiality holds)",
+        );
     }
 }
