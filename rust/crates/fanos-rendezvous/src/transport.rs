@@ -20,16 +20,35 @@
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
+use fanos_aphantos::nostos::ReplyKeys;
 use fanos_aphantos::surb::{Surb, SurbKeys, build_surb};
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
 use fanos_nyx::build_circuit;
 use fanos_pqcrypto::rng::SeedRng;
 
-use crate::{Forward, MixDirectory, Request, combiner_for, seal_forward};
+use crate::{Forward, MixDirectory, Request, combiner_for, seal_forward, seal_nostos_reply};
 
 /// A per-session cookie the service demultiplexes concurrent clients by, without learning who they are.
 pub type SessionId = [u8; 16];
+
+/// Domain label for the per-session NOSTOS reply-keypair derivation.
+const REPLY_KEYPAIR_LABEL: &[u8] = b"FANOS-v1/nostos-session-reply";
+
+/// Derive a session's **NOSTOS reply keypair** deterministically from its `secret`: the [`ReplyKeys`]
+/// (kept by the dialing driver to open replies delivered to the client's own line) and the serialized
+/// public key (which the [`RendezvousClient`] advertises in every [`Request`], so the service
+/// end-to-end-seals to it). Both the client and its driver call this with the same session secret, so
+/// they agree on the keypair without the secret ever being shared between the sending and opening halves
+/// — which lets them run as independent concurrent tasks with no shared mutable state.
+#[must_use]
+pub fn session_reply_keypair(secret: &[u8]) -> (ReplyKeys, Vec<u8>) {
+    let mut seed = Vec::with_capacity(REPLY_KEYPAIR_LABEL.len() + secret.len());
+    seed.extend_from_slice(REPLY_KEYPAIR_LABEL);
+    seed.extend_from_slice(secret);
+    let (keys, public) = ReplyKeys::generate(&seed);
+    (keys, public.encode())
+}
 
 /// The client half of an anonymous session.
 ///
@@ -48,6 +67,11 @@ pub struct RendezvousClient<F: Field> {
     directory: MixDirectory,
     threshold: u8,
     rng: SeedRng,
+    /// This session's NOSTOS reply public key, derived from the session secret via
+    /// [`session_reply_keypair`]. It rides every [`Request`] so the service end-to-end-seals its replies
+    /// to it; the matching secret half stays with the dialing driver, which opens the dead-drop delivered
+    /// at the client's own reply line — so no relay ever learns the client.
+    reply_pub: Vec<u8>,
     _f: PhantomData<F>,
 }
 
@@ -55,10 +79,15 @@ impl<F: Field> RendezvousClient<F> {
     /// Build a client half.
     ///
     /// * `forward_circuit` — hop lines to the service, ending at its [`meeting_line`](crate::meeting_line);
-    /// * `reply_circuit` — hop lines to the client's own reply rendezvous, ending at the line it listens on;
+    /// * `reply_circuit` — hop lines to the client's reply rendezvous. For NOSTOS the last hop is one of
+    ///   the client's own lines (a dead-drop it receives as a line member);
     /// * `directory` — the mixnet members' KEM keys the onions seal to;
     /// * `threshold` — how many of each hop line's `q+1` members must cooperate to peel it;
-    /// * `secret` — session entropy: the cookie and every onion seed are derived from it via a CSPRNG.
+    /// * `secret` — session entropy: the cookie and every onion seed are derived from it via a CSPRNG;
+    /// * `reply_pub` — this session's **NOSTOS reply public key** ([`session_reply_keypair`]), advertised
+    ///   in every [`Request`] so the service end-to-end-seals its replies as a dead-drop to the client's
+    ///   own line. Pass **empty** to select the legacy path — the service cookie-tags the reply for a
+    ///   rendezvous relay to forward — for a client that cannot be a line member (a bare-overlay proxy).
     #[must_use]
     pub fn new(
         forward_circuit: Vec<Triple>,
@@ -66,6 +95,7 @@ impl<F: Field> RendezvousClient<F> {
         directory: MixDirectory,
         threshold: u8,
         secret: &[u8],
+        reply_pub: Vec<u8>,
     ) -> Self {
         let mut rng = SeedRng::from_seed(secret);
         let mut cookie = [0u8; 16];
@@ -77,6 +107,7 @@ impl<F: Field> RendezvousClient<F> {
             directory,
             threshold,
             rng,
+            reply_pub,
             _f: PhantomData,
         }
     }
@@ -122,6 +153,7 @@ impl<F: Field> RendezvousClient<F> {
             cookie: self.cookie,
             reply_circuit: self.reply_circuit.clone(),
             payload: payload.to_vec(),
+            reply_pub: self.reply_pub.clone(),
         }
         .encode();
         let mut seed = [0u8; 32];
@@ -134,6 +166,22 @@ impl<F: Field> RendezvousClient<F> {
             &seed,
         )
     }
+
+    /// This session's NOSTOS reply public key (serialized), as it rides each [`Request`]. The service
+    /// end-to-end-seals replies to it; the dialing driver opens them with the matching [`ReplyKeys`] from
+    /// [`session_reply_keypair`] (a member of its own reply line, it decrypts what lands there).
+    #[must_use]
+    pub fn reply_pub(&self) -> &[u8] {
+        &self.reply_pub
+    }
+}
+
+/// A client's recorded return path: the reply circuit (hop lines ending at the client's own dead-drop
+/// line) and its NOSTOS reply public key (empty on the legacy pre-NOSTOS path).
+#[derive(Clone)]
+struct ReplyRoute {
+    circuit: Vec<Triple>,
+    reply_pub: Vec<u8>,
 }
 
 /// The service half of an anonymous session.
@@ -146,7 +194,7 @@ pub struct RendezvousService<F: Field> {
     directory: MixDirectory,
     threshold: u8,
     rng: SeedRng,
-    routes: BTreeMap<SessionId, Vec<Triple>>,
+    routes: BTreeMap<SessionId, ReplyRoute>,
     _f: PhantomData<F>,
 }
 
@@ -169,7 +217,13 @@ impl<F: Field> RendezvousService<F> {
     pub fn ingest(&mut self, delivery: &[u8]) -> Option<(SessionId, Vec<u8>)> {
         let req = Request::decode(delivery)?;
         if !req.reply_circuit.is_empty() {
-            self.routes.insert(req.cookie, req.reply_circuit);
+            self.routes.insert(
+                req.cookie,
+                ReplyRoute {
+                    circuit: req.reply_circuit,
+                    reply_pub: req.reply_pub,
+                },
+            );
         }
         Some((req.cookie, req.payload))
     }
@@ -183,21 +237,39 @@ impl<F: Field> RendezvousService<F> {
     /// Seal `payload` back through `cookie`'s recorded reply circuit. `None` if the cookie is unknown,
     /// a member key is missing, or sealing fails.
     ///
-    /// The reply is **tagged** with the session cookie (a 16-byte prefix): the reply circuit ends at a
-    /// combiner that may be a *shared* rendezvous relay serving many clients, and the peeled reply carries
-    /// no other demultiplexer, so the relay reads this prefix to forward the reply to the client that
-    /// registered that cookie (the rendezvous-relay path in `fanos-node`). A co-located client — one
-    /// listening at the combiner itself — simply strips the prefix. Either way the client's driver drops
-    /// these 16 bytes before handing the cell to its DIAULOS session.
+    /// **NOSTOS path** (the client registered a reply key): the reply is **end-to-end sealed** to that
+    /// key and delivered as a dead-drop to the client's own reply line — the delivery line's members see
+    /// only ciphertext, the client (one of the `q+1` members) decrypts, and no cookie tag is needed
+    /// because the reply key is itself the demultiplexer. No relay ever learns the client.
+    ///
+    /// **Legacy path** (no reply key): the reply is tagged with the 16-byte session cookie so a shared
+    /// rendezvous relay at the reply combiner can forward it to the registering client.
     #[must_use]
     pub fn seal_reply(&mut self, cookie: &SessionId, payload: &[u8]) -> Option<Forward> {
-        let circuit = self.routes.get(cookie)?.clone();
-        let mut seed = [0u8; 32];
-        self.rng.fill(&mut seed);
-        let mut tagged = Vec::with_capacity(cookie.len() + payload.len());
-        tagged.extend_from_slice(cookie);
-        tagged.extend_from_slice(payload);
-        seal_forward::<F>(&circuit, &self.directory, self.threshold, &tagged, &seed)
+        let route = self.routes.get(cookie)?.clone();
+        if route.reply_pub.is_empty() {
+            let mut seed = [0u8; 32];
+            self.rng.fill(&mut seed);
+            let mut tagged = Vec::with_capacity(cookie.len() + payload.len());
+            tagged.extend_from_slice(cookie);
+            tagged.extend_from_slice(payload);
+            return seal_forward::<F>(&route.circuit, &self.directory, self.threshold, &tagged, &seed);
+        }
+        // NOSTOS: end-to-end seal to the client's reply key, then dead-drop to its own line. Two
+        // independent seeds — the end-to-end nonce and the onion key material must not share entropy.
+        let mut e2e_seed = [0u8; 32];
+        let mut onion_seed = [0u8; 32];
+        self.rng.fill(&mut e2e_seed);
+        self.rng.fill(&mut onion_seed);
+        seal_nostos_reply::<F>(
+            &route.reply_pub,
+            &route.circuit,
+            &self.directory,
+            self.threshold,
+            payload,
+            &e2e_seed,
+            &onion_seed,
+        )
     }
 
     /// The number of distinct client sessions (cookies) this service is currently tracking.
@@ -212,7 +284,7 @@ impl<F: Field> RendezvousService<F> {
 mod tests {
     use fanos_field::F2;
     use fanos_geometry::{Line, Point};
-    use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+    use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
 
     use super::*;
     use crate::meeting_line;
@@ -236,7 +308,7 @@ mod tests {
     fn cookie_is_deterministic_in_the_secret_and_distinct_across_secrets() {
         let dir = fano_directory();
         let cookie = |secret: &[u8]| {
-            RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], dir.clone(), 2, secret)
+            RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], dir.clone(), 2, secret, vec![])
                 .cookie()
         };
         assert_eq!(
@@ -270,7 +342,7 @@ mod tests {
         .coords();
         let hop = (0..7).map(line).find(|&l| l != meeting).unwrap();
         let mut c =
-            RendezvousClient::<F2>::new(vec![hop, meeting], vec![line(3)], dir, 2, b"secret");
+            RendezvousClient::<F2>::new(vec![hop, meeting], vec![line(3)], dir, 2, b"secret", vec![]);
         let a = c.seal_send(b"hello").unwrap();
         let b = c.seal_send(b"hello").unwrap();
         assert_eq!(
@@ -287,7 +359,7 @@ mod tests {
     fn reply_combiner_is_the_reply_circuit_destination() {
         let dir = fano_directory();
         let rp = line(4);
-        let c = RendezvousClient::<F2>::new(vec![line(0)], vec![line(1), rp], dir, 2, b"s");
+        let c = RendezvousClient::<F2>::new(vec![line(0)], vec![line(1), rp], dir, 2, b"s", vec![]);
         assert_eq!(c.reply_combiner(), combiner_for::<F2>(rp));
     }
 
@@ -309,6 +381,7 @@ mod tests {
             cookie,
             reply_circuit: vec![hop, rp],
             payload: b"inner".to_vec(),
+            reply_pub: vec![],
         }
         .encode();
         let (got, payload) = svc.ingest(&req).unwrap();
@@ -316,7 +389,7 @@ mod tests {
         assert_eq!(payload, b"inner");
         assert!(svc.knows(&cookie));
         assert_eq!(svc.sessions(), 1);
-        // Now a reply seals through the recorded circuit.
+        // Now a reply seals through the recorded circuit (legacy cookie-tagged path — no reply key).
         let reply = svc.seal_reply(&cookie, b"resp").unwrap();
         assert_eq!(reply.combiner, combiner_for::<F2>(hop).unwrap());
     }
@@ -332,6 +405,7 @@ mod tests {
                 cookie,
                 reply_circuit: vec![line(3), line(2)],
                 payload: vec![],
+                reply_pub: vec![],
             }
             .encode(),
         )
@@ -346,6 +420,7 @@ mod tests {
                     cookie,
                     reply_circuit: vec![],
                     payload: b"more".to_vec(),
+                    reply_pub: vec![],
                 }
                 .encode(),
             )
@@ -404,7 +479,7 @@ mod tests {
     fn a_client_built_surb_returns_a_reply_without_exposing_the_coordinate() {
         use fanos_aphantos::surb::{SurbOutcome, inject_reply, open_reply, process_surb_hop};
         let client_coord = Point::<F2>::at(6).coords();
-        let mut rclient = RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], fano_directory(), 2, b"surb-session");
+        let mut rclient = RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], fano_directory(), 2, b"surb-session", vec![]);
         let combiner = rclient.reply_combiner().unwrap();
 
         // The client builds a SURB return path; its first hop is a delivery relay ≠ the injecting relay, ≠ self.
@@ -429,5 +504,68 @@ mod tests {
             }
             SurbOutcome::Forward { .. } => panic!("a single-hop SURB delivers, it does not forward"),
         }
+    }
+
+    #[test]
+    fn a_client_advertises_a_reply_key_whose_secret_the_driver_derives() {
+        use fanos_aphantos::nostos::seal_to_receiver;
+        // The client advertises reply_pub; the dialing driver derives the matching ReplyKeys from the
+        // SAME session secret via session_reply_keypair. A reply sealed to the advertised key opens with
+        // those keys — and with no other session's keys.
+        let secret = b"nostos-session";
+        let (reply_keys, reply_pub) = session_reply_keypair(secret);
+        let client = RendezvousClient::<F2>::new(
+            vec![line(0)],
+            vec![line(1)],
+            fano_directory(),
+            2,
+            secret,
+            reply_pub.clone(),
+        );
+        assert_eq!(
+            client.reply_pub(),
+            reply_pub.as_slice(),
+            "the client advertises the NOSTOS reply key it was built with",
+        );
+        let public = HybridKemPublic::decode(client.reply_pub()).unwrap();
+        let body = seal_to_receiver(&public, b"the homecoming reply", b"e2e-seed").unwrap();
+        assert_eq!(
+            reply_keys.open(&body).as_deref(),
+            Some(&b"the homecoming reply"[..]),
+            "the driver's keys open a reply sealed to the advertised public key",
+        );
+        let (other_keys, _) = session_reply_keypair(b"a-different-session");
+        assert!(
+            other_keys.open(&body).is_none(),
+            "another session's keys do not open this reply — the key is the demultiplexer",
+        );
+    }
+
+    #[test]
+    fn the_service_seals_a_nostos_reply_when_a_reply_key_is_registered() {
+        use fanos_aphantos::nostos::ReplyKeys;
+        let mut svc = RendezvousService::<F2>::new(fano_directory(), 2, b"svc-nostos");
+        let cookie = *b"nostos-cookie-16";
+        let l = line(2);
+        let (_keys, reply_pub) = ReplyKeys::generate(b"client-reply-key");
+        svc.ingest(
+            &Request {
+                cookie,
+                reply_circuit: vec![l],
+                payload: vec![],
+                reply_pub: reply_pub.encode(),
+            }
+            .encode(),
+        )
+        .unwrap();
+        // The NOSTOS reply seals (end-to-end + dead-drop) and launches at the reply line's combiner; the
+        // line's members route it and the client, a member, decrypts. Fresh seeds keep replies unlinkable.
+        let a = svc.seal_reply(&cookie, b"resp").unwrap();
+        assert_eq!(a.combiner, combiner_for::<F2>(l).unwrap());
+        let b = svc.seal_reply(&cookie, b"resp").unwrap();
+        assert_ne!(
+            a.frame, b.frame,
+            "each NOSTOS reply draws fresh seeds — no key-material reuse",
+        );
     }
 }

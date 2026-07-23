@@ -12,19 +12,19 @@
 //! stream), so the bridge's sealing/routing logic is unit-testable without a live node; [`dial_anonymous`]
 //! wires it to a real [`Client`].
 
-use fanos_aphantos::surb::{SurbKeys, open_reply};
+use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
-use fanos_geometry::{Line, Plane};
+use fanos_geometry::{Line, Plane, Point};
 use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, SessionId, combiner_for, meeting_line,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_line,
+    session_reply_keypair,
 };
 use fanos_runtime::{Command, Notification};
 
-use crate::rendezvous_relay::register_frame;
 use fanos_session::{ChannelTransport, stream_over_channels_paced};
 use rand_core::{CryptoRng, Rng};
 use std::time::Duration;
@@ -49,7 +49,7 @@ async fn rendezvous_bridge<F, S>(
     app_in: UnboundedSender<Vec<u8>>,
     send_frame: S,
     mut deliveries: broadcast::Receiver<Notification>,
-    surb_keys: Option<SurbKeys>,
+    reply_keys: ReplyKeys,
 ) where
     F: Field + Send + 'static,
     S: Fn(Coord, Vec<u8>) + Send + 'static,
@@ -62,20 +62,14 @@ async fn rendezvous_bridge<F, S>(
         loop {
             match deliveries.recv().await {
                 Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
-                    // With a SURB return path the delivered block is masked by every return hop — strip the
-                    // masks first (a block that fails to open is malformed). Then remove this session's 16-byte
-                    // cookie prefix: the DIAULOS session sees only its cell.
-                    let payload = match &surb_keys {
-                        Some(keys) => match open_reply(&payload, keys) {
-                            Ok(reply) => reply,
-                            Err(_) => continue,
-                        },
-                        None => payload,
-                    };
-                    let Some(cell) = payload.get(size_of::<SessionId>()..) else {
+                    // NOSTOS: an anonymous delivery is a dead-drop landing on this session's own reply
+                    // line — its body is end-to-end-sealed to our reply key. Open it; a body not for us
+                    // (a co-member's dead-drop on the shared line, or cover traffic) does not open, so we
+                    // skip it. The reply key is itself the demultiplexer, so there is no cookie to strip.
+                    let Some(cell) = reply_keys.open(&payload) else {
                         continue;
                     };
-                    if app_in.send(cell.to_vec()).is_err() {
+                    if app_in.send(cell).is_err() {
                         break; // the stream driver is gone
                     }
                 }
@@ -99,42 +93,26 @@ async fn rendezvous_bridge<F, S>(
 /// by `rclient`. Returns the application side of the stream; a spawned task owns the session and the
 /// rendezvous bridge.
 ///
-/// The node must be reachable at its reply rendezvous — `rclient`'s reply circuit must terminate at
-/// this node's own coordinate, so the service's replies (anonymous deliveries to this node) arrive
-/// here. Must run inside a tokio runtime.
+/// The reply comes home via NOSTOS: `rclient`'s reply circuit must terminate at one of this node's own
+/// lines (a line through its coordinate), and `reply_keys` must be the matching
+/// [`session_reply_keypair`](fanos_rendezvous::session_reply_keypair) half, so the service's dead-drop
+/// replies — anonymous deliveries this node receives as a line member — open here. [`anonymous_dial`]
+/// wires both. Must run inside a tokio runtime.
 #[must_use]
 pub fn dial_anonymous<F: Field + Send + 'static>(
     client: Client,
     session: ClientSession,
-    mut rclient: RendezvousClient<F>,
+    rclient: RendezvousClient<F>,
+    reply_keys: ReplyKeys,
 ) -> DuplexStream {
     let (out_tx, out_rx) = unbounded_channel();
     let (in_tx, in_rx) = unbounded_channel();
     let deliveries = client.subscribe();
-    // Engage the rendezvous relay at the reply combiner unless this node *is* that combiner (the
-    // co-located case, where it peels its own replies): register this session's cookie so the relay
-    // forwards the cookie-tagged replies here (audit #54, item 3). This is the general path — a proxy runs
-    // only an overlay node and cannot peel onions itself, and its coordinate reshuffles each epoch, so it
-    // relies on the cell relay sitting at the drawn reply combiner. Sent before the first onion launches,
-    // so the binding is in place well before the service's first reply completes the multi-round return.
-    // Prefer a SURB return path (audit §5 S1-H3): the relay forwards the service's reply through a pre-sealed
-    // circuit and never learns this client's coordinate. Fall back to the legacy coordinate registration only
-    // if the directory offers no delivery relay. Register before the first onion launches, so the binding is in
-    // place before the service's first reply completes the multi-round return.
-    let client_coord = client.address();
-    let mut surb_keys = None;
-    if let Some(reply_combiner) = rclient.reply_combiner()
-        && reply_combiner != client_coord
-    {
-        let frame = match rclient.build_reply_surb(client_coord) {
-            Some((surb, keys)) => {
-                surb_keys = Some(keys);
-                register_frame(rclient.cookie(), Some(&surb))
-            }
-            None => register_frame(rclient.cookie(), None),
-        };
-        client.command(Command::Emit { to: reply_combiner, frame });
-    }
+    // NOSTOS: the client receives replies as a **member of its own reply line** — the dead-drop's
+    // combiner multicasts each reply to that line's `q+1` members, and this node (a member, since the
+    // line passes through its coordinate) surfaces it as an anonymous delivery. The bridge opens it with
+    // `reply_keys`. There is no rendezvous-relay registration and no SURB: the client's coordinate never
+    // leaves the node, and no relay ever learns which member of the line is the receiver.
     tokio::spawn(rendezvous_bridge(
         rclient,
         out_rx,
@@ -145,7 +123,7 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
             client.command(Command::Emit { to, frame });
         },
         deliveries,
-        surb_keys,
+        reply_keys,
     ));
     stream_over_channels_paced(
         session,
@@ -283,15 +261,32 @@ pub fn anonymous_dial<R: CryptoRng>(
     let meeting = meeting_line::<F2>(&service_public.encode(), route.epoch, &route.beacon).coords();
     let mut forward_circuit = route.forward_hops.clone();
     forward_circuit.push(meeting);
+    // NOSTOS reply home: the terminus of the reply circuit is one of the client's OWN lines — a line
+    // through its coordinate, beacon-blinded by the session secret so it is unpredictable and rotates
+    // each epoch. The client receives the dead-drop there as a line member and no relay learns it. The
+    // drawn intermediate reply hops are kept; only the terminus becomes the own line.
+    let mut reply_circuit = route.reply_circuit.clone();
+    if let Some(point) = Point::<F2>::new(client.address()) {
+        let drop_line =
+            select_drop_line(point, secret, route.epoch.get(), route.beacon.as_bytes()).coords();
+        match reply_circuit.last_mut() {
+            Some(last) => *last = drop_line,
+            None => reply_circuit.push(drop_line),
+        }
+    }
+    // The matching reply keypair — the client advertises the public half in every Request; this driver
+    // keeps the secret half to open the dead-drop.
+    let (reply_keys, reply_pub) = session_reply_keypair(secret);
     let rclient = RendezvousClient::<F2>::new(
         forward_circuit,
-        route.reply_circuit.clone(),
+        reply_circuit,
         route.directory.clone(),
         route.threshold,
         secret,
+        reply_pub,
     );
     let session = ClientSession::dial(meeting, service_public, rng);
-    dial_anonymous(client, session, rclient)
+    dial_anonymous(client, session, rclient, reply_keys)
 }
 
 #[cfg(test)]
@@ -390,6 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_bridge_seals_outbound_and_surfaces_only_anonymous_replies() {
+        use fanos_aphantos::nostos::seal_to_receiver;
         let dir = fano_directory();
         let meeting =
             meeting_line::<F2>(b"anon-svc", Epoch::new(1), &BeaconSeed::new([0x0E; 32])).coords();
@@ -401,8 +397,10 @@ mod tests {
             .map(|i| Line::<F2>::at(i).coords())
             .find(|&l| l != hop)
             .unwrap();
+        let secret = b"bridge-secret";
+        let (reply_keys, reply_pub) = session_reply_keypair(secret);
         let rclient =
-            RendezvousClient::<F2>::new(vec![hop, meeting], vec![rp], dir, 2, b"bridge-secret");
+            RendezvousClient::<F2>::new(vec![hop, meeting], vec![rp], dir, 2, secret, reply_pub.clone());
         let expected_first_combiner = combiner_for::<F2>(hop).unwrap();
 
         let (out_tx, out_rx) = unbounded_channel();
@@ -418,7 +416,7 @@ mod tests {
                 let _ = sent_tx.send((to, frame));
             },
             deliv_rx,
-            None, // this test exercises the legacy coordinate path
+            reply_keys,
         ));
 
         // Outbound: a framed DIAULOS payload is wrapped + sealed and launched at the first hop's
@@ -435,29 +433,45 @@ mod tests {
         );
         assert!(!frame.is_empty());
 
-        // A non-anonymous delivery is filtered; the following anonymous one is surfaced with its 16-byte
-        // session-cookie prefix stripped. Since the driver's next read is the anonymous reply's cell, the
-        // non-anonymous delivery was indeed dropped.
+        // A non-anonymous delivery is filtered; a dead-drop body sealed to a DIFFERENT session's reply
+        // key does not open (the bridge skips it); only the body sealed to THIS session's reply key
+        // surfaces its cell — so the non-anonymous and foreign deliveries were both dropped.
         deliv_tx
             .send(Notification::Delivered {
                 from: [9, 9, 9],
                 payload: b"noise".to_vec(),
             })
             .unwrap();
-        // The service tags every reply with the session cookie (a shared relay uses it to route the reply
-        // here); the bridge strips those 16 bytes before the session sees the cell.
-        let mut tagged = vec![0u8; size_of::<SessionId>()];
-        tagged.extend_from_slice(b"reply");
+        let (_other, other_pub) = session_reply_keypair(b"a-different-session");
+        let foreign = seal_to_receiver(
+            &HybridKemPublic::decode(&other_pub).unwrap(),
+            b"not for this session",
+            b"foreign-seed",
+        )
+        .unwrap();
         deliv_tx
             .send(Notification::Delivered {
                 from: ANONYMOUS,
-                payload: tagged,
+                payload: foreign,
+            })
+            .unwrap();
+        // The real reply: a dead-drop body end-to-end-sealed to this session's advertised reply key.
+        let body = seal_to_receiver(
+            &HybridKemPublic::decode(&reply_pub).unwrap(),
+            b"reply",
+            b"reply-seed",
+        )
+        .unwrap();
+        deliv_tx
+            .send(Notification::Delivered {
+                from: ANONYMOUS,
+                payload: body,
             })
             .unwrap();
         assert_eq!(
             in_rx.recv().await.unwrap(),
             b"reply",
-            "only the anonymous reply reaches the session, cookie-prefix stripped"
+            "only the reply sealed to this session's key opens and reaches the DIAULOS session"
         );
     }
 }

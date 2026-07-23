@@ -31,7 +31,7 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_wire::Wire;
 
 mod transport;
-pub use transport::{RendezvousClient, RendezvousService, SessionId};
+pub use transport::{RendezvousClient, RendezvousService, SessionId, session_reply_keypair};
 
 /// The anonymous-source sentinel a threshold delivery carries (`from` in `Notification::Delivered`).
 pub use fanos_aphantos::threshold_router::ANONYMOUS;
@@ -101,17 +101,23 @@ impl MixDirectory {
 /// inner bytes end-to-end, so this wrapper carries the return route in the clear at the meeting point
 /// without weakening either property.
 /// `#[derive(Wire)]` emits the canonical `cookie(16) ‖ reply_circuit(varint count ‖ Triple×12) ‖
-/// payload(varint-prefixed)` (spec §7.1) — one derived codec for the wrapper, replacing the hand-rolled
-/// `u8` hop-count + raw trailing payload.
+/// payload(varint-prefixed) ‖ reply_pub(varint-prefixed)` (spec §7.1) — one derived codec for the
+/// wrapper, replacing the hand-rolled `u8` hop-count + raw trailing payload.
 #[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct Request {
     /// A per-session cookie: the service demultiplexes concurrent clients by it and binds each to its
     /// reply circuit, so it need not learn who any client is.
     pub cookie: [u8; 16],
-    /// Hop lines to the client's reply rendezvous (the last is where the client listens).
+    /// Hop lines to the client's reply rendezvous. For NOSTOS the **last** hop is the client's own
+    /// **dead-drop line** (one of the `q+1` lines through the client's coordinate), so the client
+    /// receives replies passively as a line member — the service never learns which member it is.
     pub reply_circuit: Vec<Triple>,
     /// The inner payload (a DIAULOS `ClientHello` or cell).
     pub payload: Vec<u8>,
+    /// The client's **NOSTOS reply public key** (a serialized [`HybridKemPublic`]): the service
+    /// end-to-end-seals its replies to it, so the dead-drop line's members — who route the reply —
+    /// see only ciphertext and only the client decrypts. Empty on the legacy (pre-NOSTOS) path.
+    pub reply_pub: Vec<u8>,
 }
 
 impl Request {
@@ -172,6 +178,28 @@ pub fn seal_forward<F: Field>(
     })
 }
 
+/// Seal a **NOSTOS reply** back through `circuit` — a threshold onion whose last hop is the client's
+/// own dead-drop line. `payload` is first end-to-end-sealed to `reply_pub` (the client's NOSTOS reply
+/// key) and wrapped in the dead-drop envelope, so the delivery line's combiner multicasts only
+/// ciphertext to the line's `q+1` members and only the client decrypts. `e2e_seed` and `onion_seed`
+/// MUST be independent fresh draws (the end-to-end nonce and every hop's key material derive from
+/// them). `None` if the reply key is malformed, a member key is missing, or sealing fails.
+#[must_use]
+pub fn seal_nostos_reply<F: Field>(
+    reply_pub: &[u8],
+    circuit: &[Triple],
+    directory: &MixDirectory,
+    threshold: u8,
+    payload: &[u8],
+    e2e_seed: &[u8],
+    onion_seed: &[u8],
+) -> Option<Forward> {
+    let public = HybridKemPublic::decode(reply_pub)?;
+    let inner = fanos_aphantos::nostos::seal_to_receiver(&public, payload, e2e_seed).ok()?;
+    let enveloped = fanos_aphantos::nostos::deaddrop_envelope(&inner);
+    seal_forward::<F>(circuit, directory, threshold, &enveloped, onion_seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +210,7 @@ mod tests {
             cookie: *b"session-cookie16",
             reply_circuit: vec![[1, 2, 3], [4, 5, 6]],
             payload: b"inner diaulos bytes".to_vec(),
+            reply_pub: b"nostos-reply-public-key".to_vec(),
         };
         let wire = req.encode();
         assert_eq!(Request::decode(&wire), Some(req));
@@ -201,14 +230,15 @@ mod tests {
 
     #[test]
     fn request_wrapper_boundary_shapes() {
-        // Empty reply circuit and empty payload — the minimal wrapper: 16 cookie ‖ varint(0) ‖ varint(0).
+        // Empty reply circuit, payload, and reply key — the minimal wrapper: 16 cookie ‖ varint(0)×3.
         let bare = Request {
             cookie: [0xAB; 16],
             reply_circuit: vec![],
             payload: vec![],
+            reply_pub: vec![],
         };
         let wire = bare.encode();
-        assert_eq!(wire.len(), 18);
+        assert_eq!(wire.len(), 19);
         assert_eq!(Request::decode(&wire), Some(bare));
 
         // A payload but no reply circuit (a follow-up cell that relies on the service's cookie binding).
@@ -216,6 +246,7 @@ mod tests {
             cookie: [0xCD; 16],
             reply_circuit: vec![],
             payload: b"cell-bytes".to_vec(),
+            reply_pub: vec![],
         };
         assert_eq!(Request::decode(&follow.encode()), Some(follow));
 
@@ -227,9 +258,10 @@ mod tests {
                 .map(|i| [i, i.wrapping_add(1), i.wrapping_add(2)])
                 .collect(),
             payload: b"tail".to_vec(),
+            reply_pub: vec![],
         };
         let wire = big.encode();
-        assert_eq!(wire.len(), 16 + 2 + 300 * 12 + 1 + 4);
+        assert_eq!(wire.len(), 16 + 2 + 300 * 12 + 1 + 4 + 1);
         assert_eq!(Request::decode(&wire), Some(big));
     }
 }

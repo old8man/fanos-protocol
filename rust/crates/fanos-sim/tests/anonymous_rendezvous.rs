@@ -139,6 +139,7 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
         cookie: *b"bidi-cookie-0001",
         reply_circuit: reply_circuit.clone(),
         payload: client_hello,
+        reply_pub: vec![],
     }
     .encode();
 
@@ -225,6 +226,7 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
         dir.clone(),
         t,
         b"rdv-sess-cli-secret",
+        vec![], // legacy cookie-tagged reply path (this manual driver reads at the reply combiner)
     );
     let mut rservice = RendezvousService::<F2>::new(dir.clone(), t, b"rdv-sess-svc-secret");
 
@@ -396,6 +398,7 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
         dir.clone(),
         t,
         b"rdv-mux-cli-a",
+        vec![], // legacy cookie-tagged reply path
     );
     let mut rc_b = RendezvousClient::<F2>::new(
         vec![hop_to_l, meeting],
@@ -403,6 +406,7 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
         dir.clone(),
         t,
         b"rdv-mux-cli-b",
+        vec![], // legacy cookie-tagged reply path
     );
     let (cookie_a, cookie_b) = (rc_a.cookie(), rc_b.cookie());
     assert_ne!(
