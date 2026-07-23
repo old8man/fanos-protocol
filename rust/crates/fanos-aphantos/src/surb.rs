@@ -225,7 +225,7 @@ pub fn open_reply(block: &[u8], keys: &SurbKeys) -> Result<Vec<u8>, SealedError>
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod tests {
     use super::*;
     use fanos_field::F31;

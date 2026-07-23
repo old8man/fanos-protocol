@@ -85,6 +85,35 @@ innermost DELIVER layer, so the client verifies the reply traversed the exact re
 - **Return hops** run the existing relay/router path over `process_surb_hop`; the client opens with `open_reply`.
 - Sim + real-QUIC: a reply reaches the client with the relay never holding its coordinate.
 
+## 3a. Wiring the live path — the architectural reality (found 2026-07-23)
+
+The deployed FANOS reply path is **threshold** onions end to end (`seal_forward` → `seal_onion`; the relay is
+`CellNode(OverlayBeaconNode, ThresholdRouter)` wrapped in `RendezvousRelay`). The single-relay `sealed` onion
+this SURB is built on is live only in the *separate* `fanos_aphantos::node` (`NyxNode`) engine, which the
+deployed node does **not** compose. So the SURB does not drop into the threshold reply circuit directly. It does
+not need to: the leak is the **final relay→client hop**, which today is a *direct* `Effect::Send { to:
+client_coord, RdvReply }` — not a threshold onion at all. The SURB upgrades exactly that one direct hop into a
+sealed return sub-circuit (the "last-mile provider hop", Loopix-style), leaving the threshold forward/reply
+circuits untouched. This is coherent, not a parallel mixnet: threshold onions still carry every anonymized
+circuit; the SURB only replaces a plaintext delivery Send.
+
+Wiring it, **backward-compatibly so the working path never regresses**:
+1. `RdvRegister` body becomes `cookie(16) ‖ [Surb::to_bytes]?` — a bare 16-byte cookie keeps the legacy
+   `cookie → coord` path; a longer body registers `cookie → Surb`. The relay holds an enum registration.
+2. On a peeled reply, a `Surb` registration → `inject_reply` → `Send { to: first_hop, SurbPacket }`; a `coord`
+   registration → the legacy `RdvReply` Send. (Single-use: evict the SURB on use.)
+3. A new `SurbPacket` frame + a **return-hop handler** that runs `process_surb_hop(packet, onion_secret)` —
+   `Forward` re-emits `SurbPacket` to `next`, `Deliver` emits `RdvReply(block)` to `coord`. The handler needs the
+   node's current **onion-ratchet secret** (the same key the `ThresholdRouter` peels with), so it is hosted where
+   that secret lives — inside/alongside the router — reusing the ratchet's bounded grace window for in-flight
+   packets across an epoch turn.
+4. The client builds the `Surb` from the mix directory's return-circuit onion keys (as it already does for
+   forward circuits), registers it, and `open_reply`s the delivered block.
+
+The `sealed`-based primitive is therefore correct and directly usable for the last-mile sub-circuit; the only
+open work is the additive `SurbPacket` routing + the onion-secret handoff, done without touching the threshold
+crown-jewel or the legacy path.
+
 ## 4. Sources
 
 Sphinx (Danezis–Goldberg, S&P 2009) — the SURB header/payload split and the reverse-mask payload; Loopix

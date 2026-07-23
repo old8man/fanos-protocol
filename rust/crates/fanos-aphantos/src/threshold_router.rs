@@ -179,6 +179,17 @@ impl<F: Field> ThresholdRouter<F> {
         self.onion.epoch()
     }
 
+    /// Peel one hop of a **SURB return packet** (audit §5 S1-H3) with this router's forward-secure onion
+    /// secrets — the same current-plus-grace-window keys it peels threshold onions with, so a reply in flight
+    /// across an epoch turn still routes. Returns the hop outcome, or `None` if no live secret peels it (the
+    /// packet is not for this relay, or is stale beyond the grace window). Keeps the onion secrets encapsulated:
+    /// the client sealed the SURB to [`onion_public`](Self::onion_public), and only the router holding the
+    /// matching secret can peel it here.
+    #[must_use]
+    pub fn peel_surb(&self, packet: &[u8]) -> Option<crate::surb::SurbOutcome> {
+        self.onion.secrets().find_map(|secret| crate::surb::process_surb_hop(packet, secret).ok())
+    }
+
     /// Override the combiner's partial-gathering deadline (default 2 s).
     #[must_use]
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
@@ -1116,5 +1127,28 @@ mod tests {
             !replay(&mut router, 4),
             "past the grace window the recorded onion is unpeelable (E4 forward secrecy)"
         );
+    }
+
+    #[test]
+    fn peel_surb_routes_a_reply_hop_with_the_forward_secure_onion_secret() {
+        use crate::surb::{SurbOutcome, build_surb, inject_reply, open_reply};
+        use fanos_nyx::build_circuit;
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"surb-router"));
+        let router = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &identity, 2, [0x33; 32]);
+        // A SURB whose sole (delivery) hop is sealed to THIS router's current forward-secure onion key.
+        let circuit = build_circuit(Point::<F2>::at(1), Point::<F2>::at(3), 1, b"surb-return").unwrap();
+        let client_coord = Point::<F2>::at(5).coords();
+        let (surb, keys) = build_surb(&circuit, &[router.onion_public()], client_coord, b"seed").unwrap();
+        match router.peel_surb(&inject_reply(&surb, b"the reply").unwrap()) {
+            Some(SurbOutcome::Deliver { coord, block }) => {
+                assert_eq!(coord, client_coord, "the router (delivery node) yields the client coordinate");
+                assert_eq!(open_reply(&block, &keys).unwrap(), b"the reply", "and the reply opens");
+            }
+            _ => panic!("the router peels the delivery hop with its onion secret"),
+        }
+        // A SURB sealed to a DIFFERENT onion key does not peel here.
+        let (_other, other_pub) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"other-onion"));
+        let (surb2, _) = build_surb(&circuit, &[&other_pub], client_coord, b"seed").unwrap();
+        assert!(router.peel_surb(&inject_reply(&surb2, b"x").unwrap()).is_none(), "a foreign-keyed SURB does not peel");
     }
 }
