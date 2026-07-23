@@ -84,6 +84,84 @@ lines and the plane's point-regularity caps any node's incidence at `(q+1)/N`, *
 monopolize proposing** — the structural centrality cap *is* the anti-cartel guarantee, not a policy. On
 proposer timeout the round increments `r` and re-elects (a fresh line), giving round-robin liveness.
 
+### 3.1 Secret-leader election (SSLE) — the `who` is hidden until it proposes
+
+The election above is *cartel-proof* but not *secret*: within an epoch the `proposer` is a public function of
+`SEED(epoch)`, `h`, `r`, so anyone can compute who leads each upcoming height. That is a live attack surface —
+Heimbach et al. (USENIX Security 2025) located >15 % of Ethereum validators in the P2P layer with 4 nodes in 3
+days; knowing the *single* next proposer lets an adversary pre-position a targeted DoS or bribe against it. The
+fix is **secret leader election**: keep the round-0 leader unknown until it actually proposes.
+
+**The derived design — "min-ticket PBFT with a public fallback"** (converged, independently, across three SSLE
+research audits: constructions, BFT-liveness, PQ-native-derivation). Round 0 of every height becomes a lottery
+over the *same* beacon-elected line `L = MapToLine(seed(h,0))` (its membership is public — the anonymity set is
+at most `q+1`):
+
+```
+ticket_i(h) = H( "taxis-leader-ticket" ‖ VRF_i(idx) ‖ SEED(epoch) ‖ h ‖ 0 )     # lowest ticket leads
+```
+
+where `VRF_i` is validator `i`'s **post-quantum Merkle-VRF** (`fanos-vrf::pqvrf`, an iVRF) at domain index
+`idx = h − base`. Every member of `L` proposes (**all-propose**, `p = 1`), attaching its `(VRF output, Merkle
+proof)` as a `LeaderWitness` *outside* the hashed header. A replica verifies each witness against the
+proposer's **pre-registered** root, ranks the valid proposals by ticket, and after a short collection window
+PREPAREs the **lowest**. Rounds `r ≥ 1` fall back to the public deterministic `proposer` of §3 — the pre-SSLE
+protocol verbatim — reached by the ordinary view-change on timeout.
+
+**Theorem (SSLE properties).** Under the epoch DVRF beacon's unbiasability and Merkle-VRF full uniqueness:
+
+* **Secrecy / unpredictability.** `ticket_i` is a function of `VRF_i`, whose output no other party can predict
+  before member `i` reveals it, and of the beacon, unpredictable before the epoch opens. So before any
+  proposal is broadcast the winner is uniform over `L` to every outside observer — an adversary cannot pre-aim
+  at *the* next proposer. The anonymity set is exactly `L` (`|L| = q+1`), and this is optimal: the line is
+  public, so no consensus-layer scheme can hide the winner in a larger set. The guaranteed benefit is the
+  Boneh–Eskandarian–Hanzlik–Greco robustness bound — attacking an `α`-fraction of `L` disrupts a round with
+  probability `≤ α`, i.e. targeted-DoS cost is multiplied by `q+1` (a surgical single-proposer strike becomes
+  impossible). With all-propose, per-round traffic is symmetric across `L`, removing the who-is-about-to-lead
+  timing tell at the protocol layer.
+* **Safety (unconditional, unchanged).** Leader selection lives entirely in the *pacemaker*; the vote logic is
+  byte-for-byte §4. HotStuff's theorem — safety holds even under a Pacemaker that proposes arbitrarily — applies
+  verbatim. Two commit certificates at one height still force two `Q`-quorums to intersect in an honest
+  validator who prepared ≤ 1 value per view (§2.1), so no two blocks commit. Min-ticket, ties, vote-splits, and
+  withheld/late tickets can therefore only *waste a view*, never fork. A member cannot grind its ticket (see
+  PQ-soundness) and cannot double-prepare (the equivocation slash, §8, still bites), so it PREPAREs exactly the
+  one min per round 0.
+* **Liveness.** All-propose makes empty rounds **structurally impossible** (`q+1 ≥ 3` tickets always exist),
+  eliminating the 30–37 % empty-slot residue that thresholded (`p<1`) sortition suffers at small committees. The
+  collection window converges honest replicas on a common min: with the early-exit (all `q+1` proposals seen)
+  the happy path prepares with no added wait, and its tick-bounded expiry (`Δ_prio`, one tick — *not* a full
+  round timeout) covers a slow/down member. Post-GST every honest replica holds the identical ticket set, hence
+  the identical min, hence a `Q`-quorum on the winner whenever it is honest (probability `≥ (n−f)/n`). Otherwise
+  one timeout drops to the public-leader ladder, live by the classical argument. So liveness never degrades
+  *below* today's baseline; SSLE only adds a fast secret-leader path on top of it.
+
+**PQ-soundness — why the ticket is a Merkle-VRF and never `H(signature)`.** The min-ticket rule is sound only
+if the ticket satisfies RFC 9381 *full uniqueness* (no party, even with malicious keygen, can produce two
+verifying outputs for one input). A hash of the validator's hybrid signature does **not**: ML-DSA (FIPS 204) is
+Fiat–Shamir-with-aborts, its verifier accepts many signatures per message, and its "deterministic" mode is an
+unverifiable signer-side convention — so a Byzantine member *grinds* signatures offline and submits the one
+minimizing `H(σ)`, winning the argmin with probability `≈ k/(k+n−1)` (~96 % at `k=100`, `n=5`). This is full
+rigging, not bias, and it also sinks Falcon (randomized) and even XMSS (X-VRF's uniqueness proof was broken at
+FC 2024). The Merkle-VRF sidesteps all of it: its output is *committed* by the pre-registered Merkle root, so
+exactly one output verifies per index — uniqueness by construction, from symmetric-hash assumptions only.
+
+**Bounded domain, per-epoch re-registration.** The Merkle-VRF domain is `2^height` leaves (`height ≤ 24`), so
+the index is **relative** (`h − base`) and the roots are re-registered each epoch over a fresh bounded domain —
+an absolute-height index would eventually exhaust the tree (OOM). Re-registration doubles as the anti-grinding
+*fence*: a validator's root is fixed strictly before the beacon it is used with, so it cannot choose a key to
+bias its ticket. The ticket hash still binds the absolute `h`, so tickets never collide across epochs that
+reuse a relative index.
+
+**Honest scope.** This is *secret-until-proposal-broadcast* within a public `q+1` line — not whole-validator-set
+SSLE. Whole-set schemes (Whisk shuffles, Sassafras ring-VRFs) are non-PQ; PQ true-SSLE (Qelect, BPR23) needs
+MB-scale multi-round shuffles or `G`-out-of-`G` synchronous tFHE whose single-crash abort is a *worse* liveness
+cliff than the empty-slot residue it removes — strictly dominated at `q+1 ≤ 8`, where the line is public anyway.
+The engine keeps a clean seam (`enable_sortition`; `None` ⇒ the public leader) so a future PQ batch ring-VRF
+ticket layer can replace the per-view lottery without touching the BFT core. Implementation: `committee.rs`
+(`leader_ticket` / `verify_leader_ticket`), `block.rs` (`LeaderWitness`), `consensus.rs`
+(`maybe_propose` / `on_propose` / the collection window), driven end-to-end in `tests/consensus_sim.rs` and over
+real QUIC in `taxis_quic.rs`.
+
 ---
 
 ## 4. The round protocol (PBFT-class, three phases + reveal)
@@ -94,10 +172,11 @@ block_hash)`. A **certificate** is a set of `Q` distinct valid signatures over t
 1. **PROPOSE** — the elected proposer assembles a block from the encrypted mempool (§5), erasure-codes the
    payload with the projective LRC and attaches the DA commitment (§6), links `parent_hash`, and broadcasts a
    signed `Propose{header, sealed_txs, da_commit}`.
-2. **PREPARE** — each validator checks: parent is the current head, the proposer is the correct beacon-elected
-   leader, the block is well-formed, and **the payload is available** by DA-sampling (§6). If all hold it
-   broadcasts `Prepare{h,r,block_hash}`. A `Q`-quorum of prepares is a **prepared certificate** (`PC`) — the
-   block is *locked*.
+2. **PREPARE** — each validator checks: parent is the current head, the proposer is entitled (the correct
+   beacon-elected leader; or, under SSLE round 0, any line member whose sortition witness verifies — §3.1), the
+   block is well-formed, and **the payload is available** by DA-sampling (§6). If all hold it broadcasts
+   `Prepare{h,r,block_hash}` — under SSLE round 0, for the **lowest-ticket** proposal collected in the window.
+   A `Q`-quorum of prepares is a **prepared certificate** (`PC`) — the block is *locked*.
 3. **COMMIT** — on seeing a `PC`, a validator broadcasts `Commit{h,r,block_hash}`. A `Q`-quorum of commits is a
    **commit certificate** (`CC`) — the block is **final** (irreversible; safety by §2.1).
 4. **REVEAL** — once a `CC` exists the block's order is fixed, so the sealing committees release their share
