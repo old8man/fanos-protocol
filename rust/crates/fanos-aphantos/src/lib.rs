@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod node;
 pub mod sealed;
+pub mod surb;
 pub mod threshold;
 pub mod threshold_router;
 
