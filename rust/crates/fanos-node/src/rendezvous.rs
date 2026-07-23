@@ -12,6 +12,7 @@
 //! stream), so the bridge's sealing/routing logic is unit-testable without a live node; [`dial_anonymous`]
 //! wires it to a real [`Client`].
 
+use fanos_aphantos::surb::{SurbKeys, open_reply};
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
 use fanos_geometry::{Line, Plane};
@@ -48,6 +49,7 @@ async fn rendezvous_bridge<F, S>(
     app_in: UnboundedSender<Vec<u8>>,
     send_frame: S,
     mut deliveries: broadcast::Receiver<Notification>,
+    surb_keys: Option<SurbKeys>,
 ) where
     F: Field + Send + 'static,
     S: Fn(Coord, Vec<u8>) + Send + 'static,
@@ -60,9 +62,16 @@ async fn rendezvous_bridge<F, S>(
         loop {
             match deliveries.recv().await {
                 Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
-                    // Every reply is tagged with this session's 16-byte cookie (so a shared rendezvous
-                    // relay can route it here); the DIAULOS session sees only its cell, so strip the
-                    // prefix. A delivery too short to hold a cookie is malformed — drop it.
+                    // With a SURB return path the delivered block is masked by every return hop — strip the
+                    // masks first (a block that fails to open is malformed). Then remove this session's 16-byte
+                    // cookie prefix: the DIAULOS session sees only its cell.
+                    let payload = match &surb_keys {
+                        Some(keys) => match open_reply(&payload, keys) {
+                            Ok(reply) => reply,
+                            Err(_) => continue,
+                        },
+                        None => payload,
+                    };
                     let Some(cell) = payload.get(size_of::<SessionId>()..) else {
                         continue;
                     };
@@ -97,7 +106,7 @@ async fn rendezvous_bridge<F, S>(
 pub fn dial_anonymous<F: Field + Send + 'static>(
     client: Client,
     session: ClientSession,
-    rclient: RendezvousClient<F>,
+    mut rclient: RendezvousClient<F>,
 ) -> DuplexStream {
     let (out_tx, out_rx) = unbounded_channel();
     let (in_tx, in_rx) = unbounded_channel();
@@ -108,15 +117,23 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
     // only an overlay node and cannot peel onions itself, and its coordinate reshuffles each epoch, so it
     // relies on the cell relay sitting at the drawn reply combiner. Sent before the first onion launches,
     // so the binding is in place well before the service's first reply completes the multi-round return.
+    // Prefer a SURB return path (audit §5 S1-H3): the relay forwards the service's reply through a pre-sealed
+    // circuit and never learns this client's coordinate. Fall back to the legacy coordinate registration only
+    // if the directory offers no delivery relay. Register before the first onion launches, so the binding is in
+    // place before the service's first reply completes the multi-round return.
+    let client_coord = client.address();
+    let mut surb_keys = None;
     if let Some(reply_combiner) = rclient.reply_combiner()
-        && reply_combiner != client.address()
+        && reply_combiner != client_coord
     {
-        // Legacy coordinate registration for now; the SURB return path (audit §5 S1-H3) is wired in next,
-        // replacing `None` with a client-built `Surb` so the relay never learns this client's coordinate.
-        client.command(Command::Emit {
-            to: reply_combiner,
-            frame: register_frame(rclient.cookie(), None),
-        });
+        let frame = match rclient.build_reply_surb(client_coord) {
+            Some((surb, keys)) => {
+                surb_keys = Some(keys);
+                register_frame(rclient.cookie(), Some(&surb))
+            }
+            None => register_frame(rclient.cookie(), None),
+        };
+        client.command(Command::Emit { to: reply_combiner, frame });
     }
     tokio::spawn(rendezvous_bridge(
         rclient,
@@ -128,6 +145,7 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
             client.command(Command::Emit { to, frame });
         },
         deliveries,
+        surb_keys,
     ));
     stream_over_channels_paced(
         session,
@@ -400,6 +418,7 @@ mod tests {
                 let _ = sent_tx.send((to, frame));
             },
             deliv_rx,
+            None, // this test exercises the legacy coordinate path
         ));
 
         // Outbound: a framed DIAULOS payload is wrapped + sealed and launched at the first hop's

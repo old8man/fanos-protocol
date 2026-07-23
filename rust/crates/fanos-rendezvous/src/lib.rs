@@ -74,6 +74,12 @@ impl MixDirectory {
         self.keys.get(coord)
     }
 
+    /// Iterate the directory's `(coordinate, key)` entries — used to pick a delivery relay for a SURB reply
+    /// block (audit §5 S1-H3).
+    pub fn entries(&self) -> impl Iterator<Item = (&Triple, &HybridKemPublic)> {
+        self.keys.iter()
+    }
+
     /// The number of known members.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -15,6 +15,8 @@ categories = ["network-programming", "cryptography"]
 fanos-calypso.workspace = true
 # The threshold onion (a hop is a line) the payloads ride, and its router framing.
 fanos-aphantos.workspace = true
+# Return circuits for the SURB reply block (audit §5 S1-H3).
+fanos-nyx.workspace = true
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-field = { workspace = true, features = ["std"] }
 # Hybrid KEM public keys of the mixnet members (the onion seals to them).

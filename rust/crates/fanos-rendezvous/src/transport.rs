@@ -20,8 +20,10 @@
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
+use fanos_aphantos::surb::{Surb, SurbKeys, build_surb};
 use fanos_field::Field;
-use fanos_geometry::Triple;
+use fanos_geometry::{Point, Triple};
+use fanos_nyx::build_circuit;
 use fanos_pqcrypto::rng::SeedRng;
 
 use crate::{Forward, MixDirectory, Request, combiner_for, seal_forward};
@@ -91,6 +93,24 @@ impl<F: Field> RendezvousClient<F> {
     #[must_use]
     pub fn reply_combiner(&self) -> Option<Triple> {
         combiner_for::<F>(*self.reply_circuit.last()?)
+    }
+
+    /// Build a **SURB reply block** (audit §5 S1-H3): a pre-sealed single-hop return path from this session's
+    /// reply combiner (the injecting relay) through a **delivery relay** to `client_coord`, so the rendezvous
+    /// relay forwards the service's reply WITHOUT ever learning `client_coord`. Register the returned [`Surb`]
+    /// with the relay in place of the coordinate; keep the [`SurbKeys`] to [`open_reply`](fanos_aphantos::surb::open_reply)
+    /// the delivered block. `None` if the directory offers no delivery relay distinct from the reply combiner
+    /// and the client. Each call draws fresh path randomness, so successive SURBs are unlinkable.
+    pub fn build_reply_surb(&mut self, client_coord: Triple) -> Option<(Surb, SurbKeys)> {
+        let combiner = self.reply_combiner()?;
+        let source = Point::<F>::new(combiner)?;
+        let mut seed = [0u8; 32];
+        self.rng.fill(&mut seed);
+        let (&delivery, delivery_key) =
+            self.directory.entries().find(|&(&c, _)| c != combiner && c != client_coord)?;
+        let dest = Point::<F>::new(delivery)?;
+        let circuit = build_circuit(source, dest, 1, &seed)?;
+        build_surb(&circuit, &[delivery_key], client_coord, &seed).ok()
     }
 
     /// Seal `payload` (a DIAULOS `ClientHello` or cell) into an onion bound for the service's meeting
@@ -188,7 +208,7 @@ impl<F: Field> RendezvousService<F> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod tests {
     use fanos_field::F2;
     use fanos_geometry::{Line, Point};
@@ -378,5 +398,36 @@ mod tests {
             "same seed → identical onion (reproducible under the sim)"
         );
         assert_ne!(a.frame, c.frame, "a different seed changes the onion");
+    }
+
+    #[test]
+    fn a_client_built_surb_returns_a_reply_without_exposing_the_coordinate() {
+        use fanos_aphantos::surb::{SurbOutcome, inject_reply, open_reply, process_surb_hop};
+        let client_coord = Point::<F2>::at(6).coords();
+        let mut rclient = RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], fano_directory(), 2, b"surb-session");
+        let combiner = rclient.reply_combiner().unwrap();
+
+        // The client builds a SURB return path; its first hop is a delivery relay ≠ the injecting relay, ≠ self.
+        let (surb, keys) = rclient.build_reply_surb(client_coord).expect("a delivery relay exists");
+        let delivery = surb.first_hop;
+        assert_ne!(delivery, combiner, "the delivery relay is not the injecting relay");
+        assert_ne!(delivery, client_coord, "nor the client itself");
+
+        // The injecting relay attaches a peeled reply (cookie ‖ cell) to the SURB — no coordinate anywhere.
+        let mut reply = rclient.cookie().to_vec();
+        reply.extend_from_slice(b"the-service-cell");
+        let packet = inject_reply(&surb, &reply).unwrap();
+
+        // The delivery relay peels it with its onion secret (regenerated from the directory's seeding) — only it
+        // learns the coordinate — and the client opens the delivered block back to the exact reply.
+        let i = (0..7).find(|&i| Point::<F2>::at(i).coords() == delivery).unwrap();
+        let (delivery_secret, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x0D, i as u8]));
+        match process_surb_hop(&packet, &delivery_secret).unwrap() {
+            SurbOutcome::Deliver { coord, block } => {
+                assert_eq!(coord, client_coord, "only the delivery relay learns the coordinate");
+                assert_eq!(open_reply(&block, &keys).unwrap(), reply, "the client recovers the exact reply");
+            }
+            SurbOutcome::Forward { .. } => panic!("a single-hop SURB delivers, it does not forward"),
+        }
     }
 }
