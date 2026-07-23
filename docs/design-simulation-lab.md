@@ -107,15 +107,17 @@ fleet scale.
 
 ## 3. What the lab does *not* do (honest limits)
 
-- **The fleet is a federation, not a connected network.** Cells are independent coherence domains — there
-  is no cross-cell message routing in the lab yet. This is correct for state inspection and for the
-  availability / partition / DDoS experiments (all intra-cell), and it is *why* coherence works at scale.
-  It means the cross-cell classes — hierarchical routing, partition-**escalation** to a parent, a global
-  adversary spanning cells — are not yet exercisable at fleet scale. Connecting the cells is the next major
-  capability; its one real design question is that `cell_liveness` is coupled to transport points `0..6`, so
-  a connected multi-cell `Sim` needs either that sensing generalised or a federation message-bus with global
-  addressing. The proven seam is `hierarchical_routing.rs` (real RouteHier descent across levels, in one
-  `Sim`).
+- **Coherence and routing are two lenses, deliberately separate.** The federated `Cluster` is the
+  *coherence* lens — cells are independent coherence domains (which is *why* coherence works at scale), so
+  it cannot express cross-cell message routing. The complementary *routing* lens now exists as
+  `Hierarchy` (`fanos-sim/src/hierarchy.rs`): a connected two-level tree on one transport plane with
+  partial routing tables, exercising genuine §L1 up-and-over **descent** and **fault containment** (crash a
+  gateway → its sub-cell is severed, the others untouched — B4/G3). It does *not* model coherence (that is
+  per base cell, transport points `0..6`), and it is a routing-**correctness** substrate at cell-tree scale
+  (transport is one flat plane, so `Join`/heartbeat still flood `O(N²)`), not a 10k-node load test. What
+  remains: deeper trees, partition-**escalation** to a parent, wiring the routing lens into `fanos-lab` as
+  its own command + experiments, and — the one hard change — generalising `cell_liveness` off its `0..6`
+  coupling so a *single* topology could carry both lenses at once.
 - **Fleet-snapshot observability fits availability, not integrity or anonymity.** The snapshot reads
   liveness + coherence + diagnostic verdict, which the availability / partition / DDoS experiments move.
   Byzantine (lying about state) and anonymity (traffic analysis) are about *specific diagnoses* and
