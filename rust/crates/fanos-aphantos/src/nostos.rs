@@ -174,14 +174,39 @@ pub fn seal_to_receiver(
     Ok(out)
 }
 
-/// Seal a full **NOSTOS reply**: end-to-end seal `payload` to the receiver, then wrap it in a
-/// threshold onion over `return_hops` whose final hop is the receiver's dead-drop line `L`.
+/// The 4-byte marker prefixing a NOSTOS dead-drop payload. When a threshold onion delivers a payload
+/// carrying this prefix, the delivery line's combiner **multicasts the remaining bytes** (the
+/// end-to-end sealed reply) to `points_on(line)` — the receiver, hidden 1-of-`(q+1)`, decrypts —
+/// rather than consuming the delivery itself. It marks the *delivery mode*, not the reply content;
+/// reply integrity is the end-to-end AEAD ([`ReplyKeys::open`]), which is why an anonymous sender who
+/// cannot MAC an unknown reply still gets tamper-evidence ("implicit integrity", Kuhn et al. ASIACRYPT'21).
+pub const DEADDROP_TAG: [u8; 4] = *b"NDD1";
+
+/// Wrap an end-to-end-sealed reply body in the dead-drop envelope ([`DEADDROP_TAG`] ‖ body).
+#[must_use]
+pub fn deaddrop_envelope(e2e_ct: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DEADDROP_TAG.len() + e2e_ct.len());
+    out.extend_from_slice(&DEADDROP_TAG);
+    out.extend_from_slice(e2e_ct);
+    out
+}
+
+/// If `payload` is a dead-drop envelope, return its end-to-end body (the bytes after [`DEADDROP_TAG`]);
+/// otherwise `None` (a normal delivery, consumed in place by the delivering line's combiner).
+#[must_use]
+pub fn parse_deaddrop(payload: &[u8]) -> Option<&[u8]> {
+    payload.strip_prefix(&DEADDROP_TAG)
+}
+
+/// Seal a full **NOSTOS reply**: end-to-end seal `payload` to the receiver, wrap it in the dead-drop
+/// envelope, then wrap *that* in a threshold onion over `return_hops` whose final hop is the receiver's
+/// dead-drop line `L`.
 ///
 /// The peer calls this with the reply handle the receiver gave it: `reply_pub` (the [`ReplyKeys`]
 /// public), `return_hops` (the return circuit ending at `L`, built by the receiver so it controls
-/// its own path home), and `threshold`. The delivering line obtains only the end-to-end ciphertext;
-/// it multicasts that to `points_on(L)`, and only the receiver opens it. `seed` MUST be fresh per
-/// reply (see [`seal_to_receiver`] and [`crate::threshold::seal_onion`]).
+/// its own path home), and `threshold`. `L`'s combiner recognizes the [`DEADDROP_TAG`] and multicasts
+/// only the end-to-end ciphertext to `points_on(L)`; only the receiver opens it. `seed` MUST be fresh
+/// per reply (see [`seal_to_receiver`] and [`crate::threshold::seal_onion`]).
 ///
 /// # Errors
 /// Propagates [`ThresholdError`] from the end-to-end seal or the onion build (e.g. [`ThresholdError::TooLong`]
@@ -197,7 +222,10 @@ pub fn seal_reply(
     let e2e_seed = hash_labeled(E2E_SEED_LABEL, seed);
     let onion_seed = hash_labeled(ONION_SEED_LABEL, seed);
     let inner = seal_to_receiver(reply_pub, payload, &e2e_seed)?;
-    seal_onion(return_hops, threshold, &inner, &onion_seed)
+    // The dead-drop envelope tells the delivery line's combiner to multicast the E2E body to the
+    // line's q+1 members (the geometric dead-drop) instead of consuming it.
+    let enveloped = deaddrop_envelope(&inner);
+    seal_onion(return_hops, threshold, &enveloped, &onion_seed)
 }
 
 #[cfg(test)]
@@ -309,21 +337,22 @@ mod tests {
         let partials: Vec<_> = (0..usize::from(t))
             .map(|i| member_partial(&inner_onion, i, &drop[i].0).unwrap())
             .collect();
-        let e2e_ciphertext = match peel_onion_with_shares(&inner_onion, &partials).unwrap() {
+        let delivered = match peel_onion_with_shares(&inner_onion, &partials).unwrap() {
             ThresholdPeel::Deliver { payload, .. } => payload,
             ThresholdPeel::Forward { .. } => panic!("the final hop delivers"),
         };
-
-        // The receiver — one of the q+1 points on L — opens it.
+        // The combiner of L recognizes the dead-drop envelope and multicasts only the E2E body to
+        // points_on(L); the receiver — one of the q+1 — opens it.
+        let e2e_ciphertext = parse_deaddrop(&delivered).expect("the reply is a dead-drop envelope");
         assert_eq!(
-            reply_keys.open(&e2e_ciphertext).as_deref(),
+            reply_keys.open(e2e_ciphertext).as_deref(),
             Some(&payload[..]),
             "the receiver recovers the reply intact",
         );
         // No one else can: neither the combiner nor any other member of L (a different reply key).
         let (foreign_keys, _) = ReplyKeys::generate(b"someone-else");
         assert_eq!(
-            foreign_keys.open(&e2e_ciphertext),
+            foreign_keys.open(e2e_ciphertext),
             None,
             "the delivering line and every non-receiver see only ciphertext",
         );

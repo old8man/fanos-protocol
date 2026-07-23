@@ -40,6 +40,10 @@ use crate::threshold::{self, ThresholdPeel};
 const TAG_ONION: u8 = 0xE0;
 const TAG_REQ: u8 = 0xE1;
 const TAG_REP: u8 = 0xE2;
+/// A NOSTOS **dead-drop cell** the combiner multicasts to a delivery line's members: `TAG_DROP ‖
+/// line(12) ‖ e2e_body`. A member hands the end-to-end body to its application; only the receiver's
+/// reply key opens it (spec §5, NOSTOS).
+const TAG_DROP: u8 = 0xE3;
 
 /// The anonymous-source sentinel in a delivery notification (the endpoint learns no originator).
 pub const ANONYMOUS: Triple = [0, 0, 0];
@@ -71,6 +75,8 @@ struct Pending {
     onion: Vec<u8>,
     shares: Vec<Share>,
     member_count: usize,
+    /// The hop line this combiner is peeling for — the members to multicast a dead-drop delivery to.
+    line: Triple,
 }
 
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
@@ -392,6 +398,7 @@ impl<F: Field> ThresholdRouter<F> {
                 onion,
                 shares,
                 member_count,
+                line,
             },
         );
         // If we already have a threshold (e.g. t = 1), peel now; else await replies until deadline.
@@ -464,6 +471,7 @@ impl<F: Field> ThresholdRouter<F> {
         if pending.shares.len() < self.threshold {
             return None;
         }
+        let line = pending.line;
         let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
         self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
         Some(match peel {
@@ -476,10 +484,18 @@ impl<F: Field> ThresholdRouter<F> {
                 {
                     return Some(Vec::new());
                 }
-                alloc::vec![Effect::Notify(Notification::Delivered {
-                    from: ANONYMOUS,
-                    payload,
-                })]
+                // NOSTOS geometric dead-drop: a delivery whose payload is dead-drop-enveloped is not
+                // consumed here — the combiner multicasts the end-to-end body to this line's `q+1`
+                // members, and the receiver, hidden among them, decrypts. A normal delivery is
+                // notified locally as before. Reply integrity is the end-to-end AEAD, so the holonomy
+                // (which the members do not receive) is not the reply's integrity guarantee here.
+                match crate::nostos::parse_deaddrop(&payload) {
+                    Some(e2e) => self.deaddrop_multicast(line, e2e),
+                    None => alloc::vec![Effect::Notify(Notification::Delivered {
+                        from: ANONYMOUS,
+                        payload,
+                    })],
+                }
             }
             ThresholdPeel::Forward { next, onion } => match Self::combiner_of(next) {
                 Some(c) => {
@@ -491,6 +507,44 @@ impl<F: Field> ThresholdRouter<F> {
                 None => Vec::new(),
             },
         })
+    }
+
+    /// Deliver a NOSTOS dead-drop: multicast the end-to-end body `e2e` to every member of `line`. This
+    /// combiner (itself a member) hands the body to its own application; every other member receives a
+    /// dead-drop cell. Only the receiver's [`ReplyKeys`](crate::nostos::ReplyKeys) opens it, so no node —
+    /// not the combiner, not any member — learns which of the `q+1` is the receiver (spec §5, NOSTOS).
+    fn deaddrop_multicast(&self, line: Triple, e2e: &[u8]) -> Vec<Effect> {
+        let me = self.coord.coords();
+        Self::line_members(line)
+            .into_iter()
+            .map(|member| {
+                if member == me {
+                    Effect::Notify(Notification::Delivered {
+                        from: ANONYMOUS,
+                        payload: e2e.to_vec(),
+                    })
+                } else {
+                    Effect::Send {
+                        to: member,
+                        frame: encode_drop(line, e2e),
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Receive a dead-drop cell as a member of `line`: hand the end-to-end body to our application, which
+    /// tries to open it with its reply key (only the intended receiver succeeds). Ignored if we are not a
+    /// member of `line` — a misrouted or spoofed cell reaches no application.
+    fn on_drop(&self, line: Triple, e2e: Vec<u8>) -> Vec<Effect> {
+        if self.my_index(line).is_some() {
+            alloc::vec![Effect::Notify(Notification::Delivered {
+                from: ANONYMOUS,
+                payload: e2e,
+            })]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -564,6 +618,10 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                 },
                 Some((&TAG_REP, body)) => match decode_rep(body) {
                     Some((req_id, share)) => self.on_reply(req_id, share),
+                    None => Vec::new(),
+                },
+                Some((&TAG_DROP, body)) => match decode_drop(body) {
+                    Some((line, e2e)) => self.on_drop(line, e2e),
                     None => Vec::new(),
                 },
                 _ => Vec::new(),
@@ -643,6 +701,19 @@ fn encode_onion(line: Triple, onion: &[u8]) -> Vec<u8> {
 }
 
 fn decode_onion(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
+    let line = fanos_geometry::decode_triple(body.get(..12)?)?;
+    Some((line, body.get(12..)?.to_vec()))
+}
+
+fn encode_drop(line: Triple, e2e: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 12 + e2e.len());
+    v.push(TAG_DROP);
+    v.extend_from_slice(&fanos_geometry::encode_triple(line));
+    v.extend_from_slice(e2e);
+    v
+}
+
+fn decode_drop(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
     let line = fanos_geometry::decode_triple(body.get(..12)?)?;
     Some((line, body.get(12..)?.to_vec()))
 }
@@ -1150,5 +1221,131 @@ mod tests {
         let (_other, other_pub) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"other-onion"));
         let (surb2, _) = build_surb(&circuit, &[&other_pub], client_coord, b"seed").unwrap();
         assert!(router.peel_surb(&inject_reply(&surb2, b"x").unwrap()).is_none(), "a foreign-keyed SURB does not peel");
+    }
+
+    #[test]
+    fn a_nostos_dead_drop_is_multicast_to_the_delivery_lines_members() {
+        use crate::nostos::{ReplyKeys, seal_reply};
+        // The delivery line L (Fano: 3 members); the receiver R is one of its members, hidden 1-of-3.
+        let l = Line::<F2>::at(1).coords();
+        let members = ThresholdRouter::<F2>::line_members(l);
+        assert_eq!(members.len(), 3);
+        let t = 2usize;
+
+        // Member forward-secure onion keys, in points_on (seal) order.
+        let onion_seed = |i: u8| {
+            let mut s = [0x60u8; 32];
+            s[31] = i;
+            s
+        };
+        let m0 = OnionKeyRatchet::new(onion_seed(0), Epoch::ZERO);
+        let m1 = OnionKeyRatchet::new(onion_seed(1), Epoch::ZERO);
+        let m2 = OnionKeyRatchet::new(onion_seed(2), Epoch::ZERO);
+        let pubs = [m0.public(), m1.public(), m2.public()];
+
+        // Seal a NOSTOS reply whose sole (delivery) hop is L.
+        let (reply_keys, reply_pub) = ReplyKeys::generate(b"nostos-reply");
+        let hops = [HopLine { line: l, members: &pubs }];
+        let payload = b"the homecoming";
+        let onion = seal_reply(&reply_pub, &hops, t as u8, payload, b"fresh-seed").unwrap();
+
+        // Drive the combiner (member 0) to the dead-drop delivery: onion seeds its share, then member
+        // 1's partial reaches t = 2 and it peels.
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"combiner-id"));
+        let mut router = ThresholdRouter::<F2>::new(combiner, &identity, t, onion_seed(0));
+        router.step(
+            Instant(0),
+            Input::Message { from: [9, 9, 9], frame: launch_frame(l, &onion) },
+        );
+        let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
+        let effects = router.step(
+            Instant(1),
+            Input::Message { from: members[1], frame: encode_rep(0, &honest1) },
+        );
+
+        // The combiner did NOT consume the delivery: it handed the body to its own app once (a Notify)
+        // and sent a dead-drop cell to each OTHER member — a multicast over all q+1 = 3.
+        let notifies: Vec<&[u8]> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Notify(Notification::Delivered { payload, .. }) => Some(payload.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notifies.len(), 1, "the combiner hands the body to its own app exactly once");
+        assert_eq!(
+            reply_keys.open(notifies[0]).as_deref(),
+            Some(&payload[..]),
+            "the end-to-end body the combiner sees opens only with the receiver's reply key",
+        );
+
+        let mut drop_dests = Vec::new();
+        for e in &effects {
+            if let Effect::Send { to, frame } = e {
+                let (tag, body) = frame.split_first().unwrap();
+                assert_eq!(*tag, TAG_DROP, "a multicast cell is a dead-drop frame");
+                let (line, e2e_body) = decode_drop(body).unwrap();
+                assert_eq!(line, l, "the cell names the delivery line");
+                assert_eq!(
+                    reply_keys.open(&e2e_body).as_deref(),
+                    Some(&payload[..]),
+                    "every member receives the same openable body",
+                );
+                drop_dests.push(*to);
+            }
+        }
+        drop_dests.sort_unstable();
+        let mut expected = alloc::vec![members[1], members[2]];
+        expected.sort_unstable();
+        assert_eq!(
+            drop_dests, expected,
+            "the dead-drop is multicast to every other member of L (the combiner keeps its own copy)",
+        );
+    }
+
+    #[test]
+    fn a_dead_drop_cell_delivers_to_a_line_member_and_a_non_member_ignores_it() {
+        use crate::nostos::{ReplyKeys, seal_to_receiver};
+        let l = Line::<F2>::at(1).coords();
+        let line = Line::<F2>::new(l).unwrap();
+        let members = ThresholdRouter::<F2>::line_members(l);
+
+        // A dead-drop cell carrying an end-to-end body for the receiver.
+        let (reply_keys, reply_pub) = ReplyKeys::generate(b"rk-drop");
+        let payload = b"drop me home";
+        let e2e = seal_to_receiver(&reply_pub, payload, b"e2e").unwrap();
+        let cell = encode_drop(l, &e2e);
+
+        // A router at a member coordinate of L hands the body to its application.
+        let (id_r, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"id-r"));
+        let mut member = ThresholdRouter::<F2>::new(Point::<F2>::new(members[1]).unwrap(), &id_r, 2, [0x1; 32]);
+        let delivered = member.step(
+            Instant(0),
+            Input::Message { from: [0, 0, 0], frame: cell.clone() },
+        );
+        let body = match delivered.as_slice() {
+            [Effect::Notify(Notification::Delivered { payload, .. })] => payload.clone(),
+            _ => panic!("a member delivers the dead-drop body to its app"),
+        };
+        assert_eq!(
+            reply_keys.open(&body).as_deref(),
+            Some(&payload[..]),
+            "the receiver opens its reply from the delivered body",
+        );
+
+        // A router NOT on L ignores the cell entirely.
+        let off_line = (0..Plane::<F2>::N as usize)
+            .map(Point::<F2>::at)
+            .find(|p| !p.is_on(&line))
+            .unwrap();
+        let (id_x, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"id-x"));
+        let mut outsider = ThresholdRouter::<F2>::new(off_line, &id_x, 2, [0x2; 32]);
+        assert!(
+            outsider
+                .step(Instant(0), Input::Message { from: [0, 0, 0], frame: cell })
+                .is_empty(),
+            "a node not on the line ignores a dead-drop cell addressed to that line",
+        );
     }
 }
