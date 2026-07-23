@@ -23,6 +23,7 @@ pub mod address;
 #[cfg(feature = "aead")]
 pub mod aead;
 pub mod beacon;
+pub mod codec;
 pub mod epoch;
 pub mod hash;
 pub mod keys;
