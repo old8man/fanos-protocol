@@ -158,22 +158,28 @@ pub fn leader_ticket(vrf_output: &VrfOutput, seed: &BeaconSeed, height: u64, rou
 }
 
 /// Verify a proposer's ticket **witness** and return its ticket value, or `None` if the witness is
-/// invalid. The proposer presents its Merkle-VRF `output` + `proof` at index `height`, checked
-/// against its pre-registered `root` (`vrf_height` = the registered tree height). Only a verified
-/// witness yields a ticket, so a min-over-verified-proposals comparison admits no forged or
-/// grindable ticket. The Merkle-VRF index is the block `height` (the sortition domain is per
-/// registration; the registrar sizes `vrf_height` to cover the heights it serves).
+/// invalid. The proposer presents its Merkle-VRF `output` + `proof` at `vrf_index`, checked against
+/// its pre-registered `root` (`vrf_height` = the registered tree height). Only a verified witness
+/// yields a ticket, so a min-over-verified-proposals comparison admits no forged or grindable ticket.
+///
+/// `vrf_index` is the **per-registration domain index** (e.g. `height − epoch_base`), kept distinct
+/// from the absolute `height`/`round` the ticket hash binds: the VRF tree has `2^vrf_height` leaves,
+/// so a long chain uses a *bounded* domain re-registered each epoch (the sound scaling — an absolute
+/// height index would eventually exhaust `MAX_HEIGHT = 24` and OOM the tree). The hash still binds the
+/// absolute `height` so tickets never collide across epochs that reuse a relative index.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // eight distinct cryptographic inputs; bundling them would be artificial
 pub fn verify_leader_ticket(
     root: &[u8; 32],
     vrf_height: u32,
+    vrf_index: u64,
     seed: &BeaconSeed,
     height: u64,
     round: u32,
     vrf_output: &VrfOutput,
     proof: &MerkleProof,
 ) -> Option<[u8; 32]> {
-    if !pqvrf::verify(root, vrf_height, height, vrf_output, proof) {
+    if !pqvrf::verify(root, vrf_height, vrf_index, vrf_output, proof) {
         return None;
     }
     Some(leader_ticket(vrf_output, seed, height, round))
@@ -294,16 +300,16 @@ mod tests {
         let root = secret.root();
         let (height, round) = (5u64, 0u32);
         let (output, proof) = secret.prove(height).unwrap();
-        // A valid witness yields exactly the direct ticket value.
+        // A valid witness (vrf_index = height here, base 0) yields exactly the direct ticket value.
         assert_eq!(
-            verify_leader_ticket(&root, vrf_height, &SEED, height, round, &output, &proof),
+            verify_leader_ticket(&root, vrf_height, height, &SEED, height, round, &output, &proof),
             Some(leader_ticket(&output, &SEED, height, round)),
         );
         // A wrong registered root rejects (can't borrow another member's identity).
-        assert_eq!(verify_leader_ticket(&[0u8; 32], vrf_height, &SEED, height, round, &output, &proof), None);
-        // A witness proving a DIFFERENT index does not verify at this height (no index substitution).
+        assert_eq!(verify_leader_ticket(&[0u8; 32], vrf_height, height, &SEED, height, round, &output, &proof), None);
+        // A witness proving a DIFFERENT index does not verify at this index (no index substitution).
         let (other_out, other_proof) = secret.prove(height + 1).unwrap();
-        assert_eq!(verify_leader_ticket(&root, vrf_height, &SEED, height, round, &other_out, &other_proof), None);
+        assert_eq!(verify_leader_ticket(&root, vrf_height, height, &SEED, height, round, &other_out, &other_proof), None);
     }
 
     #[test]

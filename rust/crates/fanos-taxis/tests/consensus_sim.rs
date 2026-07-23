@@ -14,7 +14,8 @@ use fanos_code::lrc::is_recoverable_fano;
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
-use fanos_taxis::committee::{epoch_seal_line, leader, line_members};
+use fanos_taxis::committee::{epoch_seal_line, leader, leader_line, leader_ticket, line_members};
+use fanos_vrf::pqvrf::MerkleVrfSecret;
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
@@ -34,6 +35,29 @@ const EPOCH: Epoch = Epoch::new(1);
 const ALICE: [u8; 32] = [0xA1; 32];
 const BOB: [u8; 32] = [0xB0; 32];
 const CAROL: [u8; 32] = [0xCA; 32];
+/// The SSLE Merkle-VRF tree height (domain `2^6 = 64` heights per registration — ample for these tests).
+const VRF_HEIGHT: u32 = 6;
+
+/// A deterministic per-validator Merkle-VRF seed (distinct per index, so tickets are independent draws).
+fn vrf_seed(i: usize) -> [u8; 32] {
+    let mut s = [0u8; 32];
+    s[0] = 0x5A;
+    s[1] = i as u8;
+    s
+}
+
+/// The independently-recomputed SSLE winner: the elected line member with the lowest ticket at `(height, 0)`.
+fn expected_ssle_leader(height: u64) -> u8 {
+    let members = line_members(leader_line(&SEED, height, 0));
+    members
+        .into_iter()
+        .min_by_key(|&m| {
+            let secret = MerkleVrfSecret::generate(&vrf_seed(m), VRF_HEIGHT).unwrap();
+            let (output, _) = secret.prove(height).unwrap();
+            leader_ticket(&output, &SEED, height, 0)
+        })
+        .unwrap() as u8
+}
 
 /// One validator's key material (signature + KEM).
 struct Keys {
@@ -214,6 +238,19 @@ impl Cluster {
         self.partition = vec![0; N];
     }
 
+    /// Register a Merkle-VRF root per validator and enable **secret-leader sortition** (SSLE) on every engine,
+    /// over a `2^VRF_HEIGHT` domain based at height 0. Returns the registered roots. After this, round 0 is the
+    /// min-ticket lottery over the elected line instead of the public deterministic leader.
+    fn enable_sortition_all(&mut self) -> Vec<[u8; 32]> {
+        let roots: Vec<[u8; 32]> =
+            (0..N).map(|i| MerkleVrfSecret::generate(&vrf_seed(i), VRF_HEIGHT).unwrap().root()).collect();
+        for i in 0..N {
+            let secret = MerkleVrfSecret::generate(&vrf_seed(i), VRF_HEIGHT).unwrap();
+            self.engines[i].enable_sortition(secret, roots.clone(), 0);
+        }
+        roots
+    }
+
     /// Drain the bus to quiescence.
     fn run(&mut self) {
         let mut guard = 0;
@@ -316,6 +353,80 @@ fn a_transaction_finalizes_and_executes_in_agreed_order() {
         assert_eq!(e.chain().state().balance(&BOB), 100);
         assert_eq!(e.chain().state_root(), root, "all replicas agree on the state root");
     }
+}
+
+#[test]
+fn ssle_the_secret_min_ticket_line_member_leads_and_finalizes() {
+    // Secret-leader election: with sortition enabled, EVERY elected-line member proposes (all-propose), and
+    // the cell prepares+finalizes the LOWEST-ticket proposal — the secret leader, unknown until it proposes.
+    // The finalized proposer must be the independently-recomputed min-ticket winner, and its block must carry
+    // a valid sortition witness. Safety/finality are the standard PBFT flow; only WHO leads changes.
+    let mut c = Cluster::new(&genesis());
+    c.enable_sortition_all();
+    for e in &c.engines {
+        assert!(e.sortition_enabled());
+    }
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"ssle0");
+    c.submit_all(&tx);
+    c.tick(); // all line members propose; the all-collected early-exit prepares the min-ticket in this tick.
+
+    // Height 0 finalized, unanimously and on one block (agreement) — the collection window did not split votes.
+    assert_eq!(c.honest_count_at(0), N, "every honest validator finalizes the secret-leader block at height 0");
+    assert_eq!(c.hashes_at(0).len(), 1, "all validators agree on one block at height 0");
+
+    // The finalized block was proposed by the min-ticket winner (a genuine line member), and carries its witness.
+    let finalized = c.hashes_at(0).into_iter().next().unwrap();
+    let block = c.proposed.iter().find(|b| b.hash() == finalized).unwrap();
+    let members = line_members(leader_line(&SEED, 0, 0));
+    assert!(members.contains(&usize::from(block.header.proposer)), "the secret leader is an elected line member");
+    assert_eq!(block.header.proposer, expected_ssle_leader(0), "the finalized proposer is the lowest-ticket member");
+    assert!(block.witness.is_some(), "a round-0 secret-leader block carries its Merkle-VRF ticket witness");
+
+    // The anti-MEV transfer still executed in agreed order (SSLE composes with the rest of the pipeline).
+    for e in &c.engines {
+        assert_eq!(e.chain().state().balance(&ALICE), 900);
+        assert_eq!(e.chain().state().balance(&BOB), 100);
+    }
+}
+
+#[test]
+fn ssle_leadership_is_secret_valued_and_not_the_public_schedule() {
+    // Over several heights the secret min-ticket leader is a line member each time, differs from the PUBLIC
+    // deterministic leader at least sometimes (so sortition genuinely hides/reshuffles leadership, not a
+    // relabelling of the same schedule), and never forks. Interleave timeouts so a height whose min-ticket
+    // winner is unlucky still advances via the public fallback.
+    let mut c = Cluster::new(&genesis());
+    c.enable_sortition_all();
+
+    for h in 0..5u64 {
+        let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 1, nonce: h }, &[b'h', h as u8]);
+        c.submit_all(&tx);
+        c.tick();
+        c.timeout();
+    }
+
+    let reached = c.engines[0].chain().next_height();
+    assert!(reached >= 3, "the SSLE cell makes progress across heights, reached {reached}");
+    let mut differed_from_public = false;
+    for h in 0..reached {
+        // No fork at any height.
+        assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
+        if let Some(hash) = c.hashes_at(h).into_iter().next()
+            && let Some(block) = c.proposed.iter().find(|b| b.hash() == hash)
+        {
+            // A round-0 (witnessed) block must be led by the min-ticket line member; a public-fallback block
+            // (no witness, from a view change) is led by the deterministic leader — both are line members.
+            if block.witness.is_some() {
+                assert_eq!(block.header.proposer, expected_ssle_leader(h), "height {h}: min-ticket leader");
+                assert!(line_members(leader_line(&SEED, h, 0)).contains(&usize::from(block.header.proposer)));
+                if block.header.proposer != leader(&SEED, h, 0) as u8 {
+                    differed_from_public = true;
+                }
+            }
+        }
+    }
+    assert!(differed_from_public, "the secret leader must diverge from the public schedule on some height");
 }
 
 #[test]

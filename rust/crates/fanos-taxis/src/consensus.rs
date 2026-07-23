@@ -28,10 +28,14 @@ use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_primitives::shamir::Share;
 use fanos_primitives::{BeaconSeed, Epoch, codec};
 
-use crate::block::Block;
+use fanos_vrf::pqvrf::MerkleVrfSecret;
+
+use crate::block::{Block, LeaderWitness};
 use crate::chain::Chain;
 use crate::checkpoint::{ExecCertificate, ExecVote};
-use crate::committee::{epoch_seal_line, leader, line_members};
+use crate::committee::{
+    epoch_seal_line, is_line_member, leader, leader_line, line_members, verify_leader_ticket,
+};
 use crate::incentive::{detect_equivocation, distribute, SlashEvidence};
 use crate::params::CellParams;
 use crate::state::StateMachine;
@@ -372,6 +376,42 @@ pub enum Output {
     },
 }
 
+/// The **secret-leader sortition** configuration a validator runs in round 0 (SSLE, spec §10.1,
+/// `docs/design-taxis.md` §4.2). When present, round 0 is the min-ticket lottery over the elected line
+/// ([`committee::leader_ticket`](crate::committee::leader_ticket)); when absent the engine uses the public
+/// deterministic [`leader`] for round 0 as well — the pre-SSLE protocol, kept as a safe default.
+///
+/// The VRF domain is **bounded and re-registered per epoch**: `secret` proves this validator's ticket at
+/// index `height − base`, and `roots[i]` is validator `i`'s pre-registered root (verified with the same
+/// index). A validator registers its root strictly *before* the epoch beacon it will be used with — the
+/// anti-grinding fence — which FANOS's epoch clock provides.
+pub struct Sortition {
+    /// This validator's Merkle-VRF secret (proves its own ticket witness).
+    secret: MerkleVrfSecret,
+    /// Validator `i`'s pre-registered Merkle-VRF root (verifies its ticket witness); indexed like `verifiers`.
+    roots: Vec<[u8; 32]>,
+    /// The registered tree height (domain `2^height`); all roots share it (a per-epoch protocol constant).
+    height: u32,
+    /// The chain height at VRF index 0 — the current registration's base, so `index = height − base`.
+    base: u64,
+}
+
+impl Sortition {
+    /// The VRF domain index for chain `height`: `height − base`, or `None` if `height` is below the base or
+    /// beyond this registration's `2^height` domain (the epoch must re-register before that — a graceful
+    /// round-0 abstention, never a panic).
+    fn index_for(&self, height: u64) -> Option<u64> {
+        let idx = height.checked_sub(self.base)?;
+        (idx < (1u64 << self.height)).then_some(idx)
+    }
+}
+
+/// How long a replica waits (in driver ticks) to collect the elected line's proposals before preparing the
+/// lowest-ticket one, when it has *not* already seen all line members propose. The all-members early-exit
+/// makes the happy path prepare with no added tick; this Δ_prio only binds when a member is slow/down, and
+/// is deliberately short (one tick) so a single silent line member costs one tick, not a full round timeout.
+const COLLECT_WINDOW_TICKS: u32 = 1;
+
 /// One validator's sans-I/O consensus engine over a state machine `S`.
 pub struct ConsensusEngine<S: StateMachine> {
     params: CellParams,
@@ -396,6 +436,17 @@ pub struct ConsensusEngine<S: StateMachine> {
     sent_prepare: BTreeSet<u32>,
     sent_commit: BTreeSet<u32>,
     locked_block: Option<[u8; 32]>,
+    // ── Secret-leader sortition (SSLE, round 0 only; `None` ⇒ the public-leader default) ──
+    // The registered VRF config (my secret + all validators' roots). Set by `enable_sortition`.
+    sortition: Option<Sortition>,
+    // Round-0 collected proposals at the current height: proposer index → (ticket, block_hash). Every valid
+    // line-member proposal is buffered here (all-propose); the LOWEST ticket is prepared when the collection
+    // window closes. Reset per height.
+    round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
+    // Ticks elapsed since the round-0 collection window opened (the first proposal was buffered), or `None`
+    // while it has not opened. The window closes — and the min-ticket is prepared — at `COLLECT_WINDOW_TICKS`
+    // or when all line members have proposed (early exit), whichever comes first. Reset per height.
+    round0_window: Option<u32>,
     // Anti-MEV reveal collection + execution queue.
     // `reveals`: validated share openings, keyed by (commit, revealing member) — first-writer-wins per member,
     // so a member cannot overwrite another's slot nor change its own. `pending_reveals`: authenticated-but-not-
@@ -464,6 +515,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sent_prepare: BTreeSet::new(),
             sent_commit: BTreeSet::new(),
             locked_block: None,
+            sortition: None,
+            round0_tickets: BTreeMap::new(),
+            round0_window: None,
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
             exec_queue: Vec::new(),
@@ -475,6 +529,28 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_heads: BTreeMap::new(),
             reward_per_block: 0,
         }
+    }
+
+    /// **Enable secret-leader sortition** (SSLE) for round 0: register this validator's Merkle-VRF `secret`
+    /// and every validator's pre-registered `roots` (indexed like the signature `verifiers`), over a domain
+    /// whose index-0 sits at chain height `base`. From now on round 0 is the min-ticket lottery
+    /// ([`committee::leader_ticket`](crate::committee::leader_ticket)) — all line members propose, the lowest
+    /// ticket leads — instead of the public deterministic [`leader`]. Rounds ≥ 1 are unchanged (the public
+    /// fallback). Called at genesis and re-called each epoch to rotate the bounded VRF domain (fresh `secret`,
+    /// `roots`, and `base`), which is also the anti-grinding registration fence.
+    ///
+    /// `roots.len()` should match the validator set; a proposer whose index is out of range simply fails
+    /// witness verification (its proposal is ignored), so a short/garbled registry degrades to fewer eligible
+    /// proposers, never to unsafety.
+    pub fn enable_sortition(&mut self, secret: MerkleVrfSecret, roots: Vec<[u8; 32]>, base: u64) {
+        let height = secret.height();
+        self.sortition = Some(Sortition { secret, roots, height, base });
+    }
+
+    /// Whether this validator is running round-0 secret-leader sortition (vs the public-leader default).
+    #[must_use]
+    pub fn sortition_enabled(&self) -> bool {
+        self.sortition.is_some()
     }
 
     /// Set the per-block reward pool `F` distributed to a block's commit-certificate signers on finalization
@@ -569,6 +645,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         match input {
             Input::Tick => {
                 let mut out = self.maybe_propose();
+                out.extend(self.tick_round0_window());
                 out.extend(self.maybe_request_sync());
                 out
             }
@@ -664,35 +741,84 @@ impl<S: StateMachine> ConsensusEngine<S> {
         alloc::vec![Output::Committed { height, block_hash: head }]
     }
 
-    /// Propose a block if this validator is the current-round leader and has not yet proposed this round.
+    /// Propose a block if this validator is entitled to propose this `(height, round)` and has not yet done so.
+    ///
+    /// Entitlement depends on the round mode:
+    /// * **SSLE round 0** — *every* elected-line member proposes (the all-propose min-ticket lottery), each
+    ///   attaching its Merkle-VRF sortition [`LeaderWitness`]. Replicas rank the proposals by ticket and
+    ///   prepare the lowest; the winner stays secret until it broadcasts, so no adversary can pre-aim at the
+    ///   single upcoming proposer.
+    /// * **otherwise** (round ≥ 1, or sortition disabled) — only the single public deterministic [`leader`]
+    ///   proposes, with no witness. This is the pre-SSLE protocol, the safe fallback a view change lands on.
     fn maybe_propose(&mut self) -> Vec<Output> {
         let height = self.height();
-        if leader(&self.seed, height, self.round) as u8 != self.me {
+        let sortition_round0 = self.sortition.is_some() && self.round == 0;
+        let entitled = if sortition_round0 {
+            is_line_member(&self.seed, height, 0, usize::from(self.me))
+        } else {
+            leader(&self.seed, height, self.round) as u8 == self.me
+        };
+        if !entitled || self.proposed_round == Some(self.round) {
             return Vec::new();
         }
-        if self.proposed_round == Some(self.round) {
-            return Vec::new();
-        }
-        self.proposed_round = Some(self.round);
         // Order the mempool blindly by commitment (the proposer never sees contents — anti-MEV).
         let mut sealed = self.mempool.clone();
         sealed.sort_by_key(SealedTx::commit);
-        let block = Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed);
-        // The proposer's own proposal is delivered back to it by the driver, so it prepares like everyone
-        // else; here it only broadcasts.
+        let mut block = Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed);
+        // SSLE round 0: attach my sortition ticket witness. If I cannot prove it (the bounded VRF domain was
+        // exhausted before the epoch re-registered), abstain this round rather than broadcast an un-rankable
+        // block — a graceful degradation to the remaining eligible proposers, never a stall of the whole line.
+        if sortition_round0 {
+            let Some(witness) = self.leader_witness(height) else {
+                return Vec::new();
+            };
+            block = block.with_witness(witness);
+        }
+        self.proposed_round = Some(self.round);
+        // The proposer's own proposal is delivered back to it by the driver, so it ranks/prepares like every
+        // other member; here it only broadcasts.
         alloc::vec![Output::Send(ConsensusMsg::Propose(block))]
     }
 
-    /// Validate a proposal and, if it is available and well-formed, prepare it.
+    /// Build this validator's round-0 sortition witness for `height` (its Merkle-VRF `output` + Merkle proof at
+    /// the per-epoch domain index `height − base`). `None` if sortition is disabled or the domain is exhausted.
+    fn leader_witness(&self, height: u64) -> Option<LeaderWitness> {
+        let s = self.sortition.as_ref()?;
+        let index = s.index_for(height)?;
+        let (output, proof) = s.secret.prove(index)?;
+        Some(LeaderWitness { output, proof })
+    }
+
+    /// Verify a round-0 proposal's sortition witness and return its ticket (`None` if absent/invalid). The
+    /// witness is checked against the proposer's *pre-registered* root at the same per-epoch domain index, so a
+    /// forged or grindable ticket cannot enter the min-ticket ranking.
+    fn verify_witness(&self, block: &Block) -> Option<[u8; 32]> {
+        let s = self.sortition.as_ref()?;
+        let witness = block.witness.as_ref()?;
+        let height = block.header.height;
+        let index = s.index_for(height)?;
+        let root = s.roots.get(usize::from(block.header.proposer))?;
+        verify_leader_ticket(root, s.height, index, &self.seed, height, self.round, &witness.output, &witness.proof)
+    }
+
+    /// Validate a proposal and either prepare it (round ≥ 1 / no sortition) or buffer it into the round-0
+    /// min-ticket lottery (SSLE). Every validity gate — proposer entitlement, link, structure, anti-MEV seal,
+    /// data-availability — is applied identically in both modes *before* a proposal can influence the outcome.
     fn on_propose(&mut self, block: Block, shards: &DaShards) -> Vec<Output> {
         let height = self.height();
         let bh = block.hash();
-        // Structural + leader + link checks.
-        let correct_leader = leader(&self.seed, height, self.round) as u8 == block.header.proposer;
+        let sortition_round0 = self.sortition.is_some() && self.round == 0;
+        // Proposer entitlement: SSLE round 0 admits *any* elected-line member (all-propose); otherwise only
+        // the single public deterministic leader. Plus the usual link + structure checks.
+        let proposer_ok = if sortition_round0 {
+            is_line_member(&self.seed, height, 0, usize::from(block.header.proposer))
+        } else {
+            leader(&self.seed, height, self.round) as u8 == block.header.proposer
+        };
         let links = block.header.height == height
             && block.header.parent == self.chain.head()
             && block.header.epoch == self.epoch;
-        if !correct_leader || !links || !block.verify_structure() {
+        if !proposer_ok || !links || !block.verify_structure() {
             if block.header.height > height {
                 self.note_height(block.header.height); // a proposal for a height ahead of us — we are behind
             }
@@ -712,14 +838,43 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if block.reconstruct_payload(shards).is_none() {
             return Vec::new();
         }
+        // SSLE round 0: the proposal must carry a valid sortition witness (verified against the proposer's
+        // registered root). Computed here — AFTER the availability/seal gates, exactly as for a public block —
+        // so a witness probe cannot be answered faster than a genuine proposal. An unverifiable witness ⇒ ignore.
+        let ticket = if sortition_round0 {
+            let Some(t) = self.verify_witness(&block) else {
+                return Vec::new();
+            };
+            Some(t)
+        } else {
+            None
+        };
         // Remember the (valid, available) block body so we can finalize it later even if a conflicting
         // proposal arrives afterwards (equivocation) — keyed by hash, never overwritten by a different block.
+        let proposer = block.header.proposer;
         self.proposals.entry(bh).or_insert(block);
         // If we already hold a commit certificate for this height+block but were waiting on the body (an async
         // scheduler delivered the CC first), finalize now instead of staying wedged (audit fix, HIGH 3).
         if self.pending_finalize.get(&height) == Some(&bh) {
             return self.finalize(bh);
         }
+        if let Some(ticket) = ticket {
+            // Round-0 lottery: buffer the ticket and (re)open the collection window. Do NOT prepare yet —
+            // preparing the first proposal seen would let honest replicas split their PREPAREs across different
+            // members and stall the round. We prepare the LOWEST ticket once the window closes.
+            self.round0_tickets.entry(proposer).or_insert((ticket, bh));
+            if self.round0_window.is_none() {
+                self.round0_window = Some(0);
+            }
+            // Early exit: once every elected line member has proposed, the min is final — prepare immediately,
+            // so the happy path adds no waiting beyond proposal propagation.
+            let line_size = line_members(leader_line(&self.seed, height, 0)).len();
+            if self.round0_tickets.len() >= line_size {
+                return self.prepare_round0_min();
+            }
+            return Vec::new();
+        }
+        // Round ≥ 1 (or sortition disabled): the single-leader immediate prepare (the pre-SSLE path, unchanged).
         // Safety lock: never prepare a block conflicting with the one we are locked on this height.
         if let Some(locked) = self.locked_block
             && locked != bh
@@ -735,6 +890,49 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let mut out = self.accept_vote(sv.clone());
         out.push(Output::Send(ConsensusMsg::Vote(sv)));
         out
+    }
+
+    /// Prepare the **lowest-ticket** round-0 proposal collected so far — the elected secret leader. Called on
+    /// the collection-window early-exit (all line members proposed) or its tick expiry. Prepare-once per round
+    /// 0 and lock-respecting, so it composes with the standard PBFT prepare→commit→finalize flow unchanged: the
+    /// min-ticket only decides *which* block this validator PREPAREs; everything after is byte-for-byte classical.
+    fn prepare_round0_min(&mut self) -> Vec<Output> {
+        if self.round != 0 || self.sent_prepare.contains(&0) {
+            return Vec::new();
+        }
+        let Some((_, bh)) = self.round0_tickets.values().min_by_key(|&&(t, _)| t).copied() else {
+            return Vec::new(); // nothing collected yet
+        };
+        // Respect the Tendermint lock (a no-op in round 0 — no prior lock can exist — but kept for uniformity).
+        if let Some(locked) = self.locked_block
+            && locked != bh
+        {
+            return Vec::new();
+        }
+        self.sent_prepare.insert(0);
+        let vote =
+            Vote { height: self.height(), round: 0, block_hash: bh, phase: Phase::Prepare, voter: self.me };
+        let sv = SignedVote::sign(vote, &self.signer);
+        let mut out = self.accept_vote(sv.clone());
+        out.push(Output::Send(ConsensusMsg::Vote(sv)));
+        out
+    }
+
+    /// Advance the round-0 collection window on a tick: once it has been open for `COLLECT_WINDOW_TICKS`, prepare
+    /// the lowest ticket collected (the Δ_prio expiry that covers a slow/down line member). A no-op outside
+    /// round 0, after this validator has already prepared, or before any proposal has opened the window.
+    fn tick_round0_window(&mut self) -> Vec<Output> {
+        if self.round != 0 || self.sent_prepare.contains(&0) {
+            return Vec::new();
+        }
+        let Some(w) = self.round0_window else {
+            return Vec::new(); // not opened — no round-0 proposal buffered yet
+        };
+        self.round0_window = Some(w + 1);
+        if w + 1 >= COLLECT_WINDOW_TICKS && !self.round0_tickets.is_empty() {
+            return self.prepare_round0_min();
+        }
+        Vec::new()
     }
 
     /// Ingest a vote, store it (de-duplicated), and drive the phase transitions it may complete.
@@ -945,6 +1143,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.sent_prepare.clear();
         self.sent_commit.clear();
         self.locked_block = None;
+        // Round-0 sortition working state (the registered VRF config in `sortition` persists across heights).
+        self.round0_tickets.clear();
+        self.round0_window = None;
     }
 
     /// Emit this validator's share openings for every transaction in a just-finalized block it helped seal.
