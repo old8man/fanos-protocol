@@ -8,12 +8,12 @@
 //! [`RdvRegister`](fanos_wire::FrameType::RdvRegister) frame carrying the 16-byte cookie), names that
 //! relay's line as its reply circuit's last hop, and the relay forwards each anonymous reply it peels —
 //! tagged by that cookie — to the client's real coordinate as an [`RdvReply`](fanos_wire::FrameType::RdvReply).
-//! This is Tor's rendezvous-point model. In the **legacy** mode the relay learns the client's coordinate
-//! (which the client chose) but never the service. That coordinate is the residual **S1-H3** leak: a relay
-//! colluding with the exit re-links client ↔ target. So a client may instead register a **SURB** — a
-//! [`Surb`](fanos_aphantos::surb::Surb) carried in the same `RdvRegister` — and the relay injects each reply
-//! into that pre-sealed return path, learning only its first hop, never the coordinate. Both modes coexist
-//! (backward-compatible); the SURB mode is the one that closes the correlator (`docs/design-surb.md`).
+//! This is Tor's rendezvous-point model, and it is the **bare-proxy fallback**: the relay learns the
+//! client's coordinate (which the client chose) but never the service. The stronger, primary path — where
+//! the client's coordinate never leaves its node at all — is **NOSTOS** ([`fanos_aphantos::nostos`]): a
+//! full cell-node client receives its replies as a member of its own beacon-blinded dead-drop line, needing
+//! no relay and exposing no coordinate. This relay serves only the residual case of a client that cannot be
+//! a line member. (It supersedes the earlier single-relay SURB, now retired.)
 //!
 //! **Shared by cookie.** One combiner relays for *many* clients at once: each reply carries the
 //! [`RendezvousService`](fanos_rendezvous::RendezvousService)'s 16-byte session-cookie prefix
@@ -30,7 +30,6 @@
 use std::collections::BTreeMap;
 
 use fanos_aphantos::ThresholdRouter;
-use fanos_aphantos::surb::{Surb, SurbOutcome, inject_reply};
 use fanos_aphantos::threshold_router::ANONYMOUS;
 use fanos_field::Field;
 use fanos_geometry::Triple;
@@ -38,26 +37,16 @@ use fanos_rendezvous::SessionId;
 use fanos_runtime::{Effect, Engine, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
-/// How the relay forwards a session's anonymous replies once it peels one at its combiner.
-enum Registration {
-    /// Legacy (audit #54): forward the reply directly to this coordinate — the relay learns it (the S1-H3
-    /// leak this exists to phase out). Registered by a bare-cookie `RdvRegister`.
-    Coord(Triple),
-    /// SURB (audit §5 S1-H3): inject the reply into this pre-sealed return path, so the relay learns only the
-    /// first return hop, never the client's coordinate. Registered by a `RdvRegister` carrying a [`Surb`].
-    /// Boxed so the enum stays small (a SURB holds a full-onion header).
-    Reply(Box<Surb>),
-}
-
 /// A rendezvous relay: a [`ThresholdRouter`] plus a table of the clients whose anonymous replies it
 /// forwards, keyed by each client's session cookie. Construct it at a **combiner** coordinate (the relay's
 /// line's combiner).
 pub struct RendezvousRelay<F: Field> {
     router: ThresholdRouter<F>,
-    /// `cookie → how to forward its replies` — a peeled reply prefixed with `cookie` is either sent directly
-    /// (legacy [`Coord`](Registration::Coord)) or injected into a SURB return path
-    /// ([`Reply`](Registration::Reply)).
-    registrations: BTreeMap<SessionId, Registration>,
+    /// `cookie → client coordinate`: a peeled reply prefixed with `cookie` is forwarded straight to the
+    /// registered coordinate as an [`RdvReply`](fanos_wire::FrameType::RdvReply). The relay learns that
+    /// coordinate — the **bare-proxy fallback**; a full cell-node client uses NOSTOS instead and never
+    /// registers here (its coordinate never leaves its node).
+    registrations: BTreeMap<SessionId, Triple>,
 }
 
 impl<F: Field> RendezvousRelay<F> {
@@ -71,14 +60,10 @@ impl<F: Field> RendezvousRelay<F> {
         }
     }
 
-    /// The coordinate registered for `cookie`, if any — only for a **legacy** coordinate registration; a SURB
-    /// registration returns `None`, precisely because the relay does not learn the client's coordinate (S1-H3).
+    /// The coordinate registered for `cookie` (the bare-proxy fallback), if any.
     #[must_use]
     pub fn client_for(&self, cookie: &SessionId) -> Option<Triple> {
-        match self.registrations.get(cookie) {
-            Some(Registration::Coord(coord)) => Some(*coord),
-            _ => None,
-        }
+        self.registrations.get(cookie).copied()
     }
 
     /// The number of client sessions currently registered.
@@ -118,17 +103,11 @@ impl<F: Field> RendezvousRelay<F> {
                         .and_then(|c| <SessionId>::try_from(c).ok())
                         .and_then(|cookie| self.registrations.get(&cookie))
                     {
-                        // Legacy: send the reply straight to the registered coordinate (the relay knows it).
-                        Some(Registration::Coord(client)) => {
+                        // Forward the reply straight to the registered coordinate (the bare-proxy fallback):
+                        // the relay knows the client's coordinate but never the service.
+                        Some(client) => {
                             Effect::Send { to: *client, frame: framed(FrameType::RdvReply, &payload) }
                         }
-                        // SURB: inject the reply into the client's return path — the relay forwards to the
-                        // first return hop, never learning the client's coordinate (S1-H3). A reply too large
-                        // for the SURB bucket falls through to a local delivery rather than being dropped.
-                        Some(Registration::Reply(surb)) => match inject_reply(surb, &payload) {
-                            Ok(packet) => Effect::Send { to: surb.first_hop, frame: framed(FrameType::SurbPacket, &packet) },
-                            Err(_) => Effect::Notify(Notification::Delivered { from, payload }),
-                        },
                         None => Effect::Notify(Notification::Delivered { from, payload }),
                     }
                 }
@@ -137,37 +116,14 @@ impl<F: Field> RendezvousRelay<F> {
             .collect()
     }
 
-    /// Record a client's registration: a bare 16-byte cookie is the legacy coordinate registration (forward to
-    /// the sender); a cookie followed by a [`Surb`] registers the SURB return path. A malformed body is ignored.
+    /// Record a client's registration: a 16-byte cookie binds this session to the sender's coordinate, so
+    /// the relay forwards that session's replies there (the bare-proxy fallback). A body that is not exactly
+    /// a 16-byte cookie (wrong length or trailing bytes) is ignored.
     fn register(&mut self, body: &[u8], from: Triple) {
-        let Some((cookie_bytes, rest)) = body.split_at_checked(size_of::<SessionId>()) else {
+        let Ok(cookie) = <SessionId>::try_from(body) else {
             return;
         };
-        let Ok(cookie) = <SessionId>::try_from(cookie_bytes) else {
-            return;
-        };
-        let registration = if rest.is_empty() {
-            Registration::Coord(from)
-        } else if let Some(surb) = Surb::from_bytes(rest) {
-            Registration::Reply(Box::new(surb))
-        } else {
-            return; // a present-but-malformed SURB is refused, never silently downgraded to a coordinate leak
-        };
-        self.registrations.insert(cookie, registration);
-    }
-
-    /// Route one hop of a SURB return packet: peel it with the router's onion secret, then re-emit it to the
-    /// next return hop, or deliver the reply to the client — the only node on the path that learns the coord.
-    fn route_surb(&self, packet: &[u8]) -> Vec<Effect> {
-        match self.router.peel_surb(packet) {
-            Some(SurbOutcome::Forward { next, packet }) => {
-                vec![Effect::Send { to: next, frame: framed(FrameType::SurbPacket, &packet) }]
-            }
-            Some(SurbOutcome::Deliver { coord, block }) => {
-                vec![Effect::Send { to: coord, frame: framed(FrameType::RdvReply, &block) }]
-            }
-            None => Vec::new(),
-        }
+        self.registrations.insert(cookie, from);
     }
 }
 
@@ -183,16 +139,11 @@ impl<F: Field> Engine for RendezvousRelay<F> {
         if let Input::Message { from, frame } = &input
             && let Ok((decoded, _)) = decode_frame(frame)
         {
-            match decoded.frame_type() {
-                // A client registers a session cookie — legacy (bare cookie ⇒ forward to the sender) or SURB
-                // (cookie ‖ Surb ⇒ forward through the pre-sealed return path, learning no coordinate).
-                Some(FrameType::RdvRegister) => {
-                    self.register(decoded.body, *from);
-                    return Vec::new();
-                }
-                // A SURB return packet in transit: peel one hop and forward it onward, or deliver it.
-                Some(FrameType::SurbPacket) => return self.route_surb(decoded.body),
-                _ => {}
+            // A client registers a session cookie: the relay forwards that session's replies to the
+            // sender's coordinate (the bare-proxy fallback).
+            if decoded.frame_type() == Some(FrameType::RdvRegister) {
+                self.register(decoded.body, *from);
+                return Vec::new();
             }
         }
         // Everything else is onion traffic: route it, then forward any peeled reply to its client.
@@ -206,16 +157,12 @@ impl<F: Field> Engine for RendezvousRelay<F> {
 }
 
 /// The frame a client sends to register with a rendezvous relay
-/// ([`RdvRegister`](fanos_wire::FrameType::RdvRegister)). A bare `cookie` keeps the legacy path — the relay
-/// forwards replies to the sender's coordinate. Passing a `surb` instead registers a SURB return path, so the
-/// relay forwards through it and **never learns the client's coordinate** (audit §5 S1-H3).
+/// ([`RdvRegister`](fanos_wire::FrameType::RdvRegister)): a 16-byte `cookie` binds the session so the relay
+/// forwards its replies to the sender's coordinate — the **bare-proxy fallback**, for a client that cannot
+/// be a line member. A full cell-node client uses NOSTOS and never registers here.
 #[must_use]
-pub fn register_frame(cookie: SessionId, surb: Option<&Surb>) -> Vec<u8> {
-    let mut body = cookie.to_vec();
-    if let Some(surb) = surb {
-        body.extend_from_slice(&surb.to_bytes());
-    }
-    framed(FrameType::RdvRegister, &body)
+pub fn register_frame(cookie: SessionId) -> Vec<u8> {
+    framed(FrameType::RdvRegister, &cookie)
 }
 
 #[cfg(test)]
@@ -251,7 +198,7 @@ mod tests {
             Instant(0),
             Input::Message {
                 from: client,
-                frame: register_frame(cookie, None),
+                frame: register_frame(cookie),
             },
         );
         assert_eq!(
@@ -334,7 +281,7 @@ mod tests {
                 Instant(0),
                 Input::Message {
                     from: who,
-                    frame: register_frame(ck, None),
+                    frame: register_frame(ck),
                 },
             );
         }
@@ -423,38 +370,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_surb_registration_hides_the_coordinate_and_the_relay_routes_a_return_packet() {
-        use fanos_aphantos::surb::{build_surb, open_reply};
-        use fanos_nyx::build_circuit;
-        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"surb-relay"));
-        let mut relay = RendezvousRelay::new(ThresholdRouter::<F2>::new(Point::<F2>::at(0), &identity, 1, [0x44; 32]));
-        let circuit = build_circuit(Point::<F2>::at(1), Point::<F2>::at(3), 1, b"ret").unwrap();
-        let client_coord = Point::<F2>::at(5).coords();
-
-        // A SURB registration stores the return path but exposes NO coordinate (the S1-H3 property).
-        let (_d, dpub) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"delivery"));
-        let (surb, _keys) = build_surb(&circuit, &[&dpub], client_coord, b"reg").unwrap();
-        let cookie = [0xAB; 16];
-        relay.step(Instant(0), Input::Message { from: client_coord, frame: register_frame(cookie, Some(&surb)) });
-        assert_eq!(relay.registrations(), 1, "the SURB session is registered");
-        assert_eq!(relay.client_for(&cookie), None, "a SURB registration does not expose the client coordinate");
-
-        // A SURB return packet whose delivery hop is sealed to THIS relay is peeled and delivered to the coord.
-        let (surb2, keys2) = build_surb(&circuit, &[relay.router().onion_public()], client_coord, b"pkt").unwrap();
-        let packet = inject_reply(&surb2, b"reply-payload").unwrap();
-        let out = relay.step(Instant(1), Input::Message {
-            from: Point::<F2>::at(2).coords(),
-            frame: framed(FrameType::SurbPacket, &packet),
-        });
-        match out.as_slice() {
-            [Effect::Send { to, frame }] => {
-                assert_eq!(*to, client_coord, "the relay (delivery node) delivers to the client coordinate");
-                let (decoded, _) = decode_frame(frame).unwrap();
-                assert_eq!(decoded.frame_type(), Some(FrameType::RdvReply), "as an RdvReply");
-                assert_eq!(open_reply(decoded.body, &keys2).unwrap(), b"reply-payload", "and the reply opens");
-            }
-            _ => panic!("the relay routes the SURB packet to delivery"),
-        }
-    }
 }

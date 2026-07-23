@@ -106,11 +106,6 @@ pub enum FrameType {
     /// A service-line member's PartialDec reply to its combiner (spec §12.3, audit #99): body is the
     /// 32-byte intro id ‖ the member's Shamir share (`x(1B) ‖ y`). The combiner Lagrange-combines `t`.
     SvcPartial = 0x55,
-    /// One hop of a **SURB return packet** (audit §5 S1-H3): a client's single-use reply block carrying an
-    /// anonymous reply back through a pre-sealed return path, so the rendezvous relay forwarding it never
-    /// learns the client's coordinate. Body is `header ‖ block` (`fanos_aphantos::surb`); each return hop peels
-    /// it with [`ThresholdRouter::peel_surb`] and re-emits to the next hop, or delivers to the client.
-    SurbPacket = 0x56,
     // 0x6* DIAKRISIS
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
@@ -193,7 +188,6 @@ impl FrameType {
             0x53 => Self::RdvRegister,
             0x54 => Self::SvcShareReq,
             0x55 => Self::SvcPartial,
-            0x56 => Self::SurbPacket,
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
