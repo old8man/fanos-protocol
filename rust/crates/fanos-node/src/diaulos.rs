@@ -397,6 +397,42 @@ impl<R: ServiceResolver> FanosDialer<R> {
             exit: None,
         }
     }
+
+    /// Establish a DIAULOS session to a service (identified by `service_public`, located at `coord` for the
+    /// Direct profile) via this dialer's anonymity profile. Shared by the TCP [`dial`](Self::dial) and UDP
+    /// [`dial_udp`](Self::dial_udp) paths so **both** honour the profile — an anonymous profile never reaches a
+    /// service (or the clearnet exit) by coordinate, which would leak the client's coordinate (audit S1-C1).
+    fn establish(
+        &self,
+        coord: Coord,
+        service_public: &HybridKemPublic,
+        rng: &mut SeedRng,
+    ) -> Result<DuplexStream, DialError> {
+        Ok(match &self.profile {
+            Profile::Direct => dial_service(self.client.clone(), coord, service_public, rng),
+            Profile::Fixed(route) => {
+                // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
+                let secret = os_entropy_32()?;
+                crate::rendezvous::anonymous_dial(self.client.clone(), service_public, route, &secret, rng)
+            }
+            Profile::Fresh(params) => {
+                // Derive the service's per-target meeting line, DRAW A FRESH route (new random forward/reply
+                // hops so this connection is unlinkable to the client's others), then ride the session over it.
+                let meeting = meeting_line::<F2>(&service_public.encode(), params.epoch, &params.beacon).coords();
+                let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
+                    params.directory.clone(),
+                    params.threshold,
+                    params.epoch,
+                    params.beacon,
+                    meeting,
+                    params.depths,
+                    rng,
+                );
+                let secret = os_entropy_32()?;
+                crate::rendezvous::anonymous_dial(self.client.clone(), service_public, &route, &secret, rng)
+            }
+        })
+    }
 }
 
 /// 32 fresh bytes of OS entropy, mapped to a [`DialError`] on the (unexpected) failure of the OS source
@@ -433,33 +469,8 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
         // A fresh CSPRNG seeded from OS entropy for this dial's ephemeral keys.
         let mut rng = SeedRng::from_seed(&os_entropy_32()?);
 
-        // Establish the session per the anonymity profile.
-        let stream = match &self.profile {
-            Profile::Direct => dial_service(self.client.clone(), coord, &service_public, &mut rng),
-            Profile::Fixed(route) => {
-                // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
-                let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), &service_public, route, &secret, &mut rng)
-            }
-            Profile::Fresh(params) => {
-                // The general anonymous profile: derive the service's per-target meeting line, DRAW A FRESH
-                // route (new random forward/reply hops so this connection is unlinkable to the client's
-                // others), then ride the DIAULOS session over it. `draw` and `anonymous_dial` re-derive the
-                // same meeting line from the service key, so they agree.
-                let meeting = meeting_line::<F2>(&service_public.encode(), params.epoch, &params.beacon).coords();
-                let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
-                    params.directory.clone(),
-                    params.threshold,
-                    params.epoch,
-                    params.beacon,
-                    meeting,
-                    params.depths,
-                    &mut rng,
-                );
-                let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), &service_public, &route, &secret, &mut rng)
-            }
-        };
+        // Establish the session per the anonymity profile (the exit is just a service, reached by its key).
+        let stream = self.establish(coord, &service_public, &mut rng)?;
 
         // For a clearnet target, hand the exit its destination over the (Direct or anonymous) session it now
         // rides — the exit still learns only the target, never the client's coordinate.
@@ -476,10 +487,11 @@ const UDP_TUNNEL_BUFFER: usize = 64;
 
 impl<R: ServiceResolver> UdpDialer for FanosDialer<R> {
     /// Open a UDP tunnel to a **clearnet** `target` through the configured exit — the datagram counterpart
-    /// of [`dial`](Self::dial). Datagrams ride an exit session ([`dial_exit_udp`](crate::exit::dial_exit_udp))
-    /// as length framing on the DIAULOS stream, pumped both ways into the [`UdpTunnel`]'s channels. A
-    /// `.fanos` target is [`Unsupported`](DialError::Unsupported) (services are byte streams, not datagram
-    /// endpoints); without an exit, so is any clearnet UDP target.
+    /// of [`dial`](Self::dial). The exit session is established through the **anonymity profile** (via
+    /// [`establish`](Self::establish), same as the TCP path — audit S1-C1), then handed a `udp:host:port`
+    /// target; datagrams ride it as length framing on the DIAULOS stream, pumped both ways into the
+    /// [`UdpTunnel`]'s channels. A `.fanos` target is [`Unsupported`](DialError::Unsupported) (services are
+    /// byte streams, not datagram endpoints); without an exit, so is any clearnet UDP target.
     async fn dial_udp(&self, target: &Target) -> Result<UdpTunnel, DialError> {
         if target.is_fanos() {
             return Err(DialError::Unsupported(
@@ -492,16 +504,15 @@ impl<R: ServiceResolver> UdpDialer for FanosDialer<R> {
             ));
         };
         let mut rng = SeedRng::from_seed(&os_entropy_32()?);
-        let stream = crate::exit::dial_exit_udp(
-            self.client.clone(),
-            *exit_coord,
-            exit_public,
-            &target.host(),
-            target.port(),
-            &mut rng,
-        )
-        .await
-        .map_err(DialError::Io)?;
+        // Route the exit session through the anonymity profile (audit S1-C1) — the datagram counterpart of the
+        // TCP `dial`. Before this fix `dial_udp` reached the exit by COORDINATE (Direct only), so `proxy
+        // --profile anonymous` leaked the client's coordinate to the exit on every SOCKS5 UDP datagram (DNS,
+        // QUIC/HTTP-3, WebRTC). Establishing via the profile and then handing the exit its `udp:host:port`
+        // target means an anonymous profile rides threshold onions to the exit's meeting line, never by-coord.
+        let session = self.establish(*exit_coord, exit_public, &mut rng)?;
+        let stream = crate::exit::exit_send_target(session, &format!("udp:{}:{}", target.host(), target.port()))
+            .await
+            .map_err(DialError::Io)?;
 
         // Bridge the DIAULOS datagram stream to the tunnel's channels: outbound datagrams are length-framed
         // onto the stream, inbound frames are lifted back off it. Either direction closing ends both.
