@@ -10,6 +10,13 @@ license = "MIT OR Apache-2.0"
 name = "fanos-monitor"
 path = "src/main.rs"
 
+# The operator console: run/inspect a scale-out cluster + the viability gate. Needs the simulator, so it
+# is skipped in a lean `--no-default-features` build rather than failing to compile.
+[[bin]]
+name = "fanos-lab"
+path = "src/bin/lab.rs"
+required-features = ["sim"]
+
 [dependencies]
 # A binary runs on std; the coherence math + snapshot come from the shipped telemetry crate, so the
 # operator sees exactly the production self-model.
@@ -23,8 +30,12 @@ fanos-geometry = { workspace = true, features = ["std"] }
 # only) drops it via `--no-default-features` (audit ARCH-10 D8: no hard prod-tool → test-sim coupling).
 fanos-sim = { workspace = true, optional = true }
 fanos-runtime = { workspace = true, features = ["std"] }
+# The ХОЛАРХ viability gate, surfaced as `fanos-lab gate`.
+fanos-holarch.workspace = true
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+# The operator console (`fanos-lab`) — structured subcommands over the simulator + gates.
+clap = { workspace = true }
 
 [features]
 # The `--live` demo (a real cell under the simulator) is on by default; a lean operator build turns it

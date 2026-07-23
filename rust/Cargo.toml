@@ -170,6 +170,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # browser, minimal resources. `crossterm` is the terminal backend.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
+# The operator CLI (`fanos-lab`): a structured, derive-based argument surface (spec: productivity-first CLI).
+clap = { version = "4", features = ["derive"] }
 
 # Test-only: property-based testing across all crates.
 proptest = "1"
