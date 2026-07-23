@@ -37,7 +37,7 @@ use fanos_taxis::wire::to_frame;
 use fanos_taxis::{CellParams, SealedTx, SlashEvidence};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
 
 use crate::crosscell_dir::publish_checkpoint;
 
@@ -179,9 +179,17 @@ where
         );
         engine.set_reward_per_block(params.reward_per_block);
 
-        let mut tick = interval(TICK_PERIOD);
+        // Delay the FIRST tick by a full period rather than firing it immediately (tokio's `interval` fires
+        // tick 0 at once). The leader proposes on a tick, so an immediate first tick makes it propose height 1
+        // before the other validators' drivers have finished spawning and subscribing to the consensus stream
+        // — those late nodes miss the height-1 proposal, and since TAXIS drops off-height messages with no
+        // catch-up, they wedge at genesis forever while the ready quorum advances without them (the dromos_quic
+        // stall: 2 of 7 stuck at h0). One period's grace lets every driver subscribe first. The timeout is
+        // likewise delayed so a spurious immediate round-advance cannot shuffle the height-1 leader pre-proposal.
+        let start = Instant::now();
+        let mut tick = interval_at(start + TICK_PERIOD, TICK_PERIOD);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut timeout = interval(TIMEOUT_PERIOD);
+        let mut timeout = interval_at(start + TIMEOUT_PERIOD, TIMEOUT_PERIOD);
         timeout.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // The height of the last execution checkpoint we surfaced, so each is emitted exactly once.
         let mut last_ckpt: Option<u64> = None;

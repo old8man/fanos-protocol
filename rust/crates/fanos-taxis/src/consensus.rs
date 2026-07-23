@@ -737,6 +737,18 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
         }
         out.extend(self.emit_reveals(&block));
+        // Robustness (audit §3.9): also re-broadcast our reveals for every earlier finalized-but-unexecuted
+        // block still awaiting decryption. Reveals are otherwise emitted exactly once, at finality; under
+        // async scheduling a validator that finalizes further blocks before a committee peer's reveal arrives
+        // could lose the reveal-vs-window race, drop the tx, and execute the block empty — the dromos_quic
+        // stall. Re-emitting on each finalize gives every reveal up to REVEAL_WINDOW redundant broadcasts
+        // (receivers first-writer-wins-dedup them, now cheaply — no re-verify), the principled analogue of
+        // block re-proposal on round timeout. It changes no anti-MEV semantics (reveals still post-finality)
+        // and no window backstop (a genuinely-undecryptable tx still drops).
+        let awaiting: Vec<Block> = self.exec_queue.clone();
+        for prior in &awaiting {
+            out.extend(self.emit_reveals(prior));
+        }
         self.exec_queue.push(block.clone());
         // Validate any reveals that arrived early for this block's transactions, now that we hold the committee.
         out.extend(self.drain_pending_reveals(&block));
@@ -788,12 +800,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
             if self.validate_and_record(r) {
                 out.push(Self::regossip(r));
             }
-        } else if self.verifiers.get(usize::from(r.member)).is_some_and(|vk| r.verify(vk)) {
+        } else if !self.pending_reveals.get(&r.commit).is_some_and(|m| m.contains_key(&r.member))
+            && self.verifiers.get(usize::from(r.member)).is_some_and(|vk| r.verify(vk))
+        {
             // Authenticate before buffering (audit B1): a reveal for a not-yet-finalized tx must still be signed
             // by a real committee member, so an attacker with no member key cannot flood the map with
             // attacker-keyed garbage. (The member-on-the-right-line check needs the tx, and runs in
-            // `validate_and_record` once the block finalizes.) Bound the buffer so even a Byzantine member
-            // streaming distinct commits cannot grow it without limit — evict the oldest commit past the cap.
+            // `validate_and_record` once the block finalizes.) The `contains_key` short-circuit skips the PQ
+            // verify for an already-buffered (commit, member) — a re-gossiped duplicate was authenticated on
+            // first receipt (audit §3.9 / T-H1). Bound the buffer so even a Byzantine member streaming distinct
+            // commits cannot grow it without limit — evict the oldest commit past the cap.
             if !self.pending_reveals.contains_key(&r.commit)
                 && self.pending_reveals.len() >= MAX_PENDING_REVEAL_COMMITS
                 && let Some((&oldest, _)) = self.pending_reveals.iter().next()
@@ -825,6 +841,14 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// a forged or misplaced share can never enter reconstruction. Returns whether a share was **newly** recorded
     /// (false on a duplicate), so the caller re-gossips each share exactly once (no amplification loop).
     fn validate_and_record(&mut self, r: &RevealMsg) -> bool {
+        // Cheap first-writer-wins dedup BEFORE the expensive hybrid-PQ verify (audit §3.9 / T-H1): a reveal
+        // already recorded was fully authenticated on first receipt, so a re-gossiped duplicate — which, with
+        // T-H1 re-gossip, arrives ~n× per distinct share — must cost zero signature verifications. Doing the
+        // verify first made every duplicate pay a full PQ check, widening the reveal-vs-window race under load
+        // until legitimate reveals were dropped and the anti-MEV tx never executed (the dromos_quic stall).
+        if self.reveals.get(&r.commit).is_some_and(|members| members.contains_key(&r.member)) {
+            return false; // already recorded — not newly recorded, so not re-gossiped, and not re-verified
+        }
         let Some(tx) = self.sealed_tx_for(&r.commit) else {
             return false;
         };
@@ -846,11 +870,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if usize::from(share.x()) != pos + 1 {
             return false;
         }
-        let members = self.reveals.entry(r.commit).or_default();
-        if members.contains_key(&r.member) {
-            return false; // already recorded (first-writer-wins) — not newly recorded, so not re-gossiped
-        }
-        members.insert(r.member, share);
+        self.reveals.entry(r.commit).or_default().insert(r.member, share);
         true
     }
 
