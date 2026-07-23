@@ -59,7 +59,7 @@ use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
 use fanos_runtime::{Duration, Effect, Engine, Input, Instant, TimerToken};
-use fanos_wire::{FrameType, decode_frame, encode_frame};
+use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
 use crate::config::Peer;
 
@@ -426,6 +426,23 @@ pub struct PorosHost {
     // PoW rate-limiter alone (the pre-cap default). POROS stays decoupled from the mechanism: it consumes the
     // admitted SET, not the graph, so proof-of-personhood or a credential system can supply it instead.
     admitted: Option<BTreeSet<Triple>>,
+    // This host's KEM secret — needed only to OPEN sealed reshare sub-shares when rotating into a new epoch
+    // line ([`with_kem_secret`](Self::with_kem_secret)). `None` ⇒ a serve-only host that cannot receive a
+    // reshare (it can still emit contributions, which use only the new members' PUBLIC keys).
+    kem_secret: Option<HybridKemSecret>,
+    // The active rotation-into-a-new-line context, set by [`begin_rotation`](Self::begin_rotation): incoming
+    // `PorosReshare` sub-shares are opened + gathered here, and a threshold of them combines into this host's
+    // rotated share (then adopted). `None` outside a rotation.
+    rotation: Option<RotationCtx>,
+}
+
+/// The receive-side state of a POROS line rotation: this host is a member of the incoming `new_line` for
+/// `target_epoch` and gathers a threshold of reshare sub-shares to combine into its rotated descriptor share.
+struct RotationCtx {
+    target_epoch: Epoch,
+    new_line: Vec<Triple>,
+    my_new_x: u8,
+    gather: BTreeMap<u8, Share>,
 }
 
 impl PorosHost {
@@ -458,7 +475,17 @@ impl PorosHost {
             max_pending: DEFAULT_MAX_PENDING,
             gather_timeout: DEFAULT_GATHER_TIMEOUT,
             admitted: None,
+            kem_secret: None,
+            rotation: None,
         }
+    }
+
+    /// Provide this host's KEM secret, enabling it to OPEN sealed reshare sub-shares and rotate into a new
+    /// epoch line (see [`begin_rotation`](Self::begin_rotation)). Without it the host is serve-only.
+    #[must_use]
+    pub fn with_kem_secret(mut self, kem_secret: HybridKemSecret) -> Self {
+        self.kem_secret = Some(kem_secret);
+        self
     }
 
     /// Override the combiner's gather deadline (default 2 s).
@@ -495,6 +522,102 @@ impl PorosHost {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// The epoch this host currently serves (advances when it [`adopt`](Self::adopt)s a rotation).
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// This host's `x`-coordinate (1-based position) in `line`, or `None` if it is not a member.
+    fn my_x_in(&self, line: &[Triple]) -> Option<u8> {
+        line.iter().position(|c| *c == self.coord).and_then(|i| u8::try_from(i + 1).ok())
+    }
+
+    /// **Emit this old-line member's sealed reshare contributions** to the incoming `new_line` for
+    /// `target_epoch` — one [`PorosReshare`](FrameType::PorosReshare) per new member, each sub-share KEM-sealed
+    /// to that member (`new_keys` in `new_line` order, supplied by the driver from the directory). The driver
+    /// calls this at an epoch boundary; the host need not be a member of `new_line`. Empty if this host is not
+    /// an old-line member or the Shamir/KEM parameters are invalid.
+    #[must_use]
+    pub fn emit_reshare(
+        &self,
+        target_epoch: Epoch,
+        new_line: &[Triple],
+        new_keys: &[&HybridKemPublic],
+        key_randomness: &[u8],
+        kem_seed: &[u8],
+    ) -> Vec<Effect> {
+        let Some(my_old_x) = self.my_x_in(&self.line) else {
+            return Vec::new(); // not an old-line member — nothing to reshare
+        };
+        let Ok(threshold) = u8::try_from(self.threshold) else {
+            return Vec::new();
+        };
+        let Some(sealed) = seal_reshare_contribution(&self.share, threshold, new_keys, key_randomness, kem_seed)
+        else {
+            return Vec::new();
+        };
+        new_line
+            .iter()
+            .zip(&sealed)
+            .map(|(&to, s)| Effect::Send { to, frame: reshare_frame(target_epoch, my_old_x, s) })
+            .collect()
+    }
+
+    /// **Prepare to rotate INTO** `new_line` for `target_epoch`: sets the receive context so incoming
+    /// `PorosReshare` sub-shares are opened, gathered, and combined into this host's rotated share (which it
+    /// then [`adopt`](Self::adopt)s). A no-op if this host is not a member of `new_line`. The driver computes
+    /// `new_line` from `ingress_line(community, target_epoch, beacon)` (no I/O) and calls this before the
+    /// contributions arrive.
+    pub fn begin_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>) {
+        if let Some(my_new_x) = self.my_x_in(&new_line) {
+            self.rotation = Some(RotationCtx { target_epoch, new_line, my_new_x, gather: BTreeMap::new() });
+        }
+    }
+
+    /// A reshare sub-share arrived: if it belongs to the active rotation and opens under this host's KEM
+    /// secret, gather it (first-writer-wins per old member). Once a threshold of distinct old members'
+    /// sub-shares are in, combine them into the rotated share and [`adopt`](Self::adopt) the new epoch/line.
+    fn on_reshare(&mut self, target_epoch: Epoch, old_x: u8, sealed: &SealedShare) -> Vec<Effect> {
+        let threshold = self.threshold;
+        let Some(secret) = self.kem_secret.as_ref() else {
+            return Vec::new(); // serve-only host: cannot open sealed sub-shares
+        };
+        let Some(ctx) = self.rotation.as_mut() else {
+            return Vec::new(); // no active rotation
+        };
+        if ctx.target_epoch != target_epoch {
+            return Vec::new(); // a sub-share for a different rotation
+        }
+        let Some(sub) = open_service_share(sealed, secret) else {
+            return Vec::new(); // not addressed to us, or tampered
+        };
+        ctx.gather.entry(old_x).or_insert(sub);
+        if ctx.gather.len() < threshold {
+            return Vec::new(); // still gathering
+        }
+        // A threshold of old members contributed: combine into this host's rotated share.
+        let old_xs: Vec<u8> = ctx.gather.keys().copied().collect();
+        let subs: Vec<Share> = ctx.gather.values().cloned().collect();
+        let my_new_x = ctx.my_new_x;
+        let new_line = ctx.new_line.clone();
+        let Some(new_share) = combine_descriptor_reshares(my_new_x, &subs, &old_xs) else {
+            return Vec::new();
+        };
+        self.adopt(target_epoch, new_line, new_share);
+        Vec::new()
+    }
+
+    /// Adopt a completed rotation: advance to `epoch` with `line` and `share`, and clear per-epoch working
+    /// state (the rotation context and any in-flight request gathers, which belonged to the old epoch).
+    fn adopt(&mut self, epoch: Epoch, line: Vec<Triple>, share: Share) {
+        self.epoch = epoch;
+        self.line = line;
+        self.share = share;
+        self.rotation = None;
+        self.pending.clear();
     }
 
     /// A request arrived at us as the combiner: verify its PoW, seed our own share, fan share-requests to
@@ -601,6 +724,8 @@ impl Engine for PorosHost {
                         .map_or_else(Vec::new, |requester| self.on_share_req(from, requester)),
                     Some(FrameType::PorosShare) => decode_share_reply(decoded.body)
                         .map_or_else(Vec::new, |(requester, share)| self.on_share(now, requester, share)),
+                    Some(FrameType::PorosReshare) => decode_reshare(decoded.body)
+                        .map_or_else(Vec::new, |(epoch, old_x, sealed)| self.on_reshare(epoch, old_x, &sealed)),
                     _ => Vec::new(),
                 }
             }
@@ -619,6 +744,25 @@ impl Engine for PorosHost {
 #[must_use]
 pub fn request_frame(req: &IngressRequest) -> Vec<u8> {
     encode(FrameType::PorosRequest, &req.to_bytes())
+}
+
+/// Build a [`PorosReshare`](FrameType::PorosReshare) frame: `target_epoch(8) ‖ old_x(1) ‖ SealedShare`.
+#[must_use]
+fn reshare_frame(target_epoch: Epoch, old_x: u8, sealed: &SealedShare) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&target_epoch.to_be_bytes());
+    body.push(old_x);
+    body.extend_from_slice(&sealed.to_wire());
+    encode(FrameType::PorosReshare, &body)
+}
+
+/// Decode a [`PorosReshare`](FrameType::PorosReshare) body into `(target_epoch, old_x, sealed)`.
+fn decode_reshare(body: &[u8]) -> Option<(Epoch, u8, SealedShare)> {
+    let mut r = Reader::new(body);
+    let target_epoch = Epoch::from_be_bytes(r.array::<8>()?);
+    let old_x = r.u8()?;
+    let sealed = SealedShare::from_wire(r.rest()).ok()?;
+    Some((target_epoch, old_x, sealed))
 }
 
 /// Encode a wire frame with the given type and body.
@@ -1035,5 +1179,79 @@ mod tests {
             None,
             "another member's secret cannot open a sub-share sealed to member 0 (confidentiality holds)",
         );
+    }
+
+    #[test]
+    fn the_engine_rotates_a_host_into_a_new_epoch_line_via_reshare_frames() {
+        use fanos_pqcrypto::SeedRng;
+        use fanos_runtime::{Effect, Input, Instant};
+
+        // The full engine path: OLD-line hosts emit sealed PorosReshare frames; NEW-line hosts (begin_rotation
+        // set) receive them via step(), gather a threshold, combine, and ADOPT their rotated share — advancing
+        // to the new epoch. The adopted shares then reconstruct the original descriptor.
+        let desc = descriptor(6);
+        let (t, n) = (2u8, 3u8);
+        let secret_len = desc.to_bytes().len();
+        let (old_epoch, new_epoch) = (Epoch::new(1), Epoch::new(2));
+        let beacon = BeaconSeed::new([0x55; 32]);
+        let old_line: Vec<Triple> = (0..3).map(coord).collect();
+        let new_line: Vec<Triple> = (3..6).map(coord).collect();
+        let shares = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+
+        // Old-line hosts, each holding its real descriptor share.
+        let old_host = |i: usize| {
+            PorosHost::new(old_line[i], shares[i].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+        };
+        // New-line hosts: a placeholder share (adopt replaces it), a KEM secret (to open sealed sub-shares), and
+        // the rotation context set to the new line.
+        let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> =
+            (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, j as u8]))).collect();
+        let new_keys: Vec<&HybridKemPublic> = new_kp.iter().map(|(_, p)| p).collect();
+        let mut new_hosts: Vec<PorosHost> = (0..3)
+            .map(|j| {
+                let placeholder = Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]);
+                let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, j as u8])).0; // same seed ⇒ same secret
+                let mut h = PorosHost::new(new_line[j], placeholder, new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                    .with_kem_secret(secret);
+                h.begin_rotation(new_epoch, new_line.clone());
+                h
+            })
+            .collect();
+
+        // A threshold subset of the old line (members 0, 1) each emit their sealed reshare contributions.
+        for (i, &from) in old_line.iter().enumerate().take(usize::from(t)) {
+            let key_rnd = vec![0x10u8 + i as u8; secret_len * usize::from(t - 1) + 8];
+            let effects = old_host(i).emit_reshare(new_epoch, &new_line, &new_keys, &key_rnd, &[0xB0, i as u8]);
+            assert_eq!(effects.len(), new_line.len(), "one reshare frame per new member");
+            // Route each sealed sub-share to its target new host.
+            for e in effects {
+                if let Effect::Send { to, frame } = e {
+                    let j = new_line.iter().position(|c| *c == to).unwrap();
+                    new_hosts[j].step(Instant(0), Input::Message { from, frame });
+                }
+            }
+        }
+
+        // Every new host adopted: it advanced to the new epoch, its rotation context is cleared.
+        for h in &new_hosts {
+            assert_eq!(h.epoch(), new_epoch, "the new host rotated to the new epoch");
+            assert!(h.rotation.is_none(), "the rotation completed and cleared its context");
+        }
+        // The adopted shares reconstruct the ORIGINAL descriptor — rotation preserved the hosted secret.
+        assert_eq!(
+            recover_descriptor(&[new_hosts[0].share.clone(), new_hosts[1].share.clone()]).as_ref(),
+            Some(&desc),
+            "the rotated new line hosts the identical descriptor",
+        );
+        // A stale sub-share for a DIFFERENT epoch is ignored (no spurious adoption / gather pollution).
+        let fresh_secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, 0])).0; // new_host[0]'s secret
+        let mut fresh = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+            .with_kem_secret(fresh_secret);
+        fresh.begin_rotation(new_epoch, new_line.clone());
+        let stale = old_host(0).emit_reshare(Epoch::new(99), &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xC0]);
+        if let Some(Effect::Send { frame, .. }) = stale.into_iter().next() {
+            fresh.step(Instant(0), Input::Message { from: old_line[0], frame });
+        }
+        assert_eq!(fresh.epoch(), old_epoch, "a reshare for a different target epoch does not rotate the host");
     }
 }

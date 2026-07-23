@@ -18,12 +18,13 @@
 //!
 //! ## Frame routing
 //!
-//! The three POROS host wire types — [`PorosRequest`](FrameType::PorosRequest) (a new node's admission
-//! request to the combiner), [`PorosShareReq`](FrameType::PorosShareReq) (a combiner asking a member for its
-//! descriptor share), and [`PorosShare`](FrameType::PorosShare) (a member's share) — go to the [`PorosHost`];
-//! every other input goes to `inner`. This takes precedence over the inner engine's routing. The
-//! [`PorosResponse`](FrameType::PorosResponse) is delivered to the *requesting client*, never to a host, so
-//! it is intentionally **not** routed here (an inner engine ignores it, as it would any unknown frame).
+//! The POROS host wire types — [`PorosRequest`](FrameType::PorosRequest) (a new node's admission request to
+//! the combiner), [`PorosShareReq`](FrameType::PorosShareReq) (a combiner asking a member for its descriptor
+//! share), [`PorosShare`](FrameType::PorosShare) (a member's share), and [`PorosReshare`](FrameType::PorosReshare)
+//! (a sealed reshare sub-share when the line rotates) — go to the [`PorosHost`]; every other input goes to
+//! `inner`. This takes precedence over the inner engine's routing. The [`PorosResponse`](FrameType::PorosResponse)
+//! is delivered to the *requesting client*, never to a host, so it is intentionally **not** routed here (an
+//! inner engine ignores it, as it would any unknown frame).
 //!
 //! ## Timer namespacing
 //!
@@ -71,7 +72,12 @@ impl IngressNode {
     fn is_ingress_frame(frame: &[u8]) -> bool {
         matches!(
             decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
-            Some(FrameType::PorosRequest | FrameType::PorosShareReq | FrameType::PorosShare)
+            Some(
+                FrameType::PorosRequest
+                    | FrameType::PorosShareReq
+                    | FrameType::PorosShare
+                    | FrameType::PorosReshare
+            )
         )
     }
 

@@ -118,6 +118,12 @@ pub enum FrameType {
     PorosShare = 0x58,
     /// A POROS combiner's response to a requester: a bounded bucket of entry peers (never the full set).
     PorosResponse = 0x59,
+    /// A POROS **descriptor-reshare** sub-share when the ingress line rotates for a new epoch (spec §6):
+    /// body is `target_epoch(8) ‖ old_x(1) ‖ SealedShare` — one old-line member's contribution, KEM-sealed to
+    /// the *new* member it is sent to, so the sub-share is confidential in transit. A new member gathers a
+    /// threshold of these (one per old member) and combines them into its rotated share without the descriptor
+    /// ever being reconstructed (CHURP-style proactive resharing).
+    PorosReshare = 0x5A,
     // 0x6* DIAKRISIS
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
@@ -204,6 +210,7 @@ impl FrameType {
             0x57 => Self::PorosShareReq,
             0x58 => Self::PorosShare,
             0x59 => Self::PorosResponse,
+            0x5A => Self::PorosReshare,
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
