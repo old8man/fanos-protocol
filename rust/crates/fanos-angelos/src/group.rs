@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_primitives::{aead, hash_labeled};
-use zeroize::Zeroize;
 
+use crate::chain::{ChainKdf, RecvChain, SendChain};
 use crate::nonce;
 
 /// Label deriving a member's sender chain from the group key and member id.
@@ -33,28 +33,23 @@ const MK_LABEL: &str = "FANOS-angelos-v1/group-mk";
 /// Label advancing a sender chain.
 const NEXT_LABEL: &str = "FANOS-angelos-v1/group-next";
 
+/// The chain-stepping labels for the group's per-sender chains. Reusing the shared [`crate::chain`] chains
+/// gives the group the **same reordering tolerance** the 1:1 session already has (skip-ahead + bounded banked
+/// keys), while stepping byte-identically to the original hand-rolled derivation (`MK`/`NEXT` labels).
+const GROUP_KDF: ChainKdf = ChainKdf { mk: MK_LABEL, next: NEXT_LABEL };
+
 /// One member's view of a channel: their own send chain + signing key, a receive chain per other member, and
-/// the roster of members' public verifying keys. Not `Clone` — it owns a signing secret and live chains.
+/// the roster of members' public verifying keys. Not `Clone` — it owns a signing secret and live chains (which
+/// zeroize themselves on drop).
 pub struct GroupSession {
     my_id: u32,
     sign_secret: HybridSigSecret,
-    send_chain: [u8; 32],
-    send_n: u64,
-    /// `sender_id -> (their chain as we track it, the next message number we expect from them)`.
-    recv: BTreeMap<u32, ([u8; 32], u64)>,
+    send: SendChain,
+    /// `sender_id -> their receive chain` — a full [`RecvChain`], so an out-of-order post opens ahead of the
+    /// ones it skips and a late post opens from banked keys (audit AT-M2), instead of being silently dropped.
+    recv: BTreeMap<u32, RecvChain>,
     /// `member_id -> their public verifying key` (for authenticating their posts).
     verifiers: BTreeMap<u32, HybridVerifier>,
-}
-
-impl Drop for GroupSession {
-    fn drop(&mut self) {
-        // Audit AT-M1: wipe our send chain and every tracked peer chain key. `sign_secret` (HybridSigSecret)
-        // zeroizes via its own drop; `verifiers` hold only public keys.
-        self.send_chain.zeroize();
-        for (chain, _n) in self.recv.values_mut() {
-            chain.zeroize();
-        }
-    }
 }
 
 impl GroupSession {
@@ -72,10 +67,10 @@ impl GroupSession {
         let recv = members
             .iter()
             .filter(|(id, _)| *id != my_id)
-            .map(|(id, _)| (*id, (sender_chain(group_key, *id), 0u64)))
+            .map(|(id, _)| (*id, RecvChain::new(sender_chain(group_key, *id), GROUP_KDF)))
             .collect();
         let verifiers = members.iter().filter(|(id, _)| *id != my_id).map(|(id, vk)| (*id, vk.clone())).collect();
-        Self { my_id, sign_secret, send_chain: sender_chain(group_key, my_id), send_n: 0, recv, verifiers }
+        Self { my_id, sign_secret, send: SendChain::new(sender_chain(group_key, my_id), GROUP_KDF), recv, verifiers }
     }
 
     /// This member's id.
@@ -89,10 +84,7 @@ impl GroupSession {
     /// opens with [`recv`](Self::recv), tagged (out of band) with our [`my_id`](Self::my_id).
     #[must_use]
     pub fn send(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        let mk = hash_labeled(MK_LABEL, &self.send_chain);
-        self.send_chain = hash_labeled(NEXT_LABEL, &self.send_chain);
-        let n = self.send_n;
-        self.send_n = self.send_n.saturating_add(1);
+        let (n, mk) = self.send.pop();
         let ciphertext = aead::seal(&mk, &nonce(n), plaintext).unwrap_or_default();
         let signature = self.sign_secret.sign(&signed_bytes(self.my_id, n, &ciphertext));
         let mut out = Vec::with_capacity(8 + ciphertext.len() + HYBRID_SIG_LEN);
@@ -103,8 +95,11 @@ impl GroupSession {
     }
 
     /// **Receive** a post from `sender_id`. `None` if the sender is not a tracked member, the **signature does
-    /// not verify** against the sender's key (a forgery — refused *before* the chain is touched), the message is
-    /// out of order, or it fails authentication; on failure the sender's chain is not advanced.
+    /// not verify** against the sender's key (a forgery — refused *before* the chain is touched), or the message
+    /// fails authentication. Out-of-order posts are handled, not dropped (audit AT-M2): a post ahead of the
+    /// expected number opens and the skipped keys are banked, and a late post opens from those banked keys — so a
+    /// group riding the reordering Full mixnet does not silently lose messages. Each key opens at most once
+    /// (replay-safe), and the banked store is bounded (see [`crate::chain`]).
     #[must_use]
     pub fn recv(&mut self, sender_id: u32, sealed: &[u8]) -> Option<Vec<u8>> {
         // Split the trailing signature, then verify it before anything else.
@@ -117,17 +112,8 @@ impl GroupSession {
         if !verifier.verify(&signed_bytes(sender_id, n, ciphertext), &signature) {
             return None; // forged or tampered attribution — never reaches the chain
         }
-        // Authenticated: now advance the sender chain in order.
-        let (chain, next_n) = self.recv.get_mut(&sender_id)?;
-        if n != *next_n {
-            return None;
-        }
-        let current = *chain;
-        let mk = hash_labeled(MK_LABEL, &current);
-        let plaintext = aead::open(&mk, &nonce(n), ciphertext)?;
-        *chain = hash_labeled(NEXT_LABEL, &current);
-        *next_n = next_n.saturating_add(1);
-        Some(plaintext)
+        // Authenticated: open on the sender's receive chain, which tolerates reordering (skip-ahead + banked).
+        self.recv.get_mut(&sender_id)?.open(n, ciphertext)
     }
 }
 
@@ -189,13 +175,30 @@ mod tests {
     }
 
     #[test]
-    fn posts_from_one_sender_stay_in_order_and_ratchet() {
+    fn posts_from_one_sender_open_in_order() {
         let (mut a, mut b, _c) = channel();
         let m0 = a.send(b"zero");
         let m1 = a.send(b"one");
-        assert!(b.recv(1, &m1).is_none(), "a later message before an earlier one is refused");
         assert_eq!(b.recv(1, &m0).as_deref(), Some(&b"zero"[..]));
         assert_eq!(b.recv(1, &m1).as_deref(), Some(&b"one"[..]));
+    }
+
+    #[test]
+    fn out_of_order_group_posts_open_instead_of_being_dropped() {
+        // Audit AT-M2: group text rides the REORDERING Full mixnet, so posts arrive out of order. A later post
+        // must open (banking the skipped keys) and the earlier one must still open when it arrives — not be
+        // silently lost, as the old drop-on-mismatch did.
+        let (mut a, mut b, _c) = channel();
+        let m0 = a.send(b"zero");
+        let m1 = a.send(b"one");
+        let m2 = a.send(b"two");
+        // m2 arrives FIRST: it opens, and m0/m1's keys are banked.
+        assert_eq!(b.recv(1, &m2).as_deref(), Some(&b"two"[..]), "the ahead post opens (skip-ahead)");
+        // The earlier posts then open from the banked keys, in either order.
+        assert_eq!(b.recv(1, &m1).as_deref(), Some(&b"one"[..]), "a banked earlier post opens");
+        assert_eq!(b.recv(1, &m0).as_deref(), Some(&b"zero"[..]), "and the one before it");
+        // Each opens at most once — a replayed post is refused (its key was consumed).
+        assert!(b.recv(1, &m1).is_none(), "a replayed post is refused (replay-safe)");
     }
 
     #[test]
