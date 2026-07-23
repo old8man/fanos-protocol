@@ -72,6 +72,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 vpn = ["fanos-vpn/device"]
 
 [dev-dependencies]
+# Build return circuits for the SURB relay tests (audit §5 S1-H3).
+fanos-nyx.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

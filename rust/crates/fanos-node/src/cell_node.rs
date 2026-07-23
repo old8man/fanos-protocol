@@ -309,7 +309,7 @@ mod tests {
             Instant(0),
             Input::Message {
                 from: client,
-                frame: crate::rendezvous_relay::register_frame(cookie),
+                frame: crate::rendezvous_relay::register_frame(cookie, None),
             },
         );
 

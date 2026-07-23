@@ -111,9 +111,11 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
     if let Some(reply_combiner) = rclient.reply_combiner()
         && reply_combiner != client.address()
     {
+        // Legacy coordinate registration for now; the SURB return path (audit §5 S1-H3) is wired in next,
+        // replacing `None` with a client-built `Surb` so the relay never learns this client's coordinate.
         client.command(Command::Emit {
             to: reply_combiner,
-            frame: register_frame(rclient.cookie()),
+            frame: register_frame(rclient.cookie(), None),
         });
     }
     tokio::spawn(rendezvous_bridge(
