@@ -95,13 +95,15 @@ impl IngressNode {
     }
 
     /// **Arm the receive side** of a rotation when this node is a member of the *new* (incoming) ingress line
-    /// for `target_epoch`: subsequent [`PorosReshare`](FrameType::PorosReshare) frames are opened, gathered, and
-    /// combined into this node's rotated share, which it adopts once a threshold arrive (advancing
+    /// for `target_epoch`, receiving from the outgoing `old_line`: subsequent
+    /// [`PorosReshare`](FrameType::PorosReshare) frames are **authenticated to their old member**, opened,
+    /// gathered, and combined into this node's rotated share, which it adopts once a threshold arrive (advancing
     /// [`host_epoch`](Self::host_epoch)). A no-op if this node is not on `new_line`. The old-emit
     /// ([`emit_reshares`](Self::emit_reshares)) and this new-receive role are independent — a node on both lines
-    /// (they meet in one point) calls both.
-    pub fn arm_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>) {
-        self.host.begin_rotation(target_epoch, new_line);
+    /// (they meet in one point) calls both. `old_line` is the current-epoch roster the driver computed from the
+    /// beacon; a sub-share claiming old index `x` must have arrived from `old_line[x-1]`.
+    pub fn arm_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>, old_line: Vec<Triple>) {
+        self.host.begin_rotation(target_epoch, new_line, old_line);
     }
 
     /// Whether `frame` is one of the POROS host wire types the [`PorosHost`] owns (the combiner/member frames,
@@ -347,9 +349,10 @@ mod tests {
             .collect();
 
         // New-line members arm their receive side (the driver would call this for every node it computes is on
-        // the new line for target_epoch).
+        // the new line for target_epoch), passing the OLD roster so each sub-share is authenticated to its old
+        // member.
         for n in &mut new_nodes {
-            n.arm_rotation(new_epoch, new_coords.clone());
+            n.arm_rotation(new_epoch, new_coords.clone(), old_coords.clone());
         }
         // A threshold subset of the old line emits sealed reshare frames; route them to the new line.
         for (i, &from) in old_coords.iter().enumerate().take(t) {

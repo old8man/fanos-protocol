@@ -72,6 +72,19 @@ pub const INGRESS_BUCKET: usize = 3;
 const POW_LABEL: &str = "FANOS-v1/poros-admission-pow";
 /// Domain separation for the per-request bucket ranking.
 const BUCKET_LABEL: &str = "FANOS-v1/poros-bucket";
+/// Domain separation for the **descriptor commitment** — the public binding a rotated line verifies its
+/// reconstructed descriptor against, so a corrupted reshare can never serve a silently-wrong descriptor.
+const DESCRIPTOR_COMMIT_LABEL: &str = "FANOS-v1/poros-descriptor-commit";
+
+/// The public **commitment** to an ingress descriptor: `H(descriptor bytes)`. Preimage-resistant, so it
+/// discloses nothing about the (semi-secret, per-requester-bucketed) descriptor, yet binds it — the old line
+/// publishes it, and a rotated line checks its reconstruction against it (see
+/// [`PorosHost::with_descriptor_commitment`]). Rotation preserves the descriptor, so the commitment is
+/// epoch-invariant.
+#[must_use]
+pub fn descriptor_commitment(descriptor: &IngressDescriptor) -> [u8; 32] {
+    hash_labeled(DESCRIPTOR_COMMIT_LABEL, &descriptor.to_bytes())
+}
 
 /// The moving-target **ingress line** for a community sharing `community`, at `epoch` folded with the
 /// beacon `SEED(epoch)`. Legitimate peers COMPUTE it; a censor cannot predict or pre-enumerate it, and
@@ -434,13 +447,22 @@ pub struct PorosHost {
     // `PorosReshare` sub-shares are opened + gathered here, and a threshold of them combines into this host's
     // rotated share (then adopted). `None` outside a rotation.
     rotation: Option<RotationCtx>,
+    // The public commitment `H(descriptor)` this host verifies every reconstruction against
+    // ([`with_descriptor_commitment`](Self::with_descriptor_commitment)): a reconstructed descriptor that does
+    // not match is NEVER served, so a corrupted reshare (or a tampered share set) fails safe. `None` ⇒ no
+    // verification (the pre-commitment default, for a host whose descriptor is not yet committed).
+    descriptor_commitment: Option<[u8; 32]>,
 }
 
 /// The receive-side state of a POROS line rotation: this host is a member of the incoming `new_line` for
 /// `target_epoch` and gathers a threshold of reshare sub-shares to combine into its rotated descriptor share.
+/// `old_line` is the roster of the OUTGOING line (index = share x-1) so each incoming sub-share can be
+/// **authenticated to its genuine old member** — a sub-share whose transport source is not the old member it
+/// claims to be from is rejected, closing the spoof/misattribution hole.
 struct RotationCtx {
     target_epoch: Epoch,
     new_line: Vec<Triple>,
+    old_line: Vec<Triple>,
     my_new_x: u8,
     gather: BTreeMap<u8, Share>,
 }
@@ -477,6 +499,7 @@ impl PorosHost {
             admitted: None,
             kem_secret: None,
             rotation: None,
+            descriptor_commitment: None,
         }
     }
 
@@ -485,6 +508,17 @@ impl PorosHost {
     #[must_use]
     pub fn with_kem_secret(mut self, kem_secret: HybridKemSecret) -> Self {
         self.kem_secret = Some(kem_secret);
+        self
+    }
+
+    /// Bind this host to the public **descriptor commitment** `H(descriptor)`
+    /// ([`descriptor_commitment`]): every reconstruction it serves is checked against it, so a corrupted
+    /// reshare (a Byzantine old member's poisoned sub-share) or a tampered share set can never yield a
+    /// silently-wrong served descriptor — the serve fails safe instead. The commitment is epoch-invariant
+    /// (rotation preserves the descriptor), so a rotated host carries the same one.
+    #[must_use]
+    pub fn with_descriptor_commitment(mut self, commitment: [u8; 32]) -> Self {
+        self.descriptor_commitment = Some(commitment);
         self
     }
 
@@ -566,21 +600,33 @@ impl PorosHost {
             .collect()
     }
 
-    /// **Prepare to rotate INTO** `new_line` for `target_epoch`: sets the receive context so incoming
-    /// `PorosReshare` sub-shares are opened, gathered, and combined into this host's rotated share (which it
-    /// then [`adopt`](Self::adopt)s). A no-op if this host is not a member of `new_line`. The driver computes
-    /// `new_line` from `ingress_line(community, target_epoch, beacon)` (no I/O) and calls this before the
-    /// contributions arrive.
-    pub fn begin_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>) {
+    /// **Prepare to rotate INTO** `new_line` for `target_epoch`, receiving from the outgoing `old_line`: sets
+    /// the receive context so incoming `PorosReshare` sub-shares are authenticated to their old member, opened,
+    /// gathered, and combined into this host's rotated share (which it then [`adopt`](Self::adopt)s). A no-op if
+    /// this host is not a member of `new_line`. The driver computes both rosters from
+    /// `ingress_line(community, epoch, beacon)` (no I/O) — `new_line` at `target_epoch`, `old_line` at the
+    /// current epoch — and calls this before the contributions arrive. `old_line` is the roster whose position
+    /// `x-1` a sub-share claiming index `x` must have arrived FROM (sender authentication).
+    pub fn begin_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>, old_line: Vec<Triple>) {
         if let Some(my_new_x) = self.my_x_in(&new_line) {
-            self.rotation = Some(RotationCtx { target_epoch, new_line, my_new_x, gather: BTreeMap::new() });
+            self.rotation =
+                Some(RotationCtx { target_epoch, new_line, old_line, my_new_x, gather: BTreeMap::new() });
         }
     }
 
-    /// A reshare sub-share arrived: if it belongs to the active rotation and opens under this host's KEM
-    /// secret, gather it (first-writer-wins per old member). Once a threshold of distinct old members'
-    /// sub-shares are in, combine them into the rotated share and [`adopt`](Self::adopt) the new epoch/line.
-    fn on_reshare(&mut self, target_epoch: Epoch, old_x: u8, sealed: &SealedShare) -> Vec<Effect> {
+    /// A reshare sub-share arrived from transport source `from`: authenticate it to its genuine old member
+    /// (`from` must be `old_line[old_x-1]`), and if it belongs to the active rotation and opens under this
+    /// host's KEM secret, gather it (first-writer-wins per old member). Once a threshold of distinct old
+    /// members' sub-shares are in, combine them into the rotated share and [`adopt`](Self::adopt) the new
+    /// epoch/line.
+    ///
+    /// Sender authentication closes the spoof hole: a `PorosReshare` from any coordinate other than the old
+    /// member it claims (`old_x`) is dropped, so an outsider cannot inject a sub-share. A *genuine but
+    /// Byzantine* old member's corrupt sub-share still combines here, but a rotated line NEVER serves a
+    /// descriptor that fails its [`with_descriptor_commitment`](Self::with_descriptor_commitment) check — so
+    /// corruption is fail-safe (detected at serve, never a wrong descriptor). Robust recovery from such a
+    /// Byzantine contributor (attribute + retry a different old-member subset) is the VSS follow-on.
+    fn on_reshare(&mut self, from: Triple, target_epoch: Epoch, old_x: u8, sealed: &SealedShare) -> Vec<Effect> {
         let threshold = self.threshold;
         let Some(secret) = self.kem_secret.as_ref() else {
             return Vec::new(); // serve-only host: cannot open sealed sub-shares
@@ -590,6 +636,11 @@ impl PorosHost {
         };
         if ctx.target_epoch != target_epoch {
             return Vec::new(); // a sub-share for a different rotation
+        }
+        // Sender authentication: the sub-share must have arrived FROM the old member it claims to be (index
+        // `old_x` = position `old_x - 1` in the outgoing roster). Rejects a spoofed/misattributed contribution.
+        if usize::from(old_x).checked_sub(1).and_then(|i| ctx.old_line.get(i)) != Some(&from) {
+            return Vec::new();
         }
         let Some(sub) = open_service_share(sealed, secret) else {
             return Vec::new(); // not addressed to us, or tampered
@@ -685,6 +736,14 @@ impl PorosHost {
         let Some(descriptor) = recover_descriptor(&shares) else {
             return Vec::new();
         };
+        // Fail-safe verification: if this host is bound to a descriptor commitment, a reconstruction that does
+        // not match it (a corrupted reshare, or a tampered/inconsistent share set) is NEVER served — the serve
+        // silently drops instead of handing back a wrong ingress set.
+        if let Some(commit) = self.descriptor_commitment
+            && descriptor_commitment(&descriptor) != commit
+        {
+            return Vec::new();
+        }
         let response = IngressResponse { peers: descriptor.bucket(&pending.req) };
         self.pending.remove(&requester);
         vec![Effect::Send {
@@ -725,7 +784,7 @@ impl Engine for PorosHost {
                     Some(FrameType::PorosShare) => decode_share_reply(decoded.body)
                         .map_or_else(Vec::new, |(requester, share)| self.on_share(now, requester, share)),
                     Some(FrameType::PorosReshare) => decode_reshare(decoded.body)
-                        .map_or_else(Vec::new, |(epoch, old_x, sealed)| self.on_reshare(epoch, old_x, &sealed)),
+                        .map_or_else(Vec::new, |(epoch, old_x, sealed)| self.on_reshare(from, epoch, old_x, &sealed)),
                     _ => Vec::new(),
                 }
             }
@@ -1213,7 +1272,7 @@ mod tests {
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, j as u8])).0; // same seed ⇒ same secret
                 let mut h = PorosHost::new(new_line[j], placeholder, new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
                     .with_kem_secret(secret);
-                h.begin_rotation(new_epoch, new_line.clone());
+                h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
             })
             .collect();
@@ -1247,11 +1306,165 @@ mod tests {
         let fresh_secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, 0])).0; // new_host[0]'s secret
         let mut fresh = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
             .with_kem_secret(fresh_secret);
-        fresh.begin_rotation(new_epoch, new_line.clone());
+        fresh.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
         let stale = old_host(0).emit_reshare(Epoch::new(99), &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xC0]);
         if let Some(Effect::Send { frame, .. }) = stale.into_iter().next() {
             fresh.step(Instant(0), Input::Message { from: old_line[0], frame });
         }
         assert_eq!(fresh.epoch(), old_epoch, "a reshare for a different target epoch does not rotate the host");
+    }
+
+    #[test]
+    fn a_reshare_from_the_wrong_source_is_rejected_sender_authentication() {
+        use fanos_pqcrypto::SeedRng;
+        // A spoofer sends a genuine old member's reshare frame from a DIFFERENT coordinate: on_reshare
+        // authenticates `from` against the old-line roster, so the misattributed sub-share is dropped and the
+        // gather does not fill — the host never rotates on spoofed input.
+        let desc = descriptor(6);
+        let (t, n) = (2u8, 3u8);
+        let secret_len = desc.to_bytes().len();
+        let (old_epoch, new_epoch) = (Epoch::new(1), Epoch::new(2));
+        let beacon = BeaconSeed::new([0x66; 32]);
+        let old_line: Vec<Triple> = (0..3).map(coord).collect();
+        let new_line: Vec<Triple> = (3..6).map(coord).collect();
+        let shares = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let old_host = |i: usize| {
+            PorosHost::new(old_line[i], shares[i].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+        };
+        let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x77, 0])).0;
+        let new_pubs: Vec<HybridKemPublic> =
+            (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x77, j as u8])).1).collect();
+        let new_keys: Vec<&HybridKemPublic> = new_pubs.iter().collect();
+        let mut victim = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+            .with_kem_secret(secret);
+        victim.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+
+        // Old member 0's genuine contribution to new member 0, but delivered from an IMPOSTOR coordinate.
+        let frames = old_host(0).emit_reshare(new_epoch, &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xB0]);
+        let to_victim = frames.into_iter().find_map(|e| match e {
+            Effect::Send { to, frame } if to == new_line[0] => Some(frame),
+            _ => None,
+        }).unwrap();
+        let impostor = coord(6); // not old_line[0]
+        victim.step(Instant(0), Input::Message { from: impostor, frame: to_victim });
+        assert_eq!(victim.epoch(), old_epoch, "a sub-share from the wrong source does not gather — no spoofed rotation");
+    }
+
+    #[test]
+    fn a_corrupted_reshare_never_serves_a_wrong_descriptor_commitment_fail_safe() {
+        use fanos_pqcrypto::SeedRng;
+        // A Byzantine old member sends a CORRUPT sub-share (valid source, wrong value): it authenticates and
+        // combines, so the new line's rotated shares are poisoned. But every new host is bound to the descriptor
+        // commitment, so a serve that reconstructs a descriptor != H(commitment) returns NOTHING — the wrong
+        // ingress set is never handed out (fail-safe over GF(256), where per-share Feldman verification cannot
+        // apply).
+        let desc = descriptor(6);
+        let (t, n) = (2u8, 3u8);
+        let secret_len = desc.to_bytes().len();
+        let commit = descriptor_commitment(&desc);
+        let (old_epoch, new_epoch) = (Epoch::new(1), Epoch::new(2));
+        let beacon = BeaconSeed::new([0x88; 32]);
+        let old_line: Vec<Triple> = (0..3).map(coord).collect();
+        let new_line: Vec<Triple> = (3..6).map(coord).collect();
+        let shares = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+
+        // Old member 0 is honest; old member 1 is Byzantine — it holds a CORRUPTED share (flipped bytes), so its
+        // reshare contribution poisons the combination.
+        let honest0 = PorosHost::new(old_line[0], shares[0].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let mut bad_y = shares[1].y().to_vec();
+        bad_y[0] ^= 0xFF;
+        let byz1 = PorosHost::new(old_line[1], Share::new(shares[1].x(), bad_y), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+
+        let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> =
+            (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8]))).collect();
+        let new_keys: Vec<&HybridKemPublic> = new_kp.iter().map(|(_, p)| p).collect();
+        // Every new host is COMMITTED to the true descriptor.
+        let mut new_hosts: Vec<PorosHost> = (0..3)
+            .map(|j| {
+                let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
+                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                    .with_kem_secret(secret)
+                    .with_descriptor_commitment(commit);
+                h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+                h
+            })
+            .collect();
+
+        // Route both old members' contributions (honest 0 + Byzantine 1) to the new line.
+        for (host, i) in [(&honest0, 0usize), (&byz1, 1usize)] {
+            let frames = host.emit_reshare(new_epoch, &new_line, &new_keys, &vec![0x10u8 + i as u8; secret_len + 8], &[0xB0, i as u8]);
+            for e in frames {
+                if let Effect::Send { to, frame } = e {
+                    let j = new_line.iter().position(|c| *c == to).unwrap();
+                    new_hosts[j].step(Instant(0), Input::Message { from: old_line[i], frame });
+                }
+            }
+        }
+        // The new hosts adopted (poisoned) shares — rotation "completed" from their local view.
+        assert!(new_hosts.iter().all(|h| h.epoch() == new_epoch), "the new hosts rotated on authenticated input");
+
+        // Now a request: the new combiner gathers a threshold and reconstructs — but the descriptor fails the
+        // commitment (poisoned), so it serves NOTHING rather than a wrong ingress set.
+        assert!(
+            !probe_serve(&mut new_hosts, &new_line, b"c", new_epoch, &beacon),
+            "a corrupted rotation fails the commitment and serves nothing — never a wrong descriptor",
+        );
+
+        // Control: an UNcorrupted rotation of the same committed line DOES serve (the guard is not over-eager).
+        let honest1 = PorosHost::new(old_line[1], shares[1].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let mut good_hosts: Vec<PorosHost> = (0..3)
+            .map(|j| {
+                let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
+                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                    .with_kem_secret(secret)
+                    .with_descriptor_commitment(commit);
+                h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+                h
+            })
+            .collect();
+        for (host, i) in [(&honest0, 0usize), (&honest1, 1usize)] {
+            let frames = host.emit_reshare(new_epoch, &new_line, &new_keys, &vec![0x20u8 + i as u8; secret_len + 8], &[0xC0, i as u8]);
+            for e in frames {
+                if let Effect::Send { to, frame } = e {
+                    let j = new_line.iter().position(|c| *c == to).unwrap();
+                    good_hosts[j].step(Instant(0), Input::Message { from: old_line[i], frame });
+                }
+            }
+        }
+        assert!(
+            probe_serve(&mut good_hosts, &new_line, b"c", new_epoch, &beacon),
+            "an uncorrupted committed rotation still serves — the commitment guard is not over-eager",
+        );
+    }
+
+    /// Drive one ingress request through a rotated line (combiner = `hosts[0]`) and report whether it served a
+    /// `PorosResponse` — the observable that proves the descriptor reconstructed and passed its commitment.
+    fn probe_serve(
+        hosts: &mut [PorosHost],
+        new_line: &[Triple],
+        community: &[u8],
+        epoch: Epoch,
+        beacon: &BeaconSeed,
+    ) -> bool {
+        let req = solve_ingress_request(coord(6), community, epoch, beacon, 4);
+        let fanned = hosts[0].step(Instant(1), Input::Message { from: coord(6), frame: request_frame(&req) });
+        for e in fanned {
+            if let Effect::Send { to, frame } = e
+                && let Some(j) = new_line.iter().position(|c| *c == to)
+            {
+                for reply in hosts[j].step(Instant(2), Input::Message { from: new_line[0], frame }) {
+                    if let Effect::Send { frame: share_frame, .. } = reply {
+                        for out in hosts[0].step(Instant(3), Input::Message { from: new_line[j], frame: share_frame }) {
+                            if let Effect::Send { frame: resp, .. } = out
+                                && decode_frame(&resp).ok().and_then(|(f, _)| f.frame_type()) == Some(FrameType::PorosResponse)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
