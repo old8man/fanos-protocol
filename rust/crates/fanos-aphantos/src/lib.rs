@@ -11,12 +11,14 @@
 extern crate alloc;
 
 pub mod node;
+pub mod nostos;
 pub mod sealed;
 pub mod surb;
 pub mod threshold;
 pub mod threshold_router;
 
 pub use node::{Directory, NyxNode};
+pub use nostos::{ReplyKeys, seal_reply, seal_to_receiver, select_drop_line};
 pub use sealed::{PeelOutcome, SealedError};
 pub use threshold::{ThresholdError, ThresholdSealed};
 pub use threshold_router::ThresholdRouter;
