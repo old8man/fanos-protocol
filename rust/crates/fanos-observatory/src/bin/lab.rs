@@ -108,6 +108,9 @@ struct RouteArgs {
     /// Crash this many gateways, then re-measure reachability (fault-containment demo).
     #[arg(long, default_value_t = 0)]
     crash: usize,
+    /// Instead of a single crash, sweep 0..gateways failures and print the reachability curve.
+    #[arg(long)]
+    resilience: bool,
     /// RNG seed.
     #[arg(long, short, default_value_t = 1)]
     seed: u64,
@@ -230,16 +233,36 @@ fn cmd_route(args: &RouteArgs) {
         eprintln!("route needs at least 2 gateways and 1 node per cell");
         std::process::exit(2);
     }
+    if total > 993 {
+        eprintln!("route tops out at 993 nodes (one transport plane); requested {total}");
+        std::process::exit(2);
+    }
+
+    if args.resilience {
+        // Reachability as gateways progressively fail — the containment curve.
+        let curve = if total <= 57 {
+            route_resilience::<F7>(args)
+        } else if total <= 183 {
+            route_resilience::<F13>(args)
+        } else {
+            route_resilience::<F31>(args)
+        };
+        println!("\nrouting resilience — {} gateways × {} = {total} nodes", args.gateways, args.per_cell);
+        println!("  {:>8}  {:>13}", "crashed", "reachability");
+        for (k, r) in curve {
+            println!("  {k:>8}  {:>12.1}%", r * 100.0);
+        }
+        println!();
+        return;
+    }
+
     // Pick the smallest transport plane that fits (F7=57, F13=183, F31=993 points).
     let (before, after) = if total <= 57 {
         route_run::<F7>(args)
     } else if total <= 183 {
         route_run::<F13>(args)
-    } else if total <= 993 {
-        route_run::<F31>(args)
     } else {
-        eprintln!("route tops out at 993 nodes (one transport plane); requested {total}");
-        std::process::exit(2);
+        route_run::<F31>(args)
     };
     let crashed = args.crash.min(args.gateways);
     if args.json {
@@ -268,6 +291,21 @@ fn route_run<F: Field + 'static>(args: &RouteArgs) -> (f64, f64) {
     }
     let after = h.reachability(&pairs);
     (before, after)
+}
+
+fn route_resilience<F: Field + 'static>(args: &RouteArgs) -> Vec<(usize, f64)> {
+    let pairs = cross_cell_pairs(args.gateways, args.per_cell);
+    (0..args.gateways)
+        .map(|k| {
+            let mut h = Hierarchy::<F>::two_level(args.seed, lab_config(), args.gateways, args.per_cell);
+            for g in 0..k {
+                if let Some(idx) = h.gateway(g) {
+                    h.crash(idx);
+                }
+            }
+            (k, h.reachability(&pairs))
+        })
+        .collect()
 }
 
 /// Every ordered cross-cell pair — cell `i`'s first sub-node to cell `j`'s first sub-node (`i ≠ j`).
