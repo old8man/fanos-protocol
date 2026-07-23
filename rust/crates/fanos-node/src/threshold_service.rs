@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use fanos_calypso::hosting::{SealedIntro, Share};
+use fanos_calypso::hosting::{SealedIntro, SealedShare, Share, open_service_share};
 use fanos_geometry::Triple;
 use fanos_pqcrypto::HybridKemSecret;
 use fanos_primitives::hash_labeled;
@@ -115,6 +115,18 @@ impl ThresholdService {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Open this member's **identity-custody share** — a [`SealedShare`] of the service's threshold-hosted
+    /// *identity* secret (§12.3–§12.6), distinct from the per-intro key shares. Uses this member's own KEM
+    /// secret (kept encapsulated here); `None` if the share was not sealed to it. A combiner reconstructs the
+    /// service identity from `threshold` such opened shares
+    /// ([`recover_service_key`](fanos_calypso::hosting::recover_service_key)) only when the service must
+    /// authenticate (e.g. re-signing an epoch cert, spec §12.6) — so **no single host holds the service
+    /// identity in the clear**, the same seizure-resistance the per-intro sharing gives request confidentiality.
+    #[must_use]
+    pub fn open_identity_share(&self, sealed: &SealedShare) -> Option<Share> {
+        open_service_share(sealed, &self.secret)
     }
 
     fn intro_id(intro: &SealedIntro) -> IntroId {

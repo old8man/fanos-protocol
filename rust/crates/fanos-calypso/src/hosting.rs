@@ -33,19 +33,19 @@
 //! itself might be adversarial *at deal time* — a real concern for the beacon committee's mutually
 //! distrusting members, not for an operator bootstrapping its own service.
 //!
-//! ## Live wiring (integration point)
-//! TODO(#99 follow-up): wire this into `fanos_rendezvous::RendezvousService`
-//! (`crates/fanos-rendezvous/src/transport.rs:125`), which today holds one opaque `secret` used only
-//! to seed its reply-onion RNG (`:136`, `RendezvousService::new`) and decodes each delivered
-//! `Request` directly (`:149`, `ingest`) — i.e. whichever single host runs it reads every intro
-//! alone, and alone holds whatever identity secret it was booted with. Lifting it to a genuinely
-//! threshold-hosted service means: (a) replace that one `secret` with `Vec<SealedShare>` — one per
-//! service-line member — opened via [`open_service_share`] and combined via [`recover_service_key`]
-//! whenever the service needs its identity (e.g. re-signing an epoch cert, spec §12.6); and (b)
-//! replace the direct `ingest` with a per-member `Engine` that seals/collects
-//! [`SealedIntro::member_partial`]s over the overlay before calling [`SealedIntro::open`] —
-//! `crates/fanos-sim/tests/threshold_calypso.rs` runs exactly this combiner protocol end to end
-//! (`ServiceMember`) as the template to lift into a real engine.
+//! ## Live wiring (integration point) — DONE
+//! Wired into a genuinely threshold-hosted rendezvous service by `fanos_node::ThresholdRendezvous` (the #99
+//! follow-up). It composes the two engines that already existed rather than duplicating either:
+//! `fanos_node::ThresholdService` (the per-member gather that seals/collects
+//! [`SealedIntro::member_partial`]s over the overlay before [`SealedIntro::open`] — the `ServiceMember`
+//! template of `crates/fanos-sim/tests/threshold_calypso.rs` lifted into a real multiplexed, DoS-bounded
+//! engine) and `fanos_rendezvous::RendezvousService` (the cookie→reply-route binding and reply sealing).
+//! Both TODO parts are covered: **(b)** the client seals its whole `Request` in a [`SealedIntro`] to the line
+//! and no single member reads it (the composite surfaces the decrypted request only after a threshold of
+//! PartialDecs); **(a)** the service identity is dealt one [`SealedShare`] per member (a member opens its slot
+//! via [`open_service_share`], a combiner combines `≥ t` via [`recover_service_key`] on demand — spec §12.6),
+//! so no single host holds the identity in the clear. The reply-onion RNG stays local per-member (unlinkable
+//! regardless), separate from the custodied identity.
 
 use alloc::vec::Vec;
 
