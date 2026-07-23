@@ -20,7 +20,7 @@
 //! terminate. Trust is in the algebra (every partial's DLEQ is checked against the public commitment),
 //! never in the peer that relayed it — a forged partial or round is dropped, not adopted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
@@ -41,6 +41,19 @@ const MAX_PARTIALS: usize = 256;
 /// memory against a peer flooding triggers/commits for many bogus generations (each commit still fails its
 /// binding check, so none is ever adopted — this only bounds the buffer). Oldest generations are evicted.
 const MAX_RESHARE_GENS: usize = 4;
+
+/// How many generations ahead of the adopted one a resharing trigger may name (audit §3.1). Bounds the
+/// flood/eviction surface: an unauthenticated trigger cannot jump to a far-future generation and evict the
+/// live in-progress rounds through [`BeaconNode::prune_reshare_gens`].
+const MAX_RESHARE_GEN_ADVANCE: u64 = 8;
+
+/// The smallest resharing threshold a trigger may name (audit §3.1 — the CRITICAL key-exfiltration floor).
+/// A `new_threshold = 1` reshare deals a **degree-0** polynomial `gᵢ`, so `gᵢ(j) = sᵢ` at *every* new
+/// index — one malicious new holder harvests each contributor's raw secret share and reconstructs the beacon
+/// master key. Requiring `≥ 2` makes every sub-share a single evaluation of a degree-≥1 polynomial, useless
+/// to a holder without `new_threshold` of them (and a single-identity attacker controls exactly one
+/// new-holder coordinate). See the security note on [`BeaconNode::on_reshare_trigger`].
+const MIN_RESHARE_THRESHOLD: usize = 2;
 
 /// A node running the distributed randomness beacon over its cell.
 pub struct BeaconNode<F: Field> {
@@ -171,6 +184,16 @@ impl<F: Field> BeaconNode<F> {
         (0..self.n)
             .find(|&i| Point::<F>::at(i).coords() == me)
             .map_or(0, |i| (i + 1) as u8)
+    }
+
+    /// Whether every entry of `indices` is a valid, distinct holder index: 1-based, `≤ n`, and appearing
+    /// at most once. An out-of-range index maps to no real coordinate (and would panic `Point::at`); a
+    /// repeated index is not a second independent Lagrange evaluation. (Audit §3.1 hardening.)
+    fn distinct_in_range(&self, indices: &[u8]) -> bool {
+        let mut seen = BTreeSet::new();
+        indices
+            .iter()
+            .all(|&i| i != 0 && usize::from(i) <= self.n && seen.insert(i))
     }
 
     /// Broadcast `frame` to every *other* cell member.
@@ -324,12 +347,27 @@ impl<F: Field> BeaconNode<F> {
         let Some((generation, new_threshold, contributors, new_indices)) = parse_reshare_trigger(body) else {
             return Vec::new();
         };
+        // Security floor (audit §3.1). The confirmed exfiltration set `new_threshold = 1`: a degree-0
+        // resharing polynomial evaluates to the contributor's raw share `sᵢ` at every new index, so one
+        // member could name itself the sole new holder, collect `{sᵢ}` from ≥`t` contributors, and
+        // reconstruct the beacon master key. [`MIN_RESHARE_THRESHOLD`] closes that — with `new_threshold ≥ 2`
+        // each new holder receives only a single evaluation of a degree-≥1 polynomial, and a single-identity
+        // attacker controls exactly one new-holder coordinate, so it can never gather the `new_threshold`
+        // evaluations reconstruction needs. Every index is validated (distinct, `1..=n`) so a sub-share is
+        // never routed to an out-of-range/foreign coordinate, and the generation is windowed so a far-future
+        // trigger cannot evict the live in-progress rounds. RESIDUAL (Tier-1 follow-up): a coalition of
+        // ≥`new_threshold` Byzantine anchors can still extract the raw key via a low-threshold reshare — that
+        // is within the beacon's own `< t`-Byzantine trust bound and requires an *authenticated* coordinator
+        // authorization (operator control-plane / threshold endorsement) to fully close.
         if generation <= self.reshare_gen
-            || new_threshold == 0
+            || generation > self.reshare_gen.saturating_add(MAX_RESHARE_GEN_ADVANCE)
+            || new_threshold < MIN_RESHARE_THRESHOLD
             || new_threshold > new_indices.len()
             || contributors.len() < self.threshold
+            || !self.distinct_in_range(&contributors)
+            || !self.distinct_in_range(&new_indices)
         {
-            return Vec::new(); // stale, or a nonsensical / under-provisioned reshare
+            return Vec::new(); // stale, out-of-window, key-unsafe, or nonsensical / under-provisioned
         }
         self.prune_reshare_gens(generation);
         if self.pending_reshare.get(&generation).and_then(|r| r.new_threshold).is_some() {
@@ -988,5 +1026,32 @@ mod tests {
             assert_eq!(nodes[p].epoch(), Epoch::new(2), "the clock advanced on the survivor set");
             assert_eq!(nodes[p].seed(), expected_epoch2, "the reshared beacon is the same DVRF value");
         }
+    }
+
+    #[test]
+    fn a_key_exfiltration_reshare_trigger_is_rejected() {
+        // Audit §3.1: the confirmed exploit — one member broadcasts a `new_threshold = 1` reshare naming
+        // itself the sole new holder. A degree-0 polynomial deals `gᵢ(j) = sᵢ`, so an honest anchor that
+        // dealt would hand the attacker its raw secret share; ≥ t of them reconstruct the beacon master key.
+        // The floor must make every honest anchor REFUSE, so no sub-share ever leaves for the attacker.
+        let t = 4usize;
+        let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"exfil-cell")).unwrap();
+        let mut victim = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+        let recv = |v: &mut BeaconNode<F2>, frame: Vec<u8>| v.step(Instant(0), Input::Message { from: [0, 0, 0], frame });
+
+        // The malicious trigger: threshold 1, new holder = the attacker's index 5, ≥ t named contributors.
+        assert!(recv(&mut victim, reshare_trigger_frame(1, 1, &[1, 2, 3, 4], &[5])).is_empty(),
+            "an honest anchor deals nothing for a threshold-1 (key-leaking) reshare");
+        assert_eq!(victim.reshare_gen(), 0, "and does not adopt it");
+        // Defense-in-depth: an out-of-range new index, a duplicate index, and a far-future generation are
+        // all refused before any share is dealt.
+        assert!(recv(&mut victim, reshare_trigger_frame(1, 3, &[1, 2, 3, 4], &[5, 6, 99])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(1, 3, &[1, 2, 3, 4], &[5, 5, 6])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6])).is_empty());
+        assert_eq!(victim.reshare_gen(), 0, "no malformed trigger advanced any state");
+
+        // A well-formed reshare (threshold ≥ 2, valid distinct in-range indices, in-window) is still honored.
+        assert!(!recv(&mut victim, reshare_trigger_frame(1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
+            "a legitimate reshare is still dealt");
     }
 }
