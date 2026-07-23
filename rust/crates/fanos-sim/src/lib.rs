@@ -27,6 +27,7 @@
 //! // A surviving node localizes the crash by its 3-bit syndrome.
 //! ```
 
+mod experiment;
 mod metrics;
 mod network;
 mod observatory;
@@ -34,6 +35,7 @@ mod rng;
 mod sim;
 mod trace;
 
+pub use experiment::{Experiment, Grid, Params, Row, Scenario};
 pub use metrics::{Metrics, Observed, Report};
 pub use network::NetworkModel;
 pub use observatory::{

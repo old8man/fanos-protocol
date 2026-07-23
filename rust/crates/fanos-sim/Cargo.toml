@@ -21,6 +21,10 @@ fanos-runtime = { workspace = true, features = ["std"] }
 name = "fanos-sim-demo"
 path = "src/bin/demo.rs"
 
+[[bin]]
+name = "fanos-sim-experiment"
+path = "src/bin/experiment.rs"
+
 [dev-dependencies]
 proptest.workspace = true
 # For decoding the mandatory CoherenceFrames nodes emit each diagnosis (telemetry e2e scenario).
