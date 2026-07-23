@@ -925,6 +925,64 @@ mod tests {
         assert!(!n.rebootstrap(&stale, new_commitment, Some(new_shares[4].clone())), "a stale generation is refused");
     }
 
+    /// Step `AdvanceEpoch` on only the nodes at `which` (the survivors), returning their flooded-partial bus —
+    /// the others are "lost" and never step, modelling an instantaneous mass crash.
+    fn kickoff_some(nodes: &mut [BeaconNode<F2>], which: &[usize]) -> Vec<(usize, Vec<u8>)> {
+        let mut bus = Vec::new();
+        for &p in which {
+            for e in nodes[p].step(Instant(0), Input::Command(Command::AdvanceEpoch)) {
+                if let Effect::Send { to, frame } = e
+                    && let Some(k) = node_at(to)
+                {
+                    bus.push((k, frame));
+                }
+            }
+        }
+        bus
+    }
+
+    #[test]
+    fn a_survivor_set_resumes_the_frozen_clock_after_re_genesis() {
+        use crate::RecoveryAuthorization;
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+        // Genesis t=4, n=7, recovery authority configured; survivors = points {4,5,6} (3 < t → the cliff).
+        let t = 4usize;
+        let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"resume-genesis")).unwrap();
+        let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"parent-cell"));
+        let mut nodes: Vec<BeaconNode<F2>> = (0..N)
+            .map(|i| {
+                BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t)
+                    .with_recovery_authority(authority_vk.clone())
+            })
+            .collect();
+        let survivors_pts = [4usize, 5, 6];
+
+        // (1) Frozen: only 3 < t=4 survivors flood, so no round ever assembles — the R-C1 cliff.
+        let bus = kickoff_some(&mut nodes, &survivors_pts);
+        let frozen = run(&mut nodes, bus);
+        assert!(frozen.is_empty(), "below threshold the epoch clock is frozen — no beacon assembles");
+
+        // (2) A fresh survivor DKG (a trusted deal stands in, as genesis does) + an authorized RGC fenced at 3.
+        let t2 = 2u8;
+        let (new_shares, new_commitment) =
+            deal(&[0x5E; 32], usize::from(t2), N, &mut DeterministicRng::new(b"resume-fresh")).unwrap();
+        let fence = Epoch::new(3);
+        let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &[5, 6, 7], t2, nodes[4].lineage_anchor());
+        for &p in &survivors_pts {
+            assert!(nodes[p].rebootstrap(&rgc, new_commitment.clone(), Some(new_shares[p].clone())), "survivor re-genesises");
+        }
+
+        // (3) Resumed: the 3 survivors now assemble a round at the fence — the clock ticks again, on one fresh
+        // seed, under the new key (the old-key nodes' stale partials fail against the new commitment).
+        let bus = kickoff_some(&mut nodes, &survivors_pts);
+        let resumed = run(&mut nodes, bus);
+        assert!(!resumed.is_empty(), "the re-genesised survivors resume the beacon clock");
+        assert!(resumed.iter().all(|&(_, e, _)| e == fence), "at the fenced epoch");
+        let seed = resumed[0].2;
+        assert!(resumed.iter().all(|&(_, _, s)| s == seed), "converging on one fresh seed");
+        assert_ne!(seed, [0u8; 32], "a real beacon value under the fresh key");
+    }
+
     #[test]
     fn a_pure_consumer_adopts_the_flooded_round() {
         // A node with no share never produces a partial, but adopts the round the anchors flood — so a
