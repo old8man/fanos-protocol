@@ -99,6 +99,12 @@ struct WatchArgs {
     /// Virtual milliseconds to advance per real refresh tick.
     #[arg(long, default_value_t = 300)]
     step_ms: u64,
+    /// Optionally drive a stress experiment live while watching (see `fanos-lab scenarios`).
+    #[arg(long)]
+    experiment: Option<String>,
+    /// The live experiment's intensity — crash fraction (mass-crash) or churn rate (churn).
+    #[arg(long, default_value_t = 0.05)]
+    fraction: f64,
 }
 
 fn lab_config() -> Config {
@@ -255,13 +261,24 @@ fn cmd_gate() {
 
 fn cmd_watch(args: &WatchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut cluster = build_cluster(&args.shape);
-    let label = format!("seed {}", args.shape.seed);
+    // Resolve an optional live experiment (fail fast on a bad name, before touching the terminal).
+    let experiment = args.experiment.as_deref().map(|name| {
+        Experiment::from_name(name, args.fraction, cluster.node_count()).unwrap_or_else(|| {
+            eprintln!("unknown experiment '{name}'. Try: {}", Experiment::NAMES.join(", "));
+            std::process::exit(2);
+        })
+    });
+    let label = match &experiment {
+        Some(exp) => format!("seed {} · {}", args.shape.seed, exp.name()),
+        None => format!("seed {}", args.shape.seed),
+    };
+
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = watch_loop(&mut terminal, &mut cluster, &label, args.step_ms);
+    let result = watch_loop(&mut terminal, &mut cluster, &label, args.step_ms, experiment);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -273,11 +290,13 @@ fn watch_loop(
     cluster: &mut Cluster,
     label: &str,
     step_ms: u64,
+    experiment: Option<Experiment>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cluster.refresh_telemetry();
     let mut dash = ClusterDashboard::new(cluster.snapshot(), label.to_string());
     let tick = StdDuration::from_millis(150);
     let mut last = StdInstant::now();
+    let mut exp_tick = 0usize; // advances only while the live experiment is running
 
     loop {
         terminal.draw(|f| render_cluster(f, &dash))?;
@@ -302,6 +321,10 @@ fn watch_loop(
 
         if last.elapsed() >= tick {
             if !dash.is_paused() {
+                if let Some(exp) = experiment {
+                    exp.perturb(cluster, exp_tick);
+                    exp_tick += 1;
+                }
                 cluster.run_for(Duration::from_millis(step_ms));
             }
             cluster.refresh_telemetry();
