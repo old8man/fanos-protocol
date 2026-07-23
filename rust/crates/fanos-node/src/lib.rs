@@ -16,7 +16,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bridge;
 pub mod cell_node;
 pub mod config;
 pub mod diaulos;
@@ -33,6 +32,7 @@ pub mod mix_relay;
 pub mod mixdir;
 pub mod node;
 pub mod overlay_beacon;
+pub mod poros;
 pub mod proxy;
 pub mod rendezvous;
 pub mod rendezvous_relay;
