@@ -113,6 +113,23 @@ impl ClusterDashboard {
     pub fn clear_selection(&mut self) {
         self.selected = None;
     }
+
+    /// Select the next troubled cell after the current selection (wrapping) — fast triage when a handful
+    /// of cells among thousands need attention. No-op if nothing is troubled.
+    pub fn select_next_troubled(&mut self) {
+        let n = self.snapshot.cell_count();
+        if n == 0 {
+            return;
+        }
+        let start = self.selected.map_or(0, |s| s + 1);
+        for off in 0..n {
+            let i = (start + off) % n;
+            if self.snapshot.cells[i].concerns().next().is_some() {
+                self.selected = Some(i);
+                return;
+            }
+        }
+    }
 }
 
 /// The health colour of a whole cell — the worst state any of its nodes is in.
@@ -316,9 +333,9 @@ fn render_cell_detail(f: &mut Frame<'_>, area: Rect, index: usize, cell: &FleetS
 
 fn render_footer(f: &mut Frame<'_>, area: Rect, dash: &ClusterDashboard) {
     let hint = if dash.selected.is_some() {
-        " q quit · space pause · ↑↓ change cell · esc back to cluster "
+        " q quit · space pause · ↑↓ change cell · t next issue · esc back to cluster "
     } else {
-        " q quit · space pause · f fault a cell · h heal · ←→ inspect a cell "
+        " q quit · space pause · f fault · h heal · ←→ inspect a cell · t next issue "
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(MUTED)))).alignment(Alignment::Center),
@@ -375,6 +392,18 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| render_cluster(f, &dash)).unwrap();
         assert!(buffer_text(&terminal).contains("cell 1"), "drill-down header present");
+    }
+
+    #[test]
+    fn jump_to_next_troubled_finds_the_degraded_cell() {
+        let mut cluster = Cluster::new(1, Config::default(), 8);
+        cluster.run_for(Duration::from_millis(1200));
+        // Crash a node in cell 3 — it immediately reads not-alive, so cell 3 is the only troubled one.
+        let victim = cluster.cell(3).unwrap().nodes().next().unwrap();
+        cluster.cell_mut(3).unwrap().crash(victim);
+        let mut dash = ClusterDashboard::new(cluster.snapshot(), "t");
+        dash.select_next_troubled();
+        assert_eq!(dash.selected(), Some(3), "triage jumps straight to the troubled cell");
     }
 
     #[test]

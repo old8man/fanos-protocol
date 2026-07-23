@@ -376,6 +376,7 @@ fn watch_loop(
                 KeyCode::Char(' ') => dash.toggle_pause(),
                 KeyCode::Char('f') => fault_a_cell(cluster, &dash),
                 KeyCode::Char('h') => heal_all(cluster),
+                KeyCode::Char('t') => dash.select_next_troubled(),
                 KeyCode::Left | KeyCode::Up => dash.select_delta(-1),
                 KeyCode::Right | KeyCode::Down => dash.select_delta(1),
                 _ => {}
