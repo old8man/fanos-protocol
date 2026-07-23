@@ -830,6 +830,7 @@ dependencies = [
  "fanos-pqcrypto",
  "fanos-primitives",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -882,6 +883,7 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-holarch",
  "fanos-primitives",
  "serde_json",
 ]
@@ -981,6 +983,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-holarch"
+version = "0.1.0"
+dependencies = [
+ "fanos-diakrisis",
+]
+
+[[package]]
 name = "fanos-incentives"
 version = "0.1.0"
 dependencies = [
@@ -997,6 +1006,8 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "fanos-ports",
+ "fanos-pqcrypto",
+ "fanos-primitives",
  "fanos-vrf",
  "fanos-wire",
  "zeroize",
@@ -1014,6 +1025,7 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "fanos-keygen",
+ "fanos-nyx",
  "fanos-obolos",
  "fanos-onoma",
  "fanos-pqcrypto",
@@ -1166,6 +1178,7 @@ dependencies = [
  "fanos-calypso",
  "fanos-field",
  "fanos-geometry",
+ "fanos-nyx",
  "fanos-pqcrypto",
  "fanos-wire",
  "fanos-wire-derive",
@@ -1244,6 +1257,7 @@ dependencies = [
  "fanos-incentives",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-vrf",
  "fanos-wire",
  "fanos-wire-derive",
  "proptest",

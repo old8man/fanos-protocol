@@ -12,6 +12,7 @@ members = [
     "crates/fanos-geometry",
     "crates/fanos-code",
     "crates/fanos-diakrisis",
+    "crates/fanos-holarch",
     "crates/fanos-wire",
     "crates/fanos-wire-derive",
     "crates/fanos-primitives",
@@ -101,6 +102,8 @@ fanos-field = { path = "crates/fanos-field", version = "0.1.0", default-features
 fanos-geometry = { path = "crates/fanos-geometry", version = "0.1.0", default-features = false }
 fanos-code = { path = "crates/fanos-code", version = "0.1.0", default-features = false }
 fanos-diakrisis = { path = "crates/fanos-diakrisis", version = "0.1.0", default-features = false }
+# ХОЛАРХ — the architecture viability gate (the platform's own definition of done, spec/platform.md §1).
+fanos-holarch = { path = "crates/fanos-holarch", version = "0.1.0" }
 fanos-wire = { path = "crates/fanos-wire", version = "0.1.0", default-features = false }
 fanos-wire-derive = { path = "crates/fanos-wire-derive", version = "0.1.0" }
 fanos-primitives = { path = "crates/fanos-primitives", version = "0.1.0", default-features = false }

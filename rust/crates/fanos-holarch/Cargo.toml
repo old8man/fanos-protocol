@@ -1,0 +1,19 @@
+[package]
+name = "fanos-holarch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HOLARCH — the FANOS architecture viability gate: the platform's Γ-matrix, the four release invariants (V1–V4), the σ-stress panel, and the Ω4 ablation calculus."
+keywords = ["architecture", "viability", "coherence", "holon", "fanos"]
+categories = ["mathematics", "algorithms"]
+
+[dependencies]
+# The four release thresholds (P_crit, R_th, Φ_th) are the *same* coherence family the runtime
+# DIAKRISIS plane uses — imported from it so the gate and the plane can never disagree on the window.
+fanos-diakrisis = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
