@@ -307,6 +307,22 @@ fn render_cell_detail(f: &mut Frame<'_>, area: Rect, index: usize, cell: &FleetS
         format!("cell {index} — {} nodes, {} alive", cell.stats.total, cell.stats.alive),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     ))];
+    // The cell's self-model — every member senses the same cell, so any reporting node represents it.
+    if let Some(c) = cell.nodes.iter().find_map(|n| n.coherence.as_ref()) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Φ={:.3}  P={:.3}  R={:.3}  {}  syndrome={:03b}",
+                c.phi, c.purity, c.reflection, c.regime.as_str(), c.syndrome & 0b111,
+            ),
+            Style::default().fg(if c.phi >= 1.0 { READY } else { WARN }),
+        )));
+    }
+    if cell.stats.partitioned > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ partition verdict on {} node(s) — a systemic split", cell.stats.partitioned),
+            Style::default().fg(CRIT),
+        )));
+    }
     for node in &cell.nodes {
         let (mark, col) = if !node.alive {
             ("✗ down ", DEAD)
