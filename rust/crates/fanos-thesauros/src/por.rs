@@ -59,11 +59,20 @@ fn draw(seed: &[u8; 32], counter: u64, m: usize) -> usize {
     (word % m as u64) as usize
 }
 
+/// A hard cap on the leaf domain (and hence sample count) a single audit challenge allocates over (audit §3.3,
+/// defense-in-depth). `open_deal` already bounds a deal's `size` so its leaf count is tiny (`≤ CHUNK/LEAF`);
+/// clamping here means even a params-bypassing call can never reserve an unbounded `Vec` and OOM the audit path.
+pub const MAX_AUDIT_LEAVES: usize = 1 << 20;
+
 /// The set of leaf indices challenged for `chunk` at `beacon`, wanting `k` distinct samples out of `leaves`.
 /// Publicly derivable, so the verifier recomputes it rather than trusting the prover. If `k ≥ leaves`, the whole
-/// chunk is audited.
+/// chunk is audited. Both `leaves` and `k` are clamped to [`MAX_AUDIT_LEAVES`] so the work is always bounded.
 #[must_use]
 pub fn challenge(chunk: &Cid, beacon: &[u8], k: usize, leaves: usize) -> Vec<usize> {
+    // Defensive clamp (audit §3.3): the challenge is derived deterministically by both prover and verifier, so
+    // clamping identically keeps them consistent while making the allocation unconditionally bounded.
+    let leaves = leaves.min(MAX_AUDIT_LEAVES);
+    let k = k.min(leaves);
     if leaves == 0 {
         return Vec::new();
     }
@@ -177,10 +186,21 @@ fn decode_leaf_proof(bytes: &[u8]) -> Option<(LeafProof, &[u8])> {
     Some((LeafProof { index, bytes: leaf_bytes, path }, bytes.get(off..)?))
 }
 
+/// The fewest bytes any encoded leaf proof occupies — index (4) + empty leaf-bytes length prefix (4) +
+/// zero-step path length prefix (2). Bounds `decode_response`'s pre-allocation against the actual buffer.
+const MIN_LEAFPROOF_LEN: usize = 4 + 4 + 2;
+
 /// Decode a full audit response from [`encode_response`], or `None` if malformed / truncated / over-long.
 #[must_use]
 pub fn decode_response(bytes: &[u8]) -> Option<Vec<LeafProof>> {
     let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    // Bound the pre-allocation against the bytes actually present (audit §3.3): a leaf proof is at least
+    // MIN_LEAFPROOF_LEN bytes, so a `count` beyond what the remaining buffer could hold is a crafted over-count.
+    // Reserving for it (`[0xFF; 4]` ⇒ ~4.3 billion) would OOM-abort every validator on the deterministic
+    // block-execute path — a cell-wide halt. Mirrors the `count·stride ≤ body.len()` guard in `Manifest::decode`.
+    if count > (bytes.len() - 4) / MIN_LEAFPROOF_LEN {
+        return None;
+    }
     let mut rest = bytes.get(4..)?;
     let mut response = Vec::with_capacity(count);
     for _ in 0..count {
@@ -301,5 +321,25 @@ mod tests {
         let (bytes, path) = prove_leaf(&data, other).unwrap();
         resp[0] = LeafProof { index: victim, bytes, path };
         assert!(!verify(&cid, beacon, 4, leaves, &resp), "a leaf answered at the wrong position is rejected");
+    }
+
+    #[test]
+    fn decode_response_refuses_a_crafted_over_count() {
+        // Audit §3.3: a 4-byte count claiming billions of leaf proofs must be refused BEFORE `with_capacity`,
+        // so a crafted response cannot OOM-abort every validator on the deterministic prove path.
+        let mut evil = u32::MAX.to_le_bytes().to_vec(); // claims ~4.3 billion leaf proofs …
+        evil.extend_from_slice(&[0u8; 20]); // … in 20 bytes (room for ~2)
+        assert_eq!(decode_response(&evil), None, "an over-count is refused, not pre-allocated");
+        // A count with no proof bytes at all is likewise refused (bounded by the empty remainder).
+        assert_eq!(decode_response(&1u32.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn challenge_work_is_bounded_regardless_of_params() {
+        // Audit §3.3: an unbounded leaf domain / sample count cannot make `challenge` allocate without limit.
+        let cid = chunk_cid(&chunk(1));
+        let all = challenge(&cid, b"beacon", usize::MAX, usize::MAX);
+        assert_eq!(all.len(), MAX_AUDIT_LEAVES, "the leaf domain is clamped to the cap");
+        assert_eq!(challenge(&cid, b"beacon", 7, usize::MAX).len(), 7, "a modest k over a huge domain draws exactly k");
     }
 }

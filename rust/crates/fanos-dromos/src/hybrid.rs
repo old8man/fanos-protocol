@@ -28,7 +28,10 @@ use crate::bridge::{POOL_SINK, ShieldTx};
 use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
 use crate::naming::{NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
-use crate::storage::{AUDIT_PERIOD, STORAGE_ESCROW, StorageMarket, StorageTx, deal_id, leaves_for_size};
+use crate::storage::{
+    AUDIT_PERIOD, MAX_DEAL_DURATION, MAX_DEAL_SIZE, STORAGE_ESCROW, StorageMarket, StorageTx, deal_id,
+    leaves_for_size,
+};
 use crate::token::{SignedTransfer, TokenLedger};
 
 /// The shared state key every shielded operation touches — so shielded spends serialize against each other
@@ -259,6 +262,20 @@ impl HybridLedger {
     /// the transfer binds the consumer and targets the sink, opens the deal (a fresh id), then settles the
     /// payment — so a rejected open never moves money (the naming registry's validate→settle ordering).
     fn open_deal(&mut self, params: &DealParams, payment: &SignedTransfer) -> bool {
+        // Bound the deal's audit parameters (audit §3.3). `size` is attacker-chosen and sets `por::challenge`'s
+        // leaf domain (`leaves_for_size`) on the deterministic prove path — bounding it to one chunk keeps the
+        // leaf count (and hence the audit allocation) tiny, so a crafted oversized deal can never make
+        // `challenge` reserve gigabytes and OOM-abort every validator. `k` needs no upper bound once `size` is
+        // capped (`challenge` audits at most `leaves` regardless, and `k ≥ leaves` legitimately means "audit
+        // all"); a zero `size`/`k`/`duration` is a degenerate no-op deal.
+        if params.size == 0
+            || params.size > MAX_DEAL_SIZE
+            || params.k == 0
+            || params.duration == 0
+            || params.duration > MAX_DEAL_DURATION
+        {
+            return false;
+        }
         if !payment.verify()
             || payment.transfer.from != params.consumer
             || payment.transfer.to != STORAGE_ESCROW
@@ -911,6 +928,46 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::storage_payload(&open))), ExecOutcome::Rejected);
         assert_eq!(ledger.storage_escrow(), 0, "nothing was escrowed on a refused open");
         assert_eq!(ledger.tokens().balance(&consumer), 1000, "the consumer's funds are untouched");
+    }
+
+    #[test]
+    fn a_storage_open_with_out_of_range_audit_params_is_rejected() {
+        use fanos_thesauros::DealParams;
+        // Audit §3.3: a deal whose size exceeds one chunk (⇒ an unbounded audit leaf domain) — or a degenerate
+        // zero size/duration — is refused at open, so a crafted deal can never reach the prove path and OOM
+        // every validator through `por::challenge`.
+        let (consumer_sk, consumer_vk, consumer) = account(1);
+        let (_p, _pv, provider) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        let open = |ledger: &mut HybridLedger, size: u64, duration: u64, nonce: u64| {
+            let params = DealParams {
+                cid: fanos_thesauros::Cid::new([1u8; 32]),
+                size,
+                duration,
+                replication: 3,
+                lambda_bits: 10,
+                f_tol_permille: 100,
+                k: 3,
+                price: 400,
+                provider,
+                consumer,
+            };
+            let payment = SignedTransfer::sign(
+                Transfer { from: consumer, to: STORAGE_ESCROW, amount: 400, nonce },
+                &consumer_sk,
+                consumer_vk.clone(),
+            );
+            ledger.apply(&Transaction::new(HybridLedger::storage_payload(&StorageTx::Open { params, payment })))
+        };
+        let max = MAX_DEAL_SIZE;
+        // A full-chunk in-range deal opens (the one applied tx uses nonce 0); the rejected variants below never
+        // reach the payment (they fail the param bound first), so they consume no nonce.
+        assert_eq!(open(&mut ledger, max, 4, 0), ExecOutcome::Applied, "a full-chunk in-range deal is accepted");
+        assert_eq!(open(&mut ledger, max + 1, 4, 1), ExecOutcome::Rejected, "one byte past a chunk is refused");
+        assert_eq!(open(&mut ledger, 0, 4, 2), ExecOutcome::Rejected, "a zero-size deal is refused");
+        assert_eq!(open(&mut ledger, max, 0, 3), ExecOutcome::Rejected, "a zero-duration deal is refused");
     }
 
     #[test]

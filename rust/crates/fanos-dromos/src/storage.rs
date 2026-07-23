@@ -32,6 +32,16 @@ pub const STORAGE_ESCROW: [u8; 32] = *b"FANOS-thesauros-storage-escrow!!";
 /// close. A protocol parameter (like the block time), not a per-deal secret.
 pub const AUDIT_PERIOD: u64 = 64;
 
+/// The largest chunk a single deal may cover — one content chunk (audit §3.3). `size` is attacker-chosen and
+/// drives `por::challenge`'s leaf domain (`leaves_for_size`); bounding it caps the audit allocation so a crafted
+/// oversized deal cannot make every validator OOM on the deterministic prove path. A larger object is stored as
+/// many per-chunk deals, exactly as the sharder splits it.
+pub const MAX_DEAL_SIZE: u64 = fanos_thesauros::content::CHUNK as u64;
+
+/// The most audit epochs a deal may run (audit §3.3/§3.4) — bounds a deal's on-ledger lifetime and its escrow
+/// schedule, so a crafted deal cannot pin an unbounded future deadline the per-block lapse sweep must carry.
+pub const MAX_DEAL_DURATION: u64 = 1 << 20;
+
 /// Domain label for a deal identifier.
 const DEAL_ID_LABEL: &str = "FANOS-dromos-v1/storage-deal";
 /// Domain label for the storage-market sub-state root.
