@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod cell_node;
 pub mod config;
 pub mod diaulos;
