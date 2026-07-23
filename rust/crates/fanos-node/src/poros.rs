@@ -586,9 +586,16 @@ impl PorosHost {
         let Some(my_old_x) = self.my_x_in(&self.line) else {
             return Vec::new(); // not an old-line member — nothing to reshare
         };
+        // Floor the reshare threshold at 2 (audit §5.D-1): a rotation must PRESERVE a real seize-`<t`-reveals-
+        // nothing threshold, never propagate a degenerate 1-of-n sharing where a single new-line seizure
+        // discloses the descriptor. `emit_reshare` reshares at `self.threshold`, so this rejects a host that
+        // was (mis)configured below 2 rather than silently spreading a threshold-1 secret to the new line.
         let Ok(threshold) = u8::try_from(self.threshold) else {
             return Vec::new();
         };
+        if threshold < 2 {
+            return Vec::new();
+        }
         let Some(sealed) = seal_reshare_contribution(&self.share, threshold, new_keys, key_randomness, kem_seed)
         else {
             return Vec::new();
@@ -673,7 +680,16 @@ impl PorosHost {
 
     /// A request arrived at us as the combiner: verify its PoW, seed our own share, fan share-requests to
     /// the rest of the line. A bad proof, wrong epoch/community, or a duplicate/flood is dropped.
-    fn on_request(&mut self, now: Instant, req: IngressRequest) -> Vec<Effect> {
+    fn on_request(&mut self, from: Triple, now: Instant, req: IngressRequest) -> Vec<Effect> {
+        // Gate 0 — **identity binding** (audit §5.C): the request must have arrived FROM the coordinate it
+        // claims (`req.requester`). The PoW below is bound to `req.requester`, so without this an attacker could
+        // relay or replay another identity's request/proof under its own transport; enforcing `from ==
+        // req.requester` makes the VRF-identity coordinate the unforgeable, NON-TRANSFERABLE admission subject
+        // the §6 derivation rests on (the binding the `verify_ingress_request` doc names as the caller's duty,
+        // now enforced in-engine — parallel to the reshare `from`-authentication).
+        if from != req.requester {
+            return Vec::new();
+        }
         // Gate 1 — the PoW **rate-limiter** (bounds identity-creation rate, keeps the insider count small).
         if !verify_ingress_request(&req, &self.community, self.epoch, &self.beacon, self.difficulty) {
             return Vec::new();
@@ -775,7 +791,7 @@ impl Engine for PorosHost {
                 };
                 match decoded.frame_type() {
                     Some(FrameType::PorosRequest) => IngressRequest::from_bytes(decoded.body)
-                        .map_or_else(Vec::new, |req| self.on_request(now, req)),
+                        .map_or_else(Vec::new, |req| self.on_request(from, now, req)),
                     Some(FrameType::PorosShareReq) => decoded
                         .body
                         .get(..TRIPLE_WIRE_LEN)
@@ -1060,6 +1076,21 @@ mod tests {
         );
         assert!(effects.is_empty(), "an unsolved request produces no effects");
         assert_eq!(combiner.pending(), 0, "and opens no gather");
+
+        // Identity binding (§5.C): a VALID request (correct PoW) that arrives from a DIFFERENT coordinate than
+        // it claims is dropped — the PoW is bound to `req.requester`, so a relay/replay under another transport
+        // cannot spend someone else's work. The proof is non-transferable across identities.
+        let good = solve_ingress_request(coord(4), &community, epoch, &beacon, difficulty);
+        assert!(
+            combiner.step(Instant(1), Input::Message { from: coord(5), frame: request_frame(&good) }).is_empty(),
+            "a valid request from the wrong source coordinate is rejected (from != req.requester)",
+        );
+        assert_eq!(combiner.pending(), 0, "no gather opened for a mismatched-source request");
+        // The same request from its OWN coordinate is served (the binding is not over-eager).
+        assert!(
+            !combiner.step(Instant(2), Input::Message { from: coord(4), frame: request_frame(&good) }).is_empty(),
+            "the identical request from its claimed coordinate is admitted",
+        );
     }
 
     #[test]
