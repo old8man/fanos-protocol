@@ -21,7 +21,7 @@ use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
 
-use fanos_hermes::{Htlc, HtlcTerms, Resolution};
+use fanos_hermes::{Htlc, HtlcState, HtlcTerms, Resolution};
 use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, verify};
 
 use crate::bridge::{POOL_SINK, ShieldTx};
@@ -126,7 +126,11 @@ impl HybridLedger {
     /// opens the contract (a fresh id), then settles the payment (validate-then-settle, so a rejected lock moves
     /// no money).
     fn lock_htlc(&mut self, terms: &HtlcTerms, payment: &SignedTransfer) -> bool {
-        if !payment.verify()
+        // A non-zero escrow floor (audit §3.4): an `amount == 0` lock passes the token check (`balance < 0` is
+        // false) for only a signature, yet inserts a permanent `htlcs` entry. Requiring a real locked amount
+        // makes growing the book cost the attacker locked capital.
+        if terms.amount == 0
+            || !payment.verify()
             || payment.transfer.from != terms.sender
             || payment.transfer.to != HTLC_ESCROW
             || payment.transfer.amount != terms.amount
@@ -273,9 +277,14 @@ impl HybridLedger {
             || params.k == 0
             || params.duration == 0
             || params.duration > MAX_DEAL_DURATION
+            || params.price == 0
         {
             return false;
         }
+        // A non-zero escrow floor (audit §3.4): `balance < amount` is false for `amount == 0`, so a `price = 0`
+        // deal would cost a funds-less attacker only a signature yet still insert a permanent `deals` entry that
+        // every block's lapse sweep + state root must carry. Requiring a real escrow (checked equal to `price`
+        // below) means growing the deals map costs the attacker locked capital, one Active deal at a time.
         if !payment.verify()
             || payment.transfer.from != params.consumer
             || payment.transfer.to != STORAGE_ESCROW
@@ -370,6 +379,12 @@ impl HybridLedger {
         for (consumer, refund) in refunds {
             let _ = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
         }
+        // Prune terminal deals (audit §3.4): a Completed/Closed deal settles/refunds no further, so keeping it
+        // only makes every subsequent block's lapse sweep + state root carry dead entries without bound. A
+        // prove/close for a pruned id is rejected (the deal is no longer found), and a fresh open uses a distinct
+        // nonce-derived id, so pruning can neither be replayed nor collide. Deterministic (every node prunes the
+        // same terminal set at this height), so the state root stays identical across the cell.
+        self.storage.deals.retain(|_, d| d.state() == DealState::Active);
     }
 
     /// Execute a block's ordered transactions with DROMOS's **parallel scheduler** (`spec/platform.md` §3.1):
@@ -562,6 +577,10 @@ impl StateMachine for HybridLedger {
     fn begin_block(&mut self, height: u64) {
         self.height = height;
         self.finalize_lapsed_deals();
+        // Prune terminal HTLCs (audit §3.4): a Claimed/Refunded htlc resolves no further, so keeping it only
+        // grows the book + state root without bound. A Locked htlc holds real escrow (self-limiting) and stays
+        // until it resolves; a claim/refund for a pruned id is rejected (not found). Deterministic across the cell.
+        self.htlcs.htlcs.retain(|_, h| h.state() == HtlcState::Locked);
     }
 
     /// Adopt the block's audit beacon (the parent hash) — the storage market's retrievability challenges are
@@ -970,6 +989,58 @@ mod tests {
         assert_eq!(open(&mut ledger, max + 1, 4, 1), ExecOutcome::Rejected, "one byte past a chunk is refused");
         assert_eq!(open(&mut ledger, 0, 4, 2), ExecOutcome::Rejected, "a zero-size deal is refused");
         assert_eq!(open(&mut ledger, max, 0, 3), ExecOutcome::Rejected, "a zero-duration deal is refused");
+    }
+
+    #[test]
+    fn zero_value_market_txs_are_refused_and_terminal_deals_are_pruned() {
+        use fanos_thesauros::{Cid, DealParams};
+        // Audit §3.4: a zero-price deal costs a funds-less attacker only a signature yet would insert a permanent
+        // entry — it is refused, leaving no entry. A terminal (Closed) deal is pruned at the next block, so the
+        // deals map cannot grow without bound.
+        let (consumer_sk, consumer_vk, consumer) = account(1);
+        let (_p, _pv, provider) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        let deal = |price: u64| DealParams {
+            cid: Cid::new([7u8; 32]),
+            size: 4096,
+            duration: 2,
+            replication: 1,
+            lambda_bits: 10,
+            f_tol_permille: 100,
+            k: 1,
+            price,
+            provider,
+            consumer,
+        };
+        let open = |ledger: &mut HybridLedger, price: u64, nonce: u64| {
+            let payment = SignedTransfer::sign(
+                Transfer { from: consumer, to: STORAGE_ESCROW, amount: price, nonce },
+                &consumer_sk,
+                consumer_vk.clone(),
+            );
+            ledger.apply(&Transaction::new(HybridLedger::storage_payload(&StorageTx::Open { params: deal(price), payment })))
+        };
+        // A zero-price deal is refused before the token move, so no free entry is inserted.
+        assert_eq!(open(&mut ledger, 0, 0), ExecOutcome::Rejected, "a zero-price deal is refused");
+        assert_eq!(ledger.storage.deals.len(), 0, "a refused free deal leaves no entry");
+        // A funded deal opens (one entry); the consumer then closes it early (→ Closed).
+        assert_eq!(open(&mut ledger, 400, 0), ExecOutcome::Applied);
+        assert_eq!(ledger.storage.deals.len(), 1);
+        let id = deal_id(&deal(400), 0);
+        let close_auth = SignedTransfer::sign(
+            Transfer { from: consumer, to: id, amount: 0, nonce: 1 },
+            &consumer_sk,
+            consumer_vk.clone(),
+        );
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::storage_payload(&StorageTx::Close { deal_id: id, auth: close_auth }))),
+            ExecOutcome::Applied
+        );
+        // The next block prunes the now-terminal deal, so the map returns to empty.
+        ledger.begin_block(1);
+        assert_eq!(ledger.storage.deals.len(), 0, "a terminal deal is pruned from the map");
     }
 
     #[test]
