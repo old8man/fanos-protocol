@@ -704,7 +704,22 @@ mod tests {
     use super::*;
     use crate::naming::{NameOp, TREASURY, price};
     use crate::token::{Transfer, account_id};
-    use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, build_unshield, derive_owner_pk, encode_submission};
+    use fanos_obolos::{
+        Note, Randomness, SpendInput, build_transfer, build_unshield, derive_owner_pk, derive_spend_auth,
+        encode_submission, spend_auth_commit,
+    };
+
+    /// A test spend-auth seed, deterministically distinct from the nullifier key `nsk`.
+    fn spend_seed_of(nsk: &[u8; 32]) -> [u8; 32] {
+        let mut s = *nsk;
+        s[0] ^= 0xA5;
+        s
+    }
+
+    /// The spend-auth commitment a note owned by `nsk` records in its `auth`.
+    fn auth_of(nsk: &[u8; 32]) -> [u8; 32] {
+        spend_auth_commit(&derive_spend_auth(&spend_seed_of(nsk)).1)
+    }
     use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 
     fn account(tag: u8) -> (HybridSigSecret, HybridVerifier, [u8; 32]) {
@@ -715,7 +730,7 @@ mod tests {
     }
 
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
-        Note::new(value, derive_owner_pk(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
+        Note::new(value, derive_owner_pk(nsk), auth_of(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
     }
 
     #[test]
@@ -738,7 +753,7 @@ mod tests {
         let nsk = [9u8; 32];
         let n0 = note(500, &nsk, b"n0");
         let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.shielded().path(pos).unwrap() };
         let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 0);
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied);
         let root2 = ledger.state_root();
@@ -776,7 +791,7 @@ mod tests {
         let nsk = [9u8; 32];
         let n0 = note(500, &nsk, b"n0");
         let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.shielded().path(pos).unwrap() };
         let (stx, proof) =
             build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 0);
         let submission = encode_submission(&stx, &proof);
@@ -817,7 +832,7 @@ mod tests {
         let nsk = [9u8; 32];
         let n0 = note(600, &nsk, b"n0");
         let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.shielded().path(pos).unwrap() };
         let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 100);
         let shielded_tx = Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)));
 
@@ -885,7 +900,7 @@ mod tests {
 
         // Alice shields 500 into a note she owns.
         let nsk = [7u8; 32];
-        let shield_note = Note::new(500, derive_owner_pk(&nsk), Randomness::from_seed(b"shield"), [1u8; 32]);
+        let shield_note = Note::new(500, derive_owner_pk(&nsk), auth_of(&nsk), Randomness::from_seed(b"shield"), [1u8; 32]);
         let sx = ShieldTx {
             payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 500, nonce: 0 }, &alice_sk, alice_vk),
             note: shield_note.clone(),
@@ -897,7 +912,7 @@ mod tests {
 
         // The shielded note is now privately spendable: Alice → Bob (shielded).
         let path = ledger.shielded().path(0).unwrap();
-        let sp = SpendInput { note: shield_note, nsk, path };
+        let sp = SpendInput { note: shield_note, nsk, spend_seed: spend_seed_of(&nsk), path };
         let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"bob")], 0);
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied, "the shielded note spends privately");
         assert_eq!(ledger.shielded().spent_count(), 1, "the shielded-from-transparent note was spent");
@@ -913,7 +928,7 @@ mod tests {
 
         // Alice shields 1000 into a private note.
         let nsk = [7u8; 32];
-        let shielded_note = Note::new(1000, derive_owner_pk(&nsk), Randomness::from_seed(b"u"), [1u8; 32]);
+        let shielded_note = Note::new(1000, derive_owner_pk(&nsk), auth_of(&nsk), Randomness::from_seed(b"u"), [1u8; 32]);
         let sx = ShieldTx {
             payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 1000, nonce: 0 }, &alice_sk, alice_vk),
             note: shielded_note.clone(),
@@ -923,7 +938,7 @@ mod tests {
 
         // Alice unshields the whole 1000 to Bob's transparent account (spend the note, all value exits public).
         let path = ledger.shielded().path(0).unwrap();
-        let sp = SpendInput { note: shielded_note, nsk, path };
+        let sp = SpendInput { note: shielded_note, nsk, spend_seed: spend_seed_of(&nsk), path };
         let (stx, proof) = build_unshield(ledger.params(), ledger.shielded().anchor(), &[sp], &[], 1000, bob, 0);
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied);
         assert_eq!(ledger.tokens().balance(&bob), 1000, "the value exited the pool to Bob's public account");
@@ -937,7 +952,7 @@ mod tests {
         let mut tokens = TokenLedger::new();
         tokens.credit(alice, 10_000);
         let mut ledger = HybridLedger::new(tokens);
-        let n = Note::new(500, derive_owner_pk(&[7u8; 32]), Randomness::from_seed(b"s"), [1u8; 32]);
+        let n = Note::new(500, derive_owner_pk(&[7u8; 32]), auth_of(&[7u8; 32]), Randomness::from_seed(b"s"), [1u8; 32]);
         // Payment amount (400) ≠ note value (500) — you can't mint more private value than you paid.
         let mismatch = ShieldTx {
             payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 400, nonce: 0 }, &alice_sk, alice_vk.clone()),
@@ -1335,7 +1350,7 @@ mod tests {
 
         // Alice shields 1000.
         let nsk = [7u8; 32];
-        let shield_note = Note::new(1000, derive_owner_pk(&nsk), Randomness::from_seed(b"o"), [1u8; 32]);
+        let shield_note = Note::new(1000, derive_owner_pk(&nsk), auth_of(&nsk), Randomness::from_seed(b"o"), [1u8; 32]);
         let sx = ShieldTx {
             payment: SignedTransfer::sign(Transfer { from: alice, to: POOL_SINK, amount: 1000, nonce: 0 }, &alice_sk, alice_vk),
             note: shield_note.clone(),
@@ -1345,7 +1360,7 @@ mod tests {
 
         // A shielded transfer paying a fee of 100: 1000 = 900 (shielded output) + 100 (fee).
         let path = ledger.shielded().path(0).unwrap();
-        let sp = SpendInput { note: shield_note, nsk, path };
+        let sp = SpendInput { note: shield_note, nsk, spend_seed: spend_seed_of(&nsk), path };
         let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(900, &[2u8; 32], b"out")], 100);
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)))), ExecOutcome::Applied);
         assert_eq!(ledger.tokens().balance(&TREASURY), 100, "the shielded fee is collected to the treasury");
@@ -1488,7 +1503,7 @@ mod tests {
             let nsk = [9u8; 32];
             let n0 = note(500, &nsk, b"dbl");
             let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
-            let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+            let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.shielded().path(pos).unwrap() };
             (ledger, sp)
         }
         fn spend(ledger: &HybridLedger, sp: &SpendInput, out_tag: &[u8], out_nsk: &[u8; 32]) -> Transaction {

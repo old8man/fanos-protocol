@@ -13,22 +13,35 @@
 use fanos_obolos::commit::MAX_VALUE;
 use fanos_obolos::{
     Address, ApplyError, Note, NoteCipher, Params, Randomness, ShieldedState, SpendInput, build_transfer,
-    build_transfer_delivering, derive_owner_pk, scan,
+    build_transfer_delivering, build_unshield, derive_owner_pk, derive_spend_auth, scan, spend_auth_commit,
 };
 use fanos_pqcrypto::SeedRng;
 use fanos_pqcrypto::kem::HybridKemSecret;
+
+/// A test spend-auth seed, deterministically distinct from the nullifier key `nsk` (audit §5.D-2: the
+/// spend-auth secret must be independent of the revealed nullifier key).
+fn spend_seed_of(nsk: &[u8; 32]) -> [u8; 32] {
+    let mut s = *nsk;
+    s[0] ^= 0xA5;
+    s
+}
+
+/// The spend-auth commitment a note owned by `nsk` records in its `auth`.
+fn auth_of(nsk: &[u8; 32]) -> [u8; 32] {
+    spend_auth_commit(&derive_spend_auth(&spend_seed_of(nsk)).1)
+}
 
 /// A note of `value` owned by `nsk`, with deterministic randomness from `tag`.
 fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
     let mut rho = [0u8; 32];
     rho[..tag.len().min(32)].copy_from_slice(&tag[..tag.len().min(32)]);
-    Note::new(value, derive_owner_pk(nsk), Randomness::from_seed(tag), rho)
+    Note::new(value, derive_owner_pk(nsk), auth_of(nsk), Randomness::from_seed(tag), rho)
 }
 
-/// Mint `n` into `state`, returning the `SpendInput` (note + key + current path) needed to spend it.
+/// Mint `n` into `state`, returning the `SpendInput` (note + keys + current path) needed to spend it.
 fn mint_spendable(state: &mut ShieldedState, params: &Params, n: &Note, nsk: &[u8; 32]) -> SpendInput {
     let pos = state.mint(n.commitment(params)).expect("mint");
-    SpendInput { note: n.clone(), nsk: *nsk, path: state.path(pos).expect("path") }
+    SpendInput { note: n.clone(), nsk: *nsk, spend_seed: spend_seed_of(nsk), path: state.path(pos).expect("path") }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -52,7 +65,7 @@ fn value_is_conserved_across_a_transfer_chain() {
 
     // Bob (now holding 700 at the note just appended) → Carol 400, change 280, fee 20 (700 = 400 + 280 + 20).
     let bob_pos = s.note_count() - 2; // to_bob was the first of tx1's two outputs
-    let spend_bob = SpendInput { note: to_bob, nsk: bob, path: s.path(bob_pos).expect("bob's path") };
+    let spend_bob = SpendInput { note: to_bob, nsk: bob, spend_seed: spend_seed_of(&bob), path: s.path(bob_pos).expect("bob's path") };
     let to_carol = note(400, &carol, b"b->c");
     let b_change = note(280, &bob, b"b-change");
     let (tx2, pf2) = build_transfer(&p, s.anchor(), &[spend_bob], &[to_carol, b_change], 20);
@@ -78,7 +91,7 @@ fn no_single_field_tampering_of_a_valid_transfer_survives() {
         let a0 = note(1000, &alice, b"g");
         let pos = s.mint(a0.commitment(&p)).expect("mint");
         let anchor = anchor_override.unwrap_or_else(|| s.anchor());
-        let sp = SpendInput { note: a0, nsk: spend_key, path: s.path(pos).expect("path") };
+        let sp = SpendInput { note: a0, nsk: spend_key, spend_seed: spend_seed_of(&spend_key), path: s.path(pos).expect("path") };
         build_transfer(&p, anchor, &[sp], &[out_a, out_b], fee)
     };
 
@@ -107,6 +120,61 @@ fn no_single_field_tampering_of_a_valid_transfer_survives() {
         assert_eq!(s.apply(&p, &tx, &pf), Ok(()), "the honest baseline is accepted once");
         assert_eq!(s.apply(&p, &tx, &pf), Err(ApplyError::DoubleSpend), "the replay is rejected");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Scenario 2b — HYPOTHESIS (audit §5.D-2): a signed unshield binds `public_recipient`; a copied transaction
+// cannot be redirected to a different account, and revealing the nullifier key does not confer spend authority.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+#[test]
+fn a_signed_unshield_binds_public_recipient_and_cannot_be_redirected() {
+    let p = Params::standard();
+    let alice = [1u8; 32];
+    let mut s = ShieldedState::new();
+    let a0 = note(1000, &alice, b"g");
+    let sp = mint_spendable(&mut s, &p, &a0, &alice);
+    let base = s.clone(); // the post-mint state: `a0` is a member and its root is the anchor
+
+    // Alice unshields 600 to a transparent VICTIM account, 400 stays shielded as change.
+    let victim = [0x11u8; 32];
+    let change = note(400, &alice, b"change");
+    let (tx, pf) = build_unshield(&p, s.anchor(), &[sp], &[change], 600, victim, 0);
+    assert_eq!(base.clone().apply(&p, &tx, &pf), Ok(()), "the honest unshield to the victim is accepted");
+
+    // Attack: an on-path adversary copies the broadcast (tx, proof) — which reveals the whole transparent
+    // witness, INCLUDING the nullifier key — and swaps `public_recipient` to its own account to redirect the
+    // 600. `public_recipient` is not a balance term, so ONLY the spend-auth signature can reject this; and it
+    // does, because the swap changes the sighash and the attacker cannot re-sign without the (unrevealed)
+    // spend-auth secret. The funds cannot be stolen.
+    let mut redirected = tx.clone();
+    redirected.public_recipient = [0xEEu8; 32];
+    assert_eq!(
+        base.clone().apply(&p, &redirected, &pf),
+        Err(ApplyError::InvalidProof),
+        "swapping public_recipient invalidates the spend-auth signature — the unshield cannot be redirected (§5.D-2)",
+    );
+
+    // The same holds for any other bound field the attacker might perturb to their benefit (e.g. the exit
+    // amount): the signature covers the whole sighash.
+    let mut bumped = tx.clone();
+    bumped.public_value = 600; // unchanged value re-check: tampering the auth bytes alone must also fail
+    bumped.spend_auths[0][0] ^= 0xFF; // corrupt the signature
+    assert_eq!(
+        base.clone().apply(&p, &bumped, &pf),
+        Err(ApplyError::InvalidProof),
+        "a corrupted spend-auth signature is rejected",
+    );
+
+    // And a spend cannot be re-authorized by substituting a DIFFERENT spend-auth key: the note commits to the
+    // original `auth`, so a foreign `ak` in the opening fails the `auth == H(ak)` check.
+    let mut foreign_key = pf.clone();
+    let (_ask, other_ak) = derive_spend_auth(b"a totally unrelated spend-auth key");
+    foreign_key.inputs[0].ak = other_ak.encode();
+    assert_eq!(
+        base.clone().apply(&p, &tx, &foreign_key),
+        Err(ApplyError::InvalidProof),
+        "a foreign spend-auth verifier does not match the note's committed auth",
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -178,7 +246,7 @@ fn multiple_notes_consolidate_into_one() {
     let anchor = s.anchor();
     let inputs: Vec<SpendInput> = notes_pos
         .iter()
-        .map(|(n, pos)| SpendInput { note: n.clone(), nsk: alice, path: s.path(*pos).expect("current path") })
+        .map(|(n, pos)| SpendInput { note: n.clone(), nsk: alice, spend_seed: spend_seed_of(&alice), path: s.path(*pos).expect("current path") })
         .collect();
     // Consolidate into one note of 730, fee 20 (750 = 730 + 20).
     let consolidated = note(730, &alice, b"merged");
@@ -230,10 +298,10 @@ fn a_recipient_finds_a_delivered_payment_and_an_observer_cannot() {
         let mut rng = SeedRng::from_seed(b"bob-kem");
         HybridKemSecret::generate(&mut rng)
     };
-    let bob_addr = Address::new(derive_owner_pk(&bob_nsk), bob_kem_public);
+    let bob_addr = Address::new(derive_owner_pk(&bob_nsk), auth_of(&bob_nsk), bob_kem_public);
 
     // Alice pays Bob 1000, *delivering* the note (its opening sealed to Bob).
-    let bob_note = Note::new(1000, bob_addr.owner, Randomness::from_seed(b"bobnote"), [4u8; 32]);
+    let bob_note = Note::new(1000, bob_addr.owner, bob_addr.auth, Randomness::from_seed(b"bobnote"), [4u8; 32]);
     let (tx, proof) =
         build_transfer_delivering(&p, s.anchor(), &[sp], &[(bob_note.clone(), bob_addr.clone())], 0, &mut SeedRng::from_seed(b"deliver-seed"));
     assert_eq!(s.apply(&p, &tx, &proof), Ok(()), "the delivering transfer executes normally");
@@ -241,7 +309,7 @@ fn a_recipient_finds_a_delivered_payment_and_an_observer_cannot() {
     // Bob scans the block's outputs and recovers exactly his note (so he can spend it next).
     let outputs: Vec<(&[u8; 32], &NoteCipher)> =
         tx.outputs.iter().filter_map(|o| o.cipher.as_ref().map(|c| (&o.note_commitment, c))).collect();
-    let found = scan(&bob_kem_secret, bob_addr.owner, &p, &outputs);
+    let found = scan(&bob_kem_secret, bob_addr.owner, bob_addr.auth, &p, &outputs);
     assert_eq!(found.len(), 1, "Bob finds his delivered note");
     assert_eq!(found[0], bob_note, "and recovers it exactly");
 
@@ -250,7 +318,7 @@ fn a_recipient_finds_a_delivered_payment_and_an_observer_cannot() {
         let mut rng = SeedRng::from_seed(b"eve-kem");
         HybridKemSecret::generate(&mut rng)
     };
-    assert!(scan(&eve_secret, bob_addr.owner, &p, &outputs).is_empty(), "an observer cannot detect Bob's payment");
+    assert!(scan(&eve_secret, bob_addr.owner, bob_addr.auth, &p, &outputs).is_empty(), "an observer cannot detect Bob's payment");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────

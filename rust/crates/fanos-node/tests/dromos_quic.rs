@@ -18,7 +18,7 @@ use fanos_dromos::HybridLedger;
 use fanos_field::F2;
 use fanos_geometry::Point;
 use fanos_node::{TaxisParams, spawn_taxis};
-use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, derive_owner_pk, encode_submission};
+use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, derive_owner_pk, derive_spend_auth, encode_submission, spend_auth_commit};
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
@@ -36,6 +36,18 @@ const EPOCH: Epoch = Epoch::new(1);
 
 fn make_node(coord: Point<F2>) -> Box<dyn Engine + Send> {
     Box::new(OverlayNode::<F2>::new(coord, Config::default()))
+}
+
+/// A spend-auth seed, deterministically distinct from the nullifier key `nsk` (audit §5.D-2).
+fn spend_seed_of(nsk: &[u8; 32]) -> [u8; 32] {
+    let mut s = *nsk;
+    s[0] ^= 0xA5;
+    s
+}
+
+/// The spend-auth commitment a note owned by `nsk` records in its `auth`.
+fn auth_of(nsk: &[u8; 32]) -> [u8; 32] {
+    spend_auth_commit(&derive_spend_auth(&spend_seed_of(nsk)).1)
 }
 
 struct Keys {
@@ -58,7 +70,7 @@ fn gen_keys() -> Vec<Keys> {
 
 /// Alice's genesis note (1000 units), deterministic so every validator mints the identical one.
 fn alice_note() -> Note {
-    Note::new(1000, derive_owner_pk(&ALICE_NSK), Randomness::from_seed(b"alice-genesis"), [7u8; 32])
+    Note::new(1000, derive_owner_pk(&ALICE_NSK), auth_of(&ALICE_NSK), Randomness::from_seed(b"alice-genesis"), [7u8; 32])
 }
 
 /// The genesis hybrid ledger: an empty transparent tree, and a shielded pool holding Alice's one note.
@@ -105,8 +117,8 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     let ledger = genesis_ledger();
     let anchor = ledger.shielded().anchor();
     let path = ledger.shielded().path(0).expect("Alice's note is at position 0");
-    let sp = SpendInput { note: alice_note(), nsk: ALICE_NSK, path };
-    let bob_note = Note::new(1000, derive_owner_pk(&BOB_NSK), Randomness::from_seed(b"bob"), [9u8; 32]);
+    let sp = SpendInput { note: alice_note(), nsk: ALICE_NSK, spend_seed: spend_seed_of(&ALICE_NSK), path };
+    let bob_note = Note::new(1000, derive_owner_pk(&BOB_NSK), auth_of(&BOB_NSK), Randomness::from_seed(b"bob"), [9u8; 32]);
     let (stx, proof) = build_transfer(ledger.params(), anchor, &[sp], &[bob_note], 0);
 
     // Wrap it as a DROMOS shielded transaction and seal it to the epoch keyper line (anti-MEV), then submit it

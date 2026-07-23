@@ -245,12 +245,20 @@ impl ShieldedState {
 mod tests {
     use super::*;
     use crate::commit::Randomness;
-    use crate::note::{Note, derive_owner_pk};
+    use crate::note::{Note, derive_owner_pk, derive_spend_auth, spend_auth_commit};
+
+    /// A test spend-auth seed, deterministically distinct from the nullifier key `nsk`.
+    fn spend_seed_of(nsk: &[u8; 32]) -> [u8; 32] {
+        let mut s = *nsk;
+        s[0] ^= 0xA5;
+        s
+    }
     use crate::tx::{ShieldedTx, TransparentProof};
 
     /// A note of `value` owned by `nsk`, with deterministic randomness from `tag`.
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
-        Note::new(value, derive_owner_pk(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
+        let auth = spend_auth_commit(&derive_spend_auth(&spend_seed_of(nsk)).1);
+        Note::new(value, derive_owner_pk(nsk), auth, Randomness::from_seed(tag), [tag.len() as u8; 32])
     }
 
     /// Mint `note` into `state` and return its position.
@@ -275,7 +283,7 @@ mod tests {
         crate::build::build_transfer(
             params,
             anchor,
-            &[crate::build::SpendInput { note: input.clone(), nsk: *nsk, path }],
+            &[crate::build::SpendInput { note: input.clone(), nsk: *nsk, spend_seed: spend_seed_of(nsk), path }],
             &[out_a.clone(), out_b.clone()],
             fee,
         )

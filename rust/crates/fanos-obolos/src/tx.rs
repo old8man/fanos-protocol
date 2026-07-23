@@ -25,11 +25,17 @@
 
 use alloc::vec::Vec;
 
+use fanos_pqcrypto::{HybridSignature, HybridVerifier};
+use fanos_primitives::hash_labeled;
+
 use crate::commit::{Commitment, MAX_NOTES_PER_TX, MAX_VALUE, Params, Randomness, sum, sum_randomness, verify_balance};
-use crate::note::Note;
+use crate::note::{Note, spend_auth_commit};
 use crate::note_cipher::NoteCipher;
 use crate::nullifier::Nullifier;
 use crate::tree::AuthPath;
+
+/// Domain-separation label for the transaction **sighash** — the message a spend-auth signature covers.
+const SIGHASH_LABEL: &str = "FANOS-obolos-v1/tx-sighash";
 
 /// A new note created by a transaction, as it appears on the ledger: the opaque note commitment (appended to
 /// the tree) and its value commitment (a balance term). *(A note-ciphertext sealed to the recipient, so they
@@ -68,6 +74,41 @@ pub struct ShieldedTx {
     /// The transparent account credited with [`public_value`](Self::public_value) on an unshield (ignored when
     /// `public_value == 0`).
     pub public_recipient: [u8; 32],
+    /// One **spend-authorization signature** per spent input (same order as [`nullifiers`](Self::nullifiers)),
+    /// each a [`HybridSignature::to_bytes`] encoding over the transaction [`sighash`](Self::sighash) — which
+    /// binds *every* public field, including `public_recipient`. A spend is authorized only by the note's
+    /// spend-auth key, whose secret a spend never reveals, so a broadcast transaction can be neither redirected
+    /// to a different `public_recipient` nor re-spent by an observer (audit §5.D-2). Public and backend-agnostic:
+    /// the zero-knowledge backend keeps these on the transaction unchanged. Stored as bytes because
+    /// [`HybridSignature`] is not `Eq`.
+    pub spend_auths: Vec<Vec<u8>>,
+}
+
+impl ShieldedTx {
+    /// The transaction **sighash**: a domain-separated hash of every public field **except** the
+    /// [`spend_auths`](Self::spend_auths) themselves (which sign it). This is the message each spend-auth
+    /// signature covers; changing any bound field — most importantly `public_recipient` on an unshield —
+    /// changes the sighash and invalidates every signature, and the signer's secret is never revealed, so the
+    /// binding cannot be reforged (audit §5.D-2).
+    #[must_use]
+    pub fn sighash(&self) -> [u8; 32] {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.anchor);
+        for nf in &self.nullifiers {
+            buf.extend_from_slice(nf.as_bytes());
+        }
+        for c in &self.input_values {
+            buf.extend_from_slice(&c.to_bytes());
+        }
+        for o in &self.outputs {
+            buf.extend_from_slice(&o.note_commitment);
+            buf.extend_from_slice(&o.value_commitment.to_bytes());
+        }
+        buf.extend_from_slice(&self.fee.to_be_bytes());
+        buf.extend_from_slice(&self.public_value.to_be_bytes());
+        buf.extend_from_slice(&self.public_recipient);
+        hash_labeled(SIGHASH_LABEL, &buf)
+    }
 }
 
 /// A proof that a [`ShieldedTx`] satisfies the shielded-transfer relation. The production implementation is a
@@ -91,8 +132,13 @@ pub struct InputOpening {
     pub note: Note,
     /// Its authentication path to the transaction's anchor.
     pub path: AuthPath,
-    /// The owner's secret spending key.
+    /// The owner's secret **nullifier** key (recognizes + nullifies the note; NOT spend authority — §5.D-2).
     pub nsk: [u8; 32],
+    /// The note's spend-auth **verifier** `ak` (public), as [`HybridVerifier::encode`] bytes: checked against
+    /// the note's committed [`auth`](Note::auth), and the key each [`spend_auths`](ShieldedTx::spend_auths)
+    /// signature must verify under. The matching secret `ask` is never revealed — that is what makes the spend
+    /// non-malleable. Bytes because [`HybridVerifier`] is not `Eq`.
+    pub ak: Vec<u8>,
     /// The randomness of the **re-randomised** input value commitment `com(value; value_r_in)` published on the
     /// public tx — distinct from the note's creation randomness `note.value_r`, so the spend's public
     /// `input_value` cannot be matched to the note's creation commitment (audit O-C2, the Zcash-Orchard pattern).
@@ -122,9 +168,10 @@ pub struct TransparentProof {
 
 impl ShieldedProof for TransparentProof {
     fn verify(&self, params: &Params, tx: &ShieldedTx) -> bool {
-        // Arities must line up across the public tx and the revealed witness.
+        // Arities must line up across the public tx and the revealed witness — including one spend-auth
+        // signature per input (audit §5.D-2).
         let n_in = tx.nullifiers.len();
-        if self.inputs.len() != n_in || tx.input_values.len() != n_in {
+        if self.inputs.len() != n_in || tx.input_values.len() != n_in || tx.spend_auths.len() != n_in {
             return false;
         }
         if self.outputs.len() != tx.outputs.len() {
@@ -147,17 +194,38 @@ impl ShieldedProof for TransparentProof {
             return false;
         }
 
-        // Per-input: membership under the anchor, ownership, correct nullifier, range, and value-commitment binding.
-        for ((opening, nf), input_value) in self.inputs.iter().zip(&tx.nullifiers).zip(&tx.input_values) {
+        // The message every spend-auth signature must cover — binds `public_recipient` and every other public
+        // field, so the authorization is non-malleable (audit §5.D-2).
+        let sighash = tx.sighash();
+        // Per-input: membership under the anchor, nullifier-key recognition, correct nullifier, spend
+        // AUTHORIZATION (the key committed in the note signed *this* transaction), range, value-commitment binding.
+        for (((opening, nf), input_value), spend_auth) in
+            self.inputs.iter().zip(&tx.nullifiers).zip(&tx.input_values).zip(&tx.spend_auths)
+        {
             let cm = opening.note.commitment(params);
             if !opening.path.verify(&cm, &tx.anchor) {
                 return false; // the note is not a member of the tree at this anchor
             }
             if !opening.note.is_owned_by(&opening.nsk) {
-                return false; // the spend key does not control the note (no theft)
+                return false; // the revealed nullifier key does not recognize the note
             }
             if &Nullifier::derive(&opening.nsk, &cm) != nf {
                 return false; // the nullifier is not the note's (no forged/mismatched nullifier)
+            }
+            // §5.D-2: the revealed verifier `ak` must be the one committed in the note, AND it must have signed
+            // THIS transaction's sighash. The secret `ask` is never revealed, so an attacker who copies the tx
+            // cannot swap `public_recipient` (that changes the sighash, invalidating the signature) nor re-spend
+            // the note (spending needs a fresh signature under `ask`). Revealing `nsk` no longer confers spend.
+            let (Some(ak), Some(sig)) =
+                (HybridVerifier::decode(&opening.ak), HybridSignature::from_bytes(spend_auth))
+            else {
+                return false; // a malformed verifier or signature encoding
+            };
+            if opening.note.auth != spend_auth_commit(&ak) {
+                return false; // the revealed spend-auth verifier is not the one the note commits to
+            }
+            if !ak.verify(&sighash, &sig) {
+                return false; // the spend-auth signature does not authorize this exact transaction
             }
             if opening.note.value >= MAX_VALUE {
                 return false; // O-C1: an out-of-range INPUT could forge value via q-wraparound in the sum

@@ -33,8 +33,12 @@ const OPENING_LEN: usize = 8 + Randomness::WIRE_LEN + 32;
 /// ledger. `Clone` only (mirroring the KEM key's convention).
 #[derive(Clone)]
 pub struct Address {
-    /// The note-ownership tag.
+    /// The note-ownership (nullifier-key) tag stamped on notes for this recipient.
     pub owner: [u8; 32],
+    /// The recipient's **spend-auth commitment** ([`spend_auth_commit`](crate::note::spend_auth_commit)) —
+    /// stamped into each note's `auth`, so the note can only be spent by a signature under this recipient's
+    /// spend-auth key (audit §5.D-2).
+    pub auth: [u8; 32],
     /// The hybrid-KEM public key notes are sealed to.
     pub kem_public: HybridKemPublic,
 }
@@ -42,8 +46,8 @@ pub struct Address {
 impl Address {
     /// A receiving address from its parts.
     #[must_use]
-    pub fn new(owner: [u8; 32], kem_public: HybridKemPublic) -> Self {
-        Self { owner, kem_public }
+    pub fn new(owner: [u8; 32], auth: [u8; 32], kem_public: HybridKemPublic) -> Self {
+        Self { owner, auth, kem_public }
     }
 }
 
@@ -107,13 +111,13 @@ impl NoteCipher {
     /// under the (implicitly-rejected, wrong) session key fails — which is exactly how a recipient *detects*
     /// which outputs are theirs.
     #[must_use]
-    pub fn open(&self, kem_secret: &HybridKemSecret, owner: [u8; 32]) -> Option<Note> {
+    pub fn open(&self, kem_secret: &HybridKemSecret, owner: [u8; 32], auth: [u8; 32]) -> Option<Note> {
         let kem_ct = HybridCiphertext::from_bytes(&self.kem_ct)?;
         let session = kem_secret.decapsulate(&kem_ct)?;
         let (key, nonce) = derive_key_nonce(&session);
         let opening = aead::open(&key, &nonce, &self.aead_ct)?;
         let (value, value_r, rho) = decode_opening(&opening)?;
-        Some(Note::new(value, owner, value_r, rho))
+        Some(Note::new(value, owner, auth, value_r, rho))
     }
 
     /// Canonical bytes: `kem_ct(CIPHERTEXT_LEN) ‖ aead_ct`.
@@ -141,13 +145,14 @@ impl NoteCipher {
 pub fn scan(
     kem_secret: &HybridKemSecret,
     owner: [u8; 32],
+    auth: [u8; 32],
     params: &crate::commit::Params,
     outputs: &[(&[u8; 32], &NoteCipher)],
 ) -> Vec<Note> {
     outputs
         .iter()
         .filter_map(|(commitment, cipher)| {
-            let note = cipher.open(kem_secret, owner)?;
+            let note = cipher.open(kem_secret, owner, auth)?;
             (note.commitment(params) == **commitment).then_some(note)
         })
         .collect()
@@ -159,13 +164,20 @@ mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
     use crate::commit::Params;
-    use crate::note::derive_owner_pk;
+    use crate::note::{derive_owner_pk, derive_spend_auth, spend_auth_commit};
+
+    /// The recipient's spend-auth commitment for a nullifier key `nsk` (deterministically distinct seed).
+    fn auth_of(nsk: &[u8; 32]) -> [u8; 32] {
+        let mut s = *nsk;
+        s[0] ^= 0xA5;
+        spend_auth_commit(&derive_spend_auth(&s).1)
+    }
 
     /// A receiving address + the KEM secret behind it, from a seed.
     fn recipient(nsk: &[u8; 32], kem_tag: u8) -> (Address, HybridKemSecret) {
         let mut rng = SeedRng::from_seed(&[0xE0, kem_tag]);
         let (kem_secret, kem_public) = HybridKemSecret::generate(&mut rng);
-        (Address::new(derive_owner_pk(nsk), kem_public), kem_secret)
+        (Address::new(derive_owner_pk(nsk), auth_of(nsk), kem_public), kem_secret)
     }
 
     #[test]
@@ -177,14 +189,14 @@ mod tests {
         let cipher = NoteCipher::seal(&addr, 4242, &value_r, &rho, &mut SeedRng::from_seed(b"enc-seed")).expect("seal");
 
         // The recipient opens it and recovers exactly the note.
-        let note = cipher.open(&kem_secret, addr.owner).expect("the recipient recovers the note");
+        let note = cipher.open(&kem_secret, addr.owner, addr.auth).expect("the recipient recovers the note");
         assert_eq!(note.value, 4242);
         assert_eq!(note.rho, rho);
-        assert_eq!(note, Note::new(4242, addr.owner, value_r, rho));
+        assert_eq!(note, Note::new(4242, addr.owner, addr.auth, value_r, rho));
 
         // A different recipient's key cannot open it (AEAD auth under the wrong session key fails).
         let (_other_addr, other_secret) = recipient(&[9u8; 32], 2);
-        assert!(cipher.open(&other_secret, derive_owner_pk(&[9u8; 32])).is_none(), "a non-recipient cannot open it");
+        assert!(cipher.open(&other_secret, derive_owner_pk(&[9u8; 32]), auth_of(&[9u8; 32])).is_none(), "a non-recipient cannot open it");
     }
 
     #[test]
@@ -201,8 +213,8 @@ mod tests {
         let c2 = NoteCipher::seal(&addr, 100, &value_r, &rho, &mut rng).unwrap();
         assert_ne!(c1, c2, "two seals of the same note produce distinct, unlinkable ciphertexts");
         // Both still open to the same note.
-        assert_eq!(c1.open(&kem_secret, addr.owner).unwrap().value, 100);
-        assert_eq!(c2.open(&kem_secret, addr.owner).unwrap().value, 100);
+        assert_eq!(c1.open(&kem_secret, addr.owner, addr.auth).unwrap().value, 100);
+        assert_eq!(c2.open(&kem_secret, addr.owner, addr.auth).unwrap().value, 100);
     }
 
     #[test]
@@ -221,16 +233,16 @@ mod tests {
         let (addr, kem_secret) = recipient(&nsk, 1);
         // Two notes for Alice, one for someone else.
         let (other_addr, _other_secret) = recipient(&[9u8; 32], 2);
-        let n_a = Note::new(100, addr.owner, Randomness::from_seed(b"a"), [1u8; 32]);
-        let n_b = Note::new(200, addr.owner, Randomness::from_seed(b"b"), [2u8; 32]);
-        let n_other = Note::new(300, other_addr.owner, Randomness::from_seed(b"c"), [3u8; 32]);
+        let n_a = Note::new(100, addr.owner, addr.auth, Randomness::from_seed(b"a"), [1u8; 32]);
+        let n_b = Note::new(200, addr.owner, addr.auth, Randomness::from_seed(b"b"), [2u8; 32]);
+        let n_other = Note::new(300, other_addr.owner, other_addr.auth, Randomness::from_seed(b"c"), [3u8; 32]);
         let c_a = NoteCipher::seal(&addr, n_a.value, &n_a.value_r, &n_a.rho, &mut SeedRng::from_seed(b"sa")).unwrap();
         let c_b = NoteCipher::seal(&addr, n_b.value, &n_b.value_r, &n_b.rho, &mut SeedRng::from_seed(b"sb")).unwrap();
         let c_other = NoteCipher::seal(&other_addr, n_other.value, &n_other.value_r, &n_other.rho, &mut SeedRng::from_seed(b"sc")).unwrap();
         let (cm_a, cm_b, cm_other) = (n_a.commitment(&p), n_b.commitment(&p), n_other.commitment(&p));
         let outputs = [(&cm_a, &c_a), (&cm_other, &c_other), (&cm_b, &c_b)];
 
-        let mine = scan(&kem_secret, addr.owner, &p, &outputs);
+        let mine = scan(&kem_secret, addr.owner, addr.auth, &p, &outputs);
         assert_eq!(mine.len(), 2, "Alice finds her two notes and not the third");
         assert!(mine.contains(&n_a) && mine.contains(&n_b), "the recovered notes are exactly Alice's");
     }

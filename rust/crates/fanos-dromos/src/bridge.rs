@@ -19,7 +19,7 @@ use crate::token::SignedTransfer;
 pub const POOL_SINK: [u8; 32] = *b"FANOS-obolos-shielded-pool-sink!";
 
 /// The serialized length of a note's public opening (`value(8) ‖ owner(32) ‖ value_r ‖ rho(32)`).
-const NOTE_OPENING_LEN: usize = 72 + Randomness::WIRE_LEN;
+const NOTE_OPENING_LEN: usize = 104 + Randomness::WIRE_LEN; // value(8) ‖ owner(32) ‖ auth(32) ‖ rho(32) ‖ value_r
 
 /// A **shield** transaction: fund the private pool from public tokens. `payment` sends `note.value` to the
 /// [`POOL_SINK`]; the `note` (its opening public at entry) is minted into the pool for later private spending.
@@ -38,6 +38,7 @@ impl ShieldTx {
         let mut out = self.payment.to_bytes();
         out.extend_from_slice(&self.note.value.to_le_bytes());
         out.extend_from_slice(&self.note.owner);
+        out.extend_from_slice(&self.note.auth);
         out.extend_from_slice(&self.note.value_r.to_bytes());
         out.extend_from_slice(&self.note.rho);
         out
@@ -53,8 +54,9 @@ impl ShieldTx {
         let rest = bytes.get(SignedTransfer::WIRE_LEN..)?;
         let value = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
         let owner = rest.get(8..40)?.try_into().ok()?;
-        let value_r = Randomness::from_bytes(rest.get(40..40 + Randomness::WIRE_LEN)?)?;
-        let rho = rest.get(40 + Randomness::WIRE_LEN..)?.try_into().ok()?;
-        Some(Self { payment, note: Note::new(value, owner, value_r, rho) })
+        let auth = rest.get(40..72)?.try_into().ok()?;
+        let value_r = Randomness::from_bytes(rest.get(72..72 + Randomness::WIRE_LEN)?)?;
+        let rho = rest.get(72 + Randomness::WIRE_LEN..)?.try_into().ok()?;
+        Some(Self { payment, note: Note::new(value, owner, auth, value_r, rho) })
     }
 }

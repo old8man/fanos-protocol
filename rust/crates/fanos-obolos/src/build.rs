@@ -13,28 +13,34 @@ use alloc::vec::Vec;
 use rand_core::CryptoRng;
 
 use crate::commit::{Commitment, Params, Randomness};
-use crate::note::Note;
+use crate::note::{Note, derive_spend_auth};
 use crate::note_cipher::{Address, NoteCipher};
 use crate::tree::AuthPath;
 use crate::tx::{InputOpening, OutputNote, OutputOpening, ShieldedTx, TransparentProof};
 
-/// One note being spent: the note, the secret spending key that authorises it, and its authentication path to
-/// the transaction's anchor (obtained from [`crate::state::ShieldedState::path`]).
+/// One note being spent: the note, the two independent secret keys that control it, and its authentication path
+/// to the transaction's anchor (obtained from [`crate::state::ShieldedState::path`]). The **nullifier key**
+/// `nsk` recognizes and nullifies the note (revealed at spend); the **spend-auth seed** derives the signing key
+/// that *authorizes* the spend (never revealed — audit §5.D-2). The two are independent, so revealing `nsk`
+/// does not confer spend authority.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SpendInput {
     /// The note to spend.
     pub note: Note,
-    /// The owner's secret spending key.
+    /// The owner's secret nullifier key.
     pub nsk: [u8; 32],
+    /// The seed of the owner's spend-authorization keypair ([`derive_spend_auth`]) — must be **independent** of
+    /// `nsk`; the derived verifier's [`spend_auth_commit`](crate::note::spend_auth_commit) is the note's `auth`.
+    pub spend_seed: [u8; 32],
     /// The note's authentication path to `anchor`.
     pub path: AuthPath,
 }
 
-/// Build a shielded transfer of `inputs` into `outputs`, paying `fee`, proven against `anchor`, together with
-/// the transparent proof of its correctness. The caller is responsible for value-conservation
-/// (`Σ input.value = Σ output.value + fee`) and output ranges; an unbalanced or out-of-range set produces a
-/// transaction whose proof will simply fail [`crate::tx::ShieldedProof::verify`] — which is precisely what a
-/// scenario probing an inflation or wraparound attack wants to observe.
+/// Build a shielded transfer of `inputs` into `outputs`, paying `fee`, proven against `anchor`, with a
+/// transparent proof of correctness. The caller is responsible for value-conservation
+/// (`Σ input.value = Σ output.value + fee`) and output ranges; an unbalanced/out-of-range set produces a
+/// transaction whose proof simply fails [`verify`](crate::tx::ShieldedProof::verify) — precisely what an
+/// inflation/wraparound scenario wants to observe.
 #[must_use]
 pub fn build_transfer(
     params: &Params,
@@ -42,6 +48,42 @@ pub fn build_transfer(
     inputs: &[SpendInput],
     outputs: &[Note],
     fee: u64,
+) -> (ShieldedTx, TransparentProof) {
+    build_signed(params, anchor, inputs, outputs, fee, 0, [0u8; 32])
+}
+
+/// Build an **unshield**: a shielded spend whose value partly (or wholly) *exits* the pool to a transparent
+/// account. `public_value` leaves to `public_recipient` (both bound into the sighash the spend-auth signatures
+/// cover, so the recipient cannot be swapped — audit §5.D-2); any remainder stays shielded in `outputs`. The
+/// proof enforces `Σ inputs = Σ shielded outputs + fee + public_value`. The transparent crediting of
+/// `public_recipient` is the enclosing ledger's responsibility (`fanos-dromos`).
+#[must_use]
+pub fn build_unshield(
+    params: &Params,
+    anchor: [u8; 32],
+    inputs: &[SpendInput],
+    outputs: &[Note],
+    public_value: u64,
+    public_recipient: [u8; 32],
+    fee: u64,
+) -> (ShieldedTx, TransparentProof) {
+    build_signed(params, anchor, inputs, outputs, fee, public_value, public_recipient)
+}
+
+/// The shared builder: assemble the transaction with **every** public field set, then sign the resulting
+/// [`sighash`](ShieldedTx::sighash) once per input with that input's spend-auth key — signing last, so the
+/// signatures cover the final `public_value`/`public_recipient` (audit §5.D-2). Splitting `build_transfer`
+/// and `build_unshield` around this fixes the order bug where signing before setting the public fields would
+/// leave the signature over the wrong sighash.
+#[must_use]
+fn build_signed(
+    params: &Params,
+    anchor: [u8; 32],
+    inputs: &[SpendInput],
+    outputs: &[Note],
+    fee: u64,
+    public_value: u64,
+    public_recipient: [u8; 32],
 ) -> (ShieldedTx, TransparentProof) {
     let nullifiers = inputs.iter().map(|i| i.note.nullifier(&i.nsk, params)).collect();
     // O-C2: each public input value commitment is a FRESH re-randomisation of the note's amount, so it cannot be
@@ -71,38 +113,40 @@ pub fn build_transfer(
             cipher: None,
         })
         .collect();
-    let tx =
-        ShieldedTx { anchor, nullifiers, input_values, outputs: output_notes, fee, public_value: 0, public_recipient: [0u8; 32] };
+    // The spend-auth keypairs (per input); `ak` rides the opening, `ask` signs the sighash below.
+    let auths: Vec<_> = inputs.iter().map(|i| derive_spend_auth(&i.spend_seed)).collect();
+
+    // Assemble the tx with all public fields set (spend_auths filled in after the sighash is known).
+    let mut tx = ShieldedTx {
+        anchor,
+        nullifiers,
+        input_values,
+        outputs: output_notes,
+        fee,
+        public_value,
+        public_recipient,
+        spend_auths: Vec::new(),
+    };
+    // §5.D-2: sign the final sighash (which binds public_value/public_recipient) with each input's spend-auth key.
+    let sighash = tx.sighash();
+    tx.spend_auths = auths.iter().map(|(ask, _ak)| ask.sign(&sighash).to_bytes()).collect();
 
     let input_openings = inputs
         .iter()
         .zip(input_r)
-        .map(|(i, value_r_in)| InputOpening { note: i.note.clone(), path: i.path.clone(), nsk: i.nsk, value_r_in })
+        .zip(&auths)
+        .map(|((i, value_r_in), (_ask, ak))| InputOpening {
+            note: i.note.clone(),
+            path: i.path.clone(),
+            nsk: i.nsk,
+            ak: ak.encode(),
+            value_r_in,
+        })
         .collect();
     let output_openings =
         outputs.iter().map(|n| OutputOpening { value: n.value, value_r: n.value_r.clone() }).collect();
     let proof = TransparentProof { inputs: input_openings, outputs: output_openings };
 
-    (tx, proof)
-}
-
-/// Build an **unshield**: a shielded spend whose value partly (or wholly) *exits* the pool to a transparent
-/// account. `public_value` leaves to `public_recipient`; any remainder stays shielded in `outputs`. The proof
-/// enforces `Σ inputs = Σ shielded outputs + fee + public_value`, so value cannot be conjured on exit. The
-/// transparent crediting of `public_recipient` is the enclosing ledger's responsibility (`fanos-dromos`).
-#[must_use]
-pub fn build_unshield(
-    params: &Params,
-    anchor: [u8; 32],
-    inputs: &[SpendInput],
-    outputs: &[Note],
-    public_value: u64,
-    public_recipient: [u8; 32],
-    fee: u64,
-) -> (ShieldedTx, TransparentProof) {
-    let (mut tx, proof) = build_transfer(params, anchor, inputs, outputs, fee);
-    tx.public_value = public_value;
-    tx.public_recipient = public_recipient;
     (tx, proof)
 }
 

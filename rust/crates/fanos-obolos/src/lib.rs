@@ -48,7 +48,7 @@ pub mod tx;
 pub use build::{SpendInput, build_transfer, build_transfer_delivering, build_unshield};
 pub use codec::{decode_submission, encode_submission};
 pub use commit::{Commitment, Params, Randomness, sum, sum_randomness, verify_balance};
-pub use note::{Note, derive_owner_pk};
+pub use note::{Note, derive_owner_pk, derive_spend_auth, spend_auth_commit};
 pub use note_cipher::{Address, NoteCipher, scan};
 pub use nullifier::{Nullifier, NullifierSet};
 pub use state::{ApplyError, ShieldedState};

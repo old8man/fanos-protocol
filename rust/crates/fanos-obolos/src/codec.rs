@@ -88,6 +88,7 @@ fn get_randomness(r: &mut Reader<'_>) -> Option<Randomness> {
 fn put_note(out: &mut Vec<u8>, n: &Note) {
     out.extend_from_slice(&n.value.to_le_bytes());
     out.extend_from_slice(&n.owner);
+    out.extend_from_slice(&n.auth);
     put_randomness(out, &n.value_r);
     out.extend_from_slice(&n.rho);
 }
@@ -95,9 +96,10 @@ fn put_note(out: &mut Vec<u8>, n: &Note) {
 fn get_note(r: &mut Reader<'_>) -> Option<Note> {
     let value = r.u64()?;
     let owner = r.array32()?;
+    let auth = r.array32()?;
     let value_r = get_randomness(r)?;
     let rho = r.array32()?;
-    Some(Note::new(value, owner, value_r, rho))
+    Some(Note::new(value, owner, auth, value_r, rho))
 }
 
 fn put_auth_path(out: &mut Vec<u8>, p: &AuthPath) {
@@ -206,6 +208,12 @@ impl ShieldedTx {
         out.extend_from_slice(&self.fee.to_le_bytes());
         out.extend_from_slice(&self.public_value.to_le_bytes());
         out.extend_from_slice(&self.public_recipient);
+        // Spend-auth signatures (§5.D-2): count then each length-prefixed.
+        out.extend_from_slice(&(self.spend_auths.len() as u32).to_le_bytes());
+        for sig in &self.spend_auths {
+            out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+            out.extend_from_slice(sig);
+        }
         out
     }
 
@@ -232,8 +240,20 @@ impl ShieldedTx {
         let fee = r.u64()?;
         let public_value = r.u64()?;
         let public_recipient = r.array32()?;
-        r.is_exhausted()
-            .then_some(Self { anchor, nullifiers, input_values, outputs, fee, public_value, public_recipient })
+        let spend_auths = read_vec(&mut r, |r| {
+            let len = r.u32()? as usize;
+            Some(r.take(len)?.to_vec())
+        })?;
+        r.is_exhausted().then_some(Self {
+            anchor,
+            nullifiers,
+            input_values,
+            outputs,
+            fee,
+            public_value,
+            public_recipient,
+            spend_auths,
+        })
     }
 }
 
@@ -247,6 +267,8 @@ impl TransparentProof {
             put_note(&mut out, &i.note);
             put_auth_path(&mut out, &i.path);
             out.extend_from_slice(&i.nsk);
+            out.extend_from_slice(&(i.ak.len() as u32).to_le_bytes());
+            out.extend_from_slice(&i.ak);
             put_randomness(&mut out, &i.value_r_in);
         }
         out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
@@ -265,8 +287,10 @@ impl TransparentProof {
             let note = get_note(r)?;
             let path = get_auth_path(r)?;
             let nsk = r.array32()?;
+            let ak_len = r.u32()? as usize;
+            let ak = r.take(ak_len)?.to_vec();
             let value_r_in = get_randomness(r)?;
-            Some(InputOpening { note, path, nsk, value_r_in })
+            Some(InputOpening { note, path, nsk, ak, value_r_in })
         })?;
         let outputs = read_vec(&mut r, |r| {
             let value = r.u64()?;
@@ -317,12 +341,20 @@ fn read_vec<T>(r: &mut Reader<'_>, mut f: impl FnMut(&mut Reader<'_>) -> Option<
 mod tests {
     use super::*;
     use crate::commit::Params;
-    use crate::note::derive_owner_pk;
+    use crate::note::{derive_owner_pk, derive_spend_auth, spend_auth_commit};
     use crate::state::ShieldedState;
     use crate::{SpendInput, build_transfer};
 
+    /// A test spend-auth seed, deterministically distinct from the nullifier key `nsk`.
+    fn spend_seed_of(nsk: &[u8; 32]) -> [u8; 32] {
+        let mut s = *nsk;
+        s[0] ^= 0xA5;
+        s
+    }
+
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
-        Note::new(value, derive_owner_pk(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
+        let (_ask, ak) = derive_spend_auth(&spend_seed_of(nsk));
+        Note::new(value, derive_owner_pk(nsk), spend_auth_commit(&ak), Randomness::from_seed(tag), [tag.len() as u8; 32])
     }
 
     #[test]
@@ -360,7 +392,7 @@ mod tests {
         let mut s = ShieldedState::new();
         let n0 = note(1000, &nsk, b"n0");
         let pos = s.mint(n0.commitment(&p)).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: s.path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: s.path(pos).unwrap() };
         let (tx, proof) =
             build_transfer(&p, s.anchor(), &[sp], &[note(600, &[2u8; 32], b"a"), note(400, &[3u8; 32], b"b")], 0);
 
@@ -387,7 +419,7 @@ mod tests {
         let mut s = ShieldedState::new();
         let n0 = note(1000, &nsk, b"n0");
         let pos = s.mint(n0.commitment(&p)).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: s.path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: s.path(pos).unwrap() };
         let (tx, mut proof) =
             build_transfer(&p, s.anchor(), &[sp], &[note(600, &[2u8; 32], b"a"), note(400, &[3u8; 32], b"b")], 0);
         // Smuggle a full-range coefficient into the first input opening's re-randomisation (a non-wire path).
@@ -402,7 +434,7 @@ mod tests {
         let mut s = ShieldedState::new();
         let n0 = note(1000, &nsk, b"n0");
         let pos = s.mint(n0.commitment(&p)).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: s.path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: s.path(pos).unwrap() };
         let (tx, proof) = build_transfer(&p, s.anchor(), &[sp], &[note(1000, &[2u8; 32], b"a")], 0);
         let payload = encode_submission(&tx, &proof);
         let (tx2, proof2) = decode_submission(&payload).expect("submission round-trips");

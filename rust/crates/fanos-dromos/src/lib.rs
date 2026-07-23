@@ -126,10 +126,13 @@ impl StateMachine for ShieldedLedger {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, derive_owner_pk, encode_submission};
+    use fanos_obolos::{Note, Randomness, SpendInput, build_transfer, derive_owner_pk, derive_spend_auth, encode_submission, spend_auth_commit};
+
+    fn spend_seed_of(nsk: &[u8; 32]) -> [u8; 32] { let mut s = *nsk; s[0] ^= 0xA5; s }
+    fn auth_of(nsk: &[u8; 32]) -> [u8; 32] { spend_auth_commit(&derive_spend_auth(&spend_seed_of(nsk)).1) }
 
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
-        Note::new(value, derive_owner_pk(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
+        Note::new(value, derive_owner_pk(nsk), auth_of(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
     }
 
     /// Package an OBOLOS transfer as a TAXIS transaction.
@@ -147,7 +150,7 @@ mod tests {
         let root_before = ledger.state_root();
 
         // Alice → Bob 700, change 300 (fee 0).
-        let sp = SpendInput { note: n0, nsk, path: ledger.state().path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.state().path(pos).unwrap() };
         let (tx, proof) =
             build_transfer(ledger.params(), ledger.state().anchor(), &[sp], &[note(700, &[2u8; 32], b"bob"), note(300, &nsk, b"chg")], 0);
         assert_eq!(ledger.apply(&submission(&tx, &proof)), ExecOutcome::Applied, "the shielded transfer executes");
@@ -162,7 +165,7 @@ mod tests {
         let nsk = [1u8; 32];
         let n0 = note(1000, &nsk, b"n0");
         let pos = ledger.mint(n0.commitment(ledger.params())).unwrap();
-        let sp = SpendInput { note: n0, nsk, path: ledger.state().path(pos).unwrap() };
+        let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.state().path(pos).unwrap() };
         let (tx, proof) = build_transfer(ledger.params(), ledger.state().anchor(), &[sp], &[note(1000, &[2u8; 32], b"bob")], 0);
         let submitted = submission(&tx, &proof);
         assert_eq!(ledger.apply(&submitted), ExecOutcome::Applied);
@@ -185,7 +188,7 @@ mod tests {
             let nsk = [1u8; 32];
             let n0 = note(500, &nsk, b"n0");
             let pos = ledger.mint(n0.commitment(ledger.params())).unwrap();
-            let sp = SpendInput { note: n0, nsk, path: ledger.state().path(pos).unwrap() };
+            let sp = SpendInput { note: n0, nsk, spend_seed: spend_seed_of(&nsk), path: ledger.state().path(pos).unwrap() };
             let (tx, proof) = build_transfer(ledger.params(), ledger.state().anchor(), &[sp], &[note(500, &[2u8; 32], b"bob")], 0);
             ledger.apply(&submission(&tx, &proof));
             ledger.state_root()
