@@ -740,7 +740,8 @@ fn a_network_partition_cannot_split_agreement_and_heals() {
 /// assert BFT **safety** (no honest fork) on *every* one — safety needs no synchrony, so it must hold on every
 /// schedule. `require_liveness` additionally asserts the soft aggregate-progress bound (meaningful only over
 /// many trials; off for the small default-suite smoke, on for the exhaustive release run).
-fn run_no_fork_trials(trials: u64, require_liveness: bool) {
+#[allow(clippy::too_many_lines)] // a self-contained adversarial Monte-Carlo harness; splitting it hurts clarity
+fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
     use std::collections::BTreeMap;
 
     use fanos_taxis::{Phase, SignedVote, Vote};
@@ -780,6 +781,17 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool) {
             }
         }
         let honest: Vec<usize> = (0..N).filter(|i| !byz.contains(&(*i as u8))).collect();
+
+        // With SSLE enabled, register a Merkle-VRF root per validator and turn on round-0 sortition, so honest
+        // proposers all-propose witnessed blocks. Random async delivery then stresses the min-ticket collection
+        // window (early-exit vs Δ_prio expiry interleaved arbitrarily) — safety must hold on every schedule.
+        if ssle {
+            let roots: Vec<[u8; 32]> =
+                (0..N).map(|i| MerkleVrfSecret::generate(&vrf_seed(i), VRF_HEIGHT).unwrap().root()).collect();
+            for (i, e) in engines.iter_mut().enumerate() {
+                e.enable_sortition(MerkleVrfSecret::generate(&vrf_seed(i), VRF_HEIGHT).unwrap(), roots.clone(), 0);
+            }
+        }
 
         let mut bus: VecDeque<ConsensusMsg> = VecDeque::new();
         let mut committed: Vec<Vec<(u64, [u8; 32])>> = vec![Vec::new(); N];
@@ -871,7 +883,16 @@ fn randomized_scheduling_never_forks_smoke() {
     // One deterministic-seed trial: a fast regression gate on a real Byzantine+async schedule (the exhaustive
     // random coverage is the release heavy-lane run below). Kept to a single trial so the default DEBUG suite
     // pays only one trial's worth of hybrid-PQ signing.
-    run_no_fork_trials(1, false);
+    run_no_fork_trials(1, false, false);
+}
+
+/// The same no-fork safety gate with **secret-leader sortition enabled**: honest validators all-propose
+/// witnessed round-0 blocks and rank by min-ticket, under the adversarial async scheduler + Byzantine
+/// equivocation. Proves SSLE preserves BFT safety on every schedule (one-prepare-per-round-0 + quorum
+/// intersection are what safety rests on, and the min-ticket only changes which block is prepared).
+#[test]
+fn ssle_randomized_scheduling_never_forks_smoke() {
+    run_no_fork_trials(1, false, true);
 }
 
 /// The exhaustive randomized-async + Byzantine no-fork Monte-Carlo (audit §3.8). Heavy in a DEBUG build
@@ -880,7 +901,16 @@ fn randomized_scheduling_never_forks_smoke() {
 #[test]
 #[ignore = "heavy in debug (~140s); run in release: cargo test -p fanos-taxis --test consensus_sim --release -- --ignored"]
 fn randomized_scheduling_and_byzantine_faults_never_fork() {
-    run_no_fork_trials(24, true);
+    run_no_fork_trials(24, true, false);
+}
+
+/// The exhaustive no-fork Monte-Carlo with **secret-leader sortition enabled** — the strongest SSLE safety
+/// fuzz: all-propose min-ticket round 0 under adversarial async delivery + Byzantine equivocation, over many
+/// seeds. Safety must hold on every schedule; liveness is checked softly in aggregate.
+#[test]
+#[ignore = "heavy in debug; run in release: cargo test -p fanos-taxis --test consensus_sim --release -- --ignored"]
+fn ssle_randomized_scheduling_and_byzantine_faults_never_fork() {
+    run_no_fork_trials(24, true, true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
