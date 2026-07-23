@@ -13,13 +13,14 @@ use std::time::Duration;
 use fanos_aphantos::ThresholdRouter;
 use fanos_diaulos::StaticKeypair;
 use fanos_field::Field;
-use fanos_geometry::Triple;
+use fanos_geometry::{Plane, Point, Triple};
 use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_pqcrypto::{HybridKemSecret, SeedRng};
 use fanos_quic::{
     Client, Directory, NodeHandle, ProteusConfig, spawn_self_certifying_persistent_on,
 };
 use fanos_keygen::BeaconNode;
+use fanos_keygen::recovery::{RecoveryAction, StallDetector, recovery_decision};
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
 use tokio::task::JoinHandle;
 
@@ -100,6 +101,170 @@ fn spawn_beacon_tracker(client: Client, enabled: bool) -> (Option<JoinHandle<()>
         }
     });
     (Some(task), cell)
+}
+
+/// How many consecutive epoch-driver periods with no beacon advance confirm a stall. Set above the safe-stall
+/// window depth (`BeaconWindow::DEPTH = 3`, `fanos-quic`) so a lagging-but-live cell — whose clock still
+/// advances, only late — is never mistaken for a frozen one before the recovery trigger fires.
+const RECOVERY_PATIENCE: usize = 4;
+
+/// Actuate the recovery decision for the current live anchor set (audit §4). **Regime A** emits a
+/// key-preserving `reshare_trigger` to a live anchor; **Regime B** escalates (logs) for the authority to issue a
+/// re-genesis certificate. Returns the (possibly bumped) `(generation, threshold)` to carry into the next
+/// decision, so the trigger stays monotone and tracks the reshared threshold.
+fn actuate_recovery<F: Field>(
+    client: &Client,
+    anchors: &[Triple],
+    live: &[u8],
+    threshold: usize,
+    generation: u64,
+    epoch: Epoch,
+) -> (u64, usize) {
+    match recovery_decision(live, threshold) {
+        RecoveryAction::ProactiveReshare { survivors, new_threshold } => {
+            let generation = generation.saturating_add(1);
+            let frame = BeaconNode::<F>::reshare_trigger(generation, new_threshold, &survivors, &survivors);
+            let Some(&to) = survivors.first().and_then(|&idx| anchors.get(usize::from(idx.saturating_sub(1)))) else {
+                return (generation, threshold);
+            };
+            client.command(Command::Emit { to, frame });
+            tracing::info!(target: "fanos::recovery", generation, new_threshold, survivors = survivors.len(),
+                "beacon thinning — proactive reshare (audit §4 Regime A)");
+            (generation, new_threshold)
+        }
+        RecoveryAction::RequestRegenesis { survivors } => {
+            tracing::warn!(target: "fanos::recovery", epoch = epoch.get(), survivors = survivors.len(),
+                "beacon frozen below threshold — escalating for an authorized re-genesis (audit §4 R-C1)");
+            (generation, threshold)
+        }
+        RecoveryAction::None => (generation, threshold),
+    }
+}
+
+/// Spawn the **recovery auto-trigger** (audit §4 R-C1): the production caller that turns a beacon freeze into
+/// action, closing the "`reshare_trigger` has zero production callers" gap. Beside the epoch driver it watches
+/// this node's own `BeaconReady`/`PeerDown` notifications; when the clock has not advanced for
+/// [`RECOVERY_PATIENCE`] periods it derives the live anchor set and applies [`recovery_decision`]:
+/// - **Regime A** — a lower honest-majority threshold still buys headroom while `≥ t` anchors remain: emit a
+///   key-preserving `reshare_trigger` to a live anchor (partition-safe — a `< t` minority cannot reshare);
+/// - **Regime B** — already below threshold, the key is gone: escalate for an authorized re-genesis (the
+///   single-writer authority's decision, actuated by [`BeaconNode::rebootstrap`]).
+///
+/// To emit one trigger per generation rather than one per node, only the **deterministic coordinator** — the
+/// lowest-index live anchor — fires; every node computes the same coordinator as their down-views converge.
+/// `anchors` is the cell's candidate anchor coordinates in holder-index order (`anchors[i]` ↔ index `i + 1`).
+/// The recovery watcher's mutable state (audit §4): the stall detector plus the tracked live-beacon epoch, the
+/// down-anchor set, the current threshold, and the last-triggered generation. Separated from the spawn loop so
+/// its state transitions and the coordinator election are unit-visible.
+struct RecoveryWatcher {
+    detector: StallDetector,
+    last_epoch: Epoch,
+    down: std::collections::BTreeSet<Triple>,
+    threshold: usize,
+    generation: u64,
+}
+
+impl RecoveryWatcher {
+    fn new(threshold: usize) -> Self {
+        Self {
+            detector: StallDetector::new(RECOVERY_PATIENCE),
+            last_epoch: Epoch::ZERO,
+            down: std::collections::BTreeSet::new(),
+            threshold,
+            generation: 0,
+        }
+    }
+
+    /// Fold one notification into the watched state: an epoch advance proves the anchors that produced its round
+    /// are live (clearing the down set); a `PeerDown` marks an anchor unreachable.
+    fn on_note(&mut self, note: &Notification) {
+        match note {
+            Notification::BeaconReady { epoch, .. } if *epoch > self.last_epoch => {
+                self.last_epoch = *epoch;
+                self.down.clear();
+            }
+            Notification::PeerDown(coord) => {
+                self.down.insert(*coord);
+            }
+            _ => {}
+        }
+    }
+
+    /// The live anchor holder-index set (`i + 1` for each not-down candidate, in index order).
+    fn live_anchors(&self, anchors: &[Triple]) -> Vec<u8> {
+        anchors
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !self.down.contains(*c))
+            .map(|(i, _)| u8::try_from(i).unwrap_or(u8::MAX).saturating_add(1))
+            .collect()
+    }
+
+    /// One epoch-driver tick: if a stall is confirmed and THIS node is the deterministic coordinator (the
+    /// lowest-index live anchor), actuate the recovery decision, so the cell emits one action, not one per node.
+    fn on_tick<F: Field>(&mut self, client: &Client, me: Triple, anchors: &[Triple]) {
+        if !self.detector.observe(self.last_epoch) {
+            return;
+        }
+        let live = self.live_anchors(anchors);
+        let coordinator = live.first().and_then(|&idx| anchors.get(usize::from(idx.saturating_sub(1))));
+        if coordinator == Some(&me) {
+            (self.generation, self.threshold) =
+                actuate_recovery::<F>(client, anchors, &live, self.threshold, self.generation, self.last_epoch);
+        }
+    }
+}
+
+/// Announce the node to its cell after start: kick off the heartbeat (cover traffic) if configured, and JOIN
+/// with the offered role set so the cell learns what this node serves (spec §7.8 JOIN).
+fn announce_node(handle: &NodeHandle, config: &NodeConfig) {
+    if config.start_heartbeat {
+        handle.command(Command::StartHeartbeat);
+    }
+    if config.roles.any() {
+        handle.command(Command::Join { info: vec![config.roles.encode()] });
+    }
+}
+
+/// Spawn the recovery auto-trigger for a beacon-carrying node (`None` for a bare node), deriving the cell's
+/// candidate anchor coordinates from the plane in holder-index order (audit §4).
+fn spawn_recovery<F: Field + 'static>(
+    client: Client,
+    config: &NodeConfig,
+    me: Triple,
+    has_beacon: bool,
+) -> Option<JoinHandle<()>> {
+    has_beacon.then(|| {
+        let anchors: Vec<Triple> = (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect();
+        let threshold = config.beacon.as_ref().map_or(0, |b| b.threshold);
+        spawn_recovery_trigger::<F>(client, config.epoch_period, me, anchors, threshold)
+    })
+}
+
+fn spawn_recovery_trigger<F: Field + 'static>(
+    client: Client,
+    period: Duration,
+    me: Triple,
+    anchors: Vec<Triple>,
+    threshold: usize,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut events = client.subscribe();
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // skip the immediate tick, matching the epoch driver's connect/sync grace period
+        let mut watcher = RecoveryWatcher::new(threshold);
+        loop {
+            tokio::select! {
+                ev = events.recv() => match ev {
+                    Ok(note) => watcher.on_note(&note),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = ticker.tick() => watcher.on_tick::<F>(&client, me, &anchors),
+            }
+        }
+    })
 }
 
 /// Lowercase-hex encode `bytes` — for logging the exit's public-key descriptor a proxy configures with.
@@ -209,6 +374,9 @@ pub struct Node {
     /// The background task tracking the node's live beacon (audit S1-M2) — present only when a beacon is
     /// configured. Held for the node's lifetime.
     _beacon_tracker: Option<JoinHandle<()>>,
+    /// The recovery auto-trigger (audit §4 R-C1) — present only with a beacon; fires proactive reshare /
+    /// escalates re-genesis on a beacon freeze. Held for the node's lifetime.
+    _recovery_trigger: Option<JoinHandle<()>>,
     /// The node's live `(epoch, beacon seed)`, updated by `_beacon_tracker`; `None` until the first round is
     /// adopted (or always, for a node with no beacon clock). Read by an anonymous proxy via [`live_beacon`](Self::live_beacon).
     live_beacon: LiveBeacon,
@@ -356,16 +524,12 @@ impl Node {
 
         let (beacon_tracker, live_beacon) = spawn_beacon_tracker(handle.client(), has_beacon); // live beacon (S1-M2)
 
+        let recovery_trigger = spawn_recovery::<F>(handle.client(), &config, address, has_beacon); // audit §4 R-C1
+
         // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
         spawn_exit_role(&handle, address, exit)?;
 
-        if config.start_heartbeat {
-            handle.command(Command::StartHeartbeat);
-        }
-        if config.roles.any() {
-            // Announce the role set so the cell learns what this node offers (spec §7.8 JOIN).
-            handle.command(Command::Join { info: vec![config.roles.encode()] });
-        }
+        announce_node(&handle, &config);
 
         Ok(Self {
             handle,
@@ -376,6 +540,7 @@ impl Node {
             _mix_publisher: mix_publisher,
             _epoch_driver: epoch_driver,
             _beacon_tracker: beacon_tracker,
+            _recovery_trigger: recovery_trigger,
             live_beacon,
         })
     }
@@ -474,6 +639,24 @@ mod tests {
     use super::*;
     use crate::config::{BeaconParams, ExitParams, NodeConfig, ServiceParams};
     use fanos_field::F2;
+
+    #[test]
+    fn the_recovery_watcher_tracks_live_anchors_and_clears_them_on_a_round() {
+        let anchors: Vec<Triple> = (0..Plane::<F2>::N as usize).map(|i| Point::<F2>::at(i).coords()).collect();
+        let mut w = RecoveryWatcher::new(4);
+        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 3, 4, 5, 6, 7], "all anchors live initially");
+        // PeerDown removes anchors from the live set (holder index = point index + 1).
+        w.on_note(&Notification::PeerDown(Point::<F2>::at(0).coords()));
+        w.on_note(&Notification::PeerDown(Point::<F2>::at(3).coords()));
+        assert_eq!(w.live_anchors(&anchors), vec![2, 3, 5, 6, 7], "down anchors 1 and 4 are excluded");
+        // A fresh (strictly-newer) beacon round proves its producers live — the down set clears.
+        w.on_note(&Notification::BeaconReady { epoch: Epoch::new(1), seed: [0u8; 32] });
+        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 3, 4, 5, 6, 7], "an advancing round clears the down set");
+        // A replayed, non-advancing round does NOT clear — progress is monotone.
+        w.on_note(&Notification::PeerDown(Point::<F2>::at(2).coords()));
+        w.on_note(&Notification::BeaconReady { epoch: Epoch::new(1), seed: [0u8; 32] });
+        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 4, 5, 6, 7], "a stale round keeps the down set");
+    }
 
     #[tokio::test]
     async fn resolve_rejects_a_malformed_name_without_touching_the_network() {
