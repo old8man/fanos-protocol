@@ -15,7 +15,7 @@
 //!
 //! Then the nullifiers are recorded and the output note commitments appended.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_primitives::codec::{Reader, put_seq};
@@ -31,6 +31,14 @@ const STATE_ROOT_LABEL: &str = "FANOS-obolos-v1/state-root";
 
 /// Domain-separation label for the anchor-set sub-commitment folded into the state root.
 const ANCHOR_SET_ROOT_LABEL: &str = "FANOS-obolos-v1/anchor-set-root";
+
+/// The **rolling anchor window** (audit O-M2): the maximum number of recent tree roots kept valid to cite as
+/// a spend's membership anchor. The set was previously insert-only — every historical root valid forever,
+/// folded into the state root — so it grew without bound (state-bloat DoS). A spend must now cite a root from
+/// the last `MAX_ANCHORS` state-advancing operations (Zcash's rolling-anchor design); the window is generous
+/// enough that no honest, reasonably-fresh wallet is ever caught out, while bounding the set to 32 KiB. The
+/// eviction is deterministic (FIFO over the append order all validators share), so it never forks the root.
+const MAX_ANCHORS: usize = 1024;
 
 /// Why a shielded transaction was refused. Each variant names exactly one attack the gate closes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,7 +59,12 @@ pub enum ApplyError {
 pub struct ShieldedState {
     tree: CommitmentTree,
     nullifiers: NullifierSet,
+    /// The valid membership anchors — the last [`MAX_ANCHORS`] tree roots (audit O-M2 rolling window). The set
+    /// gives O(log n) validity checks and the canonical (sorted) fold into the state root; `anchor_order`
+    /// carries the FIFO insertion order so the oldest can be evicted when the window overflows. Invariant:
+    /// `anchors` holds exactly the roots in `anchor_order` (same length, no duplicates).
     anchors: BTreeSet<[u8; 32]>,
+    anchor_order: VecDeque<[u8; 32]>,
 }
 
 impl Default for ShieldedState {
@@ -65,9 +78,28 @@ impl ShieldedState {
     #[must_use]
     pub fn new() -> Self {
         let tree = CommitmentTree::new();
-        let mut anchors = BTreeSet::new();
-        anchors.insert(tree.root());
-        Self { tree, nullifiers: NullifierSet::new(), anchors }
+        let mut state =
+            Self { tree, nullifiers: NullifierSet::new(), anchors: BTreeSet::new(), anchor_order: VecDeque::new() };
+        // The empty tree root is already a valid (empty) anchor.
+        let root = state.tree.root();
+        state.record_anchor(root);
+        state
+    }
+
+    /// Record `root` as a valid anchor, maintaining the rolling window (audit O-M2). A genuinely new root takes
+    /// a fresh window slot; if that overflows [`MAX_ANCHORS`], the **oldest** anchor is evicted FIFO. The tree is
+    /// append-only, so every advancing operation yields a distinct root — the `is_new` guard is defensive.
+    /// `anchor_order` and `anchors` stay in exact lockstep (enqueue-on-new, dequeue-on-evict), so the window is
+    /// deterministic across every validator that applied the same operation sequence.
+    fn record_anchor(&mut self, root: [u8; 32]) {
+        if self.anchors.insert(root) {
+            self.anchor_order.push_back(root);
+            if self.anchors.len() > MAX_ANCHORS
+                && let Some(oldest) = self.anchor_order.pop_front()
+            {
+                self.anchors.remove(&oldest);
+            }
+        }
     }
 
     /// The current tree root — the anchor a fresh spend should cite.
@@ -137,10 +169,12 @@ impl ShieldedState {
     pub fn to_bytes(&self) -> Vec<u8> {
         let tree = self.tree.to_bytes();
         let nullifiers = self.nullifiers.to_bytes();
-        let mut out = Vec::with_capacity(8 + tree.len() + nullifiers.len() + 4 + self.anchors.len() * 32);
+        let mut out = Vec::with_capacity(8 + tree.len() + nullifiers.len() + 4 + self.anchor_order.len() * 32);
         fanos_primitives::codec::put_var_bytes(&mut out, &tree);
         fanos_primitives::codec::put_var_bytes(&mut out, &nullifiers);
-        put_seq(&mut out, self.anchors.len(), &self.anchors, |o, a| o.extend_from_slice(a));
+        // Encode the anchors in FIFO **insertion order** (not the sorted set), so a restore rebuilds the exact
+        // rolling window — the eviction order must survive the sync or two nodes' windows would diverge (O-M2).
+        put_seq(&mut out, self.anchor_order.len(), &self.anchor_order, |o, a| o.extend_from_slice(a));
         out
     }
 
@@ -152,9 +186,16 @@ impl ShieldedState {
         let mut r = Reader::new(bytes);
         let tree = CommitmentTree::from_bytes(r.var_bytes()?)?;
         let nullifiers = NullifierSet::from_bytes(r.var_bytes()?)?;
-        let anchors: BTreeSet<[u8; 32]> = r.seq(32, Reader::array::<32>)?.into_iter().collect();
+        // Decode the FIFO-ordered anchors and rebuild both views. Reject an over-window list (> MAX_ANCHORS): an
+        // honest snapshot is always within the bound, and a tampered oversized set would fail the state-root
+        // check anyway (the anchor set is folded into `root`), but rejecting early avoids restoring a bad window.
+        let anchor_order: VecDeque<[u8; 32]> = r.seq(32, Reader::array::<32>)?.into();
         r.finish()?;
-        Some(Self { tree, nullifiers, anchors })
+        if anchor_order.len() > MAX_ANCHORS {
+            return None;
+        }
+        let anchors: BTreeSet<[u8; 32]> = anchor_order.iter().copied().collect();
+        Some(Self { tree, nullifiers, anchors, anchor_order })
     }
 
     /// **Issuance** — append a note commitment with *no* spend proof, creating value by a consensus rule (a
@@ -162,7 +203,7 @@ impl ShieldedState {
     /// (A production chain gates minting by the consensus/monetary policy; here it is the value-creation seam.)
     pub fn mint(&mut self, note_commitment: [u8; 32]) -> Option<u64> {
         let pos = self.tree.append(note_commitment)?;
-        self.anchors.insert(self.tree.root());
+        self.record_anchor(self.tree.root());
         Some(pos)
     }
 
@@ -194,7 +235,7 @@ impl ShieldedState {
         for out in &tx.outputs {
             let _ = self.tree.append(out.note_commitment);
         }
-        self.anchors.insert(self.tree.root());
+        self.record_anchor(self.tree.root());
         Ok(())
     }
 }
@@ -283,6 +324,33 @@ mod tests {
         let mut tampered = restored.clone();
         tampered.anchors.remove(&historical);
         assert_ne!(tampered.root(), s.root(), "dropping an anchor changes the root — a synced peer would reject it");
+    }
+
+    #[test]
+    fn the_anchor_set_is_a_bounded_rolling_window() {
+        // Audit O-M2: the anchor set was insert-only (unbounded state-bloat, folded into the state root). It is
+        // now a rolling window of the last MAX_ANCHORS roots — minting past the window caps the set and evicts
+        // (invalidates) the oldest anchors FIFO, so an ancient root can no longer be cited as a spend anchor.
+        let p = Params::standard();
+        let mut s = ShieldedState::new();
+        let empty_root = s.anchor(); // the genesis (empty) anchor — the very first, so the first to be evicted
+        assert!(s.is_valid_anchor(&empty_root));
+
+        // Mint enough notes to overflow the window (each mint advances the tree → one new distinct anchor).
+        for i in 0..(MAX_ANCHORS as u64 + 8) {
+            let n = note(1, &[7u8; 32], &i.to_be_bytes());
+            mint(&mut s, &p, &n);
+        }
+        assert_eq!(s.anchors.len(), MAX_ANCHORS, "the anchor set is capped at the window, not unbounded");
+        assert_eq!(s.anchor_order.len(), s.anchors.len(), "the FIFO order stays in lockstep with the set");
+        assert!(!s.is_valid_anchor(&empty_root), "the oldest anchor was evicted — it can no longer be cited");
+        assert!(s.is_valid_anchor(&s.anchor()), "the current root is always a valid anchor");
+
+        // The bounded window survives a snapshot round-trip exactly (eviction order preserved → same root).
+        let restored = ShieldedState::from_bytes(&s.to_bytes()).expect("snapshot restores");
+        assert_eq!(restored, s, "the windowed state is bit-identical after a sync");
+        assert_eq!(restored.root(), s.root(), "and reproduces the exact state root");
+        assert_eq!(restored.anchors.len(), MAX_ANCHORS, "the window bound survives the sync");
     }
 
     #[test]
