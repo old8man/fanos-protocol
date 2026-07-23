@@ -1,8 +1,8 @@
 //! **Nullifiers** — how OBOLOS makes a double-spend detectable while keeping the spent note untraceable.
 //!
 //! When a shielded note is spent, the spender reveals a **nullifier** — a pseudo-random tag derived from the
-//! note's secret spending key and the note's own commitment. Two properties, together, are what let a public
-//! ledger enforce "spend once" over *private* notes (`spec/platform.md` §4.2):
+//! note's secret nullifier key, the note's **tree position**, and its commitment. Two properties, together, are
+//! what let a public ledger enforce "spend once" over *private* notes (`spec/platform.md` §4.2):
 //!
 //! - **Deterministic** — the *same* note always yields the *same* nullifier, so spending it twice reveals the
 //!   same tag and the second spend is rejected against the public [`NullifierSet`]. Double-spend is caught.
@@ -30,14 +30,18 @@ const NF_SET_ROOT_LABEL: &str = "FANOS-obolos-v1/nf-set-root";
 pub struct Nullifier([u8; 32]);
 
 impl Nullifier {
-    /// Derive the nullifier of a note from its owner's secret spending key `nsk` and the note's commitment
-    /// `cm`: `nf = H("…/nullifier", nsk ‖ cm)`. Deterministic in `(nsk, cm)` (double-spend ⇒ repeated `nf`) yet
-    /// a keyed hash under the secret `nsk` (unlinkable to `cm` without `nsk`).
+    /// Derive the nullifier of a note from its owner's secret nullifier key `nsk`, the note's tree `position`,
+    /// and its commitment `cm`: `nf = H("…/nullifier", nsk ‖ position ‖ cm)`. Deterministic in
+    /// `(nsk, position, cm)` (double-spend ⇒ repeated `nf`), a keyed hash under the secret `nsk` (unlinkable to
+    /// the note without `nsk`), and — critically — **position-bound** (audit O-M1): every tree slot is unique,
+    /// so two notes that happen to share a commitment (equal value/owner/auth/rho) still get *distinct*
+    /// nullifiers and are both independently spendable, rather than one silently locking the other out.
     #[must_use]
-    pub fn derive(nsk: &[u8; 32], cm: &[u8; 32]) -> Self {
-        let mut preimage = [0u8; 64];
+    pub fn derive(nsk: &[u8; 32], position: u64, cm: &[u8; 32]) -> Self {
+        let mut preimage = [0u8; 72];
         preimage[..32].copy_from_slice(nsk);
-        preimage[32..].copy_from_slice(cm);
+        preimage[32..40].copy_from_slice(&position.to_be_bytes());
+        preimage[40..].copy_from_slice(cm);
         Self(hash_labeled(NULLIFIER_LABEL, &preimage))
     }
 
@@ -146,22 +150,25 @@ mod tests {
     fn a_nullifier_is_deterministic_in_the_note_and_key() {
         let nsk = [7u8; 32];
         let cm = [9u8; 32];
-        assert_eq!(Nullifier::derive(&nsk, &cm), Nullifier::derive(&nsk, &cm), "same (nsk, cm) ⇒ same nullifier");
+        assert_eq!(Nullifier::derive(&nsk, 0, &cm), Nullifier::derive(&nsk, 0, &cm), "same (nsk, cm) ⇒ same nullifier");
     }
 
     #[test]
     fn distinct_notes_or_keys_give_distinct_nullifiers() {
         let nsk = [7u8; 32];
         let cm = [9u8; 32];
-        let base = Nullifier::derive(&nsk, &cm);
-        assert_ne!(base, Nullifier::derive(&[8u8; 32], &cm), "a different spending key changes the nullifier");
-        assert_ne!(base, Nullifier::derive(&nsk, &[10u8; 32]), "a different note changes the nullifier");
+        let base = Nullifier::derive(&nsk, 0, &cm);
+        assert_ne!(base, Nullifier::derive(&[8u8; 32], 0, &cm), "a different spending key changes the nullifier");
+        assert_ne!(base, Nullifier::derive(&nsk, 0, &[10u8; 32]), "a different note changes the nullifier");
+        // Audit O-M1: the SAME key and commitment at a DIFFERENT tree position nullify distinctly, so two notes
+        // that happen to collide on their commitment never share a nullifier (no silent spend-lock).
+        assert_ne!(base, Nullifier::derive(&nsk, 1, &cm), "a different tree position changes the nullifier");
     }
 
     #[test]
     fn the_set_catches_a_double_spend() {
         let mut set = NullifierSet::new();
-        let nf = Nullifier::derive(&[1u8; 32], &[2u8; 32]);
+        let nf = Nullifier::derive(&[1u8; 32], 0, &[2u8; 32]);
         assert!(!set.contains(&nf));
         assert!(set.insert(nf), "a fresh nullifier is admitted");
         assert!(set.contains(&nf));
@@ -172,8 +179,8 @@ mod tests {
     #[test]
     fn all_fresh_rejects_seen_and_intra_transaction_repeats() {
         let mut set = NullifierSet::new();
-        let a = Nullifier::derive(&[1u8; 32], &[1u8; 32]);
-        let b = Nullifier::derive(&[2u8; 32], &[2u8; 32]);
+        let a = Nullifier::derive(&[1u8; 32], 0, &[1u8; 32]);
+        let b = Nullifier::derive(&[2u8; 32], 0, &[2u8; 32]);
         assert!(set.all_fresh(&[a, b]), "two distinct fresh nullifiers are admissible together");
         assert!(!set.all_fresh(&[a, a]), "a transaction cannot nullify the same note twice");
         set.insert(a);
@@ -183,8 +190,8 @@ mod tests {
 
     #[test]
     fn the_set_root_is_order_independent_and_binds_the_contents() {
-        let a = Nullifier::derive(&[1u8; 32], &[1u8; 32]);
-        let b = Nullifier::derive(&[2u8; 32], &[2u8; 32]);
+        let a = Nullifier::derive(&[1u8; 32], 0, &[1u8; 32]);
+        let b = Nullifier::derive(&[2u8; 32], 0, &[2u8; 32]);
         let mut s1 = NullifierSet::new();
         s1.insert(a);
         s1.insert(b);

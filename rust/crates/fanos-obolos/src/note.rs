@@ -98,10 +98,11 @@ impl Note {
         hash_labeled(NOTE_CM_LABEL, &buf)
     }
 
-    /// The nullifier revealed when this note is spent, under the owner's secret spending key `nsk`.
+    /// The nullifier revealed when this note (at tree `position`) is spent, under the owner's secret nullifier
+    /// key `nsk`. Position-bound (audit O-M1), so two notes sharing a commitment still nullify distinctly.
     #[must_use]
-    pub fn nullifier(&self, nsk: &[u8; 32], params: &Params) -> Nullifier {
-        Nullifier::derive(nsk, &self.commitment(params))
+    pub fn nullifier(&self, nsk: &[u8; 32], position: u64, params: &Params) -> Nullifier {
+        Nullifier::derive(nsk, position, &self.commitment(params))
     }
 
     /// Whether `nsk` is the secret spending key that controls this note.
@@ -147,12 +148,14 @@ mod tests {
     }
 
     #[test]
-    fn the_nullifier_is_the_owners_and_deterministic() {
+    fn the_nullifier_is_the_owners_position_bound_and_deterministic() {
         let p = Params::standard();
         let nsk = [1u8; 32];
         let n = note(100, &nsk, b"r");
-        let nf = n.nullifier(&nsk, &p);
-        assert_eq!(nf, n.nullifier(&nsk, &p), "deterministic");
-        assert_eq!(nf, Nullifier::derive(&nsk, &n.commitment(&p)), "it is the nullifier of the note commitment");
+        let nf = n.nullifier(&nsk, 7, &p);
+        assert_eq!(nf, n.nullifier(&nsk, 7, &p), "deterministic in (nsk, position, cm)");
+        assert_eq!(nf, Nullifier::derive(&nsk, 7, &n.commitment(&p)), "it is the position-bound nullifier of the note");
+        // O-M1: the SAME note at a DIFFERENT position nullifies distinctly (so a shared commitment never locks).
+        assert_ne!(nf, n.nullifier(&nsk, 8, &p), "a different tree position yields a different nullifier");
     }
 }

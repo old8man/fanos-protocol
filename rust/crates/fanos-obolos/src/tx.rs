@@ -209,8 +209,8 @@ impl ShieldedProof for TransparentProof {
             if !opening.note.is_owned_by(&opening.nsk) {
                 return false; // the revealed nullifier key does not recognize the note
             }
-            if &Nullifier::derive(&opening.nsk, &cm) != nf {
-                return false; // the nullifier is not the note's (no forged/mismatched nullifier)
+            if &Nullifier::derive(&opening.nsk, opening.path.index, &cm) != nf {
+                return false; // the nullifier is not the note's at this position (no forged/mismatched nullifier)
             }
             // §5.D-2: the revealed verifier `ak` must be the one committed in the note, AND it must have signed
             // THIS transaction's sighash. The secret `ask` is never revealed, so an attacker who copies the tx

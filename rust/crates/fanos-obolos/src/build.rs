@@ -85,7 +85,8 @@ fn build_signed(
     public_value: u64,
     public_recipient: [u8; 32],
 ) -> (ShieldedTx, TransparentProof) {
-    let nullifiers = inputs.iter().map(|i| i.note.nullifier(&i.nsk, params)).collect();
+    // Position-bound nullifiers (O-M1): the tree position comes from the input's authentication path.
+    let nullifiers = inputs.iter().map(|i| i.note.nullifier(&i.nsk, i.path.index, params)).collect();
     // O-C2: each public input value commitment is a FRESH re-randomisation of the note's amount, so it cannot be
     // matched to the note's creation commitment. The randomness is derived per-input from spender-secret
     // material (production: a CSPRNG); it is revealed to the verifier in the input opening, never on the tx.
