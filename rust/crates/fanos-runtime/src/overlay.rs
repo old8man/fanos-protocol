@@ -11,7 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_code::{da, erasure, lrc};
-use fanos_core::{AdmissionPolicy, PowAdmission};
+use fanos_core::{AdmissionPolicy, ChildSummary, ParentCell, PowAdmission};
 use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
@@ -27,6 +27,11 @@ use fanos_wire::{FrameType, ProtocolError, Wire, decode_frame, encode_frame};
 /// Storage `Publish` sub-type: the **full value**, sent origin → responsible node, which then
 /// erasure-codes it and distributes the shards. Carries no meaningful shard index (`0`).
 const PUBLISH_ORIGIN: u8 = 0;
+
+/// The upward hop budget for a cell escalation (audit R-C2): a residue is handed up at most this many strata
+/// before it is terminal (external help required), bounding the recursion at the ХОЛАРХ depth ceiling so an
+/// escalation storm cannot climb without end.
+const ESCALATE_TTL: u8 = 3;
 /// Storage `Publish` sub-type: a single **erasure shard** for the point named by the frame's shard-index
 /// byte — the receiver (its shard home) stores it under that index (spec §L4 projective LRC, #115). This is
 /// what replaces full replication: a value is `erasure::encode`d into `N=7` shards, one per Fano point, each
@@ -535,9 +540,17 @@ struct Healer {
     /// disconnected. `Verdict::Partition` is trusted only once this reaches [`PARTITION_DWELL`], so a
     /// recovery-loss transient never false-fires (resets to 0 on any connected reading).
     partition_streak: u32,
+    /// The coherence `Φ` computed on the last diagnosis — exposed so the facade can spend the coarse
+    /// `⌊log₉Φ⌋` reroute budget on a received cell escalation (audit R-C2) without re-diagnosing.
+    last_phi: f64,
 }
 
 impl Healer {
+    /// The `Φ` this reflex computed on its last diagnosis (a healthy 1.0 until the first one).
+    fn last_phi(&self) -> f64 {
+        self.last_phi
+    }
+
     /// Create the reflex with the given self-observer (built by the facade, which knows the cell id and
     /// window). Monitor/homeostat take their base-cell defaults; all healing state starts empty.
     fn new(observer: SelfObserver) -> Self {
@@ -559,6 +572,7 @@ impl Healer {
             rebalancing: false,
             endpoint_window: VecDeque::new(),
             partition_streak: 0,
+            last_phi: 1.0,
         }
     }
 
@@ -796,6 +810,7 @@ impl Healer {
                 alive_count,
                 self.effective_correlation(config.healthy_correlation),
             );
+            self.last_phi = phi; // exposed to the facade's parent-stratum reflex (R-C2)
             let plan = plan_healing(&verdict, self_index, degraded, phi);
             if !plan.is_empty() {
                 self.observer.note_healing();
@@ -996,6 +1011,11 @@ pub struct OverlayNode<F: Field> {
     /// This node's Fano point index (`Some` only on the base `N = 7` cell, where the reflexive
     /// loop's index-addressed geometry — syndrome, mediator, peeling — applies).
     self_index: Option<usize>,
+    /// The **parent-stratum reflex** (audit R-C2): when a child cell escalates its irrecoverable residue to
+    /// this cell, its members fold the failure into a [`ParentCell`] — the same reflexive Fano decoder one
+    /// tier up — and coarse-reroute around the failed child. `None` until this node first receives a child
+    /// escalation; `Some(ParentCell::new(self_index))` thereafter, accumulating each child's summary.
+    parent_cell: Option<ParentCell>,
     /// The DIAKRISIS self-healing reflex — behavioural coherence self-model + over-coupling homeostat +
     /// crash/Byzantine healing state (reroute/repair/quarantine) + polar cross-attestation. Factored into a
     /// [`Healer`] collaborator (audit #125 decompose); the facade senses liveness (below) and hands it a
@@ -1105,6 +1125,7 @@ impl<F: Field> OverlayNode<F> {
             peers,
             heartbeating: false,
             self_index,
+            parent_cell: None,
             healer: Healer::new(observer),
             witnessed: BTreeMap::new(),
             loss_reports: BTreeMap::new(),
@@ -1417,6 +1438,7 @@ impl<F: Field> OverlayNode<F> {
                 })]
             }
             Some(FrameType::RouteHier) => self.on_route_hier(from, frame.body),
+            Some(FrameType::CellEscalate) => self.on_cell_escalate(frame.body),
             Some(FrameType::DiagGossip) => {
                 // Receiving the gossip is itself a direct observation of the sender; its body
                 // corroborates the sender's view of the rest of the cell (spec §6.4).
@@ -1624,6 +1646,99 @@ impl<F: Field> OverlayNode<F> {
             }
             HierRoute::Drop => Vec::new(),
         }
+    }
+
+    /// Hand this cell's irrecoverable `residue` up to the **parent stratum** (audit R-C2): send a
+    /// [`CellEscalate`](FrameType::CellEscalate) to each member of the parent cell — the cells that are this
+    /// node's siblings one level up — so a sibling folds the failure into its [`ParentCell`] reflex and
+    /// coarse-reroutes around this (failed) child cell. A depth-1 (top-stratum) cell has no parent, so its
+    /// escalation is terminal (external help) and this is a no-op.
+    fn escalate_to_parent(&mut self, residue: u8) -> Vec<Effect> {
+        self.escalate_up(residue, ESCALATE_TTL)
+    }
+
+    /// The bounded escalation step: route the residue to the parent cell's sibling members, decrementing `ttl`
+    /// each stratum so the upward recursion terminates (the ХОЛАРХ depth ceiling).
+    fn escalate_up(&mut self, residue: u8, ttl: u8) -> Vec<Effect> {
+        // The child cell's point in the parent (the address's second-to-last level) and the parent cell's own
+        // prefix (empty at depth 2 → the top cell). Extracted as owned values so the router is free below.
+        let (child_index, prefix): (usize, Vec<Point<F>>) = {
+            let addr = &self.router.address;
+            let depth = addr.depth();
+            if depth < 2 {
+                return Vec::new(); // top stratum: no parent to escalate to
+            }
+            let Some(child_point) = addr.point_at(depth - 2) else {
+                return Vec::new();
+            };
+            let prefix = addr.points().get(..depth - 2).map(<[Point<F>]>::to_vec).unwrap_or_default();
+            (child_point.index(), prefix)
+        };
+        // Resolve each sibling's next-hop transport coordinate — the parent-prefix descended into each OTHER
+        // point (a direct base-point send at depth 2; a `RouteHier` hop deeper).
+        let mut targets: Vec<Triple> = Vec::new();
+        for i in 0..Plane::<F>::N as usize {
+            let sib = Point::<F>::at(i);
+            if sib.index() == child_index {
+                continue; // skip the failed child itself
+            }
+            let mut path = prefix.clone();
+            path.push(sib);
+            if let Some(sib_addr) = HierAddr::from_path(path)
+                && let HierRoute::Forward(next) = self.router.route(&sib_addr)
+            {
+                targets.push(next);
+            }
+        }
+        let frame = encode(FrameType::CellEscalate, &[child_index as u8, residue, ttl]);
+        targets.into_iter().map(|to| self.routed_send(to, frame.clone())).collect()
+    }
+
+    /// A received [`CellEscalate`](FrameType::CellEscalate): fold the failed child cell into this node's
+    /// parent-tier [`ParentCell`] reflex, spend the coarse `⌊log₉Φ⌋` reroute budget, and act — install coarse
+    /// reroutes around the failed child if the parent absorbs it, else hand the aggregate up to the
+    /// grandparent (bounded by `ttl`), else emit a terminal `Escalated` (external help). This is the DIAKRISIS
+    /// decoder recursing one stratum up: a child cell is one "node" of the parent Fano cell (§6.3, R-C2).
+    fn on_cell_escalate(&mut self, body: &[u8]) -> Vec<Effect> {
+        let &[child_index, residue, ttl] = body else {
+            return Vec::new();
+        };
+        let Some(self_index) = self.self_index else {
+            return Vec::new(); // off the base cell — the coarse index geometry does not apply
+        };
+        if usize::from(child_index) >= Plane::<F>::N as usize || usize::from(child_index) == self_index {
+            return Vec::new(); // a nonsensical child, or ourselves
+        }
+        let phi = self.healer.last_phi();
+        let parent = self.parent_cell.get_or_insert_with(|| ParentCell::new(self_index));
+        parent.observe(usize::from(child_index), ChildSummary::escalated(residue));
+        let parent = *parent; // Copy out — end the mutable borrow of `self` before escalating further
+
+        let mut effects = Vec::new();
+        if parent.contains_escalation(phi) {
+            // The parent absorbs it: install the coarse reroutes (failed child → via a co-linear sibling) and
+            // mark the child repaired at the coarse tier.
+            for (around, via) in parent.coarse_reroutes(phi) {
+                effects.push(Effect::Notify(Notification::Rerouted {
+                    around: Point::<F>::at(around).coords(),
+                    via: Point::<F>::at(via).coords(),
+                }));
+            }
+            effects.push(Effect::Notify(Notification::Repaired(
+                Point::<F>::at(usize::from(child_index)).coords(),
+            )));
+        } else {
+            // The parent tier cannot absorb within its own Φ-budget: hand the AGGREGATE coarse residue up to
+            // the grandparent if there is one (bounded), else terminal — external help required.
+            let aggregate = parent.degraded_mask();
+            let up = if ttl > 0 { self.escalate_up(aggregate, ttl - 1) } else { Vec::new() };
+            if up.is_empty() {
+                effects.push(Effect::Notify(Notification::Escalated(aggregate)));
+            } else {
+                effects.extend(up);
+            }
+        }
+        effects
     }
 
     fn on_send(&mut self, to: Triple, payload: &[u8]) -> Vec<Effect> {
@@ -2421,6 +2536,19 @@ impl<F: Field> OverlayNode<F> {
             &self.config,
             self.epoch,
         );
+        // R-C2: the Healer raises the `Escalated` NOTIFICATION but has no router — the facade (which owns the
+        // hierarchical address) transports the residue up to the parent cell's sibling members, where it folds
+        // into their `ParentCell` reflex. Origination lives here so a driver on any transport gets it.
+        let escalations: Vec<u8> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Notify(Notification::Escalated(mask)) => Some(*mask),
+                _ => None,
+            })
+            .collect();
+        for mask in escalations {
+            effects.extend(self.escalate_to_parent(mask));
+        }
         // §6.4 endpoint cross-attestation (#106): fold this round's per-witness liveness fresh-masks —
         // reconstructed from the corroborated `witnessed` gossip substrate plus this node's own direct view —
         // into the Healer's window, and quarantine any colluding vouch-fabricator keeping a corroborated-dead
@@ -2935,6 +3063,80 @@ mod tests {
             }),
         );
         assert_eq!(plain.hier_address().points(), &[Point::<F2>::at(6)]);
+    }
+
+    /// Decode a `CellEscalate` send into `(target, [child, residue, ttl])`, else `None`.
+    fn cell_escalate(e: &Effect) -> Option<(Triple, [u8; 3])> {
+        let Effect::Send { to, frame } = e else { return None };
+        let (f, _) = decode_frame(frame).ok()?;
+        if f.frame_type() != Some(FrameType::CellEscalate) {
+            return None;
+        }
+        match f.body {
+            [c, r, t] => Some((*to, [*c, *r, *t])),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_sub_cell_escalation_is_transported_to_the_parent_cell_siblings() {
+        // R-C2 origination: a node in a sub-cell (hier depth 2, at [3,5]) that exhausts its Φ-budget hands its
+        // residue up — a CellEscalate to each of the parent (top) cell's OTHER points, tagged with the failed
+        // child cell's root point (3). A depth-1 (top) cell has no parent, so its escalation is terminal.
+        let mut sub = OverlayNode::<F2>::new(Point::at(3), Config::default()).with_hier_address(
+            HierAddr::from_path(alloc::vec![Point::<F2>::at(3), Point::<F2>::at(5)]).unwrap(),
+        );
+        let effects = sub.escalate_to_parent(0b0110);
+        let escalations: Vec<(Triple, [u8; 3])> = effects.iter().filter_map(cell_escalate).collect();
+        // One escalation per parent-cell sibling (the six top points ≠ 3), each carrying child = 3 + the residue.
+        assert_eq!(escalations.len(), 6, "one escalation per parent-cell sibling");
+        for i in (0..7).filter(|&i| i != 3) {
+            assert!(
+                escalations.iter().any(|(to, _)| *to == Point::<F2>::at(i).coords()),
+                "escalated to sibling point {i}"
+            );
+        }
+        assert!(escalations.iter().all(|(_, body)| body[0] == 3 && body[1] == 0b0110), "child = 3, residue carried");
+
+        // The top stratum has no parent — escalation is terminal (external help), nothing sent.
+        let mut top = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        assert!(top.escalate_to_parent(0b0110).is_empty(), "a top-stratum cell escalates to no one");
+    }
+
+    #[test]
+    fn a_parent_cell_member_absorbs_a_child_escalation_by_coarse_rerouting() {
+        // R-C2 consumption: a top-cell node receiving a child escalation folds it into its ParentCell reflex
+        // and, with a healthy coarse Φ-budget, reroutes around the failed child — the audit's "Escalated was
+        // ACTED ON, not merely counted." (⌊log₉81⌋ = 2 affordable coarse hops.)
+        let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        parent.healer.last_phi = 81.0;
+        let frame = encode(FrameType::CellEscalate, &[3u8, 0b0010, ESCALATE_TTL]);
+        let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Rerouted { around, .. }) if *around == Point::<F2>::at(3).coords())),
+            "the parent tier reroutes around the failed child cell: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Repaired(c)) if *c == Point::<F2>::at(3).coords())),
+            "and marks the child repaired at the coarse tier"
+        );
+    }
+
+    #[test]
+    fn a_budgetless_top_parent_escalation_is_terminal() {
+        // With no coarse budget (Φ = 1 ⇒ ⌊log₉1⌋ = 0) and no grandparent, a top-cell parent cannot absorb the
+        // child escalation → it emits a terminal `Escalated` (external help), and does NOT reroute.
+        let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default()); // last_phi defaults to 1.0
+        let frame = encode(FrameType::CellEscalate, &[3u8, 0b0010, ESCALATE_TTL]);
+        let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Escalated(_)))),
+            "a top parent with no budget escalates terminally: {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Rerouted { .. }))),
+            "and does not reroute what it cannot afford"
+        );
     }
 
     #[test]

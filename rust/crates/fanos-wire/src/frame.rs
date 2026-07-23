@@ -122,6 +122,13 @@ pub enum FrameType {
     /// polar minimum-incident reading (`fanos_diakrisis::polar::grey_endpoint`) localizes a grey node — one
     /// heartbeat-present but lossy on every channel, which the liveness and equivocation checks cannot see.
     DiagLoss = 0x64,
+    /// A **cell escalation** to the parent stratum (audit R-C2): a child cell that exhausted its own
+    /// `Φ`-budget hands its irrecoverable residue up. Body: `child_index(1) ‖ residue(1) ‖ ttl(1)` — the
+    /// child cell's point in the parent, its unrecoverable node-mask (a stopping set, or `0` on a coherence
+    /// collapse), and a hop budget that bounds the recursion. A parent-cell member folds it into its
+    /// [`ParentCell`](fanos_core) reflex — the same reflexive Fano decoder one tier up — and coarse-reroutes
+    /// around the failed child, or re-escalates the aggregate to the grandparent until absorbed or terminal.
+    CellEscalate = 0x65,
     // 0x7* Application overlays (Kernel/Protocol split, design-platform.md §Kernel): a system Protocol
     // runs on port 0 and application overlays multiplex under one length-skippable outer type.
     App = 0x70,
@@ -186,6 +193,7 @@ impl FrameType {
             0x62 => Self::DiagVerdict,
             0x63 => Self::DiagAttest,
             0x64 => Self::DiagLoss,
+            0x65 => Self::CellEscalate,
             0x70 => Self::App,
             _ => return None,
         })
