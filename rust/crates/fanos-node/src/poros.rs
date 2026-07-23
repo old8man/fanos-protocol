@@ -41,6 +41,7 @@
 //! beacon + community secret — minimized, not eliminated, by PROTEUS obfuscation
 //! ([[proteus-morph-transforms]], the Parrot-is-Dead rule) and diverse high-collateral carriers.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fanos_calypso::hosting::{Share, recover_service_key, shard_service_key};
@@ -50,6 +51,8 @@ use fanos_geometry::{Line, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple
 use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
+use fanos_runtime::{Duration, Effect, Engine, Input, Instant, TimerToken};
+use fanos_wire::{FrameType, decode_frame, encode_frame};
 
 use crate::config::Peer;
 
@@ -278,6 +281,262 @@ fn decode_peer(bytes: &[u8]) -> Option<Peer> {
     Some(Peer { coord, addr: SocketAddr::new(ip, port) })
 }
 
+/// A POROS combiner's **response** to a requester — the bounded bucket of entry peers it served (never
+/// the full set). Encoded like an [`IngressDescriptor`]: a length-prefixed peer sequence.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct IngressResponse {
+    /// At most [`INGRESS_BUCKET`] entry peers, varying per requester.
+    pub peers: Vec<Peer>,
+}
+
+impl IngressResponse {
+    /// Canonical wire bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_seq(&mut out, self.peers.len(), &self.peers, |o, p| {
+            put_var_bytes(o, &encode_peer(p));
+        });
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let peers = r.seq(23, |r| decode_peer(r.var_bytes()?))?;
+        r.finish()?;
+        Some(Self { peers })
+    }
+}
+
+// --- The threshold-hosted ingress engine ---
+
+/// Default deadline for a POROS combiner to gather a threshold of descriptor shares.
+const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Default cap on concurrently-gathering requests — a bound on combiner state against a request flood.
+const DEFAULT_MAX_PENDING: usize = 256;
+
+/// A combiner's in-flight gather for one requester: the request, the descriptor shares collected so far
+/// (deduped by share index so a member cannot inflate the count), and the timer that bounds it.
+struct PendingServe {
+    req: IngressRequest,
+    shares: BTreeMap<u8, Share>,
+    timer: TimerToken,
+}
+
+/// One member of a **threshold-hosted POROS ingress line**, as a sans-I/O engine. It holds only *one*
+/// descriptor share (dealt via [`shard_descriptor`] for this epoch's line), so seizing it discloses
+/// nothing; a threshold `t` of members collectively reconstruct the descriptor and serve. The combiner
+/// exchange mirrors [`ThresholdService`](crate::ThresholdService) and the mixnet router:
+///
+/// 1. A requester sends a [`PorosRequest`](FrameType::PorosRequest) (its identity-bound
+///    [`IngressRequest`]) to the [`ingress_combiner`]. The combiner verifies the PoW, seeds its own
+///    share, and fans a [`PorosShareReq`](FrameType::PorosShareReq) (the requester tag) to the line.
+/// 2. Each member replies with its descriptor share in a [`PorosShare`](FrameType::PorosShare).
+/// 3. Once the combiner holds `≥ t` shares it reconstructs the descriptor ([`recover_descriptor`]),
+///    buckets it for the requester, and sends the [`PorosResponse`](FrameType::PorosResponse). It then
+///    discards the reconstructed descriptor — the at-rest "seize `< t` reveals nothing" property is
+///    unchanged; only a transient serve-time reconstruction ever lives at the combiner.
+pub struct PorosHost {
+    coord: Triple,
+    share: Share,
+    line: Vec<Triple>,
+    threshold: usize,
+    community: Vec<u8>,
+    epoch: Epoch,
+    beacon: BeaconSeed,
+    difficulty: u32,
+    pending: BTreeMap<Triple, PendingServe>,
+    seq: u64,
+    max_pending: usize,
+    gather_timeout: Duration,
+}
+
+impl PorosHost {
+    /// A line member at `coord` holding its dealt descriptor `share`, hosting the ingress
+    /// `threshold`-of-`line.len()` for `(community, epoch, beacon)` at PoW `difficulty`. `line` is every
+    /// member's coordinate in the order [`shard_descriptor`] dealt shares (position = share index).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        coord: Triple,
+        share: Share,
+        line: Vec<Triple>,
+        threshold: usize,
+        community: Vec<u8>,
+        epoch: Epoch,
+        beacon: BeaconSeed,
+        difficulty: u32,
+    ) -> Self {
+        Self {
+            coord,
+            share,
+            line,
+            threshold,
+            community,
+            epoch,
+            beacon,
+            difficulty,
+            pending: BTreeMap::new(),
+            seq: 0,
+            max_pending: DEFAULT_MAX_PENDING,
+            gather_timeout: DEFAULT_GATHER_TIMEOUT,
+        }
+    }
+
+    /// Override the combiner's gather deadline (default 2 s).
+    #[must_use]
+    pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
+        self.gather_timeout = timeout;
+        self
+    }
+
+    /// The number of requests currently gathering (combiner state), for tests/observability.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// A request arrived at us as the combiner: verify its PoW, seed our own share, fan share-requests to
+    /// the rest of the line. A bad proof, wrong epoch/community, or a duplicate/flood is dropped.
+    fn on_request(&mut self, now: Instant, req: IngressRequest) -> Vec<Effect> {
+        if !verify_ingress_request(&req, &self.community, self.epoch, &self.beacon, self.difficulty) {
+            return Vec::new();
+        }
+        if self.pending.contains_key(&req.requester) || self.pending.len() >= self.max_pending {
+            return Vec::new();
+        }
+        let mut shares = BTreeMap::new();
+        shares.insert(self.share.x(), self.share.clone());
+        let sharereq = encode(FrameType::PorosShareReq, &encode_triple(req.requester));
+        let mut effects: Vec<Effect> = self
+            .line
+            .iter()
+            .filter(|&&m| m != self.coord)
+            .map(|&m| Effect::Send { to: m, frame: sharereq.clone() })
+            .collect();
+        let timer = TimerToken(self.seq);
+        self.seq = self.seq.wrapping_add(1);
+        effects.push(Effect::ArmTimer { token: timer, after: self.gather_timeout });
+        let requester = req.requester;
+        self.pending.insert(requester, PendingServe { req, shares, timer });
+        effects.extend(self.try_serve(now, requester));
+        effects
+    }
+
+    /// A combiner asked for our descriptor share for `requester`: return our static share, tagged with the
+    /// requester so the combiner correlates it to the right gather.
+    fn on_share_req(&self, combiner: Triple, requester: Triple) -> Vec<Effect> {
+        vec![Effect::Send {
+            to: combiner,
+            frame: encode(FrameType::PorosShare, &encode_share_reply(requester, &self.share)),
+        }]
+    }
+
+    /// A member's descriptor share arrived: fold it into the matching gather and retry.
+    fn on_share(&mut self, now: Instant, requester: Triple, share: Share) -> Vec<Effect> {
+        let Some(pending) = self.pending.get_mut(&requester) else {
+            return Vec::new();
+        };
+        pending.shares.entry(share.x()).or_insert(share);
+        self.try_serve(now, requester)
+    }
+
+    /// If the gather for `requester` holds a threshold of shares, reconstruct the descriptor, bucket it,
+    /// and send the response; else leave it pending. A failed reconstruction awaits more shares.
+    fn try_serve(&mut self, _now: Instant, requester: Triple) -> Vec<Effect> {
+        let Some(pending) = self.pending.get(&requester) else {
+            return Vec::new();
+        };
+        if pending.shares.len() < self.threshold {
+            return Vec::new();
+        }
+        let shares: Vec<Share> = pending.shares.values().cloned().collect();
+        let Some(descriptor) = recover_descriptor(&shares) else {
+            return Vec::new();
+        };
+        let response = IngressResponse { peers: descriptor.bucket(&pending.req) };
+        self.pending.remove(&requester);
+        vec![Effect::Send {
+            to: requester,
+            frame: encode(FrameType::PorosResponse, &response.to_bytes()),
+        }]
+    }
+
+    /// A gather deadline fired: drop the still-incomplete request it bounds, freeing its slot.
+    fn on_timer(&mut self, token: TimerToken) -> Vec<Effect> {
+        if let Some(&requester) = self
+            .pending
+            .iter()
+            .find(|(_, p)| p.timer == token)
+            .map(|(r, _)| r)
+        {
+            self.pending.remove(&requester);
+        }
+        Vec::new()
+    }
+}
+
+impl Engine for PorosHost {
+    fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
+        match input {
+            Input::Message { from, frame } => {
+                let Ok((decoded, _)) = decode_frame(&frame) else {
+                    return Vec::new();
+                };
+                match decoded.frame_type() {
+                    Some(FrameType::PorosRequest) => IngressRequest::from_bytes(decoded.body)
+                        .map_or_else(Vec::new, |req| self.on_request(now, req)),
+                    Some(FrameType::PorosShareReq) => decoded
+                        .body
+                        .get(..TRIPLE_WIRE_LEN)
+                        .and_then(decode_triple)
+                        .map_or_else(Vec::new, |requester| self.on_share_req(from, requester)),
+                    Some(FrameType::PorosShare) => decode_share_reply(decoded.body)
+                        .map_or_else(Vec::new, |(requester, share)| self.on_share(now, requester, share)),
+                    _ => Vec::new(),
+                }
+            }
+            Input::Timer(token) => self.on_timer(token),
+            // A POROS host takes no application commands — it serves requests off the wire.
+            Input::Command(_) => Vec::new(),
+        }
+    }
+
+    fn address(&self) -> Triple {
+        self.coord
+    }
+}
+
+/// Build the [`PorosRequest`](FrameType::PorosRequest) frame a new node sends to the ingress combiner.
+#[must_use]
+pub fn request_frame(req: &IngressRequest) -> Vec<u8> {
+    encode(FrameType::PorosRequest, &req.to_bytes())
+}
+
+/// Encode a wire frame with the given type and body.
+fn encode(ty: FrameType, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_frame(ty.code(), body, &mut out);
+    out
+}
+
+/// A `PorosShare` body: `requester(12) ‖ x(1) ‖ y`.
+fn encode_share_reply(requester: Triple, share: &Share) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TRIPLE_WIRE_LEN + 1 + share.y().len());
+    out.extend_from_slice(&encode_triple(requester));
+    out.push(share.x());
+    out.extend_from_slice(share.y());
+    out
+}
+
+fn decode_share_reply(body: &[u8]) -> Option<(Triple, Share)> {
+    let requester = decode_triple(body.get(..TRIPLE_WIRE_LEN)?)?;
+    let (&x, y) = body.get(TRIPLE_WIRE_LEN..)?.split_first()?;
+    Some((requester, Share::new(x, y.to_vec())))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -377,5 +636,120 @@ mod tests {
         assert_ne!(bucket_a, bucket_b, "distinct requesters surface distinct buckets");
         // The descriptor round-trips on the wire.
         assert_eq!(IngressDescriptor::from_bytes(&desc.to_bytes()).unwrap(), desc);
+    }
+
+    #[test]
+    fn a_threshold_of_hosts_reconstructs_and_serves_a_bucket() {
+        use fanos_runtime::{Effect, Input, Instant};
+
+        // Deal the descriptor 2-of-3 across a 3-member ingress line; build a PorosHost per member.
+        let desc = descriptor(10);
+        let threshold = 2usize;
+        let community = b"comm".to_vec();
+        let (epoch, difficulty) = (Epoch::new(2), 4);
+        let beacon = BeaconSeed::new([0x33; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x21u8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let host = |i: usize| {
+            PorosHost::new(
+                line[i],
+                shares[i].clone(),
+                line.clone(),
+                threshold,
+                community.clone(),
+                epoch,
+                beacon,
+                difficulty,
+            )
+        };
+        let mut combiner = host(0); // the requester contacts line[0], the ingress combiner
+        let mut member1 = host(1);
+
+        // A requester solves an identity-bound PoW and sends the request to the combiner.
+        let requester = coord(5);
+        let req = solve_ingress_request(requester, &community, epoch, &beacon, difficulty);
+        let fanned = combiner.step(
+            Instant(0),
+            Input::Message { from: requester, frame: request_frame(&req) },
+        );
+        assert_eq!(combiner.pending(), 1, "the combiner has its own share and is gathering the rest");
+
+        // The combiner fanned a share-request to member 1; member 1 replies with its descriptor share.
+        let share_req = fanned
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == line[1] => Some(frame.clone()),
+                _ => None,
+            })
+            .expect("the combiner fanned a share-request to member 1");
+        let reply = member1.step(Instant(1), Input::Message { from: line[0], frame: share_req });
+        let share_frame = reply
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == line[0] => Some(frame.clone()),
+                _ => None,
+            })
+            .expect("member 1 returned its descriptor share to the combiner");
+
+        // The share reaches the combiner: it now holds t = 2 shares, reconstructs, and serves the bucket.
+        let served = combiner.step(Instant(2), Input::Message { from: line[1], frame: share_frame });
+        let response = served
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == requester => {
+                    let (decoded, _) = decode_frame(frame).ok()?;
+                    if decoded.frame_type() == Some(FrameType::PorosResponse) {
+                        IngressResponse::from_bytes(decoded.body)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .expect("the combiner served a PorosResponse to the requester");
+
+        assert!(
+            !response.peers.is_empty() && response.peers.len() <= INGRESS_BUCKET,
+            "a bounded, non-empty bucket is served",
+        );
+        assert_eq!(
+            response.peers,
+            desc.bucket(&req),
+            "the served bucket equals the descriptor's bucket for this requester (correct reconstruction)",
+        );
+        assert_eq!(combiner.pending(), 0, "the gather completed and freed its slot");
+    }
+
+    #[test]
+    fn a_request_with_a_bad_proof_of_work_is_dropped() {
+        use fanos_runtime::{Input, Instant};
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let community = b"c".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 8);
+        let beacon = BeaconSeed::GENESIS;
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x9u8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let mut combiner = PorosHost::new(
+            line[0],
+            shares[0].clone(),
+            line.clone(),
+            threshold,
+            community.clone(),
+            epoch,
+            beacon,
+            difficulty,
+        );
+        // A request whose nonce does not solve the challenge is refused: no gather is opened, no share
+        // requests are fanned — the PoW gate holds before any threshold work is done.
+        let bad = IngressRequest { requester: coord(4), nonce: 0 };
+        let effects = combiner.step(
+            Instant(0),
+            Input::Message { from: coord(4), frame: request_frame(&bad) },
+        );
+        assert!(effects.is_empty(), "an unsolved request produces no effects");
+        assert_eq!(combiner.pending(), 0, "and opens no gather");
     }
 }

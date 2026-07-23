@@ -106,6 +106,18 @@ pub enum FrameType {
     /// A service-line member's PartialDec reply to its combiner (spec §12.3, audit #99): body is the
     /// 32-byte intro id ‖ the member's Shamir share (`x(1B) ‖ y`). The combiner Lagrange-combines `t`.
     SvcPartial = 0x55,
+    /// A new node's **POROS ingress request** to the ingress-line combiner (spec §6, censorship
+    /// bootstrap): body is the identity-bound `IngressRequest` bytes. The combiner gathers a threshold of
+    /// descriptor shares and replies with a [`PorosResponse`](Self::PorosResponse).
+    PorosRequest = 0x56,
+    /// A POROS combiner asks a co-line member for its threshold-hosted **descriptor share** (spec §6):
+    /// the member replies with a [`PorosShare`](Self::PorosShare). No single host holds the entry set.
+    PorosShareReq = 0x57,
+    /// A POROS line member's descriptor-share reply to its combiner: body is `x(1B) ‖ y`. The combiner
+    /// reconstructs the ingress descriptor from a threshold of these, then serves a bucket.
+    PorosShare = 0x58,
+    /// A POROS combiner's response to a requester: a bounded bucket of entry peers (never the full set).
+    PorosResponse = 0x59,
     // 0x6* DIAKRISIS
     DiagGossip = 0x60,
     DiagSyndrome = 0x61,
@@ -188,6 +200,10 @@ impl FrameType {
             0x53 => Self::RdvRegister,
             0x54 => Self::SvcShareReq,
             0x55 => Self::SvcPartial,
+            0x56 => Self::PorosRequest,
+            0x57 => Self::PorosShareReq,
+            0x58 => Self::PorosShare,
+            0x59 => Self::PorosResponse,
             0x60 => Self::DiagGossip,
             0x61 => Self::DiagSyndrome,
             0x62 => Self::DiagVerdict,
