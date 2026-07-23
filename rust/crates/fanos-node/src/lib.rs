@@ -28,6 +28,7 @@ pub mod loaddir;
 pub mod role_loop;
 pub mod taxis_driver;
 pub mod identity;
+pub mod ingress_node;
 pub mod mix_relay;
 pub mod mixdir;
 pub mod node;
@@ -61,7 +62,12 @@ pub use mixdir::{
     build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,
     resolve_mix_key, spawn_mix_publisher,
 };
+pub use ingress_node::IngressNode;
 pub use node::{Health, Node};
+pub use poros::{
+    IngressDescriptor, IngressRequest, IngressResponse, PorosHost, request_frame, shard_descriptor,
+    solve_ingress_request,
+};
 pub use taxis_driver::{
     SortitionParams, TaxisEvent, TaxisHandle, TaxisParams, spawn_checkpoint_publisher, spawn_taxis,
 };
