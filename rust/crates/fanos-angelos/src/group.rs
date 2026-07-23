@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_primitives::{aead, hash_labeled};
+use zeroize::Zeroize;
 
 use crate::nonce;
 
@@ -43,6 +44,17 @@ pub struct GroupSession {
     recv: BTreeMap<u32, ([u8; 32], u64)>,
     /// `member_id -> their public verifying key` (for authenticating their posts).
     verifiers: BTreeMap<u32, HybridVerifier>,
+}
+
+impl Drop for GroupSession {
+    fn drop(&mut self) {
+        // Audit AT-M1: wipe our send chain and every tracked peer chain key. `sign_secret` (HybridSigSecret)
+        // zeroizes via its own drop; `verifiers` hold only public keys.
+        self.send_chain.zeroize();
+        for (chain, _n) in self.recv.values_mut() {
+            chain.zeroize();
+        }
+    }
 }
 
 impl GroupSession {

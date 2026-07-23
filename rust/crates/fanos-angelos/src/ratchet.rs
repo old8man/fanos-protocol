@@ -34,6 +34,7 @@ use alloc::vec::Vec;
 use fanos_pqcrypto::kem::{CIPHERTEXT_LEN, HybridCiphertext, HybridKemPublic, HybridKemSecret, PUBLIC_LEN};
 use fanos_primitives::hash_labeled;
 use rand_core::CryptoRng;
+use zeroize::Zeroize;
 
 use crate::chain::{ChainKdf, RecvChain, SendChain};
 
@@ -76,6 +77,14 @@ pub struct DoubleRatchet {
     /// Retired receive chains keyed by their epoch's peer ratchet id, holding banked keys for late messages.
     past: BTreeMap<[u8; 32], RecvChain>,
     must_ratchet: bool,
+}
+
+impl Drop for DoubleRatchet {
+    fn drop(&mut self) {
+        // Audit AT-M1: wipe the root key. The embedded send/recv/past chains and the KEM ratchet secret zeroize
+        // via their own `Drop`s (RecvChain also wipes its banked skipped keys).
+        self.root.zeroize();
+    }
 }
 
 impl DoubleRatchet {

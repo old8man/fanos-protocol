@@ -21,6 +21,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_primitives::{aead, hash_labeled};
+use zeroize::Zeroize;
 
 use crate::nonce;
 
@@ -54,6 +55,13 @@ pub(crate) struct SendChain {
     kdf: ChainKdf,
 }
 
+impl Drop for SendChain {
+    fn drop(&mut self) {
+        // Audit AT-M1: wipe the live chain key so it does not linger in freed memory.
+        self.key.zeroize();
+    }
+}
+
 impl SendChain {
     #[must_use]
     pub(crate) fn new(key: [u8; 32], kdf: ChainKdf) -> Self {
@@ -84,6 +92,16 @@ pub(crate) struct RecvChain {
     n: u64,
     skipped: BTreeMap<u64, [u8; 32]>,
     kdf: ChainKdf,
+}
+
+impl Drop for RecvChain {
+    fn drop(&mut self) {
+        // Audit AT-M1: wipe the live chain key AND every banked skipped message key.
+        self.key.zeroize();
+        for mk in self.skipped.values_mut() {
+            mk.zeroize();
+        }
+    }
 }
 
 impl RecvChain {

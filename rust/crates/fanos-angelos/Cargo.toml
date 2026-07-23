@@ -17,6 +17,8 @@ fanos-pqcrypto.workspace = true
 fanos-primitives = { workspace = true, default-features = false, features = ["aead"] }
 # The `CryptoRng` bound for the double ratchet's asymmetric (KEM) ratchet keygen/encapsulation.
 rand_core = { workspace = true }
+# Zeroize secret key material (chain/root/message/media keys) on drop (audit AT-M1).
+zeroize = { workspace = true, features = ["alloc"] }
 
 [features]
 default = ["std"]

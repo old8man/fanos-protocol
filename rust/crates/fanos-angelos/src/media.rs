@@ -18,6 +18,7 @@
 use alloc::vec::Vec;
 
 use fanos_primitives::{aead, hash_labeled};
+use zeroize::Zeroize;
 
 use crate::nonce;
 
@@ -96,6 +97,14 @@ pub struct MediaSession {
     recv_key: [u8; 32],
     epoch: u32,
     send_seq: u64,
+}
+
+impl Drop for MediaSession {
+    fn drop(&mut self) {
+        // Audit AT-M1: wipe both directions' media keys on drop.
+        self.send_key.zeroize();
+        self.recv_key.zeroize();
+    }
 }
 
 impl MediaSession {
