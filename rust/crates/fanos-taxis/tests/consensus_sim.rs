@@ -430,6 +430,33 @@ fn ssle_leadership_is_secret_valued_and_not_the_public_schedule() {
 }
 
 #[test]
+fn ssle_a_down_line_member_does_not_stall_the_round_the_window_expiry_finalizes() {
+    // The collection-window tick-expiry (Δ_prio) path — the liveness mechanism the happy-path early-exit skips.
+    // Crash one member of height 0's elected line so only q of q+1 propose: the all-collected early-exit CANNOT
+    // fire, and the window must expire and prepare the min of the LIVE proposals. A down line member just shrinks
+    // the candidate set — no view change (round advance) is needed, so this stays a witnessed round-0 block.
+    let mut c = Cluster::new(&genesis());
+    c.enable_sortition_all();
+    let members = line_members(leader_line(&SEED, 0, 0));
+    let victim = members[0];
+    c.crashed[victim] = true;
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"down0");
+    c.submit_all(&tx);
+    for _ in 0..3 {
+        c.tick(); // tick 1 collects the q live proposals; tick 2 expires the window → prepare min → finalize.
+    }
+
+    assert_eq!(c.hashes_at(0).len(), 1, "the window-expiry prepared a single agreed block");
+    assert!(c.honest_count_at(0) >= 5, "a Q-quorum finalized height 0 despite a down line member");
+    let finalized = c.hashes_at(0).into_iter().next().unwrap();
+    let block = c.proposed.iter().find(|b| b.hash() == finalized).unwrap();
+    assert_ne!(usize::from(block.header.proposer), victim, "the crashed member did not lead");
+    assert!(members.contains(&usize::from(block.header.proposer)), "the leader is a (live) line member");
+    assert!(block.witness.is_some(), "still a witnessed round-0 block — the window expiry, not a view-change fallback");
+}
+
+#[test]
 fn a_lagging_validator_state_syncs_to_the_certified_state_and_rejoins() {
     // Audit §3.9 / §4: a validator that misses heights (crashed, partitioned, or lost a startup race) must not
     // wedge forever. On recovery it detects it is behind, requests catch-up, adopts a peer's QUORUM-CERTIFIED
