@@ -22,6 +22,10 @@ fanos-wire = { workspace = true, features = ["std"] }
 # the whole OverlayNode engine crate (audit #73/#125).
 fanos-ports = { workspace = true, features = ["std"] }
 fanos-vrf.workspace = true
+# The canonical bounded codec (recovery-authorization wire form) and the shared Epoch type.
+fanos-primitives = { workspace = true, features = ["std"] }
+# The recovery authority signs re-genesis certificates with a hybrid PQ identity signature (audit §4).
+fanos-pqcrypto.workspace = true
 # Wipe this node's DKG secret contribution from memory on drop.
 zeroize = { workspace = true }
 

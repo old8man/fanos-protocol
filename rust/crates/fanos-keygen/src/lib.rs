@@ -36,7 +36,9 @@
 #![forbid(unsafe_code)]
 
 pub mod beacon;
+pub mod recovery;
 pub use beacon::BeaconNode;
+pub use recovery::RecoveryAuthorization;
 
 use std::collections::{BTreeMap, BTreeSet};
 

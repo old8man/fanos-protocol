@@ -43,6 +43,7 @@ pub struct HybridVerifier {
 }
 
 /// A hybrid signature: the Ed25519 and the ML-DSA-65 signatures.
+#[derive(Clone, PartialEq, Debug)]
 pub struct HybridSignature {
     ed25519: EdSignature,
     mldsa: MlSignature<MlDsa65>,

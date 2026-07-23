@@ -25,12 +25,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
 use fanos_ports::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
+use fanos_pqcrypto::HybridVerifier;
+use fanos_primitives::hash_labeled;
 use fanos_vrf::beacon::{BeaconPartial, BeaconRound, PARTIAL_LEN, partial_eval, verify_partial};
 use fanos_vrf::vss::{
     VssCommitment, VssShare, combine_reshare_commitment, combine_reshare_share, reshare, verify_reshare_commit,
     verify_share,
 };
 use fanos_wire::{FrameType, decode_frame, encode_frame};
+
+use crate::recovery::RecoveryAuthorization;
+
+/// Domain-separation label for the cell lineage fingerprint an `RGC` binds to (audit §4).
+const LINEAGE_LABEL: &str = "FANOS-recovery-v1/lineage";
 
 /// Cap on partials buffered per in-progress epoch. A cell has at most `N` anchors, so honest operation
 /// never approaches this; the cap bounds memory against a peer flooding forged `BeaconPartial`s (each
@@ -81,6 +88,11 @@ pub struct BeaconNode<F: Field> {
     /// commitments and this node's private sub-shares, until a canonical ≥`t`-of-old contributor set
     /// validates and the redistributed sharing is adopted.
     pending_reshare: BTreeMap<u64, ReshareRound>,
+    /// The **recovery authority** — the trust root that may authorize a below-threshold re-genesis
+    /// ([`rebootstrap`](Self::rebootstrap)). The parent cell's key, or (for the root cell) a founder/constitution
+    /// key. `None` disables re-genesis: a cell with no configured authority freezes rather than re-key on an
+    /// unauthenticated say-so (audit §4, `docs/design-recovery.md`).
+    authority: Option<HybridVerifier>,
 }
 
 /// An in-progress resharing generation (audit R-C1). A coordinator's trigger fixes the target set; each
@@ -127,7 +139,17 @@ impl<F: Field> BeaconNode<F> {
             current_round: None,
             reshare_gen: 0,
             pending_reshare: BTreeMap::new(),
+            authority: None,
         }
+    }
+
+    /// Configure the **recovery authority** whose signature may authorize a below-threshold re-genesis
+    /// ([`rebootstrap`](Self::rebootstrap)). Without it, a cell that falls below threshold freezes permanently
+    /// rather than re-key on an unauthenticated request (audit §4).
+    #[must_use]
+    pub fn with_recovery_authority(mut self, authority: HybridVerifier) -> Self {
+        self.authority = Some(authority);
+        self
     }
 
     /// The current beacon epoch.
@@ -548,6 +570,63 @@ impl<F: Field> BeaconNode<F> {
         self.pending_reshare.retain(|&g, _| g > generation);
     }
 
+    /// The cell's current **lineage fingerprint** — `H(generation ‖ group-commitment)` — the provenance an
+    /// `RGC` binds to (its `anchor`). Every honest member of the same cell at the same generation computes the
+    /// same value; a different cell (different commitment) or an already-advanced generation computes a
+    /// different one, so an authorization cannot be replayed across cells or re-applied after the fact.
+    #[must_use]
+    pub fn lineage_anchor(&self) -> [u8; 32] {
+        let commitment = self.commitment.to_bytes();
+        let mut buf = Vec::with_capacity(8 + commitment.len());
+        buf.extend_from_slice(&self.reshare_gen.to_le_bytes());
+        buf.extend_from_slice(&commitment);
+        hash_labeled(LINEAGE_LABEL, &buf)
+    }
+
+    /// **Below-threshold re-genesis** (audit §4, `docs/design-recovery.md`): install a fresh DVRF key produced by
+    /// a survivor DKG, resuming the frozen epoch clock at `auth.epoch_fence`. Returns `false` (no change) unless
+    /// every guard holds:
+    /// 1. a recovery [`authority`](Self::with_recovery_authority) is configured and `auth` verifies under it —
+    ///    the single-writer authorization that makes exactly one re-genesis canonical;
+    /// 2. `auth.generation > reshare_gen` — the monotonic fence: a stale/replayed authorization is refused, so a
+    ///    returning partitioned group is subordinated (its old-generation rounds fail against the new
+    ///    commitment), never forked;
+    /// 3. `auth.anchor == lineage_anchor()` — the authorization was issued for THIS cell at THIS generation;
+    /// 4. `auth.epoch_fence > epoch` — the resumed clock only moves forward;
+    /// 5. `new_commitment.threshold() == auth.threshold` — the DKG produced exactly the authorized threshold.
+    ///
+    /// The fresh key has no continuity with the lost one (it is information-theoretically gone); the `RGC` plus
+    /// this commitment ARE the new lineage. `new_share` is this node's share from the survivor DKG — `None` for a
+    /// pure consumer, which then adopts the resumed rounds without contributing partials.
+    pub fn rebootstrap(
+        &mut self,
+        auth: &RecoveryAuthorization,
+        new_commitment: VssCommitment,
+        new_share: Option<VssShare>,
+    ) -> bool {
+        let Some(authority) = &self.authority else {
+            return false; // re-genesis disabled — no configured trust root
+        };
+        if !auth.verify(authority)
+            || auth.generation <= self.reshare_gen
+            || auth.anchor != self.lineage_anchor()
+            || auth.epoch_fence <= self.epoch
+            || new_commitment.threshold() != usize::from(auth.threshold)
+        {
+            return false;
+        }
+        self.reshare_gen = auth.generation;
+        self.threshold = usize::from(auth.threshold);
+        self.commitment = new_commitment;
+        self.share = new_share;
+        self.epoch = auth.epoch_fence.saturating_sub(1); // the next AdvanceEpoch targets epoch_fence
+        self.seed = [0u8; 32];
+        self.pending.clear();
+        self.current_round = None;
+        self.pending_reshare.retain(|&g, _| g > auth.generation);
+        true
+    }
+
     /// Drop irrelevant reshare state (generations `≤` the adopted one) and bound the map size against a flood
     /// of bogus generations, keeping room for `incoming`.
     fn prune_reshare_gens(&mut self, incoming: u64) {
@@ -784,6 +863,66 @@ mod tests {
             assert_eq!(node.epoch(), Epoch::new(1));
             assert_eq!(node.seed(), seed0);
         }
+    }
+
+    #[test]
+    fn a_below_threshold_cell_re_genesises_only_under_an_authorized_rgc() {
+        use crate::RecoveryAuthorization;
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+        // Genesis (t=4, n=7) and a configured recovery authority (a parent cell / founder key).
+        let t = 4usize;
+        let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"regen-genesis")).unwrap();
+        let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"parent-authority"));
+        let survivor = || {
+            BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t)
+                .with_recovery_authority(authority_vk.clone())
+        };
+
+        // A fresh survivor DKG — a single trusted deal stands for it, exactly as genesis stands for the DKG: a
+        // (t'=2, n) sharing of a brand-new secret, with NO continuity to the lost key.
+        let t2 = 2u8;
+        let (new_shares, new_commitment) =
+            deal(&[0x5E; 32], usize::from(t2), N, &mut DeterministicRng::new(b"regen-fresh")).unwrap();
+        let survivors = [5u8, 6, 7]; // holder indices of points {4,5,6}
+        let fence = Epoch::new(3);
+
+        // (1) An authorized RGC re-genesises: the fresh key installs, the generation fences forward, the clock is
+        // set to resume at the fence, and the anchor produces a partial again (the freeze is lifted).
+        let mut node = survivor();
+        let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, node.lineage_anchor());
+        assert!(node.rebootstrap(&rgc, new_commitment.clone(), Some(new_shares[4].clone())), "authorized re-genesis adopts");
+        assert_eq!(node.reshare_gen(), 1, "generation fenced forward");
+        assert_eq!(node.threshold(), 2, "the fresh threshold is installed");
+        assert_eq!(node.epoch(), fence.saturating_sub(1), "the clock resumes at the fence on next advance");
+        let resumed = node.step(Instant(0), Input::Command(Command::AdvanceEpoch));
+        assert!(
+            resumed.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "the re-genesised anchor floods a fresh partial — the clock is un-frozen"
+        );
+
+        // (2) A foreign authority is refused (no fork on an unauthorized say-so).
+        let mut n = survivor();
+        let (impostor_sk, _) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"impostor"));
+        let forged = RecoveryAuthorization::issue(&impostor_sk, 1, fence, &survivors, t2, n.lineage_anchor());
+        assert!(!n.rebootstrap(&forged, new_commitment.clone(), Some(new_shares[4].clone())), "a foreign authority is refused");
+
+        // (3) An authorization anchored to a different cell/generation is refused (no cross-cell replay).
+        let wrong_anchor = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, [0xAA; 32]);
+        assert!(!n.rebootstrap(&wrong_anchor, new_commitment.clone(), Some(new_shares[4].clone())), "a foreign anchor is refused");
+
+        // (4) A non-advancing fence is refused (the clock never runs backward).
+        let backward = RecoveryAuthorization::issue(&authority_sk, 1, n.epoch(), &survivors, t2, n.lineage_anchor());
+        assert!(!n.rebootstrap(&backward, new_commitment.clone(), Some(new_shares[4].clone())), "a non-advancing fence is refused");
+
+        // (5) After a valid adoption, a stale (≤ current) generation is refused — the monotonic fence that makes
+        // a returning partition subordinate, not forking.
+        assert!(n.rebootstrap(
+            &RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, n.lineage_anchor()),
+            new_commitment.clone(),
+            Some(new_shares[4].clone()),
+        ));
+        let stale = RecoveryAuthorization::issue(&authority_sk, 1, Epoch::new(9), &survivors, t2, n.lineage_anchor());
+        assert!(!n.rebootstrap(&stale, new_commitment, Some(new_shares[4].clone())), "a stale generation is refused");
     }
 
     #[test]
