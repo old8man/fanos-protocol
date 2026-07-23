@@ -45,3 +45,41 @@ pub(crate) fn log2(x: f64) -> f64 {
         compile_error!("fanos-nyx on no_std requires the `libm` feature for log2")
     }
 }
+
+/// Natural logarithm, dispatched by target (same backend + non-rounded caveat as [`log2`]).
+#[inline]
+#[must_use]
+pub(crate) fn ln(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.ln()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::log(x)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-nyx on no_std requires the `libm` feature for ln")
+    }
+}
+
+/// `e^x`, dispatched by target (same backend + non-rounded caveat as [`log2`]). Only caller is the
+/// informational Chernoff security bound ([`crate::security::chernoff_break_bound`]), which gates no
+/// wire-visible behaviour, so an ULP of backend divergence is harmless.
+#[inline]
+#[must_use]
+pub(crate) fn exp(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.exp()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::exp(x)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-nyx on no_std requires the `libm` feature for exp")
+    }
+}
