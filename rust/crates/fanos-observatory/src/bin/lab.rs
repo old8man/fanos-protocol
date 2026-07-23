@@ -233,6 +233,7 @@ fn print_experiment(r: &ExperimentReport) {
     println!("  after       {}/{} alive · {}", r.after.alive, r.after.total, if r.after.is_healthy() { "healthy" } else { "degraded" });
     println!("  peak trouble {} cell(s) at the worst moment", r.peak_troubled_cells);
     println!("  diagnosed    up to {} node(s) diagnosed ({} of them a partition verdict)", r.peak_diagnosed, r.peak_partitioned);
+    println!("  decouples    {} correlation-shed action(s) (the homeostat's flood response)", r.decouples);
     println!("  min mean Φ   {:.3}   (deepest coherence dip)", r.min_mean_phi);
     println!("  outcome      {}\n", if r.ended_healthy { "● recovered / never broke" } else { "● ended degraded" });
 }
@@ -240,8 +241,8 @@ fn print_experiment(r: &ExperimentReport) {
 fn experiment_json(r: &ExperimentReport) -> String {
     let phi = if r.min_mean_phi.is_finite() { format!("{:.6}", r.min_mean_phi) } else { "null".to_string() };
     format!(
-        "{{\"name\":\"{}\",\"ticks\":{},\"before_alive\":{},\"after_alive\":{},\"total\":{},\"peak_troubled_cells\":{},\"peak_diagnosed\":{},\"peak_partitioned\":{},\"min_mean_phi\":{},\"ended_healthy\":{}}}",
-        r.name, r.ticks, r.before.alive, r.after.alive, r.after.total, r.peak_troubled_cells, r.peak_diagnosed, r.peak_partitioned, phi, r.ended_healthy,
+        "{{\"name\":\"{}\",\"ticks\":{},\"before_alive\":{},\"after_alive\":{},\"total\":{},\"peak_troubled_cells\":{},\"peak_diagnosed\":{},\"peak_partitioned\":{},\"decouples\":{},\"min_mean_phi\":{},\"ended_healthy\":{}}}",
+        r.name, r.ticks, r.before.alive, r.after.alive, r.after.total, r.peak_troubled_cells, r.peak_diagnosed, r.peak_partitioned, r.decouples, phi, r.ended_healthy,
     )
 }
 

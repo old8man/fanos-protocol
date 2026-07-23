@@ -99,6 +99,19 @@ fn soft_partition_never_crashes_a_node_and_recovers() {
 }
 
 #[test]
+fn a_common_mode_flood_makes_the_homeostat_shed_without_crashing() {
+    // Flood all 10 cells (70 nodes) with common-mode routed load: the T-104 homeostat sheds correlation
+    // (Decouple) in each, preserving availability by shedding rather than crashing.
+    let mut cluster = Cluster::new(1, config(), 10);
+    cluster.run_for(Duration::from_millis(1200));
+    let report = run_experiment(&mut cluster, Experiment::Flood { fraction: 1.0, bursts: 2 }, 16, step());
+
+    assert!(report.before.is_healthy(), "starts healthy");
+    assert_eq!(report.after.alive, 70, "a flood is shed, not survived by crashing — every node stays up");
+    assert!(report.decouples > 0, "the homeostat sheds correlation under over-coupling: {}", report.decouples);
+}
+
+#[test]
 fn an_experiment_run_is_deterministic_per_seed() {
     let run = || {
         let mut c = Cluster::new(9, config(), 12);

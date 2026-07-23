@@ -11,9 +11,18 @@
 use std::collections::BTreeSet;
 
 use fanos_runtime::Duration;
+use fanos_wire::{FrameType, encode_frame};
 
 use crate::cluster::Cluster;
 use crate::fleet::ClusterStats;
+
+/// One `Route` data-relay frame — the behavioural load signal the coherence self-model senses (control
+/// chatter such as pings/gossip is excluded, so only these move the behavioural `Γ_net`).
+fn route_frame() -> Vec<u8> {
+    let mut f = Vec::new();
+    encode_frame(FrameType::Route.code(), b"x", &mut f);
+    f
+}
 
 /// A parametric perturbation applied to a [`Cluster`] over a run.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,6 +73,19 @@ pub enum Experiment {
         /// The tick at which the soft partition heals.
         hold: usize,
     },
+    /// A **common-mode routed flood** (DDoS): into a `fraction` of cells, inject a *lockstep* burst of
+    /// relay traffic each tick — every peer relays the same amount to one victim, so the victim's per-peer
+    /// activity moves together (pairwise correlation in the over-coupled band `r > 1/√3`). The live
+    /// homeostat (T-104), running on the measured behavioural `Γ_net`, sheds correlation (**Decouple**):
+    /// availability is preserved by *shedding*, not by crashing. The trigger is *correlation*, not
+    /// *volume* — a decorrelated flood of equal volume would not shed. Measures the homeostat at scale.
+    Flood {
+        /// Fraction of cells to flood, in `[0, 1]`.
+        fraction: f64,
+        /// Relay bursts per peer per tick — scales the load (the lockstep structure is what triggers, not
+        /// the magnitude).
+        bursts: u32,
+    },
 }
 
 impl Experiment {
@@ -76,6 +98,7 @@ impl Experiment {
             Experiment::Cascade { .. } => "cascade",
             Experiment::Partition { .. } => "partition",
             Experiment::SoftPartition { .. } => "soft-partition",
+            Experiment::Flood { .. } => "flood",
         }
     }
 
@@ -88,12 +111,13 @@ impl Experiment {
             Experiment::Cascade { .. } => "crash one more node of a target cell each tick until it collapses",
             Experiment::Partition { .. } => "bisect a fraction of cells (nodes stay up), then heal — detect + recover",
             Experiment::SoftPartition { .. } => "lossy (incipient) bisection of a fraction of cells, then heal",
+            Experiment::Flood { .. } => "common-mode routed flood (DDoS) — the homeostat sheds correlation",
         }
     }
 
     /// The names of every built-in experiment (for `fanos-lab scenarios`).
-    pub const NAMES: [&'static str; 5] =
-        ["mass-crash", "churn", "cascade", "partition", "soft-partition"];
+    pub const NAMES: [&'static str; 6] =
+        ["mass-crash", "churn", "cascade", "partition", "soft-partition", "flood"];
 
     /// Build an experiment from its name and a `fraction` parameter (reused as the churn rate; ignored
     /// by cascade). `None` for an unknown name.
@@ -108,6 +132,7 @@ impl Experiment {
             "cascade" => Some(Experiment::Cascade { target: 0 }),
             "partition" => Some(Experiment::Partition { fraction, hold: 5 }),
             "soft-partition" => Some(Experiment::SoftPartition { fraction, cross_loss: 0.92, hold: 5 }),
+            "flood" => Some(Experiment::Flood { fraction, bursts: 2 }),
             _ => None,
         }
     }
@@ -172,6 +197,24 @@ impl Experiment {
                     for ci in 0..n {
                         if let Some(cell) = cluster.cell_mut(ci) {
                             cell.network_mut().heal(); // clear the lossy cut
+                        }
+                    }
+                }
+            }
+            Experiment::Flood { fraction, bursts } => {
+                let n = ((fraction * cluster.cell_count() as f64).round() as usize).max(1);
+                // A lockstep amount (common-mode): every peer relays the SAME count this tick, and it
+                // varies with `t` so the correlation structure stays live rather than a constant offset.
+                let amount = (t as u32 % 3 + 1) * bursts;
+                for ci in 0..n {
+                    if let Some(cell) = cluster.cell_mut(ci) {
+                        let coords: Vec<_> = cell.nodes().collect();
+                        if let Some((&victim, peers)) = coords.split_first() {
+                            for &peer in peers {
+                                for _ in 0..amount {
+                                    cell.inject_frame(peer, victim, route_frame());
+                                }
+                            }
                         }
                     }
                 }
@@ -262,6 +305,9 @@ pub struct ExperimentReport {
     pub peak_partitioned: usize,
     /// The lowest fleet mean-Φ observed across the run (the deepest coherence dip; `NaN` if never reported).
     pub min_mean_phi: f64,
+    /// Total correlation-shed (Decouple) actions the fleet's homeostats took over the run — the
+    /// availability-preserving response to over-coupling (a flood's signature).
+    pub decouples: u64,
     /// Whether the fleet ended fully alive and healthy (recovered / never broke).
     pub ended_healthy: bool,
 }
@@ -294,7 +340,8 @@ pub fn run_experiment(
         }
     }
 
-    let after = cluster.snapshot().totals;
+    let final_snapshot = cluster.snapshot();
+    let after = final_snapshot.totals;
     ExperimentReport {
         name: experiment.name(),
         ticks,
@@ -304,6 +351,7 @@ pub fn run_experiment(
         peak_diagnosed,
         peak_partitioned,
         min_mean_phi: if min_phi.is_finite() { min_phi } else { f64::NAN },
+        decouples: final_snapshot.metrics.decouples,
         ended_healthy: after.is_healthy() && after.alive == after.total,
     }
 }
