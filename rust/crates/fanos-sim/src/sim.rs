@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, BinaryHeap};
 use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification, TimerToken, Triple};
 use fanos_wire::decode_frame;
 
+use fanos_telemetry::{CoherenceFrame, CoherenceSnapshot};
+
+use crate::fleet::{FleetSnapshot, NodeState};
 use crate::metrics::{Observed, Report};
 use crate::network::NetworkModel;
 use crate::rng::Rng;
@@ -195,6 +198,10 @@ pub struct Sim {
     trace: Trace,
     /// The global passive observer's tape (frame metadata), when [`observe_frames`](Sim::observe_frames) is on.
     frame_tap: Option<Vec<FrameObs>>,
+    /// The latest coherence frame each node published (`Notification::Observed`), banked for `O(N)`
+    /// fleet snapshots ([`fleet_snapshot`](Sim::fleet_snapshot)). Updated on every emission; read-only
+    /// with respect to the run, so it never perturbs the determinism contract.
+    latest_observed: BTreeMap<Triple, Vec<u8>>,
 }
 
 impl Sim {
@@ -217,6 +224,7 @@ impl Sim {
             report: Report::default(),
             trace: Trace::new(),
             frame_tap: None,
+            latest_observed: BTreeMap::new(),
         }
     }
 
@@ -313,6 +321,37 @@ impl Sim {
             .iter()
             .map(|&n| f64::from(u8::from(self.is_alive(n))))
             .collect()
+    }
+
+    /// A whole-fleet state snapshot — every node's coordinate, liveness, and latest coherence self-model,
+    /// plus the cluster rollup and the run's cumulative metrics. This is the data contract the operator
+    /// dashboard and CLI read; it is a pure `O(N)` read over frames the nodes have already published (the
+    /// reflex emits one every heartbeat since #122), so it never advances the clock. For a guaranteed-fresh
+    /// read, call [`refresh_telemetry`](Sim::refresh_telemetry) first.
+    #[must_use]
+    pub fn fleet_snapshot(&self) -> FleetSnapshot {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|(&coord, slot)| {
+                let coherence = self
+                    .latest_observed
+                    .get(&coord)
+                    .and_then(|b| CoherenceFrame::decode(b))
+                    .map(|f| CoherenceSnapshot::from_frame(&f));
+                NodeState { coord, alive: slot.status == Status::Alive, coherence }
+            })
+            .collect();
+        FleetSnapshot::from_nodes(self.clock.as_nanos(), nodes, self.report.metrics.clone())
+    }
+
+    /// Force every live node to publish a fresh coherence frame now (a sense-only
+    /// [`Command::Observe`](fanos_runtime::Command::Observe) — no healing side effects), so the next
+    /// [`fleet_snapshot`](Sim::fleet_snapshot) reflects the current instant rather than the last heartbeat.
+    /// Drains at the current instant without advancing virtual time.
+    pub fn refresh_telemetry(&mut self) {
+        self.inject_all(&Command::Observe);
+        self.settle();
     }
 
     /// Inject an application command into `node` at the current time.
@@ -519,6 +558,11 @@ impl Sim {
                         Notification::DataLost { .. } => m.data_losses += 1,
                         Notification::Observed(_) => m.observations += 1,
                         _ => {}
+                    }
+                    // Bank this node's latest coherence frame for O(1) fleet snapshots (the `m` borrow
+                    // above has ended, so this second field is free to touch).
+                    if let Notification::Observed(bytes) = &note {
+                        self.latest_observed.insert(node, bytes.clone());
                     }
                     self.log(format!("notify {} {}", fmt_coord(node), note_desc(&note)));
                     self.report.notifications.push(Observed { node, note });

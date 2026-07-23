@@ -16,6 +16,9 @@ fanos-geometry.workspace = true
 fanos-diakrisis.workspace = true
 fanos-wire.workspace = true
 fanos-runtime = { workspace = true, features = ["std"] }
+# Decode the coherence frames nodes publish (`Notification::Observed`) into per-node snapshots for the
+# fleet-scale state inspection surface (`fleet` module — the dashboard/CLI data contract).
+fanos-telemetry = { workspace = true, features = ["std"] }
 
 [[bin]]
 name = "fanos-sim-demo"
@@ -27,8 +30,6 @@ path = "src/bin/experiment.rs"
 
 [dev-dependencies]
 proptest.workspace = true
-# For decoding the mandatory CoherenceFrames nodes emit each diagnosis (telemetry e2e scenario).
-fanos-telemetry = { workspace = true, features = ["std"] }
 # For the DIAULOS-over-overlay scenario (a reliable encrypted session over the datagram transport).
 fanos-diaulos.workspace = true
 # For the anonymous-rendezvous scenario (DIAULOS payloads over threshold onions to a meeting line).

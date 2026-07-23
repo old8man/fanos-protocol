@@ -28,6 +28,7 @@
 //! ```
 
 mod experiment;
+mod fleet;
 mod metrics;
 mod network;
 mod observatory;
@@ -36,6 +37,7 @@ mod sim;
 mod trace;
 
 pub use experiment::{Experiment, Grid, Params, Row, Scenario};
+pub use fleet::{AlarmCounts, ClusterStats, FleetSnapshot, NodeState, RegimeCounts};
 pub use metrics::{Metrics, Observed, Report};
 pub use network::NetworkModel;
 pub use observatory::{
