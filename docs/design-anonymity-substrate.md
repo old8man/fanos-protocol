@@ -168,25 +168,50 @@ therefore rests on **at least one input coordinate being VRF-beacon-blinded and 
 coordinate-VRF — the geometric analog of Tor v3's blinded keys). The design **must characterize the anonymity
 set explicitly** — which observers, which inputs secret — or it is rendezvous-efficiency, not anonymity.
 
-**Theorems to prove (open problems the audit flags as FANOS's to claim):**
-- **T1 (below-threshold IT receiver anonymity).** Extend the repliable-onion UC functionality (Ando–Lysyanskaya
-  "Cryptographic Shallots", *TCC 2021*; Kuhn–Hofheinz–Rupp–Strufe, *ASIACRYPT 2021*) so a "processing party" is
-  an interactive `t`-of-`(q+1)` committee, and add the **new property the OR literature lacks**: *below-threshold
-  simulatability* — any `< t` members' joint view is simulable from public data (an MPC-style statement absent
-  from all onion-routing work). Reuse Poly Onions' (*TCC 2022*) per-member CCA processing-oracle model and its
-  single-run⇒multi-run composition lemma. Reply integrity must be **implicit** — the anonymous receiver cannot
-  MAC a payload it does not yet know (Kuhn et al.'s key insight), so target their UE-/SNARG-style implicit
-  authentication and beat **EROR** (ePrint 2024/020, the SOTA tagging-resistant single-relay repliable format) on
-  the per-hop guarantee — not CL05, which Kuhn et al. *S&P 2020* broke. *No such theorem exists.*
-- **T2 (blinded-rendezvous anonymity).** With one input VRF-blinded, the meet point is unpredictable and
-  unlinkable to a computationally-bounded observer outside the receiver's line; state the anonymity set as the
-  `q+1` line members and prove non-linkability across epochs.
-- **T3 (intersection resistance from rotation).** Prove unbiasable per-epoch coordinate rotation *lowers*, not
-  raises, the adversary's long-term advantage — the non-trivial direction (see §3a). *This is the unsolved
-  receiver-anonymity threat (statistical disclosure), and the theorem the rotation double-edge forces.*
-- **Cost honesty.** Ando–Lysyanskaya–Upfal (*ITC 2021*) prove anonymity against an active adversary needs a
-  *superlogarithmic* number of onions per participant; NOSTOS's cover/route budget must be reported against that
-  floor, not hidden.
+**Theorems to prove — the formal targets, with exact games (formal-defs report).** The guarantee is proven in
+the **AnoA** challenge game (Backes et al. *CSF 2013* — cleanest challenger; `(ε,δ)`-IND-CDP with `ε=0`, "strong"
+iff `δ=negl`), with the achieved rung *named* in the Kuhn et al. notions (*PoPETs 2019*) to dodge the documented
+**AnoA↔Kuhn naming trap** (AnoA's `α_SA ≡` Kuhn `SO̅` *unobservability*; Loopix-style "receiver unobservability"
+`≡` the strictly-weaker `RO̅`).
+
+- **T1 — composite receiver anonymity, three strata.**
+  - *(i) Hop stratum (information-theoretic).* **Below-threshold simulatability `Sim_t`:** for every committee
+    hop `C_i` (`q+1` members, threshold `t`) and every coalition `S ⊂ C_i` with `|S| < t`, a simulator produces
+    `S`'s joint view (keys, KEM-sealed shares, routed fragments, per-member timing) from public parameters alone,
+    statistical distance `≤ 2^{-s}` (`0` for perfect Shamir sharing). This is **not** a new rung of the Kuhn
+    hierarchy — that grades *what* is hidden; `Sim_t` widens the *adversary class* the guarantee holds against.
+    The KEM-sealed-share object in `threshold.rs` is exactly what `Sim_t` is proven over.
+  - *(ii) Packet stratum (computational).* Forward **and backward** Layer-Unlinkability + Tail-Indistinguishability
+    (Kuhn–Hofheinz–Rupp–Strufe, *ASIACRYPT 2021*) for the committee-generalized packet: in each LU/TI hybrid,
+    substitute *"committee with `< t` corrupted members"* for *"honest relay"*; `Sim_t` makes that hybrid step
+    **statistical**, and the KHRS UC theorem (games ⇒ ideal functionality) carries over untouched. **Reply
+    integrity lives *inside* this proof** as implicit payload authentication (an anonymous receiver cannot MAC an
+    unknown reply, and MAC-style explicit auth is provably insufficient — KHRS) — the NOSTOS end-to-end AEAD is
+    that ingredient, not a separate lemma. **Assumption hygiene:** Scherer–Weis–Strufe (*PoPETs 2024*) proved DDH
+    is *insufficient* for Sphinx (Gap-DH + a format fix required, else a concrete sender-privacy attack), so
+    NOSTOS's PQ KEM must supply **IND-CCA + KEM anonymity/robustness** (the property doing GDH's job), cited
+    explicitly — never an inherited DDH-era statement.
+  - *(iii) End-to-end stratum.* `(0,δ)`-`α_RA` **and** `(0,δ)`-`α_Rel` IND-ANO. `α_RA` challenges two
+    adversary-chosen reply-receivers `R_0,R_1` with identical sender (*possibly corrupt* — that is the point),
+    payload, length, and timing template; `α_Rel` challenges **matched-vs-crossed** sender–receiver pairs (the
+    `M_SR` game — identifying *one* endpoint does not win, unlike the weaker `R_SR`). `δ ≤ δ_stat(hops) +
+    δ_comp(η) + δ_traffic`; achieved rung, named in Kuhn terms: receiver-side `RO̅` (or a stated leak-variant),
+    relationship-side `(SR)L̅`.
+  - **The trilemma budget lives inside T1** so stratum (i) is never misread as beating it: `δ_traffic` obeys Das
+    et al. *S&P 2018* regardless of the IT hop stratum, and the **receiver leg's constant is 4** (`4ℓβ < 1−ε`,
+    the candidate window spanning `ℓ−1` rounds *both* sides of the challenge send) — budget `4ℓβ`, though
+    Kuhn–Kitzing–Strufe *WPES 2020* conjecture it tightens to the sender's `2ℓβ`; **do not architecturally depend
+    on the gap.** With committee hops the compromise count `c` is **broken committees** (`≥ t` corrupted, prob.
+    `P_break`, §4-T4), *not* corrupted relays — the honest-majority-per-hop analogue of the honest-relay term.
+- **T2 (blinded-rendezvous anonymity).** With one rendezvous input VRF-beacon-blinded, the meet is unpredictable
+  and unlinkable to any bounded observer outside the receiver's line; the anonymity set is exactly `points_on(L)`
+  (the `q+1` members), proven non-linkable across epochs. (`c` = broken committees, as in T1.)
+- **T3 (intersection resistance from rotation).** Prove per-epoch coordinate rotation *lowers* the long-term
+  `α_RA`-advantage — the non-trivial direction — because the threshold hop's `P_break` (T4) attenuates each
+  rotation's predecessor gain below the intersection-attack's sampling gain (§3a). The receiver-side
+  statistical-disclosure threat, stated in the `α_RA` game across epochs.
+- **Cost honesty.** Ando–Lysyanskaya–Upfal (*ITC 2021*): anonymity against an active adversary needs a
+  *superlogarithmic* onion count per participant; NOSTOS's cover/route budget is reported against that floor.
 
 ## 3a. The rotation double-edge — and why the threshold hop is what makes moving-target safe
 
