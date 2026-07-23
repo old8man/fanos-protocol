@@ -19,10 +19,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use fanos_field::{F7, F13, F31, Field};
 use fanos_observatory::{ClusterDashboard, render_cluster};
 use fanos_runtime::{Config, Duration};
 use fanos_sim::stress::{Experiment, ExperimentReport, run_experiment};
-use fanos_sim::{Cluster, ClusterSnapshot};
+use fanos_sim::{Cluster, ClusterSnapshot, Hierarchy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -44,6 +45,8 @@ enum Command {
     Experiment(ExperimentArgs),
     /// Sweep across scales (1 → 10 000 nodes), reporting state at each — optionally under an experiment.
     Sweep(SweepArgs),
+    /// Cross-cell routing on a connected hierarchy: measure reachability, optionally under gateway crashes.
+    Route(RouteArgs),
     /// List the available stress experiments.
     Scenarios,
     /// Check the ХОЛАРХ architecture viability gate (V1–V4, σ-panel, Ω4 ablations).
@@ -90,6 +93,25 @@ struct RunArgs {
     #[arg(long, default_value_t = 2000)]
     run_ms: u64,
     /// Emit the cluster state as JSON instead of a human report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct RouteArgs {
+    /// Number of gateways (top-cell / sub-cells).
+    #[arg(long, short, default_value_t = 6)]
+    gateways: usize,
+    /// Descended nodes per sub-cell.
+    #[arg(long, short, default_value_t = 6)]
+    per_cell: usize,
+    /// Crash this many gateways, then re-measure reachability (fault-containment demo).
+    #[arg(long, default_value_t = 0)]
+    crash: usize,
+    /// RNG seed.
+    #[arg(long, short, default_value_t = 1)]
+    seed: u64,
+    /// Emit JSON.
     #[arg(long)]
     json: bool,
 }
@@ -142,6 +164,7 @@ fn main() {
         Command::Run(args) => cmd_run(&args),
         Command::Experiment(args) => cmd_experiment(&args),
         Command::Sweep(args) => cmd_sweep(&args),
+        Command::Route(args) => cmd_route(&args),
         Command::Scenarios => cmd_scenarios(),
         Command::Gate => cmd_gate(),
         Command::Watch(args) => {
@@ -199,6 +222,66 @@ fn cmd_sweep(args: &SweepArgs) {
         }
     }
     println!();
+}
+
+fn cmd_route(args: &RouteArgs) {
+    let total = args.gateways * (1 + args.per_cell);
+    if total == 0 || args.gateways < 2 {
+        eprintln!("route needs at least 2 gateways and 1 node per cell");
+        std::process::exit(2);
+    }
+    // Pick the smallest transport plane that fits (F7=57, F13=183, F31=993 points).
+    let (before, after) = if total <= 57 {
+        route_run::<F7>(args)
+    } else if total <= 183 {
+        route_run::<F13>(args)
+    } else if total <= 993 {
+        route_run::<F31>(args)
+    } else {
+        eprintln!("route tops out at 993 nodes (one transport plane); requested {total}");
+        std::process::exit(2);
+    };
+    let crashed = args.crash.min(args.gateways);
+    if args.json {
+        println!(
+            "{{\"gateways\":{},\"per_cell\":{},\"nodes\":{},\"crashed_gateways\":{},\"reachability_before\":{before:.6},\"reachability_after\":{after:.6}}}",
+            args.gateways, args.per_cell, total, crashed,
+        );
+    } else {
+        println!("\nconnected hierarchy — {} gateways × {} = {total} nodes", args.gateways, args.per_cell);
+        println!("  reachability       {:.1}%   (cross-cell routes delivered, up-and-over descent)", before * 100.0);
+        if args.crash > 0 {
+            println!("  crash {crashed} gateway(s)  {:.1}%   (routes into the severed sub-cells fail; the rest hold)", after * 100.0);
+        }
+        println!();
+    }
+}
+
+fn route_run<F: Field + 'static>(args: &RouteArgs) -> (f64, f64) {
+    let mut h = Hierarchy::<F>::two_level(args.seed, lab_config(), args.gateways, args.per_cell);
+    let pairs = cross_cell_pairs(args.gateways, args.per_cell);
+    let before = h.reachability(&pairs);
+    for g in 0..args.crash.min(args.gateways) {
+        if let Some(idx) = h.gateway(g) {
+            h.crash(idx);
+        }
+    }
+    let after = h.reachability(&pairs);
+    (before, after)
+}
+
+/// Every ordered cross-cell pair — cell `i`'s first sub-node to cell `j`'s first sub-node (`i ≠ j`).
+fn cross_cell_pairs(gateways: usize, per_cell: usize) -> Vec<(usize, usize)> {
+    let first_sub = |g: usize| g * (1 + per_cell) + 1;
+    let mut pairs = Vec::new();
+    for i in 0..gateways {
+        for j in 0..gateways {
+            if i != j {
+                pairs.push((first_sub(i), first_sub(j)));
+            }
+        }
+    }
+    pairs
 }
 
 fn cmd_scenarios() {
