@@ -459,6 +459,13 @@ impl HybridLedger {
                     if stx.public_value > 0 {
                         writes.push(stx.public_recipient);
                     }
+                    if stx.fee > 0 {
+                        // The fee moves POOL_SINK → TREASURY at runtime (`apply_shielded`, audit O-H1), so
+                        // TREASURY is a real write — declare it (audit §3.7). Without this a shielded-fee tx and a
+                        // name tx (which also writes TREASURY) read as non-conflicting yet both write it, so once
+                        // the parallel scheduler is live and TREASURY gains a read/debit they could fork the state.
+                        writes.push(TREASURY);
+                    }
                     AccessList::new([], writes)
                 }
                 None => AccessList::default(),
@@ -706,6 +713,40 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::name_payload(&name_tx))), ExecOutcome::Applied);
         assert_eq!(ledger.names().resolve(&name, 0).unwrap().owner, alice, "the name is Alice's");
         assert_ne!(ledger.state_root(), root2, "the name registration moved the hybrid root");
+    }
+
+    #[test]
+    fn a_shielded_fee_transaction_declares_the_treasury_write() {
+        // Audit §3.7: a shielded tx with a fee moves POOL_SINK → TREASURY at runtime, so TREASURY must be in its
+        // access list — else the parallel scheduler would run it concurrently with a name tx (also a TREASURY
+        // writer), forking the state once TREASURY gains a read/debit.
+        let (alice_sk, alice_vk, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        // A shielded tx spending a 600 note: 500 out, fee 100 → 600 = 500 + 100 (balance law).
+        let nsk = [9u8; 32];
+        let n0 = note(600, &nsk, b"n0");
+        let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
+        let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+        let (stx, proof) = build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 100);
+        let shielded_tx = Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)));
+
+        let empty: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])> = BTreeMap::new();
+        let shielded_access = ledger.access_of(&shielded_tx, &empty, &empty);
+        assert!(shielded_access.writes.contains(&TREASURY), "a shielded-fee tx declares the TREASURY write");
+
+        // A name tx also writes TREASURY, so the scheduler must treat the two as conflicting (never parallel).
+        let name_tx = NameTx {
+            op: NameOp::Register { name: b"a.fanos".to_vec(), target: b"x".to_vec(), duration: 10 },
+            payment: SignedTransfer::sign(
+                Transfer { from: alice, to: TREASURY, amount: price(b"a.fanos", 10), nonce: 0 },
+                &alice_sk,
+                alice_vk,
+            ),
+        };
+        let name_access = ledger.access_of(&Transaction::new(HybridLedger::name_payload(&name_tx)), &empty, &empty);
+        assert!(shielded_access.conflicts_with(&name_access), "shielded-fee and name txs both write TREASURY → conflict");
     }
 
     #[test]
