@@ -33,15 +33,18 @@
 //! insider count `t` small — the Mahdian *FUN 2010* `Ω(t)` floor, not `n`, is what a censor must pay
 //! to enumerate — but a true cap requires anchoring to a scarce resource: a fast-mixing trust graph
 //! (SybilLimit `O(log n)`/edge) or proof-of-personhood. That anchor is the coherence/credential layer
-//! ([[fanos-engineering-principles]]); POROS supplies the rate-limit and the threshold hosting, and
-//! composes with it.
+//! ([`crate::sybil`]). Both gates now compose in the host: [`PorosHost::with_admission`] takes the
+//! trust layer's admitted coordinate set, and [`on_request`](PorosHost) serves a requester only if it
+//! *both* clears the PoW (rate) *and* is in the admitted set (cap) — so a flood of freshly-minted
+//! identities behind a sparse trust cut cannot buy ingress no matter how much work it burns. POROS
+//! consumes the admitted *set*, not the graph, so it stays decoupled from the specific cap mechanism.
 //!
 //! **The irreducible residual, stated plainly** (the frontier does the same): a brand-new node with
 //! no beacon and no peer still needs **one** out-of-band unblockable carrier to receive the first
 //! beacon + community secret — minimized, not eliminated, by PROTEUS obfuscation
 //! ([[proteus-morph-transforms]], the Parrot-is-Dead rule) and diverse high-collateral carriers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fanos_calypso::hosting::{Share, recover_service_key, shard_service_key};
@@ -351,6 +354,12 @@ pub struct PorosHost {
     seq: u64,
     max_pending: usize,
     gather_timeout: Duration,
+    // The Sybil **cap** layer (design authority §6): an optional allowlist of admitted requester coordinates,
+    // supplied by the coherence/credential layer — canonically the fast-mixing trust graph ([`crate::sybil`]),
+    // whose conductance bound caps admitted Sybils at `O(attack edges)` regardless of their count. `None` ⇒ the
+    // PoW rate-limiter alone (the pre-cap default). POROS stays decoupled from the mechanism: it consumes the
+    // admitted SET, not the graph, so proof-of-personhood or a credential system can supply it instead.
+    admitted: Option<BTreeSet<Triple>>,
 }
 
 impl PorosHost {
@@ -382,6 +391,7 @@ impl PorosHost {
             seq: 0,
             max_pending: DEFAULT_MAX_PENDING,
             gather_timeout: DEFAULT_GATHER_TIMEOUT,
+            admitted: None,
         }
     }
 
@@ -390,6 +400,29 @@ impl PorosHost {
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
         self.gather_timeout = timeout;
         self
+    }
+
+    /// Impose the **Sybil cap**: only requesters whose coordinate is in `admitted` are served (after they also
+    /// clear the PoW rate-limiter). The set is the coherence layer's admission output — canonically the trust
+    /// graph's [`admitted`](crate::sybil::TrustGraph::admitted) coordinates — and is refreshed as trust evolves
+    /// (call again with a fresh set each epoch). Without this the host runs the rate-limiter alone.
+    #[must_use]
+    pub fn with_admission(mut self, admitted: BTreeSet<Triple>) -> Self {
+        self.admitted = Some(admitted);
+        self
+    }
+
+    /// Refresh the Sybil-cap allowlist in place (e.g. after the trust graph re-mixes for a new epoch). Passing
+    /// an empty set admits no one; to remove the cap entirely, rebuild the host.
+    pub fn set_admitted(&mut self, admitted: BTreeSet<Triple>) {
+        self.admitted = Some(admitted);
+    }
+
+    /// Whether `requester` clears the Sybil cap: always `true` when no cap is configured, else membership in the
+    /// admitted allowlist. (The PoW rate-limiter is a separate, additional gate — see [`on_request`](Self::on_request).)
+    #[must_use]
+    fn sybil_admits(&self, requester: &Triple) -> bool {
+        self.admitted.as_ref().is_none_or(|set| set.contains(requester))
     }
 
     /// The number of requests currently gathering (combiner state), for tests/observability.
@@ -401,7 +434,14 @@ impl PorosHost {
     /// A request arrived at us as the combiner: verify its PoW, seed our own share, fan share-requests to
     /// the rest of the line. A bad proof, wrong epoch/community, or a duplicate/flood is dropped.
     fn on_request(&mut self, now: Instant, req: IngressRequest) -> Vec<Effect> {
+        // Gate 1 — the PoW **rate-limiter** (bounds identity-creation rate, keeps the insider count small).
         if !verify_ingress_request(&req, &self.community, self.epoch, &self.beacon, self.difficulty) {
+            return Vec::new();
+        }
+        // Gate 2 — the Sybil **cap** (the trust-graph conductance bound): a valid PoW is necessary but not
+        // sufficient. A requester the coherence layer has not admitted is dropped no matter how much work it did,
+        // so a flood of freshly-minted identities behind a sparse trust cut cannot buy ingress.
+        if !self.sybil_admits(&req.requester) {
             return Vec::new();
         }
         if self.pending.contains_key(&req.requester) || self.pending.len() >= self.max_pending {
@@ -751,5 +791,80 @@ mod tests {
         );
         assert!(effects.is_empty(), "an unsolved request produces no effects");
         assert_eq!(combiner.pending(), 0, "and opens no gather");
+    }
+
+    #[test]
+    fn the_sybil_cap_composes_with_the_pow_rate_limiter() {
+        use fanos_runtime::{Input, Instant};
+
+        use crate::sybil::{NodeId, TrustGraph};
+
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let community = b"cap".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 4);
+        let beacon = BeaconSeed::new([0x44; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x11u8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+
+        // A distinct identity coordinate per trust node (the Fano `coord` helper only has 7 points; a real
+        // requester's VRF-identity coordinate lives in a large space — an opaque [u32;3] key for the gate).
+        let id_coord = |i: NodeId| -> Triple { [i, 0, 1] };
+        // The coherence layer's trust graph: a fast-mixing honest clique {0..15} plus a Sybil clique {100..140}
+        // attached by 2 attack edges. The conductance bound (crate::sybil) admits the honest region and caps the
+        // Sybils at O(attack edges) regardless of their count — the proven sybil.rs regime.
+        let mut g = TrustGraph::new();
+        let honest: Vec<NodeId> = (0..15).collect();
+        let sybils: Vec<NodeId> = (100..140).collect();
+        for &a in &honest {
+            for &b in &honest {
+                if a < b {
+                    g.add_edge(a, b);
+                }
+            }
+        }
+        for &a in &sybils {
+            for &b in &sybils {
+                if a < b {
+                    g.add_edge(a, b);
+                }
+            }
+        }
+        g.add_edge(0, 100); // the sparse attack cut: 2 edges
+        g.add_edge(1, 101);
+        // Admitted NodeIds → admitted coordinates (the layer maps identity handle i ↔ id_coord(i)); this SET is
+        // all POROS consumes, keeping it decoupled from the trust-graph mechanism.
+        let admitted_ids = g.admitted(0, honest.iter().chain(&sybils).copied(), 16, 0.3);
+        let admitted: BTreeSet<Triple> = admitted_ids.iter().map(|&id| id_coord(id)).collect();
+        assert!(honest.iter().all(|&h| admitted.contains(&id_coord(h))), "honest nodes clear the cap");
+
+        let mut combiner = PorosHost::new(
+            line[0],
+            shares[0].clone(),
+            line.clone(),
+            threshold,
+            community.clone(),
+            epoch,
+            beacon,
+            difficulty,
+        )
+        .with_admission(admitted.clone());
+
+        // An admitted honest requester with a valid PoW opens a gather (both gates pass).
+        let good_coord = id_coord(3);
+        let good = solve_ingress_request(good_coord, &community, epoch, &beacon, difficulty);
+        let e_good = combiner.step(Instant(0), Input::Message { from: good_coord, frame: request_frame(&good) });
+        assert!(!e_good.is_empty(), "an admitted requester with valid PoW is served");
+        assert_eq!(combiner.pending(), 1, "and opens exactly one gather");
+
+        // A Sybil requester with an EQUALLY valid PoW is dropped by the cap — burning work cannot buy ingress.
+        let sybil = *sybils.iter().find(|&&s| !admitted.contains(&id_coord(s))).expect("a Sybil is capped out");
+        let sybil_coord = id_coord(sybil);
+        let bad = solve_ingress_request(sybil_coord, &community, epoch, &beacon, difficulty);
+        assert!(verify_ingress_request(&bad, &community, epoch, &beacon, difficulty), "the Sybil's PoW is genuinely valid");
+        let e_bad = combiner.step(Instant(1), Input::Message { from: sybil_coord, frame: request_frame(&bad) });
+        assert!(e_bad.is_empty(), "the Sybil cap drops it despite valid PoW — no gather opened");
+        assert_eq!(combiner.pending(), 1, "still only the admitted requester is gathering");
     }
 }
