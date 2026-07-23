@@ -14,6 +14,7 @@
 
 use alloc::vec::Vec;
 
+use fanos_primitives::codec::{Reader, put_seq};
 use fanos_primitives::hash_labeled;
 
 /// The tree depth — `2^32` note capacity (the Zcash Sapling depth). A note's position is a `u64` index in
@@ -109,6 +110,29 @@ impl CommitmentTree {
         let pos = self.size();
         self.leaves.push(cm);
         Some(pos)
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): the appended leaves in order.
+    /// A commitment tree is fully determined by its leaves, so a restore reproduces every root and every
+    /// authentication path bit-for-bit.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.leaves.len() * 32);
+        put_seq(&mut out, self.leaves.len(), &self.leaves, |o, cm| o.extend_from_slice(cm));
+        out
+    }
+
+    /// Reconstruct a tree from [`to_bytes`](Self::to_bytes), or `None` if malformed, truncated, or claiming more
+    /// leaves than the fixed-depth tree can hold.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let leaves = r.seq(32, Reader::array::<32>)?;
+        r.finish()?;
+        if leaves.len() as u64 > 1u64 << TREE_DEPTH {
+            return None;
+        }
+        Some(Self { leaves })
     }
 
     /// The Merkle root over the fixed-depth tree with the appended leaves and canonical empty padding — the

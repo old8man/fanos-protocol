@@ -17,6 +17,7 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use fanos_primitives::codec::{Reader, put_seq};
 use fanos_primitives::hash_labeled;
 
 /// Domain-separation label for nullifier derivation.
@@ -115,6 +116,24 @@ impl NullifierSet {
             buf.extend_from_slice(nf);
         }
         hash_labeled(NF_SET_ROOT_LABEL, &buf)
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): the spent nullifiers in sorted
+    /// order, so a restore reproduces the set and its [`root`](Self::root) exactly.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.seen.len() * 32);
+        put_seq(&mut out, self.seen.len(), &self.seen, |o, nf| o.extend_from_slice(nf));
+        out
+    }
+
+    /// Reconstruct a set from [`to_bytes`](Self::to_bytes), or `None` if malformed or truncated.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let seen = r.seq(32, Reader::array::<32>)?.into_iter().collect();
+        r.finish()?;
+        Some(Self { seen })
     }
 }
 

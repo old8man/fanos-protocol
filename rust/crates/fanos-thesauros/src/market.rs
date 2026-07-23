@@ -12,6 +12,7 @@
 //! `TAG_STORAGE` arm on `HybridLedger`) drives this engine; the engine itself holds only accounting.
 
 use alloc::vec::Vec;
+use fanos_primitives::codec::{Reader, put_u64};
 
 use crate::content::Cid;
 
@@ -186,6 +187,61 @@ impl Deal {
     #[must_use]
     pub fn released(&self) -> u64 {
         self.released
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): the fixed parameters then the
+    /// mutable accounting (`epoch ‖ passed ‖ released ‖ state ‖ last_height? ‖ open_height?`), so a restored
+    /// deal reproduces the market `state_root` exactly. Each `Option<u64>` height is tagged (`0` = none,
+    /// `1` = present, then the value).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.params.to_bytes();
+        put_u64(&mut out, self.epoch);
+        put_u64(&mut out, self.passed);
+        put_u64(&mut out, self.released);
+        out.push(match self.state {
+            DealState::Active => 0,
+            DealState::Completed => 1,
+            DealState::Closed => 2,
+        });
+        for h in [self.last_height, self.open_height] {
+            match h {
+                Some(v) => {
+                    out.push(1);
+                    put_u64(&mut out, v);
+                }
+                None => out.push(0),
+            }
+        }
+        out
+    }
+
+    /// Reconstruct a deal from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / over-long.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let params = DealParams::from_bytes(r.bytes(DEAL_PARAMS_LEN)?)?;
+        let epoch = r.u64()?;
+        let passed = r.u64()?;
+        let released = r.u64()?;
+        let state = match r.u8()? {
+            0 => DealState::Active,
+            1 => DealState::Completed,
+            2 => DealState::Closed,
+            _ => return None,
+        };
+        let last_height = match r.u8()? {
+            0 => None,
+            1 => Some(r.u64()?),
+            _ => return None,
+        };
+        let open_height = match r.u8()? {
+            0 => None,
+            1 => Some(r.u64()?),
+            _ => return None,
+        };
+        r.finish()?;
+        Some(Self { params, epoch, passed, released, state, last_height, open_height })
     }
 
     /// Escrow not yet released — refundable to the consumer at close.

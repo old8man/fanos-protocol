@@ -16,7 +16,9 @@
 //! Then the nullifiers are recorded and the output note commitments appended.
 
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
+use fanos_primitives::codec::{Reader, put_seq};
 use fanos_primitives::hash_labeled;
 
 use crate::commit::Params;
@@ -26,6 +28,9 @@ use crate::tx::{ShieldedProof, ShieldedTx};
 
 /// Domain-separation label for the shielded state commitment.
 const STATE_ROOT_LABEL: &str = "FANOS-obolos-v1/state-root";
+
+/// Domain-separation label for the anchor-set sub-commitment folded into the state root.
+const ANCHOR_SET_ROOT_LABEL: &str = "FANOS-obolos-v1/anchor-set-root";
 
 /// Why a shielded transaction was refused. Each variant names exactly one attack the gate closes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,14 +101,60 @@ impl ShieldedState {
         self.tree.path(position)
     }
 
-    /// A binding commitment to the whole shielded state (`H(tree_root ‖ nullifier_set_root)`), for inclusion in
-    /// the block `state_root`.
+    /// A binding commitment to the whole shielded state —
+    /// `H(tree_root ‖ nullifier_set_root ‖ anchor_set_root)`, for inclusion in the block `state_root`.
+    ///
+    /// The **anchor set is folded in explicitly**. It is not derivable from the current tree — historical roots
+    /// are overwritten as notes are appended — yet it decides which spends are valid (a spend must cite a past
+    /// root). If the root omitted it, a state-sync peer could ship a correct tree + nullifiers with a *corrupted*
+    /// anchor set, pass the certificate's root check, and thereafter accept/reject spends divergently — a silent
+    /// fork. Folding it in makes the [`ExecCertificate`](../../fanos_taxis/checkpoint) cover the anchors too, so
+    /// a mismatched snapshot is refused on adoption (audit §3.9).
     #[must_use]
     pub fn root(&self) -> [u8; 32] {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 96];
         buf[..32].copy_from_slice(&self.tree.root());
-        buf[32..].copy_from_slice(&self.nullifiers.root());
+        buf[32..64].copy_from_slice(&self.nullifiers.root());
+        buf[64..].copy_from_slice(&self.anchor_set_root());
         hash_labeled(STATE_ROOT_LABEL, &buf)
+    }
+
+    /// A deterministic commitment to the anchor set (the labeled hash of every historical root, in canonical
+    /// sorted order) — the third leg of [`root`](Self::root).
+    fn anchor_set_root(&self) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(self.anchors.len() * 32);
+        for a in &self.anchors {
+            buf.extend_from_slice(a);
+        }
+        hash_labeled(ANCHOR_SET_ROOT_LABEL, &buf)
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): the tree, the nullifier set, and
+    /// — critically — the **full anchor set**. The anchor set must be carried explicitly because it is not
+    /// recomputable from the tree (see [`root`](Self::root)); a restore reproduces all three and hence the exact
+    /// state root.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let tree = self.tree.to_bytes();
+        let nullifiers = self.nullifiers.to_bytes();
+        let mut out = Vec::with_capacity(8 + tree.len() + nullifiers.len() + 4 + self.anchors.len() * 32);
+        fanos_primitives::codec::put_var_bytes(&mut out, &tree);
+        fanos_primitives::codec::put_var_bytes(&mut out, &nullifiers);
+        put_seq(&mut out, self.anchors.len(), &self.anchors, |o, a| o.extend_from_slice(a));
+        out
+    }
+
+    /// Reconstruct a shielded state from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated /
+    /// over-long. The anchor set is decoded explicitly (not re-derived), so historical-anchor spends remain valid
+    /// after a state sync.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let tree = CommitmentTree::from_bytes(r.var_bytes()?)?;
+        let nullifiers = NullifierSet::from_bytes(r.var_bytes()?)?;
+        let anchors: BTreeSet<[u8; 32]> = r.seq(32, Reader::array::<32>)?.into_iter().collect();
+        r.finish()?;
+        Some(Self { tree, nullifiers, anchors })
     }
 
     /// **Issuance** — append a note commitment with *no* spend proof, creating value by a consensus rule (a
@@ -203,6 +254,35 @@ mod tests {
         assert_eq!(s.apply(&p, &tx, &proof), Ok(()), "a conserving, owned, in-range spend is accepted");
         assert_eq!(s.spent_count(), 1, "the input note is nullified");
         assert_eq!(s.note_count(), 3, "the two outputs are appended");
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_and_preserves_historical_anchors() {
+        // The load-bearing state-sync property (audit §3.9): a restored shielded pool reproduces the exact state
+        // root AND keeps every historical anchor. The anchor set is not recomputable from the tree, so it must
+        // ride the snapshot explicitly, or a spend citing a valid past root would be wrongly rejected after a sync.
+        let p = Params::standard();
+        let mut s = ShieldedState::new();
+        let n0 = note(1000, &[1u8; 32], b"n0");
+        mint(&mut s, &p, &n0);
+        let historical = s.anchor(); // the root while only n0 exists — a valid anchor a later spend may cite
+        let n1 = note(500, &[2u8; 32], b"n1");
+        mint(&mut s, &p, &n1); // the tree advances; `historical` is now a PAST root, overwritten inside the tree
+        assert!(s.is_valid_anchor(&historical), "the past root is a valid anchor");
+        assert_ne!(s.anchor(), historical, "and it is no longer the current root");
+
+        // Round-trip through the snapshot.
+        let bytes = s.to_bytes();
+        let restored = ShieldedState::from_bytes(&bytes).expect("the snapshot restores");
+        assert_eq!(restored, s, "the restored state is bit-identical");
+        assert_eq!(restored.root(), s.root(), "and reproduces the exact state root");
+        assert!(restored.is_valid_anchor(&historical), "critically, the historical anchor survives the sync");
+
+        // The anchor set is genuinely bound by the root: dropping an anchor yields a DIFFERENT root, so a
+        // corrupted-anchor snapshot cannot pass the certificate's root check (the safety argument for §3.9).
+        let mut tampered = restored.clone();
+        tampered.anchors.remove(&historical);
+        assert_ne!(tampered.root(), s.root(), "dropping an anchor changes the root — a synced peer would reject it");
     }
 
     #[test]

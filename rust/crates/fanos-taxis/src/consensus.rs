@@ -26,7 +26,7 @@ use fanos_pqcrypto::kem::HybridKemSecret;
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_primitives::shamir::Share;
-use fanos_primitives::{BeaconSeed, Epoch};
+use fanos_primitives::{BeaconSeed, Epoch, codec};
 
 use crate::block::Block;
 use crate::chain::Chain;
@@ -216,6 +216,23 @@ pub enum ConsensusMsg {
     Reveal(RevealMsg),
     /// A validator's execution attestation `(height, state_root)` — the executed-state checkpoint.
     ExecVote(ExecVote),
+    /// A lagging node's **catch-up request** — "I am at `have_height`; offer me a newer certified checkpoint."
+    /// (audit §3.9 / §4 — a node that missed heights re-enters instead of wedging; `crate::sync` state-sync.)
+    SyncReq {
+        /// The requester's current next-height, so a peer offers only a strictly-newer checkpoint.
+        have_height: u64,
+    },
+    /// A peer's **catch-up response**: a quorum-signed [`ExecCertificate`], the block `head` hash at its height,
+    /// and the full serialized state at that height. All untrusted transport — the receiver verifies the
+    /// certificate against the committee keys and the restored `state_root()` against the certified root.
+    SyncResp {
+        /// The certificate proving `(height, state_root)` under a `Q`-quorum of the fixed committee.
+        cert: ExecCertificate,
+        /// The block hash at `cert.height` (so the receiver's next proposal links to the right parent).
+        head: [u8; 32],
+        /// The full state at `cert.height`, per [`StateMachine::snapshot`](crate::state::StateMachine::snapshot).
+        snapshot: Vec<u8>,
+    },
 }
 
 impl ConsensusMsg {
@@ -241,6 +258,17 @@ impl ConsensusMsg {
                 out.push(3);
                 out.extend_from_slice(&v.to_bytes());
             }
+            Self::SyncReq { have_height } => {
+                out.push(4);
+                codec::put_u64(&mut out, *have_height);
+            }
+            Self::SyncResp { cert, head, snapshot } => {
+                out.push(5);
+                // Length-prefix the variable-width certificate; `head` is fixed 32; the snapshot runs to the end.
+                codec::put_var_bytes(&mut out, &cert.to_bytes());
+                out.extend_from_slice(head);
+                out.extend_from_slice(snapshot);
+            }
         }
         out
     }
@@ -254,6 +282,19 @@ impl ConsensusMsg {
             1 => Some(Self::Vote(SignedVote::from_bytes(body)?)),
             2 => Some(Self::Reveal(RevealMsg::from_bytes(body)?)),
             3 => Some(Self::ExecVote(ExecVote::from_bytes(body)?)),
+            4 => {
+                let mut r = codec::Reader::new(body);
+                let have_height = r.u64()?;
+                r.finish()?;
+                Some(Self::SyncReq { have_height })
+            }
+            5 => {
+                let mut r = codec::Reader::new(body);
+                let cert = ExecCertificate::from_bytes(r.var_bytes()?)?;
+                let head = r.array::<32>()?;
+                let snapshot = r.rest().to_vec();
+                Some(Self::SyncResp { cert, head, snapshot })
+            }
             _ => None,
         }
     }
@@ -283,6 +324,23 @@ pub enum Input {
     ExecVote(ExecVote),
     /// The round timer fired (the proposer took too long) — advance the round and re-elect a leader.
     Timeout,
+    /// A catch-up request from validator `from` (the authenticated transport source) at `have_height`.
+    SyncReq {
+        /// The requesting validator's index (the driver fills this from the authenticated source coordinate,
+        /// so a response is directed to the real sender, not a spoofable field).
+        from: u8,
+        /// The requester's current next-height.
+        have_height: u64,
+    },
+    /// A catch-up response received off the wire (verified + adopted only if it beats our height).
+    SyncResp {
+        /// The offered certificate.
+        cert: ExecCertificate,
+        /// The block head hash at `cert.height`.
+        head: [u8; 32],
+        /// The serialized state at `cert.height`.
+        snapshot: Vec<u8>,
+    },
 }
 
 /// An action the engine asks its driver to take.
@@ -304,6 +362,14 @@ pub enum Output {
     /// (`incentive::distribute`). The driver credits each validator; this operationalizes the reward `R = F/Q`
     /// the Nash equilibrium assumes (symmetric to [`Slash`](Output::Slash)).
     Reward(Vec<(u8, u64)>),
+    /// Send `msg` **point-to-point** to validator `to` (not a broadcast) — used to direct a catch-up response
+    /// (`SyncResp`, a large state snapshot) back to the one requester, rather than flooding the cell.
+    SendTo {
+        /// The destination validator index.
+        to: u8,
+        /// The message to send.
+        msg: ConsensusMsg,
+    },
 }
 
 /// One validator's sans-I/O consensus engine over a state machine `S`.
@@ -348,6 +414,15 @@ pub struct ConsensusEngine<S: StateMachine> {
     // checkpoint that makes divergence detectable and anchors cross-cell proofs.
     exec_votes: BTreeMap<u64, BTreeMap<u8, ExecVote>>,
     checkpoint: Option<ExecCertificate>,
+    // ── State-sync retention (audit §3.9 / §4; `crate::sync`) ──
+    // The highest height seen in an off-height message we could not process — how far ahead the cell is, so a
+    // lagging node knows to request catch-up rather than wedge.
+    max_seen_height: u64,
+    // The serialized state at each executed height that can be SERVED to a syncing peer, deduped by state root
+    // (empty blocks share a root, so their state is stored once). Pruned to the window at/above the checkpoint.
+    sync_states: BTreeMap<[u8; 32], Vec<u8>>,
+    // Per executed height: its state root (into `sync_states`) and block hash (the head a syncing node adopts).
+    sync_heads: BTreeMap<u64, ([u8; 32], [u8; 32])>,
     // The per-block reward pool `F` split among the commit-certificate signers on finalization (`R = F/Q`).
     // Zero (the default) emits no reward — backward-compatible; a driver funds it from collected fees.
     reward_per_block: u64,
@@ -395,6 +470,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             pending_finalize: BTreeMap::new(),
             exec_votes: BTreeMap::new(),
             checkpoint: None,
+            max_seen_height: 0,
+            sync_states: BTreeMap::new(),
+            sync_heads: BTreeMap::new(),
             reward_per_block: 0,
         }
     }
@@ -489,13 +567,101 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Step the engine on one input, returning the actions to take.
     pub fn step(&mut self, input: Input) -> Vec<Output> {
         match input {
-            Input::Tick => self.maybe_propose(),
+            Input::Tick => {
+                let mut out = self.maybe_propose();
+                out.extend(self.maybe_request_sync());
+                out
+            }
             Input::Propose { block, shards } => self.on_propose(block, &shards),
             Input::Vote(sv) => self.accept_vote(sv),
             Input::Reveal(r) => self.on_reveal(&r),
             Input::ExecVote(v) => self.on_exec_vote(v),
             Input::Timeout => self.on_timeout(),
+            Input::SyncReq { from, have_height } => self.on_sync_req(from, have_height),
+            Input::SyncResp { cert, head, snapshot } => self.on_sync_resp(cert, head, &snapshot),
         }
+    }
+
+    /// Note that the cell has reached `height` (seen in a message we cannot yet process) — the lag signal that
+    /// tells us to request catch-up. Monotone; never decreases.
+    fn note_height(&mut self, height: u64) {
+        self.max_seen_height = self.max_seen_height.max(height);
+    }
+
+    /// If the cell has clearly moved ahead of us (a peer finalized a height we have not), broadcast a
+    /// catch-up request. Emitted at most once per `Tick`, so it is naturally rate-limited; a settled peer
+    /// answers with a certified snapshot ([`on_sync_req`](Self::on_sync_req)). Adopting is monotone and
+    /// certificate-verified, so a spurious request (we were only transiently behind) is harmless.
+    fn maybe_request_sync(&mut self) -> Vec<Output> {
+        if self.max_seen_height > self.height() {
+            alloc::vec![Output::Send(ConsensusMsg::SyncReq { have_height: self.height() })]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Serve a catch-up request: if we hold a checkpoint STRICTLY newer than the requester's height and the
+    /// certified state's snapshot, send it point-to-point to the authenticated requester `from` (never a
+    /// broadcast, and never to a spoofable field — `from` is the real transport source). A Byzantine requester
+    /// gains nothing it could not verify; the snapshot + certificate are self-authenticating.
+    fn on_sync_req(&mut self, from: u8, have_height: u64) -> Vec<Output> {
+        let Some(cert) = &self.checkpoint else {
+            return Vec::new();
+        };
+        if cert.height <= have_height {
+            return Vec::new(); // nothing newer to offer
+        }
+        let Some((root, head)) = self.sync_heads.get(&cert.height) else {
+            return Vec::new(); // we do not retain the certified height's head/state (pruned or mid-flight)
+        };
+        let Some(snapshot) = self.sync_states.get(root) else {
+            return Vec::new();
+        };
+        alloc::vec![Output::SendTo {
+            to: from,
+            msg: ConsensusMsg::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() },
+        }]
+    }
+
+    /// Adopt a catch-up response — the load-bearing state-sync step. Every guard is mandatory:
+    /// 1. **forward-only** — ignore a checkpoint at or below our finalized height (monotone, no rollback);
+    /// 2. **certificate-verified** — a `Q`-quorum of the FIXED committee must have signed `(height, root)`, so a
+    ///    Byzantine peer cannot forge it (and two certs for one height cannot disagree — the uniqueness proof);
+    /// 3. **root-verified** — the restored state's OWN recomputed `state_root()` must equal the certified root,
+    ///    so a forged/mismatched snapshot is refused (the snapshot is untrusted transport, the root is trusted).
+    ///
+    /// Only then install it atomically and reset all per-height working state so we resume at `height + 1`
+    /// without re-voting decided heights (which would read as equivocation).
+    fn on_sync_resp(&mut self, cert: ExecCertificate, head: [u8; 32], snapshot: &[u8]) -> Vec<Output> {
+        if cert.height < self.height() {
+            return Vec::new(); // (1) not ahead of us
+        }
+        if !cert.verify(self.params.quorum, &self.verifiers) {
+            return Vec::new(); // (2) forged / under-quorum certificate
+        }
+        let Some(state) = S::restore(snapshot) else {
+            return Vec::new(); // malformed snapshot
+        };
+        if state.state_root() != cert.state_root {
+            return Vec::new(); // (3) the snapshot does not restore to the certified state
+        }
+        // Atomic adoption: install the certified state at `cert.height` on `head`, reset the round machinery,
+        // and drop everything tied to the abandoned heights (the transferred state is already executed).
+        let height = cert.height;
+        self.chain.restore(height, head, state);
+        self.reset_round_state();
+        self.pending_finalize.clear();
+        self.exec_votes.clear();
+        self.exec_queue.clear();
+        self.reveals.clear();
+        self.pending_reveals.clear();
+        self.mempool.clear();
+        self.sync_states.clear();
+        self.sync_heads.clear();
+        self.checkpoint = Some(cert);
+        self.max_seen_height = self.max_seen_height.max(self.height());
+        // Signal the jump so the driver surfaces the new tip exactly like a finalized height.
+        alloc::vec![Output::Committed { height, block_hash: head }]
     }
 
     /// Propose a block if this validator is the current-round leader and has not yet proposed this round.
@@ -527,6 +693,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             && block.header.parent == self.chain.head()
             && block.header.epoch == self.epoch;
         if !correct_leader || !links || !block.verify_structure() {
+            if block.header.height > height {
+                self.note_height(block.header.height); // a proposal for a height ahead of us — we are behind
+            }
             return Vec::new();
         }
         // Anti-MEV admission (audit fix): every included transaction must be sealed to this epoch's beacon
@@ -573,6 +742,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let height = self.height();
         let v = sv.vote;
         if v.height != height {
+            if v.height > height {
+                self.note_height(v.height); // a peer is voting a height we have not reached — we are behind
+            }
             return Vec::new(); // stale or future height
         }
         let Some(verifier) = self.verifiers.get(usize::from(v.voter)) else {
@@ -756,6 +928,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
 
         // Drop included transactions from the mempool and reset the per-height working state.
         self.mempool.retain(|t| !included.contains(&t.commit()));
+        self.reset_round_state();
+        out
+    }
+
+    /// Reset the per-height consensus working state — round, proposals, prepare/commit votes, self-vote dedup,
+    /// and the Tendermint lock — so the next height starts clean. Shared by [`finalize`](Self::finalize) (after
+    /// a normal commit) and [`on_sync_resp`](Self::on_sync_resp) (after a state-sync jump), so a synced node
+    /// never re-votes an already-decided height (which would read as equivocation).
+    fn reset_round_state(&mut self) {
         self.round = 0;
         self.proposals.clear();
         self.proposed_round = None;
@@ -764,7 +945,6 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.sent_prepare.clear();
         self.sent_commit.clear();
         self.locked_block = None;
-        out
     }
 
     /// Emit this validator's share openings for every transaction in a just-finalized block it helped seal.
@@ -953,8 +1133,23 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
             // Attest the executed state at this height — the checkpoint that makes divergence detectable.
             out.push(self.emit_exec_vote(block.header.height));
+            // Retain a servable snapshot of the just-executed state so a lagging peer can state-sync to it
+            // (audit §3.9 / §4). Deduped by state root (empty blocks share a root → serialized once) and
+            // indexed by height with the block hash a syncing node adopts as its `head`.
+            self.capture_sync_snapshot(&block);
         }
         out
+    }
+
+    /// Store the just-executed state as a servable state-sync snapshot: dedup the serialized state by its root
+    /// (so a run of empty blocks costs one serialization) and record this height's `(root, block hash)`.
+    fn capture_sync_snapshot(&mut self, block: &Block) {
+        let root = self.chain.state_root();
+        if !self.sync_states.contains_key(&root) {
+            let snap = self.chain.state().snapshot();
+            self.sync_states.insert(root, snap);
+        }
+        self.sync_heads.insert(block.header.height, (root, block.header.hash()));
     }
 
     /// Sign and locally record this validator's execution attestation for `height` (the current state root),
@@ -973,6 +1168,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         };
         if !vote.verify(verifier) {
             return Vec::new(); // forged / unauthenticated attestation
+        }
+        if vote.height >= self.height() {
+            self.note_height(vote.height); // a peer executed a height at/ahead of ours — a catch-up signal
         }
         self.record_exec_vote(vote);
         Vec::new()
@@ -1004,9 +1202,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
         for (root, votes) in by_root {
             if votes.len() >= self.params.quorum {
                 self.checkpoint = Some(ExecCertificate { height, state_root: root, votes });
+                self.prune_sync_retention(height);
                 return;
             }
         }
+    }
+
+    /// Prune the state-sync retention to the window at/above the newly-certified `checkpoint_height`: a synced
+    /// node only ever serves the checkpoint height (or a still-uncertified higher one), so older per-height
+    /// heads are dead, and a state whose root no longer backs any retained head is dropped. Bounds the memory to
+    /// the (small) execution-to-certification lag.
+    fn prune_sync_retention(&mut self, checkpoint_height: u64) {
+        self.sync_heads.retain(|&h, _| h >= checkpoint_height);
+        let live: BTreeSet<[u8; 32]> = self.sync_heads.values().map(|(r, _)| *r).collect();
+        self.sync_states.retain(|r, _| live.contains(r));
     }
 
     /// Advance the round (proposer timeout): re-elect a leader and clear this round's proposal/prepare state.

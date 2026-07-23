@@ -14,6 +14,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use fanos_primitives::codec::{Reader, put_map, put_u64, read_map};
 use fanos_primitives::hash_labeled;
 use fanos_wire::Wire;
 use fanos_wire_derive::Wire;
@@ -57,6 +58,23 @@ pub trait StateMachine {
     /// same certificate that proves its balances also proves the messages it emitted to other cells; a plain
     /// state machine commits only its application state.
     fn state_root(&self) -> [u8; 32];
+
+    /// Serialize the **entire** state to canonical bytes — a state-sync snapshot ([`crate::sync`]). It MUST be
+    /// **deterministic** (two semantically-identical states encode identically) and **total** with
+    /// [`restore`](Self::restore) such that `restore(s.snapshot()).state_root() == s.state_root()`. This is the
+    /// full state, not a Merkle summary: `state_root` proves *what* the state is; `snapshot` carries *the state
+    /// itself*, so a node that fell behind (restart, partition, missed startup) can adopt a peer's checkpointed
+    /// state and rejoin consensus instead of wedging (audit §3.9 / §4 recovery). Serialize the full history
+    /// where the root does not fold it in (e.g. an anchor/root set the transfer must carry explicitly).
+    fn snapshot(&self) -> alloc::vec::Vec<u8>;
+
+    /// Reconstruct a state machine from a [`snapshot`](Self::snapshot), or `None` if the bytes are malformed or
+    /// over-long. The caller MUST verify the restored `state_root()` equals the certified
+    /// [`ExecCertificate`](crate::checkpoint::ExecCertificate) root **before** adopting it — a snapshot is
+    /// untrusted transport, only its recomputed root (checked against a quorum-signed certificate) is trusted.
+    fn restore(snapshot: &[u8]) -> Option<Self>
+    where
+        Self: Sized;
 }
 
 /// A reference account transfer: move `amount` from `from` to `to`, valid only at the sender's current
@@ -154,6 +172,30 @@ impl StateMachine for Accounts {
         }
         hash_labeled(STATE_ROOT_LABEL, &buf)
     }
+
+    fn snapshot(&self) -> Vec<u8> {
+        // Both ledger maps, each canonical (sorted) via the shared codec's generic map encoder — the same
+        // `put_map`/`read_map` every DROMOS component reuses. A restored state reproduces `state_root` exactly.
+        let mut out = Vec::new();
+        put_map(&mut out, &self.balances, |o, a, b| {
+            o.extend_from_slice(a);
+            put_u64(o, *b);
+        });
+        put_map(&mut out, &self.nonces, |o, a, n| {
+            o.extend_from_slice(a);
+            put_u64(o, *n);
+        });
+        out
+    }
+
+    fn restore(snapshot: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(snapshot);
+        let entry = |r: &mut Reader<'_>| Some((r.array::<32>()?, r.u64()?)); // account(32) ‖ value(8)
+        let balances = read_map(&mut r, 40, entry)?;
+        let nonces = read_map(&mut r, 40, entry)?;
+        r.finish()?;
+        Some(Self { balances, nonces })
+    }
 }
 
 #[cfg(test)]
@@ -210,5 +252,25 @@ mod tests {
     fn malformed_bytes_are_reported_not_applied() {
         let mut s = Accounts::new();
         assert_eq!(s.apply(&Transaction::new(b"not a transfer".to_vec())), ExecOutcome::Malformed);
+    }
+
+    #[test]
+    fn a_snapshot_restores_the_exact_state_and_reproduces_the_root() {
+        // The state-sync contract: `restore(s.snapshot())` reproduces `s.state_root()` byte-for-byte, so a
+        // lagging node can adopt a peer's snapshot and verify it against a certified root.
+        let mut s = Accounts::new();
+        s.credit(ALICE, 100);
+        s.apply(&Transfer { from: ALICE, to: BOB, amount: 40, nonce: 0 }.into_tx());
+        s.apply(&Transfer { from: BOB, to: ALICE, amount: 10, nonce: 0 }.into_tx());
+        let restored = Accounts::restore(&s.snapshot()).unwrap();
+        assert_eq!(restored, s, "restore reconstructs the exact balances + nonces");
+        assert_eq!(restored.state_root(), s.state_root(), "and reproduces the certified state root");
+        // The empty state round-trips too.
+        let empty = Accounts::new();
+        assert_eq!(Accounts::restore(&empty.snapshot()).unwrap().state_root(), empty.state_root());
+        // Malformed / truncated / over-count snapshots are refused, never panic.
+        assert!(Accounts::restore(&[]).is_none());
+        assert!(Accounts::restore(&s.snapshot()[..s.snapshot().len() - 1]).is_none(), "a truncated snapshot is refused");
+        assert!(Accounts::restore(&u32::MAX.to_le_bytes()).is_none(), "an over-count is refused, not pre-allocated");
     }
 }

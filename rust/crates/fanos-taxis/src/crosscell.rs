@@ -206,6 +206,27 @@ impl Outbox {
         self.msgs.is_empty()
     }
 
+    /// Canonical bytes of the whole outbox (its ordered messages) — the state-sync snapshot of the cross-cell
+    /// state a `StateMachine::snapshot` folds in alongside its application state (via the shared codec).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        fanos_primitives::codec::put_seq(&mut out, self.msgs.len(), &self.msgs, |o, m| {
+            fanos_primitives::codec::put_var_bytes(o, &m.to_bytes());
+        });
+        out
+    }
+
+    /// Reconstruct an outbox from [`to_bytes`](Self::to_bytes), or `None` if malformed / over-long.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = fanos_primitives::codec::Reader::new(bytes);
+        // Each message is length-prefixed (≥ 4) around its ≥ 16-byte body.
+        let msgs = r.seq(20, |r| CrossMsg::from_prefix(r.var_bytes()?).map(|(m, _)| m))?;
+        r.finish()?;
+        Some(Self { msgs })
+    }
+
     /// The Merkle root committing all messages (folded into `state_root` via [`compose_state_root`]).
     #[must_use]
     pub fn root(&self) -> [u8; 32] {

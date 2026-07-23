@@ -74,6 +74,23 @@ impl StateMachine for CrossAccounts {
     fn state_root(&self) -> [u8; 32] {
         compose_state_root(&self.accounts.state_root(), &self.outbox.root())
     }
+
+    fn snapshot(&self) -> Vec<u8> {
+        use fanos_primitives::codec::put_var_bytes;
+        let mut out = Vec::new();
+        put_var_bytes(&mut out, &self.accounts.snapshot());
+        put_var_bytes(&mut out, &self.outbox.to_bytes());
+        out
+    }
+
+    fn restore(snapshot: &[u8]) -> Option<Self> {
+        use fanos_primitives::codec::Reader;
+        let mut r = Reader::new(snapshot);
+        let accounts = Accounts::restore(r.var_bytes()?)?;
+        let outbox = Outbox::from_bytes(r.var_bytes()?)?;
+        r.finish()?;
+        Some(Self { accounts, outbox })
+    }
 }
 
 // ── A minimal generic cell harness (drives real consensus to a checkpoint) ──────────────────────────────────
@@ -160,6 +177,8 @@ impl<S: StateMachine + Clone> Cell<S> {
                     ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                     ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
                     ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
+                    // This fully-connected cross-cell harness never lags, so catch-up messages are inapplicable.
+                    ConsensusMsg::SyncReq { .. } | ConsensusMsg::SyncResp { .. } => continue,
                 };
                 let outs = self.engines[i].step(input);
                 self.absorb(outs);

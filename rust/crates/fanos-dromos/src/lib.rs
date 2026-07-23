@@ -107,6 +107,19 @@ impl StateMachine for ShieldedLedger {
     fn state_root(&self) -> [u8; 32] {
         self.state.root()
     }
+
+    /// Serialize the shielded pool to a canonical state-sync snapshot — the full [`ShieldedState`] (tree,
+    /// nullifiers, and the explicit anchor set). The [`Params`] are a network constant, reconstructed on
+    /// [`restore`](Self::restore) rather than transferred.
+    fn snapshot(&self) -> Vec<u8> {
+        self.state.to_bytes()
+    }
+
+    /// Reconstruct the ledger from [`snapshot`](Self::snapshot), or `None` if malformed. Pairs the decoded pool
+    /// with the standard consensus parameters, so `restore(s.snapshot()).state_root() == s.state_root()`.
+    fn restore(snapshot: &[u8]) -> Option<Self> {
+        Some(Self { state: ShieldedState::from_bytes(snapshot)?, params: Arc::new(Params::standard()) })
+    }
 }
 
 #[cfg(test)]

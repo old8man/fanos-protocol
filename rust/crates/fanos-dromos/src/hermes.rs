@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use fanos_hermes::{Htlc, HtlcState, HtlcTerms};
+use fanos_primitives::codec::{Reader, put_map, put_var_bytes, read_map};
 use fanos_primitives::hash_labeled;
 
 use crate::token::SignedTransfer;
@@ -126,5 +127,31 @@ impl HtlcBook {
             });
         }
         hash_labeled(HTLC_ROOT_LABEL, &buf)
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): every contract in sorted id
+    /// order (`id ‖ contract-bytes` each), so a restore reproduces the HTLC `state_root` exactly.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_map(&mut out, &self.htlcs, |o, id, htlc| {
+            o.extend_from_slice(id);
+            put_var_bytes(o, &htlc.to_bytes());
+        });
+        out
+    }
+
+    /// Reconstruct a book from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / over-long.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        // Smallest entry: id (32) ‖ length-prefixed contract (≥ 4) = 36 bytes.
+        let htlcs = read_map(&mut r, 36, |r| {
+            let id = r.array::<32>()?;
+            let htlc = Htlc::from_bytes(r.var_bytes()?)?;
+            Some((id, htlc))
+        })?;
+        r.finish()?;
+        Some(Self { htlcs })
     }
 }

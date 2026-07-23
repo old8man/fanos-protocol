@@ -13,6 +13,7 @@
 
 use alloc::vec::Vec;
 
+use fanos_primitives::codec::Reader;
 use fanos_primitives::hash_labeled;
 
 /// The fixed wire length of encoded [`HtlcTerms`].
@@ -118,6 +119,35 @@ impl Htlc {
     #[must_use]
     pub fn state(&self) -> HtlcState {
         self.state
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): the fixed-width terms then the
+    /// lifecycle state (`0` locked, `1` claimed, `2` refunded), so a restored contract reproduces the HTLC
+    /// `state_root` exactly (the root folds the state, and pruning depends on it).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.terms.to_bytes();
+        out.push(match self.state {
+            HtlcState::Locked => 0,
+            HtlcState::Claimed => 1,
+            HtlcState::Refunded => 2,
+        });
+        out
+    }
+
+    /// Reconstruct a contract from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / over-long.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let terms = HtlcTerms::from_bytes(r.bytes(TERMS_LEN)?)?;
+        let state = match r.u8()? {
+            0 => HtlcState::Locked,
+            1 => HtlcState::Claimed,
+            2 => HtlcState::Refunded,
+            _ => return None,
+        };
+        r.finish()?;
+        Some(Self { terms, state })
     }
 
     /// **Claim**: the recipient reveals `preimage` at block `height`. Succeeds only if the contract is still

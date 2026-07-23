@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use fanos_primitives::codec::{Reader, put_map, put_var_bytes, read_map};
 use fanos_primitives::hash_labeled;
 use fanos_thesauros::content::LEAF;
 use fanos_thesauros::{Deal, DealParams, DealState};
@@ -167,6 +168,32 @@ impl StorageMarket {
             });
         }
         hash_labeled(STORAGE_ROOT_LABEL, &buf)
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): every deal in sorted id order
+    /// (`id ‖ deal-bytes` each), so a restore reproduces the market `state_root` exactly.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_map(&mut out, &self.deals, |o, id, deal| {
+            o.extend_from_slice(id);
+            put_var_bytes(o, &deal.to_bytes());
+        });
+        out
+    }
+
+    /// Reconstruct a market from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / over-long.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        // Smallest entry: id (32) ‖ length-prefixed deal (≥ 4) = 36 bytes.
+        let deals = read_map(&mut r, 36, |r| {
+            let id = r.array::<32>()?;
+            let deal = Deal::from_bytes(r.var_bytes()?)?;
+            Some((id, deal))
+        })?;
+        r.finish()?;
+        Some(Self { deals })
     }
 }
 

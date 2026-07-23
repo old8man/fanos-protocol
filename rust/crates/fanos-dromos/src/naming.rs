@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use fanos_primitives::codec::{Reader, put_map, put_u64, put_var_bytes, read_map};
 use fanos_primitives::hash_labeled;
 
 use crate::token::{SignedTransfer, TokenError, TokenLedger};
@@ -324,6 +325,37 @@ impl NameRegistry {
             buf.extend_from_slice(&rec.target);
         }
         hash_labeled(ROOT_LABEL, &buf)
+    }
+
+    /// Canonical bytes for a state-sync snapshot ([`fanos_primitives::codec`]): the registry records in sorted
+    /// name order (`name ‖ owner ‖ expiry ‖ target` each), so a restore reproduces the registry `state_root`.
+    /// The clock is not state — it is supplied per block — so it is not serialized.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_map(&mut out, &self.records, |o, name, rec| {
+            put_var_bytes(o, name);
+            o.extend_from_slice(&rec.owner);
+            put_u64(o, rec.expiry);
+            put_var_bytes(o, &rec.target);
+        });
+        out
+    }
+
+    /// Reconstruct a registry from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / over-long.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        // Smallest record: empty name (4) ‖ owner (32) ‖ expiry (8) ‖ empty target (4) = 48 bytes.
+        let records = read_map(&mut r, 48, |r| {
+            let name = r.var_bytes()?.to_vec();
+            let owner = r.array::<32>()?;
+            let expiry = r.u64()?;
+            let target = r.var_bytes()?.to_vec();
+            Some((name, NameRecord { owner, target, expiry }))
+        })?;
+        r.finish()?;
+        Some(Self { records })
     }
 }
 

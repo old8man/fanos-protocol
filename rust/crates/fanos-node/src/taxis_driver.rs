@@ -211,9 +211,14 @@ where
                     let _ = reply.send((engine.chain().next_height(), engine.chain().state().clone()));
                 }
                 note = note_rx.recv() => match note {
-                    Some(Notification::App { body, .. }) => {
-                        if let Some(msg) = ConsensusMsg::from_bytes(&body) {
-                            let outs = step_msg(&mut engine, &msg);
+                    Some(Notification::App { body, from }) => {
+                        // Map the sender's overlay coordinate to its validator index (a frame from an unknown
+                        // coordinate is ignored); the index directs a state-sync reply back to the requester.
+                        if let (Some(msg), Some(src)) = (
+                            ConsensusMsg::from_bytes(&body),
+                            coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok()),
+                        ) {
+                            let outs = step_msg(&mut engine, &msg, src);
                             drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
                         }
                     }
@@ -230,13 +235,19 @@ where
 }
 
 /// Map a received consensus message to the engine input and step it. A `Propose` carries the full block, so
-/// every DA shard is present — the engine's `reconstruct_payload` still checks them against `da_commit`.
-fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg) -> Vec<Output> {
+/// every DA shard is present — the engine's `reconstruct_payload` still checks them against `da_commit`. `from`
+/// is the sender's validator index; it matters only for a `SyncReq`, whose certified-state reply the engine
+/// directs back to that requester (`Output::SendTo`).
+fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg, from: u8) -> Vec<Output> {
     let input = match msg {
         ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(b.da_shards().map(Some)) },
         ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
+        ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from, have_height: *have_height },
+        ConsensusMsg::SyncResp { cert, head, snapshot } => {
+            Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
+        }
     };
     engine.step(input)
 }
@@ -266,8 +277,19 @@ fn drive<S: StateMachine>(
                     }
                 }
                 // Deliver back to ourselves, cascading any further outputs (prepare → commit → reveal …).
-                for more in step_msg(engine, &msg) {
+                for more in step_msg(engine, &msg, me) {
                     queue.push_back(more);
+                }
+            }
+            Output::SendTo { to, msg } => {
+                // A directed reply (a `SyncResp` serving a lagging peer's `SyncReq`): emit only to that peer.
+                let frame = to_frame(&msg);
+                if to == me {
+                    for more in step_msg(engine, &msg, me) {
+                        queue.push_back(more);
+                    }
+                } else if let Some(&coord) = coords.get(to as usize) {
+                    client.command(Command::Emit { to: coord, frame });
                 }
             }
             Output::Committed { height, block_hash } => {

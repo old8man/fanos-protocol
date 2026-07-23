@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fanos_obolos::{Params, ShieldedState, ShieldedTx, TransparentProof, decode_submission};
+use fanos_primitives::codec::{Reader, put_u64, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::tx::Transaction;
@@ -649,6 +650,46 @@ impl StateMachine for HybridLedger {
         buf[128..].copy_from_slice(&self.htlcs.state_root());
         hash_labeled(HYBRID_ROOT_LABEL, &buf)
     }
+
+    /// Serialize the entire ledger to a canonical state-sync snapshot ([`fanos_primitives::codec`]): every
+    /// sub-ledger, then the block height and audit beacon. Each component is length-framed so decoding is total.
+    /// The consensus [`Params`] are a network constant (`Params::standard()`, identical on every node), so they
+    /// are reconstructed on [`restore`](Self::restore) rather than transferred.
+    fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_var_bytes(&mut out, &self.tokens.to_bytes());
+        put_var_bytes(&mut out, &self.shielded.to_bytes());
+        put_var_bytes(&mut out, &self.names.to_bytes());
+        put_var_bytes(&mut out, &self.storage.to_bytes());
+        put_var_bytes(&mut out, &self.htlcs.to_bytes());
+        put_u64(&mut out, self.height);
+        out.extend_from_slice(&self.audit_beacon);
+        out
+    }
+
+    /// Reconstruct the ledger from [`snapshot`](Self::snapshot), or `None` if any component is malformed,
+    /// truncated, or trailed by garbage. `restore(s.snapshot()).state_root() == s.state_root()` for every `s`.
+    fn restore(snapshot: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(snapshot);
+        let tokens = TokenLedger::from_bytes(r.var_bytes()?)?;
+        let shielded = ShieldedState::from_bytes(r.var_bytes()?)?;
+        let names = NameRegistry::from_bytes(r.var_bytes()?)?;
+        let storage = StorageMarket::from_bytes(r.var_bytes()?)?;
+        let htlcs = HtlcBook::from_bytes(r.var_bytes()?)?;
+        let height = r.u64()?;
+        let audit_beacon = r.array::<32>()?;
+        r.finish()?;
+        Some(Self {
+            tokens,
+            shielded,
+            names,
+            storage,
+            htlcs,
+            params: Arc::new(Params::standard()),
+            height,
+            audit_beacon,
+        })
+    }
 }
 
 /// Map an apply result to the coarse execution outcome (`Applied` on success, `Rejected` on a valid-but-refused
@@ -713,6 +754,54 @@ mod tests {
         assert_eq!(ledger.apply(&Transaction::new(HybridLedger::name_payload(&name_tx))), ExecOutcome::Applied);
         assert_eq!(ledger.names().resolve(&name, 0).unwrap().owner, alice, "the name is Alice's");
         assert_ne!(ledger.state_root(), root2, "the name registration moved the hybrid root");
+    }
+
+    #[test]
+    fn the_full_ledger_snapshots_and_restores_reproducing_the_root() {
+        // End-to-end state-sync (audit §3.9 / §4 recovery): build state across the sub-ledgers, drive the block
+        // context (height + audit beacon), then prove `restore(snapshot())` is bit-for-bit faithful — same state
+        // root, height, and per-component state — so a lagging validator can adopt a checkpoint and rejoin.
+        let (alice_sk, alice_vk, alice) = account(1);
+        let (_bob_sk, _bob_vk, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.begin_block(7);
+        ledger.set_audit_beacon([0x5a; 32]);
+
+        // Transparent transfer Alice → Bob.
+        let st = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 100, nonce: 0 }, &alice_sk, alice_vk.clone());
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::transparent_payload(&st))), ExecOutcome::Applied);
+        // Shielded mint + transfer — advances the note tree, creating multiple anchors (the critical path).
+        let nsk = [9u8; 32];
+        let n0 = note(500, &nsk, b"n0");
+        let pos = ledger.mint_shielded(n0.commitment(ledger.params())).unwrap();
+        let sp = SpendInput { note: n0, nsk, path: ledger.shielded().path(pos).unwrap() };
+        let (stx, proof) =
+            build_transfer(ledger.params(), ledger.shielded().anchor(), &[sp], &[note(500, &[2u8; 32], b"o")], 0);
+        let submission = encode_submission(&stx, &proof);
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::shielded_payload(&submission))), ExecOutcome::Applied);
+        // Name registration paid from Alice's transparent funds.
+        let name = b"alice.fanos".to_vec();
+        let fee = price(&name, 10);
+        let name_tx = NameTx {
+            op: NameOp::Register { name: name.clone(), target: b"addr".to_vec(), duration: 10 },
+            payment: SignedTransfer::sign(Transfer { from: alice, to: TREASURY, amount: fee, nonce: 1 }, &alice_sk, alice_vk),
+        };
+        assert_eq!(ledger.apply(&Transaction::new(HybridLedger::name_payload(&name_tx))), ExecOutcome::Applied);
+
+        // Snapshot → restore, and prove faithfulness.
+        let snapshot = ledger.snapshot();
+        let restored = HybridLedger::restore(&snapshot).expect("the snapshot restores");
+        assert_eq!(restored.state_root(), ledger.state_root(), "the restored ledger reproduces the exact state root");
+        assert_eq!(restored.height(), ledger.height(), "and the block height");
+        assert_eq!(restored.tokens().balance(&bob), 100, "and transparent balances");
+        assert_eq!(restored.names().resolve(&name, 0).unwrap().owner, alice, "and the name registry");
+        assert_eq!(restored.shielded().root(), ledger.shielded().root(), "and the shielded pool (with its anchors)");
+        // A trailing byte is refused — the decode is total.
+        let mut extended = snapshot.clone();
+        extended.push(0);
+        assert!(HybridLedger::restore(&extended).is_none(), "trailing garbage is refused");
     }
 
     #[test]

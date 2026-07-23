@@ -10,7 +10,7 @@
 //! key, and the signature; [`TokenLedger::apply`] verifies all three (key-binds-account, signature-valid,
 //! nonce-fresh, funds-sufficient) before moving anything.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
@@ -293,6 +293,51 @@ impl TokenLedger {
             buf.extend_from_slice(&self.nonce(a).to_le_bytes());
         }
         hash_labeled(ROOT_LABEL, &buf)
+    }
+
+    /// The canonical wire form of the **entire** token state — every account (sorted) with its balance and
+    /// nonce — for a state-sync snapshot (the `StateMachine::snapshot` path). Deterministic: the same state
+    /// always encodes identically, and [`from_bytes`](Self::from_bytes) reconstructs a state with the identical
+    /// [`state_root`](Self::state_root) (a 0 balance/nonce is inert, so the reconstruction is normalized-but-equivalent).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut accounts: BTreeSet<[u8; 32]> = self.balances.keys().copied().collect();
+        accounts.extend(self.nonces.keys().copied());
+        let mut out = Vec::with_capacity(4 + accounts.len() * 48);
+        out.extend_from_slice(&(accounts.len() as u32).to_le_bytes());
+        for a in &accounts {
+            out.extend_from_slice(a);
+            out.extend_from_slice(&self.balance(a).to_le_bytes());
+            out.extend_from_slice(&self.nonce(a).to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct a token ledger from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated /
+    /// over-long. Only non-zero balances/nonces are stored (a zero is the map default), so the result is
+    /// canonical and reproduces the source `state_root`.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+        // Each account record is 48 bytes; reject a count the buffer cannot hold (bounds the allocation).
+        if count > bytes.len().saturating_sub(4) / 48 {
+            return None;
+        }
+        let mut ledger = Self::new();
+        let mut off = 4usize;
+        for _ in 0..count {
+            let account: [u8; 32] = bytes.get(off..off + 32)?.try_into().ok()?;
+            let balance = u64::from_le_bytes(bytes.get(off + 32..off + 40)?.try_into().ok()?);
+            let nonce = u64::from_le_bytes(bytes.get(off + 40..off + 48)?.try_into().ok()?);
+            if balance > 0 {
+                ledger.balances.insert(account, balance);
+            }
+            if nonce > 0 {
+                ledger.nonces.insert(account, nonce);
+            }
+            off += 48;
+        }
+        (off == bytes.len()).then_some(ledger) // reject trailing garbage
     }
 }
 

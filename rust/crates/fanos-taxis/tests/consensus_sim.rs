@@ -18,6 +18,7 @@ use fanos_taxis::committee::{epoch_seal_line, leader, line_members};
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
+use fanos_taxis::state::StateMachine;
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
 
 /// A Shamir share serialized as the reveal wire carries it: `x(1) ‖ y`.
@@ -141,6 +142,31 @@ impl Cluster {
                 Output::Committed { height, block_hash } => self.committed[idx].push((height, block_hash)),
                 Output::Slash(ev) => self.slashes.push(ev),
                 Output::Reward(split) => self.rewards.extend(split),
+                // A point-to-point send (a catch-up SyncResp): deliver only to `to`, respecting crash +
+                // partition, and collect its outputs (the adoption's Committed) so `run` sees them.
+                Output::SendTo { to, msg } => {
+                    let to = usize::from(to);
+                    if to < N && !self.crashed[to] && self.partition[idx] == self.partition[to] {
+                        let input = self.msg_to_input(idx, &msg);
+                        let outs = self.engines[to].step(input);
+                        self.collect(to, outs);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Map a wire message from validator `from` to the engine input, filling `SyncReq.from` from the
+    /// (authenticated) sender — shared by broadcast [`deliver`](Self::deliver) and point-to-point `SendTo`.
+    fn msg_to_input(&self, from: usize, msg: &ConsensusMsg) -> Input {
+        match msg {
+            ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(self.shards_for(b)) },
+            ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
+            ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
+            ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
+            ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from: from as u8, have_height: *have_height },
+            ConsensusMsg::SyncResp { cert, head, snapshot } => {
+                Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
             }
         }
     }
@@ -165,12 +191,7 @@ impl Cluster {
             if matches!(msg, ConsensusMsg::Propose(_)) && self.deaf_propose.contains(&i) {
                 continue;
             }
-            let input = match msg {
-                ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(self.shards_for(b)) },
-                ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
-                ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
-                ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
-            };
+            let input = self.msg_to_input(from, msg);
             let outs = self.engines[i].step(input);
             self.collect(i, outs);
         }
@@ -295,6 +316,95 @@ fn a_transaction_finalizes_and_executes_in_agreed_order() {
         assert_eq!(e.chain().state().balance(&BOB), 100);
         assert_eq!(e.chain().state_root(), root, "all replicas agree on the state root");
     }
+}
+
+#[test]
+fn a_lagging_validator_state_syncs_to_the_certified_state_and_rejoins() {
+    // Audit §3.9 / §4: a validator that misses heights (crashed, partitioned, or lost a startup race) must not
+    // wedge forever. On recovery it detects it is behind, requests catch-up, adopts a peer's QUORUM-CERTIFIED
+    // state snapshot, and rejoins live consensus — reaching the state the cell agreed WITHOUT ever re-decrypting
+    // the anti-MEV transaction whose reveals it never saw, and with no fork at any height.
+    const LAG: usize = 6; // one validator falls behind; the other 6 ≥ Q = 5 keep consensus live
+    let mut c = Cluster::new(&genesis());
+    c.crashed[LAG] = true;
+
+    // Drive the live cell through a transaction and several empty blocks, forming execution checkpoints.
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 250, nonce: 0 }, b"lag-tx");
+    c.submit_all(&tx);
+    // Interleave tick + timeout so a height whose round-0 leader is the crashed validator still advances (a
+    // timeout re-elects a live leader) — otherwise the cell would stall on the laggard's leader slots.
+    for _ in 0..6 {
+        c.tick();
+        c.timeout();
+    }
+    let live_height = c.engines[0].chain().next_height();
+    assert!(live_height >= 3, "the live cell advanced past a few heights");
+    assert!(c.engines[0].latest_checkpoint().is_some(), "the live cell formed an execution checkpoint");
+    assert_eq!(c.engines[LAG].chain().next_height(), 0, "the crashed validator is stuck at genesis (no catch-up yet)");
+
+    // Recover the laggard and drive: it hears future-height messages, requests catch-up, and state-syncs.
+    c.crashed[LAG] = false;
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+
+    // It caught up — advanced far past genesis (it did NOT re-execute heights 1..H, only adopted the certified
+    // state) and reflects the transfer it never decrypted, in the exact agreed final balances.
+    assert!(c.engines[LAG].chain().next_height() >= live_height, "the laggard synced forward, not wedged");
+    assert_eq!(c.engines[LAG].chain().state().balance(&ALICE), 750, "the laggard adopted the certified ALICE balance");
+    assert_eq!(c.engines[LAG].chain().state().balance(&BOB), 250, "the laggard adopted the certified BOB balance");
+    // Every validator (now all live) agrees on the state root — the synced node is on the SAME chain.
+    let root = c.engines[0].chain().state_root();
+    assert_eq!(c.engines[LAG].chain().state_root(), root, "the synced validator's state root matches the cell");
+    // No fork: every height carries a single block hash across all validators.
+    for h in 0..c.engines[0].chain().next_height() {
+        assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
+    }
+}
+
+#[test]
+fn a_forged_or_mismatched_catch_up_response_is_refused() {
+    // The load-bearing state-sync guards (audit §3.9): a lagging node adopts ONLY a Q-quorum-certified state
+    // whose OWN recomputed root matches the certificate. A forged certificate (under-quorum) or a snapshot that
+    // does not restore to the certified root is refused — never adopted — so a Byzantine peer cannot inject a
+    // fabricated state (which would be an instant, silent fork).
+    const LAG: usize = 6;
+    let mut c = Cluster::new(&genesis());
+    c.crashed[LAG] = true;
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"adv");
+    c.submit_all(&tx);
+    for _ in 0..6 {
+        c.tick();
+        c.timeout();
+    }
+    let cert = c.engines[0].latest_checkpoint().expect("the cell certified a state").clone();
+    let head = c.engines[0].chain().head();
+    assert!(cert.height >= 1, "a checkpoint formed past genesis");
+    // The certified state, reconstructed deterministically: genesis with the one transfer applied.
+    let mut expected = genesis();
+    expected.apply(&Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx());
+    let good = expected.snapshot();
+    assert_eq!(expected.state_root(), cert.state_root, "the reconstructed state matches the certified root");
+
+    // (1) A FORGED certificate (votes truncated below the quorum) is refused — no adoption.
+    let mut weak = cert.clone();
+    weak.votes.truncate(1);
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: weak, head, snapshot: good.clone() }), Vec::new());
+    assert_eq!(c.engines[LAG].chain().next_height(), 0, "an under-quorum certificate is not adopted");
+
+    // (2) A MISMATCHED snapshot (the empty state, whose root ≠ the certified root) is refused.
+    let wrong = Accounts::new().snapshot();
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), head, snapshot: wrong }), Vec::new());
+    assert_eq!(c.engines[LAG].chain().next_height(), 0, "a snapshot that does not match the certified root is refused");
+
+    // (3) The GENUINE response IS adopted — the positive control: verified certificate + matching snapshot.
+    let outs = c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), head, snapshot: good });
+    assert!(matches!(outs.as_slice(), [Output::Committed { .. }]), "a valid response adopts (emits Committed)");
+    assert_eq!(c.engines[LAG].chain().next_height(), cert.height + 1, "the laggard adopts the certified height");
+    assert_eq!(c.engines[LAG].chain().state_root(), cert.state_root, "and reaches the certified state root");
+    // (4) A stale re-offer of the SAME certificate is now a no-op (monotone — never rolls back).
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert, head, snapshot: expected.snapshot() }), Vec::new());
 }
 
 #[test]
@@ -545,7 +655,7 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool) {
                     match o {
                         Output::Send(m) => bus.push_back(m),
                         Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
-                        Output::Slash(_) | Output::Reward(_) => {} // equivocation is expected; safety is what this checks
+                        Output::Slash(_) | Output::Reward(_) | Output::SendTo { .. } => {} // equivocation is expected; safety is what this checks
                     }
                 }
             }
@@ -571,12 +681,15 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool) {
                         ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
                         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
+                        // This trial exercises core-message safety; a lagging replica's catch-up is out of scope,
+                        // and skipping it cannot cause a fork (an un-synced node simply does not advance).
+                        ConsensusMsg::SyncReq { .. } | ConsensusMsg::SyncResp { .. } => continue,
                     };
                     for o in engines[i].step(input) {
                         match o {
                             Output::Send(m) => bus.push_back(m),
                             Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
-                            Output::Slash(_) | Output::Reward(_) => {} // safety is what this trial checks
+                            Output::Slash(_) | Output::Reward(_) | Output::SendTo { .. } => {} // safety is what this trial checks
                         }
                     }
                 }
