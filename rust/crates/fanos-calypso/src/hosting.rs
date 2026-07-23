@@ -68,6 +68,16 @@ pub fn shard_service_key(
     shamir::split(service_secret, threshold, line_size, randomness)
 }
 
+/// **Proactively reshare** a hosted secret to a *new* line without reconstructing it — for a rotating
+/// threshold committee (CHURP-style). Each old member's contribution is [`shard_service_key`] of its OWN
+/// share value over the new line's positions; a new member then combines the contributions it received (one
+/// per old member in a threshold subset at `old_xs`) with this call, obtaining its share of the SAME secret
+/// under the new line. The secret is never materialized, and the new shares lie on a fresh polynomial, so
+/// stale old shares cannot be mixed with new ones. See [`shamir::combine_contributions`].
+pub fn combine_reshares(new_x: u8, contributions: &[Share], old_xs: &[u8]) -> Result<Share, ShamirError> {
+    shamir::combine_contributions(new_x, contributions, old_xs)
+}
+
 /// Recover the service secret from `threshold` (or more) member shares.
 pub fn recover_service_key(host_shares: &[Share]) -> Result<Vec<u8>, ShamirError> {
     shamir::reconstruct(host_shares)

@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use fanos_calypso::hosting::{Share, recover_service_key, shard_service_key};
+use fanos_calypso::hosting::{Share, combine_reshares, recover_service_key, shard_service_key};
 use fanos_calypso::pow;
 use fanos_field::Field;
 use fanos_geometry::{Line, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
@@ -241,6 +241,30 @@ pub fn shard_descriptor(
 pub fn recover_descriptor(shares: &[Share]) -> Option<IngressDescriptor> {
     let bytes = recover_service_key(shares).ok()?;
     IngressDescriptor::from_bytes(&bytes)
+}
+
+/// **One old line member's resharing contribution** when the ingress line rotates for a new epoch: a fresh
+/// `threshold`-of-`new_line_size` sharing of its OWN descriptor `share` over the new line's positions. The
+/// member computes this locally and sends sub-share `k` to new member `k + 1` — no member ever reconstructs
+/// the descriptor. `None` on invalid Shamir parameters. See [`combine_descriptor_reshares`].
+#[must_use]
+pub fn reshare_descriptor_share(
+    share: &Share,
+    threshold: u8,
+    new_line_size: u8,
+    randomness: &[u8],
+) -> Option<Vec<Share>> {
+    shard_service_key(share.y(), threshold, new_line_size, randomness).ok()
+}
+
+/// **A new line member's rotated share**: combine the resharing contributions it received — `contributions[k]`
+/// from the old member at old `x`-coordinate `old_xs[k]` — into its share of the SAME descriptor under the new
+/// line, at position `new_x`. `old_xs` must be a threshold subset of the old line (`≥ t`). The descriptor is
+/// never materialized; the new shares lie on a fresh polynomial, so the seize-`<t`-reveals-nothing property
+/// holds afresh each epoch AND old shares cannot be mixed with new (proactive refresh). `None` on bad input.
+#[must_use]
+pub fn combine_descriptor_reshares(new_x: u8, contributions: &[Share], old_xs: &[u8]) -> Option<Share> {
+    combine_reshares(new_x, contributions, old_xs).ok()
 }
 
 /// The bucket-ranking key for `peer` under a request — keyed on the requester coordinate *and* the
@@ -866,5 +890,50 @@ mod tests {
         let e_bad = combiner.step(Instant(1), Input::Message { from: sybil_coord, frame: request_frame(&bad) });
         assert!(e_bad.is_empty(), "the Sybil cap drops it despite valid PoW — no gather opened");
         assert_eq!(combiner.pending(), 1, "still only the admitted requester is gathering");
+    }
+
+    #[test]
+    fn the_descriptor_reshares_to_a_new_epoch_line_without_reconstructing_it() {
+        // The ingress line rotates each epoch: the descriptor must move to the NEW line's q+1 members without
+        // any node ever holding it whole. An old threshold subset reshares; the new line recovers the SAME
+        // descriptor — and no single node reconstructed it at any point (CHURP-style proactive resharing).
+        let desc = descriptor(8);
+        let (old_t, old_n) = (2u8, 3u8);
+        let (new_t, new_n) = (2u8, 3u8);
+        let secret_len = desc.to_bytes().len();
+        let old_shares =
+            shard_descriptor(&desc, old_t, old_n, &vec![0x5Au8; secret_len * usize::from(old_t - 1) + 8]).unwrap();
+
+        // A threshold subset of the OLD line (members at x = 1, 2) each reshare their own share to the new line.
+        let old_xs = [old_shares[0].x(), old_shares[1].x()];
+        let contributions: Vec<Vec<Share>> = [&old_shares[0], &old_shares[1]]
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                // Distinct randomness per contributor ⇒ a genuinely fresh polynomial.
+                let rnd: Vec<u8> = (0..secret_len).map(|i| ((i * 31 + k * 101 + 7) % 251) as u8).collect();
+                reshare_descriptor_share(s, new_t, new_n, &rnd).expect("a valid resharing contribution")
+            })
+            .collect();
+
+        // Each new member combines the sub-shares addressed to it into its rotated share.
+        let new_shares: Vec<Share> = (0..usize::from(new_n))
+            .map(|j| {
+                let for_j: Vec<Share> = contributions.iter().map(|c| c[j].clone()).collect();
+                combine_descriptor_reshares(u8::try_from(j + 1).unwrap(), &for_j, &old_xs)
+                    .expect("a valid combined share")
+            })
+            .collect();
+
+        // The NEW line recovers the SAME descriptor from any threshold of its rotated shares.
+        assert_eq!(
+            recover_descriptor(&[new_shares[0].clone(), new_shares[2].clone()]).as_ref(),
+            Some(&desc),
+            "the new epoch line reconstructs the identical descriptor after resharing",
+        );
+        // Seizing < t of the new line still reveals nothing (a real threshold committee), and a stale old
+        // share is not a valid point of the fresh polynomial (proactive refresh).
+        assert_ne!(recover_descriptor(&[new_shares[0].clone()]).as_ref(), Some(&desc), "one new share reveals nothing");
+        assert_ne!(new_shares[0].y(), old_shares[0].y(), "the rotated share is on a fresh polynomial, not a copy");
     }
 }
