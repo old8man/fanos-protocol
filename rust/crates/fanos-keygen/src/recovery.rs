@@ -132,6 +132,59 @@ impl RecoveryAuthorization {
     }
 }
 
+/// The honest-majority threshold for a committee of `n` anchors — the smallest `t` with `t > n/2`, clamped to
+/// the resharing floor. This is the BFT honest-majority bound (`< t` corrupt tolerated), a derived quantity, not
+/// a tuned constant.
+#[must_use]
+pub fn majority_threshold(n: usize) -> usize {
+    (n / 2 + 1).max(usize::from(MIN_REGENESIS_THRESHOLD))
+}
+
+/// The recovery action for one epoch, decided purely from the live-anchor set versus the current beacon
+/// threshold (audit §4). The two regimes of `docs/design-recovery.md`, expressed as one total function.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RecoveryAction {
+    /// The anchor set is healthy for its threshold — no action.
+    None,
+    /// **Regime A — proactive reshare.** The committee has thinned enough that a lower (still honest-majority)
+    /// threshold buys fault-tolerance headroom, and `≥ threshold` anchors remain so a reshare is still possible.
+    /// Reshare the key (continuity-preserving) to `survivors` at `new_threshold`. Partition-safe: a `< threshold`
+    /// minority cannot reshare, so no competing key can arise.
+    ProactiveReshare {
+        /// The live anchor holder indices to reshare to.
+        survivors: Vec<u8>,
+        /// The lower honest-majority threshold for the shrunk committee.
+        new_threshold: usize,
+    },
+    /// **Regime B — below-threshold re-genesis.** The set has already dropped below `threshold`; the `(t, n)` key
+    /// is information-theoretically gone and a reshare is impossible. Escalate to the recovery authority for a
+    /// [`RecoveryAuthorization`] and re-key the `survivors` from a fresh DKG.
+    RequestRegenesis {
+        /// The live anchor holder indices that remain to be re-keyed under a fresh DKG.
+        survivors: Vec<u8>,
+    },
+}
+
+/// Decide the recovery action from the current `live_anchors` (holder indices) and the beacon `threshold`.
+///
+/// - `live < threshold` ⇒ reshare is impossible (it needs `≥ threshold` contributors) ⇒ **re-genesis** (B).
+/// - `live ≥ threshold` but the honest-majority threshold for the shrunk set is *below* the current one, and a
+///   fault-tolerant committee (`≥ MIN + 1` anchors) still remains ⇒ **proactive reshare** (A), lowering the
+///   threshold to `majority_threshold(live)` so the cell tolerates further losses before it can freeze.
+/// - otherwise ⇒ **none**.
+#[must_use]
+pub fn recovery_decision(live_anchors: &[u8], threshold: usize) -> RecoveryAction {
+    let live = live_anchors.len();
+    if live < threshold {
+        return RecoveryAction::RequestRegenesis { survivors: live_anchors.to_vec() };
+    }
+    let new_threshold = majority_threshold(live);
+    if new_threshold < threshold && live > usize::from(MIN_REGENESIS_THRESHOLD) {
+        return RecoveryAction::ProactiveReshare { survivors: live_anchors.to_vec(), new_threshold };
+    }
+    RecoveryAction::None
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -167,6 +220,44 @@ mod tests {
         let mut widened = rgc.clone();
         widened.survivors.push(5);
         assert!(!widened.verify(&vk), "adding a survivor invalidates the signature");
+    }
+
+    #[test]
+    fn the_recovery_decision_walks_the_honest_majority_ladder() {
+        // majority_threshold is the derived honest-majority bound, clamped to the floor.
+        assert_eq!(majority_threshold(7), 4);
+        assert_eq!(majority_threshold(5), 3);
+        assert_eq!(majority_threshold(4), 3);
+        assert_eq!(majority_threshold(3), 2);
+        assert_eq!(majority_threshold(2), 2, "the resharing floor clamps a 2-node committee");
+        assert_eq!(majority_threshold(1), 2, "and a 1-node committee (never resharable)");
+
+        let idx = |n: usize| (1..=n as u8).collect::<Vec<u8>>();
+        // Healthy for its threshold — no action while the majority bound still equals the current threshold.
+        assert_eq!(recovery_decision(&idx(7), 4), RecoveryAction::None);
+        assert_eq!(recovery_decision(&idx(6), 4), RecoveryAction::None);
+        // Thinned to where a lower honest-majority threshold buys headroom — proactively reshare (Regime A),
+        // while ≥ threshold anchors still make a reshare possible.
+        assert_eq!(
+            recovery_decision(&idx(5), 4),
+            RecoveryAction::ProactiveReshare { survivors: idx(5), new_threshold: 3 },
+        );
+        // After that reshare (t=3), the ladder continues: 5,4 healthy; 3 warrants t'=2.
+        assert_eq!(recovery_decision(&idx(4), 3), RecoveryAction::None);
+        assert_eq!(
+            recovery_decision(&idx(3), 3),
+            RecoveryAction::ProactiveReshare { survivors: idx(3), new_threshold: 2 },
+        );
+        // A minimal 2-of-2 committee is healthy (no lower honest-majority threshold exists).
+        assert_eq!(recovery_decision(&idx(2), 2), RecoveryAction::None);
+        // Below the current threshold — reshare is impossible, escalate to re-genesis (Regime B).
+        assert_eq!(
+            recovery_decision(&idx(3), 4),
+            RecoveryAction::RequestRegenesis { survivors: idx(3) },
+            "the R-C1 cliff: 3 < t=4 survivors demand an authorized re-genesis",
+        );
+        assert_eq!(recovery_decision(&idx(1), 2), RecoveryAction::RequestRegenesis { survivors: idx(1) });
+        assert_eq!(recovery_decision(&[], 2), RecoveryAction::RequestRegenesis { survivors: vec![] });
     }
 
     #[test]
