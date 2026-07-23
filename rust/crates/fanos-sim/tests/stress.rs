@@ -59,6 +59,8 @@ fn cascade_collapses_only_the_target_cell() {
 
     assert_eq!(report.after.alive, 63, "all 7 of cell 0 are down");
     assert_eq!(report.peak_troubled_cells, 1, "only the target cell is ever troubled");
+    // A localizable collapse diagnoses node faults (Localized/Escalate), not a systemic partition.
+    assert!(report.peak_diagnosed > 0, "the survivors diagnose the crashing peers");
     let troubled: Vec<_> = cluster.snapshot().troubled_cells().map(|(i, _)| i).collect();
     assert_eq!(troubled, vec![0], "exactly cell 0 collapsed");
 }
@@ -91,6 +93,9 @@ fn soft_partition_never_crashes_a_node_and_recovers() {
     assert!(report.before.is_healthy(), "starts healthy");
     assert_eq!(report.after.alive, 70, "a lossy cut never kills a node");
     assert!(report.ended_healthy, "the fleet recovers once the lossy cut heals: {:?}", report.after);
+    // The defining signal: a systemic (non-localizable) lossy split trips the PARTITION verdict — the
+    // loss-weighted Fiedler sensor catching what plain liveness cannot (every node stayed alive).
+    assert!(report.peak_partitioned > 0, "the lossy split is detected as a partition, not just degraded");
 }
 
 #[test]

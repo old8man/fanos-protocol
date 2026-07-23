@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification, TimerToken, Triple};
 use fanos_wire::decode_frame;
 
+use fanos_diakrisis::Verdict;
 use fanos_telemetry::{CoherenceFrame, CoherenceSnapshot};
 
 use crate::fleet::{FleetSnapshot, NodeState};
@@ -202,6 +203,9 @@ pub struct Sim {
     /// fleet snapshots ([`fleet_snapshot`](Sim::fleet_snapshot)). Updated on every emission; read-only
     /// with respect to the run, so it never perturbs the determinism contract.
     latest_observed: BTreeMap<Triple, Vec<u8>>,
+    /// The latest DIAKRISIS diagnostic verdict each node reached (`Notification::Verdict`), banked the
+    /// same way — the diagnosis layer, distinct from the coherence frame.
+    latest_verdict: BTreeMap<Triple, Verdict>,
 }
 
 impl Sim {
@@ -225,6 +229,7 @@ impl Sim {
             trace: Trace::new(),
             frame_tap: None,
             latest_observed: BTreeMap::new(),
+            latest_verdict: BTreeMap::new(),
         }
     }
 
@@ -345,7 +350,8 @@ impl Sim {
                     .get(&coord)
                     .and_then(|b| CoherenceFrame::decode(b))
                     .map(|f| CoherenceSnapshot::from_frame(&f));
-                NodeState { coord, alive: slot.status == Status::Alive, coherence }
+                let verdict = self.latest_verdict.get(&coord).cloned();
+                NodeState { coord, alive: slot.status == Status::Alive, coherence, verdict }
             })
             .collect();
         FleetSnapshot::from_nodes(self.clock.as_nanos(), nodes, self.report.metrics.clone())
@@ -565,10 +571,16 @@ impl Sim {
                         Notification::Observed(_) => m.observations += 1,
                         _ => {}
                     }
-                    // Bank this node's latest coherence frame for O(1) fleet snapshots (the `m` borrow
-                    // above has ended, so this second field is free to touch).
-                    if let Notification::Observed(bytes) = &note {
-                        self.latest_observed.insert(node, bytes.clone());
+                    // Bank this node's latest coherence frame + diagnostic verdict for O(1) fleet
+                    // snapshots (the `m` borrow above has ended, so these fields are free to touch).
+                    match &note {
+                        Notification::Observed(bytes) => {
+                            self.latest_observed.insert(node, bytes.clone());
+                        }
+                        Notification::Verdict(v) => {
+                            self.latest_verdict.insert(node, v.clone());
+                        }
+                        _ => {}
                     }
                     self.log(format!("notify {} {}", fmt_coord(node), note_desc(&note)));
                     self.report.notifications.push(Observed { node, note });

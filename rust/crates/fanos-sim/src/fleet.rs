@@ -12,6 +12,7 @@
 //! [`Sim`]: crate::Sim
 //! [`Sim::fleet_snapshot`]: crate::Sim::fleet_snapshot
 
+use fanos_diakrisis::Verdict;
 use fanos_runtime::Triple;
 use fanos_telemetry::{AlarmLevel, CoherenceSnapshot, Regime};
 
@@ -27,6 +28,10 @@ pub struct NodeState {
     pub alive: bool,
     /// The node's most recent coherence snapshot, if it has published one.
     pub coherence: Option<CoherenceSnapshot>,
+    /// The node's most recent DIAKRISIS diagnostic verdict, if it has published one. Distinct from the
+    /// coherence self-model: this is the *diagnosis* (`Partition`, `Localized`, …) the reflex reached —
+    /// the signal that catches, e.g., an incipient split that plain liveness cannot.
+    pub verdict: Option<Verdict>,
 }
 
 impl NodeState {
@@ -36,8 +41,8 @@ impl NodeState {
         self.coherence.as_ref().map(|c| c.phi)
     }
 
-    /// Whether this node warrants operator attention — crashed, or reporting a fault or a non-healthy
-    /// alarm. The dashboard's "concerns" list is exactly these.
+    /// Whether this node warrants operator attention — crashed, reporting a fault or a non-healthy
+    /// alarm, or carrying a non-healthy diagnostic verdict. The dashboard's "concerns" list is these.
     #[must_use]
     pub fn is_concern(&self) -> bool {
         !self.alive
@@ -45,6 +50,14 @@ impl NodeState {
                 .coherence
                 .as_ref()
                 .is_some_and(|c| c.faulted || c.alarm != AlarmLevel::Healthy)
+            || self.verdict.as_ref().is_some_and(|v| *v != Verdict::Healthy)
+    }
+
+    /// Whether the node's diagnosis is a partition (`Verdict::Partition`, §6.5) — a systemic
+    /// Φ-fragmentation, the signal an incipient split trips even when liveness stays green.
+    #[must_use]
+    pub fn is_partitioned(&self) -> bool {
+        self.verdict.as_ref() == Some(&Verdict::Partition)
     }
 }
 
@@ -104,6 +117,11 @@ pub struct ClusterStats {
     pub faulted: usize,
     /// How many are `ready` (booted, integrated, healthy).
     pub ready: usize,
+    /// How many reached a **partition** verdict (§6.5 — systemic Φ-fragmentation; catches an incipient
+    /// split that liveness alone misses).
+    pub partitioned: usize,
+    /// How many carry any non-healthy diagnostic verdict (partitioned, localized, escalated, …).
+    pub diagnosed: usize,
     /// Mean integration Φ over reporting nodes.
     pub mean_phi: f64,
     /// Minimum Φ over reporting nodes — the worst-integrated node in the fleet.
@@ -126,6 +144,8 @@ impl Default for ClusterStats {
             reporting: 0,
             faulted: 0,
             ready: 0,
+            partitioned: 0,
+            diagnosed: 0,
             mean_phi: f64::NAN,
             min_phi: f64::NAN,
             mean_purity: f64::NAN,
@@ -149,6 +169,12 @@ impl ClusterStats {
             stats.total += 1;
             if node.alive {
                 stats.alive += 1;
+            }
+            if node.is_partitioned() {
+                stats.partitioned += 1;
+            }
+            if node.verdict.as_ref().is_some_and(|v| *v != Verdict::Healthy) {
+                stats.diagnosed += 1;
             }
             if let Some(c) = &node.coherence {
                 stats.reporting += 1;

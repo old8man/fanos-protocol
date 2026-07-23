@@ -259,7 +259,9 @@ fn render_distributions(f: &mut Frame<'_>, area: Rect, snap: &ClusterSnapshot) {
             Span::styled(format!("structure {}", s.alarms.structure), Style::default().fg(CRIT)),
         ]),
         Line::from(vec![
-            Span::styled("state    ", Style::default().fg(Color::Gray)),
+            Span::styled("diagnosis", Style::default().fg(Color::Gray)),
+            Span::styled(format!(" partitioned {}  ", s.partitioned), Style::default().fg(if s.partitioned > 0 { CRIT } else { MUTED })),
+            Span::styled(format!("diagnosed {}  ", s.diagnosed), Style::default().fg(if s.diagnosed > 0 { WARN } else { MUTED })),
             Span::styled(format!("faulted {}  ", s.faulted), Style::default().fg(if s.faulted > 0 { CRIT } else { MUTED })),
             Span::styled(format!("ready {}", s.ready), Style::default().fg(READY)),
         ]),

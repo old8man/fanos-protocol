@@ -254,6 +254,12 @@ pub struct ExperimentReport {
     pub after: ClusterStats,
     /// The most cells troubled at any single tick (the worst moment).
     pub peak_troubled_cells: usize,
+    /// The most nodes carrying any non-healthy diagnostic verdict at any single tick — the diagnosis
+    /// signal (localized faults, escalations, partitions, …), distinct from the coherence dip.
+    pub peak_diagnosed: usize,
+    /// The most nodes that reached a **partition** verdict specifically at any single tick — a systemic
+    /// (non-localizable) split registers here even while every node stays alive.
+    pub peak_partitioned: usize,
     /// The lowest fleet mean-Φ observed across the run (the deepest coherence dip; `NaN` if never reported).
     pub min_mean_phi: f64,
     /// Whether the fleet ended fully alive and healthy (recovered / never broke).
@@ -271,6 +277,8 @@ pub fn run_experiment(
     cluster.refresh_telemetry();
     let before = cluster.snapshot().totals;
     let mut peak_troubled = 0;
+    let mut peak_diagnosed = 0;
+    let mut peak_partitioned = 0;
     let mut min_phi = f64::INFINITY;
 
     for t in 0..ticks {
@@ -279,6 +287,8 @@ pub fn run_experiment(
         cluster.refresh_telemetry();
         let snap = cluster.snapshot();
         peak_troubled = peak_troubled.max(snap.troubled_cells().count());
+        peak_diagnosed = peak_diagnosed.max(snap.totals.diagnosed);
+        peak_partitioned = peak_partitioned.max(snap.totals.partitioned);
         if snap.totals.mean_phi.is_finite() {
             min_phi = min_phi.min(snap.totals.mean_phi);
         }
@@ -291,6 +301,8 @@ pub fn run_experiment(
         before,
         after,
         peak_troubled_cells: peak_troubled,
+        peak_diagnosed,
+        peak_partitioned,
         min_mean_phi: if min_phi.is_finite() { min_phi } else { f64::NAN },
         ended_healthy: after.is_healthy() && after.alive == after.total,
     }
