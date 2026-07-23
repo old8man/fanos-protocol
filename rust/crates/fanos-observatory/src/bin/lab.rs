@@ -21,6 +21,7 @@ use crossterm::terminal::{
 };
 use fanos_observatory::{ClusterDashboard, render_cluster};
 use fanos_runtime::{Config, Duration};
+use fanos_sim::stress::{Experiment, ExperimentReport, run_experiment};
 use fanos_sim::{Cluster, ClusterSnapshot};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -39,8 +40,32 @@ enum Command {
     Run(RunArgs),
     /// Watch a running cluster live in a terminal dashboard (fault/heal/inspect controls).
     Watch(WatchArgs),
+    /// Run a named stress experiment against a cluster and report the fleet's response.
+    Experiment(ExperimentArgs),
+    /// List the available stress experiments.
+    Scenarios,
     /// Check the ХОЛАРХ architecture viability gate (V1–V4, σ-panel, Ω4 ablations).
     Gate,
+}
+
+#[derive(Args)]
+struct ExperimentArgs {
+    /// Which experiment (see `fanos-lab scenarios`): mass-crash | churn | cascade.
+    name: String,
+    #[command(flatten)]
+    shape: Shape,
+    /// The experiment's intensity — crash fraction (mass-crash) or churn rate (churn); ignored by cascade.
+    #[arg(long, default_value_t = 0.1)]
+    fraction: f64,
+    /// How many perturb-and-step ticks to run.
+    #[arg(long, default_value_t = 12)]
+    ticks: usize,
+    /// Virtual milliseconds per tick.
+    #[arg(long, default_value_t = 700)]
+    step_ms: u64,
+    /// Emit the report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared cluster-shape arguments.
@@ -91,6 +116,8 @@ fn build_cluster(shape: &Shape) -> Cluster {
 fn main() {
     match Cli::parse().command {
         Command::Run(args) => cmd_run(&args),
+        Command::Experiment(args) => cmd_experiment(&args),
+        Command::Scenarios => cmd_scenarios(),
         Command::Gate => cmd_gate(),
         Command::Watch(args) => {
             if let Err(err) = cmd_watch(&args) {
@@ -99,6 +126,53 @@ fn main() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// experiment / scenarios
+// ---------------------------------------------------------------------------------------------------
+
+fn cmd_scenarios() {
+    println!("\nStress experiments (fanos-lab experiment <name>):");
+    for name in Experiment::NAMES {
+        // A representative instance just to read its one-line description.
+        if let Some(exp) = Experiment::from_name(name, 0.1, 7) {
+            println!("  {:<12} {}", name, exp.describe());
+        }
+    }
+    println!();
+}
+
+fn cmd_experiment(args: &ExperimentArgs) {
+    let mut cluster = build_cluster(&args.shape);
+    cluster.run_for(Duration::from_millis(1200)); // settle to steady state before perturbing
+    let Some(experiment) = Experiment::from_name(&args.name, args.fraction, cluster.node_count()) else {
+        eprintln!("unknown experiment '{}'. Try: {}", args.name, Experiment::NAMES.join(", "));
+        std::process::exit(2);
+    };
+    let report = run_experiment(&mut cluster, experiment, args.ticks, Duration::from_millis(args.step_ms));
+    if args.json {
+        println!("{}", experiment_json(&report));
+    } else {
+        print_experiment(&report);
+    }
+}
+
+fn print_experiment(r: &ExperimentReport) {
+    println!("\nexperiment '{}' — {} ticks", r.name, r.ticks);
+    println!("  before      {}/{} alive · {}", r.before.alive, r.before.total, if r.before.is_healthy() { "healthy" } else { "degraded" });
+    println!("  after       {}/{} alive · {}", r.after.alive, r.after.total, if r.after.is_healthy() { "healthy" } else { "degraded" });
+    println!("  peak trouble {} cell(s) at the worst moment", r.peak_troubled_cells);
+    println!("  min mean Φ   {:.3}   (deepest coherence dip)", r.min_mean_phi);
+    println!("  outcome      {}\n", if r.ended_healthy { "● recovered / never broke" } else { "● ended degraded" });
+}
+
+fn experiment_json(r: &ExperimentReport) -> String {
+    let phi = if r.min_mean_phi.is_finite() { format!("{:.6}", r.min_mean_phi) } else { "null".to_string() };
+    format!(
+        "{{\"name\":\"{}\",\"ticks\":{},\"before_alive\":{},\"after_alive\":{},\"total\":{},\"peak_troubled_cells\":{},\"min_mean_phi\":{},\"ended_healthy\":{}}}",
+        r.name, r.ticks, r.before.alive, r.after.alive, r.after.total, r.peak_troubled_cells, phi, r.ended_healthy,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------------

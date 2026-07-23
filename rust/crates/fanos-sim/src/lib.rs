@@ -31,6 +31,9 @@ mod cluster;
 mod experiment;
 mod fleet;
 mod metrics;
+/// Cluster-scale stress experiments (`stress::Experiment`), namespaced to avoid clashing with the
+/// param-sweep [`Experiment`](experiment::Experiment) harness.
+pub mod stress;
 mod network;
 mod observatory;
 mod rng;
