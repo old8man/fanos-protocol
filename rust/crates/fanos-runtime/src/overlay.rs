@@ -1686,8 +1686,9 @@ impl<F: Field> OverlayNode<F> {
             path.push(sib);
             if let Some(sib_addr) = HierAddr::from_path(path)
                 && let HierRoute::Forward(next) = self.router.route(&sib_addr)
+                && next != self.coord.coords()
             {
-                targets.push(next);
+                targets.push(next); // never escalate to ourselves
             }
         }
         let frame = encode(FrameType::CellEscalate, &[child_index as u8, residue, ttl]);
