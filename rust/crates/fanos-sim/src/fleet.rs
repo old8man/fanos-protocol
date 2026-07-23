@@ -137,6 +137,45 @@ impl Default for ClusterStats {
 }
 
 impl ClusterStats {
+    /// Roll a set of node states up into cluster statistics. Works over one cell's nodes or a whole
+    /// federation's — coordinate collisions across cells are irrelevant here (this counts, it does not
+    /// key). Coherence means are over *reporting* nodes; `NaN` when none report.
+    #[must_use]
+    pub fn from_nodes<'a>(nodes: impl IntoIterator<Item = &'a NodeState>) -> Self {
+        let mut stats = ClusterStats::default();
+        let (mut sum_phi, mut sum_p, mut sum_r) = (0.0, 0.0, 0.0);
+        let mut min_phi = f64::INFINITY;
+        for node in nodes {
+            stats.total += 1;
+            if node.alive {
+                stats.alive += 1;
+            }
+            if let Some(c) = &node.coherence {
+                stats.reporting += 1;
+                if c.faulted {
+                    stats.faulted += 1;
+                }
+                if c.ready {
+                    stats.ready += 1;
+                }
+                sum_phi += c.phi;
+                sum_p += c.purity;
+                sum_r += c.reflection;
+                min_phi = min_phi.min(c.phi);
+                stats.regimes.tally(c.regime);
+                stats.alarms.tally(c.alarm);
+            }
+        }
+        if stats.reporting > 0 {
+            let n = stats.reporting as f64;
+            stats.mean_phi = sum_phi / n;
+            stats.mean_purity = sum_p / n;
+            stats.mean_reflection = sum_r / n;
+            stats.min_phi = min_phi;
+        }
+        stats
+    }
+
     /// The fraction of the fleet that is alive (`0.0` for an empty fleet).
     #[must_use]
     pub fn alive_fraction(&self) -> f64 {
@@ -174,36 +213,7 @@ impl FleetSnapshot {
     /// synthetic node lists and reused by any future non-`Sim` fleet source.
     #[must_use]
     pub fn from_nodes(at_nanos: u64, nodes: Vec<NodeState>, metrics: Metrics) -> Self {
-        let mut stats = ClusterStats { total: nodes.len(), ..ClusterStats::default() };
-        let (mut sum_phi, mut sum_p, mut sum_r) = (0.0, 0.0, 0.0);
-        let mut min_phi = f64::INFINITY;
-        for node in &nodes {
-            if node.alive {
-                stats.alive += 1;
-            }
-            if let Some(c) = &node.coherence {
-                stats.reporting += 1;
-                if c.faulted {
-                    stats.faulted += 1;
-                }
-                if c.ready {
-                    stats.ready += 1;
-                }
-                sum_phi += c.phi;
-                sum_p += c.purity;
-                sum_r += c.reflection;
-                min_phi = min_phi.min(c.phi);
-                stats.regimes.tally(c.regime);
-                stats.alarms.tally(c.alarm);
-            }
-        }
-        if stats.reporting > 0 {
-            let n = stats.reporting as f64;
-            stats.mean_phi = sum_phi / n;
-            stats.mean_purity = sum_p / n;
-            stats.mean_reflection = sum_r / n;
-            stats.min_phi = min_phi;
-        }
+        let stats = ClusterStats::from_nodes(&nodes);
         Self { at_nanos, stats, nodes, metrics }
     }
 

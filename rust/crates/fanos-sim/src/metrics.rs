@@ -41,6 +41,29 @@ pub struct Metrics {
     pub observations: u64,
 }
 
+impl Metrics {
+    /// Add another run's counters into this one, field for field — used to total a federation of cells
+    /// into one cluster figure.
+    pub fn merge(&mut self, other: &Metrics) {
+        self.frames_sent += other.frames_sent;
+        self.frames_delivered += other.frames_delivered;
+        self.frames_dropped += other.frames_dropped;
+        self.timers_fired += other.timers_fired;
+        self.payloads_delivered += other.payloads_delivered;
+        self.peer_downs += other.peer_downs;
+        self.reroutes += other.reroutes;
+        self.repairs += other.repairs;
+        self.quarantines += other.quarantines;
+        self.escalations += other.escalations;
+        self.decouples += other.decouples;
+        self.stores += other.stores;
+        self.retrieval_hits += other.retrieval_hits;
+        self.retrieval_misses += other.retrieval_misses;
+        self.data_losses += other.data_losses;
+        self.observations += other.observations;
+    }
+}
+
 /// A notification observed from a node, tagged with the observer's coordinate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed {

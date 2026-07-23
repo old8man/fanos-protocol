@@ -323,6 +323,12 @@ impl Sim {
             .collect()
     }
 
+    /// The number of nodes (alive or crashed) in the sim.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// A whole-fleet state snapshot — every node's coordinate, liveness, and latest coherence self-model,
     /// plus the cluster rollup and the run's cumulative metrics. This is the data contract the operator
     /// dashboard and CLI read; it is a pure `O(N)` read over frames the nodes have already published (the

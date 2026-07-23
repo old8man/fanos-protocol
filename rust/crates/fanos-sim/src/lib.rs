@@ -27,6 +27,7 @@
 //! // A surviving node localizes the crash by its 3-bit syndrome.
 //! ```
 
+mod cluster;
 mod experiment;
 mod fleet;
 mod metrics;
@@ -36,6 +37,7 @@ mod rng;
 mod sim;
 mod trace;
 
+pub use cluster::{CELL_SIZE, Cluster, ClusterSnapshot};
 pub use experiment::{Experiment, Grid, Params, Row, Scenario};
 pub use fleet::{AlarmCounts, ClusterStats, FleetSnapshot, NodeState, RegimeCounts};
 pub use metrics::{Metrics, Observed, Report};
@@ -55,8 +57,17 @@ use fanos_runtime::{Config, OverlayNode, Triple};
 /// Spawn a full cell `PG(2, q)`: an [`OverlayNode`] at every point. Returns the node
 /// coordinates indexed by point index (so `cell[i]` is the node at point `i`).
 pub fn spawn_cell<F: Field + 'static>(sim: &mut Sim, config: Config) -> Vec<Triple> {
-    let mut coords = Vec::with_capacity(Plane::<F>::N as usize);
-    for point in Plane::<F>::points() {
+    spawn_partial_cell::<F>(sim, config, Plane::<F>::N as usize)
+}
+
+/// Spawn the first `size` points of a cell `PG(2, q)` (clamped to the plane size) — a *partial* cell,
+/// for modelling a cell that is still filling (the "1 node, 2 nodes, 3 nodes …" progression) or a
+/// fractional last cell in a [`Cluster`](crate::Cluster). The absent points read as down to the members
+/// present, exactly as a real under-provisioned cell would sense them.
+pub fn spawn_partial_cell<F: Field + 'static>(sim: &mut Sim, config: Config, size: usize) -> Vec<Triple> {
+    let size = size.min(Plane::<F>::N as usize);
+    let mut coords = Vec::with_capacity(size);
+    for point in Plane::<F>::points().take(size) {
         let node = OverlayNode::<F>::new(point, config);
         coords.push(sim.add(Box::new(node)));
     }
