@@ -395,6 +395,12 @@ async fn build_proxy_dialer(
     exit: Option<([u32; 3], HybridKemPublic)>,
 ) -> Result<FanosDialer<NodeResolver>, NodeError> {
     let base = if let Some(cfg) = anon {
+        // Prefer the node's LIVE beacon (audit S1-M2) so the mix directory + meeting lines track the epoch the
+        // relays have actually rotated to; fall back to the static --epoch/--beacon before the first round is
+        // adopted. Without this the proxy stays pinned at epoch 0 and its dials break after the first turn.
+        let (epoch, beacon) = node
+            .live_beacon()
+            .map_or((epoch, cfg.beacon), |(e, s)| (e, BeaconSeed::new(s)));
         let directory = build_cell_mix_directory::<F2>(&node.client(), epoch).await;
         let need = usize::from(cfg.threshold) + 1;
         if directory.len() < need {
@@ -416,7 +422,7 @@ async fn build_proxy_dialer(
             directory,
             threshold: cfg.threshold,
             epoch,
-            beacon: cfg.beacon,
+            beacon,
             depths: (cfg.fwd_depth, cfg.reply_depth),
         };
         FanosDialer::anonymous_fresh(node.client(), resolver, params)
