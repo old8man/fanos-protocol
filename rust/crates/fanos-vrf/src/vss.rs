@@ -400,53 +400,80 @@ pub fn reshare<R: RngCore + CryptoRng>(
     })
 }
 
-/// Verify a resharing contribution end to end: (1) `Dᵢ`'s constant term equals the old holder's public share
-/// `sᵢ·G` derived from the **old** commitment — binding `gᵢ(0)` to the real share, so a contributor cannot
-/// redistribute a *wrong* secret — and (2) every emitted sub-share verifies against `Dᵢ` (Feldman). A holder
-/// that only holds its own sub-share checks (1) here (`old_commitment`) and (2) via [`verify_share`] directly.
+/// Check that a resharing commitment `Dᵢ` **binds to the real old share**: its constant term equals the old
+/// holder's public share `sᵢ·G` derived from the *old* commitment. This is the public gate on the canonical
+/// contributor set — a contributor cannot redistribute a *wrong* secret (audit R-C1). Every node (anchor or
+/// consumer) applies it identically to the flooded `Dᵢ`, so all agree on the valid contributors.
+#[must_use]
+pub fn verify_reshare_commit(
+    old_index: u8,
+    commit: &VssCommitment,
+    old_commitment: &VssCommitment,
+) -> bool {
+    commit.commitment_point() == old_commitment.public_share(old_index)
+}
+
+/// Verify a resharing contribution end to end: (1) [`verify_reshare_commit`] binds `gᵢ(0)` to the real old
+/// share, and (2) every emitted sub-share verifies against `Dᵢ` (Feldman). Used where the whole dealing is in
+/// hand (the dealer, a test); a receiver that holds only its own sub-share checks (1) via
+/// [`verify_reshare_commit`] and (2) via [`verify_share`] directly.
 #[must_use]
 pub fn verify_reshare(dealing: &ReshareDealing, old_commitment: &VssCommitment) -> bool {
-    dealing.commitment.commitment_point() == old_commitment.public_share(dealing.old_index)
+    verify_reshare_commit(dealing.old_index, &dealing.commitment, old_commitment)
         && dealing
             .subshares
             .iter()
             .all(|s| verify_share(s, &dealing.commitment))
 }
 
-/// Combine `≥ t` **validated** resharing contributions into new holder `new_index`'s share of the
-/// redistributed secret, and (identically, from public data) the new group commitment.
+/// Combine the flooded **public** commitments `Dᵢ` of a canonical contributor set into the redistributed
+/// group commitment `C' = Σᵢ λᵢ(0)·Dᵢ`. Derivable by **any** node from public data, so every node — anchor or
+/// pure consumer — agrees on the new commitment. Contributions are `(old_index, Dᵢ)`.
 ///
-/// With `f'(x) = Σᵢ λᵢ(0)·gᵢ(x)` over the contributors' old indices, the new share is `f'(new_index)` and the
-/// new commitment is `Σᵢ λᵢ(0)·Dᵢ`. Because `Σᵢ λᵢ(0)·sᵢ = f(0)` (Lagrange interpolation of the *old* sharing
-/// at 0), the redistributed secret and the group key `C'₀ = f(0)·G` are **unchanged** — so a partial from the
-/// new share verifies against the new commitment and the beacon output is continuous across the reshare.
-///
-/// **Precondition:** the `dealings` must come from `≥` the old threshold `t` **distinct** old holders (else
-/// the interpolation does not recover `f(0)`), and every new holder must combine the **same** canonical
-/// contributor set (so all new shares lie on one `f'`). Returns `None` if the set is empty, has a duplicate
-/// old index, mixes commitment degrees, or is missing a sub-share for `new_index`.
+/// Because `C'₀ = Σᵢ λᵢ(0)·sᵢ·G = f(0)·G` (Lagrange interpolation of the *old* sharing at 0), the group key is
+/// **unchanged** — future partials against `C'` are the identical DVRF value. `None` if the set is empty, has
+/// a duplicate old index, or mixes commitment degrees.
 #[must_use]
-pub fn combine_reshares(
-    new_index: u8,
-    dealings: &[ReshareDealing],
-) -> Option<(VssShare, VssCommitment)> {
-    let old_indices: Vec<u8> = dealings.iter().map(|d| d.old_index).collect();
+pub fn combine_reshare_commitment(
+    contributions: &[(u8, &VssCommitment)],
+) -> Option<VssCommitment> {
+    let old_indices: Vec<u8> = contributions.iter().map(|&(i, _)| i).collect();
     let lambdas = lagrange_coeffs_at_zero(&old_indices)?;
-    let new_threshold = dealings.first()?.commitment.coeffs.len();
-    let mut value = Scalar::ZERO;
+    let new_threshold = contributions.first()?.1.coeffs.len();
     let mut coeffs = Vec::with_capacity(new_threshold);
     coeffs.resize(new_threshold, RistrettoPoint::identity());
-    for (d, &lambda) in dealings.iter().zip(&lambdas) {
-        if d.commitment.coeffs.len() != new_threshold {
+    for (&(_, d), &lambda) in contributions.iter().zip(&lambdas) {
+        if d.coeffs.len() != new_threshold {
             return None; // all contributions must reshare at the same new threshold
         }
-        let sub = d.subshare_for(new_index)?;
-        value += lambda * sub.value;
-        for (acc, c) in coeffs.iter_mut().zip(&d.commitment.coeffs) {
+        for (acc, c) in coeffs.iter_mut().zip(&d.coeffs) {
             *acc += lambda * c;
         }
     }
-    Some((VssShare { index: new_index, value }, VssCommitment { coeffs }))
+    Some(VssCommitment { coeffs })
+}
+
+/// Combine the **private** sub-shares `gᵢ(j)` new holder `new_index` received from the *same* canonical
+/// contributor set into its share `s'ⱼ = Σᵢ λᵢ(0)·gᵢ(j)` of the redistributed secret. Contributions are
+/// `(old_index, gᵢ(j))` and the old-index set **must** match [`combine_reshare_commitment`]'s exactly, so the
+/// share lies on the `f'` that commitment commits to. `None` if empty or an old index repeats.
+///
+/// **Precondition:** `≥` the old threshold `t` **distinct** old holders (else the interpolation does not
+/// recover `f(0)`). The resulting share verifies against the combined commitment iff every sub-share was
+/// Feldman-valid — the caller must have checked each with [`verify_share`] first.
+#[must_use]
+pub fn combine_reshare_share(
+    new_index: u8,
+    contributions: &[(u8, &VssShare)],
+) -> Option<VssShare> {
+    let old_indices: Vec<u8> = contributions.iter().map(|&(i, _)| i).collect();
+    let lambdas = lagrange_coeffs_at_zero(&old_indices)?;
+    let value: Scalar = contributions
+        .iter()
+        .zip(&lambdas)
+        .map(|(&(_, s), &lambda)| lambda * s.value)
+        .sum();
+    Some(VssShare { index: new_index, value })
 }
 
 #[cfg(test)]
@@ -556,25 +583,33 @@ mod tests {
         // Every contribution verifies against the OLD commitment (its g_i(0) is the real old share s_i).
         assert!(dealings.iter().all(|d| verify_reshare(d, &old_c)));
 
-        // Each new holder combines the canonical quorum into its new share and the (public) new commitment.
-        let new: Vec<(VssShare, VssCommitment)> = new_indices
-            .iter()
-            .map(|&j| combine_reshares(j, &dealings).unwrap())
-            .collect();
+        // The new group commitment is derived ONCE from the public D_i — identical for every node — and its
+        // constant term is the UNCHANGED group key.
+        let commit_contribs: Vec<(u8, &VssCommitment)> =
+            dealings.iter().map(|d| (d.old_index(), d.commitment())).collect();
+        let new_c = combine_reshare_commitment(&commit_contribs).unwrap();
+        assert_eq!(new_c.commitment_point(), group_key, "the redistribution preserves the group key");
 
-        // The new commitment is identical for every holder, and its constant term is the UNCHANGED group key.
-        let c0 = new[0].1.to_bytes();
-        for (s, c) in &new {
-            assert_eq!(c.to_bytes(), c0, "all new holders derive one shared new commitment");
-            assert_eq!(c.commitment_point(), group_key, "the redistribution preserves the group key");
-            assert!(verify_share(s, c), "each new share verifies against the new commitment");
+        // Each new holder combines its own sub-shares of the same canonical set into its new share.
+        let new_shares: Vec<VssShare> = new_indices
+            .iter()
+            .map(|&j| {
+                let share_contribs: Vec<(u8, &VssShare)> = dealings
+                    .iter()
+                    .map(|d| (d.old_index(), d.subshare_for(j).unwrap()))
+                    .collect();
+                combine_reshare_share(j, &share_contribs).unwrap()
+            })
+            .collect();
+        for s in &new_shares {
+            assert!(verify_share(s, &new_c), "each new share verifies against the new commitment");
         }
 
         // Any t' = 3 of the new shares reconstruct the ORIGINAL secret — continuity end to end.
-        let picked: Vec<VssShare> = new.iter().take(3).map(|(s, _)| s.clone()).collect();
+        let picked: Vec<VssShare> = new_shares.iter().take(3).cloned().collect();
         assert_eq!(reconstruct(&picked), Some(expected), "the redistributed secret is the original");
         // Two are not enough (the new threshold really is 3).
-        let two: Vec<VssShare> = new.iter().take(2).map(|(s, _)| s.clone()).collect();
+        let two: Vec<VssShare> = new_shares.iter().take(2).cloned().collect();
         assert_ne!(reconstruct(&two), Some(expected));
     }
 

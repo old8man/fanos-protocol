@@ -614,7 +614,9 @@ mod tests {
         // The R-C1 recovery property: when a depleted anchor set is reconstituted by verifiable secret
         // redistribution, the DVRF *output* is unchanged, so the epoch clock and every seed folded from it
         // continue without a hiccup — no re-DKG, no seed discontinuity, no downstream re-derivation.
-        use crate::vss::{ReshareDealing, combine_reshares, reshare, verify_reshare};
+        use crate::vss::{
+            ReshareDealing, combine_reshare_commitment, combine_reshare_share, reshare, verify_reshare,
+        };
 
         // Original 4-of-7 anchor sharing; the epoch's beacon output is x·M(epoch).
         let (old_shares, old_c, _) = shared(b"beacon-reshare", 4, 7);
@@ -638,15 +640,25 @@ mod tests {
             .map(|s| reshare(s, 3, &new_indices, &mut DeterministicRng::new(&[s.index()])).unwrap())
             .collect();
         assert!(dealings.iter().all(|d| verify_reshare(d, &old_c)));
-        let new: Vec<(VssShare, VssCommitment)> = new_indices
+
+        // Every node derives the new commitment from the public D_i; each new holder derives its share.
+        let commit_contribs: Vec<(u8, &VssCommitment)> =
+            dealings.iter().map(|d| (d.old_index(), d.commitment())).collect();
+        let new_c = combine_reshare_commitment(&commit_contribs).unwrap();
+        let new_shares: Vec<VssShare> = new_indices
             .iter()
-            .map(|&j| combine_reshares(j, &dealings).unwrap())
+            .map(|&j| {
+                let share_contribs: Vec<(u8, &VssShare)> = dealings
+                    .iter()
+                    .map(|d| (d.old_index(), d.subshare_for(j).unwrap()))
+                    .collect();
+                combine_reshare_share(j, &share_contribs).unwrap()
+            })
             .collect();
-        let new_c = new[0].1.clone();
 
         // The NEW anchors' partials verify against the NEW commitment, and any t' = 3 of them combine to the
         // IDENTICAL beacon seed — the group key and the DVRF value are literally unchanged.
-        let new_partials: Vec<_> = new.iter().map(|(s, _)| partial_eval(s, epoch)).collect();
+        let new_partials: Vec<_> = new_shares.iter().map(|s| partial_eval(s, epoch)).collect();
         assert!(new_partials.iter().all(|p| verify_partial(p, epoch, &new_c)));
         assert_eq!(
             combine(&new_partials, 3).unwrap().seed(epoch),
