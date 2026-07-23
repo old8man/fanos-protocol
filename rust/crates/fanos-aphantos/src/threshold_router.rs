@@ -113,6 +113,13 @@ pub struct ThresholdRouter<F: Field> {
     /// adversary counting cells on the Full profile sees no signal. Bounded by [`MAX_OUTBOX`]
     /// (drop-oldest) so a flood cannot grow it. Empty in the cover-off path, where forwards leave at once.
     outbox: VecDeque<(Triple, Vec<u8>)>,
+    /// The intended circuit (`hop lines`, build `seed`) when this router **owns the endpoint** of a
+    /// circuit it agreed on — a rendezvous loopback or a reply circuit it built. Set, it verifies the
+    /// delivered path-authenticator (holonomy) and drops a payload that arrived over a different circuit
+    /// (spec §5.4, S1-M1). `None` on a transit relay, which never knows the circuit and cannot verify.
+    /// The build seed is a secret trapdoor: it is retained here **only** by the circuit's own owner, for
+    /// its own loopback check — a deliberate, scoped exception to immediate seed zeroization.
+    delivery_check: Option<(Vec<Triple>, Vec<u8>)>,
 }
 
 /// Bound on the constant-rate [`outbox`](ThresholdRouter::outbox): real forwards queued for a send slot.
@@ -154,6 +161,7 @@ impl<F: Field> ThresholdRouter<F> {
             covering: false,
             cover_seq: 0,
             outbox: VecDeque::new(),
+            delivery_check: None,
         }
     }
 
@@ -175,6 +183,17 @@ impl<F: Field> ThresholdRouter<F> {
     #[must_use]
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
         self.gather_timeout = timeout;
+        self
+    }
+
+    /// Bind this router to the endpoint of a circuit it owns (a rendezvous loopback or a reply circuit
+    /// it built): on delivery it recomputes the path-authenticator over `hop_lines` + `seed` and drops a
+    /// payload whose holonomy does not match — the live wiring of [`threshold::verify_delivery`] onto the
+    /// peel path (spec §5.4, S1-M1). A transit relay leaves this unset and delivers unverified, exactly as
+    /// [`crate::sealed`]'s relay path does — only the circuit owner can (and does) verify.
+    #[must_use]
+    pub fn with_delivery_check(mut self, hop_lines: Vec<Triple>, seed: Vec<u8>) -> Self {
+        self.delivery_check = Some((hop_lines, seed));
         self
     }
 
@@ -437,7 +456,15 @@ impl<F: Field> ThresholdRouter<F> {
         let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
         self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
         Some(match peel {
-            ThresholdPeel::Deliver { payload } => {
+            ThresholdPeel::Deliver { payload, holonomy } => {
+                // If we own this circuit's endpoint, verify the path-authenticator and drop a delivery
+                // that traversed a different circuit than agreed (spec §5.4, S1-M1). A transit relay has
+                // no `delivery_check` and delivers unverified — it cannot know the circuit.
+                if let Some((lines, seed)) = &self.delivery_check
+                    && threshold::verify_delivery(lines, seed, holonomy).is_err()
+                {
+                    return Some(Vec::new());
+                }
                 alloc::vec![Effect::Notify(Notification::Delivered {
                     from: ANONYMOUS,
                     payload,
@@ -867,6 +894,66 @@ mod tests {
         assert!(
             has_delivery(&e2, payload),
             "the honest share completes the hop despite the forged one"
+        );
+    }
+
+    #[test]
+    fn a_circuit_owning_endpoint_drops_a_delivery_that_fails_the_holonomy_check() {
+        // The live wiring of S1-M1: a router that owns a circuit's endpoint verifies the delivered
+        // path-authenticator on the peel path and drops a payload that reached it over a different
+        // circuit than agreed — while a transit relay (no `delivery_check`) delivers unverified.
+        let line_coord = Line::<F2>::at(1).coords();
+        let members = ThresholdRouter::<F2>::line_members(line_coord);
+        let t = 2usize;
+        let onion_seed = |i: u8| {
+            let mut s = [0x5Au8; 32];
+            s[31] = i;
+            s
+        };
+        let m0 = OnionKeyRatchet::new(onion_seed(0), Epoch::ZERO);
+        let m1 = OnionKeyRatchet::new(onion_seed(1), Epoch::ZERO);
+        let m2 = OnionKeyRatchet::new(onion_seed(2), Epoch::ZERO);
+        let pubs = [m0.public(), m1.public(), m2.public()];
+        let hop = HopLine { line: line_coord, members: &pubs };
+        let payload = b"anon-payload";
+        let seed = b"seed-router";
+        let onion = seal_onion(&[hop], t as u8, payload, seed).unwrap();
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let (identity0, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"identity-0"));
+
+        // Drive a fresh router (optionally given a delivery check) to the delivery hop, and report
+        // whether it emitted a Delivered. The combiner seeds its own share on the onion frame, then
+        // member 1's honest partial reaches t = 2 and the hop peels.
+        let deliver_with = |check: Option<(Vec<Triple>, Vec<u8>)>| -> bool {
+            let mut router = ThresholdRouter::<F2>::new(combiner, &identity0, t, onion_seed(0));
+            if let Some((lines, s)) = check {
+                router = router.with_delivery_check(lines, s);
+            }
+            router.step(
+                Instant(0),
+                Input::Message { from: [9, 9, 9], frame: launch_frame(line_coord, &onion) },
+            );
+            let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
+            let e = router.step(
+                Instant(1),
+                Input::Message { from: members[1], frame: encode_rep(0, &honest1) },
+            );
+            has_delivery(&e, payload)
+        };
+
+        assert!(deliver_with(None), "a transit relay delivers unverified (it cannot know the circuit)");
+        assert!(
+            deliver_with(Some((alloc::vec![line_coord], seed.to_vec()))),
+            "the endpoint accepts a delivery over the true agreed circuit"
+        );
+        let wrong_line = Line::<F2>::at(2).coords();
+        assert!(
+            !deliver_with(Some((alloc::vec![wrong_line], seed.to_vec()))),
+            "a delivery whose path does not match the agreed circuit is dropped (HolonomyFail)"
+        );
+        assert!(
+            !deliver_with(Some((alloc::vec![line_coord], b"wrong-seed".to_vec()))),
+            "a delivery under a different build seed is dropped — the holoseed is secret"
         );
     }
 

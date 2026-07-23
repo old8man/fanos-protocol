@@ -56,6 +56,9 @@ pub enum ThresholdError {
     /// The hybrid KEM's X25519 leg produced a non-contributory (low-order-point) shared secret —
     /// a malformed or malicious member key (audit B5, defense-in-depth per X-Wing guidance).
     NonContributory,
+    /// The delivered path-authenticator (holonomy) did not match the circuit the verifier expected —
+    /// the payload reached the endpoint over a different circuit than was agreed (spec §5.4, S1-M1).
+    HolonomyFail,
 }
 
 impl core::fmt::Display for ThresholdError {
@@ -67,6 +70,7 @@ impl core::fmt::Display for ThresholdError {
             Self::Kem => "KEM ciphertext failed to parse",
             Self::TooLong => "threshold onion exceeds the fixed length bucket",
             Self::NonContributory => "hybrid KEM X25519 leg was non-contributory (low-order key)",
+            Self::HolonomyFail => "delivered path-authenticator did not match the expected circuit",
         })
     }
 }
@@ -272,6 +276,56 @@ impl ThresholdSealed {
 const CMD_DELIVER: u8 = 0;
 const CMD_NEXT: u8 = 1;
 
+/// The length of the path-authenticator (holonomy) tag carried in a delivery (spec §5.4).
+pub const HOLONOMY_LEN: usize = 32;
+
+/// The domain label deriving the holonomy seed from the onion build seed. The holoseed is a *secret*
+/// (a one-way image of the build seed), so only the sender can seal a tag that verifies against the
+/// agreed circuit — an adversary who lacks the seed cannot forge a matching delivery.
+const HOLOSEED_LABEL: &str = "FANOS-v1/threshold-holoseed";
+
+/// The **holonomy** of a threshold circuit — a length-bound keyed MAC over its ordered hop *lines*.
+///
+/// Where [`crate::sealed`] authenticates a circuit of point-relays, the threshold onion's unit is a
+/// *line*, so the authenticator ratchets over the ordered hop-line coordinates (`fanos_nyx::Ratchet`,
+/// the same one-way cascade + length-binding finalization) and any inserted, substituted, reordered, or
+/// truncated hop moves the cascade and breaks the tag. The holoseed is the ratchet's secret prefix, so
+/// this is a keyed authenticator, not a public checksum — see [`HOLOSEED_LABEL`] (spec §5.4).
+#[must_use]
+pub fn circuit_line_holonomy(hop_lines: &[fanos_geometry::Triple], holoseed: &[u8; HOLONOMY_LEN]) -> [u8; HOLONOMY_LEN] {
+    let mut ratchet = fanos_nyx::ratchet::Ratchet::new(holoseed);
+    for line in hop_lines {
+        ratchet.advance(&fanos_geometry::encode_triple(*line));
+    }
+    // Length-binding finalization folds in the hop count, so a truncated/extended path is caught even if
+    // the surviving prefix matches (mirrors `fanos_nyx::circuit_holonomy`).
+    ratchet.finalize(u32::try_from(hop_lines.len()).unwrap_or(u32::MAX))
+}
+
+/// Verify a delivered `claimed` holonomy against the circuit + build `seed` the verifier legitimately
+/// knows (it built the onion, or agreed the circuit end-to-end in a rendezvous). Returns
+/// [`ThresholdError::HolonomyFail`] if the payload was delivered over a different circuit than agreed.
+///
+/// Like [`crate::sealed::verify_delivery`], this is meaningful **only** for a verifier that already
+/// holds the intended circuit + seed: a transit relay never does (and cannot verify), so it is the
+/// circuit-owning endpoint — e.g. a [`ThresholdRouter`](crate::ThresholdRouter) built with
+/// `with_delivery_check` — that performs the check (spec §5.4, S1-M1).
+///
+/// # Errors
+/// [`ThresholdError::HolonomyFail`] if the recomputed holonomy does not match `claimed`.
+pub fn verify_delivery(
+    hop_lines: &[fanos_geometry::Triple],
+    seed: &[u8],
+    claimed: [u8; HOLONOMY_LEN],
+) -> Result<(), ThresholdError> {
+    let holoseed = hash_labeled(HOLOSEED_LABEL, seed);
+    if circuit_line_holonomy(hop_lines, &holoseed) == claimed {
+        Ok(())
+    } else {
+        Err(ThresholdError::HolonomyFail)
+    }
+}
+
 /// One hop of a threshold circuit: the hop line's coordinate (where the packet is routed) and the
 /// KEM public keys of its `q+1` members, in member order.
 pub struct HopLine<'a> {
@@ -295,6 +349,10 @@ pub enum ThresholdPeel {
     Deliver {
         /// The delivered payload.
         payload: Vec<u8>,
+        /// The path-authenticator (holonomy) the sender sealed over the intended circuit. A verifier
+        /// that shares the agreed circuit + build seed confirms it via [`verify_delivery`]; a payload
+        /// delivered over a different circuit carries a different tag (spec §5.4, S1-M1).
+        holonomy: [u8; HOLONOMY_LEN],
     },
 }
 
@@ -312,13 +370,19 @@ pub fn seal_onion(
     if hops.is_empty() {
         return Err(ThresholdError::Malformed);
     }
+    // The path-authenticator over the intended hop-line circuit, sealed into the innermost delivery layer
+    // so the endpoint can confirm the payload traversed exactly the agreed circuit (spec §5.4, S1-M1).
+    let hop_lines: Vec<fanos_geometry::Triple> = hops.iter().map(|h| h.line).collect();
+    let holoseed = hash_labeled(HOLOSEED_LABEL, seed);
+    let holonomy = circuit_line_holonomy(&hop_lines, &holoseed);
     let mut inner = payload.to_vec();
     let last = hops.len() - 1;
     for (k, hop) in hops.iter().enumerate().rev() {
         // Routing command: forward to the next line, or deliver.
-        let mut cmd = Vec::with_capacity(1 + 12 + inner.len());
+        let mut cmd = Vec::with_capacity(1 + HOLONOMY_LEN + 12 + inner.len());
         if k == last {
             cmd.push(CMD_DELIVER);
+            cmd.extend_from_slice(&holonomy);
         } else if let Some(next) = hops.get(k + 1) {
             cmd.push(CMD_NEXT);
             cmd.extend_from_slice(&fanos_geometry::encode_triple(next.line));
@@ -400,9 +464,13 @@ fn peel_command(
     let cmd = sealed.open(shares)?;
     let (&tag, rest) = cmd.split_first().ok_or(ThresholdError::Malformed)?;
     match tag {
-        CMD_DELIVER => Ok(ThresholdPeel::Deliver {
-            payload: rest.to_vec(),
-        }),
+        CMD_DELIVER => {
+            let holonomy_bytes = rest.get(..HOLONOMY_LEN).ok_or(ThresholdError::Malformed)?;
+            let mut holonomy = [0u8; HOLONOMY_LEN];
+            holonomy.copy_from_slice(holonomy_bytes);
+            let payload = rest.get(HOLONOMY_LEN..).ok_or(ThresholdError::Malformed)?.to_vec();
+            Ok(ThresholdPeel::Deliver { payload, holonomy })
+        }
         CMD_NEXT => {
             let next =
                 fanos_geometry::decode_triple(rest.get(..12).ok_or(ThresholdError::Malformed)?)
@@ -466,7 +534,7 @@ mod tests {
             .collect();
         // A combiner with those t partials peels the hop.
         match peel_onion_with_shares(&onion, &partials).unwrap() {
-            ThresholdPeel::Deliver { payload } => assert_eq!(payload, b"deliver me"),
+            ThresholdPeel::Deliver { payload, .. } => assert_eq!(payload, b"deliver me"),
             ThresholdPeel::Forward { .. } => panic!("single hop should deliver"),
         }
         // A member decapsulating the wrong slot gets nothing (index 0 with member 2's secret).
@@ -564,8 +632,108 @@ mod tests {
                         "each hop stays constant-size"
                     );
                 }
-                ThresholdPeel::Deliver { payload: got } => {
+                ThresholdPeel::Deliver { payload: got, .. } => {
                     assert_eq!(got, payload, "the payload arrives intact");
+                    return;
+                }
+            }
+        }
+        panic!("onion never delivered");
+    }
+
+    /// Assemble a 3-hop threshold circuit's hop lines + member keypairs from a seed base.
+    fn holo_circuit(base: u8) -> (Vec<Vec<(HybridKemSecret, HybridKemPublic)>>, Vec<fanos_geometry::Triple>) {
+        use fanos_geometry::Point;
+        let lines: Vec<Vec<(HybridKemSecret, HybridKemPublic)>> =
+            (0..3).map(|h| line(5, base + h as u8)).collect();
+        let hop_lines: Vec<fanos_geometry::Triple> =
+            (0..3).map(|h| Point::<fanos_field::F2>::at(h).coords()).collect();
+        (lines, hop_lines)
+    }
+
+    #[test]
+    fn the_delivered_holonomy_authenticates_the_intended_circuit() {
+        let t = 3u8;
+        let (lines, hop_lines) = holo_circuit(70);
+        let pubs: Vec<Vec<&HybridKemPublic>> =
+            lines.iter().map(|kps| kps.iter().map(|(_, p)| p).collect()).collect();
+        let hops: Vec<HopLine<'_>> = pubs
+            .iter()
+            .enumerate()
+            .map(|(h, members)| HopLine { line: hop_lines[h], members })
+            .collect();
+
+        let seed = b"circuit-seed-holo";
+        let mut onion = seal_onion(&hops, t, b"payload", seed).unwrap();
+
+        // Route to the delivery hop and capture the holonomy the endpoint learns.
+        let mut delivered = None;
+        for kps in &lines {
+            let members: Vec<(usize, &HybridKemSecret)> = kps
+                .iter()
+                .take(usize::from(t))
+                .enumerate()
+                .map(|(i, (sk, _))| (i, sk))
+                .collect();
+            match peel_onion(&onion, &members).unwrap() {
+                ThresholdPeel::Forward { onion: inner, .. } => onion = pad_onion(&inner).unwrap(),
+                ThresholdPeel::Deliver { holonomy, .. } => {
+                    delivered = Some(holonomy);
+                    break;
+                }
+            }
+        }
+        let holonomy = delivered.unwrap();
+
+        // The endpoint that agreed the circuit + seed accepts it.
+        assert!(verify_delivery(&hop_lines, seed, holonomy).is_ok());
+        // A substituted hop line is rejected — the authenticator caught the tamper (S1-M1).
+        let mut substituted = hop_lines.clone();
+        substituted[1] = fanos_geometry::Point::<fanos_field::F2>::at(4).coords();
+        assert_eq!(verify_delivery(&substituted, seed, holonomy), Err(ThresholdError::HolonomyFail));
+        // A reordered path is rejected (the ratchet is order-sensitive).
+        let reordered = alloc::vec![hop_lines[1], hop_lines[0], hop_lines[2]];
+        assert_eq!(verify_delivery(&reordered, seed, holonomy), Err(ThresholdError::HolonomyFail));
+        // A truncated path is rejected (length-binding finalization).
+        assert_eq!(verify_delivery(&hop_lines[..2], seed, holonomy), Err(ThresholdError::HolonomyFail));
+        // The wrong build seed is rejected — the holoseed is secret, so a forger cannot match it.
+        assert_eq!(verify_delivery(&hop_lines, b"wrong-seed", holonomy), Err(ThresholdError::HolonomyFail));
+    }
+
+    #[test]
+    fn the_holonomy_is_sealed_until_delivery_not_a_cleartext_correlator() {
+        let t = 3u8;
+        let (lines, hop_lines) = holo_circuit(80);
+        let pubs: Vec<Vec<&HybridKemPublic>> =
+            lines.iter().map(|kps| kps.iter().map(|(_, p)| p).collect()).collect();
+        let hops: Vec<HopLine<'_>> = pubs
+            .iter()
+            .enumerate()
+            .map(|(h, members)| HopLine { line: hop_lines[h], members })
+            .collect();
+
+        let seed = b"seed";
+        let tag = circuit_line_holonomy(&hop_lines, &hash_labeled(HOLOSEED_LABEL, seed));
+        let mut onion = seal_onion(&hops, t, b"payload", seed).unwrap();
+
+        // At every hop the *wire* onion is fully sealed: the holonomy tag never appears in the clear in a
+        // forwarded packet — it rides encrypted in the innermost layer, revealed only when the last hop
+        // peels. A passive on-path relay therefore cannot use it as a cross-hop correlator.
+        for (hop, kps) in lines.iter().enumerate() {
+            assert!(
+                !onion.windows(HOLONOMY_LEN).any(|w| w == tag),
+                "holonomy tag leaked in cleartext at hop {hop}"
+            );
+            let members: Vec<(usize, &HybridKemSecret)> = kps
+                .iter()
+                .take(usize::from(t))
+                .enumerate()
+                .map(|(i, (sk, _))| (i, sk))
+                .collect();
+            match peel_onion(&onion, &members).unwrap() {
+                ThresholdPeel::Forward { onion: inner, .. } => onion = pad_onion(&inner).unwrap(),
+                ThresholdPeel::Deliver { holonomy, .. } => {
+                    assert_eq!(holonomy, tag, "the delivered tag is the sealed authenticator");
                     return;
                 }
             }
