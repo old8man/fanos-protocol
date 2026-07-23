@@ -18,10 +18,13 @@
 
 use fanos_geometry::fano;
 use fanos_primitives::{BeaconSeed, Epoch, hash_labeled};
+use fanos_vrf::pqvrf::{self, MerkleProof, VrfOutput};
 
 const LEADER_LINE_LABEL: &str = "FANOS-v1/taxis-leader-line";
 const LEADER_MEMBER_LABEL: &str = "FANOS-v1/taxis-leader-member";
 const SEAL_LINE_LABEL: &str = "FANOS-v1/taxis-seal-line";
+/// Domain separation for the secret-leader sortition ticket (SSLE, spec §10.1).
+const LEADER_TICKET_LABEL: &str = "FANOS-v1/taxis-leader-ticket";
 
 /// The per-`(height, round)` election preimage: `SEED ‖ height ‖ round`. One source of truth so the leader
 /// line and the leader member derive from the same bytes.
@@ -104,6 +107,76 @@ pub fn cross_shard_bridge(line_a: usize, line_b: usize) -> Option<usize> {
     let a = line_members(line_a);
     let b = line_members(line_b);
     a.into_iter().find(|p| b.contains(p))
+}
+
+// ===========================================================================================
+// Secret-leader sortition (SSLE) — the min-ticket over the elected line (spec §10.1).
+//
+// The elected [`leader_line`] is PUBLIC (beacon-derived), so an adversary knows the `q + 1`
+// candidate proposers. What it must NOT know until a member proposes is *which* member leads —
+// otherwise it can pre-aim a DoS/bribe at the single upcoming proposer (the Heimbach et al.
+// USENIX'25 deanonymization attack, whose fix at the consensus layer is exactly this). The
+// derived-native answer (converged across three independent SSLE audits): every line member
+// draws a **post-quantum VRF ticket**; all propose; the LOWEST ticket leads; a member reveals
+// its VRF witness with its proposal, and replicas prepare the lowest verified ticket seen.
+//
+// The ticket MUST be a full-uniqueness VRF (RFC 9381) — here FANOS's Merkle-VRF (`pqvrf`, an
+// iVRF whose output is Merkle-committed and therefore unique). It is emphatically NOT a hash of
+// an ML-DSA signature: ML-DSA is Fiat-Shamir-with-aborts, so a signer can mint many valid
+// signatures per message and GRIND the argmin — full rigging, not mere bias.
+//
+// Safety is untouched: leader selection lives entirely in the pacemaker (cf. HotStuff's theorem
+// that safety holds under an adversarial Pacemaker). Ties/splits/withheld tickets can only waste
+// a view; round ≥ 1 falls back to the public deterministic [`leader`]. See `docs/design-taxis.md`.
+// ===========================================================================================
+
+/// Whether `member` sits on the **proposer line** elected for `(height, round)` — the public
+/// `q + 1`-member committee that runs the secret-leader sortition. Membership is beacon-derived
+/// (public); *which* member leads is secret until it proposes.
+#[must_use]
+pub fn is_line_member(seed: &BeaconSeed, height: u64, round: u32, member: usize) -> bool {
+    line_members(leader_line(seed, height, round)).contains(&member)
+}
+
+/// A line member's **secret-leader sortition ticket** for `(height, round)`:
+/// `H(vrf_output ‖ SEED ‖ height ‖ round)`, where `vrf_output` is the member's post-quantum
+/// Merkle-VRF value at index `height`. **Lowest ticket leads.**
+///
+/// Folding the unbiasable epoch beacon `seed` makes the ticket unpredictable before the beacon is
+/// revealed (anti-grinding); folding `round` re-randomizes the order each view so a round change
+/// re-sortitions among the *same* line without a fresh VRF evaluation. Because `vrf_output` is
+/// Merkle-committed it is **unique** (RFC 9381 full uniqueness) — a Byzantine member cannot grind
+/// it, unlike a hash of a (non-unique) lattice signature.
+#[must_use]
+pub fn leader_ticket(vrf_output: &VrfOutput, seed: &BeaconSeed, height: u64, round: u32) -> [u8; 32] {
+    let mut buf = [0u8; 32 + 32 + 8 + 4];
+    buf[..32].copy_from_slice(vrf_output);
+    buf[32..64].copy_from_slice(seed.as_bytes());
+    buf[64..72].copy_from_slice(&height.to_be_bytes());
+    buf[72..].copy_from_slice(&round.to_be_bytes());
+    hash_labeled(LEADER_TICKET_LABEL, &buf)
+}
+
+/// Verify a proposer's ticket **witness** and return its ticket value, or `None` if the witness is
+/// invalid. The proposer presents its Merkle-VRF `output` + `proof` at index `height`, checked
+/// against its pre-registered `root` (`vrf_height` = the registered tree height). Only a verified
+/// witness yields a ticket, so a min-over-verified-proposals comparison admits no forged or
+/// grindable ticket. The Merkle-VRF index is the block `height` (the sortition domain is per
+/// registration; the registrar sizes `vrf_height` to cover the heights it serves).
+#[must_use]
+pub fn verify_leader_ticket(
+    root: &[u8; 32],
+    vrf_height: u32,
+    seed: &BeaconSeed,
+    height: u64,
+    round: u32,
+    vrf_output: &VrfOutput,
+    proof: &MerkleProof,
+) -> Option<[u8; 32]> {
+    if !pqvrf::verify(root, vrf_height, height, vrf_output, proof) {
+        return None;
+    }
+    Some(leader_ticket(vrf_output, seed, height, round))
 }
 
 #[cfg(test)]
@@ -196,5 +269,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Secret-leader sortition (SSLE) -----------------------------------------------------
+
+    #[test]
+    fn a_line_member_is_recognized_and_the_fallback_leader_is_always_one() {
+        for height in 0..12u64 {
+            for round in 0..3u32 {
+                let members = line_members(leader_line(&SEED, height, round));
+                for m in 0..fano::N {
+                    assert_eq!(is_line_member(&SEED, height, round, m), members.contains(&m));
+                }
+                // The round ≥ 1 public fallback proposer is always drawn from the same line.
+                assert!(is_line_member(&SEED, height, round, leader(&SEED, height, round)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_ticket_witness_verifies_against_the_registered_root_and_yields_the_ticket() {
+        let vrf_height = 6u32;
+        let secret = pqvrf::MerkleVrfSecret::generate(&[3u8; 32], vrf_height).unwrap();
+        let root = secret.root();
+        let (height, round) = (5u64, 0u32);
+        let (output, proof) = secret.prove(height).unwrap();
+        // A valid witness yields exactly the direct ticket value.
+        assert_eq!(
+            verify_leader_ticket(&root, vrf_height, &SEED, height, round, &output, &proof),
+            Some(leader_ticket(&output, &SEED, height, round)),
+        );
+        // A wrong registered root rejects (can't borrow another member's identity).
+        assert_eq!(verify_leader_ticket(&[0u8; 32], vrf_height, &SEED, height, round, &output, &proof), None);
+        // A witness proving a DIFFERENT index does not verify at this height (no index substitution).
+        let (other_out, other_proof) = secret.prove(height + 1).unwrap();
+        assert_eq!(verify_leader_ticket(&root, vrf_height, &SEED, height, round, &other_out, &other_proof), None);
+    }
+
+    #[test]
+    fn the_ticket_binds_output_beacon_height_and_round() {
+        let secret = pqvrf::MerkleVrfSecret::generate(&[4u8; 32], 6).unwrap();
+        let (output, _) = secret.prove(3).unwrap();
+        let base = leader_ticket(&output, &SEED, 3, 0);
+        assert_eq!(base, leader_ticket(&output, &SEED, 3, 0), "deterministic");
+        let other_seed = BeaconSeed::new([9u8; 32]);
+        assert_ne!(base, leader_ticket(&output, &other_seed, 3, 0), "beacon-bound (anti-grinding)");
+        assert_ne!(base, leader_ticket(&output, &SEED, 4, 0), "height-bound");
+        assert_ne!(base, leader_ticket(&output, &SEED, 3, 1), "round-bound (re-sortition on view change)");
+        let (other_out, _) = secret.prove(4).unwrap();
+        assert_ne!(base, leader_ticket(&other_out, &SEED, 3, 0), "output-bound (per-member)");
+    }
+
+    #[test]
+    fn min_ticket_sortition_elects_one_secret_leader_and_the_beacon_reshuffles_it() {
+        // A q+1 = 3-member line, each member with its own registered Merkle-VRF. The winner is the
+        // argmin ticket — a single well-defined leader per (height, round) — and it is unpredictable:
+        // a fresh beacon reshuffles the winner, so no adversary can pre-aim before the beacon reveals.
+        let vrf_height = 9u32; // domain 2^9 = 512 ≥ the 300 heights swept below
+        let secrets = [
+            pqvrf::MerkleVrfSecret::generate(&[10u8; 32], vrf_height).unwrap(),
+            pqvrf::MerkleVrfSecret::generate(&[11u8; 32], vrf_height).unwrap(),
+            pqvrf::MerkleVrfSecret::generate(&[12u8; 32], vrf_height).unwrap(),
+        ];
+        let winner = |seed: &BeaconSeed, height: u64| -> usize {
+            (0..3usize)
+                .min_by_key(|&i| {
+                    let (out, _) = secrets[i].prove(height).unwrap();
+                    leader_ticket(&out, seed, height, 0)
+                })
+                .unwrap()
+        };
+        // A single well-defined winner per height (deterministic given the VRF outputs + beacon).
+        for h in 0..8u64 {
+            assert_eq!(winner(&SEED, h), winner(&SEED, h));
+        }
+        // The beacon reshuffles the secret leader (unpredictable before the epoch beacon reveals).
+        let other = BeaconSeed::new([0x5A; 32]);
+        let differ = (0..64u64).filter(|&h| winner(&SEED, h) != winner(&other, h)).count();
+        assert!(differ > 20, "the beacon must reshuffle the secret leader, got {differ}/64");
+        // Fairness: over many heights every line member wins the sortition sometimes (no monopoly).
+        let mut wins = [0u32; 3];
+        for h in 0..300u64 {
+            wins[winner(&SEED, h)] += 1;
+        }
+        assert!(wins.iter().all(|&w| w > 0), "every line member wins the sortition sometimes: {wins:?}");
     }
 }

@@ -22,6 +22,9 @@ fanos-primitives = { workspace = true, features = ["std", "wire"] }
 fanos-aphantos.workspace = true
 # Hybrid PQ signatures (Ed25519+ML-DSA-65) for votes/blocks, and the hybrid KEM for mempool sealing.
 fanos-pqcrypto.workspace = true
+# The post-quantum Merkle-VRF (iVRF, `pqvrf`) — the FULL-UNIQUENESS sortition ticket for secret leader
+# election (SSLE). NEVER a hash of an ML-DSA signature (Fiat-Shamir-with-aborts is non-unique → grindable).
+fanos-vrf.workspace = true
 # Anonymous VOPRF credits: block-inclusion fees paid without deanonymising (spec §L7, task A2).
 fanos-incentives.workspace = true
 fanos-wire = { workspace = true, features = ["std"] }
