@@ -158,9 +158,19 @@ fn derive_nonce(label: &str, seed: &[u8]) -> [u8; aead::NONCE_LEN] {
 }
 
 /// KEM-seal `share` to `member_public`: a fresh hybrid encapsulation under `member_seed`, then
-/// `AEAD(H(label ‖ session), H(label ‖ member_seed), encode_share(share))`. `label` domain-separates
-/// the two callers ([`deal_service_key`] vs [`SealedIntro::seal`]) so their derived keys/nonces never
-/// collide even if a `member_seed` were ever reused across the two.
+/// `AEAD(H(label ‖ session), nonce, encode_share(share))` with a **synthetic (SIV-style) nonce** that binds
+/// the plaintext: `nonce = H(label ‖ member_seed ‖ plaintext)`. `label` domain-separates the callers
+/// ([`deal_service_key`] vs [`SealedIntro::seal`]) so their derived keys/nonces never collide.
+///
+/// **Nonce-misuse resistance (audit §5.D-3).** Every input here — the KEM encapsulation randomness, the AEAD
+/// key, and (previously) the nonce — is a deterministic function of `member_seed`, so a caller that reused a
+/// `member_seed` across two seals of *different* plaintexts would reuse `(key, nonce)` → a ChaCha20-Poly1305
+/// two-time-pad. Folding the plaintext into the nonce removes that catastrophic edge: identical
+/// `(member_seed, plaintext)` reproduce the same seal (idempotent, harmless), but a different plaintext under a
+/// reused seed derives a **different** nonce, so no keystream is ever reused across distinct data. Callers
+/// SHOULD still treat `member_seed` as single-use (a reused seed reuses the KEM ciphertext, which is *linkable*
+/// even though it is no longer *malleable*); this SIV nonce is the defense-in-depth that makes a slip safe
+/// rather than fatal — the deterministic-simulator-friendly analogue of obolos O-H2's live-RNG fix.
 fn seal_share_to_member(
     label: &str,
     share: &Share,
@@ -172,9 +182,13 @@ fn seal_share_to_member(
     let (kem_ct, session) = member_public
         .encapsulate(&mut rng)
         .ok_or(HostingError::Malformed)?;
-    let nonce = derive_nonce(label, member_seed);
-    let ciphertext = aead::seal(&hash_labeled(label, &session), &nonce, &encode_share(share))
-        .ok_or(HostingError::Aead)?;
+    let plaintext = encode_share(share);
+    // Synthetic nonce: bind the plaintext so a reused `member_seed` over different data cannot reuse (key, nonce).
+    let mut nonce_seed = member_seed.to_vec();
+    nonce_seed.extend_from_slice(&plaintext);
+    let nonce = derive_nonce(label, &nonce_seed);
+    let ciphertext =
+        aead::seal(&hash_labeled(label, &session), &nonce, &plaintext).ok_or(HostingError::Aead)?;
     Ok(SealedShare {
         kem_ct: kem_ct.to_bytes(),
         nonce,
@@ -439,6 +453,30 @@ mod tests {
                 HybridKemSecret::generate(&mut rng)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_reused_seed_over_different_plaintexts_does_not_reuse_the_aead_nonce() {
+        // Audit §5.D-3: the SIV-style nonce binds the plaintext, so even a caller that (buggily) reuses a
+        // member_seed across two seals of DIFFERENT shares gets DISTINCT nonces — no ChaCha20-Poly1305
+        // two-time-pad. (The KEM ciphertext is still identical under a reused seed — linkable, not malleable —
+        // which is why the seed should stay single-use; this nonce is the defense-in-depth.)
+        let (_secret, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xEE, 0]));
+        let share_a = Share::new(1, b"the first sub-share bytes".to_vec());
+        let share_b = Share::new(1, b"a DIFFERENT sub-share ...".to_vec());
+        let seed = b"reused-member-seed";
+        let a = seal_share_to_member(IDENTITY_SHARE_LABEL, &share_a, &public, seed).unwrap();
+        let b = seal_share_to_member(IDENTITY_SHARE_LABEL, &share_b, &public, seed).unwrap();
+        assert_ne!(a.nonce, b.nonce, "different plaintexts under a reused seed derive different nonces (no two-time-pad)");
+        assert_ne!(a.ciphertext, b.ciphertext, "and therefore different ciphertexts");
+        // Idempotence: identical (seed, plaintext) reproduce the exact same seal (deterministic, harmless).
+        let a2 = seal_share_to_member(IDENTITY_SHARE_LABEL, &share_a, &public, seed).unwrap();
+        assert_eq!(a.nonce, a2.nonce);
+        assert_eq!(a.ciphertext, a2.ciphertext);
+        // And both still open correctly under the member secret.
+        let (secret, public2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xEE, 1]));
+        let sealed = seal_share_to_member(IDENTITY_SHARE_LABEL, &share_a, &public2, seed).unwrap();
+        assert_eq!(open_sealed_share(IDENTITY_SHARE_LABEL, &sealed, &secret), Some(share_a));
     }
 
     #[test]
