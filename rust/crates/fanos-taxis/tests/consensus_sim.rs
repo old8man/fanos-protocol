@@ -488,15 +488,14 @@ fn a_network_partition_cannot_split_agreement_and_heals() {
 /// same height — must hold on *every* schedule (safety needs no synchrony). Liveness is checked softly in
 /// aggregate: under adversarial async scheduling FLP forbids guaranteed progress, but partial synchrony should
 /// let most trials advance.
-#[test]
-#[ignore = "heavy: hundreds of hybrid ML-DSA sign/verify per trial over a randomized Monte-Carlo (~140s); \
-            run in isolation with `cargo test -p fanos-taxis --test consensus_sim -- --ignored`"]
-fn randomized_scheduling_and_byzantine_faults_never_fork() {
+/// The shared Monte-Carlo body (audit §3.8): run `trials` randomized-async + Byzantine-equivocation trials and
+/// assert BFT **safety** (no honest fork) on *every* one — safety needs no synchrony, so it must hold on every
+/// schedule. `require_liveness` additionally asserts the soft aggregate-progress bound (meaningful only over
+/// many trials; off for the small default-suite smoke, on for the exhaustive release run).
+fn run_no_fork_trials(trials: u64, require_liveness: bool) {
     use std::collections::BTreeMap;
 
     use fanos_taxis::{Phase, SignedVote, Vote};
-
-    let trials = 12u64;
     let mut progress_trials = 0u64;
     for trial in 0..trials {
         let mut rng = 0xD1CE_B00F_u64 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -603,11 +602,34 @@ fn randomized_scheduling_and_byzantine_faults_never_fork() {
             progress_trials += 1;
         }
     }
-    // Aggregate liveness (soft — FLP forbids a strict async guarantee): most trials make progress.
-    assert!(
-        progress_trials * 2 > trials,
-        "only {progress_trials}/{trials} trials progressed — liveness suspiciously low"
-    );
+    // Aggregate liveness (soft — FLP forbids a strict async guarantee): most trials make progress. Only
+    // meaningful over many trials, so the small default-suite smoke skips it and gates safety alone.
+    if require_liveness {
+        assert!(
+            progress_trials * 2 > trials,
+            "only {progress_trials}/{trials} trials progressed — liveness suspiciously low"
+        );
+    }
+}
+
+/// Default-suite gate (audit §3.8): a SMALL randomized-async + Byzantine no-fork Monte-Carlo, so the BFT
+/// safety property is checked on every `cargo test` (it was previously only reachable via `--ignored`). Safety
+/// only — the soft liveness aggregate needs the exhaustive run below.
+#[test]
+fn randomized_scheduling_never_forks_smoke() {
+    // One deterministic-seed trial: a fast regression gate on a real Byzantine+async schedule (the exhaustive
+    // random coverage is the release heavy-lane run below). Kept to a single trial so the default DEBUG suite
+    // pays only one trial's worth of hybrid-PQ signing.
+    run_no_fork_trials(1, false);
+}
+
+/// The exhaustive randomized-async + Byzantine no-fork Monte-Carlo (audit §3.8). Heavy in a DEBUG build
+/// (hundreds of hybrid ML-DSA sign/verify per trial, ~140 s) but ~5 s in release — run it in the release heavy
+/// lane: `cargo test -p fanos-taxis --test consensus_sim --release -- --ignored`.
+#[test]
+#[ignore = "heavy in debug (~140s); run in release: cargo test -p fanos-taxis --test consensus_sim --release -- --ignored"]
+fn randomized_scheduling_and_byzantine_faults_never_fork() {
+    run_no_fork_trials(24, true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
