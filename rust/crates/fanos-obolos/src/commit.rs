@@ -132,6 +132,16 @@ impl Randomness {
         Self { coeffs }
     }
 
+    /// Whether this is genuine ternary randomness: exactly `L` coefficients, each in `{−1, 0, 1}` (audit §3.2).
+    /// This is the shortness the commitment's Module-LWE hiding / Module-SIS binding assume **and** the bound
+    /// that keeps the `A₁·r` dot product (`L` terms of `≈2⁶¹ · x`) inside `i128`. Only an individual
+    /// commitment's hiding randomness must satisfy it; balance randomness ([`add`](Self::add)/[`sub`](Self::sub))
+    /// is deliberately centered small-integer, not ternary, and is never committed or serialized directly.
+    #[must_use]
+    pub(crate) fn is_ternary(&self) -> bool {
+        self.coeffs.len() == L && self.coeffs.iter().all(|&c| (-1..=1).contains(&c))
+    }
+
     /// The sum `r₁ + r₂` in **centered** (small-integer) representation — used to form a transaction's balance
     /// randomness `Σr_in − Σr_out`. Coefficients are kept small (not reduced mod `q`) — they stay bounded by
     /// the number of terms (a transaction's input+output count), which is exactly the shortness the frontier

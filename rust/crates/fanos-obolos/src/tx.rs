@@ -75,8 +75,9 @@ pub struct ShieldedTx {
 /// fully-verified transparent reference.
 pub trait ShieldedProof {
     /// Whether the transaction's relation holds (membership, ownership, nullifier correctness, value binding,
-    /// balance, and output range) with respect to `params`. The **freshness** of the nullifiers (no
-    /// double-spend) is checked by the state machine against its nullifier set, not here.
+    /// balance, output range, and **randomness shortness** — every opening's commitment randomness is ternary,
+    /// §3.2) with respect to `params`. The **freshness** of the nullifiers (no double-spend) is checked by the
+    /// state machine against its nullifier set, not here.
     #[must_use]
     fn verify(&self, params: &Params, tx: &ShieldedTx) -> bool;
 }
@@ -133,6 +134,16 @@ impl ShieldedProof for TransparentProof {
         // and bound the two clear terms (fee, public_value) below MAX_VALUE, which the loops below enforce for
         // every input and output amount. Together these keep both sides of the balance law under q.
         if n_in + tx.outputs.len() > MAX_NOTES_PER_TX || tx.fee >= MAX_VALUE || tx.public_value >= MAX_VALUE {
+            return false;
+        }
+        // §3.2: every revealed opening's randomness is part of the relation and MUST be ternary — the shortness
+        // the commitment scheme assumes and the bound that keeps `A₁·r` from overflowing `i128` inside `commit`
+        // (below). The wire decoder already rejects long randomness, so re-asserting it here makes the relation
+        // explicit and closes any non-wire construction path before a long coefficient reaches the dot product.
+        let short = |r: &Randomness| r.is_ternary();
+        if !self.inputs.iter().all(|i| short(&i.value_r_in) && short(&i.note.value_r))
+            || !self.outputs.iter().all(|o| short(&o.value_r))
+        {
             return false;
         }
 

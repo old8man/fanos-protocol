@@ -163,7 +163,13 @@ impl Randomness {
         for _ in 0..crate::commit::L {
             coeffs.push(r.i64()?);
         }
-        Some(Self::from_coeffs(coeffs))
+        // Reject non-ternary randomness (audit §3.2). The wire is attacker-controlled; commitment randomness is
+        // ALWAYS ternary (`{−1, 0, 1}^L`). Without this bound, full-range i64 coefficients make the `A₁·r` dot
+        // product (`L = 256` terms of `≈2⁶¹ · x`) reach `≈2¹³²`, overflowing `i128` — which PANICS every
+        // overflow-checked validator on the consensus verify path (a single decodable `TAG_SHIELDED` submission
+        // → network-wide halt) or, in release, silently wraps and voids the mod-`Q` inflation bound (O-C1).
+        let rand = Self::from_coeffs(coeffs);
+        rand.is_ternary().then_some(rand)
     }
 }
 
@@ -330,11 +336,21 @@ mod tests {
     }
 
     #[test]
-    fn randomness_round_trips_and_preserves_centered_coefficients() {
-        let x = Randomness::from_seed(b"x").sub(&Randomness::from_seed(b"y")); // has negative coefficients
+    fn randomness_round_trips_and_rejects_non_ternary() {
+        // Genuine ternary randomness round-trips.
+        let x = Randomness::from_seed(b"x");
         let bytes = x.to_bytes();
         assert_eq!(bytes.len(), Randomness::WIRE_LEN);
         assert_eq!(Randomness::from_bytes(&bytes), Some(x));
+        // Audit §3.2: a NON-ternary coefficient is refused at decode, so a crafted `TAG_SHIELDED` submission
+        // can never drive the `A₁·r` dot product to overflow the consensus verify path. (Centered balance
+        // randomness — `sub`, coefficients in `{−2,…,2}` — is an internal verify-time computation and is
+        // deliberately never serialized onto the wire; every opening's randomness is ternary, from_seed.)
+        let mut bad = Randomness::from_seed(b"ok").to_bytes();
+        bad[..8].copy_from_slice(&i64::MAX.to_le_bytes());
+        assert_eq!(Randomness::from_bytes(&bad), None, "a full-range coefficient is refused");
+        bad[..8].copy_from_slice(&2i64.to_le_bytes());
+        assert_eq!(Randomness::from_bytes(&bad), None, "even a coefficient of 2 (just past ternary) is refused");
     }
 
     #[test]
@@ -359,6 +375,24 @@ mod tests {
         let decoded = ShieldedTx::from_bytes(&tx_bytes).unwrap();
         let decoded_proof = TransparentProof::from_bytes(&pf_bytes).unwrap();
         assert_eq!(s.apply(&p, &decoded, &decoded_proof), Ok(()), "a round-tripped tx applies");
+    }
+
+    #[test]
+    fn a_non_ternary_opening_is_refused_not_overflowed() {
+        // Audit §3.2 defense-in-depth: a proof carrying a long (non-ternary) opening randomness is REJECTED by
+        // the relation — the shortness gate runs before any `commit`, so the `A₁·r` dot product is never
+        // evaluated on a long coefficient and cannot overflow/panic the consensus verify path.
+        let p = Params::standard();
+        let nsk = [1u8; 32];
+        let mut s = ShieldedState::new();
+        let n0 = note(1000, &nsk, b"n0");
+        let pos = s.mint(n0.commitment(&p)).unwrap();
+        let sp = SpendInput { note: n0, nsk, path: s.path(pos).unwrap() };
+        let (tx, mut proof) =
+            build_transfer(&p, s.anchor(), &[sp], &[note(600, &[2u8; 32], b"a"), note(400, &[3u8; 32], b"b")], 0);
+        // Smuggle a full-range coefficient into the first input opening's re-randomisation (a non-wire path).
+        proof.inputs[0].value_r_in = Randomness::from_coeffs((0..crate::commit::L).map(|_| i64::MAX).collect());
+        assert!(s.apply(&p, &tx, &proof).is_err(), "a long-randomness opening is refused, not overflowed");
     }
 
     #[test]
