@@ -38,6 +38,7 @@ pub mod rendezvous;
 pub mod rendezvous_relay;
 pub mod resolve;
 pub mod service_node;
+pub mod sybil;
 pub mod threshold_service;
 
 pub use cell_node::CellNode;
