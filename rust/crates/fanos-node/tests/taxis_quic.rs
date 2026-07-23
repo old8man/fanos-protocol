@@ -16,10 +16,11 @@ use std::time::Duration;
 use fanos_field::F2;
 use fanos_geometry::Point;
 use fanos_node::crosscell_dir::resolve_checkpoint;
-use fanos_node::{TaxisEvent, TaxisParams, spawn_checkpoint_publisher, spawn_taxis};
+use fanos_node::{SortitionParams, TaxisEvent, TaxisParams, spawn_checkpoint_publisher, spawn_taxis};
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
+use fanos_vrf::pqvrf::MerkleVrfSecret;
 use fanos_quic::spawn_cell;
 use fanos_runtime::{Config, Engine, OverlayNode};
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
@@ -64,6 +65,17 @@ fn genesis() -> Accounts {
     s
 }
 
+/// The SSLE Merkle-VRF tree height (domain `2^6 = 64` heights — ample for this test's few blocks).
+const VRF_HEIGHT: u32 = 6;
+
+/// A deterministic per-validator Merkle-VRF seed (distinct per index).
+fn vrf_seed(i: usize) -> [u8; 32] {
+    let mut s = [0u8; 32];
+    s[0] = 0x5A;
+    s[1] = i as u8;
+    s
+}
+
 #[tokio::test]
 async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     // A genuine seven-node Fano cell over mutual-TLS QUIC, membership established (routing by coordinate works).
@@ -76,6 +88,12 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
         keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
     let keyper_commit = registry.commit();
+
+    // Secret-leader sortition registration: each validator's Merkle-VRF root, agreed committee config (like
+    // the verifiers). Enabling it here proves SSLE runs over REAL QUIC — round 0 is the all-propose min-ticket
+    // lottery, so the winning proposer is secret until it broadcasts, and the cell still finalizes normally.
+    let vrf_roots: Vec<[u8; 32]> =
+        (0..N).map(|i| MerkleVrfSecret::generate(&vrf_seed(i), VRF_HEIGHT).unwrap().root()).collect();
 
     // Spawn a production TAXIS driver on every node — validator index i seated at Point::at(i).
     let mut handles = Vec::with_capacity(N);
@@ -91,6 +109,11 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
             epoch: EPOCH,
             genesis_state: genesis(),
             reward_per_block: 0,
+            sortition: Some(SortitionParams {
+                secret: MerkleVrfSecret::generate(&vrf_seed(i), VRF_HEIGHT).unwrap(),
+                roots: vrf_roots.clone(),
+                base: 0,
+            }),
         };
         handles.push(spawn_taxis::<F2, Accounts>(cell.nodes[i].client(), params));
     }

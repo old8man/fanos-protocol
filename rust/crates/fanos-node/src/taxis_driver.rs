@@ -35,6 +35,7 @@ use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
 use fanos_taxis::state::StateMachine;
 use fanos_taxis::wire::to_frame;
 use fanos_taxis::{CellParams, SealedTx, SlashEvidence};
+use fanos_vrf::pqvrf::MerkleVrfSecret;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
@@ -71,6 +72,25 @@ pub struct TaxisParams<S> {
     pub genesis_state: S,
     /// The per-block reward pool distributed to commit-cert signers (`0` = no reward).
     pub reward_per_block: u64,
+    /// **Secret-leader sortition** (SSLE) registration, or `None` to run the public deterministic leader.
+    /// When present, round 0 becomes the min-ticket lottery over the elected line — the winner stays secret
+    /// until it proposes, so an adversary cannot pre-aim a DoS/bribe at the single upcoming proposer.
+    pub sortition: Option<SortitionParams>,
+}
+
+/// A node's **secret-leader sortition** registration (SSLE, spec §10.1) — its own post-quantum Merkle-VRF
+/// secret plus every validator's pre-registered root, over a per-epoch bounded domain based at height `base`.
+/// A node derives its `secret` deterministically from its identity and publishes its root; the collected
+/// `roots` are agreed committee config, exactly like the signature `verifiers`. Re-issued each epoch to rotate
+/// the bounded VRF domain (the anti-grinding registration fence — a key is fixed before the beacon it is used
+/// with).
+pub struct SortitionParams {
+    /// This node's Merkle-VRF secret (proves its own round-0 ticket witness).
+    pub secret: MerkleVrfSecret,
+    /// Every validator's pre-registered Merkle-VRF root, indexed by validator index (like `verifiers`).
+    pub roots: Vec<[u8; 32]>,
+    /// The chain height at VRF index 0 — this registration's base, so the ticket index is `height − base`.
+    pub base: u64,
 }
 
 /// An observable event from a running TAXIS cell — the driver's `Output` sinks, surfaced for callers/tests.
@@ -178,6 +198,9 @@ where
             params.genesis_state,
         );
         engine.set_reward_per_block(params.reward_per_block);
+        if let Some(s) = params.sortition {
+            engine.enable_sortition(s.secret, s.roots, s.base);
+        }
 
         // Delay the FIRST tick by a full period rather than firing it immediately (tokio's `interval` fires
         // tick 0 at once). The leader proposes on a tick, so an immediate first tick makes it propose height 1

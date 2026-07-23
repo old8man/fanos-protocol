@@ -95,6 +95,7 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
             epoch: EPOCH,
             genesis_state: genesis_ledger(),
             reward_per_block: 0,
+            sortition: None,
         };
         handles.push(spawn_taxis::<F2, HybridLedger>(cell.nodes[i].client(), params));
     }

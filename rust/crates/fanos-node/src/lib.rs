@@ -63,7 +63,7 @@ pub use mixdir::{
 };
 pub use node::{Health, Node};
 pub use taxis_driver::{
-    TaxisEvent, TaxisHandle, TaxisParams, spawn_checkpoint_publisher, spawn_taxis,
+    SortitionParams, TaxisEvent, TaxisHandle, TaxisParams, spawn_checkpoint_publisher, spawn_taxis,
 };
 pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
