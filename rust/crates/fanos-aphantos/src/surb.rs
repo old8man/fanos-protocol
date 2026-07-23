@@ -146,7 +146,9 @@ pub fn build_surb<F: Field>(
         let session = hop_session(public, seed, k + 1).ok_or(SealedError::NonContributory)?;
         keys.push(mask_key(&session));
     }
-    let first_hop = return_circuit.relays().first().ok_or(SealedError::Malformed)?.coords();
+    // `relays()[0]` is the circuit's non-peeling origin (the injecting relay); the outer onion layer is sealed
+    // for the FIRST PEELING hop, `relays()[1]` — that is where the relay must send the packet.
+    let first_hop = return_circuit.relays().get(1).ok_or(SealedError::Malformed)?.coords();
     Ok((Surb { first_hop, header }, SurbKeys { keys }))
 }
 
@@ -245,6 +247,8 @@ mod tests {
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
 
         let (surb, keys) = build_surb(&circuit, &pubkeys, client_coord, b"surb-seed").unwrap();
+        // The relay sends to the first PEELING hop (relays[1]), NOT the non-peeling origin (relays[0]).
+        assert_eq!(surb.first_hop, circuit.relays()[1].coords(), "first_hop is the first peeling relay");
         // The relay holds only the opaque header + the first hop — the client's coordinate appears NOWHERE in
         // what it attaches to and sends.
         assert_eq!(surb.header.len(), ONION_LEN, "the header is a constant-size onion");
