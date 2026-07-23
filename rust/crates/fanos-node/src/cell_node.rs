@@ -172,9 +172,20 @@ impl<F: Field> Engine for CellNode<F> {
             }
             // Every other timer token is the router's (gather deadline, mix release, or cover tick).
             Input::Timer(_) => self.relay.step(now, input),
-            // Every command drives the overlay+beacon composite: the epoch tick and startup advance the
-            // beacon (which `step_obn` then locks the router's onion key to) and arm the remapped overlay
-            // heartbeat; Send/Put/Get/Join/Diagnose/Observe are the overlay's directly.
+            // StartHeartbeat drives the overlay+beacon composite AND starts the relay router's cover schedule
+            // (audit S1-H1): otherwise cover only begins lazily on the router's first real forward, so the
+            // silence→cover transition coincides with — and thereby reveals — the relay's first real traffic,
+            // defeating the E1/E6 "uniform whether or not carrying real traffic" property. An idle or
+            // line-member-only relay would emit zero cover at all. Starting cover here makes it proactive from
+            // startup; the router's cover-tick timer routes back to the relay via the `Input::Timer(_)` arm.
+            Input::Command(Command::StartHeartbeat) => {
+                let mut out = self.step_obn(now, Input::Command(Command::StartHeartbeat));
+                out.extend(self.relay.router_mut().step(now, Input::Command(Command::StartHeartbeat)));
+                out
+            }
+            // Every other command drives the overlay+beacon composite: the epoch tick advances the beacon
+            // (which `step_obn` then locks the router's onion key to) and arms the remapped overlay heartbeat;
+            // Send/Put/Get/Join/Diagnose/Observe are the overlay's directly.
             Input::Command(_) => self.step_obn(now, input),
         }
     }
@@ -236,6 +247,30 @@ mod tests {
                 Effect::ArmTimer { token, .. } if *token == OVERLAY_HEARTBEAT_INNER
             )),
             "the raw inner heartbeat token never escapes the composite"
+        );
+    }
+
+    #[test]
+    fn startup_starts_the_relay_cover_schedule_proactively() {
+        use fanos_runtime::Duration;
+        // Audit S1-H1: StartHeartbeat must ALSO start the relay's cover schedule — not lazily on the first real
+        // forward — so cover runs from startup and the silence→cover transition never reveals the relay's first
+        // real traffic.
+        let (shares, commitment) = beacon_key();
+        let coord = Point::<F2>::at(0);
+        let overlay = OverlayNode::<F2>::new(coord, OverlayConfig::default());
+        let beacon = BeaconNode::<F2>::new(coord, Some(shares[0].clone()), commitment.clone(), T);
+        let obn = OverlayBeaconNode::new(overlay, beacon);
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xC5, 0]));
+        let router =
+            ThresholdRouter::<F2>::new(coord, &identity, 1, [0xC4; 32]).with_cover(Duration::from_millis(1000));
+        let mut node = CellNode::new(obn, router);
+        let effects = node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        // A router cover-tick timer (distinct from the overlay heartbeat) is armed at startup, before any real
+        // traffic — cover is proactive. Without the fix the relay never sees StartHeartbeat and arms no cover.
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::ArmTimer { token, .. } if *token != OVERLAY_HEARTBEAT)),
+            "startup arms the relay's cover-tick timer, so cover runs from startup"
         );
     }
 
