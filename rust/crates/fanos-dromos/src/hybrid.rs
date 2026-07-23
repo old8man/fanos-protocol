@@ -323,7 +323,7 @@ impl HybridLedger {
         // Settle at this block height; the deal rejects a second settlement at the same height, so a provider
         // cannot replay one proof many times within a block to drain the escrow (audit AT-C1).
         let height = self.height;
-        let Some(settlement) = self.storage.deals.get_mut(id).and_then(|d| d.settle_epoch(height, true)) else {
+        let Some(settlement) = self.storage.deals.get_mut(id).and_then(|d| d.settle_epoch(height, true, AUDIT_PERIOD)) else {
             return false;
         };
         if let Settlement::Pay { provider, amount } = settlement {
@@ -846,7 +846,9 @@ mod tests {
         let prover_auth =
             SignedTransfer::sign(Transfer { from: provider, to: id, amount: 0, nonce: 0 }, &provider_sk, provider_vk);
 
-        // Prove epoch 0: the provider answers the beacon's challenge → paid one slice (price/duration = 100).
+        // Prove epoch 0 at the first audit boundary (§3.5 cadence: a settlement may land only one AUDIT_PERIOD
+        // past the open) — the provider answers the beacon's challenge → paid one slice (price/duration = 100).
+        ledger.begin_block(AUDIT_PERIOD);
         let indices = challenge(&cid, &beacon, 3, 8);
         let response = encode_response(&prove(&chunk, &indices).unwrap());
         let prove_tx = StorageTx::Prove { deal_id: id, prover_auth: prover_auth.clone(), response };
@@ -865,9 +867,9 @@ mod tests {
         assert_eq!(ledger.tokens().balance(&provider), 100, "an unverifiable proof releases nothing");
 
         // AT-H1: a VALID proof not authorised by the provider is refused — a third party holding a replica of
-        // the public leaves cannot make the provider be paid. (Advance the height so only the signer check can
-        // reject it, not the per-height guard.)
-        ledger.begin_block(1);
+        // the public leaves cannot make the provider be paid. (Advance past the next audit boundary so only the
+        // signer check can reject it, not the per-height cadence guard.)
+        ledger.begin_block(2 * AUDIT_PERIOD);
         let real_response = encode_response(&prove(&chunk, &challenge(&cid, &beacon, 3, 8)).unwrap());
         let impostor_auth =
             SignedTransfer::sign(Transfer { from: consumer, to: id, amount: 0, nonce: 2 }, &consumer_sk, consumer_vk.clone());
