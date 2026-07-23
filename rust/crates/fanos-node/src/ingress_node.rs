@@ -38,6 +38,8 @@
 //! that tag: `(token >> 60) == 0b0101` → the host (unmapped back), everything else → the inner engine.
 
 use fanos_geometry::Triple;
+use fanos_pqcrypto::HybridKemPublic;
+use fanos_rendezvous::Epoch;
 use fanos_runtime::{Effect, Engine, Input, Instant, TimerToken};
 use fanos_wire::{FrameType, decode_frame};
 
@@ -65,6 +67,41 @@ impl IngressNode {
     #[must_use]
     pub fn new(inner: Box<dyn Engine + Send>, host: PorosHost) -> Self {
         Self { inner, host }
+    }
+
+    /// The epoch the ingress host currently serves — advances when a rotation completes. A driver polls this
+    /// after driving reshare frames to detect that this node has adopted the new line.
+    #[must_use]
+    pub fn host_epoch(&self) -> Epoch {
+        self.host.epoch()
+    }
+
+    /// **Emit this node's reshare contributions** when it is a member of the *current* (old) ingress line — the
+    /// old-side of a rotation to `target_epoch`. Returns one [`PorosReshare`](FrameType::PorosReshare) send per
+    /// new member, each sub-share KEM-sealed to it (`new_keys` in `new_line` order, resolved by the driver from
+    /// the directory). A no-op (empty) if this node is not a current old-line host. The driver calls this only
+    /// for nodes it has determined are on the old line (via `ingress_line(community, old_epoch, beacon)`).
+    #[must_use]
+    pub fn emit_reshares(
+        &self,
+        target_epoch: Epoch,
+        new_line: &[Triple],
+        new_keys: &[HybridKemPublic],
+        key_randomness: &[u8],
+        kem_seed: &[u8],
+    ) -> Vec<Effect> {
+        let key_refs: Vec<&HybridKemPublic> = new_keys.iter().collect();
+        self.host.emit_reshare(target_epoch, new_line, &key_refs, key_randomness, kem_seed)
+    }
+
+    /// **Arm the receive side** of a rotation when this node is a member of the *new* (incoming) ingress line
+    /// for `target_epoch`: subsequent [`PorosReshare`](FrameType::PorosReshare) frames are opened, gathered, and
+    /// combined into this node's rotated share, which it adopts once a threshold arrive (advancing
+    /// [`host_epoch`](Self::host_epoch)). A no-op if this node is not on `new_line`. The old-emit
+    /// ([`emit_reshares`](Self::emit_reshares)) and this new-receive role are independent — a node on both lines
+    /// (they meet in one point) calls both.
+    pub fn arm_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>) {
+        self.host.begin_rotation(target_epoch, new_line);
     }
 
     /// Whether `frame` is one of the POROS host wire types the [`PorosHost`] owns (the combiner/member frames,
@@ -260,5 +297,112 @@ mod tests {
             "after the deadline dropped the gather, the same request is accepted anew — the tick reached the \
              host, not the overlay"
         );
+    }
+
+    #[test]
+    fn a_cell_rotates_its_ingress_line_and_the_new_line_serves_requests() {
+        use fanos_calypso::hosting::Share;
+        use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
+
+        use crate::poros::{IngressResponse, PorosHost};
+
+        // The end-to-end wiring proof: a full old ingress line rotates to a new epoch line through IngressNode
+        // composites (via `rotate`), and the NEW line then SERVES an ingress request — which can only succeed if
+        // the descriptor was correctly reshared into the new hosts. Nothing reconstructs the descriptor in the
+        // clear; the new hosts hold only rotated shares, and a threshold gather serves each request.
+        let community = COMMUNITY.to_vec();
+        let beacon = BeaconSeed::new([0x71; 32]);
+        let (old_epoch, new_epoch) = (Epoch::new(1), Epoch::new(2));
+        let (t, difficulty) = (2usize, DIFFICULTY);
+        let desc = descriptor(6);
+        let secret_len = desc.to_bytes().len();
+        let old_coords: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+        let new_idx = [3usize, 4, 5];
+        let new_coords: Vec<Triple> = new_idx.iter().map(|&i| Point::<F2>::at(i).coords()).collect();
+        let shares =
+            shard_descriptor(&desc, t as u8, 3, &vec![0x5Au8; secret_len * (t - 1) + 8]).unwrap();
+
+        // Old-line IngressNodes (host + overlay), each holding its real descriptor share.
+        let old_node = |i: usize| {
+            let host = PorosHost::new(
+                old_coords[i], shares[i].clone(), old_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
+            );
+            let overlay = OverlayNode::<F2>::new(Point::<F2>::at(i), OverlayConfig::default());
+            IngressNode::new(Box::new(overlay), host)
+        };
+        // New-line IngressNodes: placeholder share (rotation replaces it) + KEM secret (to open sealed sub-shares).
+        let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> =
+            (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB1, j as u8]))).collect();
+        let new_keys: Vec<HybridKemPublic> = new_kp.iter().map(|(_, p)| p.clone()).collect();
+        let mut new_nodes: Vec<IngressNode> = (0..3)
+            .map(|j| {
+                let placeholder = Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]);
+                let host = PorosHost::new(
+                    new_coords[j], placeholder, new_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
+                )
+                .with_kem_secret(HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB1, j as u8])).0);
+                let overlay = OverlayNode::<F2>::new(Point::<F2>::at(new_idx[j]), OverlayConfig::default());
+                IngressNode::new(Box::new(overlay), host)
+            })
+            .collect();
+
+        // New-line members arm their receive side (the driver would call this for every node it computes is on
+        // the new line for target_epoch).
+        for n in &mut new_nodes {
+            n.arm_rotation(new_epoch, new_coords.clone());
+        }
+        // A threshold subset of the old line emits sealed reshare frames; route them to the new line.
+        for (i, &from) in old_coords.iter().enumerate().take(t) {
+            let key_rnd = vec![0x20u8 + i as u8; secret_len * (t - 1) + 8];
+            let frames = old_node(i).emit_reshares(new_epoch, &new_coords, &new_keys, &key_rnd, &[0xC0, i as u8]);
+            assert_eq!(frames.len(), new_coords.len(), "one reshare frame per new member");
+            for e in frames {
+                if let Effect::Send { to, frame } = e {
+                    let j = new_coords.iter().position(|c| *c == to).unwrap();
+                    new_nodes[j].step(Instant(0), Input::Message { from, frame });
+                }
+            }
+        }
+        // Every new node adopted the new epoch (the composite exposed it via `host_epoch`).
+        for n in &new_nodes {
+            assert_eq!(n.host_epoch(), new_epoch, "the new-line composite rotated to the new epoch");
+        }
+
+        // The new line now SERVES a request: a requester solves a PoW bound to the NEW epoch, contacts new
+        // combiner 0, which gathers a threshold of rotated shares across the new line and returns a bucket.
+        let requester = Point::<F2>::at(6).coords();
+        let req = solve_ingress_request(requester, &community, new_epoch, &beacon, difficulty);
+        let fanned = new_nodes[0].step(Instant(1), Input::Message { from: requester, frame: request_frame(&req) });
+        // Route the combiner's PorosShareReq fan-out to new members 1 and 2, collect their PorosShare replies.
+        let mut response: Option<Vec<u8>> = None;
+        for e in fanned {
+            if let Effect::Send { to, frame } = e
+                && let Some(j) = new_coords.iter().position(|c| *c == to)
+            {
+                for reply in new_nodes[j].step(Instant(2), Input::Message { from: new_coords[0], frame }) {
+                    if let Effect::Send { to: back, frame: share_frame } = reply
+                        && back == new_coords[0]
+                    {
+                        for served in new_nodes[0].step(Instant(3), Input::Message { from: to, frame: share_frame }) {
+                            if let Effect::Send { to: r, frame: resp } = served
+                                && r == requester
+                                && decode_frame(&resp).ok().and_then(|(f, _)| f.frame_type())
+                                    == Some(FrameType::PorosResponse)
+                            {
+                                response = Some(resp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let resp = response.expect("the rotated new line served a PorosResponse");
+        let (decoded, _) = decode_frame(&resp).unwrap();
+        let bucket = IngressResponse::from_bytes(decoded.body).expect("a valid response bucket");
+        assert!(!bucket.peers.is_empty(), "the served bucket holds entry peers — the descriptor survived rotation");
+        // Every served peer is a genuine descriptor entry (the reshared descriptor is the original).
+        for p in &bucket.peers {
+            assert!(desc.peers.iter().any(|d| d.coord == p.coord), "served peers come from the original descriptor");
+        }
     }
 }
