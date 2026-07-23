@@ -18,7 +18,7 @@
 use alloc::vec::Vec;
 
 use fanos_field::Field;
-use fanos_geometry::{Triple, decode_triple, encode_triple};
+use fanos_geometry::{TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_nyx::Circuit;
 use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
@@ -69,6 +69,29 @@ pub enum SurbOutcome {
         /// The masked reply block; the client strips the masks with [`open_reply`].
         block: Vec<u8>,
     },
+}
+
+impl Surb {
+    /// Canonical wire bytes — `first_hop(12) ‖ header(ONION_LEN)` — what a client carries in its `RdvRegister`
+    /// so the relay can forward replies through the return path without learning the client's coordinate.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TRIPLE_WIRE_LEN + ONION_LEN);
+        out.extend_from_slice(&encode_triple(self.first_hop));
+        out.extend_from_slice(&self.header);
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if the length is wrong or the coordinate malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != TRIPLE_WIRE_LEN + ONION_LEN {
+            return None;
+        }
+        let first_hop = bytes.get(..TRIPLE_WIRE_LEN).and_then(decode_triple)?;
+        let header = bytes.get(TRIPLE_WIRE_LEN..)?.to_vec();
+        Some(Self { first_hop, header })
+    }
 }
 
 /// A hop's payload-mask key, derived from its KEM session — the one value both the client (at build) and the
@@ -248,6 +271,19 @@ mod tests {
             }
         }
         assert_eq!(delivered.as_deref(), Some(reply.as_slice()), "the client recovers the exact reply");
+    }
+
+    #[test]
+    fn a_surb_round_trips_through_its_wire_form() {
+        let circuit = build_circuit(Point::<F31>::at(3), Point::<F31>::at(77), 2, b"wire").unwrap();
+        let keypairs = relays(circuit.hop_count(), 5);
+        let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
+        let (surb, _keys) = build_surb(&circuit, &pubkeys, Point::<F31>::at(8).coords(), b"s").unwrap();
+        let bytes = surb.to_bytes();
+        let decoded = Surb::from_bytes(&bytes).expect("re-decodes");
+        assert_eq!(decoded.first_hop, surb.first_hop);
+        assert_eq!(decoded.header, surb.header);
+        assert!(Surb::from_bytes(&bytes[..bytes.len() - 1]).is_none(), "a truncated SURB is refused");
     }
 
     #[test]
