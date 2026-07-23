@@ -80,6 +80,20 @@ fn partition_degrades_cells_without_crashing_them_then_heals() {
 }
 
 #[test]
+fn soft_partition_never_crashes_a_node_and_recovers() {
+    // A lossy (incipient) bisection of 3 of 10 cells: nodes stay marginally reachable, so none is ever
+    // crashed; after the cut heals the fleet returns healthy.
+    let mut cluster = Cluster::new(6, config(), 10);
+    cluster.run_for(Duration::from_millis(1200));
+    let exp = Experiment::SoftPartition { fraction: 0.3, cross_loss: 0.92, hold: 5 };
+    let report = run_experiment(&mut cluster, exp, 16, step());
+
+    assert!(report.before.is_healthy(), "starts healthy");
+    assert_eq!(report.after.alive, 70, "a lossy cut never kills a node");
+    assert!(report.ended_healthy, "the fleet recovers once the lossy cut heals: {:?}", report.after);
+}
+
+#[test]
 fn an_experiment_run_is_deterministic_per_seed() {
     let run = || {
         let mut c = Cluster::new(9, config(), 12);

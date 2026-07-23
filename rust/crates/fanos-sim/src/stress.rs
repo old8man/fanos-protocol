@@ -51,6 +51,19 @@ pub enum Experiment {
         /// The tick at which the partition heals.
         hold: usize,
     },
+    /// A **soft** (incipient) partition (§6.5): bisect a `fraction` of cells with a *lossy* cut — messages
+    /// crossing are dropped with `cross_loss`, not fully cut — then heal at `t = hold`. The far side stays
+    /// marginally reachable, so simple liveness barely notices; the degradation is subtler than a hard cut,
+    /// which is exactly the regime the loss-weighted Fiedler sensor exists to catch. Measures graceful
+    /// degradation under a lossy split and recovery.
+    SoftPartition {
+        /// Fraction of cells to softly bisect, in `[0, 1]`.
+        fraction: f64,
+        /// The probability a message crossing the cut is dropped, in `[0, 1]`.
+        cross_loss: f64,
+        /// The tick at which the soft partition heals.
+        hold: usize,
+    },
 }
 
 impl Experiment {
@@ -62,6 +75,7 @@ impl Experiment {
             Experiment::RollingChurn { .. } => "churn",
             Experiment::Cascade { .. } => "cascade",
             Experiment::Partition { .. } => "partition",
+            Experiment::SoftPartition { .. } => "soft-partition",
         }
     }
 
@@ -73,11 +87,13 @@ impl Experiment {
             Experiment::RollingChurn { .. } => "continuous: crash and later recover a few nodes each tick",
             Experiment::Cascade { .. } => "crash one more node of a target cell each tick until it collapses",
             Experiment::Partition { .. } => "bisect a fraction of cells (nodes stay up), then heal — detect + recover",
+            Experiment::SoftPartition { .. } => "lossy (incipient) bisection of a fraction of cells, then heal",
         }
     }
 
     /// The names of every built-in experiment (for `fanos-lab scenarios`).
-    pub const NAMES: [&'static str; 4] = ["mass-crash", "churn", "cascade", "partition"];
+    pub const NAMES: [&'static str; 5] =
+        ["mass-crash", "churn", "cascade", "partition", "soft-partition"];
 
     /// Build an experiment from its name and a `fraction` parameter (reused as the churn rate; ignored
     /// by cascade). `None` for an unknown name.
@@ -91,6 +107,7 @@ impl Experiment {
             }),
             "cascade" => Some(Experiment::Cascade { target: 0 }),
             "partition" => Some(Experiment::Partition { fraction, hold: 5 }),
+            "soft-partition" => Some(Experiment::SoftPartition { fraction, cross_loss: 0.92, hold: 5 }),
             _ => None,
         }
     }
@@ -135,6 +152,26 @@ impl Experiment {
                     for ci in 0..n {
                         if let Some(cell) = cluster.cell_mut(ci) {
                             cell.network_mut().partition(core::iter::empty()); // heal the cut
+                        }
+                    }
+                }
+            }
+            Experiment::SoftPartition { fraction, cross_loss, hold } => {
+                let n = ((fraction * cluster.cell_count() as f64).round() as usize).max(1);
+                if t == 0 {
+                    for ci in 0..n {
+                        if let Some(cell) = cluster.cell_mut(ci) {
+                            let coords: Vec<_> = cell.nodes().collect();
+                            let (left, right) = coords.split_at(coords.len() / 2);
+                            let a: BTreeSet<_> = left.iter().copied().collect();
+                            let b: BTreeSet<_> = right.iter().copied().collect();
+                            cell.network_mut().soft_partition([a, b], cross_loss);
+                        }
+                    }
+                } else if t == hold {
+                    for ci in 0..n {
+                        if let Some(cell) = cluster.cell_mut(ci) {
+                            cell.network_mut().heal(); // clear the lossy cut
                         }
                     }
                 }
