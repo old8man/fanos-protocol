@@ -47,6 +47,7 @@ pub mod ring_commit;
 pub mod ring_confidential;
 pub mod ring_hash;
 pub mod ring_linear;
+pub mod ring_membership;
 pub mod ring_product;
 pub mod ring_range;
 pub mod ring_zk;

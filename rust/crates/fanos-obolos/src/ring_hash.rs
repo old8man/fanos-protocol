@@ -141,6 +141,22 @@ impl HashParams {
     pub fn hash(&self, l: &HashNode, r: &HashNode) -> HashNode {
         decompose(&self.image(l, r))
     }
+
+    /// The coefficient vector of the hash's **linear relation** `A₀·l + A₁·r − G(parent) = 0`, laid out over the
+    /// concatenated limbs `left ‖ right ‖ parent` — `[A₀ row, A₁ row, −gadget weights]`. A [`crate::ring_linear`]
+    /// proof over the committed limbs with these coefficients is one zero-knowledge hash step
+    /// ([`crate::ring_membership`]). (`K_H = 1`: a single output row.)
+    #[must_use]
+    pub(crate) fn step_coeffs(&self) -> Vec<Poly> {
+        debug_assert_eq!(K_H, 1, "step_coeffs lays out a single output row");
+        let mut coeffs = Vec::with_capacity(3 * ELL_H);
+        coeffs.extend(self.a0.iter().cloned()); // A₀ (K_H·ELL_H limbs)
+        coeffs.extend(self.a1.iter().cloned()); // A₁
+        for d in 0..DIGITS {
+            coeffs.push(Poly::zero().sub(&Poly::constant(1u64 << (LOG_BASE * (d as u32))))); // −2^{LOG_BASE·d}
+        }
+        coeffs
+    }
 }
 
 /// The **gadget decomposition** `G⁻¹`: split each coefficient of the `K_H`-element `image` into its `DIGITS`
