@@ -76,6 +76,13 @@ fn next_round_timeout(current: Duration, progressed: bool) -> Duration {
     }
 }
 
+/// A callback that turns a detected equivocation into a submittable **sealed slash transaction** — injected by
+/// the node, which knows the concrete DROMOS state machine and holds the public keyper registry needed to seal.
+/// The generic engine driver stays state-machine-agnostic; this closure carries the one DROMOS-specific step, so
+/// a caught equivocation is automatically sealed and gossiped into the cell's mempool to be applied on-chain.
+/// `None` for a driver that does not auto-submit slashes (a bare consensus test harness).
+pub type SlashSealer = std::sync::Arc<dyn Fn(&SlashEvidence) -> Option<SealedTx> + Send + Sync>;
+
 /// The identity + genesis a validator's engine is built from — the agreed cell configuration
 /// ([`ConsensusEngine::new`]). Everything a node needs to join a live TAXIS cell, gathered into one struct.
 pub struct TaxisParams<S> {
@@ -103,6 +110,9 @@ pub struct TaxisParams<S> {
     /// When present, round 0 becomes the min-ticket lottery over the elected line — the winner stays secret
     /// until it proposes, so an adversary cannot pre-aim a DoS/bribe at the single upcoming proposer.
     pub sortition: Option<SortitionParams>,
+    /// How to seal a detected equivocation into a submittable slash transaction, or `None` to only surface a
+    /// [`TaxisEvent::Slashed`] without auto-submitting. Injected by the node (which holds the keyper registry).
+    pub slash_sealer: Option<SlashSealer>,
 }
 
 /// A node's **secret-leader sortition** registration (SSLE, spec §10.1) — its own post-quantum Merkle-VRF
@@ -228,6 +238,9 @@ where
         if let Some(s) = params.sortition {
             engine.enable_sortition(s.secret, s.roots, s.base);
         }
+        // How to auto-submit a caught equivocation as an on-chain slash (moved out of `params` before it is
+        // otherwise consumed above). `None` on a driver that only surfaces the slash as an event.
+        let slash_sealer = params.slash_sealer;
 
         // Delay the FIRST tick by a full period rather than firing it immediately (tokio's `interval` fires
         // tick 0 at once). The leader proposes on a tick, so an immediate first tick makes it propose height 1
@@ -257,11 +270,11 @@ where
             tokio::select! {
                 _ = tick.tick() => {
                     let outs = engine.step(Input::Tick);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs);
                 }
                 () = tokio::time::sleep_until(timeout_deadline) => {
                     let outs = engine.step(Input::Timeout);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs);
                     // This round did not finalize before its deadline: back off before injecting the next
                     // Timeout, so a slow (not failed) round is given more time rather than livelocked by a
                     // premature advance. A finalization anywhere resets it via the progress check below.
@@ -285,7 +298,7 @@ where
                                 coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok())
                             {
                                 let outs = step_msg(&mut engine, &msg, src);
-                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
+                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs);
                             }
                         }
                         // A submitted transaction: accepted from ANY sender — a client (the network ingress that
@@ -367,6 +380,7 @@ fn ingest_tx<S: StateMachine>(
 /// Act on a batch of engine outputs: broadcast every `Send` to the cell (and deliver it back to the local
 /// engine, cascading until quiescent), and surface `Committed`/`Slash`/`Reward` as [`TaxisEvent`]s. The local
 /// self-delivery is what lets the proposer prepare its own proposal (`ConsensusEngine::maybe_propose`).
+#[allow(clippy::too_many_arguments)]
 fn drive<S: StateMachine>(
     engine: &mut ConsensusEngine<S>,
     client: &Client,
@@ -375,6 +389,8 @@ fn drive<S: StateMachine>(
     outs: Vec<Output>,
     events: &broadcast::Sender<TaxisEvent>,
     last_ckpt: &mut Option<u64>,
+    slash_sealer: Option<&SlashSealer>,
+    seen: &mut BoundedMap<[u8; 32], ()>,
 ) {
     let mut queue: VecDeque<Output> = outs.into_iter().collect();
     while let Some(out) = queue.pop_front() {
@@ -408,7 +424,15 @@ fn drive<S: StateMachine>(
                 let _ = events.send(TaxisEvent::Committed { height, block_hash });
             }
             Output::Slash(ev) => {
-                let _ = events.send(TaxisEvent::Slashed { validator: slash_validator(&ev) });
+                let _ = events.send(TaxisEvent::Slashed { validator: ev.validator });
+                // Auto-submit the on-chain slash: seal the equivocation proof into a transaction and ingest +
+                // gossip it exactly like a client tx, so the whole cell includes it and the equivocator's bonded
+                // stake is debited in executed state. Idempotent — the DROMOS slash guard rejects a duplicate.
+                if let Some(sealer) = slash_sealer
+                    && let Some(sealed) = sealer(&ev)
+                {
+                    ingest_tx(engine, client, coords, me, seen, &sealed);
+                }
             }
             Output::Reward(split) => {
                 let _ = events.send(TaxisEvent::Rewarded(split));
@@ -450,11 +474,6 @@ pub fn spawn_checkpoint_publisher<S>(
             }
         }
     })
-}
-
-/// The equivocating validator named by a slash proof.
-fn slash_validator(ev: &SlashEvidence) -> u8 {
-    ev.validator
 }
 
 #[cfg(test)]

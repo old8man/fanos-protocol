@@ -14,16 +14,18 @@
 //! (its own docs forbid an un-zeroized owned copy), so re-derivation from a seed is both the hygienic and the
 //! canonical path (matching how the cell was dealt). The verifier set and keyper commitment are public.
 
-use fanos_dromos::HybridLedger;
 use fanos_dromos::token::TokenLedger;
+use fanos_dromos::{HybridLedger, SlashTx};
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_pqcrypto::{HybridKemSecret, HybridSigSecret, HybridVerifier};
 use fanos_primitives::{BeaconSeed, Epoch};
-use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry};
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_taxis::params::CellParams;
+use fanos_taxis::tx::Transaction;
+use fanos_taxis::SlashEvidence;
 use rand_core::CryptoRng;
 
-use crate::taxis_driver::TaxisParams;
+use crate::taxis_driver::{SlashSealer, TaxisParams};
 
 /// Re-derive a validator's `(consensus signing key, anti-MEV/keyper KEM secret)` from its `node_seed` — the
 /// two keys drawn in sequence from one seeded CSPRNG, the exact order the cell was dealt in, so the derivation
@@ -48,6 +50,27 @@ pub fn build_genesis(genesis_alloc: &[([u8; 32], u64)]) -> HybridLedger {
     HybridLedger::new(tokens)
 }
 
+/// Build the [`SlashSealer`] a validator uses to auto-submit a caught equivocation: look up the equivocator's
+/// verifier by index, wrap the two conflicting votes as a DROMOS [`SlashTx`], and seal that to the epoch keyper
+/// line — a transaction any validator then includes, debiting the equivocator's bonded stake in executed state.
+/// The equivocation proof is self-verifying, so a validator can seal a slash for *any* peer without extra trust.
+fn build_slash_sealer(
+    verifiers: Vec<HybridVerifier>,
+    keyper: KeyperRegistry,
+    epoch: Epoch,
+    beacon: BeaconSeed,
+    cell: CellParams,
+) -> SlashSealer {
+    std::sync::Arc::new(move |ev: &SlashEvidence| {
+        let verifier = verifiers.get(usize::from(ev.validator))?;
+        let slash = SlashTx { vote_a: ev.vote_a.clone(), vote_b: ev.vote_b.clone(), verifier: verifier.clone() };
+        let tx = Transaction::new(HybridLedger::slash_payload(&slash));
+        let mut rng_seed = [0u8; 32];
+        getrandom::fill(&mut rng_seed).ok()?;
+        seal_to_keyper_line(&keyper, &tx, epoch, &beacon, cell, &rng_seed).ok()
+    })
+}
+
 /// One validator's complete provisioning — its single secret seed plus the shared public cell configuration.
 /// Produced by [`deal_validators`], serialized to a `validator-<i>.taxis` file, and read by `fanos validator`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -64,6 +87,11 @@ pub struct ValidatorConfig {
     pub beacon: BeaconSeed,
     /// The agreed on-chain keyper decryption-key commitment.
     pub keyper_commit: [u8; 32],
+    /// The full keyper committee **registry**, canonical bytes ([`KeyperRegistry::to_bytes`]). Public config
+    /// every validator holds — to verify a served registry and to **seal its own transactions**, e.g. an
+    /// auto-submitted slash. Its commitment is [`keyper_commit`](Self::keyper_commit). Stored as bytes (like the
+    /// encoded `verifiers`) because the registry's key material is deliberately not `Eq`/`Debug`.
+    pub keyper: Vec<u8>,
     /// Every validator's consensus verifier, encoded, indexed by validator index.
     pub verifiers: Vec<Vec<u8>>,
     /// The genesis token allocation `(account_id, amount)` — the chain's initial supply. Applied identically
@@ -84,6 +112,9 @@ impl ValidatorConfig {
             .map(|v| HybridVerifier::decode(v))
             .collect::<Option<Vec<_>>>()?;
         let (signer, kem_secret) = keys_from_seed(&self.node_seed);
+        // Reconstruct the keyper registry so this validator can seal an auto-submitted slash to the epoch line.
+        let keyper = KeyperRegistry::from_bytes(&self.keyper)?;
+        let slash_sealer = Some(build_slash_sealer(verifiers.clone(), keyper, self.epoch, self.beacon, self.cell));
         Some(TaxisParams {
             cell: self.cell,
             me: self.me,
@@ -96,11 +127,13 @@ impl ValidatorConfig {
             genesis_state: build_genesis(&self.genesis_alloc),
             reward_per_block: 0,
             sortition: None,
+            slash_sealer,
         })
     }
 
     /// Canonical wire bytes: `me(1) ‖ node_seed(32) ‖ q(4) n(4) f(4) Q(4) ‖ epoch(8) ‖ beacon(32) ‖
-    /// keyper_commit(32) ‖ verifier_count(4) ‖ [len(4) ‖ verifier]…` (all big-endian).
+    /// keyper_commit(32) ‖ verifier_count(4) ‖ [len(4) ‖ verifier]… ‖ alloc_count(4) ‖ [account(32) amount(8)]…
+    /// ‖ keyper_len(4) ‖ keyper` (all big-endian).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -123,6 +156,8 @@ impl ValidatorConfig {
             out.extend_from_slice(account);
             out.extend_from_slice(&amount.to_be_bytes());
         }
+        out.extend_from_slice(&u32_of(self.keyper.len()).to_be_bytes());
+        out.extend_from_slice(&self.keyper);
         out
     }
 
@@ -154,10 +189,12 @@ impl ValidatorConfig {
             let amount = r.u64()?;
             genesis_alloc.push((account, amount));
         }
+        let keyper_len = r.u32()? as usize;
+        let keyper = r.take(keyper_len)?.to_vec();
         if !r.is_empty() {
             return None; // trailing bytes ⇒ non-canonical
         }
-        Some(Self { me, node_seed, cell, epoch, beacon, keyper_commit, verifiers, genesis_alloc })
+        Some(Self { me, node_seed, cell, epoch, beacon, keyper_commit, keyper, verifiers, genesis_alloc })
     }
 }
 
@@ -246,6 +283,7 @@ pub fn deal_validators<R: CryptoRng>(
     // to publish in the chain-info file; the validators themselves carry only its commitment.
     let registry = KeyperRegistry::new(certs);
     let keyper_commit = registry.commit();
+    let keyper_bytes = registry.to_bytes();
     let configs = node_seeds
         .into_iter()
         .enumerate()
@@ -256,6 +294,7 @@ pub fn deal_validators<R: CryptoRng>(
             epoch,
             beacon,
             keyper_commit,
+            keyper: keyper_bytes.clone(),
             verifiers: verifiers.clone(),
             genesis_alloc: genesis_alloc.to_vec(),
         })
@@ -368,6 +407,35 @@ mod tests {
                 assert_ne!(configs[i].node_seed, configs[j].node_seed, "each validator's seed is unique");
             }
         }
+    }
+
+    #[test]
+    fn a_dealt_validators_sealer_seals_a_real_equivocation_into_a_slash() {
+        use fanos_taxis::{Phase, SignedVote, Vote, detect_equivocation};
+        // A dealt validator now carries a slash sealer (built from the public keyper registry it holds), so a
+        // caught equivocation becomes a submittable sealed slash transaction — the auto-submission the driver
+        // performs on Output::Slash. This exercises the whole sealer path: registry reconstruction, verifier
+        // lookup, SlashTx construction, and sealing to the epoch keyper line.
+        let (configs, _registry) = deal_validators(
+            CellParams::FANO,
+            Epoch::new(3),
+            BeaconSeed::new([7u8; 32]),
+            &[([1u8; 32], 1_000u64)],
+            &mut SeedRng::from_seed(b"sealer-test"),
+        );
+        let params = configs[0].to_taxis_params().expect("dealt params rebuild");
+        let sealer = params.slash_sealer.expect("a dealt validator has a slash sealer");
+
+        // Validator 2 equivocates: two conflicting Commit votes signed by its own consensus key.
+        let (signer2, _kem2) = keys_from_seed(&configs[2].node_seed);
+        let verifier2 = HybridVerifier::decode(&configs[0].verifiers[2]).expect("validator 2's verifier");
+        let vote = |bh: [u8; 32]| {
+            SignedVote::sign(Vote { height: 4, round: 0, block_hash: bh, phase: Phase::Commit, voter: 2 }, &signer2)
+        };
+        let ev =
+            detect_equivocation(&vote([1u8; 32]), &vote([2u8; 32]), &verifier2).expect("a genuine equivocation");
+
+        assert!(sealer(&ev).is_some(), "the sealer seals a genuine equivocation into a submittable slash");
     }
 
     #[test]

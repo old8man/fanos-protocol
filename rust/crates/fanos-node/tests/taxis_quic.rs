@@ -114,6 +114,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
                 roots: vrf_roots.clone(),
                 base: 0,
             }),
+            slash_sealer: None,
         };
         handles.push(spawn_taxis::<F2, Accounts>(cell.nodes[i].client(), params));
     }
