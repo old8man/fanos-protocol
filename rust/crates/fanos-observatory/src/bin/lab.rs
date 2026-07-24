@@ -23,7 +23,7 @@ use fanos_field::{F7, F13, F31, Field};
 use fanos_observatory::{ClusterDashboard, render_cluster};
 use fanos_runtime::{Config, Duration};
 use fanos_sim::stress::{Experiment, ExperimentReport, run_experiment};
-use fanos_sim::{Cluster, ClusterSnapshot, Hierarchy};
+use fanos_sim::{Cluster, ClusterSnapshot, Hierarchy, UnifiedCluster};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -47,6 +47,8 @@ enum Command {
     Sweep(SweepArgs),
     /// Cross-cell routing on a connected hierarchy: measure reachability, optionally under gateway crashes.
     Route(RouteArgs),
+    /// The unified topology: K coherent cells in one Sim that BOTH report coherence AND route cross-cell.
+    Unified(UnifiedArgs),
     /// List the available stress experiments.
     Scenarios,
     /// Check the ХОЛАРХ architecture viability gate (V1–V4, σ-panel, Ω4 ablations).
@@ -93,6 +95,19 @@ struct RunArgs {
     #[arg(long, default_value_t = 2000)]
     run_ms: u64,
     /// Emit the cluster state as JSON instead of a human report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct UnifiedArgs {
+    /// Number of coherent 7-node cells (each a Fano cell embedded in one plane, with a routing gateway).
+    #[arg(long, short, default_value_t = 20)]
+    cells: usize,
+    /// RNG seed.
+    #[arg(long, short, default_value_t = 1)]
+    seed: u64,
+    /// Emit JSON.
     #[arg(long)]
     json: bool,
 }
@@ -168,6 +183,7 @@ fn main() {
         Command::Experiment(args) => cmd_experiment(&args),
         Command::Sweep(args) => cmd_sweep(&args),
         Command::Route(args) => cmd_route(&args),
+        Command::Unified(args) => cmd_unified(&args),
         Command::Scenarios => cmd_scenarios(),
         Command::Gate => cmd_gate(),
         Command::Watch(args) => {
@@ -225,6 +241,48 @@ fn cmd_sweep(args: &SweepArgs) {
         }
     }
     println!();
+}
+
+fn cmd_unified(args: &UnifiedArgs) {
+    if args.cells < 2 {
+        eprintln!("unified needs at least 2 cells");
+        std::process::exit(2);
+    }
+    let nodes = args.cells * 7;
+    // Pick the smallest plane that fits 7·cells nodes (F7=57, F13=183, F31=993 points).
+    let (total, reporting, healthy, mean_phi, reach) = if nodes <= 57 {
+        unified_run::<F7>(args)
+    } else if nodes <= 183 {
+        unified_run::<F13>(args)
+    } else if nodes <= 993 {
+        unified_run::<F31>(args)
+    } else {
+        eprintln!("unified tops out at 141 cells (993 nodes on one plane); requested {nodes} nodes");
+        std::process::exit(2);
+    };
+    if args.json {
+        println!(
+            "{{\"cells\":{},\"nodes\":{total},\"reporting\":{reporting},\"healthy\":{healthy},\"mean_phi\":{mean_phi:.6},\"reachability\":{reach:.6}}}",
+            args.cells,
+        );
+    } else {
+        println!("\nunified topology — {} coherent cells × 7 = {total} nodes, one Sim", args.cells);
+        println!("  coherence lens  {reporting}/{total} nodes report a self-model · {} · mean Φ {mean_phi:.3}", if healthy { "healthy" } else { "degraded" });
+        println!("  routing lens    {:.1}% of sampled cross-cell gateway routes delivered", reach * 100.0);
+        println!("  → both lenses on one connected topology.\n");
+    }
+}
+
+fn unified_run<F: Field + 'static>(args: &UnifiedArgs) -> (usize, usize, bool, f64, f64) {
+    let mut cluster = UnifiedCluster::new::<F>(args.seed, lab_config(), args.cells);
+    cluster.run_for(Duration::from_millis(1500));
+    let snap = cluster.snapshot();
+    let (total, reporting) = (snap.stats.total, snap.stats.reporting);
+    let (healthy, mean_phi) = (snap.stats.is_healthy(), snap.stats.mean_phi);
+    // Sample routing: cell 0 → up to 19 other cells (bounded so the probe stays cheap at large scale).
+    let pairs: Vec<(usize, usize)> = (1..args.cells.min(20)).map(|j| (0, j)).collect();
+    let reach = cluster.reachability(&pairs);
+    (total, reporting, healthy, mean_phi, reach)
 }
 
 fn cmd_route(args: &RouteArgs) {

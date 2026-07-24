@@ -51,6 +51,24 @@ fn a_fault_is_contained_to_its_cell() {
 }
 
 #[test]
+fn coherent_cells_also_route_across_each_other() {
+    // The unification: the SAME cluster reports coherence AND routes cross-cell (both lenses, one topology).
+    let mut cluster = UnifiedCluster::new::<F31>(5, config(), 12); // 84 nodes, 12 gateways
+    cluster.run_for(Duration::from_millis(1200));
+
+    // Coherence lens.
+    let snap = cluster.snapshot();
+    assert_eq!(snap.stats.reporting, 84, "every node reports coherence");
+    assert!(snap.stats.is_healthy());
+
+    // Routing lens — every ordered gateway pair reaches the other.
+    let pairs: Vec<(usize, usize)> = (0..12)
+        .flat_map(|i| (0..12).filter(move |&j| i != j).map(move |j| (i, j)))
+        .collect();
+    assert!(cluster.reachability(&pairs) > 0.999, "every cell's gateway routes to every other");
+}
+
+#[test]
 fn scales_toward_a_thousand_nodes_via_the_o_n_refresh_path() {
     // 141 cells = 987 nodes on F31 (its ceiling). Linear in cells — each node pings only its 6 members.
     let mut cluster = UnifiedCluster::new::<F31>(9, config(), 141);
