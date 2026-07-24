@@ -21,6 +21,8 @@ fanos-geometry = { workspace = true, features = ["std"] }
 fanos-field = { workspace = true, features = ["std"] }
 # Hybrid KEM public keys of the mixnet members (the onion seals to them).
 fanos-pqcrypto.workspace = true
+# Domain-separated BLAKE3 for the service host-registration tag (§3b hidden-service hosting).
+fanos-primitives.workspace = true
 # The canonical wire codec: the rendezvous `Request` wrapper derives its encoding.
 fanos-wire.workspace = true
 fanos-wire-derive.workspace = true

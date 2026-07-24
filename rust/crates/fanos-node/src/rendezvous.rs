@@ -21,7 +21,7 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_line,
-    session_reply_keypair,
+    service_tag, session_reply_keypair,
 };
 use fanos_runtime::{Command, Notification};
 
@@ -277,6 +277,10 @@ pub fn anonymous_dial<R: CryptoRng>(
     // The matching reply keypair — the client advertises the public half in every Request; this driver
     // keeps the secret half to open the dead-drop.
     let (reply_keys, reply_pub) = session_reply_keypair(secret);
+    // The service host-registration tag: if the service is hosted off its meeting combiner (the general
+    // case), the node at the combiner routes this request to the host registered under this tag
+    // (§3b). A service that is its own combiner ignores it (the delivery surfaces locally there).
+    let tag = service_tag(&service_public.encode(), route.epoch);
     let rclient = RendezvousClient::<F2>::new(
         forward_circuit,
         reply_circuit,
@@ -284,6 +288,7 @@ pub fn anonymous_dial<R: CryptoRng>(
         route.threshold,
         secret,
         reply_pub,
+        tag,
     );
     let session = ClientSession::dial(meeting, service_public, rng);
     dial_anonymous(client, session, rclient, reply_keys)
@@ -399,8 +404,15 @@ mod tests {
             .unwrap();
         let secret = b"bridge-secret";
         let (reply_keys, reply_pub) = session_reply_keypair(secret);
-        let rclient =
-            RendezvousClient::<F2>::new(vec![hop, meeting], vec![rp], dir, 2, secret, reply_pub.clone());
+        let rclient = RendezvousClient::<F2>::new(
+            vec![hop, meeting],
+            vec![rp],
+            dir,
+            2,
+            secret,
+            reply_pub.clone(),
+            [0; 32],
+        );
         let expected_first_combiner = combiner_for::<F2>(hop).unwrap();
 
         let (out_tx, out_rx) = unbounded_channel();

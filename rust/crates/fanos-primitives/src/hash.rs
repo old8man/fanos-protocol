@@ -19,6 +19,10 @@ pub mod label {
     pub const KDF: &str = "FANOS-v1/kdf";
     /// CALYPSO hidden-service rendezvous.
     pub const CALYPSO: &str = "FANOS-v1/calypso";
+    /// Rendezvous **host-registration tag**: `H(svc_pub ‖ epoch)`, disambiguating services co-located at
+    /// one meeting combiner so a hidden-service host is reachable without revealing its coordinate
+    /// (`design-anonymity-substrate.md` §3b, symmetric-NOSTOS hosting).
+    pub const RDV_HOST: &str = "FANOS-v1/rdv-host";
     /// PROTEUS transport-shape derivation.
     pub const PROTEUS: &str = "FANOS-v1/proteus-shape";
     /// Node-ID from the public-key bundle.

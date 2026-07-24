@@ -272,6 +272,7 @@ mod tests {
     fn a_request() -> Request {
         Request {
             cookie: *b"threshold-cookie",
+            service_tag: [0; 32],
             reply_circuit: vec![Point::<F2>::at(4).coords()],
             payload: b"the hidden request body".to_vec(),
             reply_pub: vec![],

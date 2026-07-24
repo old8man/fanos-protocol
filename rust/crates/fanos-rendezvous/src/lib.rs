@@ -108,6 +108,12 @@ pub struct Request {
     /// A per-session cookie: the service demultiplexes concurrent clients by it and binds each to its
     /// reply circuit, so it need not learn who any client is.
     pub cookie: [u8; 16],
+    /// The service's **host-registration tag** [`service_tag`], or all-zeros for none. When a hidden
+    /// service is hosted off its meeting combiner (the general case — the combiner is key-derived, not
+    /// the operator's coordinate), the node at the combiner routes this request to the host registered
+    /// under this tag (`design-anonymity-substrate.md` §3b). All-zeros ⇒ deliver locally (the service is
+    /// its own combiner, or the legacy/Direct path) — so this is additive and back-compatible.
+    pub service_tag: [u8; 32],
     /// Hop lines to the client's reply rendezvous. For NOSTOS the **last** hop is the client's own
     /// **dead-drop line** (one of the `q+1` lines through the client's coordinate), so the client
     /// receives replies passively as a line member — the service never learns which member it is.
@@ -200,6 +206,97 @@ pub fn seal_nostos_reply<F: Field>(
     seal_forward::<F>(circuit, directory, threshold, &enveloped, onion_seed)
 }
 
+/// The **host-registration tag** for a service: `H("FANOS-v1/rdv-host" ‖ service_pubkey ‖ epoch)`. A
+/// hidden service is reached at its [`meeting_line`], whose combiner is a function of the *service key*,
+/// not of any node's (VRF-blinded, epoch-rotated) coordinate — so the operator hosting the service is,
+/// save by luck, **not** the node at that combiner. The operator instead registers an anonymous forward
+/// route there (`design-anonymity-substrate.md` §3b); this tag lets the combiner route each client
+/// request to the right registered host when several services share one combiner (Fano has only four).
+/// It rotates per epoch and is a one-way image of the public key, so it discloses no coordinate.
+#[must_use]
+pub fn service_tag(service_pubkey: &[u8], epoch: Epoch) -> [u8; 32] {
+    let mut data = Vec::with_capacity(service_pubkey.len() + 4);
+    data.extend_from_slice(service_pubkey);
+    data.extend_from_slice(&epoch.low32_be_bytes());
+    fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::RDV_HOST, &data)
+}
+
+/// The 4-byte marker that prefixes a [`HostRegister`] onion body, distinguishing a host registration
+/// from a client [`Request`] when both peel out at a meeting combiner as anonymous deliveries. A
+/// `Request` opens with a 16-byte CSPRNG cookie, so a collision with this constant is negligible; the
+/// combiner nonetheless checks the marker *first* (both encoders are ours), making classification exact.
+pub const HOST_REGISTER_TAG: &[u8; 4] = b"RHR1";
+
+/// A hidden service's **anonymous host registration**, delivered to its [`meeting_line`]'s combiner each
+/// epoch (`design-anonymity-substrate.md` §3b). The service is treated as a NOSTOS receiver: the combiner
+/// learns only its dead-drop **line** (the last hop of `forward_circuit`), never its coordinate, and
+/// forwards each matching client request to it as a NOSTOS onion.
+///
+/// The **bare-host fallback** — an operator that cannot peel a dead-drop (a pure-overlay egress) — sends
+/// an empty `forward_circuit`, registering its plaintext coordinate for a direct forward instead; that
+/// leaks the coordinate to the one combiner node (Tor's posture, no worse). The primary, coordinate-hiding
+/// path carries a real `forward_circuit` + `reply_pub`.
+/// `#[derive(Wire)]` emits `service_tag(32) ‖ reply_pub(varint-prefixed) ‖ forward_circuit(varint count ‖
+/// Triple×12) ‖ coordinate(12)`.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
+pub struct HostRegister {
+    /// The [`service_tag`] the combiner routes matching client requests by.
+    pub service_tag: [u8; 32],
+    /// The service's **NOSTOS reply public key** (a serialized [`HybridKemPublic`]): the combiner
+    /// end-to-end-seals each forwarded request to it, so the dead-drop line's members see only ciphertext
+    /// and only the service decrypts. Empty on the bare-host fallback (direct forward to `coordinate`).
+    pub reply_pub: Vec<u8>,
+    /// Hop lines to the service's own **dead-drop line** (the last hop), through which the combiner
+    /// forwards client requests as NOSTOS onions. Empty on the bare-host fallback.
+    pub forward_circuit: Vec<Triple>,
+    /// The bare-host fallback coordinate — used **only** when `forward_circuit` is empty (the combiner
+    /// forwards by a direct `Send`, learning this coordinate). All-zeros on the primary onion path.
+    pub coordinate: Triple,
+}
+
+impl HostRegister {
+    /// The canonical wire bytes (the derived [`Wire`] codec).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        self.to_wire()
+    }
+
+    /// Decode a host registration; `None` if malformed, non-canonical, or carrying trailing bytes.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::from_wire(bytes).ok()
+    }
+}
+
+/// Seal a [`HostRegister`] into a threshold onion routed through `meeting_circuit` — hop lines whose
+/// **last** is the service's [`meeting_line`] this epoch — so it peels out at the meeting combiner as an
+/// anonymous delivery the combiner recognizes by [`HOST_REGISTER_TAG`]. The registration itself is an
+/// onion, so the combiner never learns the operator's coordinate — only the dead-drop line inside
+/// `register.forward_circuit`. `seed` domain-separates the onion's key material (fresh per registration).
+/// `None` if the circuit is empty, a member key is missing, or sealing fails.
+#[must_use]
+pub fn seal_host_register<F: Field>(
+    meeting_circuit: &[Triple],
+    directory: &MixDirectory,
+    threshold: u8,
+    register: &HostRegister,
+    seed: &[u8],
+) -> Option<Forward> {
+    let mut body = Vec::with_capacity(HOST_REGISTER_TAG.len() + 32);
+    body.extend_from_slice(HOST_REGISTER_TAG);
+    body.extend_from_slice(&register.encode());
+    seal_forward::<F>(meeting_circuit, directory, threshold, &body, seed)
+}
+
+/// If `delivery` is a [`HOST_REGISTER_TAG`]-prefixed host registration, decode it; otherwise `None` (the
+/// combiner then treats the delivery as a client [`Request`]). Used at a meeting combiner to classify each
+/// anonymous delivery.
+#[must_use]
+pub fn parse_host_register(delivery: &[u8]) -> Option<HostRegister> {
+    let body = delivery.strip_prefix(HOST_REGISTER_TAG.as_slice())?;
+    HostRegister::decode(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +305,7 @@ mod tests {
     fn request_wrapper_round_trips() {
         let req = Request {
             cookie: *b"session-cookie16",
+            service_tag: [0x5B; 32],
             reply_circuit: vec![[1, 2, 3], [4, 5, 6]],
             payload: b"inner diaulos bytes".to_vec(),
             reply_pub: b"nostos-reply-public-key".to_vec(),
@@ -217,33 +315,32 @@ mod tests {
         // Too short to hold even the cookie.
         assert!(Request::decode(&[]).is_none());
         assert!(Request::decode(&[0; 15]).is_none());
-        // A cookie but no hop-count byte is truncated.
+        // A cookie but no service_tag is truncated (the fixed 16 + 32 header is incomplete).
         assert!(Request::decode(&[0; 16]).is_none());
-        // A cookie but a truncated hop-line is rejected (16 cookie + count=2 + partial coord).
-        assert!(
-            Request::decode(&[
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1
-            ])
-            .is_none()
-        );
+        assert!(Request::decode(&[0; 47]).is_none());
+        // The full 48-byte header but no reply_circuit hop-count varint is truncated.
+        assert!(Request::decode(&[0; 48]).is_none());
     }
 
     #[test]
     fn request_wrapper_boundary_shapes() {
-        // Empty reply circuit, payload, and reply key — the minimal wrapper: 16 cookie ‖ varint(0)×3.
+        // Empty reply circuit, payload, and reply key — the minimal wrapper: 16 cookie ‖ 32 tag ‖
+        // varint(0)×3.
         let bare = Request {
             cookie: [0xAB; 16],
+            service_tag: [0; 32],
             reply_circuit: vec![],
             payload: vec![],
             reply_pub: vec![],
         };
         let wire = bare.encode();
-        assert_eq!(wire.len(), 19);
+        assert_eq!(wire.len(), 16 + 32 + 3);
         assert_eq!(Request::decode(&wire), Some(bare));
 
         // A payload but no reply circuit (a follow-up cell that relies on the service's cookie binding).
         let follow = Request {
             cookie: [0xCD; 16],
+            service_tag: [0x11; 32],
             reply_circuit: vec![],
             payload: b"cell-bytes".to_vec(),
             reply_pub: vec![],
@@ -251,9 +348,11 @@ mod tests {
         assert_eq!(Request::decode(&follow.encode()), Some(follow));
 
         // The varint hop count lifts the old 255-hop `u8` ceiling (which silently truncated): a 300-hop
-        // circuit round-trips exactly — `16 cookie ‖ varint(300)=2 ‖ 300×12 triples ‖ varint(4)=1 ‖ 4`.
+        // circuit round-trips exactly — `16 cookie ‖ 32 tag ‖ varint(300)=2 ‖ 300×12 triples ‖ varint(4)=1
+        // ‖ 4 ‖ varint(0)`.
         let big = Request {
             cookie: [1; 16],
+            service_tag: [0x22; 32],
             reply_circuit: (0..300u32)
                 .map(|i| [i, i.wrapping_add(1), i.wrapping_add(2)])
                 .collect(),
@@ -261,7 +360,57 @@ mod tests {
             reply_pub: vec![],
         };
         let wire = big.encode();
-        assert_eq!(wire.len(), 16 + 2 + 300 * 12 + 1 + 4 + 1);
+        assert_eq!(wire.len(), 16 + 32 + 2 + 300 * 12 + 1 + 4 + 1);
         assert_eq!(Request::decode(&wire), Some(big));
+    }
+
+    #[test]
+    fn host_register_round_trips_and_parses_by_tag() {
+        // The primary onion path: a real dead-drop forward circuit + NOSTOS reply key, all-zero coordinate.
+        let reg = HostRegister {
+            service_tag: [0x5B; 32],
+            reply_pub: b"service-nostos-reply-key".to_vec(),
+            forward_circuit: vec![[1, 2, 3], [4, 5, 6]],
+            coordinate: [0, 0, 0],
+        };
+        assert_eq!(HostRegister::decode(&reg.encode()), Some(reg.clone()));
+
+        // A tagged onion body parses back through the combiner's classifier; a bare `Request` does not.
+        let mut body = Vec::new();
+        body.extend_from_slice(HOST_REGISTER_TAG);
+        body.extend_from_slice(&reg.encode());
+        assert_eq!(parse_host_register(&body), Some(reg));
+        let req = Request {
+            cookie: [0xAB; 16],
+            service_tag: [0; 32],
+            reply_circuit: vec![],
+            payload: b"a client request, not a registration".to_vec(),
+            reply_pub: vec![],
+        };
+        assert!(
+            parse_host_register(&req.encode()).is_none(),
+            "a client Request is not misread as a host registration",
+        );
+
+        // The bare-host fallback: empty forward circuit + reply key, a real coordinate.
+        let fallback = HostRegister {
+            service_tag: [0x11; 32],
+            reply_pub: vec![],
+            forward_circuit: vec![],
+            coordinate: [7, 8, 9],
+        };
+        assert_eq!(HostRegister::decode(&fallback.encode()), Some(fallback));
+    }
+
+    #[test]
+    fn service_tag_is_one_way_epoch_rotating_and_service_specific() {
+        let a = service_tag(b"svc-A", Epoch::new(5));
+        // Deterministic in its inputs.
+        assert_eq!(a, service_tag(b"svc-A", Epoch::new(5)));
+        // Rotates per epoch, and separates distinct services — so co-located hosts never collide.
+        assert_ne!(a, service_tag(b"svc-A", Epoch::new(6)), "the tag rotates per epoch");
+        assert_ne!(a, service_tag(b"svc-B", Epoch::new(5)), "distinct services get distinct tags");
+        // A real tag is never the all-zero "none" sentinel.
+        assert_ne!(a, [0u8; 32]);
     }
 }

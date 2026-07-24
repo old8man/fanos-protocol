@@ -241,6 +241,71 @@ predecessor cost). If the inequality is ever tight, the tuning knob is a **bound
 This is also why the FAST lane, needing no unobservability, may rotate freely, while the MIX/NOSTOS lane's
 rotation is threshold-gated.
 
+## 3b. The service is a receiver too — production hidden-service hosting via symmetric NOSTOS
+
+NOSTOS (§3) hides the *client* that dials a service. The mirror problem — hosting a service so clients reach it
+**without the network ever learning the service's coordinate** — is not a second mechanism: it is NOSTOS applied
+to the *other* endpoint. The client already rides a forward onion to the service's **meeting line**
+`L_rdv = MapToLine(H(svc_pub ‖ epoch ‖ beacon))` and names its own dead-drop line as the reply circuit (§3). The
+gap this closes is that a meeting line's *combiner* `m = combiner_for(L_rdv)` is a function of the **service key**,
+not of any node's coordinate — and a node's coordinate is VRF-beacon-blinded and epoch-rotated (§3, the T2
+precondition). So the operator hosting `svc_pub` is, save by luck, **not** the node at `m`, and `m` rotates every
+epoch with the beacon. A production host therefore cannot "listen at its meeting combiner"; something at `m` must
+relay to it, and that relay must not learn where "it" is.
+
+**The construction — both endpoints are dead-drop receivers; the combiner is a pure rendezvous.** The service
+operator `O` is treated exactly as a NOSTOS receiver:
+
+1. **Anonymous host-registration** (`O → m`, the `RdvHostRegister` frame, wire `0x5B`). Each epoch, `O` computes
+   `m = combiner_for(L_rdv(svc_pub, epoch, beacon))`, draws a fresh dead-drop line `L_O = select_drop_line(c_O, …)`
+   through its own point, and rides a **forward onion to `m`** carrying `{ service_tag, reply_pub_O, forward_route_O }`
+   — where `service_tag = H("FANOS-v1/rdv-host" ‖ svc_pub ‖ epoch)` disambiguates services co-located at one
+   combiner (Fano has only 4), `reply_pub_O` is a fresh NOSTOS reply key, and `forward_route_O` is a threshold
+   circuit ending at `L_O`. The registration is itself an onion, so `m` learns only `O`'s **line** `L_O` (`O` hidden
+   `1`-of-`(q+1)`), never `c_O`. `O` **re-registers each epoch**, because `m` and `L_O` both rotate with the beacon.
+2. **Combiner-side forwarding** (`m → O`). When a client request peels out at `m` as an anonymous delivery, `m`
+   looks up the request's `service_tag`; if a host is registered, it **re-seals the entire client `Request` as a
+   NOSTOS onion to `forward_route_O`** (`seal_nostos_reply` — the same primitive that seals a client reply, §3) and
+   emits it. `O`, a member of `L_O`, receives the dead-drop, opens it with `reply_pub_O`'s secret, and now holds the
+   client's `Request` verbatim: cookie, the client's own reply circuit, and the DIAULOS `ClientHello` sealed to
+   `svc_pub`. A request whose tag matches no registered host falls through to a **local** delivery (unchanged), so a
+   node that genuinely *is* its own combiner still serves directly — the rule is additive.
+3. **Reply** (`O → client`). `O` ingests the request into a `RendezvousService`, drives the DIAULOS `ServerSession`
+   (only `O` holds the service secret, so only `O` completes the handshake — `m` cannot), and seals each response
+   back through the **client's** dead-drop line via ordinary NOSTOS (`RendezvousService::seal_reply`). The reply
+   goes `O → client` directly; `m` is **out of the reply path entirely**.
+
+**What each party learns — the anonymity claim.** The meeting combiner `m` sees a public `service_tag` (already
+implied by `L_rdv`, itself `H(svc_pub‖…)`), the client's dead-drop **line**, the service's dead-drop **line**, and
+ciphertext bodies — **neither endpoint's coordinate**. The forward and return legs are each threshold onions, so
+below `t` members of any hop learn information-theoretically nothing (`Sim_t`, §3-T1). The service is hidden
+`1`-of-`(q+1)` on `L_O`; the client `1`-of-`(q+1)` on its own line; the two are **symmetric**, and the relationship
+`α_Rel` (§3-T1(iii)) is protected because `m` never holds a (client-coord, service-coord) pair — it holds a
+(client-line, service-line) pair, each a `q+1` set, refreshed every epoch. This is the strict generalization of §3's
+T2 to *both* endpoints, and it is **strictly stronger than Tor's rendezvous model**, where the rendezvous point
+learns the service's introduction circuit and the intro point is chosen by (hence linkable to) the service; here the
+combiner is a beacon-derived coordinate no party selects, and the service is a blinded line member.
+
+**The bare-host fallback (stated for honesty, as with the client's bare-proxy §3-relay).** An operator that cannot
+be a line member — a pure-overlay egress with no router — may instead register its **coordinate** (an
+`RdvHostRegister` naming `c_O` with an empty `forward_route`), and `m` forwards the request by a direct `Send`. This
+leaks `c_O` to the one node `m` (exactly Tor's posture, no worse), and is the residual path for a host that cannot
+peel a dead-drop; the **primary** path is the coordinate-hiding onion registration above. The two are the same frame
+with/without a `forward_route`, mirroring the client's NOSTOS-vs-relay split precisely.
+
+**Why re-seal at the combiner rather than anchor the service at `m`.** Anchoring (dealing `svc`'s secret to the
+`q+1` members of `L_rdv` so a threshold *jointly* serves) is a genuinely different primitive — threshold-custodied
+hosting (CALYPSO/`ThresholdService`), reshared to the rotating line by POROS (§6) — and it is correct for a service
+that is *meant* to be threshold-operated (a naming oracle). It is **wrong** for a private single-operator service or
+a **clearnet exit**: you cannot Shamir-deal clearnet egress or a private key you are unwilling to expose to a
+threshold of rotating strangers. Symmetric-NOSTOS hosting keeps the secret with the operator and hides the operator;
+threshold-anchoring shares the secret and needs no operator. FANOS offers both; this section is the former, and it
+is what makes the exit and the generic `.fanos` service reachable.
+
+**Cost.** Three threshold-onion legs (client→meeting, meeting→service dead-drop, service→client dead-drop) instead of
+NOSTOS's two — the price of hiding the *second* endpoint. It obeys the same trilemma budget (§0): a hidden service is
+receiver-anonymous traffic and pays the receiver leg's constant on each blinded endpoint.
+
 ## 4. The MIX lane — ultimate anonymity, and the Anytrust-escape it buys
 
 A hop **is a line**, threshold-encrypted `t`-of-`(q+1)`, below-threshold ZK; Sphinx-uniform packets; Loopix

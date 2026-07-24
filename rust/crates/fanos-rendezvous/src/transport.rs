@@ -70,6 +70,7 @@ pub struct RendezvousClient<F: Field> {
     /// to it; the matching secret half stays with the dialing driver, which opens the dead-drop delivered
     /// at the client's own reply line — so no relay ever learns the client.
     reply_pub: Vec<u8>,
+    service_tag: [u8; 32],
     _f: PhantomData<F>,
 }
 
@@ -85,7 +86,10 @@ impl<F: Field> RendezvousClient<F> {
     /// * `reply_pub` — this session's **NOSTOS reply public key** ([`session_reply_keypair`]), advertised
     ///   in every [`Request`] so the service end-to-end-seals its replies as a dead-drop to the client's
     ///   own line. Pass **empty** to select the legacy path — the service cookie-tags the reply for a
-    ///   rendezvous relay to forward — for a client that cannot be a line member (a bare-overlay proxy).
+    ///   rendezvous relay to forward — for a client that cannot be a line member (a bare-overlay proxy);
+    /// * `service_tag` — the service's [`service_tag`](crate::service_tag), so the meeting combiner can
+    ///   route this request to a host registered off its combiner (`design-anonymity-substrate.md` §3b).
+    ///   Pass **all-zeros** when the service is its own combiner (the delivery surfaces locally there).
     #[must_use]
     pub fn new(
         forward_circuit: Vec<Triple>,
@@ -94,6 +98,7 @@ impl<F: Field> RendezvousClient<F> {
         threshold: u8,
         secret: &[u8],
         reply_pub: Vec<u8>,
+        service_tag: [u8; 32],
     ) -> Self {
         let mut rng = SeedRng::from_seed(secret);
         let mut cookie = [0u8; 16];
@@ -106,6 +111,7 @@ impl<F: Field> RendezvousClient<F> {
             threshold,
             rng,
             reply_pub,
+            service_tag,
             _f: PhantomData,
         }
     }
@@ -131,6 +137,7 @@ impl<F: Field> RendezvousClient<F> {
     pub fn seal_send(&mut self, payload: &[u8]) -> Option<Forward> {
         let wrapped = Request {
             cookie: self.cookie,
+            service_tag: self.service_tag,
             reply_circuit: self.reply_circuit.clone(),
             payload: payload.to_vec(),
             reply_pub: self.reply_pub.clone(),
@@ -288,8 +295,16 @@ mod tests {
     fn cookie_is_deterministic_in_the_secret_and_distinct_across_secrets() {
         let dir = fano_directory();
         let cookie = |secret: &[u8]| {
-            RendezvousClient::<F2>::new(vec![line(0)], vec![line(1)], dir.clone(), 2, secret, vec![])
-                .cookie()
+            RendezvousClient::<F2>::new(
+                vec![line(0)],
+                vec![line(1)],
+                dir.clone(),
+                2,
+                secret,
+                vec![],
+                [0; 32],
+            )
+            .cookie()
         };
         assert_eq!(
             cookie(b"alpha"),
@@ -321,8 +336,15 @@ mod tests {
         )
         .coords();
         let hop = (0..7).map(line).find(|&l| l != meeting).unwrap();
-        let mut c =
-            RendezvousClient::<F2>::new(vec![hop, meeting], vec![line(3)], dir, 2, b"secret", vec![]);
+        let mut c = RendezvousClient::<F2>::new(
+            vec![hop, meeting],
+            vec![line(3)],
+            dir,
+            2,
+            b"secret",
+            vec![],
+            [0; 32],
+        );
         let a = c.seal_send(b"hello").unwrap();
         let b = c.seal_send(b"hello").unwrap();
         assert_eq!(
@@ -339,7 +361,15 @@ mod tests {
     fn reply_combiner_is_the_reply_circuit_destination() {
         let dir = fano_directory();
         let rp = line(4);
-        let c = RendezvousClient::<F2>::new(vec![line(0)], vec![line(1), rp], dir, 2, b"s", vec![]);
+        let c = RendezvousClient::<F2>::new(
+            vec![line(0)],
+            vec![line(1), rp],
+            dir,
+            2,
+            b"s",
+            vec![],
+            [0; 32],
+        );
         assert_eq!(c.reply_combiner(), combiner_for::<F2>(rp));
     }
 
@@ -359,6 +389,7 @@ mod tests {
         // Ingesting a request binds the cookie to its reply circuit and surfaces the inner bytes.
         let req = Request {
             cookie,
+            service_tag: [0; 32],
             reply_circuit: vec![hop, rp],
             payload: b"inner".to_vec(),
             reply_pub: vec![],
@@ -383,6 +414,7 @@ mod tests {
         svc.ingest(
             &Request {
                 cookie,
+                service_tag: [0; 32],
                 reply_circuit: vec![line(3), line(2)],
                 payload: vec![],
                 reply_pub: vec![],
@@ -398,6 +430,7 @@ mod tests {
             .ingest(
                 &Request {
                     cookie,
+                    service_tag: [0; 32],
                     reply_circuit: vec![],
                     payload: b"more".to_vec(),
                     reply_pub: vec![],
@@ -470,6 +503,7 @@ mod tests {
             2,
             secret,
             reply_pub.clone(),
+            [0; 32],
         );
         assert_eq!(
             client.reply_pub(),
@@ -500,6 +534,7 @@ mod tests {
         svc.ingest(
             &Request {
                 cookie,
+                service_tag: [0; 32],
                 reply_circuit: vec![l],
                 payload: vec![],
                 reply_pub: reply_pub.encode(),
