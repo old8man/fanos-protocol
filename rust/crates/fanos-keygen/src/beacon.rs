@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
 use fanos_ports::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
-use fanos_pqcrypto::HybridVerifier;
+use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_primitives::hash_labeled;
 use fanos_vrf::beacon::{BeaconPartial, BeaconRound, PARTIAL_LEN, partial_eval, verify_partial};
 use fanos_vrf::vss::{
@@ -183,19 +183,23 @@ impl<F: Field> BeaconNode<F> {
         self.share.is_some()
     }
 
-    /// Build a resharing-trigger frame for a coordinator to broadcast (audit R-C1): start generation
-    /// `generation`, redistributing the beacon key to the `new_indices` holder set at `new_threshold`, dealt
-    /// by the named live `contributors` (which must number ≥ the current threshold). In production a parent
-    /// cell or an operator issues this (authenticated over the parent link); the simulator's driver injects
-    /// it directly. The trigger is self-flooding (monotone), so it need only reach one live anchor.
+    /// Build an **authenticated** resharing-trigger frame for the recovery `authority` to broadcast (audit
+    /// R-C1 + §2.1): start generation `generation`, redistributing the beacon key to the `new_indices` holder
+    /// set at `new_threshold`, dealt by the named live `contributors` (which must number ≥ the current
+    /// threshold). The frame carries the authority's signature over its parameters, so only the holder of the
+    /// recovery-authority **secret** — a parent cell or an operator, the same trust root that issues a
+    /// re-genesis certificate — can trigger a reshare; a node cannot self-issue one (an unauthenticated
+    /// trigger was the §2.1 2-coalition key-exfiltration oracle). The trigger self-floods (monotone) with its
+    /// signature, so it need only reach one live anchor.
     #[must_use]
     pub fn reshare_trigger(
+        authority: &HybridSigSecret,
         generation: u64,
         new_threshold: usize,
         contributors: &[u8],
         new_indices: &[u8],
     ) -> Vec<u8> {
-        reshare_trigger_frame(generation, new_threshold, contributors, new_indices)
+        reshare_trigger_frame(authority, generation, new_threshold, contributors, new_indices)
     }
 
     /// This node's beacon holder index — its Fano point index `+ 1` (the [`VssShare`] convention: the anchor
@@ -366,21 +370,30 @@ impl<F: Field> BeaconNode<F> {
     /// Handle a resharing trigger: record the target parameters for `generation`, re-flood it once (monotone, so it
     /// terminates), and — if this node is a named contributor — deal its verifiable contribution.
     fn on_reshare_trigger(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((generation, new_threshold, contributors, new_indices)) = parse_reshare_trigger(body) else {
+        let Some((generation, new_threshold, contributors, new_indices, sig)) = parse_reshare_trigger(body)
+        else {
             return Vec::new();
         };
-        // Security floor (audit §3.1). The confirmed exfiltration set `new_threshold = 1`: a degree-0
-        // resharing polynomial evaluates to the contributor's raw share `sᵢ` at every new index, so one
-        // member could name itself the sole new holder, collect `{sᵢ}` from ≥`t` contributors, and
-        // reconstruct the beacon master key. [`MIN_RESHARE_THRESHOLD`] closes that — with `new_threshold ≥ 2`
-        // each new holder receives only a single evaluation of a degree-≥1 polynomial, and a single-identity
-        // attacker controls exactly one new-holder coordinate, so it can never gather the `new_threshold`
-        // evaluations reconstruction needs. Every index is validated (distinct, `1..=n`) so a sub-share is
-        // never routed to an out-of-range/foreign coordinate, and the generation is windowed so a far-future
-        // trigger cannot evict the live in-progress rounds. RESIDUAL (Tier-1 follow-up): a coalition of
-        // ≥`new_threshold` Byzantine anchors can still extract the raw key via a low-threshold reshare — that
-        // is within the beacon's own `< t`-Byzantine trust bound and requires an *authenticated* coordinator
-        // authorization (operator control-plane / threshold endorsement) to fully close.
+        // AUTHENTICATION (audit §2.1 — closes the master-key exfiltration oracle). A reshare CHANGES the
+        // sharing threshold, so `new_threshold` alone cannot distinguish a legitimate recovery-reshare (which
+        // lowers the threshold to a survivor set — a 4-of-7 cell reshares to 3-of-4) from a malicious
+        // downgrade. Without authentication a 2-anchor coalition could name `new_threshold = 2` at its own
+        // indices, have ≥`t` honest anchors deal sub-shares to it, and reconstruct the beacon master key. The
+        // trigger MUST therefore be signed by the beacon's recovery `authority` — the SAME trust root that
+        // authorizes re-genesis (`with_recovery_authority`) — so a node can never self-issue one. A cell with
+        // no authority configured cannot reshare at all (consistent with re-genesis being disabled without a
+        // trust root). A forged/foreign signature is rejected here, before any anchor deals a single sub-share.
+        let Some(authority) = &self.authority else {
+            return Vec::new(); // no trust root ⇒ no authenticated reshare is possible
+        };
+        let params = reshare_trigger_params(generation, new_threshold, &contributors, &new_indices);
+        if !authority.verify(&reshare_trigger_signing_message(&params), &sig) {
+            return Vec::new(); // unauthenticated / forged / tampered trigger
+        }
+        // Defence-in-depth sanity (the authority signature is the real gate). `MIN_RESHARE_THRESHOLD` keeps a
+        // reshare off the degenerate degree-0 (raw-share) case even under a careless/compromised authority;
+        // every index is validated distinct + `1..=n` so a sub-share is never routed to a foreign coordinate;
+        // and the generation is windowed so a far-future trigger cannot evict the live in-progress rounds.
         if generation <= self.reshare_gen
             || generation > self.reshare_gen.saturating_add(MAX_RESHARE_GEN_ADVANCE)
             || new_threshold < MIN_RESHARE_THRESHOLD
@@ -395,7 +408,9 @@ impl<F: Field> BeaconNode<F> {
         if self.pending_reshare.get(&generation).and_then(|r| r.new_threshold).is_some() {
             return Vec::new(); // already have this trigger — do not re-flood or re-deal
         }
-        let reflood = reshare_trigger_frame(generation, new_threshold, &contributors, &new_indices);
+        // Re-flood the identical AUTHENTICATED frame (monotone) — the signature travels with it, so every
+        // downstream anchor verifies the authority exactly as we just did.
+        let reflood = encode(FrameType::BeaconReshareTrigger, body);
         {
             let round = self.pending_reshare.entry(generation).or_default();
             round.new_threshold = Some(new_threshold);
@@ -703,8 +718,15 @@ fn reshare_rng(share: &VssShare, generation: u64) -> fanos_vrf::vss::Determinist
     fanos_vrf::vss::DeterministicRng::new(&seed)
 }
 
-/// `BeaconReshareTrigger` body: `generation(8) ‖ new_threshold(1) ‖ n_contrib(1) ‖ contributors ‖ n_new(1) ‖ new_indices`.
-fn reshare_trigger_frame(generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
+/// Domain label for the authority signature that authorizes a `BeaconReshareTrigger` (audit §2.1). A reshare
+/// **changes the sharing threshold**, so the parameters alone cannot distinguish a legitimate recovery-reshare
+/// (which lowers the threshold to a survivor set) from a malicious downgrade — hence the trust root must sign.
+const RESHARE_TRIGGER_SIG_LABEL: &[u8] = b"FANOS-v1/beacon-reshare-trigger";
+
+/// The canonical parameter encoding of a reshare trigger — the bytes the authority signs, and the frame's
+/// prefix before the trailing signature: `generation(8) ‖ new_threshold(1) ‖ n_contrib(1) ‖ contributors ‖
+/// n_new(1) ‖ new_indices`.
+fn reshare_trigger_params(generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(8 + 2 + contributors.len() + 1 + new_indices.len());
     body.extend_from_slice(&generation.to_be_bytes());
     body.push(new_threshold as u8);
@@ -712,18 +734,46 @@ fn reshare_trigger_frame(generation: u64, new_threshold: usize, contributors: &[
     body.extend_from_slice(contributors);
     body.push(new_indices.len() as u8);
     body.extend_from_slice(new_indices);
+    body
+}
+
+/// The message the authority signs and every anchor verifies: `LABEL ‖ params`.
+fn reshare_trigger_signing_message(params: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RESHARE_TRIGGER_SIG_LABEL.len() + params.len());
+    m.extend_from_slice(RESHARE_TRIGGER_SIG_LABEL);
+    m.extend_from_slice(params);
+    m
+}
+
+/// `BeaconReshareTrigger` body: `params ‖ HybridSignature`, where the signature is by the beacon's recovery
+/// `authority` over `LABEL ‖ params` — so an unauthenticated (forged) trigger is rejected before any anchor
+/// deals a sub-share (audit §2.1). The frame self-floods with its signature, so every downstream anchor
+/// re-verifies the same authorization.
+fn reshare_trigger_frame(authority: &HybridSigSecret, generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
+    let params = reshare_trigger_params(generation, new_threshold, contributors, new_indices);
+    let sig = authority.sign(&reshare_trigger_signing_message(&params));
+    let mut body = params;
+    body.extend_from_slice(&sig.to_bytes());
     encode(FrameType::BeaconReshareTrigger, &body)
 }
 
-fn parse_reshare_trigger(body: &[u8]) -> Option<(u64, usize, Vec<u8>, Vec<u8>)> {
+/// The parsed fields of an authenticated reshare trigger: `(generation, new_threshold, contributors,
+/// new_indices, authority_signature)`.
+type ParsedReshareTrigger = (u64, usize, Vec<u8>, Vec<u8>, HybridSignature);
+
+fn parse_reshare_trigger(body: &[u8]) -> Option<ParsedReshareTrigger> {
     let generation = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
     let new_threshold = usize::from(*body.get(8)?);
     let n_contrib = usize::from(*body.get(9)?);
     let contributors = body.get(10..10 + n_contrib)?.to_vec();
     let n_new_pos = 10 + n_contrib;
     let n_new = usize::from(*body.get(n_new_pos)?);
-    let new_indices = body.get(n_new_pos + 1..n_new_pos + 1 + n_new)?.to_vec();
-    Some((generation, new_threshold, contributors, new_indices))
+    let new_indices_end = n_new_pos + 1 + n_new;
+    let new_indices = body.get(n_new_pos + 1..new_indices_end)?.to_vec();
+    // The trailing bytes are the authority signature — `from_bytes` requires exactly `HYBRID_SIG_LEN`, so a
+    // truncated/oversized tail (or a missing signature on a legacy frame) is rejected here.
+    let sig = HybridSignature::from_bytes(body.get(new_indices_end..)?)?;
+    Some((generation, new_threshold, contributors, new_indices, sig))
 }
 
 /// `BeaconReshareCommit` body: `generation(8) ‖ old_index(1) ‖ new_threshold(1) ‖ VssCommitment(Dᵢ)`.
@@ -1162,12 +1212,18 @@ mod tests {
         // Audit R-C1: a 4-of-7 beacon reshares to the 4 survivors {points 3,4,5,6} at a new threshold t'=3,
         // BEFORE the original set is decimated below t. The survivors then run the clock past the original
         // n−t+1 cliff, and the reshared beacon is the SAME DVRF value (the group key is unchanged).
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
         use fanos_vrf::beacon::combine;
         let t = 4usize;
         let (shares, commitment) =
             deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"reshare-cell")).unwrap();
+        // The recovery authority (a parent cell / operator) that must authorize the reshare (§2.1).
+        let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"reshare-authority"));
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
-            .map(|i| BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t))
+            .map(|i| {
+                BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t)
+                    .with_recovery_authority(authority_vk.clone())
+            })
             .collect();
 
         // Genesis epoch 1 across all 7 anchors.
@@ -1187,7 +1243,7 @@ mod tests {
         // 3..6); new threshold t'=3. A coordinator broadcasts the trigger to the whole cell.
         let contributors = [4u8, 5, 6, 7];
         let new_indices = [4u8, 5, 6, 7];
-        let trigger = reshare_trigger_frame(1, 3, &contributors, &new_indices);
+        let trigger = reshare_trigger_frame(&authority_sk, 1, 3, &contributors, &new_indices);
         let initial: Vec<(usize, Vec<u8>)> = (0..N).map(|k| (k, trigger.clone())).collect();
         route(&mut nodes, initial, &[]);
 
@@ -1227,28 +1283,42 @@ mod tests {
 
     #[test]
     fn a_key_exfiltration_reshare_trigger_is_rejected() {
-        // Audit §3.1: the confirmed exploit — one member broadcasts a `new_threshold = 1` reshare naming
-        // itself the sole new holder. A degree-0 polynomial deals `gᵢ(j) = sᵢ`, so an honest anchor that
-        // dealt would hand the attacker its raw secret share; ≥ t of them reconstruct the beacon master key.
-        // The floor must make every honest anchor REFUSE, so no sub-share ever leaves for the attacker.
+        // Audit §2.1: a reshare CHANGES the sharing threshold, so an unauthenticated trigger is a beacon
+        // master-key exfiltration oracle — a 2-anchor coalition could name new_threshold=2 at its own indices
+        // and reconstruct the key. The trigger is authenticated against the beacon's recovery authority; a
+        // forged/foreign signature is refused before any anchor deals a single sub-share.
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
         let t = 4usize;
         let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"exfil-cell")).unwrap();
-        let mut victim = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+        let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"exfil-authority"));
+        let (impostor_sk, _) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"exfil-impostor"));
+        let mut victim = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t)
+            .with_recovery_authority(authority_vk);
         let recv = |v: &mut BeaconNode<F2>, frame: Vec<u8>| v.step(Instant(0), Input::Message { from: [0, 0, 0], frame });
 
-        // The malicious trigger: threshold 1, new holder = the attacker's index 5, ≥ t named contributors.
-        assert!(recv(&mut victim, reshare_trigger_frame(1, 1, &[1, 2, 3, 4], &[5])).is_empty(),
-            "an honest anchor deals nothing for a threshold-1 (key-leaking) reshare");
+        // The §2.1 exploit — a 2-coalition names new_threshold=2 at its own indices {5,6} — but SIGNED BY THE
+        // ATTACKER, not the authority. It is refused, so no honest anchor deals a sub-share. This is the fix.
+        assert!(recv(&mut victim, reshare_trigger_frame(&impostor_sk, 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
+            "a foreign-signed (unauthenticated) reshare trigger is refused — the 2-coalition exfil is closed");
         assert_eq!(victim.reshare_gen(), 0, "and does not adopt it");
-        // Defense-in-depth: an out-of-range new index, a duplicate index, and a far-future generation are
-        // all refused before any share is dealt.
-        assert!(recv(&mut victim, reshare_trigger_frame(1, 3, &[1, 2, 3, 4], &[5, 6, 99])).is_empty());
-        assert!(recv(&mut victim, reshare_trigger_frame(1, 3, &[1, 2, 3, 4], &[5, 5, 6])).is_empty());
-        assert!(recv(&mut victim, reshare_trigger_frame(1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6])).is_empty());
-        assert_eq!(victim.reshare_gen(), 0, "no malformed trigger advanced any state");
+        // Tampering a validly-signed trigger (corrupt a trailing signature byte) also fails verification.
+        let mut tampered = reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7]);
+        if let Some(b) = tampered.last_mut() {
+            *b ^= 0xFF;
+        }
+        assert!(recv(&mut victim, tampered).is_empty(), "a tampered signature is refused");
 
-        // A well-formed reshare (threshold ≥ 2, valid distinct in-range indices, in-window) is still honored.
-        assert!(!recv(&mut victim, reshare_trigger_frame(1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
-            "a legitimate reshare is still dealt");
+        // Even correctly AUTHORITY-signed, the defence-in-depth guards still refuse: a degree-0 (threshold-1)
+        // reshare, an out-of-range or duplicate new index, and a far-future generation.
+        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 1, &[1, 2, 3, 4], &[5])).is_empty(),
+            "the MIN_RESHARE_THRESHOLD floor refuses a degree-0 reshare even from the authority");
+        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[5, 6, 99])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[5, 5, 6])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6])).is_empty());
+        assert_eq!(victim.reshare_gen(), 0, "no refused trigger advanced any state");
+
+        // A well-formed reshare correctly signed by the authority is honored.
+        assert!(!recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
+            "a legitimate authority-signed reshare is still dealt");
     }
 }

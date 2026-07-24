@@ -108,7 +108,10 @@ fn proactive_resharing_survives_the_r_c1_cliff() {
     // broadcasts the trigger; it self-floods, so injecting it at one anchor reaches the cell.
     let contributors = [4u8, 5, 6, 7];
     let new_holders = [4u8, 5, 6, 7];
-    let trigger = BeaconNode::<F2>::reshare_trigger(1, 3, &contributors, &new_holders);
+    // A reshare changes the threshold, so it must be authorized by the beacon's recovery authority (§2.1);
+    // the operator/parent signs the trigger. spawn_beacon_cell configured the cell with this authority.
+    let (authority_sk, _) = common::recovery_authority();
+    let trigger = BeaconNode::<F2>::reshare_trigger(&authority_sk, 1, 3, &contributors, &new_holders);
     sim.inject_frame(cell[6], cell[6], trigger);
     sim.run_for(Duration::from_millis(3000)); // the reshare deals, floods, and is adopted cell-wide
 

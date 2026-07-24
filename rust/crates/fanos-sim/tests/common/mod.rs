@@ -7,6 +7,7 @@ use fanos_field::Field;
 use fanos_geometry::Plane;
 use fanos_keygen::BeaconNode;
 use fanos_node::OverlayBeaconNode;
+use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_runtime::{Config, OverlayNode, Triple};
 use fanos_sim::Sim;
 use fanos_vrf::vss::{DeterministicRng, deal};
@@ -36,12 +37,21 @@ pub fn spawn_beacon_cell<F: Field + 'static>(
         &mut DeterministicRng::new(b"fanos-sim/recovery/beacon-cell"),
     )
     .unwrap();
+    let (_, authority_vk) = recovery_authority();
     let mut coords = Vec::with_capacity(n);
     for (i, point) in Plane::<F>::points().enumerate() {
         let overlay = OverlayNode::<F>::new(point, config);
         let share = (i < anchors).then(|| shares[i].clone());
-        let beacon = BeaconNode::<F>::new(point, share, commitment.clone(), threshold);
+        let beacon = BeaconNode::<F>::new(point, share, commitment.clone(), threshold)
+            .with_recovery_authority(authority_vk.clone());
         coords.push(sim.add(Box::new(OverlayBeaconNode::new(overlay, beacon))));
     }
     coords
+}
+
+/// The sim's fixed recovery authority (a parent/operator trust root). [`spawn_beacon_cell`] configures every
+/// beacon with its verifier, so a scenario can drive an AUTHENTICATED reshare (audit §2.1) by signing the
+/// trigger with the secret this returns.
+pub fn recovery_authority() -> (HybridSigSecret, HybridVerifier) {
+    HybridSigSecret::generate(&mut SeedRng::from_seed(b"fanos-sim/recovery/authority"))
 }

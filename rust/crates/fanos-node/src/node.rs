@@ -108,29 +108,20 @@ fn spawn_beacon_tracker(client: Client, enabled: bool) -> (Option<JoinHandle<()>
 /// advances, only late — is never mistaken for a frozen one before the recovery trigger fires.
 const RECOVERY_PATIENCE: usize = 4;
 
-/// Actuate the recovery decision for the current live anchor set (audit §4). **Regime A** emits a
-/// key-preserving `reshare_trigger` to a live anchor; **Regime B** escalates (logs) for the authority to issue a
-/// re-genesis certificate. Returns the (possibly bumped) `(generation, threshold)` to carry into the next
-/// decision, so the trigger stays monotone and tracks the reshared threshold.
-fn actuate_recovery<F: Field>(
-    client: &Client,
-    anchors: &[Triple],
-    live: &[u8],
-    threshold: usize,
-    generation: u64,
-    epoch: Epoch,
-) -> (u64, usize) {
+/// Actuate the recovery decision for the current live anchor set (audit §4). Both non-trivial regimes now
+/// **escalate to the recovery authority** rather than self-issue: a reshare (Regime A) changes the sharing
+/// threshold and a re-genesis (Regime B) mints a fresh key, so — per audit §2.1 — both must be AUTHORIZED by
+/// the beacon's authority (a node holds no authority secret and cannot sign either). A node detects the
+/// condition and escalates; the operator / parent then issues the authenticated `BeaconNode::reshare_trigger`
+/// / `RecoveryAuthorization`. Returns `(generation, threshold)` unchanged — no state advances until the
+/// authority actually acts.
+fn actuate_recovery(live: &[u8], threshold: usize, generation: u64, epoch: Epoch) -> (u64, usize) {
     match recovery_decision(live, threshold) {
         RecoveryAction::ProactiveReshare { survivors, new_threshold } => {
-            let generation = generation.saturating_add(1);
-            let frame = BeaconNode::<F>::reshare_trigger(generation, new_threshold, &survivors, &survivors);
-            let Some(&to) = survivors.first().and_then(|&idx| anchors.get(usize::from(idx.saturating_sub(1)))) else {
-                return (generation, threshold);
-            };
-            client.command(Command::Emit { to, frame });
-            tracing::info!(target: "fanos::recovery", generation, new_threshold, survivors = survivors.len(),
-                "beacon thinning — proactive reshare (audit §4 Regime A)");
-            (generation, new_threshold)
+            // A node cannot sign the authenticated reshare trigger (§2.1) — escalate for the authority to issue it.
+            tracing::warn!(target: "fanos::recovery", new_threshold, survivors = survivors.len(),
+                "beacon thinning — escalating for an authorized proactive reshare (audit §4 Regime A / §2.1)");
+            (generation, threshold)
         }
         RecoveryAction::RequestRegenesis { survivors } => {
             tracing::warn!(target: "fanos::recovery", epoch = epoch.get(), survivors = survivors.len(),
@@ -145,8 +136,9 @@ fn actuate_recovery<F: Field>(
 /// action, closing the "`reshare_trigger` has zero production callers" gap. Beside the epoch driver it watches
 /// this node's own `BeaconReady`/`PeerDown` notifications; when the clock has not advanced for
 /// [`RECOVERY_PATIENCE`] periods it derives the live anchor set and applies [`recovery_decision`]:
-/// - **Regime A** — a lower honest-majority threshold still buys headroom while `≥ t` anchors remain: emit a
-///   key-preserving `reshare_trigger` to a live anchor (partition-safe — a `< t` minority cannot reshare);
+/// - **Regime A** — a lower honest-majority threshold still buys headroom while `≥ t` anchors remain: escalate
+///   for an authorized proactive reshare (a reshare changes the threshold, so — §2.1 — the authority must sign
+///   the trigger; a node holds no authority secret and cannot self-issue one);
 /// - **Regime B** — already below threshold, the key is gone: escalate for an authorized re-genesis (the
 ///   single-writer authority's decision, actuated by [`BeaconNode::rebootstrap`]).
 ///
@@ -202,7 +194,7 @@ impl RecoveryWatcher {
 
     /// One epoch-driver tick: if a stall is confirmed and THIS node is the deterministic coordinator (the
     /// lowest-index live anchor), actuate the recovery decision, so the cell emits one action, not one per node.
-    fn on_tick<F: Field>(&mut self, client: &Client, me: Triple, anchors: &[Triple]) {
+    fn on_tick(&mut self, me: Triple, anchors: &[Triple]) {
         if !self.detector.observe(self.last_epoch) {
             return;
         }
@@ -210,7 +202,7 @@ impl RecoveryWatcher {
         let coordinator = live.first().and_then(|&idx| anchors.get(usize::from(idx.saturating_sub(1))));
         if coordinator == Some(&me) {
             (self.generation, self.threshold) =
-                actuate_recovery::<F>(client, anchors, &live, self.threshold, self.generation, self.last_epoch);
+                actuate_recovery(&live, self.threshold, self.generation, self.last_epoch);
         }
     }
 }
@@ -237,11 +229,11 @@ fn spawn_recovery<F: Field + 'static>(
     has_beacon.then(|| {
         let anchors: Vec<Triple> = (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect();
         let threshold = config.beacon.as_ref().map_or(0, |b| b.threshold);
-        spawn_recovery_trigger::<F>(client, config.epoch_period, me, anchors, threshold)
+        spawn_recovery_trigger(client, config.epoch_period, me, anchors, threshold)
     })
 }
 
-fn spawn_recovery_trigger<F: Field + 'static>(
+fn spawn_recovery_trigger(
     client: Client,
     period: Duration,
     me: Triple,
@@ -261,7 +253,7 @@ fn spawn_recovery_trigger<F: Field + 'static>(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
-                _ = ticker.tick() => watcher.on_tick::<F>(&client, me, &anchors),
+                _ = ticker.tick() => watcher.on_tick(me, &anchors),
             }
         }
     })
