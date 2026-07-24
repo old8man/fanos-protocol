@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::simd::f64x8;
 use core::simd::num::SimdFloat;
 
+use crate::eig::eigenvalues_symmetric;
 use crate::mathfns::sqrt;
 
 /// The systemic-correlation threshold `r* = 1/√(N−1)` (spec §2.7). At the mean off-diagonal
@@ -95,6 +96,12 @@ impl CoherenceMatrix {
         if c.iter().any(|x| !x.is_finite()) {
             return None;
         }
+        // A correlation entry obeys |c_ij| ≤ 1 (Cauchy–Schwarz on the underlying signals); a
+        // magnitude above 1 is not a correlation at all and would inflate the Frobenius sum —
+        // and thus Φ — without bound. The unit diagonal is checked exactly just below.
+        if c.iter().any(|x| x.abs() > 1.0 + 1e-9) {
+            return None;
+        }
         for i in 0..n {
             if (c.get(i * n + i)? - 1.0).abs() > 1e-9 {
                 return None;
@@ -104,6 +111,18 @@ impl CoherenceMatrix {
                     return None;
                 }
             }
+        }
+        // A genuine correlation matrix is positive semidefinite. |c_ij| ≤ 1 is necessary but not
+        // sufficient for n ≥ 3 (e.g. every off-diagonal = −0.9 is symmetric, unit-diagonal, and
+        // in range yet has a negative eigenvalue), so reject any matrix whose least eigenvalue is
+        // negative beyond a few-ulp floor: an indefinite "self-model" produces a finite but
+        // meaningless Φ that can invert the V17 leading-indicator ordering and misfire Decouple/
+        // Systemic. The spectrum is exact for symmetric input; the solver already rejects the
+        // non-finite inputs excluded above, so `?` here is belt-and-braces. Eigenvalues sum to
+        // Tr = n, so a floor of −1e-9·n absorbs Jacobi rounding without admitting real negatives.
+        let eigs = eigenvalues_symmetric(&c, n)?;
+        if eigs.first().is_some_and(|&min| min < -1e-9 * n as f64) {
+            return None;
         }
         Some(Self { n, c })
     }
@@ -380,15 +399,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_correlation_rejects_non_finite_entries() {
-        // A valid 2×2 correlation matrix is accepted.
+    fn from_correlation_rejects_non_finite_out_of_range_and_non_psd_matrices() {
+        // Valid correlation matrices (finite, |r| ≤ 1, symmetric, unit-diagonal, PSD) are accepted.
         assert!(CoherenceMatrix::from_correlation(vec![1.0, 0.3, 0.3, 1.0], 2).is_some());
+        assert!(CoherenceMatrix::from_correlation(vec![1.0, 0.5, 0.5, 1.0], 2).is_some());
+        // r = 0.9 equicorrelated 3×3 is PSD (eigenvalues {2.8, 0.1, 0.1}) — accepted.
+        assert!(
+            CoherenceMatrix::from_correlation(vec![1.0, 0.9, 0.9, 0.9, 1.0, 0.9, 0.9, 0.9, 1.0], 3)
+                .is_some()
+        );
         // NaN or ±∞ anywhere is rejected — they would silently pass the tolerance checks (every
         // comparison with NaN is false) and poison the self-model (D2).
         assert!(CoherenceMatrix::from_correlation(vec![1.0, f64::NAN, f64::NAN, 1.0], 2).is_none());
         assert!(CoherenceMatrix::from_correlation(vec![f64::INFINITY, 0.0, 0.0, 1.0], 2).is_none());
         assert!(
             CoherenceMatrix::from_correlation(vec![1.0, 0.3, 0.3, f64::NEG_INFINITY], 2).is_none()
+        );
+        // |c_ij| > 1 is not a correlation (Cauchy–Schwarz): rejected before it can inflate Φ.
+        assert!(CoherenceMatrix::from_correlation(vec![1.0, 5.0, 5.0, 1.0], 2).is_none());
+        // Symmetric, unit-diagonal, |r| ≤ 1, but indefinite (every off-diagonal = −0.9 ⇒ least
+        // eigenvalue −0.8): the "spurious over-coupling" shape a garbage self-model takes. Rejected.
+        assert!(
+            CoherenceMatrix::from_correlation(
+                vec![1.0, -0.9, -0.9, -0.9, 1.0, -0.9, -0.9, -0.9, 1.0],
+                3
+            )
+            .is_none(),
+            "an in-range but non-PSD matrix must be rejected"
         );
     }
 
@@ -473,7 +510,17 @@ mod quarantine_experiment {
         u * 1.8 - 0.9
     }
 
-    /// A random symmetric, unit-diagonal `n×n` correlation matrix.
+    /// Wrap a raw symmetric matrix for the pure-algebra tests, bypassing the `from_correlation`
+    /// PSD / |r| ≤ 1 ingestion guard. Those tests exercise the Frobenius identities (`phi`,
+    /// `excise`, `phi_after_quarantine`, `quarantine_lowers_phi`), which hold for **any**
+    /// symmetric unit-diagonal matrix — including the deliberately non-PSD Byzantine
+    /// over-coupling case — so they must not be filtered by the ingestion boundary (which is
+    /// tested separately in `from_correlation_rejects_non_finite_out_of_range_and_non_psd_matrices`).
+    fn wrap_raw(c: Vec<f64>, n: usize) -> CoherenceMatrix {
+        CoherenceMatrix { n, c }
+    }
+
+    /// A random symmetric, unit-diagonal `n×n` matrix (not necessarily PSD — see [`wrap_raw`]).
     fn random_matrix(seed: u64, n: usize) -> CoherenceMatrix {
         let mut s = seed;
         let mut c = vec![0.0; n * n];
@@ -485,7 +532,7 @@ mod quarantine_experiment {
                 c[j * n + i] = v;
             }
         }
-        CoherenceMatrix::from_correlation(c, n).unwrap()
+        wrap_raw(c, n)
     }
 
     #[test]
@@ -537,7 +584,9 @@ mod quarantine_experiment {
             c[j] = 0.9; // row 0
             c[j * n] = 0.9; // column 0
         }
-        let byz = CoherenceMatrix::from_correlation(c, n).unwrap();
+        // Non-PSD by construction (node 0's over-coupling is geometrically impossible) — this is
+        // exactly what `from_correlation` now rejects, so build it raw to test the diagnosis algebra.
+        let byz = wrap_raw(c, n);
         assert!(byz.coupling_energy(0) > byz.phi() / 2.0, "the Byzantine node's coupling exceeds Φ/2");
         assert!(byz.quarantine_lowers_phi(0), "quarantining the Byzantine node lowers Φ");
         assert!(byz.phi_after_quarantine(0).unwrap() < byz.phi(), "Φ strictly drops");
@@ -551,7 +600,7 @@ mod quarantine_experiment {
             c2[j] = 0.0;
             c2[j * n] = 0.0;
         }
-        let silent = CoherenceMatrix::from_correlation(c2, n).unwrap();
+        let silent = wrap_raw(c2, n);
         assert!(silent.coupling_energy(0) < silent.phi() / 2.0, "the silent node's coupling is below Φ/2");
         assert!(!silent.quarantine_lowers_phi(0), "quarantining a silent node is forbidden — it would raise Φ");
         assert!(silent.phi_after_quarantine(0).unwrap() > silent.phi(), "removing the silent node concentrates coupling");

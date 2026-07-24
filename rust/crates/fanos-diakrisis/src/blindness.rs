@@ -55,7 +55,10 @@ pub fn is_fano_blind() -> bool {
 /// The spectrum of the summed line adjacency, sorted ascending: `[−1, −1, −1, −1, −1, −1, 6]`.
 #[must_use]
 pub fn blindness_spectrum() -> Vec<f64> {
-    eigenvalues_symmetric(&line_adjacency_sum(), N)
+    // The summed Fano line-adjacency is a fixed, finite, well-conditioned matrix, so the solver
+    // always converges; the fallback keeps this demonstrator total (never panics on the library
+    // surface). The test below pins the length + exact spectrum, so a regression cannot hide.
+    eigenvalues_symmetric(&line_adjacency_sum(), N).unwrap_or_default()
 }
 
 #[cfg(test)]
