@@ -27,13 +27,13 @@ use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
 use fanos_pqcrypto::kem::HybridKemSecret;
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier};
-use fanos_primitives::{BeaconSeed, Epoch};
+use fanos_primitives::{BeaconSeed, BoundedMap, Epoch};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
 use fanos_taxis::checkpoint::ExecCertificate;
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
 use fanos_taxis::state::StateMachine;
-use fanos_taxis::wire::to_frame;
+use fanos_taxis::wire::{TaxisApp, parse_app_body, to_frame, tx_to_frame};
 use fanos_taxis::{CellParams, SealedTx, SlashEvidence};
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -57,6 +57,12 @@ const ROUND_TIMEOUT_BASE: Duration = Duration::from_millis(1_500);
 /// advance reshuffles the leader before the in-flight round can commit). Bounded so a truly failed leader is
 /// still skipped in finite time. Reset to [`ROUND_TIMEOUT_BASE`] the moment the height advances (progress).
 const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
+
+/// Cap on the tx-gossip dedup set (commitments of transactions this node has already ingested + flooded). A
+/// remote-chosen value (a sealed transaction's commitment) keys it, so it is bounded against a flood; a
+/// well-behaved transaction whose commitment is evicted is simply re-gossiped once more (best-effort, like any
+/// flood-dedup cache).
+const SEEN_TX_CAP: usize = 8192;
 
 /// The next round timeout: reset to [`ROUND_TIMEOUT_BASE`] on progress (the height advanced — a fresh height
 /// restarts at round 0), else double the current timeout up to [`ROUND_TIMEOUT_MAX`] (Tendermint-style
@@ -242,6 +248,10 @@ where
         let mut last_height = engine.chain().next_height();
         // The height of the last execution checkpoint we surfaced, so each is emitted exactly once.
         let mut last_ckpt: Option<u64> = None;
+        // Tx-gossip dedup: a bounded set of transaction commitments this node has already ingested + gossiped,
+        // so a received transaction floods the cell exactly once and a committed (pruned) one does not
+        // re-circulate. Bounded ([`SEEN_TX_CAP`]) against a commitment flood.
+        let mut seen_txs: BoundedMap<[u8; 32], ()> = BoundedMap::new(SEEN_TX_CAP);
 
         loop {
             tokio::select! {
@@ -259,23 +269,33 @@ where
                     timeout_deadline = Instant::now() + round_timeout;
                 }
                 Some(tx) = submit_rx.recv() => {
-                    engine.submit(tx);
+                    // A locally-submitted transaction is ingested AND gossiped, so a single `handle.submit`
+                    // (or a `fanos pay` client) seeds every validator's mempool, not just this one.
+                    ingest_tx(&mut engine, &client, &coords, me, &mut seen_txs, &tx);
                 }
                 Some(reply) = query_rx.recv() => {
                     let _ = reply.send((engine.chain().next_height(), engine.chain().state().clone()));
                 }
                 note = note_rx.recv() => match note {
-                    Some(Notification::App { body, from }) => {
-                        // Map the sender's overlay coordinate to its validator index (a frame from an unknown
-                        // coordinate is ignored); the index directs a state-sync reply back to the requester.
-                        if let (Some(msg), Some(src)) = (
-                            ConsensusMsg::from_bytes(&body),
-                            coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok()),
-                        ) {
-                            let outs = step_msg(&mut engine, &msg, src);
-                            drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
+                    Some(Notification::App { body, from }) => match parse_app_body(&body) {
+                        // A consensus message: accepted only from a known validator coordinate (its index also
+                        // directs a state-sync reply back to the requester); a frame from a stranger is ignored.
+                        Some(TaxisApp::Consensus(msg)) => {
+                            if let Some(src) =
+                                coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok())
+                            {
+                                let outs = step_msg(&mut engine, &msg, src);
+                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
+                            }
                         }
-                    }
+                        // A submitted transaction: accepted from ANY sender — a client (the network ingress that
+                        // makes the chain usable) or another validator's gossip — ingested into the mempool and
+                        // flooded once to the rest of the cell.
+                        Some(TaxisApp::Tx(tx)) => {
+                            ingest_tx(&mut engine, &client, &coords, me, &mut seen_txs, &tx);
+                        }
+                        None => {}
+                    },
                     // Fixed-epoch cell: the seed/epoch are pinned at construction. A future rotation policy
                     // would re-derive the leader schedule + keyper line here at a height boundary.
                     Some(_) => {}
@@ -313,6 +333,35 @@ fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg
         }
     };
     engine.step(input)
+}
+
+/// Ingest a submitted transaction and gossip it to the cell **exactly once**. A transaction whose commitment
+/// this node has already seen is dropped (so the flood terminates, and a committed/pruned transaction does not
+/// re-circulate); otherwise it is submitted to the mempool, and **iff it was valid and newly added** it is
+/// flooded to every other validator so the whole cell's mempool converges. Sealing to the keyper committee is
+/// public, so admission here is intentionally permissive — a fee/stake mempool bound is the separate economic
+/// layer (audit T-H5), not this transport concern.
+fn ingest_tx<S: StateMachine>(
+    engine: &mut ConsensusEngine<S>,
+    client: &Client,
+    coords: &[Triple],
+    me: u8,
+    seen: &mut BoundedMap<[u8; 32], ()>,
+    tx: &SealedTx,
+) {
+    let commit = tx.commit();
+    if seen.contains_key(&commit) {
+        return;
+    }
+    if engine.submit(tx.clone()) {
+        seen.insert(commit, ());
+        let frame = tx_to_frame(tx);
+        for (p, &to) in coords.iter().enumerate() {
+            if u8::try_from(p).unwrap_or(u8::MAX) != me {
+                client.command(Command::Emit { to, frame: frame.clone() });
+            }
+        }
+    }
 }
 
 /// Act on a batch of engine outputs: broadcast every `Send` to the cell (and deliver it back to the local

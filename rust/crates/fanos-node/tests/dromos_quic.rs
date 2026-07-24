@@ -23,9 +23,10 @@ use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_quic::spawn_cell;
-use fanos_runtime::{Config, Engine, OverlayNode};
+use fanos_runtime::{Command, Config, Engine, OverlayNode};
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_dromos::TokenLedger;
+use fanos_taxis::wire::tx_to_frame;
 use fanos_taxis::{CellParams, Transaction};
 
 const N: usize = 7;
@@ -169,6 +170,85 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     for h in &handles {
         let (height, ledger) = h.snapshot().await.expect("a live node snapshot");
         assert!(height >= 1, "the node advanced past genesis");
+        assert_eq!(ledger.shielded().spent_count(), 1, "Alice's note is nullified on every node");
+        assert_eq!(ledger.shielded().note_count(), 2, "Bob's note was created on every node");
+    }
+}
+
+/// The same private transfer, but submitted the way a **real external client** does: sealed and sent as a
+/// single transaction App-frame to **one** validator over the network — no in-process `handle.submit`
+/// anywhere. That validator ingests it into its mempool and gossips it once to the rest of the cell, so every
+/// validator's mempool converges and the transfer executes. This proves the shipped chain accepts client
+/// transactions over the wire (the network ingress + gossip), not just via a test's in-process injection.
+#[tokio::test]
+async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_whole_cell() {
+    let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
+
+    let keys = gen_keys();
+    let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+    let registry = KeyperRegistry::new(
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+    );
+    let keyper_commit = registry.commit();
+
+    let mut handles = Vec::with_capacity(N);
+    for (i, k) in keys.into_iter().enumerate() {
+        let params = TaxisParams {
+            cell: CellParams::FANO,
+            me: i as u8,
+            signer: k.sig,
+            kem_secret: k.kem,
+            verifiers: verifiers.clone(),
+            keyper_commit,
+            seed: SEED,
+            epoch: EPOCH,
+            genesis_state: genesis_ledger(),
+            reward_per_block: 0,
+            sortition: None,
+        };
+        handles.push(spawn_taxis::<F2, HybridLedger>(cell.nodes[i].client(), params));
+    }
+
+    // Build + seal the identical private transfer (Alice's genesis note → Bob).
+    let ledger = genesis_ledger();
+    let anchor = ledger.shielded().anchor();
+    let path = ledger.shielded().path(0).expect("Alice's note is at position 0");
+    let sp = SpendInput { note: alice_note(), nsk: ALICE_NSK, spend_seed: spend_seed_of(&ALICE_NSK), path };
+    let bob_note = Note::new(1000, derive_owner_pk(&BOB_NSK), auth_of(&BOB_NSK), Randomness::from_seed(b"bob"), [9u8; 32]);
+    let (stx, proof) = build_transfer(ledger.params(), anchor, &[sp], &[bob_note], 0);
+    let dromos_tx = Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)));
+    let sealed = seal_to_keyper_line(&registry, &dromos_tx, EPOCH, &SEED, CellParams::FANO, b"ingress-seed")
+        .expect("seal the DROMOS transaction to the keyper line");
+
+    // Submit OVER THE NETWORK to exactly ONE validator (index 3): emit the transaction App-frame to its
+    // coordinate from another node's overlay. Nothing calls `handle.submit` — the cell must gossip the
+    // transaction to every mempool from that single ingress point, or no block will include it.
+    let target = Point::<F2>::at(3).coords();
+    cell.nodes[0].client().command(Command::Emit { to: target, frame: tx_to_frame(&sealed) });
+
+    // Every node's shielded pool converges to "Alice spent, Bob created" — the cross-node witness that a
+    // network-submitted transaction propagated to the whole cell and executed over live consensus.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(tokio::time::Instant::now() <= deadline, "the network-submitted transfer did not reach the cell in time");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut all_executed = true;
+        for h in &handles {
+            match h.snapshot().await {
+                Some((height, ledger)) if height >= 1 && ledger.shielded().spent_count() == 1 && ledger.shielded().note_count() == 2 => {}
+                _ => {
+                    all_executed = false;
+                    break;
+                }
+            }
+        }
+        if all_executed {
+            break;
+        }
+    }
+
+    for h in &handles {
+        let (_, ledger) = h.snapshot().await.expect("a live node snapshot");
         assert_eq!(ledger.shielded().spent_count(), 1, "Alice's note is nullified on every node");
         assert_eq!(ledger.shielded().note_count(), 2, "Bob's note was created on every node");
     }

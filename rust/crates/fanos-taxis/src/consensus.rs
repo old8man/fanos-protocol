@@ -614,15 +614,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// is not sealed to this epoch's beacon-chosen keyper line (wrong epoch, wrong line, or wrong committee
     /// size) is **rejected here**, so a malformed seal can never be ordered into a block (audit fix — see
     /// [`valid_seal`](Self::valid_seal)).
-    pub fn submit(&mut self, tx: SealedTx) {
+    /// Submit a sealed transaction to the mempool. Returns `true` iff it was **valid and newly added** — the
+    /// signal a networked driver uses to gossip a received transaction exactly once (an invalid seal, or a
+    /// commitment already in the mempool, returns `false`, so re-broadcasts neither bloat the pool nor loop).
+    pub fn submit(&mut self, tx: SealedTx) -> bool {
         if !self.valid_seal(&tx) {
-            return;
+            return false;
         }
         // De-duplicate by commitment so a re-broadcast does not bloat the mempool.
         let commit = tx.commit();
         if self.mempool.iter().all(|t| t.commit() != commit) {
             self.mempool.push(tx);
+            return true;
         }
+        false
     }
 
     /// Whether a sealed transaction is bound to this epoch's **beacon-chosen keyper line** — the anti-MEV
