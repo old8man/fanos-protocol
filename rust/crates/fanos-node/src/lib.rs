@@ -60,7 +60,7 @@ pub use fanos_onoma::Epoch;
 pub use fanos_quic::{Environment, Morph, MorphCodec};
 pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;
-pub use rendezvous_host::{serve_anonymous, serve_anonymous_rpc};
+pub use rendezvous_host::{HostEpoch, serve_anonymous, serve_anonymous_rpc, spawn_rendezvous_host};
 pub use mixdir::{
     build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,
     resolve_mix_key, spawn_mix_publisher,

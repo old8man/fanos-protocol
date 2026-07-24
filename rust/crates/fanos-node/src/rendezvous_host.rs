@@ -27,14 +27,21 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use fanos_aphantos::nostos::ReplyKeys;
+use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
+use fanos_geometry::{Point, Triple};
+use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_quic::Client;
-use fanos_rendezvous::{ANONYMOUS, MixDirectory, RendezvousService, SessionId};
+use fanos_rendezvous::{
+    ANONYMOUS, BeaconSeed, Epoch, HostRegister, MixDirectory, RendezvousService, SessionId,
+    meeting_line, seal_host_register, service_tag,
+};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced};
+
+use crate::mixdir::build_cell_mix_directory;
 use rand_core::CryptoRng;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
@@ -254,6 +261,113 @@ pub fn serve_anonymous_rpc<R, H>(
         }
     };
     serve_anonymous(client, keypair, rng, rservice, reply_keys, epoch_updates, wrap);
+}
+
+/// Spawn the production **hidden-service host** driver (§3b): host `service` anonymously so clients reach it
+/// at its rotating meeting line even though this node is (in general) *not* that line's combiner. Each epoch
+/// it rebuilds the cell mix directory, computes the meeting combiner and its own beacon-blinded dead-drop
+/// line, draws a fresh dead-drop reply key, and **registers** an anonymous forward route at the combiner (an
+/// onion, so no node learns this coordinate) — then hands the fresh `(key, directory)` to the
+/// [`serve_anonymous`] accept loop it runs, which opens each forwarded request and serves `handler`. Returns
+/// the epoch-loop task; the accept loop runs as its own spawned task.
+///
+/// `coord` is this node's overlay coordinate (its dead-drop line passes through it); `host_secret` seeds the
+/// dead-drop line selection and the per-epoch reply key (deterministic, so a restart re-derives them);
+/// `initial` is the current `(epoch, beacon seed)` (e.g. `node.live_beacon()`), so the first registration
+/// happens at startup rather than waiting for the next `BeaconReady`.
+pub fn spawn_rendezvous_host<H>(
+    client: Client,
+    coord: Triple,
+    service: StaticKeypair,
+    host_secret: Vec<u8>,
+    threshold: u8,
+    initial: (Epoch, [u8; 32]),
+    handler: H,
+) -> JoinHandle<()>
+where
+    H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+{
+    let service_public = service.public().clone();
+    let (epoch_tx, epoch_rx) = unbounded_channel::<HostEpoch>();
+    // The accept loop opens forwarded dead-drops (its key ring fed per epoch) and serves the request/response
+    // handler; it starts with an empty ring + directory, filled by the first rotation below.
+    let rservice = RendezvousService::<F2>::new(MixDirectory::new(), threshold, &host_secret);
+    serve_anonymous_rpc(
+        client.clone(),
+        service,
+        SeedRng::from_seed(&host_secret),
+        rservice,
+        Vec::new(),
+        Some(epoch_rx),
+        handler,
+    );
+    tokio::spawn(async move {
+        let mut events = client.subscribe();
+        let (mut epoch, mut seed) = initial;
+        rotate_host(&client, coord, &service_public, &host_secret, threshold, epoch, seed, &epoch_tx).await;
+        loop {
+            match events.recv().await {
+                Ok(Notification::BeaconReady { epoch: reached, seed: s }) if reached > epoch => {
+                    epoch = reached;
+                    seed = s;
+                    rotate_host(&client, coord, &service_public, &host_secret, threshold, epoch, seed, &epoch_tx)
+                        .await;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// One epoch's host rotation: rebuild the directory, register the anonymous forward route at the current
+/// meeting combiner, and push the fresh `(reply key, directory)` to the accept loop. A silent no-op if the
+/// directory is not yet resolvable or a member key is missing — the next epoch (or the client's retransmits)
+/// retries.
+#[allow(clippy::too_many_arguments)]
+async fn rotate_host(
+    client: &Client,
+    coord: Triple,
+    service_public: &HybridKemPublic,
+    host_secret: &[u8],
+    threshold: u8,
+    epoch: Epoch,
+    seed: [u8; 32],
+    epoch_tx: &UnboundedSender<HostEpoch>,
+) {
+    let dir = build_cell_mix_directory::<F2>(client, epoch).await;
+    if dir.is_empty() {
+        return;
+    }
+    let beacon = BeaconSeed::new(seed);
+    let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &beacon).coords();
+    let Some(point) = Point::<F2>::new(coord) else { return };
+    // The dead-drop line: beacon-blinded, through this node's own point — forwarded requests come home here.
+    let drop_line = select_drop_line(point, host_secret, epoch.get(), &seed).coords();
+    // A fresh per-epoch dead-drop reply keypair (deterministic in secret+epoch), advertised in the
+    // registration and handed to the accept loop to open forwarded requests.
+    let (reply_keys, reply_pub) = ReplyKeys::generate(&epoch_seed(host_secret, epoch, b"reply"));
+    let tag = service_tag(&service_public.encode(), epoch);
+    let Some(reg) =
+        HostRegister::onion::<F2>(tag, reply_pub.encode(), vec![drop_line], &dir, threshold)
+    else {
+        return;
+    };
+    // Register anonymously: seal the registration to the meeting line and raw-emit it at the combiner.
+    if let Some(fwd) = seal_host_register::<F2>(&[meeting], &dir, threshold, &reg, &epoch_seed(host_secret, epoch, b"reg")) {
+        client.command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
+    }
+    let _ = epoch_tx.send(HostEpoch { reply_keys, directory: dir });
+}
+
+/// A domain-separated per-epoch seed for the host's reply key / registration onion, so each epoch draws fresh
+/// key material and the two uses never collide, yet a restart re-derives the same values.
+fn epoch_seed(host_secret: &[u8], epoch: Epoch, domain: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(host_secret.len() + domain.len() + 8);
+    s.extend_from_slice(host_secret);
+    s.extend_from_slice(domain);
+    s.extend_from_slice(&epoch.get().to_be_bytes());
+    s
 }
 
 /// Spin up one anonymous session, keyed by `cookie`: a [`serve_over_channels`] DIAULOS server bridged so its

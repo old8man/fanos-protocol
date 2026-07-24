@@ -22,7 +22,7 @@ use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, OverlayBeaconNode, RendezvousRoute, StaticResolver,
-    serve_anonymous_rpc,
+    serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
@@ -453,4 +453,93 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     );
     drop(nodes);
     drop((host_node, client_node));
+}
+
+#[tokio::test]
+async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
+    // The full operator driver (§3b): `spawn_rendezvous_host` builds the cell directory, registers an
+    // anonymous forward route each epoch, and runs the accept loop — no manual registration. Proves the
+    // driver glue over real QUIC end-to-end.
+    let dir = Directory::new();
+    let t = 2usize;
+    let beacon_t = 4usize;
+    let (_shares, commitment) =
+        deal(&[0xB9; 32], beacon_t, 7, &mut DeterministicRng::new(b"anon-driver")).unwrap();
+
+    let mut nodes: Vec<Option<NodeHandle>> = Vec::new();
+    let mut mix = MixDirectory::new();
+    for i in 0..7usize {
+        let (handle, public) = spawn_composite(i, &dir, t, &commitment, beacon_t).await;
+        mix.insert(Point::<F2>::at(i).coords(), public);
+        nodes.push(Some(handle));
+    }
+    // Publish each node's mix key (same onion seed its router uses), so the host driver's
+    // `build_cell_mix_directory` resolves the whole cell.
+    let mut publishers = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let mut onion_seed = [0xC4u8; 32];
+        onion_seed[31] = i as u8;
+        publishers.push(spawn_mix_publisher(
+            node.as_ref().unwrap().client(),
+            Point::<F2>::at(i).coords(),
+            onion_seed,
+        ));
+    }
+    tokio::time::sleep(StdDuration::from_millis(800)).await; // let the keys publish
+
+    let mut skp = SeedRng::from_seed(b"driver-svc");
+    let service = StaticKeypair::generate(&mut skp);
+    let service_public = service.public().clone();
+    let epoch = fanos_rendezvous::Epoch::ZERO;
+    let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
+    let m_index = Point::<F2>::new(combiner_for::<F2>(meeting).unwrap()).unwrap().index();
+
+    // Host on a node that is NOT the meeting combiner; the driver registers it anonymously.
+    let host_index = (0..7).find(|&i| i != m_index).unwrap();
+    let host = nodes[host_index].take().unwrap();
+    let _driver = spawn_rendezvous_host(
+        host.client(),
+        Point::<F2>::at(host_index).coords(),
+        service,
+        b"driver-host-secret".to_vec(),
+        t as u8,
+        (epoch, [0x5E; 32]), // the genesis (epoch, beacon-seed) — TEST_BEACON's bytes
+        |req| {
+            let mut resp = b"anon-quic-200:".to_vec();
+            resp.extend_from_slice(req);
+            resp
+        },
+    );
+    tokio::time::sleep(StdDuration::from_millis(800)).await; // let it build the directory + register
+
+    let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
+    let client_node = nodes[client_index].take().unwrap();
+    let params = AnonRouteParams {
+        directory: mix,
+        threshold: t as u8,
+        epoch,
+        beacon: TEST_BEACON,
+        depths: (1, 1),
+    };
+    let resolver = StaticResolver::new().with("driver.fanos", meeting, service_public);
+    let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
+    let mut stream = dialer
+        .dial(&Target::Name("driver.fanos".to_owned(), 80))
+        .await
+        .expect("anonymous dial to a driver-hosted service");
+    let response = tokio::time::timeout(StdDuration::from_secs(50), async {
+        stream.write_all(b"GET /driver").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        resp
+    })
+    .await
+    .expect("the driver-hosted anonymous session completed in time");
+    assert_eq!(
+        response, b"anon-quic-200:GET /driver",
+        "the spawn_rendezvous_host driver registered + served an off-combiner client end-to-end",
+    );
+    drop(nodes);
+    drop((host, client_node, publishers));
 }
