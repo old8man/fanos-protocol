@@ -22,7 +22,7 @@ use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, OverlayBeaconNode, RendezvousRoute, StaticResolver,
-    serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host,
+    serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
@@ -497,7 +497,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     // Host on a node that is NOT the meeting combiner; the driver registers it anonymously.
     let host_index = (0..7).find(|&i| i != m_index).unwrap();
     let host = nodes[host_index].take().unwrap();
-    let _driver = spawn_rendezvous_host(
+    let _driver = spawn_rendezvous_host_rpc(
         host.client(),
         Point::<F2>::at(host_index).coords(),
         service,

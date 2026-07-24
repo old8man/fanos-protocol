@@ -248,19 +248,25 @@ pub fn serve_anonymous_rpc<R, H>(
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    let wrap = move |mut stream: DuplexStream| {
-        let handler = handler.clone();
-        async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut request = Vec::new();
-            if stream.read_to_end(&mut request).await.is_ok() {
-                let response = handler(&request);
-                let _ = stream.write_all(&response).await;
-                let _ = stream.shutdown().await;
-            }
-        }
-    };
-    serve_anonymous(client, keypair, rng, rservice, reply_keys, epoch_updates, wrap);
+    serve_anonymous(client, keypair, rng, rservice, reply_keys, epoch_updates, move |stream| {
+        run_rpc(handler.clone(), stream)
+    });
+}
+
+/// Drive one anonymous session in **request/response** shape: read the whole request (until the client
+/// half-closes), call `handler(&request)`, write the response, and close. Shared by the `_rpc`
+/// conveniences so the adapter lives in exactly one place.
+async fn run_rpc<H>(handler: Arc<H>, mut stream: DuplexStream)
+where
+    H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    if stream.read_to_end(&mut request).await.is_ok() {
+        let response = handler(&request);
+        let _ = stream.write_all(&response).await;
+        let _ = stream.shutdown().await;
+    }
 }
 
 /// Spawn the production **hidden-service host** driver (§3b): host `service` anonymously so clients reach it
@@ -268,14 +274,16 @@ pub fn serve_anonymous_rpc<R, H>(
 /// it rebuilds the cell mix directory, computes the meeting combiner and its own beacon-blinded dead-drop
 /// line, draws a fresh dead-drop reply key, and **registers** an anonymous forward route at the combiner (an
 /// onion, so no node learns this coordinate) — then hands the fresh `(key, directory)` to the
-/// [`serve_anonymous`] accept loop it runs, which opens each forwarded request and serves `handler`. Returns
-/// the epoch-loop task; the accept loop runs as its own spawned task.
+/// [`serve_anonymous`] accept loop it runs, which opens each forwarded request and hands the session's byte
+/// stream to `handler` (a **full-duplex** handler — e.g. forward each session to a local port, the onion-
+/// service model; [`spawn_rendezvous_host_rpc`] is the request/response convenience). Returns the epoch-loop
+/// task; the accept loop runs as its own spawned task.
 ///
 /// `coord` is this node's overlay coordinate (its dead-drop line passes through it); `host_secret` seeds the
 /// dead-drop line selection and the per-epoch reply key (deterministic, so a restart re-derives them);
 /// `initial` is the current `(epoch, beacon seed)` (e.g. `node.live_beacon()`), so the first registration
 /// happens at startup rather than waiting for the next `BeaconReady`.
-pub fn spawn_rendezvous_host<H>(
+pub fn spawn_rendezvous_host<H, Fut>(
     client: Client,
     coord: Triple,
     service: StaticKeypair,
@@ -285,14 +293,15 @@ pub fn spawn_rendezvous_host<H>(
     handler: H,
 ) -> JoinHandle<()>
 where
-    H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+    H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
     let service_public = service.public().clone();
     let (epoch_tx, epoch_rx) = unbounded_channel::<HostEpoch>();
-    // The accept loop opens forwarded dead-drops (its key ring fed per epoch) and serves the request/response
+    // The accept loop opens forwarded dead-drops (its key ring fed per epoch) and hands each session to the
     // handler; it starts with an empty ring + directory, filled by the first rotation below.
     let rservice = RendezvousService::<F2>::new(MixDirectory::new(), threshold, &host_secret);
-    serve_anonymous_rpc(
+    serve_anonymous(
         client.clone(),
         service,
         SeedRng::from_seed(&host_secret),
@@ -317,6 +326,27 @@ where
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+    })
+}
+
+/// The **request/response** convenience over [`spawn_rendezvous_host`]: each anonymous session's request is
+/// read whole, `handler(&request)` produces the response, and the session closes. A streaming hidden service
+/// (forward each session to a local port) uses [`spawn_rendezvous_host`] directly.
+pub fn spawn_rendezvous_host_rpc<H>(
+    client: Client,
+    coord: Triple,
+    service: StaticKeypair,
+    host_secret: Vec<u8>,
+    threshold: u8,
+    initial: (Epoch, [u8; 32]),
+    handler: H,
+) -> JoinHandle<()>
+where
+    H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    spawn_rendezvous_host(client, coord, service, host_secret, threshold, initial, move |stream| {
+        run_rpc(handler.clone(), stream)
     })
 }
 
