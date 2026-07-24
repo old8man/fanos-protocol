@@ -543,9 +543,24 @@ struct Healer {
     /// The coherence `Φ` computed on the last diagnosis — exposed so the facade can spend the coarse
     /// `⌊log₉Φ⌋` reroute budget on a received cell escalation (audit R-C2) without re-diagnosing.
     last_phi: f64,
+    /// The explicit cell members (transport coord by position) when this reflex runs a cell **embedded**
+    /// in a larger plane — mirroring the facade's [`OverlayNode::cell_members`], so behavioural sampling,
+    /// polar attestation, and the healing actuators (reroute/repair/quarantine) all map cell position `i`
+    /// to the real member coordinate. `None` on the base cell, where position `i` is `Point::at(i)`.
+    cell_members: Option<[Triple; 7]>,
 }
 
 impl Healer {
+    /// Cell position `i` (`0..7`) → transport coordinate: the explicit member when embedded, else the base
+    /// plane's `Point::at(i)`. The Healer's counterpart to [`OverlayNode::cell_coord`], so the reflex's
+    /// coord lookups and actuator targets are correct for a cell seated anywhere.
+    fn cell_coord<F: Field>(&self, i: usize) -> Triple {
+        self.cell_members
+            .as_ref()
+            .and_then(|members| members.get(i).copied())
+            .unwrap_or_else(|| Point::<F>::at(i).coords())
+    }
+
     /// The `Φ` this reflex computed on its last diagnosis (a healthy 1.0 until the first one).
     fn last_phi(&self) -> f64 {
         self.last_phi
@@ -573,6 +588,7 @@ impl Healer {
             endpoint_window: VecDeque::new(),
             partition_streak: 0,
             last_phi: 1.0,
+            cell_members: None,
         }
     }
 
@@ -650,7 +666,7 @@ impl Healer {
             *slot = if i == self_index {
                 f64::from(self.self_activity)
             } else {
-                let coord = Point::<F>::at(i).coords();
+                let coord = self.cell_coord::<F>(i);
                 f64::from(self.activity.get(&coord).copied().unwrap_or(0))
             };
         }
@@ -686,7 +702,7 @@ impl Healer {
     ) -> [[f64; 7]; 7] {
         let mut matrix = [[0.0f64; 7]; 7];
         for k in 0..7usize {
-            let coord = Point::<F>::at(k).coords();
+            let coord = self.cell_coord::<F>(k);
             let triple = match self.attested.get(&coord) {
                 Some((rates, seen)) if now.since(*seen) <= timeout => *rates,
                 _ => polar::mediator_attestation(k, degraded),
@@ -896,8 +912,8 @@ impl Healer {
         for action in &plan.actions {
             match *action {
                 HealingAction::Reroute { around, via } => {
-                    let around_c = Point::<F>::at(around).coords();
-                    let via_c = Point::<F>::at(via).coords();
+                    let around_c = self.cell_coord::<F>(around);
+                    let via_c = self.cell_coord::<F>(via);
                     if self.reroute.insert(around_c, via_c) != Some(via_c) {
                         effects.push(Effect::Notify(Notification::Rerouted {
                             around: around_c,
@@ -906,13 +922,13 @@ impl Healer {
                     }
                 }
                 HealingAction::Repair { node, .. } => {
-                    let node_c = Point::<F>::at(node).coords();
+                    let node_c = self.cell_coord::<F>(node);
                     if self.repaired.insert(node_c) {
                         effects.push(Effect::Notify(Notification::Repaired(node_c)));
                     }
                 }
                 HealingAction::Quarantine { node } => {
-                    let node_c = Point::<F>::at(node).coords();
+                    let node_c = self.cell_coord::<F>(node);
                     effects.extend(self.quarantine(node_c, now));
                 }
                 HealingAction::Decouple => {
@@ -973,7 +989,7 @@ impl Healer {
         let mut effects = Vec::new();
         for idx in polar::fabricators_by_persistent_freshness(&window, ENDPOINT_MIN_STALE, subjects)
         {
-            let node_c = Point::<F>::at(idx).coords();
+            let node_c = self.cell_coord::<F>(idx);
             effects.extend(self.quarantine(node_c, now));
         }
         effects
@@ -1176,6 +1192,7 @@ impl<F: Field> OverlayNode<F> {
                 });
             }
         }
+        self.healer.cell_members = Some(members); // the reflex actuates on the real member coords too
         self.cell_members = Some(members);
         self
     }

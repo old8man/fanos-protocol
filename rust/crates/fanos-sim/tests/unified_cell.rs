@@ -65,3 +65,21 @@ fn crashing_a_member_of_an_embedded_cell_is_sensed() {
     );
     assert!(snap.concerns().count() >= 1, "the crashed member (and any degradation) is flagged");
 }
+
+#[test]
+fn an_embedded_cell_heals_around_a_downed_member_using_real_coords() {
+    let (mut sim, members) = embedded_cell(3);
+    let victim = members[2];
+    sim.crash(victim);
+    sim.run_for(Duration::from_millis(2500));
+
+    // The survivors reroute around the loss — and, crucially, the reroute targets REAL cell members
+    // (mapped through cell_coord), not the base plane's points 0..6. Before the Healer generalization,
+    // `around`/`via` would have been Point::at(position) — coordinates no cell member occupies.
+    let reroutes: Vec<(Triple, Triple, Triple)> = sim.report().reroutes().collect();
+    assert!(!reroutes.is_empty(), "the embedded cell reroutes around the downed member");
+    for (_, around, via) in &reroutes {
+        assert!(members.contains(around), "reroute 'around' is a real cell member: {around:?}");
+        assert!(members.contains(via), "reroute 'via' is a real cell member: {via:?}");
+    }
+}
