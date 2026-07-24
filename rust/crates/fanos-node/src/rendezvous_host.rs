@@ -32,17 +32,87 @@ use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_quic::Client;
-use fanos_rendezvous::{ANONYMOUS, RendezvousService, SessionId};
+use fanos_rendezvous::{ANONYMOUS, MixDirectory, RendezvousService, SessionId};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced};
 use rand_core::CryptoRng;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::diaulos::{MAX_SESSIONS, SESSION_IDLE_TIMEOUT, SESSION_SWEEP_INTERVAL, Session, evict_lru};
+
+/// How many recent epochs' dead-drop [`ReplyKeys`] the accept loop keeps. The meeting combiner, the
+/// dead-drop line, and the reply key all rotate with the beacon each epoch (§3b); a request forwarded just
+/// before a rotation is sealed to the *previous* epoch's key, so the loop tries the last few keys, not only
+/// the newest — enough to open across a boundary without unboundedly hoarding keys.
+const MAX_REPLY_KEYS: usize = 3;
+
+/// One epoch's rotating host material, pushed to a running [`serve_anonymous`] loop by the
+/// `spawn_rendezvous_host` driver: the fresh dead-drop [`ReplyKeys`] (to open forwarded requests) and the
+/// current mix directory (the members' onion keys the reply onions seal to, which rotate each epoch, E4).
+pub struct HostEpoch {
+    /// This epoch's dead-drop reply keypair — the secret half, kept to open forwarded requests.
+    pub reply_keys: ReplyKeys,
+    /// This epoch's mix directory, for sealing replies back to clients.
+    pub directory: MixDirectory,
+}
+
+/// Open a forwarded request: try each dead-drop key in the ring (a request may be sealed to the current or a
+/// recent epoch's key); if none opens it, it is a plaintext request delivered directly (this node *is* the
+/// combiner) and is ingested raw. `ReplyKeys::open` authenticates, so a wrong key never yields a false body.
+fn open_forwarded(ring: &[ReplyKeys], payload: Vec<u8>) -> Vec<u8> {
+    for keys in ring {
+        if let Some(opened) = keys.open(&payload) {
+            return opened;
+        }
+    }
+    payload
+}
+
+/// Ring the new epoch's dead-drop key (keeping the last [`MAX_REPLY_KEYS`]) and swap the reply directory; a
+/// `None` update means the driver stopped, so keep serving with the last material. Kept out of the
+/// `serve_anonymous` loop body so that stays within the pedantic line budget.
+fn apply_epoch(
+    ring: &mut Vec<ReplyKeys>,
+    rservice: &mut RendezvousService<F2>,
+    update: Option<HostEpoch>,
+) {
+    if let Some(HostEpoch { reply_keys, directory }) = update {
+        ring.push(reply_keys);
+        if ring.len() > MAX_REPLY_KEYS {
+            ring.remove(0);
+        }
+        rservice.set_directory(directory);
+    }
+}
+
+/// Await the next [`HostEpoch`] from the driver, or never resolve when no driver is attached — so the
+/// `serve_anonymous` select can carry an optional epoch channel without a dedicated arm type.
+async fn recv_epoch(updates: &mut Option<UnboundedReceiver<HostEpoch>>) -> Option<HostEpoch> {
+    match updates.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Evict every session idle past [`SESSION_IDLE_TIMEOUT`], aborting its handler task (reclaiming a wedged
+/// one). Extracted from the loop body to keep `serve_anonymous` within the pedantic line budget.
+fn sweep_idle_sessions(sessions: &mut HashMap<SessionId, Session>) {
+    let now = Instant::now();
+    let idle: Vec<SessionId> = sessions
+        .iter()
+        .filter(|(_, s)| now.duration_since(s.last_active) >= SESSION_IDLE_TIMEOUT)
+        .map(|(&cookie, _)| cookie)
+        .collect();
+    for cookie in idle {
+        if let Some(session) = sessions.remove(&cookie) {
+            session.task.abort();
+        }
+    }
+}
 
 /// Run a **multi-client, full-duplex** DIAULOS service on the *anonymous* path: each anonymous client that
 /// reaches this node's meeting combiner gets its own session driven as an async [`DuplexStream`] and handed
@@ -54,17 +124,20 @@ use crate::diaulos::{MAX_SESSIONS, SESSION_IDLE_TIMEOUT, SESSION_SWEEP_INTERVAL,
 /// `rservice` must be built with the current-epoch mix directory + threshold (the keys the reply onions seal
 /// to); a node re-arms it as the epoch rotates (the `spawn_rendezvous_host` node driver).
 ///
-/// `reply_keys` is the host's own NOSTOS dead-drop secret for the current epoch, present when the service is
-/// hosted **off** its meeting combiner (§3b): a forwarded request arrives as a dead-drop end-to-end sealed to
-/// it, so the loop opens each delivery with it before ingesting. Pass `None` when the service *is* its own
-/// combiner (requests arrive as plaintext `Request`s). `open()` authenticates, so a plaintext request simply
-/// fails to open and falls through to the raw path — a `Some` host transparently serves both.
+/// `reply_keys` is the host's NOSTOS dead-drop secret ring: when the service is hosted **off** its meeting
+/// combiner (§3b) a forwarded request arrives as a dead-drop end-to-end sealed to it, so the loop opens each
+/// delivery with it before ingesting. Pass **empty** when the service *is* its own combiner (requests arrive
+/// as plaintext `Request`s — `open()` authenticates, so the empty ring just ingests raw). `epoch_updates`, if
+/// present, is the channel the `spawn_rendezvous_host` driver pushes each epoch's fresh [`HostEpoch`] on: the
+/// loop rings the new key (keeping the last [`MAX_REPLY_KEYS`], so a request forwarded across the boundary
+/// still opens) and swaps the reply directory. Pass `None` for a fixed single-epoch host (tests, at-combiner).
 pub fn serve_anonymous<R, H, Fut>(
     client: Client,
     keypair: StaticKeypair,
     mut rng: R,
     mut rservice: RendezvousService<F2>,
-    reply_keys: Option<ReplyKeys>,
+    mut reply_keys: Vec<ReplyKeys>,
+    mut epoch_updates: Option<UnboundedReceiver<HostEpoch>>,
     handler: H,
 ) where
     R: CryptoRng + Send + 'static,
@@ -88,12 +161,9 @@ pub fn serve_anonymous<R, H, Fut>(
                 event = deliveries.recv() => match event {
                     Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
                         // A forwarded request (§3b) arrives as a dead-drop end-to-end sealed to this host's
-                        // reply key — open it first; a direct request (this node IS the combiner) ingests
-                        // as-is. `open()` authenticates, so it unwraps only genuine dead-drops for this host.
-                        let request = match &reply_keys {
-                            Some(keys) => keys.open(&payload).unwrap_or(payload),
-                            None => payload,
-                        };
+                        // reply key — open it (trying the recent-epoch ring); a direct request (this node IS
+                        // the combiner) opens under no key and ingests as-is.
+                        let request = open_forwarded(&reply_keys, payload);
                         // Ingest binds the cookie→reply-route and surfaces the inner DIAULOS bytes; a
                         // non-`Request` body (e.g. a stray dead-drop) yields `None` and is ignored.
                         let Some((cookie, inner)) = rservice.ingest(&request) else { continue };
@@ -143,19 +213,11 @@ pub fn serve_anonymous<R, H, Fut>(
                         sessions.remove(&cookie);
                     }
                 }
-                _ = sweep.tick() => {
-                    // Evict sessions idle past the timeout: abort the handler task, reclaiming a wedged one.
-                    let now = Instant::now();
-                    let idle: Vec<SessionId> = sessions
-                        .iter()
-                        .filter(|(_, s)| now.duration_since(s.last_active) >= SESSION_IDLE_TIMEOUT)
-                        .map(|(&cookie, _)| cookie)
-                        .collect();
-                    for cookie in idle {
-                        if let Some(session) = sessions.remove(&cookie) {
-                            session.task.abort();
-                        }
-                    }
+                _ = sweep.tick() => sweep_idle_sessions(&mut sessions),
+                // The host driver rotated the epoch: ring the new dead-drop key and swap the reply directory
+                // (a no-op when no driver is attached — `recv_epoch` is then `pending` and never fires).
+                update = recv_epoch(&mut epoch_updates) => {
+                    apply_epoch(&mut reply_keys, &mut rservice, update);
                 }
             }
         }
@@ -171,14 +233,15 @@ pub fn serve_anonymous_rpc<R, H>(
     keypair: StaticKeypair,
     rng: R,
     rservice: RendezvousService<F2>,
-    reply_keys: Option<ReplyKeys>,
+    reply_keys: Vec<ReplyKeys>,
+    epoch_updates: Option<UnboundedReceiver<HostEpoch>>,
     handler: H,
 ) where
     R: CryptoRng + Send + 'static,
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    serve_anonymous(client, keypair, rng, rservice, reply_keys, move |mut stream: DuplexStream| {
+    let wrap = move |mut stream: DuplexStream| {
         let handler = handler.clone();
         async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -189,7 +252,8 @@ pub fn serve_anonymous_rpc<R, H>(
                 let _ = stream.shutdown().await;
             }
         }
-    });
+    };
+    serve_anonymous(client, keypair, rng, rservice, reply_keys, epoch_updates, wrap);
 }
 
 /// Spin up one anonymous session, keyed by `cookie`: a [`serve_over_channels`] DIAULOS server bridged so its
@@ -236,4 +300,29 @@ where
         let _ = done_tx.send(cookie);
     });
     (in_tx, task)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use fanos_aphantos::nostos::seal_to_receiver;
+
+    #[test]
+    fn open_forwarded_tries_the_recent_epoch_ring() {
+        // A request forwarded under epoch B is end-to-end sealed to B's dead-drop key; the host may have
+        // already rotated, so B is not the ring's head — the ring must be TRIED, not just its newest key.
+        let (a1, _) = ReplyKeys::generate(b"epoch-A");
+        let (a2, _) = ReplyKeys::generate(b"epoch-A"); // same seed ⇒ same keys as a1
+        let (b_keys, b_pub) = ReplyKeys::generate(b"epoch-B");
+        let body = seal_to_receiver(&b_pub, b"a forwarded request", b"e2e-seed").unwrap();
+
+        // Ring holds the previous (A) and current (B) epoch keys → B opens it.
+        assert_eq!(open_forwarded(&[a1, b_keys], body.clone()), b"a forwarded request");
+        // Only the wrong epoch (A) → cannot open, falls through to the raw bytes (a direct request would).
+        assert_eq!(open_forwarded(&[a2], body.clone()), body);
+        // An empty ring (the service IS its own combiner) always ingests raw.
+        let plain = b"plaintext request at the combiner".to_vec();
+        assert_eq!(open_forwarded(&[], plain.clone()), plain);
+    }
 }

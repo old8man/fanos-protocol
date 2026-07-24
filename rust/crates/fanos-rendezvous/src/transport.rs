@@ -264,6 +264,14 @@ impl<F: Field> RendezvousService<F> {
     pub fn sessions(&self) -> usize {
         self.routes.len()
     }
+
+    /// Swap the mix directory the reply onions seal to — the members' onion keys rotate every epoch
+    /// (forward secrecy, E4), so a long-lived host driver refreshes this each epoch while **keeping** the
+    /// cookie→reply-route bindings (an in-flight session survives the rotation; only the keys it seals to
+    /// advance).
+    pub fn set_directory(&mut self, directory: MixDirectory) {
+        self.directory = directory;
+    }
 }
 
 #[cfg(test)]
@@ -551,5 +559,32 @@ mod tests {
             a.frame, b.frame,
             "each NOSTOS reply draws fresh seeds — no key-material reuse",
         );
+    }
+
+    #[test]
+    fn set_directory_swaps_the_reply_sealing_keys_keeping_bindings() {
+        use fanos_aphantos::nostos::ReplyKeys;
+        // A host driver refreshes the directory each epoch (the members' onion keys rotate, E4) without
+        // losing its cookie→reply-route bindings. Start empty: the binding is recorded but the reply cannot
+        // seal (no member keys). Swap in a populated directory and the SAME binding seals.
+        let mut svc = RendezvousService::<F2>::new(MixDirectory::new(), 2, b"swap-svc");
+        let cookie = *b"swap-cookie-0001";
+        let l = line(2);
+        let (_keys, reply_pub) = ReplyKeys::generate(b"swap-client");
+        svc.ingest(
+            &Request {
+                cookie,
+                service_tag: [0; 32],
+                reply_circuit: vec![l],
+                payload: vec![],
+                reply_pub: reply_pub.encode(),
+            }
+            .encode(),
+        )
+        .unwrap();
+        assert!(svc.seal_reply(&cookie, b"resp").is_none(), "empty directory: no keys to seal the reply");
+        svc.set_directory(fano_directory());
+        assert!(svc.knows(&cookie), "the swap keeps the binding (an in-flight session survives rotation)");
+        assert!(svc.seal_reply(&cookie, b"resp").is_some(), "with the directory the same binding now seals");
     }
 }

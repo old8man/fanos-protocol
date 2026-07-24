@@ -191,7 +191,8 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         service,
         SeedRng::from_seed(b"anon-quic-svc-accept"),
         rservice,
-        None, // service is its own combiner here — no forwarded dead-drops to open
+        vec![], // service is its own combiner here — no forwarded dead-drops to open
+        None,   // no epoch-rotation driver: a fixed single-epoch test
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
@@ -309,7 +310,8 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         service,
         SeedRng::from_seed(b"anon-cell-svc-accept"),
         rservice,
-        None, // service is its own combiner here — no forwarded dead-drops to open
+        vec![], // service is its own combiner here — no forwarded dead-drops to open
+        None,   // no epoch-rotation driver: a fixed single-epoch test
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
@@ -407,7 +409,8 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         service,
         SeedRng::from_seed(b"off-combiner-svc-accept"),
         rservice,
-        Some(host_reply_keys),
+        vec![host_reply_keys], // the off-combiner host opens forwarded dead-drops with this key
+        None,                  // fixed genesis epoch — no rotation driver
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
