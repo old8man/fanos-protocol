@@ -21,6 +21,10 @@ fanos-geometry = { workspace = true, features = ["std"] }
 fanos-core = { workspace = true, features = ["std"] }
 # TAXIS L0 primitives (ExecCertificate, CrossCellReceipt, ChildRegistry) the cross-cell directories transport.
 fanos-taxis.workspace = true
+# The DROMOS hybrid ledger + OBOLOS shielded pool — the `StateMachine` a `fanos validator` runs on TAXIS
+# consensus. Optional (gated by the `validator` feature): a base node/proxy build does not pull the ledger.
+fanos-dromos = { workspace = true, optional = true }
+fanos-obolos = { workspace = true, features = ["std"], optional = true }
 fanos-runtime = { workspace = true, features = ["std"] }
 fanos-quic.workspace = true
 # For `.fanos` name resolution: ONOMA addresses/derivations + CALYPSO descriptors.
@@ -70,6 +74,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # crate). Off by default: without it, `fanos vpn` reports that the build lacks VPN support. Build a VPN-
 # capable binary with `cargo build -p fanos-node --features vpn`.
 vpn = ["fanos-vpn/device"]
+
+# `fanos validator` / `fanos taxis-deal` — run the TAXIS blockchain (the DROMOS hybrid ledger) from the node
+# binary. Off by default: without it, those subcommands report the build lacks validator support. Build a
+# chain-capable binary with `cargo build -p fanos-node --features validator`.
+validator = ["dep:fanos-dromos", "dep:fanos-obolos"]
 
 [dev-dependencies]
 # Build return circuits for the SURB relay tests (audit §5 S1-H3).

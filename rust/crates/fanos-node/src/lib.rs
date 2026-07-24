@@ -27,6 +27,9 @@ pub mod crosscell_dir;
 pub mod loaddir;
 pub mod role_loop;
 pub mod taxis_driver;
+/// Validator provisioning for running the TAXIS blockchain from the binary (`fanos taxis-deal` / `validator`).
+#[cfg(feature = "validator")]
+pub mod taxis_config;
 pub mod identity;
 pub mod ingress_node;
 pub mod mix_relay;
@@ -76,6 +79,8 @@ pub use poros::{
 pub use taxis_driver::{
     SortitionParams, TaxisEvent, TaxisHandle, TaxisParams, spawn_checkpoint_publisher, spawn_taxis,
 };
+#[cfg(feature = "validator")]
+pub use taxis_config::{ValidatorConfig, deal_validators, genesis_ledger, keys_from_seed};
 pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
