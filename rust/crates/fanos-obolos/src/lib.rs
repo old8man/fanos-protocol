@@ -41,6 +41,8 @@ pub mod commit;
 pub mod note;
 pub mod note_cipher;
 pub mod nullifier;
+pub mod ring;
+pub mod ring_commit;
 pub mod state;
 pub mod tree;
 pub mod tx;
