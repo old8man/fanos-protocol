@@ -44,6 +44,7 @@ pub mod nullifier;
 pub mod state;
 pub mod tree;
 pub mod tx;
+pub mod wallet;
 
 pub use build::{SpendInput, build_transfer, build_transfer_delivering, build_unshield};
 pub use codec::{decode_submission, encode_submission};
@@ -54,3 +55,4 @@ pub use nullifier::{Nullifier, NullifierSet};
 pub use state::{ApplyError, ShieldedState};
 pub use tree::{AuthPath, CommitmentTree, TREE_DEPTH};
 pub use tx::{InputOpening, OutputNote, OutputOpening, ShieldedProof, ShieldedTx, TransparentProof};
+pub use wallet::{FullViewingKey, IncomingViewingKey, SpendingKey};
