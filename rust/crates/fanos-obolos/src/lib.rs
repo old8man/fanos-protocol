@@ -51,6 +51,7 @@ pub mod ring_linear;
 pub mod ring_membership;
 pub mod ring_product;
 pub mod ring_range_agg;
+pub mod ring_shortness;
 pub mod ring_zk;
 pub mod state;
 pub mod tree;
