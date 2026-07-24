@@ -36,11 +36,16 @@ pub fn keys_from_seed(node_seed: &[u8; 32]) -> (HybridSigSecret, HybridKemSecret
     (sig, kem)
 }
 
-/// The genesis ledger a freshly-provisioned cell starts from: an empty DROMOS hybrid ledger (empty token
-/// accounts + empty shielded pool). Initial allocations are applied as ordinary transactions after genesis.
+/// Build the DROMOS genesis ledger for a `(account_id, amount)` allocation — the chain's initial token supply
+/// credited into a fresh hybrid ledger (empty shielded pool). Every validator builds the SAME ledger from the
+/// shared allocation, so they agree on the genesis state (minting is genesis-only, so this is the whole supply).
 #[must_use]
-pub fn genesis_ledger() -> HybridLedger {
-    HybridLedger::new(TokenLedger::new())
+pub fn build_genesis(genesis_alloc: &[([u8; 32], u64)]) -> HybridLedger {
+    let mut tokens = TokenLedger::new();
+    for (account, amount) in genesis_alloc {
+        tokens.credit(*account, *amount);
+    }
+    HybridLedger::new(tokens)
 }
 
 /// One validator's complete provisioning — its single secret seed plus the shared public cell configuration.
@@ -61,13 +66,18 @@ pub struct ValidatorConfig {
     pub keyper_commit: [u8; 32],
     /// Every validator's consensus verifier, encoded, indexed by validator index.
     pub verifiers: Vec<Vec<u8>>,
+    /// The genesis token allocation `(account_id, amount)` — the chain's initial supply. Applied identically
+    /// by every validator (it is shared config), so they agree on the genesis state. Minting is a
+    /// genesis-only operation, so an empty allocation is a permanently fund-less chain — `fanos taxis-deal`
+    /// credits a founder account here so the chain is usable.
+    pub genesis_alloc: Vec<([u8; 32], u64)>,
 }
 
 impl ValidatorConfig {
-    /// Rebuild the [`TaxisParams`] `spawn_taxis` consumes, running on `genesis`. `None` if a stored verifier is
-    /// malformed.
+    /// Rebuild the [`TaxisParams`] `spawn_taxis` consumes, running on the genesis ledger this config's
+    /// allocation defines. `None` if a stored verifier is malformed.
     #[must_use]
-    pub fn to_taxis_params(&self, genesis: HybridLedger) -> Option<TaxisParams<HybridLedger>> {
+    pub fn to_taxis_params(&self) -> Option<TaxisParams<HybridLedger>> {
         let verifiers = self
             .verifiers
             .iter()
@@ -83,7 +93,7 @@ impl ValidatorConfig {
             keyper_commit: self.keyper_commit,
             seed: self.beacon,
             epoch: self.epoch,
-            genesis_state: genesis,
+            genesis_state: build_genesis(&self.genesis_alloc),
             reward_per_block: 0,
             sortition: None,
         })
@@ -107,6 +117,11 @@ impl ValidatorConfig {
         for v in &self.verifiers {
             out.extend_from_slice(&u32_of(v.len()).to_be_bytes());
             out.extend_from_slice(v);
+        }
+        out.extend_from_slice(&u32_of(self.genesis_alloc.len()).to_be_bytes());
+        for (account, amount) in &self.genesis_alloc {
+            out.extend_from_slice(account);
+            out.extend_from_slice(&amount.to_be_bytes());
         }
         out
     }
@@ -132,10 +147,17 @@ impl ValidatorConfig {
             let len = r.u32()? as usize;
             verifiers.push(r.take(len)?.to_vec());
         }
+        let alloc_count = r.u32()? as usize;
+        let mut genesis_alloc = Vec::with_capacity(alloc_count.min(65_536));
+        for _ in 0..alloc_count {
+            let account = r.array32()?;
+            let amount = r.u64()?;
+            genesis_alloc.push((account, amount));
+        }
         if !r.is_empty() {
             return None; // trailing bytes ⇒ non-canonical
         }
-        Some(Self { me, node_seed, cell, epoch, beacon, keyper_commit, verifiers })
+        Some(Self { me, node_seed, cell, epoch, beacon, keyper_commit, verifiers, genesis_alloc })
     }
 }
 
@@ -144,7 +166,13 @@ impl ValidatorConfig {
 /// [`ValidatorConfig`] per validator, all sharing the same public cell configuration. `rng` is OS entropy in
 /// production (`fanos taxis-deal`) or a seeded CSPRNG under test.
 #[must_use]
-pub fn deal_validators<R: CryptoRng>(cell: CellParams, epoch: Epoch, beacon: BeaconSeed, rng: &mut R) -> Vec<ValidatorConfig> {
+pub fn deal_validators<R: CryptoRng>(
+    cell: CellParams,
+    epoch: Epoch,
+    beacon: BeaconSeed,
+    genesis_alloc: &[([u8; 32], u64)],
+    rng: &mut R,
+) -> Vec<ValidatorConfig> {
     // Draw each validator's secret seed, and derive its public verifier + keyper KEM public in one pass.
     let mut node_seeds = Vec::with_capacity(cell.n);
     let mut verifiers: Vec<Vec<u8>> = Vec::with_capacity(cell.n);
@@ -171,6 +199,7 @@ pub fn deal_validators<R: CryptoRng>(cell: CellParams, epoch: Epoch, beacon: Bea
             beacon,
             keyper_commit,
             verifiers: verifiers.clone(),
+            genesis_alloc: genesis_alloc.to_vec(),
         })
         .collect()
 }
@@ -233,16 +262,19 @@ mod tests {
     #[test]
     fn a_dealt_cell_rebuilds_consistent_taxis_params_for_every_validator() {
         let cell = CellParams::FANO;
-        let configs = deal_validators(cell, Epoch::new(5), BeaconSeed::new([0x5E; 32]), &mut SeedRng::from_seed(b"deal"));
+        let alloc = vec![([0x11; 32], 1_000_000u64), ([0x22; 32], 500u64)];
+        let configs =
+            deal_validators(cell, Epoch::new(5), BeaconSeed::new([0x5E; 32]), &alloc, &mut SeedRng::from_seed(b"deal"));
         assert_eq!(configs.len(), cell.n, "one config per validator seat");
 
-        // Every validator agrees on the SAME public cell config (verifiers, keyper commit, cell, beacon)…
+        // Every validator agrees on the SAME public cell config (verifiers, keyper commit, cell, beacon, alloc)…
         let shared = &configs[0];
         for (i, c) in configs.iter().enumerate() {
             assert_eq!(c.me as usize, i, "indices are 0..n in seat order");
             assert_eq!(c.verifiers, shared.verifiers, "the verifier set is shared");
             assert_eq!(c.keyper_commit, shared.keyper_commit, "the keyper commitment is shared");
             assert_eq!(c.cell, cell);
+            assert_eq!(c.genesis_alloc, alloc, "the genesis allocation is shared identically");
         }
         // …but each has a DISTINCT secret seed, and its own verifier is the one it re-derives from that seed.
         for c in &configs {
@@ -255,18 +287,23 @@ mod tests {
                 "a validator's own verifier is derived from its secret seed",
             );
         }
-        // The params rebuild for every validator, seating each at its own index over a shared genesis.
+        // The params rebuild for every validator, seating each at its own index over a shared genesis whose
+        // token balances match the allocation — so every validator starts from the identical funded state.
         for c in &configs {
-            let params = c.to_taxis_params(genesis_ledger()).expect("params rebuild");
+            let params = c.to_taxis_params().expect("params rebuild");
             assert_eq!(params.me, c.me);
             assert_eq!(params.verifiers.len(), cell.n);
             assert_eq!(params.keyper_commit, shared.keyper_commit);
+            assert_eq!(params.genesis_state.tokens().balance(&[0x11; 32]), 1_000_000, "genesis credited the alloc");
+            assert_eq!(params.genesis_state.tokens().balance(&[0x22; 32]), 500);
+            assert_eq!(params.genesis_state.tokens().balance(&[0x99; 32]), 0, "an unallocated account is empty");
         }
     }
 
     #[test]
     fn distinct_validators_get_distinct_secret_seeds() {
-        let configs = deal_validators(CellParams::FANO, Epoch::ZERO, BeaconSeed::GENESIS, &mut SeedRng::from_seed(b"d2"));
+        let configs =
+            deal_validators(CellParams::FANO, Epoch::ZERO, BeaconSeed::GENESIS, &[], &mut SeedRng::from_seed(b"d2"));
         for i in 0..configs.len() {
             for j in (i + 1)..configs.len() {
                 assert_ne!(configs[i].node_seed, configs[j].node_seed, "each validator's seed is unique");
@@ -276,7 +313,13 @@ mod tests {
 
     #[test]
     fn a_validator_config_round_trips_through_bytes() {
-        let configs = deal_validators(CellParams::FANO, Epoch::new(9), BeaconSeed::new([7; 32]), &mut SeedRng::from_seed(b"rt"));
+        let configs = deal_validators(
+            CellParams::FANO,
+            Epoch::new(9),
+            BeaconSeed::new([7; 32]),
+            &[([0xAB; 32], 42), ([0xCD; 32], u64::MAX)],
+            &mut SeedRng::from_seed(b"rt"),
+        );
         let c = &configs[3];
         let bytes = c.to_bytes();
         assert_eq!(ValidatorConfig::from_bytes(&bytes).as_ref(), Some(c), "the provisioning round-trips");

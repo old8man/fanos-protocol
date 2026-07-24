@@ -669,7 +669,9 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
 /// keyper commitment) plus that validator's one secret seed.
 #[cfg(feature = "validator")]
 fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
+    use fanos_dromos::token::account_id;
     use fanos_node::{ValidatorConfig, deal_validators};
+    use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_taxis::params::CellParams;
 
@@ -682,22 +684,39 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
         Some(s) => parse_beacon_hex(s)?,
         None => BeaconSeed::GENESIS,
     };
+    let supply: u64 = match flag(args, "--supply") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --supply '{s}'")))?,
+        None => 1_000_000_000,
+    };
     let cell = CellParams::FANO;
+
+    // The genesis FOUNDER: a fresh token keypair credited the whole initial supply (minting is genesis-only,
+    // so this is the entire supply). Its 32-byte secret seed is written to `founder.key` so the operator can
+    // later spend the genesis funds — a client reconstructs the signing key from the seed.
+    let mut founder_seed = [0u8; 32];
+    getrandom::fill(&mut founder_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let (_founder_sig, founder_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(&founder_seed));
+    let founder = account_id(&founder_vk);
+    let genesis_alloc = vec![(founder, supply)];
 
     // The validator seeds are drawn from OS entropy — this tool holds the whole cell's key material for the
     // moment of dealing (a single-operator bootstrap; a trust-minimized deployment provisions each validator
-    // independently and exchanges only the public verifiers/keyper commitment).
+    // independently and exchanges only the public verifiers/keyper commitment/genesis allocation).
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let configs = deal_validators(cell, epoch, beacon, &mut SeedRng::from_seed(&rng_seed));
+    let configs = deal_validators(cell, epoch, beacon, &genesis_alloc, &mut SeedRng::from_seed(&rng_seed));
 
     for c in &configs {
         let path = format!("{out}/validator-{}.taxis", c.me);
         std::fs::write(&path, ValidatorConfig::to_bytes(c))?;
         println!("wrote {path}");
     }
+    let fpath = format!("{out}/founder.key");
+    std::fs::write(&fpath, founder_seed)?;
+    println!("wrote {fpath} (the genesis founder's secret seed — keep it safe)");
     println!(
-        "dealt a {}-validator TAXIS cell (epoch {}); run each with `fanos validator --config validator-<i>.taxis`",
+        "dealt a {}-validator TAXIS cell (epoch {}); genesis-funded a founder with {supply} (key in founder.key)\n\
+         run each validator with `fanos validator --config validator-<i>.taxis`",
         cell.n,
         epoch.get(),
     );
@@ -723,7 +742,7 @@ fn cmd_taxis_deal(_args: &[String]) -> Result<(), NodeError> {
 async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     use fanos_dromos::HybridLedger;
     use fanos_geometry::Point;
-    use fanos_node::{ValidatorConfig, genesis_ledger, spawn_taxis};
+    use fanos_node::{ValidatorConfig, spawn_taxis};
     use fanos_quic::{Directory, credentials_for_point, spawn_self_certifying_persistent_on};
     use fanos_runtime::{Config as OverlayConfig, OverlayNode};
 
@@ -764,7 +783,7 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
 
     // Run the consensus engine over the DROMOS hybrid ledger. The handle owns the driver tasks; keep it alive.
     let params = config
-        .to_taxis_params(genesis_ledger())
+        .to_taxis_params()
         .ok_or_else(|| NodeError::Config("the validator config carries a malformed verifier".to_owned()))?;
     let handle = spawn_taxis::<F2, HybridLedger>(node.client(), params);
     let mut events = handle.subscribe();
@@ -1014,8 +1033,9 @@ fn print_help() {
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
-         \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64]\n\
-         \x20             (deal a 7-validator TAXIS blockchain cell; writes validator-<i>.taxis; --features validator)\n\
+         \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64] [--supply N]\n\
+         \x20             (deal a 7-validator TAXIS blockchain cell + a genesis-funded founder; writes\n\
+         \x20             validator-<i>.taxis + founder.key; --features validator)\n\
          \x20 fanos validator --config validator-<i>.taxis [--listen ADDR] [--bootstrap <coord>@host:port,…]\n\
          \x20             (run a TAXIS blockchain validator over the DROMOS ledger; --features validator)\n\
          \x20 fanos help\n\
