@@ -108,6 +108,10 @@ struct UnifiedArgs {
     /// coherence member, so its loss both degrades its cell and severs cross-cell routing to it).
     #[arg(long, default_value_t = 0)]
     crash: usize,
+    /// Instead of one crash, sweep 0..N gateway failures and print how BOTH lenses degrade — the coupled
+    /// resilience curve.
+    #[arg(long)]
+    resilience: bool,
     /// RNG seed.
     #[arg(long, short, default_value_t = 1)]
     seed: u64,
@@ -263,16 +267,35 @@ fn cmd_unified(args: &UnifiedArgs) {
         std::process::exit(2);
     }
     let nodes = args.cells * 7;
+    if nodes > 993 {
+        eprintln!("unified tops out at 141 cells (993 nodes on one plane); requested {nodes} nodes");
+        std::process::exit(2);
+    }
+
+    if args.resilience {
+        let curve = if nodes <= 57 {
+            unified_resilience::<F7>(args)
+        } else if nodes <= 183 {
+            unified_resilience::<F13>(args)
+        } else {
+            unified_resilience::<F31>(args)
+        };
+        println!("\nunified resilience — {} cells × 7 = {nodes} nodes (both lenses vs gateway failures)", args.cells);
+        println!("  {:>8}  {:>8}  {:>9}  {:>7}  {:>12}", "crashed", "alive", "verdict", "mean Φ", "reachable");
+        for (k, m) in curve {
+            println!("  {k:>8}  {:>8}  {:>9}  {:>7.3}  {:>11.1}%", m.alive, if m.healthy { "healthy" } else { "degraded" }, m.mean_phi, m.reach * 100.0);
+        }
+        println!();
+        return;
+    }
+
     // Pick the smallest plane that fits 7·cells nodes (F7=57, F13=183, F31=993 points).
     let (before, after) = if nodes <= 57 {
         unified_run::<F7>(args)
     } else if nodes <= 183 {
         unified_run::<F13>(args)
-    } else if nodes <= 993 {
-        unified_run::<F31>(args)
     } else {
-        eprintln!("unified tops out at 141 cells (993 nodes on one plane); requested {nodes} nodes");
-        std::process::exit(2);
+        unified_run::<F31>(args)
     };
     if args.json {
         print!(
@@ -317,6 +340,24 @@ fn unified_run<F: Field + 'static>(args: &UnifiedArgs) -> (UnifiedMetrics, Optio
         None
     };
     (before, after)
+}
+
+fn unified_resilience<F: Field + 'static>(args: &UnifiedArgs) -> Vec<(usize, UnifiedMetrics)> {
+    let mut cluster = UnifiedCluster::new::<F>(args.seed, lab_config(), args.cells);
+    cluster.run_for(Duration::from_millis(1500));
+    let max = args.cells.saturating_sub(1).min(12); // keep cell 0 (the probe origin) + bound the sweep
+    let mut curve = Vec::with_capacity(max + 1);
+    for k in 0..=max {
+        if k > 0 {
+            // Crash the k-th gateway from the end (incremental — cell 0 always survives).
+            if let Some(gw) = cluster.gateway(args.cells - k) {
+                cluster.crash(gw);
+            }
+            cluster.run_for(Duration::from_millis(1500)); // let the cells sense the loss
+        }
+        curve.push((k, measure_unified(&mut cluster, args.cells)));
+    }
+    curve
 }
 
 fn measure_unified(cluster: &mut UnifiedCluster, cells: usize) -> UnifiedMetrics {
