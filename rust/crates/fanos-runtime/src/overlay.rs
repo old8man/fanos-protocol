@@ -1174,6 +1174,15 @@ impl<F: Field> OverlayNode<F> {
             .unwrap_or_else(|| Point::<F>::at(i).coords())
     }
 
+    /// The cell position (`0..7`) of transport coordinate `coord`, if it is a member of this cell — the
+    /// inverse of [`cell_coord`](Self::cell_coord), used to fold gossiped rows back onto cell positions.
+    fn cell_position(&self, coord: Triple) -> Option<usize> {
+        match &self.cell_members {
+            Some(members) => members.iter().position(|&m| m == coord),
+            None => (0..7usize).find(|&i| Point::<F>::at(i).coords() == coord),
+        }
+    }
+
     /// Seat this node in an explicit 7-node Fano cell (`members`, in canonical position order) rather than the
     /// base plane's points `0..6` — for a cell embedded in a larger transport plane (a unified hierarchy). Sets
     /// the reflexive `self_index` to this node's position and rebuilds the cell peer set from the six other
@@ -1371,7 +1380,7 @@ impl<F: Field> OverlayNode<F> {
     fn health_view(&self, now: Instant) -> Vec<u8> {
         let mut body = Vec::with_capacity(14);
         for i in 0..7usize {
-            let coord = Point::<F>::at(i).coords();
+            let coord = self.cell_coord(i);
             let age = if coord == self.coord.coords() {
                 0
             } else {
@@ -1394,7 +1403,7 @@ impl<F: Field> OverlayNode<F> {
         let self_c = self.coord.coords();
         (0..7usize)
             .map(|i| {
-                let coord = Point::<F>::at(i).coords();
+                let coord = self.cell_coord(i);
                 if coord == self_c {
                     0
                 } else {
@@ -1431,7 +1440,7 @@ impl<F: Field> OverlayNode<F> {
                 continue; // the gossiper had no fresh observation of point i
             }
             let observed = Instant(now.as_nanos().saturating_sub(u64::from(age_ms) * 1_000_000));
-            let coord = Point::<F>::at(i).coords();
+            let coord = self.cell_coord(i);
             let slot = self
                 .witnessed
                 .entry(coord)
@@ -2526,7 +2535,7 @@ impl<F: Field> OverlayNode<F> {
         let self_c = self.coord.coords();
         let mut mask = 0u8;
         for k in 0..7usize {
-            let coord = Point::<F>::at(k).coords();
+            let coord = self.cell_coord(k);
             let fresh = coord == self_c
                 || self
                     .peers
@@ -2551,14 +2560,14 @@ impl<F: Field> OverlayNode<F> {
         let timeout = self.config.liveness_timeout;
         let self_c = self.coord.coords();
         core::array::from_fn(|w| {
-            let witness_c = Point::<F>::at(w).coords();
+            let witness_c = self.cell_coord(w);
             if witness_c == self_c {
                 return Some(self.own_fresh_mask(now));
             }
             let mut mask = 0u8;
             let mut present = false;
             for k in 0..7usize {
-                let subject_c = Point::<F>::at(k).coords();
+                let subject_c = self.cell_coord(k);
                 if let Some(seen) = self
                     .witnessed
                     .get(&subject_c)
@@ -2654,7 +2663,7 @@ impl<F: Field> OverlayNode<F> {
     /// (`loss_reports`), plus this node's own directly-measured row (`peers[*].loss`).
     fn grey_rate_matrix(&self, now: Instant) -> [[f64; 7]; 7] {
         let timeout = self.config.liveness_timeout;
-        let point_index = |c: &Triple| (0..7).find(|&i| Point::<F>::at(i).coords() == *c);
+        let point_index = |c: &Triple| self.cell_position(*c);
         let mut directional = [[0.0f64; 7]; 7]; // directional[a][b] = a's loss toward b
         for (coord, (row, seen)) in &self.loss_reports {
             if now.since(*seen) <= timeout
@@ -2670,7 +2679,7 @@ impl<F: Field> OverlayNode<F> {
             && let Some(dst) = directional.get_mut(me)
         {
             for (b, cell) in dst.iter_mut().enumerate() {
-                let coord = Point::<F>::at(b).coords();
+                let coord = self.cell_coord(b);
                 *cell = self.peers.get(&coord).map_or(0.0, |p| p.loss);
             }
         }
@@ -2694,7 +2703,7 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         }
         let matrix = self.grey_rate_matrix(now);
-        let grey = polar::grey_endpoint(&matrix, GREY_TOL).map(|i| Point::<F>::at(i).coords());
+        let grey = polar::grey_endpoint(&matrix, GREY_TOL).map(|i| self.cell_coord(i));
         if grey == self.grey_reported {
             return Vec::new();
         }
