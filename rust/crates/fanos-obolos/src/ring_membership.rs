@@ -12,7 +12,7 @@
 //! > **SOUNDNESS SCOPE — the linear core.** This proves the *linear* hash relation in zero knowledge. A complete
 //! > membership proof additionally needs each node proven **short** (limbs `< 2^{LOG_BASE}`) — otherwise a prover
 //! > could satisfy the linear system with non-short "nodes" and forge a path. That shortness is a
-//! > [`crate::ring_range`] proof per limb; it is deferred because, unaggregated, it is `O(ELL_H·LOG_BASE)` per
+//! > [`crate::ring_range_agg`] proof per limb; it is deferred because, unaggregated, it is `O(ELL_H·LOG_BASE)` per
 //! > node — the **range-proof aggregation** is the prerequisite that makes the whole path proof practical. The
 //! > linear step here is correct and composes with those shortness proofs once aggregated.
 //!

@@ -47,7 +47,7 @@ use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 
 /// The wide masking bound `2²⁰` for the revealed randomness openings — far above the short (`≤ 2`) witness
 /// randomness they hide, and far below `q`, so binding holds and rejection almost never fires. Shared with the
-/// range proof's reconstruction argument ([`crate::ring_range`]).
+/// linear-relation proof ([`crate::ring_linear`]).
 pub(crate) const MASK_BOUND: i64 = 1 << 20;
 
 /// Accept region for a linear opening `r_z = γ·r + r_b`: the hidden part `‖γ·r‖∞ ≤ 1`, so `‖r_z‖∞ ≤ B − 1`.

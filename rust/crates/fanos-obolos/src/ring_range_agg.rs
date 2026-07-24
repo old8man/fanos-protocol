@@ -1,5 +1,5 @@
 //! The **aggregated range proof** — `v ∈ [0, 2^bits)` in zero knowledge with size *independent of the bit count*,
-//! the practical successor to the per-bit [`crate::ring_range`] (`O(bits)` product proofs). This is what makes
+//! the practical successor to a per-bit range proof (`O(bits)` product proofs). This is what makes
 //! confidential amounts *and* the untraceability shortness proofs affordable.
 //!
 //! ## Construction — a Bulletproofs-style argument in the lattice setting

@@ -1,5 +1,5 @@
 //! The **confidential-amount proof** — the amount-privacy half of a shielded transfer, composing the two ring-ZK
-//! primitives this crate builds: a [range proof](crate::ring_range) per output and one [balance
+//! primitives this crate builds: a [range proof](crate::ring_range_agg) per output and one [balance
 //! proof](crate::ring_balance). Together they attest, in zero knowledge, that
 //!
 //! 1. **balance** — `Σ input values = Σ output values + fee` (no value is created), and
@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use crate::ring_balance::{RingBalanceProof, prove_balance, verify_balance};
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
-use crate::ring_range::{RangeProof, prove_range, verify_range};
+use crate::ring_range_agg::{AggRangeProof, prove_range_agg, verify_range_agg};
 
 /// A shielded transfer's **secret** amount witness: each input's re-randomised value commitment opening, and each
 /// output's amount with its commitment randomness.
@@ -41,10 +41,11 @@ pub struct AmountWitness<'a> {
     pub fee: u64,
 }
 
-/// The zero-knowledge confidential-amount proof: a range proof per output plus the transfer's balance proof.
+/// The zero-knowledge confidential-amount proof: an aggregated range proof per output plus the transfer's balance
+/// proof.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ConfidentialAmountProof {
-    output_ranges: Vec<RangeProof>,
+    output_ranges: Vec<AggRangeProof>,
     balance: RingBalanceProof,
 }
 
@@ -74,7 +75,7 @@ pub fn prove_amounts(
         s.extend_from_slice(seed);
         s.extend_from_slice(b"/range/");
         s.extend_from_slice(&(i as u64).to_le_bytes());
-        output_ranges.push(prove_range(params, v, r, bits, &s)?);
+        output_ranges.push(prove_range_agg(params, v, r, bits, &s)?);
     }
 
     // One balance proof over inputs, outputs, and the fee.
@@ -108,7 +109,7 @@ pub fn verify_amounts(
         return false;
     }
     for (range, com) in proof.output_ranges.iter().zip(output_commitments) {
-        if !verify_range(params, com, range) {
+        if !verify_range_agg(params, com, range) {
             return false;
         }
     }
