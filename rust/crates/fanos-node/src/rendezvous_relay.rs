@@ -33,7 +33,8 @@ use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::threshold_router::ANONYMOUS;
 use fanos_field::Field;
 use fanos_geometry::Triple;
-use fanos_rendezvous::SessionId;
+use fanos_primitives::hash::{hash_labeled, label};
+use fanos_rendezvous::{HostRegister, Request, SessionId, parse_host_register};
 use fanos_runtime::{Effect, Engine, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
@@ -52,6 +53,19 @@ pub struct RendezvousRelay<F: Field> {
     /// OOM. At [`MAX_REGISTRATIONS`] the oldest registration is evicted — a bound, not a leak (an evicted client
     /// simply re-registers; the bare-proxy fallback is best-effort by design).
     reg_order: VecDeque<SessionId>,
+    /// `service_tag → registration`: an anonymously-registered hidden service hosted **off** this combiner
+    /// (`design-anonymity-substrate.md` §3b). When a client request whose `service_tag` matches peels out
+    /// here, this relay re-seals it as a NOSTOS onion to the service's registered dead-drop line — so the
+    /// service is reachable without this node (or anyone) learning its coordinate. Bounded like
+    /// `registrations`.
+    hosts: BTreeMap<[u8; 32], HostRegister>,
+    /// FIFO insertion order of `hosts`' tags, bounding the map at [`MAX_HOSTS`] against a registration flood.
+    host_order: VecDeque<[u8; 32]>,
+    /// Per-node seed for the fresh onion/e2e seeds each host-forward draws; deterministic (derived from this
+    /// relay's coordinate) so a sim reproduces exactly, distinct per node so two combiners never collide.
+    forward_seed: [u8; 32],
+    /// Monotonic counter domain-separating each forward's seed pair, so no two forwards reuse key material.
+    forward_counter: u64,
 }
 
 /// The cap on concurrently-registered bare-proxy client sessions (audit robustness B2). Beyond it, the
@@ -59,16 +73,70 @@ pub struct RendezvousRelay<F: Field> {
 /// bound. Generous enough for any real relay's concurrent fallback clients.
 const MAX_REGISTRATIONS: usize = 4096;
 
+/// The cap on concurrently-registered hidden-service hosts (§3b). A `HostRegister` peels out as an
+/// anonymous delivery, so — like the client registrations — an unbounded map would be a remote OOM; beyond
+/// the cap the oldest host is evicted FIFO (it re-registers each epoch anyway). Generous for any real cell.
+const MAX_HOSTS: usize = 4096;
+
 impl<F: Field> RendezvousRelay<F> {
-    /// A relay wrapping `router`. No client is registered until one sends an
-    /// [`RdvRegister`](fanos_wire::FrameType::RdvRegister); until then the relay just routes.
+    /// A relay wrapping `router`. No client or host is registered until one sends an
+    /// [`RdvRegister`](fanos_wire::FrameType::RdvRegister) / a §3b host registration; until then it just routes.
     #[must_use]
     pub fn new(router: ThresholdRouter<F>) -> Self {
+        // Derive the host-forward seed from this relay's coordinate: deterministic (sim-reproducible) and
+        // per-node distinct, with no new constructor parameter to thread through every caller.
+        let forward_seed = hash_labeled(label::KDF, &encode_coord(router.address()));
         Self {
             router,
             registrations: BTreeMap::new(),
             reg_order: VecDeque::new(),
+            hosts: BTreeMap::new(),
+            host_order: VecDeque::new(),
+            forward_seed,
+            forward_counter: 0,
         }
+    }
+
+    /// The number of hidden-service hosts currently registered here.
+    #[must_use]
+    pub fn hosts(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// Record a hidden service's anonymous host registration (§3b): bind its `service_tag` to the route the
+    /// relay forwards matching client requests through. Only **primary** (coordinate-hiding) registrations
+    /// are accepted — a non-empty `forward_circuit` with self-provisioned keys; a bare-host registration
+    /// (direct-coordinate fallback) is ignored here (its forwarding is a separate, weaker path). Bounded FIFO.
+    fn register_host(&mut self, reg: HostRegister) {
+        if reg.forward_circuit.is_empty() || reg.forward_keys.is_empty() {
+            return;
+        }
+        let tag = reg.service_tag;
+        if self.hosts.insert(tag, reg).is_none() {
+            self.host_order.push_back(tag);
+            if self.hosts.len() > MAX_HOSTS
+                && let Some(oldest) = self.host_order.pop_front()
+            {
+                self.hosts.remove(&oldest);
+            }
+        }
+    }
+
+    /// The next `(e2e_seed, onion_seed)` pair for a host-forward — two independent fresh draws (the NOSTOS
+    /// end-to-end nonce and the onion key material must not share entropy), advancing the counter.
+    fn next_forward_seeds(&mut self) -> ([u8; 32], [u8; 32]) {
+        let n = self.forward_counter;
+        self.forward_counter += 1;
+        let mut data = [0u8; 40];
+        data[..32].copy_from_slice(&self.forward_seed);
+        data[32..].copy_from_slice(&n.to_be_bytes());
+        let e2e = hash_labeled(label::KDF, &data);
+        // A distinct second draw: flip the domain by appending a marker byte.
+        let mut data2 = [0u8; 41];
+        data2[..40].copy_from_slice(&data);
+        data2[40] = 0x01;
+        let onion = hash_labeled(label::KDF, &data2);
+        (e2e, onion)
     }
 
     /// The coordinate registered for `cookie` (the bare-proxy fallback), if any.
@@ -94,37 +162,61 @@ impl<F: Field> RendezvousRelay<F> {
         &mut self.router
     }
 
-    /// Rewrite the router's effects: an anonymous delivery (a peeled reply) whose leading 16 bytes match a
-    /// registered cookie becomes an [`RdvReply`](fanos_wire::FrameType::RdvReply) `Send` to that client's
-    /// coordinate — so the reply reaches the client while the service that sealed it never learned that
-    /// coordinate. A delivery with no matching registration passes through unchanged (a plain router, e.g.
-    /// the service's own meeting-line combiner, or a client co-located at its combiner).
-    fn relay_deliveries(&self, effects: Vec<Effect>) -> Vec<Effect> {
-        if self.registrations.is_empty() {
-            return effects;
-        }
-        effects
-            .into_iter()
-            .map(|e| match e {
-                Effect::Notify(Notification::Delivered { from, payload })
-                    if from == ANONYMOUS =>
-                {
-                    match payload
-                        .get(..size_of::<SessionId>())
-                        .and_then(|c| <SessionId>::try_from(c).ok())
-                        .and_then(|cookie| self.registrations.get(&cookie))
-                    {
-                        // Forward the reply straight to the registered coordinate (the bare-proxy fallback):
-                        // the relay knows the client's coordinate but never the service.
-                        Some(client) => {
-                            Effect::Send { to: *client, frame: framed(FrameType::RdvReply, &payload) }
-                        }
-                        None => Effect::Notify(Notification::Delivered { from, payload }),
-                    }
+    /// Rewrite the router's effects, resolving each peeled anonymous delivery in priority order:
+    /// 1. a **registered client's** cookie-tagged reply → an [`RdvReply`](fanos_wire::FrameType::RdvReply)
+    ///    `Send` to that client (the bare-proxy fallback — the relay knows the *client*, never the service);
+    /// 2. a **§3b host registration** → bind the hidden service's forward route (no effect emitted);
+    /// 3. a **client request naming a registered host** → re-seal it as a NOSTOS onion to that host's
+    ///    dead-drop line and `Send` it on — so the service is reachable though it is *not* this combiner and
+    ///    this relay learns neither endpoint's coordinate;
+    /// 4. anything else → pass through as a local anonymous delivery (the service *is* its own combiner, or an
+    ///    unrelated onion). The rule is additive: with no clients and no hosts registered, every delivery
+    ///    falls straight through and the relay is a plain router.
+    fn process_deliveries(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+        // Every anonymous delivery is inspected — no empty-map fast path: the *first* host registration
+        // arrives while `hosts` is still empty, so skipping classification then would never bind it.
+        let mut out = Vec::with_capacity(effects.len());
+        for e in effects {
+            match e {
+                Effect::Notify(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
+                    out.extend(self.classify_anonymous(payload));
                 }
-                other => other,
-            })
-            .collect()
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// Resolve one peeled anonymous delivery to its effect(s) (see [`Self::process_deliveries`]).
+    fn classify_anonymous(&mut self, payload: Vec<u8>) -> Vec<Effect> {
+        // 1. A registered client's cookie-tagged reply → forward to that client.
+        if let Some(client) = payload
+            .get(..size_of::<SessionId>())
+            .and_then(|c| <SessionId>::try_from(c).ok())
+            .and_then(|cookie| self.registrations.get(&cookie))
+        {
+            return vec![Effect::Send { to: *client, frame: framed(FrameType::RdvReply, &payload) }];
+        }
+        // 2. A host registration → bind it (primary, coordinate-hiding registrations only).
+        if let Some(reg) = parse_host_register(&payload) {
+            self.register_host(reg);
+            return Vec::new();
+        }
+        // 3. A client request naming a registered host → re-seal to that host's dead-drop and forward.
+        if let Some(req) = Request::decode(&payload)
+            && req.service_tag != [0u8; 32]
+            && let Some(reg) = self.hosts.get(&req.service_tag).cloned()
+        {
+            let (e2e, onion) = self.next_forward_seeds();
+            return match reg.seal_forward_to_host::<F>(&payload, &e2e, &onion) {
+                Some(fwd) => vec![Effect::Send { to: fwd.combiner, frame: fwd.frame }],
+                // A registered host whose route we cannot seal to: drop, don't surface locally (this node
+                // is not the service — a local delivery would be answered by the wrong party).
+                None => Vec::new(),
+            };
+        }
+        // 4. Otherwise a local anonymous delivery (the service is its own combiner, or an unrelated onion).
+        vec![Effect::Notify(Notification::Delivered { from: ANONYMOUS, payload })]
     }
 
     /// Record a client's registration: a 16-byte cookie binds this session to the sender's coordinate, so
@@ -156,6 +248,12 @@ fn framed(frame_type: FrameType, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// A coordinate's canonical bytes (three big-endian `u32`s), for deriving this relay's forward seed. Built
+/// once at construction, so the small allocation is immaterial.
+fn encode_coord(coord: Triple) -> Vec<u8> {
+    coord.iter().flat_map(|c| c.to_be_bytes()).collect()
+}
+
 impl<F: Field> Engine for RendezvousRelay<F> {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         if let Input::Message { from, frame } = &input
@@ -168,9 +266,10 @@ impl<F: Field> Engine for RendezvousRelay<F> {
                 return Vec::new();
             }
         }
-        // Everything else is onion traffic: route it, then forward any peeled reply to its client.
+        // Everything else is onion traffic: route it, then resolve each peeled anonymous delivery (client
+        // reply / host registration / request-for-a-registered-host / local).
         let effects = self.router.step(now, input);
-        self.relay_deliveries(effects)
+        self.process_deliveries(effects)
     }
 
     fn address(&self) -> Triple {
@@ -427,4 +526,92 @@ mod tests {
         );
     }
 
+    /// §3b: a hidden service registers **anonymously** at its meeting combiner, then a matching client
+    /// request peeled there is re-sealed to the service's dead-drop line and forwarded on — not surfaced
+    /// locally. The relay learns neither the service's coordinate (it registered by onion, naming only a
+    /// line) nor the client's (the request names only its own dead-drop line).
+    #[test]
+    fn a_relay_forwards_a_request_to_an_anonymously_registered_host() {
+        use fanos_pqcrypto::HybridKemSecret;
+        use fanos_rendezvous::{HOST_REGISTER_TAG, MixDirectory, combiner_for, service_tag};
+
+        // A KEM key at every Fano point, so any line's members can be sealed to (the host's forward route).
+        let mut dir = MixDirectory::new();
+        for i in 0..7u8 {
+            let (_s, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD0, i]));
+            dir.insert(Point::<F2>::at(usize::from(i)).coords(), public);
+        }
+
+        // The relay sits at line L's combiner (t = 1: the combiner is member 0).
+        let l = Line::<F2>::at(0).coords();
+        let combiner = Point::<F2>::new(line_member_coords::<F2>(l)[0]).unwrap();
+        let onion_seed = [0xA5u8; 32];
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"host-relay-id"));
+        let mut relay =
+            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+        let relay_onion = OnionKeyRatchet::new(onion_seed, Epoch::ZERO);
+        let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xA5, 1]));
+        let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xA5, 2]));
+        let pubs = [relay_onion.public(), &p1, &p2];
+        // Seal a single-hop onion to L carrying `body`, peelable by the relay (member 0, t = 1).
+        let seal_to_relay = |body: &[u8], seed: &[u8]| {
+            let onion = seal_onion(&[HopLine { line: l, members: &pubs }], 1, body, seed).unwrap();
+            launch_frame(l, &onion)
+        };
+
+        // The service's meeting tag and its dead-drop line L_O (a different line). It registers by onion.
+        let tag = service_tag(b"a-hidden-service-key", Epoch::new(0));
+        let drop_line = Line::<F2>::at(3).coords();
+        let (_svc_keys, svc_reply_pub) =
+            fanos_aphantos::nostos::ReplyKeys::generate(b"svc-deaddrop");
+        let reg = HostRegister::onion::<F2>(tag, svc_reply_pub.encode(), vec![drop_line], &dir, 1)
+            .expect("the dead-drop line's members are in the directory");
+        let mut reg_body = HOST_REGISTER_TAG.to_vec();
+        reg_body.extend_from_slice(&reg.encode());
+        relay.step(Instant(0), Input::Message { from: [9, 9, 9], frame: seal_to_relay(&reg_body, b"reg") });
+        assert_eq!(relay.hosts(), 1, "the anonymous host registration was bound by its tag");
+
+        // A client request naming that service_tag, peeled at the relay, is forwarded to the dead-drop.
+        let request = Request {
+            cookie: *b"client-cookie-01",
+            service_tag: tag,
+            reply_circuit: vec![Line::<F2>::at(5).coords()],
+            payload: b"a DIAULOS ClientHello".to_vec(),
+            reply_pub: b"client-reply-key".to_vec(),
+        }
+        .encode();
+        let effects =
+            relay.step(Instant(1), Input::Message { from: [8, 8, 8], frame: seal_to_relay(&request, b"req") });
+        let drop_combiner = combiner_for::<F2>(drop_line).unwrap();
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Send { to, .. } if *to == drop_combiner)),
+            "the request is re-sealed and forwarded to the service's dead-drop line combiner",
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS
+            )),
+            "the request left for the host, not surfaced locally (this node is not the service)",
+        );
+
+        // A request for an UNregistered tag falls through to a local anonymous delivery (unchanged behaviour).
+        let other = Request {
+            cookie: *b"client-cookie-02",
+            service_tag: service_tag(b"some-other-service", Epoch::new(0)),
+            reply_circuit: vec![],
+            payload: b"unrelated".to_vec(),
+            reply_pub: vec![],
+        }
+        .encode();
+        let effects =
+            relay.step(Instant(2), Input::Message { from: [7, 7, 7], frame: seal_to_relay(&other, b"oth") });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS
+            )),
+            "a request for no registered host surfaces locally, as before",
+        );
+    }
 }

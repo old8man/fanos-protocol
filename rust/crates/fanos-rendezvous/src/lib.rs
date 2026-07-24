@@ -221,6 +221,19 @@ pub fn service_tag(service_pubkey: &[u8], epoch: Epoch) -> [u8; 32] {
     fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::RDV_HOST, &data)
 }
 
+/// One `(coordinate, KEM public key)` entry of a self-provisioned forwarding directory carried inside a
+/// [`HostRegister`]. The meeting combiner that forwards a request to a hidden service holds no global mix
+/// directory (it is any node the beacon happened to place there), so the service's registration carries the
+/// member keys of its *own* forward route — all already public (published in mixdir), and re-sent each epoch
+/// as the route rotates — letting the combiner seal the forward onion as a pure function of the registration.
+#[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
+pub struct MixEntry {
+    /// The member's overlay coordinate.
+    pub coord: Triple,
+    /// Its serialized [`HybridKemPublic`].
+    pub key: Vec<u8>,
+}
+
 /// The 4-byte marker that prefixes a [`HostRegister`] onion body, distinguishing a host registration
 /// from a client [`Request`] when both peel out at a meeting combiner as anonymous deliveries. A
 /// `Request` opens with a 16-byte CSPRNG cookie, so a collision with this constant is negligible; the
@@ -249,12 +262,101 @@ pub struct HostRegister {
     /// Hop lines to the service's own **dead-drop line** (the last hop), through which the combiner
     /// forwards client requests as NOSTOS onions. Empty on the bare-host fallback.
     pub forward_circuit: Vec<Triple>,
+    /// The self-provisioned member keys for `forward_circuit`'s lines ([`MixEntry`]), so the combiner —
+    /// which holds no global directory — can seal the forward onion. Empty on the bare-host fallback.
+    pub forward_keys: Vec<MixEntry>,
+    /// The threshold `t` the forward onion's hops seal to (`t`-of-`(q+1)`), as the service chose it.
+    pub threshold: u8,
     /// The bare-host fallback coordinate — used **only** when `forward_circuit` is empty (the combiner
     /// forwards by a direct `Send`, learning this coordinate). All-zeros on the primary onion path.
     pub coordinate: Triple,
 }
 
 impl HostRegister {
+    /// Build the **primary** (coordinate-hiding) registration: the combiner will forward client requests as
+    /// NOSTOS onions to the service's dead-drop line (`forward_circuit`'s last hop), end-to-end sealed to
+    /// `reply_pub`. `directory` supplies the member keys for `forward_circuit`'s lines — extracted into the
+    /// registration so the combiner (which holds no directory) can seal. `None` if a member key is missing.
+    #[must_use]
+    pub fn onion<F: Field>(
+        service_tag: [u8; 32],
+        reply_pub: Vec<u8>,
+        forward_circuit: Vec<Triple>,
+        directory: &MixDirectory,
+        threshold: u8,
+    ) -> Option<Self> {
+        let mut forward_keys = Vec::new();
+        for &line in &forward_circuit {
+            for coord in line_member_coords::<F>(line) {
+                let key = directory.get(&coord)?.encode();
+                if !forward_keys.iter().any(|e: &MixEntry| e.coord == coord) {
+                    forward_keys.push(MixEntry { coord, key });
+                }
+            }
+        }
+        Some(Self {
+            service_tag,
+            reply_pub,
+            forward_circuit,
+            forward_keys,
+            threshold,
+            coordinate: [0, 0, 0], // the primary onion path hides the coordinate; all-zeros = none
+        })
+    }
+
+    /// Build the **bare-host fallback** registration (an operator that cannot peel a dead-drop): the combiner
+    /// forwards each request by a direct `Send` to `coordinate`, learning it. Weaker than [`Self::onion`] —
+    /// the primary path hides the coordinate; this leaks it to the one combiner node (Tor's posture).
+    #[must_use]
+    pub fn bare(service_tag: [u8; 32], coordinate: Triple) -> Self {
+        Self {
+            service_tag,
+            reply_pub: Vec::new(),
+            forward_circuit: Vec::new(),
+            forward_keys: Vec::new(),
+            threshold: 0,
+            coordinate,
+        }
+    }
+
+    /// The self-provisioned forward directory rebuilt as a [`MixDirectory`] (for the combiner's seal).
+    #[must_use]
+    pub fn forward_directory(&self) -> MixDirectory {
+        let mut dir = MixDirectory::new();
+        for entry in &self.forward_keys {
+            if let Some(public) = HybridKemPublic::decode(&entry.key) {
+                dir.insert(entry.coord, public);
+            }
+        }
+        dir
+    }
+
+    /// Seal a client `request` into a NOSTOS onion bound for this service's dead-drop line — what a meeting
+    /// combiner emits to forward the request on. The whole `Request` is carried (so the service binds the
+    /// client's reply route), end-to-end sealed to the service's `reply_pub` and dead-dropped to
+    /// `forward_circuit`'s last hop. `None` on the bare-host fallback (empty `forward_circuit`) or if sealing
+    /// fails. `e2e_seed`/`onion_seed` MUST be independent fresh draws (as in [`seal_nostos_reply`]).
+    #[must_use]
+    pub fn seal_forward_to_host<F: Field>(
+        &self,
+        request: &[u8],
+        e2e_seed: &[u8],
+        onion_seed: &[u8],
+    ) -> Option<Forward> {
+        if self.forward_circuit.is_empty() {
+            return None;
+        }
+        seal_nostos_reply::<F>(
+            &self.reply_pub,
+            &self.forward_circuit,
+            &self.forward_directory(),
+            self.threshold,
+            request,
+            e2e_seed,
+            onion_seed,
+        )
+    }
+
     /// The canonical wire bytes (the derived [`Wire`] codec).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -298,6 +400,7 @@ pub fn parse_host_register(delivery: &[u8]) -> Option<HostRegister> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -371,6 +474,8 @@ mod tests {
             service_tag: [0x5B; 32],
             reply_pub: b"service-nostos-reply-key".to_vec(),
             forward_circuit: vec![[1, 2, 3], [4, 5, 6]],
+            forward_keys: vec![MixEntry { coord: [1, 1, 1], key: b"member-key".to_vec() }],
+            threshold: 2,
             coordinate: [0, 0, 0],
         };
         assert_eq!(HostRegister::decode(&reg.encode()), Some(reg.clone()));
@@ -392,14 +497,58 @@ mod tests {
             "a client Request is not misread as a host registration",
         );
 
-        // The bare-host fallback: empty forward circuit + reply key, a real coordinate.
-        let fallback = HostRegister {
-            service_tag: [0x11; 32],
-            reply_pub: vec![],
-            forward_circuit: vec![],
-            coordinate: [7, 8, 9],
-        };
+        // The bare-host fallback: empty forward circuit/keys, a real coordinate.
+        let fallback = HostRegister::bare([0x11; 32], [7, 8, 9]);
+        assert!(fallback.forward_circuit.is_empty() && fallback.forward_keys.is_empty());
         assert_eq!(HostRegister::decode(&fallback.encode()), Some(fallback));
+    }
+
+    #[test]
+    fn onion_registration_self_provisions_its_forward_keys_and_seals() {
+        use fanos_field::F2;
+        use fanos_geometry::Line;
+        use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+
+        // A Fano directory (a KEM key at every point), and a 1-hop forward route to a dead-drop line.
+        let mut dir = MixDirectory::new();
+        for i in 0..7u8 {
+            let (_s, public) =
+                HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, i]));
+            dir.insert(fanos_geometry::Point::<F2>::at(usize::from(i)).coords(), public);
+        }
+        let drop_line = Line::<F2>::at(2).coords();
+        let (reply_keys, reply_pub) =
+            fanos_aphantos::nostos::ReplyKeys::generate(b"svc-forward-reply");
+
+        let reg = HostRegister::onion::<F2>(
+            [0x5B; 32],
+            reply_pub.encode(),
+            vec![drop_line],
+            &dir,
+            2,
+        )
+        .expect("all forward-line members are in the directory");
+        // It carried exactly the 3 members of the dead-drop line, and the directory rebuilds to them.
+        assert_eq!(reg.forward_keys.len(), 3);
+        assert_eq!(reg.forward_directory().len(), 3);
+        assert_eq!(reg.threshold, 2);
+
+        // The combiner seals a client request to the service's dead-drop; it launches at the drop line's
+        // combiner, and only the service (with reply_keys) opens the end-to-end body once peeled.
+        let fwd = reg
+            .seal_forward_to_host::<F2>(b"the-wrapped-client-request", b"e2e-seed", b"onion-seed")
+            .expect("a primary registration seals a forward onion");
+        assert_eq!(fwd.combiner, combiner_for::<F2>(drop_line).unwrap());
+        // The bare-host fallback has no forward circuit, so it seals nothing (the combiner Sends direct).
+        assert!(
+            HostRegister::bare([9; 32], [1, 1, 1])
+                .seal_forward_to_host::<F2>(b"x", b"e", b"o")
+                .is_none()
+        );
+        // A drop route whose line members are absent from the directory can't self-provision.
+        let empty = MixDirectory::new();
+        assert!(HostRegister::onion::<F2>([1; 32], vec![], vec![drop_line], &empty, 2).is_none());
+        let _ = &reply_keys; // reply_keys' secret half stays with the service; only the public traveled
     }
 
     #[test]
