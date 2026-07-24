@@ -7,6 +7,26 @@
 
 > **Resolution status — refreshed 2026-07-24: every finding in this document is RESOLVED.** Each was re-verified against the current source in a full per-finding closure re-audit; the last open items (D2, D4, A4/A4b, A6, C4, G1) were closed on 2026-07-24, and the rest were confirmed already fixed. The workspace has since grown to 41 crates and passes `cargo clippy --workspace --all-targets -D warnings` and `cargo test --workspace` green (the mid-change `cargo fmt` failure noted above is long gone). Resolutions are annotated inline (`— **RESOLVED**`) and summarised in the §2 table. This document is deliberately **retained** as the project's internal defect-audit record and external-audit deliverable (`crypto-audit-readiness.md` §6.5), not deleted.
 
+> **Consolidation status — this file is now the single FANOS audit record (consolidated 2026-07-24).** It gathers **four chronological audit passes** into one document (the separate `docs/audit-2026-07-2*.md` files were merged in and removed). Read it as a timeline — each later pass independently re-verified and **supersedes** the earlier one:
+>
+> | Pass | Date | Scope | Status of its own findings |
+> |---|---|---|---|
+> | **Audit I** — this document, above | 2026-07-18 | the original whole-workspace architectural audit | **fully resolved** — every finding closed and re-verified (the `— RESOLVED` tags + §2 table) |
+> | **Audit II** — below | 2026-07-22 | first adversarial review of the crown-jewel subsystems (OBOLOS/DROMOS/THESAUROS/ANGELOS/live TAXIS): 9 CRITICAL + ~18 HIGH | superseded by III–IV + subsequent work |
+> | **Audit III** — below | 2026-07-23 | re-audit of II: 13 fixes confirmed, plus new *unauthenticated/unbounded recovery-wiring* findings (§3.1–§3.9) | superseded by IV + subsequent work |
+> | **Audit IV** — below | 2026-07-23 (deep) | re-verified III at `file:line`; reframed the frontier as *"no driver"* | the most recent frontier snapshot |
+>
+> **Current status of Audits II–IV (2026-07-24), checked against the current tree.** Each pass closed most of the prior pass's frontier, and substantial subsequent work has closed most of what Audit IV named:
+> - **Shipped-binary chain** (Audit IV's "no driver"): **CLOSED** — `fanos taxis-deal` + `fanos validator` provision and run the TAXIS blockchain, with genesis token allocation and Tendermint-style round-timeout backoff (the §5.B `dromos_quic` livelock).
+> - **Anonymous hidden-service reachability** (Audit III §5 / IV): **CLOSED** — `fanos host` serves and `fanos proxy --profile anonymous` dials a symmetric-NOSTOS hidden service over real QUIC, neither coordinate revealed; the S1-M2 epoch-follow break is closed.
+> - **Mass-loss recovery** (R-C1 cliff, Audit II/III §4): **CLOSED** — partition-safe below-threshold re-genesis (RGC + `BeaconNode::rebootstrap` + generation fencing) + an auto-trigger (recovery-decision ladder + stall detector) replaces the permanent freeze; durable state-sync + secret-leader election are built and proven over real QUIC.
+> - **The Audit III §3 DoS/overflow cluster:** §3.2 (OBOLOS ternary-randomness reject), §3.3 (storage `decode_response` bound), §3.5 (audit-cadence), §3.4 (market floors + prune), §3.7 (TREASURY access-list), §3.8/§3.9 (CI green): **CLOSED** per Audit IV's re-verification + subsequent commits.
+> - **Γ-viability gate** (Audit II CRITICAL-ARCH): **CLOSED** — built as the `fanos-holarch` crate (`gamma`/`verdict`/`panel`/`Sigma` + the Ω4 ablations); the E∧L verdict is now a CI number.
+> - **⚠ One open item — beacon-reshare key-secrecy** (Audit IV §2.1, CRITICAL, **STILL OPEN — live**): the single-member exfil is fixed, but a **2-anchor coalition can still reconstruct the beacon master secret** via an unauthenticated low-threshold `BeaconReshareTrigger` (now live because the recovery auto-trigger is wired). A threshold floor cannot fix it (legitimate recovery must lower the threshold); the fix is to **authenticate the trigger against the beacon `authority`** and route the auto-trigger through it (as `rebootstrap` already is) — a change spanning `beacon.rs` + the concurrently-developed recovery-actuation flow (`recovery.rs`), so it is left for the recovery-owning work rather than rushed here. **This is the platform's single top open security item** — full detail + the exact fix at Audit IV §2.1 below.
+> - **Remaining:** the coherence/meta-holon tail (E→L / L→O / Ω2 / Ω9 reconciliation) and the per-subsystem MEDIUM/LOW items are preserved in the dated sections below and tracked in ongoing work. Where an archived section says "unbuilt/open," verify against the current tree — it has advanced hundreds of commits since each snapshot.
+>
+> Inter-audit references in the archived sections (e.g. "`docs/audit-2026-07-23.md`", "pass 1") now point to the correspondingly-dated section **within this file**.
+
 ---
 
 ## 1. Executive summary
@@ -463,3 +483,1381 @@ A follow-up spec-vs-implementation audit (driving toward #97) re-swept the spec 
 None of these is a regression — each is a tracked frontier item, several already in progress. This addendum records where the "drive to 100%" effort stands; it does not supersede the Tier-0/1 resolutions above.
 
 **Update — 2026-07-24: all nine addendum items are now resolved.** A per-item re-audit against the current tree confirmed each is implemented: §6.4 live diagnose→heal (`on_diagnose` runs every heartbeat), §12.3 threshold-hosted CALYPSO (`ServiceNode`+`ThresholdService` wired into `Node::start`), §7.4 capability negotiation (`fanos-wire::capability`, folded into HELLO), §7.9 wire-KAT harness (`fanos-wire/tests/wire_kat.rs` loads + verifies `conformance/vectors/wire.json`), L3.2 per-epoch reshuffle (`reshuffle_loop` on `BeaconReady`), L3.3 Sybil admission (`PowAdmission` wired into JOIN via `with_admission_pow`), L4.1 erasure coding (`fanos-code::{erasure,lrc}` replaces full replication), §5.4 holonomy verification (`verify_delivery` produces `WireError::HolonomyFail` on the live peel path), and PROTEUS enablement (config/CLI surface + auto-fallback + capability advertisement). The deeper residuals surfaced afterwards — cross-cell erasure placement, full hidden-service reachability, censored-bootstrap bridges — are carried forward and tracked in the consolidated later-audit sections that follow (Audits II–IV).
+
+
+---
+
+<!-- ═══════════════════ AUDIT II of IV ═══════════════════ -->
+
+> **Audit II of IV — consolidated into `docs/audit.md` on 2026-07-24** (formerly `docs/audit-2026-07-22.md`). The first adversarial review of the crown-jewel subsystems built after Audit I (OBOLOS / DROMOS / THESAUROS / ANGELOS / live TAXIS). Preserved verbatim as a dated snapshot; for the **current** status of its findings see the *Consolidation status* note near the top of this file — most were closed by Audits III–IV and the subsequent recovery / anonymity / validator work.
+
+# FANOS platform deep audit — 2026-07-22
+
+**Scope:** the whole `rust/` workspace (39 crates, ~88.5k LoC) + `spec/protocol.md`, `spec/platform.md`, and the HOLARCH meta-spec (`uhm-theory/.../applied/research/holarch.md`), with special focus on (1) end-to-end anonymity for `.fanos` and clearnet surfing, (2) survival + self-organization under mass destruction and heterogeneous recovery, (3) holonic-architecture compliance and cross-level coherence, and (4) the simulator.
+
+**Baseline at audit time:** the tree is **332 commits past** the prior audit (`docs/audit.md`, 2026-07-18); the whole workspace **compiles green under `--all-targets`**; **1408** `#[test]`/`#[tokio::test]` annotations. Full `cargo test --workspace` + `clippy --all-targets -D warnings` result: **see §0**.
+
+**Method:** eight parallel adversarial audit streams (anonymity, OBOLOS, TAXIS/DROMOS, ANGELOS/THESAUROS, HOLARCH coherence, simulator, systemic robustness, mass-failure self-organization), each grounded in the specs above and told to verify *current* code (not the prior audit's snapshot). Every CRITICAL/HIGH below was read at `file:line` by the responsible stream; findings are tagged **CONFIRMED** (read and definite) or **LIKELY** (inferred, needs a second look). This document is written to be executed from — the sibling dev-agent should treat §10 as the work queue.
+
+---
+
+## §0. Verification baseline
+
+- `cargo build --workspace --all-targets`: **PASS** (exit 0, verified this session).
+- `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (clean, verified this session — the CI gate holds).
+- `cargo test --workspace`: **green** (verified this session — exit 0, **1414 passed / 0 failed** across 181 test binaries).
+- No `TODO`/`unimplemented!` markers in `rust/crates` (per `docs/tasks.md`, re-confirmed by the robustness stream: all new crates `forbid(unsafe_code)`, no `unwrap`/`expect`/`panic`/OOB-indexing in non-test code for obolos/dromos/thesauros/angelos).
+
+The important caveat this audit establishes: **green tests do not cover the findings below.** Nearly every CRITICAL/HIGH lives in a code path the existing tests do not exercise adversarially (media seals one-direction-only; `settle_epoch` is fed a bool directly; the sim broadcasts every reveal to all validators; the sim moves reshuffled nodes to unoccupied coordinates; etc.). The green suite is real, but it is a *conformance/regression* suite, not an *adversarial* one.
+
+---
+
+## §1. Executive summary
+
+FANOS is, as the prior audit found, an unusually principled and honest codebase — the cryptographic cores are real (audited PQ primitives, a correct 1:1 double ratchet with genuine FS+PCS, a sound projective-LRC store, exact DIAKRISIS invariant math, BFT ordering safety verified to `q=1000`), the status discipline is candid, and the transport/stream DoS cluster that dominated the last audit is **genuinely fixed**. The team has closed an enormous amount in four days.
+
+But this audit surfaces one dominant, systemic theme and a cluster of load-bearing defects inside it.
+
+### The meta-pattern (present in 6 of 8 streams): **libraries/engines/proofs ahead, live-wiring behind**
+
+The cryptographic cores, accounting math, invariant formulas, controllers, and healing actuators are built, unit-proven, and tested. What is missing, over and over, is the layer *around* them:
+
+- **the guards** — replay/epoch binding, sender authentication, direction separation, input validation before buffering;
+- **the enablement** — cover traffic + mixing, beacon provisioning, self-organization actuation, differential-privacy export, holonomy verification;
+- **the recovery wiring** — beacon resharing, parent escalation transport, cross-cell erasure.
+
+Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not sloppiness; it is the gap between an excellent skeleton and a live, adversary-facing, self-healing platform — the same "excellent foundations, incomplete productionization" shape the prior audit named, now extended into the crown-jewel subsystems (OBOLOS, DROMOS, THESAUROS, ANGELOS, live TAXIS) that were built *after* that audit and had never been reviewed.
+
+### Severity tally
+
+| Severity | Count | Where |
+|---|---|---|
+| **CRITICAL** (security/liveness/funds) | **9** | OBOLOS inflation (C1) + untraceability break (C2); THESAUROS escrow drain (S4-C1); ANGELOS media nonce-reuse (S4-C2) + group forgery (S4-C3); anonymity clearnet-not-anonymized (S1-C1); resilience beacon-stall (R-C1) + escalation-unwired (R-C2) + erasure-loss (R-C3) |
+| **CRITICAL-ARCH** | **1** | HOLARCH Γ-viability gate unbuilt while gated tiers ship |
+| **HIGH / HIGH-ARCH** | **~18** | TAXIS exec-divergence (borderline critical), round-lock liveness wedge, keyper censorship, DA-not-wired, slashing-not-applied; anonymity cover/mixing-off, beacon-unreachable, cookie-correlator; resilience membership-lockout, self-org-not-live, zero-reintegration-budget; robustness B1 taxis-pending-reveals; OBOLOS fee-drift + note-cipher-nonce; THESAUROS PoR-not-provider-bound + reputation-not-wired; ANGELOS media-replay; HOLARCH E→L/L→O/self-org/Ω2 |
+| **MEDIUM / LOW** | ~40 | per-subsystem, §5–§7 |
+
+### The three answers the user asked for, up front
+
+1. **Ultimate anonymity (`.fanos` + clearnet):** the cryptographic core is strong and the anonymous `.fanos` path is now genuinely live over real QUIC (a real advance over the prior "sim-only"), **but the shipping node delivers threshold-onion unlinkability *without* the GPA defenses, forward secrecy, moving-target rotation, or clearnet anonymization the spec advertises** — cover traffic and mixing are off, the beacon is unreachable so epochs never advance, `--profile anonymous` sends clearnet *direct*, and the session cookie is a cleartext cross-correlator. **§3.** The guarantee is real in the engine and inert in deployment. *Not yet defensible as "ultimate."*
+2. **Mass-destruction → heterogeneous recovery self-organization:** **not flawless — three CRITICAL cliffs**, all on the *unwired* recovery path: the beacon permanently stalls below threshold with no re-DKG (a network-wide liveness SPOF), escalation-to-parent is a log line, and erasure loss past `[7,3,4]` is silent permanent data loss. The self-organizing role loop is *never called by `Node::start`*. **§2.** The proofs exist; the network that would survive its own destruction does not run.
+3. **Holonic coherence:** the network-cell layer is genuinely holonic in code; the *platform* layer is holonic in prose and conventional in code — the Γ-viability gate the platform calls its release criterion is **unbuilt**, and the meta-holon's cross-block is ~1/3 wired (L↔E live, E→L absent, L→O reversed). **§4.**
+
+---
+
+## §2. Mass destruction → heterogeneous recovery (the self-organization scenario) — PRIORITY
+
+*This is the user's most-emphasized dimension: nodes go offline en masse, then recover heterogeneously — some identical (rebooted server, same identity/coordinate), some changed, some never, and new nodes appear. The self-organization model must be flawless. It is not.* The scenario's survival depends **almost entirely on the unwired half** of the codebase (`roles.rs`, `hierarchy.rs`, `partition.rs`, `regeneration.rs`, `derive_hierarchical_address`, `LiveRoleController` — all built, unit-proven, and **not driven in `Node::start`**).
+
+### [CRITICAL] R-C1 — Beacon liveness cliff: sub-threshold anchor loss permanently stalls the epoch clock; no re-DKG / resharing
+*Anchors:* `fanos-vrf/src/beacon.rs:283` (`assemble`), `:235` (`combine`), `:313` (`verify_and_seed`) — all return `None` below threshold; `fanos-keygen/src/beacon.rs:135` (`try_assemble`); `fanos-quic/src/driver.rs:829` (`reshuffle_loop` blocks on `BeaconReady`); `fanos-node/src/overlay_beacon.rs:107` (`drive_overlay` only advances on `BeaconReady`); `fanos-node/src/config.rs:31-36` (static shares, no re-DKG).
+
+**Trajectory:** losing `n−t+1` anchors → no round assembles → no `BeaconReady` → the epoch clock **and** the coordinate reshuffle both freeze forever → recovering/new nodes cannot compute current placement, cannot pull-sync the beacon (no synced peer to answer), and land at genesis in a different coordinate space than the survivors → HELLO `EPOCH_STALE` rejects them → **the cell is frozen and unjoinable.** There is **no anchor-reconstitution / proactive-resharing / re-DKG path anywhere** (grep for `reshare`/`proactive`/`refresh`/`redeal` = none; the DKG is one-shot, dead shares are gone). Because the design propagates *one* beacon down the hierarchy (`design-self-organization.md §6`), this is a **network-wide randomness-liveness single point of failure**, not a local one. For a Fano cell (`n=7`, `t∈{3,4,5}`), the ">3 losses/cell" boundary the whole fault model is built around is *exactly* this cliff.
+
+**Fix (fundamental, painful, correct):** proactive **verifiable secret resharing** (periodic re-DKG / Herzberg-style proactive VSS) so a depleted anchor set below `t` is reconstituted from ≥`t` survivors without revealing the secret; plus a **beacon re-bootstrap protocol** (on `<t` live anchors for `D` epochs, run a fresh DKG among current members and publish a new commitment via the parent, or an operator-signed rollover at the genesis root); plus **safe-stall semantics** — when the beacon is down, freeze coordinates *and* freeze `EPOCH_STALE` rejection, so a lagging node can still attach to the last good epoch instead of deadlocking.
+
+### [CRITICAL] R-C2 — Escalation / parent-recovery is not wired: the recovery-of-last-resort is a log line
+*Anchors:* `fanos-node/src/bin/fanos.rs:543` (the **only** `Notification::Escalated` consumer — an `info!` log); `fanos-diakrisis/src/hierarchy.rs` (pure function, no live parent cell, "fed by hand" per `design-coordinates.md §4(d)`); `fanos-runtime/src/overlay.rs:911` (`HealingAction::Escalate`), `:813` (`BandControl::Escalate → Escalated(0)`); `fanos-core/src/roles.rs:620` (`assign_report` deficit — also no live parent).
+
+**Trajectory:** every design doc names escalation as the authoritative fix for a collapsed cell (`ddos-homeostasis.md §5`: `P<2/7 ⇒ g_V=0 ⇒` regeneration off `⇒` external help required; `design-self-organization.md §4`: deficit → parent recruits/relaxes). In the running system, a collapsed or under-provisioned cell emits `Escalated` and **nothing receives it** — no parent recruits a sibling node, no cross-cell reconstruction, no service-level relaxation. The mass-recovery scenario's entire "hand the residue up" branch is unimplemented.
+
+**Fix:** build the live `ParentCell` transport — route child `Notification::Escalated{mask}` and role `deficit` to a parent committee (the Maekawa bridge point is already computed geometrically), with a real re-provisioning action (recruit a capable sibling into the child roster, or authoritatively lower the child's advertised service level) and a **bounded, terminating** escalation contract. This is the keystone R-C1, R-C3, and H-3 all depend on for recovery.
+
+### [CRITICAL] R-C3 — Erasure repair past the `[7,3,4]` bound is silent permanent data loss
+*Anchors:* `fanos-runtime/src/overlay.rs:32,1851` (one shard per Fano point); `fanos-code/src/erasure.rs:83` (`K=3`); `fanos-code/src/lrc.rs` (`is_recoverable_fano`/`is_hyperoval_fano`); `overlay.rs:250` (`reconstruct_highest` returns `None` if unrecoverable).
+
+**Trajectory:** mass loss dropping `>3` point-occupants (or exactly a 4-point hyperoval) → the key is unrecoverable → the read returns a miss and the node emits `Escalated`, but content placement is **single-plane** (`design-coordinates.md §4(e)`: "MapToPoint(H(key)) is single-plane full-cell today; the hierarchy needs a cross-cell key-placement rule"), so **there is no parent peel** to reconstruct from. Data is silently, permanently gone; the "honest accounting" is a counter and a log line.
+
+**Fix:** a genuine **hierarchical erasure layer** — cross-cell shard placement (spread a key's shards across sibling cells so a whole-cell loss is still a ≤tolerance loss at the parent) + a parent-driven reconstruction path. Short of that, at minimum a **durable loss ledger** (which keys became unrecoverable, at which epoch) so loss is accounted, not swallowed.
+
+### [HIGH] R-H1 — Membership is first-write-wins keyed by *coordinate*: returning/new identities are locked out; rosters diverge across reshuffle
+*Anchors:* `fanos-runtime/src/overlay.rs:2109` (a repeat at an occupied coord is dropped whole), `:2059` (`on_announce` — no epoch check on the announced coord), `:2233` (`on_reseat` removes **only self's** old entry — other members' stale coords are never evicted); `derive_hierarchical_address` descent tie-break is unwired into `on_announce`.
+
+**Trajectory:** (a) a rebooted-identical node reclaiming its point loses to whoever holds it in each peer's view; (b) a new 8th identity on the 7-point base cell collides and is rejected with no descent; (c) after a reshuffle, node B moving onto a point still holding A's stale entry has its announce dropped, so B goes missing from A's roster until A also churns. Under mass reshuffle+churn the roster diverges node-to-node — the `members` map is effectively append-until-self-moves.
+
+**Fix:** key membership by **`NodeId` with an `(epoch, coord)` stamp**; admit the **highest-epoch** announcement (last-writer-wins on epoch, first-writer-wins only within an epoch); evict stale-epoch entries on reseat; wire the deterministic descent policy (min-id tie-break) into `on_announce` so base-cell collisions resolve instead of silently locking out.
+
+### [HIGH] R-H2 — Self-organizing re-roling is not live; even the library diverges under churn (split-brain of function)
+*Anchors:* `fanos-node/src/role_loop.rs` (`spawn_self_organization` is **never called by `Node::start`**); `fanos-node/src/node.rs:322` (static `config.roles` via `Command::Join`); `fanos-core/src/roles.rs:373` (`cell_setpoint` sums `node_loads`), `:572` (`assign` is deterministic **only** given identical members/epoch/beacon/demand), `:453` (`Reputation.observe` halves score on a "did-not-perform" observation).
+
+**Trajectory:** (a) in production, roles never re-assign under churn — a cell that loses all its exits/storage nodes does not promote survivors; (b) if the loop *were* wired, `members`/`node_loads` come from an eventually-consistent store, so mid-churn nodes hold different rosters/loads → different `cell_setpoint` → different `demand` → different `assign` — two honest nodes deterministically disagree on who holds which role; (c) a node knocked offline by the mass event while holding a role is scored non-performing and decayed toward `REP_FLOOR` (1/8) — **punished for an outage that was not its fault.**
+
+**Fix:** wire `spawn_self_organization` into `Node::start` (this is also HOLARCH finding §4-H3 — the self-org brain is disconnected from the hands); make the setpoint/roster inputs **epoch-snapshotted and quorum-agreed** (assign off a committed membership snapshot per epoch, not the live mutable store) so the determinism precondition actually holds under churn; gate reputation decay on **reachability-corroborated** non-performance (a corroborated-down node is excused, not slashed).
+
+### [HIGH] R-H3 — Reintegration budget is zero for near-healthy cells: deep repair is structurally forbidden, forcing (unwired) escalation
+*Anchors:* `fanos-diakrisis/src/healing.rs:39` (`max_reroute_depth = ⌊log₉ Φ⌋`), `:19` (Φ→Φ/9 per coarse hop); `fanos-diakrisis/src/regeneration.rs:64` (`recovery_time = 1/Δ`, → ∞ as the gap closes).
+
+**Trajectory:** a healthy cell sits at `Φ∈(1,2]`, so `max_reroute_depth(Φ<9)=0` — it cannot afford **even one** coarse cross-segment hop without dropping below `Φ=1`. Mass recovery needing deep reroutes (large `d`, whole segments gone) is therefore budget-forbidden and must escalate — but escalation is R-C2 (unwired). So deep-repair scenarios cannot reintegrate above `Φ=1` from inside, and the outside help does not run: a stuck-fragmented cell. (The containment theorem is working exactly as designed; combined with R-C2 it produces the stall.)
+
+**Fix:** primarily R-C2 (make escalation real so the `⌊log₉Φ⌋` floor hands off correctly); secondarily, expose the depth-0 condition as an explicit "must escalate for any cross-segment repair" signal rather than an implicit reroute that silently no-ops.
+
+### [MEDIUM] R-M1 — Quarantine keyed by coordinate not identity (C5 residual)
+*Anchors:* `overlay.rs:919` (`quarantine` by `Triple`), `:587` (`is_quarantined` by `Triple`), `:121` (`QUARANTINE_TTL = 60s`). **The prior audit's C5 permanence is FIXED** (`:592` re-admits after the TTL, pinned by `quarantine_is_bounded_and_re_admits_a_member_after_the_ttl` `:3483`). Residual: coordinates reshuffle every epoch, so a quarantine tag on epoch-N's coordinate is meaningless at N+1 — a Byzantine identity sheds it by the epoch turning, and an innocent identity reshuffling onto that point *inherits* it. Diagnosis remains **local-only** (each node quarantines independently), so under chaos different nodes drop different members → inconsistent frame-acceptance. **Fix:** key quarantine by `NodeId` (follow the identity across reshuffle) and make the distrust verdict cell-corroborated (the polar cross-attestation already gathers the evidence).
+
+### [MEDIUM] R-M2 — Bootstrap under mass failure: static seed list + genesis fallback → epoch split-brain
+*Anchors:* `node.rs:198` (static bootstrap seeds), `fanos-keygen/src/beacon.rs:209` (`BeaconReq` only answered by a *synced* peer). If the configured seeds are among the dead, a recovering/new node has no discovery; if it reaches a live-but-stalled cell it cannot advance past genesis. **Fix:** a self-healing seed/rendezvous (the DVRF rendezvous beacon already exists) plus the R-C1 safe-stall join semantics.
+
+### Simulator cannot model this scenario today — see §7 (S-P0.0). This is itself a required improvement.
+
+---
+
+## §3. End-to-end anonymity (`.fanos` + clearnet) — PRIORITY
+
+**Headline:** the anonymous `.fanos` datapath is now genuinely live over real QUIC (`fanos-node/tests/anonymous_quic.rs:101,232` — forward + full request/response), a real advance over the prior audit's "sim-only (A5/#54)". The threshold-onion crypto is genuine (KEM-sealed Shamir shares, below-`t` zero-knowledge, forged/out-of-range shares neither block nor kill an honest peel). **But the anonymity *properties* the spec sells on top of that datapath are largely inert in the shipping node.** The meta-pattern again.
+
+### [CRITICAL] S1-C1 — `--profile anonymous` does NOT anonymize clearnet/exit traffic
+*Anchors:* `fanos-node/src/diaulos.rs:414-433` (`FanosDialer::dial` handles a non-`.fanos` target in an early branch → `exit::dial_exit` → `dial_service`, the **Direct** by-coordinate transport `:104-112,424`, **never consulting `self.profile`**); `exit.rs:97-108` (exit demuxes clients by `Notification::Delivered{from}` = the client's real overlay coordinate); banner at `bin/fanos.rs:248-262`.
+
+**Attack:** a user runs `fanos proxy --profile anonymous` to browse the web anonymously; the CLI prints `Profile: anonymous` and `Clearnet: via exit x:y:z`, implying the clearnet is anonymized. It is not — every clearnet dial is a Direct DIAULOS session addressed to the exit by coordinate, so the exit (a Tor-exit-equivalent, often adversarial) and any relay on the path learn the client's coordinate for **every** clearnet site, and because the coordinate is a stable pseudonym this is durable, cross-session linkage. This silently defeats one of the two headline use-cases.
+
+**Fix:** route clearnet through the anonymous rendezvous to the exit's service key (the exit already advertises one, `exit.rs:280-317`) exactly like a `.fanos` service; until then, `--profile anonymous` must **refuse** clearnet targets rather than silently downgrade, and the banner must not claim anonymity for the exit path.
+
+### [HIGH] S1-H1 — The shipping mixnet runs with cover traffic AND Poisson mixing OFF: no GPA (T2) defense
+*Anchors:* `fanos-node/src/node.rs:263-268` builds `ThresholdRouter::new(...)` with **neither** `.with_cover(...)` **nor** `.with_mixing(...)` — the only setters for `cover_interval`/`mean_delay` (`threshold_router.rs:184-197`), called **only in aphantos/sim tests**, never on any shipping path. `NodeConfig` has no cover/mixing knob. With `mean_delay=0` every hop forwards immediately (`:286`) and `cover_interval=0` makes `StartHeartbeat` a no-op (`:221`). A global passive adversary — the T2 threat the Full profile claims to defend "strong (cover+mixing)" (spec §8.2, §5.5) — sees real timing and volume with no cover and no reordering, and performs standard end-to-end correlation. **E1/E2/E6 "RESOLVED (#61)" is true for the *engine*, not the *shipping node*.** **Fix:** enable cover+mixing on the deployed `CellNode` router (a `NodeConfig` λ/μ dial per §5.5), on by default for Full; add an integration test asserting a running cell emits constant-rate indistinguishable cells.
+
+### [HIGH] S1-H2 — The distributed beacon is unreachable from the shipping binary → epoch never advances → E4 forward-secrecy and E5 rotation are both inert
+*Anchors:* `fanos-node/src/config.rs:392` (`NodeConfig::beacon` defaults `None`), `:410-411` (`from_config_str` has no key — "provisioned out-of-band"); `bin/fanos.rs` has no `--beacon-share`/anchor flag; `node.rs:310-314` (`epoch_driver`/`mix_publisher` gated off when `beacon=None`). Consequences (all CONFIRMED): the onion ratchet never advances (`threshold_router.rs:562` never invoked) → a relay uses one static onion key forever → **a later relay compromise decrypts every onion ever routed through it** (the exact threat E4/`OnionKeyRatchet` was built to stop); meeting lines and coordinates never rotate (fixed SEED) → long-term rendezvous surveillance and path targeting become possible; PROTEUS per-epoch shape rotation (§13.4) never fires. The engines are real and proven in `epoch_clock.rs` (which provisions `BeaconParams` programmatically) — a **library** embedder can set `config.beacon`, the **CLI** cannot. **Fix:** expose beacon genesis provisioning through the CLI/config (anchor share + group-commitment file) and a genesis tool; make `fanos node` advance epochs.
+
+### [HIGH] S1-H3 — The session cookie is a cleartext cross-correlator, and the reply-relay learns the client's real coordinate
+*Anchors:* `fanos-node/src/rendezvous.rs:111-118` (client sends `RdvRegister` **directly from its own coordinate** to the reply relay), `rendezvous_relay.rs:122` (relay records `cookie → client_coordinate`); the **same 16-byte cookie** is delivered in cleartext in the `Request` at the service's meeting-line combiner (`fanos-rendezvous/src/transport.rs:100-116,149`) and prefixes every reply (`:173`); the `Request` also carries the full `reply_circuit`, so the service learns the reply-relay's coordinate.
+
+**Attack:** (a) a malicious hidden service reads `reply_circuit` → identifies the exact relay holding the client's coordinate → colludes with/compromises that one cell node → learns the client (breaks §12.4 "neither side learns the other's coordinate"; very feasible on a 7-node cell). (b) A GPA (undefended per S1-H1) links `client_coord ↔ cookie ↔ service` with **no compromise at all**, because the `RdvRegister` is an un-onion-wrapped overlay send from the client's real coordinate. **Fix:** the client must reach its reply rendezvous **through an onion circuit** (never a raw `Emit` from its own coordinate), and the cookie must not be a single value visible in cleartext at both ends — use independent, per-direction, unlinkable tags.
+
+### MEDIUM/LOW (anonymity)
+- **S1-M1** — holonomy path-authenticator (§5.4/§5.7) is **absent on the shipping Full/threshold path** (`verify_holonomy`/`circuit_holonomy` only in `sealed.rs:180,252`, the sim-only Lite `NyxNode`; `ThresholdRouter`+`fanos-rendezvous` have none). Per-hop AEAD still catches tampering, but the end-to-end path authenticator both endpoints were to verify is missing. (Same finding as robustness "holonomy still open".) **Fix:** carry+verify `Hol` on the threshold path, or scope §5.4 to the Lite engine in the spec.
+- **S1-M2** — anonymous proxy defaults to a predictable genesis beacon/epoch 0 with no live sync (`bin/fanos.rs:188-194`; `Node` exposes no beacon/epoch accessor) → the meeting line is static and computable, defeating E5's "unpredictable in advance" in deployment; once S1-H2 is fixed, dials fail if relays rotate past epoch 0.
+- **S1-M3** [LIKELY] — mix-key store slots are unauthenticated (`mixdir.rs:16-19,50-59`, self-flagged "not self-certifying") → an attacker overwrites honest members' slots with garbage keys, steering path selection toward the attacker's relays and undermining the random-placement assumption `P_hop`/`P_link` rests on. **Fix:** sign `(coord, epoch, onion_pub)`, reject foreign writes.
+- **S1-M4** — the shipping node is Fano `F2` (`q=2`): 7-node cell, 3-member lines, 2-of-3 threshold → per-hop anonymity set ≤3, only 3 of 7 points are combiners. Combined with S1-H1/H2 a 1–2-node adversary in the cell likely sits on both the entry and the meeting/reply combiner. The spec's `P_link` tables assume `q+1 ∈ [8,32]`, not 3. **Fix:** document that base-cell anonymity is weak; require hierarchy/larger `q` (or a minimum live-relay count well above threshold) before advertising Full-profile guarantees.
+- **S1-M5** — censored bootstrap (PROTEUS moving-target bridges, §13.6) is not wired (`fanos-proteus::bridge` referenced nowhere in node/quic) → a cold-start user under censorship cannot get in. (PROTEUS frame-shaping and morph auto-fallback *are* wired and enable-able.)
+- **S1-M6** — threshold-onion `ct_len` is cleartext (`threshold.rs:79-93`) → an on-path relay reads the remaining layer count → learns its path position (size is constant 20480B, but the per-layer length is plaintext; `sealed.rs` AEAD-encrypts it). **Fix:** flat-header Sphinx-style length hiding.
+- **S1-L1** onion size 20480B ≠ spec §5.7's 8192B (constant, so not an anonymity bug — conformance). **S1-L2** PROTEUS epoch rotation inert without the beacon. **S1-L3** the transparent-share `fanos_nyx::sheaf`/`tessera` onions remain `pub` re-exported alongside the real KEM-sealed module (integrator footgun).
+
+**Verified SOUND (do-not-regress):** threshold-onion crypto; the live anonymous `.fanos` path over QUIC; fresh unlinkable per-dial routes; **no client DNS leak** (`.fanos` answered in-network, exit does remote resolution → with `socks5h` the client never resolves clearnet DNS); E3 descriptor nonce (SIV salt bound to plaintext); the onion FS + cover/mixing engines are *correct* (the defect is that they are not enabled); DIAULOS E2E encryption; PROTEUS obfuscation + auto-fallback.
+
+---
+
+## §4. HOLARCH holonic coherence + cross-level composition
+
+### [CRITICAL-ARCH] S5-C1 — the Γ-viability release gate is UNBUILT while gated tiers ship
+*Evidence (exhaustive):* no `architecture/` directory (`find` = 0); **zero Python in the repo** (`fanos_verify.py`, the model §9.6 cites, lives only in the *other* uhm-theory repo); CI (`.github/workflows/ci.yml`) computes no architectural P/R/Φ/D; no Rust computes an architecture-Γ from declared budgets (grep `holarch`/`viable_window`/`sigma_panel`/`AspectBudget` → two *comment* mentions only); **V4 differentiation `D=1+6·Coh_E` is computed nowhere**; the **σ-panel exists nowhere**; the platform's own composed verdict (`platform.md:49`: `P≈0.36, R≥1/3, Φ≈1.6, D≥2.3`) was **never reproduced** by any code (`holarch_lab.py` has W1/W2/W3 but no FANOS-platform E∧L instance, and is not run by this CI). Honestly tracked open at `docs/tasks.md:65`.
+
+`platform.md §1.3` declares the four invariants "the platform's **architectural release gates** — computed, not asserted," and §9.6 makes the calculator the *throughout* roadmap item — yet TAXIS, DROMOS, OBOLOS, and THESAUROS have materially shipped through no such gate. The central epistemic differentiator the platform claims over conventional architecture — that its viability window is a CI-checked number — is currently prose. This is exactly the failure mode HOLARCH itself names ("конституция, которую нечем вычислить, — совет, а не закон").
+
+**Fix (high-leverage, self-contained):** build the calculator as specified — a small `architecture/` companion (Python matching `holarch_lab.py`'s flow-constructor, or a `fanos-cli` subcommand) holding the declared per-tier `holarch.v1` budget vectors, computing P/R/Φ/D + the σ-panel + the four Ω4 ablations, added as a CI step; recompute §1.2's numbers and replace "≈" with the computed values. This single act closes the CRITICAL-ARCH finding, gives Ω2/Ω9 (below) a place to be machine-checked, and converts the platform's own definition of done into a gate.
+
+### [HIGH-ARCH] the meta-holon's cross-block is ~1/3 wired (composition ahead of the wiring)
+- **S5-H1 — E→L "the mempool is a mixnet" has no wire.** The anti-MEV encrypted mempool is real and strong (`keyper.rs`), but nothing propagates a transaction through APHANTOS to reach it: `ConsensusMsg = {Propose,Vote,Reveal,ExecVote}` (`consensus.rs:202-211`) — **there is no transaction-submission wire variant at all**; the only ingress is the in-process `TaxisHandle::submit` mpsc (`taxis_driver.rs:102-110`). `platform.md:45` states in present tense that transactions "propagate through the APHANTOS mixnet" — prose. Per T-77 the integration gain lives *entirely* in this cross-block. **Fix:** add a client tx-submission App-frame and route it over the existing mixnet path (`Command::Emit`/CellNode from #54).
+- **S5-H2 — L→O "the blockchain pays the mixnet's foundation" is directionally reversed.** Sybil admission is PoW-only (`admission.rs:9-13`, stake is an unimplemented trait slot); the beacon is produced by the standalone DVRF and TAXIS *consumes* it (`TaxisParams.seed` pinned at construction, rotation unwired) — today **O feeds L, not L→O**. What *is* real: ledger-owned naming and the consensus-fed storage-audit beacon. **Fix:** implement the stake `AdmissionPolicy` against the ledger, and either wire consensus into beacon generation/rotation or amend §1.2 to the actual direction.
+- **S5-H3 — self-organization computes but does not actuate** (= R-H2; the highest cross-cutting overlap). The Lyapunov controller and the live directory loop are wired, but `spawn_self_organization`/`assigned` have **zero consumers** outside `role_loop.rs`, and `Node::start` actuates from static `config.roles`. "The network assigns function" is true of a computation the node ignores. **Fix:** subscribe the node to `assigned` and start/stop relay/store/service/exit engines from it.
+- **S5-H4 — Ω2 "every tier names all seven aspects" is fulfilled by exactly one tier of six.** Only THESAUROS has the full seven-aspect budget table (`design-storage.md:38-66`); TAXIS/DROMOS/OBOLOS/ONOMA/ANGELOS/HERMES carry only dominant-aspect signatures, and `design-taxis.md`/`design-platform.md` have zero aspect mentions. Nothing records or enforces the gate. **Fix:** add the seven-row budget table to each tier's design section (it also feeds the calculator its vectors).
+
+### MEDIUM/LOW (coherence)
+- **S5-M1** — Ω9 CALM classes are absent everywhere (the only "CALM" in the repo is the promise itself); the engineering facts exist (TAXIS coordinated, L4 LWW monotonic) but are undeclared. **Fix:** one line per LU/consistency contract.
+- **S5-M2** — the depth-3 subjecthood ceiling is respected by construction but enforced nowhere (no `SAD_MAX` constant; `geometry MAX_DEPTH=8` is *addressing* depth, legitimately distinct). **Fix:** a named `SUBJECT_DEPTH_MAX = 3` in `fanos-core` with the T-142 citation, consulted by the taxis hierarchy/crosscell layer.
+- **S5-M3** — internal contradiction on staking: `platform.md:46` grounds the platform on "stake (the LO channel read literally)" and plans HERMES bonding/slashing, while `platform.md:243`/`design-storage.md:196-199` declare "FANOS forbids capital staking (it deanonymizes)". The reconciliation (validators are public infra; storage/relay roles stay anonymous) is plausible but unstated. **Fix:** one delimiting paragraph in §1.2.
+- **S5-M4** [MED→LOW] — the storage-audit beacon doc says "PQ-VRF beacon" but the wiring feeds the parent block hash (`consensus.rs:878-880`), giving the previous proposer bounded grinding over the next challenge; reconcile the doc / derive from the epoch PQ-VRF beacon + height.
+- **S5-L1** stale refs (`platform.md:49` "§8" should be §9; `fanos_verify.py` cited but absent from this repo — the real verifier is `fanos-cli`). **S5-L2** ANGELOS is a library, not yet a node tenant (tracked `tasks.md:62-63`).
+
+**Verified SOUND:** DIAKRISIS invariant math is **exact to spec and CI-verified** (`coherence.rs`: `P=frob/N²`, `Φ=(frob−N)/N`, `R=1/(N·P)`, `r*=1/√(N−1)`, `P_crit=2/N`, `R_TH=1/3`, `PHI_TH=1`, equicorrelated forms — all match §2.7, re-proved by `fanos-cli` on every CI run + miri + wasm; D6 quarantine cross-validated over 800 matrices). L↔E is a real, live composition (obolos → `HybridLedger impl StateMachine` → live TAXIS over QUIC in `dromos_quic.rs`). THESAUROS is the Ω2/Ω9 exemplar. Depth-2 recursion is done right (parent-attests-child + parent-observes-child + live checkpoints; HERMES correctly framed as federation beyond it). **The network cell layer is genuinely holonic in code; the platform layer is holonic in prose and conventional in code.**
+
+---
+
+## §5. Crown-jewel subsystem findings (first-ever audit coverage)
+
+### 5.1 OBOLOS — the private currency (2 CRITICAL, in the pinned *relation* → a future ZK backend inherits them)
+
+- **[CRITICAL] O-C1 — modular-wraparound inflation.** `commit.rs:253-262` (`verify_balance`) is a mod-`q` identity (`Q=2⁶¹−1`, `MAX_VALUE=2⁵¹`, ratio 1023); the range guard `tx.rs:144` is per-output and outputs-only (inputs never range-checked), and there is **no bound on the number/sum of outputs** (`state.rs:133` only caps at 2³² outputs). **Confirmed numerically:** input `v=1000`; 1025 in-range outputs summing to `Q+1000 ≡ 1000 (mod Q)` → balance passes, each output `< MAX_VALUE` → range passes → **1025 notes ≈2⁶¹ minted from a 1000-value input (×2.3e15)**. Reachable end-to-end via DROMOS `TAG_SHIELDED` (`hybrid.rs:287-290`). The existing test `scenarios.rs:117` only exercises a single out-of-range output. **Fix:** hard-cap `#inputs+#outputs ≤ ⌊Q/MAX_VALUE⌋`, range-check inputs, bound `Σv_out < q` — the pinned relation must carry the bounded-sum constraint the ZK circuit will enforce. (Contributing: `state.rs:112-116` mint + `hybrid.rs:140-152` shield append notes with no `value<MAX_VALUE` check; `public_value` `tx.rs:64` unbounded before the mod-`q` balance.)
+- **[CRITICAL] O-C2 — untraceability defeated.** `tx.rs:53-55` publishes `pub input_values: Vec<Commitment>` as cleartext on the public `ShieldedTx`; `build.rs:45` sets them to the note's own `value_commitment` **with its original randomness**, and `tx.rs:137` requires equality — but that same `com(v; value_r)` was already public in the note's creating `OutputNote.value_commitment` (`tx.rs:39`), paired there with its tree leaf. **Attack (public chain data only):** build the map `value_commitment → (note_commitment, leaf)`; any spend's `input_values[i]` is a byte-for-byte match → the exact spent note and leaf are identified → the whole-pool anonymity set collapses to one note, for **every** note created via a shielded output. Persists under the real ZK backend (the leak is in the public tx body, not the swappable proof). **Fix (Zcash-Orchard pattern):** reveal a freshly re-randomized `cv_in = com(v; r_fresh)` per spend and prove in `π` it commits to the same `v`; never republish the note's creation commitment at spend time.
+- **[HIGH] O-H1 — the shielded fee is never collected + pool invariant drift** (`hybrid.rs:159-170`): the fee reduces `Σv_out` but is credited to no one, breaking §4.3's "public fee so validators can be paid" and the claimed `POOL_SINK == Σ unspent note values` invariant. Not fund loss (stranded), but incentive + invariant. **Fix:** debit `POOL_SINK` by the fee, credit the proposer/treasury.
+- **[HIGH] O-H2 — note-cipher key AND nonce both from the KEM session → reuse is catastrophic + linkable** (`note_cipher.rs:60-67,94-100`): reusing `rng_seed` to the same recipient reuses the ChaCha20-Poly1305 nonce (keystream + Poly1305 forgery) and produces identical `kem_ct` (linkable). **Fix:** `nonce = H(session ‖ kem_ct)` or a counter; generate coins internally from a CSPRNG.
+- **MEDIUM:** O-M1 nullifier `nf=H(nsk‖cm)` diverges from spec's `PRF(nsk, position)` (sound, but duplicate-`cm` notes share a nullifier → spend-lock); O-M2 anchor set is insert-only unbounded (`state.rs:49,65,116,146` — no rolling window); O-M3 collapsed key hierarchy (one `nsk` = owner + nullifier key; `TransparentProof` reveals it → no viewing-key-only capability, so §4.5 disclosure is impossible without full spend authority); O-M4 stealth address unimplemented (`note_cipher.rs:34-48` static `Address.owner`; unlinkability is delivered by the hiding commitment, not the advertised one-time keys — reconcile the wording).
+- **Honesty note:** the `ShieldedProof` seam is genuinely isolated (a real trait, only `TransparentProof` does real checks, **no accept-all/`todo!`/`return true` stub** — grep-confirmed), and the lattice params are honestly tagged `[P]/[H]`. But the overclaim at `lib.rs:19-31`/`tx.rs:16-21` ("the accounting is fully verified now"; "`TransparentProof` proves exactly what the ZK backend must") is **false given O-C1/O-C2** — the pinned relation is inflatable and traceable. **Retract that claim until O-C1/O-C2 are fixed.**
+- **SOUND:** commitment tree, nullifier double-spend guard (atomic), lattice commitment (genuinely additively-homomorphic + binding), `state_root` consistency, shield/unshield conservation (gated + atomic + replay-protected), note delivery (fresh ML-KEM, `scan` re-verifies), codecs.
+
+### 5.2 TAXIS / DROMOS — consensus + execution (ordering safety SOUND; execution-layer HIGHs)
+
+*No confirmed CRITICAL: ordering agreement is sound and Monte-Carlo-verified (no two conflicting blocks finalizable). The findings are in the execution layer TAXIS deliberately decouples from ordering.*
+
+- **[HIGH, borderline CRITICAL] T-H1 — reveal-driven execution-state divergence (nondeterminism).** `consensus.rs:835-888` (`try_execute`): the reveal window drops an undecryptable tx based on `self.reveals` = shares **this validator locally collected** (per-validator, async). The window boundary is deterministic, but the *share set at that boundary is not agreed*. **Scenario:** on a Fano keyper line (3 members, `t=2`, `f=2`), 2 Byzantine members reveal valid signed shares only to validators {0,1,2} → {0,1,2} execute tx X, {3,4,5,6} drop it after the window → **honest validators hold permanently different state roots** (a late share never re-executes; the block already left `exec_queue`). Also reachable with honest keypers under a slow/partitioned link delaying a share past 4 heights. The comment at `:862` claiming "the drop is identical on every validator" is **false**. The `ExecCertificate` *detects* it (no `Q`-quorum root forms) so it is not a silent cross-cell theft, but honest nodes fork intra-cell state and checkpoint liveness is lost. **Uncovered by tests** (the sim broadcasts every reveal; Byzantine nodes only equivocate on prepare votes; no test asserts state-root equality across validators). **Fix:** gate execution on *agreed* data — the on-chain decryption-key commitment (Shutter/Ferveo, already in `design-taxis.md §5.1`) or a `Q`-quorum "undecryptable" certificate.
+- **[HIGH, LIKELY] T-H2 — the round lock has no unlock / re-propose rule → partial-lock liveness wedge.** `consensus.rs:547-551` refuses any block ≠ `locked_block`; `:494-510` always assembles a *fresh* block, never re-proposing the locked value; `:945` only bumps the round on timeout. The code implements the *refuse-conflicting* half of Tendermint but not the *unlock-on-newer-PC / re-propose-locked-value* half. A partial lock (3 validators lock B, `<Q` commits) + fresh proposals forever → the height wedges permanently (safety preserved, liveness not). **Fix:** implement `lockedValue`/`validRound` — the proposer re-proposes its locked value with a PC justification; validators unlock when shown a PC for a round ≥ their lockedRound.
+- **[HIGH, disclosed] T-H3 — a within-`f` keyper majority can transiently censor a targeted tx** (`consensus.rs:835-888` + `incentive.rs:247-266`): 2-of-3 keyper line, 2 Byzantine withhold reveals → tx dropped after the reveal window; only *permanent* censorship is proven impossible; per-epoch, per-tx censorship is operational and unpriced, with no force-inclusion/inclusion-list. Compounds with T-H1.
+- **[HIGH, disclosed [P]] T-H4 — DA dispersal is not wired.** `taxis_driver.rs:228` derives the DA shards from the proposer's own block, so `reconstruct_payload` always sees the full set → the whole payload rides in the proposal, real withholding is never modeled, and erasure-coded dispersal gives no scalability. **Fix:** ship headers + sampled shards and verify a signed DA-attestation quorum in-engine.
+- **[HIGH, disclosed] T-H5 — slashing is detected but never applied; rewards are non-canonical and never minted.** `taxis_driver.rs:268-273` maps `Output::Slash`/`Reward` to events that **never touch ledger state**; `consensus.rs:717-730` computes the reward split from the *local* commit view (non-canonical, would fork the root if folded). The Nash equilibrium's `S>0`/`R` conditions are provable-but-not-live. **Fix:** apply slashing/rewards to a real balance canonically.
+- **MEDIUM:** T-M1 cross-cell is one-way emission-proof, not two-phase atomic, and not wired into any shipped `StateMachine` (replay-dedup by `(source,nonce)` is delegated and implemented nowhere → a naive wiring double-applies); T-M2 live parent attestation never calls `conflict()` → silently anchors the first-seen child fork; T-M3 `pending_finalize` body admission is gated by the current-round leader → a CC-without-body can re-wedge after a timeout; T-M4 cross-cell verifier trust-root is assumed, not established for peer cells.
+- **LOW:** duplicate tx not rejected structurally; `open_from_subset` combinatorial cap at 4096; well-sealed-but-undecryptable tx wastes a block slot.
+- **Not built (honest `[P]`, not flaws):** intra-cell parallel execution / deterministic scheduler is **absent** (no rayon/threads/access-lists; execution is strictly sequential → trivially deterministic → *no* parallel-nondeterminism because there is no parallelism); dispersed DA datapath; two-phase cross-cell; operational slashing; mid-chain keyper/committee rotation.
+- **SOUND:** BFT ordering safety (`f=⌊(n−1)/3⌋`, `Q=⌈(n+f+1)/2⌉`, exhaustive to `q=1000`; certificate/vote validation; randomized async Monte-Carlo no-fork); anti-MEV blind ordering; executed-state checkpoint; cross-cell receipt primitive; `state_root` determinism (all sub-ledgers sorted-BTreeMap under domain-separated BLAKE3); VOPRF fee-credit binding.
+
+### 5.3 ANGELOS / THESAUROS — messenger + storage market (3 CRITICAL)
+
+- **[CRITICAL] AT-C1 — storage escrow drained by proof-replay within one audit epoch.** `hybrid.rs:200-219` (`prove_deal`) has no "already-proven-at-this-beacon/epoch" guard, the deal epoch advances **per proof submitted** (not per block/time), and the audit response is **order-malleable** (`por::verify` matches indices order-independently while `encode_response` serializes in slice order). So a provider proves once then submits many byte-distinct leaf-order-permuted copies for the same `(deal, beacon)`; the mempool dedups by exact commitment (permuted variants pass), and block `apply` never dedups. **Scenario:** `duration=100`, prove once, submit 99 permuted copies in one block → each `settle_epoch(true)` releases `price/duration` → the **full escrow is drained for a single proof-of-holding**; `close()` refunds 0. Direct consumer fund loss; the pay-per-proof guarantee collapses. **Fix:** bind each proof to the epoch/height (store `last_audited_height` per deal; reject a second settle for the same period) and make the response canonical (ascending indices, `verify` rejecting non-canonical/duplicate ordering).
+- **[CRITICAL] AT-C2 — the media plane reuses (key, nonce) across both call directions.** `media.rs:62-67` (`MediaSession::new`) derives `key = H(EPOCH0_LABEL, secret)` with **no role/direction split** and starts `send_seq=0`; both caller and callee build from the *same* `media_secret` (`call.rs:80-95`). Caller frame `seq=0` and callee frame `seq=0` are both `AEAD(K, nonce(0), …)` over different plaintexts → **ChaCha20-Poly1305 nonce reuse** → two-time-pad keystream recovery (XOR of the two live media streams) + Poly1305 forgery. The 1:1 `Session` splits `a2b`/`b2a` correctly; the media session forgot it. (Group/SFU → N-way reuse.) Not caught because every test seals one direction only. **Fix:** per-sender/per-direction keys (mix role/identity/SSRC into the KDF) or partition the nonce space by a sender id in the frame header.
+- **[CRITICAL] AT-C3 — group sender-keys have no sender authentication.** `group.rs:41-101`: a member's chain is `H("group-sender", group_key ‖ member_id)`; every member knows `group_key` and every `member_id`, so **every member can derive every other member's message keys**, and `recv` "authenticates" only by decrypting under a key the receiver itself can compute. There is **no per-sender signature** — any member can seal a message under another member's chain and attribute it to them; `Message.sender` is cryptographically unbacked inside a group. Below the Signal Sender-Keys baseline the spec invokes; severe for a "Discord-class" platform (moderation, roles, accountability). **Fix:** a per-sender signature key; sign each post; distribute only the public half.
+- **[HIGH] AT-H1 — PoR is not provider-bound** (`storage.rs:58-64` `Prove` carries no signature/prover identity; `hybrid.rs:200-219` pays a fixed `params.provider`): the leaves are public ciphertext bytes any replica/cache can produce (the `[7,3,4]` code replicates them), so the designated provider can delete its copy and still be paid whenever any other party submits a valid proof. **Fix:** require the `Prove` tx to be signed by `params.provider`, bind the proof to that identity.
+- **[HIGH] AT-H2 — reputation decay + timeout/miss path are not wired** (grep `observe`/`Reputation`/`Settlement::Miss` in dromos = nothing): only pay-per-proof exists; `settle_epoch(false)` is never called, there is no audit deadline, a non-proving deal sits `Active` forever, and the consumer refund only happens on a *manual* `Close`. Two of the three forces the no-staking incentive model depends on are absent from the running system. **Fix:** drive a per-epoch audit deadline off the height clock; on a miss, call the miss path + `Reputation::observe(false)` + auto-refund.
+- **[HIGH] AT-H3 — media plane has no replay protection** (`media.rs:103-113` `open_frame(&self)` is stateless): any captured frame re-opens while its epoch is current; SRTP mandates a replay window. **Fix:** a sliding replay window per epoch.
+- **MEDIUM:** AT-M1 no key zeroization anywhere in ANGELOS (no `zeroize` dep, no `Drop`/`Zeroize`); AT-M2 the group session drops all out-of-order messages while channel text rides the reordering Full mixnet (permanent loss); AT-M3 per-chunk PoR soundness is capped at the leaf count (`0.9^64 ≈ 9.7` bits, not the advertised λ=20/30/40 — the market treats one chunk pass as the epoch's proof); AT-M4 `close_deal` accepts any consumer signature unbound to `(deal_id, close, height)` → replay a historical `SignedTransfer` to force-close deals early (griefing); AT-M5 session/ratchet randomness is caller-seeded (`SeedRng` satisfies the `CryptoRng` bound) → a weak/reused seed silently breaks FS+PCS.
+- **LOW:** media cleartext `epoch‖seq` flow-fingerprint; `unwrap_or_default` masks AEAD-seal failure; unbounded Merkle-path length; pre-auth skip-key derivation (bounded ~µs); `audit_beacon` inits to zero (latent).
+- **SOUND:** the **1:1 double ratchet reaches Signal parity** — FS *and* PCS are both real (traced: one-way BLAKE3 chains overwrite the prior key; after compromise the peer's fresh ratchet key + ratchet-on-top heals the root; replays/tampers refused; skipped-key storage bounded); the 1:1 session direction split; PoR challenge unpredictability + Merkle verification + the exact `k` formula; edge encryption (no plaintext to the store); deal accounting arithmetic (conserved); canonical KAT-pinned codecs. **Baselines:** 1:1 = Signal parity minus zeroization + enforced-CSPRNG; groups behind Signal (no sender auth, no reordering); media below SRTP (nonce reuse, no replay); storage crypto Storj/Sia-class but the market wiring behind all three.
+
+### 5.4 Systemic robustness — prior cluster fixed; bug-class migrated to new wiring
+
+**Prior-audit robustness cluster (re-verified against current code): C1, C2, C3/F1, F2, F3, F4 — all FIXED** (largely via the `fanos-stream` extraction and the per-peer driver rework: `REQUEST_TIMEOUT=10s` + waiter eviction; bounded `INPUT_CAP=1024` with back-pressure + per-peer workers + `MAX_INBOUND_CONNECTIONS=512`/`_PER_SOURCE=32`; admission anchored on `delivered`; `MAX_CONCURRENT_STREAMS=256` + retire/reset; `VecDeque`+`base` reclaim; RFC-6298 RTO). **C5 (quarantine expiry), C6 (Decouple made real), #100 (version/capability negotiation), #101 (wire-KAT harness loads+verifies `wire.json`), #103 (PoW admission) — all FIXED.** **C7 (telemetry DP) — PARTIAL:** `dp.rs` machinery exists and is tested, but `.privatize(` has **no live caller** — the observer still emits the exact syndrome + scalars un-privatized. **Holonomy verification — STILL OPEN** (function exists, live peel path never recomputes/compares, `HolonomyFail` never produced).
+
+**New findings (bug-class = unbounded attacker-keyed map + missing validation, migrated to the newest live wiring):**
+- **[HIGH] B1 — unauthenticated, uncapped `pending_reveals` in TAXIS consensus → single-peer remote OOM.** `consensus.rs:777-784` (`on_reveal`): the `else` branch buffers a raw `RevealMsg` whose `commit` is not a known finalized tx **without `validate_and_record`, so the signature is never verified**, keyed by the attacker-chosen 32-byte `r.commit`; `drain_pending_reveals` only evicts commits that become finalized txs → garbage is never evicted. A single connected peer streams reveals with distinct random commits (each carrying a `share`+`sig` Vec) and grows the map without bound. **Fix:** verify `r.verify(verifiers[r.member])` eagerly before buffering (the verifier is already available) + bound `pending_reveals` with LRU/TTL.
+- **[MEDIUM] B2 — unbounded `RendezvousRelay.registrations` on the live anonymous-relay role** (`rendezvous_relay.rs:43,122`, live in `mix_relay.rs:48` + `cell_node.rs:75`): `registrations.insert(cookie, from)` per inbound `RdvRegister`, attacker-chosen 16-byte cookie, no cap/TTL. The live successor to the prior A4. **Fix:** LRU+TTL like `MAX_SESSIONS`.
+- **[MEDIUM, LIKELY] B3 — unauthenticated block proposals inflate `proposals` within a height** (`consensus.rs:513-540`): a block is not authenticated by a leader signature (only a `proposer:u8` index), so any peer can craft a structurally-valid block claiming `proposer = elected-leader-index` and grow the map with distinct forged payloads (bounded per height; a within-height memory-amplification DoS, not a safety break). **Fix:** require + verify a leader signature over the block hash.
+- **LOW:** TAXIS mempool has no size cap (but is fed only from the local bounded mpsc, not the network); `exec_votes` keyed by height is never pruned (verifies the signature first → permissioned/slashable). **Clean:** obolos/dromos/thesauros/angelos have no `unwrap`/`expect`/`panic`/OOB-indexing in non-test code; all new crates `forbid(unsafe_code)`.
+
+---
+
+## §6. Painful-but-correct architectural improvements
+
+*Per the directive "everything that can be improved must be improved, especially painful architectural moments." These are the structural changes the findings converge on — larger than a single fix, worth doing once, correctly.*
+
+1. **Wire the self-organization loop into `Node::start` and make it churn-safe** (R-H2 / S5-H3). Replace static `config.roles` with the live `assigned` `RoleSet`; snapshot the roster/setpoint per epoch off a committed membership set (not the live mutable store) so `assign` is deterministic under churn; gate reputation on reachability-corroborated non-performance. *This is the single change that most directly serves "flawless self-organization."*
+2. **Give the beacon a resharing + re-bootstrap contract, and the epoch clock safe-stall semantics** (R-C1). A one-shot DKG with static shares is a network-wide liveness SPOF; proactive VSS / periodic re-DKG + a below-threshold re-bootstrap + freeze-don't-deadlock is the fundamental fix.
+3. **Build the live `ParentCell` escalation transport** (R-C2). Escalation is the documented recovery-of-last-resort across the whole design; it must be a real cross-cell action (recruit/relax), not a log line — with a bounded, terminating contract.
+4. **Make placement identity-first, epoch-stamped, collision-resolving** (R-H1, R-M1). Key membership *and* quarantine by `NodeId` with `(epoch, coord)`, admit highest-epoch, evict stale on reseat, and wire the deterministic descent tie-break — so returning and new identities are never silently locked out and quarantine follows the identity across reshuffle.
+5. **Hierarchical erasure placement** (R-C3). Cross-cell shard placement + parent-driven reconstruction so a whole-cell loss is recoverable; short of that, a durable loss ledger so loss is accounted.
+6. **Close the shielded-relation soundness/privacy holes in the *statement*, not the backend** (O-C1, O-C2). The bounded-sum constraint and per-spend re-randomized value commitments must be part of the pinned relation, so the eventual ZK circuit enforces them.
+7. **Build the HOLARCH Γ-calculator gate** (S5-C1). It is the platform's own definition of done, it is self-contained, and it gives Ω2/Ω9 and the depth constant a place to be machine-checked. High leverage, low blast radius.
+8. **Enable the anonymity properties in the shipping node** (S1-H1, S1-H2). Cover+mixing on by default for Full; beacon provisioning via CLI so epochs advance (forward secrecy + rotation depend on it). The engines exist — this is a config/wiring surface, not new crypto.
+9. **Authenticate-before-buffer, everywhere** (B1, B3, T-H1's share agreement). The recurring remote-DoS/nondeterminism class is "buffer attacker-keyed data before validating"; make eager validation + bounded, evicting maps the standing pattern for every network-fed map.
+10. *(Already tracked, endorse:)* the `#73` architecture refactor — split `fanos-runtime`, decompose `OverlayNode`, typed `StorageAddress`, secret-field encapsulation — is the right home for several of the above seams.
+
+---
+
+## §7. Simulator improvement backlog
+
+`fanos-sim` is a **real** deterministic simulator (drives the actual sans-I/O engines, real wire encode/decode round-trips, virtual-time DES, seeded determinism, a genuine coherence observatory + Monte-Carlo layer) — not a test suite masquerading as one. Its self-balancing/homeostasis coverage is a genuine strength. Three gaps, and the user's scenario needs the first two:
+
+- **S-P0.0 (new, top priority) — model mass-destruction + heterogeneous recovery.** Today the sim **cannot express** the user's scenario: `spawn_cell` builds bare overlays (not `OverlayBeaconNode`s), `reshuffle.rs` injects `Reseat` directly (never driving `beacon → BeaconReady → reshuffle`), so you cannot crash an anchor batch and *observe the epoch clock stall* (the R-C1 experiment); `recover` restores the *exact* prior engine, so "returns changed" is inexpressible; and `step` moves reshuffled nodes to unoccupied coordinates, so the R-H1 placement-collision/lockout class *cannot occur*. **Build:** `spawn_beacon_cell::<F>(sim, t, anchors)` + `Sim::tick_epoch()` driving the real `BeaconReady→Reseat` loop; `Sim::recover_as(node, engine)` + `Sim::mass_event({crash, recover_identical, recover_changed, add_fresh, leave_dead})` applied atomically; a **multi-occupant coordinate model** (the hardest lift — it touches the sim's core one-occupant invariant) so lockout/descent is testable; and survival assertions (beacon advances iff ≥`t` anchors survive; survivor rosters converge; a `Put` before the event is `Get`-recoverable iff ≤3 shard-points died; `Escalated` was *acted on*, not merely counted).
+- **S-P0.1–P0.5 — adversarial scenarios for the crown jewels** (confirmed: **zero** obolos/dromos/taxis/angelos/thesauros coverage in `fanos-sim`; TAXIS/OBOLOS have strong-but-*siloed* per-crate harnesses, THESAUROS/ANGELOS/DROMOS are thin even locally). In deficit order: **DROMOS determinism under adversarial scheduling** (random conflicting tx set × N permuted schedules → identical state root); **ANGELOS ratchet-under-compromise** (state-exfil at t → assert PCS heals within one KEM step; adversary reorder/drop/replay; GPA metadata non-fingerprint); **THESAUROS cheating-provider** (withhold/forge-PoR/adaptive-to-audit strategy knob × audit-frequency sweep → cheating dominated) — *note this would have caught AT-C1*; **TAXIS-in-sim over a partition** (port `never_fork` onto seeded loss+partition — the split-brain condition T-H1/T-H2 live in); **OBOLOS networked double-spend race** (conflicting spends to different validators under partition → heal → exactly one nullifier wins).
+- **S-P1.1 (the enabler) — a `SubsystemEngine` adapter** so a non-`fanos_ports::Engine` state machine can be driven by `Sim`, converting the five fragmented per-crate harnesses into clients of the one platform (shared network model, determinism trace, GPA tape, observatory). Then **S-P1.2** a richer `Transport` trait (per-link/asymmetric latency, bandwidth/queueing, Gilbert-Elliott bursty loss, reorder, clock skew — the file already anticipates it) and **S-P1.3** an active/adaptive network adversary (strategic delay/reorder/selective-drop; a rushing adversary for BFT/DKG).
+- **S-P2 (SecOps usability)** — an `Experiment` abstraction (parameter grid → seeded runs → JSON/CSV artifact) + a `fanos-sim` CLI (`--param k=v --seeds N --out file`) generalizing `endpoint_attestation_research.rs`, with an extensible `Metrics` side-channel. This is what turns "what `f` deanonymizes at Full?" from a recompile into a command — and is the foundation for the `fanos evolve` genetic-search harness `coherent-cybernetics.md §6` envisions.
+- **S-P3** — extend `network-threat-model.md` with crown-jewel rows (it is stale: F3 is marked ⬜ but `consensus_sim.rs` covers Byzantine agreement); add a PROTEUS DPI/probing sim (G1/G2 are design-only); add a self-org role-loop-under-churn scenario (folds into S-P0.0).
+
+---
+
+## §8. Prioritized remediation roadmap (the dev-agent work queue)
+
+**Tier 0 — security/liveness/funds; do first**
+1. **OBOLOS O-C1 (inflation) + O-C2 (untraceability)** — fix the pinned relation (bounded-sum constraint + range-check inputs; per-spend re-randomized value commitments). Retract the "verified now" claim until done.
+2. **THESAUROS AT-C1 (escrow drain)** — per-deal epoch/height binding + canonical audit response.
+3. **ANGELOS AT-C2 (media nonce reuse) + AT-C3 (group forgery)** — per-direction media keys; per-sender group signatures.
+4. **Anonymity S1-C1 (clearnet direct)** — refuse-or-route; fix the banner. **S1-H3 (cookie correlator)** — onion-wrap the reply registration; per-direction tags.
+5. **TAXIS T-H1 (execution divergence)** — gate execution on agreed reveal data. **Robustness B1 (pending_reveals OOM)** — validate-before-buffer + bound.
+
+**Tier 1 — self-organization / recovery (the user's priority) + anonymity enablement**
+6. **R-C1 beacon resharing + safe-stall; R-C2 live parent escalation; R-C3 hierarchical erasure** (the three recovery cliffs). 
+7. **R-H1 identity-first epoch-stamped membership; R-H2 wire + churn-harden self-organization; R-M1 identity-keyed quarantine.**
+8. **S1-H1 cover+mixing on in the shipping node; S1-H2 CLI beacon provisioning** (turns forward secrecy + rotation on).
+9. **TAXIS T-H2 (round-lock liveness), T-H5 (apply slashing/rewards); O-H1/O-H2, AT-H1/H2/H3.**
+
+**Tier 2 — coherence / architecture**
+10. **Build the HOLARCH Γ-calculator gate (S5-C1)**; wire E→L tx submission (S5-H1); implement the stake `AdmissionPolicy` (S5-H2); add the seven-aspect budget tables (S5-H4) + CALM classes (S5-M1) + `SUBJECT_DEPTH_MAX` (S5-M2); reconcile the staking contradiction (S5-M3).
+11. **Wire C7 telemetry DP onto the export path; wire holonomy verification (S1-M1) onto the threshold peel path** — the two remaining "built-but-unwired" residuals.
+12. **Robustness B2/B3; TAXIS T-M1..M4; the `#73` refactor.**
+
+**Tier 3 — simulator + hardening**
+13. **S-P0.0 (mass-failure/recovery scenario modeling)** + **S-P1.1 (SubsystemEngine adapter)** + the crown-jewel adversarial scenarios (S-P0.1–P0.5) — several of which would have caught the Tier-0 findings.
+14. **S-P2 experiment-runner CLI + metrics export** (foundation for `fanos evolve`); S-P1.2/1.3 transport + active-adversary fidelity; the anonymity MEDIUMs (S1-M2..M6) and OBOLOS/ANGELOS/THESAUROS MEDIUMs.
+
+---
+
+## §9. What is verified SOUND (do-not-regress)
+
+- **Cryptographic cores:** audited PQ primitives; the hybrid KEM combiner (full transcript); the DIAULOS handshake; the **1:1 double ratchet (FS+PCS both real)**; the threshold-onion (KEM-sealed Shamir, below-`t` zero-knowledge); OBOLOS's commitment tree / nullifier guard / additively-homomorphic lattice commitment; the PoR challenge unpredictability + Merkle verification + exact `k` formula; edge encryption (no plaintext to the store).
+- **Consensus:** BFT ordering safety (exhaustive to `q=1000`, randomized async no-fork); anti-MEV blind ordering; the executed-state checkpoint; `state_root` determinism (no HashMap/float/iteration-order nondeterminism reaches any root).
+- **Invariant math:** DIAKRISIS Φ/P/R/r*/thresholds exact to spec, CI-verified + miri + wasm.
+- **Robustness:** the entire transport/stream DoS cluster (C1/C2/C3/F1/F2/F3/F4) is genuinely closed; version/capability negotiation; the wire-KAT harness; PoW admission; quarantine expiry; a real `Decouple`.
+- **Anonymity:** the live anonymous `.fanos` path over real QUIC; fresh unlinkable per-dial routes; no client DNS leak; the SIV descriptor nonce.
+- **Determinism:** sans-I/O purity holds; the simulator drives the real engines with trace-strength reproducibility.
+- **Honesty:** the status discipline is candid — the ZK proof is `[P]` everywhere, the Γ-gate and ANGELOS composition are tracked open, the `ShieldedProof` seam has no accept-all stub. The gaps this audit sharpens are, overwhelmingly, *unfinished wiring*, not *wrong foundations*.
+
+---
+
+## §10. Appendix — coverage and method
+
+Eight parallel adversarial streams, each reading current code at `file:line`: (1) end-to-end anonymity, (2) OBOLOS, (3) TAXIS/DROMOS, (4) ANGELOS/THESAUROS, (5) HOLARCH coherence, (6) simulator, (7) systemic robustness, (8) mass-failure self-organization. Working notes with the full per-stream detail (every anchor, every fix) are preserved. Findings are tagged CONFIRMED (read and definite) vs LIKELY (inferred). This audit did **not** modify code — it is assessment only, written for the sibling dev-agent to execute from §8.
+
+*The bar the project sets for itself is "verified-or-it-doesn't-ship" and "no compromise around a known defect." Measured against that bar, the foundations pass and the wiring does not yet — and the distance between the two, subsystem by subsystem, is the subject of this document.*
+
+
+---
+
+<!-- ═══════════════════ AUDIT III of IV ═══════════════════ -->
+
+> **Audit III of IV — consolidated 2026-07-24** (formerly `docs/audit-2026-07-23.md`). A re-audit that independently re-verified Audit II's remediation and surfaced new wiring-layer findings (unauthenticated/unbounded recovery wiring). Preserved verbatim; current status in the *Consolidation status* note at top.
+
+# FANOS platform re-audit — 2026-07-23
+
+**Scope:** a full re-audit after the dev-agent's remediation of `docs/audit-2026-07-22.md` (**41 commits, ~4,140 insertions across 57 files, + the new `fanos-hermes` crate**). Same requirements as the prior audit: architectural compliance, ultimate anonymity (`.fanos` + clearnet), cross-level coherence, most-advanced mechanisms, continuous-improvement, the simulator — with the user's priority focus on **survival + self-organization under mass destruction → heterogeneous recovery**, and on **painful architectural moments**.
+
+**Method:** eight parallel streams (OBOLOS, ANGELOS/THESAUROS, TAXIS + new DROMOS scheduler, anonymity, mass-failure resilience, robustness/new-code sweep, coherence + HERMES + simulator). **The discipline this pass: independently verify every claimed fix in current code — do not trust the fix claims — and hunt for incomplete fixes and NEW bugs the fixes introduced,** plus audit the two new subsystems cold and re-sweep everything still open. Every verdict was read at `file:line`; two arithmetic-critical OBOLOS claims and the beacon-reshare crypto were re-derived by hand; several were executed. Findings are **CONFIRMED** (read/ran, definite) or **LIKELY** (inferred). No code was modified.
+
+**Baseline:** the tree compiles green `--all-targets`; `cargo test --workspace` + `clippy --all-targets -D warnings`: **see §0**.
+
+---
+
+## §0. Verification baseline
+- `cargo build --workspace --all-targets`: **PASS** (exit 0, verified this session).
+- `cargo clippy --workspace --all-targets -- -D warnings`: **FAILS (exit 101)** — see §3.9. One denied `expect_used` lint at `crates/fanos-aphantos/src/threshold.rs:686:24` (`delivered.expect("the onion is delivered")` in a `#[cfg(test)]` block). The CI gate is **currently red**; the dev-agent's "clippy clean" claim does not hold under `--all-targets`.
+- `cargo test --workspace`: **one failure, reproduces 2/2 in isolation** — `a_private_transfer_executes_over_live_consensus_end_to_end` (`fanos-node/tests/dromos_quic.rs:137`) hits its **60 s deadline** waiting for the private transfer to converge across the live 7-node cell; **39+ other binaries pass**. This is **NOT a load flake** (see §3.9): the test's own sanity check at `:120` — the built transfer applies to a fresh genesis ledger with `ExecOutcome::Applied` — **passes**, so the transaction is valid and the stall is in the *live consensus/execute path* (the test's own comment: "a live-path failure is a consensus/transport issue"). The platform's headline "E∧L composition proven runnable end-to-end" test is **currently red**. This contradicts the "green suite" claim.
+- **Coverage caveat (repeats and sharpens the prior audit's):** the green suite does **not** exercise the findings below. Several fixes are pinned by tests that assert the *narrow* property (media seals one direction; `settle_epoch` refused at the same height) while the *residual* attack (cross-direction is now safe but SFU is unbuilt; cross-height settlement is unbounded) is untested. **Two coverage regressions were introduced this cycle:** the strongest BFT no-fork Monte-Carlo test is now `#[ignore]`d (§3.7), and the OBOLOS overflow panic (§3.2) is reachable in the default overflow-checked test profile yet unguarded.
+
+---
+
+## §1. Executive summary
+
+**The dev-agent did substantial, largely-honest work, and the core cryptographic and arithmetic fixes are genuinely sound.** Independent verification confirms **13 fixes correct**: O-C1 (inflation cap — bound math re-derived), O-C2 (untraceability — the re-randomized commitment is correctly *bound to the note's value*, the hard part), O-H1 (fee conservation), O-H2 (fresh randomness), AT-C2 (per-direction media keys), AT-C3 (group sender signatures — Signal Sender-Keys parity), AT-M4 (close bound to deal), B1 (auth-before-buffer + bound), S1-H2 (beacon reachable — executed green over real QUIC), and the new **HERMES** HTLC subsystem is built, sound, and holonically correct (respects the depth-3 federation ceiling). The reshare *crypto* (Desmedt–Jajodia continuity + binding) is mathematically correct, the DROMOS parallel scheduler is provably deterministic + serial-equivalent, and the simulator has genuinely crossed toward an experimentation tool (a real `fanos-sim-experiment` CLI now exists). The four items the dev-agent flagged deferred (Γ-gate, E→L, L→O stake, self-org actuation) are genuinely still open exactly as described — the honesty holds up.
+
+**But the re-audit's core value is what independent verification found that the fixes introduced or left — and it is serious.** The remediation pattern this cycle was to *add recovery and guard wiring*, and several of those additions were **added without authentication or without bounds**, re-instantiating the project's own meta-pattern in a sharper form:
+
+> **New meta-pattern this cycle: recovery/guard wiring was added, but often *unauthenticated* or *unbounded* — so the fix opened a new attack surface.**
+
+### The new problems (introduced or left by the fixes)
+
+| # | Severity | Finding | Origin |
+|---|---|---|---|
+| §3.1 | **CRITICAL** | **Unauthenticated `BeaconReshareTrigger` = beacon master-key exfiltration oracle** — one malicious cell member reshares to `threshold=1` at its own index and reconstructs the beacon secret in the clear | the **R-C1 recovery fix** opened it |
+| §3.2 | **HIGH → potentially CRITICAL** | **OBOLOS unbounded-randomness overflow on the consensus verify path** — a single crafted shielded tx panics every overflow-checked validator (consensus halt) or, in release, wraps and voids O-C1's mod-Q inflation proof | the **O-C2 fix** added the reachable instance |
+| §3.3 | **HIGH** | **Storage-audit `decode_response`/`challenge` unbounded** — a free crafted `Prove` tx allocates ~240 GB and aborts every validator identically → cell-wide consensus halt | new THESAUROS wiring |
+| §3.4 | **HIGH** | **Unbounded `deals`/`htlcs` maps + free zero-value txs** → per-block O(all-deals-ever) sweep + unbounded memory | new storage/HERMES ledger wiring |
+| §3.5 | **HIGH** | **AT-C1 residual — audit cadence unenforced**: a provider front-loads all `duration` proofs into consecutive blocks, collects 100% of escrow, then deletes the data | AT-C1 fix incomplete |
+| §3.6 | **HIGH** | **AT-H1 residual — PoR still proves access, not possession**: the provider binding is a static replayable transfer and the leaves are public ciphertext any replica can prove → delete your copy, keep getting paid | AT-H1 fix incomplete |
+| §3.7 | **MEDIUM (latent → fork)** | **DROMOS `TREASURY` access-list omission** — safe today (scheduler unwired + TREASURY additive) but a consensus fork the moment the scheduler goes live *and* TREASURY gains a read/debit | new scheduler |
+| §3.8 | **MEDIUM (CI)** | **The strongest BFT no-fork Monte-Carlo test is now `#[ignore]`d** — the safety property the prior audit cited as the baseline is now opt-in | test change |
+| §3.9 | **HIGH (CI red)** | **The suite is NOT green:** clippy `--all-targets` fails (`expect_used` in a fanos-aphantos test) **and** the headline full-platform e2e test (`dromos_quic`) fails 2/2 in isolation — a real live-consensus/execute regression (the tx is provably valid). The "green suite" claim that gated this batch is currently false | lint + consensus-layer change |
+
+### The two priority questions, re-answered
+
+1. **Mass-destruction → heterogeneous-recovery self-organization (user #1): STILL NOT flawless.** The reshare crypto is correct, but (a) the fix only works **proactively, before** the loss — the actual **instantaneous mass-loss case still freezes the epoch clock permanently** (`recovery.rs` honestly asserts this), with no below-threshold re-bootstrap and no auto-trigger; (b) the reshare trigger is the **CRITICAL key-leak** above; (c) parent escalation (R-C2) is a **no-op on the flat depth-1 cell** that the scenario actually runs on; (d) membership lockout (R-H1) and self-org actuation (R-H2) remain open, so returning/new nodes are still dropped and survivors are never re-roled. **§4.**
+2. **Ultimate anonymity: STILL NOT defensible.** Only S1-H2 (beacon reachable) is fully correct. S1-C1 is incomplete — **UDP clearnet still leaks the client's coordinate to the exit**, and **anonymous clearnet TCP is non-functional by construction** (no node role hosts an anonymous rendezvous service, so it fails closed). S1-H1's cover traffic is **dead from startup** (the `StartHeartbeat` is swallowed by `CellNode`), so the GPA onset defense is not proactive. And S1-H2's correct fix **aggravates S1-M2** (the proxy can't follow the now-advancing epoch clock → dials break after epoch 0). **§5.**
+
+**Net security-critical delta:** 5 of the prior 9 security CRITICALs are correctly fixed (O-C1, O-C2, AT-C1-literal, AT-C2, AT-C3, S1-C1-TCP-leg — with residuals on the storage ones), but **+1 new CRITICAL** (reshare key-leak) **+1 new HIGH-maybe-CRITICAL** (OBOLOS overflow) **+2 new HIGH** (storage halt, unbounded deals) were introduced. The absolute count of shipping-blocking issues did not drop as much as the commit log suggests, because the fixes traded old bugs for new ones in the wiring layer.
+
+---
+
+## §2. Fix-verification scorecard
+
+| Finding | Claimed fix | **Verdict** | Note |
+|---|---|---|---|
+| **O-C1** inflation | cap `≤1021` notes + range-check inputs + bound fee/public | **FIXED-CORRECTLY** | math re-derived; `D∈(−Q,Q)⟹D=0`. But depends on randomness being short — see §3.2 |
+| **O-C2** untraceability | fresh re-randomised `cv_in` bound to note value | **FIXED-CORRECTLY** | value-binding verified (`tx.rs:157`); no soundness hole, no residual leak |
+| **O-H1** fee never collected | debit POOL_SINK, credit TREASURY | **FIXED-CORRECTLY** | conservation exact; invariant restored |
+| **O-H2** note-cipher reuse | `seal` takes `CryptoRng` | **FIXED-CORRECTLY** | fresh per seal; no fixed-seed caller |
+| **AT-C2** media nonce reuse | per-direction `MediaRole` keys | **FIXED-CORRECTLY** (1:1) | SFU/N-way is *unbuilt*, not "safe" — needs SSRC keying when built |
+| **AT-C3** group forgery | per-sender signatures, verify-before-chain | **FIXED-CORRECTLY** | Signal Sender-Keys parity; bind `group_id‖epoch` for defense-in-depth |
+| **AT-M4** close-replay | bind close auth to `deal_id` | **FIXED-CORRECTLY** | idempotent-safe |
+| **B1** pending_reveals OOM | auth-before-buffer + cap 4096 | **FIXED-CORRECTLY** | eviction is min-key not LRU (minor) |
+| **S1-H2** beacon reachable | `--beacon-params` + `beacon-deal` | **FIXED-CORRECTLY** | executed green; but aggravates S1-M2 (§5) |
+| **R-C3** loss ledger | account, don't swallow | **FIXED-CORRECTLY** (as scoped) | accounts loss; data still gone (no cross-cell reconstruction) |
+| **R-H2** reputation | excuse corroborated-down | **library FIXED / actuation ARCH-BLOCKED** | `spawn_self_organization` still unwired |
+| **HERMES** (new) | PQ HTLC atomic swaps | **BUILT, SOUND, holonically correct** | strongest new work; foreign adapter/custody honestly `[P]` |
+| **DROMOS scheduler** (new) | deterministic parallel exec | **CORRECT but NOT WIRED** + latent bug | serial-equivalent + double-spend-safe; TREASURY access-list gap (§3.7); zero live benefit today |
+| **S-P0.0 sim** | tick_epoch + recovery.rs | **REAL** (cliff + proactive fix demonstrated) | heterogeneous-recovery/collision half not built |
+| **S-P2 sim CLI** | experiment-runner | **BUILT** (genuine) | one scenario registered; foundation real |
+| **AT-C1** escrow drain | height-binding + canonical response | **INCOMPLETE** | literal replay closed; **cadence unenforced** → §3.5 |
+| **AT-H1** PoR provider-bind | `prover_auth` signed transfer | **INCOMPLETE** | static/replayable + proves access not possession → §3.6 |
+| **AT-H2** reputation/refund | deadline + auto-refund + reputation | **INCOMPLETE** | refund correct; **reputation half unwired** + new unbounded-deals HIGH (§3.4) |
+| **T-H1** exec divergence | reveal re-gossip | **INCOMPLETE** | defeats selective-delivery under partial synchrony; async residual + untested |
+| **R-C1** beacon cliff | proactive reshare (Desmedt–Jajodia) | **INCOMPLETE + NEW CRITICAL** | crypto sound; but proactive-only (mass loss still freezes) + §3.1 key-leak |
+| **R-C2** parent escalation | `CellEscalate` recursion | **INCOMPLETE** | terminates correctly; but observational-only + **no-op on flat cells** |
+| **S1-C1** clearnet-direct | route clearnet through profile | **INCOMPLETE** | TCP forward fixed; **UDP leaks (§5), TCP non-functional (§5)** |
+| **S1-H1** cover/mixing | on-by-default | **INCOMPLETE** | **cover-from-startup dead** — `StartHeartbeat` swallowed (§5) |
+
+---
+
+## §3. New / residual findings (the re-audit's core)
+
+### §3.1 [CRITICAL] Unauthenticated `BeaconReshareTrigger` — beacon master-key exfiltration oracle
+`fanos-keygen/src/beacon.rs:323` (`on_reshare_trigger`). The only guard (`:327-333`) checks `new_threshold != 0`, `new_threshold ≤ new_indices.len()`, `contributors.len() ≥ threshold` — **no authentication of the trigger and no lower bound** on `new_threshold`/`new_indices`. The frame is routed straight in (`overlay_beacon.rs:82` includes `BeaconReshareTrigger` in `is_beacon_frame`).
+
+**Exploit (single malicious admitted cell member, CONFIRMED by trace):** send `BeaconReshareTrigger{gen > cur, new_threshold = 1, contributors = [the t honest anchors], new_indices = [attacker's own point index]}`. The guard passes. Each honest anchor calls `deal_reshare` (`:354`) **without validating the trigger's legitimacy**; with `new_threshold = 1`, `deal_scalar` builds a **degree-0** polynomial (`vss.rs:264-285`), so `gᵢ(j) = sᵢ` for every `j` — and `:387-395` **sends that sub-share (= the anchor's real secret share `sᵢ`) to the attacker's coordinate.** The attacker collects `{sᵢ}` from ≥`t` contributors and `combine_reshare_share` yields `Σ λᵢ(0)·sᵢ = x` — **the beacon master secret in the clear.** It can then predict every future beacon, coordinate, and rendezvous line. The doc's claimed "authenticated over the parent link" mitigation is **not implemented**. This is precisely the "wrong reshare leaks the key" failure the recovery fix needed to avoid. (Also a liveness-DoS from the same root — a trigger flood evicts the legitimate coordinator's in-progress generation, defeating recovery; robustness stream N3.)
+
+**Fix:** authenticate the trigger (coordinator/parent/operator signature, or a designated-coordinator role check); enforce a security floor — `new_threshold ≥ current t`, `new_indices` must be the full anchor set, reject any shrink-to-attacker; bound `generation ∈ (reshare_gen, reshare_gen + K]`.
+
+### §3.2 [HIGH → potentially CRITICAL] OBOLOS unbounded-randomness overflow on the consensus verify path
+`codec.rs:157-167` (`Randomness::from_bytes` reads `L` raw `i64` with **no shortness/bound check**); `commit.rs:179,181` (the `i128` dot-product); reached from `tx.rs:141` (`note.value_r`, pre-existing) **and `tx.rs:157` (`value_r_in` — added by the O-C2 fix, reachable with no mint)**; consensus path `state.rs:136` `apply → proof.verify ← hybrid.rs:243 apply_shielded ← hybrid.rs:567`. The commitment assumes short/ternary randomness (`commit.rs:10,101`) but the verifier never enforces it: `A₁·r` sums `L=256` products of `a ∈ [0,2⁶¹)` and attacker-chosen `x ∈ [i64::MIN, i64::MAX]`, reaching `≈2¹³²` past `i128::MAX (2¹²⁷)`.
+
+**CONFIRMED end-to-end** (standalone reproducer, three ways incl. a no-mint submission overflowing at `tx.rs:141` *before* the membership check): **debug / overflow-checks-on** (the default dev/test/CI profile, and any overflow-hardened production node) → `panic "attempt to add with overflow"` → a **single decodable `TAG_SHIELDED` submission crashes every overflow-checked validator → network-wide liveness event.** **Default release** (overflow-checks off) → silent two's-complement wrap, deterministic (no fork) **but voids the clean mod-`Q` argument O-C1's fix relies on** → a crafted-coefficient inflation is **LIKELY but unproven** (129 mixed-modulus constraints, ~512 `i64` DOF; could not be ruled out). If realizable → CRITICAL supply inflation. **Fix:** reject any `Randomness` coefficient outside `{−1,0,1}` in `from_bytes` and assert it in `TransparentProof::verify`; add randomness-shortness to the relation text (`tx.rs:11-17` lists value-range but omits it) — the "TransparentProof proves exactly what the ZK backend must" claim is still slightly overclaimed until this lands.
+
+### §3.3 [HIGH] Storage-audit execution path — remote OOM/abort via attacker-controlled counts
+`fanos-thesauros/src/por.rs`, reached from `HybridLedger::prove_deal` (`hybrid.rs:288-316`) during **deterministic block execution** (so every validator aborts identically → cell-wide halt). (a) `decode_response` (`por.rs:182-185`) reads `count` from a 4-byte attacker prefix and calls `Vec::with_capacity(count)` **with no check against `bytes.len()`** — `[0xFF;4]` ⇒ ~240 GB reservation ⇒ `handle_alloc_error` abort. The correct guard is **present elsewhere in the same codebase** (`content.rs:229` `Manifest::decode` checks `body.len() == count*36` first). (b) `challenge` (`por.rs:66-80`) takes unbounded `params.k` / `size` (validated nowhere at `open_deal`); `k = u32::MAX` ⇒ `(0..leaves).collect()` (~34 GB) or a billions-entry `BTreeSet`. Attacker cost: two zero-value txs (§3.4). **Fix:** bound `count ≤ (bytes.len()-4)/MIN_LEAFPROOF_LEN` before `with_capacity`; reject `k`/`size` above protocol maxima at `open_deal`; clamp `challenge` work.
+
+### §3.4 [HIGH] Unbounded `deals`/`htlcs` maps + free zero-value transactions
+`token.rs:179` (`balance < amount` is false for `amount == 0`) ⇒ `open_deal(price=0)` and `lock_htlc(amount=0)` cost only a signature from a funds-less fresh keypair. `StorageMarket::deals` (`storage.rs:139`) and `HtlcBook::htlcs` (`hermes.rs:112`) are **never pruned** (Completed/Closed/Claimed/Refunded persist forever); `begin_block → finalize_lapsed_deals` (`hybrid.rs:343-356`) and both `state_root`s iterate **every** entry each block. A single peer streams distinct-id zero-value Opens/Locks → unbounded validator memory **and** a monotonically-growing per-block CPU tax. **Fix:** a minimum fee / non-zero escrow floor; prune terminal deals/htlcs; a deadline-indexed lapse sweep (the code comment at `hybrid.rs:341` already flags the linear scan). (Also the AT-H2 "reputation half": `grep` for `Reputation`/`Settlement::Miss` in `fanos-dromos` = nothing — the miss/decay path is unwired on-ledger.)
+
+### §3.5 [HIGH] AT-C1 residual — audit cadence unenforced
+The same-block permutation replay is correctly closed (canonical-ascending `por::verify` + strictly-increasing height). **But `AUDIT_PERIOD=64` is enforced nowhere on the pay path** (it gates only the lapse deadline, `storage.rs:29-33`). `set_audit_beacon(block.header.parent)` (`consensus.rs:930`) changes the beacon **every block**, and `settle_epoch` requires only `height > last`. So a provider submits a fresh valid `Prove` **every block**, advances one epoch/block, and **collects the entire escrow in `duration` blocks** instead of over `duration·64` — same number of proofs, no extra cost, strictly rational — then the deal `Completed`s and the provider deletes the data. The consumer paid for `64·duration` blocks of durability and got `duration`. **Fix:** require `height ≥ last_height + AUDIT_PERIOD` in `settle_epoch`.
+
+### §3.6 [HIGH] AT-H1 residual — PoR proves access, not possession
+`prover_auth` (`hybrid.rs:296`) binds identity + deal, but it is a **static, replayable `SignedTransfer`** (`token.rs:47-57` signs `LABEL‖from‖to‖amount‖nonce` — not the beacon/height/response; "verified, never applied," so the nonce/replay machinery never runs). One provider signature is byte-identical every epoch and replayable forever, and the outer `Prove` tx is itself unauthenticated (the audit's B3). Combined with the untouched root cause — the PoR leaves are **public edge-ciphertext replicated across the `[7,3,4]` cell**, so any replica can compute a valid response — a provider can **sign `prover_auth` once, delete its copy, and keep collecting** (itself or via any confederate). With §3.5 this is 100% escrow in `duration` blocks storing nothing. **Fix:** make `prover_auth` a signature over a fresh per-epoch challenge (`deal_id‖audit_beacon‖height‖H(response)`); ideally encode leaves under a provider-unique key so the response demonstrates *possession*.
+
+### §3.7 [MEDIUM, latent → fork] DROMOS scheduler `TREASURY` access-list omission
+`apply_shielded` credits `TREASURY` when `fee > 0` (`hybrid.rs:252-254`), but the `TAG_SHIELDED` access list (`:424-428`) declares only `{SHIELDED_MARKER, POOL_SINK, [recipient]}` — **not `TREASURY`** (a name tx *does* declare it, `:435`). So a shielded-fee tx and a name tx are "non-conflicting" per declaration yet both write `TREASURY` at runtime, violating the "conservative superset" contract (`:407`). Benign today only because `TREASURY` is credit-only/additive (order-independent) **and** the scheduler is off the live path (`execute_block` has zero non-test callers; consensus runs a serial `apply` loop, `consensus.rs:931-933`). It becomes a **consensus fork** the moment the scheduler is wired live *and* `TREASURY` gains a read/debit (governance, treasury-funded rewards, a cap check), or the same omission recurs on a non-commutative key. Untested. **Fix:** declare `TREASURY` in the shielded-fee access list; audit every access list for runtime-write completeness before wiring the scheduler live.
+
+### §3.8 [MEDIUM, CI] Strongest BFT no-fork test now `#[ignore]`d
+`consensus_sim.rs:491-493` — the randomized-async + Byzantine-equivocation "never fork" Monte-Carlo test (the strongest safety property, ~140 s) is now `#[ignore]`, so it does not run in the default `cargo test`. The prior audit cited the green suite as the safety baseline; that guarantee is now opt-in. **Fix:** restore it to a CI lane (nightly/heavy) so the no-fork property stays gated. (Also: the partition test `consensus_sim.rs:454` is correct but its docstring mislabels it as covering T-H1/T-H2, which it does not exercise.)
+
+### §3.9 [HIGH — the CI gate is currently RED] clippy fails + the full-platform e2e test fails
+The prior audit's §0 (and the dev-agent's notes) cite a green suite as the safety baseline. **Running it this session, it is not green:**
+
+- **clippy `--all-targets -D warnings` FAILS** at `crates/fanos-aphantos/src/threshold.rs:686:24` — `let holonomy = delivered.expect("the onion is delivered");` inside a `#[cfg(test)]` block trips the denied `expect_used` lint. This is the classic `--lib`-vs-`--all-targets` trap (a plain `clippy --lib` or `cargo build` does not surface it — which is why it slipped through). A one-line fix (`let Some(holonomy) = delivered else { panic!(...) }` or a scoped `#[allow]`), but the workspace CI gate is red until it lands. **Fix:** replace the test `expect` per the workspace lint policy; run `clippy --all-targets -D warnings` in CI (not `--lib`).
+- **`dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end` FAILS, reproducing 2/2 in isolation** (each a 60 s deadline stall, not a load flake). The test's in-body sanity check (`:117-122`) proves the *transaction is valid* (`local.apply(&dromos_tx) == ExecOutcome::Applied` against a fresh genesis ledger) — so the failure is in the **live consensus/execute path**: across the real 7-node QUIC cell, the shielded transfer never reaches `spent_count==1 ∧ note_count==2` on all nodes within 60 s. This is the platform's headline "the E∧L composition proven runnable end-to-end" test (`docs/tasks.md` T3), and it is currently red. **Prime suspects are this cycle's consensus-layer changes** — the **T-H1 reveal re-gossip** (`consensus.rs` on_reveal/validate_and_record, which altered reveal handling) and/or the **B1 reveal-auth-before-buffer** (`consensus.rs:791`, which now *drops* a reveal whose signature does not verify against `verifiers[member]` — if the live keyper/verifier wiring in this path does not satisfy that check, legitimate reveals are dropped → the anti-MEV tx is never decrypted → never executes → 60 s timeout). *Not root-caused here* (git-bisecting against the pre-remediation commit would require a checkout that could disrupt the parallel dev branch), but it reproduces deterministically and the transaction is provably valid, so it is a **real regression, not an environmental flake** — the dev-agent should reproduce with `RUST_LOG` on the reveal/execute path and bisect T-H1/B1. This is the single most urgent verification-integrity finding: **a headline correctness test regressed and the "green suite" claim that gated this batch is currently false.**
+
+---
+
+## §4. Mass-destruction → heterogeneous recovery (user priority #1) — current verdict: STILL NOT FLAWLESS
+
+The reshare **crypto** is correct and continuity is real (verified algebraically: `combine_reshare_commitment` preserves the group key; the DVRF output is byte-identical, `beacon.rs:612`), and the **safe-stall** admission window is sound (`quic/identity.rs`, `driver.rs:822` — bounded, VRF/epoch-bound, no admission bypass). But the recovery is not flawless:
+
+1. **The instantaneous mass-loss case still freezes permanently.** `recovery.rs:66` (`the_epoch_clock_freezes_below_threshold_the_r_c1_cliff`) crashes `n−t+1 = 4` anchors and asserts `tick_epoch() == None` **twice** — the reactive cliff is unfixed. The reshare needs `contributors.len() ≥ threshold` (`keygen/beacon.rs:330`), i.e. **≥ t live anchors** — once already below `t`, you cannot reshare. The audit's prescribed **below-threshold re-bootstrap / re-DKG is absent** (grep confirms), and there is **no auto-trigger** (`reshare_trigger` has zero production callers; `spawn_epoch_driver` only sends `AdvanceEpoch`). So R-C1 is **proactive-scheduled-churn-only** — it survives only if operators reshared *before* the loss (which `recovery.rs:95` does, with all 7 anchors up).
+2. **That proactive path is the §3.1 CRITICAL key-leak.**
+3. **R-C2 parent escalation is a no-op on the flat cell.** It terminates correctly (`ESCALATE_TTL=3` + depth bound, self-send filtered) but the parent action is observational only (`Rerouted`/`Repaired` → `info!` logs, no recruit/relax), and on the common **depth-1 Fano cell** `escalate_up` returns empty (`overlay.rs:1668`). The mass-recovery scenario runs on exactly that flat cell.
+4. **Membership still locks out returning/new identities (R-H1, correctly deferred).** `members: BTreeMap<Triple, …>` keyed by coordinate, first-write-wins (`overlay.rs:2258`), no `(epoch,coord)` stamp. A rebooted-identical node whose stale entry lingers, and any colliding new/returning identity on the 7-point cell, is silently dropped → rosters diverge under churn. The deferral is sound (a naive id-key without an authenticated epoch opens a coord-hijack), but it means reintegration at the membership layer is still broken.
+5. **Self-org still does not actuate (R-H2, arch-blocked).** The reputation excusal is correct, but `spawn_self_organization` has zero callers; `Node::start` composes roles once from static `config.roles` (`node.rs:236-293`) → survivors are never promoted.
+6. **R-C3 accounts loss correctly but does not recover it** (no cross-cell reconstruction); **R-H3** (depth-0 reroute budget) is unaddressed.
+
+**End-to-end:** instantaneous ≥`n−t+1` loss → permanent freeze (dominant break); if proactively reshared → key-leak; returning/new nodes → locked out; re-roling → doesn't happen; data past `[7,3,4]` → accounted but gone.
+
+**Painful-but-correct fixes (priority):** (1) **authenticate + bound + auto-trigger the reshare** (closes §3.1 *and* half the cliff) **+ a below-threshold re-DKG re-bootstrap** for the already-sub-threshold case; (2) **wire `spawn_self_organization` into `Node::start`** off an epoch-snapshotted, corroboration-gated membership; (3) **identity-first, authenticated-`(epoch,coord)` membership**; (4) **real parent re-provisioning + a hierarchy that actually nests + cross-cell erasure placement** so a whole-cell loss is recoverable, not merely accounted.
+
+**Simulator:** S-P0.0 genuinely reproduces the cliff and the proactive fix (5/5 `recovery.rs` green), but the heterogeneous-recovery half is missing — no `recover_as`/`mass_event`, and the one-occupant coordinate model means the R-H1 lockout class *still cannot occur in the sim*. Build the multi-occupant model + `mass_event` so the scenario is fully expressible.
+
+---
+
+## §5. Anonymity — current verdict: STILL NOT "ultimate"
+
+Only **S1-H2 (beacon reachable)** is fully correct (executed green: a provisioned node advances ≥2 epochs over real QUIC; the onion ratchet + coordinates rotate). The rest:
+
+- **S1-C1 clearnet — INCOMPLETE.** The TCP *forward* leg is fixed (onion to `meeting_line(exit_key)`, no coordinate leak). But **(a) UDP clearnet still goes Direct** — `dial_udp` (`diaulos.rs:483-504`) never consults `self.profile`, so `proxy --profile anonymous` sends **every SOCKS5 UDP datagram (DNS, QUIC/HTTP-3, WebRTC) Direct to the exit by coordinate** (live path `socks5.rs:134 → udp.rs:111`). **(b) Anonymous clearnet TCP is non-functional** — the onion targets the exit's meeting line, but the exit listens at its own coordinate via the Direct `serve` loop and **no node role hosts an anonymous `RendezvousService`** (grep: only tests/reply-forwarder/calypso), so onions aimed at the exit are never served; `dial()` has no Direct fallback → it fails closed (no leak, but browsing doesn't work). The banner (`bin/fanos.rs:280`) overclaims for both.
+- **S1-H1 cover traffic — INCOMPLETE (dead from startup).** `CellNode::step` routes all commands to `step_obn`, which **never forwards `StartHeartbeat` to the relay** (`cell_node.rs:133-154`), so the router's cover flag is never set at startup. Cover self-starts *lazily* on the first real forward — so the silence→cover transition **coincides with and reveals** the relay's first real traffic, defeating the E1/E6 "uniform whether or not carrying real traffic" property. An idle or line-member-only relay emits **zero cover**. **Fix:** forward `StartHeartbeat` to the relay in `step_obn` (or start cover on role activation).
+- **S1-H3 cookie correlator — STILL OPEN (deferral sound), now worse.** The client still `Emit`s the registration from its real coordinate; the reply combiner learns `cookie→client_coord`. Because S1-C1 now routes *clearnet* through the same machinery, **the reply-relay leak now applies to clearnet too** — exit + reply-relay collusion re-links client↔target, undercutting S1-C1's forward-path win. Needs a SURB-style encrypted single-use reply tag + onion-wrapped registration.
+- **S1-M2 — OPEN + aggravated by S1-H2.** The proxy is pinned at static `--epoch`/`--beacon` (default genesis) and `Node` exposes no accessor to sync the live value; now that relays *advance* epochs (S1-H2), a proxy at epoch 0 draws its mix directory / meeting lines for epoch 0 while relays rotated to epoch N → **dials fail after the first epoch turn.** **Fix:** expose the current `(epoch,beacon)` on `Node`; the proxy consumes it.
+- **Still open (unchanged):** S1-M1 (holonomy absent on the threshold path), S1-M3 (unauthenticated mix-key slots → circuit steering toward attacker-peelable relays), S1-M4 (3-node Fano anonymity set), S1-M5 (censored-bootstrap bridges not wired), S1-M6 (`ct_len` cleartext hop-position leak).
+
+**A bare `fanos node` delivers zero anonymity** (empty `RoleSet`, `beacon: None`); the whole stack requires deliberate provisioning, and even fully provisioned the residuals above break both headline paths. Not defensible as "ultimate."
+
+---
+
+## §6. Coherence, HERMES, DROMOS, simulator
+
+- **Γ-viability gate — STILL UNBUILT (highest-weight arch gap).** No `architecture/` dir, no Python, no Rust computes an architecture-Γ P/R/Φ/D from budgets, no CI step; V4 + σ-panel + the Ω4 ablations exist nowhere; `platform.md:49`'s verdict is still an unreproduced estimate while every gated tier has shipped. The platform's "computed, not asserted" release gate remains prose.
+- **E→L / L→O / Ω2 / Ω9 / depth-const / staking contradiction — all STILL OPEN** exactly as the prior audit found (no `SubmitTx` wire; PoW-only admission; Ω2 THESAUROS-only; CALM absent; no `SUBJECT_DEPTH_MAX`; the "stake read literally" vs "forbids capital staking" contradiction unreconciled).
+- **Self-org actuation (R-H2) — STILL ARCH-BLOCKED** (see §4).
+- **HERMES (new) — BUILT, SOUND, holonically correct.** The HTLC state machine is correct (BLAKE3-preimage PQ hashlock; claim requires `Locked ∧ height < timeout ∧ hash(preimage)==hashlock`, refund requires `Locked ∧ height ≥ timeout`; the boundary is exact and gap-free → exactly one fires). The cross-chain `T_B < T_A` asymmetry is correct and unit-proven (happy + abort). Ledger integration is coherent (`TAG_HTLC`, `HTLC_ESCROW` keyless sink, validate-then-settle, unique `htlc_id`, block-height clock). No griefing beyond the inherent hashlock free-option. It **respects the depth-3 federation ceiling** (federation, not a third tier) and realizes the T-77 cross-holon framing. Honestly scoped (foreign adapters/custody/bonding `[P]`). The strongest new work. Minor nit: `claim/refund` discard the `move_system` result (`let _ =`, `hermes.rs:153/163`).
+- **DROMOS parallel execution — scheduler built + proven-deterministic + serial-equivalent + double-spend-safe, but NOT wired live** (§3.7) — a real correctness/safety advance (the hard part is done and proven), zero throughput benefit today, with the latent `TREASURY` access-list bug.
+- **Simulator — crossed toward an experimentation tool.** `S-P2` is genuinely built (a real `fanos-sim-experiment` CLI: `--param` grid, `--seeds`, `--out`, CSV/JSON, a real `Experiment` abstraction) — the operator-facing capability the prior audit flagged missing. `S-P0.0` genuinely reproduces the R-C1 cliff and the fix. The crown-jewel adversarial scenarios (S-P0.1–0.5) are **real and passing but siloed in per-crate harnesses** — the `S-P1.1` `SubsystemEngine` adapter that would make them sim-native was not built, so they don't share the network model / determinism trace / GPA tape / observatory. `S-P1.2` transport is still a single global model (soft-partition added). Foundation real, breadth nascent.
+
+---
+
+## §7. Still-open from the prior audit (unchanged — confirmed)
+
+OBOLOS O-M1/M2/M3/M4; ANGELOS AT-M1 (no zeroize), AT-M2 (group out-of-order drop), AT-M3 (per-chunk PoR < λ), AT-M5 (caller-seeded ratchet randomness), AT-H3 (media replay window); TAXIS T-H2 (round-lock liveness wedge), T-H3 (keyper censorship), T-H4 (DA dispersal — engine gained in-engine verification but the driver still feeds the proposer's own full shard set), T-H5 (slashing/rewards emitted but never applied to state), T-M1-M4 (cross-cell); C7 (telemetry-DP built-but-unwired — zero `.privatize` callers), holonomy verification (absent from the threshold/rendezvous peel path). None regressed; each remains as characterized.
+
+---
+
+## §8. Prioritized remediation roadmap (dev-agent work queue)
+
+**Tier 0 — new security-critical, do first**
+0. **§3.9 Get the CI gate green first** — fix the `expect_used` lint at `threshold.rs:686`; root-cause and fix the `dromos_quic` e2e regression (reproduce with `RUST_LOG`, bisect T-H1 re-gossip / B1 reveal-auth). A red headline test invalidates the "verified" status of everything else this batch. Run `clippy --all-targets -D warnings` + the un-`#[ignore]`d Monte-Carlo test in CI.
+1. **§3.1 Authenticate + bound the `BeaconReshareTrigger`** (the key-leak) — sign the trigger, enforce `new_threshold ≥ t` + full-anchor `new_indices`, bound `generation`. This is the most severe finding of the re-audit.
+2. **§3.2 Enforce OBOLOS randomness-shortness on the verify path** — reject coefficients outside `{−1,0,1}` in `from_bytes` + `TransparentProof::verify`; add it to the relation text. (Closes the consensus-halt panic and the release-wrap inflation risk.)
+3. **§3.3 Bound the storage-audit `decode_response`/`challenge`** (mirror `Manifest::decode`; cap `k`/`size` at `open_deal`) — closes the cell-wide OOM halt.
+4. **§3.4 + §3.5 + §3.6 Storage market hardening** — reject `price==0` / min escrow; prune terminal deals/htlcs; enforce `AUDIT_PERIOD` cadence in `settle_epoch`; make `prover_auth` a fresh per-epoch challenge (possession, not access); wire the reputation/miss path.
+
+**Tier 1 — the user's #1 (recovery) + anonymity**
+5. **§4: below-threshold re-DKG re-bootstrap + auto-trigger** for the instantaneous-mass-loss case (the cliff is not yet closed); **wire self-org actuation** (R-H2); **identity-first authenticated `(epoch,coord)` membership** (R-H1); **real parent re-provisioning + cross-cell erasure** (R-C2/R-C3 fundamentals).
+6. **§5: route `dial_udp` through the profile (or refuse UDP)**; **host an anonymous `RendezvousService` in the exit role** (make clearnet TCP actually work); **forward `StartHeartbeat` to the relay** (proactive cover); **expose `(epoch,beacon)` on `Node`** so the proxy follows the clock (S1-M2); then S1-H3 (SURB), S1-M1/M3/M6.
+
+**Tier 2 — coherence / correctness-latent**
+7. **§3.7 Declare `TREASURY` in the shielded-fee access list** + audit all access lists before wiring the scheduler live. **§3.8 Restore the Monte-Carlo no-fork test to CI.**
+8. **Build the Γ-viability gate** (§6); wire E→L tx submission; implement the stake `AdmissionPolicy`; add the Ω2 budgets + Ω9 CALM classes + `SUBJECT_DEPTH_MAX`; reconcile the staking contradiction; wire C7 telemetry-DP + holonomy on the threshold path.
+
+**Tier 3 — simulator + remaining MEDIUM/LOW**
+9. **Build the `S-P1.1 SubsystemEngine` adapter** (unifies the siloed crown-jewel scenarios) + the multi-occupant coordinate model + `mass_event` (so the R-H1 lockout and heterogeneous recovery are expressible); **`S-P1.2` richer transport**; the remaining MEDIUM/LOW across OBOLOS/ANGELOS/THESAUROS/TAXIS.
+
+---
+
+## §9. Verified SOUND this cycle (do-not-regress)
+
+The 13 correct fixes in §2 (O-C1/O-C2/O-H1/O-H2, AT-C2/AT-C3/AT-M4, B1, S1-H2, R-C3, HERMES, the DROMOS scheduler's determinism/serial-equivalence/double-spend-safety, the reshare crypto's continuity+binding, the safe-stall window, the S-P0.0 sim, the S-P2 CLI); plus everything the prior audit marked sound and that did not regress (BFT ordering safety, the 1:1 double ratchet FS+PCS, DIAKRISIS invariant math, the transport/stream DoS cluster, the threshold-onion crypto, no-client-DNS-leak). The dev-agent's status discipline remained honest — the four deferred items are genuinely still open exactly as flagged.
+
+---
+
+## §10. Appendix — method and confidence
+
+Eight parallel streams, current code read at `file:line`; the OBOLOS bound math + value-binding and the reshare Lagrange algebra were re-derived by hand; S1-H2, HERMES, the crown-jewel scenarios, and the OBOLOS overflow were executed. Working notes with every anchor and fix are preserved. The re-audit's central lesson: **the remediation was real and the cryptographic cores are sound, but adding recovery and guard wiring without authentication or bounds re-created the platform's meta-pattern in a sharper form — the beacon reshare, the storage-audit path, the escalation frame, and the deals map were all added as new *unauthenticated or unbounded* network-fed surfaces.** Authenticate-before-act and bound-every-map must be the standing discipline for the next cycle, and the two priority dimensions — flawless mass-recovery self-organization and ultimate anonymity — are **not yet met.**
+
+
+---
+
+<!-- ═══════════════════ AUDIT IV of IV ═══════════════════ -->
+
+> **Audit IV of IV — consolidated 2026-07-24** (formerly `docs/audit-2026-07-23-deep.md`, previously untracked). The deepest architecture→implementation pass; re-verified Audit III at `file:line` and reframed the frontier as *"no driver"* (engines built, production actuation last-mile behind). Preserved verbatim; current status in the *Consolidation status* note at top.
+
+# FANOS deep architecture + implementation audit — 2026-07-23 (pass 2)
+
+**Auditor:** independent read-only pass (a *separate* agent performs the fixes; this document is written to be
+directly actionable by that agent — every finding carries an exact `file:line`, a concrete trigger, and the fix).
+
+**Scope.** A full-stack audit *from architecture to implementation* with the user's headline priority foregrounded:
+**the code architecture must be flawless and code across all 39 crates must be maximally reused** ("blockchain of the
+future"). Grounded in `spec/protocol.md` + `spec/platform.md` and the subsystem design docs in `docs/`. Covers: build/CI
+health, independent re-verification of every prior-audit finding (`docs/audit-2026-07-23.md`) against *current* code,
+new findings, cross-crate DRY/reuse, dependency-graph hygiene, spec-compliance, and empirical simulator experiments.
+
+**Method.** Four parallel read-only streams (architecture/DRY, blockchain-core, crypto/keygen/POROS, anonymity/storage)
+plus the auditor's own verification at `file:line`, hand re-derivation of the load-bearing bounds, and **live simulator
+experiments** driven through `fanos-sim` (the deterministic driver over the real node engines). No code was modified by
+the audit. Findings are **CONFIRMED** (read/ran, definite) or **LIKELY** (inferred).
+
+**Pinned baseline.** `HEAD = 25b0a6f` ("poros: engine-level line rotation …"), Fri 2026-07-23 17:53.
+
+> ⚠️ **Live-tree caveat.** The repository is under **active concurrent development** by the fixing agent: during this
+> audit `HEAD` advanced **`274a0f2 → 25b0a6f → 6d81506`** (and `recovery.rs` / `threshold_service.rs` / `Cargo.lock`
+> carry uncommitted WIP). Findings are pinned to `25b0a6f` unless noted; load-bearing items were re-verified at
+> `file:line`. Line numbers drift as the tree moves.
+>
+> 🚨 **§5.D-1 is transitioning latent → live during finalization.** The newest commit `6d81506`
+> ("IngressNode rotation API — `emit_reshares` + `arm_rotation`") adds the **driver-facing rotation API** that §7.1
+> flagged as missing — but a grep of the current `poros.rs` confirms `on_reshare` (`:583`) **still takes no `from` and
+> performs no commitment verification.** So the fixing agent is wiring the POROS rotation driver **without** the §5.D-1
+> receive-path verification — exactly the "wiring the driver converts a latent HIGH into a live ingress-DoS" transition
+> this report warns of. **§5.D-1 + Tier-0 #3 must land with (or before) the driver.**
+>
+> 🔒 **The audit modified no production code.** All four read-only streams confirmed zero `Edit`/`Write` calls to
+> tracked files; the auditor's temporary `fanos-sim` experiment and chain-core's two throwaway diagnostic tests were all
+> removed. The transient `poros.rs`/`ingress_node.rs`/`frame.rs`/`threshold_service.rs` modifications observed mid-audit
+> were the **concurrent fixing agent's** work (committed as `25b0a6f`/`6d81506` + WIP), not the auditors'. Final tree
+> handed back exactly as found: `M Cargo.lock`, `M recovery.rs`, `M threshold_service.rs` (all the fixing agent's), plus
+> this report.
+
+---
+
+## §0. Verification baseline (CI health) — GREEN
+
+Independently run this session on the pinned tree:
+
+- `cargo build --workspace --all-targets` → **PASS** (exit 0, 2m40s).
+- `cargo clippy --workspace --all-targets -- -D warnings` → **PASS** (exit 0, 2m58s, no warnings).
+- `cargo test -p fanos-sim --test recovery` → **5/5 PASS**; auditor's two custom sim experiments → PASS (§6).
+
+**This flips the prior audit's §0/§3.9 red-CI finding.** The `expect_used` clippy failure at
+`fanos-aphantos/src/threshold.rs` is resolved, and `--all-targets` is clean. The dev-agent's "green suite" claim now
+holds for build + clippy. **And the pass-1 §3.9 `dromos_quic` stall is now root-caused** (chain-core, §5.B): it **passes
+in isolation (8.56 s)** and only stalls **under CPU load** — a wall-clock round-timeout livelock in the *ordering* path,
+**not** the reveal-race the pass-1 audit hypothesized (that hypothesis was wrong; the reveal fixes work). So the headline
+e2e test is green on an unloaded CI runner but has a real performance cliff (§5.B HIGH-1).
+
+---
+
+## §1. Executive summary
+
+**The remediation since `docs/audit-2026-07-23.md` (pass 1) is substantial and genuine — but incomplete on the most
+severe item.** Independent re-verification confirms **§3.2, §3.3, §3.5, and §3.9-clippy fully fixed** (several with
+defense-in-depth + tests), **§3.6 fixed-or-partial**, and **§3.1 only *half* fixed**: the single-member key-exfil is
+closed, but re-verification uncovered that the *same* surface still admits a **2-anchor coalition** master-key exfil
+(the fix floored the threshold at 2 instead of at `t`, and left the trigger unauthenticated). So the security ledger is
+**net-positive but not clean** — the worst DoS (§3.2) is gone, yet a CRITICAL key-secrecy break persists:
+
+| Pass-1 finding | Severity | **Re-verified verdict** | Evidence |
+|---|---|---|---|
+| §3.1 beacon reshare key-exfil (single-member) | CRITICAL | **single-member FIXED; 2-coalition still LIVE (CRITICAL)** | `beacon.rs:386` floors at `2`, **not `self.threshold`**, and the trigger is unauthenticated → §2.1 |
+| §3.2 OBOLOS randomness overflow | HIGH→CRIT | **FIXED** (defense-in-depth + tests) | `codec.rs:166-172` ternary reject at decode **and** `tx.rs:143-145` in the verify relation |
+| §3.3 storage `decode_response` OOM | HIGH | **FIXED** | `por.rs:201-203` bounds `count ≤ (len-4)/MIN_LEAFPROOF_LEN` |
+| §3.5 storage audit-cadence drain | HIGH | **FIXED** | `market.rs:269` `settle_epoch` enforces `height ≥ last + AUDIT_PERIOD` |
+| §3.6 PoR proves-access-not-possession | HIGH | **PARTIAL** | fresh `ProverAuth` over `deal_id‖H(response)` (`hybrid.rs:325`); residual = public replicated leaves |
+| §3.9 clippy `--all-targets` red | HIGH (CI) | **FIXED** | §0 above |
+
+**The meta-pattern persists, one layer up.** The project's signature failure mode — *"libraries ahead, live-wiring
+behind"* — recurs, but the remediation has pushed the frontier from "crypto exists" to "engine exists": the primitives
+and even the sans-I/O engines are built and unit-tested, while the **production driver / actuation last-mile** is still
+missing. This is now the dominant architectural gap and the core of the user's two priorities:
+
+> **New framing: the gap is no longer "no library" but "no driver."** Recovery, POROS rotation, DROMOS parallelism, and
+> telemetry-DP all have a *complete, tested engine* and *no production caller that drives it end-to-end*.
+
+**The apex of that pattern (arch-dry, HIGH):** the **shipped `fanos` binary runs no blockchain at all.** `fanos-dromos`
+and `fanos-obolos` are `[dev-dependencies]` of `fanos-node`, `spawn_taxis` has **zero production callers**, and
+`bin/fanos.rs` / `fanos-ffi` / `fanos-cli` contain no ledger wiring — the entire L-machine (TAXIS/DROMOS/OBOLOS) is
+exercised only by `tests/dromos_quic.rs`. And when that test path *is* driven under CPU load, chain-core found it
+**livelocks** (a wall-clock round timeout that a large block cannot beat under contention — §5.B). So both the *product*
+wiring and the *performance* of the value tier are pre-production. Two further latent-but-serious correctness landmines
+sit in the value tier awaiting their drivers: the **`public_recipient` fund-redirection** hole (§5.D-2, live the moment
+unshield-crediting is wired) and the **POROS reshare corruption** (§5.D-1, live the moment rotation is triggered).
+
+### The priority verdicts
+
+1. **Mass-destruction → recovery (user #1): NOT yet flawless — the auto-trigger detects but does not recover.**
+   The new `StallDetector` + `RecoveryWatcher` (`node.rs:106-216`) is honest new infrastructure, but as wired it
+   **cannot recover a mass-loss freeze**: (a) Regime A (proactive reshare) is stall-gated into unreachability (§4.1);
+   (b) Regime B only emits a `tracing::warn!` — **`BeaconNode::rebootstrap` has zero production callers** and no code
+   issues/consumes a re-genesis certificate automatically (§4.2). Empirically (§6): the clock **does** self-heal on
+   *churn-rejoin* (returning anchors), but stays frozen for permanent loss. **The recovery loop's last mile is open.**
+2. **Ultimate anonymity: delegated to the anonymity stream (§5.C).** Prior-audit §5 residuals (UDP-profile clearnet
+   leak, cover-from-startup, proxy epoch-pinning, no hosted anonymous rendezvous, SSLE) are re-verified there.
+
+### Net delta since pass 1
+Security posture improved on the arithmetic/DoS axis (§3.2 consensus-halt and §3.3/§3.5 storage closed; §3.2 was the
+worst DoS). **But two live security defects remain, both in the threshold-resharing surface:**
+- **[CRITICAL] §2.1** — the beacon reshare trigger is unauthenticated and floors `new_threshold` at 2 not `t`, so a
+  **2-anchor coalition reconstructs the beacon master secret** (a confirmed threshold-downgrade exfil, live in the test
+  suite), and the now-live recovery auto-trigger makes reshares routine cover.
+- **[HIGH] §5.D-1** — the POROS descriptor-reshare receive path accepts **forged, unverified** contributions, so **one
+  remote node corrupts a new-line member's rotated share** → ingress DoS the moment the rotation driver is wired.
+
+The same root cause underlies both: **resharing without an authenticated trigger and without receiver-side binding
+verification.** The dominant *architectural* debt is the driver-wiring last-mile (§4, §7) and cross-crate reuse (§3).
+
+---
+
+## §2. Independent fix-verification detail
+
+### §2.1 [CRITICAL — live] §3.1 beacon `BeaconReshareTrigger` — single-member exfil FIXED, but a 2-coalition threshold-downgrade exfil REMAINS — CONFIRMED
+
+> **Current status — 2026-07-24 (this consolidation): STILL OPEN — the one live CRITICAL across all four audits.** Re-verified against today's tree: the floor is still the constant `MIN_RESHARE_THRESHOLD = 2` (`beacon.rs:63,386`), **not `self.threshold`**, and `on_reshare_trigger` (`beacon.rs:368`, dispatch `:655`) still performs **no authentication** — the trigger frame carries no signature. It is now **live**: the recovery auto-trigger is wired (`node.rs:213 → actuate_recovery → BeaconNode::reshare_trigger`, `node.rs:126`), so any admitted anchor can forge an identical unsigned `BeaconReshareTrigger` naming `new_threshold=2` + a 2-anchor coalition's own indices and reconstruct the beacon master secret. **A threshold floor alone cannot fix this:** legitimate below-threshold recovery *must* lower the threshold (a 4-of-7 cell reshares to 3-of-4 survivors — test `a_reshare_moves_the_beacon_to_a_survivor_set`), so the threshold value cannot distinguish legitimate-recovery from malicious-exfil. **The only fix is authentication** — require the trigger to carry a signature by the beacon's `authority` trust root (the `HybridVerifier` already wired into `rebootstrap`, `beacon.rs:607-610`), and change the recovery auto-trigger to **escalate a proactive reshare to that authority** (exactly as Regime B already escalates `rebootstrap`) instead of a node self-issuing an unauthenticated reshare. This spans `beacon.rs` (the verify path + the trigger frame) **and** the recovery-actuation flow (`node.rs::actuate_recovery` + `recovery_decision`/`RecoveryAction` in `recovery.rs`, which is under concurrent development). It is therefore deliberately **not** closed in this consolidation pass — which touched no consensus-critical recovery code — and is the platform's single top open security item (see the *Consolidation status* note at the top of this file).
+
+`fanos-keygen/src/beacon.rs`. The receive path `on_reshare_trigger` (`:368`, guard `:384-393`) now enforces, before dealing:
+```
+generation > reshare_gen  ∧  generation ≤ reshare_gen + MAX_RESHARE_GEN_ADVANCE
+new_threshold ≥ MIN_RESHARE_THRESHOLD (=2)      // :386 — floors at 2, NOT at self.threshold
+new_threshold ≤ new_indices.len()
+contributors.len() ≥ self.threshold
+distinct_in_range(contributors) ∧ distinct_in_range(new_indices)
+```
+and `on_reshare_commit` (`:468`) rejects any contribution that fails `verify_reshare_commit` against the *current*
+commitment (binding). The prior CRITICAL — a **single** member naming `new_threshold=1` at its own index — is **closed**;
+with `t' ≥ 2` a single identity holds only one evaluation of a degree-≥1 polynomial. Empirically confirmed in the
+simulator (§6, P2): the `t'=1` trigger is silently dropped and the clock advances undisturbed.
+
+**But the core hole is still live and is CRITICAL, not merely a residual** (crypto/keygen stream; the code's own note at
+`beacon.rs:380-383` labels it a "Tier-1 follow-up"). The floor is `MIN_RESHARE_THRESHOLD = 2`, **not `self.threshold`**,
+and the trigger carries **no authentication** (`reshare_trigger_frame`/`parse_reshare_trigger`, `:706-727`, have no
+signature field; dispatch `overlay_beacon.rs:82 → beacon.rs:655` performs no sender/authority check).
+
+> **Exploit (CONFIRMED, reproducible).** Cell `n=7`, threshold `t=4` (BFT tolerates `f ≤ 2` Byzantine). **Two** colluding
+> anchors sit at Fano indices 5 and 6. Anchor 5 broadcasts (no signature needed)
+> `reshare_trigger_frame(generation=1, new_threshold=2, contributors=[1,2,3,4], new_indices=[5,6])`. Every guard clause
+> passes (`gen 1∈(0,8]`; `t'=2 ≥ 2` and `≤ |{5,6}|`; `|contributors|=4 ≥ t`; both sets distinct/in-range). Honest anchors
+> 1..4 each run `deal_reshare` (`:414`): deal a fresh degree-1 `gᵢ` with `gᵢ(0)=sᵢ` and **send `gᵢ(5)→coord(5)` and
+> `gᵢ(6)→coord(6)`** (`:447-454`). The coalition collects `{gᵢ(5)}` and `{gᵢ(6)}`, computes `H(5)=Σλᵢgᵢ(5)`,
+> `H(6)=Σλᵢgᵢ(6)`; `H` has degree `t'−1 = 1`, so **two points interpolate `H(0)=S` = the beacon master secret.** Two
+> Byzantine anchors — *within* the tolerated `f ≤ 2` — reconstruct a secret that the `(4,7)` design says needs 4
+> shareholders. The key-secrecy threshold is downgraded from `t` to `2`.
+
+**Smoking gun in the test suite:** `beacon.rs:1251` asserts that a threshold-*lowering* reshare
+(`new_threshold=3, new_indices=[4,5,6,7]` against a victim at `t=4`) is **honored** (`!is_empty()`, "a legitimate reshare
+is still dealt") — i.e. the downgrade path is deliberately live. With the beacon now emitting reshare triggers
+automatically (§4), this attack has routine cover, and it works for any `t ≥ 3`.
+
+**Fix (reuses existing infra; from the crypto/keygen stream):**
+1. **Authenticate** — `BeaconNode` already holds `self.authority: Option<HybridVerifier>` (`beacon.rs:607`, used by
+   `rebootstrap`). Add a `HybridSignature` field to the trigger wire (`:706-727`) over a domain-separated
+   `signable(generation, new_threshold, contributors, new_indices, self.lineage_anchor())` — mirror
+   `RecoveryAuthorization::signable` (`recovery.rs:52-63`; `HybridVerifier::verify` checks Ed25519 **and** ML-DSA-65,
+   `sig.rs:104-105`). Require a valid authority sig in `on_reshare_trigger` before the guard; make `actuate_recovery`
+   (`node.rs:126`) sign with the authority secret — making Regime A authority-authorized like Regime B re-genesis.
+2. **Fallback if no authority is configured** — change `beacon.rs:386` from `new_threshold < MIN_RESHARE_THRESHOLD` to
+   `new_threshold < self.threshold`: an unauthenticated reshare may **preserve/raise** the threshold (always
+   confidentiality-safe) but never **lower** it. (A threshold-preserving reshare needs a coalition of `≥ t` new coords =
+   `≥ t` identities = outside the trust model.) **Note:** this fix requires updating the `beacon.rs:1251` test, which
+   currently asserts the downgrade is honored.
+3. **Minimal stopgap** if the signature work is deferred: apply the `:386` change **and** make `node.rs` Regime A
+   escalate-and-log like Regime B (`:135-139`) rather than emit a downgrade trigger — closes the exfil now, at the cost
+   of autonomous proactive resharing until the signed path lands.
+
+This is the **top security item** of the audit.
+
+### §2.2 [FIXED] §3.2 OBOLOS randomness overflow — CONFIRMED (defense-in-depth)
+`fanos-obolos`. Two independent guards now enforce ternary (`{−1,0,1}`) commitment randomness:
+- **Decode:** `codec.rs:157-172` — `Randomness::from_bytes` returns `rand.is_ternary().then_some(rand)`; a full-range
+  `i64` *or even a coefficient of 2* is refused (tests `:350-353`).
+- **Relation:** `tx.rs:143-145` — `TransparentProof::verify` re-asserts `short(r) = r.is_ternary()` over every input and
+  output opening, and the relation text (`tx.rs:15,78-82`) now *lists* randomness-shortness (closing the pass-1
+  "overclaimed relation" nit).
+The `A₁·r` dot-product can no longer reach `2¹³²`; the consensus-halt panic and the release-wrap inflation risk are both
+closed. **Re-derived by hand: bounded.**
+
+### §2.3 [FIXED] §3.3 storage `decode_response` — CONFIRMED
+`fanos-thesauros/src/por.rs:201-203` now bounds `count > (bytes.len()-4)/MIN_LEAFPROOF_LEN → None`, mirroring
+`Manifest::decode`. (It still *hand-rolls* the bound — see the DRY finding §3.1 below.) The `challenge`/`k`/`size` arm
+of pass-1 §3.3 is delegated to the anonymity/storage stream (§5.C) to confirm the `open_deal` caps.
+
+### §2.4 [FIXED] §3.5 storage audit cadence — CONFIRMED
+`fanos-thesauros/src/market.rs:269` `settle_epoch` now computes `floor = last_height.unwrap_or(open) + min_interval`
+(`= AUDIT_PERIOD`) and returns `None` if `height < floor` on the ledger path. A provider can advance a deal at most once
+per `AUDIT_PERIOD` blocks; the front-loading escrow-drain is closed. Called with `AUDIT_PERIOD` from
+`hybrid.rs:338`.
+
+### §2.5 [FIXED for the replay class; residual LOW for possession] §3.6 PoR — CONFIRMED (both storage + crypto streams)
+`hybrid.rs:315-345` `prove_deal` now requires a dedicated `ProverAuth` (not the old static `SignedTransfer`) that
+`verify(id, response_bytes, provider)` binds to `deal_id ‖ H(response)` (`hybrid.rs:325`), beacon-bound via
+`por::verify(cid, audit_beacon, …)` (`:332`). A third party lacking the provider key cannot forge it, and a captured auth
+cannot be replayed across epochs — the **replay/forgery class is closed.** **Residual CONFIRMED (downgraded to LOW):** the
+leaf *encoding* did **not** become provider-unique — `seal_object` (`object.rs:41`) seals under the *object's* fresh key,
+and leaves stay content-addressed ciphertext replicated across the `[7,3,4]` cell. `ProverAuth` binds the **payee**, not
+the **holder**, so a provider that deleted its copy can fetch the leaves from a sibling replica and still prove — *access,
+not possession.* Because the data remains retrievable cell-wide, this is an **intra-cell free-rider nuance (LOW)**, not a
+durability break. **Full fix (optional):** encode leaves under a provider-unique key so only the designated holder can
+answer. (Storage `challenge`/`open_deal` caps the pass-1 §3.3 `k`/`size` arm flagged are also present — §5.C.)
+
+---
+
+## §3. Architecture & code-reuse (the user's headline) — DRY findings
+
+> The remaining sub-findings (crypto-wrapper duplication, Merkle/accumulator duplication, epoch-math duplication,
+> per-crate reuse census) are produced by the **architecture/DRY stream** and integrated in §5.A. The auditor's own
+> confirmed reuse findings:
+
+### §3.1 [HIGH — reuse] The canonical bounded reader exists but is inconsistently adopted — CONFIRMED
+`fanos-primitives::codec` provides the *correct, reusable* bounded decoder: `Reader::seq(min_elem, f)` bounds
+pre-allocation against the bytes actually present and refuses `min_elem = 0` (`codec.rs:77-83`); `read_map` likewise;
+tests reject over-counts (`:179-192`). **Yet at least four incompatible bounding strategies coexist across crates:**
+
+| Strategy | Site(s) | Problem |
+|---|---|---|
+| `Reader::seq` (the shared, correct one) | `fanos-primitives`, parts of ledger codecs | ✅ the target |
+| manual `count > (len-4)/MIN → None` + hand loop | `thesauros/por.rs:201` | secure *now*, but was the §3.3 vuln until pass 1 patched it by hand |
+| manual `body.len() == count*stride` pre-check | `thesauros/content.rs:229` | different idiom, same intent |
+| `count.min(1024)` cap | `obolos/codec.rs:308` | a magic cap, not bytes-bounded |
+| **no bound** on `with_capacity(<wire count>)` | `vrf/beacon.rs:348`, `vrf/pqvrf.rs:115,119,164`, `vrf/shuffle.rs:291-312`, `taxis/checkpoint.rs:174`, `taxis/crosscell.rs:322`, `dromos/hybrid.rs:1397`, `node/rendezvous.rs:220`, `nyx/tessera.rs:119-127`, `nyx/guard.rs:65`, `aphantos/node.rs:326` | each is a place a bound can be *forgotten* (as `por.rs` originally was) |
+
+**This is the cleanest illustration of the DRY thesis in the codebase:** the *same* safety invariant is re-implemented
+by hand in ≥4 ways, and the one time it was omitted it was a cell-wide-halt HIGH. **Fix:** route every length-prefixed
+wire decode through `Reader::seq`/`read_map`, and delete the hand-rolled variants. This simultaneously (a) removes the
+duplication, (b) makes the unbounded-alloc DoS class *structurally impossible* rather than whack-a-mole, and (c) is
+exactly the "maximal reuse" the user demands. Each `with_capacity(<wire count>)` site above must be audited: some have
+a *protocol-fixed* count (safe) but should still adopt the shared reader for uniformity; the VRF/taxis ones read the
+count from the wire and need the bound.
+
+### §3.2 [MED — architecture] `fanos-node` is a god-crate — CONFIRMED
+`fanos-node` = **19 internal `fanos-*` dependencies, ~11.1k LOC** (the widest fan-out in the workspace by far; next is
+`fanos-runtime` at 11). It composes essentially every subsystem (aphantos, calypso, diaulos, keygen, proxy, quic,
+rendezvous, session, taxis, vpn, vrf, obolos-via-dromos, …). This is the known `OverlayNode`-decompose / `fanos-runtime`
+-split backlog. Some breadth is inherent to an integration crate, but 11k LOC + 19 deps is a decomposition target: the
+`Node::start` role-composition, the driver tasks (epoch, recovery, exit, service, poros), and the engine composites
+(`OverlayBeaconNode`, `CellNode`, `IngressNode`) are separable into role-scoped modules/crates. *Architecture stream to
+propose the split boundary.*
+
+### §3.3 [OK — do not regress] Dependency-graph hygiene is otherwise good
+The internal graph is cleanly layered (`fanos-field` (0 deps) → `geometry` → `wire`/`primitives`/`vrf`/`pqcrypto` →
+mid-tier → `runtime`/`node`); **no cycles** observed. The one apparent inversion — `fanos-observatory → fanos-sim` — is
+**deliberately feature-gated** (`optional = true`, feature `sim`; the Cargo.toml cites audit ARCH-10 D8 and offers
+`--no-default-features` for a sim-free shipping monitor). Good hygiene; the only nit is `sim` being on by *default*, so
+the shipped monitor bundles the simulator unless explicitly slimmed. Keep this handled.
+
+---
+
+## §4. Mass-destruction → recovery (user priority #1) — the driver last-mile is open
+
+The recovery **crypto and engine** are real and correct (reshare continuity + binding: §2.1; `RecoveryAuthorization` is
+a hybrid-PQ signed, floored, generation-fenced cert: `recovery.rs:31-133`; `rebootstrap` exists on `BeaconNode`; the
+committed sim tests pass 5/5 incl. `proactive_resharing_survives_the_r_c1_cliff`). The gap is **actuation**.
+
+### §4.1 [HIGH] Regime A (proactive reshare) is stall-gated into unreachability — CONFIRMED
+`node.rs` `RecoveryWatcher::on_tick` (`:205-215`) gates **all** actuation behind
+`if !self.detector.observe(self.last_epoch) { return; }` — the `StallDetector` fires only after `RECOVERY_PATIENCE = 4`
+consecutive **non-advancing** epochs, i.e. *after the clock has already frozen*. But a clock freeze from anchor loss
+means `live_anchors < threshold`, at which point `recovery_decision` (`recovery.rs:176-186`) returns **`RequestRegenesis`
+(Regime B)**, never `ProactiveReshare` (Regime A). Regime A requires `live ≥ threshold` (clock still advancing) — and
+while the clock advances, `on_note` bumps `last_epoch`, the detector resets, and `on_tick` never actuates.
+**Consequence:** the proactive reshare that is *supposed to lower the threshold ahead of a loss and prevent the freeze*
+is effectively **dead code in production** — reachable only in the pathological corner of a transient-loss stall at
+*exactly*-`threshold` membership. The headroom-buying mechanism never auto-fires on the monotonic-loss path the mass-
+destruction scenario actually runs.
+**Fix:** drive Regime A off a **membership-thinning** signal (corroborated `PeerDown` count vs `threshold`) that is
+*independent of* the stall detector, so a cell reshares to a lower threshold *while still live*; keep the stall detector
+only for Regime B.
+
+**The `StallDetector` logic itself is correct** (crypto/keygen stream, verified at `recovery.rs:191-223`): an advancing
+(even every-other-period) clock never fires (`observe` resets `missed=0` on any advance); only `patience` *consecutive*
+non-advances fire, exactly once at the boundary, re-fire blocked; genesis all-zero never fires; and
+`patience = RECOVERY_PATIENCE = 4 > BeaconWindow::DEPTH = 3`, so a lagging-but-live cell is not mistaken for frozen. No
+false-positive, no missed sustained freeze. The reachability defect in §4.1 is therefore **not** a detector bug — it is
+the `on_tick` gate composing a correct detector with a decision function that routes the frozen state to Regime B. **The
+`BeaconReady → on_note` delivery is confirmed wired** (crypto stream traced the full path
+`beacon.rs:330 → driver.rs:1039,546,499 → node.rs:252,260,182`; the only caveat is an unrealistic >4096-deep broadcast
+backlog), so there is no false-fire risk either. The defect is purely the gate.
+
+### §4.2 [HIGH] Regime B escalates correctly-by-design, but the RGC issue/consume loop is not wired — CONFIRMED
+Two things are true and must be held together:
+- **The escalate-not-auto-rekey behavior is correct.** `actuate_recovery` (`node.rs:135-139`) handles
+  `RequestRegenesis` by emitting a `tracing::warn!` and escalating — it does **not** auto-rekey. This is *right*: a
+  `(t,n)` secret with `< t` shares is information-theoretically gone, and two partitioned minorities each re-keying would
+  **fork**. `recovery.rs:1-11` argues this correctly — below-threshold recovery *must* be fenced by a single-writer
+  authority (a signed `RecoveryAuthorization` with a strictly-monotonic generation), never trustless. And the crypto is
+  sound: `RecoveryAuthorization` is a floored (`MIN_REGENESIS_THRESHOLD`), generation-fenced, hybrid-PQ-signed cert
+  (`recovery.rs:31-133`), and `BeaconNode::rebootstrap` (`beacon.rs:601-628`) adopts it. **The pass-1 "reactive cliff" is
+  closed at the crypto layer.**
+- **But the loop is not automated.** `BeaconNode::rebootstrap` has **no non-test caller**, and **no production code
+  issues *or consumes* a `RecoveryAuthorization`** (`RecoveryAuthorization::issue` appears only in `recovery.rs` tests;
+  the `fanos-incentives` `issue(...)` hits are an unrelated blind-signature method). There is no frame handler that, on
+  receiving an RGC, calls `rebootstrap`. So on a real below-threshold freeze: `StallDetector` confirms → coordinator logs
+  → **and there it stops** — the clock stays frozen until a human operator (a) reads the log, (b) obtains the authority
+  key, (c) issues an RGC, and (d) delivers it to a survivor that manually calls `rebootstrap`. None of (a)–(d) is wired.
+**Fix:** wire the two missing legs — (1) an operator/authority control-plane that *receives* the escalation and issues a
+`RecoveryAuthorization` (the authority key already configurable via `with_recovery_authority`, `beacon.rs:150`), and (2)
+a production frame handler that *consumes* a delivered RGC via `rebootstrap`. Until both land, below-threshold "recovery"
+is detection + logging + a manual operator runbook — not autonomous recovery. (This is a *narrower, fairer* framing than
+"recovery is broken": the design deliberately keeps a human/authority in the below-threshold loop for fork-safety; the
+gap is that the two ends of that loop have no production wiring.)
+
+### §4.3 [Context] Empirical result — the freeze is survivable for *transient* loss (§6, P1)
+The simulator experiment (§6) shows that when the crashed anchors **return** (churn-rejoin, shares intact), the beacon
+engine **does resume** the clock (`None,None → Epoch 3,4`). So the freeze is permanent only for *permanent* loss; a
+transient mass-outage self-heals at the engine level once `≥ threshold` anchors are back. **Caveat (R-H1):** the sim
+models one occupant per coordinate, so a returning identity always reclaims its exact slot+share; on a real network the
+membership/identity layer (stale entries, coordinate collisions, VRF reshuffle to a new coord, lost shares) may block
+the right nodes from returning to the right slots. That membership-reintegration layer remains the open reliability
+question for the returning-node case.
+
+### §4.4 Net #1-priority verdict
+Instantaneous permanent ≥`n−t+1` loss → **still a permanent freeze** (no auto-recovery); transient loss → self-heals at
+the engine level (good, empirically shown), *if* membership lets nodes return; the auto-trigger is **detect-and-log**,
+not recover. **The four painful-but-correct fixes:** (1) authenticate the reshare trigger (also closes §2.1 residual);
+(2) drive Regime A off membership-thinning, not stall; (3) wire the RGC issue/consume loop for Regime B; (4) close the
+membership-reintegration (R-H1) so returning/new identities reclaim slots safely.
+
+---
+
+## §5. Stream findings (integrated as the parallel streams report)
+
+> The four read-only streams (architecture/DRY, blockchain-core, crypto/keygen/POROS, anonymity/storage) are running.
+> Their detailed `file:line` findings are integrated into the subsections below as each completes. The auditor has
+> pre-verified the load-bearing items above; the streams supply breadth (OBOLOS `O-M*`, SSLE safety, the full anonymity
+> §5 residual set, storage `challenge`/deals-map bounds, and the per-crate DRY census).
+
+### §5.A Architecture / DRY (stream: arch-dry) — INTEGRATED
+
+**[HIGH] The shipped binary runs no blockchain — the whole L-machine is test-only wiring.** `spawn_taxis`
+(`taxis_driver.rs:151`) has **zero production callers** (only the `lib.rs:72` re-export); **`fanos-dromos` and
+`fanos-obolos` are `[dev-dependencies]` of `fanos-node`**, pulled in solely by `tests/dromos_quic.rs`; and the single
+`fanos` binary (`bin/fanos.rs`), `fanos-ffi`, and `fanos-cli` contain **no TAXIS/ledger wiring at all**. So the entire
+platform value-tier (TAXIS/DROMOS/OBOLOS) is exercised only by integration tests — a running `fanos` node cannot be a
+validator. This is the single loudest structural signal of the whole audit and the root of the "engine-ahead,
+driver-behind" pattern at the *product* level. **Fix:** promote `dromos`/`obolos` to real deps, add a config-gated
+validator role in `bin/fanos.rs` that instantiates `spawn_taxis::<F, HybridLedger>`, and expose it through `fanos-ffi`.
+
+**[HIGH] Three divergent Merkle implementations with incompatible rules + proof formats.** `thesauros/content.rs:88-113`
+(lone odd node **promoted** unchanged; proofs = `MerkleStep{sibling, sibling_on_right}`), `taxis/crosscell.rs:96-158`
+(odd tail **duplicated**; proofs = index-parity `Vec<[u8;32]>`), `vrf/pqvrf.rs:61-140` (perfect `2^h` tree). Same abstract
+structure, three dialects — and `crosscell`'s duplicate-last rule is the **CVE-2012-2459** ambiguity class unless the leaf
+count is externally bound (flagged to the correctness stream). `obolos/tree.rs` (incremental frontier) is a genuinely
+different structure — rightly separate. Positive: `taxis/committee.rs`+`block.rs` already **reuse** `pqvrf::MerkleProof`
+for the SSLE ticket path — that seam is clean. **Fix:** one `merkle` module in `fanos-primitives` (domain-separated via
+`hash_labeled`, one odd-rule, one proof type); thesauros + crosscell adopt; pqvrf reuses as the perfect-tree case.
+
+**[HIGH] Wire bifurcation — three serialization dialects; the ledger layer bypasses `fanos-wire` entirely.**
+`#[derive(Wire)]` is used in only **9** crates; **21 crates hand-roll big-endian, 20 little-endian, 12 mix both** (taxis
+alone: 10 BE files + 1 LE + 3 derive). **Zero `fanos-wire` usage** in the consensus-critical app crates: `obolos/codec`,
+`dromos/{naming,token,storage,hermes}`, `hermes/htlc`, `thesauros/{por,content,market}`, `angelos` (8 files),
+`incentives`, `onoma`. This contradicts `primitives/epoch.rs`'s own "one canonical wire width" doctrine (audit A3). The
+encodings **aren't consensus-frozen yet — the window to unify is now.** **Fix:** `#[derive(Wire)]` across the ledger
+crates, or at minimum the shared `Reader` + one endianness. (This is the same root as the §3.1 bounded-reader finding,
+at larger scale.)
+
+**[HIGH] `fanos-runtime` is one 3,870-line file.** The crate is `lib.rs` + `overlay.rs`, and the `OverlayNode`
+decomposition **already exists at the type level** (`Config`, `Store`, `Router`, `Membership`, `Healer`, the 15-field
+`OverlayNode` struct, the `Engine` impl — all in that one file); only the module split never happened. **Fix:**
+mechanical split into `store/router/membership/healer/hier/node.rs`, `lib.rs` re-exports, **zero API change**. Next-worst
+cohesive-but-big files: `quic/driver.rs` (1936), `dromos/hybrid.rs` (1530), `taxis/consensus.rs` (1432),
+`aphantos/threshold_router.rs` (1317), `keygen/beacon.rs` (1254). (`fanos-sim`'s 13.5k = 2.1k src + 11.2k *test
+scenarios* — intended per the SecOps directive, not a smell — which revises my earlier "god-crate" note on sim; the
+real god-object is `runtime/overlay.rs` and `fanos-node`.)
+
+**[MED] Threshold KEM-seal hosted in the anonymity crate ⇒ consensus depends on the onion router.** `taxis/tx.rs:15` +
+`keyper.rs:30` import `ThresholdSealed`/`ThresholdError` from `fanos-aphantos` (whose `threshold.rs` 858 ln + `sealed.rs`
+523 ln are general threshold-KEM machinery inside the 4.5k routing crate). **This is the one questionable edge in an
+otherwise clean graph.** **Fix:** extract `threshold.rs`+`sealed.rs` into a low-layer crate (`fanos-threshold`, or into
+`fanos-pqcrypto`); aphantos and taxis both import it.
+
+**[MED] POROS protocol engine lives inside the integrator crate.** `node/poros.rs` (1,039 ln) is a full sans-I/O ingress
+engine + 11 hand-rolled codec fns *inside `fanos-node`*, while every sibling engine has its own crate (`keygen::BeaconNode`,
+calypso hosting, aphantos). **Fix:** move engine+codec to a protocol crate; node keeps only the tokio driver.
+
+**[MED] No shared bounded-collection type — every subsystem hand-rolls cap+eviction.** `keygen/beacon.rs:45,50,254,634`,
+`taxis/consensus.rs:48,56,1195`, plus maps in `dromos/hybrid.rs`, `quic/driver.rs`, `diaulos/conn.rs`. The historical
+"OOM cluster" is exactly missed instances of this. **Fix:** one `BoundedMap` with explicit insert policies
+(reject-new / evict-oldest / evict-terminal) — makes the OOM bug class unconstructible.
+
+**[MED] Additional dead/unwired public APIs (beyond DROMOS/telemetry/POROS-driver already logged):**
+- **Hierarchy SEND API is test-only** — `runtime/overlay.rs:1584-1608` (`learn_hier_peer`/`hier_next_hop`/`send_hier`):
+  RouteHier *forwarding* is wired engine-internally, but the only *initiators* are `sim/tests/hier_poisoning.rs`.
+- **`fanos-angelos` (2,290 ln) has zero consumers outside its own tests** — no node driver, no FFI surface. A product
+  with no socket. (Matches memory [[angelos-messenger]]: the crypto is done; the wiring isn't.)
+- **`spawn_self_organization`** (`node/role_loop.rs:165`) — **zero callers anywhere** (R-H2 actuation still unwired).
+- **`CoherenceFrame::privatize`** — test-only callers; telemetry leaves via `DiagGossip` without crossing the DP export
+  boundary, so the ε-guarantee is decorative (corroborates §7.3).
+- **Stale backlog:** `StorageAddress` matches nothing in the workspace — storage addressing is thesauros `Cid`
+  end-to-end; the backlog item names a non-existent type (drop it).
+
+**[LOW] Four identical copies of `fn encode(ty: FrameType, body: &[u8])`** (`keygen/beacon.rs:685`,
+`runtime/overlay.rs:2689`, `node/poros.rs`, `node/threshold_service.rs`) → a `FrameType`-accepting `encode_frame` in
+`fanos-wire`, delete all four. **[LOW] `SplitMix64` ×7** (2 legit no_std/sim, 5 test copies) → expose once from
+primitives/testkit. **[LOW] `generation` is a bare `u64`** across keygen/node recovery frames while `epoch` got the A3
+newtype — same truncation-risk class → a `Generation` newtype beside `Epoch`.
+
+**Crypto-wrapper verdict — mostly EXEMPLARY (do-not-regress):** `hash_labeled` (one home, ~40 consumers, zero re-wraps),
+AEAD (primitives `aead` feature is the *only* AEAD dep), Shamir (primitives only), Lagrange-at-zero (`vrf/vss.rs:302`),
+`NodeId` (pqcrypto imports from primitives — the don't-duplicate directive **holds**), KEM/sig (pqcrypto only). The
+VRF/beacon three-layer split (primitives no_std reference → fanos-vrf ristretto production → keygen networked engine) is
+**deliberate and documented, not duplication**. The Epoch newtype is the model A3 closure. **The only crypto-reuse
+defects are the Merkle triplication + the `ThresholdSealed` placement above.**
+
+**Dependency-graph shape:** a clean **5-layer DAG, no cycles**. High fan-in on `field/geometry/wire/primitives/pqcrypto`
+is an appropriate platform base. Apparent inversions dissolve on inspection (`quic→runtime` is the sans-I/O host pattern;
+`primitives→wire` is optional+feature-gated; `observatory→sim` is feature-gated §3.3). **Exactly one bad edge:**
+`taxis→aphantos` (above). The loudest signal is `dromos`/`obolos` as **dev-deps** of `fanos-node` (the test-only chain,
+finding #1).
+
+**Top 5 DRY wins (arch-dry):** (1) unify ledger serialization on `Wire`/`derive(Wire)` — ~25 files of bespoke
+length-prefix logic deleted; (2) one Merkle in primitives — kills the thesauros/crosscell divergence + an ambiguity
+class; (3) one `BoundedMap` — makes the OOM class unconstructible; (4) fold the three allocation-bound variants
+(`obolos:308`, `checkpoint:171`, `por:201`) into the shared `Reader`; (5) `encode(ty,body)` ×4 + `SplitMix64` ×5 →
+one wire helper + one primitives home.
+
+### §5.B Blockchain core: TAXIS / DROMOS / ledger / SSLE (stream: chain-core) — INTEGRATED
+
+**[HIGH] Round-timeout livelock on large blocks under CPU load (resolves the pass-1 §3.9 mystery, with the correct root
+cause).** `taxis_driver.rs:46-50,266` + the consensus ordering path. Chain-core **ran `dromos_quic`**: it **passes in
+isolation (8.56 s)** but **livelocks under CPU load** — reproduced deterministically via a block-size sweep (empty→h13,
+3.5KB→h10, 7KB→h4, 10.6KB→h1, 13KB→h0 in 19 s): per-height latency is **superlinear in block bytes**. Root cause:
+`TIMEOUT_PERIOD=1500 ms` is **wall-clock**, and under `(cores+2)` contention the per-height cost — erasure `da_shards()`
+(~4.4 ms) **recomputed per-propose at `taxis_driver.rs:266` *and again* in `verify_structure`**, `reconstruct_payload`
+(~5.8 ms), plus the ML-DSA cascade over propose + ~6 prepares + ~6 commits + reveals — **exceeds 1500 ms**, so every round
+times out and re-proposes → livelock, total cell halt, no self-recovery while load persists. **Safety is never violated
+(no fork).** **The pass-1 §3.9 root-cause hypothesis (T-H1 reveal re-gossip / B1 reveal-auth) was WRONG** — the reveal
+fixes work; the stall is in **ordering under load, before any reveal**. **Fix:** cache `da_shards` on the `Block`
+(the proposer already computed them — don't re-encode on receive) + an adaptive/larger round timeout + cap block payload
+bytes.
+
+**[MED] Slashing & rewards emitted but never applied (T-H5).** `taxis_driver.rs:321-326`: `Output::Slash`/`Reward`
+become `TaxisEvent`s only — **no stake/balance mutation**, and there is **no bonded-stake state anywhere** in
+TAXIS/DROMOS to slash (`storage.rs:8` "No bond, no staking"; `HybridLedger` has no stake map). Equivocation costs the
+attacker nothing on-chain; the Nash equilibrium (`incentive.rs`) is proven abstractly but **unenforced**. **This connects
+to the spec-coherence "staking contradiction" (§7.5):** the platform simultaneously says stake secures the substrate
+(`platform.md §1.2 L→O`) and forbids capital staking (`§7`), and the code lands on "no stake state at all" — so slashing
+has nothing to bite. **Fix:** add a bonded-stake sub-ledger + apply Slash/Reward into executed state (and reconcile the
+spec).
+
+**[MED] DA not independently sampled (T-H4).** `taxis_driver.rs:266`: the driver feeds the engine the **proposer's own
+full shard set** (`b.da_shards().map(Some)`), so `reconstruct_payload` checks proposer-supplied data, not network
+samples. A proposer that gossips a full block to its target validator defeats DA sampling (acknowledged in-code at
+`:20-22`). The §6.3/§L4.3 DA guarantee is not live on the consensus path. **Fix:** sample shards from peers, not from the
+proposer's attachment.
+
+**[LOW] T-H2 no explicit unlock rule** (`consensus.rs:1028,1423`): `locked_block` clears only on finalize/sync, no
+unlock-on-higher-prepared-cert; advances via re-lock on each new prepared cert, so not currently wedge-able (partition MC
+passes) — theoretical residual. **T-H3 keyper censorship: bounded/OK** (`incentive::can_permanently_censor` false within
+`f`; machine-checked).
+
+**SSLE secret-leader election — SAFE & live, does NOT break BFT (CONFIRMED, corroborating the auditor's preliminary
+read).** No two leaders can both drive a commit at one height/view: the min-ticket only changes **which** block an honest
+validator PREPAREs; each still sends **≤1 PREPARE per `(height,round)`** (`sent_prepare` idempotence,
+`consensus.rs:900,912`), so quorum-intersection is untouched — two conflicting prepared certs would need >7 prepares from
+7 validators. Split round-0 prepares only waste a view → round-1 public fallback (a **liveness** cost, not a fork); the
+`ssle_..._never_fork` Monte-Carlo (24 Byzantine + async trials) passes. The ticket is **unpredictable & non-grindable**:
+`H(vrf_output‖SEED‖height‖round)` with `vrf_output` a **Merkle-VRF/iVRF (RFC-9381 full uniqueness)**, root pre-registered
+before the beacon (`pqvrf.rs:16` — one leaf per epoch, no argmin grind, unlike `H(ML-DSA-sig)`), the unbiasable SEED
+blocking pre-aiming; `verify_witness` pins `index = height − base` and `root = roots[proposer]`
+(`consensus.rs:795-802`). The collection window is bounded (`COLLECT_WINDOW_TICKS=1` + all-members early-exit +
+never-empty-when-open + an independent round-timeout backstop) → no wedge of its own (it shares only the HIGH-1 load
+fragility). **Verdict: the SSLE addition is architecturally sound and does not regress consensus safety.**
+
+**§3.4 — FIXED.** Non-zero floors are present at the right layer (`hybrid.rs`, the open/lock sites, not `token.rs`):
+`lock_htlc` rejects `amount==0` (`:133`); `open_deal` rejects `price==0` and requires `payment.amount==price`
+(`:276-294`). Terminal-state pruning is present + deterministic: `finalize_lapsed_deals` retains only `Active` (`:390`),
+`begin_block` retains only `Locked` HTLCs (`:593`). Map growth now costs refundable locked capital, self-pruned on lapse.
+
+**§3.7 — FIXED (access lists complete).** Chain-core audited **every** `hybrid.rs` access list against the keys each tag
+actually writes — all are conservative supersets, and **`TREASURY` is now declared for the shielded-fee case**
+(`hybrid.rs:468`, the pass-1 fix). TAG_TRANSPARENT/SHIELDED/NAME/SHIELD/STORAGE(Open/Prove/Close)/HTLC(Lock/Claim/Refund)
+all check out; conditional party keys are omitted only when the op fails and writes nothing; same-block pending
+deals/htlcs are tracked in the `access_lists` forward pass. Scheduler determinism (BTreeMap/BTreeSet, no clock/thread
+leak) + serial-equivalence verified. **So the §3.7 latent-fork risk is closed at the declaration level** — the DROMOS
+scheduler is still unwired (§7.2), but wiring it live no longer forks on the TREASURY omission.
+
+**T-M1..M4 cross-cell:** not deep-dived by chain-core (surface read only) — flagged as **not covered** this pass.
+
+### §5.C Anonymity + storage (stream: anon-storage) — INTEGRATED
+
+**Anonymity headline-path verdict: `.fanos` NO, clearnet TCP NO, clearnet UDP NO** — end-to-end anonymity does not work
+today, but **not because of a client-side leak** (those are fixed): because **nothing hosts the service side of the
+rendezvous**. The Direct profile works but reveals the client coordinate (the CLI says so honestly).
+
+**Major good news — the prior-audit §5 client-side leaks are ALL fixed** (verified by the stream at `file:line`):
+- **S1-C1(a) UDP clearnet — FIXED:** `dial_udp` now routes through `establish` (`diaulos.rs:512`), shared with TCP.
+- **S1-H1 cover-from-startup — FIXED:** `cell_node.rs:181-185` forwards `StartHeartbeat` to the relay router, and
+  production builds it `.with_cover(cover_interval)` (`node.rs:480`).
+- **S1-M2 proxy epoch-pinning — FIXED:** `Node::live_beacon()` (`node.rs:553`) exposes `(epoch,beacon)`, consumed by
+  `build_proxy_dialer` (`fanos.rs:401-403`).
+- **S1-H3 cookie correlator — SUPERSEDED by NOSTOS:** production dial uses a dead-drop reply (`reply_keys.open` +
+  `select_drop_line`), no relay registration, no SURB; the client coordinate never leaves the node.
+- **S1-M1 holonomy on the peel path — FIXED:** `circuit_line_holonomy` keyed MAC verified on `Deliver`
+  (`threshold.rs:295,322-325`).
+
+**[CRITICAL — anonymity] No production node completes an anonymous session end-to-end.** The client-side stack is
+correct and fully wired (§5.C good-news above) — `FanosDialer::anonymous_dial` computes `meeting = meeting_line(exit_public)`
+(`rendezvous.rs:261`) and rides threshold onions there via `Command::Emit` (`rendezvous.rs:122`) — **but there is no
+anonymous endpoint to answer it, so the dial hangs to timeout.** Three disjoint host situations, none of which serves the
+anonymous client (exact chain, confirmed by the anonymity stream):
+1. **The clearnet exit is Direct-served, not anonymous.** `spawn_exit_role` → `serve_exit` (`node.rs:301` → `exit.rs:102`)
+   runs the **Direct `serve` loop**, which dispatches on `Notification::Delivered{from}` at the node's **own coordinate**
+   (`diaulos.rs:143-144`); neither `exit.rs` nor the exit role references `meeting_line`/`RendezvousService` — the exit
+   publishes its key and is **dialed by coordinate** (`spawn_exit_publisher`, `exit.rs:331`). So onions aimed at
+   `meeting_line(exit_public)` reach no endpoint.
+2. **The generic anonymous `.fanos` rendezvous has no production host** — `RendezvousService::new` exists only in
+   `tests/anonymous_quic.rs:264,370` + a calypso TODO.
+3. **The hosted CALYPSO `ThresholdService` (`node.rs:498`) is a *different, client-less, reply-unwired* protocol** and
+   does **not** rescue it: (a) it ingests `FrameType::RdvIntro` carrying a `SealedIntro` (CALYPSO threshold-decrypt,
+   `threshold_service.rs:245`, `service_node.rs:72`) — a **disjoint frame vocabulary** from the client's DIAULOS
+   `ClientSession`-over-onions, so it can't answer it; (b) **no production client** builds a `SealedIntro`/`RdvIntro`
+   (`intro_frame` `threshold_service.rs:268` + `SealedIntro::seal` have **zero production callers**); (c) **no reply
+   last-mile** — `ThresholdService` only surfaces the request as `Notification::Delivered{from: ANONYMOUS}`
+   (`threshold_service.rs:217-220`) and its docs say "reply sealing is the application's" (`:28-30`); that application
+   loop (consume → drive session → `seal_reply`) is the **test-only** `anonymous_service` (`tests/anonymous_quic.rs:169-229`).
+
+So the client-side anonymity machinery is entirely wasted for lack of a server. **Design decision required:** the meeting
+combiner `combiner_for(meeting_line(service_public))` is a function of the **key, not the node's coordinate**, so a
+service is generally **not** at its own meeting combiner (the test cheats by placing the node at `nodes[l_index]`).
+Production needs either a `RendezvousRelay` at the meeting-combiner coord that forwards peeled `Deliver` payloads to a
+registered service, **or** service anchoring at that coord, re-registered each epoch (the meeting line rotates with the
+beacon). **Fix:** port `tests/anonymous_quic.rs::anonymous_service` (169-229) into `src` as a production `serve_anonymous`
++ an anonymous `serve_exit`, wire into `spawn_exit_role` (`node.rs:301`), and add a hidden-service CLI verb
+(`bin/fanos.rs` has only node/proxy/vpn/id/beacon-deal/resolve).
+
+**[HIGH] POROS ingress: identity-binding `from == req.requester` unenforced.** `on_request` (`poros.rs:625`) checks
+PoW+Sybil on `req.requester` (a frame-body field) but never against the arriving transport `from`; `IngressNode::step`
+(`ingress_node.rs:104-111`) routes by frame-type only and drops `from` (the host's own doc at `poros.rs:161-163` says the
+caller MUST check). **Trigger:** anyone sends a `PorosRequest` claiming an arbitrary requester coord with a self-ground
+PoW (PoW is public) → amplified DoS (each forged request opens a gather, fans `PorosShareReq` to all `q+1`, fills the
+`pending` cap of 256) + breaks the "non-transferable identity-bound" property censorship-resistance rests on.
+**Bounded:** the response is sent `to: requester` (`:690`), **not** to the forger, so the descriptor bucket is **not
+disclosed** — DoS + invariant break, not leakage. POROS is **not deployed** (only tests construct it), so latent — but
+must be fixed before the ingress role ships. **Fix:** decode `PorosRequest` in `ingress_node.rs:104` and drop unless
+`req.requester == from`.
+
+**[MED] 3-member anonymity set in the F2 base cell (S1-M4).** `nostos.rs:78` + all rendezvous pinned to `F2` (q=2) →
+receiver hidden 1-of-3, meeting line 3 members. Not a leak (the construction is sound) but weak vs a cell-local
+adversary. Fix is **compositional** (multi-cell / larger planes for sensitive traffic), not a point patch; document
+per-cell anonymity-set size as first-class.
+
+**[MED] Unauthenticated mix-key store slots → liveness-fault DoS (S1-M3).** `publish_mix_key` (`mixdir.rs:50`) writes
+onion keys to `mix-key/coord/epoch` without slot-owner authentication (`mixdir.rs:16-19` admits it), and
+`require_self_certified_membership` (`overlay.rs:166`) is false-by-default + gates membership not slot ownership.
+**Trigger:** overwrite the 7 cell coords' key slots each epoch. **Not deanonymization** (a forged key only makes that
+member unable to peel → the circuit re-draws with `t` genuine members) but **perpetual forced liveness faults** degrade
+the anon path. **Fix:** bind the published mix key to its cert-derived coord (reject the `put` unless the writer identity
+hashes to `coord`), the hardening `mixdir.rs:19` already names.
+
+**[LOW/MED] Threshold-onion `ct_len` hop-position leak (S1-M6).** Documented + transport-mitigated (`threshold.rs:83-104`);
+packet size is constant (`THRESHOLD_ONION_LEN=20480`) so a passive net observer sees nothing, but the per-layer
+`ct_len`/`members` header is cleartext (`threshold.rs:234,255`), so a **peeling relay** learns its hop position/depth
+(a traffic-analysis aid, not next-hop identity — below-threshold ZK + holonomy still hold). Relies entirely on QUIC for
+observer-hiding. **Optional fix:** flat-header Sphinx-style per-layer length encryption.
+
+**NOSTOS / POROS / T4 are in CODE with tests, not docs-only** (verified): NOSTOS (`nostos.rs` — `select_drop_line`,
+`seal_to_receiver`/`ReplyKeys`, `seal_reply`, tested for receiver-only open + below-threshold ZK + the pairwise-meet
+trap); POROS (ingress line, identity-bound non-transferable PoW, threshold-sharded descriptor + sealed resharing, Sybil
+cap composed with PoW); T4 Anytrust-escape (`nyx/security.rs` — `chernoff_break_bound` + `kl_divergence`, tested that the
+bound dominates the exact combinatorial tail). These are analysis/claim-validating functions of the right shape, not
+runtime mechanisms.
+
+**Storage:** §3.3 **FIXED** (the `challenge`/`open_deal` caps the auditor deferred are present: `challenge` clamps
+leaves+`k` to `MAX_AUDIT_LEAVES=1<<20` at `por.rs:74-75`; `open_deal` bounds `size≤MAX_DEAL_SIZE`, `k≠0`,
+`duration≤MAX_DEAL_DURATION`, `price≠0` at `hybrid.rs:276-284`). §3.5 **FIXED**. **§3.6 residual CONFIRMED (the auditor's
+instinct was right):** the leaf encoding did **not** become provider-unique — `seal_object` (`object.rs:41`) seals under
+the *object's* fresh key, and leaves are content-addressed ciphertext replicated across the `[7,3,4]` cell. The only
+change was the fresh per-epoch `ProverAuth`, which binds the **payee** (provider key) + response but **not the holder**.
+So a provider that deleted its copy can still fetch the leaves from a sibling replica, produce the response, sign, and
+collect — **proving access, not possession.** Because the data stays retrievable cell-wide, this is an **intra-cell
+free-rider nuance (downgrade to LOW)**, not a durability/possession break — but the property is genuinely still open.
+**Full fix:** encode leaves under a provider-unique key so only the designated holder can answer.
+
+### §5.D Crypto / keygen / POROS (stream: crypto-keygen) — INTEGRATED
+Stream corroborated §2.1 (§3.1 CRITICAL, with the 2-coalition exploit + `beacon.rs:1251` test evidence — now folded into
+§2.1), §2.2 (§3.2 fixed, with a hand re-derivation: ternary `r` ⇒ `A₁·r ≤ 2⁶⁹ ≪ i128`, and the recomputed
+`r_balance ∈ [−1021,1021] ⇒ ≤ 2⁷⁹`), and §4 (StallDetector correct; RGC path sound). Tests run green: `fanos-obolos`
+37/37, `fanos-keygen` 19/19, `fanos-primitives::shamir` 9/9. New finding:
+
+**[HIGH → live-when-the-driver-lands] §5.D-1 — POROS descriptor-reshare accepts forged, unverified contributions.**
+The POROS/CALYPSO reshare is raw Shamir over GF(256) with **no commitment/verifiability** and the wired receive path
+authenticates nothing. Three compounding gaps:
+- **(a) forged sender/`old_x`:** dispatch `poros.rs:727-728` decodes `(epoch, old_x, sealed)` and calls
+  `self.on_reshare(epoch, old_x, &sealed)` **without the transport `from`**; `on_reshare` (`:583`) never checks that
+  `from` is the old-line member at `old_x`, and `old_x` is pure wire data (`decode_reshare`, `:760`).
+- **(b) no binding verification:** `on_reshare` opens the sealed sub-share (`:594`) and combines via
+  `combine_descriptor_reshares → combine_reshares → shamir::combine_contributions` (`shamir.rs:204`) — a blind Lagrange
+  sum with **zero check** that each contribution is a correct re-split of old member `old_x`'s real share. No
+  Feldman/Pedersen anywhere in `fanos-primitives::shamir` or `fanos-calypso::hosting`. (Contrast: the *beacon* reshare
+  *does* verify — `verify_reshare_commit` + `verify_share` + self-check — and would refuse to adopt.)
+- **(c) first-writer-wins gather:** `ctx.gather.entry(old_x).or_insert(sub)` (`:597`).
+
+> **Trigger:** a new-line member `V` publishes its KEM key in the roster (`hosting.rs:352`). After `V` calls
+> `begin_rotation` (`:574`), any unprivileged remote node (need **not** be an old-line member) seals garbage to `V`'s
+> published key and floods `PorosReshare` frames for `old_x ∈ {1..threshold}`, beating the honest members
+> (`PorosReshare` has no PoW/rate-limit, unlike `PorosRequest` at `:627`). `open_service_share` succeeds (genuinely
+> sealed to `V`), garbage is gathered, and once `gather.len() ≥ threshold` `V` combines and **adopts** a share on a
+> polynomial `H′` with `H′(0) ≠ descriptor` (`:606-609`). **Consequence:** one remote node corrupts any new-line
+> member's rotated share → the new line cannot reconstruct the ingress descriptor → **POROS ingress DoS** for that epoch,
+> defeating the `t`-of-`(q+1)` fault tolerance the design claims (confidentiality is preserved — sealing holds — so this
+> is a *DoS/integrity* break, not exfil).
+
+**This is latent only because the rotation *trigger* driver is unwired (§7.1) — but the receive/dispatch path IS wired,
+so it becomes live the instant §7.1 lands.** The engine test (`poros.rs:1185`) covers only the honest path + a stale-epoch
+drop; forged-`old_x` / garbage-sub-share / first-writer poisoning are untested. **Fix:** (1) pass `from` into
+`on_reshare` and require `from == old_line_coord_for(old_x)` (the beacon-derived `ingress_line(community, prev_epoch,
+beacon)`, same derivation `begin_rotation` uses); (2) add verifiable resharing — a hash-based vector commitment over the
+evaluations (there is no group in GF(256)) or lift descriptor custody to the Ristretto VSS the beacon already uses, and
+verify each opened sub-share against it before combining; (3) floor `new_threshold ≥ 2` in `emit_reshare`/
+`shard_service_key` (`poros.rs:544`, `hosting.rs:62`) — `shamir::split` only rejects 0, so `threshold=1` gives degree-0
+= every new member reconstructs the descriptor alone (same class as the beacon exfil).
+
+**POROS resharing verdict: NOT production-safe.** The CHURP continuity *algebra* is correct
+(`H(0)=Σλₖ·f(old_xₖ)=f(0)=S`) and KEM-sealing correctly protects sub-share **confidentiality** in transit — but it is
+"CHURP-style" in name only: it **omits CHURP's entire verification layer** (unauthenticated trigger + unverified
+contributions). The `hosting.rs:20-34` "dealt-and-sealed not DKG" justification holds for *bootstrap* (one trusted
+operator-dealer) but **explicitly does not cover resharing**, whose dealers are the mutually-distrusting old-line members
+— exactly the adversarial-dealer case that needs verifiability. Proactive-security refresh holds only if old shares are
+erased each epoch: `Share` is `ZeroizeOnDrop` (`shamir.rs:64-70`), but the (unbuilt) driver must actually drop old shares
+on rotation — **a driver requirement to flag.**
+
+**[HIGH — NEW, latent] §5.D-2 — the ShieldedProof relation omits `public_recipient` → fund-redirection landmine.**
+`fanos-obolos/src/tx.rs`: `TransparentProof::verify` (`:124-191`) **never references `tx.public_recipient`** (field at
+`:70`). It binds `public_value` in the balance term (`:190`) but **not who receives it**. `public_recipient` is
+transmitted (`codec.rs:208,234`) and committed into the tx, but the *proof relation* — the statement the ZK backend must
+mirror — omits it. **Trigger:** for an unshield (`public_value > 0`), an attacker copies the victim's public tx fields +
+proof, swaps `public_recipient` to its own account, and rebroadcasts; `verify` still passes (recomputed `balance_r` is
+unchanged; `public_recipient` isn't in the relation). Both txs share the nullifiers → whichever consensus orders first
+wins, the victim's original is rejected as a double-spend, and **the unshielded funds are redirected to the attacker
+(theft).** **Not exploitable today** — unshield-crediting is unbuilt (`fanos-dromos/src/bridge.rs:17` "every (future)
+unshield debits"), but it becomes **live theft the instant the ledger reads `tx.public_recipient` to credit an unshield.**
+**Fix:** fold `public_recipient` into the proof relation (a bound message in `verify` + the pinned ZK statement), or bind
+it under an outer sender signature over the full tx before any crediting. **Must be closed before unshield-crediting is
+wired.**
+
+**[MED — NEW] §5.D-3 — the O-H2 nonce-hygiene fix was not propagated to the calypso sealing layer.**
+`fanos-calypso/src/hosting.rs:164-183` `seal_share_to_member` derives **both** the KEM-encapsulation RNG
+(`SeedRng::from_seed(member_seed)`) **and** the AEAD nonce (`derive_nonce(label, member_seed)`) deterministically from
+`member_seed`, and the AEAD key `= H(label‖session)` is likewise a deterministic function of it — so `(key, nonce)` is a
+pure function of `(label, member_seed)`, with `member_seed = kem_seed ‖ i`. **If a caller reuses `kem_seed`** across two
+seals of different plaintexts (two deals, a retried reshare, or `seal_reshare_contribution` `poros.rs:281` with a
+repeated seed), member `i` gets identical `(key, nonce)` over different data → **ChaCha20-Poly1305 two-time-pad** (leaks
+the XOR of two Shamir sub-shares) + Poly1305 forgery. The O-H2 fix switched `fanos-obolos/note_cipher.rs:98` to a live
+`&mut CryptoRng`; **the same pattern persists un-hardened in every calypso sealer** (`deal_service_key`,
+`SealedIntro::seal`, `seal_reshare_contribution`), enforced only by caller discipline. **Fix:** mirror O-H2 — take a live
+`CryptoRng` for the KEM encapsulation (fresh per seal), or bind a fresh per-seal salt into `member_seed`; add a
+debug-assert / doc contract that `kem_seed` is single-use.
+
+**[MED ×4] O-M1–O-M4 — all STILL OPEN (verified unchanged):**
+- **O-M1** — nullifier `= H(nsk‖cm)`, **not** `PRF(nsk, position)` (`nullifier.rs:37-42`, `note.rs:72-73`): two leaves
+  with identical `cm` share one nullifier ⇒ only one is spendable (spend-lock), bound solely to `rho` uniqueness. **Fix:**
+  bind the nullifier to the note's tree position (Zcash-Orchard).
+- **O-M2** — the anchor set is **insert-only unbounded** (`state.rs:54,197`), folded into `state_root` ⇒ grows forever =
+  state-bloat DoS. **Fix:** a rolling window of the last N roots.
+- **O-M3** — **collapsed key hierarchy**: one `nsk` is both owner-authority and nullifier key, and the proof **reveals
+  `nsk`** (`tx.rs:95`) ⇒ no viewing-key-only capability, so the `platform.md §4.5` selective-disclosure option is
+  impossible without full spend authority. **Fix:** split into (spend, nullifier, incoming-viewing) keys (Sapling/Orchard).
+- **O-M4** — **stealth addresses unimplemented**: `derive_owner_pk` is a *static* per-recipient owner (`note.rs:22-25`);
+  the advertised one-time keys don't exist. On-chain unlinkability still holds (hiding commitment + fresh KEM ct), but two
+  spends by one recipient reveal the same `nsk` in the transparent proof ⇒ **linkable-on-spend**. **Fix:** implement the
+  KEM-derived per-payment owner key, or stop advertising it in the docs.
+
+**StallDetector wiring — CONFIRMED sound (this closes the §4.1 open question).** The crypto stream traced the full path:
+beacon emits `Effect::Notify(BeaconReady)` (`beacon.rs:330`) → effect pump `notify_tx.send` (`driver.rs:1039-1040`) →
+forwarder `events_tx.send` (`:546`) → `client.subscribe()` (`:499`) → watcher `on_note` (`node.rs:252,260,182`). **So
+`BeaconReady` does reach `on_note`; there is no delivery gap** (the only caveat is a >4096-deep broadcast backlog →
+`Lagged`, unrealistic). Therefore §4.1 is purely the `on_tick` **gate** composing a correct detector with a decision
+function that routes the frozen state to Regime B — the architectural defect stands, and it is *not* a detector bug.
+
+**OBOLOS still-sound (do-not-regress), re-verified by the stream:** O-C1 inflation cap (`MAX_NOTES_PER_TX=1021`, the
+`D∈(−Q,Q) ∧ D≡0 ⇒ D=0` integer argument, enforced on the apply path `state.rs:187`); O-C2 value-bound re-randomization;
+O-H1 fee conservation (`verify_balance`, `tx.rs:190`); O-H2 fresh seal key+nonce *in obolos*; hybrid signature checks
+Ed25519 **and** ML-DSA-65 (no PQ downgrade); the ShieldedProof seam binds every field **except** `public_recipient`
+(§5.D-2); the *beacon* reshare sub-share verifiability (`verify_reshare_commit`/`verify_share`, `vss.rs`) that the POROS
+path lacks.
+
+---
+
+## §6. Simulator experiments (auditor-run, empirical)
+
+Two experiments were driven through `fanos-sim` on the pinned tree (temporary test, since removed; results reproduced
+2/2). They validate the #1-priority claims *empirically*, not just by code-reading.
+
+**P1 — returning-node recovery.** A `4-of-7` beacon cell; crash 4 anchors (below threshold), then `recover()` them.
+```
+after mass-loss:  tick = None, None          # R-C1 freeze reproduced
+after return:     tick = Some(Epoch 3), Some(Epoch 4)   # clock RESTARTS
+```
+→ the beacon engine **self-heals on churn-rejoin**; the freeze is permanent only for permanent loss (see §4.3 caveat).
+
+**P2 — malicious `t'=1` reshare (the §3.1 shape).** Inject
+`reshare_trigger(gen=1, new_threshold=1, contributors=[1,2,3,4], new_indices=[7])`:
+```
+after malicious reshare:  tick = Some(Epoch 3), Some(Epoch 4)   # clock UNDISTURBED
+```
+→ the `MIN_RESHARE_THRESHOLD=2` floor **rejects** the exfiltration-shaped trigger; the beacon is unaffected —
+empirical confirmation of the §2.1 fix.
+
+**Simulator-as-platform note.** The `fanos-sim-experiment` CLI is real but registers **only one** scenario
+(`diakrisis-resilience`, `bin/experiment.rs:76`); the crown-jewel adversarial scenarios remain siloed in per-crate
+`tests/*.rs`. The `Sim` API is capable (`tick_epoch` drives the real DVRF clock; `observe_frames` gives a GPA tape;
+`crash`/`recover`/`partition`/`heal`), but the R-H1 membership-lockout class **cannot be expressed** (one occupant per
+coordinate), which is exactly why P1's returning-node result is optimistic. **Recommendation:** add a multi-occupant
+coordinate model + a `mass_event`/`recover_as` affordance and register the recovery + anonymity-GPA scenarios into the
+experiment CLI, so the #1-priority story is a repeatable experiment, not a bespoke test.
+
+---
+
+## §7. Persistent "engine-ahead, driver-behind" gaps (the meta-pattern, current)
+
+Each item below has a **complete, tested engine/library** and **no production driver** — the recurring pattern, verified
+at `25b0a6f`:
+
+1. **[HIGH] POROS proactive line-rotation — receive path wired *and unverified* (§5.D-1), trigger driver unwired.** The
+   rotation crypto + sans-I/O engine are built and unit-tested, and the **receive/dispatch path is wired** (`IngressNode`
+   routes `PorosReshare=0x5A` → `on_reshare` → gather → adopt). But the **trigger** side —
+   `emit_reshare`/`begin_rotation` — has **only `#[cfg(test)]` callers** (`poros.rs:1189-1251`): no production driver
+   triggers rotation at an epoch boundary or discovers the new line's KEM keys (the commit message's own residual:
+   *"the remaining reshare work is now only the driver loop"*). So a live ingress line **does not rotate its descriptor
+   per epoch** and the CHURP proactive-security property is not achieved end-to-end. **Critically, the wired-but-unverified
+   receive path is the §5.D-1 [HIGH] DoS surface** — so the driver loop **must not** be added without first adding the
+   requester-binding + contribution-verification of §5.D-1, or wiring it converts a latent finding into a live one.
+   **Fix:** add §5.D-1's verification, *then* the epoch-boundary driver loop (+ erase old shares on rotation).
+2. **[MED] DROMOS parallel scheduler — proven, unwired (access lists now complete).** `execute_block` (deterministic +
+   serial-equivalent + double-spend-safe, stochastically tested) has **only test callers**; consensus runs serial
+   `execute → apply` (`consensus.rs:1332`, `chain.rs:106`). Zero throughput benefit today. **The pass-1 §3.7 latent-fork
+   risk is now closed:** chain-core audited **every** `hybrid.rs` access list and confirms all are conservative supersets,
+   with **`TREASURY` now declared** for the shielded-fee case (`hybrid.rs:468`). So wiring the scheduler live no longer
+   forks on that omission — the remaining work is purely dispatching waves onto a thread pool (the reference runs them
+   in index order). **Fix:** wire the scheduler to gain the throughput the "high-speed L1" claim (`platform.md §3`)
+   promises; keep the access-list-completeness discipline as new tags are added.
+3. **[MED] Telemetry differential privacy — built, unwired.** `dp.rs:142 privatize(...)` has **no production caller**
+   (only `tests/`). The DP export path (C7) is not on any live telemetry surface. **Fix:** call `privatize` on the
+   telemetry egress with the configured `PrivacyBudget`.
+4. **[HIGH — spec release-gate] The Γ-viability gate is unbuilt.** `spec/platform.md §9(6)` and §1.3 name a
+   Γ-calculator (`architecture/` companion) computing `P/R/Φ/D` as *the platform's CI-checked release gate* — the
+   analogue of the network's `fanos_verify.py`. **No `architecture/` dir, no calculator, no CI step exists.** The
+   platform's viability verdict (`P≈0.36, R≥1/3, Φ≈1.6, D≥2.3`) remains an honest `[C]` construction over declared
+   budgets (`platform.md:49,284`), never a measurement. This is spec-acknowledged `[P]`, but it is the single largest
+   *architectural-completeness* gap and the only way to make "in the viability window" reproducible.
+5. **[MED] Coherence-layer gaps (re-confirmed, sharpened):** the "staking contradiction" is now concrete — chain-core
+   confirms **there is no bonded-stake state anywhere** (`storage.rs:8` "No bond, no staking"; `HybridLedger` has no stake
+   map), so **slashing/rewards are emitted but have nothing to bite** (T-H5, §5.B), and the "stake read literally"
+   (`platform.md §1.2 L→O`) vs "FANOS forbids capital staking" (`§7`) tension is unresolved *by omission* (no stake at
+   all). Admission is PoW/Sybil-cap only. Also unbuilt: the Ω2 aspect-budgets / Ω9 CALM classes / `SUBJECT_DEPTH_MAX`
+   remain design-only. **Fix:** decide the staking model (add a bonded-stake sub-ledger, or excise slashing and state the
+   PoW-only security budget), then reconcile the spec.
+
+---
+
+## §8. Spec-compliance assessment (`spec/protocol.md`, `spec/platform.md`)
+
+The spec is **exemplary in honesty** — every nontrivial claim carries a `[T]/[C]/[H]/[P]/[И]` tag, and the platform doc
+explicitly flags its own load-bearing risks (§10: the PQ shielded proof `[P]/[H]`, the Γ-numbers as `[C]`, the
+"high-speed L1" as a program). **The implementation does not contradict the spec** — the wiring gaps in §4/§7 are all
+consistent with the spec's `[C]` ("built, not fully live") / `[P]` ("program") tags. The audit's value here is the
+tension between the spec's *permitted staging* and the project's *standing engineering discipline*
+(`no-deferring-implement-fully`, `verified-or-it-doesn't-ship`, `pursue-ultimate-best`): the `[C]→live` and `[P]→built`
+transitions in §4/§7 are precisely the deferred last-miles the discipline says must close.
+
+- `platform.md §9`: *"each lands green (workspace tests + clippy --all-targets -D warnings) before the next."* — **holds
+  at HEAD** (§0). Good.
+- `platform.md §4.3`: the OBOLOS accounting around the `[P]` shielded proof is claimed "verified now" — consistent with
+  the confirmed soundness of O-C1/O-C2 (pass 1) + §3.2 (this pass); the ZK backend is the honest isolated `[P]`.
+- `platform.md §7` THESAUROS PoR `[T]` soundness bound `k ≥ λ·ln2/(−ln(1−f_tol))` — the storage stream should confirm
+  the `challenge` implementation matches this derived `k` (and enforces it as an upper *and* lower bound — pass-1 §3.3's
+  unbounded-`k` arm).
+
+---
+
+## §9. Prioritized remediation queue (for the fixing agent)
+
+**Tier 0 — security: one live CRITICAL + two latent landmines to close before their enabling driver lands**
+1. **§2.1 [CRITICAL] Authenticate the `BeaconReshareTrigger`** (sign it via the existing `HybridVerifier` authority;
+   `beacon.rs:706-727` + `on_reshare_trigger`), and as an unauthenticated fallback change `beacon.rs:386` to
+   `new_threshold < self.threshold` (a reshare may raise/preserve, never lower). Update the `beacon.rs:1251` test. Closes
+   the 2-coalition master-key exfil; the now-live auto-trigger makes it urgent.
+2. **§5.D-2 [HIGH → theft-when-wired] Bind `public_recipient` into the ShieldedProof relation** (`tx.rs` `verify` + the
+   pinned ZK statement) **before** unshield-crediting is wired (`dromos/bridge.rs`). Otherwise the first unshield-credit
+   is redirectable theft.
+3. **§5.D-1 [HIGH → DoS-when-wired] Verify + bind the POROS reshare receive path** *before* wiring its driver (§7.1):
+   pass `from` into `on_reshare` and require `from == old_line_coord_for(old_x)`; add a hash-based commitment check on
+   each contribution; floor `new_threshold ≥ 2`; erase old shares on adopt.
+
+**Tier 1 — user priority #1 (recovery last-mile) + anonymity headline**
+4. **§4.1** Drive Regime A (proactive reshare) off membership-thinning, independent of the (correct) stall detector.
+5. **§4.2** Wire the two RGC legs (authority issues on escalation; a frame handler consumes via `rebootstrap`) so
+   below-threshold recovery is autonomous, not a manual operator runbook. (The crypto + fork-safety design are correct.)
+6. **§4.3 / R-H1** Close membership-reintegration so returning/new identities reclaim slots safely (and make it
+   expressible in the multi-occupant sim, §6).
+7. **§5.C [CRITICAL-anonymity] Host a production anonymous `RendezvousService`** at the meeting-combiner coord (make the
+   design decision: a `RendezvousRelay` at `combiner_for(meeting_line(key))` that forwards to a registered service, vs
+   service anchoring; re-register each epoch), wire into `spawn_exit_role`, add a hidden-service CLI verb. Also bind
+   `from == req.requester` in POROS ingress (`ingress_node.rs:104`).
+
+**Tier 2 — make the platform actually run, and perform**
+8. **arch-dry #1 [HIGH] Wire a validator role into the shipped binary** — promote `fanos-dromos`/`fanos-obolos` from
+   dev-deps to real deps, add a config-gated role in `bin/fanos.rs` calling `spawn_taxis::<F, HybridLedger>`, expose via
+   FFI. Today the `fanos` binary runs no blockchain.
+9. **§5.B HIGH-1 [HIGH] Fix the round-timeout livelock** — cache `da_shards` on the `Block` (don't re-encode on receive),
+   adopt an adaptive/larger round timeout, cap block payload bytes.
+10. **§7.1** POROS epoch-boundary rotation driver (after Tier-0 #3). **§7.2** Wire the DROMOS scheduler (access lists are
+    now complete — §5.B). **§7.3** Wire telemetry `privatize` on the egress. **§7.4** Build the Γ-viability gate
+    (`architecture/` + CI). **§5.D-3** propagate the O-H2 live-RNG nonce fix to the calypso sealers. **§5.C S1-M3**
+    authenticate mix-key store slots.
+
+**Tier 3 — correctness tail + the reuse mandate + breadth**
+11. **Value-tier correctness:** O-M1 (position-bound nullifier), O-M2 (bounded anchor window), O-M3 (split key
+    hierarchy + viewing keys), O-M4 (stealth addresses); T-H4 (sample DA from peers, not the proposer); T-H5 (add
+    bonded-stake state or excise slashing + reconcile the spec).
+12. **The reuse mandate (user headline):** adopt `Reader::seq`/`read_map` everywhere (§3.1); **one Merkle in
+    `fanos-primitives`** (kills the thesauros/crosscell divergence *and* the CVE-2012-2459 ambiguity class); unify ledger
+    serialization on `derive(Wire)`; introduce `BoundedMap`; extract `ThresholdSealed` into a low-layer crate; split
+    `runtime/overlay.rs` (mechanical) and decompose `fanos-node`; delete the `encode()`×4 / `SplitMix64`×5 copies; add a
+    `Generation` newtype.
+13. **Anonymity depth:** S1-M4 (per-cell set size / multi-cell composition), S1-M6 (flat-header per-layer length
+    encryption).
+
+---
+
+## §10. Verified-sound this pass (do-not-regress)
+**Fixes confirmed:** §3.2 ternary defense-in-depth; §3.3 `decode_response` + `challenge`/`open_deal` caps; §3.4 non-zero
+floors + terminal-state pruning; §3.5 `settle_epoch` cadence; **§3.7 all access lists complete (TREASURY declared)**;
+§3.9 `--all-targets` build+clippy green; the §3.1 *single-member* exfil floor + binding + generation-windowing (the
+2-coalition variant remains — §2.1); the entire **client-side anonymity leak set** (S1-C1a UDP profile, S1-H1 cover,
+S1-M2 epoch, S1-H3 via NOSTOS, S1-M1 holonomy). **Sound designs:** SSLE secret-leader election (safety preserved, MC-
+proven — §5.B); the reshare continuity crypto + `verify_reshare_commit`/`verify_share` binding; `RecoveryAuthorization`
+PQ cert (floored + fenced) and `rebootstrap`; the `StallDetector` logic *and* its `BeaconReady` wiring; the OBOLOS
+accounting core (O-C1/O-C2/O-H1/O-H2, hybrid sig no-downgrade) except the `public_recipient` relation gap (§5.D-2); the
+shared `Reader`/`read_map` bounded codec; the crypto-wrapper reuse (`hash_labeled`/AEAD/Shamir/NodeId/VRF-layering all
+single-homed — §5.A); the clean 5-layer dependency DAG; the deliberately-feature-gated `observatory → sim` coupling; the
+POROS + DROMOS **engine** correctness (sound — only their drivers are missing). NOSTOS/POROS/T4 and the crown-jewel
+scenarios are real code with tests, not docs. The committed recovery sim suite (5/5) and the auditor's two sim
+experiments pass; `fanos-obolos` 37/37, `fanos-keygen` 19/19, `fanos-primitives::shamir` 9/9 green.
+
+---
+
+*Method appendix.* Pinned to `25b0a6f`. The auditor ran build / clippy `--all-targets` / the recovery suite / two live
+`fanos-sim` experiments this session, and re-verified §0, §2.1–§2.5, §3.1–§3.3, §4, §6, §7 at `file:line` (with hand
+re-derivation of the §2.1 Lagrange/degree-0 exfil and the §2.2 `i128` overflow bound). §5.A–D breadth is from four
+independent **read-only** streams (architecture/DRY, blockchain-core, crypto/keygen/POROS, anonymity/storage), each of
+which ran targeted tests and returned `file:line` findings; the streams **corroborated** every auditor finding they
+overlapped and **added** the `public_recipient` landmine (§5.D-2), the round-timeout livelock root-cause (§5.B), the
+test-only chain wiring (§5.A), the O-M residuals, and the precise anonymity-host scope (§5.C). The four streams and the
+auditor independently confirm the audit modified no production code.
+
+**The central lesson of this pass:** the remediation since pass 1 was real — the worst DoS (§3.2) and the storage/access-
+list/§3.4/§3.7 classes are genuinely closed, the client-side anonymity leaks are fixed, and SSLE is safe — **but the
+frontier has moved from "missing library" to "missing driver," and that shift hides three sharp edges:** (1) one live
+CRITICAL (the 2-coalition beacon exfil) that the partial §3.1 fix left open; (2) two latent correctness landmines
+(`public_recipient` theft, POROS reshare corruption) that go live the instant their drivers land — and one of those
+drivers (`6d81506`) landed *during this audit* without its guard; (3) an entire value tier and anonymity host that are
+test-only, so the platform's headline claims ("high-speed private L1", "ultimate anonymity") are not yet runnable
+end-to-end. **The two user priorities turn on closing those production last-miles *with* their security guards, and on
+authenticating the one remaining reshare surface — not on new cryptography.**
