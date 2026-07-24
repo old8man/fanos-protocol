@@ -45,9 +45,30 @@ use crate::crosscell_dir::publish_checkpoint;
 /// How often the driver ticks the engine — the leader proposes on a tick, so this bounds block time.
 const TICK_PERIOD: Duration = Duration::from_millis(150);
 
-/// How often the driver injects a round `Timeout` — a proposer that never proposes must not wedge the height.
-/// Comfortably longer than a tick so the happy path finalizes well before a round ever times out.
-const TIMEOUT_PERIOD: Duration = Duration::from_millis(1_500);
+/// The **base** round-timeout: how long the driver waits before injecting a `Timeout` (advancing a round whose
+/// proposer never proposed) at a fresh height. Comfortably longer than a tick so the happy path finalizes well
+/// before a round ever times out.
+const ROUND_TIMEOUT_BASE: Duration = Duration::from_millis(1_500);
+
+/// The **cap** on the adaptively-backed-off round timeout. A round that fails to finalize by its deadline
+/// doubles the next round's timeout (see [`next_round_timeout`]) up to this ceiling — so a genuinely slow round
+/// (a CPU-loaded host whose multi-round threshold gathers take longer than the base timeout) is given more
+/// time rather than prematurely advanced, which under a fixed timeout **livelocks** the height (each premature
+/// advance reshuffles the leader before the in-flight round can commit). Bounded so a truly failed leader is
+/// still skipped in finite time. Reset to [`ROUND_TIMEOUT_BASE`] the moment the height advances (progress).
+const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
+
+/// The next round timeout: reset to [`ROUND_TIMEOUT_BASE`] on progress (the height advanced — a fresh height
+/// restarts at round 0), else double the current timeout up to [`ROUND_TIMEOUT_MAX`] (Tendermint-style
+/// exponential backoff, so consensus adapts its pace to the host's actual round latency instead of livelocking).
+#[must_use]
+fn next_round_timeout(current: Duration, progressed: bool) -> Duration {
+    if progressed {
+        ROUND_TIMEOUT_BASE
+    } else {
+        (current * 2).min(ROUND_TIMEOUT_MAX)
+    }
+}
 
 /// The identity + genesis a validator's engine is built from — the agreed cell configuration
 /// ([`ConsensusEngine::new`]). Everything a node needs to join a live TAXIS cell, gathered into one struct.
@@ -212,8 +233,13 @@ where
         let start = Instant::now();
         let mut tick = interval_at(start + TICK_PERIOD, TICK_PERIOD);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut timeout = interval_at(start + TIMEOUT_PERIOD, TIMEOUT_PERIOD);
-        timeout.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The round timeout is ADAPTIVE (audit: the fixed timeout livelocked a CPU-loaded cell). It starts at
+        // ROUND_TIMEOUT_BASE — delayed one period, like the first tick, so a spurious immediate advance cannot
+        // shuffle the height-1 leader before it proposes — then backs off each round that fails to finalize and
+        // resets on height progress (see next_round_timeout + the progress check after the select).
+        let mut round_timeout = ROUND_TIMEOUT_BASE;
+        let mut timeout_deadline = start + round_timeout;
+        let mut last_height = engine.chain().next_height();
         // The height of the last execution checkpoint we surfaced, so each is emitted exactly once.
         let mut last_ckpt: Option<u64> = None;
 
@@ -223,9 +249,14 @@ where
                     let outs = engine.step(Input::Tick);
                     drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
                 }
-                _ = timeout.tick() => {
+                () = tokio::time::sleep_until(timeout_deadline) => {
                     let outs = engine.step(Input::Timeout);
                     drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt);
+                    // This round did not finalize before its deadline: back off before injecting the next
+                    // Timeout, so a slow (not failed) round is given more time rather than livelocked by a
+                    // premature advance. A finalization anywhere resets it via the progress check below.
+                    round_timeout = next_round_timeout(round_timeout, false);
+                    timeout_deadline = Instant::now() + round_timeout;
                 }
                 Some(tx) = submit_rx.recv() => {
                     engine.submit(tx);
@@ -250,6 +281,15 @@ where
                     Some(_) => {}
                     None => break, // the drainer stopped (client shut down)
                 },
+            }
+            // Progress check: whenever the height advances — a block finalized (via votes on the happy path, or
+            // after a skipped round) — reset the adaptive round timeout to its base, since a fresh height starts
+            // at round 0. This makes the backoff self-correcting: it grows only while a single height is stuck.
+            let height = engine.chain().next_height();
+            if height != last_height {
+                last_height = height;
+                round_timeout = ROUND_TIMEOUT_BASE;
+                timeout_deadline = Instant::now() + round_timeout;
             }
         }
     });
@@ -366,4 +406,31 @@ pub fn spawn_checkpoint_publisher<S>(
 /// The equivocating validator named by a slash proof.
 fn slash_validator(ev: &SlashEvidence) -> u8 {
     ev.validator
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_round_timeout_backs_off_exponentially_caps_and_resets_on_progress() {
+        // A stuck height doubles the round timeout each failed round…
+        let mut t = ROUND_TIMEOUT_BASE;
+        t = next_round_timeout(t, false);
+        assert_eq!(t, ROUND_TIMEOUT_BASE * 2, "one failed round doubles the timeout");
+        t = next_round_timeout(t, false);
+        assert_eq!(t, ROUND_TIMEOUT_BASE * 4);
+        // …up to the cap, and never beyond it (a truly failed leader is still skipped in finite time).
+        for _ in 0..20 {
+            t = next_round_timeout(t, false);
+        }
+        assert_eq!(t, ROUND_TIMEOUT_MAX, "backoff is bounded by the cap");
+        assert_eq!(next_round_timeout(t, false), ROUND_TIMEOUT_MAX, "it never grows past the cap");
+        // Progress (the height advanced) snaps it straight back to the base — the backoff is self-correcting,
+        // so it grows ONLY while a single height is stuck, never accumulating across a healthy chain.
+        assert_eq!(next_round_timeout(t, true), ROUND_TIMEOUT_BASE, "a finalized height resets the timeout");
+        assert_eq!(next_round_timeout(ROUND_TIMEOUT_BASE, true), ROUND_TIMEOUT_BASE);
+        // The base is strictly below the cap (the backoff has room to grow), the invariant the fix relies on.
+        assert!(ROUND_TIMEOUT_BASE < ROUND_TIMEOUT_MAX, "the base must leave headroom to back off");
+    }
 }
