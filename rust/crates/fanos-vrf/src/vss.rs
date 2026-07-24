@@ -19,6 +19,7 @@ use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::traits::Identity;
 use curve25519_dalek::{RistrettoPoint, Scalar};
 use rand_core::{CryptoRng, RngCore};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use fanos_primitives::hash::hash_xof;
 
@@ -95,6 +96,15 @@ impl core::fmt::Debug for VssShare {
             .finish()
     }
 }
+
+// Wipe the secret share scalar on drop (audit A6) — `index` is the public evaluation point, `value`
+// is the secret. `Scalar: Zeroize` via curve25519-dalek's `zeroize` feature.
+impl Drop for VssShare {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
+}
+impl ZeroizeOnDrop for VssShare {}
 
 impl VssShare {
     /// The 32-byte encoding of the share value (for transport / storage).

@@ -22,6 +22,8 @@ vrf-r255 = "0.1"
 # Feldman VSS shares the ristretto255 group vrf-r255 already pulls in (same version).
 curve25519-dalek.workspace = true
 rand_core = { version = "0.6", default-features = false }
+# Wipe the secret Feldman/VSS share scalar from memory on drop (audit A6).
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

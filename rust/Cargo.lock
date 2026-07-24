@@ -1121,6 +1121,7 @@ dependencies = [
  "fanos-primitives",
  "libm",
  "proptest",
+ "zeroize",
 ]
 
 [[package]]
@@ -1130,6 +1131,7 @@ dependencies = [
  "fanos-pqcrypto",
  "fanos-primitives",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1372,6 +1374,7 @@ dependencies = [
  "fanos-primitives",
  "rand_core 0.6.4",
  "vrf-r255",
+ "zeroize",
 ]
 
 [[package]]

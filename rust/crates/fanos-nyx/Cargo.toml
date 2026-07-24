@@ -16,6 +16,8 @@ fanos-geometry.workspace = true
 fanos-primitives = { workspace = true, features = ["aead"] }
 blake3 = { workspace = true }
 libm = { workspace = true, optional = true }
+# Wipe the per-onion ratchet state from memory on drop (audit A6).
+zeroize = { workspace = true }
 
 [features]
 default = ["std"]

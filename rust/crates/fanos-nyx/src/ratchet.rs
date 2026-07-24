@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_primitives::hash_labeled;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::path::Circuit;
 
@@ -44,10 +45,25 @@ const RATCHET_LABEL: &str = "FANOS-v1/nyx-ratchet";
 const RATCHET_FINAL_LABEL: &str = "FANOS-v1/nyx-ratchet-final";
 
 /// A one-way key ratchet advanced once per hop.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Ratchet {
     state: [u8; 32],
 }
+
+// Redacted Debug (audit A6): the derived Debug printed `state` — the secret ratchet key — so a stray
+// `{:?}`/`dbg!` on a Ratchet, or any struct containing one, would leak forward-secure key material.
+impl core::fmt::Debug for Ratchet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Ratchet").field("state", &"<redacted>").finish()
+    }
+}
+
+impl Drop for Ratchet {
+    fn drop(&mut self) {
+        self.state.zeroize();
+    }
+}
+impl ZeroizeOnDrop for Ratchet {}
 
 impl Ratchet {
     /// Start a ratchet from a shared seed.

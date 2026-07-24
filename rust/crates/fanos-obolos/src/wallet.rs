@@ -40,6 +40,7 @@ use fanos_pqcrypto::rng::SeedRng;
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, HybridSigSecret, HybridVerifier};
 use fanos_primitives::hash_labeled;
 use rand_core::CryptoRng;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::commit::Params;
 use crate::note::{Note, derive_owner_pk, derive_spend_auth, spend_auth_commit};
@@ -79,6 +80,13 @@ fn split_96(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
 pub struct SpendingKey {
     seed: [u8; 32],
 }
+
+impl Drop for SpendingKey {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+    }
+}
+impl ZeroizeOnDrop for SpendingKey {}
 
 impl SpendingKey {
     /// A wallet from a 32-byte spending seed (the operator's backed-up secret).
@@ -155,6 +163,15 @@ pub struct FullViewingKey {
     auth: [u8; 32],
 }
 
+impl Drop for FullViewingKey {
+    fn drop(&mut self) {
+        self.kem_seed.zeroize();
+        self.nsk.zeroize();
+        self.auth.zeroize();
+    }
+}
+impl ZeroizeOnDrop for FullViewingKey {}
+
 impl FullViewingKey {
     /// The `owner` tag this key sees (`= derive_owner_pk(nsk)`).
     #[must_use]
@@ -221,6 +238,15 @@ pub struct IncomingViewingKey {
     owner: [u8; 32],
     auth: [u8; 32],
 }
+
+impl Drop for IncomingViewingKey {
+    fn drop(&mut self) {
+        self.kem_seed.zeroize();
+        self.owner.zeroize();
+        self.auth.zeroize();
+    }
+}
+impl ZeroizeOnDrop for IncomingViewingKey {}
 
 impl IncomingViewingKey {
     /// The receiving [`Address`] this key views.

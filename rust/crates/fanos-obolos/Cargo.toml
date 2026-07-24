@@ -18,6 +18,8 @@ fanos-primitives = { workspace = true, default-features = false, features = ["ae
 fanos-pqcrypto.workspace = true
 # The `CryptoRng` bound for note-cipher sealing — callers supply fresh randomness per seal (no seed reuse).
 rand_core = { workspace = true }
+# Wipe wallet secrets (the spending seed and viewing-key material) from memory on drop (audit A6).
+zeroize = { workspace = true }
 
 [features]
 default = ["std"]
