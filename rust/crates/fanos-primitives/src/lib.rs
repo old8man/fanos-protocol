@@ -24,6 +24,7 @@ pub mod address;
 pub mod aead;
 pub mod beacon;
 pub mod codec;
+pub mod collections;
 pub mod epoch;
 pub mod hash;
 pub mod keys;
@@ -33,6 +34,7 @@ pub mod vrf;
 
 pub use address::{address_matches_identity, address_matches_identity_from, address_point};
 pub use beacon::BeaconSeed;
+pub use collections::BoundedMap;
 pub use epoch::Epoch;
 pub use hash::{DIGEST_LEN, hash_labeled, label, subkey};
 pub use keys::{HybridPublicKey, NodeId};

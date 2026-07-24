@@ -27,12 +27,11 @@
 //! (which composes this to make every cell relay a rendezvous point). It is *additive*: a client that
 //! already sits at a combiner keeps listening there directly; nothing in the sealing path changes.
 
-use std::collections::{BTreeMap, VecDeque};
-
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::threshold_router::ANONYMOUS;
 use fanos_field::Field;
 use fanos_geometry::Triple;
+use fanos_primitives::BoundedMap;
 use fanos_primitives::hash::{hash_labeled, label};
 use fanos_rendezvous::{HostRegister, Request, SessionId, parse_host_register};
 use fanos_runtime::{Effect, Engine, Input, Instant, Notification};
@@ -47,20 +46,17 @@ pub struct RendezvousRelay<F: Field> {
     /// registered coordinate as an [`RdvReply`](fanos_wire::FrameType::RdvReply). The relay learns that
     /// coordinate — the **bare-proxy fallback**; a full cell-node client uses NOSTOS instead and never
     /// registers here (its coordinate never leaves its node).
-    registrations: BTreeMap<SessionId, Triple>,
-    /// FIFO insertion order of `registrations`' cookies, so the map can be **bounded** (audit robustness B2):
-    /// an `RdvRegister` carries an attacker-chosen 16-byte cookie, so an unbounded map is a single-peer remote
-    /// OOM. At [`MAX_REGISTRATIONS`] the oldest registration is evicted — a bound, not a leak (an evicted client
-    /// simply re-registers; the bare-proxy fallback is best-effort by design).
-    reg_order: VecDeque<SessionId>,
+    /// `cookie → client coordinate`: the **bare-proxy fallback** — a peeled reply prefixed with `cookie` is
+    /// forwarded straight to the registered coordinate as an [`RdvReply`](fanos_wire::FrameType::RdvReply). The
+    /// relay learns that coordinate; a full cell-node client uses NOSTOS instead and never registers here. A
+    /// [`BoundedMap`] so an attacker-chosen 16-byte-cookie flood cannot grow it (audit robustness B2): at
+    /// [`MAX_REGISTRATIONS`] the oldest is evicted (an evicted client re-registers; the fallback is best-effort).
+    registrations: BoundedMap<SessionId, Triple>,
     /// `service_tag → registration`: an anonymously-registered hidden service hosted **off** this combiner
-    /// (`design-anonymity-substrate.md` §3b). When a client request whose `service_tag` matches peels out
-    /// here, this relay re-seals it as a NOSTOS onion to the service's registered dead-drop line — so the
-    /// service is reachable without this node (or anyone) learning its coordinate. Bounded like
-    /// `registrations`.
-    hosts: BTreeMap<[u8; 32], HostRegister>,
-    /// FIFO insertion order of `hosts`' tags, bounding the map at [`MAX_HOSTS`] against a registration flood.
-    host_order: VecDeque<[u8; 32]>,
+    /// (`design-anonymity-substrate.md` §3b). A matching client request peeled here is re-sealed as a NOSTOS
+    /// onion to the service's registered dead-drop line — reachable without any node learning its coordinate.
+    /// A [`BoundedMap`], bounded like `registrations` at [`MAX_HOSTS`] against a registration flood.
+    hosts: BoundedMap<[u8; 32], HostRegister>,
     /// Per-node seed for the fresh onion/e2e seeds each host-forward draws; deterministic (derived from this
     /// relay's coordinate) so a sim reproduces exactly, distinct per node so two combiners never collide.
     forward_seed: [u8; 32],
@@ -88,10 +84,8 @@ impl<F: Field> RendezvousRelay<F> {
         let forward_seed = hash_labeled(label::KDF, &encode_coord(router.address()));
         Self {
             router,
-            registrations: BTreeMap::new(),
-            reg_order: VecDeque::new(),
-            hosts: BTreeMap::new(),
-            host_order: VecDeque::new(),
+            registrations: BoundedMap::new(MAX_REGISTRATIONS),
+            hosts: BoundedMap::new(MAX_HOSTS),
             forward_seed,
             forward_counter: 0,
         }
@@ -111,15 +105,8 @@ impl<F: Field> RendezvousRelay<F> {
         if reg.forward_circuit.is_empty() || reg.forward_keys.is_empty() {
             return;
         }
-        let tag = reg.service_tag;
-        if self.hosts.insert(tag, reg).is_none() {
-            self.host_order.push_back(tag);
-            if self.hosts.len() > MAX_HOSTS
-                && let Some(oldest) = self.host_order.pop_front()
-            {
-                self.hosts.remove(&oldest);
-            }
-        }
+        // The `BoundedMap` bounds this against a registration flood (a re-registration refreshes the route).
+        self.hosts.insert(reg.service_tag, reg);
     }
 
     /// The next `(e2e_seed, onion_seed)` pair for a host-forward — two independent fresh draws (the NOSTOS
@@ -226,18 +213,9 @@ impl<F: Field> RendezvousRelay<F> {
         let Ok(cookie) = <SessionId>::try_from(body) else {
             return;
         };
-        // A re-registration of a known cookie just refreshes its coordinate (no new slot, no order change); a
-        // new cookie takes a fresh slot and pushes to the FIFO order. `reg_order` and `registrations` track
-        // exactly the same set (a cookie is enqueued when inserted-as-new and dequeued when evicted), so on
-        // overflow evicting the single oldest restores the bound (audit B2) — a bounded map, not a leak.
-        if self.registrations.insert(cookie, from).is_none() {
-            self.reg_order.push_back(cookie);
-            if self.registrations.len() > MAX_REGISTRATIONS
-                && let Some(oldest) = self.reg_order.pop_front()
-            {
-                self.registrations.remove(&oldest);
-            }
-        }
+        // The `BoundedMap` bounds this against a cookie flood: a re-registration refreshes the coordinate; a
+        // new cookie takes a slot, evicting the oldest at capacity (audit B2) — a bounded map, not a leak.
+        self.registrations.insert(cookie, from);
     }
 }
 
