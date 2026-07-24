@@ -161,6 +161,60 @@ impl ValidatorConfig {
     }
 }
 
+/// The **public** chain parameters a client needs to build, seal, and submit a transaction to a running TAXIS
+/// cell — everything except a secret key. `fanos taxis-deal` writes it (`chain-info.taxis`) and `fanos pay`
+/// reads it. Unlike a [`ValidatorConfig`], it carries the full keyper **registry** (the committee's KEM public
+/// keys — what a client seals to for the anti-MEV line), not a node's secret seed.
+#[derive(Clone)]
+pub struct ChainInfo {
+    /// The cell's BFT quorum parameters.
+    pub cell: CellParams,
+    /// The epoch the cell runs at (binds the keyper committee + the sealing).
+    pub epoch: Epoch,
+    /// The epoch beacon seed.
+    pub beacon: BeaconSeed,
+    /// The keyper committee registry — the public KEM keys a client seals a transaction to.
+    pub keyper: KeyperRegistry,
+}
+
+impl ChainInfo {
+    /// Canonical bytes: `q(4) n(4) f(4) Q(4) ‖ epoch(8) ‖ beacon(32) ‖ registry_len(4) ‖ registry`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.cell.q.to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.n).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.f).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.quorum).to_be_bytes());
+        out.extend_from_slice(&self.epoch.get().to_be_bytes());
+        out.extend_from_slice(self.beacon.as_bytes());
+        let reg = self.keyper.to_bytes();
+        out.extend_from_slice(&u32_of(reg.len()).to_be_bytes());
+        out.extend_from_slice(&reg);
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes); `None` on truncation, a bad registry, or trailing bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Cursor::new(bytes);
+        let cell = CellParams {
+            q: r.u32()?,
+            n: r.u32()? as usize,
+            f: r.u32()? as usize,
+            quorum: r.u32()? as usize,
+        };
+        let epoch = Epoch::new(r.u64()?);
+        let beacon = BeaconSeed::new(r.array32()?);
+        let reg_len = r.u32()? as usize;
+        let keyper = KeyperRegistry::from_bytes(r.take(reg_len)?)?;
+        if !r.is_empty() {
+            return None; // trailing bytes ⇒ non-canonical
+        }
+        Some(Self { cell, epoch, beacon, keyper })
+    }
+}
+
 /// Deal a fresh cell of validators: for each of the cell's `n` seats, draw a secret `node_seed` from `rng`,
 /// derive its signing + KEM keys, and assemble the shared verifier set + keyper registry. Returns one
 /// [`ValidatorConfig`] per validator, all sharing the same public cell configuration. `rng` is OS entropy in
@@ -172,7 +226,7 @@ pub fn deal_validators<R: CryptoRng>(
     beacon: BeaconSeed,
     genesis_alloc: &[([u8; 32], u64)],
     rng: &mut R,
-) -> Vec<ValidatorConfig> {
+) -> (Vec<ValidatorConfig>, KeyperRegistry) {
     // Draw each validator's secret seed, and derive its public verifier + keyper KEM public in one pass.
     let mut node_seeds = Vec::with_capacity(cell.n);
     let mut verifiers: Vec<Vec<u8>> = Vec::with_capacity(cell.n);
@@ -187,8 +241,12 @@ pub fn deal_validators<R: CryptoRng>(
         certs.push(KeyperKeyCert::register(u8_of(i), kem_pub, &sig));
         node_seeds.push(node_seed);
     }
-    let keyper_commit = KeyperRegistry::new(certs).commit();
-    node_seeds
+    // The full registry (the committee's KEM public keys) is what a *client* needs to seal a transaction to
+    // the anti-MEV keyper line, so it is returned alongside the per-validator configs for `fanos taxis-deal`
+    // to publish in the chain-info file; the validators themselves carry only its commitment.
+    let registry = KeyperRegistry::new(certs);
+    let keyper_commit = registry.commit();
+    let configs = node_seeds
         .into_iter()
         .enumerate()
         .map(|(i, node_seed)| ValidatorConfig {
@@ -201,7 +259,8 @@ pub fn deal_validators<R: CryptoRng>(
             verifiers: verifiers.clone(),
             genesis_alloc: genesis_alloc.to_vec(),
         })
-        .collect()
+        .collect();
+    (configs, registry)
 }
 
 /// A `usize`/`u32` narrowed for the wire (saturating — a real cell is tiny; this only guards a pathological
@@ -263,7 +322,7 @@ mod tests {
     fn a_dealt_cell_rebuilds_consistent_taxis_params_for_every_validator() {
         let cell = CellParams::FANO;
         let alloc = vec![([0x11; 32], 1_000_000u64), ([0x22; 32], 500u64)];
-        let configs =
+        let (configs, _registry) =
             deal_validators(cell, Epoch::new(5), BeaconSeed::new([0x5E; 32]), &alloc, &mut SeedRng::from_seed(b"deal"));
         assert_eq!(configs.len(), cell.n, "one config per validator seat");
 
@@ -302,7 +361,7 @@ mod tests {
 
     #[test]
     fn distinct_validators_get_distinct_secret_seeds() {
-        let configs =
+        let (configs, _registry) =
             deal_validators(CellParams::FANO, Epoch::ZERO, BeaconSeed::GENESIS, &[], &mut SeedRng::from_seed(b"d2"));
         for i in 0..configs.len() {
             for j in (i + 1)..configs.len() {
@@ -312,8 +371,33 @@ mod tests {
     }
 
     #[test]
+    fn chain_info_round_trips_and_preserves_the_sealing_authority() {
+        // The public chain-info a client reads: it must carry the FULL keyper registry (not just its commit),
+        // because a client seals to the committee's KEM keys. Prove the registry survives the round-trip.
+        let cell = CellParams::FANO;
+        let epoch = Epoch::new(9);
+        let beacon = BeaconSeed::new([0x33; 32]);
+        let (configs, registry) =
+            deal_validators(cell, epoch, beacon, &[([1; 32], 100)], &mut SeedRng::from_seed(b"ci"));
+        let commit = registry.commit();
+        let info = ChainInfo { cell, epoch, beacon, keyper: registry };
+
+        let back = ChainInfo::from_bytes(&info.to_bytes()).expect("chain-info round-trips");
+        assert_eq!(back.epoch, epoch);
+        assert_eq!(back.beacon.as_bytes(), beacon.as_bytes());
+        assert_eq!(back.cell, cell);
+        assert_eq!(back.keyper.len(), configs.len(), "every validator's keyper key survives");
+        assert_eq!(back.keyper.commit(), commit, "the committed sealing authority is identical");
+
+        // Trailing bytes ⇒ non-canonical.
+        let mut extra = info.to_bytes();
+        extra.push(0);
+        assert!(ChainInfo::from_bytes(&extra).is_none(), "trailing bytes are rejected");
+    }
+
+    #[test]
     fn a_validator_config_round_trips_through_bytes() {
-        let configs = deal_validators(
+        let (configs, _registry) = deal_validators(
             CellParams::FANO,
             Epoch::new(9),
             BeaconSeed::new([7; 32]),

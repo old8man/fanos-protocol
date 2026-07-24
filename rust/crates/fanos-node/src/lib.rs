@@ -80,7 +80,7 @@ pub use taxis_driver::{
     SortitionParams, TaxisEvent, TaxisHandle, TaxisParams, spawn_checkpoint_publisher, spawn_taxis,
 };
 #[cfg(feature = "validator")]
-pub use taxis_config::{ValidatorConfig, build_genesis, deal_validators, keys_from_seed};
+pub use taxis_config::{ChainInfo, ValidatorConfig, build_genesis, deal_validators, keys_from_seed};
 pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};

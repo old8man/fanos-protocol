@@ -133,6 +133,37 @@ impl KeyperRegistry {
         self.certs.is_empty()
     }
 
+    /// Canonical bytes: `n(4) ‖ cert₀ ‖ … ‖ cert_{n−1}`, each a fixed-width [`KeyperKeyCert::to_bytes`]. The
+    /// public form a client needs to seal a transaction to the committee — published in `fanos taxis-deal`'s
+    /// chain-info file so `fanos pay` can reconstruct the sealing authority.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.certs.len() * (PUBLIC_LEN + HYBRID_SIG_LEN));
+        out.extend_from_slice(&u32::try_from(self.certs.len()).unwrap_or(u32::MAX).to_be_bytes());
+        for c in &self.certs {
+            out.extend_from_slice(&c.to_bytes());
+        }
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes); `None` on truncation, a malformed cert, or trailing bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let n = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+        let cert_len = PUBLIC_LEN + HYBRID_SIG_LEN;
+        let mut certs = Vec::with_capacity(n.min(4096));
+        let mut off: usize = 4;
+        for _ in 0..n {
+            let end = off.checked_add(cert_len)?;
+            certs.push(KeyperKeyCert::from_bytes(bytes.get(off..end)?)?);
+            off = end;
+        }
+        if off != bytes.len() {
+            return None; // trailing bytes ⇒ non-canonical
+        }
+        Some(Self { certs })
+    }
+
     /// Validator `i`'s committed decryption (KEM public) key, or `None` if out of range.
     #[must_use]
     pub fn key(&self, i: usize) -> Option<&HybridKemPublic> {

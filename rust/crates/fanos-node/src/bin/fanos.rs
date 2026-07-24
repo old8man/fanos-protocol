@@ -51,6 +51,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
         Some("host") => cmd_host(args.get(2..).unwrap_or(&[])).await,
         Some("validator") => cmd_validator(args.get(2..).unwrap_or(&[])).await,
+        Some("pay") => cmd_pay(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
@@ -670,7 +671,7 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
 #[cfg(feature = "validator")]
 fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
     use fanos_dromos::token::account_id;
-    use fanos_node::{ValidatorConfig, deal_validators};
+    use fanos_node::{ChainInfo, ValidatorConfig, deal_validators};
     use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_taxis::params::CellParams;
@@ -704,13 +705,19 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
     // independently and exchanges only the public verifiers/keyper commitment/genesis allocation).
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let configs = deal_validators(cell, epoch, beacon, &genesis_alloc, &mut SeedRng::from_seed(&rng_seed));
+    let (configs, registry) =
+        deal_validators(cell, epoch, beacon, &genesis_alloc, &mut SeedRng::from_seed(&rng_seed));
 
     for c in &configs {
         let path = format!("{out}/validator-{}.taxis", c.me);
         std::fs::write(&path, ValidatorConfig::to_bytes(c))?;
         println!("wrote {path}");
     }
+    // The public chain info a client needs to build, seal, and submit a transaction (`fanos pay`).
+    let info = ChainInfo { cell, epoch, beacon, keyper: registry };
+    let ipath = format!("{out}/chain-info.taxis");
+    std::fs::write(&ipath, info.to_bytes())?;
+    println!("wrote {ipath} (public chain info for `fanos pay`)");
     let fpath = format!("{out}/founder.key");
     std::fs::write(&fpath, founder_seed)?;
     println!("wrote {fpath} (the genesis founder's secret seed — keep it safe)");
@@ -726,6 +733,95 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
 /// Without the `validator` feature the binary carries no ledger, so `fanos taxis-deal` cannot deal a cell.
 #[cfg(not(feature = "validator"))]
 fn cmd_taxis_deal(_args: &[String]) -> Result<(), NodeError> {
+    Err(NodeError::Config(
+        "this build lacks validator support — rebuild with `cargo build -p fanos-node --features validator`"
+            .to_owned(),
+    ))
+}
+
+/// `fanos pay --chain-info chain-info.taxis --key founder.key --to <hex account> --amount N [--nonce M]
+/// --bootstrap <coord>@host:port,…`: the **client half of the network transaction ingress**. Build a
+/// transparent value transfer, seal it to the cell's anti-MEV keyper line (so no validator sees its contents
+/// before the order is fixed), join the overlay, and submit it to a validator — which ingests it into its
+/// mempool and gossips it across the cell. Provision the cell with `fanos taxis-deal` (which writes the
+/// `chain-info.taxis` this reads and the `founder.key` that funds the genesis account).
+#[cfg(feature = "validator")]
+async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
+    use fanos_dromos::HybridLedger;
+    use fanos_dromos::token::{SignedTransfer, Transfer, account_id};
+    use fanos_geometry::Point;
+    use fanos_node::ChainInfo;
+    use fanos_pqcrypto::HybridSigSecret;
+    use fanos_pqcrypto::rng::SeedRng;
+    use fanos_runtime::Command;
+    use fanos_taxis::Transaction;
+    use fanos_taxis::keyper::seal_to_keyper_line;
+    use fanos_taxis::wire::tx_to_frame;
+
+    init_tracing();
+
+    // The public chain info (keyper registry + epoch + beacon + cell) — everything a client needs but a key.
+    let info_path = flag(args, "--chain-info")
+        .ok_or_else(|| NodeError::Config("fanos pay requires --chain-info chain-info.taxis".to_owned()))?;
+    let info = ChainInfo::from_bytes(&std::fs::read(info_path)?)
+        .ok_or_else(|| NodeError::Config("malformed chain-info file".to_owned()))?;
+
+    // The sender's 32-byte key seed (e.g. `founder.key`) → its signing keypair + account id.
+    let key_path = flag(args, "--key")
+        .ok_or_else(|| NodeError::Config("fanos pay requires --key <32-byte seed file> (e.g. founder.key)".to_owned()))?;
+    let seed: [u8; 32] = std::fs::read(key_path)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| NodeError::Config("the --key file must be a 32-byte seed".to_owned()))?;
+    let (signer, from_key) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
+    let from = account_id(&from_key);
+
+    let to_hex = flag(args, "--to")
+        .ok_or_else(|| NodeError::Config("fanos pay requires --to <32-byte hex account id>".to_owned()))?;
+    let to: [u8; 32] = decode_hex(to_hex)
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| NodeError::Config("--to must be a 32-byte (64 hex char) account id".to_owned()))?;
+    let amount: u64 = flag(args, "--amount")
+        .ok_or_else(|| NodeError::Config("fanos pay requires --amount N".to_owned()))?
+        .parse()
+        .map_err(|_| NodeError::Config("bad --amount".to_owned()))?;
+    let nonce: u64 = match flag(args, "--nonce") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config("bad --nonce".to_owned()))?,
+        None => 0,
+    };
+
+    // Build + sign the transparent transfer, wrap it as a DROMOS transaction, and seal it to the epoch keyper
+    // line with fresh OS entropy (the anti-MEV property: the order is fixed on the sealed ciphertext).
+    let signed = SignedTransfer::sign(Transfer { from, to, amount, nonce }, &signer, from_key);
+    let tx = Transaction::new(HybridLedger::transparent_payload(&signed));
+    let mut rng_seed = [0u8; 32];
+    getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let sealed = seal_to_keyper_line(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
+        .map_err(|e| NodeError::Config(format!("could not seal the transaction: {e:?}")))?;
+
+    // Join the overlay (bootstrap to the validators via --bootstrap) and submit to validator 0, which ingests
+    // the sealed transaction and gossips it to the whole cell's mempool.
+    let config = node_config_from_args(args)?;
+    let node = Node::start::<F2>(config).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let bootstrap connections establish
+    let submitted = node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: tx_to_frame(&sealed) });
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let the frame flush + propagate
+    node.shutdown();
+    if submitted {
+        println!(
+            "submitted: transfer {amount} → {to_hex} (nonce {nonce}), sealed to the epoch {} keyper line",
+            info.epoch.get()
+        );
+        Ok(())
+    } else {
+        Err(NodeError::Config("could not emit the transaction (is the client connected to a validator?)".to_owned()))
+    }
+}
+
+/// Without the `validator` feature the binary carries no ledger, so `fanos pay` cannot build a transaction.
+#[cfg(not(feature = "validator"))]
+#[allow(clippy::unused_async)]
+async fn cmd_pay(_args: &[String]) -> Result<(), NodeError> {
     Err(NodeError::Config(
         "this build lacks validator support — rebuild with `cargo build -p fanos-node --features validator`"
             .to_owned(),
