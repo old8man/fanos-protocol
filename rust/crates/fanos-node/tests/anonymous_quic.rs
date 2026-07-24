@@ -15,6 +15,7 @@
 use std::time::Duration as StdDuration;
 
 use fanos_aphantos::ThresholdRouter;
+use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
@@ -29,7 +30,8 @@ use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_runtime::{Config as OverlayConfig, OverlayNode};
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousService, combiner_for, meeting_line, seal_forward,
+    ANONYMOUS, BeaconSeed, HostRegister, MixDirectory, RendezvousService, combiner_for, meeting_line,
+    seal_forward, seal_host_register, service_tag,
 };
 
 /// The epoch's public randomness beacon, shared by the service (which listens on the derived meeting
@@ -189,6 +191,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         service,
         SeedRng::from_seed(b"anon-quic-svc-accept"),
         rservice,
+        None, // service is its own combiner here — no forwarded dead-drops to open
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
@@ -306,6 +309,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         service,
         SeedRng::from_seed(b"anon-cell-svc-accept"),
         rservice,
+        None, // service is its own combiner here — no forwarded dead-drops to open
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
@@ -348,4 +352,102 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     );
     drop(nodes);
     drop(client_node);
+}
+
+#[tokio::test]
+async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
+    // The §3b general case — no cheat: the service operator is NOT the node at its meeting combiner (it
+    // cannot choose its VRF coordinate). It registers an anonymous forward route (its own dead-drop line)
+    // with the combiner by onion; the combiner re-seals each client request to that dead-drop; the operator
+    // opens it and serves. Neither the combiner nor anyone learns the operator's coordinate.
+    let dir = Directory::new();
+    let t = 2usize;
+    let beacon_t = 4usize;
+    let (_shares, commitment) =
+        deal(&[0xB8; 32], beacon_t, 7, &mut DeterministicRng::new(b"anon-offcombiner")).unwrap();
+
+    let mut nodes: Vec<Option<NodeHandle>> = Vec::new();
+    let mut mix = MixDirectory::new();
+    for i in 0..7usize {
+        let (handle, public) = spawn_composite(i, &dir, t, &commitment, beacon_t).await;
+        mix.insert(Point::<F2>::at(i).coords(), public);
+        nodes.push(Some(handle));
+    }
+
+    let mut skp = SeedRng::from_seed(b"off-combiner-svc");
+    let service = StaticKeypair::generate(&mut skp);
+    let service_public = service.public().clone();
+    let epoch = fanos_rendezvous::Epoch::ZERO;
+    let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
+    let m_combiner = combiner_for::<F2>(meeting).unwrap();
+    let m_index = Point::<F2>::new(m_combiner).unwrap().index();
+
+    // The operator hosts on a node that is NOT the meeting combiner — the realistic case.
+    let host_index = (0..7).find(|&i| i != m_index).unwrap();
+    let host_point = Point::<F2>::at(host_index);
+    // Its dead-drop line (beacon-blinded, through its own point): where forwarded requests come home.
+    let drop_line =
+        select_drop_line(host_point, b"off-combiner-host", epoch.get(), TEST_BEACON.as_bytes()).coords();
+    let (host_reply_keys, host_reply_pub) = ReplyKeys::generate(b"off-combiner-host");
+    let tag = service_tag(&service_public.encode(), epoch);
+    // The primary, coordinate-hiding registration: a 1-hop forward route to the dead-drop line.
+    let reg = HostRegister::onion::<F2>(tag, host_reply_pub.encode(), vec![drop_line], &mix, t as u8)
+        .expect("the dead-drop line's members are in the mix directory");
+
+    let host_node = nodes[host_index].take().unwrap();
+    // The operator registers anonymously: seal the registration to the meeting line and emit it (it peels at
+    // the combiner, which binds the tag → forward route, learning only the dead-drop LINE, not this node).
+    let reg_fwd = seal_host_register::<F2>(&[meeting], &mix, t as u8, &reg, b"off-combiner-reg").unwrap();
+    host_node.client().command(Command::Emit { to: reg_fwd.combiner, frame: reg_fwd.frame });
+
+    // The operator serves anonymously, opening each forwarded dead-drop with its reply key.
+    let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"off-combiner-svc-secret");
+    serve_anonymous_rpc(
+        host_node.client(),
+        service,
+        SeedRng::from_seed(b"off-combiner-svc-accept"),
+        rservice,
+        Some(host_reply_keys),
+        |req| {
+            let mut resp = b"anon-quic-200:".to_vec();
+            resp.extend_from_slice(req);
+            resp
+        },
+    );
+    // Let the one-hop registration reach and bind at the combiner before the client dials.
+    tokio::time::sleep(StdDuration::from_millis(500)).await;
+
+    // A third node dials by name — it neither is the combiner nor knows where the service is.
+    let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
+    let client_node = nodes[client_index].take().unwrap();
+    let params = AnonRouteParams {
+        directory: mix,
+        threshold: t as u8,
+        epoch,
+        beacon: TEST_BEACON,
+        depths: (1, 1),
+    };
+    let resolver = StaticResolver::new().with("off.fanos", meeting, service_public);
+    let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
+    let mut stream = dialer
+        .dial(&Target::Name("off.fanos".to_owned(), 80))
+        .await
+        .expect("anonymous dial to an off-combiner service");
+
+    let response = tokio::time::timeout(StdDuration::from_secs(50), async {
+        stream.write_all(b"GET /off").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        resp
+    })
+    .await
+    .expect("the off-combiner anonymous session completed in time");
+
+    assert_eq!(
+        response, b"anon-quic-200:GET /off",
+        "a service hosted off its meeting combiner was reached end-to-end via combiner forwarding",
+    );
+    drop(nodes);
+    drop((host_node, client_node));
 }

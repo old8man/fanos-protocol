@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use fanos_aphantos::nostos::ReplyKeys;
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_pqcrypto::rng::SeedRng;
@@ -52,11 +53,18 @@ use crate::diaulos::{MAX_SESSIONS, SESSION_IDLE_TIMEOUT, SESSION_SWEEP_INTERVAL,
 ///
 /// `rservice` must be built with the current-epoch mix directory + threshold (the keys the reply onions seal
 /// to); a node re-arms it as the epoch rotates (the `spawn_rendezvous_host` node driver).
+///
+/// `reply_keys` is the host's own NOSTOS dead-drop secret for the current epoch, present when the service is
+/// hosted **off** its meeting combiner (§3b): a forwarded request arrives as a dead-drop end-to-end sealed to
+/// it, so the loop opens each delivery with it before ingesting. Pass `None` when the service *is* its own
+/// combiner (requests arrive as plaintext `Request`s). `open()` authenticates, so a plaintext request simply
+/// fails to open and falls through to the raw path — a `Some` host transparently serves both.
 pub fn serve_anonymous<R, H, Fut>(
     client: Client,
     keypair: StaticKeypair,
     mut rng: R,
     mut rservice: RendezvousService<F2>,
+    reply_keys: Option<ReplyKeys>,
     handler: H,
 ) where
     R: CryptoRng + Send + 'static,
@@ -79,9 +87,16 @@ pub fn serve_anonymous<R, H, Fut>(
             tokio::select! {
                 event = deliveries.recv() => match event {
                     Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
+                        // A forwarded request (§3b) arrives as a dead-drop end-to-end sealed to this host's
+                        // reply key — open it first; a direct request (this node IS the combiner) ingests
+                        // as-is. `open()` authenticates, so it unwraps only genuine dead-drops for this host.
+                        let request = match &reply_keys {
+                            Some(keys) => keys.open(&payload).unwrap_or(payload),
+                            None => payload,
+                        };
                         // Ingest binds the cookie→reply-route and surfaces the inner DIAULOS bytes; a
                         // non-`Request` body (e.g. a stray dead-drop) yields `None` and is ignored.
-                        let Some((cookie, inner)) = rservice.ingest(&payload) else { continue };
+                        let Some((cookie, inner)) = rservice.ingest(&request) else { continue };
                         // Reuse a live session, or spin up a fresh one on first contact / after the previous
                         // one finished. At the cap, evict the least-recently-active first (audit A4).
                         let live = sessions.get(&cookie).is_some_and(|s| !s.in_tx.is_closed());
@@ -156,13 +171,14 @@ pub fn serve_anonymous_rpc<R, H>(
     keypair: StaticKeypair,
     rng: R,
     rservice: RendezvousService<F2>,
+    reply_keys: Option<ReplyKeys>,
     handler: H,
 ) where
     R: CryptoRng + Send + 'static,
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    serve_anonymous(client, keypair, rng, rservice, move |mut stream: DuplexStream| {
+    serve_anonymous(client, keypair, rng, rservice, reply_keys, move |mut stream: DuplexStream| {
         let handler = handler.clone();
         async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
