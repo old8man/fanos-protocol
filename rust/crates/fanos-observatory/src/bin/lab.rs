@@ -104,6 +104,10 @@ struct UnifiedArgs {
     /// Number of coherent 7-node cells (each a Fano cell embedded in one plane, with a routing gateway).
     #[arg(long, short, default_value_t = 20)]
     cells: usize,
+    /// Crash this many gateways, then re-measure — showing the two lenses COUPLED (a gateway is also a
+    /// coherence member, so its loss both degrades its cell and severs cross-cell routing to it).
+    #[arg(long, default_value_t = 0)]
+    crash: usize,
     /// RNG seed.
     #[arg(long, short, default_value_t = 1)]
     seed: u64,
@@ -243,6 +247,16 @@ fn cmd_sweep(args: &SweepArgs) {
     println!();
 }
 
+/// Both-lens metrics of a unified cluster at one moment.
+struct UnifiedMetrics {
+    total: usize,
+    alive: usize,
+    reporting: usize,
+    healthy: bool,
+    mean_phi: f64,
+    reach: f64,
+}
+
 fn cmd_unified(args: &UnifiedArgs) {
     if args.cells < 2 {
         eprintln!("unified needs at least 2 cells");
@@ -250,7 +264,7 @@ fn cmd_unified(args: &UnifiedArgs) {
     }
     let nodes = args.cells * 7;
     // Pick the smallest plane that fits 7·cells nodes (F7=57, F13=183, F31=993 points).
-    let (total, reporting, healthy, mean_phi, reach) = if nodes <= 57 {
+    let (before, after) = if nodes <= 57 {
         unified_run::<F7>(args)
     } else if nodes <= 183 {
         unified_run::<F13>(args)
@@ -261,28 +275,64 @@ fn cmd_unified(args: &UnifiedArgs) {
         std::process::exit(2);
     };
     if args.json {
-        println!(
-            "{{\"cells\":{},\"nodes\":{total},\"reporting\":{reporting},\"healthy\":{healthy},\"mean_phi\":{mean_phi:.6},\"reachability\":{reach:.6}}}",
-            args.cells,
+        print!(
+            "{{\"cells\":{},\"nodes\":{},\"reporting\":{},\"healthy\":{},\"mean_phi\":{:.6},\"reachability\":{:.6}",
+            args.cells, before.total, before.reporting, before.healthy, before.mean_phi, before.reach,
         );
+        if let Some(a) = &after {
+            print!(",\"crashed_gateways\":{},\"after\":{{\"reporting\":{},\"healthy\":{},\"reachability\":{:.6}}}", args.crash.min(args.cells), a.reporting, a.healthy, a.reach);
+        }
+        println!("}}");
     } else {
-        println!("\nunified topology — {} coherent cells × 7 = {total} nodes, one Sim", args.cells);
-        println!("  coherence lens  {reporting}/{total} nodes report a self-model · {} · mean Φ {mean_phi:.3}", if healthy { "healthy" } else { "degraded" });
-        println!("  routing lens    {:.1}% of sampled cross-cell gateway routes delivered", reach * 100.0);
-        println!("  → both lenses on one connected topology.\n");
+        println!("\nunified topology — {} coherent cells × 7 = {} nodes, one Sim", args.cells, before.total);
+        println!("  coherence lens  {}/{} nodes report a self-model · {} · mean Φ {:.3}", before.reporting, before.total, if before.healthy { "healthy" } else { "degraded" }, before.mean_phi);
+        println!("  routing lens    {:.1}% of sampled cross-cell gateway routes delivered", before.reach * 100.0);
+        if let Some(a) = &after {
+            let k = args.crash.min(args.cells);
+            println!("  — crash {k} gateway(s) (each also a coherence member) —");
+            println!("  coherence lens  {}/{} alive · {} · mean Φ {:.3}  (the {k} cells that lost their gateway degrade)", a.alive, a.total, if a.healthy { "healthy" } else { "degraded" }, a.mean_phi);
+            println!("  routing lens    {:.1}% reachable  (routes into the severed cells fail — the two lenses are coupled at the gateway)", a.reach * 100.0);
+        } else {
+            println!("  → both lenses on one connected topology.");
+        }
+        println!();
     }
 }
 
-fn unified_run<F: Field + 'static>(args: &UnifiedArgs) -> (usize, usize, bool, f64, f64) {
+fn unified_run<F: Field + 'static>(args: &UnifiedArgs) -> (UnifiedMetrics, Option<UnifiedMetrics>) {
     let mut cluster = UnifiedCluster::new::<F>(args.seed, lab_config(), args.cells);
     cluster.run_for(Duration::from_millis(1500));
+    let before = measure_unified(&mut cluster, args.cells);
+    let after = if args.crash > 0 {
+        // Crash the LAST k gateways (cell 0 — the routing probe origin — survives).
+        let k = args.crash.min(args.cells);
+        for c in (args.cells - k)..args.cells {
+            if let Some(gw) = cluster.gateway(c) {
+                cluster.crash(gw);
+            }
+        }
+        cluster.run_for(Duration::from_millis(2500)); // let the cells sense the loss
+        Some(measure_unified(&mut cluster, args.cells))
+    } else {
+        None
+    };
+    (before, after)
+}
+
+fn measure_unified(cluster: &mut UnifiedCluster, cells: usize) -> UnifiedMetrics {
+    cluster.refresh_telemetry();
     let snap = cluster.snapshot();
-    let (total, reporting) = (snap.stats.total, snap.stats.reporting);
-    let (healthy, mean_phi) = (snap.stats.is_healthy(), snap.stats.mean_phi);
-    // Sample routing: cell 0 → up to 19 other cells (bounded so the probe stays cheap at large scale).
-    let pairs: Vec<(usize, usize)> = (1..args.cells.min(20)).map(|j| (0, j)).collect();
-    let reach = cluster.reachability(&pairs);
-    (total, reporting, healthy, mean_phi, reach)
+    // Route from cell 0 (which survives) to a bounded sample of other cells.
+    let pairs: Vec<(usize, usize)> = (1..cells.min(20)).map(|j| (0, j)).collect();
+    let reach = cluster.reachability(pairs.as_slice());
+    UnifiedMetrics {
+        total: snap.stats.total,
+        alive: snap.stats.alive,
+        reporting: snap.stats.reporting,
+        healthy: snap.stats.is_healthy(),
+        mean_phi: snap.stats.mean_phi,
+        reach,
+    }
 }
 
 fn cmd_route(args: &RouteArgs) {
