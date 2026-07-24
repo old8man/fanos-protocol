@@ -206,6 +206,14 @@ impl Poly {
         &self.coeffs
     }
 
+    /// A ring element from `D` raw coefficients, each reduced into `[0, q)` — the codec inverse of
+    /// [`coeffs`](Self::coeffs), used to decode a commitment or proof from the wire (untrusted input is reduced,
+    /// so a non-canonical encoding decodes to its canonical residue rather than being rejected).
+    #[must_use]
+    pub fn from_u64(coeffs: &[u64; D]) -> Self {
+        Self { coeffs: coeffs.iter().map(|&c| reduce(u128::from(c))).collect() }
+    }
+
     /// The constant coefficient `c₀` (an embedded amount is read back here).
     #[must_use]
     pub fn constant_term(&self) -> u64 {
@@ -219,6 +227,38 @@ impl Poly {
         hash_xof("FANOS-obolos-v1/ring-uniform", seed, &mut bytes);
         let (words, _) = bytes.as_chunks::<8>();
         Self { coeffs: words.iter().take(D).map(|w| reduce(u128::from(u64::from_le_bytes(*w)))).collect() }
+    }
+
+    /// A **uniformly bounded** ring element with centred coefficients in `[−bound, bound]` (stored mod `q`),
+    /// derived deterministically from `seed` — the masking `y` of the zero-knowledge opening proof
+    /// ([`crate::ring_zk`]). Uses 8 bytes per coefficient reduced into the span (a negligible modular bias,
+    /// tolerable for the re-randomised, never-revealed masking; the proof re-samples on rejection).
+    #[must_use]
+    pub fn uniform_bounded(seed: &[u8], bound: i64) -> Self {
+        let span = (2 * bound + 1) as u64;
+        let mut bytes = alloc::vec![0u8; D * 8];
+        hash_xof("FANOS-obolos-v1/ring-mask", seed, &mut bytes);
+        let (words, _) = bytes.as_chunks::<8>();
+        let coeffs = words
+            .iter()
+            .take(D)
+            .map(|w| {
+                let v = (u64::from_le_bytes(*w) % span) as i64 - bound; // in [−bound, bound]
+                if v < 0 { Q - v.unsigned_abs() } else { v as u64 }
+            })
+            .collect();
+        Self { coeffs }
+    }
+
+    /// Whether every coefficient, **centred** into `(−q/2, q/2]`, has absolute value `≤ bound` — the shortness
+    /// check the opening proof applies to its response `z` (a masked value stays small; a forged one wraps `q`).
+    #[must_use]
+    pub fn infinity_norm_le(&self, bound: i64) -> bool {
+        let b = i128::from(bound);
+        self.coeffs.iter().all(|&c| {
+            let centered = if c > Q / 2 { i128::from(c) - i128::from(Q) } else { i128::from(c) };
+            centered.abs() <= b
+        })
     }
 
     /// A **short ternary** ring element `{−1, 0, 1}^D` (stored as `0`, `1`, `q−1`), the commitment randomness /

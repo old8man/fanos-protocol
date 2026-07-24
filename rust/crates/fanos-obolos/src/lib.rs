@@ -43,6 +43,7 @@ pub mod note_cipher;
 pub mod nullifier;
 pub mod ring;
 pub mod ring_commit;
+pub mod ring_zk;
 pub mod state;
 pub mod tree;
 pub mod tx;

@@ -85,6 +85,16 @@ impl RingParams {
     fn a2_dot(&self, r: &[Poly]) -> Poly {
         self.a2.iter().zip(r).fold(Poly::zero(), |acc, (a, rj)| acc.add(&a.mul(rj)))
     }
+
+    /// `M·y = (A₁·y, ⟨a₂, y⟩)` — the `K + 1` ring elements the commitment and its zero-knowledge opening proof
+    /// ([`crate::ring_zk`]) share, for an arbitrary `ELL`-vector `y` (the proof masks it wide, so `y` is NOT
+    /// restricted to ternary).
+    #[must_use]
+    pub(crate) fn m_times(&self, y: &[Poly]) -> Vec<Poly> {
+        let mut out = self.a1_times(y); // K
+        out.push(self.a2_dot(y)); // + 1
+        out
+    }
 }
 
 /// Short (ternary) commitment randomness — an `ELL`-vector of ternary ring elements, the hiding secret.
@@ -164,6 +174,16 @@ impl RingCommitment {
     #[must_use]
     pub fn opens_to(&self, params: &RingParams, value: u64, r: &RingRandomness) -> bool {
         self == &Self::commit(params, value, r)
+    }
+
+    /// The opening-proof statement `u = (t0, t1 − value)` — the `K + 1` ring elements a short `r` maps to under
+    /// `M`: `M·r = u` iff this commitment opens to `value` under `r`. The zero-knowledge proof proves knowledge
+    /// of such a short `r` without revealing it ([`crate::ring_zk`]).
+    #[must_use]
+    pub(crate) fn statement(&self, value: u64) -> Vec<Poly> {
+        let mut u = self.t0.clone();
+        u.push(self.t1.sub(&Poly::constant(value)));
+        u
     }
 
     /// The `t0` binding components (the zero-knowledge opening proof forms its statement from these).
