@@ -38,7 +38,7 @@ Non-goals (v1): a global order-book matching engine (a derived posted price suff
 third-party *retrieval* market (retrieval of content you hold a capability for is served by the LRC line,
 §8); reinventing erasure/placement/DA (all inherited, §3).
 
-## 2. Ontological placement (ХОЛАРХ Ω2 — every aspect named)
+## 2. Ontological placement (HOLARCH Ω2 — every aspect named)
 
 Persistence is the **O — Foundation** ("Основание": substrate and supply — runtime, transport, **storage**,
 stake, budget) aspect at platform scale (`spec/platform.md` §1.1 already files "the L4 erasure store" under

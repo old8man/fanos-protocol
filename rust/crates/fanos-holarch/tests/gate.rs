@@ -1,4 +1,4 @@
-//! The ХОЛАРХ release gate as a CI-checkable test: the FANOS platform must sit in the viable window,
+//! The HOLARCH release gate as a CI-checkable test: the FANOS platform must sit in the viable window,
 //! the reference corners must hold, and every Ω4 ablation must break exactly the invariant it targets.
 //! `cargo test -p fanos-holarch` failing == the platform failing its own definition of done.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -12,7 +12,7 @@ use fanos_holarch::{
 #[test]
 fn fanos_platform_is_in_the_viable_window() {
     let v = fanos_platform().gamma().verdict();
-    assert!(v.viable(), "FANOS platform must pass the ХОЛАРХ gate: {v}");
+    assert!(v.viable(), "FANOS platform must pass the HOLARCH gate: {v}");
 
     // In-window with genuine margin, not on a knife-edge (P strictly inside (2/7, 3/7]).
     assert!(v.purity > 2.0 / 7.0, "V1: P={} must exceed the 2/7 noise floor", v.purity);

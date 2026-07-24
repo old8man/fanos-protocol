@@ -8,7 +8,7 @@
 //! mempool hide the *network* linkage (who submitted, in what order) — the E∧L composition made spendable.
 //!
 //! A private currency must deliver three orthogonal properties, all **E** (interiority) facts enforced by **L**
-//! (a zero-knowledge proof), in the ХОЛАРХ reading:
+//! (a zero-knowledge proof), in the HOLARCH reading:
 //!
 //! | Property | hides | this crate's machinery |
 //! |---|---|---|

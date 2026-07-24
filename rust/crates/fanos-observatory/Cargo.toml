@@ -30,7 +30,7 @@ fanos-geometry = { workspace = true, features = ["std"] }
 # only) drops it via `--no-default-features` (audit ARCH-10 D8: no hard prod-tool → test-sim coupling).
 fanos-sim = { workspace = true, optional = true }
 fanos-runtime = { workspace = true, features = ["std"] }
-# The ХОЛАРХ viability gate, surfaced as `fanos-lab gate`.
+# The HOLARCH viability gate, surfaced as `fanos-lab gate`.
 fanos-holarch.workspace = true
 ratatui = { workspace = true }
 crossterm = { workspace = true }

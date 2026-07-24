@@ -1,5 +1,5 @@
 //! The **deterministic parallel scheduler** — DROMOS's intra-cell (vertical) parallelism (`spec/platform.md`
-//! §3.1, §3.3; the ХОЛАРХ **DL — Regulation** channel). Consensus fixes the *order* of a block's transactions
+//! §3.1, §3.3; the HOLARCH **DL — Regulation** channel). Consensus fixes the *order* of a block's transactions
 //! serially and blind (anti-MEV); after the reveal, execution fans out: non-conflicting transactions run
 //! concurrently. The load-bearing property is **determinism** — every validator must compute the *identical*
 //! schedule and hence the identical state, so the schedule is a pure function of the ordered transactions and

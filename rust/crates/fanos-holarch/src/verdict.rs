@@ -9,7 +9,7 @@ use crate::gamma::Gamma;
 
 /// The differentiation threshold `D_th = 2` (V4). Interiority must carry enough of the structure that
 /// the holon has a genuine inside; below 2 it is a thin public surface. (Differentiation is a
-/// ХОЛАРХ-specific measure, so its threshold lives here rather than in the shared coherence family.)
+/// HOLARCH-specific measure, so its threshold lives here rather than in the shared coherence family.)
 pub const D_TH: f64 = 2.0;
 
 /// One of the four release invariants — enough to name the binding constraint or the target of an

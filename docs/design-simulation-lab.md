@@ -74,7 +74,7 @@ fanos-lab watch --nodes N [--experiment X] [--fraction F]     # live dashboard (
 fanos-lab sweep [--experiment X] [--max-nodes N]              # state (& resilience) 7 → 10003, one table
 fanos-lab experiment <name> --nodes N [--fraction F] [--json] # run one edge case, report the response
 fanos-lab scenarios                                           # list experiments
-fanos-lab gate                                                # the ХОЛАРХ viability panel (fanos-holarch)
+fanos-lab gate                                                # the HOLARCH viability panel (fanos-holarch)
 ```
 
 Watch keys: `q` quit · `space` pause · `f` fault a cell · `h` heal · `t` next issue · `←→` inspect a cell.

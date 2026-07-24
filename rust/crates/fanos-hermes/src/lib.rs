@@ -1,7 +1,7 @@
 //! # HERMES — the post-quantum threshold cross-chain
 //!
 //! *Greek Ἑρμῆς, the crosser of boundaries — god of travel, commerce, and messengers.* HERMES is the platform's
-//! cross-chain tier (`spec/platform.md` §8): a **federation**, not a deeper recursive tier (ХОЛАРХ's depth
+//! cross-chain tier (`spec/platform.md` §8): a **federation**, not a deeper recursive tier (HOLARCH's depth
 //! ceiling — beyond depth 2, federate). Its synthesis is two composable modes:
 //!
 //! 1. **PQ hash-locked atomic swaps** — trustless, no custody, for chains that support hashlocks. This module,

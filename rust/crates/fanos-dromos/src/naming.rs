@@ -2,7 +2,7 @@
 //! memorable names are *owned* on the ledger, bought and renewed with the platform's currency, and resolve to a
 //! target descriptor (a payment address, a CALYPSO service, an ANGELOS messaging id). Registration is a
 //! **signed, fee-paying** operation, so the same post-quantum key that owns the funds owns the name — and the
-//! fee flowing to a treasury, plus expiry, is the anti-squatting pressure (the ХОЛАРХ **DL — Regulation**
+//! fee flowing to a treasury, plus expiry, is the anti-squatting pressure (the HOLARCH **DL — Regulation**
 //! channel: a demand-priced scarce resource).
 //!
 //! Every operation carries a [`SignedTransfer`] paying the fee to the [`TREASURY`]; its signature *is* the

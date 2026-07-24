@@ -1,7 +1,7 @@
-//! # ХОЛАРХ — the FANOS architecture viability gate
+//! # HOLARCH — the FANOS architecture viability gate
 //!
 //! This crate is the platform's *own definition of done*: a mechanical calculator that decides
-//! whether the FANOS architecture sits inside the **viable window** of the ХОЛАРХ meta-model
+//! whether the FANOS architecture sits inside the **viable window** of the HOLARCH meta-model
 //! (`uhm-theory` corpus, `applied/research/holarch.md`; reference lab `architecture/holarch_lab.py`).
 //! It is the executable form of `spec/platform.md` §1 — the release gate the platform must pass.
 //!

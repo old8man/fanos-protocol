@@ -7,7 +7,7 @@
 //! ```text
 //! fanos-lab run   --nodes 1001 --run-ms 3000       # headless: run and print cluster state (--json too)
 //! fanos-lab watch --nodes 350                       # live ratatui dashboard, with fault/heal controls
-//! fanos-lab gate                                    # the ХОЛАРХ viability gate (V1–V4 + σ + ablations)
+//! fanos-lab gate                                    # the HOLARCH viability gate (V1–V4 + σ + ablations)
 //! ```
 
 use std::io;
@@ -51,7 +51,7 @@ enum Command {
     Unified(UnifiedArgs),
     /// List the available stress experiments.
     Scenarios,
-    /// Check the ХОЛАРХ architecture viability gate (V1–V4, σ-panel, Ω4 ablations).
+    /// Check the HOLARCH architecture viability gate (V1–V4, σ-panel, Ω4 ablations).
     Gate,
 }
 
@@ -580,7 +580,7 @@ fn cluster_json(snap: &ClusterSnapshot) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// gate — the ХОЛАРХ viability panel
+// gate — the HOLARCH viability panel
 // ---------------------------------------------------------------------------------------------------
 
 fn cmd_gate() {

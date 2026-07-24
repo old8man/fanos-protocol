@@ -29,7 +29,7 @@ use fanos_wire::{FrameType, ProtocolError, Wire, decode_frame, encode_frame};
 const PUBLISH_ORIGIN: u8 = 0;
 
 /// The upward hop budget for a cell escalation (audit R-C2): a residue is handed up at most this many strata
-/// before it is terminal (external help required), bounding the recursion at the ХОЛАРХ depth ceiling so an
+/// before it is terminal (external help required), bounding the recursion at the HOLARCH depth ceiling so an
 /// escalation storm cannot climb without end.
 const ESCALATE_TTL: u8 = 3;
 /// Storage `Publish` sub-type: a single **erasure shard** for the point named by the frame's shard-index
@@ -1724,7 +1724,7 @@ impl<F: Field> OverlayNode<F> {
     }
 
     /// The bounded escalation step: route the residue to the parent cell's sibling members, decrementing `ttl`
-    /// each stratum so the upward recursion terminates (the ХОЛАРХ depth ceiling).
+    /// each stratum so the upward recursion terminates (the HOLARCH depth ceiling).
     fn escalate_up(&mut self, residue: u8, ttl: u8) -> Vec<Effect> {
         // The child cell's point in the parent (the address's second-to-last level) and the parent cell's own
         // prefix (empty at depth 2 → the top cell). Extracted as owned values so the router is free below.

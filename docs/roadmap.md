@@ -218,7 +218,7 @@ anonymity substrate.
 
 ## 5. The UHM grounding — coherent cybernetics on every level
 
-FANOS is the platform realization of the UHM (УГМ) ontology — the ХОЛАРХ meta-holon made runnable — and this is *why* it can self-observe:
+FANOS is the platform realization of the UHM (УГМ) ontology — the HOLARCH meta-holon made runnable — and this is *why* it can self-observe:
 
 - **The reflexive plane.** DIAKRISIS is the network's self-model: a cell of seven reads its own
   coherence matrix `Γ_net`, the third-order statistic `Φ / P / R`. A network that measures itself can

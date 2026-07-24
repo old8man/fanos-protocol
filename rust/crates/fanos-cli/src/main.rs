@@ -302,15 +302,15 @@ fn run_all_checks() -> Report {
     r
 }
 
-/// The ХОЛАРХ architecture viability gate (`spec/platform.md` §1): the FANOS platform's coherence
+/// The HOLARCH architecture viability gate (`spec/platform.md` §1): the FANOS platform's coherence
 /// matrix `Γ` sits in the viable window — V1 distinctness, V2 reflection, V3 integration, V4
 /// differentiation — judged against the same coherence thresholds the DIAKRISIS runtime plane uses.
 /// This is the platform's own definition of done, reproduced here as a release gate.
 fn verify_holarch(r: &mut Report) {
-    println!(" Part XVI — ХОЛАРХ architecture viability gate");
+    println!(" Part XVI — HOLARCH architecture viability gate");
     let panel = fanos_holarch::Panel::run();
     for c in &panel.checks {
-        r.check(c.id, "ХОЛАРХ", c.pass, &c.detail);
+        r.check(c.id, "HOLARCH", c.pass, &c.detail);
     }
     let m = fanos_holarch::fanos_platform().gamma().verdict().margins();
     r.check(

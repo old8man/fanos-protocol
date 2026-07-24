@@ -17,7 +17,7 @@
 ## 🏛 PLATFORM TRANSFORMATION — IN PROGRESS (2026-07-22, user directive)
 
 **FANOS is now a holonic PLATFORM, not just a protocol** — a maximal-anonymity mixnet (E-machine) composed
-with a high-speed private post-quantum L1 blockchain (L-machine) into one meta-holon, grounded in ХОЛАРХ.
+with a high-speed private post-quantum L1 blockchain (L-machine) into one meta-holon, grounded in HOLARCH.
 Design authority: **`spec/platform.md`** (the E∧L synthesis, the 4 viability invariants as release gates, the
 subsystem specs). `protocol.md` reframed; all docs made consistent (FANOS=platform).
 
@@ -62,7 +62,7 @@ Roadmap (`spec/platform.md` §8), sequential + verified:
       - [ ] Residual: ANGELOS (anonymous PQ messenger — compose NYX/CALYPSO/DIAULOS/ONOMA); name→descriptor
             resolution wired to CALYPSO/OBOLOS/ANGELOS endpoints.
 - [ ] **T5 · HERMES (L12)** — PQ threshold cross-chain (atomic-swap mode first, custody second).
-- [ ] **ХОЛАРХ gate** — a Γ-calculator that CI-checks the platform's P/R/Φ/D viability verdict.
+- [ ] **HOLARCH gate** — a Γ-calculator that CI-checks the platform's P/R/Φ/D viability verdict.
 
 ---
 

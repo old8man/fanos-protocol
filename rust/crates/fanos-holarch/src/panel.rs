@@ -6,7 +6,7 @@ use crate::aspect::Aspect;
 use crate::gamma::Gamma;
 use crate::instance::{Ablation, agent_platform, blockchain, fanos_platform, mixnet};
 
-/// The honesty class of a check (mirrors the ХОЛАРХ lab): a computed fact about the machinery, or the
+/// The honesty class of a check (mirrors the HOLARCH lab): a computed fact about the machinery, or the
 /// self-consistency of an engineering instance (true by construction, demonstrated).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Class {
@@ -139,7 +139,7 @@ impl Panel {
 
 impl fmt::Display for Panel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "ХОЛАРХ viability gate — FANOS platform (spec/platform.md §1)")?;
+        writeln!(f, "HOLARCH viability gate — FANOS platform (spec/platform.md §1)")?;
         for c in &self.checks {
             let mark = if c.pass { "PASS" } else { "FAIL" };
             writeln!(f, "  [{:<3}] {} {mark} — {}", c.id, c.class.label(), c.detail)?;
