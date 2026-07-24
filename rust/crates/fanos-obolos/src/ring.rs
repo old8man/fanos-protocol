@@ -34,12 +34,27 @@ pub const D: usize = 256;
 /// A primitive root (generator) of `Z_q^*`. `7` generates the Goldilocks multiplicative group.
 const GENERATOR: u64 = 7;
 
-/// Reduce a wide product into `[0, q)`. **Correctness-first**: a plain modulo. The fast Goldilocks reduction
-/// (exploiting `2⁶⁴ ≡ 2³² − 1 (mod q)`) is a verified drop-in optimisation (see the STATUS note).
+/// `2⁶⁴ mod q = 2³² − 1` — the Goldilocks reduction constant (`ε`, where `q = 2⁶⁴ − ε`).
+const EPSILON: u64 = 0xFFFF_FFFF;
+
+/// Reduce a 128-bit value into the canonical `[0, q)` — the **fast Goldilocks reduction** (Plonky2), exploiting
+/// `2⁶⁴ ≡ 2³² − 1` and `2⁹⁶ ≡ −1 (mod q)`: with `x = hi·2⁶⁴ + lo` and `hi = hi_hi·2³² + hi_lo`,
+/// `x ≡ lo − hi_hi + hi_lo·ε`. Each `overflowing_{sub,add}` corrects a `2⁶⁴` wrap by `∓ε`; `hi_lo·ε < 2⁶⁴ − 2³³`
+/// leaves headroom so no second carry occurs, and one conditional `− q` canonicalises. This replaces a plain `%`
+/// with a few adds/shifts and is verified equal to it over the whole input range
+/// ([`fast_reduction_equals_modulo`](self)).
 #[inline]
 #[must_use]
 fn reduce(x: u128) -> u64 {
-    (x % (Q as u128)) as u64
+    let lo = x as u64;
+    let hi = (x >> 64) as u64;
+    let hi_hi = hi >> 32; // bits 96..128 — 2⁹⁶ ≡ −1
+    let hi_lo = hi & EPSILON; // bits 64..96 — 2⁶⁴ ≡ ε
+    let (t0, borrow) = lo.overflowing_sub(hi_hi);
+    let t0 = t0.wrapping_sub(EPSILON * u64::from(borrow)); // a 2⁶⁴ underflow ≡ +ε, so subtract ε back
+    let (res, carry) = t0.overflowing_add(hi_lo * EPSILON);
+    let res = res.wrapping_add(EPSILON * u64::from(carry)); // a 2⁶⁴ overflow dropped ε, so add it back
+    if res >= Q { res - Q } else { res } // res ∈ [0, 2⁶⁴); q ≤ res < q + ε ⇒ one subtraction canonicalises
 }
 
 /// `a + b mod q`.
@@ -392,6 +407,44 @@ impl Poly {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_reduction_equals_modulo() {
+        // The fast Goldilocks reduction must equal the plain modulo it replaces, over the WHOLE 128-bit input
+        // range — a wrong reduction would silently corrupt every ring operation, so this is exhaustively checked.
+        let reference = |x: u128| (x % (Q as u128)) as u64;
+        // Edge cases: boundaries of q, the reduction limbs (2³², 2⁶⁴, 2⁹⁶), and every product of edge residues.
+        let edges: [u128; 14] = [
+            0, 1, 2, u128::from(EPSILON), u128::from(EPSILON) + 1, 1 << 32, 1 << 64, 1 << 96,
+            u128::from(Q), u128::from(Q) - 1, u128::from(Q) + 1, 2 * u128::from(Q) - 1, u128::MAX,
+            u128::MAX - u128::from(Q),
+        ];
+        for &x in &edges {
+            assert_eq!(reduce(x), reference(x), "edge reduce({x})");
+        }
+        // Every product of two near-maximal field residues (the fmul worst cases) and their sums.
+        let residues = [0u64, 1, 2, EPSILON, EPSILON + 1, 1 << 32, Q / 2, Q - 2, Q - 1];
+        for &a in &residues {
+            for &b in &residues {
+                let prod = u128::from(a) * u128::from(b);
+                assert_eq!(reduce(prod), reference(prod), "reduce({a}·{b})");
+                let sum = u128::from(a) + u128::from(b);
+                assert_eq!(reduce(sum), reference(sum), "reduce({a}+{b})");
+            }
+        }
+        // A large deterministic random sweep (xorshift64), covering the full 128-bit range.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2_000_000u32 {
+            let x = (u128::from(next()) << 64) | u128::from(next());
+            assert_eq!(reduce(x), reference(x));
+        }
+    }
 
     #[test]
     fn the_field_is_a_field() {
