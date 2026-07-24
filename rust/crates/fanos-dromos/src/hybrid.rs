@@ -241,14 +241,16 @@ impl HybridLedger {
     /// (authorised by the shielded proof, which enforced `Σ inputs = Σ shielded outputs + fee + public_value`).
     /// Atomic: the pool must back the exit before anything mutates, and the shielded spend leaves token balances
     /// untouched, so the transparent move always completes.
-    fn apply_shielded(&mut self, stx: &ShieldedTx, proof: &TransparentProof) -> bool {
+    fn apply_shielded(&mut self, stx: &ShieldedTx, proof_ok: bool) -> bool {
         // Both the public output and the fee are clear value LEAVING the shielded pool (the balance law is
         // Σ inputs = Σ shielded outputs + fee + public_value), so the pool sink must back their sum.
         let leaving = stx.public_value.saturating_add(stx.fee);
         if leaving > 0 && self.pool_backing() < leaving {
             return false;
         }
-        if self.shielded.apply(&self.params, stx, proof).is_err() {
+        // The proof verdict (`proof_ok`) was computed by the caller — inline for a single transaction, or in the
+        // parallel pre-pass for a block. The commit itself reads only shielded state (anchors, nullifiers, tree).
+        if self.shielded.apply_with_verdict(stx, proof_ok).is_err() {
             return false;
         }
         if stx.public_value > 0 {
@@ -398,17 +400,94 @@ impl HybridLedger {
     /// transaction's [`ExecOutcome`] in the original order.
     #[must_use]
     pub fn execute_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
+        // The conflict-free schedule (spec §3): each wave's transactions touch disjoint state, so they are safe
+        // to commit in any order. The expensive, stateless half of validation — hybrid PQ signatures and shielded
+        // zero-knowledge proofs — is verified in parallel up front (`verify_batch`), reading no ledger state;
+        // then each transaction is committed in schedule order using its pre-computed verdict. Because every
+        // verdict is a pure function of its transaction, the result is independent of how the verification is
+        // split across cores — a validator with more cores computes the *same* block, so consensus is preserved.
         let access = self.access_lists(txs);
         let waves = schedule(&access);
+        let verdicts = self.verify_batch(txs);
         let mut outcomes = vec![ExecOutcome::Malformed; txs.len()];
         for wave in &waves {
             for &i in wave {
                 if let (Some(tx), Some(slot)) = (txs.get(i), outcomes.get_mut(i)) {
-                    *slot = self.apply(tx);
+                    *slot = self.apply_with_verdict(tx, verdicts.get(i).copied().flatten());
                 }
             }
         }
         outcomes
+    }
+
+    /// Verify every parallelizable transaction's signature or proof **concurrently** — the stateless, expensive
+    /// half of execution, which reads no ledger state and so runs across all cores before the serial commit.
+    /// Returns a verdict per transaction: `Some(valid)` for a transparent or shielded transfer checked here,
+    /// `None` for every other transaction (committed with an inline check, and for a malformed body that the
+    /// commit will reject anyway). Deterministic: each verdict is a pure function of its transaction, so the
+    /// output does not depend on the thread count or scheduling.
+    #[must_use]
+    fn verify_batch(&self, txs: &[Transaction]) -> Vec<Option<bool>> {
+        let jobs: Vec<(usize, StatelessJob)> =
+            txs.iter().enumerate().filter_map(|(i, tx)| stateless_job(tx).map(|j| (i, j))).collect();
+        let mut verdicts = vec![None; txs.len()];
+        if jobs.is_empty() {
+            return verdicts;
+        }
+        for (i, ok) in par_verify(&jobs, &self.params) {
+            if let Some(slot) = verdicts.get_mut(i) {
+                *slot = Some(ok);
+            }
+        }
+        verdicts
+    }
+
+    /// Execute one committed transaction, dispatching on its type tag. When a pre-computed stateless `verdict`
+    /// (its signature or proof result from [`verify_batch`](Self::verify_batch)) is supplied it is used; when
+    /// `None` — the single-transaction path — the check runs inline. Outcomes are identical either way: an
+    /// unknown tag or malformed body is [`ExecOutcome::Malformed`]; a well-formed-but-invalid transaction is
+    /// [`ExecOutcome::Rejected`]; success is [`ExecOutcome::Applied`].
+    fn apply_with_verdict(&mut self, tx: &Transaction, verdict: Option<bool>) -> ExecOutcome {
+        match tx.payload.split_first() {
+            Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
+                Some(st) => {
+                    let ok = verdict.unwrap_or_else(|| st.verify());
+                    outcome(self.tokens.apply_with_verdict(&st, ok).is_ok())
+                }
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
+                Some((shielded_tx, proof)) => {
+                    let ok =
+                        verdict.unwrap_or_else(|| ShieldedState::verify_proof(&self.params, &shielded_tx, &proof));
+                    outcome(self.apply_shielded(&shielded_tx, ok))
+                }
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
+                Some(name_tx) => outcome(self.names.apply(&name_tx, &mut self.tokens, self.height).is_ok()),
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_SHIELD, body)) => match ShieldTx::from_bytes(body) {
+                Some(sx) => outcome(self.shield(&sx)),
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
+                Some(StorageTx::Open { params, payment }) => outcome(self.open_deal(&params, &payment)),
+                Some(StorageTx::Prove { deal_id, prover_auth, response }) => {
+                    outcome(self.prove_deal(&deal_id, &prover_auth, &response))
+                }
+                Some(StorageTx::Close { deal_id, auth }) => outcome(self.close_deal(&deal_id, &auth)),
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
+                Some(HtlcTx::Lock { terms, payment }) => outcome(self.lock_htlc(&terms, &payment)),
+                Some(HtlcTx::Claim { htlc_id, preimage }) => outcome(self.claim_htlc(&htlc_id, &preimage)),
+                Some(HtlcTx::Refund { htlc_id }) => outcome(self.refund_htlc(&htlc_id)),
+                None => ExecOutcome::Malformed,
+            },
+            _ => ExecOutcome::Malformed,
+        }
     }
 
     /// Derive the access list of every transaction, in a single forward pass that also tracks deals **opened
@@ -602,41 +681,11 @@ impl StateMachine for HybridLedger {
 
     /// Execute one committed transaction by dispatching on its type tag. An unknown tag or empty payload is
     /// [`ExecOutcome::Malformed`]; a well-formed-but-invalid transaction (bad signature, double-spend, taken
-    /// name, insufficient funds) is [`ExecOutcome::Rejected`]; success is [`ExecOutcome::Applied`].
+    /// name, insufficient funds) is [`ExecOutcome::Rejected`]; success is [`ExecOutcome::Applied`]. The
+    /// single-transaction entry point: it verifies inline (no pre-computed verdict). Block execution instead
+    /// verifies in parallel and drives [`apply_with_verdict`](HybridLedger::apply_with_verdict) directly.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome {
-        match tx.payload.split_first() {
-            Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
-                Some(st) => outcome(self.tokens.apply(&st).is_ok()),
-                None => ExecOutcome::Malformed,
-            },
-            Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
-                Some((shielded_tx, proof)) => outcome(self.apply_shielded(&shielded_tx, &proof)),
-                None => ExecOutcome::Malformed,
-            },
-            Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
-                Some(name_tx) => outcome(self.names.apply(&name_tx, &mut self.tokens, self.height).is_ok()),
-                None => ExecOutcome::Malformed,
-            },
-            Some((&TAG_SHIELD, body)) => match ShieldTx::from_bytes(body) {
-                Some(sx) => outcome(self.shield(&sx)),
-                None => ExecOutcome::Malformed,
-            },
-            Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
-                Some(StorageTx::Open { params, payment }) => outcome(self.open_deal(&params, &payment)),
-                Some(StorageTx::Prove { deal_id, prover_auth, response }) => {
-                    outcome(self.prove_deal(&deal_id, &prover_auth, &response))
-                }
-                Some(StorageTx::Close { deal_id, auth }) => outcome(self.close_deal(&deal_id, &auth)),
-                None => ExecOutcome::Malformed,
-            },
-            Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
-                Some(HtlcTx::Lock { terms, payment }) => outcome(self.lock_htlc(&terms, &payment)),
-                Some(HtlcTx::Claim { htlc_id, preimage }) => outcome(self.claim_htlc(&htlc_id, &preimage)),
-                Some(HtlcTx::Refund { htlc_id }) => outcome(self.refund_htlc(&htlc_id)),
-                None => ExecOutcome::Malformed,
-            },
-            _ => ExecOutcome::Malformed,
-        }
+        self.apply_with_verdict(tx, None)
     }
 
     /// `H(tokens ‖ shielded ‖ names ‖ storage ‖ htlc)` — one commitment over transparent balances, shielded
@@ -696,6 +745,58 @@ impl StateMachine for HybridLedger {
 /// transaction — recorded as included-but-rejected, never a consensus failure).
 fn outcome(ok: bool) -> ExecOutcome {
     if ok { ExecOutcome::Applied } else { ExecOutcome::Rejected }
+}
+
+/// A transaction's **stateless verification job** — the signature or proof that can be checked without any
+/// ledger state, and so verified in parallel before the serial commit (see [`HybridLedger::verify_batch`]).
+/// Only the two high-volume transaction types with an expensive verification are represented; every other type
+/// is committed with an inline check. The shielded pair is boxed to keep the two variants a similar size.
+enum StatelessJob {
+    /// A transparent transfer: verify its hybrid post-quantum signature. Boxed — the signature is multi-kilobyte.
+    Transparent(Box<SignedTransfer>),
+    /// A shielded transfer: verify its zero-knowledge proof against the pool parameters.
+    Shielded(Box<(ShieldedTx, TransparentProof)>),
+}
+
+/// The stateless verification job for `tx`, or `None` for a transaction type committed with an inline check (or
+/// a malformed body, which the commit rejects anyway).
+fn stateless_job(tx: &Transaction) -> Option<StatelessJob> {
+    match tx.payload.split_first() {
+        Some((&TAG_TRANSPARENT, body)) => {
+            SignedTransfer::from_bytes(body).map(|st| StatelessJob::Transparent(Box::new(st)))
+        }
+        Some((&TAG_SHIELDED, body)) => decode_submission(body).map(|pair| StatelessJob::Shielded(Box::new(pair))),
+        _ => None,
+    }
+}
+
+/// Evaluate one job's verdict — a pure function of the job and the shared, immutable pool `params`.
+fn eval_job((i, job): &(usize, StatelessJob), params: &Params) -> (usize, bool) {
+    let ok = match job {
+        StatelessJob::Transparent(st) => st.verify(),
+        StatelessJob::Shielded(pair) => ShieldedState::verify_proof(params, &pair.0, &pair.1),
+    };
+    (*i, ok)
+}
+
+/// Evaluate every job's verdict, fanned out across the machine's parallelism with scoped threads. Each verdict
+/// depends only on its job and `params` (never ledger state), so splitting the jobs across threads cannot change
+/// any result — the output is deterministic regardless of the thread count or scheduling, which is what lets
+/// validators with different core counts agree on the block. A thread that panics contributes no verdicts; those
+/// transactions simply fall back to the inline check in `apply_with_verdict`, so a panic costs speed, not safety.
+fn par_verify(jobs: &[(usize, StatelessJob)], params: &Params) -> Vec<(usize, bool)> {
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    if threads <= 1 || jobs.len() <= 1 {
+        return jobs.iter().map(|j| eval_job(j, params)).collect();
+    }
+    let chunk = jobs.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().map(|j| eval_job(j, params)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
 }
 
 #[cfg(test)]
@@ -1541,5 +1642,64 @@ mod tests {
             assert_eq!(outcomes[0], ExecOutcome::Applied, "the first-committed spend wins");
             assert_eq!(outcomes[1], ExecOutcome::Rejected);
         }
+    }
+
+    #[test]
+    fn parallel_verification_of_a_mixed_block_matches_serial_including_a_forgery() {
+        // The parallel executor verifies the stateless half of validation — hybrid PQ signatures AND shielded
+        // zero-knowledge proofs — off the commit thread. This exercises all three cases in ONE block: a valid
+        // transparent transfer, a valid shielded spend, and a FORGED transfer (signed by the wrong key). The
+        // committed result — including rejecting the forgery — must be byte-identical to serial inline
+        // execution: moving verification off-thread changes nothing but speed.
+        let a = account(1);
+        let b = account(2);
+        let build = |acct: &(HybridSigSecret, HybridVerifier, [u8; 32]), to: [u8; 32], amount: u64, nonce: u64| {
+            let st = SignedTransfer::sign(Transfer { from: acct.2, to, amount, nonce }, &acct.0, acct.1.clone());
+            Transaction::new(HybridLedger::transparent_payload(&st))
+        };
+        // A single shielded note minted into the pool; the ledger also funds the two transparent accounts.
+        let nsk = [7u8; 32];
+        let n0 = note(500, &nsk, b"mix");
+        let make_ledger = || {
+            let mut t = TokenLedger::new();
+            t.credit(a.2, 10_000);
+            t.credit(b.2, 10_000);
+            let mut l = HybridLedger::new(t);
+            let pos = l.mint_shielded(n0.commitment(l.params())).unwrap();
+            (l, pos)
+        };
+        let (base, pos) = make_ledger();
+        let sp = SpendInput {
+            note: n0.clone(),
+            nsk,
+            spend_seed: spend_seed_of(&nsk),
+            path: base.shielded().path(pos).unwrap(),
+        };
+        let (stx, proof) = build_transfer(
+            base.params(),
+            base.shielded().anchor(),
+            std::slice::from_ref(&sp),
+            &[note(500, &[8u8; 32], b"out")],
+            0,
+        );
+        let shielded_tx = Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)));
+        // Forged: claims to be FROM `a`, but is signed by `b`'s key — its signature does not authorise it.
+        let forged = {
+            let st = SignedTransfer::sign(Transfer { from: a.2, to: b.2, amount: 500, nonce: 0 }, &b.0, b.1.clone());
+            Transaction::new(HybridLedger::transparent_payload(&st))
+        };
+        let txs = vec![build(&a, b.2, 100, 0), shielded_tx, forged, build(&b, a.2, 200, 0)];
+
+        let (mut serial, _) = make_ledger();
+        let serial_outcomes: Vec<_> = txs.iter().map(|t| serial.apply(t)).collect();
+        let (mut parallel, _) = make_ledger();
+        let parallel_outcomes = parallel.execute_block(&txs);
+
+        assert_eq!(parallel_outcomes, serial_outcomes, "parallel outcomes == serial for the mixed block");
+        assert_eq!(parallel.state_root(), serial.state_root(), "parallel state == serial");
+        assert_eq!(serial_outcomes[0], ExecOutcome::Applied, "the transparent transfer applied");
+        assert_eq!(serial_outcomes[1], ExecOutcome::Applied, "the shielded spend applied");
+        assert_eq!(serial_outcomes[2], ExecOutcome::Rejected, "the forgery is rejected off-thread exactly as inline");
+        assert_eq!(serial_outcomes[3], ExecOutcome::Applied, "the second transparent transfer applied");
     }
 }

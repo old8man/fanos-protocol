@@ -215,6 +215,26 @@ impl ShieldedState {
         tx: &ShieldedTx,
         proof: &P,
     ) -> Result<(), ApplyError> {
+        // Single-transaction path: verify the proof inline, then commit. Block execution verifies proofs in
+        // parallel up front (see [`verify_proof`](Self::verify_proof)) and commits via [`apply_with_verdict`].
+        self.apply_with_verdict(tx, Self::verify_proof(params, tx, proof))
+    }
+
+    /// Whether `proof` attests `tx` under `params` — the shielded transfer's one stateless, expensive step (the
+    /// zero-knowledge proof verification). It reads **no ledger state**, so a block's proofs can be verified
+    /// concurrently before the serial commit; [`apply_with_verdict`](Self::apply_with_verdict) consumes the result.
+    #[must_use]
+    pub fn verify_proof<P: ShieldedProof>(params: &Params, tx: &ShieldedTx, proof: &P) -> bool {
+        proof.verify(params, tx)
+    }
+
+    /// Commit a shielded transfer whose proof `verdict` is already known. The stateful half of
+    /// [`apply`](Self::apply): the known-anchor, fresh-nullifier, and capacity checks in the same order, then —
+    /// only if the proof held — recording the nullifiers and appending the output note commitments. Splitting the
+    /// verdict out lets a block verify every proof in parallel, then commit serially in consensus order, with a
+    /// result identical to `apply` — the proof verification reads no ledger state, so evaluating it earlier and
+    /// off-thread cannot change the outcome.
+    pub fn apply_with_verdict(&mut self, tx: &ShieldedTx, verdict: bool) -> Result<(), ApplyError> {
         if !self.anchors.contains(&tx.anchor) {
             return Err(ApplyError::UnknownAnchor);
         }
@@ -225,7 +245,7 @@ impl ShieldedState {
         if self.tree.size().saturating_add(tx.outputs.len() as u64) > (1u64 << TREE_DEPTH) {
             return Err(ApplyError::CapacityExceeded);
         }
-        if !proof.verify(params, tx) {
+        if !verdict {
             return Err(ApplyError::InvalidProof);
         }
         // Commit: record the nullifiers and append the output note commitments (capacity pre-checked).

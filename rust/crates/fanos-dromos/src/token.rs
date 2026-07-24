@@ -242,7 +242,18 @@ impl TokenLedger {
 
     /// Apply an authorised transfer, or reject it with the reason. Atomic: on any error nothing changes.
     pub fn apply(&mut self, st: &SignedTransfer) -> Result<(), TokenError> {
-        if !st.verify() {
+        // Single-transaction path: verify the signature inline, then settle. Block execution verifies every
+        // transfer's signature in parallel up front and settles via [`apply_with_verdict`](Self::apply_with_verdict).
+        self.apply_with_verdict(st, st.verify())
+    }
+
+    /// Settle a signed transfer whose signature was **already verified** (the `sig_ok` verdict). The signature
+    /// check is the transfer's one stateless, expensive step (a hybrid post-quantum verification); factoring it
+    /// out lets a block verify every transfer's signature in parallel *before* this serial settle. The result is
+    /// identical to [`apply`](Self::apply): the settle reads only ledger state (nonce, balance), never the
+    /// signature, so verifying the signature earlier and off-thread cannot change the outcome.
+    pub fn apply_with_verdict(&mut self, st: &SignedTransfer, sig_ok: bool) -> Result<(), TokenError> {
+        if !sig_ok {
             return Err(TokenError::Unauthorized);
         }
         let t = &st.transfer;
