@@ -35,6 +35,7 @@ mod metrics;
 /// Cluster-scale stress experiments (`stress::Experiment`), namespaced to avoid clashing with the
 /// param-sweep [`Experiment`](experiment::Experiment) harness.
 pub mod stress;
+mod unified;
 mod network;
 mod observatory;
 mod rng;
@@ -45,6 +46,7 @@ pub use cluster::{CELL_SIZE, Cluster, ClusterSnapshot};
 pub use experiment::{Experiment, Grid, Params, Row, Scenario};
 pub use fleet::{AlarmCounts, ClusterStats, FleetSnapshot, NodeState, RegimeCounts};
 pub use hierarchy::Hierarchy;
+pub use unified::UnifiedCluster;
 pub use metrics::{Metrics, Observed, Report};
 pub use network::NetworkModel;
 pub use observatory::{
