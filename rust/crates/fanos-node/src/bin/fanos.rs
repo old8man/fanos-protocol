@@ -52,6 +52,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
+        Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -659,6 +660,57 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// `fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64]`: deal a fresh 7-validator TAXIS cell (the base
+/// Fano cell) from OS entropy and write each validator's provisioning file (`validator-<i>.taxis`, `i = 0..6`)
+/// into `DIR` (default `.`). Run each with `fanos validator --config validator-<i>.taxis`. A single-operator
+/// convenience for a permissioned cell — every validator file carries the whole public config (verifier set,
+/// keyper commitment) plus that validator's one secret seed.
+#[cfg(feature = "validator")]
+fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
+    use fanos_node::{ValidatorConfig, deal_validators};
+    use fanos_pqcrypto::rng::SeedRng;
+    use fanos_taxis::params::CellParams;
+
+    let out = flag(args, "--out").unwrap_or(".");
+    let epoch = match flag(args, "--epoch") {
+        Some(s) => Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?),
+        None => Epoch::ZERO,
+    };
+    let beacon = match flag(args, "--beacon") {
+        Some(s) => parse_beacon_hex(s)?,
+        None => BeaconSeed::GENESIS,
+    };
+    let cell = CellParams::FANO;
+
+    // The validator seeds are drawn from OS entropy — this tool holds the whole cell's key material for the
+    // moment of dealing (a single-operator bootstrap; a trust-minimized deployment provisions each validator
+    // independently and exchanges only the public verifiers/keyper commitment).
+    let mut rng_seed = [0u8; 32];
+    getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let configs = deal_validators(cell, epoch, beacon, &mut SeedRng::from_seed(&rng_seed));
+
+    for c in &configs {
+        let path = format!("{out}/validator-{}.taxis", c.me);
+        std::fs::write(&path, ValidatorConfig::to_bytes(c))?;
+        println!("wrote {path}");
+    }
+    println!(
+        "dealt a {}-validator TAXIS cell (epoch {}); run each with `fanos validator --config validator-<i>.taxis`",
+        cell.n,
+        epoch.get(),
+    );
+    Ok(())
+}
+
+/// Without the `validator` feature the binary carries no ledger, so `fanos taxis-deal` cannot deal a cell.
+#[cfg(not(feature = "validator"))]
+fn cmd_taxis_deal(_args: &[String]) -> Result<(), NodeError> {
+    Err(NodeError::Config(
+        "this build lacks validator support — rebuild with `cargo build -p fanos-node --features validator`"
+            .to_owned(),
+    ))
+}
+
 /// Resolve a `.fanos` name against the network and print the authenticated result.
 async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
@@ -870,6 +922,8 @@ fn print_help() {
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
+         \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64]\n\
+         \x20             (deal a 7-validator TAXIS blockchain cell; writes validator-<i>.taxis; --features validator)\n\
          \x20 fanos help\n\
          \n\
          PROXY PROFILES:\n\
