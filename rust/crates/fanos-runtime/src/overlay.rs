@@ -1786,14 +1786,13 @@ impl<F: Field> OverlayNode<F> {
             // The parent absorbs it: install the coarse reroutes (failed child → via a co-linear sibling) and
             // mark the child repaired at the coarse tier.
             for (around, via) in parent.coarse_reroutes(phi) {
+                // Parent positions → the parent cell's real member coordinates (base cell: Point::at).
                 effects.push(Effect::Notify(Notification::Rerouted {
-                    around: Point::<F>::at(around).coords(),
-                    via: Point::<F>::at(via).coords(),
+                    around: self.cell_coord(around),
+                    via: self.cell_coord(via),
                 }));
             }
-            effects.push(Effect::Notify(Notification::Repaired(
-                Point::<F>::at(usize::from(child_index)).coords(),
-            )));
+            effects.push(Effect::Notify(Notification::Repaired(self.cell_coord(usize::from(child_index)))));
         } else {
             // The parent tier cannot absorb within its own Φ-budget: hand the AGGREGATE coarse residue up to
             // the grandparent if there is one (bounded), else terminal — external help required.
