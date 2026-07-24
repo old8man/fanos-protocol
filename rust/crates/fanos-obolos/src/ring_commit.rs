@@ -138,6 +138,41 @@ impl RingRandomness {
         debug_assert_eq!(r.len(), ELL, "a randomness has ELL components");
         Self { r }
     }
+
+    /// **Wide masking** randomness — `ELL` uniformly-`bound`ed components, deterministic from `seed`. The product
+    /// proof ([`crate::ring_product`]) blinds its revealed randomness openings with these (`bound ≫ 1`), so the
+    /// short ternary randomness they carry stays hidden.
+    #[must_use]
+    pub(crate) fn from_uniform_bounded(seed: &[u8], bound: i64) -> Self {
+        let r = (0..ELL)
+            .map(|j| {
+                let mut s = Vec::with_capacity(seed.len() + 8);
+                s.extend_from_slice(seed);
+                s.extend_from_slice(&(j as u64).to_le_bytes());
+                Poly::uniform_bounded(&s, bound)
+            })
+            .collect();
+        Self { r }
+    }
+
+    /// Scale by a ring element: `c·r` component-wise. With `c` a monomial the result stays short.
+    #[must_use]
+    pub(crate) fn scale(&self, c: &Poly) -> Self {
+        Self { r: self.r.iter().map(|rj| c.mul(rj)).collect() }
+    }
+
+    /// Component-wise sum `r + other` (both `ELL` components).
+    #[must_use]
+    pub(crate) fn add(&self, other: &Self) -> Self {
+        Self { r: self.r.iter().zip(&other.r).map(|(a, b)| a.add(b)).collect() }
+    }
+
+    /// Whether every component is within infinity-norm `bound` — the shortness a proof's masked randomness opening
+    /// must satisfy.
+    #[must_use]
+    pub(crate) fn infinity_norm_le(&self, bound: i64) -> bool {
+        self.r.iter().all(|p| p.infinity_norm_le(bound))
+    }
 }
 
 /// A ring-BDLOP value commitment `(t0 ∈ R_q^K, t1 ∈ R_q)` — hiding the amount, binding, additively homomorphic.
@@ -151,7 +186,23 @@ impl RingCommitment {
     /// Commit to `value` under short randomness `r`: `(A₁·r, ⟨a₂, r⟩ + value)`.
     #[must_use]
     pub fn commit(params: &RingParams, value: u64, r: &RingRandomness) -> Self {
-        Self { t0: params.a1_times(&r.r), t1: params.a2_dot(&r.r).add(&Poly::constant(value)) }
+        Self::commit_message(params, &Poly::constant(value), r)
+    }
+
+    /// Commit to a **full ring-element message** `msg` under short randomness `r`: `(A₁·r, ⟨a₂, r⟩ + msg)`. Value
+    /// commitments embed the amount as a constant polynomial ([`commit`](Self::commit)); the product proof
+    /// ([`crate::ring_product`]) commits general messages (masking terms and cross-products) this way.
+    #[must_use]
+    pub fn commit_message(params: &RingParams, msg: &Poly, r: &RingRandomness) -> Self {
+        Self { t0: params.a1_times(&r.r), t1: params.a2_dot(&r.r).add(msg) }
+    }
+
+    /// Scale this commitment by a ring element `c`: `c·(t0, t1) = (c·t0, c·t1)` — a commitment to `c·msg` under
+    /// `c·r`. With `c` a **monomial** (the challenge form), `c·r` stays short, so binding is preserved: the
+    /// product proof's verifier forms `γ·X`, `γ²·Z`, `γ·T` this way.
+    #[must_use]
+    pub fn scale(&self, c: &Poly) -> Self {
+        Self { t0: self.t0.iter().map(|p| c.mul(p)).collect(), t1: c.mul(&self.t1) }
     }
 
     /// The commitment to a **public** amount with zero randomness: `(0, value)`. The fee enters the balance law
