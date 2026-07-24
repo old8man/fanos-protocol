@@ -4,6 +4,7 @@
 //!   * `fanos node`  — run a node (overlay membership, storage, healing) over QUIC.
 //!   * `fanos proxy` — run local SOCKS5 / HTTP-CONNECT listeners tunnelling to `.fanos` services (§11.3).
 //!   * `fanos host`  — host a hidden service on the anonymous rendezvous, forwarding to a local port (§3b).
+//!   * `fanos validator` / `taxis-deal` — deal + run a TAXIS blockchain cell over the DROMOS ledger.
 //!   * `fanos id`    — print (and optionally persist) a node's self-certifying coordinate.
 //!   * `fanos help`  — usage.
 
@@ -49,6 +50,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
         Some("host") => cmd_host(args.get(2..).unwrap_or(&[])).await,
+        Some("validator") => cmd_validator(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
@@ -711,6 +713,96 @@ fn cmd_taxis_deal(_args: &[String]) -> Result<(), NodeError> {
     ))
 }
 
+/// `fanos validator --config validator-<i>.taxis --listen ADDR --bootstrap <coord>@host:port,…`: run a TAXIS
+/// blockchain validator — the caller that closes the "`spawn_taxis` has no prod caller" production gap. It
+/// seats a node at its consensus point `Point::at(me)` (a production fixed-coordinate node — `spawn_pinned`'s
+/// grind, so the coordinate is *chosen*, not VRF-accepted, which the Fano-cell BFT structure requires), wires
+/// the other validators' coordinates→sockets from `--bootstrap`, and runs the sans-I/O consensus engine over
+/// the DROMOS hybrid ledger (`spawn_taxis`). Provision a cell with `fanos taxis-deal`.
+#[cfg(feature = "validator")]
+async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
+    use fanos_dromos::HybridLedger;
+    use fanos_geometry::Point;
+    use fanos_node::{ValidatorConfig, genesis_ledger, spawn_taxis};
+    use fanos_quic::{Directory, credentials_for_point, spawn_self_certifying_persistent_on};
+    use fanos_runtime::{Config as OverlayConfig, OverlayNode};
+
+    init_tracing();
+    let config_path = flag(args, "--config")
+        .ok_or_else(|| NodeError::Config("fanos validator requires --config validator-<i>.taxis".to_owned()))?;
+    let config = ValidatorConfig::from_bytes(&std::fs::read(config_path)?)
+        .ok_or_else(|| NodeError::Config("malformed validator config file".to_owned()))?;
+    let me = config.me;
+    let listen: SocketAddr = match flag(args, "--listen") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --listen '{s}'")))?,
+        None => SocketAddr::from(([0, 0, 0, 0], 0)),
+    };
+
+    // The other validators' coordinates → sockets (this node reaches its peers by coordinate). Same
+    // `<coord>@host:port` form as `fanos node --bootstrap`, but here every peer is a fixed cell seat.
+    let directory = Directory::new();
+    for value in flag_all(args, "--bootstrap") {
+        for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let peer = Peer::parse(part)?;
+            directory.insert(peer.coord, peer.addr);
+        }
+    }
+
+    // Seat the node at Point::at(me) (grind an identity that hits it) and bind the consensus listen socket.
+    let target = Point::<F2>::at(usize::from(me));
+    let creds = credentials_for_point::<F2>(target, fanos_quic::DEFAULT_GRIND_LIMIT)
+        .ok_or_else(|| NodeError::Config(format!("could not seat a node at validator point {me}")))?;
+    let mut node = spawn_self_certifying_persistent_on::<F2>(
+        listen,
+        &creds,
+        |coord| Box::new(OverlayNode::<F2>::new(coord, OverlayConfig::default())),
+        directory,
+        None,
+    )
+    .await
+    .map_err(|e| NodeError::Config(format!("could not start the validator node: {e:?}")))?;
+
+    // Run the consensus engine over the DROMOS hybrid ledger. The handle owns the driver tasks; keep it alive.
+    let params = config
+        .to_taxis_params(genesis_ledger())
+        .ok_or_else(|| NodeError::Config("the validator config carries a malformed verifier".to_owned()))?;
+    let handle = spawn_taxis::<F2, HybridLedger>(node.client(), params);
+    let mut events = handle.subscribe();
+
+    let [x, y, z] = node.address();
+    eprintln!(
+        "fanos validator {me} up — seat {x}:{y}:{z}, listening on {listen}\n  running TAXIS consensus over \
+         the DROMOS hybrid ledger (epoch {})",
+        config.epoch.get(),
+    );
+    info!(validator = me, coord = ?node.address(), %listen, "fanos validator up");
+
+    // Serve until Ctrl-C, logging consensus progress and draining the node's notifications.
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal received");
+    };
+    tokio::select! {
+        () = shutdown => {}
+        () = async { while let Ok(ev) = events.recv().await { info!(?ev, "taxis event"); } } => {}
+        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+    }
+    node.shutdown();
+    eprintln!("fanos validator {me} down");
+    Ok(())
+}
+
+/// Without the `validator` feature the binary carries no ledger, so it cannot run a `fanos validator`.
+/// `async` only to share the dispatcher's `.await` with the real command; it awaits nothing.
+#[cfg(not(feature = "validator"))]
+#[allow(clippy::unused_async)]
+async fn cmd_validator(_args: &[String]) -> Result<(), NodeError> {
+    Err(NodeError::Config(
+        "this build lacks validator support — rebuild with `cargo build -p fanos-node --features validator`"
+            .to_owned(),
+    ))
+}
+
 /// Resolve a `.fanos` name against the network and print the authenticated result.
 async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
@@ -924,6 +1016,8 @@ fn print_help() {
          \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
          \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64]\n\
          \x20             (deal a 7-validator TAXIS blockchain cell; writes validator-<i>.taxis; --features validator)\n\
+         \x20 fanos validator --config validator-<i>.taxis [--listen ADDR] [--bootstrap <coord>@host:port,…]\n\
+         \x20             (run a TAXIS blockchain validator over the DROMOS ledger; --features validator)\n\
          \x20 fanos help\n\
          \n\
          PROXY PROFILES:\n\
