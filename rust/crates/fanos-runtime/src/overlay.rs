@@ -1011,6 +1011,12 @@ pub struct OverlayNode<F: Field> {
     /// This node's Fano point index (`Some` only on the base `N = 7` cell, where the reflexive
     /// loop's index-addressed geometry — syndrome, mediator, peeling — applies).
     self_index: Option<usize>,
+    /// The explicit 7-member cell this node self-diagnoses with, when it is **not** the base plane's
+    /// points `0..6` — i.e. a 7-node Fano cell embedded in a larger transport plane (a unified
+    /// hierarchy). `None` on the base cell, where cell position `i` is `Point::at(i)`; `Some(members)`
+    /// remaps position `i` to `members[i]`, so the whole index-addressed reflex runs unchanged over a
+    /// cell seated anywhere. See [`cell_coord`](Self::cell_coord) / [`with_cell_members`](Self::with_cell_members).
+    cell_members: Option<[Triple; 7]>,
     /// The **parent-stratum reflex** (audit R-C2): when a child cell escalates its irrecoverable residue to
     /// this cell, its members fold the failure into a [`ParentCell`] — the same reflexive Fano decoder one
     /// tier up — and coarse-reroute around the failed child. `None` until this node first receives a child
@@ -1125,6 +1131,7 @@ impl<F: Field> OverlayNode<F> {
             peers,
             heartbeating: false,
             self_index,
+            cell_members: None,
             parent_cell: None,
             healer: Healer::new(observer),
             witnessed: BTreeMap::new(),
@@ -1138,6 +1145,39 @@ impl<F: Field> OverlayNode<F> {
     /// The node's cell neighbour coordinates (its quorum members).
     pub fn neighbours(&self) -> impl Iterator<Item = Triple> + '_ {
         self.peers.keys().copied()
+    }
+
+    /// The transport coordinate of cell position `i` (`0..7`): the explicit [`cell_members`](Self::with_cell_members)
+    /// entry when this node is a cell embedded in a larger plane, else the base plane's `Point::at(i)`. This is
+    /// the single indirection the index-addressed reflex routes through, so a cell runs identically wherever it
+    /// is seated.
+    fn cell_coord(&self, i: usize) -> Triple {
+        self.cell_members
+            .as_ref()
+            .and_then(|members| members.get(i).copied())
+            .unwrap_or_else(|| Point::<F>::at(i).coords())
+    }
+
+    /// Seat this node in an explicit 7-node Fano cell (`members`, in canonical position order) rather than the
+    /// base plane's points `0..6` — for a cell embedded in a larger transport plane (a unified hierarchy). Sets
+    /// the reflexive `self_index` to this node's position and rebuilds the cell peer set from the six other
+    /// members, so liveness sensing, witnessing, and the whole reflex run over the real cell.
+    #[must_use]
+    pub fn with_cell_members(mut self, members: [Triple; 7]) -> Self {
+        self.self_index = members.iter().position(|&m| m == self.coord.coords());
+        self.peers.clear();
+        for &m in &members {
+            if m != self.coord.coords() {
+                self.peers.entry(m).or_insert(Peer {
+                    last_seen: None,
+                    reported_down: false,
+                    loss: 0.0,
+                    awaiting_pong: false,
+                });
+            }
+        }
+        self.cell_members = Some(members);
+        self
     }
 
     /// Whether `coord` is live, corroborated across its line-witnesses (spec §6.4). Our own direct
@@ -2426,14 +2466,15 @@ impl<F: Field> OverlayNode<F> {
     /// off the base `N = 7` cell, where the index-addressed syndrome geometry does not apply.
     fn cell_liveness(&self, now: Instant) -> Option<(usize, u8, usize)> {
         let self_index = self.self_index?;
+        let own = self.coord.coords();
         let mut degraded = 0u8;
         let mut alive_count = 1usize; // self is alive
         for i in 0..7usize {
-            let point = Point::<F>::at(i);
-            if point == self.coord {
+            let coord = self.cell_coord(i); // base cell: Point::at(i); embedded cell: members[i]
+            if coord == own {
                 continue;
             }
-            if self.coord_alive(point.coords(), now) {
+            if self.coord_alive(coord, now) {
                 alive_count += 1;
             } else {
                 degraded |= 1 << i;
