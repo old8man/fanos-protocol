@@ -259,6 +259,22 @@ mod tests {
     }
 
     #[test]
+    fn an_invertible_challenge_difference_extracts_the_exact_witness() {
+        // Monomials X^i are valid (ternary) challenges whose difference is ALWAYS a unit ([`crate::ring`]). With
+        // such a pair the relaxed opening sharpens to the EXACT witness: from z̄ = c̄·r the extractor recovers
+        // r = c̄⁻¹·z̄ and confirms M·r = u — a true opening, not merely a c̄-scaled one.
+        let (params, commitment, r) = setup(77, b"ring-zk-exact");
+        let u = commitment.statement(77);
+        let c_bar = Poly::monomial(9).sub(&Poly::monomial(2)); // X^9 − X^2, a unit
+        let c_bar_inv = c_bar.inverse().expect("a monomial difference is invertible");
+        // z̄_j = c̄·r_j (the masking cancels across two transcripts under c = X^9, c' = X^2).
+        let z_bar: Vec<Poly> = r.components().iter().map(|rj| c_bar.mul(rj)).collect();
+        let extracted: Vec<Poly> = z_bar.iter().map(|zj| c_bar_inv.mul(zj)).collect();
+        assert_eq!(extracted, r.components(), "c̄⁻¹·z̄ recovers the exact randomness r");
+        assert_eq!(params.m_times(&extracted), u, "M·r = u — an exact opening of the commitment");
+    }
+
+    #[test]
     fn a_forged_proof_without_a_witness_is_rejected() {
         // A prover with no short opening cannot pass: any in-bound responses + any challenge recompute a w whose
         // hash is (with probability 3^-D) not the challenge — Fiat–Shamir rejects.

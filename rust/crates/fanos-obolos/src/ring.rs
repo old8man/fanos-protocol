@@ -200,6 +200,23 @@ impl Poly {
         Self { coeffs }
     }
 
+    /// The monomial `X^m ∈ R_q` for any `m` (taken mod `2D`). For `m mod 2D ≥ D` it is `−X^{(m mod 2D)−D}` (the
+    /// negacyclic wrap `X^D = −1`). The set `{X^m : 0 ≤ m < 2D}` is the **challenge set** the range/product proofs
+    /// use: every element is short (`‖·‖∞ = 1`) and — the load-bearing property for soundness extraction — every
+    /// *difference* `X^i − X^j` (`i ≠ j mod 2D`) is a **unit**. That holds on this fully-splitting ring precisely
+    /// because `2D` is a power of two, so `X^{i−j} − 1` shares no root with `X^D + 1`
+    /// ([`monomial_challenge_differences_are_units`](self)).
+    #[must_use]
+    pub fn monomial(m: usize) -> Self {
+        let mut coeffs = alloc::vec![0u64; D];
+        let m = m % (2 * D);
+        let (idx, val) = if m < D { (m, 1) } else { (m - D, Q - 1) };
+        if let Some(c) = coeffs.get_mut(idx) {
+            *c = val;
+        }
+        Self { coeffs }
+    }
+
     /// The coefficient slice.
     #[must_use]
     pub fn coeffs(&self) -> &[u64] {
@@ -322,6 +339,33 @@ impl Poly {
         Self { coeffs: prod }
     }
 
+    /// Whether this ring element is a **unit** (invertible) — true iff none of its `D` NTT slots vanish. On the
+    /// fully-splitting Goldilocks ring `R_q ≅ (Z_q)^D` (slot-wise via the NTT), a product is a unit exactly when
+    /// no slot is zero.
+    #[must_use]
+    pub fn is_invertible(&self) -> bool {
+        let mut slots = self.coeffs.clone();
+        ntt(&mut slots);
+        slots.iter().all(|&s| s != 0)
+    }
+
+    /// The multiplicative inverse `a⁻¹` in `R_q`, or `None` if `a` is not a unit. Computed slot-wise in the NTT
+    /// domain — `a⁻¹ = INTT((slotᵢ⁻¹)ᵢ)` — which is *exact* because the ring fully splits. The extractor of a
+    /// range/product proof divides by an (always-invertible) challenge difference this way.
+    #[must_use]
+    pub fn inverse(&self) -> Option<Self> {
+        let mut slots = self.coeffs.clone();
+        ntt(&mut slots);
+        if slots.contains(&0) {
+            return None; // a zero slot ⇒ a zero divisor, not a unit
+        }
+        for s in &mut slots {
+            *s = finv(*s);
+        }
+        intt(&mut slots);
+        Some(Self { coeffs: slots })
+    }
+
     /// The negacyclic **schoolbook** product — the `O(D²)` reference [`mul`](Self::mul) is verified against.
     #[cfg(test)]
     #[must_use]
@@ -406,6 +450,40 @@ mod tests {
         assert_eq!(a.mul(&b), b.mul(&a), "commutative");
         assert_eq!(a.mul(&b.add(&c)), a.mul(&b).add(&a.mul(&c)), "distributive over +");
         assert_eq!(a.add(&b).sub(&b), a, "additive inverse");
+    }
+
+    #[test]
+    fn ring_inversion_is_exact_on_the_splitting_field() {
+        // On the fully-splitting Goldilocks ring, NTT-domain slot inversion is exact.
+        let a = Poly::uniform(b"invert-me");
+        let a_inv = a.inverse().expect("a uniform element is almost surely a unit");
+        assert_eq!(a.mul(&a_inv), Poly::constant(1), "a · a⁻¹ = 1");
+        assert!(Poly::constant(1).is_invertible(), "1 is a unit");
+        assert!(Poly::zero().inverse().is_none(), "0 is not a unit");
+        // X^m is always a unit (its inverse is the negacyclic X^{2D−m}).
+        assert!(Poly::monomial(5).is_invertible(), "a monomial is a unit");
+        assert_eq!(Poly::monomial(5).mul(&Poly::monomial(5).inverse().unwrap()), Poly::constant(1));
+    }
+
+    #[test]
+    fn monomial_challenge_differences_are_units() {
+        // The load-bearing lemma for range/product-proof soundness: every difference X^i − X^j (i ≠ j mod 2D) is
+        // invertible in R_q, so the extractor can divide by a challenge difference. Holds because 2D is a power of
+        // two, so X^{i−j} − 1 shares no root with X^D + 1 even though the ring fully splits.
+        for i in 0..10usize {
+            for j in 0..10usize {
+                let diff = Poly::monomial(i).sub(&Poly::monomial(j));
+                if i == j {
+                    assert!(!diff.is_invertible(), "X^i − X^i = 0 is not a unit");
+                } else {
+                    assert!(diff.is_invertible(), "X^{i} − X^{j} is a unit");
+                    assert_eq!(diff.mul(&diff.inverse().unwrap()), Poly::constant(1), "and its inverse inverts");
+                }
+            }
+        }
+        // A far-apart pair, and the negacyclic-wrapped range m ≥ D (monomial(300) = −X^{44}).
+        assert!(Poly::monomial(300).sub(&Poly::monomial(5)).is_invertible(), "wrapped monomials too");
+        assert!(Poly::monomial(511).sub(&Poly::monomial(0)).is_invertible(), "the widest gap < 2D");
     }
 
     #[test]
