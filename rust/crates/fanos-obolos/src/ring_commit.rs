@@ -167,6 +167,13 @@ impl RingRandomness {
         Self { r: self.r.iter().zip(&other.r).map(|(a, b)| a.add(b)).collect() }
     }
 
+    /// Component-wise difference `r − other` — the randomness of a difference commitment `C_a − C_b`, which the
+    /// conditional-swap proof ([`crate::ring_membership`]) opens as a product proof's factor.
+    #[must_use]
+    pub(crate) fn sub(&self, other: &Self) -> Self {
+        Self { r: self.r.iter().zip(&other.r).map(|(a, b)| a.sub(b)).collect() }
+    }
+
     /// Whether every component is within infinity-norm `bound` — the shortness a proof's masked randomness opening
     /// must satisfy.
     #[must_use]
