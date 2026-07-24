@@ -381,6 +381,28 @@ impl Poly {
         Some(Self { coeffs: slots })
     }
 
+    /// The **coefficient-wise (Hadamard) product** `(a ∘ b)_i = a_i·b_i` — *not* the ring product. The aggregated
+    /// range proof ([`crate::ring_range_agg`]) checks binarity through this: the verifier forms `f ∘ (x − f)` from
+    /// the revealed masked bits `f` as a known polynomial.
+    #[must_use]
+    pub(crate) fn hadamard(&self, other: &Self) -> Self {
+        Self { coeffs: self.coeffs.iter().zip(&other.coeffs).map(|(&a, &b)| fmul(a, b)).collect() }
+    }
+
+    /// The polynomial with **every** coefficient equal to the scalar `v` — the coefficient-wise broadcast used to
+    /// form `x − f` (all `D` coefficients `x − f_i`), distinct from [`constant`](Self::constant) (only `c₀ = v`).
+    #[must_use]
+    pub(crate) fn broadcast(v: u64) -> Self {
+        Self { coeffs: alloc::vec![reduce(u128::from(v)); D] }
+    }
+
+    /// The **weighted coefficient sum** `Σ_{i<bits} coeffᵢ·2ⁱ (mod q)` — the reconstruction inner product
+    /// `⟨f, 2^vec⟩` that links the packed bits to the committed value. `bits ≤ 63`.
+    #[must_use]
+    pub(crate) fn inner_pow2(&self, bits: usize) -> u64 {
+        self.coeffs.iter().take(bits).enumerate().fold(0u64, |acc, (i, &c)| fadd(acc, fmul(c, 1u64 << i)))
+    }
+
     /// The negacyclic **schoolbook** product — the `O(D²)` reference [`mul`](Self::mul) is verified against.
     #[cfg(test)]
     #[must_use]
