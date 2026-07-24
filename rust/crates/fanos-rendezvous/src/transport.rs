@@ -18,12 +18,12 @@
 //!   client's reply circuit, which ends at the combiner the client listens on.
 
 use core::marker::PhantomData;
-use std::collections::BTreeMap;
 
 use fanos_aphantos::nostos::ReplyKeys;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_pqcrypto::rng::SeedRng;
+use fanos_primitives::BoundedMap;
 
 use crate::{Forward, MixDirectory, Request, combiner_for, seal_forward, seal_nostos_reply};
 
@@ -171,6 +171,16 @@ struct ReplyRoute {
     reply_pub: Vec<u8>,
 }
 
+/// Cap on the cookie→reply-circuit table. The cookie is **remote-chosen**, so an unbounded map is a
+/// single-peer memory-exhaustion DoS (audit robustness B2 / A4): a client streaming distinct cookies —
+/// past the node's session cap, which does not evict this table, and across epoch rotations, which keep
+/// it — grows it without limit. A [`BoundedMap`] caps it with FIFO eviction. The bound sits well above
+/// the node's live-session cap (`MAX_SESSIONS = 1024`), so honest concurrent clients are never evicted
+/// under normal load; the FIFO bound engages only under a flood, and an evicted honest client simply
+/// re-registers its route on its next cell (the reply then rides DIAULOS retransmission — the bound is
+/// best-effort, never a correctness dependency).
+const MAX_ROUTES: usize = 4096;
+
 /// The service half of an anonymous session.
 ///
 /// It [`ingest`](Self::ingest)s requests delivered at its meeting line — recording each cookie's reply
@@ -181,7 +191,8 @@ pub struct RendezvousService<F: Field> {
     directory: MixDirectory,
     threshold: u8,
     rng: SeedRng,
-    routes: BTreeMap<SessionId, ReplyRoute>,
+    /// Cookie → reply circuit. Bounded ([`MAX_ROUTES`]) because the cookie is remote-chosen.
+    routes: BoundedMap<SessionId, ReplyRoute>,
     _f: PhantomData<F>,
 }
 
@@ -193,7 +204,7 @@ impl<F: Field> RendezvousService<F> {
             directory,
             threshold,
             rng: SeedRng::from_seed(secret),
-            routes: BTreeMap::new(),
+            routes: BoundedMap::new(MAX_ROUTES),
             _f: PhantomData,
         }
     }
@@ -411,6 +422,39 @@ mod tests {
         // Now a reply seals through the recorded circuit (legacy cookie-tagged path — no reply key).
         let reply = svc.seal_reply(&cookie, b"resp").unwrap();
         assert_eq!(reply.combiner, combiner_for::<F2>(hop).unwrap());
+    }
+
+    #[test]
+    fn a_cookie_flood_cannot_grow_the_route_table_without_bound() {
+        // The cookie is remote-chosen, so a client streaming distinct cookies must not grow the
+        // route table without limit (audit A4 / robustness B2). The BoundedMap caps it at
+        // MAX_ROUTES with FIFO eviction: the table stays capped and the oldest cookie is evicted.
+        let dir = fano_directory();
+        let mut svc = RendezvousService::<F2>::new(dir, 2, b"flood-svc");
+        let overflow = 100usize;
+        let mut first_cookie = [0u8; 16];
+        first_cookie[..8].copy_from_slice(&0u64.to_le_bytes());
+        for i in 0..(MAX_ROUTES + overflow) {
+            let mut cookie = [0u8; 16];
+            cookie[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            svc.ingest(
+                &Request {
+                    cookie,
+                    service_tag: [0; 32],
+                    reply_circuit: vec![line(3), line(2)],
+                    payload: b"x".to_vec(),
+                    reply_pub: vec![],
+                }
+                .encode(),
+            )
+            .unwrap();
+        }
+        assert_eq!(svc.sessions(), MAX_ROUTES, "the route table is capped, not unbounded");
+        // The oldest cookie was evicted FIFO; the most recent is retained.
+        assert!(!svc.knows(&first_cookie), "the oldest cookie was evicted under the flood");
+        let mut last_cookie = [0u8; 16];
+        last_cookie[..8].copy_from_slice(&((MAX_ROUTES + overflow - 1) as u64).to_le_bytes());
+        assert!(svc.knows(&last_cookie), "the most recent cookie is retained");
     }
 
     #[test]
