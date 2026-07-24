@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -47,7 +47,7 @@ pub(crate) const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// its last-activity time (for idle and LRU eviction). Shared by the Direct [`serve`] loop (keyed by
 /// client coordinate) and the anonymous [`crate::rendezvous_host::serve_anonymous`] loop (keyed by cookie).
 pub(crate) struct Session {
-    pub(crate) in_tx: UnboundedSender<Vec<u8>>,
+    pub(crate) in_tx: Sender<Vec<u8>>,
     pub(crate) task: JoinHandle<()>,
     pub(crate) last_active: Instant,
 }
@@ -167,7 +167,10 @@ where
                         }
                         if let Some(session) = peers.get_mut(&from) {
                             session.last_active = Instant::now();
-                            let _ = session.in_tx.send(payload);
+                            // try_send: drop this datagram if the session's bounded inbound queue
+                            // is full (audit A4b) — DIAULOS retransmits — or if it is closed (the
+                            // session is reaped by the is_closed() checks above).
+                            let _ = session.in_tx.try_send(payload);
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -236,13 +239,13 @@ fn spawn_client_session<H, Fut>(
     from: Coord,
     handler: Arc<H>,
     done_tx: UnboundedSender<Coord>,
-) -> (UnboundedSender<Vec<u8>>, JoinHandle<()>)
+) -> (Sender<Vec<u8>>, JoinHandle<()>)
 where
     H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
-    let (out_tx, mut out_rx) = unbounded_channel::<Vec<u8>>();
+    let (in_tx, in_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
+    let (out_tx, mut out_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
     // Outbound: this session's cells are addressed to the client coordinate over the node.
     tokio::spawn(async move {
         while let Some(payload) = out_rx.recv().await {
@@ -550,7 +553,7 @@ mod tests {
 
     /// A session whose last activity was `age` ago (a still-live but idle handler task).
     fn idle_session(age: Duration) -> Session {
-        let (in_tx, _in_rx) = unbounded_channel::<Vec<u8>>();
+        let (in_tx, _in_rx) = channel::<Vec<u8>>(1);
         let task = tokio::spawn(std::future::pending::<()>());
         Session {
             in_tx,

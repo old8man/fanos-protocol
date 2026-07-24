@@ -22,7 +22,8 @@ use std::time::Duration;
 use fanos_diaulos::{ClientSession, Coord, ServerSession, StaticKeypair};
 use rand_core::CryptoRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 /// The internal duplex buffer between the app and the driver.
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -35,10 +36,23 @@ const READ_CHUNK: usize = 16 * 1024;
 /// (`inbound`). A Direct driver wires these to overlay `Command::Send`/deliveries; an anonymous
 /// driver wires them to a rendezvous circuit.
 pub struct ChannelTransport {
-    /// Framed payloads to send to the peer.
-    pub outbound: UnboundedSender<Vec<u8>>,
-    /// Framed payloads received from the peer.
-    pub inbound: UnboundedReceiver<Vec<u8>>,
+    /// Framed payloads to send to the peer. Bounded ([`ChannelTransport::CAP`]).
+    pub outbound: Sender<Vec<u8>>,
+    /// Framed payloads received from the peer. Bounded ([`ChannelTransport::CAP`]) — the inbound
+    /// sender is fed by peer deliveries (adversary-reachable), so an unbounded queue is a
+    /// single-peer memory-exhaustion DoS (audit A4b).
+    pub inbound: Receiver<Vec<u8>>,
+}
+
+impl ChannelTransport {
+    /// Depth of both datagram queues. The inbound side is fed by peer deliveries, so it must be
+    /// bounded (audit A4b); the outbound side is bounded for symmetry (the loopback wiring uses one
+    /// channel as one peer's outbound and the other's inbound, so both halves share a kind). A full
+    /// queue **drops** the datagram rather than blocking — DIAULOS retransmits unacked cells, so a
+    /// bounded lossy queue is the correct memory bound (and mirrors the overlay's own lossy
+    /// delivery). The depth sits far above a healthy in-flight window (SACK width 64), so it never
+    /// sheds under honest load; the FIFO drop engages only under a peer flood.
+    pub const CAP: usize = 1024;
 }
 
 /// Drive a dialed [`ClientSession`] as an async duplex byte stream over `transport`. Returns the
@@ -125,8 +139,8 @@ pub fn dial_over_transport<T: OverlayTransport>(
     transport: T,
 ) -> DuplexStream {
     let peer = session.peer();
-    let (out_tx, out_rx) = unbounded_channel();
-    let (in_tx, in_rx) = unbounded_channel();
+    let (out_tx, out_rx) = channel(ChannelTransport::CAP);
+    let (in_tx, in_rx) = channel(ChannelTransport::CAP);
     tokio::spawn(bridge(transport, peer, out_rx, in_tx));
     stream_over_channels(
         session,
@@ -137,13 +151,21 @@ pub fn dial_over_transport<T: OverlayTransport>(
     )
 }
 
+/// Offer a datagram to a bounded transport channel; returns `true` to keep the driver loop running.
+/// A **full** channel *drops* the datagram — the peer's DIAULOS layer retransmits unacked cells, so a
+/// queue that sheds under a flood is exactly the audit-A4b memory bound (and mirrors the overlay's own
+/// lossy delivery). A **closed** channel means the far end is gone, so the loop should stop.
+fn offer(tx: &Sender<Vec<u8>>, payload: Vec<u8>) -> bool {
+    !matches!(tx.try_send(payload), Err(TrySendError::Closed(_)))
+}
+
 /// Bridge the channel transport to a coordinate-addressed overlay: outbound payloads go to `peer`;
 /// deliveries from `peer` come back in.
 async fn bridge<T: OverlayTransport>(
     mut transport: T,
     peer: Coord,
-    mut out_rx: UnboundedReceiver<Vec<u8>>,
-    in_tx: UnboundedSender<Vec<u8>>,
+    mut out_rx: Receiver<Vec<u8>>,
+    in_tx: Sender<Vec<u8>>,
 ) {
     loop {
         tokio::select! {
@@ -153,7 +175,7 @@ async fn bridge<T: OverlayTransport>(
             },
             delivery = transport.recv() => match delivery {
                 Some((from, payload)) => {
-                    if from == peer && in_tx.send(payload).is_err() {
+                    if from == peer && !offer(&in_tx, payload) {
                         return;
                     }
                 }
@@ -371,7 +393,7 @@ async fn drive<S: SessionStream>(
         };
         emit = Emit::None;
         for payload in payloads {
-            if outbound.send(payload).is_err() {
+            if !offer(&outbound, payload) {
                 return; // the transport is gone
             }
         }
@@ -433,13 +455,16 @@ mod tests {
     use super::*;
     use fanos_diaulos::{ServerSession, StaticKeypair};
     use fanos_pqcrypto::rng::SeedRng;
+    // The mock overlay network ((Coord, payload)) is test scaffolding, not the bounded datagram
+    // transport under test, so it stays on unbounded channels.
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
     /// A minimal async service loop: drive a `ServerSession` over the mirror channels and answer the
     /// request (uppercased) once fully received — the loopback peer for the async-stream test.
     async fn serve_uppercase(
         keypair: StaticKeypair,
-        outbound: UnboundedSender<Vec<u8>>,
-        mut inbound: UnboundedReceiver<Vec<u8>>,
+        outbound: Sender<Vec<u8>>,
+        mut inbound: Receiver<Vec<u8>>,
     ) {
         let mut server = ServerSession::new();
         let mut rng = SeedRng::from_seed(b"async-session-server");
@@ -463,7 +488,7 @@ mod tests {
             // One emit per wake (below): the inbound arm coalesces its whole batch first, so this is
             // one emit per batch or tick — never one per datagram.
             for payload in server.poll_payloads() {
-                if outbound.send(payload).is_err() {
+                if !offer(&outbound, payload) {
                     return;
                 }
             }
@@ -490,8 +515,8 @@ mod tests {
         // The coordinate is unused by the channel transport (it addresses the single peer).
         let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
-        let (c2s_tx, c2s_rx) = unbounded_channel();
-        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
         let mut stream = stream_over_channels(
             client,
             ChannelTransport {
@@ -528,8 +553,8 @@ mod tests {
         let mut crng = SeedRng::from_seed(b"duplex-client");
         let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
-        let (c2s_tx, c2s_rx) = unbounded_channel();
-        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
         let mut client_stream = stream_over_channels(
             client,
             ChannelTransport {
@@ -656,6 +681,8 @@ mod tests {
         let session = ClientSession::dial(SERVICE, keypair.public(), &mut crng);
         assert_eq!(session.peer(), SERVICE);
 
+        // The mock *network* carries (Coord, payload) and is test scaffolding, not the bounded
+        // datagram transport under test — keep it unbounded so it never sheds in the test harness.
         let (c2s_tx, c2s_rx) = unbounded_channel();
         let (s2c_tx, s2c_rx) = unbounded_channel();
         let transport = MockTransport {
@@ -690,8 +717,8 @@ mod tests {
         let mut crng = SeedRng::from_seed(b"async-large-client");
         let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
-        let (c2s_tx, c2s_rx) = unbounded_channel();
-        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
         let mut stream = stream_over_channels(
             client,
             ChannelTransport {
@@ -727,8 +754,8 @@ mod tests {
         let mut crng = SeedRng::from_seed(b"async-empty-client");
         let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
 
-        let (c2s_tx, c2s_rx) = unbounded_channel();
-        let (s2c_tx, s2c_rx) = unbounded_channel();
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
         let mut stream = stream_over_channels(
             client,
             ChannelTransport {

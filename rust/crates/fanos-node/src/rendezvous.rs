@@ -30,7 +30,8 @@ use rand_core::{CryptoRng, Rng};
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 /// Bridge a DIAULOS session's datagram channels to the base overlay through a threshold-onion
 /// rendezvous.
@@ -45,8 +46,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// until the driver's channels or the delivery stream close.
 async fn rendezvous_bridge<F, S>(
     mut rclient: RendezvousClient<F>,
-    mut app_out: UnboundedReceiver<Vec<u8>>,
-    app_in: UnboundedSender<Vec<u8>>,
+    mut app_out: Receiver<Vec<u8>>,
+    app_in: Sender<Vec<u8>>,
     send_frame: S,
     mut deliveries: broadcast::Receiver<Notification>,
     reply_keys: ReplyKeys,
@@ -69,8 +70,10 @@ async fn rendezvous_bridge<F, S>(
                     let Some(cell) = reply_keys.open(&payload) else {
                         continue;
                     };
-                    if app_in.send(cell).is_err() {
-                        break; // the stream driver is gone
+                    // A full inbound queue drops the reply (audit A4b) — DIAULOS retransmits it;
+                    // a closed one means the stream driver is gone, so end the bridge.
+                    if let Err(TrySendError::Closed(_)) = app_in.try_send(cell) {
+                        break;
                     }
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -105,8 +108,8 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
     rclient: RendezvousClient<F>,
     reply_keys: ReplyKeys,
 ) -> DuplexStream {
-    let (out_tx, out_rx) = unbounded_channel();
-    let (in_tx, in_rx) = unbounded_channel();
+    let (out_tx, out_rx) = channel(ChannelTransport::CAP);
+    let (in_tx, in_rx) = channel(ChannelTransport::CAP);
     let deliveries = client.subscribe();
     // NOSTOS: the client receives replies as a **member of its own reply line** — the dead-drop's
     // combiner multicasts each reply to that line's `q+1` members, and this node (a member, since the
@@ -300,6 +303,9 @@ pub fn anonymous_dial<R: CryptoRng>(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    // The test's frame-capture sink carries (Coord, payload) and is scaffolding, not the bounded
+    // datagram transport under test, so it stays on an unbounded channel.
+    use tokio::sync::mpsc::unbounded_channel;
     use fanos_field::F2;
     use fanos_geometry::{Line, Point};
     use fanos_pqcrypto::{HybridKemSecret, SeedRng};
@@ -417,8 +423,8 @@ mod tests {
         );
         let expected_first_combiner = combiner_for::<F2>(hop).unwrap();
 
-        let (out_tx, out_rx) = unbounded_channel();
-        let (in_tx, mut in_rx) = unbounded_channel();
+        let (out_tx, out_rx) = channel(ChannelTransport::CAP);
+        let (in_tx, mut in_rx) = channel(ChannelTransport::CAP);
         let (sent_tx, mut sent_rx) = unbounded_channel::<(Coord, Vec<u8>)>();
         let (deliv_tx, deliv_rx) = broadcast::channel(16);
 
@@ -435,7 +441,7 @@ mod tests {
 
         // Outbound: a framed DIAULOS payload is wrapped + sealed and launched at the first hop's
         // combiner — never forwarded in the clear.
-        out_tx.send(b"diaulos-hello".to_vec()).unwrap();
+        out_tx.send(b"diaulos-hello".to_vec()).await.unwrap();
         let (to, frame) = sent_rx.recv().await.unwrap();
         assert_eq!(
             to, expected_first_combiner,

@@ -45,7 +45,7 @@ use crate::mixdir::build_cell_mix_directory;
 use rand_core::CryptoRng;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -196,7 +196,10 @@ pub fn serve_anonymous<R, H, Fut>(
                         }
                         if let Some(session) = sessions.get_mut(&cookie) {
                             session.last_active = Instant::now();
-                            let _ = session.in_tx.send(inner);
+                            // try_send: drop this datagram if the session's bounded inbound queue is
+                            // full (audit A4b) — DIAULOS retransmits — or if it is closed (reaped by
+                            // the is_closed() checks above).
+                            let _ = session.in_tx.try_send(inner);
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -411,13 +414,13 @@ fn spawn_anonymous_session<H, Fut>(
     handler: Arc<H>,
     seal_tx: UnboundedSender<(SessionId, Vec<u8>)>,
     done_tx: UnboundedSender<SessionId>,
-) -> (UnboundedSender<Vec<u8>>, JoinHandle<()>)
+) -> (Sender<Vec<u8>>, JoinHandle<()>)
 where
     H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
-    let (out_tx, mut out_rx) = unbounded_channel::<Vec<u8>>();
+    let (in_tx, in_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
+    let (out_tx, mut out_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
     // Outbound: this session's cells are funnelled to the central loop for sealing through its reply route.
     tokio::spawn(async move {
         while let Some(cell) = out_rx.recv().await {
