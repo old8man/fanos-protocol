@@ -171,6 +171,32 @@ impl Block {
         self.header.hash()
     }
 
+    /// The block's **skeleton** — the same header, witness, and last_commit but an EMPTY payload. Because the
+    /// hash is header-only, `skeleton().hash() == self.hash()`: for DA dispersal (spec §6) a proposer broadcasts
+    /// the skeleton (small) and disperses the erasure shards separately; a validator samples shards from peers,
+    /// reconstructs the payload, and rebuilds the identical block with [`with_sealed_txs`](Self::with_sealed_txs).
+    /// The header still commits to the real payload via `tx_root`/`da_commit`, so the skeleton cannot misrepresent
+    /// it — a rebuilt block whose reconstructed payload disagrees with the header fails [`verify_structure`].
+    #[must_use]
+    pub fn skeleton(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            sealed_txs: Vec::new(),
+            witness: self.witness.clone(),
+            last_commit: self.last_commit.clone(),
+        }
+    }
+
+    /// Rebuild a full block from a skeleton by supplying the `sealed_txs` reconstructed from DA shards. The header
+    /// (and thus the hash) is unchanged; [`reconstruct_payload`](Self::reconstruct_payload) has already verified
+    /// the payload against `da_commit`. Restores the block the proposer assembled, ready for the ordinary
+    /// finalize/reveal/execute path.
+    #[must_use]
+    pub fn with_sealed_txs(mut self, sealed_txs: Vec<SealedTx>) -> Self {
+        self.sealed_txs = sealed_txs;
+        self
+    }
+
     /// Canonical bytes: the fixed-width [`Wire`] header, the self-delimiting sealed-tx payload, then the
     /// **witness section** — a length-prefixed [`LeaderWitness`] encoding (empty = no witness). The witness
     /// trails the payload so the block identity (header hash) is unaffected by its presence.
@@ -342,6 +368,23 @@ mod tests {
         // The header round-trips through its canonical Wire encoding (so all validators hash the same bytes).
         let bytes = block.header.to_wire();
         assert_eq!(BlockHeader::from_wire(&bytes).unwrap(), block.header);
+    }
+
+    #[test]
+    fn a_skeleton_and_dispersed_shards_reconstruct_the_identical_block() {
+        let full = sample_block();
+        let skeleton = full.skeleton();
+        assert!(skeleton.sealed_txs.is_empty(), "the skeleton drops the payload");
+        assert_eq!(skeleton.hash(), full.hash(), "the hash is header-only, so it is unchanged");
+        assert!(!skeleton.verify_structure(), "an empty payload does NOT match the header commitments");
+
+        // Disperse the payload as DA shards, reconstruct it, and rebuild the block from the skeleton.
+        let shards = full.da_shards();
+        let present: [Option<Vec<u8>>; erasure::N] = core::array::from_fn(|p| Some(shards[p].clone()));
+        let payload = skeleton.reconstruct_payload(&present).expect("the full shard set reconstructs the payload");
+        let rebuilt = skeleton.clone().with_sealed_txs(payload);
+        assert_eq!(rebuilt, full, "skeleton + reconstructed payload == the original block");
+        assert!(rebuilt.verify_structure(), "the rebuilt block's commitments now match its payload");
     }
 
     #[test]

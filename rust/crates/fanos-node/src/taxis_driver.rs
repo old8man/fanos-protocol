@@ -31,10 +31,10 @@ use fanos_primitives::{BeaconSeed, BoundedMap, Epoch};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
 use fanos_taxis::checkpoint::ExecCertificate;
-use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
+use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output};
 use fanos_taxis::state::StateMachine;
-use fanos_taxis::wire::{TaxisApp, parse_app_body, to_frame, tx_to_frame};
-use fanos_taxis::{CellParams, SealedTx, SlashEvidence};
+use fanos_taxis::wire::{ShardMsg, TaxisApp, parse_app_body, shard_to_frame, to_frame, tx_to_frame};
+use fanos_taxis::{Block, CellParams, SealedTx, SlashEvidence};
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -63,6 +63,34 @@ const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
 /// well-behaved transaction whose commitment is evicted is simply re-gossiped once more (best-effort, like any
 /// flood-dedup cache).
 const SEEN_TX_CAP: usize = 8192;
+
+/// Cap on the number of blocks whose own DA shard this node retains to serve peers' sampling requests.
+const DA_HELD_CAP: usize = 512;
+/// Cap on skeletons awaiting DA reconstruction (shards still being sampled) — bounded against a proposal flood.
+const DA_PENDING_CAP: usize = 64;
+
+/// A skeleton block awaiting **DA reconstruction**: the shards gathered so far (this node's own dispersed shard
+/// plus those sampled from peers). Once enough arrive, [`try_reconstruct`] rebuilds the full block and admits it
+/// to the consensus engine exactly like an ordinary proposal.
+struct PendingDa {
+    skeleton: Block,
+    shards: Box<DaShards>,
+}
+
+/// The driver's **data-availability transport** state (spec §6). Kept entirely in the driver: the consensus
+/// engine only ever sees a fully-reconstructed block, so its finality logic is untouched by DA sampling.
+struct DaState {
+    /// This node's own shard for recent blocks (received via the proposer's dispersal), served on request.
+    held: BoundedMap<[u8; 32], Vec<u8>>,
+    /// Skeletons whose payload is still being sampled from peers, keyed by block hash.
+    pending: BoundedMap<[u8; 32], PendingDa>,
+}
+
+impl DaState {
+    fn new() -> Self {
+        Self { held: BoundedMap::new(DA_HELD_CAP), pending: BoundedMap::new(DA_PENDING_CAP) }
+    }
+}
 
 /// The next round timeout: reset to [`ROUND_TIMEOUT_BASE`] on progress (the height advanced — a fresh height
 /// restarts at round 0), else double the current timeout up to [`ROUND_TIMEOUT_MAX`] (Tendermint-style
@@ -183,6 +211,8 @@ impl<S> TaxisHandle<S> {
 /// Must run inside a tokio runtime. The node must be seated at `Point::at(params.me)` so its validator index
 /// matches its overlay coordinate (the fan-out addresses peers by `Point::at(p).coords()`).
 #[must_use]
+#[allow(clippy::too_many_lines)] // the driver is one cohesive async orchestration loop (select over ticks,
+// timeouts, submissions, and the DA/consensus/tx receive paths) — splitting it would only scatter shared state.
 pub fn spawn_taxis<F, S>(client: Client, params: TaxisParams<S>) -> TaxisHandle<S>
 where
     F: Field,
@@ -263,16 +293,18 @@ where
         // so a received transaction floods the cell exactly once and a committed (pruned) one does not
         // re-circulate. Bounded ([`SEEN_TX_CAP`]) against a commitment flood.
         let mut seen_txs: BoundedMap<[u8; 32], ()> = BoundedMap::new(SEEN_TX_CAP);
+        // Data-availability transport (spec §6): dispersed shards this node serves + skeletons it is sampling.
+        let mut da = DaState::new();
 
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     let outs = engine.step(Input::Tick);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                 }
                 () = tokio::time::sleep_until(timeout_deadline) => {
                     let outs = engine.step(Input::Timeout);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                     // This round did not finalize before its deadline: back off before injecting the next
                     // Timeout, so a slow (not failed) round is given more time rather than livelocked by a
                     // premature advance. A finalization anywhere resets it via the progress check below.
@@ -289,14 +321,22 @@ where
                 }
                 note = note_rx.recv() => match note {
                     Some(Notification::App { body, from }) => match parse_app_body(&body) {
-                        // A consensus message: accepted only from a known validator coordinate (its index also
-                        // directs a state-sync reply back to the requester); a frame from a stranger is ignored.
+                        // A proposal arrives DA-dispersed: a payload-less skeleton (the full block rides as
+                        // shards). Sample its shards from peers and admit it to the engine once reconstructed
+                        // (spec §6). Only a known validator's skeleton is worth sampling.
+                        Some(TaxisApp::Consensus(ConsensusMsg::Propose(skeleton))) => {
+                            if coords.contains(&from) {
+                                on_skeleton(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, skeleton);
+                            }
+                        }
+                        // Any other consensus message: accepted only from a known validator coordinate (its index
+                        // also directs a state-sync reply back to the requester); a frame from a stranger is ignored.
                         Some(TaxisApp::Consensus(msg)) => {
                             if let Some(src) =
                                 coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok())
                             {
                                 let outs = step_msg(&mut engine, &msg, src);
-                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs);
+                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                             }
                         }
                         // A submitted transaction: accepted from ANY sender — a client (the network ingress that
@@ -304,6 +344,11 @@ where
                         // flooded once to the rest of the cell.
                         Some(TaxisApp::Tx(tx)) => {
                             ingest_tx(&mut engine, &client, &coords, me, &mut seen_txs, &tx);
+                        }
+                        // A DA shard — a dispersed / sampled shard, or a peer's sampling request. Handled by the
+                        // driver's DA layer; a reconstructed block enters the engine via `try_reconstruct`.
+                        Some(TaxisApp::Shard(shard)) => {
+                            on_shard(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, shard, from);
                         }
                         None => {}
                     },
@@ -389,20 +434,46 @@ fn drive<S: StateMachine>(
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
+    da: &mut DaState,
 ) {
     let mut queue: VecDeque<Output> = outs.into_iter().collect();
     while let Some(out) = queue.pop_front() {
         match out {
             Output::Send(msg) => {
-                let frame = to_frame(&msg);
-                // Broadcast to every *other* validator (point-to-point fan-out — no gossip primitive needed
-                // for a small structured cell where every validator is directly addressable).
-                for (p, &to) in coords.iter().enumerate() {
-                    if u8::try_from(p).unwrap_or(u8::MAX) != me {
-                        client.command(Command::Emit { to, frame: frame.clone() });
+                if let ConsensusMsg::Propose(block) = &msg {
+                    // DA dispersal (spec §6): rather than broadcasting the full block, broadcast the small
+                    // *skeleton* and disperse ONE erasure shard to each validator. Availability is then
+                    // established by real peer sampling — not the proposer's self-report — while every voter
+                    // still agrees on the identical block (the skeleton shares the full block's header hash).
+                    let hash = block.hash();
+                    let shards = block.da_shards();
+                    let skeleton_frame = to_frame(&ConsensusMsg::Propose(block.skeleton()));
+                    for (p, &to) in coords.iter().enumerate() {
+                        let Ok(idx) = u8::try_from(p) else { continue };
+                        if idx != me {
+                            client.command(Command::Emit { to, frame: skeleton_frame.clone() });
+                            if let Some(shard) = shards.get(p) {
+                                let deliver = ShardMsg::Deliver { block: hash, index: idx, data: shard.clone() };
+                                client.command(Command::Emit { to, frame: shard_to_frame(&deliver) });
+                            }
+                        }
+                    }
+                    // Keep my own shard to serve samplers; deliver the FULL block (which I hold) to my own engine.
+                    if let Some(mine) = shards.get(usize::from(me)) {
+                        da.held.insert(hash, mine.clone());
+                    }
+                } else {
+                    let frame = to_frame(&msg);
+                    // Broadcast to every *other* validator (point-to-point fan-out — no gossip primitive needed
+                    // for a small structured cell where every validator is directly addressable).
+                    for (p, &to) in coords.iter().enumerate() {
+                        if u8::try_from(p).unwrap_or(u8::MAX) != me {
+                            client.command(Command::Emit { to, frame: frame.clone() });
+                        }
                     }
                 }
-                // Deliver back to ourselves, cascading any further outputs (prepare → commit → reveal …).
+                // Deliver back to ourselves, cascading any further outputs (prepare → commit → reveal …). For a
+                // Propose this is the FULL block: the proposer already holds its own payload.
                 for more in step_msg(engine, &msg, me) {
                     queue.push_back(more);
                 }
@@ -442,6 +513,110 @@ fn drive<S: StateMachine>(
         *last_ckpt = Some(cert.height);
         let _ = events.send(TaxisEvent::Checkpointed(cert.clone()));
     }
+}
+
+/// Handle a received DA **skeleton** (a payload-less proposal): buffer it, request every shard it is missing
+/// from that shard's holder, and — once enough shards are gathered — reconstruct the full block and admit it to
+/// the engine. This is where "PREPARE gated on DA sampling" (spec §6) becomes real: a withholding proposer whose
+/// shards no quorum will serve never reconstructs here, so this validator never admits the block, never PREPAREs.
+#[allow(clippy::too_many_arguments)]
+fn on_skeleton<S: StateMachine>(
+    engine: &mut ConsensusEngine<S>,
+    client: &Client,
+    coords: &[Triple],
+    me: u8,
+    da: &mut DaState,
+    events: &broadcast::Sender<TaxisEvent>,
+    last_ckpt: &mut Option<u64>,
+    slash_sealer: Option<&SlashSealer>,
+    seen: &mut BoundedMap<[u8; 32], ()>,
+    skeleton: Block,
+) {
+    let hash = skeleton.hash();
+    if da.pending.contains_key(&hash) {
+        return; // already sampling this block
+    }
+    let mut shards: Box<DaShards> = Box::new(core::array::from_fn(|_| None));
+    // Seed with my own dispersed shard, if I already hold it.
+    if let Some(mine) = da.held.get(&hash)
+        && let Some(slot) = shards.get_mut(usize::from(me))
+    {
+        *slot = Some(mine.clone());
+    }
+    // Sample every other shard from the validator that holds it.
+    for (p, &to) in coords.iter().enumerate() {
+        let Ok(idx) = u8::try_from(p) else { continue };
+        if idx != me {
+            client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block: hash, index: idx }) });
+        }
+    }
+    da.pending.insert(hash, PendingDa { skeleton, shards });
+    try_reconstruct(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, hash);
+}
+
+/// Handle a received DA **shard** message: store a delivered shard (feeding any pending reconstruction, and
+/// retaining my own dispersed shard to serve later requests), or answer a sampling request with my shard.
+#[allow(clippy::too_many_arguments)]
+fn on_shard<S: StateMachine>(
+    engine: &mut ConsensusEngine<S>,
+    client: &Client,
+    coords: &[Triple],
+    me: u8,
+    da: &mut DaState,
+    events: &broadcast::Sender<TaxisEvent>,
+    last_ckpt: &mut Option<u64>,
+    slash_sealer: Option<&SlashSealer>,
+    seen: &mut BoundedMap<[u8; 32], ()>,
+    msg: ShardMsg,
+    from: Triple,
+) {
+    match msg {
+        ShardMsg::Deliver { block, index, data } => {
+            if index == me {
+                da.held.insert(block, data.clone()); // dispersed to me — I now serve this shard
+            }
+            if let Some(pending) = da.pending.get_mut(&block)
+                && let Some(slot) = pending.shards.get_mut(usize::from(index))
+            {
+                *slot = Some(data);
+            }
+            try_reconstruct(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, block);
+        }
+        ShardMsg::Request { block, index } => {
+            if index == me
+                && let Some(shard) = da.held.get(&block)
+            {
+                let deliver = ShardMsg::Deliver { block, index: me, data: shard.clone() };
+                client.command(Command::Emit { to: from, frame: shard_to_frame(&deliver) });
+            }
+        }
+    }
+}
+
+/// Try to reconstruct a buffered skeleton from the shards gathered so far. On success, rebuild the full block and
+/// admit it to the engine exactly like an ordinary proposal, driving the resulting outputs (its PREPARE, …).
+#[allow(clippy::too_many_arguments)]
+fn try_reconstruct<S: StateMachine>(
+    engine: &mut ConsensusEngine<S>,
+    client: &Client,
+    coords: &[Triple],
+    me: u8,
+    da: &mut DaState,
+    events: &broadcast::Sender<TaxisEvent>,
+    last_ckpt: &mut Option<u64>,
+    slash_sealer: Option<&SlashSealer>,
+    seen: &mut BoundedMap<[u8; 32], ()>,
+    hash: [u8; 32],
+) {
+    let full = {
+        let Some(pending) = da.pending.get(&hash) else { return };
+        let Some(payload) = pending.skeleton.reconstruct_payload(&pending.shards) else { return };
+        pending.skeleton.clone().with_sealed_txs(payload)
+    };
+    da.pending.remove(&hash);
+    // `from` (here `me`) is unused for a Propose; the reconstructed block carries its own proposer index.
+    let outs = step_msg(engine, &ConsensusMsg::Propose(full), me);
+    drive(engine, client, coords, me, outs, events, last_ckpt, slash_sealer, seen, da);
 }
 
 /// Spawn a **cross-cell checkpoint publisher** for a running cell: subscribe to `handle`'s events and, for each

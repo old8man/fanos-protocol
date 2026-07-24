@@ -53,6 +53,23 @@ impl<K: Ord + Copy, V> BoundedMap<K, V> {
         self.map.get(key)
     }
 
+    /// A mutable reference to `key`'s value, if present. Mutating a value in place is not a re-insertion, so the
+    /// size and eviction order are untouched (only [`insert`](Self::insert) enrolls a key in the order).
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
+    /// Remove `key`, returning its value if present. Its slot in the eviction order is dropped too, so `order`
+    /// keeps tracking exactly the live key set (an eviction never surfaces a stale key that would skip a real
+    /// one and break the bound). Removing an absent key is a no-op.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let value = self.map.remove(key)?;
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        Some(value)
+    }
+
     /// Whether `key` is present.
     #[must_use]
     pub fn contains_key(&self, key: &K) -> bool {
@@ -125,5 +142,27 @@ mod tests {
         assert!(m.insert(1, 1).is_none());
         assert_eq!(m.insert(2, 2), Some((1, 1)), "capacity 0 behaves as 1 — every new key evicts the last");
         assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn get_mut_edits_in_place_and_remove_keeps_the_eviction_order_consistent() {
+        let mut m: BoundedMap<u8, u8> = BoundedMap::new(3);
+        m.insert(1, 10);
+        m.insert(2, 20);
+        m.insert(3, 30);
+        // get_mut edits in place without touching size or order.
+        *m.get_mut(&2).unwrap() = 99;
+        assert_eq!(m.get(&2), Some(&99));
+        assert_eq!(m.len(), 3);
+
+        // Remove the OLDEST key (1); its slot leaves the order too, so it never surfaces to skip a real key.
+        assert_eq!(m.remove(&1), Some(10));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.remove(&1), None, "removing an absent key is a no-op");
+        // Filling back to capacity and beyond evicts the true oldest LIVE key (2), not the removed stale 1.
+        m.insert(4, 40); // {2,3,4} — at capacity, no eviction
+        assert_eq!(m.insert(5, 50), Some((2, 99)), "the oldest live key (2) is evicted, not the removed stale 1");
+        assert!(!m.contains_key(&1) && !m.contains_key(&2));
+        assert!(m.contains_key(&3) && m.contains_key(&4) && m.contains_key(&5));
     }
 }
