@@ -46,11 +46,12 @@ use crate::ring::{D, Poly};
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 
 /// The wide masking bound `2²⁰` for the revealed randomness openings — far above the short (`≤ 2`) witness
-/// randomness they hide, and far below `q`, so binding holds and rejection almost never fires.
-const MASK_BOUND: i64 = 1 << 20;
+/// randomness they hide, and far below `q`, so binding holds and rejection almost never fires. Shared with the
+/// range proof's reconstruction argument ([`crate::ring_range`]).
+pub(crate) const MASK_BOUND: i64 = 1 << 20;
 
 /// Accept region for a linear opening `r_z = γ·r + r_b`: the hidden part `‖γ·r‖∞ ≤ 1`, so `‖r_z‖∞ ≤ B − 1`.
-const ACCEPT_LINEAR: i64 = MASK_BOUND - 1;
+pub(crate) const ACCEPT_LINEAR: i64 = MASK_BOUND - 1;
 
 /// Accept region for the product opening `s = γ²·r_z + γ·r_t + r_u`: the hidden part `‖γ²r_z + γr_t‖∞ ≤ 2`.
 const ACCEPT_PRODUCT: i64 = MASK_BOUND - 2;
