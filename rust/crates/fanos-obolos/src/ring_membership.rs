@@ -1,23 +1,23 @@
 //! **Zero-knowledge Merkle membership** over the SIS tree — the untraceability proof a spend attaches to show its
-//! note is a leaf under the public anchor *without revealing which leaf*. This module builds it bottom-up; the
-//! first piece is the **hash step**: a zero-knowledge proof that committed nodes `(left, right, parent)` satisfy
-//! `parent = hash(left, right)` ([`crate::ring_hash`]).
+//! note is a leaf under the public anchor *without revealing which leaf*. Built bottom-up from three parts:
 //!
-//! Because the SIS hash relation is `R_q`-linear — `G(parent) = A₀·left + A₁·right`, i.e.
-//! `A₀·left + A₁·right − G(parent) = 0` — a hash step is exactly one [`crate::ring_linear`] proof over the
-//! concatenated limbs `left ‖ right ‖ parent` with the coefficients [`HashParams::step_coeffs`]. A full path
-//! proof (the next increment) *chains* hash steps — the parent commitments of level `j` are the child commitments
-//! of level `j+1` — up to the public root, with a conditional swap per level so the position stays hidden.
+//! - **hash step** ([`prove_hash_step`]) — committed `(left, right, parent)` satisfy `parent = hash(left, right)`.
+//!   The SIS hash relation is `R_q`-linear (`A₀·left + A₁·right − G(parent) = 0`), so a step is one
+//!   [`crate::ring_linear`] proof over `left ‖ right ‖ parent` with coefficients [`HashParams::step_coeffs`].
+//! - **conditional swap** ([`prove_swap`]) — a hidden bit `d` selects `left = child + d·(sibling − child)`
+//!   (`right` derived), so the path leaks no position. Per limb a [`crate::ring_product`] proof, plus `d` binary.
+//! - **path** ([`prove_path`]) — *chains* swap + hash step up the tree (parent of level `j` = child of `j+1`),
+//!   ties the top node to the public root, and keeps the leaf and every intermediate node hidden.
 //!
-//! > **SOUNDNESS SCOPE — the linear core.** This proves the *linear* hash relation in zero knowledge. A complete
-//! > membership proof additionally needs each node proven **short** (limbs `< 2^{LOG_BASE}`) — otherwise a prover
-//! > could satisfy the linear system with non-short "nodes" and forge a path. That shortness is a
-//! > [`crate::ring_range_agg`] proof per limb; it is deferred because, unaggregated, it is `O(ELL_H·LOG_BASE)` per
-//! > node — the **range-proof aggregation** is the prerequisite that makes the whole path proof practical. The
-//! > linear step here is correct and composes with those shortness proofs once aggregated.
+//! > **SOUNDNESS SCOPE — the structural core.** These prove the *linear* hash relations and the swap selections and
+//! > tie leaf → root. A complete proof additionally proves every node **short** (limbs `< 2^{LOG_BASE}`, a
+//! > [`crate::ring_shortness`] proof per limb) — otherwise a prover could satisfy the linear system with non-short
+//! > "nodes" and forge a path (and the swap's constant-`d` guarantee rests on shortness too). Shortness composes
+//! > per node; it is `O(depth·ELL_H·LOG_BASE)` binarity proofs — deferred as the known cost of lattice ZK
+//! > membership (recursive-SNARK compaction is future work).
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Tests verify a genuine hash step proves and verifies, and that a
-//! > wrong parent (or swapped children) has no accepting proof.
+//! > **STATUS — [P]/[H], correctness-first.** Tests verify a genuine hash step, both swap directions, and a full
+//! > leaf→root path; and that a wrong parent, a wrong swap, or a wrong root has no accepting proof.
 
 use alloc::vec::Vec;
 
@@ -168,6 +168,151 @@ pub fn verify_swap(
     true
 }
 
+/// One level of a [`PathProof`]: the sibling and direction-bit commitments, the swapped `left` node's commitment,
+/// the resulting parent node's commitment, and the swap + hash-step proofs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PathLevel {
+    sibling: Vec<RingCommitment>,
+    d_com: RingCommitment,
+    left: Vec<RingCommitment>,
+    node: Vec<RingCommitment>,
+    swap: SwapProof,
+    step: HashStepProof,
+}
+
+/// A zero-knowledge **Merkle membership** proof: a hidden leaf hashes up to the public root, position hidden.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PathProof {
+    leaf: Vec<RingCommitment>,
+    levels: Vec<PathLevel>,
+    root_r: Vec<RingRandomness>, // the top node's randomness, revealed to tie it to the public root
+}
+
+/// Deterministic randomness for a node's `ELL_H` limbs, domain-separated by role and level.
+fn node_r(seed: &[u8], role: &str, level: usize) -> Vec<RingRandomness> {
+    (0..crate::ring_hash::ELL_H)
+        .map(|i| {
+            let mut s = seed.to_vec();
+            s.extend_from_slice(role.as_bytes());
+            s.extend_from_slice(&(level as u64).to_le_bytes());
+            s.extend_from_slice(&(i as u64).to_le_bytes());
+            RingRandomness::from_seed(&s)
+        })
+        .collect()
+}
+
+/// Component-wise `a + b − c` over three limb-randomness vectors — the derived `right = child + sibling − left`.
+fn combine_r(a: &[RingRandomness], b: &[RingRandomness], c: &[RingRandomness]) -> Vec<RingRandomness> {
+    a.iter().zip(b).zip(c).map(|((ai, bi), ci)| ai.add(bi).sub(ci)).collect()
+}
+
+/// Prove, in zero knowledge, that `leaf` is a member of a Merkle tree — hashing it up through `siblings` with
+/// hidden `directions` (`0` = the running node is the left child, `1` = the right). The prover *computes* the top
+/// node; [`verify_path`] ties it to the public root. The leaf and every intermediate node stay hidden, and the
+/// position is hidden by the per-level conditional swap. `None` only on a sub-proof's rare masking exhaustion.
+///
+/// > **SOUNDNESS SCOPE — the structural core.** This chains the swap + hash-step relations and ties the top to the
+/// > public root. A complete proof additionally proves every node **short** ([`crate::ring_shortness`] per limb) —
+/// > without which non-short "nodes" could satisfy the linear relations and forge a path. Shortness composes per
+/// > node (it is `O(depth·ELL_H·LOG_BASE)` binarity proofs — deferred as the known cost of lattice ZK membership).
+#[must_use]
+pub fn prove_path(
+    params: &RingParams,
+    hp: &HashParams,
+    leaf: &HashNode,
+    siblings: &[HashNode],
+    directions: &[u64],
+    seed: &[u8],
+) -> Option<PathProof> {
+    let depth = siblings.len();
+    if directions.len() != depth || depth == 0 {
+        return None;
+    }
+    let leaf_r = node_r(seed, "/leaf", 0);
+    let leaf_coms = commit_node(params, leaf, &leaf_r);
+
+    let mut child = leaf.clone();
+    let mut child_r = leaf_r.clone();
+    let mut levels = Vec::with_capacity(depth);
+    let mut top_r = leaf_r;
+    for (j, (sibling, &d)) in siblings.iter().zip(directions).enumerate() {
+        let sib_r = node_r(seed, "/sib", j);
+        let d_poly = Poly::constant(d);
+        let mut ds = seed.to_vec();
+        ds.extend_from_slice(b"/dir");
+        ds.extend_from_slice(&(j as u64).to_le_bytes());
+        let d_r = RingRandomness::from_seed(&ds);
+
+        // (left, right) = d ? (sibling, child) : (child, sibling); left committed fresh, right derived.
+        let (left, right) = if d == 1 { (sibling.clone(), child.clone()) } else { (child.clone(), sibling.clone()) };
+        let left_r = node_r(seed, "/left", j);
+        let right_r = combine_r(&child_r, &sib_r, &left_r); // child_r + sib_r − left_r
+        let node = hp.hash(&left, &right);
+        let is_top = j == depth - 1;
+        let nr = node_r(seed, if is_top { "/root" } else { "/node" }, j);
+
+        let child_w = NodeWitness { node: &child, randomness: &child_r };
+        let sib_w = NodeWitness { node: sibling, randomness: &sib_r };
+        let left_w = NodeWitness { node: &left, randomness: &left_r };
+        let right_w = NodeWitness { node: &right, randomness: &right_r };
+        let node_w = NodeWitness { node: &node, randomness: &nr };
+        let mut sw = seed.to_vec();
+        sw.extend_from_slice(b"/sw");
+        sw.extend_from_slice(&(j as u64).to_le_bytes());
+        let swap = prove_swap(params, &child_w, &sib_w, &left_w, &d_poly, &d_r, &sw)?;
+        let mut hs = seed.to_vec();
+        hs.extend_from_slice(b"/hs");
+        hs.extend_from_slice(&(j as u64).to_le_bytes());
+        let step = prove_hash_step(params, hp, &left_w, &right_w, &node_w, &hs)?;
+
+        levels.push(PathLevel {
+            sibling: commit_node(params, sibling, &sib_r),
+            d_com: RingCommitment::commit_message(params, &d_poly, &d_r),
+            left: commit_node(params, &left, &left_r),
+            node: commit_node(params, &node, &nr),
+            swap,
+            step,
+        });
+        child = node;
+        child_r.clone_from(&nr);
+        top_r = nr;
+    }
+    Some(PathProof { leaf: leaf_coms, levels, root_r: top_r })
+}
+
+/// Verify a [`prove_path`] proof that some hidden leaf is a member of the tree with the public `root`.
+#[must_use]
+pub fn verify_path(params: &RingParams, hp: &HashParams, root: &HashNode, proof: &PathProof) -> bool {
+    if proof.levels.is_empty() {
+        return false;
+    }
+    let mut child = proof.leaf.clone();
+    for level in &proof.levels {
+        // right = child + sibling − left (homomorphic).
+        if level.sibling.len() != child.len() || level.left.len() != child.len() {
+            return false;
+        }
+        let right: Vec<RingCommitment> = child
+            .iter()
+            .zip(&level.sibling)
+            .zip(&level.left)
+            .map(|((c, s), l)| c.add(s).sub(l))
+            .collect();
+        if !verify_swap(params, &child, &level.sibling, &level.left, &level.d_com, &level.swap) {
+            return false;
+        }
+        if !verify_hash_step(params, hp, &level.left, &right, &level.node, &level.step) {
+            return false;
+        }
+        child.clone_from(&level.node);
+    }
+    // Tie the top node to the public root: C_top = com(root; root_r).
+    match proof.levels.last() {
+        Some(top) => top.node == commit_node(params, root, &proof.root_r),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -263,5 +408,48 @@ mod tests {
         let lw = NodeWitness { node: &sib, randomness: &sr }; // wrong: left = sibling under d = 0
         let proof = prove_swap(&params, &cw, &sw, &lw, &d0, &rd0, b"ws").expect("proof emitted");
         assert!(!verify_swap(&params, &child_coms, &sib_coms, &sib_coms, &cd0, &proof), "d=0 with left=sib is wrong");
+    }
+
+    /// The root a depth-2 path with the given leaf, siblings, and directions hashes to.
+    fn tree_root(hp: &HashParams, leaf: &HashNode, sib0: &HashNode, sib1: &HashNode, d0: u64, d1: u64) -> HashNode {
+        let (l0, r0) =
+            if d0 == 1 { (sib0.clone(), leaf.clone()) } else { (leaf.clone(), sib0.clone()) };
+        let node0 = hp.hash(&l0, &r0);
+        let (l1, r1) =
+            if d1 == 1 { (sib1.clone(), node0.clone()) } else { (node0.clone(), sib1.clone()) };
+        hp.hash(&l1, &r1)
+    }
+
+    #[test]
+    fn a_membership_path_proves_and_verifies() {
+        let params = RingParams::standard();
+        let hp = HashParams::standard();
+        let leaf = HashNode::from_bytes(b"path-leaf");
+        let sib0 = HashNode::from_bytes(b"path-sib0");
+        let sib1 = HashNode::from_bytes(b"path-sib1");
+        let (d0, d1) = (1u64, 0u64);
+        let root = tree_root(&hp, &leaf, &sib0, &sib1, d0, d1);
+        let sibs = [sib0, sib1];
+        let dirs = [d0, d1];
+        let proof = prove_path(&params, &hp, &leaf, &sibs, &dirs, b"seed").expect("membership path");
+        assert!(verify_path(&params, &hp, &root, &proof), "a genuine leaf→root path verifies");
+    }
+
+    #[test]
+    fn a_path_to_a_wrong_root_is_rejected() {
+        let params = RingParams::standard();
+        let hp = HashParams::standard();
+        let leaf = HashNode::from_bytes(b"wr-leaf");
+        let sib0 = HashNode::from_bytes(b"wr-sib0");
+        let sib1 = HashNode::from_bytes(b"wr-sib1");
+        let (d0, d1) = (0u64, 1u64);
+        let root = tree_root(&hp, &leaf, &sib0, &sib1, d0, d1);
+        let sibs = [sib0, sib1];
+        let dirs = [d0, d1];
+        let proof = prove_path(&params, &hp, &leaf, &sibs, &dirs, b"seed").expect("path");
+        // The top-node tie is to the real root; a different anchor is rejected.
+        let wrong_root = HashNode::from_bytes(b"wr-not-the-root");
+        assert!(!verify_path(&params, &hp, &wrong_root, &proof), "a path does not verify against a wrong root");
+        assert!(verify_path(&params, &hp, &root, &proof), "…but does against the real root");
     }
 }
