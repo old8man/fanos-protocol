@@ -129,6 +129,15 @@ impl RingRandomness {
     pub fn components(&self) -> &[Poly] {
         &self.r
     }
+
+    /// A randomness from explicit component polynomials — the **balance** randomness `Σr_in − Σr_out` (a signed
+    /// sum of ternaries: no longer ternary, but still short with `‖·‖∞ ≤ #notes`) is assembled this way for its
+    /// zero-knowledge opening-to-zero proof ([`crate::ring_balance`]). Must have `ELL` components.
+    #[must_use]
+    pub(crate) fn from_components(r: Vec<Poly>) -> Self {
+        debug_assert_eq!(r.len(), ELL, "a randomness has ELL components");
+        Self { r }
+    }
 }
 
 /// A ring-BDLOP value commitment `(t0 ∈ R_q^K, t1 ∈ R_q)` — hiding the amount, binding, additively homomorphic.

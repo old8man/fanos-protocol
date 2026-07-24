@@ -42,15 +42,44 @@ use fanos_primitives::hash::hash_xof;
 use crate::ring::{D, Poly};
 use crate::ring_commit::{ELL, RingCommitment, RingParams, RingRandomness};
 
-/// The masking half-width `B`: each response coefficient is masked over `[−B, B]`. Chosen `≫ β = D` so the abort
-/// probability is small and the proof succeeds after ≈1 resample, while `B·(ternary) ` stays far below `q`.
-pub const MASK_BOUND: i64 = 1 << 19;
+/// The slack factor `B / β`: the masking is `2¹¹×` wider than the response bound, so the per-coefficient accept
+/// probability is `≈ 1 − 1/2048` and the whole proof succeeds after `≈ 1.6` resamples (`(1−1/2048)^{ELL·D} ≈ 0.6`).
+const SLACK: i64 = 1 << 11;
 
-/// The response shortness bound `β = D`: `‖c·r_j‖∞ ≤ D` for a ternary challenge and ternary randomness, so an
-/// honest `z_j = y_j + c·r_j` (with `‖y_j‖∞ ≤ B`) is accepted iff `‖z_j‖∞ ≤ B − β`, the `c·r`-independent region.
-const BETA: i64 = D as i64;
+/// The **norm regime** of an opening proof: the response bound `β` (a bound on `‖c·r_j‖∞`) and the masking width
+/// `B = β·SLACK`, which together fix the `c·r`-independent accept region `‖z_j‖∞ ≤ B − β` — the region an honest
+/// masked response lands in and the shortness a verifier checks. It is **derived from context** by both parties
+/// (a note-value opening is [`TERNARY`](Self::TERNARY); a balance opening scales with the note count via
+/// [`for_randomness_bound`](Self::for_randomness_bound)), so it is never carried in the proof.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OpeningParams {
+    mask_bound: i64,
+    beta: i64,
+}
 
-/// A bound on resample attempts (completeness needs ≈1; exceeding it signals a parameter error).
+impl OpeningParams {
+    /// The regime for a **ternary** opening — a single note-value commitment, `‖r‖∞ = 1`, so `β = D` (a ternary
+    /// challenge convolved with ternary randomness has `‖c·r‖∞ ≤ D`). `B = D·2¹¹ = 2¹⁹`.
+    pub const TERNARY: Self = Self { mask_bound: D as i64 * SLACK, beta: D as i64 };
+
+    /// The regime for an opening whose randomness has infinity norm `≤ r_bound` — e.g. a **balance** randomness
+    /// `Σr_in − Σr_out`, a signed sum of `n` ternaries with `‖·‖∞ ≤ n`. Then `β = D·r_bound` and `B = β·SLACK`
+    /// (still far below `q`). `r_bound` is clamped to `≥ 1`; both prover and verifier pass the same `n`.
+    #[must_use]
+    pub fn for_randomness_bound(r_bound: i64) -> Self {
+        let beta = D as i64 * r_bound.max(1);
+        Self { mask_bound: beta.saturating_mul(SLACK), beta }
+    }
+
+    /// The accept region half-width `B − β`: an honest response satisfies `‖z_j‖∞ ≤ B − β` independently of the
+    /// witness `c·r` (that is the zero-knowledge), and the verifier rejects any `z_j` outside it.
+    #[must_use]
+    fn accept_bound(&self) -> i64 {
+        self.mask_bound - self.beta
+    }
+}
+
+/// A bound on resample attempts (completeness needs `≈ 1.6`; exceeding it signals a parameter error).
 const MAX_ATTEMPTS: u32 = 64;
 
 /// A compact zero-knowledge proof of knowledge of a short opening: the ternary challenge and the `ELL` masked
@@ -74,15 +103,18 @@ fn challenge(u: &[Poly], w: &[Poly]) -> Poly {
     Poly::ternary(&seed)
 }
 
-/// Prove knowledge of the short randomness `r` opening `commitment` to `value`, in zero knowledge. `seed` seeds
-/// the (re-randomised, never-revealed) masking. `None` only if the masking never lands short within
-/// [`MAX_ATTEMPTS`] — a parameter error, not a normal outcome.
+/// Prove knowledge of the short randomness `r` opening `commitment` to `value`, in zero knowledge, in the norm
+/// `regime` (which both parties derive from context — [`OpeningParams::TERNARY`] for a note, or
+/// [`OpeningParams::for_randomness_bound`] for a balance). `seed` seeds the (re-randomised, never-revealed)
+/// masking. `None` only if the masking never lands short within [`MAX_ATTEMPTS`] — a parameter error, not a
+/// normal outcome.
 #[must_use]
 pub fn prove_opening(
     params: &RingParams,
     commitment: &RingCommitment,
     value: u64,
     r: &RingRandomness,
+    regime: &OpeningParams,
     seed: &[u8],
 ) -> Option<RingOpeningProof> {
     let u = commitment.statement(value);
@@ -94,29 +126,31 @@ pub fn prove_opening(
                 s.extend_from_slice(seed);
                 s.extend_from_slice(&attempt.to_le_bytes());
                 s.extend_from_slice(&(j as u64).to_le_bytes());
-                Poly::uniform_bounded(&s, MASK_BOUND)
+                Poly::uniform_bounded(&s, regime.mask_bound)
             })
             .collect();
         let w = params.m_times(&y);
         let c = challenge(&u, &w);
         // z_j = y_j + c·r_j.
         let z: Vec<Poly> = y.iter().zip(r).map(|(yj, rj)| yj.add(&c.mul(rj))).collect();
-        if z.iter().all(|zj| zj.infinity_norm_le(MASK_BOUND - BETA)) {
+        if z.iter().all(|zj| zj.infinity_norm_le(regime.accept_bound())) {
             return Some(RingOpeningProof { challenge: c, z });
         }
     }
     None
 }
 
-/// Verify a [`prove_opening`] proof that `commitment` opens to `value` under *some* short randomness.
+/// Verify a [`prove_opening`] proof that `commitment` opens to `value` under *some* short randomness, in the
+/// norm `regime` (the same one the prover used, re-derived from context).
 #[must_use]
 pub fn verify_opening(
     params: &RingParams,
     commitment: &RingCommitment,
     value: u64,
     proof: &RingOpeningProof,
+    regime: &OpeningParams,
 ) -> bool {
-    if proof.z.len() != ELL || !proof.z.iter().all(|zj| zj.infinity_norm_le(MASK_BOUND - BETA)) {
+    if proof.z.len() != ELL || !proof.z.iter().all(|zj| zj.infinity_norm_le(regime.accept_bound())) {
         return false; // wrong arity, or a response outside the norm bound
     }
     let u = commitment.statement(value);
@@ -174,33 +208,36 @@ mod tests {
     #[test]
     fn an_honest_opening_proof_verifies_and_hides_the_randomness() {
         let (params, commitment, r) = setup(42, b"ring-zk-happy");
-        let proof = prove_opening(&params, &commitment, 42, &r, b"proof-seed").expect("honest proof");
-        assert!(verify_opening(&params, &commitment, 42, &proof), "an honest opening proof verifies");
+        let t = &OpeningParams::TERNARY;
+        let proof = prove_opening(&params, &commitment, 42, &r, t, b"proof-seed").expect("honest proof");
+        assert!(verify_opening(&params, &commitment, 42, &proof, t), "an honest opening proof verifies");
         // A different masking seed ⇒ a different transcript for the SAME statement (re-randomised).
-        let proof2 = prove_opening(&params, &commitment, 42, &r, b"other-seed").expect("honest proof");
+        let proof2 = prove_opening(&params, &commitment, 42, &r, t, b"other-seed").expect("honest proof");
         assert_ne!(proof.to_bytes(), proof2.to_bytes(), "the proof is re-randomised, not deterministic in r");
-        assert!(verify_opening(&params, &commitment, 42, &proof2));
+        assert!(verify_opening(&params, &commitment, 42, &proof2, t));
     }
 
     #[test]
     fn a_proof_for_the_wrong_value_or_commitment_is_rejected() {
         let (params, commitment, r) = setup(100, b"ring-zk-wrong");
-        let proof = prove_opening(&params, &commitment, 100, &r, b"seed").unwrap();
-        assert!(!verify_opening(&params, &commitment, 101, &proof), "the value is bound into the statement");
+        let t = &OpeningParams::TERNARY;
+        let proof = prove_opening(&params, &commitment, 100, &r, t, b"seed").unwrap();
+        assert!(!verify_opening(&params, &commitment, 101, &proof, t), "the value is bound into the statement");
         let other = RingCommitment::commit(&params, 100, &RingRandomness::from_seed(b"different-r"));
-        assert!(!verify_opening(&params, &other, 100, &proof), "the commitment is bound into the statement");
+        assert!(!verify_opening(&params, &other, 100, &proof, t), "the commitment is bound into the statement");
     }
 
     #[test]
     fn a_tampered_response_is_rejected() {
         let (params, commitment, r) = setup(7, b"ring-zk-tamper");
-        let proof = prove_opening(&params, &commitment, 7, &r, b"seed").unwrap();
+        let t = &OpeningParams::TERNARY;
+        let proof = prove_opening(&params, &commitment, 7, &r, t, b"seed").unwrap();
         let mut tampered = proof.clone();
         // Add 1 to one response coefficient: w changes, so the recomputed challenge no longer matches.
         let mut z0 = tampered.z[0].coeffs().to_vec();
         z0[0] = crate::ring::fadd(z0[0], 1);
         tampered.z[0] = Poly::from_u64(&z0.try_into().unwrap());
-        assert!(!verify_opening(&params, &commitment, 7, &tampered), "a tampered response fails Fiat–Shamir");
+        assert!(!verify_opening(&params, &commitment, 7, &tampered, t), "a tampered response fails Fiat–Shamir");
     }
 
     #[test]
@@ -230,16 +267,36 @@ mod tests {
             challenge: Poly::ternary(b"arbitrary-challenge"),
             z: (0..ELL).map(|j| Poly::uniform_bounded(&[b'z', j as u8], 5)).collect(),
         };
-        assert!(!verify_opening(&params, &commitment, 9, &forged), "a witness-free proof fails Fiat–Shamir");
+        assert!(!verify_opening(&params, &commitment, 9, &forged, &OpeningParams::TERNARY), "no witness ⇒ FS fails");
     }
 
     #[test]
     fn the_proof_round_trips_through_its_bytes() {
         let (params, commitment, r) = setup(555, b"ring-zk-codec");
-        let proof = prove_opening(&params, &commitment, 555, &r, b"seed").unwrap();
+        let proof = prove_opening(&params, &commitment, 555, &r, &OpeningParams::TERNARY, b"seed").unwrap();
         let back = RingOpeningProof::from_bytes(&proof.to_bytes()).expect("round-trips");
         assert_eq!(back, proof);
-        assert!(verify_opening(&params, &commitment, 555, &back));
+        assert!(verify_opening(&params, &commitment, 555, &back, &OpeningParams::TERNARY));
         assert!(RingOpeningProof::from_bytes(&proof.to_bytes()[..proof.to_bytes().len() - 1]).is_none());
+    }
+
+    #[test]
+    fn the_larger_norm_regime_opens_a_non_ternary_randomness() {
+        // The balance regime: a randomness whose infinity norm exceeds 1 (here a sum of several ternaries) still
+        // has a complete, verifying opening proof under the matching `for_randomness_bound`, and the TERNARY
+        // regime's tighter accept region would (correctly) reject its wider response.
+        let params = RingParams::standard();
+        let parts: Vec<RingRandomness> = (0..6u8).map(|i| RingRandomness::from_seed(&[b'p', i])).collect();
+        // r = Σ parts (component-wise) — ‖r‖∞ ≤ 6; commit to 0 under it, as a balance residual would.
+        let r = RingRandomness::from_components(
+            (0..ELL)
+                .map(|j| parts.iter().fold(Poly::zero(), |acc, p| acc.add(&p.components()[j])))
+                .collect(),
+        );
+        let commitment = RingCommitment::commit(&params, 0, &r);
+        let regime = OpeningParams::for_randomness_bound(6);
+        let proof = prove_opening(&params, &commitment, 0, &r, &regime, b"bal-seed").expect("wide opening");
+        assert!(verify_opening(&params, &commitment, 0, &proof, &regime), "the wider regime verifies");
+        assert!(regime.accept_bound() > OpeningParams::TERNARY.accept_bound(), "the balance regime is wider");
     }
 }

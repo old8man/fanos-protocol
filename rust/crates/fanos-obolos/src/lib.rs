@@ -42,6 +42,7 @@ pub mod note;
 pub mod note_cipher;
 pub mod nullifier;
 pub mod ring;
+pub mod ring_balance;
 pub mod ring_commit;
 pub mod ring_zk;
 pub mod state;
