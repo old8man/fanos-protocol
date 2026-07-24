@@ -23,7 +23,11 @@ const KIND_TX: u8 = 0x01;
 /// **transaction** (a client sends it to a validator, which gossips it so every mempool holds it). A 1-byte
 /// kind prefix on the App body keeps the two unambiguous while sharing the one `App` frame code — so TAXIS
 /// still claims no new top-level frame code (audit A1).
+// A transient per-frame dispatch enum: `parse_app_body` builds one, the driver matches it once and drops it —
+// it is never stored in bulk, so the `Consensus`/`Tx` size imbalance never multiplies in memory. Boxing the
+// large arm would only add a heap allocation on the hot consensus receive path for no real benefit.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum TaxisApp {
     /// A consensus message (Propose / Vote / Reveal / ExecVote / Sync …).
     Consensus(ConsensusMsg),

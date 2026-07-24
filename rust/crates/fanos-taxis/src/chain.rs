@@ -8,6 +8,8 @@
 
 use alloc::vec::Vec;
 
+use fanos_pqcrypto::HybridVerifier;
+
 use crate::block::{BlockHeader, GENESIS_PARENT};
 use crate::state::StateMachine;
 use crate::tx::Transaction;
@@ -100,6 +102,12 @@ impl<S: StateMachine> Chain<S> {
     /// (see [`StateMachine::set_audit_beacon`]).
     pub fn set_audit_beacon(&mut self, beacon: [u8; 32]) {
         self.state.set_audit_beacon(beacon);
+    }
+
+    /// Credit the block reward to the parent block's finalizers before this block's transactions
+    /// (see [`StateMachine::apply_block_reward`]).
+    pub fn apply_block_reward(&mut self, beneficiaries: &[HybridVerifier], amount: u64) {
+        self.state.apply_block_reward(beneficiaries, amount);
     }
 
     /// Execute one transaction against the state (applied in committed order after its block finalizes).

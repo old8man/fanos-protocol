@@ -99,8 +99,6 @@ struct Cluster {
     proposed: Vec<Block>,
     /// Equivocation proofs the engines surfaced (the operational slashing signal).
     slashes: Vec<SlashEvidence>,
-    /// Block-reward splits the engines surfaced (validator, amount).
-    rewards: Vec<(u8, u64)>,
 }
 
 impl Cluster {
@@ -140,7 +138,6 @@ impl Cluster {
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
-            rewards: Vec::new(),
         }
     }
 
@@ -165,7 +162,6 @@ impl Cluster {
                 Output::Send(msg) => self.bus.push_back((idx, msg)),
                 Output::Committed { height, block_hash } => self.committed[idx].push((height, block_hash)),
                 Output::Slash(ev) => self.slashes.push(ev),
-                Output::Reward(split) => self.rewards.extend(split),
                 // A point-to-point send (a catch-up SyncResp): deliver only to `to`, respecting crash +
                 // partition, and collect its outputs (the adoption's Committed) so `run` sees them.
                 Output::SendTo { to, msg } => {
@@ -805,7 +801,7 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
                     match o {
                         Output::Send(m) => bus.push_back(m),
                         Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
-                        Output::Slash(_) | Output::Reward(_) | Output::SendTo { .. } => {} // equivocation is expected; safety is what this checks
+                        Output::Slash(_) | Output::SendTo { .. } => {} // equivocation is expected; safety is what this checks
                     }
                 }
             }
@@ -839,7 +835,7 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
                         match o {
                             Output::Send(m) => bus.push_back(m),
                             Output::Committed { height, block_hash } => committed[i].push((height, block_hash)),
-                            Output::Slash(_) | Output::Reward(_) | Output::SendTo { .. } => {} // safety is what this trial checks
+                            Output::Slash(_) | Output::SendTo { .. } => {} // safety is what this trial checks
                         }
                     }
                 }
@@ -1120,22 +1116,43 @@ fn an_undecryptable_transaction_is_deterministically_dropped_after_the_reveal_wi
 /// pool F among the commit-certificate signers (R = F/Q each) — the reward the Nash equilibrium assumes,
 /// surfaced as Output::Reward for the driver to credit, symmetric to the equivocation slash.
 #[test]
-fn finalizing_a_block_rewards_its_commit_certificate_signers() {
+fn a_finalized_blocks_commit_certificate_is_recorded_as_the_next_blocks_last_commit() {
+    use fanos_taxis::Phase;
+    // The canonical block reward (`incentive`, `StateMachine::apply_block_reward`) credits the finalizers of the
+    // PARENT block, read from the block's recorded `last_commit`. This verifies the consensus half: a block above
+    // height 1 records a *valid commit Q-certificate for its parent*, so every validator credits the identical,
+    // agreed finalizer set — the property that lets the reward be a deterministic in-state transition (rather
+    // than a per-node event that could never enter the state root). The balance effect is a state-machine
+    // concern — the reference `Accounts` has no treasury; `fanos-dromos` tests the `HybridLedger` crediting.
     let mut c = Cluster::new(&genesis());
     for e in &mut c.engines {
         e.set_reward_per_block(500);
     }
     let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"reward");
     c.submit_all(&tx);
-    c.tick();
-    assert!(!c.rewards.is_empty(), "finalization surfaces a reward split");
-    // Each engine splits F = 500 evenly among the Q..N commit signers it certified, so every surfaced share is
-    // F/(signers) ∈ [F/N, F/Q] = [71, 100]. (The split is over each node's commit view; a canonical, cross-node-
-    // identical reward would record the commit certificate in the chain — the same refinement the execution
-    // checkpoint makes for state, tracked as future work.)
-    assert!(c.rewards.iter().all(|(_, amt)| (500 / 7..=500 / 5).contains(amt)), "each share is F/(signers) ∈ [71,100]");
-    let rewarded: BTreeSet<u8> = c.rewards.iter().map(|(v, _)| *v).collect();
-    assert!(rewarded.len() >= 5, "at least a Q-quorum of distinct signers were rewarded, got {}", rewarded.len());
+    for _ in 0..8 {
+        c.tick();
+    }
+
+    // The reward is now an in-state transition at execution (there is no surfaced reward event) — the consensus
+    // half verified here is that a block records the exact finalizer set its execution will reward.
+    // The verifier set is deterministic (the same keys the cluster is built from).
+    let verifiers: Vec<HybridVerifier> = gen_keys().iter().map(|k| k.sig_pub.clone()).collect();
+    // Every block above genesis (height ≥ 1) records a valid commit certificate for its parent.
+    let above_genesis: Vec<&Block> = c.proposed.iter().filter(|b| b.header.height >= 1).collect();
+    assert!(!above_genesis.is_empty(), "consensus advanced past the genesis block");
+    for b in &above_genesis {
+        let cert = b.last_commit.as_ref().expect("a block above genesis records its parent's commit certificate");
+        assert_eq!(cert.phase, Phase::Commit, "last_commit is a COMMIT certificate");
+        assert_eq!(cert.block_hash, b.header.parent, "it certifies exactly the parent block");
+        assert_eq!(cert.height, b.header.height - 1, "at the parent's height");
+        assert!(cert.verify(CellParams::FANO.quorum, &verifiers), "a valid Q-quorum of distinct finalizers");
+        assert!(cert.votes.len() >= 5, "at least a Q-quorum of finalizers is recorded, got {}", cert.votes.len());
+    }
+    // The first block (height 0, parent GENESIS_PARENT) has no parent commit to record.
+    for b in c.proposed.iter().filter(|b| b.header.height == 0) {
+        assert!(b.last_commit.is_none(), "the genesis block (height 0) records no last_commit");
+    }
 }
 
 /// The on-chain **decryption-key commitment** (anti-MEV `crate::keyper`): every validator agreed at genesis to

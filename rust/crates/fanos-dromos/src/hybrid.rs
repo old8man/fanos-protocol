@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fanos_obolos::{Params, ShieldedState, ShieldedTx, TransparentProof, decode_submission};
+use fanos_pqcrypto::HybridVerifier;
 use fanos_primitives::codec::{Reader, put_u64, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_taxis::state::{ExecOutcome, StateMachine};
@@ -785,6 +786,27 @@ impl StateMachine for HybridLedger {
     /// (`crate::storage`).
     fn set_audit_beacon(&mut self, beacon: [u8; 32]) {
         self.audit_beacon = beacon;
+    }
+
+    fn apply_block_reward(&mut self, beneficiaries: &[HybridVerifier], amount: u64) {
+        // Pay the block reward from the TREASURY — which accumulates transaction fees and slashed stake — so
+        // users' fees and forfeited stakes fund the validators who finalize blocks (the economic loop closes;
+        // no minting, so rewards are never inflationary). Cap at the treasury balance (graceful when empty) and
+        // split equally among the finalizers; any integer-division remainder stays in the treasury. Deterministic:
+        // the beneficiaries come from the committed `last_commit` certificate and the treasury balance is state.
+        let count = u64::try_from(beneficiaries.len()).unwrap_or(u64::MAX);
+        if count == 0 || amount == 0 {
+            return;
+        }
+        let pot = amount.min(self.tokens.balance(&TREASURY));
+        let share = pot / count;
+        if share == 0 {
+            return;
+        }
+        for v in beneficiaries {
+            // Total paid = share·count ≤ pot ≤ treasury, so each move is funded (never underflows).
+            let _ = self.tokens.move_system(&TREASURY, account_id(v), share);
+        }
     }
 
     /// Execute one committed transaction by dispatching on its type tag. An unknown tag or empty payload is
@@ -1923,5 +1945,33 @@ mod tests {
             "votes not signed by the cited key are not evidence"
         );
         assert_eq!(ledger.stake().bonded(&acct), 500, "no stake moved");
+    }
+
+    #[test]
+    fn the_block_reward_is_paid_from_the_treasury_to_the_finalizers() {
+        // The canonical block reward (`StateMachine::apply_block_reward`) credits the parent's finalizers from
+        // the TREASURY — where fees and slashed stake accumulate — capped at the treasury balance (no minting).
+        let (_s1, v1, a1) = account(1);
+        let (_s2, v2, a2) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(TREASURY, 1000); // the treasury is funded (fees + slashes accrue here)
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Reward 300 split between two finalizers → 150 each; the treasury is debited by 300.
+        ledger.apply_block_reward(&[v1.clone(), v2.clone()], 300);
+        assert_eq!(ledger.tokens().balance(&a1), 150);
+        assert_eq!(ledger.tokens().balance(&a2), 150);
+        assert_eq!(ledger.tokens().balance(&TREASURY), 700, "the treasury funds the reward");
+
+        // Capped at the treasury balance (never minted): 999_999 requested, only 700 left → 350 each, treasury 0.
+        ledger.apply_block_reward(&[v1.clone(), v2.clone()], 999_999);
+        assert_eq!(ledger.tokens().balance(&a1), 500);
+        assert_eq!(ledger.tokens().balance(&a2), 500);
+        assert_eq!(ledger.tokens().balance(&TREASURY), 0, "the reward never exceeds the treasury (no inflation)");
+
+        // An empty treasury pays nothing (graceful — the equilibrium's C1 holds only while fees fund rewards).
+        ledger.apply_block_reward(&[v1, v2], 500);
+        assert_eq!(ledger.tokens().balance(&a1), 500, "an empty treasury pays no reward");
+        assert_eq!(ledger.tokens().balance(&TREASURY), 0);
     }
 }

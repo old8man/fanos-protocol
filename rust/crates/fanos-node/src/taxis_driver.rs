@@ -140,13 +140,11 @@ pub enum TaxisEvent {
         /// The finalized block hash.
         block_hash: [u8; 32],
     },
-    /// A validator was caught equivocating (the driver would apply the economic slash).
+    /// A validator was caught equivocating (the driver auto-submits the on-chain slash).
     Slashed {
         /// The equivocating validator's index.
         validator: u8,
     },
-    /// A finalized block's reward split among its commit-certificate signers (`(validator, amount)`).
-    Rewarded(Vec<(u8, u64)>),
     /// The cell's **execution checkpoint** advanced: a fresh `Q`-quorum [`ExecCertificate`] over the executed
     /// state at a new height — the artifact a parent cell attests for shared security ([`spawn_checkpoint_publisher`]).
     Checkpointed(ExecCertificate),
@@ -433,9 +431,6 @@ fn drive<S: StateMachine>(
                 {
                     ingest_tx(engine, client, coords, me, seen, &sealed);
                 }
-            }
-            Output::Reward(split) => {
-                let _ = events.send(TaxisEvent::Rewarded(split));
             }
         }
     }

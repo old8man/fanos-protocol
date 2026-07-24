@@ -36,7 +36,7 @@ use crate::checkpoint::{ExecCertificate, ExecVote};
 use crate::committee::{
     epoch_seal_line, is_line_member, leader, leader_line, line_members, verify_leader_ticket,
 };
-use crate::incentive::{detect_equivocation, distribute, SlashEvidence};
+use crate::incentive::{SlashEvidence, detect_equivocation};
 use crate::params::CellParams;
 use crate::state::StateMachine;
 use crate::tx::{SealedTx, Transaction, TxCommit};
@@ -362,10 +362,6 @@ pub enum Output {
     /// A validator was caught **equivocating** — a self-contained, verifiable proof (two conflicting signed
     /// votes at one slot). The driver applies the slash and can gossip the evidence; anyone can re-verify it.
     Slash(SlashEvidence),
-    /// The finalized block's reward split among its commit-certificate signers — `(validator, amount)` pairs
-    /// (`incentive::distribute`). The driver credits each validator; this operationalizes the reward `R = F/Q`
-    /// the Nash equilibrium assumes (symmetric to [`Slash`](Output::Slash)).
-    Reward(Vec<(u8, u64)>),
     /// Send `msg` **point-to-point** to validator `to` (not a broadcast) — used to direct a catch-up response
     /// (`SyncResp`, a large state snapshot) back to the one requester, rather than flooding the cell.
     SendTo {
@@ -477,6 +473,10 @@ pub struct ConsensusEngine<S: StateMachine> {
     // The per-block reward pool `F` split among the commit-certificate signers on finalization (`R = F/Q`).
     // Zero (the default) emits no reward — backward-compatible; a driver funds it from collected fees.
     reward_per_block: u64,
+    // The commit certificate of the most-recently-finalized block, captured at finality so the NEXT block this
+    // validator proposes can record it as its `last_commit` — the canonical finalizer set every validator then
+    // credits the block reward to (`crate::incentive`). `None` until the first block finalizes.
+    last_finalized_cert: Option<Certificate>,
 }
 
 impl<S: StateMachine> ConsensusEngine<S> {
@@ -528,6 +528,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_states: BTreeMap::new(),
             sync_heads: BTreeMap::new(),
             reward_per_block: 0,
+            last_finalized_cert: None,
         }
     }
 
@@ -766,10 +767,22 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if !entitled || self.proposed_round == Some(self.round) {
             return Vec::new();
         }
+        // A freshly state-synced validator adopted its parent's state without locally finalizing it, so it holds
+        // no commit certificate to record as this block's `last_commit` (every block above height 0 must record
+        // one — the reward beneficiaries). Abstain rather than broadcast a block peers will reject; it recovers
+        // the instant it helps finalize a height, which sets `last_finalized_cert`.
+        if height > 0 && self.last_finalized_cert.is_none() {
+            return Vec::new();
+        }
         // Order the mempool blindly by commitment (the proposer never sees contents — anti-MEV).
         let mut sealed = self.mempool.clone();
         sealed.sort_by_key(SealedTx::commit);
         let mut block = Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed);
+        // Record the certificate that finalized the parent as this block's `last_commit`, so its execution
+        // rewards exactly that (agreed) finalizer set. None before the first finalization (genesis child).
+        if let Some(cert) = &self.last_finalized_cert {
+            block = block.with_last_commit(cert.clone());
+        }
         // SSLE round 0: attach my sortition ticket witness. If I cannot prove it (the bounded VRF domain was
         // exhausted before the epoch re-registered), abstain this round rather than broadcast an un-rankable
         // block — a graceful degradation to the remaining eligible proposers, never a stall of the whole line.
@@ -823,7 +836,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let links = block.header.height == height
             && block.header.parent == self.chain.head()
             && block.header.epoch == self.epoch;
-        if !proposer_ok || !links || !block.verify_structure() {
+        if !proposer_ok || !links || !block.verify_structure() || !self.valid_last_commit(&block) {
             if block.header.height > height {
                 self.note_height(block.header.height); // a proposal for a height ahead of us — we are behind
             }
@@ -1076,6 +1089,24 @@ impl<S: StateMachine> ConsensusEngine<S> {
         Certificate { phase, height, round, block_hash, votes }
     }
 
+    /// Whether a proposal's recorded `last_commit` is acceptable. A block above height 1 must record a valid
+    /// commit **Q-certificate for its parent** — the finalizer set its execution rewards, verified here so a
+    /// proposer cannot fabricate beneficiaries. A height-1 block's parent is genesis (never voted), so it records
+    /// none. (The round within the certificate is free: any round that finalized the parent is legitimate.)
+    fn valid_last_commit(&self, block: &Block) -> bool {
+        match &block.last_commit {
+            // Only the first block (height 0, parent GENESIS_PARENT) has no parent commit to record; every later
+            // block MUST record the certificate that finalized its parent (the reward beneficiaries).
+            None => block.header.height == 0,
+            Some(cert) => {
+                cert.phase == Phase::Commit
+                    && cert.block_hash == block.header.parent
+                    && cert.height == block.header.height.saturating_sub(1)
+                    && cert.verify(self.params.quorum, &self.verifiers)
+            }
+        }
+    }
+
     /// Finalize the block named by `block_hash`: extend the chain, emit the anti-MEV reveals for this
     /// validator's shares, queue execution, and reset per-height state for the next height.
     fn finalize(&mut self, block_hash: [u8; 32]) -> Vec<Output> {
@@ -1089,28 +1120,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
         };
         self.pending_finalize.remove(&height);
         let included: BTreeSet<TxCommit> = block.sealed_txs.iter().map(SealedTx::commit).collect();
+        // Capture the canonical commit certificate that finalized this block — BEFORE `chain.finalize` advances
+        // `self.height()`, which `collect_cert` filters votes by. The NEXT block this validator proposes records
+        // it as its `last_commit`: that recorded certificate — not any node's local commit view — is the agreed
+        // finalizer set the block reward is credited to at execution (`StateMachine::apply_block_reward`), which
+        // is what lets the reward be part of committed state at all (a per-node split could differ across
+        // validators and so could never be part of the state root).
+        self.last_finalized_cert = Some(self.collect_cert(Phase::Commit, block_hash));
         self.chain.finalize(block.header.clone());
 
         let mut out = alloc::vec![Output::Committed { height, block_hash }];
-        // Distribute the block reward `F` among the distinct commit signers this validator certified (`R = F/Q`
-        // each) — the operational reward the Nash equilibrium assumes, symmetric to the equivocation slash. The
-        // split is over this node's commit view (≥ Q signers); a canonical, cross-node-identical reward would
-        // record the commit certificate in the chain (the same refinement the execution checkpoint makes for
-        // state) — future work.
-        if self.reward_per_block > 0 {
-            let mut signers: Vec<u8> = self
-                .commits
-                .iter()
-                .filter(|sv| sv.vote.phase == Phase::Commit && sv.vote.block_hash == block_hash)
-                .map(|sv| sv.vote.voter)
-                .collect();
-            signers.sort_unstable();
-            signers.dedup();
-            let split = distribute(self.reward_per_block, &signers);
-            if !split.is_empty() {
-                out.push(Output::Reward(split));
-            }
-        }
         out.extend(self.emit_reveals(&block));
         // Robustness (audit §3.9): also re-broadcast our reveals for every earlier finalized-but-unexecuted
         // block still awaiting decryption. Reveals are otherwise emitted exactly once, at finality; under
@@ -1334,6 +1353,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // The parent hash is an unpredictable, consensus-committed value (fixed before this block's
             // transactions), so a storage-market audit drawn from it cannot be pre-satisfied by the prover.
             self.chain.set_audit_beacon(block.header.parent);
+            // Credit the block reward to the parent's finalizers — the validators whose signatures form this
+            // block's recorded `last_commit` (already validated as a commit Q-certificate for the parent in
+            // on_propose). Canonical: every validator reads the identical finalizer set from the committed
+            // block, so crediting it is a deterministic state transition that lands in the state root.
+            if self.reward_per_block > 0
+                && let Some(cert) = &block.last_commit
+            {
+                let beneficiaries: Vec<HybridVerifier> = cert
+                    .votes
+                    .iter()
+                    .filter_map(|sv| self.verifiers.get(usize::from(sv.vote.voter)).cloned())
+                    .collect();
+                self.chain.apply_block_reward(&beneficiaries, self.reward_per_block);
+            }
             for txn in &opened {
                 self.chain.execute(txn);
             }

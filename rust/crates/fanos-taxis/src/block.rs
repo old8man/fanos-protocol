@@ -21,10 +21,12 @@ use fanos_wire::Wire;
 use fanos_wire_derive::Wire;
 
 use crate::tx::{SealedTx, TxCommit};
+use crate::vote::Certificate;
 
 const HEADER_LABEL: &str = "FANOS-v1/taxis-block-header";
 const TX_ROOT_LABEL: &str = "FANOS-v1/taxis-tx-root";
 const DA_COMMIT_LABEL: &str = "FANOS-v1/taxis-da-commit";
+const LAST_COMMIT_LABEL: &str = "FANOS-v1/taxis-last-commit";
 
 /// The **secret-leader sortition witness** a round-0 proposer attaches to its block: its post-quantum
 /// Merkle-VRF `output` at index `height`, plus the `proof` binding that output to the proposer's
@@ -89,6 +91,11 @@ pub struct BlockHeader {
     pub tx_root: [u8; 32],
     /// A binding commitment to the erasure-coded payload shards — what DA sampling verifies against.
     pub da_commit: [u8; 32],
+    /// A binding commitment to the block's `last_commit` — the parent block's commit certificate (`H(cert)`,
+    /// or all-zero at genesis / height 1). Recording it in the hashed header fixes the reward beneficiaries (the
+    /// parent's finalizers) as part of block identity, so every validator credits the identical, agreed set
+    /// (`crate::incentive`).
+    pub last_commit_root: [u8; 32],
 }
 
 impl BlockHeader {
@@ -111,6 +118,10 @@ pub struct Block {
     /// public-fallback (round ≥ 1) block. It rides **outside** the hashed header — an auxiliary leadership
     /// proof, so the block identity ([`hash`](Self::hash)) is independent of it (see [`LeaderWitness`]).
     pub witness: Option<LeaderWitness>,
+    /// The parent block's commit certificate — the finalizers rewarded when this block executes (the
+    /// Tendermint-style `LastCommit`). `None` at genesis / height 1. Committed by the header's
+    /// `last_commit_root`, so unlike the [`witness`](Self::witness) it **is** part of the block hash.
+    pub last_commit: Option<Certificate>,
 }
 
 impl Block {
@@ -128,8 +139,21 @@ impl Block {
     ) -> Self {
         let tx_root = tx_root(&commits_of(&sealed_txs));
         let da_commit = commit_shards(&erasure::encode(&encode_payload(&sealed_txs)));
-        let header = BlockHeader { parent, height, epoch, proposer, tx_root, da_commit };
-        Self { header, sealed_txs, witness: None }
+        let header =
+            BlockHeader { parent, height, epoch, proposer, tx_root, da_commit, last_commit_root: commit_last(None) };
+        Self { header, sealed_txs, witness: None, last_commit: None }
+    }
+
+    /// Attach the parent block's commit certificate as this block's `last_commit`, updating the header's
+    /// `last_commit_root` (and thus the block [`hash`](Self::hash)). The proposer chains this after
+    /// [`assemble`](Self::assemble) so the block records who finalized its parent — the reward beneficiaries the
+    /// incentive equilibrium credits. Chained before [`with_witness`](Self::with_witness), which does not alter
+    /// the hash.
+    #[must_use]
+    pub fn with_last_commit(mut self, cert: Certificate) -> Self {
+        self.header.last_commit_root = commit_last(Some(&cert));
+        self.last_commit = Some(cert);
+        self
     }
 
     /// Attach the secret-leader sortition `witness` (the proposer's Merkle-VRF ticket proof). Chained after
@@ -154,6 +178,9 @@ impl Block {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.header.to_wire();
         out.extend_from_slice(&encode_payload(&self.sealed_txs));
+        // Length-prefixed last_commit (empty ⇒ None): the parent's commit certificate, ahead of the witness.
+        let last_commit_bytes = self.last_commit.as_ref().map(Certificate::to_bytes).unwrap_or_default();
+        fanos_primitives::codec::put_var_bytes(&mut out, &last_commit_bytes);
         // Length-prefixed witness: empty var-bytes ⇒ no sortition witness (a public-fallback block).
         let witness_bytes = self.witness.as_ref().map(LeaderWitness::to_bytes).unwrap_or_default();
         fanos_primitives::codec::put_var_bytes(&mut out, &witness_bytes);
@@ -174,11 +201,14 @@ impl Block {
         // Witness section: a length-prefixed LeaderWitness (empty ⇒ None). Trailing bytes after it are
         // rejected, preserving the canonical one-encoding rule.
         let mut r = fanos_primitives::codec::Reader::new(cur);
+        let last_commit_bytes = r.var_bytes()?;
+        let last_commit =
+            if last_commit_bytes.is_empty() { None } else { Some(Certificate::from_bytes(last_commit_bytes)?) };
         let witness_bytes = r.var_bytes()?;
         let witness =
             if witness_bytes.is_empty() { None } else { Some(LeaderWitness::from_bytes(witness_bytes)?) };
         r.finish()?;
-        Some(Self { header, sealed_txs, witness })
+        Some(Self { header, sealed_txs, witness, last_commit })
     }
 
     /// The ordered transaction commitments — what the proposer ordered by (blind to contents).
@@ -205,7 +235,10 @@ impl Block {
     pub fn verify_structure(&self) -> bool {
         let tx_root_ok = self.header.tx_root == tx_root(&self.tx_commits());
         let da_ok = self.header.da_commit == commit_shards(&self.da_shards());
-        tx_root_ok && da_ok
+        // The recorded last_commit must match the header's commitment (a proposer cannot record one finalizer
+        // set in the header and ship a different one). Its *validity* as a quorum cert is checked by consensus.
+        let last_ok = self.header.last_commit_root == commit_last(self.last_commit.as_ref());
+        tx_root_ok && da_ok && last_ok
     }
 
     /// Reconstruct a block's payload from a **subset** of its shards (an erased point is `None`) and verify
@@ -241,6 +274,16 @@ fn tx_root(commits: &[TxCommit]) -> [u8; 32] {
         buf.extend_from_slice(c);
     }
     hash_labeled(TX_ROOT_LABEL, &buf)
+}
+
+/// A binding commitment to a block's `last_commit` certificate — `H(cert)` if present, else all-zero. Folded
+/// into the hashed header, so the recorded finalizer set (the reward beneficiaries) is part of block identity —
+/// every validator that votes for the block therefore agrees on exactly who its execution will reward.
+fn commit_last(last_commit: Option<&Certificate>) -> [u8; 32] {
+    match last_commit {
+        Some(cert) => hash_labeled(LAST_COMMIT_LABEL, &cert.to_bytes()),
+        None => [0u8; 32],
+    }
 }
 
 /// A binding commitment to all `N = 7` payload shards: `H(len₀ ‖ shard₀ ‖ len₁ ‖ shard₁ ‖ …)`. A validator

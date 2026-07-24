@@ -192,6 +192,46 @@ impl Certificate {
         }
         count >= quorum
     }
+
+    /// Canonical bytes: `phase(1) ‖ height(8) ‖ round(4) ‖ block_hash(32) ‖ vote_count(4) ‖ vote…`, each a
+    /// fixed-width [`SignedVote::to_bytes`]. The form a block records as its `last_commit` (the Tendermint-style
+    /// previous-commit certificate), so every validator credits the identical, agreed finalizer set.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let vote_len = VOTE_LEN + HYBRID_SIG_LEN;
+        let mut out = Vec::with_capacity(1 + 8 + 4 + 32 + 4 + self.votes.len() * vote_len);
+        out.push(self.phase.code());
+        out.extend_from_slice(&self.height.to_be_bytes());
+        out.extend_from_slice(&self.round.to_be_bytes());
+        out.extend_from_slice(&self.block_hash);
+        out.extend_from_slice(&u32::try_from(self.votes.len()).unwrap_or(u32::MAX).to_be_bytes());
+        for sv in &self.votes {
+            out.extend_from_slice(&sv.to_bytes());
+        }
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed, truncated, or trailed by extra bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let vote_len = VOTE_LEN + HYBRID_SIG_LEN;
+        let phase = Phase::from_code(*bytes.first()?)?;
+        let height = u64::from_be_bytes(bytes.get(1..9)?.try_into().ok()?);
+        let round = u32::from_be_bytes(bytes.get(9..13)?.try_into().ok()?);
+        let block_hash = bytes.get(13..45)?.try_into().ok()?;
+        let n = u32::from_be_bytes(bytes.get(45..49)?.try_into().ok()?) as usize;
+        let mut votes = Vec::with_capacity(n.min(1024));
+        let mut off: usize = 49;
+        for _ in 0..n {
+            let end = off.checked_add(vote_len)?;
+            votes.push(SignedVote::from_bytes(bytes.get(off..end)?)?);
+            off = end;
+        }
+        if off != bytes.len() {
+            return None; // trailing bytes ⇒ non-canonical
+        }
+        Some(Self { phase, height, round, block_hash, votes })
+    }
 }
 
 #[cfg(test)]

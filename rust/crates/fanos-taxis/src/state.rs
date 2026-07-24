@@ -14,6 +14,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use fanos_pqcrypto::HybridVerifier;
 use fanos_primitives::codec::{Reader, put_map, put_u64, read_map};
 use fanos_primitives::hash_labeled;
 use fanos_wire::Wire;
@@ -48,6 +49,15 @@ pub trait StateMachine {
     /// a storage market's proof-of-retrievability audit). Called once per block, before its transactions,
     /// alongside [`begin_block`](Self::begin_block). The default is a no-op.
     fn set_audit_beacon(&mut self, _beacon: [u8; 32]) {}
+
+    /// Credit the **block reward** to the finalizers of the parent block — the `beneficiaries`, the validators
+    /// whose signatures form the block's recorded `last_commit` certificate. Called once per block, before its
+    /// transactions, with the per-block reward `amount`. This is the canonical, in-state form of the reward the
+    /// incentive equilibrium assumes (`R = amount / |beneficiaries|` each): because the finalizer set is read
+    /// from the committed block, every validator credits the identical set. The state machine derives each
+    /// beneficiary's account from its key and funds the reward from whatever pool its economics dictate. The
+    /// default is a no-op — a plain ledger has no block reward.
+    fn apply_block_reward(&mut self, _beneficiaries: &[HybridVerifier], _amount: u64) {}
 
     /// Apply one transaction (already reconstructed and in committed order) to the state.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome;
