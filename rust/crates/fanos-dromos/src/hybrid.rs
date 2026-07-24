@@ -29,11 +29,12 @@ use crate::bridge::{POOL_SINK, ShieldTx};
 use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
 use crate::naming::{NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
+use crate::stake::{STAKE_SINK, SlashTx, StakeLedger, StakeTx, slot_key};
 use crate::storage::{
     AUDIT_PERIOD, MAX_DEAL_DURATION, MAX_DEAL_SIZE, STORAGE_ESCROW, StorageMarket, StorageTx, deal_id,
     leaves_for_size,
 };
-use crate::token::{ProverAuth, SignedTransfer, TokenLedger};
+use crate::token::{ProverAuth, SignedTransfer, TokenLedger, account_id};
 
 /// The shared state key every shielded operation touches — so shielded spends serialize against each other
 /// (they mutate the one nullifier set / commitment tree) while parallelizing against disjoint transparent work.
@@ -53,6 +54,10 @@ pub const TAG_SHIELD: u8 = 0x03;
 pub const TAG_STORAGE: u8 = 0x04;
 /// Transaction-type tag: a HERMES atomic-swap operation (lock/claim/refund).
 pub const TAG_HTLC: u8 = 0x05;
+/// Transaction-type tag: a validator staking operation (bond/unbond).
+pub const TAG_STAKE: u8 = 0x06;
+/// Transaction-type tag: a validator slashing proof (equivocation evidence).
+pub const TAG_SLASH: u8 = 0x07;
 
 /// Domain-separation label for the hybrid state root.
 const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
@@ -66,6 +71,7 @@ pub struct HybridLedger {
     names: NameRegistry,
     storage: StorageMarket,
     htlcs: HtlcBook,
+    stake: StakeLedger,
     params: Arc<Params>,
     height: u64,
     audit_beacon: [u8; 32],
@@ -81,6 +87,7 @@ impl HybridLedger {
             names: NameRegistry::new(),
             storage: StorageMarket::default(),
             htlcs: HtlcBook::default(),
+            stake: StakeLedger::new(),
             params: Arc::new(Params::standard()),
             height: 0,
             audit_beacon: [0u8; 32],
@@ -91,6 +98,12 @@ impl HybridLedger {
     #[must_use]
     pub fn storage(&self) -> &StorageMarket {
         &self.storage
+    }
+
+    /// The validator stake sub-state (read-only) — bonded collateral and slashed-fault records.
+    #[must_use]
+    pub fn stake(&self) -> &StakeLedger {
+        &self.stake
     }
 
     /// The balance held in the storage-escrow sink (the sum of unreleased deal escrow by construction).
@@ -261,6 +274,67 @@ impl HybridLedger {
         // and paying no one — now the fee is collected and validator-distributable.
         if stx.fee > 0 {
             let _ = self.tokens.move_system(&POOL_SINK, TREASURY, stx.fee);
+        }
+        true
+    }
+
+    /// Apply a validator staking operation. **Bond**: settle the signer's authorised transfer to [`STAKE_SINK`]
+    /// (its signature, nonce, and balance are all checked by the token ledger), then record the bonded amount —
+    /// so `STAKE_SINK`'s balance stays exactly equal to the total bonded stake. **Unbond**: verify the signer's
+    /// authorisation, require they have that much bonded, then release it from `STAKE_SINK` back to their
+    /// balance. `false` (rejected, no state change) on a bad signature, wrong nonce, insufficient balance or
+    /// stake, or a transfer not directed at `STAKE_SINK`.
+    fn apply_stake(&mut self, tx: &StakeTx) -> bool {
+        let st = tx.transfer();
+        if st.transfer.to != STAKE_SINK {
+            return false; // a staking op must be authorised specifically to the stake sink
+        }
+        match tx {
+            StakeTx::Bond(_) => {
+                // The transfer debits the signer and credits STAKE_SINK, with signature, nonce, and balance all
+                // checked; on success the same amount is recorded as bonded (STAKE_SINK now backs it 1:1).
+                if self.tokens.apply(st).is_ok() {
+                    self.stake.increase(st.transfer.from, st.transfer.amount);
+                    true
+                } else {
+                    false
+                }
+            }
+            StakeTx::Unbond(_) => {
+                // Unbond releases funds back to the signer, so it cannot reuse the transfer's from→to debit; the
+                // authorisation and available stake are checked explicitly, then STAKE_SINK → signer is moved.
+                if !st.verify() || self.stake.bonded(&st.transfer.from) < st.transfer.amount {
+                    return false;
+                }
+                if !self.tokens.consume_nonce(&st.transfer.from, st.transfer.nonce) {
+                    return false; // stale / replayed nonce
+                }
+                let ok = self.stake.decrease(&st.transfer.from, st.transfer.amount);
+                debug_assert!(ok, "bonded ≥ amount was checked immediately above");
+                let _ = self.tokens.move_system(&STAKE_SINK, st.transfer.from, st.transfer.amount);
+                true
+            }
+        }
+    }
+
+    /// Apply a slashing proof: re-verify the equivocation, then debit the equivocator's **entire** bonded stake
+    /// to the treasury. The slashed account is `account_id(verifier)` — the account it bonds from — recovered
+    /// from the proof itself, so no validator registry is consulted. Idempotent per fault: the equivocation slot
+    /// is recorded, so resubmitting the proof (or a second proof of the same slot) is rejected and cannot drain
+    /// freshly re-bonded stake. `false` (rejected) if the proof is not a genuine equivocation, or is a duplicate.
+    fn apply_slash(&mut self, tx: &SlashTx) -> bool {
+        let Some(ev) = tx.evidence() else {
+            return false; // not a genuine, validly-signed equivocation ⇒ not slashable
+        };
+        let account = account_id(&tx.verifier);
+        let slot = slot_key(&account, &ev);
+        if !self.stake.record_slashed(slot) {
+            return false; // this fault was already punished ⇒ a duplicate, no further effect
+        }
+        let amount = self.stake.bonded(&account);
+        if amount > 0 {
+            let _ = self.stake.decrease(&account, amount);
+            let _ = self.tokens.move_system(&STAKE_SINK, TREASURY, amount);
         }
         true
     }
@@ -486,6 +560,14 @@ impl HybridLedger {
                 Some(HtlcTx::Refund { htlc_id }) => outcome(self.refund_htlc(&htlc_id)),
                 None => ExecOutcome::Malformed,
             },
+            Some((&TAG_STAKE, body)) => match StakeTx::from_bytes(body) {
+                Some(stake_tx) => outcome(self.apply_stake(&stake_tx)),
+                None => ExecOutcome::Malformed,
+            },
+            Some((&TAG_SLASH, body)) => match SlashTx::from_bytes(body) {
+                Some(slash_tx) => outcome(self.apply_slash(&slash_tx)),
+                None => ExecOutcome::Malformed,
+            },
             _ => ExecOutcome::Malformed,
         }
     }
@@ -602,6 +684,20 @@ impl HybridLedger {
                 }
                 None => AccessList::default(),
             },
+            Some((&TAG_STAKE, body)) => match StakeTx::from_bytes(body) {
+                // Bond debits `from` → STAKE_SINK; unbond releases STAKE_SINK → `from`. Both touch exactly these
+                // two accounts, so declaring them serializes a stake op against any conflicting transfer (e.g. a
+                // same-sender transfer that shares the nonce sequence).
+                Some(stake_tx) => AccessList::new([], [stake_tx.transfer().transfer.from, STAKE_SINK]),
+                None => AccessList::default(),
+            },
+            Some((&TAG_SLASH, body)) => match SlashTx::from_bytes(body) {
+                // Slashing moves the equivocator's bonded stake STAKE_SINK → TREASURY: it writes the equivocator's
+                // account (its bonded balance), the sink, and the treasury. Declaring TREASURY also serializes it
+                // against name and shielded-fee txs, which write TREASURY too.
+                Some(slash_tx) => AccessList::new([], [account_id(&slash_tx.verifier), STAKE_SINK, TREASURY]),
+                None => AccessList::default(),
+            },
             _ => AccessList::default(),
         }
     }
@@ -652,6 +748,18 @@ impl HybridLedger {
         Self::tagged(TAG_NAME, &name_tx.to_bytes())
     }
 
+    /// Wrap a validator staking operation (bond/unbond) as a DROMOS transaction payload.
+    #[must_use]
+    pub fn stake_payload(tx: &StakeTx) -> Vec<u8> {
+        Self::tagged(TAG_STAKE, &tx.to_bytes())
+    }
+
+    /// Wrap a validator slashing proof (equivocation evidence) as a DROMOS transaction payload.
+    #[must_use]
+    pub fn slash_payload(tx: &SlashTx) -> Vec<u8> {
+        Self::tagged(TAG_SLASH, &tx.to_bytes())
+    }
+
     fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + body.len());
         out.push(tag);
@@ -688,15 +796,17 @@ impl StateMachine for HybridLedger {
         self.apply_with_verdict(tx, None)
     }
 
-    /// `H(tokens ‖ shielded ‖ names ‖ storage ‖ htlc)` — one commitment over transparent balances, shielded
-    /// notes, names, storage deals, and atomic-swap contracts, for the block's executed-state checkpoint.
+    /// `H(tokens ‖ shielded ‖ names ‖ storage ‖ htlc ‖ stake)` — one commitment over transparent balances,
+    /// shielded notes, names, storage deals, atomic-swap contracts, and validator stake, for the block's
+    /// executed-state checkpoint.
     fn state_root(&self) -> [u8; 32] {
-        let mut buf = [0u8; 160];
+        let mut buf = [0u8; 192];
         buf[..32].copy_from_slice(&self.tokens.state_root());
         buf[32..64].copy_from_slice(&self.shielded.root());
         buf[64..96].copy_from_slice(&self.names.state_root());
         buf[96..128].copy_from_slice(&self.storage.state_root());
-        buf[128..].copy_from_slice(&self.htlcs.state_root());
+        buf[128..160].copy_from_slice(&self.htlcs.state_root());
+        buf[160..].copy_from_slice(&self.stake.state_root());
         hash_labeled(HYBRID_ROOT_LABEL, &buf)
     }
 
@@ -711,6 +821,7 @@ impl StateMachine for HybridLedger {
         put_var_bytes(&mut out, &self.names.to_bytes());
         put_var_bytes(&mut out, &self.storage.to_bytes());
         put_var_bytes(&mut out, &self.htlcs.to_bytes());
+        put_var_bytes(&mut out, &self.stake.to_bytes());
         put_u64(&mut out, self.height);
         out.extend_from_slice(&self.audit_beacon);
         out
@@ -725,6 +836,7 @@ impl StateMachine for HybridLedger {
         let names = NameRegistry::from_bytes(r.var_bytes()?)?;
         let storage = StorageMarket::from_bytes(r.var_bytes()?)?;
         let htlcs = HtlcBook::from_bytes(r.var_bytes()?)?;
+        let stake = StakeLedger::from_bytes(r.var_bytes()?)?;
         let height = r.u64()?;
         let audit_beacon = r.array::<32>()?;
         r.finish()?;
@@ -734,6 +846,7 @@ impl StateMachine for HybridLedger {
             names,
             storage,
             htlcs,
+            stake,
             params: Arc::new(Params::standard()),
             height,
             audit_beacon,
@@ -804,7 +917,8 @@ fn par_verify(jobs: &[(usize, StatelessJob)], params: &Params) -> Vec<(usize, bo
 mod tests {
     use super::*;
     use crate::naming::{NameOp, TREASURY, price};
-    use crate::token::{Transfer, account_id};
+    use crate::token::Transfer;
+    use fanos_taxis::{Phase, SignedVote, Vote};
     use fanos_obolos::{
         Note, Randomness, SpendInput, build_transfer, build_unshield, derive_owner_pk, derive_spend_auth,
         encode_submission, spend_auth_commit,
@@ -1701,5 +1815,113 @@ mod tests {
         assert_eq!(serial_outcomes[1], ExecOutcome::Applied, "the shielded spend applied");
         assert_eq!(serial_outcomes[2], ExecOutcome::Rejected, "the forgery is rejected off-thread exactly as inline");
         assert_eq!(serial_outcomes[3], ExecOutcome::Applied, "the second transparent transfer applied");
+    }
+
+    #[test]
+    fn a_validator_bonds_unbonds_and_the_stake_sink_backs_the_total() {
+        let (sk, vk, acct) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(acct, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        let stake_op = |bond: bool, amount: u64, nonce: u64| {
+            let st = SignedTransfer::sign(Transfer { from: acct, to: STAKE_SINK, amount, nonce }, &sk, vk.clone());
+            let tx = if bond { StakeTx::Bond(st) } else { StakeTx::Unbond(st) };
+            Transaction::new(HybridLedger::stake_payload(&tx))
+        };
+
+        // Bond 600: the balance falls, the bonded rises, and the sink backs it exactly.
+        assert_eq!(ledger.apply(&stake_op(true, 600, 0)), ExecOutcome::Applied);
+        assert_eq!(ledger.stake().bonded(&acct), 600);
+        assert_eq!(ledger.tokens().balance(&acct), 400);
+        assert_eq!(ledger.tokens().balance(&STAKE_SINK), 600, "the sink balance equals the total bonded");
+        assert_eq!(ledger.stake().total_bonded(), 600);
+
+        // Unbond 250 back to the balance.
+        assert_eq!(ledger.apply(&stake_op(false, 250, 1)), ExecOutcome::Applied);
+        assert_eq!(ledger.stake().bonded(&acct), 350);
+        assert_eq!(ledger.tokens().balance(&acct), 650);
+        assert_eq!(ledger.tokens().balance(&STAKE_SINK), 350, "the sink still backs the bonded total");
+
+        // The stake ledger's guards: cannot unbond more than bonded, nor bond more than the balance.
+        assert_eq!(ledger.apply(&stake_op(false, 9999, 2)), ExecOutcome::Rejected, "over-unbond rejected");
+        assert_eq!(ledger.stake().bonded(&acct), 350, "a failed unbond changes nothing");
+        assert_eq!(ledger.apply(&stake_op(true, 999_999, 2)), ExecOutcome::Rejected, "over-bond rejected");
+        assert_eq!(ledger.stake().bonded(&acct), 350);
+        // A stake op not directed at STAKE_SINK is not a valid authorisation.
+        let misdirected =
+            SignedTransfer::sign(Transfer { from: acct, to: [9u8; 32], amount: 1, nonce: 2 }, &sk, vk.clone());
+        let tx = Transaction::new(HybridLedger::stake_payload(&StakeTx::Bond(misdirected)));
+        assert_eq!(ledger.apply(&tx), ExecOutcome::Rejected, "a bond must be authorised to STAKE_SINK");
+    }
+
+    #[test]
+    fn an_equivocating_validator_is_slashed_of_its_entire_bonded_stake() {
+        let (sk, vk, acct) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(acct, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        let bond = |amount: u64, nonce: u64| {
+            let st = SignedTransfer::sign(Transfer { from: acct, to: STAKE_SINK, amount, nonce }, &sk, vk.clone());
+            Transaction::new(HybridLedger::stake_payload(&StakeTx::Bond(st)))
+        };
+        assert_eq!(ledger.apply(&bond(800, 0)), ExecOutcome::Applied);
+        assert_eq!(ledger.stake().bonded(&acct), 800);
+
+        // The validator equivocates: two Commit votes at the same (height, round) for different blocks.
+        let vote = |block_hash: [u8; 32]| {
+            SignedVote::sign(Vote { height: 5, round: 0, block_hash, phase: Phase::Commit, voter: 2 }, &sk)
+        };
+        let slash =
+            SlashTx { vote_a: vote([0xAA; 32]), vote_b: vote([0xBB; 32]), verifier: vk.clone() };
+        let slash_tx = Transaction::new(HybridLedger::slash_payload(&slash));
+
+        assert_eq!(ledger.apply(&slash_tx), ExecOutcome::Applied, "a genuine equivocation is slashable");
+        assert_eq!(ledger.stake().bonded(&acct), 0, "the entire bonded stake is slashed");
+        assert_eq!(ledger.tokens().balance(&TREASURY), 800, "the slashed stake goes to the treasury");
+        assert_eq!(ledger.tokens().balance(&STAKE_SINK), 0, "the sink is emptied to match");
+
+        // The same fault cannot be slashed twice (idempotent per equivocation slot).
+        assert_eq!(ledger.apply(&slash_tx), ExecOutcome::Rejected, "a duplicate slash is a no-op");
+        assert_eq!(ledger.tokens().balance(&TREASURY), 800, "no double-slash");
+
+        // Re-bonding is safe: the recorded fault cannot drain freshly bonded stake.
+        assert_eq!(ledger.apply(&bond(100, 1)), ExecOutcome::Applied);
+        assert_eq!(ledger.apply(&slash_tx), ExecOutcome::Rejected, "the old proof cannot re-slash");
+        assert_eq!(ledger.stake().bonded(&acct), 100, "the re-bonded stake is untouched");
+    }
+
+    #[test]
+    fn a_bogus_slash_proof_slashes_no_one() {
+        let (sk, vk, acct) = account(3);
+        let (_sk2, vk2, _acct2) = account(4);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(acct, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        let bond = SignedTransfer::sign(Transfer { from: acct, to: STAKE_SINK, amount: 500, nonce: 0 }, &sk, vk.clone());
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::stake_payload(&StakeTx::Bond(bond)))),
+            ExecOutcome::Applied
+        );
+
+        // Two IDENTICAL votes are not a conflict — no equivocation.
+        let v = Vote { height: 1, round: 0, block_hash: [1u8; 32], phase: Phase::Prepare, voter: 3 };
+        let same = SlashTx { vote_a: SignedVote::sign(v, &sk), vote_b: SignedVote::sign(v, &sk), verifier: vk.clone() };
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::slash_payload(&same))),
+            ExecOutcome::Rejected,
+            "identical votes are not equivocation"
+        );
+        assert_eq!(ledger.stake().bonded(&acct), 500, "no stake moved");
+
+        // Conflicting votes, but the cited verifier (vk2) did not sign them → the signatures do not verify.
+        let mk = |bh: [u8; 32]| SignedVote::sign(Vote { height: 1, round: 0, block_hash: bh, phase: Phase::Commit, voter: 3 }, &sk);
+        let wrong = SlashTx { vote_a: mk([1u8; 32]), vote_b: mk([2u8; 32]), verifier: vk2 };
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::slash_payload(&wrong))),
+            ExecOutcome::Rejected,
+            "votes not signed by the cited key are not evidence"
+        );
+        assert_eq!(ledger.stake().bonded(&acct), 500, "no stake moved");
     }
 }

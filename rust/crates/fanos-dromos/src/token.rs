@@ -287,6 +287,18 @@ impl TokenLedger {
         true
     }
 
+    /// Check `account`'s next nonce is `nonce` and advance it, moving no money — the replay guard for an
+    /// authorised operation that is *not* a `from → to` transfer. A stake **unbond** releases funds back to the
+    /// signer, so it cannot reuse [`apply`](Self::apply)'s debit, yet must still consume a nonce from the
+    /// signer's one sequence. `false` (and unchanged) on a mismatch. In-crate only, like [`move_system`].
+    pub(crate) fn consume_nonce(&mut self, account: &[u8; 32], nonce: u64) -> bool {
+        if self.nonce(account) != nonce {
+            return false;
+        }
+        *self.nonces.entry(*account).or_insert(0) += 1;
+        true
+    }
+
     /// A binding commitment to the whole ledger — the sorted `(account, balance, nonce)` triples, hashed.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {

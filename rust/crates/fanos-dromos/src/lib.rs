@@ -20,11 +20,15 @@ pub mod hermes;
 pub mod hybrid;
 pub mod naming;
 pub mod scheduler;
+pub mod stake;
 pub mod storage;
 pub mod token;
 
 pub use bridge::{POOL_SINK, ShieldTx};
-pub use hybrid::{HybridLedger, TAG_NAME, TAG_SHIELD, TAG_SHIELDED, TAG_TRANSPARENT};
+pub use hybrid::{
+    HybridLedger, TAG_NAME, TAG_SHIELD, TAG_SHIELDED, TAG_SLASH, TAG_STAKE, TAG_TRANSPARENT,
+};
+pub use stake::{STAKE_SINK, SlashTx, StakeLedger, StakeTx};
 pub use naming::{
     Descriptor, DescriptorKind, NameError, NameOp, NameRecord, NameRegistry, NameTx, TREASURY, price,
 };
