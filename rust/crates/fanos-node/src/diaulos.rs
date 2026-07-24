@@ -33,27 +33,29 @@ use tokio::time::Instant;
 /// not admission-gated (unlike overlay membership, §L3), so without a cap a flood of distinct source
 /// coordinates — or handlers that never finish — would grow the peer map without bound (audit A4). At the
 /// cap, the least-recently-active session is evicted (its handler aborted) to admit a new one.
-const MAX_SESSIONS: usize = 1024;
+pub(crate) const MAX_SESSIONS: usize = 1024;
 
 /// A session with no traffic for this long is evicted — its inbound channel closed and its handler task
 /// aborted — reclaiming a wedged or abandoned handler that never signals completion (audit A4).
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the accept loop sweeps for idle sessions to evict.
-const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// One live client session in the service accept loop: the channel feeding it inbound datagrams, its
+/// One live client session in a service accept loop: the channel feeding it inbound datagrams, its
 /// handler task (aborted on idle/cap eviction, so a wedged handler is reclaimed, not merely detached), and
-/// its last-activity time (for idle and LRU eviction).
-struct Session {
-    in_tx: UnboundedSender<Vec<u8>>,
-    task: JoinHandle<()>,
-    last_active: Instant,
+/// its last-activity time (for idle and LRU eviction). Shared by the Direct [`serve`] loop (keyed by
+/// client coordinate) and the anonymous [`crate::rendezvous_host::serve_anonymous`] loop (keyed by cookie).
+pub(crate) struct Session {
+    pub(crate) in_tx: UnboundedSender<Vec<u8>>,
+    pub(crate) task: JoinHandle<()>,
+    pub(crate) last_active: Instant,
 }
 
-/// Evict the least-recently-active session (called when the map is at [`MAX_SESSIONS`]), aborting its
-/// handler task so a stuck session cannot hold a slot against a live client.
-fn evict_lru(peers: &mut HashMap<Coord, Session>) {
+/// Evict the least-recently-active session (called when a session map is at [`MAX_SESSIONS`]), aborting its
+/// handler task so a stuck session cannot hold a slot against a live client. Generic over the session key so
+/// both accept loops (coordinate-keyed and cookie-keyed) share one bound.
+pub(crate) fn evict_lru<K: Copy + Eq + std::hash::Hash>(peers: &mut HashMap<K, Session>) {
     let victim = peers
         .iter()
         .min_by_key(|(_, s)| s.last_active)

@@ -15,12 +15,13 @@
 use std::time::Duration as StdDuration;
 
 use fanos_aphantos::ThresholdRouter;
-use fanos_diaulos::{ServerSession, StaticKeypair};
+use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, OverlayBeaconNode, RendezvousRoute, StaticResolver,
+    serve_anonymous_rpc,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
@@ -28,8 +29,7 @@ use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_runtime::{Config as OverlayConfig, OverlayNode};
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousService, SessionId, combiner_for, meeting_line,
-    seal_forward,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousService, combiner_for, meeting_line, seal_forward,
 };
 
 /// The epoch's public randomness beacon, shared by the service (which listens on the derived meeting
@@ -148,86 +148,6 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     );
 }
 
-/// What the service's next poll should send, if anything — mirrors `fanos_session`'s internal
-/// client-side split (see its `drive` loop): `Tick` runs `ServerSession::poll_payloads`, the
-/// clock-ticking RFC 6298 retransmit sweep, which must fire at a **fixed cadence**; `Reactive` runs
-/// `poll_new` (first-sent data plus a fresh ack, never a resend), safe to call any number of times
-/// between ticks. A service that instead called `poll_payloads` on every notification — as this loop
-/// used to — races its own RTO clock ahead of real time under load (inbound notifications include the
-/// client's own retransmissions), which starves backoff of the chance to converge: the mechanism behind
-/// the real-QUIC anonymous-session retransmit-storm livelock this split exists to prevent.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Emit {
-    None,
-    Reactive,
-    Tick,
-}
-
-/// The service side of an anonymous session over its meeting-line node: ingest requests, drive a
-/// DIAULOS `ServerSession`, and seal each reply back through the client's reply circuit — paced to the
-/// mixnet round trip so replies do not flood the path.
-async fn anonymous_service(
-    keypair: StaticKeypair,
-    mut node: NodeHandle,
-    mut rservice: RendezvousService<F2>,
-) {
-    let mut server = ServerSession::new();
-    let mut rng = SeedRng::from_seed(b"anon-quic-svc-accept");
-    let mut cookie: Option<SessionId> = None;
-    let mut answered = false;
-    let mut ticker = tokio::time::interval(StdDuration::from_millis(250));
-    let mut emit = Emit::None; // nothing to send until the first ClientHello arrives
-    loop {
-        if let Some(sid) = server.primary()
-            && !answered
-            && server.receiver_finished(sid)
-        {
-            let got = server.read(sid);
-            let mut resp = b"anon-quic-200:".to_vec();
-            resp.extend_from_slice(&got);
-            server.write(sid, &resp);
-            server.finish(sid);
-            answered = true;
-            if emit == Emit::None {
-                emit = Emit::Reactive;
-            }
-        }
-        if let Some(ck) = cookie {
-            let payloads = match emit {
-                Emit::Tick => server.poll_payloads(),
-                Emit::Reactive => server.poll_new(),
-                Emit::None => Vec::new(),
-            };
-            for payload in payloads {
-                if let Some(fwd) = rservice.seal_reply(&ck, &payload) {
-                    // Raw-emit the reply onion at its first combiner (a CellNode service would otherwise
-                    // wrap it in a routed Route frame the mixnet cannot peel); a router node treats Emit
-                    // and Send identically.
-                    node.command(Command::Emit {
-                        to: fwd.combiner,
-                        frame: fwd.frame,
-                    });
-                }
-            }
-        }
-        emit = Emit::None;
-        tokio::select! {
-            n = node.next_notification() => match n {
-                Some(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
-                    if let Some((ck, inner)) = rservice.ingest(&payload) {
-                        cookie = Some(ck);
-                        server.handle_payload(&keypair, &inner, &mut rng);
-                        emit = Emit::Reactive;
-                    }
-                }
-                Some(_) => {}
-                None => return,
-            },
-            _ = ticker.tick() => emit = Emit::Tick,
-        }
-    }
-}
-
 #[tokio::test]
 async fn a_full_anonymous_session_completes_over_real_quic() {
     let dir = Directory::new();
@@ -262,7 +182,19 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
 
     let service_node = nodes[l_index].take().unwrap();
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"anon-quic-svc-secret");
-    tokio::spawn(anonymous_service(service, service_node, rservice));
+    // The PRODUCTION src host driver — the same accept loop, no test fixture (§3b). It ingests each
+    // anonymous request, drives the DIAULOS server, and seals the reply back through the client's route.
+    serve_anonymous_rpc(
+        service_node.client(),
+        service,
+        SeedRng::from_seed(b"anon-quic-svc-accept"),
+        rservice,
+        |req| {
+            let mut resp = b"anon-quic-200:".to_vec();
+            resp.extend_from_slice(req);
+            resp
+        },
+    );
 
     let client_node = nodes[rp_index].take().unwrap();
     let route = RendezvousRoute {
@@ -368,7 +300,18 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
 
     let service_node = nodes[l_index].take().unwrap();
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"anon-cell-svc-secret");
-    tokio::spawn(anonymous_service(service, service_node, rservice));
+    // The production src host driver (§3b), on the full deployed cell-of-composites shape.
+    serve_anonymous_rpc(
+        service_node.client(),
+        service,
+        SeedRng::from_seed(b"anon-cell-svc-accept"),
+        rservice,
+        |req| {
+            let mut resp = b"anon-quic-200:".to_vec();
+            resp.extend_from_slice(req);
+            resp
+        },
+    );
 
     // A different cell node is the anonymous client. Its coordinate is not the service's combiner, so its
     // fresh reply rendezvous (drawn at random) is served by a relay that forwards the reply to it.

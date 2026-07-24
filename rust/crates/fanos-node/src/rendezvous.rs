@@ -137,8 +137,10 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
 
 /// Retransmit cadence for an anonymous session. A hop is a multi-round threshold gather over the
 /// overlay, so the effective round trip is far larger than the Direct profile's base tick; pace
-/// retransmits to it so the client does not flood onions faster than the mixnet can peel them.
-const RENDEZVOUS_TICK: Duration = Duration::from_millis(250);
+/// retransmits to it so the client does not flood onions faster than the mixnet can peel them. The
+/// **service** side ([`crate::rendezvous_host::serve_anonymous`]) MUST pace to the same value, or its
+/// replies flood the return path — the two halves share this one constant.
+pub(crate) const RENDEZVOUS_TICK: Duration = Duration::from_millis(250);
 
 /// The circuit + mixnet parameters a client uses to reach a service anonymously. `forward_hops` and
 /// `reply_circuit` are hop *lines* (a hop is a line); the meeting line is appended to the forward hops

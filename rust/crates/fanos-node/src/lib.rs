@@ -36,6 +36,7 @@ pub mod overlay_beacon;
 pub mod poros;
 pub mod proxy;
 pub mod rendezvous;
+pub mod rendezvous_host;
 pub mod rendezvous_relay;
 pub mod resolve;
 pub mod service_node;
@@ -59,6 +60,7 @@ pub use fanos_onoma::Epoch;
 pub use fanos_quic::{Environment, Morph, MorphCodec};
 pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;
+pub use rendezvous_host::{serve_anonymous, serve_anonymous_rpc};
 pub use mixdir::{
     build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,
     resolve_mix_key, spawn_mix_publisher,
