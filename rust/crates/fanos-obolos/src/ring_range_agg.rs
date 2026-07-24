@@ -41,19 +41,20 @@ use crate::ring_product::REPETITIONS;
 /// `REPETITIONS = 16` rounds target `≈ 2⁻¹²⁸`. Illustrative.
 const CHALLENGE_BITS: u32 = 9;
 
-/// The challenge is drawn from `[1, CHALLENGE_MOD]` (nonzero — `x = 0` gives a vacuous round).
-const CHALLENGE_MOD: u64 = (1 << CHALLENGE_BITS) - 1;
+/// The challenge is drawn from `[1, CHALLENGE_MOD]` (nonzero — `x = 0` gives a vacuous round). Shared with the
+/// binarity proof ([`crate::ring_binary`]).
+pub(crate) const CHALLENGE_MOD: u64 = (1 << CHALLENGE_BITS) - 1;
 
-/// **Wide** masking for the openings `z_ba`, `z_w` that hide *witness* randomness (`r_b`, `r_v`). Sized so the
-/// whole-proof accept rate is high: `B ≈ β·(coefficient count)` with `β = CHALLENGE_MOD` — here `2²⁵ ≫ 511·2¹⁵`.
-const MASK_WIDE: i64 = 1 << 25;
+/// **Wide** masking for the openings that hide *witness* randomness. Sized so the whole-proof accept rate is high:
+/// `B ≈ β·(coefficient count)` with `β = CHALLENGE_MOD` — here `2²⁵ ≫ 511·2¹⁵`. Shared with [`crate::ring_binary`].
+pub(crate) const MASK_WIDE: i64 = 1 << 25;
 
 /// Accept region for a wide opening `x·r + r_mask`, hidden part `‖x·r‖∞ ≤ CHALLENGE_MOD`.
-const ACCEPT_WIDE: i64 = MASK_WIDE - CHALLENGE_MOD as i64;
+pub(crate) const ACCEPT_WIDE: i64 = MASK_WIDE - CHALLENGE_MOD as i64;
 
 /// `z_de = x·r_d + r_e` hides only *fresh* ternary masking, so it is inherently small: `‖·‖∞ ≤ CHALLENGE_MOD + 1`.
 /// No rejection is needed; the bound is a binding check.
-const ACCEPT_SMALL: i64 = CHALLENGE_MOD as i64 + 1;
+pub(crate) const ACCEPT_SMALL: i64 = CHALLENGE_MOD as i64 + 1;
 
 /// A bound on resample attempts (the wide masking keeps rejection rare).
 const MAX_ATTEMPTS: u32 = 32;
@@ -79,8 +80,8 @@ pub struct AggRangeProof {
     rounds: Vec<AggRound>,
 }
 
-/// `x·p` coefficient-wise (a scalar-by-polynomial product): `broadcast(x) ∘ p`.
-fn scalar_mul(x: u64, p: &Poly) -> Poly {
+/// `x·p` coefficient-wise (a scalar-by-polynomial product): `broadcast(x) ∘ p`. Shared with the binarity proof.
+pub(crate) fn scalar_mul(x: u64, p: &Poly) -> Poly {
     Poly::broadcast(x).hadamard(p)
 }
 
