@@ -61,10 +61,11 @@ const CRS_LABEL: &str = "FANOS-obolos-v1/commit-crs";
 /// The domain-separation label for deriving commitment randomness from a seed.
 const RAND_LABEL: &str = "FANOS-obolos-v1/commit-rand";
 
-/// Reduce a wide accumulator into the canonical range `[0, q)`.
+/// Reduce a wide accumulator into the canonical range `[0, q)`. Shared with the zero-knowledge opening proof
+/// ([`crate::zk`]), which reduces the same `M·y` map over a *wide* (masked) `y`.
 #[inline]
 #[must_use]
-fn rem(x: i128) -> i64 {
+pub(crate) fn rem(x: i128) -> i64 {
     let r = ((x % Q) + Q) % Q;
     r as i64
 }
@@ -82,6 +83,21 @@ impl Params {
     #[must_use]
     pub fn standard() -> Self {
         Self::from_seed(b"FANOS-obolos-v1/standard-crs")
+    }
+
+    /// `M·y = (A₁·y mod q, ⟨a₂, y⟩ mod q)` for an arbitrary integer vector `y` of length `L` — the linear map
+    /// the commitment and its zero-knowledge opening proof ([`crate::zk`]) share. Unlike [`Commitment::commit`],
+    /// `y` is NOT restricted to ternary: the proof masks it over a wide range, and the products stay well within
+    /// `i128` (`L` terms of `≈2⁶¹ · 2¹⁷`). Returns `N + 1` coefficients: the `N` of `A₁·y`, then `⟨a₂, y⟩`.
+    #[must_use]
+    pub(crate) fn m_times(&self, y: &[i64]) -> Vec<i64> {
+        let (rows, _) = self.a1.as_chunks::<L>();
+        let mut out: Vec<i64> = rows
+            .iter()
+            .map(|row| rem(row.iter().zip(y).map(|(a, x)| i128::from(*a) * i128::from(*x)).sum()))
+            .collect();
+        out.push(rem(self.a2.iter().zip(y).map(|(a, x)| i128::from(*a) * i128::from(*x)).sum()));
+        out
     }
 
     /// Parameters derived deterministically from `seed` (a nothing-up-my-sleeve public matrix; a tiny modular
@@ -236,6 +252,18 @@ impl Commitment {
     #[must_use]
     pub(crate) fn from_parts(t0: Vec<i64>, t1: i64) -> Self {
         Self { t0, t1 }
+    }
+
+    /// The `t0` component (`A₁·r`) — the zero-knowledge opening proof ([`crate::zk`]) forms its statement from it.
+    #[must_use]
+    pub(crate) fn t0_ref(&self) -> &[i64] {
+        &self.t0
+    }
+
+    /// The `t1` component (`⟨a₂, r⟩ + value`).
+    #[must_use]
+    pub(crate) fn t1_of(&self) -> i64 {
+        self.t1
     }
 }
 
