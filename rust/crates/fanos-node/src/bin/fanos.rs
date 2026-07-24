@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   * `fanos node`  — run a node (overlay membership, storage, healing) over QUIC.
 //!   * `fanos proxy` — run local SOCKS5 / HTTP-CONNECT listeners tunnelling to `.fanos` services (§11.3).
+//!   * `fanos host`  — host a hidden service on the anonymous rendezvous, forwarding to a local port (§3b).
 //!   * `fanos id`    — print (and optionally persist) a node's self-certifying coordinate.
 //!   * `fanos help`  — usage.
 
@@ -11,20 +12,24 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
 use fanos_field::F2;
+use fanos_onoma::Address;
 use fanos_pqcrypto::kem::HybridKemPublic;
+use fanos_pqcrypto::rng::SeedRng;
 use fanos_node::{
     AnonRouteParams, BeaconParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
     NodeConfig,
     NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
-    build_cell_mix_directory, identity, serve_proxy,
+    build_cell_mix_directory, identity, publish_service, serve_proxy, spawn_rendezvous_host,
 };
 // Only the (feature-gated) `fanos vpn` command dials clearnet by IP with an empty resolver.
 #[cfg(feature = "vpn")]
 use fanos_node::StaticResolver;
 use fanos_runtime::Notification;
 use fanos_vrf::vss::{DeterministicRng, deal};
-use tokio::net::TcpListener;
+use tokio::io::{DuplexStream, copy_bidirectional};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::info;
 
 #[tokio::main]
@@ -43,6 +48,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
     match args.get(1).map(String::as_str) {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
+        Some("host") => cmd_host(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
@@ -299,6 +305,113 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     }
     node.shutdown();
     eprintln!("fanos proxy down");
+    Ok(())
+}
+
+/// Host a **hidden service** on the anonymous rendezvous (§3b, `design-anonymity-substrate.md`): run a node,
+/// publish the service's descriptor so clients resolve its `.fanos` name, and forward every incoming
+/// anonymous session to a local `--forward host:port` (the onion-service model). The service is reachable at
+/// its rotating meeting line though this node is never that line's combiner, and no party — not even the
+/// combiner — learns this node's coordinate. `--host-key <file>` is the service's secret seed, its **stable
+/// `.fanos` identity** (keep it secret; generate one with `head -c 32 /dev/urandom > svc.key`). The dial
+/// side is `fanos proxy --profile anonymous` with a matching `--epoch`/`--beacon`/`--threshold`.
+async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
+    init_tracing();
+    let forward: SocketAddr = flag(args, "--forward")
+        .ok_or_else(|| NodeError::Config("fanos host requires --forward <host:port>".to_owned()))?
+        .parse()
+        .map_err(|_| NodeError::Config("bad --forward (expected host:port)".to_owned()))?;
+    let host_secret = match flag(args, "--host-key") {
+        Some(p) => std::fs::read(p)?,
+        None => {
+            return Err(NodeError::Config(
+                "fanos host requires --host-key <file> — the service's secret seed and stable .fanos \
+                 identity (generate one with `head -c 32 /dev/urandom > svc.key`)"
+                    .to_owned(),
+            ));
+        }
+    };
+    let epoch = match flag(args, "--epoch") {
+        Some(s) => {
+            Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?)
+        }
+        None => Epoch::ZERO,
+    };
+    let beacon = match flag(args, "--beacon") {
+        Some(s) => parse_beacon_hex(s)?,
+        None => BeaconSeed::GENESIS,
+    };
+    let threshold: u8 = match flag(args, "--threshold") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
+        None => 2,
+    };
+    if threshold == 0 {
+        return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
+    }
+    let descriptor_pow: u32 = match flag(args, "--descriptor-pow") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --descriptor-pow '{s}'")))?,
+        None => 0,
+    };
+
+    // Derive the service identity + its `.fanos` address from the secret seed.
+    let service = StaticKeypair::generate(&mut SeedRng::from_seed(&host_secret));
+    let bundle = bundle_from_kem_public(service.public());
+    let address = Address::from_bundle(&bundle);
+
+    let config = node_config_from_args(args)?;
+    let mut node = Node::start::<F2>(config).await?;
+    let health = node.health();
+
+    // Publish the descriptor so clients resolve `<name>.fanos` → the service key. The coordinate is a
+    // PLACEHOLDER (all-zero): an anonymous dial derives the meeting line from the KEY and ignores it, and
+    // publishing this node's real coordinate would deanonymize the service (§3b).
+    if let Err(e) =
+        publish_service(&node.client(), &bundle, [0, 0, 0], epoch, descriptor_pow, b"profile=anonymous")
+            .await
+    {
+        node.shutdown();
+        return Err(e);
+    }
+
+    // Forward each accepted anonymous session to the local target (the onion-service model).
+    let handler = move |mut stream: DuplexStream| async move {
+        match TcpStream::connect(forward).await {
+            Ok(mut tcp) => {
+                let _ = copy_bidirectional(&mut stream, &mut tcp).await;
+            }
+            Err(e) => info!(%forward, error = %e, "hidden-service forward dial failed"),
+        }
+    };
+    let _driver = spawn_rendezvous_host(
+        node.client(),
+        node.address(),
+        service,
+        host_secret,
+        threshold,
+        (epoch, *beacon.as_bytes()),
+        handler,
+    );
+
+    let [x, y, z] = health.address;
+    eprintln!(
+        "fanos host up — coordinate {x}:{y}:{z} on {}\n  address: {}\n  forward: {forward}\n  \
+         profile: anonymous (threshold {threshold}, epoch {}) — clients dial `--profile anonymous`",
+        health.local_addr,
+        address.to_name(),
+        epoch.get(),
+    );
+    info!(coord = ?health.address, name = %address.to_name(), %forward, "fanos host up");
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal received");
+    };
+    tokio::select! {
+        () = shutdown => {}
+        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+    }
+    node.shutdown();
+    eprintln!("fanos host down");
     Ok(())
 }
 
@@ -748,6 +861,10 @@ fn print_help() {
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
          \x20             [--bootstrap ...] [--listen ADDR]\n\
+         \x20 fanos host  --forward HOST:PORT --host-key FILE [--epoch N] [--beacon HEX64] [--threshold T] \\\n\
+         \x20             [--descriptor-pow BITS] [--config FILE] [--bootstrap ...] [--listen ADDR]\n\
+         \x20             (host a hidden service on the anonymous rendezvous §3b: forward each incoming\n\
+         \x20             anonymous session to a local port; --host-key is your stable .fanos identity)\n\
          \x20 fanos vpn   [--tun NAME] [--exit-via FILE] [--epoch N] [--config FILE] [--bootstrap ...]\n\
          \x20             (full-tunnel: routes all TCP+UDP through an exit; needs --features vpn + root)\n\
          \x20 fanos id    [--identity PATH]\n\
