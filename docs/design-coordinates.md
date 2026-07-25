@@ -373,6 +373,45 @@ Supplying the rank required returning what was already being computed and discar
 terms of them so the two can never disagree about what a valid claim is. A node binds its own point ranked at genesis and
 on every epoch reshuffle.
 
+### ⚠️ What probing cost — displacement became steerable, and that is worse than what it replaced
+
+An honest accounting of a feature I added, since the adversarial consequence was not considered when it was designed.
+
+A node's probe walk is **public**: it is a deterministic function of its VRF output, which its own `HELLO` proof carries.
+So anyone who knows a victim's identity can compute the victim's entire fallback sequence `p₀, p₁, p₂, …` as soon as the
+epoch's beacon lands — at the same moment the victim can. Combined with grinding (threat model B1: ~`N` local hashes to
+seat a Sybil at a *chosen* point), an attacker can therefore **steer** a victim:
+
+1. compute the victim's sequence and pick the index `j` whose point it wants the victim on;
+2. seat low-ranked Sybils at `p₀ … p_{j−1}` — about `j·N` grinding draws and `j` admissions;
+3. the victim deterministically lands on `p_j`.
+
+**The trade is not obviously favourable.** Before probing, an attacker who collided with a victim merely made it
+*unroutable*: a denial of service, disruptive and **detectable**. After probing, the same spend lands the victim
+*somewhere the attacker chose* — and steering a victim onto a line the attacker occupies is **eclipse**, which is quieter
+and worse than denial of service. Probing bought capacity (`O(√P) → P`, measured) and sold a failure mode.
+
+**A depth cap does not rescue it.** Bounding the walk at `K` limits the attacker to the victim's first `K` points, but the
+victim's sequence is a permutation of arbitrary points, so what matters is whether *any* of them lies on the attacker's
+target line — and that probability is not small:
+
+| plane | `K = 4` | `K = 8` | `K = 16` | `K = 64` |
+|---|---|---|---|---|
+| `q = 31` (`N = 993`, line = 32) | 12.3% | 23.1% | 40.8% | 87.7% |
+| `q = 127` (`N = 16257`, line = 128) | 3.1% | 6.1% | 11.9% | 39.7% |
+
+A cap tight enough to matter (`K ≤ 4` at `q = 31`) starts costing real seating failures at any load worth having, so the
+cap is a dial between two harms rather than a fix, and it is deliberately **not** applied.
+
+**There is no clean cryptographic mitigation, and the reason is structural.** The walk must be *verifiable*, so it cannot
+be secret; and it is computable from public data the moment the beacon is known, so it cannot be a race the victim wins.
+The defence is the same one everything else here reduces to: **identities must be scarce**, because every seat the
+attacker needs costs `~N` grinding *plus an admission*, and the steering cost is linear in `j`. At `q = 127` and a
+meaningful admission difficulty, steering a victim two hops costs real money; at `q = 2` it costs nothing, which is one
+more reason the base cell is a test fixture and not a deployment.
+
+Recorded here rather than in a commit message because it is a standing property of the design, not an incident.
+
 ### Still not wired
 
 The `HELLO` frame carries a bare proof, so a node cannot yet *present* a probed point (`index > 0`) to a peer: the claim
