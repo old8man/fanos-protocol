@@ -240,6 +240,31 @@ fn combine_r(a: &[RingRandomness], b: &[RingRandomness], c: &[RingRandomness]) -
     a.iter().zip(b).zip(c).map(|((ai, bi), ci)| ai.add(bi).sub(ci)).collect()
 }
 
+/// The node value + randomness at each rung of the path: `[leaf, node_0, …, node_{depth-1}]` (the last is the
+/// root). Deterministic from `seed` — [`prove_path_sound`] recomputes it to attach a shortness proof per node.
+/// (It mirrors [`prove_path`]'s internal chain derivation; the two must stay in step.)
+fn path_chain(
+    hp: &HashParams,
+    leaf: &HashNode,
+    siblings: &[HashNode],
+    directions: &[u64],
+    seed: &[u8],
+) -> Vec<(HashNode, Vec<RingRandomness>)> {
+    let depth = siblings.len();
+    let mut chain = Vec::with_capacity(depth + 1);
+    chain.push((leaf.clone(), node_r(seed, "/leaf", 0)));
+    let mut child = leaf.clone();
+    for (j, (sibling, &d)) in siblings.iter().zip(directions).enumerate() {
+        let (left, right) =
+            if d == 1 { (sibling.clone(), child.clone()) } else { (child.clone(), sibling.clone()) };
+        let node = hp.hash(&left, &right);
+        let is_top = j == depth - 1;
+        chain.push((node.clone(), node_r(seed, if is_top { "/root" } else { "/node" }, j)));
+        child = node;
+    }
+    chain
+}
+
 /// Prove, in zero knowledge, that `leaf` is a member of a Merkle tree — hashing it up through `siblings` with
 /// hidden `directions` (`0` = the running node is the left child, `1` = the right). The prover *computes* the top
 /// node; [`verify_path`] ties it to the public root. The leaf and every intermediate node stay hidden, and the
@@ -345,6 +370,91 @@ pub fn verify_path(params: &RingParams, hp: &HashParams, root: &HashNode, proof:
         Some(top) => top.node == commit_node(params, root, &proof.root_r),
         None => false,
     }
+}
+
+/// A **fully sound** membership proof: the structural [`PathProof`] plus a shortness proof for every *hidden* node
+/// (leaf, siblings, intermediate nodes), so no non-short "node" can satisfy the linear hash relations and forge a
+/// path. The public root's shortness is checked directly. This is `O(depth·ELL_H·LOG_BASE·REPETITIONS)` binarity
+/// proofs — the inherent cost of lattice ZK Merkle membership (recursive-SNARK compaction is future work).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SoundPathProof {
+    path: PathProof,
+    leaf_short: Vec<ShortnessProof>,         // ELL_H
+    sibling_short: Vec<Vec<ShortnessProof>>, // depth × ELL_H
+    node_short: Vec<Vec<ShortnessProof>>,    // (depth−1) intermediate nodes × ELL_H
+}
+
+/// A sub-seed `base ‖ tag ‖ index`.
+fn tagged(base: &[u8], tag: &[u8], index: usize) -> Vec<u8> {
+    let mut s = base.to_vec();
+    s.extend_from_slice(tag);
+    s.extend_from_slice(&(index as u64).to_le_bytes());
+    s
+}
+
+/// Prove membership **soundly**: [`prove_path`] plus node-shortness (`bits = LOG_BASE`) on the leaf, every
+/// sibling, and every intermediate node. The root is public, so its shortness is checked directly by
+/// [`verify_path_sound`].
+#[must_use]
+pub fn prove_path_sound(
+    params: &RingParams,
+    hp: &HashParams,
+    leaf: &HashNode,
+    siblings: &[HashNode],
+    directions: &[u64],
+    seed: &[u8],
+) -> Option<SoundPathProof> {
+    let path = prove_path(params, hp, leaf, siblings, directions, seed)?;
+    let depth = siblings.len();
+    let bits = crate::ring_hash::LOG_BASE as usize;
+
+    let leaf_short = prove_node_short(params, leaf, &node_r(seed, "/leaf", 0), bits, &tagged(seed, b"/lshort", 0))?;
+
+    let mut sibling_short = Vec::with_capacity(depth);
+    for (j, sibling) in siblings.iter().enumerate() {
+        let sib_r = node_r(seed, "/sib", j);
+        sibling_short.push(prove_node_short(params, sibling, &sib_r, bits, &tagged(seed, b"/sshort", j))?);
+    }
+
+    // Intermediate nodes node_0 … node_{depth−2} (skip node_{depth−1} = root, which is public).
+    let chain = path_chain(hp, leaf, siblings, directions, seed);
+    let mut node_short = Vec::with_capacity(depth.saturating_sub(1));
+    for (j, (node, nr)) in chain.iter().skip(1).take(depth.saturating_sub(1)).enumerate() {
+        node_short.push(prove_node_short(params, node, nr, bits, &tagged(seed, b"/nshort", j))?);
+    }
+
+    Some(SoundPathProof { path, leaf_short, sibling_short, node_short })
+}
+
+/// Verify a [`prove_path_sound`] proof: the structural path, every hidden node's shortness, and the public root's
+/// shortness (its digits are `< 2^{LOG_BASE}`, checked directly).
+#[must_use]
+pub fn verify_path_sound(params: &RingParams, hp: &HashParams, root: &HashNode, proof: &SoundPathProof) -> bool {
+    if !verify_path(params, hp, root, &proof.path) {
+        return false;
+    }
+    let depth = proof.path.levels.len();
+    let bits = crate::ring_hash::LOG_BASE as usize;
+    if proof.sibling_short.len() != depth || proof.node_short.len() != depth.saturating_sub(1) {
+        return false;
+    }
+    if !verify_node_short(params, &proof.path.leaf, bits, &proof.leaf_short) {
+        return false;
+    }
+    for (level, ss) in proof.path.levels.iter().zip(&proof.sibling_short) {
+        if !verify_node_short(params, &level.sibling, bits, ss) {
+            return false;
+        }
+    }
+    // Intermediate nodes: levels[0 .. depth−1].node = node_0 … node_{depth−2}.
+    for (level, ns) in proof.path.levels.iter().take(depth.saturating_sub(1)).zip(&proof.node_short) {
+        if !verify_node_short(params, &level.node, bits, ns) {
+            return false;
+        }
+    }
+    // The public root's limbs must be short (digits < 2^LOG_BASE).
+    let bound = 1u64 << bits;
+    root.limbs().iter().all(|limb| limb.coeffs().iter().all(|&c| c < bound))
 }
 
 #[cfg(test)]
@@ -512,5 +622,25 @@ mod tests {
         let wrong_root = HashNode::from_bytes(b"wr-not-the-root");
         assert!(!verify_path(&params, &hp, &wrong_root, &proof), "a path does not verify against a wrong root");
         assert!(verify_path(&params, &hp, &root, &proof), "…but does against the real root");
+    }
+
+    #[test]
+    #[ignore = "sound path proves shortness at bits=LOG_BASE=16 — ~minute of binarity proofs; run with --ignored"]
+    fn a_sound_membership_path_proves_and_verifies() {
+        // A fully sound depth-1 membership: the structural path plus node-shortness on the leaf and sibling
+        // (the root, node_0, is public). Verifies every node is a genuine short SIS node — no forged path.
+        let params = RingParams::standard();
+        let hp = HashParams::standard();
+        let leaf = HashNode::from_bytes(b"sp-leaf");
+        let sib0 = HashNode::from_bytes(b"sp-sib0");
+        let d0 = 1u64;
+        let root = {
+            let (l, r) = if d0 == 1 { (sib0.clone(), leaf.clone()) } else { (leaf.clone(), sib0.clone()) };
+            hp.hash(&l, &r)
+        };
+        let sibs = [sib0];
+        let dirs = [d0];
+        let proof = prove_path_sound(&params, &hp, &leaf, &sibs, &dirs, b"seed").expect("sound path");
+        assert!(verify_path_sound(&params, &hp, &root, &proof), "a fully sound depth-1 path verifies");
     }
 }
