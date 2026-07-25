@@ -95,6 +95,19 @@ impl RingParams {
         out.push(self.a2_dot(y)); // + 1
         out
     }
+
+    /// Row `k` of the binding matrix `A₁` (its `ELL` entries) — the value-tie proof ([`crate::ring_value_tie`])
+    /// uses these as the public coefficients of the linear relation `t0_k = Σ_j A₁_{kj}·r_j`.
+    #[must_use]
+    pub(crate) fn a1_row(&self, k: usize) -> &[Poly] {
+        self.a1.chunks(ELL).nth(k).unwrap_or(&[])
+    }
+
+    /// The message row `a₂` (its `ELL` entries) — the coefficients of `t1 = ⟨a₂, r⟩ + v`.
+    #[must_use]
+    pub(crate) fn a2(&self) -> &[Poly] {
+        &self.a2
+    }
 }
 
 /// Short (ternary) commitment randomness — an `ELL`-vector of ternary ring elements, the hiding secret.
