@@ -23,7 +23,7 @@
 use alloc::vec::Vec;
 
 use crate::ring::{D, Poly};
-use crate::ring_binary::{BinaryProof, prove_binary, verify_binary};
+use crate::ring_binary::{AggBinaryProof, prove_binary_agg, verify_binary_agg};
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 use crate::ring_linear::{LinearProof, prove_linear, verify_linear};
 
@@ -31,17 +31,22 @@ use crate::ring_linear::{LinearProof, prove_linear, verify_linear};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ShortnessProof {
     bit_planes: Vec<RingCommitment>, // C_{p_j}, t commitments
-    binary: Vec<BinaryProof>,        // each p_j is {0,1}-valued
+    binary: AggBinaryProof,          // ONE proof that every p_j is {0,1}-valued
     reconstruction: LinearProof,     // p = Σ 2ʲ p_j
 }
 
 impl crate::ring_size::ProofSize for ShortnessProof {
-    /// `t` plane commitments + **`t` full binarity proofs** + one reconstruction over `t+1` messages.
+    /// `t` plane commitments + **one aggregated binarity proof** + one reconstruction over `t+1` messages.
     ///
-    /// The middle term is the whole stack's dominant cost: a membership path needs one of these *per node limb*, so a
-    /// depth-`d` spend pays `(2d+1) · ELL_H · t` binarity proofs. Aggregating the `t` binarity checks into a single
-    /// relation — `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0` for a challenge `y` — is the first compaction to reach for; a wider
-    /// challenge (hence fewer repetitions) is the second.
+    /// The middle term is the whole stack's dominant cost — a membership path needs one of these *per node limb*. It
+    /// used to be `t` separate binarity proofs; aggregating them into the single relation
+    /// `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0` halved it (docs §6.1, rung 1). What remains there is irreducible at this level:
+    /// each revealed plane still needs its own binding and mask.
+    ///
+    /// That moved the bottleneck to the **reconstruction**, which is now the larger part. It is a general
+    /// [`crate::ring_linear`] proof, and that generality is unnecessary here: `ring_linear` pays per-message openings
+    /// to survive *huge* coefficients, but these are `2ʲ ≤ 2¹⁵`, so `r_p − Σ 2ʲ·r_j` stays `≈2¹⁶` — short against `q`.
+    /// A single opening-to-zero on the homomorphic difference would replace it at ~1/333 the size (docs §6.1, rung 2).
     fn ring_elements(&self) -> usize {
         self.bit_planes.ring_elements() + self.binary.ring_elements() + self.reconstruction.ring_elements()
     }
@@ -92,14 +97,10 @@ pub fn prove_short(
     let bit_planes: Vec<RingCommitment> =
         planes.iter().zip(&plane_r).map(|(pj, rj)| RingCommitment::commit_message(params, pj, rj)).collect();
 
-    // Each plane is binary.
-    let mut binary = Vec::with_capacity(t);
-    for (j, (pj, rj)) in planes.iter().zip(&plane_r).enumerate() {
-        let mut s = seed.to_vec();
-        s.extend_from_slice(b"/bin/");
-        s.extend_from_slice(&(j as u64).to_le_bytes());
-        binary.push(prove_binary(params, pj, rj, &s)?);
-    }
+    // Every plane is binary — ONE aggregated proof, not one per plane (the stack's dominant cost, docs §6.1).
+    let mut bseed = seed.to_vec();
+    bseed.extend_from_slice(b"/bin");
+    let binary = prove_binary_agg(params, &planes, &plane_r, &bseed)?;
 
     // Reconstruction: p − Σ 2ʲ p_j = 0.
     let mut messages = Vec::with_capacity(t + 1);
@@ -121,14 +122,12 @@ pub fn prove_short(
 /// Verify a [`prove_short`] proof that `c_p` opens to a polynomial with `‖·‖∞ < 2^t`.
 #[must_use]
 pub fn verify_short(params: &RingParams, c_p: &RingCommitment, t: usize, proof: &ShortnessProof) -> bool {
-    if proof.bit_planes.len() != t || proof.binary.len() != t {
+    if proof.bit_planes.len() != t {
         return false;
     }
-    // Each plane is {0,1}-valued.
-    for (plane, bin) in proof.bit_planes.iter().zip(&proof.binary) {
-        if !verify_binary(params, plane, bin) {
-            return false;
-        }
+    // Every plane is {0,1}-valued, in one aggregated check.
+    if !verify_binary_agg(params, &proof.bit_planes, &proof.binary) {
+        return false;
     }
     // And the planes recompose to the committed p.
     let mut commitments = Vec::with_capacity(t + 1);
@@ -213,28 +212,34 @@ mod tests {
 
         // A binarity round is 3 commitments + the revealed f + 2 openings; a linear round over n messages is
         // (n+1) commitments + n revealed + (n+1) openings. Shortness = T planes + T binarity + 1 reconstruction.
-        let binary_one = REPETITIONS * (3 * (K + 1) + 1 + 2 * ELL);
+        let separate = REPETITIONS * (3 * (K + 1) + 1 + 2 * ELL); // what ONE plane used to cost
+        let aggregated = REPETITIONS * (T * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL); // all T planes, one proof
         let n = T + 1; // the reconstruction relates p to its T planes
         let recon = REPETITIONS * ((n + 1) * (K + 1) + n + (n + 1) * ELL);
-        let expected = T * (K + 1) + T * binary_one + recon;
+        let expected = T * (K + 1) + aggregated + recon;
         assert_eq!(proof.ring_elements(), expected, "the accounting matches the construction exactly");
         assert_eq!(proof.encoded_bytes(), expected * BYTES_PER_ELEMENT);
 
-        // The dominant term, stated as a ratio rather than an adjective: the T binarity proofs are the bulk even at
-        // this small T, and a real node uses T = LOG_BASE with ELL_H limbs.
-        let binary_share = T * binary_one;
+        // The aggregation's win, measured. The ratio approaches (3(K+1)+1+2ELL)/(K+1+1+ELL) ≈ 2.14× as the fixed
+        // per-round overhead amortises: 1.67× at this test's small T, and ≥2× from the real width upward — so assert
+        // the loose bound here and the exact one at t = LOG_BASE, which is what a spend actually pays.
+        assert!(aggregated < T * separate, "aggregating is cheaper than one proof per plane ({aggregated} vs {})", T * separate);
+        let real_t = LOG_BASE as usize;
+        let real_agg = REPETITIONS * (real_t * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL);
         assert!(
-            binary_share * 2 > proof.ring_elements(),
-            "the per-plane binarity proofs are over half of a shortness proof ({binary_share} of {})",
-            proof.ring_elements()
+            real_agg * 2 <= real_t * separate,
+            "at t = LOG_BASE the aggregation at least halves binarity ({real_agg} vs {})",
+            real_t * separate
         );
-        // At the real width, one node's shortness is ELL_H limbs × LOG_BASE planes of binarity — the term any
-        // compaction must attack. Kept as an assertion so the ratio cannot silently regress.
-        let real_binary_per_node = ELL_H * (LOG_BASE as usize) * binary_one;
+        // Binarity is still the bulk of a shortness proof, and a real node pays ELL_H limbs at t = LOG_BASE — so this
+        // remains the term the next rung of the ladder must attack. Asserted so the ratio cannot silently regress.
+        let real_per_node = ELL_H
+            * (LOG_BASE as usize * (K + 1)
+                + REPETITIONS * (LOG_BASE as usize * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL));
         assert!(
-            real_binary_per_node * BYTES_PER_ELEMENT > 1 << 20,
-            "one node's binarity alone exceeds a megabyte ({} bytes)",
-            real_binary_per_node * BYTES_PER_ELEMENT
+            real_per_node * BYTES_PER_ELEMENT > 1 << 20,
+            "one node's shortness still exceeds a megabyte ({} bytes)",
+            real_per_node * BYTES_PER_ELEMENT
         );
     }
 

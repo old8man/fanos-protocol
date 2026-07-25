@@ -14,14 +14,17 @@
 //!
 //! - a [`crate::ring_linear`] proof over `n` messages costs `REPETITIONS · (n+1)(K+1) + n + (n+1)·ELL` elements —
 //!   linear in the statement width and in the repetition count;
-//! - a [`crate::ring_shortness`] proof at width `t` costs **`t` full binarity proofs** plus one reconstruction, and
-//!   the untraceability path needs one *per node limb* — so node shortness dominates everything else, by orders of
+//! - a [`crate::ring_shortness`] proof costs one aggregated binarity proof plus one reconstruction, and the
+//!   untraceability path needs one *per node limb* — so node shortness dominates everything else by orders of
 //!   magnitude, and it is the term any compaction must attack first.
 //!
-//! > **STATUS — measurement, not calibration.** These are exact counts of what the current constructions emit. They
-//! > are not a claim that the sizes are acceptable: they are the evidence that aggregation of the bit-plane binarity
-//! > checks, and a wider challenge (fewer repetitions), are the load-bearing optimisations — see
-//! > `docs/design-obolos-zk.md` §6.
+//! The counts have already earned their keep twice: they showed that aggregating the bit-plane binarity checks was
+//! worth 2× (built), and then that doing so **moves the bottleneck** to the reconstruction — which turns out to be
+//! paying for a coefficient blow-up that cannot occur at its coefficient sizes. Neither was visible without numbers.
+//!
+//! > **STATUS — measurement, not calibration.** These are exact counts of what the current constructions emit, checked
+//! > against the constructions in test. They are not a claim that the sizes are acceptable — see
+//! > `docs/design-obolos-zk.md` §6 for the measured ladder and its ceiling.
 
 use alloc::vec::Vec;
 

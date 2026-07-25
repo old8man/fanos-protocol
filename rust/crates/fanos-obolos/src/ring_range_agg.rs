@@ -45,9 +45,26 @@ const CHALLENGE_BITS: u32 = 9;
 /// binarity proof ([`crate::ring_binary`]).
 pub(crate) const CHALLENGE_MOD: u64 = (1 << CHALLENGE_BITS) - 1;
 
-/// **Wide** masking for the openings that hide *witness* randomness. Sized so the whole-proof accept rate is high:
-/// `B ≈ β·(coefficient count)` with `β = CHALLENGE_MOD` — here `2²⁵ ≫ 511·2¹⁵`. Shared with [`crate::ring_binary`].
-pub(crate) const MASK_WIDE: i64 = 1 << 25;
+/// **Wide** masking for the openings that hide *witness* randomness — sized so a whole proof accepts on the first
+/// attempt with overwhelming probability. Shared with [`crate::ring_binary`].
+///
+/// The width is **derived, not chosen**. Rejection is per *coefficient*: an opening `x·r + r_mask` leaves the accept
+/// region only if `r_mask` lands within `CHALLENGE_MOD` of the boundary, i.e. with probability `≈ CHALLENGE_MOD/B`.
+/// A Fiat–Shamir transcript covers every round at once (that is what forbids per-round grinding), so **all** of a
+/// proof's openings share a single accept event and the per-coefficient probability compounds over
+/// `openings · ELL · D` coefficients. For the aggregated binarity proof an opening is revealed *per plane*, so that
+/// count carries an extra factor of `t`:
+///
+/// ```text
+/// P(accept) ≈ (1 − CHALLENGE_MOD/B)^(t · REPETITIONS · ELL · D)
+/// ```
+///
+/// At `B = 2²⁵` that is 0.78 for `t = 1` but only **0.018** for `t = 16` and ~0 for `t = 64` — which is exactly how
+/// the aggregation first failed: the mask had been sized for a single opening. `B = 2⁴⁰` gives `> 0.999` even at
+/// `t = 64`, so no resampling is expected at any width the stack uses. The cost is a correspondingly larger
+/// extractable-opening norm (`2⁴⁰`, still far below `q = 2⁶⁴`); like every parameter here that bound awaits
+/// calibration, so the trade is recorded rather than hidden.
+pub(crate) const MASK_WIDE: i64 = 1 << 40;
 
 /// Accept region for a wide opening `x·r + r_mask`, hidden part `‖x·r‖∞ ≤ CHALLENGE_MOD`.
 pub(crate) const ACCEPT_WIDE: i64 = MASK_WIDE - CHALLENGE_MOD as i64;

@@ -64,6 +64,58 @@ impl crate::ring_size::ProofSize for BinaryProof {
     }
 }
 
+/// One round of the **aggregated** proof: a masking commitment per plane, the two aggregate masking commitments, and
+/// the revealed masked planes with their openings.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct AggBinRound {
+    c_a: Vec<RingCommitment>,  // com(a_j), one per plane
+    c_d: RingCommitment,       // com(Σ_j y^j·(a_j∘(1−2p_j)))
+    c_e: RingCommitment,       // com(−Σ_j y^j·(a_j∘a_j))
+    f: Vec<Poly>,              // f_j = x·p_j + a_j
+    z_ba: Vec<RingRandomness>, // x·r_{p_j} + r_{a_j}
+    z_de: RingRandomness,      // x·r_D + r_E
+}
+
+/// A zero-knowledge proof that **every** polynomial in a committed family is `{0,1}`-valued — one proof for all of
+/// them, rather than [`BinaryProof`] each.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AggBinaryProof {
+    rounds: Vec<AggBinRound>,
+}
+
+impl crate::ring_size::ProofSize for AggBinRound {
+    fn ring_elements(&self) -> usize {
+        self.c_a.ring_elements() + self.c_d.ring_elements() + self.c_e.ring_elements() + self.f.len()
+            + self.z_ba.ring_elements()
+            + self.z_de.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for AggBinaryProof {
+    /// `REPETITIONS · (t·(K+1+1+ELL) + 2·(K+1) + ELL)` versus `t` separate proofs' `REPETITIONS · t·(3(K+1)+1+2ELL)`.
+    /// The per-plane `c_d, c_e, z_de` collapse into one triple; the per-plane `c_a, f, z_ba` are irreducible, because
+    /// each revealed plane still needs its own binding and mask.
+    fn ring_elements(&self) -> usize {
+        self.rounds.ring_elements()
+    }
+}
+
+/// `y^0 … y^{t−1}` in the field — the aggregation weights.
+fn powers(y: u64, t: usize) -> Vec<u64> {
+    let mut out = Vec::with_capacity(t);
+    let mut acc = 1u64;
+    for _ in 0..t {
+        out.push(acc);
+        acc = crate::ring::fmul(acc, y);
+    }
+    out
+}
+
+/// `Σ_j w_j · term(j)` coefficient-wise — the aggregate the binarity check is stated over.
+fn weighted(weights: &[u64], mut term: impl FnMut(usize) -> Poly) -> Poly {
+    weights.iter().enumerate().fold(Poly::zero(), |acc, (j, &w)| acc.add(&scalar_mul(w, &term(j))))
+}
+
 /// Absorb a commitment into a Fiat–Shamir transcript.
 fn absorb(buf: &mut Vec<u8>, c: &RingCommitment) {
     for p in c.t0().iter().chain(core::iter::once(c.t1())) {
@@ -104,6 +156,190 @@ fn mask_seed(base: &[u8], attempt: u32, k: usize, tag: u8) -> Vec<u8> {
     s.extend_from_slice(&attempt.to_le_bytes());
     s.extend_from_slice(&(k as u64).to_le_bytes());
     s.push(tag);
+    s
+}
+
+/// The aggregation seed — the statement (every plane commitment) and every round's per-plane masking commitments.
+/// The `y` challenge must come **after** these and **before** `c_d`/`c_e`, which depend on `y`.
+fn agg_seed_y(planes: &[RingCommitment], rounds: &[AggBinRound]) -> [u8; 32] {
+    let mut buf = Vec::new();
+    for c in planes {
+        absorb(&mut buf, c);
+    }
+    for r in rounds {
+        for a in &r.c_a {
+            absorb(&mut buf, a);
+        }
+    }
+    let mut seed = [0u8; 32];
+    hash_xof("FANOS-obolos-v1/ring-binary-agg-y", &buf, &mut seed);
+    seed
+}
+
+/// The evaluation seed — the aggregation seed plus every round's aggregate masking commitments.
+fn agg_seed_x(seed_y: &[u8; 32], rounds: &[AggBinRound]) -> [u8; 32] {
+    let mut buf = seed_y.to_vec();
+    for r in rounds {
+        absorb(&mut buf, &r.c_d);
+        absorb(&mut buf, &r.c_e);
+    }
+    let mut seed = [0u8; 32];
+    hash_xof("FANOS-obolos-v1/ring-binary-agg-x", &buf, &mut seed);
+    seed
+}
+
+/// Round `k`'s **wide** aggregation challenge `y ∈ [1, q)`.
+///
+/// Unlike `x`, `y` may span the whole field: it never enters an opening that must stay short — it appears only inside
+/// the prover's aggregate messages and in the verifier's own recomputation from revealed values. That is what keeps
+/// the aggregation free: the extra soundness term is `(t−1)/q ≈ 2⁻⁶⁰` rather than `(t−1)/2^{CHALLENGE_BITS}`, so the
+/// per-round error stays the `2/2^{CHALLENGE_BITS}` of the un-aggregated proof and `REPETITIONS` still reaches `2⁻¹²⁸`.
+fn round_y(seed: &[u8; 32], k: usize) -> u64 {
+    let mut input = Vec::with_capacity(40);
+    input.extend_from_slice(seed);
+    input.extend_from_slice(&(k as u64).to_le_bytes());
+    let mut out = [0u8; 8];
+    hash_xof("FANOS-obolos-v1/ring-binary-agg-ychal", &input, &mut out);
+    (u64::from_le_bytes(out) % (crate::ring::Q - 1)) + 1
+}
+
+/// Prove, in zero knowledge, that **every** `planes[j]` is `{0,1}`-valued — one proof for the whole family.
+///
+/// The aggregation: for a wide challenge `y` and the small challenge `x`, the revealed masked planes satisfy
+///
+/// ```text
+/// Σ_j y^j·(f_j ∘ (x − f_j)) = x²·Σ_j y^j·(p_j∘(1−p_j)) + x·D + E
+/// ```
+///
+/// with `D = Σ_j y^j·(a_j∘(1−2p_j))` and `E = −Σ_j y^j·(a_j∘a_j)` committed once. Checking that single identity forces
+/// `Σ_j y^j·(p_j∘(1−p_j)) = 0`; a non-binary plane leaves a nonzero polynomial of degree `< t` in `y`, which a random
+/// `y` annihilates only with probability `≤ (t−1)/q`. So `t` binarity statements cost one proof instead of `t`.
+///
+/// `None` if the inputs disagree in length, or on the rare masking exhaustion.
+#[must_use]
+pub fn prove_binary_agg(
+    params: &RingParams,
+    planes: &[Poly],
+    plane_r: &[RingRandomness],
+    seed: &[u8],
+) -> Option<AggBinaryProof> {
+    let t = planes.len();
+    if t == 0 || plane_r.len() != t {
+        return None;
+    }
+    let one_minus_2p: Vec<Poly> = planes.iter().map(|p| Poly::broadcast(1).sub(&p.add(p))).collect();
+    let plane_coms: Vec<RingCommitment> =
+        planes.iter().zip(plane_r).map(|(p, r)| RingCommitment::commit_message(params, p, r)).collect();
+
+    for attempt in 0..MAX_ATTEMPTS {
+        // Phase 1 — per-plane maskings and their commitments, which fix `y`.
+        struct Masking {
+            a: Vec<Poly>,
+            r_a: Vec<RingRandomness>,
+            r_d: RingRandomness,
+            r_e: RingRandomness,
+        }
+        let mut maskings = Vec::with_capacity(REPETITIONS);
+        let mut rounds: Vec<AggBinRound> = Vec::with_capacity(REPETITIONS);
+        for k in 0..REPETITIONS {
+            let a: Vec<Poly> = (0..t).map(|j| Poly::uniform(&plane_seed(seed, attempt, k, 0, j))).collect();
+            let r_a: Vec<RingRandomness> = (0..t)
+                .map(|j| RingRandomness::from_uniform_bounded(&plane_seed(seed, attempt, k, 1, j), MASK_WIDE))
+                .collect();
+            let c_a = a.iter().zip(&r_a).map(|(aj, rj)| RingCommitment::commit_message(params, aj, rj)).collect();
+            let zero = RingCommitment::commit_message(params, &Poly::zero(), &RingRandomness::from_seed(b"/init"));
+            rounds.push(AggBinRound {
+                c_a,
+                c_d: zero.clone(),
+                c_e: zero,
+                f: Vec::new(),
+                z_ba: Vec::new(),
+                z_de: RingRandomness::from_seed(b"/init"),
+            });
+            maskings.push(Masking {
+                a,
+                r_a,
+                r_d: RingRandomness::from_seed(&mask_seed(seed, attempt, k, 2)), // ternary (fresh)
+                r_e: RingRandomness::from_seed(&mask_seed(seed, attempt, k, 3)), // ternary (fresh)
+            });
+        }
+
+        // Phase 2 — `y` is now fixed, so the aggregate maskings can be committed.
+        let seed_y = agg_seed_y(&plane_coms, &rounds);
+        for (k, (m, round)) in maskings.iter().zip(&mut rounds).enumerate() {
+            let w = powers(round_y(&seed_y, k), t);
+            let d = weighted(&w, |j| match (m.a.get(j), one_minus_2p.get(j)) {
+                (Some(aj), Some(oj)) => aj.hadamard(oj),
+                _ => Poly::zero(),
+            });
+            let e = Poly::zero().sub(&weighted(&w, |j| m.a.get(j).map_or_else(Poly::zero, |aj| aj.hadamard(aj))));
+            round.c_d = RingCommitment::commit_message(params, &d, &m.r_d);
+            round.c_e = RingCommitment::commit_message(params, &e, &m.r_e);
+        }
+
+        // Phase 3 — `x` is fixed, so the masked planes and openings can be revealed.
+        let seed_x = agg_seed_x(&seed_y, &rounds);
+        let mut ok = true;
+        for (k, (m, round)) in maskings.iter().zip(&mut rounds).enumerate() {
+            let x = round_challenge(&seed_x, k);
+            let cx = Poly::constant(x);
+            round.f = planes.iter().zip(&m.a).map(|(p, aj)| scalar_mul(x, p).add(aj)).collect();
+            round.z_ba = plane_r.iter().zip(&m.r_a).map(|(rp, ra)| rp.scale(&cx).add(ra)).collect();
+            round.z_de = m.r_d.scale(&cx).add(&m.r_e);
+            if !round.z_ba.iter().all(|z| z.infinity_norm_le(ACCEPT_WIDE))
+                || !round.z_de.infinity_norm_le(ACCEPT_SMALL)
+            {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Some(AggBinaryProof { rounds });
+        }
+    }
+    None
+}
+
+/// Verify a [`prove_binary_agg`] proof that every one of `plane_coms` opens to a `{0,1}`-valued polynomial.
+#[must_use]
+pub fn verify_binary_agg(params: &RingParams, plane_coms: &[RingCommitment], proof: &AggBinaryProof) -> bool {
+    let t = plane_coms.len();
+    if t == 0 || proof.rounds.len() != REPETITIONS {
+        return false;
+    }
+    let seed_y = agg_seed_y(plane_coms, &proof.rounds);
+    let seed_x = agg_seed_x(&seed_y, &proof.rounds);
+    for (k, rd) in proof.rounds.iter().enumerate() {
+        if rd.c_a.len() != t || rd.f.len() != t || rd.z_ba.len() != t {
+            return false;
+        }
+        if !rd.z_ba.iter().all(|z| z.infinity_norm_le(ACCEPT_WIDE)) || !rd.z_de.infinity_norm_le(ACCEPT_SMALL) {
+            return false;
+        }
+        let x = round_challenge(&seed_x, k);
+        let cx = Poly::constant(x);
+        // Each revealed plane is bound to its commitment: com(f_j; z_ba_j) = x·C_{p_j} + C_{a_j}.
+        for (((f, z), cp), ca) in rd.f.iter().zip(&rd.z_ba).zip(plane_coms).zip(&rd.c_a) {
+            if RingCommitment::commit_message(params, f, z) != cp.scale(&cx).add(ca) {
+                return false;
+            }
+        }
+        // The single aggregated binarity identity, over the revealed planes the verifier already holds.
+        let w = powers(round_y(&seed_y, k), t);
+        let agg = weighted(&w, |j| {
+            rd.f.get(j).map_or_else(Poly::zero, |f| f.hadamard(&Poly::broadcast(x).sub(f)))
+        });
+        if RingCommitment::commit_message(params, &agg, &rd.z_de) != rd.c_d.scale(&cx).add(&rd.c_e) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A domain-separated masking seed for plane `j`: `base ‖ attempt ‖ k ‖ tag ‖ j`.
+fn plane_seed(base: &[u8], attempt: u32, k: usize, tag: u8, j: usize) -> Vec<u8> {
+    let mut s = mask_seed(base, attempt, k, tag);
+    s.extend_from_slice(&(j as u64).to_le_bytes());
     s
 }
 
@@ -243,6 +479,75 @@ mod tests {
         let proof = prove_binary(&params, &p, &r, b"seed").unwrap();
         let (_r2, other) = commit(&params, &p, b"other-randomness");
         assert!(!verify_binary(&params, &other, &proof), "the commitment is bound in");
+    }
+
+    /// Commit a family of planes, returning `(randomness, commitments)`.
+    fn commit_all(params: &RingParams, planes: &[Poly], tag: &[u8]) -> (Vec<RingRandomness>, Vec<RingCommitment>) {
+        let r: Vec<RingRandomness> = (0..planes.len())
+            .map(|j| {
+                let mut s = tag.to_vec();
+                s.extend_from_slice(&(j as u64).to_le_bytes());
+                RingRandomness::from_seed(&s)
+            })
+            .collect();
+        let c = planes.iter().zip(&r).map(|(p, rj)| RingCommitment::commit_message(params, p, rj)).collect();
+        (r, c)
+    }
+
+    #[test]
+    fn an_aggregated_proof_covers_a_whole_family_of_planes() {
+        let params = RingParams::standard();
+        let planes: Vec<Poly> = (0..8u64).map(|j| binary_poly(0x9E37_79B9_7F4A_7C15 ^ (j << 3))).collect();
+        let (r, c) = commit_all(&params, &planes, b"agg-happy");
+        let proof = prove_binary_agg(&params, &planes, &r, b"seed").expect("aggregated binarity");
+        assert!(verify_binary_agg(&params, &c, &proof), "every plane is binary");
+        // Arity is bound: a family of a different size cannot ride this proof.
+        assert!(!verify_binary_agg(&params, &c[..7], &proof), "the plane count is bound in");
+        assert!(!verify_binary_agg(&params, &[], &proof), "an empty family is refused");
+    }
+
+    #[test]
+    fn one_non_binary_plane_among_many_is_caught() {
+        // The property the y-aggregation must preserve: a single bad plane cannot hide behind its binary siblings.
+        // Its p∘(1−p) is nonzero, so Σ_j y^j·(p_j∘(1−p_j)) is a nonzero degree-<t polynomial in y — which a random
+        // wide y annihilates only with probability ≤ (t−1)/q.
+        let params = RingParams::standard();
+        for bad_at in [0usize, 3, 7] {
+            let planes: Vec<Poly> = (0..8usize)
+                .map(|j| {
+                    if j == bad_at {
+                        let mut coeffs = [0u64; D];
+                        coeffs[5] = 2; // not a bit
+                        Poly::from_u64(&coeffs)
+                    } else {
+                        binary_poly(0xABCD_1234 ^ (j as u64))
+                    }
+                })
+                .collect();
+            let (r, c) = commit_all(&params, &planes, b"agg-bad");
+            let proof = prove_binary_agg(&params, &planes, &r, b"seed").expect("proof emitted");
+            assert!(!verify_binary_agg(&params, &c, &proof), "a non-binary plane at index {bad_at} is caught");
+        }
+    }
+
+    #[test]
+    fn the_aggregated_proof_is_smaller_than_one_proof_per_plane() {
+        // The first rung of the compaction ladder (docs §6.1), as a measurement rather than a claim: the per-plane
+        // c_d/c_e/z_de collapse into a single triple, and the ratio must not silently regress.
+        use crate::ring_size::ProofSize;
+        let params = RingParams::standard();
+        let planes: Vec<Poly> = (0..16u64).map(|j| binary_poly(0x5555_AAAA ^ j)).collect();
+        let (r, c) = commit_all(&params, &planes, b"agg-size");
+        let agg = prove_binary_agg(&params, &planes, &r, b"seed").expect("aggregated");
+        assert!(verify_binary_agg(&params, &c, &agg), "the aggregated proof is valid");
+        // The un-aggregated cost of the same statement: one proof per plane.
+        let one = prove_binary(&params, &planes[0], &r[0], b"seed").expect("single");
+        let separate = planes.len() * one.ring_elements();
+        assert!(
+            agg.ring_elements() * 2 <= separate,
+            "aggregation halves the binarity cost ({} vs {separate} elements)",
+            agg.ring_elements()
+        );
     }
 
     #[test]

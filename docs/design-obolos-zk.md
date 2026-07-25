@@ -319,38 +319,73 @@ counts the `R_q` elements it consists of, and the counts are checked against the
 auditable rather than estimated. At `D = 256`, `K = 1`, `ℓ = 4`, `ℓ_H = 4`, `LOG_BASE = 16`, `REPETITIONS = 16`, with
 one `u64` per coefficient (2 KiB per element):
 
-| Component | elements | size |
-|---|---|---|
-| one binarity proof | 240 | 0.47 MiB |
-| one hash step (linear proof, `n = 12`) | 1 440 | 2.81 MiB |
-| **shortness at `t = LOG_BASE`, per limb** | 5 872 | **11.5 MiB** |
-| **node shortness (`ℓ_H` limbs)** | 23 488 | **45.9 MiB** |
-| node shortness in a depth-1 path (3 nodes) | | 138 MiB |
-| node shortness in a depth-32 path (65 nodes) | | **2.9 GiB** |
+| Component | elements | size | before rung 1 |
+|---|---|---|---|
+| one hash step (linear proof, `n = 12`) | 1 440 | 2.81 MiB | — |
+| aggregated binarity over `t = LOG_BASE` planes | 1 920 | 3.75 MiB | 7.50 MiB (16 separate) |
+| **shortness at `t = LOG_BASE`, per limb** | 3 952 | **7.72 MiB** | 11.5 MiB |
+| **node shortness (`ℓ_H` limbs)** | 15 808 | **30.9 MiB** | 45.9 MiB |
+| node shortness in a depth-1 path (3 nodes) | | 92.6 MiB | 138 MiB |
+| node shortness in a depth-32 path (65 nodes) | | **2.0 GiB** | 2.9 GiB |
 
 So the dominant term is unambiguous, and it is not the hash steps or the amount proofs — it is **node shortness**,
-`(2d+1) · ℓ_H · LOG_BASE` binarity proofs for a depth-`d` spend. Everything else is rounding error beside it.
+`ℓ_H · LOG_BASE` bit-planes per node across `2d+1` nodes for a depth-`d` spend. Everything else is rounding error.
 
 ### 6.1 The compaction ladder, and its ceiling
 
-Each step below is derived, and the factor is arithmetic from the table — no guesswork:
+Each rung is derived, and its factor is arithmetic from the table — no guesswork.
 
-1. **Aggregate the bit-plane binarity checks.** Rather than `t` separate proofs, commit the `t` planes and prove the
-   single relation `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0` for a challenge `y`: a non-binary plane leaves a nonzero degree-`<t`
-   polynomial in `y`, which a random `y` kills with probability `≤ (t−1)/|challenge|`. Per round this drops the
-   per-plane `c_d, c_e, z_de` (8 of 15 elements), keeping the irreducible `c_a, f, z_ba` — **≈2×**, or **≈3×** when
-   aggregated across a whole node's `ℓ_H · t` planes at once.
-2. **Widen the challenge to shorten the repetitions.** `CHALLENGE_BITS = 9` forces 16 rounds for `2⁻¹²⁸`. The width is
-   bounded only by the masking having room above it (`MASK_WIDE` must dominate `x·witness`, and `2⁵⁷ < q` leaves
-   plenty), so a `2³²` challenge needs ~4 rounds — **≈4×**.
-3. **Encode short elements at their true width.** Most revealed elements are *openings* bounded by `ACCEPT_*`, not
-   general elements mod `q`; ternary randomness is 2 bits per coefficient, not 64 — **≈2×** on the remainder.
+**Rung 1 — aggregate the bit-plane binarity checks. Built** ([`prove_binary_agg`](../rust/crates/fanos-obolos/src/ring_binary.rs)).
+Rather than `t` separate proofs, commit the `t` planes and prove the single relation `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0`,
+which follows from
+`Σ_j y^j·(f_j ∘ (x − f_j)) = x²·Σ_j y^j·(p_j∘(1−p_j)) + x·D + E` with `D, E` committed once. A non-binary plane leaves a
+nonzero degree-`<t` polynomial in `y`. Crucially **`y` may be wide** — it never enters an opening that must stay
+short, appearing only inside the prover's aggregate messages and the verifier's own recomputation — so the added
+soundness term is `(t−1)/q ≈ 2⁻⁶⁰` and the per-round error stays the un-aggregated `2/2^{CHALLENGE_BITS}`. Measured
+**2.0× at `t = LOG_BASE`** (asymptotically `15/7 ≈ 2.14×`); what remains is irreducible at this level, since each
+revealed plane still needs its own binding and mask.
 
-Together ≈10–25×: a depth-32 spend falls from ~3 GiB to a few hundred MiB. That is the honest ceiling of
-constant-factor work, and it is **still impractical** — which is precisely why production lattice systems wrap
-membership in a recursive/succinct proof rather than paying for it directly. Recursive compaction is therefore not a
-nice-to-have on this stack's roadmap; it is the only route to a shippable spend proof, and the numbers above are why.
-The construction is sound and complete today, and it will stay `[P]` until that route is built.
+> Building it surfaced a parameter that had been sized for the wrong case. Rejection sampling is per *coefficient*,
+> and one Fiat–Shamir transcript covers every round, so **all** of a proof's openings share a single accept event —
+> aggregation multiplies that count by `t`. At `MASK_WIDE = 2²⁵` the accept probability is 0.78 for one opening but
+> 0.018 at `t = 16` and ~0 at `t = 64`; the prover simply exhausted its attempts. The width is now derived from
+> `P(accept) ≈ (1 − CHALLENGE_MOD/B)^(t·REPETITIONS·ℓ·D)`, giving `B = 2⁴⁰` and `> 0.999` even at `t = 64`. Side
+> effect: the un-aggregated proofs stopped resampling too, and the crate's test suite got ~10× faster.
+
+Rung 1 also **moved the bottleneck**, which changes what comes next. A per-limb shortness proof is now:
+
+| part | elements | challenge |
+|---|---|---|
+| plane commitments | 32 | — |
+| aggregated binarity | 1 920 | scalar (`2⁹`) |
+| **reconstruction** `p − Σ 2ʲ·pⱼ = 0` | **2 000** | monomial (`2D = 512`) |
+
+So the reconstruction has *overtaken* binarity, and the next rung must attack it rather than the binarity rounds.
+
+**Rung 2 — state the reconstruction as an opening-to-zero, not a general linear proof.** `ring_linear` exists to
+survive **huge** coefficients: `Σ cᵢ·rᵢ` for uniform matrix entries dwarfs `q`, so it masks and reveals per-message
+openings, paying `(n+1)·ℓ` of them per round. The reconstruction's coefficients are `2ʲ ≤ 2¹⁵`, so **that blow-up
+never happens**: by homomorphism `C_p − Σ 2ʲ·C_{pⱼ}` is already a commitment to `p − Σ 2ʲ·pⱼ` under randomness
+`r_p − Σ 2ʲ·r_j`, whose norm is `≤ 1 + 2^t ≈ 2¹⁶` — short against `q = 2⁶⁴`. Proving that *one* difference opens to
+zero ([`ring_zk`], exactly as [`ring_balance`] does for the balance residual) replaces 2 000 elements with ~6:
+**≈333× on the component, ≈2.0× on the shortness proof.** Structural, not parametric — the general proof was simply
+the wrong tool for these coefficient sizes.
+
+**Rung 3 — widen the scalar challenge.** `CHALLENGE_BITS = 9` forces 16 rounds for `2⁻¹²⁸`, and `2¹⁶` would need 9.
+Note this helps *only* the scalar-challenge proofs: the monomial-challenge ones (`ring_linear`, `ring_product`) draw
+from the ring's `2D = 512` monomials, a space pinned by `D` itself. So it is worth **≈1.3×** after rung 2, not the
+`≈4×` a rounds-only count suggests — and it trades against the binding margin, since the mask must keep dominating
+`x·witness`. That makes it a calibration decision, not a free win.
+
+**Rung 4 — encode short elements at their true width.** Most revealed elements are *openings* bounded by `ACCEPT_*`,
+not general elements mod `q`; ternary randomness is 2 bits per coefficient, not 64 — **≈2×** on the remainder.
+
+Together ≈5× from here, not the order of magnitude a naive reading of the rungs suggests: a depth-32 spend falls from
+~2 GiB to ~400 MiB. That is the honest ceiling of constant-factor work, and it is **still impractical** — which is
+precisely why production lattice systems wrap membership in a recursive/succinct proof rather than paying for it
+directly. Recursive compaction is therefore not a nice-to-have on this stack's roadmap; it is the only route to a
+shippable spend proof, and the numbers above are why. The construction is sound and complete today, and it will stay
+`[P]` until that route is built.
 
 ## 7. Verification status
 
