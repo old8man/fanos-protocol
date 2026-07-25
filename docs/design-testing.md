@@ -229,6 +229,41 @@ of the high tiers (whose job is to fail *only* on integration faults).
   mechanism for occupying a chosen coordinate in a production-sized overlay, and must not be presented as
   one — its whole safety argument is that the grind is cheap only at cell scale.
 
+### 5.1 The boundary no rung crosses — the deployed node's *composition*
+
+By this document's own thesis, the boundary a tier abstracts is the bug class it cannot see. Applied to the ladder
+as a whole, there is one boundary **every** rung abstracts:
+
+| rung | what it runs |
+|---|---|
+| T0 | one engine, sans-I/O |
+| T2 | `fanos_runtime::OverlayNode` — the overlay **engine** — over virtual time |
+| T3/T4 | `fanos_quic` — the **transport** and a cell of it |
+| T5 | the application above the overlay |
+
+None of them runs **`fanos_node::Node`** — the deployed node, which composes the overlay engine *plus* around a
+dozen driver tasks: the self-organizing role loop, the capability/load/mix publishers, the epoch driver, the beacon
+tracker, the recovery trigger, the exit role, the rendezvous host. `fanos-sim` does not reference `fanos_node::` at
+all (it carries the crate only as a dev-dependency for one scenario). So the ladder is faithful about *protocol*
+and *transport*, and silent about **wiring** — whether those tasks are started, in what order, and whether their
+inputs are ready when they run.
+
+That is not a hypothetical class. Wiring the role loop into `Node::start` immediately surfaced four defects that
+every rung above was structurally unable to see, because none of them ran the composition:
+
+1. `spawn_self_organization` **had no callers** — the whole self-organizing subsystem was proven-but-unreachable,
+   so a deployed node's roles came from its config file and the cell had no say;
+2. the genesis assignment **raced its own publishers**, which write from sibling tasks;
+3. it needed **both** the capability and the load report, and waiting on one still produced an empty assignment;
+4. every cell-wide directory scan was **sequential**, so an unoccupied slot cost the full `RESOLVE_TIMEOUT` and one
+   epoch's assignment took `N × 5s` — unfinishable on a production-sized plane.
+
+Each is a composition fault, invisible to a rung that instantiates the engine directly. The fix is not another
+scenario at an existing rung: it is to make the simulator drive the **real node composition**, with only the clock,
+transport, and RNG virtualised — which is what "differs from production only in transport" has to mean if it is to
+carry weight. That requires the drivers' `Client` and time seams to be injectable rather than concrete, and it is
+the simulator's most valuable open piece of work.
+
 ---
 
 ## 6. Running the tiers
