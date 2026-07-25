@@ -227,3 +227,107 @@ shipped model is `q = 2` + hierarchy, so the capability is not mistaken for one 
   connection handshake exchanges + verifies a mutual proof-of-coordinate **HELLO** (the proof is bound to
   the certificate by `node_id = H(cert)`, so no live challenge is needed) — plus `fanos-node` (the
   identity coordinate helper).
+
+---
+
+## Collision resolution — verifiable coordinate probing
+
+### The bound being escaped
+
+A coordinate is `MapToPoint(VRF(sk, id ‖ epoch ‖ beacon))`: a **uniform draw** over the plane's `P = q² + q + 1` points.
+Two nodes drawing the same point are *mutually unroutable* — the coordinate → address table holds one address per point —
+so a cell can only see its own membership while the draw is injective, and
+
+```text
+P(injective) = P! / ((P − n)! · Pⁿ) ≈ exp(−n²/2P)
+E[distinct]  = P · (1 − (1 − 1/P)ⁿ)
+```
+
+By the birthday bound injectivity survives only while `n = O(√P)`, and `√P ≈ q`. **Without resolution a PG(2,q) cell
+supports on the order of `q` nodes, not `q² + q + 1`** — a factor-`q` capacity loss. Measured: seven nodes in PG(2,2)
+occupied **four** distinct points, one held by three nodes (`docs/design-testing.md` §5.3.4a).
+
+### The constraint that shapes the design
+
+Placement security (§3.2 assumption 2) rests on a node being unable to **aim** its coordinate — at a victim's lines, at a
+chosen storage neighbourhood. Any resolution rule that lets a node influence where it is displaced *to* trades that away:
+a free choice among `K` destinations is exactly a factor-`K` gain in aiming power. So the design gives the node **none**.
+
+### The construction
+
+`fanos_vrf::probe_point` — **double hashing** over the canonical point index:
+
+```text
+p_k = Point::at((i₀ + k·s) mod P),   i₀ = index(MapToPoint(output)),   gcd(s, P) = 1
+```
+
+Both `i₀` and the stride `s` derive from the node's *own* VRF output, so the walk is verifiable and unchoosable, and a new
+beacon reshuffles the entire sequence — assumption 2 extends to **every** probe index, not just `k = 0`. `gcd(s, P) = 1`
+makes `k ↦ (i₀ + k·s) mod P` a cyclic permutation of all `P` points, so probing seats a node whenever any point is free.
+
+Two details that are load-bearing rather than fussy:
+
+- The stride is searched upward from a hashed start until coprime. `P = q² + q + 1` **need not be prime** (`21 = 3·7` at
+  `q = 4`), so a bare `H mod P` could land on a divisor and silently confine the walk to a short orbit.
+- The first construction, `p_k = MapToPoint(H(probe ‖ output ‖ k))`, was a random *function*, not a permutation: a node's
+  own sequence repeated points and never enumerated the plane. It seated **5 of 7** at `n = P = 7` — better than the bare
+  4.62, but the probing was re-colliding with itself. The simulator caught this on the first measurement.
+
+### Rank, and why resolution needs no agreement
+
+Rank is the VRF output itself, lowest wins: unforgeable, and unpredictable before the beacon. Both sides of a collision
+compute the same verdict from public data, and the verdicts are **complementary** — an empty point is free, and so is one
+held by a *higher*-ranked node, because that node is the one who must move. So exactly one party yields, and resolution is
+a **local pairwise rule**: no negotiation, no round trip, and no dependency on agreed membership (which would be circular,
+since membership is what collisions obstruct).
+
+`settle_index` is the sans-I/O core a node runs: walk to the first index whose point no lower-ranked node holds. It is
+monotone in information — a node that has seen fewer peers may settle early and later advance — which is a *convergence*
+question, not a correctness one, since every intermediate position is a claim it can legitimately prove.
+
+### The claim, and the one freedom it closes
+
+The node cannot choose *where* its sequence goes, so the only thing left to misreport is *how far along* it sits.
+`CoordinateClaim { proof, index, witnesses }` closes that: index `k` is accepted only with **exactly** `k` witnesses, the
+`j`-th being a genuinely lower-ranked node whose *preference* is the claimant's `j`-th point. A lower-ranked node
+preferring `p` displaces the claimant from `p`, so each step is a public fact rather than an assertion.
+
+`verify_coordinate_claim` is the acceptance predicate a peer runs on a `HELLO`. Three properties worth stating:
+
+- **Non-recursive.** A witness proves only its own preference, never where it settled, so a chain of length `k` costs `k`
+  independent VRF verifications and never unfolds into the witnesses' own chains. The price is *phantom collisions* — a
+  witness itself displaced from `p` still displaces the claimant — which costs occupancy efficiency, never correctness or
+  security, and cannot be manufactured since the claimant does not choose which witnesses exist.
+- **Witness distinctness is automatic.** A witness justifies index `j` only if its single preference *is* the claimant's
+  `j`-th point, and distinct indices are distinct points on a permutation walk, so one witness can never justify two
+  steps. No separate check, and one less thing to get wrong.
+- **Exactly `k`, not at least `k`.** A longer chain is rejected too, which stops a claimant padding a chain and then
+  asserting a lower index whose point it happens to prefer.
+
+`probe_point(·, 0)` is the pre-existing derivation and `CoordinateClaim::direct` the pre-existing `HELLO` proof, so a node
+that meets no collision presents and verifies exactly what it always did.
+
+### Measured
+
+Over the real derivation, not an urn model (`fanos-sim`):
+
+| plane `P` | nodes | load | bare `E[distinct]` | globally-ordered seating | **local uncoordinated settling** |
+|---|---|---|---|---|---|
+| 7 | 7 | 1.00 | 4.62 | 7/7 (2.29 probes/node) | **7/7 in 4 sweeps** |
+| 21 | 7 | 0.33 | 6.08 | 7/7 (1.00) | — |
+| 21 | 15 | 0.71 | 10.90 | 15/15 (1.73) | **15/15 in 4 sweeps** |
+| 993 | 200 | 0.20 | 181.23 | 200/200 (1.15) | **200/200 in 3 sweeps** |
+
+The last column is the one that matters for deployability. The first measurement seated nodes in a globally-sorted rank
+order, which **no node can compute** — it needs the whole membership. The local column instead has every node run
+`settle_index` against only the occupancy it can see, in arbitrary arrival order, repeatedly, as a live node would: it
+converges to the *same* full occupancy in a handful of sweeps, and provably terminates rather than oscillating.
+
+Capacity therefore goes from `O(√P)` to the full `P`, at 1–2.3 probes per node.
+
+### Not yet wired
+
+`verify_coordinate` (the `HELLO` path) and `Directory` collision handling still carry only `k = 0`, so a deployed node
+cannot yet *present* a probed point — the primitive and its acceptance predicate exist and are verified, the live path
+does not consume them. `Directory` would additionally need each entry's rank to drive `settle_index`, since it currently
+stores only coordinate → address.

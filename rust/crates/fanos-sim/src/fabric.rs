@@ -707,8 +707,9 @@ mod tests {
         // Simulated over the real derivation (`probe_point` + `outranks`) rather than an abstract urn model, applying the
         // exact rule a node applies locally: lowest rank keeps a contested point, everyone else advances along its own
         // sequence. Phantom collisions are included, since the non-recursive witness rule permits them.
-        use fanos_vrf::{VrfSecret, outranks, probe_point};
+        use fanos_field::{F2, F4, F31};
         use fanos_primitives::{BeaconSeed, Epoch};
+        use fanos_vrf::{VrfSecret, probe_point};
 
         for &(points, n) in &[(7usize, 7u32), (21, 7), (21, 15), (993, 200)] {
             let epoch = Epoch::new(4);
@@ -727,15 +728,15 @@ mod tests {
             // Seat everyone by ascending rank: a node takes the first point in its own sequence not already held by a
             // lower-ranked node. That is exactly the fixed point the local pairwise rule converges to.
             let mut order: Vec<usize> = (0..outputs.len()).collect();
-            order.sort_by(|&a, &b| if outranks(&outputs[a], &outputs[b]) { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater });
+            order.sort_by_key(|&i| outputs.get(i).copied().unwrap_or([0xff; 64]));
             let mut held: HashSet<fanos_geometry::Triple> = HashSet::new();
             let mut probes = 0u32;
-            for &i in &order {
+            for out in order.iter().filter_map(|&i| outputs.get(i)) {
                 for k in 0..u16::try_from(points).unwrap_or(u16::MAX) {
                     let candidate = match points {
-                        7 => probe_point::<fanos_field::F2>(&outputs[i], k).coords(),
-                        21 => probe_point::<fanos_field::F4>(&outputs[i], k).coords(),
-                        _ => probe_point::<fanos_field::F31>(&outputs[i], k).coords(),
+                        7 => probe_point::<F2>(out, k).coords(),
+                        21 => probe_point::<F4>(out, k).coords(),
+                        _ => probe_point::<F31>(out, k).coords(),
                     };
                     probes += 1;
                     if held.insert(candidate) { break }
@@ -751,6 +752,101 @@ mod tests {
                 f64::from(n) <= bare + 0.01 || (held.len() as f64) > bare,
                 "and it beats the bare draw wherever the bare draw loses points"
             );
+        }
+    }
+
+    #[test]
+    fn uncoordinated_local_settling_converges_to_full_occupancy() {
+        // The property that decides whether the rule is *usable* rather than merely sound. The previous measurement
+        // seated nodes in a globally-sorted rank order, which no node can compute — it needs the whole membership. Here
+        // every node instead runs `settle_index` against only the occupancy it can *see*, in an arbitrary arrival order,
+        // repeatedly, exactly as a live node would when peers appear. Two questions: does it terminate, and does it
+        // reach the same full occupancy as the global order?
+        use fanos_field::{F2, F4, F31};
+        use fanos_primitives::{BeaconSeed, Epoch};
+        use fanos_vrf::{VrfSecret, probe_point, settle_index};
+
+        for &(points, n) in &[(7usize, 7u32), (21, 15), (993, 200)] {
+            let epoch = Epoch::new(11);
+            let beacon = BeaconSeed::GENESIS;
+            let outputs: Vec<_> = (0..n)
+                .map(|i| {
+                    let sk = VrfSecret::from_seed([u8::try_from(i % 251).unwrap_or(0); 32]);
+                    let mut alpha = i.to_be_bytes().to_vec();
+                    alpha.extend_from_slice(&epoch.low32_be_bytes());
+                    alpha.extend_from_slice(beacon.as_bytes());
+                    sk.prove(&alpha).1
+                })
+                .collect();
+
+            // `seats[i]` is node i's current index; occupancy is derived from it, so a node displaced by a newcomer is
+            // observed as gone from its old point on the next sweep — the live behaviour, not a one-shot assignment.
+            let mut seats: Vec<Option<u16>> = vec![None; outputs.len()];
+            let mut sweeps = 0u32;
+            loop {
+                sweeps += 1;
+                let mut moved = false;
+                for i in 0..outputs.len() {
+                    let occupancy = |probe: &dyn Fn(usize, u16) -> fanos_geometry::Triple,
+                                     target: fanos_geometry::Triple| {
+                        seats.iter().enumerate().find_map(|(j, s)| {
+                            let k = (*s)?;
+                            (j != i && probe(j, k) == target).then(|| outputs.get(j).copied()).flatten()
+                        })
+                    };
+                    let Some(mine) = outputs.get(i) else { continue };
+                    let settled = match points {
+                        7 => {
+                            let probe = |j: usize, k: u16| {
+                                outputs.get(j).map_or_else(fanos_geometry::Triple::default, |o| probe_point::<F2>(o, k).coords())
+                            };
+                            settle_index::<F2>(mine, |p| occupancy(&probe, p.coords()))
+                        }
+                        21 => {
+                            let probe = |j: usize, k: u16| {
+                                outputs.get(j).map_or_else(fanos_geometry::Triple::default, |o| probe_point::<F4>(o, k).coords())
+                            };
+                            settle_index::<F4>(mine, |p| occupancy(&probe, p.coords()))
+                        }
+                        _ => {
+                            let probe = |j: usize, k: u16| {
+                                outputs.get(j).map_or_else(fanos_geometry::Triple::default, |o| probe_point::<F31>(o, k).coords())
+                            };
+                            settle_index::<F31>(mine, |p| occupancy(&probe, p.coords()))
+                        }
+                    };
+                    if seats.get(i).copied().flatten() != settled {
+                        moved = true;
+                        if let Some(slot) = seats.get_mut(i) {
+                            *slot = settled;
+                        }
+                    }
+                }
+                assert!(sweeps < 200, "settling must converge, not oscillate (P={points}, n={n})");
+                if !moved {
+                    break;
+                }
+            }
+
+            let held: HashSet<fanos_geometry::Triple> = seats
+                .iter()
+                .enumerate()
+                .filter_map(|(j, s)| {
+                    let k = (*s)?;
+                    let out = outputs.get(j)?;
+                    Some(match points {
+                        7 => probe_point::<F2>(out, k).coords(),
+                        21 => probe_point::<F4>(out, k).coords(),
+                        _ => probe_point::<F31>(out, k).coords(),
+                    })
+                })
+                .collect();
+            println!(
+                "P={points:>4} n={n:>3}  local settling → {:>3}/{n} distinct in {sweeps} sweeps  (bare E={:.2})",
+                held.len(),
+                expected_distinct(points, n)
+            );
+            assert_eq!(held.len(), n as usize, "local settling seats everyone (P={points}, n={n})");
         }
     }
 
