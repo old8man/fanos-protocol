@@ -34,6 +34,7 @@ mod hierarchy;
 mod metrics;
 /// Cluster-scale stress experiments (`stress::Experiment`), namespaced to avoid clashing with the
 /// param-sweep [`Experiment`](experiment::Experiment) harness.
+pub mod fabric;
 pub mod stress;
 mod unified;
 mod network;

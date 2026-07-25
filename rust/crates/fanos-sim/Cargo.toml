@@ -16,6 +16,13 @@ fanos-geometry.workspace = true
 fanos-diakrisis.workspace = true
 fanos-wire.workspace = true
 fanos-runtime = { workspace = true, features = ["std"] }
+# The in-memory datagram fabric implements quinn's AsyncUdpSocket, so real nodes run over a modelled carrier
+# (`fabric.rs`) — the transport-injection seam of docs/design-testing.md §5.1.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+# Real nodes over the modelled fabric: `fabric.rs` tests spawn genuine self-certifying nodes through the
+# `fanos_quic::Fabric::Abstract` seam, so the whole production path above the socket is exercised.
+fanos-quic.workspace = true
 # Decode the coherence frames nodes publish (`Notification::Observed`) into per-node snapshots for the
 # fleet-scale state inspection surface (`fleet` module — the dashboard/CLI data contract).
 fanos-telemetry = { workspace = true, features = ["std"] }

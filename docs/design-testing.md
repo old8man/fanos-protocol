@@ -259,10 +259,41 @@ every rung above was structurally unable to see, because none of them ran the co
    epoch's assignment took `N × 5s` — unfinishable on a production-sized plane.
 
 Each is a composition fault, invisible to a rung that instantiates the engine directly. The fix is not another
-scenario at an existing rung: it is to make the simulator drive the **real node composition**, with only the clock,
-transport, and RNG virtualised — which is what "differs from production only in transport" has to mean if it is to
-carry weight. That requires the drivers' `Client` and time seams to be injectable rather than concrete, and it is
-the simulator's most valuable open piece of work.
+scenario at an existing rung: it is to make the simulator drive the **real node composition**, with only the
+transport virtualised — which is what "differs from production only in transport" has to mean if it is to carry
+weight.
+
+### 5.2 T2f — real nodes over a modelled carrier
+
+That rung now exists. [`fanos_quic::Fabric`](../rust/crates/fanos-quic/src/driver.rs) chooses where a node's QUIC
+endpoint gets its datagrams — a bound UDP socket, or a caller-supplied `AsyncUdpSocket` — and
+[`fanos_sim::fabric`](../rust/crates/fanos-sim/src/fabric.rs) is a modelled carrier implementing the latter. A node
+spawned over it *is* the production node: real QUIC state machine, real TLS, real driver actors, real composition.
+Only reachability, one-way latency with jitter, independent loss, and partition are modelled.
+
+Two properties differ from the tiers around it and are worth stating:
+
+- **It is wall-clock, deliberately.** Delays are real `tokio` sleeps, so a scenario is *not* bit-reproducible the way
+  T2 is. T2 buys determinism by abstracting the socket, which is exactly why it cannot see composition faults; this
+  rung buys composition fidelity by giving that up. They are complements, not substitutes.
+- **Partition is directional.** A one-way cut is both a real failure mode (asymmetric routing, a middlebox filtering
+  one direction) and a strictly sharper test: a protocol that assumes reachability is symmetric passes a symmetric
+  partition and fails this one.
+
+It costs almost nothing — the fabric's tests spawn real self-certifying nodes, exchange traffic, cut one direction and
+heal it, in ~0.2 s with no OS sockets — so a large fleet of *composed* nodes is affordable where a real-UDP tier is
+not.
+
+> **Two lessons from building it, recorded because both were mine and both looked like framework faults.**
+>
+> `poll_recv` **must register the caller's waker** when it has nothing to return. A bare `Poll::Pending` compiles,
+> type-checks, and then silently never receives another datagram — nothing will ever wake the task. The first
+> pass-through fabric did exactly that and the node hung.
+>
+> And **do not assert carrier properties through overlay operations.** Two attempts asserted a put/get round-trip; a
+> key routes to its *responsible point*, which with two of seven points occupied exists only depending on where random
+> credentials landed — so the test was intermittently asserting a property of the overlay's addressing while claiming
+> to test the transport. `Command::Send` names its destination, which is the property actually under test.
 
 ---
 
