@@ -1615,6 +1615,76 @@ mod tests {
     /// A signing account: `(secret, verifier, id)`.
     type Account = (HybridSigSecret, HybridVerifier, [u8; 32]);
 
+    /// **The drift guard**: what `apply` actually writes must be inside what `access_of` declared.
+    ///
+    /// `access_of` and `apply` are two hand-maintained matches over the same eight tags — one computing what a
+    /// transaction *touches*, the other what it *does* — and the parallel scheduler's correctness rests entirely on
+    /// them agreeing. Add a write to `apply` and forget it in `access_of`, and two genuinely conflicting transactions
+    /// share a wave and fork the state.
+    ///
+    /// That is not hypothetical. The shielded arm of `access_of` carries a comment recording exactly this defect: a
+    /// missing `TREASURY` write (audit §3.7), found by review rather than by a test. This is the test.
+    ///
+    /// The direction is deliberately one-way. A declared write that never happens is *conservative* — it costs
+    /// parallelism, never correctness — so over-declaring is not a failure. Only under-declaring is, and only
+    /// under-declaring can fork the state.
+    ///
+    /// The guard was checked to have teeth rather than assumed to: deleting `TREASURY` from the name arm of `access_of`
+    /// — reintroducing the §3.7 defect exactly — fails this on seed 0. A guard that cannot fail proves nothing.
+    #[test]
+    fn every_key_apply_touches_was_declared_by_access_of() {
+        for seed in 0..64u64 {
+            let (accounts, txs) = random_conflicting_block(seed);
+            let ids: Vec<[u8; 32]> = accounts.iter().map(|(_, _, id)| *id).collect();
+            // TREASURY and the shielded markers are ledger-wide keys a transaction may touch without being an account.
+            let watched: Vec<[u8; 32]> =
+                ids.iter().copied().chain([TREASURY, POOL_SINK, SHIELDED_MARKER]).collect();
+
+            let mut ledger = ledger_with(&accounts);
+            // The generator only produces transparent transfers, and the defect this guards against lived in the
+            // arms that touch TREASURY. A guard that never exercises the risky arm is theatre, so a name registration
+            // — which debits its payer AND credits TREASURY — is appended to every block.
+            let (payer_sk, payer_vk, payer) = &accounts[0];
+            let payer_nonce = txs
+                .iter()
+                .filter_map(|t| match t.payload.split_first() {
+                    Some((&TAG_TRANSPARENT, body)) => SignedTransfer::from_bytes(body),
+                    _ => None,
+                })
+                .filter(|st| st.transfer.from == *payer)
+                .count() as u64;
+            let name = format!("acct{seed}.fanos").into_bytes();
+            let name_tx = NameTx {
+                op: NameOp::Register { name: name.clone(), target: b"addr".to_vec(), duration: 10 },
+                payment: SignedTransfer::sign(
+                    Transfer { from: *payer, to: TREASURY, amount: price(&name, 10), nonce: payer_nonce },
+                    payer_sk,
+                    payer_vk.clone(),
+                ),
+            };
+            let mut txs = txs;
+            txs.push(Transaction::new(HybridLedger::name_payload(&name_tx)));
+            let declared = ledger.access_lists(&txs);
+
+            for (tx, access) in txs.iter().zip(declared.iter()) {
+                let before: Vec<u64> = watched.iter().map(|k| ledger.tokens().balance(k)).collect();
+                ledger.apply(tx);
+                let after: Vec<u64> = watched.iter().map(|k| ledger.tokens().balance(k)).collect();
+
+                for ((key, b), a) in watched.iter().zip(before.iter()).zip(after.iter()) {
+                    if b != a {
+                        assert!(
+                            access.writes.contains(key),
+                            "seed {seed}: apply changed a balance access_of did not declare — this is the shape of \
+                             the audit §3.7 fork: the scheduler would place this transaction in a wave with another \
+                             that also writes it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A deterministic splitmix64 PRNG (reproducible, no wall-clock entropy) for building random blocks.
     fn splitmix(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
