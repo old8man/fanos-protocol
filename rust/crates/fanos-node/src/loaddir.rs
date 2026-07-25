@@ -19,11 +19,11 @@ use fanos_field::Field;
 use fanos_quic::Client;
 use fanos_rendezvous::Epoch;
 use fanos_runtime::Notification;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capdir::cell_cap_coords;
-use crate::resolve::RESOLVE_TIMEOUT;
+use crate::resolve::{RESOLVE_TIMEOUT, resolve_directory};
 
 /// The overlay store slot a node's per-epoch load report lives at — domain-separated, keyed by coordinate and
 /// epoch (each epoch's report at its own address).
@@ -80,12 +80,11 @@ pub async fn resolve_load(client: &Client, coord: Coord, epoch: Epoch) -> Option
 /// zero load. Every node computes the identical setpoint from the identical roster reads — the agreed input the
 /// deterministic assignment needs.
 pub async fn build_cell_setpoint<F: Field>(client: &Client, epoch: Epoch, capacity: Demand) -> Demand {
-    let mut loads = Vec::new();
-    for coord in cell_cap_coords::<F>() {
-        if let Some(load) = resolve_load(client, coord, epoch).await {
-            loads.push(load);
-        }
-    }
+    let resolved = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+        resolve_load(&client, coord, epoch).await
+    })
+    .await;
+    let loads: Vec<Demand> = resolved.into_iter().map(|(_, load)| load).collect();
     cell_setpoint(&loads, capacity)
 }
 
@@ -98,11 +97,16 @@ pub fn spawn_load_publisher(
     client: Client,
     coord: Coord,
     load_source: impl Fn() -> Demand + Send + 'static,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
         publish_load(&client, coord, epoch, load_source()).await;
+        // Signal the genesis load report, for the same reason as the capability publisher: the setpoint is derived
+        // from these reports, and a setpoint of zero correctly assigns nobody — so assigning before the node's own
+        // report lands produces an empty assignment that looks like a controller fault.
+        let _ = ready_tx.send(());
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch: e, .. }) => {
@@ -115,7 +119,8 @@ pub fn spawn_load_publisher(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
+    });
+    (handle, ready_rx)
 }
 
 #[cfg(test)]

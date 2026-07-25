@@ -165,6 +165,39 @@ impl ServiceResolver for NodeResolver {
     }
 }
 
+/// Resolve every coordinate of a cell-wide directory **concurrently**, preserving `coords` order.
+///
+/// The sequential form this replaces cost `N × RESOLVE_TIMEOUT` whenever slots were unoccupied — a *miss* is the
+/// expensive case, since it waits out the timeout, and a sparse cell is mostly misses. That made a cell-wide scan
+/// take tens of seconds on the 7-point test plane and, on a real plane (`N = q²+q+1`), longer than the epoch it was
+/// scanning for: the self-organizing role loop could not have completed a single epoch in production.
+///
+/// Concurrent, the whole scan is bounded by *one* [`RESOLVE_TIMEOUT`] rather than `N` of them.
+///
+/// **Order is preserved deliberately.** These directories feed deterministic cell-wide agreement (the role
+/// assignment consumes the roster), so the result must not depend on which lookup finished first. Results are
+/// re-sorted into `coords` order before returning.
+pub(crate) async fn resolve_directory<T, Fut, R>(client: &Client, coords: Vec<Coord>, resolve: R) -> Vec<(Coord, T)>
+where
+    R: Fn(Client, Coord) -> Fut + Clone + Send + 'static,
+    Fut: core::future::Future<Output = Option<T>> + Send,
+    T: Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for (index, coord) in coords.into_iter().enumerate() {
+        let (client, resolve) = (client.clone(), resolve.clone());
+        set.spawn(async move { (index, coord, resolve(client, coord).await) });
+    }
+    let mut found = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, coord, Some(value))) = joined {
+            found.push((index, coord, value));
+        }
+    }
+    found.sort_by_key(|(index, _, _)| *index);
+    found.into_iter().map(|(_, coord, value)| (coord, value)).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

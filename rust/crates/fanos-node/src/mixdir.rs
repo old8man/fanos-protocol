@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::EpochDriver;
-use crate::resolve::RESOLVE_TIMEOUT;
+use crate::resolve::{RESOLVE_TIMEOUT, resolve_directory};
 
 /// The overlay store slot a node's per-epoch onion key is published at — domain-separated from every
 /// other use of the store, keyed by the node's coordinate **and the epoch**. Tagging the slot with the
@@ -111,11 +111,13 @@ pub fn cell_mix_coords<F: Field>() -> Vec<Coord> {
 /// directory, no hand-built map — the cell advertises itself through the overlay store, one relay per
 /// epoch-tagged slot, and a client reads the current epoch's advertisement.
 pub async fn build_cell_mix_directory<F: Field>(client: &Client, epoch: Epoch) -> MixDirectory {
+    let resolved = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
+        resolve_mix_key(&client, coord, epoch).await
+    })
+    .await;
     let mut dir = MixDirectory::new();
-    for coord in cell_mix_coords::<F>() {
-        if let Some(public) = resolve_mix_key(client, coord, epoch).await {
-            dir.insert(coord, public);
-        }
+    for (coord, public) in resolved {
+        dir.insert(coord, public);
     }
     dir
 }

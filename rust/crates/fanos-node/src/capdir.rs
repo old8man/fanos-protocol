@@ -23,10 +23,10 @@ use fanos_quic::Client;
 use fanos_rendezvous::Epoch;
 use fanos_runtime::Notification;
 use fanos_vrf::{VrfPublic, VrfSecret};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::resolve::RESOLVE_TIMEOUT;
+use crate::resolve::{RESOLVE_TIMEOUT, resolve_directory};
 
 /// The overlay store slot a node's per-epoch capability advertisement lives at — domain-separated, keyed by
 /// the node's coordinate **and** the epoch (so each epoch's advertisement has its own address and a stale one
@@ -96,13 +96,11 @@ pub fn cell_cap_coords<F: Field>() -> Vec<Coord> {
 /// present, authenticated set. Deterministic across nodes given the same live set (the design's agreed-input
 /// requirement).
 pub async fn build_capability_directory<F: Field>(client: &Client, epoch: Epoch) -> Vec<(NodeId, Capability)> {
-    let mut members = Vec::new();
-    for coord in cell_cap_coords::<F>() {
-        if let Some(member) = resolve_capability(client, coord, epoch).await {
-            members.push(member);
-        }
-    }
-    members
+    let resolved = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+        resolve_capability(&client, coord, epoch).await
+    })
+    .await;
+    resolved.into_iter().map(|(_, member)| member).collect()
 }
 
 /// Keep a node's capability advertisement **live**: spawn the task that (re)publishes its signed descriptor at
@@ -118,11 +116,16 @@ pub fn spawn_capability_publisher(
     node_id: NodeId,
     vrf_secret: VrfSecret,
     capability: Capability,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
         publish_capability(&client, coord, epoch, &vrf_secret, node_id, capability).await;
+        // The genesis advertisement is now readable, which the role loop must know before it assigns: a node cannot
+        // be assigned from a roster that does not yet contain it. Signalling is deterministic where polling the
+        // directory is not — each poll costs a full cell scan, so a retry loop cannot converge promptly.
+        let _ = ready_tx.send(());
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch: e, .. }) => {
@@ -135,7 +138,8 @@ pub fn spawn_capability_publisher(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
+    });
+    (handle, ready_rx)
 }
 
 #[cfg(test)]

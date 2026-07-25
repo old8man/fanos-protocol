@@ -14,6 +14,8 @@
 //! coordination — the deterministic self-organization proven in `fanos-core/tests/self_organization.rs`, now
 //! over the live directory.
 
+use core::time::Duration;
+
 use fanos_core::roles::{Capability, Demand, Reputation, RoleController, RoleSet};
 use fanos_diaulos::Coord;
 use fanos_field::Field;
@@ -21,7 +23,7 @@ use fanos_primitives::{BeaconSeed, Epoch, NodeId};
 use fanos_quic::Client;
 use fanos_runtime::Notification;
 use fanos_vrf::VrfSecret;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::capdir::{build_capability_directory, spawn_capability_publisher};
@@ -89,14 +91,14 @@ pub fn spawn_role_loop<F: Field>(
     node_id: NodeId,
     controller: RoleController,
     capacity: Demand,
+    ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
 ) -> (JoinHandle<()>, watch::Receiver<RoleSet>) {
     let (roles_tx, roles_rx) = watch::channel(RoleSet::EMPTY);
     let handle = tokio::spawn(async move {
         let mut live = LiveRoleController::new(node_id, controller);
         let mut events = client.subscribe();
         let mut cur = Epoch::ZERO;
-        // Genesis-epoch assignment (before the first beacon) over whoever has published at genesis.
-        assign_epoch::<F>(&client, &mut live, Epoch::ZERO, &BeaconSeed::GENESIS, capacity, &roles_tx).await;
+        genesis_assign::<F>(&client, &mut live, capacity, ready, &roles_tx).await;
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch, seed }) if epoch > cur => {
@@ -109,6 +111,43 @@ pub fn spawn_role_loop<F: Field>(
         }
     });
     (handle, roles_rx)
+}
+
+/// How long the genesis assignment waits for this node's own publishes to land before giving up and leaving the
+/// first assignment to the beacon. Bounded so a node whose store is unreachable does not hang its role loop.
+const GENESIS_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The **genesis assignment**, before any beacon round.
+///
+/// It cannot simply run once. The capability publisher writes this node's own advertisement from a *sibling task*, so
+/// a single attempt races it and can assign over a roster that does not yet contain the node itself — and on a cell
+/// whose beacon clock has not started, nothing would ever revisit that. (The same race applies to every peer's
+/// publish, which is why a node booting first always sees a thin directory.)
+///
+/// So it waits for **both** of this node's own publishes to signal — its capability advertisement *and* its load
+/// report. Both are needed and for different reasons: the capability decides who is *eligible*, while the load decides
+/// the *setpoint*, and a setpoint of zero correctly assigns nobody. Waiting on only one produced an empty assignment
+/// that read like a controller fault and was actually a missing input.
+///
+/// The publishers *signal* rather than the loop polling the directory. Polling looks equivalent and is not: each poll
+/// costs a full cell-wide scan bounded by [`RESOLVE_TIMEOUT`](crate::resolve), so a retry loop cannot converge
+/// promptly, and a node's first epoch would silently serve nothing.
+async fn genesis_assign<F: Field>(
+    client: &Client,
+    live: &mut LiveRoleController,
+    capacity: Demand,
+    ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
+    roles_tx: &watch::Sender<RoleSet>,
+) {
+    let (capability_ready, load_ready) = ready;
+    let both = async {
+        let _ = capability_ready.await;
+        let _ = load_ready.await;
+    };
+    if tokio::time::timeout(GENESIS_READY_TIMEOUT, both).await.is_err() {
+        return; // the store is not answering; the beacon's first round will assign instead
+    }
+    assign_epoch::<F>(client, live, Epoch::ZERO, &BeaconSeed::GENESIS, capacity, roles_tx).await;
 }
 
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
@@ -169,10 +208,11 @@ pub fn spawn_self_organization<F: Field>(
     load_source: impl Fn() -> Demand + Send + 'static,
 ) -> SelfOrganization {
     let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller } = config;
-    let capability_publisher =
+    let (capability_publisher, capability_ready) =
         spawn_capability_publisher(client.clone(), coord, node_id, vrf_secret, capability);
-    let load_publisher = spawn_load_publisher(client.clone(), coord, load_source);
-    let (role_loop, assigned) = spawn_role_loop::<F>(client, node_id, controller, capacity);
+    let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), coord, load_source);
+    let (role_loop, assigned) =
+        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready));
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
 }
 

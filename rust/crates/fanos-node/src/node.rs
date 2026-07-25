@@ -29,7 +29,12 @@ use crate::{
     spawn_exit_publisher, spawn_mix_publisher,
 };
 
+use fanos_core::roles::{Capability, Demand, Role, RoleController, RoleSet as CoreRoleSet};
+use fanos_primitives::NodeId;
+use fanos_quic::NodeCredentials;
+
 use crate::config::{NodeConfig, RoleSet};
+use crate::role_loop::{SelfOrgConfig, SelfOrganization, spawn_self_organization};
 use crate::error::NodeError;
 use crate::identity;
 use crate::resolve::{ResolvedService, verify_descriptor};
@@ -349,6 +354,57 @@ fn exit_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<u16>)>, Node
     Ok(Some((params.seed, params.allowed_ports.clone())))
 }
 
+/// The capacity weight a node advertises for role assignment. Uniform for now: the controller's preference is then
+/// driven by reputation and the beacon lottery rather than by a self-declared number no peer can check. A real
+/// capacity class (bandwidth/uptime tier) belongs with the telemetry that would substantiate it.
+const ROLE_CAPACITY_WEIGHT: u16 = 4;
+
+/// The load one node is taken to absorb per role — the setpoint denominator (`⌈load / capacity⌉`). `1` makes the
+/// cell's setpoint equal the number of nodes offering the role, i.e. "everyone who offers it, serves it", which is
+/// the right default before telemetry can say otherwise.
+const ROLE_CAPACITY_PER_NODE: u16 = 1;
+
+/// The assignment controller's loop gain `κ = ROLE_GAIN_SEVENTH/7`. `7` is `κ = 1`: track the setpoint in one step,
+/// since with the placeholder load sensor above the setpoint is not noisy enough to need damping. A telemetry-driven
+/// sensor should lower it so the Lyapunov descent smooths real load jitter.
+const ROLE_GAIN_SEVENTH: u8 = 7;
+
+
+/// Spawn the **self-organizing role subsystem** (`crate::role_loop`): advertise what this node offers, report its
+/// observed load, and run the cell's deterministic assignment each epoch.
+///
+/// Until this call existed the subsystem was a proven library a running node never started — so a deployed node's
+/// roles were whatever its config file said and the cell had no say, the "libraries-ahead / wiring-behind" pattern
+/// `docs/audit.md` tracks. The split it establishes is the intended one: **config declares the offer, the cell
+/// decides the assignment.** A caller actuates [`Node::assigned_roles`], which changes as the cell rebalances.
+fn spawn_roles<F: Field + 'static>(
+    handle: &NodeHandle,
+    coord: Triple,
+    credentials: &NodeCredentials,
+    roles: RoleSet,
+) -> SelfOrganization {
+    let offered = roles.offered();
+    spawn_self_organization::<F>(
+        handle.client(),
+        coord,
+        SelfOrgConfig {
+            // The node's id for role assignment **is** its coordinate-VRF public key. That makes the capability
+            // advertisement self-certifying: the descriptor is signed by the key its id names, so a node cannot
+            // publish a capability under another's id without that node's secret — closing, for this directory, the
+            // identity-binding step `capdir` records as outstanding.
+            node_id: NodeId(credentials.vrf_secret().public().to_bytes()),
+            vrf_secret: credentials.vrf_secret(),
+            capability: Capability::new(offered, ROLE_CAPACITY_WEIGHT),
+            capacity: Demand::per_role(|_| ROLE_CAPACITY_PER_NODE),
+            controller: RoleController::new(Demand::default(), Demand::default(), ROLE_GAIN_SEVENTH),
+        },
+        // Until a telemetry-driven load sensor lands, a node reports the load it is itself serving: one unit per role
+        // it offers. That is honest — it is the load this node accounts for — and makes the cell setpoint the count
+        // of offering nodes, so the assignment tracks the real offer rather than a fabricated number.
+        move || Demand::per_role(|r| u16::from(offered.has(r))),
+    )
+}
+
 /// A running FANOS node.
 pub struct Node {
     handle: NodeHandle,
@@ -369,6 +425,9 @@ pub struct Node {
     /// The recovery auto-trigger (audit §4 R-C1) — present only with a beacon; fires proactive reshare /
     /// escalates re-genesis on a beacon freeze. Held for the node's lifetime.
     _recovery_trigger: Option<JoinHandle<()>>,
+    /// The **self-organizing role subsystem** — the capability/load publishers and the per-epoch assignment loop.
+    /// Held for the node's lifetime; [`assigned_roles`](Self::assigned_roles) reads the current assignment.
+    self_org: SelfOrganization,
     /// The node's live `(epoch, beacon seed)`, updated by `_beacon_tracker`; `None` until the first round is
     /// adopted (or always, for a node with no beacon clock). Read by an anonymous proxy via [`live_beacon`](Self::live_beacon).
     live_beacon: LiveBeacon,
@@ -521,6 +580,9 @@ impl Node {
         // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
         spawn_exit_role(&handle, address, exit)?;
 
+        // The self-organizing role subsystem (see [`spawn_roles`]).
+        let self_org = spawn_roles::<F>(&handle, address, &credentials, config.roles);
+
         announce_node(&handle, &config);
 
         Ok(Self {
@@ -533,8 +595,26 @@ impl Node {
             _epoch_driver: epoch_driver,
             _beacon_tracker: beacon_tracker,
             _recovery_trigger: recovery_trigger,
+            self_org,
             live_beacon,
         })
+    }
+
+    /// The roles the **cell has assigned** this node for the current epoch — the subset of what its config offers
+    /// that the network decided it should actually serve.
+    ///
+    /// Distinct from [`Health::roles`], which reports the *offer*. A node actuates its behaviours from this: the
+    /// assignment changes each epoch as the cell rebalances, so a role is started and stopped over the node's life
+    /// rather than fixed at boot. Empty until the first beacon round is adopted (nothing to assign from before then).
+    #[must_use]
+    pub fn assigned_roles(&self) -> CoreRoleSet {
+        *self.self_org.assigned.borrow()
+    }
+
+    /// Whether the cell has currently assigned this node `role`.
+    #[must_use]
+    pub fn serves(&self, role: Role) -> bool {
+        self.assigned_roles().has(role)
     }
 
     /// The node's live beacon — the `(epoch, seed)` it has most recently adopted from a threshold round
@@ -836,6 +916,47 @@ mod tests {
         .await
         .expect("an exit node with valid parameters starts");
         assert!(node.health().local_addr.port() > 0, "endpoint bound");
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_running_node_gets_its_roles_from_the_cell_not_its_config_file() {
+        // The wiring this closes: the self-organizing role subsystem was a proven library that Node::start never
+        // called, so a deployed node's roles were whatever its config said. Now config declares the OFFER and the
+        // cell assigns from it — a distinction that only exists if the subsystem actually runs in a live node.
+        use std::time::Duration;
+
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let (_shares, commitment) = deal(&[0xC1; 32], 2, 3, &mut DeterministicRng::new(b"role-wire")).unwrap();
+        let offered = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams { commitment, threshold: 2, share: None }),
+            roles: offered,
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("node starts");
+
+        // The offer is what config said; the assignment is the cell's, and it converges on the offer for a cell of
+        // one (nobody else can serve, so everything this node offers is wanted). Give the loop an epoch to run.
+        assert_eq!(node.health().roles, offered, "health reports the OFFER");
+        let mut assigned = node.assigned_roles();
+        for _ in 0..200 {
+            if assigned.any() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assigned = node.assigned_roles();
+        }
+        assert!(
+            assigned.has(Role::Relay) && assigned.has(Role::Rendezvous),
+            "the cell assigned the roles this node offered (assigned = {assigned:?})"
+        );
+        assert!(node.serves(Role::Rendezvous), "…including the NOSTOS rendezvous role");
+        // A role the node never offered is never assigned — the offer is a ceiling, not a hint.
+        assert!(!node.serves(Role::Exit), "an unoffered role is not assigned");
         node.shutdown();
     }
 

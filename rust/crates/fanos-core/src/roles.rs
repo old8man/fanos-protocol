@@ -110,6 +110,18 @@ const _: () = {
 pub struct RoleSet(u8);
 
 impl RoleSet {
+    /// The bit each role occupies — exposed so a peer-facing encoding (the JOIN role bitfield in `fanos-node`) can
+    /// *prove* it agrees with this bitset rather than restating the layout and hoping.
+    pub const BIT_RELAY: u8 = 1 << 0;
+    /// The storage-role bit; see [`BIT_RELAY`](Self::BIT_RELAY).
+    pub const BIT_STORAGE: u8 = 1 << 1;
+    /// The service-role bit; see [`BIT_RELAY`](Self::BIT_RELAY).
+    pub const BIT_SERVICE: u8 = 1 << 2;
+    /// The exit-role bit; see [`BIT_RELAY`](Self::BIT_RELAY).
+    pub const BIT_EXIT: u8 = 1 << 3;
+    /// The rendezvous-role bit; see [`BIT_RELAY`](Self::BIT_RELAY).
+    pub const BIT_RENDEZVOUS: u8 = 1 << 4;
+
     /// The empty set.
     pub const EMPTY: RoleSet = RoleSet(0);
 

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
 use fanos_geometry::Triple;
 use fanos_quic::{Environment, Morph};
 use fanos_vrf::vss::{VssCommitment, VssShare};
@@ -385,10 +386,16 @@ impl Peer {
     }
 }
 
-/// The roles a node advertises (a capability set; spec §7.4 / `docs/design.md` §12). In Phase 1 all
-/// roles are served by the overlay engine; the set is advertised via JOIN so the cell learns it.
-// Four independent role flags are the natural shape of a capability set (they map 1:1 to the JOIN
-// bitfield); a struct here reads better than an opaque bitmask at the call sites.
+/// The roles a node **offers** (a capability set; spec §7.4 / `docs/design.md` §12), advertised via JOIN so the cell
+/// learns it.
+///
+/// This is the *operator's declaration* — what the node is willing to do. It is deliberately distinct from
+/// [`fanos_core::roles::RoleSet`], which is what the cell's self-organizing controller **assigns** from that offer
+/// each epoch; config names roles in text, the controller reasons over a bitset. [`RoleSet::offered`] is the single
+/// canonical bridge between them, and the two encodings are proven identical by a const assertion beside it, so the
+/// duplication cannot drift into disagreement about what a bit means.
+// Independent role flags are the natural shape of a declaration (they map 1:1 to the JOIN bitfield); a struct here
+// reads better than an opaque bitmask at the call sites.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct RoleSet {
@@ -400,25 +407,46 @@ pub struct RoleSet {
     pub service: bool,
     /// Bridges to the clear net (an exit).
     pub exit: bool,
+    /// Serves as a member of an anonymous **rendezvous line** — NOSTOS receiver anonymity and hidden-service
+    /// hosting (`docs/design-anonymity-substrate.md` §3/§3b). Offering it lets the cell assign the node a point on
+    /// a line; the service's anonymity set is that line's membership, so coverage is provisioned cell-wide rather
+    /// than configured per host.
+    pub rendezvous: bool,
 }
 
 impl RoleSet {
     /// Whether any role is advertised.
     #[must_use]
     pub fn any(self) -> bool {
-        self.relay || self.storage || self.service || self.exit
+        self.relay || self.storage || self.service || self.exit || self.rendezvous
+    }
+
+    /// The offered set as the **core** [`fanos_core::roles::RoleSet`] the self-organizing controller assigns from —
+    /// the one canonical bridge between the operator's declaration and the cell's assignment machinery.
+    #[must_use]
+    pub fn offered(self) -> CoreRoleSet {
+        let mut set = CoreRoleSet::default();
+        for (offered, role) in [
+            (self.relay, Role::Relay),
+            (self.storage, Role::Storage),
+            (self.service, Role::Service),
+            (self.exit, Role::Exit),
+            (self.rendezvous, Role::Rendezvous),
+        ] {
+            if offered {
+                set.insert(role);
+            }
+        }
+        set
     }
 
     /// A compact one-byte encoding for the JOIN announcement.
     #[must_use]
     pub fn encode(self) -> u8 {
-        u8::from(self.relay)
-            | (u8::from(self.storage) << 1)
-            | (u8::from(self.service) << 2)
-            | (u8::from(self.exit) << 3)
+        self.offered().bits()
     }
 
-    /// Parse a comma-separated role list (`relay,storage,service,exit`).
+    /// Parse a comma-separated role list (`relay,storage,service,exit,rendezvous`).
     ///
     /// # Errors
     /// [`NodeError::Config`] on an unknown role name.
@@ -430,12 +458,24 @@ impl RoleSet {
                 "storage" => roles.storage = true,
                 "service" => roles.service = true,
                 "exit" => roles.exit = true,
+                "rendezvous" => roles.rendezvous = true,
                 other => return Err(NodeError::Config(format!("unknown role '{other}'"))),
             }
         }
         Ok(roles)
     }
 }
+
+// The JOIN bitfield and the core bitset must mean the same thing bit for bit, or a peer's advertisement would be
+// read as a different role set than the cell assigns from. `encode` is now defined *through* `offered`, so they
+// cannot diverge by construction; this pins the bit positions themselves so the wire format is stable too.
+const _: () = {
+    assert!(CoreRoleSet::BIT_RELAY == 1 << 0, "JOIN bit 0 is relay");
+    assert!(CoreRoleSet::BIT_STORAGE == 1 << 1, "JOIN bit 1 is storage");
+    assert!(CoreRoleSet::BIT_SERVICE == 1 << 2, "JOIN bit 2 is service");
+    assert!(CoreRoleSet::BIT_EXIT == 1 << 3, "JOIN bit 3 is exit");
+    assert!(CoreRoleSet::BIT_RENDEZVOUS == 1 << 4, "JOIN bit 4 is rendezvous");
+};
 
 /// A node's runtime configuration.
 #[derive(Clone, Debug)]
