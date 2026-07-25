@@ -36,6 +36,22 @@ pub struct UntraceableProof {
     nsk_coms: Vec<RingCommitment>, // the committed (hidden) secret nullifier key
 }
 
+impl UntraceableProof {
+    /// The commitment to the spent note `cm` (the membership leaf) — the per-input spend proof
+    /// ([`crate::ring_input`]) binds the note-validity and value-tie proofs against it.
+    #[must_use]
+    pub fn cm_commitment(&self) -> &[RingCommitment] {
+        self.membership.leaf_commitment()
+    }
+
+    /// The commitment to the hidden secret nullifier key `nsk` — bound against the note-validity proof's owner
+    /// derivation.
+    #[must_use]
+    pub fn nsk_commitment(&self) -> &[RingCommitment] {
+        &self.nsk_coms
+    }
+}
+
 /// Prove a spend's untraceability: `cm` is a member of the tree (`tree_hp`, hashing up through `siblings` with
 /// hidden `directions`), and the public `nf = nf_hp.hash(nsk, cm)` is derived from `nsk` and this same `cm`. The
 /// caller obtains `nf` as `nf_hp.hash(nsk, cm)`.
