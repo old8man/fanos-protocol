@@ -1302,6 +1302,7 @@ dependencies = [
  "fanos-onoma",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-quic",
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-telemetry",
@@ -1309,7 +1310,9 @@ dependencies = [
  "fanos-vrf",
  "fanos-wire",
  "proptest",
+ "quinn",
  "rand_core 0.6.4",
+ "tokio",
 ]
 
 [[package]]
