@@ -55,6 +55,7 @@ pub mod ring_nullifier;
 pub mod ring_product;
 pub mod ring_range_agg;
 pub mod ring_shortness;
+pub mod ring_tree;
 pub mod ring_tx;
 pub mod ring_untraceable;
 pub mod ring_value_tie;
