@@ -82,6 +82,50 @@ pub fn parent_coherence(child_activity: &[Vec<f64>]) -> Option<CoherenceMatrix> 
 /// Both are kept. The grey-endpoint rule reads *analogue* loss and needs no per-child reporting, so it still works where
 /// children are uncooperative or silent; the federated verdict reads *digital* self-reports and is exact where they exist.
 /// They fail in different directions, which is the reason to have both rather than a reason to pick.
+/// Gate each child's self-reported axis mask on the parent's **own** measurement of that child.
+///
+/// This is what makes a self-reported federation sound, and it is the composition the two localizers were always able to
+/// support. A child's report is forgeable — `fanos_code::golay::Provenance` records that a lying member can otherwise
+/// relocate blame onto a healthy sibling, measured at 24.9% of decodable frames. But the parent measures each child's
+/// **loss** from its own traffic, and that measurement is not the child's to forge.
+///
+/// So the two are composed by *authority over different questions*:
+///
+/// * the parent's measurement decides **whether** a child is faulty — coarse, sound, unforgeable by the child;
+/// * the child's report decides **which axes** — fine, forgeable, and therefore admissible only about a child the parent
+///   has already independently found faulty.
+///
+/// A child the parent measures as healthy contributes a **zero block**, so its fabricated faults never enter the word and
+/// cannot move the blame anywhere. A liar can at most under-report its own genuine faults, which is the direction that
+/// harms only itself.
+///
+/// `tol` is the same per-child jitter slack [`localize_failing_child`] uses, so the two localizers agree about what
+/// "measurably lossy" means rather than drifting apart on two thresholds.
+#[must_use]
+pub fn corroborated_reports(
+    child_degraded: &[u8; fano::N],
+    child_bus_faults: &[bool; fano::N],
+    child_losses: &[f64; fano::N],
+    tol: f64,
+) -> ([u8; fano::N], [bool; fano::N]) {
+    let baseline = child_losses.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut axes = [0u8; fano::N];
+    let mut buses = [false; fano::N];
+    for (i, (a, b)) in axes.iter_mut().zip(buses.iter_mut()).enumerate() {
+        let lossy = child_losses.get(i).is_some_and(|l| *l > baseline + tol);
+        if lossy {
+            *a = child_degraded.get(i).copied().unwrap_or(0) & 0x7F;
+            *b = child_bus_faults.get(i).copied().unwrap_or(false);
+        }
+    }
+    (axes, buses)
+}
+
+/// Run the Turyn covering over the children's axis masks (`docs/design-federation.md`).
+///
+/// `provenance` states where the masks came from and therefore how far the grammar may be trusted with them — see
+/// [`fanos_code::golay::Provenance`]. Pass [`golay::Provenance::Measured`] only for masks that are not the reporting
+/// child's to forge; [`corroborated_reports`] is how a self-reported mask earns that standing.
 #[must_use]
 pub fn federated_diagnosis(
     child_degraded: &[u8; fano::N],
@@ -130,10 +174,14 @@ pub fn diagnose_level(
     Some(LevelDiagnosis {
         measures,
         failing_child: localize_failing_child(&inter_child_loss(child_losses), tol),
-        // Self-reported, because these masks come from the children themselves. A child controlling its own eight
-        // coordinates can otherwise relocate blame onto a healthy sibling (`fanos_code::golay::Provenance`), so the
-        // grammar is trusted only as far as that provenance allows.
-        federated: federated_diagnosis(child_degraded, child_bus_faults, golay::Provenance::SelfReported),
+        // Corroborated before use: a child's axis mask is admitted only about a child the parent's OWN loss measurement
+        // already found faulty, so a fabricated report never enters the word and cannot move blame onto a sibling. With
+        // the forgeable half gated, what remains is parent-measured in the sense that matters, so the full `t = 3`
+        // applies rather than the reduced self-reported capability.
+        federated: {
+            let (axes, buses) = corroborated_reports(child_degraded, child_bus_faults, child_losses, tol);
+            federated_diagnosis(&axes, &buses, golay::Provenance::Measured)
+        },
         escalate: measures.phi < PHI_TH - 1e-9,
     })
 }
@@ -187,6 +235,59 @@ mod tests {
             panic!("one per child must localize")
         };
         assert_eq!(f.total(), 7, "all seven attributed without any gap to lean on");
+    }
+
+    #[test]
+    fn a_lying_child_cannot_inject_faults_the_parent_does_not_measure() {
+        // The framing attack, defeated by composition rather than by a cap. A child fabricates four faults in its own
+        // block — the exact shape that relocates blame onto a healthy sibling when the grammar trusts self-reports. The
+        // parent measures no loss at that child, so its whole block is refused and never enters the word.
+        let mut degraded = [0u8; fano::N];
+        degraded[6] = 0b0000_1111; // the lie
+        let quiet = [0.01f64; fano::N]; // the parent sees every child as equally, minimally lossy
+        let (axes, _) = corroborated_reports(&degraded, &[false; fano::N], &quiet, 0.1);
+        assert_eq!(axes, [0u8; fano::N], "an uncorroborated report contributes nothing at all");
+        assert_eq!(
+            federated_diagnosis(&axes, &[false; fano::N], golay::Provenance::Measured),
+            federation::Cell::Healthy,
+            "so it cannot move blame anywhere, let alone onto a sibling"
+        );
+    }
+
+    #[test]
+    fn a_corroborated_child_keeps_its_axis_detail() {
+        // The other direction, which matters just as much: gating must not throw away real diagnosis. The parent measures
+        // child 2 as lossy, so child 2's axis detail IS admitted — the parent's measurement decides *whether*, the
+        // child's report decides *which axes*.
+        let mut degraded = [0u8; fano::N];
+        degraded[2] = 0b0000_0101; // axes 0 and 2
+        let mut losses = [0.01f64; fano::N];
+        losses[2] = 0.8; // and the parent independently sees it
+        let (axes, _) = corroborated_reports(&degraded, &[false; fano::N], &losses, 0.1);
+        assert_eq!(axes[2], 0b0000_0101, "the corroborated child's detail survives");
+        let federation::Cell::Localized(f) = federated_diagnosis(&axes, &[false; fano::N], golay::Provenance::Measured)
+        else {
+            panic!("must localize")
+        };
+        assert_eq!(f.axes[2], 0b0000_0101);
+        assert_eq!(f.total(), 2);
+    }
+
+    #[test]
+    fn a_liar_can_only_under_report_its_own_faults_which_harms_only_itself() {
+        // The residual, stated so it is not mistaken for soundness. Gating stops a child inventing faults; it cannot make
+        // a child confess ones it hides. A child the parent measures as lossy but which reports a clean mask contributes
+        // nothing — the parent still knows it is lossy (that is `failing_child`), it simply learns no axis detail.
+        let degraded = [0u8; fano::N]; // child 4 hides everything
+        let mut losses = [0.01f64; fano::N];
+        losses[4] = 0.9;
+        let (axes, _) = corroborated_reports(&degraded, &[false; fano::N], &losses, 0.1);
+        assert_eq!(axes[4], 0, "a hidden fault stays hidden — under-reporting is not prevented");
+        assert_eq!(
+            localize_failing_child(&inter_child_loss(&losses), 0.1),
+            Some(4),
+            "but the parent's own measurement still names the child, so the liar gains nothing but vagueness"
+        );
     }
 
     #[test]

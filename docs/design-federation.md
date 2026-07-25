@@ -172,9 +172,30 @@ which is the counter-intuitive part. Framing needs the true deviation to reach w
 different weight-≤3 leader; capping at 2 stops one member carrying the word there alone.
 
 **Consequence for §11's health directory:** `publish_health` is a **self-report**, so `diagnose_children` passes
-`SelfReported` and gets the reduced capability. Recovering the full `t = 3` needs peer-measured input — which DIAKRISIS's
-analogue localizer already produces, since it measures a child's loss *from its peers*. Wiring that is the next step, and
-it is the difference between the grammar's advertised power and its currently reachable power.
+`SelfReported` and gets the reduced capability.
+
+### 6.1 Recovering the full capability — composition by authority, not by a cap
+
+Full `t = 3` needs input the reporting child cannot forge. There is no purely peer-measured *per-axis* source: a child
+cell's axis mask is inherently its own claim at this level, since only the child observes its own seven points. But the
+parent independently measures each child's **loss**, and that is not the child's to forge.
+
+So the two localizers compose by having **authority over different questions**:
+
+| | authority | property |
+|---|---|---|
+| parent's loss measurement | **whether** a child is faulty | coarse, sound, unforgeable by the child |
+| child's own report | **which axes** | fine, forgeable — admissible only about a child already found faulty |
+
+`corroborated_reports` gates each child's mask on the parent's measurement: a child the parent measures as healthy
+contributes a **zero block**, so a fabricated report never enters the word and cannot move blame anywhere. With the
+forgeable half gated, what remains is unforgeable in the sense that matters, and `Measured` applies — the full `t = 3`
+returns without a cap.
+
+**The residual, stated so it is not mistaken for soundness.** Gating stops a child *inventing* faults; it cannot make a
+child *confess* ones it hides. A lying child can still under-report itself — but the parent's own measurement already
+names it as failing, so the liar buys vagueness, not innocence, and the harm falls on itself. All three directions are
+tested.
 
 **Four faults are `Ambiguous`, not guessed.** `d = 8` gives `t = 3` and covering radius 4, so a weight-4 pattern is
 detected and *not* localizable. Reporting "detected but ambiguous" is the true state, and a controller that acts on a
