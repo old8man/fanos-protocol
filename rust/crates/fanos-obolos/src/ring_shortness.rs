@@ -35,6 +35,18 @@ pub struct ShortnessProof {
     reconstruction: LinearProof,     // p = Σ 2ʲ p_j
 }
 
+impl crate::ring_size::ProofSize for ShortnessProof {
+    /// `t` plane commitments + **`t` full binarity proofs** + one reconstruction over `t+1` messages.
+    ///
+    /// The middle term is the whole stack's dominant cost: a membership path needs one of these *per node limb*, so a
+    /// depth-`d` spend pays `(2d+1) · ELL_H · t` binarity proofs. Aggregating the `t` binarity checks into a single
+    /// relation — `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0` for a challenge `y` — is the first compaction to reach for; a wider
+    /// challenge (hence fewer repetitions) is the second.
+    fn ring_elements(&self) -> usize {
+        self.bit_planes.ring_elements() + self.binary.ring_elements() + self.reconstruction.ring_elements()
+    }
+}
+
 /// The `j`-th bit-plane of `p`: coefficient `i` is the `j`-th bit of `p`'s coefficient `i`.
 fn bit_plane(p: &Poly, j: usize) -> Poly {
     let mut coeffs = [0u64; D];
@@ -183,6 +195,47 @@ mod tests {
         let proof = prove_short(&params, &p, &r, T, b"seed").unwrap();
         let (_r2, other) = commit(&params, &p, b"other-randomness");
         assert!(!verify_short(&params, &other, T, &proof), "the commitment is bound in");
+    }
+
+    #[test]
+    fn the_measured_size_matches_the_construction_and_exposes_the_dominant_term() {
+        // The accounting is only worth trusting if it matches the construction exactly, so derive the expected count
+        // from the constants and check the real proof against it — then state what it implies for a whole spend.
+        use crate::ring_commit::{ELL, K};
+        use crate::ring_hash::{ELL_H, LOG_BASE};
+        use crate::ring_product::REPETITIONS;
+        use crate::ring_size::{BYTES_PER_ELEMENT, ProofSize};
+
+        let params = RingParams::standard();
+        let p = poly(&[1, 2, 3]);
+        let (r, _c) = commit(&params, &p, b"size-short");
+        let proof = prove_short(&params, &p, &r, T, b"seed").expect("short");
+
+        // A binarity round is 3 commitments + the revealed f + 2 openings; a linear round over n messages is
+        // (n+1) commitments + n revealed + (n+1) openings. Shortness = T planes + T binarity + 1 reconstruction.
+        let binary_one = REPETITIONS * (3 * (K + 1) + 1 + 2 * ELL);
+        let n = T + 1; // the reconstruction relates p to its T planes
+        let recon = REPETITIONS * ((n + 1) * (K + 1) + n + (n + 1) * ELL);
+        let expected = T * (K + 1) + T * binary_one + recon;
+        assert_eq!(proof.ring_elements(), expected, "the accounting matches the construction exactly");
+        assert_eq!(proof.encoded_bytes(), expected * BYTES_PER_ELEMENT);
+
+        // The dominant term, stated as a ratio rather than an adjective: the T binarity proofs are the bulk even at
+        // this small T, and a real node uses T = LOG_BASE with ELL_H limbs.
+        let binary_share = T * binary_one;
+        assert!(
+            binary_share * 2 > proof.ring_elements(),
+            "the per-plane binarity proofs are over half of a shortness proof ({binary_share} of {})",
+            proof.ring_elements()
+        );
+        // At the real width, one node's shortness is ELL_H limbs × LOG_BASE planes of binarity — the term any
+        // compaction must attack. Kept as an assertion so the ratio cannot silently regress.
+        let real_binary_per_node = ELL_H * (LOG_BASE as usize) * binary_one;
+        assert!(
+            real_binary_per_node * BYTES_PER_ELEMENT > 1 << 20,
+            "one node's binarity alone exceeds a megabyte ({} bytes)",
+            real_binary_per_node * BYTES_PER_ELEMENT
+        );
     }
 
     #[test]

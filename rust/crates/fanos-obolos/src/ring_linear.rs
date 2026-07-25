@@ -59,6 +59,21 @@ pub struct LinearProof {
     rounds: Vec<LinearRound>,
 }
 
+impl crate::ring_size::ProofSize for LinearRound {
+    fn ring_elements(&self) -> usize {
+        self.a_coms.ring_elements() + self.a_agg.ring_elements() + self.z.len() + self.rz.ring_elements()
+            + self.s_agg.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for LinearProof {
+    /// `REPETITIONS` rounds, each `(n+1)·(K+1)` commitment elements + `n` revealed messages + `(n+1)·ELL` openings —
+    /// so a linear proof is linear in *both* the statement width `n` and the repetition count.
+    fn ring_elements(&self) -> usize {
+        self.rounds.ring_elements()
+    }
+}
+
 /// The weighted sum `Σ cᵢ·zᵢ` in `R_q` — the aggregate the relation is checked on (revealed messages only).
 fn weighted_sum(coeffs: &[Poly], terms: &[Poly]) -> Poly {
     coeffs.iter().zip(terms).fold(Poly::zero(), |acc, (c, z)| acc.add(&c.mul(z)))

@@ -305,10 +305,54 @@ The proof stack is complete and verified; wiring it into the ledger is the "libr
    `TransparentProof` retained as the degraded-mode oracle.
 3. **Calibrate** `REPETITIONS`, `CHALLENGE_BITS`, and `(K, ℓ, D, q)` to a bit-security target; add constant-time
    arithmetic and the merged-butterfly NTT; commission external cryptanalysis. Until then the backend stays
-   **[P]/[H]** and is never claimed as production-audited. A whole-transaction proof is *minutes* at real `bits`
-   (the inherent lattice-ZK cost); range/shortness aggregation and recursive-SNARK compaction are the perf frontier.
+   **[P]/[H]** and is never claimed as production-audited.
+4. **Compact the proof** — a whole-transaction proof is *minutes* to produce and, more decisively, **gigabytes** to
+   transmit at a realistic tree depth. §6 measures this and derives the ladder; recursive compaction is the only route
+   to a shippable spend proof, and it gates any wire codec (encoding a multi-gigabyte object is not the problem worth
+   solving first).
 
-## 6. Verification status
+## 6. Cost — measured, not asserted
+
+Lattice-ZK cost is usually reported as proving *time*. For this stack **size** is the harder half, and it had been
+described only qualitatively. [`ring_size`](../rust/crates/fanos-obolos/src/ring_size.rs) makes it exact: every proof
+counts the `R_q` elements it consists of, and the counts are checked against the constructions in test, so they are
+auditable rather than estimated. At `D = 256`, `K = 1`, `ℓ = 4`, `ℓ_H = 4`, `LOG_BASE = 16`, `REPETITIONS = 16`, with
+one `u64` per coefficient (2 KiB per element):
+
+| Component | elements | size |
+|---|---|---|
+| one binarity proof | 240 | 0.47 MiB |
+| one hash step (linear proof, `n = 12`) | 1 440 | 2.81 MiB |
+| **shortness at `t = LOG_BASE`, per limb** | 5 872 | **11.5 MiB** |
+| **node shortness (`ℓ_H` limbs)** | 23 488 | **45.9 MiB** |
+| node shortness in a depth-1 path (3 nodes) | | 138 MiB |
+| node shortness in a depth-32 path (65 nodes) | | **2.9 GiB** |
+
+So the dominant term is unambiguous, and it is not the hash steps or the amount proofs — it is **node shortness**,
+`(2d+1) · ℓ_H · LOG_BASE` binarity proofs for a depth-`d` spend. Everything else is rounding error beside it.
+
+### 6.1 The compaction ladder, and its ceiling
+
+Each step below is derived, and the factor is arithmetic from the table — no guesswork:
+
+1. **Aggregate the bit-plane binarity checks.** Rather than `t` separate proofs, commit the `t` planes and prove the
+   single relation `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0` for a challenge `y`: a non-binary plane leaves a nonzero degree-`<t`
+   polynomial in `y`, which a random `y` kills with probability `≤ (t−1)/|challenge|`. Per round this drops the
+   per-plane `c_d, c_e, z_de` (8 of 15 elements), keeping the irreducible `c_a, f, z_ba` — **≈2×**, or **≈3×** when
+   aggregated across a whole node's `ℓ_H · t` planes at once.
+2. **Widen the challenge to shorten the repetitions.** `CHALLENGE_BITS = 9` forces 16 rounds for `2⁻¹²⁸`. The width is
+   bounded only by the masking having room above it (`MASK_WIDE` must dominate `x·witness`, and `2⁵⁷ < q` leaves
+   plenty), so a `2³²` challenge needs ~4 rounds — **≈4×**.
+3. **Encode short elements at their true width.** Most revealed elements are *openings* bounded by `ACCEPT_*`, not
+   general elements mod `q`; ternary randomness is 2 bits per coefficient, not 64 — **≈2×** on the remainder.
+
+Together ≈10–25×: a depth-32 spend falls from ~3 GiB to a few hundred MiB. That is the honest ceiling of
+constant-factor work, and it is **still impractical** — which is precisely why production lattice systems wrap
+membership in a recursive/succinct proof rather than paying for it directly. Recursive compaction is therefore not a
+nice-to-have on this stack's roadmap; it is the only route to a shippable spend proof, and the numbers above are why.
+The construction is sound and complete today, and it will stay `[P]` until that route is built.
+
+## 7. Verification status
 
 The whole backend is empirically verified — completeness, soundness (a false statement has no accepting proof),
 binding, and zero-knowledge re-randomisation on every primitive — under the workspace clippy gate. It composes

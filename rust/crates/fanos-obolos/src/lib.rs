@@ -56,6 +56,7 @@ pub mod ring_output;
 pub mod ring_product;
 pub mod ring_range_agg;
 pub mod ring_shortness;
+pub mod ring_size;
 pub mod ring_state;
 pub mod ring_tree;
 pub mod ring_tx;

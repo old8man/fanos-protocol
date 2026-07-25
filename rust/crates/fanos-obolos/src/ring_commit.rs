@@ -293,6 +293,27 @@ impl RingCommitment {
     }
 }
 
+impl crate::ring_size::ProofSize for RingCommitment {
+    /// `t0 ∈ R_q^K` plus `t1 ∈ R_q`.
+    fn ring_elements(&self) -> usize {
+        self.t0.len() + 1
+    }
+}
+
+impl crate::ring_size::ProofSize for RingRandomness {
+    /// `ELL` ring elements.
+    fn ring_elements(&self) -> usize {
+        self.r.len()
+    }
+}
+
+impl crate::ring_size::ProofSize for Poly {
+    /// One ring element.
+    fn ring_elements(&self) -> usize {
+        1
+    }
+}
+
 /// The homomorphic sum of a list of commitments, or the commitment to zero for an empty list.
 #[must_use]
 pub fn sum(commitments: &[RingCommitment]) -> RingCommitment {

@@ -48,6 +48,22 @@ pub struct BinaryProof {
     rounds: Vec<BinaryRound>,
 }
 
+impl crate::ring_size::ProofSize for BinaryRound {
+    fn ring_elements(&self) -> usize {
+        self.c_a.ring_elements() + self.c_d.ring_elements() + self.c_e.ring_elements() + 1
+            + self.z_ba.ring_elements()
+            + self.z_de.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for BinaryProof {
+    /// `REPETITIONS` rounds of a fixed `3·(K+1) + 1 + 2·ELL` elements — constant per round, but the *count* of these
+    /// proofs is what makes shortness expensive ([`crate::ring_shortness`] needs one per bit-plane).
+    fn ring_elements(&self) -> usize {
+        self.rounds.ring_elements()
+    }
+}
+
 /// Absorb a commitment into a Fiat–Shamir transcript.
 fn absorb(buf: &mut Vec<u8>, c: &RingCommitment) {
     for p in c.t0().iter().chain(core::iter::once(c.t1())) {
