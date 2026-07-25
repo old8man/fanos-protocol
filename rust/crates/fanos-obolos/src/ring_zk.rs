@@ -90,6 +90,14 @@ pub struct RingOpeningProof {
     z: Vec<Poly>, // ELL polynomials
 }
 
+impl crate::ring_size::ProofSize for RingOpeningProof {
+    /// The challenge plus the `ELL` masked responses — a *single* round, because the ternary challenge space `3^D`
+    /// already exceeds `2¹²⁸`. That is what makes this the cheapest way to state any relation it can express.
+    fn ring_elements(&self) -> usize {
+        1 + self.z.len()
+    }
+}
+
 /// The Fiat–Shamir challenge: hash the statement `u` and the commitment `w` to a short ternary polynomial.
 fn challenge(u: &[Poly], w: &[Poly]) -> Poly {
     let mut transcript = Vec::with_capacity((u.len() + w.len()) * D * 8);

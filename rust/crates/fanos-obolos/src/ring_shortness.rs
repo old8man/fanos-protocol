@@ -8,31 +8,60 @@
 //! Decompose `p` into its `t` **bit-planes** `p = Σ_{j<t} 2ʲ·p_j`, where `p_j` holds the `j`-th bit of every
 //! coefficient of `p` (so each `p_j` is `{0,1}`-valued). Commit the planes and prove:
 //!
-//! 1. **binarity** — each `p_j` is `{0,1}`-valued ([`crate::ring_binary`]); and
-//! 2. **reconstruction** — `p − Σ_{j<t} 2ʲ·p_j = 0` (a [`crate::ring_linear`] relation over `p` and the planes).
+//! 1. **binarity** — every `p_j` is `{0,1}`-valued, in **one** aggregated proof ([`crate::ring_binary`]); and
+//! 2. **reconstruction** — `p − Σ_{j<t} 2ʲ·p_j = 0`.
 //!
 //! Together: every coefficient of `p` equals `Σ_{j<t} 2ʲ·bit` with each `bit ∈ {0,1}`, i.e. lies in `[0, 2^t)`. A
 //! non-short `p` (some coefficient `≥ 2^t`) cannot be decomposed into `t` binary planes that recompose to it, so no
 //! accepting proof exists.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of [`crate::ring_binary`] and [`crate::ring_linear`];
-//! > it inherits their status. Size/time is `O(t)` binarity proofs plus one reconstruction — the untraceability
-//! > hash step needs one of these per node limb. Tests verify a short polynomial proves, a non-short one is
-//! > rejected, commitment binding, and re-randomisation.
+//! ## The reconstruction is an opening-to-zero, not a linear proof
+//!
+//! Stating (2) with [`crate::ring_linear`] costs `t+1` masked messages and openings *per round* — that proof exists to
+//! survive **huge** coefficients, where `Σ cᵢ·rᵢ` dwarfs `q` and cannot be revealed short. Here the coefficients are
+//! `2ʲ ≤ 2^{t−1}`, so the blow-up it insures against never happens:
+//!
+//! ```text
+//! C_p − Σ_j 2ʲ·C_{p_j}  =  com( p − Σ_j 2ʲ·p_j ;  r_p − Σ_j 2ʲ·r_j )
+//! ```
+//!
+//! is a commitment the verifier forms *itself* by homomorphism, and its randomness has `‖·‖∞ ≤ 1 + 2^t − 1 = 2^t` —
+//! short against `q = 2⁶⁴`. So the whole relation is: **that one difference opens to zero**, an
+//! [opening-to-zero proof](crate::ring_zk) in the `for_randomness_bound(2^t)` regime, exactly as
+//! [`crate::ring_balance`] treats the balance residual. That replaces ~2000 ring elements with ~6 (docs §6.1 rung 2),
+//! and it is why `t` is capped at [`MAX_WIDTH`] here: the regime's masking is `2^{19+t}`, which must stay well below `q`.
+//!
+//! One property changes with the substitution and is worth stating, since this proof is the *foundation* of membership
+//! soundness. [`crate::ring_zk`] has **relaxed** special-soundness: extraction yields `M·z̄ = c̄·u` for a challenge
+//! difference `c̄`, which pins the residual's message to zero exactly when `c̄` is invertible. On this fully-splitting
+//! ring a ternary `c̄` has essentially uniform NTT slots, so it is non-invertible only if some slot vanishes —
+//! probability `≈ D/q = 2⁻⁵⁶`. The general linear proof reached the same conclusion via monomial challenges, whose
+//! differences are *always* units; here it holds with overwhelming probability instead of certainty. That is the same
+//! relaxation [`crate::ring_balance`] already rests on, and it is part of what the pending calibration must confirm.
+//!
+//! > **STATUS — [P]/[H], correctness-first.** A composition of [`crate::ring_binary`] and [`crate::ring_zk`]; it
+//! > inherits their status. The untraceability hash step needs one of these per node limb, which makes it the stack's
+//! > dominant cost (`docs/design-obolos-zk.md` §6). Tests verify a short polynomial proves, a non-short one is
+//! > rejected, commitment binding, re-randomisation, and that the measured size matches the construction.
 
 use alloc::vec::Vec;
 
 use crate::ring::{D, Poly};
 use crate::ring_binary::{AggBinaryProof, prove_binary_agg, verify_binary_agg};
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
-use crate::ring_linear::{LinearProof, prove_linear, verify_linear};
+use crate::ring_zk::{OpeningParams, RingOpeningProof, prove_opening, verify_opening};
+
+/// The largest bit-width this proof supports. The reconstruction's opening regime masks at `2^{19+t}`
+/// ([`OpeningParams::for_randomness_bound`] of `2^t`), which must stay well below `q = 2⁶⁴`; at `t = 40` that is
+/// `2⁵⁹`, and `t = 44` would already reach `2⁶³`. Every caller uses `t = LOG_BASE = 16`.
+pub const MAX_WIDTH: usize = 40;
 
 /// A zero-knowledge proof that a committed polynomial has `‖·‖∞ < 2^t`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ShortnessProof {
-    bit_planes: Vec<RingCommitment>, // C_{p_j}, t commitments
-    binary: AggBinaryProof,          // ONE proof that every p_j is {0,1}-valued
-    reconstruction: LinearProof,     // p = Σ 2ʲ p_j
+    bit_planes: Vec<RingCommitment>,     // C_{p_j}, t commitments
+    binary: AggBinaryProof,              // ONE proof that every p_j is {0,1}-valued
+    reconstruction: RingOpeningProof,    // C_p − Σ 2ʲ·C_{p_j} opens to ZERO
 }
 
 impl crate::ring_size::ProofSize for ShortnessProof {
@@ -43,10 +72,8 @@ impl crate::ring_size::ProofSize for ShortnessProof {
     /// `Σ_j y^j·(p_j ∘ (p_j − 1)) = 0` halved it (docs §6.1, rung 1). What remains there is irreducible at this level:
     /// each revealed plane still needs its own binding and mask.
     ///
-    /// That moved the bottleneck to the **reconstruction**, which is now the larger part. It is a general
-    /// [`crate::ring_linear`] proof, and that generality is unnecessary here: `ring_linear` pays per-message openings
-    /// to survive *huge* coefficients, but these are `2ʲ ≤ 2¹⁵`, so `r_p − Σ 2ʲ·r_j` stays `≈2¹⁶` — short against `q`.
-    /// A single opening-to-zero on the homomorphic difference would replace it at ~1/333 the size (docs §6.1, rung 2).
+    /// The reconstruction is now a *single* opening-to-zero (docs §6.1 rung 2) rather than a general linear proof over
+    /// `t+1` messages — ~6 elements instead of ~2000 — so the aggregated binarity is once again the whole cost.
     fn ring_elements(&self) -> usize {
         self.bit_planes.ring_elements() + self.binary.ring_elements() + self.reconstruction.ring_elements()
     }
@@ -61,19 +88,23 @@ fn bit_plane(p: &Poly, j: usize) -> Poly {
     Poly::from_u64(&coeffs)
 }
 
-/// The reconstruction coefficients `[1, −2⁰, −2¹, …, −2^{t−1}]` over `[p, p_0, …, p_{t−1}]` (so the relation is
-/// `p − Σ 2ʲ p_j = 0`).
-fn recon_coeffs(t: usize) -> Vec<Poly> {
-    let mut coeffs = Vec::with_capacity(t + 1);
-    coeffs.push(Poly::constant(1));
-    for j in 0..t {
-        coeffs.push(Poly::zero().sub(&Poly::constant(1u64 << j)));
-    }
-    coeffs
+/// The homomorphic reconstruction residual `C_p − Σ_j 2ʲ·C_{p_j}` — a commitment to `p − Σ 2ʲ·p_j`, which the verifier
+/// forms itself from public values. Scaling by the *constant* `2ʲ` is coefficient-wise, so the residual's randomness is
+/// `r_p − Σ 2ʲ·r_j` with norm `≤ 2^t` (accounted for by the opening regime).
+fn residual(c_p: &RingCommitment, planes: &[RingCommitment]) -> RingCommitment {
+    planes
+        .iter()
+        .enumerate()
+        .fold(c_p.clone(), |acc, (j, cj)| acc.sub(&cj.scale(&Poly::constant(1u64 << j))))
 }
 
-/// Prove, in zero knowledge, that `com(p; r_p)` opens to a polynomial with `‖p‖∞ < 2^t`. `t ≤ 62`. `None` only on
-/// a sub-proof's rare masking exhaustion.
+/// The opening regime of the reconstruction residual: its randomness is a signed combination bounded by `2^t`.
+fn recon_regime(t: usize) -> OpeningParams {
+    OpeningParams::for_randomness_bound(1i64 << t)
+}
+
+/// Prove, in zero knowledge, that `com(p; r_p)` opens to a polynomial with `‖p‖∞ < 2^t`. `None` if `t` is zero or
+/// exceeds [`MAX_WIDTH`], or on a sub-proof's rare masking exhaustion.
 #[must_use]
 pub fn prove_short(
     params: &RingParams,
@@ -82,7 +113,9 @@ pub fn prove_short(
     t: usize,
     seed: &[u8],
 ) -> Option<ShortnessProof> {
-    debug_assert!(t <= 62, "2^t must fit in a coefficient");
+    if t == 0 || t > MAX_WIDTH {
+        return None;
+    }
     let c_p = RingCommitment::commit_message(params, p, r_p);
     // Bit-planes, each under fresh ternary randomness.
     let planes: Vec<Poly> = (0..t).map(|j| bit_plane(p, j)).collect();
@@ -102,19 +135,15 @@ pub fn prove_short(
     bseed.extend_from_slice(b"/bin");
     let binary = prove_binary_agg(params, &planes, &plane_r, &bseed)?;
 
-    // Reconstruction: p − Σ 2ʲ p_j = 0.
-    let mut messages = Vec::with_capacity(t + 1);
-    messages.push(p.clone());
-    messages.extend(planes);
-    let mut randomness = Vec::with_capacity(t + 1);
-    randomness.push(r_p.clone());
-    randomness.extend(plane_r);
-    let mut commitments = Vec::with_capacity(t + 1);
-    commitments.push(c_p);
-    commitments.extend(bit_planes.iter().cloned());
+    // Reconstruction: the homomorphic residual C_p − Σ 2ʲ·C_{p_j} opens to ZERO under r_p − Σ 2ʲ·r_j.
+    let diff_r = plane_r
+        .iter()
+        .enumerate()
+        .fold(r_p.clone(), |acc, (j, rj)| acc.sub(&rj.scale(&Poly::constant(1u64 << j))));
     let mut rseed = seed.to_vec();
     rseed.extend_from_slice(b"/recon");
-    let reconstruction = prove_linear(params, &commitments, &recon_coeffs(t), &messages, &randomness, &rseed)?;
+    let reconstruction =
+        prove_opening(params, &residual(&c_p, &bit_planes), 0, &diff_r, &recon_regime(t), &rseed)?;
 
     Some(ShortnessProof { bit_planes, binary, reconstruction })
 }
@@ -122,18 +151,15 @@ pub fn prove_short(
 /// Verify a [`prove_short`] proof that `c_p` opens to a polynomial with `‖·‖∞ < 2^t`.
 #[must_use]
 pub fn verify_short(params: &RingParams, c_p: &RingCommitment, t: usize, proof: &ShortnessProof) -> bool {
-    if proof.bit_planes.len() != t {
+    if t == 0 || t > MAX_WIDTH || proof.bit_planes.len() != t {
         return false;
     }
     // Every plane is {0,1}-valued, in one aggregated check.
     if !verify_binary_agg(params, &proof.bit_planes, &proof.binary) {
         return false;
     }
-    // And the planes recompose to the committed p.
-    let mut commitments = Vec::with_capacity(t + 1);
-    commitments.push(c_p.clone());
-    commitments.extend(proof.bit_planes.iter().cloned());
-    verify_linear(params, &commitments, &recon_coeffs(t), &proof.reconstruction)
+    // And the planes recompose to the committed p: the residual the verifier forms opens to zero.
+    verify_opening(params, &residual(c_p, &proof.bit_planes), 0, &proof.reconstruction, &recon_regime(t))
 }
 
 #[cfg(test)]
@@ -214,8 +240,7 @@ mod tests {
         // (n+1) commitments + n revealed + (n+1) openings. Shortness = T planes + T binarity + 1 reconstruction.
         let separate = REPETITIONS * (3 * (K + 1) + 1 + 2 * ELL); // what ONE plane used to cost
         let aggregated = REPETITIONS * (T * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL); // all T planes, one proof
-        let n = T + 1; // the reconstruction relates p to its T planes
-        let recon = REPETITIONS * ((n + 1) * (K + 1) + n + (n + 1) * ELL);
+        let recon = 1 + ELL; // rung 2: ONE opening-to-zero (challenge + ELL responses), single-round
         let expected = T * (K + 1) + aggregated + recon;
         assert_eq!(proof.ring_elements(), expected, "the accounting matches the construction exactly");
         assert_eq!(proof.encoded_bytes(), expected * BYTES_PER_ELEMENT);
@@ -231,8 +256,16 @@ mod tests {
             "at t = LOG_BASE the aggregation at least halves binarity ({real_agg} vs {})",
             real_t * separate
         );
-        // Binarity is still the bulk of a shortness proof, and a real node pays ELL_H limbs at t = LOG_BASE — so this
-        // remains the term the next rung of the ladder must attack. Asserted so the ratio cannot silently regress.
+        // Rung 2: the reconstruction, which after rung 1 had OVERTAKEN binarity as the larger part, is now negligible.
+        // A general linear proof over T+1 messages would have cost REPETITIONS·((T+2)(K+1) + (T+1) + (T+2)ELL).
+        let recon_as_linear = REPETITIONS * ((T + 2) * (K + 1) + (T + 1) + (T + 2) * ELL);
+        assert!(
+            recon * 100 < recon_as_linear,
+            "the opening-to-zero reconstruction is orders of magnitude smaller ({recon} vs {recon_as_linear})"
+        );
+        assert!(recon * 10 < aggregated, "and it is now negligible beside the binarity it used to exceed");
+        // Binarity is once again the whole of a shortness proof, and a real node pays ELL_H limbs at t = LOG_BASE — so
+        // that is what the remaining rungs must attack. Asserted so the ratio cannot silently regress.
         let real_per_node = ELL_H
             * (LOG_BASE as usize * (K + 1)
                 + REPETITIONS * (LOG_BASE as usize * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL));

@@ -362,30 +362,62 @@ Rung 1 also **moved the bottleneck**, which changes what comes next. A per-limb 
 
 So the reconstruction has *overtaken* binarity, and the next rung must attack it rather than the binarity rounds.
 
-**Rung 2 — state the reconstruction as an opening-to-zero, not a general linear proof.** `ring_linear` exists to
-survive **huge** coefficients: `Σ cᵢ·rᵢ` for uniform matrix entries dwarfs `q`, so it masks and reveals per-message
-openings, paying `(n+1)·ℓ` of them per round. The reconstruction's coefficients are `2ʲ ≤ 2¹⁵`, so **that blow-up
-never happens**: by homomorphism `C_p − Σ 2ʲ·C_{pⱼ}` is already a commitment to `p − Σ 2ʲ·pⱼ` under randomness
-`r_p − Σ 2ʲ·r_j`, whose norm is `≤ 1 + 2^t ≈ 2¹⁶` — short against `q = 2⁶⁴`. Proving that *one* difference opens to
-zero ([`ring_zk`], exactly as [`ring_balance`] does for the balance residual) replaces 2 000 elements with ~6:
-**≈333× on the component, ≈2.0× on the shortness proof.** Structural, not parametric — the general proof was simply
-the wrong tool for these coefficient sizes.
+**Rung 2 — state the reconstruction as an opening-to-zero, not a general linear proof. Built** ([`ring_shortness`](../rust/crates/fanos-obolos/src/ring_shortness.rs)).
+`ring_linear` exists to survive **huge** coefficients: `Σ cᵢ·rᵢ` for uniform matrix entries dwarfs `q`, so it masks and
+reveals per-message openings, paying `(n+1)·ℓ` of them per round. The reconstruction's coefficients are `2ʲ ≤ 2¹⁵`, so
+**that blow-up never happens**: by homomorphism `C_p − Σ 2ʲ·C_{pⱼ}` is already a commitment to `p − Σ 2ʲ·pⱼ` under
+randomness `r_p − Σ 2ʲ·r_j`, whose norm is `≤ 2^t ≈ 2¹⁶` — short against `q = 2⁶⁴`. Proving that *one* difference opens
+to zero ([`ring_zk`], exactly as [`ring_balance`] does for the balance residual) replaces 2 000 elements with **6**:
+measured **≈2.0× on the shortness proof**. Structural, not parametric — the general proof was simply the wrong tool
+for these coefficient sizes. One property softens with it: `ring_zk`'s special-soundness is *relaxed*, so the residual's
+message is pinned to zero only when the challenge difference is invertible — on this fully-splitting ring, all but
+`≈ D/q = 2⁻⁵⁶` of ternary differences. Certainty becomes overwhelming probability; the width cap `t ≤ 40` keeps the
+regime's `2^{19+t}` masking well below `q`.
 
-**Rung 3 — widen the scalar challenge.** `CHALLENGE_BITS = 9` forces 16 rounds for `2⁻¹²⁸`, and `2¹⁶` would need 9.
-Note this helps *only* the scalar-challenge proofs: the monomial-challenge ones (`ring_linear`, `ring_product`) draw
-from the ring's `2D = 512` monomials, a space pinned by `D` itself. So it is worth **≈1.3×** after rung 2, not the
-`≈4×` a rounds-only count suggests — and it trades against the binding margin, since the mask must keep dominating
-`x·witness`. That makes it a calibration decision, not a free win.
+### 6.2 Progress, and what is left
 
-**Rung 4 — encode short elements at their true width.** Most revealed elements are *openings* bounded by `ACCEPT_*`,
-not general elements mod `q`; ternary randomness is 2 bits per coefficient, not 64 — **≈2×** on the remainder.
+| stage | per limb | per node | depth-32 path | cumulative |
+|---|---|---|---|---|
+| original | 5 872 | 45.9 MiB | 2 982 MiB | 1.0× |
+| + rung 1 (aggregated binarity) | 3 952 | 30.9 MiB | 2 007 MiB | 1.5× |
+| **+ rung 2 (opening-to-zero)** | **1 957** | **15.3 MiB** | **994 MiB** | **3.0×** |
+| + rung 3 (projected) | 1 117 | 8.7 MiB | 567 MiB | 5.3× |
 
-Together ≈5× from here, not the order of magnitude a naive reading of the rungs suggests: a depth-32 spend falls from
-~2 GiB to ~400 MiB. That is the honest ceiling of constant-factor work, and it is **still impractical** — which is
-precisely why production lattice systems wrap membership in a recursive/succinct proof rather than paying for it
-directly. Recursive compaction is therefore not a nice-to-have on this stack's roadmap; it is the only route to a
-shippable spend proof, and the numbers above are why. The construction is sound and complete today, and it will stay
-`[P]` until that route is built.
+With the reconstruction gone, the aggregated binarity is ~98% of a shortness proof. Its per-round composition:
+
+| part | elements | share |
+|---|---|---|
+| `z_ba` (per-plane randomness openings) | 64 | **53%** |
+| `c_a` (per-plane masking commitments) | 32 | 27% |
+| `f` (revealed masked planes) | 16 | 13% |
+| `c_d`, `c_e`, `z_de` (aggregate) | 8 | 7% |
+
+**Rung 3 — widen the scalar challenge.** `CHALLENGE_BITS = 9` forces 16 rounds for `2⁻¹²⁸`; `2¹⁶` needs 9 — worth
+**≈1.75×** now that the reconstruction no longer dilutes it. It helps *only* the scalar-challenge proofs: the
+monomial-challenge ones (`ring_linear`, `ring_product`) draw from the ring's `2D = 512` monomials, a space pinned by `D`
+itself.
+
+The obvious objection is that widening `x` must cost binding margin, since the mask has to keep dominating `x·witness`.
+At `2¹⁶` it does not — because rung 1 already raised `MASK_WIDE` to `2⁴⁰` for the aggregation. The accept probability
+stays `0.991`, `ACCEPT_WIDE = B − 2¹⁶` is unchanged to within a part in `2²⁴`, and the extractable-opening norm stays
+`≈2⁴⁰`, so **nothing is weakened**: soundness is `9 × 2⁻¹⁵ = 2⁻¹³⁵`, comfortably past the `2⁻¹²⁸` target. Going further
+does start to cost — `2²⁰` drops the accept rate to `0.90` — so `2¹⁶` is where the free part ends.
+
+**Rung 4 — encode short elements at their true width.** `z_ba` is bounded by `ACCEPT_WIDE`, not `q`; ternary randomness
+is 2 bits per coefficient, not 64 — **≈1.15×** on what remains.
+
+> **A negative result, recorded so it is not re-attempted.** `z_ba` is the largest remaining item, and aggregating it
+> the obvious way — reveal only `Σⱼ wⱼ·z_ba,ⱼ` and check one combined binding — is **unsound**. The per-plane openings
+> are precisely what forbids `fⱼ ≠ x·pⱼ + aⱼ`; against a single combined check a prover can distribute deviations `δⱼ`
+> so that `Σⱼ wⱼ·δⱼ = 0` while each `δⱼ ≠ 0`, then feed those unbound `fⱼ` to the binarity identity — which assumed
+> `fⱼ = x·pⱼ + aⱼ` and now proves nothing about the committed planes. Folding it soundly needs a genuine
+> inner-product argument, not a random linear combination.
+
+Together ≈2× more from here: a depth-32 spend reaches ~500 MiB. That is the honest ceiling of constant-factor work,
+and it is **still impractical** — which is precisely why production lattice systems wrap membership in a
+recursive/succinct proof rather than paying for it directly. Recursive compaction is therefore not a nice-to-have on
+this stack's roadmap; it is the only route to a shippable spend proof, and the numbers above are why. The construction
+is sound and complete today, and it will stay `[P]` until that route is built.
 
 ## 7. Verification status
 
