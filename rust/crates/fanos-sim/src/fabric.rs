@@ -367,6 +367,44 @@ mod tests {
         b.shutdown();
     }
 
+    #[tokio::test]
+    async fn a_whole_deployed_node_runs_on_the_fabric_and_self_organizes() {
+        // The rung this tier exists for. `Node::start_over` is the DEPLOYED node — every driver task it composes:
+        // capability publisher, load publisher, role loop, beacon tracker, epoch driver, recovery trigger, mix
+        // publisher. None of that is reachable from a rung that instantiates an engine, which is exactly why four
+        // wiring bugs survived until the role loop was connected (docs/design-testing.md §5.1).
+        //
+        // Asserting on the ASSIGNMENT is the sharp end: it is produced by the composition, not by any one component —
+        // capability advertisement + load report + directory scan + controller, each over the fabric.
+        use fanos_core::roles::Role;
+        use fanos_field::F2;
+        use fanos_node::{Node, NodeConfig, RoleSet};
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let fabric = Fabric::new(Link::ideal());
+        let (_shares, commitment) =
+            deal(&[0xF4; 32], 2, 3, &mut DeterministicRng::new(b"fabric-node")).expect("deal");
+        let offered = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let node = Node::start_over::<F2>(
+            NodeConfig {
+                beacon: Some(fanos_node::BeaconParams { commitment, threshold: 2, share: None }),
+                roles: offered,
+                ..NodeConfig::default()
+            },
+            fanos_quic::Fabric::Abstract(fabric.bind()),
+        )
+        .await
+        .expect("a whole node starts on the fabric");
+
+        // The cell assigned from the offer — which only happens if the publishers, the directory scan and the
+        // controller all completed over the modelled carrier.
+        let assigned = until(|| node.assigned_roles().any()).await;
+        assert!(assigned, "the deployed node's composition ran and produced an assignment");
+        assert!(node.serves(Role::Rendezvous), "including the role it offered");
+        assert!(!node.serves(Role::Exit), "and not one it did not");
+        node.shutdown();
+    }
+
     #[test]
     fn an_unreachable_destination_is_dropped_not_an_error() {
         // A datagram to an endpoint that does not exist must behave as UDP does: dropped, with nothing reported to

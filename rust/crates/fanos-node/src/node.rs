@@ -17,7 +17,7 @@ use fanos_geometry::{Plane, Point, Triple};
 use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_pqcrypto::{HybridKemSecret, SeedRng};
 use fanos_quic::{
-    Client, Directory, NodeHandle, ProteusConfig, spawn_self_certifying_persistent_on,
+    Client, Directory, Fabric, NodeHandle, ProteusConfig, spawn_self_certifying_persistent_over,
 };
 use fanos_keygen::BeaconNode;
 use fanos_keygen::recovery::{RecoveryAction, StallDetector, recovery_decision};
@@ -452,6 +452,26 @@ impl Node {
     /// # Errors
     /// [`NodeError`] if the identity cannot be loaded or the QUIC endpoint cannot be bound.
     pub async fn start<F: Field + 'static>(config: NodeConfig) -> Result<Self, NodeError> {
+        let listen = config.listen;
+        Self::start_over::<F>(config, Fabric::Udp(listen)).await
+    }
+
+    /// Start a node over an explicit transport [`Fabric`] — the **simulation entry point**.
+    ///
+    /// Identical to [`start`](Self::start) in every respect except where datagrams come from. Pass
+    /// `Fabric::Abstract(socket)` (e.g. `fanos_sim::fabric::Fabric::bind`) to run this node — the *whole* node, every
+    /// driver task it composes — over a modelled carrier. That is what makes the composition layer observable: it is
+    /// where the wiring lives, and instantiating an engine directly cannot reach it
+    /// (`docs/design-testing.md` §5.1/§5.2).
+    ///
+    /// `config.listen` is ignored when a fabric is supplied; a fabric endpoint has its own synthetic address.
+    ///
+    /// # Errors
+    /// [`NodeError`] if the identity cannot be loaded or the endpoint cannot be created.
+    // Nothing here awaits — endpoint creation is synchronous and every driver is `tokio::spawn`ed — but both entry
+    // points stay `async` for API stability, matching `fanos_quic`'s spawn family.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn start_over<F: Field + 'static>(config: NodeConfig, fabric: Fabric) -> Result<Self, NodeError> {
         let credentials = identity::load_or_generate(config.identity_path.as_deref())?;
 
         // Seed the address book so a fresh node can dial into the network (design.md §9).
@@ -496,8 +516,8 @@ impl Node {
         let service = service_params(&config)?;
         // Validate the exit role's parameters up front too (it spawns its relay after the node is up).
         let exit = exit_params(&config)?;
-        let handle = spawn_self_certifying_persistent_on::<F>(
-            config.listen,
+        let handle = spawn_self_certifying_persistent_over::<F>(
+            fabric,
             &credentials,
             move |coord| -> Box<dyn Engine + Send> {
                 // A deployed node is seated by its VRF beacon coordinate (`spawn_self_certifying…` →
@@ -563,8 +583,7 @@ impl Node {
                 Some(env) => ProteusConfig::auto(secret, env),
                 None => ProteusConfig::with_morph(secret, config.proteus_morph),
             }),
-        )
-        .await?;
+        )?;
 
         let address = handle.address();
         let local_addr = handle.local_addr();
