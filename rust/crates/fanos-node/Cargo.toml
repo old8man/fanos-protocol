@@ -15,6 +15,7 @@ name = "fanos"
 path = "src/bin/fanos.rs"
 
 [dependencies]
+fanos-code.workspace = true
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 # The self-organizing role assignment (capability descriptors + the RoleController) the live role loop drives.
