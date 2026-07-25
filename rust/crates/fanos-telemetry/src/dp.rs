@@ -157,4 +157,22 @@ impl CoherenceFrame {
         // post-processing of the single Laplace release, so the whole frame is ε-DP.
         Self::observe(self.cell_id, self.epoch, &matrix, 0, 0.0, -1, 0)
     }
+
+    /// The **only sanctioned way to produce bytes that leave the cell**: privatize, then encode.
+    ///
+    /// [`CoherenceFrame::encode`] is cell-*local*. That is not a stylistic preference — the reflexive loop needs the exact
+    /// syndrome to localize a fault, so the engine must keep it, and the engine is sans-I/O and therefore has no RNG to
+    /// privatize with. Privatization can only happen at the export boundary, in a driver that owns entropy.
+    ///
+    /// That asymmetry is exactly how a differential-privacy guarantee gets lost in practice: the exact frame is right there,
+    /// already encoded, and shipping it is one line shorter than doing this. So the sanctioned path is given a name and the
+    /// local one is documented as local, and a future export path has to *deliberately* bypass this rather than merely
+    /// forget it existed.
+    ///
+    /// `rng` must be fresh per release — reusing a deterministic draw across exports voids the guarantee (see
+    /// [`Self::privatize`]).
+    #[must_use]
+    pub fn export(&self, budget: PrivacyBudget, rng: &mut impl Rng) -> [u8; crate::frame::FRAME_LEN] {
+        self.privatize(budget, rng).encode()
+    }
 }

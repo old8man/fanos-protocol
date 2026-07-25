@@ -200,6 +200,12 @@ impl CoherenceFrame {
     /// verdict(1) ‖ phi(4) ‖ purity(4) ‖ reflection(4) ‖ mean_r(4) ‖ gap(4) ‖ forecast(2) ‖
     /// heal_seq(4)`, all big-endian, `f32` as IEEE-754 bits.
     #[must_use]
+    /// Encode this frame's exact bytes — **cell-local only**.
+    ///
+    /// The reflexive loop needs the exact syndrome to localize a fault, so this is the right thing *inside* a cell. For
+    /// anything that leaves the cell — cross-cell roll-up, a monitor feed, any shareable telemetry — use
+    /// [`CoherenceFrame::export`], which privatizes first. Shipping these bytes outward publishes the exact 3-bit
+    /// syndrome, spectral gap, heal counter and forecast, which is precisely what the ε-DP release exists to withhold.
     pub fn encode(&self) -> [u8; FRAME_LEN] {
         // The derived `Wire` codec emits the fields in declaration order, which is exactly the layout
         // above — byte-for-byte identical to the previous hand-rolled writer (audit A1). A fixed-layout

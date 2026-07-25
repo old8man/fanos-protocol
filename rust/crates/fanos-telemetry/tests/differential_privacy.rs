@@ -186,3 +186,30 @@ fn a_smaller_epsilon_hides_more() {
         "smaller ε hides more: adv(ε=0.2)={strong:.3} must be < adv(ε=1.0)={weak:.3}"
     );
 }
+
+#[test]
+fn the_export_path_privatizes_where_the_local_encode_does_not() {
+    // The seam audit C7 left open. `.privatize(` had no caller anywhere — not because it was forgotten, but because the
+    // engine that produces frames is sans-I/O and has no RNG, so privatization can only happen at an export boundary in a
+    // driver. There is no live export path yet, and that is exactly when the guard is cheap to put in: the exact frame is
+    // already encoded and shipping it is one line shorter than doing this.
+    //
+    // So `encode` is documented cell-local and `export` is the sanctioned outward path. Asserting they differ is what
+    // stops a future export from shipping `encode()` out of habit.
+    let internal = internal_frame(0.5, 0b0010_1101, 0.37, 5);
+    let local = internal.encode();
+    let exported = internal.export(PrivacyBudget::default(), &mut SplitMix64(9));
+    assert_ne!(local, exported, "exported bytes must not be the exact frame");
+
+    // And the withheld fields are withheld, not merely noised — the cell-granular floor.
+    let Some(out) = CoherenceFrame::decode(&exported) else { panic!("an exported frame decodes") };
+    assert_eq!(out.syndrome, 0, "the exact syndrome point is withheld");
+    assert_eq!(out.gap, 0.0, "the spectral gap is withheld");
+    assert_eq!(out.forecast, -1, "the cascade forecast is withheld");
+    assert_eq!(out.heal_seq, 0, "the heal-event counter is withheld");
+    assert_eq!(out.cell_id, internal.cell_id, "identity and epoch are not secrets — roll-up needs them");
+    assert_eq!(out.epoch, internal.epoch);
+
+    // `export` is exactly privatize-then-encode: one path, so the two cannot drift apart.
+    assert_eq!(exported, internal.privatize(PrivacyBudget::default(), &mut SplitMix64(9)).encode());
+}
