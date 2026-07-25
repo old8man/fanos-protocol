@@ -493,6 +493,40 @@ site to fail rather than 60 s. That is the correct trade (a false red on a worki
 on a broken one) but it is a trade, not a free lunch, and the earlier claim that the headroom "pays nothing" was true
 only of the healthy path.
 
+### 5.3.4a The open finding, closed — it was never a resolution defect
+
+§5.3.2 recorded a failing acceptance test against cell-wide directory resolution. **That framing was wrong, and the
+instrument corrected it.** Resolution is sound. The failures were **coordinate collisions**.
+
+A coordinate is `MapToPoint(VRF(sk, node‖epoch‖beacon))` — a uniform draw over the plane's `P = q² + q + 1` points. Two
+nodes drawing the same point are *mutually unroutable*, because the coordinate → address table holds one address per
+point, so no node can ever see the whole cell. Measured at 7 nodes in PG(2,2) (load factor 1): **4 distinct coordinates
+of 7**, with one point claimed by three nodes. The predicted expectation is `7·(1 − (6/7)⁷) = 4.62`.
+
+The decisive experiment was enlarging the plane with everything else held fixed — same fleet, same carrier, same code.
+PG(2,4) at 7 nodes gave 7 distinct coordinates and rosters `[7; 7]`, full cell-wide agreement.
+
+Two consequences, both larger than the test:
+
+**1. A cell supports on the order of `q` nodes, not `q² + q + 1`.** `P(injective) = P! / ((P − n)! · Pⁿ) ≈ exp(−n²/2P)`,
+so by the birthday bound injectivity survives only while `n = O(√P)`, and `√P ≈ q`. That is a factor-`q` reduction in
+usable cell capacity against the naive reading, and it is a property of the *draw*, not of any subsystem above it.
+Resolving collisions rather than tolerating them belongs to the coordinate-VRF Level B reshuffle
+(`docs/design-coordinates.md`); `Directory` already *counts* collisions, so they were anticipated but never resolved.
+
+**2. Every cell-wide test here was confounded.** `P(injective) = 210/343 ≈ 0.61` at 3 nodes in PG(2,2), so roughly two
+runs in five drew a collision — and a collision-split roster is indistinguishable from a resolution defect. Those runs
+are the `[1, 1, 2]`, `[2, 1, 2]`, `[1, 2, 2]` trajectories quoted earlier in this section. The missing-trigger defect of
+§5.3.1 was real and independent (a *frozen epoch* is not something a collision produces), but the roster values it was
+measured through were partly artifact.
+
+The lasting fix is **not** a bigger plane — at 7 nodes even PG(2,4) is a coin flip at `P(injective) ≈ 0.325`, which two
+consecutive runs demonstrated by yielding 7 then 6 distinct points. It is assertions that **do not depend on the draw**:
+compare each node's roster against the number of *occupied* coordinates, never against the node count. The first version
+of the closing test asserted injectivity and was itself a coin flip — caught on its first run. `expected_distinct` and
+`injective_probability` are now derived functions in `fanos-sim`, pinned at T0 against their closed forms, so the figures
+that justify a fleet's size are checkable rather than asserted.
+
 ### 5.3.5 The ceiling hypothesis was wrong too — and the refresh really was starving consensus
 
 Raising the ceilings produced a decisive negative result. Under a full-parallel run **both** DROMOS QUIC tests then
@@ -522,12 +556,46 @@ exactly while there is evidence it has something to close, and not otherwise.
 The lesson is sharper than the fix: **a bounded cost is not a removed cost.** A mechanism that runs forever on the
 critical path needs a condition under which it does nothing, not merely a cap on how much it does.
 
-**One confound, stated plainly.** Partway through this investigation the process table showed an unrelated project's test
-suite running on the same machine. So the *magnitude* of contention in the measurements above was partly external and is
-not reproducible from this repo alone. What survives the confound is the controlled comparison, because both arms ran
-under the same conditions: with the refresh on, DROMOS failed at both 60 s and 240 s; with it off, DROMOS passed and a
-different test failed instead. The direction of that result is sound; any absolute timing figure quoted here is not, and
-should be re-measured on a quiet machine before being relied on.
+### 5.3.6 The confound, and how much of §5.3.5 survives it
+
+Partway through, the process table showed an unrelated project's test suite running on the same machine, at load average
+**15**. That is not a footnote — it invalidates most of the measurements above as evidence *about FANOS*:
+
+- **DROMOS convergence under a saturated host is not a valid measurement at all.** With the foreign workload running, both
+  DROMOS tests fail *alone*, in a fixture that does not even use `fanos_node::Node` and so cannot be touched by the role
+  loop. The same tests passed alone in ~4 s earlier in the same session.
+- **The causal claim in §5.3.5 is therefore weaker than stated.** Its controlled comparison — refresh on: DROMOS fails at
+  60 s and 240 s; refresh off: DROMOS passes, a different test fails — was a real A/B, but both arms ran on a host whose
+  background load was outside my control and varying. The direction is *suggestive*, not established. It should be
+  re-measured on a quiet machine before anyone relies on "the refresh starves consensus" as a fact.
+- **The fix in §5.3.5 stands on its own merits regardless.** Running a periodic cell-wide scan only while the gap it
+  exists to close is *observable* is strictly better than running it forever at any duty cycle, whether or not it was
+  what broke those tests. That is why it was kept.
+
+Two further things the confound taught, which do generalise:
+
+**Check the host before diagnosing the system.** Several hours of this investigation attributed to FANOS what belonged to
+`ps`. A load figure is part of a measurement's provenance, and I did not record it until it contradicted me. I then very
+nearly repeated the error one step later: with the whole-cell fixture lock switched to `tokio`'s mutex, both DROMOS tests
+failed at 240 s each and the obvious reading was that the new primitive had broken them — the foreign suite had simply
+restarted, load back at 15. The same pair passed in **8.49 s** at load 6. Every timing in this section should be read as
+carrying that caveat.
+
+The durable fix for the fixture contention is not a ceiling at all but the serialization in `common::serial_cell`: a
+convention that already existed in `fanos-ffi` (whose comment names this exact failure mode) yet lived only in that
+crate, so every other suite either rediscovered it or silently did without.
+
+**Per-crate runs are the trustworthy gate here; the full-parallel run is not.** That ordering is now the recommendation,
+and it is why the `#[ignore]`d probes exist: a probe that prints a trajectory tells you *whether the host was the
+problem*, where a pass/fail cannot.
+
+One genuine finding did come out of it. `establish_membership`'s backstop expiry was **silent**, and assembly continued
+best-effort with incomplete membership — which, by that function's own documentation, makes a `Put` place every erasure
+shard on a single node. A degraded fixture then surfaces as some unrelated test failing to converge, with no diagnostic
+pointing back. Expiry is now reported loudly. Widening that particular ceiling, by contrast, was a mistake I made and
+measured: at 240 s the DROMOS tests failed *alone* at 241 s with the wait having eaten their whole budget, where at 10 s
+they passed in ~4 s. A backstop whose expiry is harmless must stay short; only a backstop whose expiry is a *failure*
+should be generous. Those are opposite ceilings, and treating them alike is the error.
 
 Two general lessons. **A periodic mechanism's cost belongs in its derivation**: a period chosen for how fast convergence
 *should* be, with no reference to what one iteration costs, produces a duty cycle by accident. And **a plausible cause is

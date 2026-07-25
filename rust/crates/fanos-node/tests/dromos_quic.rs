@@ -86,6 +86,7 @@ fn genesis_ledger() -> HybridLedger {
 
 #[tokio::test]
 async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time — see `common::serial_cell`
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
 
     // Cell key material + the agreed anti-MEV decryption authority (keyper registry).
@@ -188,6 +189,7 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
 /// transactions over the wire (the network ingress + gossip), not just via a test's in-process injection.
 #[tokio::test]
 async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_whole_cell() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time — see `common::serial_cell`
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
 
     let keys = gen_keys();

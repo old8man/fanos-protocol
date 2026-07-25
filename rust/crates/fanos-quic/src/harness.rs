@@ -111,6 +111,13 @@ pub async fn spawn_cell<F: Field + 'static>(
 /// A backstop on membership convergence: if some announcement is lost, assembly proceeds best-effort
 /// rather than hanging. Generously wide because this is real QUIC on a machine shared with the whole test
 /// suite — convergence is normally sub-second, but a saturated host must not spuriously trip it.
+///
+/// Unlike the other ceilings this codebase carries, this one is **deliberately short**, and widening it is a mistake I
+/// made and measured. Expiry here does not fail anything — assembly continues best-effort — so a wide value does not buy
+/// robustness, it buys a *stall*: raised to 240 s, the DROMOS QUIC tests then failed **alone** at 241 s, the wait having
+/// consumed their entire budget, where at 10 s they passed in ~4 s. That result also says something important about the
+/// fixture, which is why expiry is now reported: full membership convergence does **not** reliably happen here, and the
+/// cell has been assembling best-effort in silence. See `docs/design-testing.md` §5.3.6.
 const MEMBERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bring the freshly assembled cell to an *established* state: every node announces itself and the call
@@ -142,7 +149,7 @@ async fn establish_membership(nodes: &mut [NodeHandle]) {
     // Announcements flood concurrently and each node buffers its own notification stream, so draining the
     // nodes one after another never misses an event — a peer's `MemberJoined` is already queued by the
     // time we poll it. Bounded by `MEMBERSHIP_TIMEOUT` so a dropped announcement degrades to best-effort.
-    let _ = tokio::time::timeout(MEMBERSHIP_TIMEOUT, async {
+    let established = tokio::time::timeout(MEMBERSHIP_TIMEOUT, async {
         for node in nodes.iter_mut() {
             let mut learned = 0;
             while learned < expected {
@@ -155,6 +162,15 @@ async fn establish_membership(nodes: &mut [NodeHandle]) {
         }
     })
     .await;
+    if established.is_err() {
+        // Loud, because the consequence lands somewhere else entirely: a degraded fixture surfaces as an unrelated test
+        // failing to converge, with nothing pointing back here. Silence was how this stayed unattributed.
+        eprintln!(
+            "WARNING: cell membership did not converge within {MEMBERSHIP_TIMEOUT:?} — assembling best-effort. \
+             Shard placement and content routing read the occupancy set, so any test on this cell may fail for \
+             reasons unrelated to what it asserts (fanos_quic::harness::establish_membership)."
+        );
+    }
 }
 
 #[cfg(test)]

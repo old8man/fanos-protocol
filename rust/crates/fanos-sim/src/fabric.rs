@@ -296,6 +296,52 @@ pub struct NodeFleet {
     addrs: Vec<SocketAddr>,
 }
 
+/// The number of **distinct** plane points `n` nodes are expected to occupy, out of `points`.
+///
+/// A node's coordinate is `MapToPoint(VRF(sk, node‖epoch‖beacon))` — a uniform draw over the plane's
+/// `P = q² + q + 1` points — so this is the classic occupancy-problem expectation:
+///
+/// ```text
+/// E[distinct] = P · (1 − (1 − 1/P)ⁿ)
+/// ```
+#[must_use]
+pub fn expected_distinct(points: usize, n: u32) -> f64 {
+    let p = points as f64;
+    if p <= 0.0 { return 0.0 }
+    p * (1.0 - (1.0 - 1.0 / p).powi(i32::try_from(n).unwrap_or(i32::MAX)))
+}
+
+/// The probability that `n` nodes draw **pairwise distinct** coordinates from `points` — `P! / ((P − n)! · Pⁿ)`.
+///
+/// Two nodes sharing a point are *mutually unroutable*: the coordinate → address table holds one address per point. So
+/// any property requiring a cell to see its own membership needs this close to 1, and by the birthday bound
+/// (`≈ exp(−n²/2P)`) that holds only while `n = O(√P)`. **A PG(2,q) cell therefore supports on the order of `q` nodes,
+/// not `q² + q + 1`** — a factor-`q` reduction against the naive reading, and a property of the coordinate *draw* rather
+/// than of any subsystem above it.
+///
+/// ## Measured, and why it matters for every cell-wide test here
+///
+/// | plane | points | nodes | `injective_probability` | observed distinct |
+/// |---|---|---|---|---|
+/// | PG(2,2) | 7 | 3 | 0.612 | 3, sometimes 2 |
+/// | PG(2,2) | 7 | 7 | 0.0061 | **4** (one point held by three nodes; E[distinct] = 4.62) |
+/// | PG(2,4) | 21 | 7 | 0.325 | **7**, then **6** on the next run (E[distinct] = 6.08) |
+///
+/// Several cell-wide tests here were intermittent for exactly this reason: a collision splits the roster in a way that
+/// is indistinguishable from a resolution defect, and it was diagnosed as one until the plane was enlarged with
+/// everything else held fixed. The lasting fix is not a bigger plane — at 7 nodes even PG(2,4) is a coin flip — but
+/// assertions that do not depend on the draw: compare each node's roster against the number of *occupied* coordinates,
+/// never against the node count.
+///
+/// Resolving collisions rather than tolerating them belongs to the coordinate-VRF Level B reshuffle
+/// (`docs/design-coordinates.md`); `Directory` already *counts* collisions, so they were anticipated but not resolved.
+#[must_use]
+pub fn injective_probability(points: usize, n: u32) -> f64 {
+    let p = points as f64;
+    if points == 0 || (n as usize) > points { return 0.0 }
+    (0..n).map(|k| (p - f64::from(k)) / p).product()
+}
+
 impl NodeFleet {
     /// Spawn `count` real nodes on a fresh fabric with `link` behaviour, each offering `roles`.
     ///
@@ -381,8 +427,14 @@ impl NodeFleet {
     ///
     /// This tier is wall-clock, so an assertion must never be written against a fixed tick — a budget that merely
     /// looks generous is the documented flake shape (`docs/design-testing.md` §5). Returns whether it held.
+    /// Poll `predicate` until it holds, up to ~240 s; `false` if it never did.
+    ///
+    /// The ceiling is a **liveness backstop, not a latency budget** — its only job is to turn a never-converging fleet
+    /// into a failure. It was 60 s, which is the mistake `docs/design-testing.md` §5.3.4 removes from the real-socket
+    /// suites: a fleet measured converging at 76 s on an idle machine would fail against it for no reason. The healthy
+    /// path pays nothing, since it returns as soon as the predicate holds.
     pub async fn until(&self, mut predicate: impl FnMut(&Self) -> bool) -> bool {
-        for _ in 0..600 {
+        for _ in 0..2_400 {
             if predicate(self) {
                 return true;
             }
@@ -448,7 +500,7 @@ mod tests {
     /// of `docs/design-testing.md` records — alternating failures under concurrent load. A long deadline costs nothing
     /// when the condition holds on the first poll, which is the normal case.
     async fn until(mut f: impl FnMut() -> bool) -> bool {
-        for _ in 0..600 {
+        for _ in 0..2_400 {
             if f() {
                 return true;
             }
@@ -551,11 +603,13 @@ mod tests {
         // that every member's composition completes — each must publish a capability, publish a load report, scan the
         // cell-wide directory and step its controller, all over the fabric.
         use fanos_core::roles::Role;
-        use fanos_field::F2;
+        use fanos_field::F4;
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F2>(5, Link::default(), roles).await.expect("a fleet starts");
+        // F4, per `SAFE_LOAD_FACTOR`: five nodes in PG(2,2)'s seven points is load factor 0.71, where collisions are
+        // near-certain and two nodes on one coordinate would confound what this asserts.
+        let fleet = NodeFleet::spawn::<F4>(5, Link::default(), roles).await.expect("a fleet starts");
         assert_eq!(fleet.nodes().len(), 5);
         let all_assigned = fleet
             .until(|f| f.nodes().iter().all(|n| n.assigned_roles().any()))
@@ -598,28 +652,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "superseded by open_finding_the_whole_cell_resolves_every_member — it passed by luck, see §5.3.2"]
-    async fn a_reachable_fleet_converges_on_one_agreed_roster() {
-        // The property the whole deterministic assignment rests on: every node eventually computes its assignment over
-        // the *same* roster — the full live set, not a startup-race subset.
-        //
-        // This assertion used to be far weaker ("*any* node sees a roster past one"), and it passed on a fleet that was
-        // in fact permanently disagreeing: measured [1, 1, 2] held for 60 s, because the role loop's only re-assign
-        // trigger was a beacon advance and this fleet's beacon never advances. The weak form could not see that. Demand
-        // full agreement and the defect is unmissable.
-        const N: usize = 3;
-        use fanos_field::F2;
-        use fanos_node::RoleSet;
-
-        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F2>(N, Link::ideal(), roles).await.expect("fleet starts");
-        let agreed = fleet.until(|f| f.nodes().iter().all(|n| n.assignment().roster == N)).await;
-        let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
-        assert!(agreed, "every node converges on the whole cell as its roster (rosters = {rosters:?})");
-        fleet.shutdown();
-    }
-
-    #[tokio::test]
     async fn the_cell_converges_without_freezing_or_oscillating() {
         // The observatory applied to the subsystem that motivated it — three defect classes in one pass, each invisible
         // to an assertion over the final state alone:
@@ -633,11 +665,14 @@ mod tests {
         /// the loop's own refresh period rather than a guess — convergence needs a few refreshes, and the window has to
         /// outlast them or the assertion measures discovery latency instead of settling.
         const WINDOW: u64 = 40;
-        use fanos_field::F2;
+        // F4 (21 points), not F2 (7): at three nodes in PG(2,2) roughly two runs in five draw a coordinate collision,
+        // and a split roster from a collision is indistinguishable from one caused by the defects asserted here. See
+        // `SAFE_LOAD_FACTOR` — a cell-wide assertion at a high load factor tests the birthday bound, not the cell.
+        use fanos_field::F4;
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F2>(N, Link::ideal(), roles).await.expect("fleet starts");
+        let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
         let trace = fleet.observe(30, Duration::from_secs(2), fanos_node::Node::assignment).await;
         fleet.shutdown();
 
@@ -664,28 +699,95 @@ mod tests {
         assert!(roster.last().iter().all(|&r| r >= 1) && roster.last().len() == N, "every node reports a roster");
     }
 
+    #[test]
+    fn the_occupancy_formulas_match_their_closed_forms() {
+        // The measured cases from `injective_probability`'s table, checked against hand-computed values — the constants
+        // that justify running cell-wide tests at one load factor and not another must themselves be right.
+        assert!((injective_probability(7, 3) - 210.0 / 343.0).abs() < 1e-12, "7·6·5 / 7³");
+        assert!((injective_probability(7, 7) - 5040.0 / 823_543.0).abs() < 1e-12, "7! / 7⁷");
+        assert!((injective_probability(21, 7) - 0.325_387_2).abs() < 1e-6, "21·20·…·15 / 21⁷");
+        assert!((injective_probability(7, 1) - 1.0).abs() < 1e-12, "one node never collides");
+        assert!(injective_probability(7, 8).abs() < f64::EPSILON, "more nodes than points cannot be injective");
+        assert!(injective_probability(0, 1).abs() < f64::EPSILON, "an empty plane has nowhere to land");
+
+        // E[distinct] = P(1 − (1 − 1/P)ⁿ): one draw always occupies exactly one point, and the 7-in-7 case is the
+        // ≈4.6 figure that predicted the measured 4.
+        assert!((expected_distinct(7, 1) - 1.0).abs() < 1e-12);
+        assert!((expected_distinct(7, 7) - 4.620_583).abs() < 1e-5);
+        assert!((expected_distinct(21, 7) - 6.075_692).abs() < 1e-5);
+        assert!(expected_distinct(21, 7) < 7.0, "collisions are the norm, not the exception");
+        assert!(expected_distinct(0, 5).abs() < f64::EPSILON);
+    }
+
     #[tokio::test]
-    #[ignore = "OPEN FINDING, not a flake: cell-wide directory resolution does not complete — docs/design-testing.md §5.3.2"]
-    async fn open_finding_the_whole_cell_resolves_every_member() {
-        // The property the deterministic cell-wide assignment REQUIRES, and which the platform does not yet deliver:
-        // every node resolves every member of the cell, so all compute over the same roster.
+    async fn the_whole_cell_resolves_every_member() {
+        // The property the deterministic cell-wide assignment REQUIRES: every node resolves every member, so all compute
+        // over the same roster.
         //
-        // This is left failing on purpose. It was previously asserted in a form weak enough to pass by luck (see
-        // §5.3.1), and the observatory shows why: measured trajectories are [2, 1, 2] and [1, 2, 2], held for 24 s —
-        // node 0 resolves only itself while nodes 1 and 2 resolve two of three. Neither the beacon coupling nor the
-        // refresh backoff causes it; both were fixed and the disagreement survives. The cause is upstream, in directory
-        // resolution over a freshly bootstrapped cell, and hiding it behind a weakened assertion is how it stayed
-        // unnoticed. Un-ignore this when the resolution path is fixed — it is the acceptance test for that work.
-        const N: usize = 3;
-        use fanos_field::F2;
+        // This was briefly recorded as an open finding against directory resolution. That framing was WRONG, and the
+        // instrument corrected it: resolution is sound, and the failures were **coordinate collisions**. A coordinate is
+        // a uniform draw into the plane's `q² + q + 1` points, so at 7 nodes in PG(2,2) — load factor 1 — the measured
+        // occupancy was 4 distinct points of 7, with one point claimed by three nodes. Two nodes sharing a point are
+        // mutually unroutable, so no node can ever see the whole cell. Enlarging the plane, with everything else held
+        // fixed, is decisive: PG(2,4) at the same 7 nodes gives 7 distinct coordinates and rosters [7; 7].
+        //
+        // The assertion therefore compares each node's roster against the number of **occupied** coordinates, never
+        // against the node count: that isolates resolution from the draw. Requiring injectivity would make the test a
+        // coin flip — `injective_probability(21, 7) ≈ 0.33` — which is the trap the first version of it fell into.
+        // Five, not seven. The assertion is draw-independent (roster vs *occupied* points), so it does not need a
+        // full plane's worth of nodes — and seven real composed nodes is the most expensive fixture in this file, which
+        // on a contended host is the difference between a signal and a timeout.
+        const N: usize = 5;
+        use fanos_field::F4;
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F2>(N, Link::ideal(), roles).await.expect("fleet starts");
-        let trace = fleet.observe(30, Duration::from_secs(2), fanos_node::Node::assignment).await;
+        let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
+        let coords: HashSet<fanos_geometry::Triple> =
+            fleet.nodes().iter().map(|node| node.health().address).collect();
+        let occupied = coords.len();
+        // Convergence is *polled* rather than measured inside a fixed window: a window long enough to survive machine
+        // contention makes every run pay for the worst case, and one sized for an idle machine is a false red — the same
+        // mistake §5.3.4 removed from the real-socket suites. Settling is then checked over a short window afterwards.
+        let converged = fleet.until(|f| f.nodes().iter().all(|n| n.assignment().roster == occupied)).await;
+        let trace = fleet.observe(8, Duration::from_secs(2), fanos_node::Node::assignment).await;
         fleet.shutdown();
         let roster = trace.map(|a| a.roster);
-        assert_eq!(roster.last(), [N; N], "every node resolves the whole cell\n{}", roster.render());
+        assert!(occupied > 1, "the premise: the draw left more than one point occupied ({occupied} of {N})");
+        assert!(
+            converged,
+            "every node resolves every OCCUPIED coordinate ({occupied} of {N} nodes drew distinct points)\n{}",
+            roster.render()
+        );
+        assert_eq!(roster.changes_after(Duration::ZERO), 0, "and it holds\n{}", roster.render());
+    }
+
+    #[tokio::test]
+    #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
+    async fn probe_roster_convergence_against_cell_occupancy() {
+        // Hypothesis for the open finding: the capability/load directories ride the erasure-coded L4 store, whose
+        // [7,3,4] LRC needs FOUR of seven shard homes to reconstruct, and sends to unoccupied coordinates are dropped.
+        // If so, a three-node cell is simply BELOW the store's threshold and cannot resolve its own directory at all —
+        // which would make this a configuration floor, not a resolution defect. Occupancy is the independent variable.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        for n in [7usize] {
+            let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+            let fleet = NodeFleet::spawn::<F4>(n, Link::ideal(), roles).await.expect("fleet starts");
+            let trace = fleet.observe(30, Duration::from_secs(4), fanos_node::Node::assignment).await;
+            let peers: Vec<usize> = fleet.nodes().iter().map(|node| node.health().known_peers).collect();
+            let coords: Vec<fanos_geometry::Triple> = fleet.nodes().iter().map(|node| node.health().address).collect();
+            let distinct: HashSet<fanos_geometry::Triple> = coords.iter().copied().collect();
+            println!("  coords {coords:?} → {} distinct of {n}", distinct.len());
+            fleet.shutdown();
+            let roster = trace.map(|a| a.roster);
+            println!(
+                "occupancy {n}/7: final rosters {:?}  agreed={:?}  known_peers={peers:?}",
+                roster.last(),
+                roster.stable_agreement_at().map(|d| d.as_secs())
+            );
+        }
     }
 
     #[tokio::test]
@@ -694,11 +796,13 @@ mod tests {
         // Verifying a claim I made in docs §5.3 rather than trusting it: that cell-wide agreement is a property of
         // LATER epochs, once the beacon advances and the loop re-assigns over a fuller directory. If the roster never
         // grows, that sentence is wrong and the situation is worse than described — agreement would never be reached.
-        use fanos_field::F2;
+        use fanos_field::F4;
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F2>(3, Link::ideal(), roles).await.expect("fleet starts");
+        // F4 for the same reason as the assertions: the original F2 timeline that motivated this probe was partly a
+        // collision artifact. The frozen *epoch* it revealed was real and independent of that.
+        let fleet = NodeFleet::spawn::<F4>(3, Link::ideal(), roles).await.expect("fleet starts");
         for tick in 0..12 {
             let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
             let epochs: Vec<String> =
