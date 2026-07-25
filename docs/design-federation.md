@@ -263,4 +263,5 @@ both are present. Where they part, the *claim* is the suspect one.
   couplings and no puncture. Whether FANOS's hierarchy should additionally be diagnosed *as* that tower — inter-level
   couplings as coordinates — is a genuine open question, and the same [P] item ERGON §10 lists as "ecology dynamics".
 - **The network path that fills the masks.** `diagnose_level` now consumes the children's degraded-axis masks; a parent
-  gathering them over the wire each epoch is node plumbing (`fanos-node`), and a separate seam from this algebra.
+  gathering them over the wire each epoch is node plumbing (`fanos-node`), and a separate seam from this algebra. The same
+  applies to the tower: `tower::diagnose` is ready, and nothing yet reports a coupling's health up the hierarchy.

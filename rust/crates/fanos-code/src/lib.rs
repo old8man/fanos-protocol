@@ -14,6 +14,9 @@
 //! * [`federation`] — the **covering** (`docs/design-federation.md`): a federation triple *is a line of the parent cell*,
 //!   so the grouping is structural rather than configured — seven overlapping federations, each child covered by three,
 //!   any two sharing exactly one child. Diagnosis peels over them, and the greedy order is verified optimal.
+//! * [`tower`] — the **vertical** reading (T-232): an `m`-level tower's load is `U(m) = 8m − 1` — its axes *plus its
+//!   couplings*, because a grammar blind to coupling faults certifies the floors and not the tower. The ladder selects
+//!   `m = 3` for multi-fault protection, giving the platform's composition ceiling a *third* independent derivation.
 //! * [`syndrome`] — the `21 → 7 → 3 → 1` localization pyramid: 3-bit syndrome for one fault,
 //!   the 7-theme layer for two (V13, V21).
 //! * [`lrc`] — projective erasure repair by peeling, and hyperoval failure (V9, V20): a
@@ -36,6 +39,7 @@ pub mod golay;
 pub mod hamming;
 pub mod lrc;
 pub mod syndrome;
+pub mod tower;
 
 #[cfg(feature = "alloc")]
 pub mod da;
