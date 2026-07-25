@@ -27,6 +27,7 @@ use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 use crate::ring_hash::{HashNode, HashParams};
 use crate::ring_linear::{LinearProof, prove_linear, verify_linear};
 use crate::ring_product::{ProductProof, ProductWitness, prove_product, verify_product};
+use crate::ring_shortness::{ShortnessProof, prove_short, verify_short};
 
 /// A node together with the randomness committing each of its limbs — the secret witness of one tree node.
 pub struct NodeWitness<'a> {
@@ -166,6 +167,39 @@ pub fn verify_swap(
         }
     }
     true
+}
+
+/// Prove every limb of a committed node is **short** (`< 2^bits`) — i.e. the node is a valid SIS tree node. For
+/// the tree hash use `bits = LOG_BASE`. One [`crate::ring_shortness`] proof per limb; attaching these to each node
+/// of a [`PathProof`] is what completes membership soundness (a non-short node could otherwise satisfy the linear
+/// hash relations and forge a path).
+#[must_use]
+pub fn prove_node_short(
+    params: &RingParams,
+    node: &HashNode,
+    randomness: &[RingRandomness],
+    bits: usize,
+    seed: &[u8],
+) -> Option<Vec<ShortnessProof>> {
+    let mut proofs = Vec::with_capacity(node.limbs().len());
+    for (i, (limb, r)) in node.limbs().iter().zip(randomness).enumerate() {
+        let mut s = seed.to_vec();
+        s.extend_from_slice(b"/short/");
+        s.extend_from_slice(&(i as u64).to_le_bytes());
+        proofs.push(prove_short(params, limb, r, bits, &s)?);
+    }
+    Some(proofs)
+}
+
+/// Verify a [`prove_node_short`] proof against a node's public limb commitments.
+#[must_use]
+pub fn verify_node_short(
+    params: &RingParams,
+    node: &[RingCommitment],
+    bits: usize,
+    proofs: &[ShortnessProof],
+) -> bool {
+    node.len() == proofs.len() && node.iter().zip(proofs).all(|(c, p)| verify_short(params, c, bits, p))
 }
 
 /// One level of a [`PathProof`]: the sibling and direction-bit commitments, the swapped `left` node's commitment,
@@ -317,6 +351,7 @@ pub fn verify_path(params: &RingParams, hp: &HashParams, root: &HashNode, proof:
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::ring::D;
     use crate::ring_hash::ELL_H;
 
     /// Fresh ternary randomness for a node's `ELL_H` limbs.
@@ -408,6 +443,32 @@ mod tests {
         let lw = NodeWitness { node: &sib, randomness: &sr }; // wrong: left = sibling under d = 0
         let proof = prove_swap(&params, &cw, &sw, &lw, &d0, &rd0, b"ws").expect("proof emitted");
         assert!(!verify_swap(&params, &child_coms, &sib_coms, &sib_coms, &cd0, &proof), "d=0 with left=sib is wrong");
+    }
+
+    #[test]
+    fn a_short_node_proves_and_a_non_short_limb_is_rejected() {
+        let params = RingParams::standard();
+        let small = |a: u64, b: u64| {
+            let mut c = [0u64; D];
+            c[0] = a;
+            c[1] = b;
+            Poly::from_u64(&c)
+        };
+        // A node whose limbs all have coefficients < 2^4 = 16 (a small `bits` keeps the shortness proof fast).
+        let limbs: Vec<Poly> = (0..ELL_H).map(|i| small(3 + i as u64, 15 - i as u64)).collect();
+        let node = HashNode::from_limbs(limbs);
+        let nr = node_randomness(b"ns");
+        let coms = commit_node(&params, &node, &nr);
+        let proofs = prove_node_short(&params, &node, &nr, 4, b"seed").expect("short node");
+        assert!(verify_node_short(&params, &coms, 4, &proofs), "a node with all-<16 limbs proves short");
+        // A limb with a coefficient of 16 is not < 2^4: its shortness proof cannot verify.
+        let bad: Vec<Poly> =
+            (0..ELL_H).map(|i| if i == 0 { small(16, 0) } else { small(3 + i as u64, 15 - i as u64) }).collect();
+        let bad_node = HashNode::from_limbs(bad);
+        let bad_nr = node_randomness(b"ns-bad");
+        let bad_coms = commit_node(&params, &bad_node, &bad_nr);
+        let bad_proofs = prove_node_short(&params, &bad_node, &bad_nr, 4, b"seed").expect("emitted");
+        assert!(!verify_node_short(&params, &bad_coms, 4, &bad_proofs), "a limb of 16 is not < 2^4");
     }
 
     /// The root a depth-2 path with the given leaf, siblings, and directions hashes to.

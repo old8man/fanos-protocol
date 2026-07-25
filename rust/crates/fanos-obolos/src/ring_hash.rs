@@ -75,6 +75,15 @@ impl HashNode {
         &self.limbs
     }
 
+    /// A node from explicit limb polynomials (must be `ELL_H` of them) — for assembling derived nodes and, in
+    /// tests, small nodes whose shortness is fast to prove.
+    #[must_use]
+    #[allow(dead_code)] // consumed by tests now; the sound-path assembly constructs derived nodes with it
+    pub(crate) fn from_limbs(limbs: Vec<Poly>) -> Self {
+        debug_assert_eq!(limbs.len(), ELL_H, "a node has ELL_H limbs");
+        Self { limbs }
+    }
+
     /// Encode arbitrary bytes (e.g. a note commitment) as a short leaf node — the gadget decomposition of a
     /// uniform `K_H`-element image derived from the bytes, so the leaf is deterministic, short, and re-hashable.
     #[must_use]
