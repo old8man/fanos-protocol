@@ -508,6 +508,10 @@ impl<F: Field> Engine for NyxNode<F> {
                 | Command::Put { .. }
                 | Command::Get { .. }
                 | Command::SampleAvailability { .. }
+                // Quarantine/Readmit are the overlay's identity-keyed distrust (audit R-M1); a mixnet relay holds no
+                // membership verdict, so it has nothing to apply them to.
+                | Command::Quarantine { .. }
+                | Command::Readmit { .. }
                 | Command::Join { .. }
                 | Command::AdvanceEpoch
                 | Command::Reseat { .. },

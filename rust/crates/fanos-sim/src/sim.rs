@@ -50,6 +50,8 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Join { .. } => "Join",
         Command::AdvanceEpoch => "AdvanceEpoch",
         Command::Reseat { .. } => "Reseat",
+        Command::Quarantine { .. } => "Quarantine",
+        Command::Readmit { .. } => "Readmit",
     }
 }
 

@@ -131,6 +131,29 @@ pub enum Command {
     /// Advance the epoch beacon; the new epoch floods the cell (adopt-max), rotating epoch-derived
     /// rendezvous and shapes (spec §L3 beacon).
     AdvanceEpoch,
+    /// (Re-)quarantine the peer currently seated at `coord` — the driver's half of identity-keyed distrust
+    /// (audit R-M1).
+    ///
+    /// The engine drops frames by **coordinate**, because that is all it routes on and it is crypto-free. But a
+    /// coordinate is a per-epoch VRF placement, so a tag left on one is meaningless after a reshuffle: a Byzantine
+    /// identity sheds its tag by the epoch turning, and an innocent identity landing on that point inherits it. Both
+    /// directions are wrong, and the second is the worse one.
+    ///
+    /// Identity lives where it is *authenticated* — the transport verified the HELLO proof binding
+    /// `coord = MapToPoint(VRF(sk, cert ‖ epoch ‖ beacon))`, so only the driver knows which identity sits where. So the
+    /// driver holds distrust keyed by identity and uses this command to re-apply it to that identity's **current**
+    /// coordinate, with [`Command::Readmit`] to clear a tag whose occupant has changed. The engine keeps the mechanism;
+    /// the driver keeps the meaning.
+    Quarantine {
+        /// The peer's current coordinate.
+        coord: Triple,
+    },
+    /// Clear any quarantine tag on `coord` — used when a **different** identity takes that point, so an innocent
+    /// arrival does not inherit its predecessor's distrust (audit R-M1). See [`Command::Quarantine`].
+    Readmit {
+        /// The coordinate to clear.
+        coord: Triple,
+    },
     /// Re-seat this node at a new VRF coordinate for the per-epoch reshuffle (spec §L3 "epoch reshuffle",
     /// §3.2): the driver computes `coord = MapToPoint(VRF(sk, node‖epoch‖beacon))` for the new epoch (the
     /// engine is crypto-free and cannot) and hands it here. The engine re-derives its cell neighbours /

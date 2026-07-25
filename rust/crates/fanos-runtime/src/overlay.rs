@@ -956,6 +956,15 @@ impl Healer {
     /// emitting a `Quarantined` notification only on a *new* distrust (idempotent across rounds). The single
     /// quarantine actuator shared by the mediator model (`violated_classes`, via the healing plan) and the
     /// endpoint fabrication detector ([`attest_endpoints`]) — one reason for a member's frames to be dropped.
+    /// Clear any quarantine tag on `node_c`, re-admitting it immediately rather than at TTL expiry.
+    ///
+    /// Used when a coordinate's **occupant changes** (audit R-M1): a tag belongs to an identity, and the arriving
+    /// identity has not earned its predecessor's distrust. Silent — re-admission is the absence of a verdict, not a
+    /// verdict, so it emits no notification.
+    fn readmit(&mut self, node_c: Triple) {
+        self.quarantined.remove(&node_c);
+    }
+
     fn quarantine(&mut self, node_c: Triple, now: Instant) -> Option<Effect> {
         self.quarantined
             .insert(node_c, now)
@@ -2738,6 +2747,16 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::SampleAvailability { key }) => self.on_sample(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
+            // Audit R-M1: the driver re-applies distrust to the identity's *current* coordinate, and clears a tag whose
+            // occupant has changed. The engine stays coordinate-keyed and crypto-free; the driver supplies the identity
+            // binding it alone authenticated.
+            Input::Command(Command::Quarantine { coord }) => {
+                self.healer.quarantine(coord, now).into_iter().collect()
+            }
+            Input::Command(Command::Readmit { coord }) => {
+                self.healer.readmit(coord);
+                Vec::new()
+            }
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
             Input::Timer(HEARTBEAT) if self.heartbeating => self.on_heartbeat(now),
@@ -3788,6 +3807,55 @@ mod tests {
             )),
             "the shard-set matching the in-flight nonce reconstructs and resolves the read"
         );
+    }
+
+    #[test]
+    fn a_reshuffled_identity_neither_sheds_its_quarantine_nor_bequeaths_it() {
+        // Audit R-M1, both directions. A quarantine tag belongs to an IDENTITY, but the engine can only drop by
+        // coordinate — and a coordinate is a per-epoch VRF placement. So the driver, which alone authenticated the
+        // identity↔coordinate binding, keeps distrust by identity and uses these two commands to keep the engine's
+        // coordinate-keyed view honest across a move.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let old = Point::<F2>::at(1).coords();
+        let new_coord = Point::<F2>::at(2).coords();
+        let t0 = Instant(0);
+
+        // The engine quarantines the peer at `old` (whatever the local verdict was).
+        node.step(t0, Input::Command(Command::Quarantine { coord: old }));
+        assert!(node.healer.is_quarantined(old, t0), "the tag lands");
+
+        // DIRECTION 1 — the Byzantine identity reshuffles to a new coordinate. Without the driver re-applying, it
+        // would arrive clean: the tag is on a point it no longer occupies. With it, distrust follows the identity.
+        node.step(t0, Input::Command(Command::Quarantine { coord: new_coord }));
+        assert!(node.healer.is_quarantined(new_coord, t0), "distrust follows the identity to its new point");
+
+        // DIRECTION 2 — and the worse one. An *innocent* identity now lands on the vacated `old`. Left alone it would
+        // inherit a verdict it never earned, which is a live denial-of-service against an honest node by nothing more
+        // than the epoch turning. The driver clears the stale tag when the occupant changes.
+        node.step(t0, Input::Command(Command::Readmit { coord: old }));
+        assert!(!node.healer.is_quarantined(old, t0), "the arriving identity does not inherit its predecessor's tag");
+        assert!(node.healer.is_quarantined(new_coord, t0), "and clearing one point does not clear the other");
+    }
+
+    #[test]
+    fn re_admission_is_silent_because_it_is_the_absence_of_a_verdict() {
+        // Quarantining announces a new distrust; re-admitting announces nothing. A `Notification::Quarantined` is a
+        // claim about a peer, and its withdrawal is not a counter-claim — it is the tag ceasing to apply, which no
+        // observer needs told.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let c = Point::<F2>::at(3).coords();
+        let effects = node.step(Instant(0), Input::Command(Command::Quarantine { coord: c }));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Quarantined(t)) if t == &c)),
+            "a new distrust is announced"
+        );
+        // Idempotent: re-issuing the same tag is not a second verdict.
+        let again = node.step(Instant(0), Input::Command(Command::Quarantine { coord: c }));
+        assert!(!again.iter().any(|e| matches!(e, Effect::Notify(Notification::Quarantined(_)))));
+
+        let cleared = node.step(Instant(0), Input::Command(Command::Readmit { coord: c }));
+        assert!(cleared.is_empty(), "re-admission emits nothing");
+        assert!(!node.healer.is_quarantined(c, Instant(0)));
     }
 
     #[test]
