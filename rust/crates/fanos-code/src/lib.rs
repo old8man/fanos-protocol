@@ -6,6 +6,11 @@
 //! code (LRC). This crate exposes both, and the DIAKRISIS fault localizer built on them:
 //!
 //! * [`hamming`] — the Hamming(7,4) / Fano correspondence and single-error syndrome (V10).
+//! * [`golay`] — the **Turyn federation** (T-228, `docs/design-federation.md`): three cells, each contributing its seven
+//!   axes plus a parity bus, glued through the mirror orientation of the same plane, giving the extended Golay `[24,12,8]`
+//!   — the unique perfect grammar that localizes *any three* simultaneous faults across the federation. Where a lone cell
+//!   locates one fault and aliases two onto a confident wrong answer, three cells locate three, including all three inside
+//!   one member.
 //! * [`syndrome`] — the `21 → 7 → 3 → 1` localization pyramid: 3-bit syndrome for one fault,
 //!   the 7-theme layer for two (V13, V21).
 //! * [`lrc`] — projective erasure repair by peeling, and hyperoval failure (V9, V20): a
@@ -23,6 +28,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod golay;
 pub mod hamming;
 pub mod lrc;
 pub mod syndrome;
