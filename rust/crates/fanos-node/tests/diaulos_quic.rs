@@ -9,6 +9,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
@@ -79,7 +81,7 @@ fn warm(a: &Node, b: &Node) {
 
 /// One request/response over a dialed stream: write `request`, signal end, read the whole response.
 async fn exchange(stream: &mut DuplexStream, request: &[u8]) -> Vec<u8> {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(request).await.unwrap();
         stream.shutdown().await.unwrap();
         let mut buf = Vec::new();

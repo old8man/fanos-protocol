@@ -343,13 +343,196 @@ loss=90%  delivered=  4  rosters=[1, 1, 1]
 
 At **zero loss** a three-node fleet reaches `[2, 2, 1]`, not `[3, 3, 3]`. The genesis assignment is gated on *this
 node's own* publishes (§5.1), which is what makes it deterministic — but that window is far shorter than peer discovery
-takes, so at genesis a node has typically seen one or two members however healthy the carrier is. Cell-wide agreement
-is therefore a property of **later epochs**, once the beacon advances and the loop re-assigns over a fuller directory;
-it is not a property of startup at all, and the previous code could not have told anyone that.
+takes, so at genesis a node has typically seen one or two members however healthy the carrier is. The genesis
+assignment is therefore *provisional by construction*, and the roster is what makes that legible rather than a
+footnote.
 
-That reframes the guarantee honestly: the genesis assignment is *provisional by construction*, and the roster is what
-makes the distinction legible rather than a footnote. Whether a node should additionally *defer* acting on a
-provisional assignment is a policy question per subsystem, and belongs with the subsystem that carries the risk.
+### 5.3.1 The correction — agreement was not "a property of later epochs", it was never reached
+
+This section first concluded that cell-wide agreement is "a property of later epochs, once the beacon advances and the
+loop re-assigns over a fuller directory". **That was a hypothesis stated as a finding, and the instrument refutes it.**
+Left running for a full minute on a *perfect* carrier, the fleet never converges:
+
+```
+t=  0s  rosters=[0, 0, 0]  epochs=[0, 0, 0]  known_peers=[1, 2, 2]
+t=  5s  rosters=[1, 1, 2]  epochs=[0, 0, 0]  known_peers=[1, 2, 2]
+…                                                                  (unchanged through t = 55 s)
+t= 55s  rosters=[1, 1, 2]  epochs=[0, 0, 0]  known_peers=[1, 2, 2]
+```
+
+The epoch never leaves `0`, so the loop — whose **only** re-assign trigger was `Notification::BeaconReady` — never runs
+again. The startup-race view was not provisional at all; it was **permanent**. Every node kept a different roster
+forever, and the deterministic cell-wide assignment the whole design rests on was silently not in effect.
+
+The defect is the *coupling*, not the beacon: role assignment is a **homeostatic** function, and tying it exclusively to
+beacon advance freezes it precisely when a cell most needs to adapt — a stalled beacon is the entire subject of the
+recovery work (§4 R‑C1), and it would also have pinned every node's roles to its startup view. The fix is a
+`ROSTER_REFRESH` tick that re-assigns at the **current** epoch. Determinism survives because no new randomness enters:
+same epoch, same beacon seed, and a roster that only converges *upward* toward the true live set, so two nodes that have
+discovered the same members compute the same assignment exactly as they would on a beacon advance. Measured after the
+fix, on the same fleet:
+
+```
+t=  5s  rosters=[1, 2, 3]      t= 15s  rosters=[3, 3, 3]   ← full agreement, epoch still 0
+```
+
+The cadence itself is then derived rather than picked. A fixed 5 s scan forever costs two cell-wide directory reads per
+node per tick indefinitely, so the refresh — a fixed-point iteration — is polled at a rate proportional to how fast it is
+still moving: geometric backoff while the assignment is unchanged, floor `ROSTER_REFRESH` = 5 s (the discovery
+timescale), ceiling one `DEFAULT_EPOCH_PERIOD` = 600 s (past which a live beacon would have re-assigned anyway, so the
+worst-case detection latency equals the guarantee the beacon path already gives).
+
+**The naive form of that backoff was itself a defect, and the instrument caught it too.** A single sample cannot
+distinguish a *converged* iteration from one that has **not started moving yet**. Backing off on one unchanged
+observation relaxed the cadence 5→10→20→40 s *while the roster was still filling*, and the fleet that converges at 15 s
+idle then failed to converge inside 60 s under concurrent load — the optimization delayed exactly the guarantee it was
+attached to. Fixed-point detection needs at least two identical successive iterates, so backoff is gated on
+`STABLE_BEFORE_BACKOFF` = 3 consecutive unchanged assignments (two for the fixed point, a third as margin against a
+repeated transient). Below that count the cadence stays pinned at the floor, so discovery is never slowed: the suite went
+from 61 s failing to 13 s green.
+
+Three lessons worth more than the fixes. First, **a weak assertion hides a strong defect**: the standing test asked whether
+*any* node saw a roster past one, which `[1, 1, 2]` satisfies — it is now `all(roster == N)`, and in that form the bug
+could not have survived a single run. Second, the finding came from *watching* rather than asserting: the probe that
+printed a timeline made a frozen value obvious where a pass/fail could only ever have reported "ok". Third, **a fix's own
+optimization needs the same instrument** — the backoff was reasoned from first principles and still wrong, and only
+re-running the fleet showed it.
+
+Whether a node should additionally *defer* acting on a provisional assignment remains a policy question per subsystem,
+and belongs with the subsystem that carries the risk.
+
+### 5.3.2 The observatory, and the deeper finding it exposed
+
+The find in §5.3.1 came from *watching a timeline*, not from an assertion — so that act is now a first-class instrument
+rather than something whoever reads the output happens to notice. `fanos-sim` gains a two-part **observatory**: a
+sans-I/O `observe::Timeline<T>` (a recorded trajectory plus pure analysis, unit-tested at T0 by known-answer timelines —
+an instrument that lies is worse than none) and `NodeFleet::observe`, which samples any observable across the fleet in a
+single pass, so different quantities are always compared at the same instants.
+
+It names three defect classes, each **inexpressible** as an assertion over final state — which is exactly why all three
+were unguarded:
+
+| Property | Healthy | The defect it names |
+|---|---|---|
+| `frozen()` | `false` | a missing trigger — the system never moves at all (§5.3.1) |
+| `stable_agreement_at()` | `Some(t)` | permanent disagreement — nodes hold different views forever |
+| `changes_after(t)` | `0` | **oscillation** — it moves but never settles |
+
+Oscillation had never been tested for anywhere in the suite, and for this protocol it is the costliest of the three: a
+role set that churns churns the **anonymity set** with it.
+
+**Turned on the role loop, the observatory immediately failed the fix from §5.3.1.** The refresh backoff relaxed on
+*local* stability, but the fixed point sought is *global* agreement — and a node stuck at a roster of one cannot
+distinguish "the cell is just me" from "I have discovered no one yet". It saw three identical samples, concluded it had
+converged, and stopped looking:
+
+```
+t=  6s  [1, 1, 2]   →   t= 14s  [2, 1, 2]   →   … unchanged through t = 38 s
+```
+
+So the backoff is additionally gated on `!is_solitary()`: a solitary assignment is never grounds to relax, however many
+identical samples precede it. **That fix holds and the cell still does not agree** — `[1, 2, 2]` for 24 s, node 0
+resolving only itself while nodes 1 and 2 resolve two of three.
+
+That is the real finding, and it is upstream of everything above: **cell-wide directory resolution does not complete on a
+freshly bootstrapped cell.** Neither the beacon coupling nor the backoff causes it — both were fixed and the
+disagreement survives — so the deterministic cell-wide assignment's *input* is simply not available. The earlier
+`[3, 3, 3]` observations were luck, and the assertion that reported them was weak enough to bank on luck.
+
+It is recorded as `open_finding_the_whole_cell_resolves_every_member`: an `#[ignore]`d test that **fails**, named as an
+open finding rather than a flake, and serving as the acceptance test for the resolution work. Weakening it to green is
+precisely how it stayed invisible for as long as it did.
+
+### 5.3.3 The refresh's cost, its derived bound — and the attribution that was wrong
+
+Timing-sensitive real-socket tests that pass alone began failing under full-parallel workspace runs, a different one each
+time (`fanos-ffi`, the DROMOS QUIC cell, the rendezvous-host driver). The obvious suspect was the new refresh, and
+inspecting it did find a real cost worth fixing: one assignment scanned **two** cell-wide directories *sequentially*, each
+bounded by `RESOLVE_TIMEOUT` = 5 s, on a 5 s period — a duty cycle near **1**, so the node is permanently scanning the
+cell, the next refresh starting as the last one ends.
+
+**But the suspicion was wrong, and only a baseline showed it.** Re-running the whole suite with the refresh period set to
+an hour — effectively off — fails too, on yet another real-socket test (`fanos-quic`'s fabric seam). So the load
+sensitivity is **pre-existing**: under `cargo test --workspace` one random real-socket/real-timing test misses its
+deadline, with or without the refresh. That matters twice over — it means the duty cycle was not the cause, and it means
+**the verification gate itself is unreliable at full parallelism**, which is its own open finding (a green full-workspace
+run is currently partly luck; per-crate runs are the trustworthy signal).
+
+The corrections below are therefore kept on their own merits — they are derived improvements to a mechanism that runs
+forever on every node — not as a fix for the failures that prompted looking. No chosen numbers:
+
+1. The capability and load directories are **independent reads**, so they are now scanned concurrently (`tokio::join!`).
+   An assignment's worst case is one `RESOLVE_TIMEOUT`, not two.
+2. `ROSTER_REFRESH = 3 × RESOLVE_TIMEOUT`, which bounds the refresh at a **1/3 duty cycle**. The period is a function of
+   the work it schedules: anything near 1× and successive scans overlap.
+
+Two solitary cases also had to be separated, and the signal that separates them is a bound rather than a threshold. The
+transport's own peer table is a *lower bound* on live membership that owes nothing to the overlay store, so: solitary
+with **zero** peers means there is nothing to discover and polling cannot help — relax fully; solitary with peers means
+the directory view is demonstrably *behind* the transport view — positive evidence of incompleteness, stay at the floor.
+Without the first case a genuinely alone node scans the whole cell forever with every read timing out, which is both
+sustained load and, on a real network, a traffic beacon. Without the second, §5.3.2's stuck node stops looking.
+
+### 5.3.4 Fixing the gate itself, not recording it as debt
+
+An unreliable gate is not a footnote — it is the thing every other claim in this document rests on, so it was fixed
+rather than noted. The root cause was uniform across fourteen sites: every real-socket wait carried a hand-picked
+ceiling (10 s, 15 s, 20 s, 30 s, 40 s, 45 s, 50 s, 60 s, and a per-call `secs` argument), and each of those numbers was
+**two quantities collapsed into one**:
+
+1. *how long this operation is expected to take* — a latency claim, worth asserting explicitly if it matters;
+2. *how long before we conclude it will never finish* — a liveness backstop.
+
+Sizing (2) as though it were (1) converts machine contention into a false red. All fourteen now share one
+`common::HANG_CEILING`, documented as explicitly **not** a latency budget: a test that needs to pin latency asserts it
+separately, which keeps the claim visible instead of hidden inside a timeout argument. The `fanos-quic` poll helpers got
+the same treatment (`await_until`'s ~2 s ceiling became ~30 s).
+
+**The honest cost**: a generous backstop makes a *genuine* hang slower to surface — a real deadlock now takes 240 s per
+site to fail rather than 60 s. That is the correct trade (a false red on a working system is worse than a slow true red
+on a broken one) but it is a trade, not a free lunch, and the earlier claim that the headroom "pays nothing" was true
+only of the healthy path.
+
+### 5.3.5 The ceiling hypothesis was wrong too — and the refresh really was starving consensus
+
+Raising the ceilings produced a decisive negative result. Under a full-parallel run **both** DROMOS QUIC tests then
+failed at the *complete* 240 s ceiling — not one, and not slowly. A wait that misses 60 s and also misses 240 s is not
+short of time; it is not progressing. So contention-headroom was the wrong diagnosis, and the earlier refresh-off
+baseline had already hinted as much by failing a *different* test and leaving DROMOS green.
+
+The refresh was starving the node's critical path. A seven-node real-QUIC consensus cell, each node also running a
+periodic cell-wide directory scan, does not merely slow down when the machine is oversubscribed — it stops converging.
+The 1/3 duty cycle of §5.3.3 bounded the cost but did not remove it, and for something that runs forever on every node,
+bounded is not good enough.
+
+The correct form drops the steady-state cost to **zero**, and it comes from asking what the refresh is actually for. It
+exists to close one gap: the directory-derived roster lagging true membership. The transport's own peer table is a lower
+bound on that membership owing nothing to the overlay store, so the gap is *directly observable* — and when it is not
+observed, there is no evidence of any work to do:
+
+```text
+roster < peers()  → the directory view is demonstrably behind the transport view: stay at the floor, keep looking
+otherwise         → no observable gap: relax (a beacon advance or a new peer returns the loop to the floor by itself)
+```
+
+That single comparison also subsumes the `!is_solitary()` special case it replaced, which had only covered the
+`roster == 1` instance of the same condition. With it, DROMOS passes and the loop still converges — the refresh runs
+exactly while there is evidence it has something to close, and not otherwise.
+
+The lesson is sharper than the fix: **a bounded cost is not a removed cost.** A mechanism that runs forever on the
+critical path needs a condition under which it does nothing, not merely a cap on how much it does.
+
+**One confound, stated plainly.** Partway through this investigation the process table showed an unrelated project's test
+suite running on the same machine. So the *magnitude* of contention in the measurements above was partly external and is
+not reproducible from this repo alone. What survives the confound is the controlled comparison, because both arms ran
+under the same conditions: with the refresh on, DROMOS failed at both 60 s and 240 s; with it off, DROMOS passed and a
+different test failed instead. The direction of that result is sound; any absolute timing figure quoted here is not, and
+should be re-measured on a quiet machine before being relied on.
+
+Two general lessons. **A periodic mechanism's cost belongs in its derivation**: a period chosen for how fast convergence
+*should* be, with no reference to what one iteration costs, produces a duty cycle by accident. And **a plausible cause is
+not a measured one** — the duty cycle was real, the arithmetic was right, the reasoning was clean, and it still was not
+what broke those tests. One baseline run settled what an hour of inference could not.
 
 ---
 

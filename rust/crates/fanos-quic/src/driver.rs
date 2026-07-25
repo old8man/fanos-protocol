@@ -1804,13 +1804,17 @@ mod tests {
         // subset of a seven-point plane is not a whole cell); the point is that the attempt drives real QUIC
         // datagrams through the injected socket.
         //
+        // A poll-until ceiling exists only to turn a hang into a failure, so it is sized for a *loaded* machine, not an
+        // idle one: the healthy path exits in well under a second and pays nothing for the headroom, while a ceiling
+        // tuned to the idle case is itself a defect — it converts machine contention into a false red. Measured: this
+        // test missed a ~20 s ceiling under a full-workspace parallel run while passing in 1 s alone.
         // Written as poll-until-observed with a generous deadline rather than "wait N then assert" — the latter
         // passed alone and failed under concurrent test load, which is the flake shape §5 of docs/design-testing.md
         // records. The property is *that* traffic crosses the fabric, never how promptly.
         let dialer = handles.first().expect("two nodes").client();
         let dial = tokio::spawn(async move { dialer.get(b"fabric-seam/key".to_vec()).await });
         let mut crossed = 0;
-        for _ in 0..200 {
+        for _ in 0..1_800 {
             crossed = fabrics.iter().map(|f| f.sent()).sum::<usize>();
             if crossed > 0 {
                 break;
@@ -2051,13 +2055,16 @@ mod tests {
         );
     }
 
-    /// Poll `cond` up to ~2s, yielding between checks; returns whether it became true.
+    /// Poll `cond` up to ~30s, yielding between checks; returns whether it became true.
+    ///
+    /// The ceiling is deliberately far above the healthy path (which resolves in milliseconds): its only job is to turn
+    /// a hang into a failure, and a ceiling sized for an idle machine turns parallel-run contention into a false red.
     async fn await_until(cond: impl Fn() -> bool) -> bool {
-        for _ in 0..400 {
+        for _ in 0..3_000 {
             if cond() {
                 return true;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         false
     }

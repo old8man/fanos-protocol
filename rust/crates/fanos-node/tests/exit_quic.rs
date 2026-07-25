@@ -10,6 +10,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
+mod common;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
@@ -158,7 +160,7 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
     // does), so this also exercises the DIAULOS flush-on-write fix — without it a sub-segment write is
     // never shipped until the stream closes and this would hang.
     let sent = b"through the exit to the clearnet";
-    let echoed = tokio::time::timeout(Duration::from_secs(15), async {
+    let echoed = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(sent).await.unwrap();
         let mut buf = vec![0u8; sent.len()];
         stream.read_exact(&mut buf).await.unwrap();
@@ -199,7 +201,7 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
 
     // The exit denies the port before connecting anywhere, so it relays nothing and closes: the client
     // reads EOF (no echo). Also confirm the echo server itself never received a connection.
-    let got = tokio::time::timeout(Duration::from_secs(10), async {
+    let got = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(b"should not pass").await.ok();
         stream.shutdown().await.ok();
         let mut buf = Vec::new();
@@ -253,7 +255,7 @@ async fn an_exit_advertises_itself_and_is_discovered() {
     // fast local store hit — unlike an empty peer slot on this lone node, which has no live responder.
     let client = node.client();
     let coord = node.address();
-    let found = tokio::time::timeout(Duration::from_secs(10), async {
+    let found = tokio::time::timeout(common::HANG_CEILING, async {
         loop {
             if let Some(public) = resolve_exit_key(&client, coord, Epoch::ZERO).await {
                 return public;
@@ -295,7 +297,7 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
         .expect("the dialer reached the clearnet target through the exit");
 
     let sent = b"proxy dialer -> exit -> clearnet";
-    let echoed = tokio::time::timeout(Duration::from_secs(15), async {
+    let echoed = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(sent).await.unwrap();
         let mut buf = vec![0u8; sent.len()];
         stream.read_exact(&mut buf).await.unwrap();
@@ -335,7 +337,7 @@ async fn the_proxy_dialer_relays_udp_through_the_exit() {
     let udp_echo = spawn_udp_echo().await;
 
     let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, e_public);
-    let mut tunnel = tokio::time::timeout(Duration::from_secs(15), dialer.dial_udp(&Target::Ip(udp_echo)))
+    let mut tunnel = tokio::time::timeout(common::HANG_CEILING, dialer.dial_udp(&Target::Ip(udp_echo)))
         .await
         .expect("open the UDP tunnel in time")
         .expect("the dialer opened a UDP tunnel through the exit");
@@ -343,7 +345,7 @@ async fn the_proxy_dialer_relays_udp_through_the_exit() {
     // Two datagrams each round-trip: client → exit → UDP echo → exit → client.
     for payload in [b"a dns query".as_slice(), b"and a second datagram".as_slice()] {
         tunnel.outbound.send(payload.to_vec()).await.unwrap();
-        let echoed = tokio::time::timeout(Duration::from_secs(15), tunnel.inbound.recv())
+        let echoed = tokio::time::timeout(common::HANG_CEILING, tunnel.inbound.recv())
             .await
             .expect("a datagram comes back in time")
             .expect("the tunnel is still open");

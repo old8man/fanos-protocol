@@ -12,6 +12,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+mod common;
+
 use std::time::Duration as StdDuration;
 
 use fanos_aphantos::ThresholdRouter;
@@ -80,9 +82,12 @@ async fn router(i: usize, dir: &Directory, t: usize) -> (NodeHandle, HybridKemPu
     (handle, onion_public)
 }
 
-/// Await an anonymous delivery of `want` on `node`, within `secs`.
-async fn await_anonymous(node: &mut NodeHandle, want: &[u8], secs: u64) -> bool {
-    tokio::time::timeout(StdDuration::from_secs(secs), async {
+/// Await an anonymous delivery of `want` on `node`, bounded by the shared hang ceiling.
+///
+/// The ceiling used to be a per-call `secs` argument, which is the same conflation `common::HANG_CEILING` removes: a
+/// caller passing `20` was not claiming the delivery takes 20 s, it was guessing how long to wait before giving up.
+async fn await_anonymous(node: &mut NodeHandle, want: &[u8]) -> bool {
+    tokio::time::timeout(common::HANG_CEILING, async {
         loop {
             match node.next_notification().await {
                 Some(Notification::Delivered { from, payload })
@@ -145,7 +150,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     // The node sitting at the meeting line's combiner receives the payload anonymously — the mixnet
     // peeled both hops over the real socket, and no node (nor the endpoint) learned the source.
     assert!(
-        await_anonymous(&mut nodes[l_index], &payload, 20).await,
+        await_anonymous(&mut nodes[l_index], &payload).await,
         "the onion was delivered anonymously to the meeting line over QUIC"
     );
 }
@@ -219,7 +224,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         .await
         .expect("anonymous dial by name");
 
-    let response = tokio::time::timeout(StdDuration::from_secs(40), async {
+    let response = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(b"GET /anon").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut resp = Vec::new();
@@ -338,7 +343,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         .await
         .expect("fresh anonymous dial by name");
 
-    let response = tokio::time::timeout(StdDuration::from_secs(45), async {
+    let response = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(b"GET /cell").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut resp = Vec::new();
@@ -437,7 +442,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         .await
         .expect("anonymous dial to an off-combiner service");
 
-    let response = tokio::time::timeout(StdDuration::from_secs(50), async {
+    let response = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(b"GET /off").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut resp = Vec::new();
@@ -527,7 +532,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         .dial(&Target::Name("driver.fanos".to_owned(), 80))
         .await
         .expect("anonymous dial to a driver-hosted service");
-    let response = tokio::time::timeout(StdDuration::from_secs(50), async {
+    let response = tokio::time::timeout(common::HANG_CEILING, async {
         stream.write_all(b"GET /driver").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut resp = Vec::new();

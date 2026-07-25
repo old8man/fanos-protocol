@@ -11,6 +11,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+mod common;
+
 use std::time::Duration;
 
 use fanos_field::F2;
@@ -139,7 +141,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     }
 
     // Liveness witness: the cell finalizes at least one block over real QUIC.
-    let committed = tokio::time::timeout(Duration::from_secs(30), async {
+    let committed = tokio::time::timeout(common::HANG_CEILING, async {
         loop {
             if let Ok(TaxisEvent::Committed { height, .. }) = events.recv().await {
                 return height;
@@ -153,7 +155,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     // End-to-end safety+liveness: wait until EVERY node's finalized ledger reflects the transfer — BOB credited
     // 100 and ALICE debited to 900. Divergent (forked) execution would leave some node's ledger different, so
     // unanimous agreement on the executed balances is the cross-node no-fork witness.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + common::HANG_CEILING;
     loop {
         assert!(tokio::time::Instant::now() <= deadline, "the transfer did not execute across the whole cell in time");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -187,7 +189,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     // store, and it is a valid Q-quorum certificate over the executed state — exactly what a parent cell attests
     // for hierarchical shared security (`crosscell_dir::attest_children`).
     let reader = cell.nodes[1].client();
-    let ckpt_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let ckpt_deadline = tokio::time::Instant::now() + common::HANG_CEILING;
     let cert = loop {
         assert!(tokio::time::Instant::now() <= ckpt_deadline, "the cell published no execution checkpoint in time");
         if let Some(cert) = resolve_checkpoint(&reader, CELL_ID, EPOCH).await {

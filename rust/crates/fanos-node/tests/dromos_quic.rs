@@ -12,6 +12,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+mod common;
+
 use std::time::Duration;
 
 use fanos_dromos::HybridLedger;
@@ -146,8 +148,11 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     // 1) and Bob's note created (note_count 2 — the genesis note plus Bob's). Convergence across all seven is
     // the cross-node witness that the private transfer executed over live consensus without forking.
     // Generous deadline: the shielded payload (~7 KB) is far larger than a plain transfer, so the block and its
-    // reveals carry more over the loopback — normal convergence is ~2 s, but the ceiling stays wide.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // reveals carry more over the loopback — normal convergence is ~2 s, but the ceiling stays wide. Sized for a
+    // *loaded* machine on purpose: seven real-QUIC nodes competing with the rest of a parallel workspace run missed a
+    // 60 s ceiling while passing in ~3 s alone, and a poll-until ceiling tuned to the idle case converts contention
+    // into a false red. The healthy path pays nothing for the headroom.
+    let deadline = tokio::time::Instant::now() + common::HANG_CEILING;
     loop {
         assert!(tokio::time::Instant::now() <= deadline, "the private transfer did not execute across the cell in time");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -229,8 +234,10 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
     cell.nodes[0].client().command(Command::Emit { to: target, frame: tx_to_frame(&sealed) });
 
     // Every node's shielded pool converges to "Alice spent, Bob created" — the cross-node witness that a
-    // network-submitted transaction propagated to the whole cell and executed over live consensus.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // network-submitted transaction propagated to the whole cell and executed over live consensus. Ceiling sized for a
+    // loaded machine for the same reason as its sibling above: this is the test that measurably missed 60 s under a
+    // parallel workspace run while passing in ~3 s alone.
+    let deadline = tokio::time::Instant::now() + common::HANG_CEILING;
     loop {
         assert!(tokio::time::Instant::now() <= deadline, "the network-submitted transfer did not reach the cell in time");
         tokio::time::sleep(Duration::from_millis(150)).await;

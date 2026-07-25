@@ -132,26 +132,125 @@ pub fn spawn_role_loop<F: Field>(
     controller: RoleController,
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
+    peers: impl Fn() -> usize + Send + 'static,
 ) -> (JoinHandle<()>, watch::Receiver<Assignment>) {
     let (roles_tx, roles_rx) = watch::channel(Assignment::NONE);
     let handle = tokio::spawn(async move {
         let mut live = LiveRoleController::new(node_id, controller);
         let mut events = client.subscribe();
         let mut cur = Epoch::ZERO;
+        let mut seed = BeaconSeed::GENESIS;
         genesis_assign::<F>(&client, &mut live, capacity, ready, &roles_tx).await;
+        // The refresh is a fixed-point iteration over the roster, so it is polled at a rate proportional to how fast it
+        // is still moving: back off geometrically while the assignment is unchanged, snap back to the floor the moment
+        // it moves. Converged cells therefore stop paying for it (a fixed 5 s scan forever is two cell-wide directory
+        // reads per node per tick, indefinitely), while a cell that is still discovering — or has just lost a member —
+        // is re-checked at the discovery timescale. Bounded above by ROSTER_REFRESH_MAX, below by ROSTER_REFRESH.
+        let mut backoff = ROSTER_REFRESH;
+        let mut settled = Assignment::NONE;
+        let mut stable = 0u32;
+        let mut refresh = tokio::time::interval(backoff);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        refresh.tick().await; // the first tick is immediate; the genesis assignment just ran
         loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch, seed }) if epoch > cur => {
-                    cur = epoch;
-                    assign_epoch::<F>(&client, &mut live, epoch, &BeaconSeed::new(seed), capacity, &roles_tx).await;
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(Notification::BeaconReady { epoch, seed: s }) if epoch > cur => {
+                        cur = epoch;
+                        seed = BeaconSeed::new(s);
+                        settled = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
+                        // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
+                        // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
+                        stable = 0;
+                        backoff = ROSTER_REFRESH;
+                        refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
+                        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                // Re-assign at the *current* epoch as the roster fills in. Without this the loop's only trigger is a
+                // beacon advance, so a cell whose beacon has stalled — or has not started — keeps the provisional
+                // genesis assignment forever. Measured: rosters frozen at [1, 1, 2] for 60 s on a perfect carrier,
+                // epoch never leaving 0 (`docs/design-testing.md` §5.3).
+                //
+                // Determinism survives because the inputs are still agreed: same epoch, same beacon, and a roster that
+                // only converges *upward* toward the true live set. Two nodes that have discovered the same members
+                // compute the same assignment, exactly as on a beacon advance — the refresh adds no new randomness, it
+                // just stops the cell being stuck with a startup-race view of itself.
+                _ = refresh.tick() => {
+                    let now = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
+                    if now == settled {
+                        stable = stable.saturating_add(1);
+                        // Local stability is *not* evidence of the global fixed point, and conflating the two is the
+                        // same error one level up. A solitary assignment is the one value that cannot distinguish "the
+                        // cell really is just me" from "I have not discovered anyone yet" — so a node holding one has no
+                        // grounds to relax, however many identical samples it has seen. Measured with this gate absent:
+                        // a fleet reached [1, 1, 2], one node backed off 5→10→20→40 s while still at a roster of one,
+                        // and the cell then sat at [2, 1, 2] indefinitely (`docs/design-testing.md` §5.3.2).
+                        // The refresh exists to close one specific gap: the directory-derived roster lagging true
+                        // membership. The transport's own peer table is a *lower bound* on that membership which owes
+                        // nothing to the overlay store, so the gap is directly observable — and when it is not observed,
+                        // there is no evidence of work to do.
+                        //
+                        //   roster <  peers()  → the directory view is demonstrably BEHIND the transport view. Positive
+                        //                        evidence of incompleteness: stay at the floor and keep looking.
+                        //   otherwise          → no observable gap. Relax; a beacon advance or a peer appearing will
+                        //                        bring the loop back to the floor on its own.
+                        //
+                        // This replaced a `!is_solitary()` special case, which only covered the roster == 1 instance of
+                        // the same condition. Measured consequence of relaxing too little: the refresh's steady-state
+                        // scan competes with the node's critical path, and under machine contention a seven-node
+                        // real-QUIC consensus cell then fails to converge *at all* — not slowly, at any ceiling
+                        // (`docs/design-testing.md` §5.3.5). Steady-state cost must be zero, not a trickle.
+                        let behind = now.roster < peers();
+                        if stable >= STABLE_BEFORE_BACKOFF && !behind {
+                            backoff = (backoff * 2).min(ROSTER_REFRESH_MAX);
+                        }
+                    } else {
+                        settled = now;
+                        stable = 0;
+                        backoff = ROSTER_REFRESH;
+                    }
+                    refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
+                    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
     (handle, roles_rx)
 }
+
+/// How often the role loop re-assigns at the **current** epoch, so a roster that was incomplete at startup converges.
+///
+/// The loop's only other trigger is a beacon advance. That is insufficient on its own: role assignment is a
+/// *homeostatic* function, and tying it exclusively to the beacon freezes it precisely when a cell most needs to
+/// adapt — a stalled beacon (audit §4 R-C1's whole subject) would otherwise pin every node to whatever partial view
+/// its startup race produced.
+///
+/// The period is **derived from the work it schedules**, not chosen: one assignment costs up to one
+/// [`RESOLVE_TIMEOUT`] (the two directory scans run concurrently), so a 3× period bounds the refresh at a **1/3 duty
+/// cycle**. Anything near 1× and the scans overlap — the node is then permanently scanning the cell, which measurably
+/// destabilised timing-sensitive real-socket tests running alongside it and would be a traffic beacon in production.
+const ROSTER_REFRESH: Duration = Duration::from_secs(3 * crate::resolve::RESOLVE_TIMEOUT.as_secs());
+
+/// The ceiling the refresh backs off to, **derived** as one [`DEFAULT_EPOCH_PERIOD`](crate::config::DEFAULT_EPOCH_PERIOD).
+///
+/// Past one epoch the refresh has no work left that the beacon path would not do anyway: a live beacon re-assigns on
+/// advance, so the refresh is *strictly* the fallback for a beacon that has stalled. Capping there keeps the fallback's
+/// worst-case detection latency equal to the guarantee the beacon path already offers, at a cost that decays to nothing.
+const ROSTER_REFRESH_MAX: Duration = crate::config::DEFAULT_EPOCH_PERIOD;
+
+/// Consecutive unchanged assignments required before the refresh cadence is allowed to relax.
+///
+/// One sample cannot tell a *converged* iteration from one that has **not started moving yet** — and conflating them is
+/// not a cosmetic error: backing off during discovery delays the agreement the refresh exists to reach. Measured with
+/// naive one-sample backoff, a fleet that converges at 15 s on an idle machine failed to converge inside 60 s under
+/// concurrent load, because the cadence relaxed 5→10→20→40 s while the roster was still filling underneath it.
+///
+/// Detecting a fixed point needs at least two identical successive iterates; a third is margin against a transient that
+/// happens to repeat. Below this count the cadence stays pinned at [`ROSTER_REFRESH`], so discovery is never slowed.
+const STABLE_BEFORE_BACKOFF: u32 = 3;
 
 /// How long the genesis assignment waits for this node's own publishes to land before giving up and leaving the
 /// first assignment to the beacon. Bounded so a node whose store is unreachable does not hang its role loop.
@@ -200,11 +299,17 @@ async fn assign_epoch<F: Field>(
     beacon: &BeaconSeed,
     capacity: Demand,
     roles_tx: &watch::Sender<Assignment>,
-) {
-    let members = build_capability_directory::<F>(client, epoch).await;
-    let setpoint = build_cell_setpoint::<F>(client, epoch, capacity).await;
+) -> Assignment {
+    // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
+    // assignment's worst-case latency is one RESOLVE_TIMEOUT, not two. That halving is what lets the refresh period
+    // below stay short enough to converge while keeping its duty cycle bounded.
+    let (members, setpoint) = tokio::join!(
+        build_capability_directory::<F>(client, epoch),
+        build_cell_setpoint::<F>(client, epoch, capacity)
+    );
     let roles = live.step(&members, epoch, beacon, setpoint);
     let _ = roles_tx.send(roles);
+    roles
 }
 
 /// The running self-organizing subsystem of a node: the three background tasks (capability publisher, load
@@ -246,13 +351,14 @@ pub fn spawn_self_organization<F: Field>(
     coord: Coord,
     config: SelfOrgConfig,
     load_source: impl Fn() -> Demand + Send + 'static,
+    peers: impl Fn() -> usize + Send + 'static,
 ) -> SelfOrganization {
     let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller } = config;
     let (capability_publisher, capability_ready) =
         spawn_capability_publisher(client.clone(), coord, node_id, vrf_secret, capability);
     let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), coord, load_source);
     let (role_loop, assigned) =
-        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready));
+        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers);
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
 }
 

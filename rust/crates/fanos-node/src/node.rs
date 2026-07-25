@@ -382,8 +382,10 @@ fn spawn_roles<F: Field + 'static>(
     coord: Triple,
     credentials: &NodeCredentials,
     roles: RoleSet,
+    directory: &Directory,
 ) -> SelfOrganization {
     let offered = roles.offered();
+    let peers = directory.clone();
     spawn_self_organization::<F>(
         handle.client(),
         coord,
@@ -402,6 +404,9 @@ fn spawn_roles<F: Field + 'static>(
         // it offers. That is honest — it is the load this node accounts for — and makes the cell setpoint the count
         // of offering nodes, so the assignment tracks the real offer rather than a fabricated number.
         move || Demand::per_role(|r| u16::from(offered.has(r))),
+        // The transport's own peer table, as a lower bound on live membership that owes nothing to the overlay store.
+        // The role loop uses it to tell "I am alone" from "I have found no one yet" — see `ROSTER_REFRESH`.
+        move || peers.len(),
     )
 }
 
@@ -600,7 +605,7 @@ impl Node {
         spawn_exit_role(&handle, address, exit)?;
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
-        let self_org = spawn_roles::<F>(&handle, address, &credentials, config.roles);
+        let self_org = spawn_roles::<F>(&handle, address, &credentials, config.roles, &directory);
 
         announce_node(&handle, &config);
 

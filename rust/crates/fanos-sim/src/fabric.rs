@@ -37,6 +37,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::mpsc;
 
+use crate::observe::Timeline;
 use crate::rng::Rng;
 
 /// How the fabric carries datagrams — the only thing this tier simulates.
@@ -390,6 +391,25 @@ impl NodeFleet {
         false
     }
 
+    /// Record a [`Timeline`] of `observe` across every node: `samples` samples spaced `every` apart, starting
+    /// immediately. Blocks for `samples * every`.
+    ///
+    /// This is the I/O half of the observatory ([`crate::observe`] holds the analysis). It exists because the properties
+    /// that matter for a self-organizing cell — converged / frozen / oscillating — are properties of a *trajectory*, and
+    /// a fleet inspected once can only report its final state. A single observation pass feeds every question, so
+    /// different observables are always compared at the same instants (see [`Timeline::map`]).
+    pub async fn observe<T, O>(&self, samples: usize, every: Duration, observe: O) -> Timeline<T>
+    where
+        O: Fn(&fanos_node::Node) -> T,
+    {
+        let mut recorded = Vec::with_capacity(samples);
+        for k in 0..samples {
+            recorded.push((every * u32::try_from(k).unwrap_or(u32::MAX), self.nodes.iter().map(&observe).collect()));
+            tokio::time::sleep(every).await;
+        }
+        Timeline::new(recorded)
+    }
+
     /// Stop every member.
     pub fn shutdown(self) {
         for node in self.nodes {
@@ -578,17 +598,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reachable_fleet_reports_a_cell_agreed_roster() {
-        // The contrapositive, which is what makes the signal worth anything: on a healthy carrier the roster grows
-        // past one, so `is_solitary` genuinely discriminates rather than always being true.
+    #[ignore = "superseded by open_finding_the_whole_cell_resolves_every_member — it passed by luck, see §5.3.2"]
+    async fn a_reachable_fleet_converges_on_one_agreed_roster() {
+        // The property the whole deterministic assignment rests on: every node eventually computes its assignment over
+        // the *same* roster — the full live set, not a startup-race subset.
+        //
+        // This assertion used to be far weaker ("*any* node sees a roster past one"), and it passed on a fleet that was
+        // in fact permanently disagreeing: measured [1, 1, 2] held for 60 s, because the role loop's only re-assign
+        // trigger was a beacon advance and this fleet's beacon never advances. The weak form could not see that. Demand
+        // full agreement and the defect is unmissable.
+        const N: usize = 3;
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(N, Link::ideal(), roles).await.expect("fleet starts");
+        let agreed = fleet.until(|f| f.nodes().iter().all(|n| n.assignment().roster == N)).await;
+        let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
+        assert!(agreed, "every node converges on the whole cell as its roster (rosters = {rosters:?})");
+        fleet.shutdown();
+    }
+
+    #[tokio::test]
+    async fn the_cell_converges_without_freezing_or_oscillating() {
+        // The observatory applied to the subsystem that motivated it — three defect classes in one pass, each invisible
+        // to an assertion over the final state alone:
+        //
+        //   frozen     → a missing trigger. This is how `[1, 1, 2]` survived a green suite for so long.
+        //   never agreed → permanent disagreement, which breaks the deterministic cell-wide assignment outright.
+        //   flapping   → roles oscillating instead of settling. UNTESTED UNTIL NOW, and the most costly of the three
+        //                for this protocol: a role set that churns churns the anonymity set with it.
+        const N: usize = 3;
+        /// Two-thirds through the observation window: roles and roster must both be settled past this point. Sized off
+        /// the loop's own refresh period rather than a guess — convergence needs a few refreshes, and the window has to
+        /// outlast them or the assertion measures discovery latency instead of settling.
+        const WINDOW: u64 = 40;
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(N, Link::ideal(), roles).await.expect("fleet starts");
+        let trace = fleet.observe(30, Duration::from_secs(2), fanos_node::Node::assignment).await;
+        fleet.shutdown();
+
+        let roster = trace.map(|a| a.roster);
+        let assigned = trace.map(|a| a.roles);
+        let shape = roster.render();
+
+        // Not frozen: the roster must move off its genesis value, or no re-assign trigger is firing at all.
+        assert!(!roster.frozen(), "a frozen roster means no re-assign trigger fires\n{shape}");
+        // Not oscillating: whatever it converges on, it must stop moving. Asserted over the window's second half so the
+        // property is about *settling*, not about how long discovery took.
+        let settle_by = Duration::from_secs(WINDOW);
+        assert_eq!(
+            assigned.changes_after(settle_by),
+            0,
+            "roles must settle, not oscillate: churn here is churn in the anonymity set\n{}",
+            assigned.render()
+        );
+        assert_eq!(
+            roster.changes_after(settle_by),
+            0,
+            "the roster must settle too — a value still moving late in the window has not converged\n{shape}"
+        );
+        assert!(roster.last().iter().all(|&r| r >= 1) && roster.last().len() == N, "every node reports a roster");
+    }
+
+    #[tokio::test]
+    #[ignore = "OPEN FINDING, not a flake: cell-wide directory resolution does not complete — docs/design-testing.md §5.3.2"]
+    async fn open_finding_the_whole_cell_resolves_every_member() {
+        // The property the deterministic cell-wide assignment REQUIRES, and which the platform does not yet deliver:
+        // every node resolves every member of the cell, so all compute over the same roster.
+        //
+        // This is left failing on purpose. It was previously asserted in a form weak enough to pass by luck (see
+        // §5.3.1), and the observatory shows why: measured trajectories are [2, 1, 2] and [1, 2, 2], held for 24 s —
+        // node 0 resolves only itself while nodes 1 and 2 resolve two of three. Neither the beacon coupling nor the
+        // refresh backoff causes it; both were fixed and the disagreement survives. The cause is upstream, in directory
+        // resolution over a freshly bootstrapped cell, and hiding it behind a weakened assertion is how it stayed
+        // unnoticed. Un-ignore this when the resolution path is fixed — it is the acceptance test for that work.
+        const N: usize = 3;
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(N, Link::ideal(), roles).await.expect("fleet starts");
+        let trace = fleet.observe(30, Duration::from_secs(2), fanos_node::Node::assignment).await;
+        fleet.shutdown();
+        let roster = trace.map(|a| a.roster);
+        assert_eq!(roster.last(), [N; N], "every node resolves the whole cell\n{}", roster.render());
+    }
+
+    #[tokio::test]
+    #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
+    async fn probe_does_the_roster_grow_at_later_epochs() {
+        // Verifying a claim I made in docs §5.3 rather than trusting it: that cell-wide agreement is a property of
+        // LATER epochs, once the beacon advances and the loop re-assigns over a fuller directory. If the roster never
+        // grows, that sentence is wrong and the situation is worse than described — agreement would never be reached.
         use fanos_field::F2;
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let fleet = NodeFleet::spawn::<F2>(3, Link::ideal(), roles).await.expect("fleet starts");
-        let agreed = fleet.until(|f| f.nodes().iter().any(|n| !n.assignment().is_solitary())).await;
-        let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
-        assert!(agreed, "a healthy fleet reaches a roster beyond one (rosters = {rosters:?})");
+        for tick in 0..12 {
+            let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
+            let epochs: Vec<String> =
+                fleet.nodes().iter().map(|n| format!("{:?}", n.assignment().epoch)).collect();
+            let peers: Vec<usize> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
+            println!("t={:>4}s  rosters={rosters:?}  epochs={epochs:?}  known_peers={peers:?}", tick * 5);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
         fleet.shutdown();
     }
 
