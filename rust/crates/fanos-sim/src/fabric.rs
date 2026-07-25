@@ -700,6 +700,61 @@ mod tests {
     }
 
     #[test]
+    fn probing_recovers_the_capacity_the_birthday_bound_costs() {
+        // The measurement that decides whether `fanos_vrf::probe_point` is worth its verification cost: with resolution,
+        // does a cell of n nodes actually occupy n distinct points where a bare draw occupies only ~√P?
+        //
+        // Simulated over the real derivation (`probe_point` + `outranks`) rather than an abstract urn model, applying the
+        // exact rule a node applies locally: lowest rank keeps a contested point, everyone else advances along its own
+        // sequence. Phantom collisions are included, since the non-recursive witness rule permits them.
+        use fanos_vrf::{VrfSecret, outranks, probe_point};
+        use fanos_primitives::{BeaconSeed, Epoch};
+
+        for &(points, n) in &[(7usize, 7u32), (21, 7), (21, 15), (993, 200)] {
+            let epoch = Epoch::new(4);
+            let beacon = BeaconSeed::GENESIS;
+            let outputs: Vec<_> = (0..n)
+                .map(|i| {
+                    let sk = VrfSecret::from_seed([u8::try_from(i % 251).unwrap_or(0); 32]);
+                    let id = i.to_be_bytes();
+                    let mut alpha = id.to_vec();
+                    alpha.extend_from_slice(&epoch.low32_be_bytes());
+                    alpha.extend_from_slice(beacon.as_bytes());
+                    sk.prove(&alpha).1
+                })
+                .collect();
+
+            // Seat everyone by ascending rank: a node takes the first point in its own sequence not already held by a
+            // lower-ranked node. That is exactly the fixed point the local pairwise rule converges to.
+            let mut order: Vec<usize> = (0..outputs.len()).collect();
+            order.sort_by(|&a, &b| if outranks(&outputs[a], &outputs[b]) { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater });
+            let mut held: HashSet<fanos_geometry::Triple> = HashSet::new();
+            let mut probes = 0u32;
+            for &i in &order {
+                for k in 0..u16::try_from(points).unwrap_or(u16::MAX) {
+                    let candidate = match points {
+                        7 => probe_point::<fanos_field::F2>(&outputs[i], k).coords(),
+                        21 => probe_point::<fanos_field::F4>(&outputs[i], k).coords(),
+                        _ => probe_point::<fanos_field::F31>(&outputs[i], k).coords(),
+                    };
+                    probes += 1;
+                    if held.insert(candidate) { break }
+                }
+            }
+            let bare = expected_distinct(points, n);
+            println!(
+                "P={points:>4} n={n:>3} load={:.2}  probed occupancy {:>3}/{n}  bare E[distinct]={bare:.2}  probes/node={:.2}",
+                f64::from(n) / points as f64, held.len(), f64::from(probes) / f64::from(n)
+            );
+            assert_eq!(held.len(), n as usize, "probing seats every node at a distinct point (P={points}, n={n})");
+            assert!(
+                f64::from(n) <= bare + 0.01 || (held.len() as f64) > bare,
+                "and it beats the bare draw wherever the bare draw loses points"
+            );
+        }
+    }
+
+    #[test]
     fn the_occupancy_formulas_match_their_closed_forms() {
         // The measured cases from `injective_probability`'s table, checked against hand-computed values — the constants
         // that justify running cell-wide tests at one load factor and not another must themselves be right.

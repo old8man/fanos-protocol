@@ -167,6 +167,134 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
     map_to_point::<F>(label::COORD, output)
 }
 
+/// The `k`-th point of a node's **verifiable probe sequence** — where it lands after being displaced from its first `k`
+/// preferences by lower-ranked claimants. `k = 0` is exactly [`coordinate_from_output`], so nothing changes for a node
+/// that meets no collision.
+///
+/// ## Why a probe sequence at all
+///
+/// A coordinate is a *uniform draw* over the plane's `P = q² + q + 1` points, so by the birthday bound distinct nodes
+/// collide once `n` approaches `√P ≈ q`, and two nodes on one point are mutually unroutable (one address per point).
+/// Measured: seven nodes in PG(2,2) occupied **four** distinct points. Without resolution a cell therefore supports
+/// `O(q)` nodes rather than `q² + q + 1` — a factor-`q` capacity loss (`fanos_sim::fabric::injective_probability`).
+///
+/// ## Why the sequence is derived from the node's own output, and nothing else
+///
+/// Placement security (§3.2 assumption 2) rests on a node being unable to *aim* its coordinate — at a victim's lines, at
+/// a chosen storage neighbourhood. Any resolution rule that lets a node influence where it is displaced **to** trades
+/// that away: choosing freely among `K` destinations is exactly a factor-`K` gain in aiming power.
+///
+/// So the destination sequence is a pure function of the node's own VRF output, fixed the moment the epoch's beacon is
+/// known and no more predictable than `p_0` was. A node has **zero** choice over the *set* of points available to it. The
+/// only thing it could misreport is *how far along* the sequence it sits, and that is what [`displacement_is_forced`]
+/// makes it prove.
+///
+/// ## Why the sequence is a permutation, and not another hash
+///
+/// The obvious construction — `p_k = MapToPoint(H(probe ‖ output ‖ k))` — is a random *function*, so a node's own
+/// sequence repeats points and never enumerates the plane. Measured on that version: at `n = P = 7` it seated **5** of 7
+/// nodes, better than the bare draw's 4.62 but still short, because 7 draws from 7 points cover only ~4.6 of them. The
+/// probing was re-colliding with itself.
+///
+/// This is **double hashing**, the classic fix: walk the canonical point index by a fixed stride,
+///
+/// ```text
+/// p_k = Point::at((i₀ + k·s) mod P),   i₀ = index(MapToPoint(output)),   s coprime to P
+/// ```
+///
+/// `gcd(s, P) = 1` makes `k ↦ (i₀ + k·s) mod P` a **cyclic permutation of all `P` points**, so the sequence enumerates
+/// the whole plane and probing seats every node whenever `n ≤ P`. Both `i₀` and `s` derive from the node's own output, so
+/// the permutation is verifiable and unchoosable; the stride is searched upward from a hashed start until coprime, which
+/// terminates immediately in practice and is deterministic for any `P` — necessary because `P = q² + q + 1` need not be
+/// prime (`P = 21 = 3·7` for `q = 4`).
+#[must_use]
+pub fn probe_point<F: Field>(output: &VrfOutput, k: u16) -> Point<F> {
+    let first = coordinate_from_output::<F>(output);
+    if k == 0 {
+        return first;
+    }
+    let n = plane_points::<F>();
+    let step = usize::from(k).wrapping_mul(probe_stride::<F>(output)) % n;
+    Point::at((first.index() + step) % n)
+}
+
+/// The number of points in `F`'s projective plane, `q² + q + 1`.
+#[must_use]
+fn plane_points<F: Field>() -> usize {
+    let q = F::Q as usize;
+    q * q + q + 1
+}
+
+/// The node's probe **stride**: the smallest value at or above a hashed start that is coprime to the plane size, so the
+/// probe walk is a cyclic permutation of every point rather than a sub-cycle.
+///
+/// Searching upward keeps the derivation deterministic and total for composite `P`, where a bare `H mod P` could land on
+/// a divisor and confine the walk to a short orbit — the failure that a "random stride" would hit silently.
+#[must_use]
+fn probe_stride<F: Field>(output: &VrfOutput) -> usize {
+    let n = plane_points::<F>();
+    if n <= 2 {
+        return 1;
+    }
+    let digest = fanos_primitives::hash::hash_labeled(label::COORD_PROBE, output);
+    let start = 1 + (usize::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]) % (n - 1));
+    (0..n).map(|d| 1 + ((start - 1 + d) % (n - 1))).find(|&s| gcd(s, n) == 1).unwrap_or(1)
+}
+
+/// Binary-free Euclidean gcd, used only to pick a stride coprime to the plane size.
+#[must_use]
+const fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Total order used to arbitrate a collision: the VRF output read big-endian, lowest wins.
+///
+/// It is an ordering on *unforgeable* values — a node cannot lower its own rank without a different VRF secret, and
+/// cannot predict its rank before the epoch's beacon. Both sides of a collision compute the same verdict from public
+/// data, so resolution needs no negotiation, no round trip, and no agreement on membership: it is a **local pairwise
+/// rule** that two nodes discovering each other apply identically.
+#[must_use]
+pub fn outranks(a: &VrfOutput, b: &VrfOutput) -> bool { a < b }
+
+/// Whether a claimant at probe index `k` was **forced** off its `j`-th preference by `witness`, for `j < k`.
+///
+/// The claimant's probe sequence is fixed by its own output, so the one degree of freedom left is claiming a larger `k`
+/// than reality — landing further along a sequence it cannot choose, but which it might still prefer. This closes it: a
+/// claim to index `k` is accepted only with `k` witnesses, the `j`-th showing that some **lower-ranked** node prefers the
+/// claimant's `j`-th point. A lower-ranked node preferring `p` displaces the claimant from `p`, so each step is a public
+/// fact rather than an assertion.
+///
+/// Verification is deliberately **non-recursive**: the witness proves only its own *preference* (`probe_point(·, 0)`), not
+/// where it finally settled, so checking a chain of length `k` costs `k` independent VRF verifications and never unfolds
+/// into the witnesses' own chains. The price is that a witness which was itself displaced from `p` still displaces the
+/// claimant — a phantom collision that can leave a point empty. That costs *occupancy efficiency*, never correctness or
+/// security, and it cannot be manufactured: the claimant does not choose which witnesses exist.
+#[must_use]
+pub fn displacement_is_forced<F: Field>(
+    claimant: &VrfOutput,
+    j: u16,
+    witness_public: &VrfPublic,
+    witness_id: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    witness_proof: &VrfProof,
+) -> bool {
+    let Some(witness_output) = witness_public.verify(&beacon_alpha(witness_id, epoch, beacon), witness_proof) else {
+        return false;
+    };
+    // Strictly lower rank, and its *preference* is the point the claimant is being displaced from. Equality of outputs
+    // would mean the same VRF, i.e. the same node — never a displacement.
+    outranks(&witness_output, claimant)
+        && probe_point::<F>(&witness_output, 0) == probe_point::<F>(claimant, j)
+}
+
 /// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch_low32_be ‖ beacon_seed`
 /// (spec §L0/§L3, `VRF(sk, id ‖ epoch ‖ SEED(epoch))`). Folding the epoch's **beacon seed** is what makes the coordinate
 /// *unpredictable ahead of the epoch* — an adversary cannot grind for a future placement it cannot yet
@@ -216,6 +344,121 @@ pub fn verify_coordinate<F: Field>(
 mod tests {
     use super::*;
     use fanos_field::F31;
+
+    #[test]
+    fn probe_zero_is_exactly_the_existing_coordinate() {
+        // The compatibility hinge: a node meeting no collision derives what it always did, so adding resolution changes
+        // no coordinate that was already correct.
+        let sk = VrfSecret::from_seed([9u8; 32]);
+        let (_p, _proof) = prove_coordinate::<F31>(&sk, b"node", Epoch::ZERO, &BeaconSeed::GENESIS);
+        let (proof, output) = sk.prove(&beacon_alpha(b"node", Epoch::ZERO, &BeaconSeed::GENESIS));
+        let _ = proof;
+        assert_eq!(probe_point::<F31>(&output, 0), coordinate_from_output::<F31>(&output));
+    }
+
+    #[test]
+    fn the_probe_sequence_is_fixed_by_the_node_and_offers_no_choice() {
+        // The security property the whole design turns on: the sequence is a pure function of the node's own VRF output,
+        // so it is settled the moment the beacon is known. A node has no more say over p_k than it had over p_0 — the
+        // points differ from each other (a sequence, not a constant) but are not selectable.
+        let sk = VrfSecret::from_seed([4u8; 32]);
+        let (_, output) = sk.prove(&beacon_alpha(b"n", Epoch::new(3), &BeaconSeed::GENESIS));
+        let seq: Vec<_> = (0..6).map(|k| probe_point::<F31>(&output, k)).collect();
+        assert_eq!(seq, (0..6).map(|k| probe_point::<F31>(&output, k)).collect::<Vec<_>>(), "deterministic");
+        assert!(seq.windows(2).any(|w| matches!(w, [a, b] if a != b)), "it advances rather than repeating a point");
+
+        // The property double hashing buys, and the reason the first construction was replaced: the sequence visits
+        // EVERY point of the plane exactly once, so probing can always seat a node while any point is free.
+        let plane = 31 * 31 + 31 + 1;
+        let visited: alloc::collections::BTreeSet<_> = (0..u16::try_from(plane).unwrap_or(u16::MAX))
+            .map(|k| probe_point::<F31>(&output, k).index())
+            .collect();
+        assert_eq!(visited.len(), plane, "the probe walk is a cyclic permutation of all {plane} points");
+
+        // A different beacon reshuffles the whole sequence, not just its head — so a future epoch's fallbacks are as
+        // unpredictable as its preference (§3.2 assumption 2 extends to every probe index).
+        let (_, later) = sk.prove(&beacon_alpha(b"n", Epoch::new(3), &BeaconSeed::new([7u8; 32])));
+        let moved = (0..6).filter(|&k| probe_point::<F31>(&later, k) != probe_point::<F31>(&output, k)).count();
+        assert!(moved >= 5, "a new beacon moves essentially the entire sequence (moved {moved} of 6)");
+    }
+
+    #[test]
+    fn rank_is_a_strict_total_order_on_unforgeable_values() {
+        let lo: VrfOutput = [0u8; OUTPUT_LEN];
+        let mut hi: VrfOutput = [0u8; OUTPUT_LEN];
+        hi[OUTPUT_LEN - 1] = 1;
+        assert!(outranks(&lo, &hi));
+        assert!(!outranks(&hi, &lo));
+        assert!(!outranks(&lo, &lo), "not reflexive — a node never displaces itself");
+    }
+
+    #[test]
+    fn a_displacement_claim_needs_a_genuinely_lower_ranked_witness_at_that_point() {
+        // Search for a real colliding pair rather than constructing one: two secrets whose *preferences* coincide on a
+        // small plane. F31's plane has 31² + 31 + 1 = 993 points, so a few hundred draws suffice by the birthday bound.
+        let epoch = Epoch::new(2);
+        let beacon = BeaconSeed::GENESIS;
+        let mut seen: Vec<(u8, VrfOutput, VrfProof, Point<F31>)> = Vec::new();
+        let mut pair = None;
+        for seed in 0u8..=250 {
+            let sk = VrfSecret::from_seed([seed; 32]);
+            let id = [seed];
+            let (proof, output) = sk.prove(&beacon_alpha(&id, epoch, &beacon));
+            let point = probe_point::<F31>(&output, 0);
+            if let Some(prev) = seen.iter().find(|(_, _, _, p)| *p == point) {
+                pair = Some((*prev, (seed, output, proof, point)));
+                break;
+            }
+            seen.push((seed, output, proof, point));
+        }
+        let ((a_seed, a_out, a_proof, _), (b_seed, b_out, b_proof, _)) =
+            pair.unwrap_or_else(|| unreachable!("two preferences collide within 251 draws on a 993-point plane"));
+
+        // Orient the pair: the lower-ranked one is the witness that forces the other off index 0.
+        let (loser, l_out, winner, w_proof) = if outranks(&a_out, &b_out) {
+            (b_seed, b_out, a_seed, a_proof)
+        } else {
+            (a_seed, a_out, b_seed, b_proof)
+        };
+        let w_out = if outranks(&a_out, &b_out) { a_out } else { b_out };
+        let w_pk = VrfSecret::from_seed([winner; 32]).public();
+
+        assert!(
+            displacement_is_forced::<F31>(&l_out, 0, &w_pk, &[winner], epoch, &beacon, &w_proof),
+            "a lower-ranked node preferring the same point forces the displacement"
+        );
+        // The reverse direction must fail: the higher-ranked node does not displace the lower one.
+        let l_pk = VrfSecret::from_seed([loser; 32]).public();
+        let l_proof = VrfSecret::from_seed([loser; 32]).prove(&beacon_alpha(&[loser], epoch, &beacon)).0;
+        assert!(
+            !displacement_is_forced::<F31>(&w_out, 0, &l_pk, &[loser], epoch, &beacon, &l_proof),
+            "rank is what decides, and the winner keeps its point"
+        );
+        // And a claim about the WRONG index fails: the witness collides with index 0, not index 1.
+        assert!(
+            !displacement_is_forced::<F31>(&l_out, 1, &w_pk, &[winner], epoch, &beacon, &w_proof),
+            "a witness justifies exactly the index whose point it collides with — this is what bounds k"
+        );
+    }
+
+    #[test]
+    fn a_forged_or_foreign_witness_justifies_nothing() {
+        let epoch = Epoch::ZERO;
+        let beacon = BeaconSeed::GENESIS;
+        let sk = VrfSecret::from_seed([11u8; 32]);
+        let (_, mine) = sk.prove(&beacon_alpha(b"me", epoch, &beacon));
+        let other = VrfSecret::from_seed([12u8; 32]);
+        let (other_proof, _) = other.prove(&beacon_alpha(b"other", epoch, &beacon));
+
+        // Right proof, wrong node id ⇒ the VRF verification itself fails, so no witness value is ever produced.
+        assert!(!displacement_is_forced::<F31>(&mine, 0, &other.public(), b"wrong-id", epoch, &beacon, &other_proof));
+        // Right proof, wrong epoch ⇒ same. A stale witness cannot be replayed into a later epoch.
+        assert!(!displacement_is_forced::<F31>(
+            &mine, 0, &other.public(), b"other", Epoch::new(1), &beacon, &other_proof
+        ));
+        // Right proof, wrong public key ⇒ same.
+        assert!(!displacement_is_forced::<F31>(&mine, 0, &sk.public(), b"other", epoch, &beacon, &other_proof));
+    }
 
     fn secret(seed: u8) -> VrfSecret {
         VrfSecret::from_seed([seed; 32])

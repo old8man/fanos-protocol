@@ -13,6 +13,11 @@ pub const DIGEST_LEN: usize = 32;
 pub mod label {
     /// Coordinate derivation `MapToPoint(VRF(sk, node ‖ epoch ‖ beacon))`.
     pub const COORD: &str = "FANOS-v1/coord";
+    /// Coordinate **probe sequence**: the `k`-th point a node falls back to when lower-ranked claimants hold its earlier
+    /// preferences (`fanos_vrf::probe_point`). A separate domain from [`COORD`] so probe `k ≥ 1` can never collide by
+    /// construction with some other node's *preference* derivation — the two derivations must stay independent for the
+    /// occupancy analysis to hold.
+    pub const COORD_PROBE: &str = "FANOS-v1/coord-probe";
     /// Private rendezvous line derivation.
     pub const RDV: &str = "FANOS-v1/rdv";
     /// Generic key-derivation.
