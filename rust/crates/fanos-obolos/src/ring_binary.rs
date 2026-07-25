@@ -13,7 +13,7 @@
 //!
 //! `f ∘ (x−f) = x²·(p∘(1−p)) + x·(a∘(1−2p)) − a∘a`; the check forces the `x²` term `p∘(1−p) = 0`, i.e. `p` binary.
 //! A non-binary `p` survives only if `x` hits a root of a degree-2 identity (`≤ 2/2^{CHALLENGE_BITS}` per round →
-//! `≈2⁻¹²⁸` over [`REPETITIONS`](crate::ring_product::REPETITIONS) rounds). Shares the challenge width, masking
+//! `≈2⁻¹²⁸` over [`SCALAR_ROUNDS`](crate::ring_range_agg::SCALAR_ROUNDS) rounds). Shares the challenge width, masking
 //! bound, and `scalar_mul` with [`crate::ring_range_agg`].
 //!
 //! > **STATUS — [P]/[H], correctness-first.** Tests verify a binary polynomial proves, a non-binary one is
@@ -25,8 +25,7 @@ use fanos_primitives::hash::hash_xof;
 
 use crate::ring::Poly;
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
-use crate::ring_product::REPETITIONS;
-use crate::ring_range_agg::{ACCEPT_SMALL, ACCEPT_WIDE, CHALLENGE_MOD, MASK_WIDE, scalar_mul};
+use crate::ring_range_agg::{ACCEPT_SMALL, ACCEPT_WIDE, CHALLENGE_MOD, MASK_WIDE, SCALAR_ROUNDS, scalar_mul};
 
 /// A bound on resample attempts (the wide masking keeps rejection rare).
 const MAX_ATTEMPTS: u32 = 32;
@@ -57,7 +56,7 @@ impl crate::ring_size::ProofSize for BinaryRound {
 }
 
 impl crate::ring_size::ProofSize for BinaryProof {
-    /// `REPETITIONS` rounds of a fixed `3·(K+1) + 1 + 2·ELL` elements — constant per round, but the *count* of these
+    /// `SCALAR_ROUNDS` rounds of a fixed `3·(K+1) + 1 + 2·ELL` elements — constant per round, but the *count* of these
     /// proofs is what makes shortness expensive ([`crate::ring_shortness`] needs one per bit-plane).
     fn ring_elements(&self) -> usize {
         self.rounds.ring_elements()
@@ -92,7 +91,7 @@ impl crate::ring_size::ProofSize for AggBinRound {
 }
 
 impl crate::ring_size::ProofSize for AggBinaryProof {
-    /// `REPETITIONS · (t·(K+1+1+ELL) + 2·(K+1) + ELL)` versus `t` separate proofs' `REPETITIONS · t·(3(K+1)+1+2ELL)`.
+    /// `SCALAR_ROUNDS · (t·(K+1+1+ELL) + 2·(K+1) + ELL)` versus `t` separate proofs' `SCALAR_ROUNDS · t·(3(K+1)+1+2ELL)`.
     /// The per-plane `c_d, c_e, z_de` collapse into one triple; the per-plane `c_a, f, z_ba` are irreducible, because
     /// each revealed plane still needs its own binding and mask.
     fn ring_elements(&self) -> usize {
@@ -193,7 +192,7 @@ fn agg_seed_x(seed_y: &[u8; 32], rounds: &[AggBinRound]) -> [u8; 32] {
 /// Unlike `x`, `y` may span the whole field: it never enters an opening that must stay short — it appears only inside
 /// the prover's aggregate messages and in the verifier's own recomputation from revealed values. That is what keeps
 /// the aggregation free: the extra soundness term is `(t−1)/q ≈ 2⁻⁶⁰` rather than `(t−1)/2^{CHALLENGE_BITS}`, so the
-/// per-round error stays the `2/2^{CHALLENGE_BITS}` of the un-aggregated proof and `REPETITIONS` still reaches `2⁻¹²⁸`.
+/// per-round error stays the `2/2^{CHALLENGE_BITS}` of the un-aggregated proof and `SCALAR_ROUNDS` still reaches `2⁻¹²⁸`.
 fn round_y(seed: &[u8; 32], k: usize) -> u64 {
     let mut input = Vec::with_capacity(40);
     input.extend_from_slice(seed);
@@ -239,9 +238,9 @@ pub fn prove_binary_agg(
             r_d: RingRandomness,
             r_e: RingRandomness,
         }
-        let mut maskings = Vec::with_capacity(REPETITIONS);
-        let mut rounds: Vec<AggBinRound> = Vec::with_capacity(REPETITIONS);
-        for k in 0..REPETITIONS {
+        let mut maskings = Vec::with_capacity(SCALAR_ROUNDS);
+        let mut rounds: Vec<AggBinRound> = Vec::with_capacity(SCALAR_ROUNDS);
+        for k in 0..SCALAR_ROUNDS {
             let a: Vec<Poly> = (0..t).map(|j| Poly::uniform(&plane_seed(seed, attempt, k, 0, j))).collect();
             let r_a: Vec<RingRandomness> = (0..t)
                 .map(|j| RingRandomness::from_uniform_bounded(&plane_seed(seed, attempt, k, 1, j), MASK_WIDE))
@@ -304,7 +303,7 @@ pub fn prove_binary_agg(
 #[must_use]
 pub fn verify_binary_agg(params: &RingParams, plane_coms: &[RingCommitment], proof: &AggBinaryProof) -> bool {
     let t = plane_coms.len();
-    if t == 0 || proof.rounds.len() != REPETITIONS {
+    if t == 0 || proof.rounds.len() != SCALAR_ROUNDS {
         return false;
     }
     let seed_y = agg_seed_y(plane_coms, &proof.rounds);
@@ -354,9 +353,9 @@ pub fn prove_binary(params: &RingParams, p: &Poly, r_p: &RingRandomness, seed: &
             r_d: RingRandomness,
             r_e: RingRandomness,
         }
-        let mut maskings = Vec::with_capacity(REPETITIONS);
-        let mut rounds = Vec::with_capacity(REPETITIONS);
-        for k in 0..REPETITIONS {
+        let mut maskings = Vec::with_capacity(SCALAR_ROUNDS);
+        let mut rounds = Vec::with_capacity(SCALAR_ROUNDS);
+        for k in 0..SCALAR_ROUNDS {
             let a = Poly::uniform(&mask_seed(seed, attempt, k, 0));
             let d = a.hadamard(&one_minus_2p);
             let e = Poly::zero().sub(&a.hadamard(&a)); // −a∘a
@@ -398,7 +397,7 @@ pub fn prove_binary(params: &RingParams, p: &Poly, r_p: &RingRandomness, seed: &
 /// Verify a [`prove_binary`] proof that `c_p` opens to a `{0,1}`-valued polynomial.
 #[must_use]
 pub fn verify_binary(params: &RingParams, c_p: &RingCommitment, proof: &BinaryProof) -> bool {
-    if proof.rounds.len() != REPETITIONS {
+    if proof.rounds.len() != SCALAR_ROUNDS {
         return false;
     }
     let seed_h = challenge_seed(c_p, proof.rounds.iter());

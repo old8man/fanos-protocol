@@ -228,7 +228,7 @@ mod tests {
         // from the constants and check the real proof against it — then state what it implies for a whole spend.
         use crate::ring_commit::{ELL, K};
         use crate::ring_hash::{ELL_H, LOG_BASE};
-        use crate::ring_product::REPETITIONS;
+        use crate::ring_range_agg::SCALAR_ROUNDS;
         use crate::ring_size::{BYTES_PER_ELEMENT, ProofSize};
 
         let params = RingParams::standard();
@@ -238,8 +238,8 @@ mod tests {
 
         // A binarity round is 3 commitments + the revealed f + 2 openings; a linear round over n messages is
         // (n+1) commitments + n revealed + (n+1) openings. Shortness = T planes + T binarity + 1 reconstruction.
-        let separate = REPETITIONS * (3 * (K + 1) + 1 + 2 * ELL); // what ONE plane used to cost
-        let aggregated = REPETITIONS * (T * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL); // all T planes, one proof
+        let separate = SCALAR_ROUNDS * (3 * (K + 1) + 1 + 2 * ELL); // what ONE plane used to cost
+        let aggregated = SCALAR_ROUNDS * (T * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL); // all T planes, one proof
         let recon = 1 + ELL; // rung 2: ONE opening-to-zero (challenge + ELL responses), single-round
         let expected = T * (K + 1) + aggregated + recon;
         assert_eq!(proof.ring_elements(), expected, "the accounting matches the construction exactly");
@@ -250,7 +250,7 @@ mod tests {
         // the loose bound here and the exact one at t = LOG_BASE, which is what a spend actually pays.
         assert!(aggregated < T * separate, "aggregating is cheaper than one proof per plane ({aggregated} vs {})", T * separate);
         let real_t = LOG_BASE as usize;
-        let real_agg = REPETITIONS * (real_t * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL);
+        let real_agg = SCALAR_ROUNDS * (real_t * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL);
         assert!(
             real_agg * 2 <= real_t * separate,
             "at t = LOG_BASE the aggregation at least halves binarity ({real_agg} vs {})",
@@ -258,7 +258,7 @@ mod tests {
         );
         // Rung 2: the reconstruction, which after rung 1 had OVERTAKEN binarity as the larger part, is now negligible.
         // A general linear proof over T+1 messages would have cost REPETITIONS·((T+2)(K+1) + (T+1) + (T+2)ELL).
-        let recon_as_linear = REPETITIONS * ((T + 2) * (K + 1) + (T + 1) + (T + 2) * ELL);
+        let recon_as_linear = crate::ring_product::REPETITIONS * ((T + 2) * (K + 1) + (T + 1) + (T + 2) * ELL);
         assert!(
             recon * 100 < recon_as_linear,
             "the opening-to-zero reconstruction is orders of magnitude smaller ({recon} vs {recon_as_linear})"
@@ -268,7 +268,7 @@ mod tests {
         // that is what the remaining rungs must attack. Asserted so the ratio cannot silently regress.
         let real_per_node = ELL_H
             * (LOG_BASE as usize * (K + 1)
-                + REPETITIONS * (LOG_BASE as usize * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL));
+                + SCALAR_ROUNDS * (LOG_BASE as usize * (K + 1 + 1 + ELL) + 2 * (K + 1) + ELL));
         assert!(
             real_per_node * BYTES_PER_ELEMENT > 1 << 20,
             "one node's shortness still exceeds a megabyte ({} bytes)",

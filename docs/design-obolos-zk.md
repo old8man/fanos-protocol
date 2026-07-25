@@ -7,7 +7,8 @@
 > (Module-SIS / Module-LWE) — **no new hardness is invented**. Every module is **[P]/[H] correctness-first**: the
 > constructions and their soundness/ZK arguments are the security spec and are empirically tested (completeness,
 > soundness, binding, ZK re-randomisation), while the parameters `(D, q, K, ℓ, REPETITIONS, CHALLENGE_BITS)` are
-> illustrative — bit-security calibration, constant-time arithmetic, and external cryptanalysis are the
+> illustrative — though several are now *derived* rather than picked (§6.1); bit-security calibration,
+> constant-time arithmetic, and external cryptanalysis are the
 > documented heavy-artillery follow-ups.
 
 ## 0. What must be proven
@@ -69,6 +70,22 @@ could commit a near-`q` "negative" amount and forge money (audit O-C1). The **ag
 superseding the per-bit first cut) is what makes it affordable — ~13× faster on the confidential-amount tests,
 and the prerequisite for the untraceability shortness proofs below.
 
+### 2.1 The aggregation, precisely
+
+Pack the bits `b(X) = Σ bᵢXⁱ`, commit `C_b` once. Per round, for a **small scalar** `x` reveal one masked
+polynomial `f = x·b + a` and check three homomorphic openings:
+
+```text
+opening:        com(f)          = x·C_b + C_a
+binarity:       com(f ∘ (x−f))  = x·C_d + C_e     (d = a∘(1−2b),  e = −a∘a)
+reconstruction: com(⟨f, 2^vec⟩) = x·C_v + C_w     (w = ⟨a, 2^vec⟩)
+```
+
+`x` scalar makes `f∘(x−f)` a Hadamard product the *verifier* forms from the revealed `f`; its `x²` coefficient is
+`b∘(1−b)`, forced to zero → `b` binary. A non-binary `b` survives only at a degree-2 root of a random `x`
+(`≤ 2/2^{CHALLENGE_BITS}` per round → `2⁻¹²⁸` over `SCALAR_ROUNDS`, §6.1 rung 3). Only the openings that hide *witness* randomness
+need wide masking; `f`'s masking is uniform.
+
 ### 2.2 Three bounds, not one — closing wraparound completely
 
 A range proof alone is *not* enough, and each of the following was a live inflation path found by auditing the ring
@@ -83,22 +100,6 @@ path against what the transparent one enforces:
 The bounds are checked *before* any proof verification, so an oversized claim cannot force wasted work. Each has a
 test that constructs the forging transaction and shows it refused — the range-width test additionally verifies the
 attack proof is internally consistent at the prover's own width, so the pinned width is demonstrably what stops it.
-
-### 2.1 The aggregation, precisely
-
-Pack the bits `b(X) = Σ bᵢXⁱ`, commit `C_b` once. Per round, for a **small scalar** `x` reveal one masked
-polynomial `f = x·b + a` and check three homomorphic openings:
-
-```text
-opening:        com(f)          = x·C_b + C_a
-binarity:       com(f ∘ (x−f))  = x·C_d + C_e     (d = a∘(1−2b),  e = −a∘a)
-reconstruction: com(⟨f, 2^vec⟩) = x·C_v + C_w     (w = ⟨a, 2^vec⟩)
-```
-
-`x` scalar makes `f∘(x−f)` a Hadamard product the *verifier* forms from the revealed `f`; its `x²` coefficient is
-`b∘(1−b)`, forced to zero → `b` binary. A non-binary `b` survives only at a degree-2 root of a random `x`
-(`≤ 2/2^{CHALLENGE_BITS}` per round → `2⁻¹²⁸` over `REPETITIONS`). Only the openings that hide *witness* randomness
-need wide masking; `f`'s masking is uniform.
 
 ## 3. Untraceability — zero-knowledge Merkle membership
 
@@ -380,8 +381,8 @@ regime's `2^{19+t}` masking well below `q`.
 |---|---|---|---|---|
 | original | 5 872 | 45.9 MiB | 2 982 MiB | 1.0× |
 | + rung 1 (aggregated binarity) | 3 952 | 30.9 MiB | 2 007 MiB | 1.5× |
-| **+ rung 2 (opening-to-zero)** | **1 957** | **15.3 MiB** | **994 MiB** | **3.0×** |
-| + rung 3 (projected) | 1 117 | 8.7 MiB | 567 MiB | 5.3× |
+| + rung 2 (opening-to-zero) | 1 957 | 15.3 MiB | 994 MiB | 3.0× |
+| **+ rung 3 (derived round count)** | **1 117** | **8.7 MiB** | **567 MiB** | **5.3×** |
 
 With the reconstruction gone, the aggregated binarity is ~98% of a shortness proof. Its per-round composition:
 
@@ -392,16 +393,18 @@ With the reconstruction gone, the aggregated binarity is ~98% of a shortness pro
 | `f` (revealed masked planes) | 16 | 13% |
 | `c_d`, `c_e`, `z_de` (aggregate) | 8 | 7% |
 
-**Rung 3 — widen the scalar challenge.** `CHALLENGE_BITS = 9` forces 16 rounds for `2⁻¹²⁸`; `2¹⁶` needs 9 — worth
-**≈1.75×** now that the reconstruction no longer dilutes it. It helps *only* the scalar-challenge proofs: the
-monomial-challenge ones (`ring_linear`, `ring_product`) draw from the ring's `2D = 512` monomials, a space pinned by `D`
-itself.
+**Rung 3 — give the scalar-challenge proofs their own round count. Built.** The repetition count was a *single*
+constant shared by every proof, which quietly charged the scalar-challenge proofs for a limit that is not theirs. The
+monomial-challenge proofs (`ring_linear`, `ring_product`) need 16 rounds because their per-round error is pinned at
+`2/2D = 2⁻⁸` by the ring's `2D = 512` monomials — a space `D` itself fixes. A *scalar* challenge has no such ceiling,
+so `SCALAR_ROUNDS` is now **derived** from the width, `⌈128/(CHALLENGE_BITS − 1)⌉`, and static-asserted to reach the
+target. At `CHALLENGE_BITS = 16` that is 9 rounds instead of 16 — measured **1.75×**.
 
 The obvious objection is that widening `x` must cost binding margin, since the mask has to keep dominating `x·witness`.
 At `2¹⁶` it does not — because rung 1 already raised `MASK_WIDE` to `2⁴⁰` for the aggregation. The accept probability
 stays `0.991`, `ACCEPT_WIDE = B − 2¹⁶` is unchanged to within a part in `2²⁴`, and the extractable-opening norm stays
-`≈2⁴⁰`, so **nothing is weakened**: soundness is `9 × 2⁻¹⁵ = 2⁻¹³⁵`, comfortably past the `2⁻¹²⁸` target. Going further
-does start to cost — `2²⁰` drops the accept rate to `0.90` — so `2¹⁶` is where the free part ends.
+`≈2⁴⁰`, so **nothing is weakened**: soundness becomes `9 × 2⁻¹⁵ = 2⁻¹³⁵`, past the `2⁻¹²⁸` target rather than short of
+it. Going further does start to cost — `2²⁰` drops the accept rate to `0.90` — so `2¹⁶` is where the free part ends.
 
 **Rung 4 — encode short elements at their true width.** `z_ba` is bounded by `ACCEPT_WIDE`, not `q`; ternary randomness
 is 2 bits per coefficient, not 64 — **≈1.15×** on what remains.
@@ -413,7 +416,7 @@ is 2 bits per coefficient, not 64 — **≈1.15×** on what remains.
 > `fⱼ = x·pⱼ + aⱼ` and now proves nothing about the committed planes. Folding it soundly needs a genuine
 > inner-product argument, not a random linear combination.
 
-Together ≈2× more from here: a depth-32 spend reaches ~500 MiB. That is the honest ceiling of constant-factor work,
+Only rung 4 remains, worth ≈1.15×: a depth-32 spend reaches ~490 MiB. That is the honest ceiling of constant-factor work,
 and it is **still impractical** — which is precisely why production lattice systems wrap membership in a
 recursive/succinct proof rather than paying for it directly. Recursive compaction is therefore not a nice-to-have on
 this stack's roadmap; it is the only route to a shippable spend proof, and the numbers above are why. The construction

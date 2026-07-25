@@ -19,11 +19,11 @@
 //! product — and every opening `x·r + r_mask` stays short so binding holds. Expanding, `f∘(x−f) = x²·(b∘(1−b)) +
 //! x·(a∘(1−2b)) − a∘a`; the binarity check forces the `x²` term to vanish, i.e. `b∘(1−b)=0`. A non-binary `b`
 //! leaves a nonzero `x²` coefficient, so the degree-2 identity holds at a random `x` with probability `≤
-//! 2/2^{CHALLENGE_BITS}` per round — driven to `≈2⁻¹²⁸` by [`REPETITIONS`](crate::ring_product::REPETITIONS) rounds
+//! 2/2^{CHALLENGE_BITS}` per round — driven to `≈2⁻¹²⁸` by [`SCALAR_ROUNDS`] rounds
 //! under one Fiat–Shamir seed. High coefficients of `b` (index `≥ bits`) are also forced binary but carry weight
 //! `0` in `⟨·,2^vec⟩`, so they cannot affect `v`.
 //!
-//! Size: `C_b` plus `REPETITIONS` rounds of a handful of commitments and one polynomial — independent of `bits`.
+//! Size: `C_b` plus `SCALAR_ROUNDS` rounds of a handful of commitments and one polynomial — independent of `bits`.
 //!
 //! > **STATUS — [P]/[H], correctness-first.** Construction/soundness/ZK are the spec; `CHALLENGE_BITS`, the
 //! > repetition count, and the masking bound are illustrative (calibration pending), not constant-time. Tests
@@ -35,11 +35,32 @@ use fanos_primitives::hash::hash_xof;
 
 use crate::ring::{D, Poly};
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
-use crate::ring_product::REPETITIONS;
 
-/// Scalar challenge width: `x ∈ [1, 2^{CHALLENGE_BITS})`. Per-round soundness `≤ 2/2^{CHALLENGE_BITS} = 2⁻⁸`, so
-/// `REPETITIONS = 16` rounds target `≈ 2⁻¹²⁸`. Illustrative.
-const CHALLENGE_BITS: u32 = 9;
+/// Scalar challenge width: `x ∈ [1, 2^{CHALLENGE_BITS})`, giving per-round soundness `≤ 2/2^{CHALLENGE_BITS}`.
+///
+/// This is **independent of** the monomial-challenge width used by [`crate::ring_linear`] and
+/// [`crate::ring_product`], which is fixed at `2D = 512` by the ring itself and cannot be widened without changing
+/// `D`. A *scalar* challenge has no such ceiling, so the round count follows from the width rather than from `D` —
+/// see [`SCALAR_ROUNDS`].
+///
+/// `16` is where widening stops being free. The mask must keep dominating `x·witness`, and [`MASK_WIDE`] is already
+/// `2⁴⁰` (sized for the aggregation), so at `2¹⁶` the accept rate is still `0.991` and the extractable-opening norm is
+/// unchanged to within a part in `2²⁴` — nothing is weakened. At `2²⁰` the accept rate falls to `0.90`, which would be
+/// a real trade.
+const CHALLENGE_BITS: u32 = 16;
+
+/// Parallel repetitions for the **scalar**-challenge proofs — derived from [`CHALLENGE_BITS`] as
+/// `⌈128 / (CHALLENGE_BITS − 1)⌉`, since each round contributes `2/2^{CHALLENGE_BITS} = 2^{-(CHALLENGE_BITS−1)}`.
+///
+/// Shared with [`crate::ring_binary`]. Distinct from [`REPETITIONS`](crate::ring_product::REPETITIONS), which the
+/// monomial-challenge proofs need at 16 because their per-round error is pinned at `2/2D = 2⁻⁸`; borrowing that count
+/// here charged the scalar proofs for a limit that is not theirs.
+pub(crate) const SCALAR_ROUNDS: usize = 128usize.div_ceil(CHALLENGE_BITS as usize - 1);
+
+const _: () = assert!(
+    SCALAR_ROUNDS * (CHALLENGE_BITS as usize - 1) >= 128,
+    "the scalar-challenge rounds must reach the 2^-128 soundness target"
+);
 
 /// The challenge is drawn from `[1, CHALLENGE_MOD]` (nonzero — `x = 0` gives a vacuous round). Shared with the
 /// binarity proof ([`crate::ring_binary`]).
@@ -56,7 +77,7 @@ pub(crate) const CHALLENGE_MOD: u64 = (1 << CHALLENGE_BITS) - 1;
 /// count carries an extra factor of `t`:
 ///
 /// ```text
-/// P(accept) ≈ (1 − CHALLENGE_MOD/B)^(t · REPETITIONS · ELL · D)
+/// P(accept) ≈ (1 − CHALLENGE_MOD/B)^(t · SCALAR_ROUNDS · ELL · D)
 /// ```
 ///
 /// At `B = 2²⁵` that is 0.78 for `t = 1` but only **0.018** for `t = 16` and ~0 for `t = 64` — which is exactly how
@@ -187,9 +208,9 @@ pub fn prove_range_agg(
             r_e: RingRandomness,
             r_w: RingRandomness,
         }
-        let mut maskings = Vec::with_capacity(REPETITIONS);
-        let mut rounds = Vec::with_capacity(REPETITIONS);
-        for k in 0..REPETITIONS {
+        let mut maskings = Vec::with_capacity(SCALAR_ROUNDS);
+        let mut rounds = Vec::with_capacity(SCALAR_ROUNDS);
+        for k in 0..SCALAR_ROUNDS {
             let a = Poly::uniform(&mask_seed(seed, attempt, k, 0));
             let d = a.hadamard(&one_minus_2b);
             let e = Poly::zero().sub(&a.hadamard(&a)); // −a∘a
@@ -248,7 +269,7 @@ pub fn verify_range_agg(
     bits: usize,
     proof: &AggRangeProof,
 ) -> bool {
-    if proof.bits != bits || proof.rounds.len() != REPETITIONS {
+    if proof.bits != bits || proof.rounds.len() != SCALAR_ROUNDS {
         return false;
     }
     let seed_h = challenge_seed(value_commitment, &proof.c_b, proof.rounds.iter());
