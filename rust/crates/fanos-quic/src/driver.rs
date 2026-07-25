@@ -633,7 +633,7 @@ pub async fn spawn(
         None, // identity
         server,
         client,
-        default_bind(),
+        default_bind().into(),
     )
 }
 
@@ -662,7 +662,7 @@ pub async fn spawn_self_certifying<F: Field + 'static>(
         &creds,
         make_engine,
         directory,
-        default_bind(),
+        default_bind().into(),
         Capabilities::CORE,
         None,
     )
@@ -685,7 +685,7 @@ pub async fn spawn_self_certifying_with_capabilities<F: Field + 'static>(
         &creds,
         make_engine,
         directory,
-        default_bind(),
+        default_bind().into(),
         capabilities,
         None,
     )
@@ -705,7 +705,7 @@ pub async fn spawn_self_certifying_persistent<F: Field + 'static>(
         credentials,
         make_engine,
         directory,
-        default_bind(),
+        default_bind().into(),
         Capabilities::CORE,
         None,
     )
@@ -730,7 +730,36 @@ pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
         credentials,
         make_engine,
         directory,
-        bind,
+        bind.into(),
+        Capabilities::CORE,
+        proteus,
+    )
+}
+
+/// Spawn a self-certifying persistent node over an arbitrary [`Fabric`] — the **transport-injection seam**.
+///
+/// Identical to [`spawn_self_certifying_persistent_on`] except that the caller supplies the datagram carrier. Pass
+/// `Fabric::Udp(addr)` for production; pass `Fabric::Abstract(socket)` to run this node — real QUIC, real TLS, real
+/// composition — over a modelled fabric. Nothing above the socket changes, which is what makes a simulation built on
+/// it differ from a deployment in the transport and *only* the transport.
+///
+/// # Errors
+/// [`QuicError`] if the credentials cannot be turned into a TLS configuration or the endpoint cannot be created.
+pub fn spawn_self_certifying_persistent_over<F: Field + 'static>(
+    fabric: Fabric,
+    credentials: &NodeCredentials,
+    make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
+    directory: Directory,
+    proteus: Option<ProteusConfig>,
+) -> Result<NodeHandle, QuicError> {
+    let (server, client, _cert) = node_configs_mutual_from(credentials)?;
+    self_certifying_inner::<F, _>(
+        server,
+        client,
+        credentials,
+        make_engine,
+        directory,
+        fabric,
         Capabilities::CORE,
         proteus,
     )
@@ -743,7 +772,7 @@ fn self_certifying_inner<F: Field + 'static, M>(
     creds: &NodeCredentials,
     make_engine: M,
     directory: Directory,
-    bind: SocketAddr,
+    bind: Fabric,
     capabilities: Capabilities,
     proteus: Option<ProteusConfig>,
 ) -> Result<NodeHandle, QuicError>
@@ -940,8 +969,40 @@ pub async fn spawn_shaped(
         None, // identity
         server,
         client,
-        default_bind(),
+        default_bind().into(),
     )
+}
+
+/// Where a node's QUIC endpoint gets its datagrams — **the transport seam**.
+///
+/// Production binds a real UDP socket. [`Fabric::Abstract`] hands quinn an
+/// [`AsyncUdpSocket`](quinn::AsyncUdpSocket) instead, which is what lets a simulator run **real nodes** — real QUIC
+/// state machine, real TLS, real node composition — over a modelled datagram fabric. Everything above the socket is
+/// then byte-for-byte the production path, so the simulator differs from a deployment in the transport and *only* the
+/// transport (`docs/design-testing.md` §5.1).
+///
+/// The distinction matters because the composition above this line is where wiring bugs live, and a simulator that
+/// instantiates engines directly cannot see them.
+pub enum Fabric {
+    /// A real UDP socket bound at this address — production, and the T3/T4 test tiers.
+    Udp(SocketAddr),
+    /// An abstract socket supplied by the caller — the simulator's in-memory fabric.
+    Abstract(Arc<dyn quinn::AsyncUdpSocket>),
+}
+
+impl From<SocketAddr> for Fabric {
+    fn from(bind: SocketAddr) -> Self {
+        Self::Udp(bind)
+    }
+}
+
+impl core::fmt::Debug for Fabric {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Udp(addr) => f.debug_tuple("Udp").field(addr).finish(),
+            Self::Abstract(_) => f.write_str("Abstract(<socket>)"),
+        }
+    }
 }
 
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
@@ -955,7 +1016,7 @@ fn spawn_inner(
     identity: Identity,
     mut server_cfg: ServerConfig,
     mut client_cfg: ClientConfig,
-    bind: SocketAddr,
+    fabric: Fabric,
 ) -> Result<NodeHandle, QuicError> {
     let addr = engine.address();
 
@@ -963,7 +1024,17 @@ fn spawn_inner(
     server_cfg.transport_config(tuned_transport());
     client_cfg.transport_config(tuned_transport());
 
-    let mut endpoint = Endpoint::server(server_cfg, bind)?;
+    let mut endpoint = match fabric {
+        Fabric::Udp(bind) => Endpoint::server(server_cfg, bind)?,
+        // The same endpoint over a caller-supplied socket: identical QUIC/TLS configuration, only the datagram
+        // carrier differs.
+        Fabric::Abstract(socket) => Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_cfg),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?,
+    };
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;
     directory.insert(addr, local_addr);
@@ -1602,11 +1673,157 @@ fn decode_punch(body: &[u8]) -> Option<(Triple, SocketAddr)> {
     Some((peer, addr))
 }
 
+/// A pass-through [`AsyncUdpSocket`](quinn::AsyncUdpSocket) over a tokio UDP socket — the identity fabric.
+///
+/// It exists to prove the [`Fabric::Abstract`] seam carries a *real* node: same QUIC, same TLS, same driver actors,
+/// datagrams reaching the wire through an injected socket rather than one quinn bound itself. A simulator's fabric
+/// replaces the body of these methods with a modelled carrier (latency, jitter, loss, partition); the seam it plugs
+/// into is this one.
+///
+/// **Readiness is the whole difficulty.** `poll_recv` must register the caller's waker when it has nothing to hand
+/// back — returning a bare `Poll::Pending` compiles, type-checks, and then silently never receives another datagram,
+/// because nothing will ever wake the task. Hence `tokio::net::UdpSocket` rather than a raw one: its
+/// `poll_recv_ready`/`poll_send_ready` do the reactor registration. Any simulated fabric owes the same contract to
+/// whatever queue backs it.
+#[cfg(test)]
+#[derive(Debug)]
+struct PassThroughFabric {
+    socket: tokio::net::UdpSocket,
+    /// Datagrams handed to this fabric by the node — the evidence that real node traffic crosses the seam.
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl PassThroughFabric {
+    fn bound(addr: SocketAddr) -> std::io::Result<Arc<Self>> {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(Arc::new(Self {
+            socket: tokio::net::UdpSocket::from_std(socket)?,
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        }))
+    }
+
+    fn sent(&self) -> usize {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl quinn::AsyncUdpSocket for PassThroughFabric {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        Box::pin(WritablePoller(self))
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.socket.try_send_to(transmit.contents, transmit.destination).map(|_| ())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let (Some(buf), Some(slot)) = (bufs.first_mut(), meta.first_mut()) else {
+            return std::task::Poll::Ready(Ok(0));
+        };
+        loop {
+            // Register interest *before* attempting the read, so a datagram arriving between the two still wakes us.
+            std::task::ready!(self.socket.poll_recv_ready(cx))?;
+            match self.socket.try_recv_from(buf) {
+                Ok((len, addr)) => {
+                    *slot = quinn::udp::RecvMeta { addr, len, stride: len, ecn: None, dst_ip: None };
+                    return std::task::Poll::Ready(Ok(1));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // spurious readiness; re-register
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+/// Writability half of the fabric's readiness contract — the same registration discipline as `poll_recv`.
+#[cfg(test)]
+#[derive(Debug)]
+struct WritablePoller(Arc<PassThroughFabric>);
+
+#[cfg(test)]
+impl quinn::UdpPoller for WritablePoller {
+    fn poll_writable(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.socket.poll_send_ready(cx)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use fanos_field::F2;
+
+    #[tokio::test]
+    async fn the_fabric_seam_carries_real_node_traffic() {
+        // The transport-injection seam (docs/design-testing.md §5.1): a node spawned over Fabric::Abstract is the
+        // SAME node — same QUIC state machine, same TLS, same driver actors — with its datagrams flowing through a
+        // caller-supplied socket. A simulator substitutes a modelled carrier at exactly this point, which is what
+        // lets it run the real node COMPOSITION rather than bare engines.
+        //
+        // Proven by two fabric-injected nodes dialling each other: the assertion is that node traffic actually
+        // crosses the injected sockets, which is the property a simulated fabric depends on.
+        use fanos_runtime::{Config, OverlayNode};
+
+        let directory = Directory::new();
+        let mut fabrics = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let credentials = NodeCredentials::generate().expect("credentials");
+            let fabric = PassThroughFabric::bound(SocketAddr::from(([127, 0, 0, 1], 0))).expect("fabric binds");
+            let handle = spawn_self_certifying_persistent_over::<F2>(
+                Fabric::Abstract(fabric.clone()),
+                &credentials,
+                |point| Box::new(OverlayNode::<F2>::new(point, Config::default())),
+                directory.clone(),
+                None,
+            )
+            .expect("a node spawns over the injected fabric");
+            assert!(handle.local_addr().port() > 0, "the injected socket is bound");
+            assert_eq!(handle.client().address(), handle.address(), "the client addresses the same node");
+            fabrics.push(fabric);
+            handles.push(handle);
+        }
+
+        // Ask one to reach the other. Whether the overlay operation itself succeeds is not the point (a two-node
+        // subset of a seven-point plane is not a whole cell); the point is that the attempt drives real QUIC
+        // datagrams through the injected socket.
+        //
+        // Written as poll-until-observed with a generous deadline rather than "wait N then assert" — the latter
+        // passed alone and failed under concurrent test load, which is the flake shape §5 of docs/design-testing.md
+        // records. The property is *that* traffic crosses the fabric, never how promptly.
+        let dialer = handles.first().expect("two nodes").client();
+        let dial = tokio::spawn(async move { dialer.get(b"fabric-seam/key".to_vec()).await });
+        let mut crossed = 0;
+        for _ in 0..200 {
+            crossed = fabrics.iter().map(|f| f.sent()).sum::<usize>();
+            if crossed > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        dial.abort();
+        assert!(crossed > 0, "real node traffic crossed the injected fabric");
+
+        for handle in handles {
+            handle.shutdown();
+        }
+    }
 
     #[test]
     fn relay_frame_round_trips_target_origin_and_inner() {
