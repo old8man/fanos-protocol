@@ -32,9 +32,14 @@
 
 use alloc::vec::Vec;
 
-use crate::ring_commit::{RANGE_BITS, RingCommitment, RingParams, RingRandomness};
+use fanos_primitives::codec::{Reader, put_seq, put_u64};
+
+use crate::ring::D;
+use crate::ring_commit::{
+    COMMITMENT_BYTES, MAX_NOTES_PER_TX, RANGE_BITS, RingCommitment, RingParams, RingRandomness,
+};
 use crate::ring_confidential::{AmountWitness, ConfidentialAmountProof, prove_amounts, verify_amounts};
-use crate::ring_hash::{HashNode, LOG_BASE};
+use crate::ring_hash::{ELL_H, HashNode, LOG_BASE};
 use crate::ring_input::{InputProof, SpendScheme, prove_input, verify_input};
 use crate::ring_output::{OutputProof, prove_output, verify_output};
 
@@ -145,6 +150,50 @@ impl RingShieldedTx {
         }
     }
 
+    /// The transaction's canonical bytes — what consensus orders, gossips, and stores.
+    ///
+    /// Note the asymmetry this makes visible: the *public* object is small (~14 KiB for a 1-in/1-out transfer — nodes
+    /// are `ELL_H·D·2` bytes via the short-digit encoding, commitments `(K+1)·D·8`), while its **proof** is hundreds of
+    /// MiB (`docs/design-obolos-zk.md` §6). So the ledger object can cross a wire today; only the proof is gated on
+    /// recursive compaction. Encoding them separately is what keeps that distinction honest.
+    ///
+    /// `None` if any node is not a valid short SIS node (which cannot happen for a well-formed transaction: every
+    /// anchor and leaf is a hash output, and the nullifiers are checked short by the proof).
+    #[must_use]
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.anchor.to_short_bytes()?);
+        put_seq_nodes(&mut out, &self.nullifiers)?;
+        put_seq(&mut out, self.input_cvs.len(), &self.input_cvs, |o, c| o.extend_from_slice(&c.to_bytes()));
+        put_seq(&mut out, self.output_cvs.len(), &self.output_cvs, |o, c| o.extend_from_slice(&c.to_bytes()));
+        put_seq_nodes(&mut out, &self.output_cms)?;
+        put_u64(&mut out, self.fee);
+        Some(out)
+    }
+
+    /// Decode a transaction from [`to_bytes`](Self::to_bytes). `None` if malformed, non-canonical (an unreduced
+    /// coefficient), carrying trailing bytes, **arity-inconsistent** (a nullifier per input value commitment, a note
+    /// commitment per output value commitment), or claiming more value terms than [`MAX_NOTES_PER_TX`] — the last
+    /// being a decode bound, so a hostile message cannot force unbounded allocation before any check runs.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let anchor = HashNode::from_short_bytes(r.bytes(NODE_BYTES)?)?;
+        let nullifiers = r.seq(NODE_BYTES, |rr| HashNode::from_short_bytes(rr.bytes(NODE_BYTES)?))?;
+        let input_cvs = r.seq(COMMITMENT_BYTES, |rr| RingCommitment::from_bytes(rr.bytes(COMMITMENT_BYTES)?))?;
+        let output_cvs = r.seq(COMMITMENT_BYTES, |rr| RingCommitment::from_bytes(rr.bytes(COMMITMENT_BYTES)?))?;
+        let output_cms = r.seq(NODE_BYTES, |rr| HashNode::from_short_bytes(rr.bytes(NODE_BYTES)?))?;
+        let fee = r.u64()?;
+        r.finish()?;
+        if nullifiers.len() != input_cvs.len() || output_cms.len() != output_cvs.len() {
+            return None;
+        }
+        if input_cvs.len().saturating_add(output_cvs.len()) > MAX_NOTES_PER_TX {
+            return None;
+        }
+        Some(Self { anchor, nullifiers, input_cvs, output_cvs, output_cms, fee })
+    }
+
     /// Whether `proof` attests this transaction's relation — the stateless, expensive half of applying it. Reads no
     /// ledger state, so a block's proofs can be verified concurrently before the serial commit
     /// ([`crate::ring_state::RingShieldedState::apply_with_verdict`]).
@@ -162,6 +211,19 @@ impl RingShieldedTx {
             proof,
         )
     }
+}
+
+/// A node's canonical wire width ([`HashNode::to_short_bytes`]) — one `u16` digit per coefficient.
+const NODE_BYTES: usize = ELL_H * D * 2;
+
+/// Encode a length-prefixed run of nodes; `None` if any is not a valid short SIS node.
+fn put_seq_nodes(out: &mut Vec<u8>, nodes: &[HashNode]) -> Option<()> {
+    let mut encoded = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        encoded.push(n.to_short_bytes()?);
+    }
+    put_seq(out, encoded.len(), &encoded, |o, e| o.extend_from_slice(e));
+    Some(())
 }
 
 /// A sub-seed `base ‖ tag ‖ index`.
@@ -292,6 +354,55 @@ pub fn verify_shielded_tx(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A transaction with the given arity, built from distinct nodes and commitments (no proof needed — the codec is
+    /// independent of the proof, which is exactly the separation being tested).
+    fn sample_tx(n_in: usize, n_out: usize) -> RingShieldedTx {
+        let params = RingParams::standard();
+        let node = |tag: &[u8]| HashNode::from_bytes(tag);
+        let com = |i: usize| {
+            RingCommitment::commit(&params, 1000 + i as u64, &RingRandomness::from_seed(&[i as u8]))
+        };
+        RingShieldedTx {
+            anchor: node(b"codec-anchor"),
+            nullifiers: (0..n_in).map(|i| node(&[b'n', i as u8])).collect(),
+            input_cvs: (0..n_in).map(com).collect(),
+            output_cvs: (0..n_out).map(|i| com(i + 100)).collect(),
+            output_cms: (0..n_out).map(|i| node(&[b'o', i as u8])).collect(),
+            fee: 42,
+        }
+    }
+
+    #[test]
+    fn a_transaction_round_trips_canonically() {
+        for (n_in, n_out) in [(1usize, 1usize), (0, 1), (1, 0), (3, 5)] {
+            let tx = sample_tx(n_in, n_out);
+            let bytes = tx.to_bytes().expect("a well-formed transaction encodes");
+            assert_eq!(RingShieldedTx::from_bytes(&bytes).as_ref(), Some(&tx), "{n_in}-in/{n_out}-out round-trips");
+            // One encoding only: trailing bytes and truncation are both refused.
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(RingShieldedTx::from_bytes(&trailing).is_none(), "trailing bytes are refused");
+            let truncated = bytes.get(..bytes.len() - 1).expect("non-empty encoding");
+            assert!(RingShieldedTx::from_bytes(truncated).is_none(), "truncation is refused");
+        }
+        // The size asymmetry that makes this codec worth having on its own: the public object is KiB, the proof is
+        // hundreds of MiB (docs §6). Encoding them separately is what lets the ledger object cross a wire today.
+        let bytes = sample_tx(1, 1).to_bytes().unwrap();
+        assert!(bytes.len() < 20 * 1024, "a 1-in/1-out transaction is KiB-scale, not MiB ({} bytes)", bytes.len());
+    }
+
+    #[test]
+    fn an_arity_inconsistent_encoding_is_refused() {
+        let tx = sample_tx(1, 1);
+        // Arity must line up: a nullifier per input value commitment, a note commitment per output value commitment.
+        let mismatched = RingShieldedTx { nullifiers: Vec::new(), ..tx.clone() };
+        let raw = mismatched.to_bytes().unwrap();
+        assert!(RingShieldedTx::from_bytes(&raw).is_none(), "a missing nullifier is refused");
+        let mismatched = RingShieldedTx { output_cms: Vec::new(), ..tx };
+        let raw = mismatched.to_bytes().unwrap();
+        assert!(RingShieldedTx::from_bytes(&raw).is_none(), "a missing output note commitment is refused");
+    }
 
     #[test]
     #[ignore = "whole-tx spend at real bits — several minutes; run with --ignored"]

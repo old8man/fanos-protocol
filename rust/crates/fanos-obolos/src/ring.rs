@@ -238,9 +238,43 @@ impl Poly {
         &self.coeffs
     }
 
-    /// A ring element from `D` raw coefficients, each reduced into `[0, q)` — the codec inverse of
-    /// [`coeffs`](Self::coeffs), used to decode a commitment or proof from the wire (untrusted input is reduced,
-    /// so a non-canonical encoding decodes to its canonical residue rather than being rejected).
+    /// The polynomial's canonical bytes: every coefficient as a little-endian `u64`, in order.
+    ///
+    /// A general element of `R_q` needs the full width — its coefficients are only bounded by `q`. Canonicity comes
+    /// from the decoder ([`from_bytes`](Self::from_bytes)) rejecting any coefficient `≥ q`, so each polynomial has
+    /// exactly one encoding and no two byte strings decode alike. (Elements that are *known* short — openings,
+    /// ternary randomness — could pack far tighter; that is `docs/design-obolos-zk.md` §6.1 rung 4.)
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(D * 8);
+        for &c in self.coeffs() {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        out
+    }
+
+    /// Decode a polynomial from [`to_bytes`](Self::to_bytes). `None` if the length is wrong or any coefficient is
+    /// **not reduced** (`≥ q`) — an unreduced coefficient would give a second encoding of the same element.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != D * 8 {
+            return None;
+        }
+        let mut coeffs = [0u64; D];
+        for (slot, chunk) in coeffs.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            let v = u64::from_le_bytes(*chunk);
+            if v >= Q {
+                return None; // not canonical
+            }
+            *slot = v;
+        }
+        Some(Self::from_u64(&coeffs))
+    }
+
+    /// A ring element from `D` raw coefficients, each reduced into `[0, q)`. Reduction here is deliberate: callers
+    /// build polynomials from arithmetic that may exceed `q`. Wire input goes through
+    /// [`from_bytes`](Self::from_bytes) instead, which *rejects* unreduced coefficients rather than folding them, so
+    /// the encoding stays canonical.
     #[must_use]
     pub fn from_u64(coeffs: &[u64; D]) -> Self {
         Self { coeffs: coeffs.iter().map(|&c| reduce(u128::from(c))).collect() }

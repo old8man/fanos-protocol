@@ -293,6 +293,36 @@ impl RingCommitment {
     }
 }
 
+/// A commitment's canonical wire width: `t0 ∈ R_q^K` plus `t1 ∈ R_q`, each a full ring element.
+pub const COMMITMENT_BYTES: usize = (K + 1) * crate::ring::D * 8;
+
+impl RingCommitment {
+    /// The commitment's canonical bytes — `t0` in order, then `t1`, each a [`Poly::to_bytes`] element.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(COMMITMENT_BYTES);
+        for p in self.t0.iter().chain(core::iter::once(&self.t1)) {
+            out.extend_from_slice(&p.to_bytes());
+        }
+        out
+    }
+
+    /// Decode a commitment from [`to_bytes`](Self::to_bytes), or `None` if the length is wrong or any coefficient is
+    /// unreduced (canonicity is enforced element-wise by [`Poly::from_bytes`]).
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != COMMITMENT_BYTES {
+            return None;
+        }
+        let mut polys = Vec::with_capacity(K + 1);
+        for chunk in bytes.as_chunks::<{ crate::ring::D * 8 }>().0 {
+            polys.push(Poly::from_bytes(chunk)?);
+        }
+        let t1 = polys.pop()?;
+        Some(Self { t0: polys, t1 })
+    }
+}
+
 impl crate::ring_size::ProofSize for RingCommitment {
     /// `t0 ∈ R_q^K` plus `t1 ∈ R_q`.
     fn ring_elements(&self) -> usize {
@@ -352,6 +382,26 @@ mod tests {
         assert!(c.opens_to(&params, 12345, &r), "the true opening verifies");
         assert!(!c.opens_to(&params, 12346, &r), "a wrong value does not open it (binding)");
         assert!(!c.opens_to(&params, 12345, &RingRandomness::from_seed(b"other-r")), "wrong randomness fails");
+    }
+
+    #[test]
+    fn the_commitment_codec_round_trips_and_rejects_non_canonical_bytes() {
+        // Canonicity is enforced element-wise, so it is tested here rather than at the transaction level: exactly one
+        // byte string per commitment, and an unreduced coefficient (a second encoding of the same residue) is refused.
+        let params = RingParams::standard();
+        let c = RingCommitment::commit(&params, 7, &RingRandomness::from_seed(b"codec"));
+        let bytes = c.to_bytes();
+        assert_eq!(bytes.len(), COMMITMENT_BYTES, "K+1 full ring elements");
+        assert_eq!(RingCommitment::from_bytes(&bytes).as_ref(), Some(&c), "round-trips exactly");
+        assert!(RingCommitment::from_bytes(&bytes[..bytes.len() - 1]).is_none(), "a wrong length is refused");
+        // Patch the first coefficient to q — congruent to 0, so accepting it would give two encodings of one element.
+        let mut unreduced = bytes.clone();
+        unreduced[..8].copy_from_slice(&Q.to_le_bytes());
+        assert!(RingCommitment::from_bytes(&unreduced).is_none(), "an unreduced coefficient is refused");
+        // …and q−1 is fine, so the bound is exactly `< q` rather than something looser.
+        let mut max = bytes.clone();
+        max[..8].copy_from_slice(&(Q - 1).to_le_bytes());
+        assert!(RingCommitment::from_bytes(&max).is_some(), "q−1 is a legal coefficient");
     }
 
     #[test]
