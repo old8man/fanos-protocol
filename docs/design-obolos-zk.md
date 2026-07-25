@@ -296,21 +296,30 @@ production by per-note incremental witnesses, with byte-identical roots and path
 
 ## 5. Integration roadmap
 
-The proof stack is complete and verified; wiring it into the ledger is the "libraries-ahead → wired" step
-(`docs/audit.md`). In order:
+The proof stack is complete and verified. Wiring it into the ledger is the "libraries-ahead → wired" step
+(`docs/audit.md`) — but §6 establishes that the ordering is **not** the obvious one, because proof size gates the
+wiring rather than merely limiting its scale.
 
-1. **Migrate the value commitment and note model** in `tx` / `build` / `wallet` / `codec` and downstream
+1. **Recursive compaction — the blocker, and the only real one.** A 1-in/1-out transaction proof is 145 MiB at
+   *depth 1*, the shallowest a Merkle path can be, so no tree configuration makes it gossipable (§6). Everything below
+   is unreachable until a spend proof is succinct. §6.1's constant-factor ladder is built out to rung 3 and reaches
+   ~126 MiB — a measured ceiling, not an estimate, and still four orders of magnitude short.
+2. **Migrate the value commitment and note model** in `tx` / `build` / `wallet` / `codec` and downstream
    `fanos-dromos` from the flat-vector [`commit`](../rust/crates/fanos-obolos/src/commit.rs) to
-   [`ring_commit`](../rust/crates/fanos-obolos/src/ring_commit.rs) + SIS notes.
-2. **Wire `ring_tx` as `ShieldedProof`** — replacing the transparent proof as the consensus relation, with
-   `TransparentProof` retained as the degraded-mode oracle.
-3. **Calibrate** `REPETITIONS`, `CHALLENGE_BITS`, and `(K, ℓ, D, q)` to a bit-security target; add constant-time
-   arithmetic and the merged-butterfly NTT; commission external cryptanalysis. Until then the backend stays
+   [`ring_commit`](../rust/crates/fanos-obolos/src/ring_commit.rs) + SIS notes. The ledger half of this exists
+   ([`ring_state`](../rust/crates/fanos-obolos/src/ring_state.rs) + [`ring_tree`](../rust/crates/fanos-obolos/src/ring_tree.rs),
+   with a state-sync snapshot), and the public transaction already has a canonical wire encoding — it is the *proof*
+   that cannot cross a wire.
+3. **Wire `ring_tx` as `ShieldedProof`** — replacing the transparent proof as the consensus relation, with
+   `TransparentProof` retained as the degraded-mode oracle. Gated on (1).
+4. **Calibrate** `(K, ℓ, D, q)`, the challenge widths, and the masking bounds to a bit-security target; add
+   constant-time arithmetic and the merged-butterfly NTT; commission external cryptanalysis. Several parameters that
+   were once picked are now *derived* (§6.1) — `RANGE_BITS`, `SCALAR_ROUNDS`, `MASK_WIDE`, `MASK_BOUND`,
+   `MAX_NOTES_PER_TX` — which narrows this step to the ranks and the ring. Until it is done the backend stays
    **[P]/[H]** and is never claimed as production-audited.
-4. **Compact the proof** — a whole-transaction proof is *minutes* to produce and, more decisively, **gigabytes** to
-   transmit at a realistic tree depth. §6 measures this and derives the ladder; recursive compaction is the only route
-   to a shippable spend proof, and it gates any wire codec (encoding a multi-gigabyte object is not the problem worth
-   solving first).
+
+Until (1) lands, the shipping path remains the transparent proof, and this backend is a complete, sound,
+correctness-verified *research* implementation of the relation it will eventually replace.
 
 ## 6. Cost — measured, not asserted
 
