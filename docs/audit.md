@@ -36,7 +36,7 @@
 > | **Holonomy verification** | "function exists, live peel path never compares, `HolonomyFail` never produced" | **stale — RESOLVED.** Produced on the live path at `fanos-aphantos/src/sealed.rs:255`, pinned by `sealed.rs:519` and `threshold_router.rs:1023` |
 > | **S1-H1** cover + mixing off | "the shipping node builds the router with neither" | **stale — RESOLVED.** `fanos-node/src/node.rs:555-556` applies both, non-zero by default (`DEFAULT_MIX_DELAY = 50 ms`) |
 > | **C7** telemetry DP | "`.privatize(` has no live caller — the observer still emits the exact syndrome un-privatized" | **mis-stated, now RESOLVED.** No *export path for frames exists at all*, so nothing was leaking; the engine is sans-I/O and cannot privatize. Closed at the seam: `CoherenceFrame::export` is the sanctioned outward path and `encode` is documented cell-local |
-> | **R-M1** quarantine keyed by coordinate | "coordinates reshuffle, so the tag aliases" | **REAL, and sharper than written** — see the finding below. The one substantive item left across all four passes |
+> | **R-M1** quarantine keyed by coordinate | "coordinates reshuffle, so the tag aliases" | was **REAL and sharper than written**; **RESOLVED 2026-07-26** — distrust split along the authentication seam: engine keeps the mechanism, driver keeps the identity. See the finding below |
 >
 > **On deleting this file:** it should not be. It is the project's external-audit deliverable
 > (`crypto-audit-readiness.md` §6.5) and the provenance record for how each defect was found and closed — deleting a
@@ -625,9 +625,35 @@ both against us:
   parent's children and reports `Partial` rather than guessing — which is exactly the cell-corroborated distrust input this
   fix wants, and it did not exist when the finding was written.
 
-The blocker is architectural rather than clerical: the sans-I/O overlay engine routes on `Triple` and does not carry a
-frame's sender `NodeId`, so keying by identity means threading identity into the engine's frame path. That is a proper unit
-of work, not a tail-end patch, and it is the **single remaining substantive finding across all four audit passes**.
+**RESOLVED 2026-07-26.** The fix respects the seam rather than breaking it. Threading `NodeId` through the engine's frame
+path was the obvious move and the wrong one: the engine routes on `Triple` because that is all it *should* know, and it is
+deliberately crypto-free. Identity lives where it is **authenticated** — the HELLO exchange verified
+`coord = MapToPoint(VRF(sk, cert ‖ epoch ‖ beacon))` against the peer's certificate, so the driver, and only the driver,
+knows which identity sits where.
+
+So distrust is split along that line. The engine keeps the **mechanism** (drop by coordinate) and gains two commands;
+`fanos-quic` keeps the **meaning** (a `Distrust` map keyed by a hash of the peer certificate — exactly as unforgeable as
+the coordinate proof bound to it) and keeps the engine's view honest:
+
+- `Command::Quarantine { coord }` — re-applied when a distrusted identity is seated at a new coordinate, so it cannot
+  **shed** its verdict by moving.
+- `Command::Readmit { coord }` — issued when a coordinate's occupant *changes*, so an arriving identity cannot **inherit**
+  a verdict it never earned. This is the direction that mattered most: inheriting is a denial of service against an honest
+  node caused by nothing but the clock.
+
+Both fire at once when a distrusted identity lands on a point vacated by another, and the order is load-bearing — clear
+first, then re-apply, or the re-application is undone by the clear that follows it.
+
+Two further details the tests pin. A verdict about a coordinate nobody occupies is **dropped, not stored**: there is no
+identity to blame, and storing it keyed by the coordinate would reintroduce precisely the aliasing being removed. And the
+driver expires its map against `fanos_runtime::QUARANTINE_TTL` — the engine's own window, now exported for the purpose —
+so the two halves can never disagree about who is trusted.
+
+Re-admission is silent while quarantine notifies: a `Notification::Quarantined` is a claim about a peer, and its
+withdrawal is not a counter-claim but the tag ceasing to apply.
+
+**With this, no substantive finding remains open across the four audit passes.** The residue is the coherence/meta-holon
+reconciliation tail (E→L / L→O / Ω2 / Ω9), which is design work rather than defect closure.
 
 ### [MEDIUM] R-M2 — Bootstrap under mass failure: static seed list + genesis fallback → epoch split-brain
 *Anchors:* `node.rs:198` (static bootstrap seeds), `fanos-keygen/src/beacon.rs:209` (`BeaconReq` only answered by a *synced* peer). If the configured seeds are among the dead, a recovering/new node has no discovery; if it reaches a live-but-stalled cell it cannot advance past genesis. **Fix:** a self-healing seed/rendezvous (the DVRF rendezvous beacon already exists) plus the R-C1 safe-stall join semantics.

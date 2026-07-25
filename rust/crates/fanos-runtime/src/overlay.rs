@@ -129,7 +129,7 @@ const DA_SAMPLES: usize = 3;
 /// member is re-admitted; if it is still structurally inconsistent the next diagnosis re-quarantines it
 /// (the polar sum-rules re-catch it), and the authoritative clear remains the parent's re-provisioning
 /// (escalation). Bounded, so `quarantined` cannot grow without limit either (audit C5).
-const QUARANTINE_TTL: Duration = Duration::from_millis(60_000);
+pub const QUARANTINE_TTL: Duration = Duration::from_millis(60_000);
 
 /// Configuration of a node's liveness behaviour.
 // The several `bool`s here are independent, orthogonal deployment toggles (self-healing on/off, and the

@@ -294,6 +294,8 @@ struct Transport {
     /// The address book, so the receive path can register a peer's punched address and the send path can
     /// resolve a destination coordinate to a socket.
     directory: Directory,
+    /// Identity-keyed distrust, so a quarantine follows the peer rather than the point (audit R-M1).
+    distrust: Arc<Distrust>,
 }
 
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
@@ -1056,6 +1058,9 @@ fn spawn_inner(
     let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(REFLEXIVE_QUORUM)));
     let peer_addrs: PeerAddrs = Arc::new(Mutex::new(HashMap::new()));
+    // Identity-keyed distrust, shared between the engine loop (which sees verdicts) and the accept path (which sees who
+    // is seated where) — audit R-M1.
+    let distrust: Arc<Distrust> = Arc::new(Distrust::default());
 
     // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
@@ -1069,6 +1074,7 @@ fn spawn_inner(
         reflexive: reflexive.clone(),
         peer_addrs,
         directory,
+        distrust: distrust.clone(),
     };
     tokio::spawn(accept_loop(transport.clone()));
     tokio::spawn(transport_loop(transport, send_rx));
@@ -1078,6 +1084,7 @@ fn spawn_inner(
         input_tx.clone(),
         send_tx,
         notify_tx,
+        distrust,
     ));
     // The router owns the notification stream: it correlates get/put replies and fans events out.
     tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone()));
@@ -1101,6 +1108,7 @@ async fn engine_loop(
     input_tx: mpsc::Sender<Input>,
     send_tx: mpsc::UnboundedSender<SendRequest>,
     notify_tx: mpsc::UnboundedSender<Notification>,
+    distrust: Arc<Distrust>,
 ) {
     let origin = StdInstant::now();
     while let Some(input) = input_rx.recv().await {
@@ -1116,10 +1124,89 @@ async fn engine_loop(
                     tokio::spawn(fire_timer(tx, token, delay));
                 }
                 Effect::Notify(note) => {
+                    // Audit R-M1: a verdict is about the *identity* seated at that coordinate, not about the point. The
+                    // driver is the only component that knows which, so it banks it here — before the notification goes
+                    // on, since a consumer may act on it.
+                    if let Notification::Quarantined(coord) = note {
+                        distrust.observe_verdict(coord);
+                    }
                     let _ = notify_tx.send(note);
                 }
             }
         }
+    }
+}
+
+/// **Identity-keyed distrust** — the driver's half of audit R-M1.
+///
+/// The engine drops frames by coordinate, because that is all it routes on and it is crypto-free. But a coordinate is a
+/// per-epoch VRF placement, so a tag left on one aliases the moment a node moves: a Byzantine identity sheds it by the
+/// epoch turning, and an innocent identity landing on that point inherits it. The second is worse — a denial of service
+/// against an honest node caused by nothing but the clock.
+///
+/// Identity lives here because this is where it is **authenticated**: the HELLO exchange verified
+/// `coord = MapToPoint(VRF(sk, cert ‖ epoch ‖ beacon))` against the peer's certificate, so the driver — and only the
+/// driver — knows which identity sits where. It therefore holds distrust by identity and keeps the engine's
+/// coordinate-keyed view honest, re-issuing [`Command::Quarantine`] when a distrusted identity moves and
+/// [`Command::Readmit`] when a coordinate's occupant changes.
+#[derive(Default)]
+struct Distrust {
+    /// Identity → when it was quarantined. Keyed by a hash of the peer certificate, which is what the coordinate proof
+    /// is bound to, so the key is exactly as unforgeable as the coordinate itself.
+    by_identity: Mutex<HashMap<[u8; 32], StdInstant>>,
+    /// Coordinate → the identity currently seated there, so a change of occupant is observable.
+    seated: Mutex<HashMap<Triple, [u8; 32]>>,
+}
+
+/// A peer's stable identity: the hash of the certificate its coordinate proof is bound to.
+fn identity_of(cert_der: &[u8]) -> [u8; 32] {
+    fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::NODE_ID, cert_der)
+}
+
+impl Distrust {
+    /// Record the engine's verdict against the *identity* seated at `coord`, so it survives the peer moving.
+    ///
+    /// A verdict about a coordinate nobody is seated at is dropped rather than stored: there is no identity to blame, and
+    /// storing it keyed by the coordinate would reintroduce the aliasing this exists to remove.
+    fn observe_verdict(&self, coord: Triple) {
+        let Ok(seated) = self.seated.lock() else { return };
+        let Some(&id) = seated.get(&coord) else { return };
+        if let Ok(mut by_id) = self.by_identity.lock() {
+            by_id.entry(id).or_insert_with(StdInstant::now);
+        }
+    }
+
+    /// Seat `id` at `coord` and return the commands the engine needs to stay consistent.
+    ///
+    /// Two independent corrections, and both matter:
+    /// * the coordinate's occupant **changed** ⇒ [`Command::Readmit`], so the arriving identity does not inherit a
+    ///   verdict it never earned;
+    /// * the arriving identity is **still distrusted** ⇒ [`Command::Quarantine`], so it cannot shed a verdict by moving.
+    ///
+    /// Both can fire at once — a distrusted identity moving onto a point vacated by another distrusted one — and the
+    /// order matters: clear first, then re-apply, or the re-application is undone.
+    fn seat(&self, coord: Triple, id: [u8; 32]) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        let replaced = match self.seated.lock() {
+            Ok(mut seated) => seated.insert(coord, id).is_some_and(|prev| prev != id),
+            Err(_) => return cmds,
+        };
+        if replaced {
+            cmds.push(Command::Readmit { coord });
+        }
+        let distrusted = match self.by_identity.lock() {
+            Ok(mut by_id) => {
+                // Expire on read against the *engine's* window, so the two halves never disagree about who is trusted.
+                let ttl = std::time::Duration::from_nanos(fanos_runtime::QUARANTINE_TTL.as_nanos());
+                by_id.retain(|_, since| since.elapsed() <= ttl);
+                by_id.contains_key(&id)
+            }
+            Err(_) => false,
+        };
+        if distrusted {
+            cmds.push(Command::Quarantine { coord });
+        }
+        cmds
     }
 }
 
@@ -1380,6 +1467,15 @@ async fn accept_loop(t: Transport) {
             let established = tokio::time::timeout(HELLO_DEADLINE, async {
                 let conn = incoming.await.ok()?;
                 let from = resolve_peer_hello(&conn, &t).await?;
+                // Audit R-M1: the HELLO exchange just proved this peer's coordinate against its certificate, so this is
+                // the one moment the identity↔coordinate binding is known. Seat it, and issue whatever the engine needs
+                // to stay consistent — clear a stale tag if the occupant changed, re-apply one if this identity is
+                // still distrusted. Both can fire, and `seat` orders them so the re-application is not undone.
+                if let Some(cert) = peer_cert_der(&conn) {
+                    for cmd in t.distrust.seat(from, identity_of(&cert)) {
+                        let _ = t.input_tx.send(Input::Command(cmd)).await;
+                    }
+                }
                 Some((conn, from))
             })
             .await;
@@ -2075,6 +2171,72 @@ mod tests {
             quiet.is_err(),
             "no re-seat command when the coordinate does not move"
         );
+    }
+
+    #[test]
+    fn distrust_follows_the_identity_and_is_not_inherited_by_the_next_occupant() {
+        // Audit R-M1, both directions, on the pure half of the driver's logic.
+        let d = Distrust::default();
+        let p0: Triple = [1, 1, 0];
+        let p1: Triple = [0, 1, 1];
+        let byzantine = identity_of(b"cert-byzantine");
+        let innocent = identity_of(b"cert-innocent");
+
+        // The Byzantine peer is seated and then quarantined by the engine.
+        assert!(d.seat(p0, byzantine).is_empty(), "a first seating needs no correction");
+        d.observe_verdict(p0);
+
+        // DIRECTION 1 — it reshuffles to a new point. Without this it would arrive clean, because the tag is on a point
+        // it no longer occupies.
+        assert_eq!(
+            d.seat(p1, byzantine),
+            vec![Command::Quarantine { coord: p1 }],
+            "distrust follows the identity to its new coordinate"
+        );
+
+        // DIRECTION 2, the worse one — an innocent peer lands on the vacated point. It must arrive clean, and it must
+        // NOT pick up its predecessor's verdict, which it never earned.
+        assert_eq!(
+            d.seat(p0, innocent),
+            vec![Command::Readmit { coord: p0 }],
+            "the arriving identity clears the stale tag rather than inheriting it"
+        );
+
+        // And an innocent peer that merely re-connects at its own point triggers nothing.
+        assert!(d.seat(p0, innocent).is_empty(), "re-seating the same identity is not a change of occupant");
+    }
+
+    #[test]
+    fn a_distrusted_identity_landing_on_a_vacated_point_both_clears_and_re_applies() {
+        // Both corrections at once, and the order matters: clear first, then re-apply, or the re-application is undone
+        // by the clear that follows it.
+        let d = Distrust::default();
+        let point: Triple = [1, 0, 1];
+        let first = identity_of(b"cert-first");
+        let second = identity_of(b"cert-second");
+        let elsewhere: Triple = [0, 0, 1];
+
+        d.seat(point, first);
+        d.observe_verdict(point); // `first` is distrusted
+        d.seat(elsewhere, second);
+        d.observe_verdict(elsewhere); // so is `second`
+
+        assert_eq!(
+            d.seat(point, second),
+            vec![Command::Readmit { coord: point }, Command::Quarantine { coord: point }],
+            "clear the predecessor's tag, then re-apply the arriving identity's own"
+        );
+    }
+
+    #[test]
+    fn a_verdict_about_an_unoccupied_point_is_dropped_rather_than_stored() {
+        // Storing it would have to be keyed by the coordinate, which is exactly the aliasing this removes. With no
+        // identity to blame there is nothing to remember.
+        let d = Distrust::default();
+        let ghost: Triple = [1, 1, 1];
+        d.observe_verdict(ghost);
+        let arriving = identity_of(b"cert-arriving");
+        assert!(d.seat(ghost, arriving).is_empty(), "an arrival inherits nothing from a verdict about nobody");
     }
 
     /// Poll `cond` up to ~30s, yielding between checks; returns whether it became true.
