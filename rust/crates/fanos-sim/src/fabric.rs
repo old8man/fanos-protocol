@@ -278,6 +278,126 @@ impl UdpPoller for AlwaysWritable {
     }
 }
 
+
+/// A fleet of **real deployed nodes** on one modelled fabric — the composed-node facility a scenario drives.
+///
+/// Every member is a genuine [`fanos_node::Node`]: the overlay engine *plus* every driver task it composes. That is
+/// what distinguishes this from [`crate::fleet`], which models node state directly, and from [`crate::sim`], which
+/// steps engines — neither can observe wiring, and wiring is where composition faults live
+/// (`docs/design-testing.md` §5.1).
+///
+/// Nodes bootstrap exactly as a deployment does: the first member's fabric address is handed to the rest as a
+/// [`Peer`], so discovery is the real path rather than a pre-populated table.
+pub struct NodeFleet {
+    /// The carrier every member shares — partition and inspect it here.
+    pub fabric: Fabric,
+    nodes: Vec<fanos_node::Node>,
+    addrs: Vec<SocketAddr>,
+}
+
+impl NodeFleet {
+    /// Spawn `count` real nodes on a fresh fabric with `link` behaviour, each offering `roles`.
+    ///
+    /// The first node carries the beacon parameters (a cell needs one beacon authority) and the rest bootstrap from
+    /// it. `count` must be at least 1.
+    ///
+    /// # Errors
+    /// Propagates the first node-start failure.
+    pub async fn spawn<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+    ) -> Result<Self, fanos_node::NodeError> {
+        let fabric = Fabric::new(link);
+        let (_shares, commitment) = fanos_vrf::vss::deal(
+            &[0xF1; 32],
+            2,
+            3,
+            &mut fanos_vrf::vss::DeterministicRng::new(b"fabric-fleet"),
+        )
+        .ok_or(fanos_node::NodeError::Identity)?;
+        let mut nodes: Vec<fanos_node::Node> = Vec::with_capacity(count);
+        let mut addrs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let socket = fabric.bind();
+            let addr = socket.addr();
+            // Bootstrap from whoever is already up — the real discovery path, not a seeded table.
+            let bootstrap = nodes
+                .iter()
+                .zip(&addrs)
+                .map(|(node, &addr)| fanos_node::Peer { coord: node.health().address, addr })
+                .collect();
+            let node = fanos_node::Node::start_over::<F>(
+                fanos_node::NodeConfig {
+                    beacon: Some(fanos_node::BeaconParams { commitment: commitment.clone(), threshold: 2, share: None }),
+                    roles,
+                    bootstrap,
+                    ..fanos_node::NodeConfig::default()
+                },
+                fanos_quic::Fabric::Abstract(socket),
+            )
+            .await?;
+            nodes.push(node);
+            addrs.push(addr);
+        }
+        Ok(Self { fabric, nodes, addrs })
+    }
+
+    /// The fleet's nodes.
+    #[must_use]
+    pub fn nodes(&self) -> &[fanos_node::Node] {
+        &self.nodes
+    }
+
+    /// Member `index`, if it exists.
+    #[must_use]
+    pub fn node(&self, index: usize) -> Option<&fanos_node::Node> {
+        self.nodes.get(index)
+    }
+
+    /// Cut `from → to` by member index — **directional**, so a scenario can model the asymmetric reachability real
+    /// censorship produces. Silently ignores an out-of-range index.
+    pub fn partition(&self, from: usize, to: usize) {
+        if let (Some(&a), Some(&b)) = (self.addrs.get(from), self.addrs.get(to)) {
+            self.fabric.partition(a, b);
+        }
+    }
+
+    /// Cut both directions between two members.
+    pub fn isolate(&self, a: usize, b: usize) {
+        self.partition(a, b);
+        self.partition(b, a);
+    }
+
+    /// Restore `from → to`.
+    pub fn heal(&self, from: usize, to: usize) {
+        if let (Some(&a), Some(&b)) = (self.addrs.get(from), self.addrs.get(to)) {
+            self.fabric.heal(a, b);
+        }
+    }
+
+    /// Poll `predicate` until it holds, or give up after a deliberately generous deadline.
+    ///
+    /// This tier is wall-clock, so an assertion must never be written against a fixed tick — a budget that merely
+    /// looks generous is the documented flake shape (`docs/design-testing.md` §5). Returns whether it held.
+    pub async fn until(&self, mut predicate: impl FnMut(&Self) -> bool) -> bool {
+        for _ in 0..600 {
+            if predicate(self) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// Stop every member.
+    pub fn shutdown(self) {
+        for node in self.nodes {
+            node.shutdown();
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -403,6 +523,57 @@ mod tests {
         assert!(node.serves(Role::Rendezvous), "including the role it offered");
         assert!(!node.serves(Role::Exit), "and not one it did not");
         node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_fleet_of_composed_nodes_self_organizes_over_the_carrier() {
+        // A fleet of REAL deployed nodes, bootstrapping off each other over the modelled carrier. The assertion is
+        // that every member's composition completes — each must publish a capability, publish a load report, scan the
+        // cell-wide directory and step its controller, all over the fabric.
+        use fanos_core::roles::Role;
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(5, Link::default(), roles).await.expect("a fleet starts");
+        assert_eq!(fleet.nodes().len(), 5);
+        let all_assigned = fleet
+            .until(|f| f.nodes().iter().all(|n| n.assigned_roles().any()))
+            .await;
+        assert!(all_assigned, "every member's composition produced an assignment over the carrier");
+        // Every member offered rendezvous, so the cell should be serving it — the property NOSTOS hosting coverage
+        // depends on, now observable end to end rather than asserted of a controller in isolation.
+        assert!(
+            fleet.nodes().iter().any(|n| n.serves(Role::Rendezvous)),
+            "the cell provisioned the anonymous rendezvous role"
+        );
+        assert!(fleet.fabric.delivered() > 0, "the fleet's traffic crossed the modelled carrier");
+        fleet.shutdown();
+    }
+
+    #[tokio::test]
+    #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
+    async fn probe_loss_tolerance_of_the_composition() {
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        for loss in [0u8, 10, 25, 50, 75, 90] {
+            let started = std::time::Instant::now();
+            let fleet = NodeFleet::spawn::<F2>(3, Link::default().with_loss(loss), roles)
+                .await
+                .expect("fleet starts");
+            let ok = fleet.until(|f| f.nodes().iter().all(|n| n.assigned_roles().any())).await;
+            // Does each node's peer count agree? `known_peers` is the address book — a proxy for whether discovery
+            // completed, i.e. whether the rosters the controllers agreed over were the same set.
+            let peers: Vec<usize> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
+            println!(
+                "loss={loss:>2}%  all-assigned={ok:<5}  elapsed={:>7.2?}  delivered={:>5} dropped={:>5}  known_peers={peers:?}",
+                started.elapsed(),
+                fleet.fabric.delivered(),
+                fleet.fabric.dropped()
+            );
+            fleet.shutdown();
+        }
     }
 
     #[test]

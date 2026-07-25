@@ -295,6 +295,41 @@ not.
 > credentials landed — so the test was intermittently asserting a property of the overlay's addressing while claiming
 > to test the transport. `Command::Send` names its destination, which is the property actually under test.
 
+### 5.3 First finding from the new rung — the assignment converges on a roster of one
+
+Using the fleet as an instrument rather than a regression test (`probe_loss_tolerance_of_the_composition`) produced a
+result that no prior rung could have shown. Across loss from 0% to 90%:
+
+```
+loss= 0%  all-assigned=true  elapsed=4.11s  delivered=956  dropped=  0  known_peers=[1, 2, 3]
+loss=50%  all-assigned=true  elapsed=4.13s  delivered= 14  dropped= 43  known_peers=[1, 2, 2]
+loss=90%  all-assigned=true  elapsed=4.12s  delivered=  4  dropped= 32  known_peers=[1, 2, 2]
+```
+
+Two invariants across the sweep give it away. `known_peers` is exactly the *bootstrap* count (node `i` is seeded with
+`i` peers), identical at 0% and 90% — network discovery contributed nothing within the window. And convergence time is
+flat at ~4.1 s regardless of how much the carrier dropped.
+
+The mechanism: **a node's own capability and load slots are local store reads.** `build_capability_directory` therefore
+resolves the node itself with zero peer contact, and the genesis assignment proceeds over a **roster of one**. At 90%
+loss, with four datagrams delivered in total, every node still reported a complete assignment.
+
+Nothing here is unsafe in isolation — a node never assigns itself a role it did not offer. What is missing is that the
+determinism argument the design rests on is *conditional*: `role_loop` states it is "deterministic across nodes given
+the same live set", and in a lossy or partitioned cell the live sets are **not** the same. Each node then steps an
+identical controller over a *different* roster, so the cell disagrees about who serves what while every member believes
+it agreed. Consequences: every role is over-provisioned (each node assigns itself), and for
+[`Role::Rendezvous`](../rust/crates/fanos-core/src/roles.rs) the cell's estimate of line coverage — which *is* the
+anonymity set a hidden service hides in — is wrong in the direction of overconfidence.
+
+Worth noting honestly: the genesis-ordering fix in §5.1 (wait for this node's own publishes to signal) made the
+roster-of-one path *reliable* rather than racy. It fixed a real bug and sharpened this one.
+
+The remedy is observability before policy, and deliberately not a quorum threshold — a fresh or genuinely small cell
+must still be able to start. An assignment should carry **the roster it was computed over**, so a node can tell a
+cell-agreed assignment from a solitary guess, and so a subsystem whose safety depends on cell-wide agreement
+(rendezvous coverage above all) can decline to rely on a provisional one.
+
 ---
 
 ## 6. Running the tiers

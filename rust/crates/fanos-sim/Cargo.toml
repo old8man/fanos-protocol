@@ -24,6 +24,10 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 # `fanos_quic::Fabric::Abstract` seam, so the whole production path above the socket is exercised.
 fanos-quic.workspace = true
 fanos-vrf.workspace = true
+# The composed-node fleet (`fabric::NodeFleet`) drives REAL deployed nodes over the modelled carrier, which is the
+# only way a scenario can observe the node's composition (docs/design-testing.md §5.1). No cycle: fanos-node does
+# not depend on fanos-sim.
+fanos-node.workspace = true
 # Decode the coherence frames nodes publish (`Notification::Observed`) into per-node snapshots for the
 # fleet-scale state inspection surface (`fleet` module — the dashboard/CLI data contract).
 fanos-telemetry = { workspace = true, features = ["std"] }
