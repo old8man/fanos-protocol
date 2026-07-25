@@ -86,12 +86,13 @@ pub fn parent_coherence(child_activity: &[Vec<f64>]) -> Option<CoherenceMatrix> 
 pub fn federated_diagnosis(
     child_degraded: &[u8; fano::N],
     child_bus_faults: &[bool; fano::N],
+    provenance: golay::Provenance,
 ) -> federation::Cell {
     let mut reports = [golay::Report::default(); federation::CHILDREN];
     for (r, (&axes, &bus)) in reports.iter_mut().zip(child_degraded.iter().zip(child_bus_faults.iter())) {
         *r = golay::Report { axes: axes & 0x7F, bus_fault: bus };
     }
-    federation::diagnose_cell(reports)
+    federation::diagnose_cell(reports, provenance)
 }
 
 /// One level's diagnosis: the parent's coherence measures over its children, the localized failing child (if
@@ -129,7 +130,10 @@ pub fn diagnose_level(
     Some(LevelDiagnosis {
         measures,
         failing_child: localize_failing_child(&inter_child_loss(child_losses), tol),
-        federated: federated_diagnosis(child_degraded, child_bus_faults),
+        // Self-reported, because these masks come from the children themselves. A child controlling its own eight
+        // coordinates can otherwise relocate blame onto a healthy sibling (`fanos_code::golay::Provenance`), so the
+        // grammar is trusted only as far as that provenance allows.
+        federated: federated_diagnosis(child_degraded, child_bus_faults, golay::Provenance::SelfReported),
         escalate: measures.phi < PHI_TH - 1e-9,
     })
 }
@@ -163,7 +167,7 @@ mod tests {
         // and only if its loss stands out; the federated grammar names the axes.
         let mut degraded = [0u8; fano::N];
         degraded[5] = 0b0010_1001; // axes 0, 3 and 5 of child 5
-        let verdict = federated_diagnosis(&degraded, &[false; fano::N]);
+        let verdict = federated_diagnosis(&degraded, &[false; fano::N], golay::Provenance::Measured);
         let federation::Cell::Localized(f) = verdict else { panic!("three faults must localize") };
         assert_eq!(f.axes[5], 0b0010_1001, "the axes are named, not just the child");
         assert_eq!(f.total(), 3);
@@ -179,7 +183,7 @@ mod tests {
             *d = 1 << (c % 7);
         }
         assert_eq!(localize_failing_child(&inter_child_loss(&[0.2; fano::N]), 0.1), None, "no gap, no verdict");
-        let federation::Cell::Localized(f) = federated_diagnosis(&degraded, &[false; fano::N]) else {
+        let federation::Cell::Localized(f) = federated_diagnosis(&degraded, &[false; fano::N], golay::Provenance::Measured) else {
             panic!("one per child must localize")
         };
         assert_eq!(f.total(), 7, "all seven attributed without any gap to lean on");
@@ -188,7 +192,7 @@ mod tests {
     #[test]
     fn a_clean_parent_is_federated_healthy() {
         assert_eq!(
-            federated_diagnosis(&[0; fano::N], &[false; fano::N]),
+            federated_diagnosis(&[0; fano::N], &[false; fano::N], golay::Provenance::Measured),
             federation::Cell::Healthy
         );
     }
@@ -219,7 +223,7 @@ mod tests {
         let mut degraded = [0u8; fano::N];
         degraded[1] = 0b0000_1111; // four axes in one child: unavoidably beyond the grammar
         let federation::Cell::Partial { localized, unexplained } =
-            federated_diagnosis(&degraded, &[false; fano::N])
+            federated_diagnosis(&degraded, &[false; fano::N], golay::Provenance::Measured)
         else {
             panic!("four in one child cannot localize")
         };

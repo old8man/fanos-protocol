@@ -391,7 +391,7 @@ mod tests {
         let mut levels = [Level::new(0); HEIGHT as usize];
         levels[2].axes = 0b0000_0100;
         let reports = as_reports(levels, [true, false], false);
-        assert_eq!(golay::diagnose(reports), match golay::locate(word(levels, [true, false], false)) {
+        assert_eq!(golay::diagnose(reports, golay::Provenance::Measured), match golay::locate(word(levels, [true, false], false)) {
             Some(f) if f.is_empty() => golay::Verdict::Healthy,
             Some(f) => golay::Verdict::Localized(f),
             None => golay::Verdict::Ambiguous,

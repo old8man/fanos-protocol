@@ -135,7 +135,11 @@ pub async fn diagnose_children(
             *slot = r;
         }
     }
-    federation::diagnose_cell(reports)
+    // SELF-REPORTED, and the distinction is load-bearing: these masks are what each child says about *itself*, so a child
+    // controlling its own eight coordinates could otherwise relocate blame onto a healthy sibling — the Golay decoder
+    // corrects by moving to the nearest codeword, so injected coordinates do not add noise, they move the blame. See
+    // `fanos_code::golay::Provenance`. A peer-measured source keeps the full `t = 3`; this one does not.
+    federation::diagnose_cell(reports, golay::Provenance::SelfReported)
 }
 
 /// Keep this cell's health report **live**: spawn the task that publishes `health()`'s current view each epoch.
@@ -227,7 +231,7 @@ mod tests {
         let quiet = Report::default();
         assert_eq!(quiet.block(), 0);
         assert_eq!(
-            federation::diagnose_cell([Report::default(); federation::CHILDREN]),
+            federation::diagnose_cell([Report::default(); federation::CHILDREN], golay::Provenance::Measured),
             federation::Cell::Healthy,
             "seven silent children are healthy, not seven accusations"
         );
@@ -240,7 +244,7 @@ mod tests {
         // names all three, and the right child.
         let mut reports = [Report::default(); federation::CHILDREN];
         reports[5] = Report { axes: 0b0100_1001, bus_fault: false }; // axes 0, 3, 6
-        let federation::Cell::Localized(f) = federation::diagnose_cell(reports) else {
+        let federation::Cell::Localized(f) = federation::diagnose_cell(reports, golay::Provenance::Measured) else {
             panic!("three faults must localize")
         };
         assert_eq!(f.axes[5], 0b0100_1001, "all three named, and attributed to child 5");

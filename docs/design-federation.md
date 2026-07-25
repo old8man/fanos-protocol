@@ -140,10 +140,41 @@ its bus; it does not compute one. A constructor that derived the bus from the fa
 weight-4 block, pushing a correctable pattern out of range and making the federation answer `Ambiguous` for exactly the
 case it exists to handle. Parity is a property of the codeword, never of the error.
 
-**Byzantine self-reporting needs no separate path.** Every codeword's block is even, so an odd-weight observation cannot be
-a codeword and lands in the syndrome as an ordinary fault coordinate. A lying member and a broken member are diagnosed by
-the *same* mechanism — which is why there is no trust assumption here to get wrong, and why a member cannot make itself
-look healthy by adjusting one number.
+**⚠️ Byzantine self-reporting — this document claimed the wrong thing, and an adversarial probe refuted it.** The claim
+was that a lying member "needs no separate path" because an odd-weight block cannot be a codeword, so a liar and a broken
+member are diagnosed by the same mechanism. **False.** Probed exhaustively: with unbounded self-reports, **4 928 of 19 770
+decodable frames (24.9%) blamed a member with no fault at all.** Concretely — member 1 has one true fault, member 2
+fabricates four in its own block, and the decoder names an axis of member 0, who is entirely healthy.
+
+The reason is structural, not a missing check. Golay's power comes from treating all 24 coordinates as **one
+measurement**, and error correction works by moving to the *nearest codeword* — so injected coordinates do not add noise,
+they **relocate the blame**. That is sound only when the coordinates come from a common, non-adversarial process, and a
+member reporting on itself is exactly not that.
+
+**The fix is provenance, in the type system.** `golay::Provenance` forces a caller to say where reports came from, because
+the two cases have genuinely different capabilities:
+
+| provenance | meaning | capability |
+|---|---|---|
+| `Measured` | peers observed each member's health | full `t = 3`, including all three faults inside one member |
+| `SelfReported` | each member claimed its own | blocks capped at `MAX_BLOCK_WEIGHT = 2`; past that, `Ambiguous` |
+
+There is no default. Guessing permissively *is* the framing attack; guessing restrictively silently loses the headline
+capability.
+
+**And the two are in real tension, which is worth naming rather than smoothing over.** "Three faults inside one member" —
+§7's headline row — requires trusting a single member's block at weight 3, and that is precisely the trust a liar
+exploits. Provenance does not dissolve the tension; it makes the choice explicit and sources it from a fact about the
+data rather than a hope about the members.
+
+`MAX_BLOCK_WEIGHT = 2` is measured, not reasoned: a cap of **3** — the code's own `t` — still permits 21.1% misattribution,
+which is the counter-intuitive part. Framing needs the true deviation to reach weight ≥ 4 so the decoder settles on a
+different weight-≤3 leader; capping at 2 stops one member carrying the word there alone.
+
+**Consequence for §11's health directory:** `publish_health` is a **self-report**, so `diagnose_children` passes
+`SelfReported` and gets the reduced capability. Recovering the full `t = 3` needs peer-measured input — which DIAKRISIS's
+analogue localizer already produces, since it measures a child's loss *from its peers*. Wiring that is the next step, and
+it is the difference between the grammar's advertised power and its currently reachable power.
 
 **Four faults are `Ambiguous`, not guessed.** `d = 8` gives `t = 3` and covering radius 4, so a weight-4 pattern is
 detected and *not* localizable. Reporting "detected but ambiguous" is the true state, and a controller that acts on a

@@ -51,7 +51,8 @@
 
 use fanos_geometry::fano;
 
-use crate::golay::{self, Report, Word};
+pub use crate::golay;
+use crate::golay::{Report, Word};
 
 /// Children of a parent cell — the plane's seven points, each hosting a child cell.
 pub const CHILDREN: usize = fano::N;
@@ -118,7 +119,7 @@ pub enum Cell {
 /// (weight ≤ [`golay::T`]), attributes those faults, and removes them from what remains. Verified optimal — see the module
 /// note — so the simple rule is the right one.
 #[must_use]
-pub fn diagnose_cell(reports: [Report; CHILDREN]) -> Cell {
+pub fn diagnose_cell(reports: [Report; CHILDREN], provenance: golay::Provenance) -> Cell {
     // Remaining observation per child, as an 8-bit block (axes in bits 0..6, bus in bit 7).
     let mut left = [0u8; CHILDREN];
     for (slot, r) in left.iter_mut().zip(reports.iter()) {
@@ -135,6 +136,13 @@ pub fn diagnose_cell(reports: [Report; CHILDREN]) -> Cell {
             let blocks = line.map(|p| left.get(p as usize).copied().unwrap_or(0));
             if blocks.iter().all(|b| *b == 0) {
                 continue; // nothing to explain on this line
+            }
+            // Provenance decides how far a line may be trusted: a self-reported block past `MAX_BLOCK_WEIGHT` lets one
+            // child relocate blame onto a healthy sibling, so such a line is skipped rather than decoded.
+            if provenance == golay::Provenance::SelfReported
+                && blocks.iter().any(|b| b.count_ones() > golay::MAX_BLOCK_WEIGHT)
+            {
+                continue;
             }
             let Some(faults) = golay::locate(Word::from_blocks(blocks)) else {
                 continue; // this federation is saturated — try another line
@@ -199,7 +207,7 @@ mod tests {
 
     #[test]
     fn a_clean_cell_is_healthy() {
-        assert_eq!(diagnose_cell([Report::axes(0); CHILDREN]), Cell::Healthy);
+        assert_eq!(diagnose_cell([Report::axes(0); CHILDREN], golay::Provenance::Measured), Cell::Healthy);
     }
 
     #[test]
@@ -210,7 +218,7 @@ mod tests {
         for (i, r) in reports.iter_mut().enumerate() {
             *r = Report::axes(1 << (i % golay::AXES));
         }
-        let Cell::Localized(f) = diagnose_cell(reports) else { panic!("must fully localize") };
+        let Cell::Localized(f) = diagnose_cell(reports, golay::Provenance::Measured) else { panic!("must fully localize") };
         assert_eq!(f.total(), 7);
         for i in 0..CHILDREN {
             assert_eq!(f.axes[i], 1 << (i % golay::AXES), "child {i}'s fault attributed to child {i}");
@@ -223,7 +231,7 @@ mod tests {
         // verdict, and a self-healing controller acts on it. Here all three are attributed to the right child and axes.
         let mut reports = [Report::axes(0); CHILDREN];
         reports[4] = Report::axes(0b0101_0100); // axes 2, 4 and 6 of child 4
-        let Cell::Localized(f) = diagnose_cell(reports) else { panic!("must fully localize") };
+        let Cell::Localized(f) = diagnose_cell(reports, golay::Provenance::Measured) else { panic!("must fully localize") };
         assert_eq!(f.axes[4], 0b0101_0100);
         assert_eq!(f.total(), 3);
         for (i, m) in f.axes.iter().enumerate() {
@@ -251,7 +259,7 @@ mod tests {
                     for (r, m) in reports.iter_mut().zip(want.iter()) {
                         *r = Report::axes(*m);
                     }
-                    match diagnose_cell(reports) {
+                    match diagnose_cell(reports, golay::Provenance::Measured) {
                         Cell::Localized(f) => assert_eq!(f.axes, want, "attribution must be exact"),
                         other => panic!("three faults must localize, got {other:?}"),
                     }
@@ -269,7 +277,7 @@ mod tests {
         // names what is unexplained instead of inventing an attribution.
         let mut reports = [Report::axes(0); CHILDREN];
         reports[6] = Report::axes(0b0000_1111);
-        let Cell::Partial { localized, unexplained } = diagnose_cell(reports) else {
+        let Cell::Partial { localized, unexplained } = diagnose_cell(reports, golay::Provenance::Measured) else {
             panic!("four faults in one child cannot be localized")
         };
         assert!(localized.is_empty(), "nothing was attributed");
@@ -289,7 +297,7 @@ mod tests {
         let mut reports = [Report::axes(0); CHILDREN];
         reports[0] = Report::axes(0b0000_1111);
         reports[3] = Report::axes(0b0100_0000);
-        let Cell::Partial { localized, unexplained } = diagnose_cell(reports) else {
+        let Cell::Partial { localized, unexplained } = diagnose_cell(reports, golay::Provenance::Measured) else {
             panic!("child 0 cannot be explained")
         };
         assert_eq!(localized.axes[3], 0b0100_0000, "the reachable fault is still attributed");
@@ -301,7 +309,7 @@ mod tests {
     fn a_bus_fault_is_attributed_to_its_child_without_naming_an_axis() {
         let mut reports = [Report::axes(0); CHILDREN];
         reports[2] = Report::bus_only();
-        let Cell::Localized(f) = diagnose_cell(reports) else { panic!("must localize") };
+        let Cell::Localized(f) = diagnose_cell(reports, golay::Provenance::Measured) else { panic!("must localize") };
         assert!(f.bus[2], "the bus fault is attributed to child 2");
         assert_eq!(f.axes[2], 0, "and names no axis, because a bus is not an axis");
         assert_eq!(f.total(), 1);

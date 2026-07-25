@@ -428,6 +428,52 @@ pub enum Verdict {
     Ambiguous,
 }
 
+/// The most faults one member's block may carry before the whole word is refused — **2**.
+///
+/// Defence in depth against the misattribution above, measured rather than reasoned. Exhaustive search over every true
+/// fault pattern of weight ≤ 3 among two honest members, against *every* 8-bit value a third member could report:
+///
+/// | per-block cap | decodable frames | frames blaming an innocent member |
+/// |---|---|---|
+/// | none | 19 770 | 4 928 (**24.9%**) |
+/// | 3 | 8 485 | 1 792 (**21.1%**) |
+/// | **2** | 14 701 | **0** |
+/// | 1 | 729 | 0 |
+///
+/// A cap of 3 — the code's own `T` — is *not* enough, which is the counter-intuitive part and the reason this is a
+/// measured constant rather than an assumed one. The mechanism: framing needs the true deviation to reach weight ≥ 4, so
+/// the decoder settles on a *different* weight-≤3 leader; capping each block at 2 keeps a single member from carrying the
+/// word there alone, and the honest outcome past that is [`Verdict::Ambiguous`] rather than a wrong name.
+pub const MAX_BLOCK_WEIGHT: u32 = 2;
+
+/// Whether every member's block is within [`MAX_BLOCK_WEIGHT`].
+#[must_use]
+pub fn blocks_within_cap(reports: [Report; MEMBERS]) -> bool {
+    reports.iter().all(|r| r.block().count_ones() <= MAX_BLOCK_WEIGHT)
+}
+
+/// Where a set of reports came from — and therefore how far the grammar may be trusted with them.
+///
+/// This is in the type system rather than in a comment because the two cases have **different capabilities**, and the
+/// difference is not a tuning knob:
+///
+/// * [`Provenance::Measured`] — each member's health was observed by its *peers*. The coordinates then come from one
+///   non-adversarial process, which is exactly the assumption Golay decoding needs, so the full `t = 3` applies: three
+///   faults anywhere, including all three inside one member.
+/// * [`Provenance::SelfReported`] — each member reported on itself. A member then controls its own eight coordinates, and
+///   error correction *relocates blame* rather than merely absorbing noise, so [`MAX_BLOCK_WEIGHT`] applies and the
+///   reachable capability is lower.
+///
+/// A caller must say which. There is no default, because guessing wrong in the permissive direction is the framing attack
+/// and guessing wrong in the restrictive direction silently loses the headline capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provenance {
+    /// Observed by peers — one common, non-adversarial measurement process.
+    Measured,
+    /// Claimed by each member about itself — adversarially controllable per block.
+    SelfReported,
+}
+
 /// Diagnose a federation from its three members' reports.
 ///
 /// This is the whole point of the module expressed as one call, and the qualitative gain over per-cell diagnosis is worth
@@ -435,13 +481,33 @@ pub enum Verdict {
 /// in one cell alias onto a wrong single-fault verdict, which is worse than no verdict. A three-cell federation localizes
 /// **three** faults *anywhere*, including all three inside one member, and when the damage exceeds three it says so.
 ///
-/// A member that under-reports or lies needs no special handling. Every codeword has even weight on each block, so an
-/// odd-weight observation cannot be a codeword and lands in the syndrome as an ordinary fault coordinate. Byzantine
-/// self-reporting and genuine hardware fault are therefore diagnosed by the *same* mechanism, which is why there is no
-/// separate trust path to get wrong — and why a member cannot make itself look healthy by adjusting one number.
+/// ## ⚠️ The trust model, corrected — reports must be MEASURED, not self-reported
+///
+/// An earlier version of this note claimed a lying member "needs no special handling" because an odd-weight block cannot
+/// be a codeword, so Byzantine self-reporting and genuine fault were "diagnosed by the same mechanism". **That was wrong,
+/// and an adversarial probe refuted it: 4 928 of 19 770 decodable frames (24.9%) blamed a member with no fault at all.**
+/// Concretely — one true fault at member 1, member 2 fabricates four faults in its own block, and the decoder names an
+/// axis of member 0, who is entirely healthy.
+///
+/// The reason is structural rather than a missing check. Golay's power comes from treating all 24 coordinates as **one
+/// measurement**, and error correction works by moving to the nearest codeword — so injected coordinates do not merely add
+/// noise, they *relocate the blame*. That is valid only if the coordinates come from a common, non-adversarial process.
+/// A member reporting on itself is exactly not that.
+///
+/// **So the load-bearing requirement is on the input, not the code:** a `Report` must be *peer-measured* health — what a
+/// member's neighbours observe of it — not what it says about itself. DIAKRISIS's analogue localizer already measures a
+/// child's loss from its peers, and that is the sound source. A self-report may only enter after corroboration.
+///
+/// [`MAX_BLOCK_WEIGHT`] is defence in depth for the residual case, not the fix.
 #[must_use]
 #[allow(clippy::indexing_slicing)] // fixed-size array, constant indices
-pub fn diagnose(reports: [Report; MEMBERS]) -> Verdict {
+pub fn diagnose(reports: [Report; MEMBERS], provenance: Provenance) -> Verdict {
+    // Self-reported blocks past `MAX_BLOCK_WEIGHT` let a single member relocate blame onto a healthy sibling, and the
+    // decoder cannot tell an injected coordinate from a measured one. `Ambiguous` is the true answer there. Peer-measured
+    // reports carry no such control, so they keep the full capability.
+    if provenance == Provenance::SelfReported && !blocks_within_cap(reports) {
+        return Verdict::Ambiguous;
+    }
     let word = Word::from_blocks([reports[0].block(), reports[1].block(), reports[2].block()]);
     match locate(word) {
         Some(f) if f.is_empty() => Verdict::Healthy,
@@ -737,7 +803,7 @@ mod tests {
         // The all-clear: three members reporting no faults, each bus honest. The zero word is a codeword.
         let clean = [Report::axes(0); MEMBERS];
         assert!(clean.iter().all(|r| r.even()));
-        assert_eq!(diagnose(clean), Verdict::Healthy);
+        assert_eq!(diagnose(clean, Provenance::Measured), Verdict::Healthy);
     }
 
     #[test]
@@ -746,7 +812,7 @@ mod tests {
         // onto a wrong single-fault verdict — worse than no verdict. The federation names all three, and names the member.
         let mut reports = [Report::axes(0); MEMBERS];
         reports[1] = Report::axes(0b0001_0110); // axes 1, 2 and 4 of member 1
-        let Verdict::Localized(f) = diagnose(reports) else { panic!("three faults must localize") };
+        let Verdict::Localized(f) = diagnose(reports, Provenance::Measured) else { panic!("three faults must localize") };
         assert_eq!(f.len(), 3);
         let named: Vec<(usize, usize)> = f.axes().collect();
         assert_eq!(named, vec![(1, 1), (1, 2), (1, 4)], "member and axis, exactly");
@@ -760,7 +826,7 @@ mod tests {
     #[test]
     fn faults_spread_across_all_three_members_are_localized_too() {
         let reports = [Report::axes(0b0000_0001), Report::axes(0b0000_0010), Report::axes(0b0001_0000)];
-        let Verdict::Localized(f) = diagnose(reports) else { panic!("must localize") };
+        let Verdict::Localized(f) = diagnose(reports, Provenance::Measured) else { panic!("must localize") };
         let named: Vec<(usize, usize)> = f.axes().collect();
         assert_eq!(named, vec![(0, 0), (1, 1), (2, 4)], "one per member, each named");
     }
@@ -773,7 +839,7 @@ mod tests {
         let mut reports = [Report::axes(0); MEMBERS];
         reports[2] = Report::axes(0b0000_0001); // an odd-weight block: no codeword has one
         assert!(!reports[2].even(), "odd weight is itself evidence of damage");
-        let Verdict::Localized(f) = diagnose(reports) else { panic!("localizable") };
+        let Verdict::Localized(f) = diagnose(reports, Provenance::Measured) else { panic!("localizable") };
         assert_eq!(f.bits(), [0], "and it is localized to exactly that coordinate");
     }
 
@@ -789,6 +855,49 @@ mod tests {
         let b = Report::bus_only();
         assert_eq!(b.block(), 0x80);
         assert!(!b.even(), "a lone bus fault is odd-weight, hence detectable");
+    }
+
+    #[test]
+    fn a_lying_member_cannot_frame_an_innocent_sibling_when_it_reports_on_itself() {
+        // The attack this module claimed was impossible, and was not. Found by adversarially probing an asserted
+        // property rather than by review: with unbounded self-reports, 4 928 of 19 770 decodable frames (24.9%) named a
+        // member with no fault at all. The mechanism is structural — Golay corrects by moving to the nearest codeword, so
+        // injected coordinates RELOCATE the blame instead of merely adding noise.
+        //
+        // Reproduced here exactly: member 1 has one true fault, member 2 fabricates four in its own block, and the
+        // unbounded decoder names an axis of member 0 — who is entirely healthy.
+        let mut reports = [Report::axes(0); MEMBERS];
+        reports[1] = Report::axes(0b0000_0001);
+        reports[2] = Report::axes(0b0000_1111); // the lie
+        let raw = Word::from_blocks([reports[0].block(), reports[1].block(), reports[2].block()]);
+        let framed = locate(raw).expect("the unbounded word still decodes — that is the problem");
+        assert!(
+            framed.axes().any(|(m, _)| m == 0),
+            "without the provenance gate the decoder blames member 0, who has nothing wrong"
+        );
+
+        // Declared as self-reported, the same input is refused instead of misattributed.
+        assert_eq!(diagnose(reports, Provenance::SelfReported), Verdict::Ambiguous);
+        assert!(!blocks_within_cap(reports));
+    }
+
+    #[test]
+    fn provenance_decides_the_capability_and_the_tension_is_real() {
+        // The honest cost, stated as a test rather than buried. Three faults inside ONE member is the headline
+        // capability — and it is exactly the shape a liar exploits, because it requires trusting one member's block at
+        // weight 3. So the two are in direct tension and provenance is what resolves it.
+        let mut reports = [Report::axes(0); MEMBERS];
+        reports[1] = Report::axes(0b0001_0110); // three faults, one member
+
+        // Peer-measured: no member controls its own coordinates, so the full capability stands.
+        let Verdict::Localized(f) = diagnose(reports, Provenance::Measured) else {
+            panic!("measured reports keep t = 3 anywhere")
+        };
+        assert_eq!(f.len(), 3);
+        assert!(f.axes().all(|(m, _)| m == 1));
+
+        // Self-reported: the same pattern is indistinguishable from a lie, so it is refused rather than trusted.
+        assert_eq!(diagnose(reports, Provenance::SelfReported), Verdict::Ambiguous);
     }
 
     #[test]
