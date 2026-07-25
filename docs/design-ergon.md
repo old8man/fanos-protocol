@@ -441,7 +441,14 @@ Recorded here rather than discovered later.
 ## 11. Implementation order
 
 1. `fanos-ergon`: the sans-I/O term algebra — `Term`, `Effect`, `Footprint`, `fp`, `depth`, well-typedness, with the
-   closure theorem's induction as the test suite. No ledger dependency; `no_std`.
+   closure theorem's induction as the test suite. No ledger dependency; `no_std`. **Done.**
+   
+   One thing attempting step 2 surfaced, worth recording as a design fact rather than a fix: a `Key`'s slot is **32 bytes,
+   not a `u64`**, because that is what a host state key actually is (`fanos-dromos`'s keys are 32-byte account, name and
+   deal hashes). A narrower slot would force a footprint to **truncate**, and truncation has two failure modes of very
+   different severity — two distinct keys colliding makes the scheduler see a conflict that is not there (a silent
+   throughput loss), or lets a `Par` claim a disjointness it does not have (a state fork). Sizing the type to the domain
+   removes the question instead of documenting it.
 2. The eight existing rules re-expressed as primitive effects, behind the same wire tags so no capability is lost.
 3. `HybridLedger::apply` replaced by the term interpreter; the declared `AccessList` deleted and `fp` wired into DROMOS.
 4. `Gate`/`Alt` predicates over ledger state; HERMES's HTLC migrated to `Gate` and `TAG_HTLC` retired.

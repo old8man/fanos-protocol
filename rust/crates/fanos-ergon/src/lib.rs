@@ -91,18 +91,41 @@ pub type LineId = u32;
 /// The algebra remains ignorant of what a slot **means**, so it can be proven once and reused by any state machine; but it
 /// is deliberately *not* ignorant of placement, because placement is what decides whether two effects can run on
 /// different machines.
+///
+/// The slot is 32 bytes because that is what a host state key actually is — `fanos_dromos`'s ledger keys are 32-byte
+/// account, name and deal hashes, and DIAULOS/OBOLOS keys are digests too. A narrower slot would force the one thing a
+/// footprint must never do: **truncate**. Two distinct ledger keys colliding into one slot would make the scheduler read
+/// two independent transactions as conflicting (a silent throughput loss) or, worse, let a `Par` claim disjointness it
+/// does not have. Sizing the type to the domain removes the question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Key {
     /// The projective point this state lives at.
     pub point: PointId,
-    /// The slot at that point.
-    pub slot: u64,
+    /// The slot at that point — a host state key, full width.
+    pub slot: [u8; 32],
 }
 
 impl Key {
-    /// A key at `point`, slot `slot`.
+    /// A key at `point` with the given 32-byte slot.
     #[must_use]
-    pub const fn at(point: PointId, slot: u64) -> Self { Self { point, slot } }
+    pub const fn at(point: PointId, slot: [u8; 32]) -> Self { Self { point, slot } }
+
+    /// A key at `point` whose slot is a small integer — for tests and for hosts whose state is enumerable rather than
+    /// hashed. Big-endian in the low eight bytes, so ordering matches the integer's.
+    #[must_use]
+    // Both indices are bounded by the loop and by `to_be_bytes`'s fixed width, so the panic clippy warns about is
+    // unreachable; `slice::get` is not const-stable, and this must stay `const` to be usable in constant contexts.
+    #[allow(clippy::indexing_slicing)]
+    pub const fn small(point: PointId, n: u64) -> Self {
+        let mut slot = [0u8; 32];
+        let be = n.to_be_bytes();
+        let mut i = 0;
+        while i < 8 {
+            slot[24 + i] = be[i];
+            i += 1;
+        }
+        Self { point, slot }
+    }
 }
 
 /// How *localised* a term's state access is — the geometric reading of a footprint, and the axis of parallelism that
@@ -608,7 +631,7 @@ mod tests {
     use super::*;
 
     /// A key at point `n`, slot 0 — the tests care about identity and placement, not slots.
-    fn k(n: PointId) -> Key { Key::at(n, 0) }
+    fn k(n: PointId) -> Key { Key::small(n, 0) }
 
     /// Keys at the given points.
     fn ks(ns: &[PointId]) -> Vec<Key> { ns.iter().copied().map(k).collect() }
@@ -650,6 +673,26 @@ mod tests {
         // And D_MAX is exactly the largest admissible order.
         let highest = (1..8).filter(|&m| ladder(m) <= 1.0).max().unwrap();
         assert_eq!(u32::from(D_MAX), highest, "D_MAX is the ceiling the ladder computes, not a chosen number");
+    }
+
+    #[test]
+    fn a_full_width_slot_keeps_distinct_host_keys_distinct() {
+        // Why the slot is 32 bytes and not a u64. A footprint must never truncate: two distinct ledger keys collapsing
+        // into one slot would either make the scheduler see a conflict that is not there (silent throughput loss) or —
+        // the dangerous direction — let a `Par` claim a disjointness it does not have.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[0] = 1; // differs only in the HIGH bytes, exactly where a u64 truncation would have lost it
+        b[1] = 1;
+        let ka = Key::at(3, a);
+        let kb = Key::at(3, b);
+        assert_ne!(ka, kb, "keys differing outside the low 8 bytes stay distinct");
+        assert!(!Footprint::new(vec![], vec![ka]).conflicts(&Footprint::new(vec![], vec![kb])));
+
+        // And the small-integer helper is order-preserving, so a host with enumerable state gets sane ordering.
+        assert!(Key::small(0, 1) < Key::small(0, 2));
+        assert!(Key::small(0, 255) < Key::small(0, 256));
+        assert_eq!(Key::small(0, 0).slot, [0u8; 32]);
     }
 
     #[test]
