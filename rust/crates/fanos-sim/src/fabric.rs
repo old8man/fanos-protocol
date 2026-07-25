@@ -552,6 +552,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_node_that_can_reach_nobody_reports_a_solitary_assignment() {
+        // The §5.3 finding, now detectable. A node's own capability and load slots are LOCAL reads, so an isolated
+        // node still computes a valid-looking assignment — over a roster of one. Before `Assignment::roster` existed
+        // that was indistinguishable from a cell-agreed decision, which is what made it dangerous: every member of a
+        // partitioned cell assigns itself every role it offers and believes the cell agreed.
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        // Total loss: nothing whatsoever crosses the carrier.
+        let fleet = NodeFleet::spawn::<F2>(2, Link::ideal().with_loss(100), roles).await.expect("fleet starts");
+        let assigned = fleet.until(|f| f.nodes().iter().all(|n| n.assigned_roles().any())).await;
+        assert!(assigned, "an unreachable node still assigns itself — the behaviour §5.3 measured");
+        for node in fleet.nodes() {
+            let assignment = node.assignment();
+            assert!(
+                assignment.is_solitary(),
+                "…and now says so: roster={} for a node that reached nobody",
+                assignment.roster
+            );
+        }
+        assert_eq!(fleet.fabric.delivered(), 0, "nothing crossed the carrier, confirming the isolation");
+        fleet.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_reachable_fleet_reports_a_cell_agreed_roster() {
+        // The contrapositive, which is what makes the signal worth anything: on a healthy carrier the roster grows
+        // past one, so `is_solitary` genuinely discriminates rather than always being true.
+        use fanos_field::F2;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(3, Link::ideal(), roles).await.expect("fleet starts");
+        let agreed = fleet.until(|f| f.nodes().iter().any(|n| !n.assignment().is_solitary())).await;
+        let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
+        assert!(agreed, "a healthy fleet reaches a roster beyond one (rosters = {rosters:?})");
+        fleet.shutdown();
+    }
+
+    #[tokio::test]
     #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
     async fn probe_loss_tolerance_of_the_composition() {
         use fanos_field::F2;
@@ -566,8 +607,9 @@ mod tests {
             // Does each node's peer count agree? `known_peers` is the address book — a proxy for whether discovery
             // completed, i.e. whether the rosters the controllers agreed over were the same set.
             let peers: Vec<usize> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
+            let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
             println!(
-                "loss={loss:>2}%  all-assigned={ok:<5}  elapsed={:>7.2?}  delivered={:>5} dropped={:>5}  known_peers={peers:?}",
+                "loss={loss:>2}%  all-assigned={ok:<5}  {:>7.2?}  delivered={:>5} dropped={:>5}  peers={peers:?} rosters={rosters:?}",
                 started.elapsed(),
                 fleet.fabric.delivered(),
                 fleet.fabric.dropped()

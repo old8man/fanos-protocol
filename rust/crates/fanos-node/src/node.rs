@@ -34,7 +34,7 @@ use fanos_primitives::NodeId;
 use fanos_quic::NodeCredentials;
 
 use crate::config::{NodeConfig, RoleSet};
-use crate::role_loop::{SelfOrgConfig, SelfOrganization, spawn_self_organization};
+use crate::role_loop::{Assignment, SelfOrgConfig, SelfOrganization, spawn_self_organization};
 use crate::error::NodeError;
 use crate::identity;
 use crate::resolve::{ResolvedService, verify_descriptor};
@@ -627,6 +627,17 @@ impl Node {
     /// rather than fixed at boot. Empty until the first beacon round is adopted (nothing to assign from before then).
     #[must_use]
     pub fn assigned_roles(&self) -> CoreRoleSet {
+        self.assignment().roles
+    }
+
+    /// This node's full current [`Assignment`] — the roles **and the roster they were computed over**.
+    ///
+    /// Prefer this over [`assigned_roles`](Self::assigned_roles) wherever the *authority* of the assignment matters.
+    /// A node whose peers are unreachable still computes a valid-looking assignment over a roster of one, because its
+    /// own capability and load slots are local reads (`docs/design-testing.md` §5.3); only the roster distinguishes a
+    /// cell-agreed assignment from a solitary guess, and [`Assignment::is_solitary`] names the unambiguous case.
+    #[must_use]
+    pub fn assignment(&self) -> Assignment {
         *self.self_org.assigned.borrow()
     }
 

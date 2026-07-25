@@ -326,9 +326,30 @@ Worth noting honestly: the genesis-ordering fix in §5.1 (wait for this node's o
 roster-of-one path *reliable* rather than racy. It fixed a real bug and sharpened this one.
 
 The remedy is observability before policy, and deliberately not a quorum threshold — a fresh or genuinely small cell
-must still be able to start. An assignment should carry **the roster it was computed over**, so a node can tell a
-cell-agreed assignment from a solitary guess, and so a subsystem whose safety depends on cell-wide agreement
-(rendezvous coverage above all) can decline to rely on a provisional one.
+must still be able to start. [`Assignment`](../rust/crates/fanos-node/src/role_loop.rs) therefore carries **the roster
+it was computed over**, with `is_solitary()` naming the one case that needs no policy to interpret (`roster ≤ 1`: the
+node saw nobody else). A subsystem whose safety depends on cell-wide agreement — rendezvous coverage above all, since a
+line's membership *is* the anonymity set — can now decline to act on a solitary assignment instead of being unable to
+tell.
+
+**And the roster immediately showed something sharper.** Re-running the sweep with it reported:
+
+```
+loss= 0%  delivered=937  rosters=[2, 2, 1]
+loss=10%  delivered=713  rosters=[1, 2, 2]
+loss=25%  delivered= 54  rosters=[1, 1, 1]
+loss=90%  delivered=  4  rosters=[1, 1, 1]
+```
+
+At **zero loss** a three-node fleet reaches `[2, 2, 1]`, not `[3, 3, 3]`. The genesis assignment is gated on *this
+node's own* publishes (§5.1), which is what makes it deterministic — but that window is far shorter than peer discovery
+takes, so at genesis a node has typically seen one or two members however healthy the carrier is. Cell-wide agreement
+is therefore a property of **later epochs**, once the beacon advances and the loop re-assigns over a fuller directory;
+it is not a property of startup at all, and the previous code could not have told anyone that.
+
+That reframes the guarantee honestly: the genesis assignment is *provisional by construction*, and the roster is what
+makes the distinction legible rather than a footnote. Whether a node should additionally *defer* acting on a
+provisional assignment is a policy question per subsystem, and belongs with the subsystem that carries the risk.
 
 ---
 

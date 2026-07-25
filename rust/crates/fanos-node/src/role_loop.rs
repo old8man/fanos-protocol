@@ -29,6 +29,45 @@ use tokio::task::JoinHandle;
 use crate::capdir::{build_capability_directory, spawn_capability_publisher};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
+/// This node's assignment for an epoch, **with the roster it was computed over**.
+///
+/// The roster is not decoration. The assignment is only *cell-agreed* when every member stepped the controller over
+/// the same live set — the property [`spawn_role_loop`]'s determinism rests on. A node's own capability and load slots
+/// are **local** store reads, so a node that can reach nobody still resolves itself, computes a perfectly valid
+/// assignment over a roster of one, and cannot tell the difference. Measured on the composed-node fleet: at 90% loss,
+/// four datagrams delivered in total, every member reported a complete assignment
+/// (`docs/design-testing.md` §5.3).
+///
+/// Carrying the roster makes that visible instead of implicit. There is deliberately **no quorum threshold** here — a
+/// fresh or genuinely small cell must still be able to start — so the judgement is left to the caller, with
+/// [`is_solitary`](Self::is_solitary) covering the one case that needs no policy at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Assignment {
+    /// The roles the cell assigned this node.
+    pub roles: RoleSet,
+    /// How many authenticated cell members the assignment was computed over, including this node. `0` before the
+    /// first assignment.
+    pub roster: usize,
+    /// The epoch it was computed for.
+    pub epoch: Epoch,
+}
+
+impl Assignment {
+    /// The empty assignment, before the first one is computed.
+    pub const NONE: Self = Self { roles: RoleSet::EMPTY, roster: 0, epoch: Epoch::ZERO };
+
+    /// Whether this node saw **no other member** — so the assignment is its own guess, not the cell's decision.
+    ///
+    /// Threshold-free on purpose: `roster ≤ 1` needs no policy to interpret. A subsystem whose safety depends on
+    /// cell-wide agreement should decline to act on a solitary assignment; [`crate::rendezvous_host`] coverage is the
+    /// motivating case, since a rendezvous line's membership *is* the anonymity set a hidden service hides in, and
+    /// over-estimating it is a privacy claim the cell cannot back.
+    #[must_use]
+    pub fn is_solitary(self) -> bool {
+        self.roster <= 1
+    }
+}
+
 /// A node's **sans-I/O** live role controller: it holds the epoch-persistent [`RoleController`] state and, for a
 /// given epoch's authenticated member set, beacon, and setpoint, produces *this* node's assigned [`RoleSet`].
 /// The async loop below is a thin driver over it, so the identical logic runs under the simulator and a live
@@ -72,10 +111,11 @@ impl LiveRoleController {
         epoch: Epoch,
         beacon: &BeaconSeed,
         setpoint: Demand,
-    ) -> RoleSet {
+    ) -> Assignment {
         let weighted = self.reputation.adjust(members);
         let report = self.controller.step(&weighted, epoch, beacon, setpoint);
-        report.roles.get(&self.node_id).copied().unwrap_or(RoleSet::EMPTY)
+        let roles = report.roles.get(&self.node_id).copied().unwrap_or(RoleSet::EMPTY);
+        Assignment { roles, roster: members.len(), epoch }
     }
 }
 
@@ -92,8 +132,8 @@ pub fn spawn_role_loop<F: Field>(
     controller: RoleController,
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
-) -> (JoinHandle<()>, watch::Receiver<RoleSet>) {
-    let (roles_tx, roles_rx) = watch::channel(RoleSet::EMPTY);
+) -> (JoinHandle<()>, watch::Receiver<Assignment>) {
+    let (roles_tx, roles_rx) = watch::channel(Assignment::NONE);
     let handle = tokio::spawn(async move {
         let mut live = LiveRoleController::new(node_id, controller);
         let mut events = client.subscribe();
@@ -137,7 +177,7 @@ async fn genesis_assign<F: Field>(
     live: &mut LiveRoleController,
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
-    roles_tx: &watch::Sender<RoleSet>,
+    roles_tx: &watch::Sender<Assignment>,
 ) {
     let (capability_ready, load_ready) = ready;
     let both = async {
@@ -159,7 +199,7 @@ async fn assign_epoch<F: Field>(
     epoch: Epoch,
     beacon: &BeaconSeed,
     capacity: Demand,
-    roles_tx: &watch::Sender<RoleSet>,
+    roles_tx: &watch::Sender<Assignment>,
 ) {
     let members = build_capability_directory::<F>(client, epoch).await;
     let setpoint = build_cell_setpoint::<F>(client, epoch, capacity).await;
@@ -177,7 +217,7 @@ pub struct SelfOrganization {
     /// Runs the assignment each epoch.
     pub role_loop: JoinHandle<()>,
     /// This node's currently-assigned roles — the node subscribes and actuates its role behaviors from it.
-    pub assigned: watch::Receiver<RoleSet>,
+    pub assigned: watch::Receiver<Assignment>,
 }
 
 /// A node's inputs to the self-organizing subsystem: its identity (`node_id`, `vrf_secret`), the `capability`
@@ -244,7 +284,7 @@ mod tests {
         let mut demand_after = 0;
         for i in 0..5u8 {
             let mut live = LiveRoleController::new(node(i), ctrl());
-            if live.step(&members, Epoch::new(1), &beacon, setpoint).has(Role::Relay) {
+            if live.step(&members, Epoch::new(1), &beacon, setpoint).roles.has(Role::Relay) {
                 active += 1;
             }
             demand_after = live.demand().of(Role::Relay);
