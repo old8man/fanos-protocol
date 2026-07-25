@@ -11,6 +11,9 @@
 //!   — the unique perfect grammar that localizes *any three* simultaneous faults across the federation. Where a lone cell
 //!   locates one fault and aliases two onto a confident wrong answer, three cells locate three, including all three inside
 //!   one member.
+//! * [`federation`] — the **covering** (`docs/design-federation.md`): a federation triple *is a line of the parent cell*,
+//!   so the grouping is structural rather than configured — seven overlapping federations, each child covered by three,
+//!   any two sharing exactly one child. Diagnosis peels over them, and the greedy order is verified optimal.
 //! * [`syndrome`] — the `21 → 7 → 3 → 1` localization pyramid: 3-bit syndrome for one fault,
 //!   the 7-theme layer for two (V13, V21).
 //! * [`lrc`] — projective erasure repair by peeling, and hyperoval failure (V9, V20): a
@@ -28,6 +31,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod federation;
 pub mod golay;
 pub mod hamming;
 pub mod lrc;

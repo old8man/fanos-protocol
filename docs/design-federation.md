@@ -171,14 +171,67 @@ mode rather than lowering its probability.
 
 ---
 
-## 8. Not yet wired [P]
+## 8. Which three cells — the triple is a line [T]
 
-- **The live federation driver.** `fanos_code::golay` is sans-I/O and complete; nothing yet gathers three cells' `Report`s
-  each epoch and acts on the `Verdict`. That belongs beside DIAKRISIS's per-cell diagnosis (`fanos-diakrisis`), which today
-  stops at the cell boundary.
-- **Which three cells.** A federation is exactly three members, so a deployment with more cells must *partition* into
-  triples, and which triples is an open design question — the natural candidate is the hierarchy's own parent-cell
-  grouping (§L1), so that the federation triple is a structural fact rather than a configuration.
+A federation has exactly three members, so a parent cell's seven children must be grouped into triples. **The grouping is
+forced, not chosen:** a Fano line has exactly `q + 1 = 3` points, and a federation has exactly three members, so a
+federation triple *is a line of the parent cell*. `fanos_code::federation` asserts `LINE_SIZE == golay::MEMBERS` at compile
+time, because if that ever failed the grouping would stop being structural and would need re-deriving rather than patching.
+
+Everything else follows from the plane:
+
+| property | value | why |
+|---|---|---|
+| federations covering a parent | **7** | one per line |
+| members each | **3** | `LINE_SIZE` = `golay::MEMBERS` |
+| federations per child | **3** | three lines through every point |
+| children shared by two federations | **exactly 1** | the Steiner property |
+
+So every child is diagnosed by **three** independent Golay grammars, and any two federations overlap in exactly one child
+— which is what makes cross-checking possible rather than merely redundant.
+
+### 8.1 Peeling, and the greedy rule is optimal [T]
+
+One federation localizes at most three faults among its three children, so a pattern across the whole parent cell is
+diagnosed by **peeling**: take a line whose members' combined observation is localizable, attribute it, remove it from what
+remains, repeat. That is the same shape `fanos_code::lrc` uses for erasure repair on the same plane — both are
+local-recovery decoders over lines, which is coherence rather than coincidence.
+
+The greedy rule (first localizable line) was checked against exhaustive backtracking over every fault distribution with up
+to four faults per child — 78 124 patterns. **They agree exactly**: 10 347 solvable either way. The greedy order is
+therefore optimal, not a pragmatic compromise, and there is no cleverer selection rule waiting to be found.
+
+### 8.2 The measured envelope [T]
+
+| fault pattern | outcome |
+|---|---|
+| ≤ 3 faults anywhere in the parent cell | **always fully localized**, including all three inside one child (verified exhaustively over all C(49,3) = 18 424 placements) |
+| ≤ 1 fault per child, so up to **7** total | **always fully localized**, each cross-checked by three federations |
+| 4 faults in one child | **not localizable — and unavoidably so** |
+| otherwise | pattern-dependent (13.2% of the sampled space; up to 12 total in favourable patterns), reported as `Partial` |
+
+The third row is arithmetic, not a shortfall: every line through that child sees all four faults, and by van
+Lint–Tietäväinen no perfect binary code corrects four. A covering by lines cannot escape it, and saying so beats implying
+the covering is unbounded.
+
+What the covering *does* remove is the lone cell's failure mode. A cell running Hamming(7,4) answers two faults with a
+confident wrong single-fault verdict and a self-healing controller acts on it. Here three faults in one child are
+attributed exactly, and when a pattern exceeds the grammar the answer is `Partial` **naming what is still unexplained** —
+so a controller knows both what it may act on and precisely what it may not. That distinction is the point.
+
+### 8.3 Peeling means a saturated federation does not blind the others
+
+A child carrying four faults saturates all three lines through it, but the other four lines are untouched: a fault at a
+different child is still attributed through a line that avoids the saturated one. Localized damage stays localized in its
+*diagnostic* consequences too, which is the property a flat 56-coordinate code over the whole parent would not have.
+
+---
+
+## 9. Not yet wired [P]
+
+- **The live driver.** The algebra is complete and sans-I/O; nothing yet gathers seven children's `Report`s each epoch and
+  acts on the `Cell` verdict. That belongs beside DIAKRISIS's per-cell diagnosis (`fanos-diakrisis`), which today stops at
+  the cell boundary.
 - **The `U(m) = 8m − 1` vertical reading.** §3 records that the vertical 3-tower carries the same grammar with two
-  couplings and no puncture. Whether FANOS's hierarchy should be diagnosed *as* that tower — inter-level couplings as
-  coordinates — is a genuine and attractive open question, and is the same [P] item ERGON §10 lists as "ecology dynamics".
+  couplings and no puncture. Whether FANOS's hierarchy should additionally be diagnosed *as* that tower — inter-level
+  couplings as coordinates — is a genuine open question, and the same [P] item ERGON §10 lists as "ecology dynamics".
