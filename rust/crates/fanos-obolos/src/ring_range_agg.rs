@@ -118,6 +118,23 @@ pub struct AggRangeProof {
     rounds: Vec<AggRound>,
 }
 
+impl crate::ring_size::ProofSize for AggRound {
+    fn ring_elements(&self) -> usize {
+        self.c_a.ring_elements() + self.c_d.ring_elements() + self.c_e.ring_elements() + self.c_w.ring_elements()
+            + 1
+            + self.z_ba.ring_elements()
+            + self.z_de.ring_elements()
+            + self.z_w.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for AggRangeProof {
+    /// `C_b` plus `SCALAR_ROUNDS` fixed-size rounds — independent of `bits`, which is the point of the aggregation.
+    fn ring_elements(&self) -> usize {
+        self.c_b.ring_elements() + self.rounds.ring_elements()
+    }
+}
+
 /// `x·p` coefficient-wise (a scalar-by-polynomial product): `broadcast(x) ∘ p`. Shared with the binarity proof.
 pub(crate) fn scalar_mul(x: u64, p: &Poly) -> Poly {
     Poly::broadcast(x).hadamard(p)

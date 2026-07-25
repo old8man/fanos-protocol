@@ -484,6 +484,44 @@ pub fn verify_path_sound(params: &RingParams, hp: &HashParams, root: &HashNode, 
     root.limbs().iter().all(|limb| limb.coeffs().iter().all(|&c| c < bound))
 }
 
+impl crate::ring_size::ProofSize for HashStepProof {
+    fn ring_elements(&self) -> usize {
+        self.0.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for SwapProof {
+    fn ring_elements(&self) -> usize {
+        self.bit.ring_elements() + self.limbs.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for PathLevel {
+    fn ring_elements(&self) -> usize {
+        self.sibling.ring_elements() + self.d_com.ring_elements() + self.left.ring_elements()
+            + self.node.ring_elements()
+            + self.swap.ring_elements()
+            + self.step.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for PathProof {
+    fn ring_elements(&self) -> usize {
+        self.leaf.ring_elements() + self.levels.ring_elements() + self.root_r.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for SoundPathProof {
+    /// The structural path plus a shortness proof per hidden node — the second term is the stack's dominant cost
+    /// (`docs/design-obolos-zk.md` §6): `2·depth + 1` nodes, each `ELL_H` limbs.
+    fn ring_elements(&self) -> usize {
+        self.path.ring_elements()
+            + self.leaf_short.ring_elements()
+            + self.sibling_short.iter().map(crate::ring_size::ProofSize::ring_elements).sum::<usize>()
+            + self.node_short.iter().map(crate::ring_size::ProofSize::ring_elements).sum::<usize>()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

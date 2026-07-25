@@ -127,6 +127,16 @@ pub fn verify_output(
         && cm.limbs().iter().all(|l| l.coeffs().iter().all(|&c| c < (1u64 << LOG_BASE)))
 }
 
+impl crate::ring_size::ProofSize for OutputProof {
+    fn ring_elements(&self) -> usize {
+        self.value_coms.ring_elements() + self.owner_coms.ring_elements() + self.cm_step.ring_elements()
+            + self.cm_r.ring_elements()
+            + self.value_tie.ring_elements()
+            + self.value_short.ring_elements()
+            + self.owner_short.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {

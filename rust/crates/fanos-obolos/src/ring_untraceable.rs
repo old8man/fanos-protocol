@@ -164,6 +164,13 @@ pub fn verify_untraceable(
     verify_linear(params, &commitments, &position_tie_coeffs(depth), &proof.position_tie)
 }
 
+impl crate::ring_size::ProofSize for UntraceableProof {
+    fn ring_elements(&self) -> usize {
+        self.membership.ring_elements() + self.nullifier.ring_elements() + self.position_tie.ring_elements()
+            + self.nsk_coms.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

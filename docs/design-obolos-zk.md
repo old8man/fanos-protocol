@@ -320,17 +320,27 @@ counts the `R_q` elements it consists of, and the counts are checked against the
 auditable rather than estimated. At `D = 256`, `K = 1`, `ℓ = 4`, `ℓ_H = 4`, `LOG_BASE = 16`, `REPETITIONS = 16`, with
 one `u64` per coefficient (2 KiB per element):
 
-| Component | elements | size | before rung 1 |
-|---|---|---|---|
-| one hash step (linear proof, `n = 12`) | 1 440 | 2.81 MiB | — |
-| aggregated binarity over `t = LOG_BASE` planes | 1 920 | 3.75 MiB | 7.50 MiB (16 separate) |
-| **shortness at `t = LOG_BASE`, per limb** | 3 952 | **7.72 MiB** | 11.5 MiB |
-| **node shortness (`ℓ_H` limbs)** | 15 808 | **30.9 MiB** | 45.9 MiB |
-| node shortness in a depth-1 path (3 nodes) | | 92.6 MiB | 138 MiB |
-| node shortness in a depth-32 path (65 nodes) | | **2.0 GiB** | 2.9 GiB |
+The accounting now covers every proof type, so the headline can be the object that actually decides whether this path
+can be wired: a **whole shielded transaction**. At the current constants, with one `u64` per coefficient (2 KiB per
+element):
 
-So the dominant term is unambiguous, and it is not the hash steps or the amount proofs — it is **node shortness**,
-`ℓ_H · LOG_BASE` bit-planes per node across `2d+1` nodes for a depth-`d` spend. Everything else is rounding error.
+| Component | elements | size |
+|---|---|---|
+| one hash step (linear proof, `n = 12`) | 1 440 | 2.81 MiB |
+| aggregated binarity over `t = LOG_BASE` planes | 1 080 | 2.11 MiB |
+| shortness at `t = LOG_BASE`, per limb | 1 117 | 2.18 MiB |
+| **node shortness (`ℓ_H` limbs)** | 4 468 | **8.7 MiB** |
+| one input's spend proof (depth 1) | 61 877 | 121 MiB |
+| one output's creation proof | 12 176 | 23.8 MiB |
+| the confidential amounts | 196 | 0.38 MiB |
+| **a 1-in/1-out transaction, depth 1** | **74 249** | **145 MiB** |
+| a 1-in/1-out transaction, depth 32 | | **875 MiB** |
+
+The dominant term is unambiguous, and it is not the hash steps or the amount proofs — it is **node shortness**. But
+note *how many* nodes a transaction proves short, which is easy to undercount: a depth-`d` spend pays
+`(2d+1)` for the membership path **plus 4 for the nullifier** (`nsk`, `cm`, `pos`, `slot`), **5 for the note**
+(`nsk`, `value`, `rho`, `tag`, `owner`) and **2 for the output** (`value`, `note_owner`) — 14 even at depth 1, where
+the path contributes only 3. Quoting the path alone understates a transaction by ~2.5×.
 
 ### 6.1 The compaction ladder, and its ceiling
 
@@ -377,12 +387,15 @@ regime's `2^{19+t}` masking well below `q`.
 
 ### 6.2 Progress, and what is left
 
-| stage | per limb | per node | depth-32 path | cumulative |
+| stage | per limb | per node | depth-32 *path* shortness | cumulative |
 |---|---|---|---|---|
 | original | 5 872 | 45.9 MiB | 2 982 MiB | 1.0× |
 | + rung 1 (aggregated binarity) | 3 952 | 30.9 MiB | 2 007 MiB | 1.5× |
 | + rung 2 (opening-to-zero) | 1 957 | 15.3 MiB | 994 MiB | 3.0× |
 | **+ rung 3 (derived round count)** | **1 117** | **8.7 MiB** | **567 MiB** | **5.3×** |
+
+(The last column is the *path's* shortness alone, which is what the rungs were measured against as they were built.
+The whole-transaction figures above are the honest totals — 145 MiB at depth 1, 875 MiB at depth 32.)
 
 With the reconstruction gone, the aggregated binarity is ~98% of a shortness proof. Its per-round composition:
 
@@ -416,7 +429,7 @@ is 2 bits per coefficient, not 64 — **≈1.15×** on what remains.
 > `fⱼ = x·pⱼ + aⱼ` and now proves nothing about the committed planes. Folding it soundly needs a genuine
 > inner-product argument, not a random linear combination.
 
-Only rung 4 remains, worth ≈1.15×: a depth-32 spend reaches ~490 MiB. That is the honest ceiling of constant-factor work,
+Only rung 4 remains, worth ≈1.15×: a depth-32 transaction reaches ~760 MiB, and a depth-1 one ~126 MiB. That is the honest ceiling of constant-factor work,
 and it is **still impractical** — which is precisely why production lattice systems wrap membership in a
 recursive/succinct proof rather than paying for it directly. Recursive compaction is therefore not a nice-to-have on
 this stack's roadmap; it is the only route to a shippable spend proof, and the numbers above are why. The construction

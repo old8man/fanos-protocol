@@ -188,6 +188,18 @@ pub fn verify_nullifier(
         && nf.limbs().iter().all(|l| l.coeffs().iter().all(|&c| c < (1u64 << LOG_BASE)))
 }
 
+impl crate::ring_size::ProofSize for NullifierProof {
+    fn ring_elements(&self) -> usize {
+        self.slot_coms.ring_elements() + self.pos_coms.ring_elements() + self.slot_step.ring_elements()
+            + self.step.ring_elements()
+            + self.nsk_short.ring_elements()
+            + self.cm_short.ring_elements()
+            + self.pos_short.ring_elements()
+            + self.slot_short.ring_elements()
+            + self.nf_r.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {

@@ -191,6 +191,20 @@ pub fn verify_note(
         && verify_node_short(params, &proof.note_owner_coms, bits, &proof.owner_short)
 }
 
+impl crate::ring_size::ProofSize for NoteProof {
+    fn ring_elements(&self) -> usize {
+        self.tag_coms.ring_elements() + self.note_owner_coms.ring_elements() + self.rho_coms.ring_elements()
+            + self.tag_step.ring_elements()
+            + self.owner_step.ring_elements()
+            + self.cm_step.ring_elements()
+            + self.nsk_short.ring_elements()
+            + self.value_short.ring_elements()
+            + self.rho_short.ring_elements()
+            + self.tag_short.ring_elements()
+            + self.owner_short.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

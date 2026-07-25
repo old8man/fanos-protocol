@@ -144,6 +144,12 @@ pub fn verify_value_tie(
     verify_linear(params, &commitments, &coeffs, &proof.t1_rel)
 }
 
+impl crate::ring_size::ProofSize for ValueTieProof {
+    fn ring_elements(&self) -> usize {
+        self.rv_coms.ring_elements() + self.t0_rels.ring_elements() + self.t1_rel.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

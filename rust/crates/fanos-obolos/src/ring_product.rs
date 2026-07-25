@@ -118,6 +118,25 @@ pub struct ProductProof {
     rounds: Vec<ProductRound>,
 }
 
+impl crate::ring_size::ProofSize for RoundAux {
+    fn ring_elements(&self) -> usize {
+        self.b1.ring_elements() + self.b2.ring_elements() + self.t.ring_elements() + self.u.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for ProductRound {
+    fn ring_elements(&self) -> usize {
+        self.aux.ring_elements() + 2 + self.r_z1.ring_elements() + self.r_z2.ring_elements()
+            + self.s.ring_elements()
+    }
+}
+
+impl crate::ring_size::ProofSize for ProductProof {
+    fn ring_elements(&self) -> usize {
+        self.rounds.ring_elements()
+    }
+}
+
 /// Absorb a commitment's polynomials into the Fiat–Shamir transcript.
 fn absorb(buf: &mut Vec<u8>, c: &RingCommitment) {
     for p in c.t0().iter().chain(core::iter::once(c.t1())) {

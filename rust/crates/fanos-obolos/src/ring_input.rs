@@ -148,6 +148,13 @@ pub fn verify_input(
         && verify_value_tie(params, cv, &proof.value_coms, &proof.value_tie)
 }
 
+impl crate::ring_size::ProofSize for InputProof {
+    fn ring_elements(&self) -> usize {
+        self.value_coms.ring_elements() + self.note.ring_elements() + self.value_tie.ring_elements()
+            + self.untraceable.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

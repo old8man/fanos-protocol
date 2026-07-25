@@ -146,6 +146,12 @@ pub fn verify_amounts(
     verify_balance(params, input_commitments, output_commitments, fee, &proof.balance)
 }
 
+impl crate::ring_size::ProofSize for ConfidentialAmountProof {
+    fn ring_elements(&self) -> usize {
+        self.output_ranges.ring_elements() + self.balance.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {

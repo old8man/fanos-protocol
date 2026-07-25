@@ -350,10 +350,20 @@ pub fn verify_shielded_tx(
     verify_amounts(params, input_cvs, output_cvs, fee, RANGE_BITS, &proof.amounts)
 }
 
+impl crate::ring_size::ProofSize for ShieldedTxProof {
+    /// The whole cost of a shielded transfer: a spend proof per input, a creation proof per output, and the amounts.
+    /// This is the number that decides whether the ring path can be wired as a live consensus relation
+    /// (`docs/design-obolos-zk.md` §6) — per-input membership shortness dominates it entirely.
+    fn ring_elements(&self) -> usize {
+        self.inputs.ring_elements() + self.outputs.ring_elements() + self.amounts.ring_elements()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::ring_size::ProofSize;
 
     /// A transaction with the given arity, built from distinct nodes and commitments (no proof needed — the codec is
     /// independent of the proof, which is exactly the separation being tested).
@@ -446,5 +456,26 @@ mod tests {
             !verify_shielded_tx(&params, &scheme, &root, &input_cvs, &nullifiers, &output_cvs, &output_cms, 101, &proof),
             "an inflated fee is rejected"
         );
+
+        // THE number that decides whether this path can be a live consensus relation (docs §6). Everything else in
+        // the stack is measured analytically; this is the real object, at a depth-1 tree — the smallest possible.
+        let proof_bytes = proof.encoded_bytes();
+        let public = RingShieldedTx {
+            anchor: root,
+            nullifiers,
+            input_cvs: input_cvs.to_vec(),
+            output_cvs: output_cvs.to_vec(),
+            output_cms,
+            fee,
+        };
+        let tx_bytes = public.to_bytes().expect("the public transaction encodes").len();
+        assert!(
+            proof_bytes > 1000 * tx_bytes,
+            "the proof dwarfs the public transaction by orders of magnitude ({proof_bytes} vs {tx_bytes} bytes)"
+        );
+        // A depth-1 spend — one sibling, the minimum a Merkle path can have — is already MiB-scale, so the ratio is
+        // not an artefact of a deep tree: no tree depth makes this gossipable, which is why recursive compaction
+        // gates the WIRING and not merely the scale.
+        assert!(proof_bytes > 8 << 20, "even a depth-1 spend proof exceeds 8 MiB ({proof_bytes} bytes)");
     }
 }
