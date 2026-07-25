@@ -25,6 +25,24 @@
 > - **Beacon-reshare key-secrecy** (Audit IV §2.1, CRITICAL, **RESOLVED 2026-07-24**): the last live CRITICAL across all four audits is now closed. The `BeaconReshareTrigger` is **authenticated** — it carries a `HybridSignature` by the beacon's recovery `authority`, and `on_reshare_trigger` refuses any unsigned/foreign-signed/tampered trigger before any anchor deals a sub-share; `node.rs::actuate_recovery` escalates a proactive reshare to that authority (as re-genesis already is) rather than a node self-issuing one. The 2-anchor-coalition master-key exfiltration is closed, while legitimate threshold-lowering recovery still works (the authority signs it). The in-flux `recovery.rs` was not touched. Full detail at Audit IV §2.1 below. **With this, no open CRITICAL/HIGH security item remains across the four audits** — the residual is the coherence/MEDIUM-LOW tail noted next.
 > - **Remaining:** the coherence/meta-holon tail (E→L / L→O / Ω2 / Ω9 reconciliation) and the per-subsystem MEDIUM/LOW items are preserved in the dated sections below and tracked in ongoing work. Where an archived section says "unbuilt/open," verify against the current tree — it has advanced hundreds of commits since each snapshot.
 >
+> ### Residual sweep — 2026-07-26
+>
+> Every item the consolidation left explicitly named as open was re-verified against the current source. **Three of four
+> were stale; one is real.** Recording which is which matters more than the count: an audit that carries stale findings
+> teaches readers to discount it, and one that quietly drops them loses the trail.
+>
+> | Item | Snapshot said | Verified 2026-07-26 |
+> |---|---|---|
+> | **Holonomy verification** | "function exists, live peel path never compares, `HolonomyFail` never produced" | **stale — RESOLVED.** Produced on the live path at `fanos-aphantos/src/sealed.rs:255`, pinned by `sealed.rs:519` and `threshold_router.rs:1023` |
+> | **S1-H1** cover + mixing off | "the shipping node builds the router with neither" | **stale — RESOLVED.** `fanos-node/src/node.rs:555-556` applies both, non-zero by default (`DEFAULT_MIX_DELAY = 50 ms`) |
+> | **C7** telemetry DP | "`.privatize(` has no live caller — the observer still emits the exact syndrome un-privatized" | **mis-stated, now RESOLVED.** No *export path for frames exists at all*, so nothing was leaking; the engine is sans-I/O and cannot privatize. Closed at the seam: `CoherenceFrame::export` is the sanctioned outward path and `encode` is documented cell-local |
+> | **R-M1** quarantine keyed by coordinate | "coordinates reshuffle, so the tag aliases" | **REAL, and sharper than written** — see the finding below. The one substantive item left across all four passes |
+>
+> **On deleting this file:** it should not be. It is the project's external-audit deliverable
+> (`crypto-audit-readiness.md` §6.5) and the provenance record for how each defect was found and closed — deleting a
+> resolved audit destroys the evidence that it *was* resolved, which is the opposite of what an audit trail is for. A
+> finding's closure is recorded in place; the document is the history, not the to-do list.
+>
 > Inter-audit references in the archived sections (e.g. "`docs/audit-2026-07-23.md`", "pass 1") now point to the correspondingly-dated section **within this file**.
 
 ---
@@ -594,6 +612,23 @@ Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not s
 ### [MEDIUM] R-M1 — Quarantine keyed by coordinate not identity (C5 residual)
 *Anchors:* `overlay.rs:919` (`quarantine` by `Triple`), `:587` (`is_quarantined` by `Triple`), `:121` (`QUARANTINE_TTL = 60s`). **The prior audit's C5 permanence is FIXED** (`:592` re-admits after the TTL, pinned by `quarantine_is_bounded_and_re_admits_a_member_after_the_ttl` `:3483`). Residual: coordinates reshuffle every epoch, so a quarantine tag on epoch-N's coordinate is meaningless at N+1 — a Byzantine identity sheds it by the epoch turning, and an innocent identity reshuffling onto that point *inherits* it. Diagnosis remains **local-only** (each node quarantines independently), so under chaos different nodes drop different members → inconsistent frame-acceptance. **Fix:** key quarantine by `NodeId` (follow the identity across reshuffle) and make the distrust verdict cell-corroborated (the polar cross-attestation already gathers the evidence).
 
+**Re-verified 2026-07-26: STILL OPEN, and now sharper.** `fanos-runtime/src/overlay.rs:959` still takes `node_c: Triple` and
+`:622` still tests `from: Triple`, so the aliasing stands exactly as described. Two things have changed since the snapshot,
+both against us:
+
+- **Coordinates now move more often, not less.** Verifiable coordinate probing (`docs/design-coordinates.md`) relocates a
+  node whose preferred point is held by a lower-ranked claimant — so a coordinate can change *within* an epoch, not only
+  across one. Every additional relocation is another chance for a Byzantine identity to shed its tag and for an innocent one
+  to inherit it.
+- **The evidence for the corroborated verdict is now better than the snapshot assumed.** Besides the polar
+  cross-attestation, the Turyn federated covering (`docs/design-federation.md`) attributes faults to `(child, axis)` across a
+  parent's children and reports `Partial` rather than guessing — which is exactly the cell-corroborated distrust input this
+  fix wants, and it did not exist when the finding was written.
+
+The blocker is architectural rather than clerical: the sans-I/O overlay engine routes on `Triple` and does not carry a
+frame's sender `NodeId`, so keying by identity means threading identity into the engine's frame path. That is a proper unit
+of work, not a tail-end patch, and it is the **single remaining substantive finding across all four audit passes**.
+
 ### [MEDIUM] R-M2 — Bootstrap under mass failure: static seed list + genesis fallback → epoch split-brain
 *Anchors:* `node.rs:198` (static bootstrap seeds), `fanos-keygen/src/beacon.rs:209` (`BeaconReq` only answered by a *synced* peer). If the configured seeds are among the dead, a recovering/new node has no discovery; if it reaches a live-but-stalled cell it cannot advance past genesis. **Fix:** a self-healing seed/rendezvous (the DVRF rendezvous beacon already exists) plus the R-C1 safe-stall join semantics.
 
@@ -612,7 +647,14 @@ Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not s
 
 **Fix:** route clearnet through the anonymous rendezvous to the exit's service key (the exit already advertises one, `exit.rs:280-317`) exactly like a `.fanos` service; until then, `--profile anonymous` must **refuse** clearnet targets rather than silently downgrade, and the banner must not claim anonymity for the exit path.
 
-### [HIGH] S1-H1 — The shipping mixnet runs with cover traffic AND Poisson mixing OFF: no GPA (T2) defense
+### [HIGH] S1-H1 — ~~The shipping mixnet runs with cover traffic AND Poisson mixing OFF~~ — **RESOLVED (re-verified 2026-07-26)**
+
+`fanos-node/src/node.rs:555-556` builds the live router with `.with_mixing(mix_mean_delay).with_cover(cover_interval)`, and
+both are **non-zero by default** — `DEFAULT_MIX_DELAY = 50 ms`, plus `DEFAULT_COVER_INTERVAL` — as `NodeConfig` fields that
+name this finding. So the shipping relay defends against T2 by default and an operator must deliberately zero it to trade
+anonymity for latency/bandwidth. The snapshot below is retained for the record.
+
+
 *Anchors:* `fanos-node/src/node.rs:263-268` builds `ThresholdRouter::new(...)` with **neither** `.with_cover(...)` **nor** `.with_mixing(...)` — the only setters for `cover_interval`/`mean_delay` (`threshold_router.rs:184-197`), called **only in aphantos/sim tests**, never on any shipping path. `NodeConfig` has no cover/mixing knob. With `mean_delay=0` every hop forwards immediately (`:286`) and `cover_interval=0` makes `StartHeartbeat` a no-op (`:221`). A global passive adversary — the T2 threat the Full profile claims to defend "strong (cover+mixing)" (spec §8.2, §5.5) — sees real timing and volume with no cover and no reordering, and performs standard end-to-end correlation. **E1/E2/E6 "RESOLVED (#61)" is true for the *engine*, not the *shipping node*.** **Fix:** enable cover+mixing on the deployed `CellNode` router (a `NodeConfig` λ/μ dial per §5.5), on by default for Full; add an integration test asserting a running cell emits constant-rate indistinguishable cells.
 
 ### [HIGH] S1-H2 — The distributed beacon is unreachable from the shipping binary → epoch never advances → E4 forward-secrecy and E5 rotation are both inert
