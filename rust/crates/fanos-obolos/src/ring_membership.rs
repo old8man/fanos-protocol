@@ -222,8 +222,10 @@ pub struct PathProof {
     root_r: Vec<RingRandomness>, // the top node's randomness, revealed to tie it to the public root
 }
 
-/// Deterministic randomness for a node's `ELL_H` limbs, domain-separated by role and level.
-fn node_r(seed: &[u8], role: &str, level: usize) -> Vec<RingRandomness> {
+/// Deterministic randomness for a node's `ELL_H` limbs, domain-separated by role and level. `pub(crate)` so the
+/// untraceability composition ([`crate::ring_untraceable`]) can derive the *same* leaf randomness, sharing the note
+/// commitment between the membership and nullifier proofs.
+pub(crate) fn node_r(seed: &[u8], role: &str, level: usize) -> Vec<RingRandomness> {
     (0..crate::ring_hash::ELL_H)
         .map(|i| {
             let mut s = seed.to_vec();
@@ -382,6 +384,15 @@ pub struct SoundPathProof {
     leaf_short: Vec<ShortnessProof>,         // ELL_H
     sibling_short: Vec<Vec<ShortnessProof>>, // depth × ELL_H
     node_short: Vec<Vec<ShortnessProof>>,    // (depth−1) intermediate nodes × ELL_H
+}
+
+impl SoundPathProof {
+    /// The commitment to the membership **leaf** — the note commitment `cm`. The untraceability composition shares
+    /// this with the nullifier proof, so a spend proves membership of *exactly* the note it nullifies.
+    #[must_use]
+    pub fn leaf_commitment(&self) -> &[RingCommitment] {
+        &self.path.leaf
+    }
 }
 
 /// A sub-seed `base ‖ tag ‖ index`.
