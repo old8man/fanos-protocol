@@ -29,9 +29,34 @@
 //!   the two independent sampling paths (rejection sampling vs. bit masking)
 //!   where a bias bug could hide.
 //! * **(M2) Cost unit.** We count *hash evaluations*: one `MapToPoint(H(·))` per
-//!   candidate `cert`. Any real per-admission cost (PoW difficulty, stake)
-//!   multiplies these counts; the geometry fixes the *number of trials*, which is
-//!   what we derive and measure.
+//!   candidate `cert`. The geometry fixes the *number of trials*, which is what
+//!   we derive and measure.
+//!
+//!   **Correction (2026-07-26).** This paragraph used to say a per-admission cost
+//!   (PoW difficulty, stake) *multiplies* these counts. **It does not, and the
+//!   error is large enough to matter.** A trial is a purely local
+//!   `MapToPoint(H(cert))` — the adversary never announces a losing candidate, so
+//!   no admission gate ever sees one. Grinding is **offline and unpriced**. The
+//!   admission cost is paid once per Sybil *actually seated*, so it is **additive
+//!   per seat**, not multiplicative over trials:
+//!
+//!   ```text
+//!       cost  =  E[T] hashes  +  (seats placed) · (admission cost)
+//!   ```
+//!
+//!   The gap is not a rounding detail. For `q = 31` (`N = 993`) at PoW difficulty
+//!   `2²⁰`: seizing **one chosen point** costs `993 + 2²⁰ ≈ 1.05·10⁶`, where the
+//!   multiplicative reading claims `993 · 2²⁰ ≈ 1.04·10⁹` — an overstatement of
+//!   **992×**, i.e. by a factor of `N` exactly. Capturing a **whole line**
+//!   (`E[T] ≈ 4030` trials, 32 seats) costs `4030 + 32·2²⁰ ≈ 3.4·10⁷` against a
+//!   claimed `4.2·10⁹` — **126×**.
+//!
+//!   The security reading below is unaffected in *shape* — the cost is still
+//!   `Θ(N·log)` in trials and polynomial — but the constant a deployment can buy
+//!   with admission difficulty is far smaller than the old sentence implied, and
+//!   sizing a difficulty against it would have over-estimated the margin by
+//!   two to three orders of magnitude. What admission difficulty genuinely
+//!   prices is **occupying** seats, never **targeting** them.
 //!
 //! ## (a) Seizing one chosen point — the geometric law
 //!
