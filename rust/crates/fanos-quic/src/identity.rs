@@ -68,6 +68,20 @@ pub fn verifiable_coordinate<F: Field>(
     prove_coordinate::<F>(&creds.vrf_secret(), creds.cert_der(), epoch, beacon)
 }
 
+/// As [`verifiable_coordinate`], but also returning this node's **rank** — needed to bind its directory entry so a
+/// coordinate collision is arbitrated by an unforgeable value instead of by whoever connected last
+/// (`Directory::insert_ranked`).
+// Crate-internal: only the driver binds its own directory entry, and exposing a second coordinate-derivation entry point
+// publicly would invite callers to pick the wrong one. The public surface stays `verifiable_coordinate`.
+#[must_use]
+pub(crate) fn verifiable_coordinate_ranked<F: Field>(
+    creds: &NodeCredentials,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> (Point<F>, VrfProof, fanos_vrf::VrfOutput) {
+    fanos_vrf::prove_coordinate_ranked::<F>(&creds.vrf_secret(), creds.cert_der(), epoch, beacon)
+}
+
 /// The coordinate-VRF public key embedded in a certificate, or `None` if the certificate is unparsable or
 /// carries no [`FANOS_VRF_OID`] extension. Read from a peer's *authenticated* certificate to check its
 /// coordinate proof.

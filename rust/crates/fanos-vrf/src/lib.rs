@@ -504,8 +504,24 @@ pub fn prove_coordinate<F: Field>(
     epoch: Epoch,
     beacon: &BeaconSeed,
 ) -> (Point<F>, VrfProof) {
+    let (point, proof, _rank) = prove_coordinate_ranked::<F>(secret, node_id, epoch, beacon);
+    (point, proof)
+}
+
+/// As [`prove_coordinate`], but also returning this node's own **rank** — the VRF output.
+///
+/// A node needs its own rank for two things it cannot do without: binding its directory entry so a collision is
+/// arbitrated by an unforgeable value rather than by arrival order, and driving [`settle_index`] to find the first probe
+/// point no lower-ranked node holds. Both were previously impossible because the output was computed and thrown away.
+#[must_use]
+pub fn prove_coordinate_ranked<F: Field>(
+    secret: &VrfSecret,
+    node_id: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> (Point<F>, VrfProof, VrfOutput) {
     let (proof, output) = secret.prove(&beacon_alpha(node_id, epoch, beacon));
-    (coordinate_from_output::<F>(&output), proof)
+    (coordinate_from_output::<F>(&output), proof, output)
 }
 
 /// Verify that `claimed` is the correct epoch coordinate for the node with `public` key under the
@@ -520,10 +536,26 @@ pub fn verify_coordinate<F: Field>(
     claimed: &Point<F>,
     proof: &VrfProof,
 ) -> bool {
-    match public.verify(&beacon_alpha(node_id, epoch, beacon), proof) {
-        Some(output) => &coordinate_from_output::<F>(&output) == claimed,
-        None => false,
-    }
+    verify_coordinate_rank::<F>(public, node_id, epoch, beacon, claimed, proof).is_some()
+}
+
+/// As [`verify_coordinate`], but returning the verified **rank** — the VRF output itself — on success.
+///
+/// The rank is what a collision is arbitrated by (`fanos_quic::Directory::insert_ranked`), and it is already computed
+/// while checking the proof. Returning it rather than discarding it is what lets the transport record *who* may keep a
+/// contested point, instead of falling back on arrival order, which an attacker controls. [`verify_coordinate`] is
+/// defined in terms of this so the two can never disagree about what a valid claim is.
+#[must_use]
+pub fn verify_coordinate_rank<F: Field>(
+    public: &VrfPublic,
+    node_id: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    claimed: &Point<F>,
+    proof: &VrfProof,
+) -> Option<VrfOutput> {
+    let output = public.verify(&beacon_alpha(node_id, epoch, beacon), proof)?;
+    (coordinate_from_output::<F>(&output) == *claimed).then_some(output)
 }
 
 #[cfg(test)]

@@ -325,9 +325,42 @@ converges to the *same* full occupancy in a handful of sweeps, and provably term
 
 Capacity therefore goes from `O(√P)` to the full `P`, at 1–2.3 probes per node.
 
-### Not yet wired
+### Wiring: rank arbitration replaces arrival order
 
-`verify_coordinate` (the `HELLO` path) and `Directory` collision handling still carry only `k = 0`, so a deployed node
-cannot yet *present* a probed point — the primitive and its acceptance predicate exist and are verified, the live path
-does not consume them. `Directory` would additionally need each entry's rank to drive `settle_index`, since it currently
-stores only coordinate → address.
+`Directory` now stores each entry's **rank** alongside its address (`insert_ranked`), and a contested point is decided by
+the rank rather than by whoever bound last. That fixes a security bug, not merely a capacity one. The previous code
+documented its own consequence — "the colliding node silently shadows another and one becomes unreachable" — and treated
+it as a fault to be relocated out of. But it was **exploitable**: a node whose coordinate landed on a victim's point could
+*evict* the victim simply by connecting after it, and arrival order is attacker-controlled. Rank is a VRF output: neither
+party chooses it, and it cannot be forged without the node's secret.
+
+The arbitration is deliberately asymmetric about missing ranks:
+
+| newcomer | incumbent | outcome | why |
+|---|---|---|---|
+| ranked | ranked | lowest rank keeps the point | matches `settle_index`, so the displaced node's own local walk agrees with every peer's directory unprompted |
+| ranked | unranked | newcomer wins | an unranked entry is a bootstrap seed or pinned fixture, not a proven claim |
+| unranked | ranked | **rejected** | no evidence, no eviction — otherwise the arrival-order attack returns |
+| unranked | unranked | last writer wins | unchanged pre-existing behaviour for seed entries |
+
+`rank_at` is the occupancy oracle `settle_index` consumes, and returns `None` for both "unbound" and "bound but unranked"
+— for settling those are the same answer, since an unranked occupant offers no evidence that it may keep the point.
+
+Supplying the rank required returning what was already being computed and discarded: `prove_coordinate_ranked` and
+`verify_coordinate_rank` yield the VRF output, with the pre-existing `prove_coordinate` / `verify_coordinate` defined in
+terms of them so the two can never disagree about what a valid claim is. A node binds its own point ranked at genesis and
+on every epoch reshuffle.
+
+### Still not wired
+
+The `HELLO` frame carries a bare proof, so a node cannot yet *present* a probed point (`index > 0`) to a peer: the claim
+type, its codec and its acceptance predicate are verified, but the frame format and `verify_hello` still assume `k = 0`.
+Two consequences worth stating plainly rather than leaving implicit:
+
+- A node can *detect* that it should move (its own `settle_index` walk, against ranks it has recorded) but cannot yet
+  announce the point it moved to.
+- The inbound path deliberately does not insert peer coordinates into the directory — a connection *is* the reachability,
+  and inventing an address from the source port would clobber the peer's real listen address — so in a production
+  deployment `rank_at` is populated by this node's own binding plus hole-punch and bootstrap entries. Driving
+  `settle_index` across a whole cell therefore wants the **membership** layer's occupancy set (`MemberJoined`, which
+  already carries coordinates), not the transport directory alone. That is the next unit.
