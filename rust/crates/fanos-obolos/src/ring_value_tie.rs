@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 
 use crate::ring::Poly;
 use crate::ring_commit::{ELL, RingCommitment, RingParams, RingRandomness};
-use crate::ring_hash::{ELL_H, HashNode, LOG_BASE};
+use crate::ring_hash::{HashNode, digit_weights};
 use crate::ring_linear::{LinearProof, prove_linear, verify_linear};
 use crate::ring_membership::commit_node;
 
@@ -54,11 +54,6 @@ fn sub(base: &[u8], tag: &[u8], index: usize) -> Vec<u8> {
     s.extend_from_slice(tag);
     s.extend_from_slice(&(index as u64).to_le_bytes());
     s
-}
-
-/// The gadget weights `2^{LOG_BASE·d}` (one per node limb) — the coefficients recomposing the value's digits.
-fn digit_weights() -> Vec<Poly> {
-    (0..ELL_H).map(|d| Poly::constant(1u64 << (LOG_BASE * d as u32))).collect()
 }
 
 /// Prove that `value_node` encodes the amount committed by `cv = ring_commit(v; rv)`. `value_node.limbs[d]` must be
@@ -155,9 +150,9 @@ mod tests {
     use super::*;
     use crate::ring_membership::node_r;
 
-    /// The digit-encoding node of `v`: limb `d` is `⟨(v >> 16d) & 0xFFFF⟩` as a constant polynomial.
+    /// The digit-encoding node of `v` — the canonical integer-into-node encoding.
     fn value_node(v: u64) -> HashNode {
-        HashNode::from_limbs((0..ELL_H).map(|d| Poly::constant((v >> (LOG_BASE * d as u32)) & 0xFFFF)).collect())
+        HashNode::from_u64_digits(v)
     }
 
     #[test]

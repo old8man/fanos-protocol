@@ -25,9 +25,10 @@
 //!
 //! - **privacy**: leaf equality is public on the tree, so an observer would learn "these two outputs are the same
 //!   amount to the same recipient" — from opaque commitments that are meant to leak nothing;
-//! - **spendability**: an identical `cm` yields an identical nullifier `nf = hash(nsk, cm)`, so the second note
-//!   would be rejected as a double-spend — value silently destroyed. (This is [`crate::nullifier`]'s audit O-M1
-//!   hazard in ring form; a fresh `rho` per note means honest notes never collide.)
+//! - **spendability**: an identical `cm` would give an identical nullifier, so the second note would be rejected as
+//!   a double-spend — value silently destroyed. A fresh `rho` per note means honest notes never collide; the
+//!   **position-bound** nullifier ([`crate::ring_nullifier`]) then removes the hazard entirely, since every tree
+//!   slot is unique even if two leaves are not (audit O-M1 in ring form).
 //!
 //! All three relations are `R_q`-linear, so the proof is three [hash steps](crate::ring_membership::prove_hash_step)
 //! plus node-shortness on `nsk`, `value`, `rho`, and the two intermediates. Knowing `nsk` *and* `rho` is what lets

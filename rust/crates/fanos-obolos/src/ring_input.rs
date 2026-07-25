@@ -5,7 +5,7 @@
 //! - **note-validity** ([`crate::ring_note`]) — `cm = hash(value_node, hash(hash(nsk, nsk), rho))`;
 //! - **value-tie** ([`crate::ring_value_tie`]) — `value_node` encodes the amount in `Cv`;
 //! - **untraceability** ([`crate::ring_untraceable`]) — `cm` is a tree member under the public root, and the public
-//!   nullifier `nf = hash(nsk, cm)`.
+//!   nullifier is its correct **position-bound** nullifier `nf = hash(nsk, hash(cm, pos))` at the very slot proven.
 //!
 //! The bindings are the soundness: the note-validity and value-tie proofs are verified against the **untraceability
 //! leaf commitment** (`cm`) and its **nsk commitment**, and against one shared `value_node` commitment. So the note
@@ -25,7 +25,8 @@ use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 use crate::ring_hash::{HashNode, HashParams};
 use crate::ring_membership::{NodeWitness, commit_node, node_r};
 use crate::ring_note::{NoteProof, NoteScheme, prove_note, verify_note};
-use crate::ring_untraceable::{UntraceableProof, prove_untraceable, verify_untraceable};
+use crate::ring_nullifier::nullifier_of;
+use crate::ring_untraceable::{UntraceableProof, position_of, prove_untraceable, verify_untraceable};
 use crate::ring_value_tie::{ValueTieProof, prove_value_tie, verify_value_tie};
 
 /// The domain-separated SIS hash instances a spend uses — the [`NoteScheme`] (how a note is built) plus the two
@@ -35,7 +36,9 @@ pub struct SpendScheme {
     pub note: NoteScheme,
     /// The note-commitment tree hash.
     pub tree_hp: HashParams,
-    /// The nullifier hash `nf = hash(nsk, cm)`.
+    /// The slot hash `slot = hash(cm, pos_node)` — the note's position-bound identity.
+    pub slot_hp: HashParams,
+    /// The nullifier hash `nf = hash(nsk, slot)`.
     pub nf_hp: HashParams,
 }
 
@@ -46,6 +49,7 @@ impl SpendScheme {
         Self {
             note: NoteScheme::standard(),
             tree_hp: HashParams::standard(),
+            slot_hp: HashParams::from_seed(b"FANOS-obolos-v1/note-slot"),
             nf_hp: HashParams::from_seed(b"FANOS-obolos-v1/nullifier"),
         }
     }
@@ -68,7 +72,8 @@ fn sub(base: &[u8], tag: &[u8]) -> Vec<u8> {
 }
 
 /// Prove the full spend of one input: the note `cm = hash(value_node, hash(hash(nsk, nsk), rho))` is a tree member
-/// with the public root, its nullifier is `nf = hash(nsk, cm)`, and `value_node` encodes the amount in `cv`. `rho`
+/// with the public root, its nullifier is the position-bound `nf = hash(nsk, hash(cm, pos))` at the slot the path
+/// proves, and `value_node` encodes the amount in `cv`. `rho`
 /// is the note's per-note uniqueness randomness (delivered to the spender with the note's opening). Returns the
 /// note commitment `cm` (the leaf the caller hashes to the root) and the public nullifier `nf`.
 #[allow(clippy::too_many_arguments)]
@@ -98,9 +103,20 @@ pub fn prove_input(
     // Value-tie — value_node encodes cv's amount (/vtie masking).
     let value_tie = prove_value_tie(params, cv, rv, value_node, &value_r, &sub(seed, b"/vtie"))?;
 
-    // Untraceability — membership of cm + nullifier(nsk, cm). Uses `seed` directly, so cm_r/nsk_r match the note.
-    let untraceable = prove_untraceable(params, &scheme.tree_hp, &scheme.nf_hp, &cm, nsk, siblings, directions, seed)?;
-    let nf = scheme.nf_hp.hash(nsk, &cm);
+    // Untraceability — membership of cm + its position-bound nullifier. Uses `seed` directly, so cm_r/nsk_r match
+    // the note proof's.
+    let untraceable = prove_untraceable(
+        params,
+        &scheme.tree_hp,
+        &scheme.slot_hp,
+        &scheme.nf_hp,
+        &cm,
+        nsk,
+        siblings,
+        directions,
+        seed,
+    )?;
+    let nf = nullifier_of(&scheme.slot_hp, &scheme.nf_hp, nsk, &cm, position_of(directions));
 
     let value_coms = commit_node(params, value_node, &value_r);
     Some((cm, nf, InputProof { value_coms, note, value_tie, untraceable }))
@@ -117,8 +133,8 @@ pub fn verify_input(
     nf: &HashNode,
     proof: &InputProof,
 ) -> bool {
-    // Membership + nullifier bind the note commitment `cm` and the key `nsk`.
-    verify_untraceable(params, &scheme.tree_hp, &scheme.nf_hp, root, nf, &proof.untraceable)
+    // Membership + position-bound nullifier bind the note commitment `cm`, the key `nsk`, and the tree slot.
+    verify_untraceable(params, &scheme.tree_hp, &scheme.slot_hp, &scheme.nf_hp, root, nf, &proof.untraceable)
         // The note is well-formed over the SAME cm, nsk (from untraceability) and value_node.
         && verify_note(
             params,

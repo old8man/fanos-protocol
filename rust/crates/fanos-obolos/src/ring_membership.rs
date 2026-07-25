@@ -237,6 +237,16 @@ pub(crate) fn node_r(seed: &[u8], role: &str, level: usize) -> Vec<RingRandomnes
         .collect()
 }
 
+/// The randomness committing the **direction bit** at `level`, derived from the path seed. `pub(crate)` so the
+/// untraceability composition can re-derive it and prove a *position* relation over the very same `d_com`s the path
+/// publishes ([`crate::ring_nullifier`] binds a nullifier to its tree slot that way).
+pub(crate) fn dir_r(seed: &[u8], level: usize) -> RingRandomness {
+    let mut s = seed.to_vec();
+    s.extend_from_slice(b"/dir");
+    s.extend_from_slice(&(level as u64).to_le_bytes());
+    RingRandomness::from_seed(&s)
+}
+
 /// Component-wise `a + b − c` over three limb-randomness vectors — the derived `right = child + sibling − left`.
 fn combine_r(a: &[RingRandomness], b: &[RingRandomness], c: &[RingRandomness]) -> Vec<RingRandomness> {
     a.iter().zip(b).zip(c).map(|((ai, bi), ci)| ai.add(bi).sub(ci)).collect()
@@ -299,10 +309,7 @@ pub fn prove_path(
     for (j, (sibling, &d)) in siblings.iter().zip(directions).enumerate() {
         let sib_r = node_r(seed, "/sib", j);
         let d_poly = Poly::constant(d);
-        let mut ds = seed.to_vec();
-        ds.extend_from_slice(b"/dir");
-        ds.extend_from_slice(&(j as u64).to_le_bytes());
-        let d_r = RingRandomness::from_seed(&ds);
+        let d_r = dir_r(seed, j);
 
         // (left, right) = d ? (sibling, child) : (child, sibling); left committed fresh, right derived.
         let (left, right) = if d == 1 { (sibling.clone(), child.clone()) } else { (child.clone(), sibling.clone()) };
@@ -392,6 +399,15 @@ impl SoundPathProof {
     #[must_use]
     pub fn leaf_commitment(&self) -> &[RingCommitment] {
         &self.path.leaf
+    }
+
+    /// The commitments to the hidden **direction bits**, level 0 (the leaf's own side) upward. The bits *are* the
+    /// leaf's tree index in binary — `position = Σ_j 2ʲ·d_j` — so these are exactly what a position-bound
+    /// nullifier ties itself to ([`crate::ring_untraceable`]), without publishing the position. Each bit is already
+    /// proven binary by its level's swap proof.
+    #[must_use]
+    pub fn direction_commitments(&self) -> Vec<RingCommitment> {
+        self.path.levels.iter().map(|l| l.d_com.clone()).collect()
     }
 }
 

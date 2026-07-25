@@ -52,6 +52,9 @@ pub const BASE: u64 = 1 << LOG_BASE;
 /// Module rank of the linear image (`SIS rows = K_H·D`). Illustrative — a calibration parameter.
 pub const K_H: usize = 1;
 
+/// Domain-separation label for a node's canonical 32-byte digest ([`HashNode::digest`]).
+const NODE_DIGEST_LABEL: &str = "FANOS-obolos-v1/ring-node-digest";
+
 /// Node width in ring elements: the gadget decomposition of a `K_H`-element image is `K_H·DIGITS` short polys.
 pub const ELL_H: usize = K_H * DIGITS;
 
@@ -82,6 +85,35 @@ impl HashNode {
     pub(crate) fn from_limbs(limbs: Vec<Poly>) -> Self {
         debug_assert_eq!(limbs.len(), ELL_H, "a node has ELL_H limbs");
         Self { limbs }
+    }
+
+    /// The node's canonical **32-byte digest** — a labeled hash of every limb coefficient in little-endian order.
+    ///
+    /// A node is `ELL_H·D` ring coefficients (kilobytes), so the *ledger* cannot key its nullifier set or its anchor
+    /// window on nodes directly — the state would grow by kilobytes per spent note, and the block `state_root` is 32
+    /// bytes. This digest is that key: the encoding is injective over **all** nodes (a full `u64` per coefficient, so
+    /// injectivity needs no shortness precondition), and collision resistance is the same BLAKE3 assumption the
+    /// BLAKE3-side ledger already makes. It is an *indexing and commitment* device only — soundness comes from the
+    /// zero-knowledge proof, which is always stated over the full node.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(self.limbs.len() * D * 8);
+        for limb in &self.limbs {
+            for &c in limb.coeffs() {
+                buf.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        fanos_primitives::hash_labeled(NODE_DIGEST_LABEL, &buf)
+    }
+
+    /// Encode a `u64` as a short node — one base-`2^{LOG_BASE}` **digit per limb**, in the limbs' constant terms
+    /// (`ELL_H·LOG_BASE = 64` bits, so every `u64` fits exactly). This is the canonical way an *integer* enters a
+    /// node relation, used for the amount (the `value_node` tied to a value commitment by
+    /// [`crate::ring_value_tie`]) and for a leaf's tree position (the `pos_node` binding a nullifier to its slot,
+    /// [`crate::ring_nullifier`]). Its inverse is `Σ_d 2^{LOG_BASE·d}·limb_d`, the weights those proofs use.
+    #[must_use]
+    pub fn from_u64_digits(v: u64) -> Self {
+        Self { limbs: (0..ELL_H).map(|d| Poly::constant((v >> (LOG_BASE * d as u32)) & (BASE - 1))).collect() }
     }
 
     /// Encode arbitrary bytes (e.g. a note commitment) as a short leaf node — the gadget decomposition of a
@@ -166,6 +198,14 @@ impl HashParams {
         }
         coeffs
     }
+}
+
+/// The digit weights `2^{LOG_BASE·d}` (one per limb) — the public coefficients that recompose a
+/// [`HashNode::from_u64_digits`] node back to its integer. The value-tie and the nullifier's position-tie state
+/// their linear relations over these.
+#[must_use]
+pub(crate) fn digit_weights() -> Vec<Poly> {
+    (0..ELL_H).map(|d| Poly::constant(1u64 << (LOG_BASE * d as u32))).collect()
 }
 
 /// The **gadget decomposition** `G⁻¹`: split each coefficient of the `K_H`-element `image` into its `DIGITS`
