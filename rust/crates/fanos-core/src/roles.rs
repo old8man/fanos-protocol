@@ -42,8 +42,9 @@ use alloc::vec::Vec;
 use fanos_primitives::{hash_labeled, BeaconSeed, Epoch, NodeId};
 use fanos_vrf::{VrfProof, VrfPublic, VrfSecret, PROOF_LEN};
 
-/// The functional roles a cell provides. Extensible; the four base roles mirror the node's advertised
-/// capability set (relay traffic, store L4 shards, host CALYPSO services, bridge to the clear net).
+/// The functional roles a cell provides. Extensible; the base roles mirror the node's advertised capability set
+/// (relay traffic, store L4 shards, host CALYPSO services, bridge to the clear net, and host the anonymous
+/// rendezvous line an unlinkable receiver comes home on).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Role {
     /// Relays application traffic for others (onion hops).
@@ -54,23 +55,55 @@ pub enum Role {
     Service,
     /// Bridges to the clear net (an exit).
     Exit,
+    /// Serves as a member of an anonymous **rendezvous line** — the NOSTOS receiver-anonymity substrate
+    /// (`docs/design-anonymity-substrate.md` §3/§3b). A hosting node is one point of the `q+1` on a line, so the
+    /// hidden service's anonymity set *is* the line's membership; the cell therefore needs enough of the line
+    /// occupied for a receiver to be reachable at all, and enough for the threshold peel (`t`-of-`q+1`) to have
+    /// a below-threshold guarantee worth having.
+    ///
+    /// This is why hosting must be an assignable role rather than a hand-started daemon: coverage of the line is
+    /// a *cell* property, so the same deterministic controller that provisions relays and exits has to provision
+    /// it, or the anonymity set is whatever operators happened to configure.
+    Rendezvous,
 }
 
 impl Role {
     /// Every role, in canonical order — the iteration order of an assignment.
-    pub const ALL: [Role; 4] = [Role::Relay, Role::Storage, Role::Service, Role::Exit];
+    pub const ALL: [Role; 5] = [Role::Relay, Role::Storage, Role::Service, Role::Exit, Role::Rendezvous];
+
+    /// The number of roles — the width of a per-role array ([`Demand`]).
+    pub const COUNT: usize = Role::ALL.len();
+
+    /// This role's index into a per-role array, in [`Role::ALL`] order.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.tag() as usize
+    }
 
     /// The 1-byte domain tag mixed into the ticket hash (distinct per role).
     #[must_use]
-    fn tag(self) -> u8 {
+    const fn tag(self) -> u8 {
         match self {
             Role::Relay => 0,
             Role::Storage => 1,
             Role::Service => 2,
             Role::Exit => 3,
+            Role::Rendezvous => 4,
         }
     }
 }
+
+// [`Demand`] indexes a `[u16; Role::COUNT]` by [`Role::index`], so every role's index must be a distinct, in-bounds
+// slot and must agree with the `Role::ALL` order that per-role iteration uses. Checked at compile time, which is what
+// makes the indexing in `Demand` provably panic-free rather than merely believed to be.
+#[allow(clippy::indexing_slicing)] // const-evaluated: `i < Role::COUNT == Role::ALL.len()`
+const _: () = {
+    let mut i = 0;
+    while i < Role::COUNT {
+        assert!(Role::ALL[i].index() == i, "Role::ALL order must match Role::index()");
+        i += 1;
+    }
+};
 
 /// A set of roles — a compact bit set over [`Role`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -252,40 +285,51 @@ pub fn verified_members<'a>(
 /// Per-role **demand**: how many active nodes the cell wants serving each role this epoch. Structural roles
 /// (consensus validation, the beacon keyper line) are fixed by the geometry and are *not* assigned here — this
 /// governs the elastic roles a cell provisions to taste.
+/// It is indexed **by role** rather than holding a field per role. That is not cosmetic: every operation here is
+/// per-role and identical across roles (supply, rebalance, sum, setpoint, deficit), so named fields forced six
+/// parallel enumerations that all had to be edited in lockstep to add a role — the kind of structure that makes an
+/// extension point *look* extensible while charging for every use of it. Indexed by [`Role::ALL`], adding a role is
+/// the enum variant and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Demand {
-    /// Wanted active relays.
-    pub relay: u16,
-    /// Wanted active storage nodes.
-    pub storage: u16,
-    /// Wanted active service hosts.
-    pub service: u16,
-    /// Wanted active exits.
-    pub exit: u16,
+    /// Wanted active nodes per role, indexed by [`Role::index`].
+    counts: [u16; Role::COUNT],
 }
 
+// Every index below is `Role::index()`, proven `< Role::COUNT` and `ALL`-consistent by the const assertion above.
+#[allow(clippy::indexing_slicing)]
 impl Demand {
+    /// A demand from an explicit per-role array, in [`Role::ALL`] order.
+    #[must_use]
+    pub const fn from_counts(counts: [u16; Role::COUNT]) -> Self {
+        Self { counts }
+    }
+
+    /// The demand built by evaluating `f` for each role — the shape every per-role construction below takes.
+    #[must_use]
+    pub fn per_role(mut f: impl FnMut(Role) -> u16) -> Self {
+        let mut counts = [0u16; Role::COUNT];
+        for role in Role::ALL {
+            counts[role.index()] = f(role);
+        }
+        Self { counts }
+    }
+
     /// The demand for one role.
     #[must_use]
     pub fn of(self, role: Role) -> u16 {
-        match role {
-            Role::Relay => self.relay,
-            Role::Storage => self.storage,
-            Role::Service => self.service,
-            Role::Exit => self.exit,
-        }
+        self.counts[role.index()]
+    }
+
+    /// Set the demand for one role.
+    pub fn set(&mut self, role: Role, units: u16) {
+        self.counts[role.index()] = units;
     }
 
     /// The per-role **eligible supply** — how many members can serve each role (the demand ceiling).
     #[must_use]
     pub fn supply(members: &[(NodeId, Capability)]) -> Demand {
-        let count = |role: Role| members.iter().filter(|(_, c)| c.offered.has(role)).count() as u16;
-        Demand {
-            relay: count(Role::Relay),
-            storage: count(Role::Storage),
-            service: count(Role::Service),
-            exit: count(Role::Exit),
-        }
+        Demand::per_role(|role| members.iter().filter(|(_, c)| c.offered.has(role)).count() as u16)
     }
 
     /// **Homeostatic rebalance** (self-balancing) — a **Lyapunov-descent** proportional controller, grounded in
@@ -318,36 +362,22 @@ impl Demand {
             let next = (d + delta).clamp(0, i64::from(u16::MAX)) as u16;
             next.max(fl)
         };
-        Demand {
-            relay: step(self.relay, setpoint.relay, floor.relay),
-            storage: step(self.storage, setpoint.storage, floor.storage),
-            service: step(self.service, setpoint.service, floor.service),
-            exit: step(self.exit, setpoint.exit, floor.exit),
-        }
+        Demand::per_role(|role| step(self.of(role), setpoint.of(role), floor.of(role)))
     }
 }
 
 impl Demand {
     /// Add `units` of load to one role (saturating).
+    #[allow(clippy::indexing_slicing)] // `Role::index()`, bounded by the const assertion above
     fn add_role(&mut self, role: Role, units: u16) {
-        let slot = match role {
-            Role::Relay => &mut self.relay,
-            Role::Storage => &mut self.storage,
-            Role::Service => &mut self.service,
-            Role::Exit => &mut self.exit,
-        };
+        let slot = &mut self.counts[role.index()];
         *slot = slot.saturating_add(units);
     }
 
     /// Per-role saturating sum with `other`.
     #[must_use]
     fn saturating_sum(self, other: Demand) -> Demand {
-        Demand {
-            relay: self.relay.saturating_add(other.relay),
-            storage: self.storage.saturating_add(other.storage),
-            service: self.service.saturating_add(other.service),
-            exit: self.exit.saturating_add(other.exit),
-        }
+        Demand::per_role(|role| self.of(role).saturating_add(other.of(role)))
     }
 }
 
@@ -356,13 +386,7 @@ impl Demand {
 /// the target the [`RoleController`]'s Lyapunov rebalance tracks.
 #[must_use]
 pub fn setpoint_from(load: Demand, capacity: Demand) -> Demand {
-    let ceil_div = |l: u16, c: u16| -> u16 { l.div_ceil(c.max(1)) };
-    Demand {
-        relay: ceil_div(load.relay, capacity.relay),
-        storage: ceil_div(load.storage, capacity.storage),
-        service: ceil_div(load.service, capacity.service),
-        exit: ceil_div(load.exit, capacity.exit),
-    }
+    Demand::per_role(|role| load.of(role).div_ceil(capacity.of(role).max(1)))
 }
 
 /// The **cell-agreed setpoint** from every node's observed load: sum the per-node loads (the same summed value
@@ -645,12 +669,7 @@ pub fn assign_report(
     let short = |role: Role| demand.of(role).saturating_sub(supply(role));
     AssignReport {
         roles: assign(members, epoch, beacon, demand),
-        deficit: Demand {
-            relay: short(Role::Relay),
-            storage: short(Role::Storage),
-            service: short(Role::Service),
-            exit: short(Role::Exit),
-        },
+        deficit: Demand::per_role(short),
     }
 }
 
@@ -673,7 +692,7 @@ mod tests {
     #[test]
     fn assignment_is_deterministic_and_verifiable() {
         let members = cell(7, &[Role::Relay, Role::Storage], 4);
-        let d = Demand { relay: 3, storage: 4, service: 0, exit: 0 };
+        let d = Demand::from_counts([3, 4, 0, 0, 0]);
         let a = assign(&members, E, &B, d);
         // Recomputable byte-for-byte.
         assert_eq!(a, assign(&members, E, &B, d));
@@ -687,7 +706,7 @@ mod tests {
     #[test]
     fn demand_is_filled_exactly_when_supply_suffices() {
         let members = cell(7, &[Role::Relay], 4);
-        let d = Demand { relay: 3, ..Default::default() };
+        let d = Demand::from_counts([3, 0, 0, 0, 0]);
         let a = assign(&members, E, &B, d);
         let relays = a.values().filter(|r| r.has(Role::Relay)).count();
         assert_eq!(relays, 3, "exactly the demanded number of relays are active");
@@ -704,11 +723,15 @@ mod tests {
         for m in members.iter_mut().take(3) {
             m.1 = Capability::new(RoleSet::of(&[Role::Relay, Role::Exit]), 4);
         }
-        let d = Demand { relay: 2, exit: 5, ..Default::default() };
+        let d = Demand::from_counts([2, 0, 0, 5, 0]);
         let report = assign_report(&members, E, &B, d);
         let exits = report.roles.values().filter(|r| r.has(Role::Exit)).count();
         assert_eq!(exits, 3, "only the 3 exit-capable nodes can be assigned exit");
-        assert_eq!(report.deficit.exit, 2, "the 2 unfillable exits are a reported deficit (escalation signal)");
+        assert_eq!(
+            report.deficit.of(Role::Exit),
+            2,
+            "the 2 unfillable exits are a reported deficit (escalation signal)"
+        );
     }
 
     #[test]
@@ -717,7 +740,7 @@ mod tests {
         // for a scarce (demand-1) role — capability-weighting, not a coin flip.
         let mut members = cell(12, &[Role::Relay], 1);
         members[0].1 = Capability::new(RoleSet::of(&[Role::Relay]), MAX_WEIGHT);
-        let d = Demand { relay: 1, ..Default::default() };
+        let d = Demand::from_counts([1, 0, 0, 0, 0]);
         let mut heavy = 0u32;
         let trials = 400u64;
         for e in 0..trials {
@@ -735,7 +758,7 @@ mod tests {
         // With equal weights the scarce role rotates over epochs — no node monopolizes it (moving target +
         // load spreading), and the assignment is unpredictable before the beacon (anti-grinding).
         let members = cell(7, &[Role::Relay], 4);
-        let d = Demand { relay: 1, ..Default::default() };
+        let d = Demand::from_counts([1, 0, 0, 0, 0]);
         let mut winners = alloc::collections::BTreeSet::new();
         for e in 0..40u64 {
             let a = assign(&members, Epoch::new(e), &B, d);
@@ -752,7 +775,7 @@ mod tests {
     fn a_node_can_hold_several_roles_at_once() {
         // A capable, high-weight node naturally accumulates multiple roles when demand is high relative to supply.
         let members = cell(4, &[Role::Relay, Role::Storage, Role::Service, Role::Exit], 8);
-        let d = Demand { relay: 4, storage: 4, service: 4, exit: 4 };
+        let d = Demand::from_counts([4, 4, 4, 4, 0]);
         let a = assign(&members, E, &B, d);
         assert!(a.values().any(|r| r.count() >= 2), "at least one node holds multiple roles simultaneously");
         // With demand == supply on every role, every node serves every role it offered.
@@ -763,14 +786,14 @@ mod tests {
 
     #[test]
     fn rebalance_steps_toward_the_setpoint() {
-        let d = Demand { relay: 4, storage: 4, ..Default::default() };
-        let floor = Demand { relay: 1, storage: 1, service: 1, exit: 1 };
+        let d = Demand::from_counts([4, 4, 0, 0, 0]);
+        let floor = Demand::from_counts([1, 1, 1, 1, 0]);
         // Want more relays, fewer storage: at κ = 1 the demand jumps straight to the setpoint.
-        let setpoint = Demand { relay: 9, storage: 2, ..Default::default() };
+        let setpoint = Demand::from_counts([9, 2, 0, 0, 0]);
         let next = d.rebalance(setpoint, floor, 7);
-        assert_eq!(next.relay, 9, "κ=1 reaches the raised setpoint");
-        assert_eq!(next.storage, 2, "κ=1 reaches the lowered setpoint");
-        assert!(next.storage >= floor.storage, "never below the floor");
+        assert_eq!(next.of(Role::Relay), 9, "κ=1 reaches the raised setpoint");
+        assert_eq!(next.of(Role::Storage), 2, "κ=1 reaches the lowered setpoint");
+        assert!(next.of(Role::Storage) >= floor.of(Role::Storage), "never below the floor");
     }
 
     #[test]
@@ -782,16 +805,16 @@ mod tests {
             let target = 50u16;
             for &start in &[2u16, 400] {
                 // Approach the same setpoint from below and from above — both must contract monotonically.
-                let mut d = Demand { relay: start, ..Default::default() };
-                let setpoint = Demand { relay: target, ..Default::default() };
+                let mut d = Demand::per_role(|r| if r == Role::Relay { start } else { 0 });
+                let setpoint = Demand::per_role(|r| if r == Role::Relay { target } else { 0 });
                 let mut prev_err = u64::MAX;
                 for _ in 0..256 {
                     d = d.rebalance(setpoint, floor, k);
-                    let err = u64::from(d.relay.abs_diff(target)).pow(2);
+                    let err = u64::from(d.of(Role::Relay).abs_diff(target)).pow(2);
                     assert!(err <= prev_err, "κ={k}/7 from {start}: Lyapunov error must not increase ({prev_err}→{err})");
                     prev_err = err;
                 }
-                assert_eq!(d.relay, target, "κ={k}/7 from {start}: converges to the setpoint, no overshoot");
+                assert_eq!(d.of(Role::Relay), target, "κ={k}/7 from {start}: converges to the setpoint, no overshoot");
             }
         }
     }
@@ -802,27 +825,27 @@ mod tests {
         // roles. It converges its demand, assigns min(demand, supply), and escalates a genuine shortfall.
         let members = cell(10, &[Role::Relay], 4); // 10 relay-capable nodes
         let mut ctrl = RoleController::new(
-            Demand { relay: 2, ..Default::default() },
-            Demand { relay: 1, ..Default::default() },
+            Demand::from_counts([2, 0, 0, 0, 0]),
+            Demand::from_counts([1, 0, 0, 0, 0]),
             3, // κ = 3/7
         );
         // The driver's setpoint: the load wants 6 relays (≤ supply). Demand converges up to 6, assigns 6.
-        let setpoint = Demand { relay: 6, ..Default::default() };
-        let mut last = ctrl.demand().relay;
+        let setpoint = Demand::from_counts([6, 0, 0, 0, 0]);
+        let mut last = ctrl.demand().of(Role::Relay);
         for e in 0..40u64 {
             let report = ctrl.step(&members, Epoch::new(e), &B, setpoint);
             let active = report.roles.values().filter(|r| r.has(Role::Relay)).count();
-            assert_eq!(active as u16, ctrl.demand().relay.min(10), "assigns min(demand, supply)");
-            assert!(ctrl.demand().relay >= last, "demand rises monotonically toward the setpoint");
-            assert_eq!(report.deficit.relay, 0, "supply covers this setpoint — no deficit");
-            last = ctrl.demand().relay;
+            assert_eq!(active as u16, ctrl.demand().of(Role::Relay).min(10), "assigns min(demand, supply)");
+            assert!(ctrl.demand().of(Role::Relay) >= last, "demand rises monotonically toward the setpoint");
+            assert_eq!(report.deficit.of(Role::Relay), 0, "supply covers this setpoint — no deficit");
+            last = ctrl.demand().of(Role::Relay);
         }
-        assert_eq!(ctrl.demand().relay, 6, "the controller settles at the setpoint");
+        assert_eq!(ctrl.demand().of(Role::Relay), 6, "the controller settles at the setpoint");
         // A setpoint BEYOND the eligible supply: demand climbs past supply, assigns all 10, escalates the rest.
-        let mut hungry = RoleController::new(Demand { relay: 8, ..Default::default() }, Demand::default(), 7);
-        let report = hungry.step(&members, Epoch::new(0), &B, Demand { relay: 15, ..Default::default() });
+        let mut hungry = RoleController::new(Demand::from_counts([8, 0, 0, 0, 0]), Demand::default(), 7);
+        let report = hungry.step(&members, Epoch::new(0), &B, Demand::from_counts([15, 0, 0, 0, 0]));
         assert_eq!(report.roles.values().filter(|r| r.has(Role::Relay)).count(), 10, "assigns all it can");
-        assert_eq!(report.deficit.relay, 5, "the 5 relays it wants but cannot fill are escalated to the parent");
+        assert_eq!(report.deficit.of(Role::Relay), 5, "the 5 relays it wants but cannot fill are escalated to the parent");
     }
 
     #[test]
@@ -864,22 +887,22 @@ mod tests {
 
     #[test]
     fn the_load_meter_derives_a_setpoint_and_the_cell_agrees_on_the_aggregate() {
-        let capacity = Demand { relay: 10, storage: 5, ..Default::default() };
+        let capacity = Demand::from_counts([10, 5, 0, 0, 0]);
         let mut m = LoadMeter::new(capacity);
         m.record(Role::Relay, 20);
         m.record(Role::Relay, 5); // 25 relay-units observed
         m.record(Role::Storage, 3);
-        assert_eq!(m.observed_load(), Demand { relay: 25, storage: 3, ..Default::default() });
+        assert_eq!(m.observed_load(), Demand::from_counts([25, 3, 0, 0, 0]));
         // Local setpoint: ⌈25/10⌉ = 3 relays, ⌈3/5⌉ = 1 storage.
-        assert_eq!(m.local_setpoint(), Demand { relay: 3, storage: 1, ..Default::default() });
+        assert_eq!(m.local_setpoint(), Demand::from_counts([3, 1, 0, 0, 0]));
         // The whole cell agrees on the aggregate: sum every node's observed load, then ⌈total / capacity⌉.
         let loads = [
-            Demand { relay: 25, storage: 3, ..Default::default() },
-            Demand { relay: 40, ..Default::default() },
-            Demand { relay: 15, storage: 7, ..Default::default() },
+            Demand::from_counts([25, 3, 0, 0, 0]),
+            Demand::from_counts([40, 0, 0, 0, 0]),
+            Demand::from_counts([15, 7, 0, 0, 0]),
         ];
         // relay total 80 → ⌈80/10⌉ = 8; storage total 10 → ⌈10/5⌉ = 2.
-        assert_eq!(cell_setpoint(&loads, capacity), Demand { relay: 8, storage: 2, ..Default::default() });
+        assert_eq!(cell_setpoint(&loads, capacity), Demand::from_counts([8, 2, 0, 0, 0]));
         // reset clears the window for the next epoch.
         m.reset();
         assert_eq!(m.observed_load(), Demand::default());
@@ -913,7 +936,7 @@ mod tests {
         // Over many epochs the full-trust node wins a scarce role far more than the de-weighted failer.
         let mut good_wins = 0u32;
         for e in 0..200u64 {
-            let a = assign(&adjusted, Epoch::new(e), &B, Demand { relay: 1, ..Default::default() });
+            let a = assign(&adjusted, Epoch::new(e), &B, Demand::from_counts([1, 0, 0, 0, 0]));
             if a.get(&node(1)).is_some_and(|r| r.has(Role::Relay)) {
                 good_wins += 1;
             }
@@ -941,5 +964,41 @@ mod tests {
         // The returned node that serves recovers exactly as usual — the excuse changed nothing but the outage.
         rep.observe_reachable(offline, true, true);
         assert_eq!(rep.score(&offline), REP_SCALE, "serving keeps full standing");
+    }
+
+    #[test]
+    fn the_role_set_is_extensible_without_touching_the_per_role_machinery() {
+        // Role::Rendezvous was added for the NOSTOS receiver-anonymity substrate, and the point of the indexed
+        // `Demand` is that adding it required only the enum variant. Assert the properties that makes true, so a
+        // future role cannot silently half-land: every role has a distinct in-bounds slot, `per_role` reaches all of
+        // them, and the supply/demand plumbing sees the new one.
+        assert_eq!(Role::ALL.len(), Role::COUNT);
+        let mut seen = [false; Role::COUNT];
+        for role in Role::ALL {
+            assert!(role.index() < Role::COUNT, "{role:?} indexes in bounds");
+            assert!(!seen[role.index()], "{role:?} has a distinct slot");
+            seen[role.index()] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every slot is claimed by exactly one role");
+
+        // `per_role` is the single construction point, so it must reach every role — including the newest.
+        let d = Demand::per_role(|r| r.index() as u16 + 1);
+        for role in Role::ALL {
+            assert_eq!(d.of(role), role.index() as u16 + 1, "per_role reaches {role:?}");
+        }
+
+        // A node offering ONLY the new role counts toward its supply and nothing else's — i.e. the role is real to
+        // the assignment machinery, not just present in the enum.
+        let members = [(node(1), Capability::new(RoleSet::of(&[Role::Rendezvous]), 4))];
+        let supply = Demand::supply(&members);
+        assert_eq!(supply.of(Role::Rendezvous), 1, "the rendezvous host is eligible supply");
+        assert_eq!(supply.of(Role::Relay), 0, "and is not counted as anything else");
+        // …and the assignment actually gives it out when the cell demands it.
+        let want = Demand::per_role(|r| u16::from(r == Role::Rendezvous));
+        let assigned = assign(&members, Epoch::new(1), &BeaconSeed::new([9u8; 32]), want);
+        assert!(
+            assigned.get(&node(1)).is_some_and(|r| r.has(Role::Rendezvous)),
+            "the only rendezvous-capable node is assigned the role"
+        );
     }
 }

@@ -192,11 +192,11 @@ mod tests {
         let members: Vec<(NodeId, Capability)> =
             (0..5).map(|i| (node(i), Capability::new(RoleSet::of(&[Role::Relay]), 4))).collect();
         let beacon = BeaconSeed::new([0x33; 32]);
-        let setpoint = Demand { relay: 3, ..Default::default() };
+        let setpoint = Demand::per_role(|r| if r == Role::Relay { 3 } else { 0 });
         let ctrl = || {
             RoleController::new(
-                Demand { relay: 1, ..Default::default() },
-                Demand { relay: 1, ..Default::default() },
+                Demand::per_role(|r| u16::from(r == Role::Relay)),
+                Demand::per_role(|r| u16::from(r == Role::Relay)),
                 7, // κ = 1: jump straight to the setpoint
             )
         };
@@ -207,7 +207,7 @@ mod tests {
             if live.step(&members, Epoch::new(1), &beacon, setpoint).has(Role::Relay) {
                 active += 1;
             }
-            demand_after = live.demand().relay;
+            demand_after = live.demand().of(Role::Relay);
         }
         assert_eq!(active, 3, "the cell assigns exactly the demanded 3 relays across its members");
         assert_eq!(demand_after, 3, "each controller tracked the setpoint");

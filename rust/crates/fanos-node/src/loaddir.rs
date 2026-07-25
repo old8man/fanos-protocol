@@ -13,7 +13,7 @@
 //! sum), never another's; the performance-reputation loop prices sustained mis-reporting. Signing/coord-binding
 //! the report is the same later-hardening step the sibling directories note.
 
-use fanos_core::roles::{cell_setpoint, Demand};
+use fanos_core::roles::{cell_setpoint, Demand, Role};
 use fanos_diaulos::Coord;
 use fanos_field::Field;
 use fanos_quic::Client;
@@ -34,27 +34,33 @@ fn load_slot(coord: Coord, epoch: Epoch) -> Vec<u8> {
     key
 }
 
-/// A load report's canonical bytes: `relay ‖ storage ‖ service ‖ exit`, each a big-endian `u16`.
+/// A load report's canonical width — one big-endian `u16` per role, **derived from [`Role::COUNT`]**.
+///
+/// It used to be a hand-written `8` for the four roles then defined, which is the same desync hazard the [`Demand`]
+/// refactor removed: a fifth role would have silently reported only the first four. Deriving the width means adding
+/// a role cannot leave the codec behind.
+const LOAD_BYTES: usize = Role::COUNT * 2;
+
+/// A load report's canonical bytes: one big-endian `u16` per role, in [`Role::ALL`] order.
 #[must_use]
-fn encode_load(load: Demand) -> [u8; 8] {
-    let mut b = [0u8; 8];
-    b[0..2].copy_from_slice(&load.relay.to_be_bytes());
-    b[2..4].copy_from_slice(&load.storage.to_be_bytes());
-    b[4..6].copy_from_slice(&load.service.to_be_bytes());
-    b[6..8].copy_from_slice(&load.exit.to_be_bytes());
+fn encode_load(load: Demand) -> [u8; LOAD_BYTES] {
+    let mut b = [0u8; LOAD_BYTES];
+    for (slot, role) in b.as_chunks_mut::<2>().0.iter_mut().zip(Role::ALL) {
+        *slot = load.of(role).to_be_bytes();
+    }
     b
 }
 
-/// Parse a load report (sans-I/O), or `None` if not exactly 8 bytes.
+/// Parse a load report (sans-I/O), or `None` if not exactly [`LOAD_BYTES`] long.
+///
+/// A peer running a different role set therefore writes a wrong-width slot and is simply *not counted* toward the
+/// cell setpoint, rather than mis-parsed — the safe direction, since a missing report lowers the setpoint while a
+/// mis-parsed one would corrupt it.
 #[must_use]
 pub fn parse_load(bytes: &[u8]) -> Option<Demand> {
-    let b: [u8; 8] = bytes.try_into().ok()?;
-    Some(Demand {
-        relay: u16::from_be_bytes([b[0], b[1]]),
-        storage: u16::from_be_bytes([b[2], b[3]]),
-        service: u16::from_be_bytes([b[4], b[5]]),
-        exit: u16::from_be_bytes([b[6], b[7]]),
-    })
+    let b: [u8; LOAD_BYTES] = bytes.try_into().ok()?;
+    let pairs = b.as_chunks::<2>().0;
+    Some(Demand::per_role(|role| pairs.get(role.index()).map_or(0, |p| u16::from_be_bytes(*p))))
 }
 
 /// Publish this node's observed per-role `load` for `epoch` at its coordinate slot. `false` if the store
@@ -129,7 +135,7 @@ mod tests {
 
     #[test]
     fn a_load_report_round_trips() {
-        let load = Demand { relay: 25, storage: 3, service: 0, exit: 7 };
+        let load = Demand::from_counts([25, 3, 0, 7, 0]);
         assert_eq!(parse_load(&encode_load(load)), Some(load));
         assert_eq!(parse_load(b"short"), None, "a wrong-length report is rejected");
     }

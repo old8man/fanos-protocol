@@ -55,17 +55,17 @@ const RELAY_WANT: [u16; 24] = [2, 3, 4, 6, 8, 10, 12, 12, 12, 11, 10, 8, 7, 6, 5
 
 /// Wrap the driver's desired relay count into a per-role setpoint (storage held steady at 4).
 fn setpoint(relay_want: u16) -> Demand {
-    Demand { relay: relay_want, storage: 4, ..Demand::default() }
+    Demand::per_role(|r| match r { Role::Relay => relay_want, Role::Storage => 4, _ => 0 })
 }
 
 #[test]
 fn a_cell_self_organizes_roles_in_lockstep_over_epochs() {
     let members = heterogeneous_cell();
-    let relay_supply = Demand::supply(&members).relay; // 8 relay-capable nodes
+    let relay_supply = Demand::supply(&members).of(Role::Relay); // 8 relay-capable nodes
 
     // Every node runs an identical controller — same initial demand, floor, and gain (κ = 3/7).
-    let start = Demand { relay: 2, storage: 4, ..Demand::default() };
-    let floor = Demand { relay: 1, storage: 1, ..Demand::default() };
+    let start = Demand::from_counts([2, 4, 0, 0, 0]);
+    let floor = Demand::from_counts([1, 1, 0, 0, 0]);
     let mut controllers: Vec<RoleController> = (0..13).map(|_| RoleController::new(start, floor, 3)).collect();
 
     let mut relay_active_union: BTreeSet<u8> = BTreeSet::new();
@@ -102,8 +102,8 @@ fn a_cell_self_organizes_roles_in_lockstep_over_epochs() {
                 relay_active_union.insert(id.0[0]);
             }
         }
-        demand_trace.push(controllers[0].demand().relay);
-        peak_deficit = peak_deficit.max(report.deficit.relay);
+        demand_trace.push(controllers[0].demand().of(Role::Relay));
+        peak_deficit = peak_deficit.max(report.deficit.of(Role::Relay));
     }
 
     // (3) HOMEOSTATIC CONVERGENCE: the demand rose while the cell was congested and relaxed when it went slack —
@@ -126,28 +126,28 @@ fn a_deficit_escalates_to_the_parent_cell() {
     // The holarchic loop (UHM T-148 recovery): when a child cell cannot self-provision a role, the shortfall
     // rises to the parent, whose own controller provisions extra capacity to lend down.
     let members = heterogeneous_cell();
-    let start = Demand { relay: 2, ..Demand::default() };
-    let floor = Demand { relay: 1, ..Demand::default() };
+    let start = Demand::from_counts([2, 0, 0, 0, 0]);
+    let floor = Demand::from_counts([1, 0, 0, 0, 0]);
     let mut child = RoleController::new(start, floor, 7); // κ = 1: jump to setpoint, so the deficit appears fast
     // The parent provisions a spare pool; its setpoint absorbs whatever deficit the child reports.
-    let mut parent = RoleController::new(Demand { relay: 0, ..Demand::default() }, Demand::default(), 7);
+    let mut parent = RoleController::new(Demand::from_counts([0, 0, 0, 0, 0]), Demand::default(), 7);
 
     let mut parent_saw_escalation = false;
     // Sustained congestion far above the child's 8-relay supply.
     for e in 0..8u64 {
-        let child_report = child.step(&members, Epoch::new(e), &BEACON, Demand { relay: 14, ..Demand::default() });
+        let child_report = child.step(&members, Epoch::new(e), &BEACON, Demand::from_counts([14, 0, 0, 0, 0]));
         // The parent's setpoint for this role is the child's unmet demand — it provisions to cover the gap.
         let parent_report =
-            parent.step(&members, Epoch::new(e), &BEACON, Demand { relay: child_report.deficit.relay, ..Demand::default() });
-        if child_report.deficit.relay > 0 {
+            parent.step(&members, Epoch::new(e), &BEACON, Demand::per_role(|r| if r == Role::Relay { child_report.deficit.of(Role::Relay) } else { 0 }));
+        if child_report.deficit.of(Role::Relay) > 0 {
             parent_saw_escalation = true;
             // The parent's demand grows toward the child's deficit — the overflow path is engaged.
-            assert!(parent.demand().relay > 0, "epoch {e}: the parent provisions against the child's deficit");
+            assert!(parent.demand().of(Role::Relay) > 0, "epoch {e}: the parent provisions against the child's deficit");
         }
         let _ = parent_report;
     }
     assert!(parent_saw_escalation, "sustained congestion beyond the child's supply must escalate a deficit");
-    assert!(parent.demand().relay >= 6, "the parent provisioned the child's ~6-relay shortfall, got {}", parent.demand().relay);
+    assert!(parent.demand().of(Role::Relay) >= 6, "the parent provisioned the child's ~6-relay shortfall, got {}", parent.demand().of(Role::Relay));
 }
 
 #[test]
@@ -155,10 +155,10 @@ fn the_minimum_gain_still_converges_the_cell() {
     // Even at the UHM viability floor κ_bootstrap = 1/7 (the slowest admissible loop gain), the cell's demand
     // still converges to a stable provisioning under a fixed load — the pull toward the setpoint never vanishes.
     let members = heterogeneous_cell();
-    let mut ctrl = RoleController::new(Demand { relay: 1, ..Demand::default() }, Demand { relay: 1, ..Demand::default() }, GAIN_BOOTSTRAP_SEVENTHS);
+    let mut ctrl = RoleController::new(Demand::from_counts([1, 0, 0, 0, 0]), Demand::from_counts([1, 0, 0, 0, 0]), GAIN_BOOTSTRAP_SEVENTHS);
     // A steady load wanting 6 relays (≤ supply): the slow controller must still reach and hold it.
     for e in 0..80u64 {
-        ctrl.step(&members, Epoch::new(e), &BEACON, Demand { relay: 6, ..Demand::default() });
+        ctrl.step(&members, Epoch::new(e), &BEACON, Demand::from_counts([6, 0, 0, 0, 0]));
     }
-    assert_eq!(ctrl.demand().relay, 6, "at κ_bootstrap the demand still converges to the setpoint");
+    assert_eq!(ctrl.demand().of(Role::Relay), 6, "at κ_bootstrap the demand still converges to the setpoint");
 }
