@@ -227,11 +227,40 @@ different child is still attributed through a line that avoids the saturated one
 
 ---
 
-## 9. Not yet wired [P]
+## 9. Wired into the diagnosis path
 
-- **The live driver.** The algebra is complete and sans-I/O; nothing yet gathers seven children's `Report`s each epoch and
-  acts on the `Cell` verdict. That belongs beside DIAKRISIS's per-cell diagnosis (`fanos-diakrisis`), which today stops at
-  the cell boundary.
+`fanos_diakrisis::hierarchy` now carries the federated verdict, and the seam needed no adapter: a cell's health was already
+represented as a **7-bit degraded-axis mask** (`polar::rho_vector_from_degraded`, `polar::mediator_attestation`), which is
+exactly `golay::Report::axes`. `LevelDiagnosis` gained a `federated: federation::Cell` field and `diagnose_level` takes the
+children's masks, so the covering runs *in* the diagnosis path rather than beside it.
+
+### 9.1 Two localizers, kept deliberately
+
+| | `localize_failing_child` (existing) | the federated verdict |
+|---|---|---|
+| granularity | *which child* is failing | *which `(child, axis)`* pairs |
+| multiplicity | at most **one** child | up to **3** anywhere, or 1 per child across all 7 |
+| a uniformly lossy parent | **silent** — there is no gap to find | attributed; the grammar needs no gap |
+| over capacity | silent | `Partial`, naming what is unexplained |
+| basis | a loss-gap threshold | a perfect code (T-228) |
+
+Both are kept, and not out of caution. The grey-endpoint rule reads **analogue** loss measured *about* a child by its peers,
+so it needs no cooperation and degrades to silence. The federated grammar reads **digital** self-reports *claimed by* the
+child, so it is exact where they exist and blind where they lie. They fail in different directions, which is a reason to
+have both rather than a reason to choose.
+
+### 9.2 The cross-check neither localizer can make alone
+
+Because one side is measured about a child and the other is claimed by it, a **disagreement is itself a signal**:
+`localizers_disagree` reports a child whose peers see loss while its own report claims no faulty axis. That is the
+observable signature of a member misreporting its own health — invisible to either localizer in isolation, and free once
+both are present. Where they part, the *claim* is the suspect one.
+
+---
+
+## 10. Still open [P]
 - **The `U(m) = 8m − 1` vertical reading.** §3 records that the vertical 3-tower carries the same grammar with two
   couplings and no puncture. Whether FANOS's hierarchy should additionally be diagnosed *as* that tower — inter-level
   couplings as coordinates — is a genuine open question, and the same [P] item ERGON §10 lists as "ecology dynamics".
+- **The network path that fills the masks.** `diagnose_level` now consumes the children's degraded-axis masks; a parent
+  gathering them over the wire each epoch is node plumbing (`fanos-node`), and a separate seam from this algebra.

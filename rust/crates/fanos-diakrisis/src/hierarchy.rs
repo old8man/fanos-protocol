@@ -18,6 +18,7 @@
 
 use alloc::vec::Vec;
 
+use fanos_code::{federation, golay};
 use fanos_geometry::fano;
 
 use crate::coherence::{CoherenceMatrix, Measures, PHI_TH};
@@ -64,39 +65,167 @@ pub fn parent_coherence(child_activity: &[Vec<f64>]) -> Option<CoherenceMatrix> 
     CoherenceMatrix::from_signals(child_activity)
 }
 
+/// The **federated verdict** over a parent's children — the Turyn covering applied to the degraded-axis masks the
+/// children already compute (`docs/design-federation.md`).
+///
+/// This is a strictly finer instrument than [`localize_failing_child`], and the difference is worth stating rather than
+/// leaving to be discovered:
+///
+/// | | `localize_failing_child` | the federated verdict |
+/// |---|---|---|
+/// | granularity | *which child* is failing | *which `(child, axis)`* pairs are faulty |
+/// | multiplicity | at most **one** child | up to **3** faults anywhere, or 1 per child across all 7 |
+/// | a uniformly lossy parent | **silent** (no gap to find) | attributed, because the grammar does not need a gap |
+/// | over capacity | silent | `Partial`, *naming what is unexplained* |
+/// | basis | a loss-gap threshold | a perfect code (T-228) |
+///
+/// Both are kept. The grey-endpoint rule reads *analogue* loss and needs no per-child reporting, so it still works where
+/// children are uncooperative or silent; the federated verdict reads *digital* self-reports and is exact where they exist.
+/// They fail in different directions, which is the reason to have both rather than a reason to pick.
+#[must_use]
+pub fn federated_diagnosis(
+    child_degraded: &[u8; fano::N],
+    child_bus_faults: &[bool; fano::N],
+) -> federation::Cell {
+    let mut reports = [golay::Report::default(); federation::CHILDREN];
+    for (r, (&axes, &bus)) in reports.iter_mut().zip(child_degraded.iter().zip(child_bus_faults.iter())) {
+        *r = golay::Report { axes: axes & 0x7F, bus_fault: bus };
+    }
+    federation::diagnose_cell(reports)
+}
+
 /// One level's diagnosis: the parent's coherence measures over its children, the localized failing child (if
-/// any), and whether the parent must escalate to *its* parent (the parent itself is not integrated, `Φ < 1` —
-/// the leading indicator, one level up).
+/// any), the **federated verdict** over their reported axes, and whether the parent must escalate to *its* parent
+/// (the parent itself is not integrated, `Φ < 1` — the leading indicator, one level up).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct LevelDiagnosis {
     /// The parent-level coherence measures (Φ, P, R) over the children's activity.
     pub measures: Measures,
     /// The localized failing child index `0..7`, if exactly one grey child stands out.
     pub failing_child: Option<usize>,
+    /// The federated verdict over the children's degraded-axis reports — see [`federated_diagnosis`].
+    pub federated: federation::Cell,
     /// Whether the parent must escalate to its own parent (`Φ < 1`).
     pub escalate: bool,
 }
 
-/// Diagnose one hierarchy level from the children's activity signals (parent coherence) and their aggregate
-/// losses (localization). `None` if the activity signals are unusable.
+/// Diagnose one hierarchy level from the children's activity signals (parent coherence), their aggregate
+/// losses (analogue localization), and their reported degraded axes (federated localization). `None` if the
+/// activity signals are unusable.
+///
+/// The two localizers are deliberately both present rather than one chosen: the loss-gap rule needs no cooperation from
+/// the children and degrades to silence, while the federated grammar needs their reports and is exact. A parent that has
+/// both can cross-check them, and a disagreement is itself a signal — a child whose analogue loss says "failing" while its
+/// own report says "healthy" is the shape of a lying member.
 #[must_use]
 pub fn diagnose_level(
     child_activity: &[Vec<f64>],
     child_losses: &[f64; fano::N],
+    child_degraded: &[u8; fano::N],
+    child_bus_faults: &[bool; fano::N],
     tol: f64,
 ) -> Option<LevelDiagnosis> {
     let measures = parent_coherence(child_activity)?.measures();
     Some(LevelDiagnosis {
         measures,
         failing_child: localize_failing_child(&inter_child_loss(child_losses), tol),
+        federated: federated_diagnosis(child_degraded, child_bus_faults),
         escalate: measures.phi < PHI_TH - 1e-9,
     })
+}
+
+/// Whether the analogue and federated localizers **disagree** about a child: the loss gap names it failing while its own
+/// report claims no faulty axis, or the reverse.
+///
+/// A disagreement is not noise to be smoothed over — it is the observable signature of a member misreporting its own
+/// health, which neither localizer can see alone. The analogue side is measured *about* the child by its peers; the
+/// federated side is claimed *by* the child. Where they part, the claim is the suspect one.
+#[must_use]
+pub fn localizers_disagree(d: &LevelDiagnosis) -> Option<usize> {
+    let child = d.failing_child?;
+    let reported = match d.federated {
+        federation::Cell::Healthy => 0,
+        federation::Cell::Localized(f) | federation::Cell::Partial { localized: f, .. } => {
+            f.axes.get(child).map_or(0, |m| m.count_ones())
+        }
+    };
+    if reported == 0 { Some(child) } else { None }
 }
 
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_federated_verdict_attributes_what_the_loss_gap_cannot() {
+        // The upgrade, side by side. Three degraded axes inside one child: the loss-gap rule can at best name the child,
+        // and only if its loss stands out; the federated grammar names the axes.
+        let mut degraded = [0u8; fano::N];
+        degraded[5] = 0b0010_1001; // axes 0, 3 and 5 of child 5
+        let verdict = federated_diagnosis(&degraded, &[false; fano::N]);
+        let federation::Cell::Localized(f) = verdict else { panic!("three faults must localize") };
+        assert_eq!(f.axes[5], 0b0010_1001, "the axes are named, not just the child");
+        assert_eq!(f.total(), 3);
+    }
+
+    #[test]
+    fn a_uniformly_degraded_parent_is_attributed_where_the_gap_rule_is_silent() {
+        // The grey-endpoint rule needs a *gap*: a cell whose children are all equally lossy offers none, and the rule is
+        // correctly silent (`grey_endpoint_is_silent_on_a_fair_lossy_cell`). The federated grammar needs no gap — one
+        // degraded axis per child is seven faults, and it attributes every one.
+        let mut degraded = [0u8; fano::N];
+        for (c, d) in degraded.iter_mut().enumerate() {
+            *d = 1 << (c % 7);
+        }
+        assert_eq!(localize_failing_child(&inter_child_loss(&[0.2; fano::N]), 0.1), None, "no gap, no verdict");
+        let federation::Cell::Localized(f) = federated_diagnosis(&degraded, &[false; fano::N]) else {
+            panic!("one per child must localize")
+        };
+        assert_eq!(f.total(), 7, "all seven attributed without any gap to lean on");
+    }
+
+    #[test]
+    fn a_clean_parent_is_federated_healthy() {
+        assert_eq!(
+            federated_diagnosis(&[0; fano::N], &[false; fano::N]),
+            federation::Cell::Healthy
+        );
+    }
+
+    #[test]
+    fn a_child_whose_peers_see_loss_but_who_reports_health_is_flagged() {
+        // The cross-check the two localizers make possible, and neither can make alone: the analogue side is measured
+        // *about* a child by its peers, the federated side is claimed *by* the child. Where they part, the claim is the
+        // suspect one — which is the observable signature of a member misreporting its own health.
+        let mut losses = [0.01f64; fano::N];
+        losses[2] = 0.9; // peers see child 2 as badly lossy
+        let activity: Vec<Vec<f64>> = (0..fano::N).map(|i| (0..8).map(|t| ((i + t) as f64).sin()).collect()).collect();
+        let d = diagnose_level(&activity, &losses, &[0; fano::N], &[false; fano::N], 0.1).unwrap();
+        assert_eq!(d.failing_child, Some(2), "the loss gap names child 2");
+        assert_eq!(d.federated, federation::Cell::Healthy, "yet child 2 reports no faulty axis");
+        assert_eq!(localizers_disagree(&d), Some(2), "the disagreement is surfaced, not averaged away");
+
+        // And when the child reports honestly, there is no disagreement to flag.
+        let mut degraded = [0u8; fano::N];
+        degraded[2] = 0b0000_0001;
+        let honest = diagnose_level(&activity, &losses, &degraded, &[false; fano::N], 0.1).unwrap();
+        assert_eq!(honest.failing_child, Some(2));
+        assert_eq!(localizers_disagree(&honest), None, "agreement is not a disagreement");
+    }
+
+    #[test]
+    fn over_capacity_damage_is_reported_partial_rather_than_guessed() {
+        let mut degraded = [0u8; fano::N];
+        degraded[1] = 0b0000_1111; // four axes in one child: unavoidably beyond the grammar
+        let federation::Cell::Partial { localized, unexplained } =
+            federated_diagnosis(&degraded, &[false; fano::N])
+        else {
+            panic!("four in one child cannot localize")
+        };
+        assert!(localized.is_empty());
+        assert_eq!(unexplained[1], 0b0000_1111, "and the unexplained damage is named for the controller");
+    }
 
     #[test]
     fn a_parent_localizes_its_one_failing_child() {
@@ -135,7 +264,7 @@ mod tests {
         let together: Vec<Vec<f64>> = (0..fano::N)
             .map(|k| shared.iter().map(|&x| x + 0.001 * f64::from(k as u32)).collect())
             .collect();
-        let d_together = diagnose_level(&together, &[0.05; fano::N], 0.1).unwrap();
+        let d_together = diagnose_level(&together, &[0.05; fano::N], &[0; fano::N], &[false; fano::N], 0.1).unwrap();
         assert!(d_together.measures.phi >= PHI_TH, "correlated sub-cells integrate at the parent (Φ={})", d_together.measures.phi);
         assert!(!d_together.escalate, "an integrated parent does not escalate");
 
@@ -143,7 +272,7 @@ mod tests {
         let apart: Vec<Vec<f64>> = (0..fano::N)
             .map(|k| (0..40usize).map(|t| ((t * (k + 1) * 7 + k * 3) % 11) as f64).collect())
             .collect();
-        let d_apart = diagnose_level(&apart, &[0.05; fano::N], 0.1).unwrap();
+        let d_apart = diagnose_level(&apart, &[0.05; fano::N], &[0; fano::N], &[false; fano::N], 0.1).unwrap();
         assert!(d_apart.escalate == (d_apart.measures.phi < PHI_TH - 1e-9), "escalation tracks the parent Φ<1 leading indicator");
     }
 
