@@ -34,8 +34,22 @@ pub const K: usize = 1;
 pub const ELL: usize = 4;
 
 /// The amount ceiling `2⁵¹` — comfortably below `q = 2⁶⁴ − 2³² + 1`, so a transaction's homomorphic sums stay in
-/// a single coefficient without wrapping (a range proof, the frontier ZK component, enforces `v < MAX_VALUE`).
+/// a single coefficient without wrapping (a range proof enforces `v < MAX_VALUE`; see [`RANGE_BITS`]).
 pub const MAX_VALUE: u64 = 1 << 51;
+
+/// The **protocol range width** every shielded amount is proven to — `log₂(MAX_VALUE)`, so a range proof at this
+/// width is exactly the statement `v < MAX_VALUE`.
+///
+/// This is a *constant*, not a parameter, and that is load-bearing (audit O-C1). The aggregated range proof
+/// ([`crate::ring_range_agg`]) carries its width inside the proof object, so if a verifier trusted that field the
+/// **prover** would choose the bound: with `bits = 62`, four outputs each just under `2⁶²` sum to `q + ε`, which is
+/// `≡ ε (mod q)` — they balance against an input worth `ε` while being worth `≈2⁶⁴` in the pool. Consensus therefore
+/// pins the width here rather than accepting a per-call argument, and the verifier rejects any proof whose declared
+/// width differs. Together with [`MAX_NOTES_PER_TX`] and the same bound on the cleartext fee, no side of the balance
+/// law can reach `q`.
+pub const RANGE_BITS: usize = 51;
+
+const _: () = assert!(MAX_VALUE == 1 << RANGE_BITS, "RANGE_BITS must be exactly log2(MAX_VALUE)");
 
 /// The maximum value-bearing notes per transaction — **derived**, not chosen: every homomorphic sum must stay
 /// below `q` over the integers or a wrap forges value (audit O-C1). `⌊q / MAX_VALUE⌋ − 2` with `q ≈ 2⁶⁴`,

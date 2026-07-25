@@ -32,10 +32,9 @@
 
 use alloc::vec::Vec;
 
-use crate::ring::Poly;
-use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
+use crate::ring_commit::{RANGE_BITS, RingCommitment, RingParams, RingRandomness};
 use crate::ring_confidential::{AmountWitness, ConfidentialAmountProof, prove_amounts, verify_amounts};
-use crate::ring_hash::{ELL_H, HashNode, LOG_BASE};
+use crate::ring_hash::{HashNode, LOG_BASE};
 use crate::ring_input::{InputProof, SpendScheme, prove_input, verify_input};
 use crate::ring_output::{OutputProof, prove_output, verify_output};
 
@@ -86,7 +85,7 @@ pub struct ShieldedTxProof {
 /// The public artifacts a proved shielded transaction emits, alongside the [`ShieldedTxProof`]: the input note
 /// commitments (the spent leaves — the caller hashes each up its auth path to recover the anchor), the output note
 /// commitments (the **new leaves** to append to the tree), and the public nullifiers. The value commitments and
-/// fee are the caller's own public inputs; a later increment folds all of these into one `RingShieldedTx` object.
+/// fee are the caller's own public inputs; [`RingShieldedTx`] assembles all of it into the ledger object.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProvenTx {
     /// The spent inputs' note commitments (the leaves whose membership is proven).
@@ -99,6 +98,72 @@ pub struct ProvenTx {
     pub proof: ShieldedTxProof,
 }
 
+/// A **ring-native shielded transaction** — the public object consensus orders and [`crate::ring_state`] applies.
+/// It is the ring successor to [`crate::tx::ShieldedTx`]: everything a validator needs, and *nothing* that would
+/// identify a note, an owner, or an amount.
+///
+/// Note what is absent versus the BLAKE3 object: no spend-auth signatures. There, revealing the nullifier key at
+/// spend time forced a separate signing key to keep a broadcast transaction from being re-authorised (audit §5.D-2).
+/// Here `nsk` is *never revealed* — it stays inside the zero-knowledge proof — so the proof itself is the spend
+/// authorization. Malleability protection for an unshield's public recipient still needs binding into the proof
+/// statement when that path is ported; a pure shielded transfer has no such field.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RingShieldedTx {
+    /// The tree root the inputs are proven members of.
+    pub anchor: HashNode,
+    /// One public nullifier per spent input (double-spend guard; position-bound, so no note can lock another out).
+    pub nullifiers: Vec<HashNode>,
+    /// One re-randomised value commitment per spent input (the inputs' balance terms).
+    pub input_cvs: Vec<RingCommitment>,
+    /// One value commitment per created output (the outputs' balance terms).
+    pub output_cvs: Vec<RingCommitment>,
+    /// One note commitment per created output — the **new leaves** appended to the tree, each bound to its
+    /// `output_cvs` entry by the output proof, so a created note is worth exactly what it balances.
+    pub output_cms: Vec<HashNode>,
+    /// The public fee (a cleartext balance term).
+    pub fee: u64,
+}
+
+impl RingShieldedTx {
+    /// Assemble the public transaction from a [`prove_shielded_tx`] result and the caller's public value
+    /// commitments. `anchor` is the root the inputs' membership was proven against.
+    #[must_use]
+    pub fn new(
+        anchor: HashNode,
+        proven: &ProvenTx,
+        input_cvs: Vec<RingCommitment>,
+        output_cvs: Vec<RingCommitment>,
+        fee: u64,
+    ) -> Self {
+        Self {
+            anchor,
+            nullifiers: proven.nullifiers.clone(),
+            input_cvs,
+            output_cvs,
+            output_cms: proven.output_cms.clone(),
+            fee,
+        }
+    }
+
+    /// Whether `proof` attests this transaction's relation — the stateless, expensive half of applying it. Reads no
+    /// ledger state, so a block's proofs can be verified concurrently before the serial commit
+    /// ([`crate::ring_state::RingShieldedState::apply_with_verdict`]).
+    #[must_use]
+    pub fn verify(&self, params: &RingParams, scheme: &SpendScheme, proof: &ShieldedTxProof) -> bool {
+        verify_shielded_tx(
+            params,
+            scheme,
+            &self.anchor,
+            &self.input_cvs,
+            &self.nullifiers,
+            &self.output_cvs,
+            &self.output_cms,
+            self.fee,
+            proof,
+        )
+    }
+}
+
 /// A sub-seed `base ‖ tag ‖ index`.
 fn sub(base: &[u8], tag: &[u8], index: usize) -> Vec<u8> {
     let mut s = base.to_vec();
@@ -107,15 +172,15 @@ fn sub(base: &[u8], tag: &[u8], index: usize) -> Vec<u8> {
     s
 }
 
-/// The digit-encoding value node for amount `v` (one base-`2^{LOG_BASE}` digit per limb).
-fn value_node(v: u64) -> HashNode {
-    HashNode::from_limbs((0..ELL_H).map(|d| Poly::constant((v >> (LOG_BASE * d as u32)) & 0xFFFF)).collect())
-}
-
 /// Prove a whole shielded transaction: each `input` is spent (valid note, tree member, nullified, amount-tied),
 /// each `output` creates a leaf bound to its value commitment, and the amounts balance with every output in
-/// `[0, 2^range_bits)`. The caller must ensure `Σ inputs = Σ outputs + fee`. Returns the [`ProvenTx`] public
-/// artifacts (input/output note commitments, nullifiers) and the proof.
+/// `[0, MAX_VALUE)`. The caller must ensure `Σ inputs = Σ outputs + fee`. Returns the [`ProvenTx`] public artifacts
+/// (input/output note commitments, nullifiers) and the proof.
+///
+/// The range width is deliberately **not** a parameter: it is the protocol constant
+/// [`RANGE_BITS`](crate::ring_commit::RANGE_BITS), so no call site — honest or otherwise — can widen the bound that
+/// keeps the balance law from wrapping modulo `q` (audit O-C1). Because the range proof is *aggregated*, its cost is
+/// independent of the width, so pinning it to the real ceiling is free.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn prove_shielded_tx(
@@ -124,7 +189,6 @@ pub fn prove_shielded_tx(
     inputs: &[TxInput],
     outputs: &[TxOutput],
     fee: u64,
-    range_bits: usize,
     seed: &[u8],
 ) -> Option<ProvenTx> {
     let mut input_proofs = Vec::with_capacity(inputs.len());
@@ -134,7 +198,7 @@ pub fn prove_shielded_tx(
     let mut input_r = Vec::with_capacity(inputs.len());
     for (i, inp) in inputs.iter().enumerate() {
         let cv = RingCommitment::commit(params, inp.value, &inp.rv);
-        let vn = value_node(inp.value);
+        let vn = HashNode::from_u64_digits(inp.value);
         let (cm, nf, proof) = prove_input(
             params,
             scheme,
@@ -161,7 +225,7 @@ pub fn prove_shielded_tx(
     let mut output_cms = Vec::with_capacity(outputs.len());
     for (i, out) in outputs.iter().enumerate() {
         let cv = RingCommitment::commit(params, out.value, &out.rv);
-        let vn = value_node(out.value);
+        let vn = HashNode::from_u64_digits(out.value);
         let note_owner = scheme.note.note_owner(&out.owner_tag, &out.rho);
         let (cm, proof) = prove_output(
             params,
@@ -180,7 +244,7 @@ pub fn prove_shielded_tx(
     let output_values: Vec<u64> = outputs.iter().map(|o| o.value).collect();
     let output_r: Vec<RingRandomness> = outputs.iter().map(|o| o.rv.clone()).collect();
     let witness = AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee };
-    let amounts = prove_amounts(params, &input_cvs, &witness, range_bits, &sub(seed, b"/amt", 0))?;
+    let amounts = prove_amounts(params, &input_cvs, &witness, RANGE_BITS, &sub(seed, b"/amt", 0))?;
 
     let proof = ShieldedTxProof { inputs: input_proofs, outputs: output_proofs, amounts };
     Some(ProvenTx { input_cms: cms, output_cms, nullifiers: nfs, proof })
@@ -221,7 +285,7 @@ pub fn verify_shielded_tx(
         }
     }
     // The amounts balance, with every output in range — over the same input value commitments.
-    verify_amounts(params, input_cvs, output_cvs, fee, &proof.amounts)
+    verify_amounts(params, input_cvs, output_cvs, fee, RANGE_BITS, &proof.amounts)
 }
 
 #[cfg(test)]
@@ -256,7 +320,7 @@ mod tests {
             TxOutput { value: v_out, rv: rv_out.clone(), owner_tag, rho: HashNode::from_bytes(b"tx-rho-out") };
 
         let ProvenTx { input_cms, output_cms, nullifiers, proof } =
-            prove_shielded_tx(&params, &scheme, &[input], &[output], fee, 16, b"seed").expect("shielded tx");
+            prove_shielded_tx(&params, &scheme, &[input], &[output], fee, b"seed").expect("shielded tx");
         // Reconstruct the public transaction: the tree root, and the input/output value commitments.
         let cm = input_cms.first().unwrap();
         let root = scheme.tree_hp.hash(cm, &sib0); // d=0 ⇒ (cm, sib)

@@ -3,7 +3,7 @@
 //! proof](crate::ring_balance). Together they attest, in zero knowledge, that
 //!
 //! 1. **balance** — `Σ input values = Σ output values + fee` (no value is created), and
-//! 2. **range** — every *output* amount is in `[0, 2^bits)`,
+//! 2. **range** — every *output* amount is in `[0, MAX_VALUE)`,
 //!
 //! which is exactly what makes confidential amounts *sound*: balance alone holds only modulo `q`, so without the
 //! range bound an output could commit a value near `q` (a "negative" amount) and forge money; the range proof
@@ -11,20 +11,27 @@
 //! commitment to a note that was itself created as a range-proven output, so their range holds by induction over
 //! the pool's history (the note's membership + nullifier, the *untraceability* half, is proven separately).
 //!
+//! Getting that right takes **three** bounds, not one — the range width must be the *verifier's* demand and not the
+//! prover's claim, the cleartext fee must be bounded, and the number of value terms must be bounded. Each closes a
+//! distinct modular-wraparound path; [`verify_amounts`] documents them, and each has a test that exhibits the
+//! forging transaction it refuses.
+//!
 //! This is the ring-native successor to the amount checks the transparent [`crate::tx::TransparentProof`] does in
 //! the clear (`Σin = Σout + fee` on revealed openings, `value < MAX_VALUE` per amount). Once the ledger's value
 //! commitment migrates from the flat-vector [`crate::commit`] to [`crate::ring_commit`], this proof drops into the
 //! shielded-transaction relation as the confidentiality component of `ConfidentialProof`, alongside the
 //! untraceability proofs.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the underlying primitives; it inherits their
-//! > status (parameters illustrative, not constant-time, range proof not yet aggregated). Tests verify a balanced
-//! > in-range transfer proves and verifies, and that inflation or an out-of-range output has no accepting proof.
+//! > **STATUS — [P]/[H], correctness-first.** A composition of the underlying primitives; it inherits their status
+//! > (parameters illustrative, not constant-time). Tests verify a balanced in-range transfer proves and verifies;
+//! > that inflation, an out-of-range output, or a swapped commitment has no accepting proof; and that each of the
+//! > three wraparound paths above is refused — the range-width test constructs the actual forging transaction and
+//! > shows it is internally consistent, so that only the pinned width stands between it and the pool.
 
 use alloc::vec::Vec;
 
 use crate::ring_balance::{RingBalanceProof, prove_balance, verify_balance};
-use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
+use crate::ring_commit::{MAX_NOTES_PER_TX, MAX_VALUE, RingCommitment, RingParams, RingRandomness};
 use crate::ring_range_agg::{AggRangeProof, prove_range_agg, verify_range_agg};
 
 /// A shielded transfer's **secret** amount witness: each input's re-randomised value commitment opening, and each
@@ -95,21 +102,43 @@ pub fn prove_amounts(
     Some(ConfidentialAmountProof { output_ranges, balance })
 }
 
-/// Verify a [`prove_amounts`] proof against the public input and output value commitments and the fee.
+/// Verify a [`prove_amounts`] proof against the public input and output value commitments and the fee, demanding
+/// the range width `bits` (normally [`RANGE_BITS`] — consensus pins it; see below).
+///
+/// Three bounds together are what make the balance law sound over the integers rather than only modulo `q`
+/// (audit O-C1). Each closes a distinct wraparound path, and dropping any one forges value:
+///
+/// - **the range width is the verifier's** — the proof carries its own width, so accepting that field would let the
+///   prover choose the bound: four outputs each just under `2⁶²` sum to `q + ε ≡ ε`, balancing against an input worth
+///   `ε` while being worth `≈2⁶⁴` in the pool;
+/// - **the cleartext fee is bounded** — it has no range proof, so an unbounded `fee ≈ q` makes `Σin ≡ Σout + fee`
+///   satisfiable with an output *larger* than its input (a "negative" fee), inflating by the difference;
+/// - **the number of value terms is bounded** — even with every amount below `MAX_VALUE`, enough terms reach `q`;
+///   [`MAX_NOTES_PER_TX`] is derived (`⌊q / MAX_VALUE⌋ − 2`) so no side of the law can.
+///
+/// Input amounts still need no range proof: every input is a re-randomised commitment to a note created as a
+/// range-proven output, so their range holds by induction over the pool — *provided* issuance
+/// ([`crate::ring_state::RingShieldedState::mint`]) respects `MAX_VALUE`, which is the monetary policy's duty.
 #[must_use]
 pub fn verify_amounts(
     params: &RingParams,
     input_commitments: &[RingCommitment],
     output_commitments: &[RingCommitment],
     fee: u64,
+    bits: usize,
     proof: &ConfidentialAmountProof,
 ) -> bool {
+    // Bound the cleartext fee and the number of value terms *first*, so neither side of the balance law can reach
+    // `q` — and so an over-sized claim is refused before any expensive verification is attempted.
+    if fee >= MAX_VALUE || input_commitments.len().saturating_add(output_commitments.len()) > MAX_NOTES_PER_TX {
+        return false;
+    }
     // One range proof per output, in order.
     if proof.output_ranges.len() != output_commitments.len() {
         return false;
     }
     for (range, com) in proof.output_ranges.iter().zip(output_commitments) {
-        if !verify_range_agg(params, com, range) {
+        if !verify_range_agg(params, com, bits, range) {
             return false;
         }
     }
@@ -122,9 +151,12 @@ pub fn verify_amounts(
 mod tests {
     use super::*;
     use crate::ring::Poly;
+    use crate::ring_commit::RANGE_BITS;
 
-    // A small range width keeps the (unaggregated) range proofs fast; the composition is identical at RANGE_BITS.
+    // A small range width keeps the range proofs' packing cheap; the composition is identical at RANGE_BITS.
     const BITS: usize = 8;
+    // The width a prover would pick to attempt wraparound inflation (the widest the proof system allows).
+    const WIDE: usize = 62;
 
     /// Commit `value` and return `(randomness, commitment)`.
     fn commit(params: &RingParams, value: u64, seed: &[u8]) -> (RingRandomness, RingCommitment) {
@@ -144,7 +176,7 @@ mod tests {
         let (input_r, output_r, output_values) = ([r_in], [r_o1, r_o2], [150u64, 30]);
         let witness = AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee: 20 };
         let proof = prove_amounts(&params, &inputs, &witness, BITS, b"seed").expect("valid transfer");
-        assert!(verify_amounts(&params, &inputs, &outputs, 20, &proof), "the transfer verifies");
+        assert!(verify_amounts(&params, &inputs, &outputs, 20, BITS, &proof), "the transfer verifies");
     }
 
     #[test]
@@ -158,7 +190,7 @@ mod tests {
         let (input_r, output_r, output_values) = ([r_in], [r_o1, r_o2], [151u64, 30]);
         let witness = AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee: 20 };
         let proof = prove_amounts(&params, &inputs, &witness, BITS, b"seed").expect("proof emitted");
-        assert!(!verify_amounts(&params, &inputs, &outputs, 20, &proof), "inflation is rejected");
+        assert!(!verify_amounts(&params, &inputs, &outputs, 20, BITS, &proof), "inflation is rejected");
     }
 
     #[test]
@@ -171,7 +203,119 @@ mod tests {
         let (input_r, output_r, output_values) = ([r_in], [r_o1], [300u64]);
         let witness = AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee: 0 };
         let proof = prove_amounts(&params, &inputs, &witness, BITS, b"seed").expect("proof emitted");
-        assert!(!verify_amounts(&params, &inputs, &outputs, 0, &proof), "an out-of-range output is rejected");
+        assert!(!verify_amounts(&params, &inputs, &outputs, 0, BITS, &proof), "an out-of-range output is rejected");
+    }
+
+    #[test]
+    fn a_transfer_proves_and_verifies_at_the_protocol_range_width() {
+        // The width consensus actually demands (`ring_tx` pins it), exercised directly: a balanced transfer with a
+        // near-ceiling amount proves and verifies at RANGE_BITS. Because the range proof is *aggregated* its cost is
+        // independent of the width, so the real ceiling is as cheap here as a toy one — which is what makes pinning
+        // it free rather than a trade-off.
+        let params = RingParams::standard();
+        let big = MAX_VALUE - 1; // the largest legal amount
+        let (r_in, c_in) = commit(&params, big, b"rb-in");
+        let (r_o, c_o) = commit(&params, big - 7, b"rb-o");
+        let (inputs, outputs) = ([c_in.clone()], [c_o]);
+        let (input_r, output_r, output_values) = ([r_in], [r_o], [big - 7]);
+        let witness = AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee: 7 };
+        let proof = prove_amounts(&params, &inputs, &witness, RANGE_BITS, b"rb").expect("proves at RANGE_BITS");
+        assert!(verify_amounts(&params, &inputs, &outputs, 7, RANGE_BITS, &proof), "and verifies at RANGE_BITS");
+        // MAX_VALUE itself is one too large: the reconstruction needs a 52nd bit, which the packing does not carry.
+        let (r_over, c_over) = commit(&params, MAX_VALUE, b"rb-over");
+        let over_values = [MAX_VALUE];
+        let over_r = [r_over];
+        let over = AmountWitness { input_r: &input_r, output_values: &over_values, output_r: &over_r, fee: 0 };
+        let bad = prove_amounts(&params, core::slice::from_ref(&c_in), &over, RANGE_BITS, b"rb2").expect("emitted");
+        assert!(
+            !verify_amounts(&params, core::slice::from_ref(&c_in), &[c_over], 0, RANGE_BITS, &bad),
+            "an amount at MAX_VALUE is out of range"
+        );
+    }
+
+    #[test]
+    fn a_prover_chosen_range_width_cannot_forge_value_by_wraparound() {
+        // Audit O-C1, the attack the pinned range width closes. The range proof carries its own width, so a verifier
+        // that trusted that field would let the PROVER choose the bound. At bits = 62, four outputs each just under
+        // 2^62 sum to q + 100 ≡ 100 (mod q): they balance against an input worth 100 while being worth ≈2^64 in the
+        // pool — value forged from nothing, with every individual check satisfied.
+        let params = RingParams::standard();
+        let big = (1u64 << WIDE) - 1;
+        let mut values = alloc::vec![big; 3];
+        // The fourth output makes the sum exactly q + 100, and is itself still < 2^62.
+        values.push(crate::ring::Q.wrapping_add(100).wrapping_sub(big.wrapping_mul(3)));
+        assert!(values.iter().all(|&v| v < (1u64 << WIDE)), "every output is within the wide range");
+        assert_eq!(
+            values.iter().fold(0u128, |a, &v| a + u128::from(v)),
+            u128::from(crate::ring::Q) + 100,
+            "…and they sum to q + 100, i.e. ≡ 100 (mod q)"
+        );
+
+        let (r_in, c_in) = commit(&params, 100, b"wrap-in");
+        let (output_r, outputs): (Vec<_>, Vec<_>) = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| commit(&params, v, &alloc::format!("wrap-o{i}").into_bytes()))
+            .unzip();
+        let inputs = [c_in];
+        let input_r = [r_in];
+        let witness = AmountWitness { input_r: &input_r, output_values: &values, output_r: &output_r, fee: 0 };
+        let proof = prove_amounts(&params, &inputs, &witness, WIDE, b"wrap").expect("the wide proof is emitted");
+
+        // The attack is REAL: at the prover's own width the whole relation checks out — balance included.
+        assert!(
+            verify_amounts(&params, &inputs, &outputs, 0, WIDE, &proof),
+            "the forging transaction is internally consistent — only the pinned width stops it"
+        );
+        // And it is refused at the protocol width, which is the only width consensus ever demands.
+        assert!(
+            !verify_amounts(&params, &inputs, &outputs, 0, RANGE_BITS, &proof),
+            "a proof whose declared range width is not the protocol's is rejected"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_fee_cannot_forge_value() {
+        // The fee is a CLEARTEXT balance term with no range proof, so it must be bounded: with fee = q − 100,
+        // Σin ≡ Σout + fee is satisfiable by an output *larger* than its input (a "negative" fee), inflating by 100.
+        let params = RingParams::standard();
+        let huge_fee = crate::ring::Q - 100;
+        let (r_in, c_in) = commit(&params, 50, b"fee-in");
+        let (r_o, c_o) = commit(&params, 150, b"fee-o"); // 150 out from a 50 input: 50 ≡ 150 + (q − 100) (mod q)
+        let (inputs, outputs) = ([c_in], [c_o]);
+        let (input_r, output_r, output_values) = ([r_in], [r_o], [150u64]);
+        let witness =
+            AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee: huge_fee };
+        let proof = prove_amounts(&params, &inputs, &witness, BITS, b"fee").expect("proof emitted");
+        // Balance itself is satisfied modulo q — the bound is the only thing that refuses it.
+        assert!(
+            !verify_amounts(&params, &inputs, &outputs, huge_fee, BITS, &proof),
+            "a fee at or above MAX_VALUE is rejected"
+        );
+        assert!(huge_fee >= MAX_VALUE, "…and that is precisely the bound being enforced");
+    }
+
+    #[test]
+    fn the_note_count_bound_keeps_the_balance_sums_below_q() {
+        // Even with every amount below MAX_VALUE, enough value terms reach q. MAX_NOTES_PER_TX is derived so they
+        // cannot — check the derivation holds, then that the gate refuses an over-count (before any verification).
+        assert!(
+            u128::from(MAX_NOTES_PER_TX as u64) * u128::from(MAX_VALUE) < u128::from(crate::ring::Q),
+            "MAX_NOTES_PER_TX · MAX_VALUE must stay below q, or a full transaction could wrap"
+        );
+        let params = RingParams::standard();
+        let (r_in, c_in) = commit(&params, 10, b"cnt-in");
+        let (r_o, c_o) = commit(&params, 10, b"cnt-o");
+        let (input_r, output_r, output_values) = ([r_in], [r_o], [10u64]);
+        let witness = AmountWitness { input_r: &input_r, output_values: &output_values, output_r: &output_r, fee: 0 };
+        let proof = prove_amounts(&params, core::slice::from_ref(&c_in), &witness, BITS, b"cnt").expect("proof emitted");
+        assert!(verify_amounts(&params, core::slice::from_ref(&c_in), core::slice::from_ref(&c_o), 0, BITS, &proof), "one-in/one-out is fine");
+        // Claiming more value terms than the bound is refused outright.
+        let too_many = alloc::vec![c_in; MAX_NOTES_PER_TX];
+        assert!(
+            !verify_amounts(&params, &too_many, &[c_o], 0, BITS, &proof),
+            "a transaction with more value terms than MAX_NOTES_PER_TX is rejected"
+        );
     }
 
     #[test]
@@ -185,6 +329,6 @@ mod tests {
         let proof = prove_amounts(&params, &inputs, &witness, BITS, b"seed").unwrap();
         // Verify against a different output commitment: both the range proof and balance are bound to c_o1.
         let (_r, c_other) = commit(&params, 80, b"different");
-        assert!(!verify_amounts(&params, &inputs, &[c_other], 20, &proof), "the output commitment is bound in");
+        assert!(!verify_amounts(&params, &inputs, &[c_other], 20, BITS, &proof), "the output commitment is bound in");
     }
 }

@@ -38,7 +38,8 @@ const ANCHOR_SET_ROOT_LABEL: &str = "FANOS-obolos-v1/anchor-set-root";
 /// the last `MAX_ANCHORS` state-advancing operations (Zcash's rolling-anchor design); the window is generous
 /// enough that no honest, reasonably-fresh wallet is ever caught out, while bounding the set to 32 KiB. The
 /// eviction is deterministic (FIFO over the append order all validators share), so it never forks the root.
-const MAX_ANCHORS: usize = 1024;
+/// `pub(crate)` so the ring-native state ([`crate::ring_state`]) enforces the *same* window — one policy, not two.
+pub(crate) const MAX_ANCHORS: usize = 1024;
 
 /// Why a shielded transaction was refused. Each variant names exactly one attack the gate closes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

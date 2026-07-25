@@ -69,6 +69,21 @@ could commit a near-`q` "negative" amount and forge money (audit O-C1). The **ag
 superseding the per-bit first cut) is what makes it affordable — ~13× faster on the confidential-amount tests,
 and the prerequisite for the untraceability shortness proofs below.
 
+### 2.2 Three bounds, not one — closing wraparound completely
+
+A range proof alone is *not* enough, and each of the following was a live inflation path found by auditing the ring
+path against what the transparent one enforces:
+
+| Bound | Why it is load-bearing |
+|---|---|
+| the range width is the **verifier's demand** (`RANGE_BITS`, pinned by consensus — never a per-call argument) | the aggregated proof carries its own width, so trusting that field lets the *prover* choose the bound: four outputs each just under `2⁶²` sum to `q + ε ≡ ε`, balancing against an input worth `ε` while being worth `≈2⁶⁴` in the pool |
+| the cleartext **fee** `< MAX_VALUE` | the fee has no range proof, so an unbounded `fee ≈ q` makes `Σin ≡ Σout + fee` satisfiable with an output *larger* than its input — a "negative" fee |
+| the **note count** `≤ MAX_NOTES_PER_TX` | even with every amount below `MAX_VALUE`, enough terms reach `q`; the constant is derived as `⌊q / MAX_VALUE⌋ − 2` so no side of the law can |
+
+The bounds are checked *before* any proof verification, so an oversized claim cannot force wasted work. Each has a
+test that constructs the forging transaction and shows it refused — the range-width test additionally verifies the
+attack proof is internally consistent at the prover's own width, so the pinned width is demonstrably what stops it.
+
 ### 2.1 The aggregation, precisely
 
 Pack the bits `b(X) = Σ bᵢXⁱ`, commit `C_b` once. Per round, for a **small scalar** `x` reveal one masked
@@ -241,26 +256,54 @@ input's and output's `Cv` with the balance proof:
 | integrity (spend the note you balance) | shared `Cv`: input proof ↔ balance |
 | conservation (create only what you balance) | shared `Cv`: output proof ↔ balance, per output |
 
-`prove_shielded_tx` returns a `ProvenTx` — input leaves, **output leaves to append**, nullifiers, proof — the shape
-the ledger's `apply` consumes. The commitment tree those leaves live in is
-[`ring_tree`](../rust/crates/fanos-obolos/src/ring_tree.rs): a Merkle tree over the SIS hash yielding the root
-(anchor) and auth paths (siblings + directions) that `prove_path_sound` consumes.
+`prove_shielded_tx` returns a `ProvenTx` — input leaves, **output leaves to append**, nullifiers, proof — which
+[`RingShieldedTx`](../rust/crates/fanos-obolos/src/ring_tx.rs) assembles with the public value commitments into the
+object consensus orders.
+
+Note what that object does *not* carry: **spend-auth signatures**. In the BLAKE3 design a spend reveals the
+nullifier key, so a separate signing key was needed to stop a broadcast transaction being re-authorised to another
+recipient (audit §5.D-2). Here `nsk` is never revealed — it stays inside the proof — so the proof *is* the spend
+authorization. (An unshield's public recipient must still be bound into the proof statement when that path is
+ported; a pure shielded transfer has no such field.)
+
+## 4a. The ledger — the ring-native state machine
+
+[`ring_state`](../rust/crates/fanos-obolos/src/ring_state.rs) is where the stack stops being a library: `apply`
+verifies a real `ShieldedTxProof` — no witness revealed, no transparent oracle. It keeps [`state.rs`](../rust/crates/fanos-obolos/src/state.rs)'s
+gate order exactly, and is atomic (on any failure the state is untouched):
+
+**known anchor → fresh nullifiers → capacity → valid proof → commit.**
+
+The verdict is split out (`apply_with_verdict`) so a block verifies every proof in parallel and then commits serially
+in consensus order, with an identical result — proof verification reads no ledger state.
+
+**Why the node digest.** A ring nullifier or root is a `HashNode` — kilobytes of ring coefficients. Keying the
+nullifier set and anchor window on nodes would grow executed state by kilobytes per spent note, and the block
+`state_root` is 32 bytes. So the *sets* key on `HashNode::digest` (injective under the same BLAKE3 assumption the
+BLAKE3-side ledger already makes), while every **soundness** check is stated over the full node inside the proof.
+That lets the nullifier set and the rolling-anchor policy (`MAX_ANCHORS`, audit O-M2) be *literally the same code* as
+`state.rs`'s, not a second divergent implementation of the same rules.
+
+**The tree.** [`ring_tree`](../rust/crates/fanos-obolos/src/ring_tree.rs) is a Merkle tree over the SIS hash with
+canonical empty-subtree padding, yielding the root (anchor) and the auth paths (siblings + direction bits) that
+`prove_path_sound` and the §4.1b position tie consume. It maintains an **incremental frontier** — `pending[h]` is the
+complete height-`h` subtree awaiting a right sibling, and appending carries upward exactly as binary addition carries
+— so `append` and `root` are `O(depth)`, independent of pool size. That is not a micro-optimisation: recomputing the
+root per append is `O(n)`, making a block of `k` notes `O(n·k)`, which no ledger can carry. It stays a *reference*
+tree in retaining every leaf so it can produce any note's `auth_path` in `O(n)` — a wallet operation, replaced in
+production by per-note incremental witnesses, with byte-identical roots and paths.
 
 ## 5. Integration roadmap
 
 The proof stack is complete and verified; wiring it into the ledger is the "libraries-ahead → wired" step
 (`docs/audit.md`). In order:
 
-1. **Ring-native shielded state** — `ring_tree` + a nullifier set + `apply(tx)` verifying `ring_tx` and appending
-   the proven output leaves: the ring successor to [`state.rs`](../rust/crates/fanos-obolos/src/state.rs), with the
-   same gate order (known anchor → fresh nullifiers → capacity → valid proof → commit) and the same rolling-anchor
-   window (audit O-M2).
-2. **Migrate the value commitment and note model** in `tx` / `build` / `wallet` / `codec` and downstream
+1. **Migrate the value commitment and note model** in `tx` / `build` / `wallet` / `codec` and downstream
    `fanos-dromos` from the flat-vector [`commit`](../rust/crates/fanos-obolos/src/commit.rs) to
    [`ring_commit`](../rust/crates/fanos-obolos/src/ring_commit.rs) + SIS notes.
-3. **Wire `ring_tx` as `ShieldedProof`** — replacing the transparent proof as the consensus relation, with
+2. **Wire `ring_tx` as `ShieldedProof`** — replacing the transparent proof as the consensus relation, with
    `TransparentProof` retained as the degraded-mode oracle.
-4. **Calibrate** `REPETITIONS`, `CHALLENGE_BITS`, and `(K, ℓ, D, q)` to a bit-security target; add constant-time
+3. **Calibrate** `REPETITIONS`, `CHALLENGE_BITS`, and `(K, ℓ, D, q)` to a bit-security target; add constant-time
    arithmetic and the merged-butterfly NTT; commission external cryptanalysis. Until then the backend stays
    **[P]/[H]** and is never claimed as production-audited. A whole-transaction proof is *minutes* at real `bits`
    (the inherent lattice-ZK cost); range/shortness aggregation and recursive-SNARK compaction are the perf frontier.

@@ -134,7 +134,9 @@ fn mask_seed(base: &[u8], attempt: u32, k: usize, tag: u8) -> Vec<u8> {
     s
 }
 
-/// Prove, in zero knowledge, that `com(value; r_value)` opens to some `v ∈ [0, 2^bits)`. `bits ≤ 62`.
+/// Prove, in zero knowledge, that `com(value; r_value)` opens to some `v ∈ [0, 2^bits)`. Returns `None` if
+/// `bits > 62` (`2^bits` must fit in a coefficient) — a hard check, not a debug assertion, since a silently-accepted
+/// oversized width is a soundness failure rather than a programming slip.
 #[must_use]
 pub fn prove_range_agg(
     params: &RingParams,
@@ -143,7 +145,9 @@ pub fn prove_range_agg(
     bits: usize,
     seed: &[u8],
 ) -> Option<AggRangeProof> {
-    debug_assert!(bits <= 62, "2^bits must fit in a coefficient");
+    if bits > 62 {
+        return None;
+    }
     let v_com = RingCommitment::commit_message(params, &Poly::constant(value), r_value);
     // Pack the bits: b(X) = Σ_{i<bits} ((value>>i)&1)·Xⁱ.
     let mut b_coeffs = [0u64; D];
@@ -215,9 +219,19 @@ pub fn prove_range_agg(
 }
 
 /// Verify a [`prove_range_agg`] proof that `value_commitment` opens to some `v ∈ [0, 2^bits)`.
+///
+/// **`bits` is the verifier's demand, not the prover's claim** (audit O-C1). The proof carries its own width — the
+/// reconstruction weights depend on it — but a verifier that simply *used* that field would let the prover choose
+/// the bound, which forges value by modular wraparound (see [`crate::ring_commit::RANGE_BITS`]). So the declared
+/// width must equal the width the caller demands, or the proof is refused.
 #[must_use]
-pub fn verify_range_agg(params: &RingParams, value_commitment: &RingCommitment, proof: &AggRangeProof) -> bool {
-    if proof.rounds.len() != REPETITIONS {
+pub fn verify_range_agg(
+    params: &RingParams,
+    value_commitment: &RingCommitment,
+    bits: usize,
+    proof: &AggRangeProof,
+) -> bool {
+    if proof.bits != bits || proof.rounds.len() != REPETITIONS {
         return false;
     }
     let seed_h = challenge_seed(value_commitment, &proof.c_b, proof.rounds.iter());
@@ -266,7 +280,7 @@ mod tests {
         let params = RingParams::standard();
         let (r, c) = commit(&params, 40_000, b"agg-happy"); // < 2^16 = 65536
         let proof = prove_range_agg(&params, 40_000, &r, BITS, b"seed").expect("in range");
-        assert!(verify_range_agg(&params, &c, &proof), "40000 ∈ [0, 2^16) verifies");
+        assert!(verify_range_agg(&params, &c, 16, &proof), "40000 ∈ [0, 2^16) verifies");
     }
 
     #[test]
@@ -275,7 +289,7 @@ mod tests {
         for v in [0u64, 1, (1 << BITS) - 1] {
             let (r, c) = commit(&params, v, &[b'a', v as u8, (v >> 8) as u8]);
             let proof = prove_range_agg(&params, v, &r, BITS, b"seed").expect("boundary");
-            assert!(verify_range_agg(&params, &c, &proof), "boundary {v} verifies");
+            assert!(verify_range_agg(&params, &c, 16, &proof), "boundary {v} verifies");
         }
     }
 
@@ -286,7 +300,7 @@ mod tests {
         let params = RingParams::standard();
         let (r, c) = commit(&params, 1 << BITS, b"agg-oob");
         let proof = prove_range_agg(&params, 1 << BITS, &r, BITS, b"seed").expect("proof emitted");
-        assert!(!verify_range_agg(&params, &c, &proof), "2^16 ∉ [0, 2^16) is rejected");
+        assert!(!verify_range_agg(&params, &c, 16, &proof), "2^16 ∉ [0, 2^16) is rejected");
     }
 
     #[test]
@@ -295,7 +309,7 @@ mod tests {
         let (r, _c) = commit(&params, 1234, b"agg-bind");
         let proof = prove_range_agg(&params, 1234, &r, BITS, b"seed").unwrap();
         let (_r2, other) = commit(&params, 1234, b"other-randomness");
-        assert!(!verify_range_agg(&params, &other, &proof), "the value commitment is bound in");
+        assert!(!verify_range_agg(&params, &other, 16, &proof), "the value commitment is bound in");
     }
 
     #[test]
@@ -305,6 +319,6 @@ mod tests {
         let p1 = prove_range_agg(&params, 999, &r, BITS, b"seed-a").unwrap();
         let p2 = prove_range_agg(&params, 999, &r, BITS, b"seed-b").unwrap();
         assert_ne!(p1, p2, "different seeds ⇒ different zero-knowledge proofs");
-        assert!(verify_range_agg(&params, &c, &p1) && verify_range_agg(&params, &c, &p2));
+        assert!(verify_range_agg(&params, &c, 16, &p1) && verify_range_agg(&params, &c, 16, &p2));
     }
 }

@@ -36,6 +36,7 @@ use crate::ring::Poly;
 use crate::ring_hash::{ELL_H, HashNode, HashParams};
 
 /// A fixed-depth Merkle tree over the SIS hash. Leaves are note commitments; capacity is `2^depth`.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RingTree {
     hp: HashParams,
     leaves: Vec<HashNode>,
@@ -87,6 +88,19 @@ impl RingTree {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.leaves.is_empty()
+    }
+
+    /// The tree's depth (`log₂` of its capacity).
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// The appended leaves in tree order — what a state snapshot carries. Restoring re-appends them in this order,
+    /// which rebuilds the frontier (and hence every root and path) exactly.
+    #[must_use]
+    pub fn leaves(&self) -> &[HashNode] {
+        &self.leaves
     }
 
     /// Append a leaf (a note commitment). Returns its index, or `None` if the tree is full.

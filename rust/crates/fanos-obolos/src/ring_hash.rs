@@ -55,6 +55,10 @@ pub const K_H: usize = 1;
 /// Domain-separation label for a node's canonical 32-byte digest ([`HashNode::digest`]).
 const NODE_DIGEST_LABEL: &str = "FANOS-obolos-v1/ring-node-digest";
 
+// [`HashNode::to_short_bytes`] encodes one digit per `u16`, which is a bijection only while a digit is exactly 16
+// bits wide. If the gadget base ever changes, that encoding must change with it.
+const _: () = assert!(LOG_BASE == 16, "the canonical node encoding packs one digit per u16");
+
 /// Node width in ring elements: the gadget decomposition of a `K_H`-element image is `K_H·DIGITS` short polys.
 pub const ELL_H: usize = K_H * DIGITS;
 
@@ -85,6 +89,45 @@ impl HashNode {
     pub(crate) fn from_limbs(limbs: Vec<Poly>) -> Self {
         debug_assert_eq!(limbs.len(), ELL_H, "a node has ELL_H limbs");
         Self { limbs }
+    }
+
+    /// The node's canonical bytes — every coefficient as a little-endian `u16`, limb by limb. `None` if the node is
+    /// not [`short`](Self::is_short).
+    ///
+    /// A valid node's coefficients are digits `< BASE = 2^{LOG_BASE}`, and `LOG_BASE = 16` makes a digit *exactly* a
+    /// `u16` — so this is a **bijection** between short nodes and byte strings of length `ELL_H·D·2`, which is what a
+    /// canonical encoding needs (two byte strings can never decode to the same node, and a node has one encoding).
+    /// It is also 4× tighter than the `u64`-per-coefficient form [`digest`](Self::digest) hashes.
+    #[must_use]
+    pub fn to_short_bytes(&self) -> Option<Vec<u8>> {
+        if !self.is_short() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(ELL_H * D * 2);
+        for limb in &self.limbs {
+            for &c in limb.coeffs() {
+                out.extend_from_slice(&(u16::try_from(c).ok()?).to_le_bytes());
+            }
+        }
+        Some(out)
+    }
+
+    /// Decode a node from [`to_short_bytes`](Self::to_short_bytes), or `None` if the length is wrong. Every `u16`
+    /// is a valid digit, so any correctly-sized input decodes to a genuinely short node.
+    #[must_use]
+    pub fn from_short_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != ELL_H * D * 2 {
+            return None;
+        }
+        let mut limbs = Vec::with_capacity(ELL_H);
+        for limb in bytes.as_chunks::<{ D * 2 }>().0 {
+            let mut coeffs = [0u64; D];
+            for (slot, &pair) in coeffs.iter_mut().zip(limb.as_chunks::<2>().0) {
+                *slot = u64::from(u16::from_le_bytes(pair));
+            }
+            limbs.push(Poly::from_u64(&coeffs));
+        }
+        Some(Self { limbs })
     }
 
     /// The node's canonical **32-byte digest** — a labeled hash of every limb coefficient in little-endian order.
@@ -263,6 +306,30 @@ mod tests {
         assert!(a.is_short(), "a leaf node has digit-sized coefficients");
         assert_eq!(a, node(b"leaf-1"), "encoding is deterministic");
         assert_ne!(a, node(b"leaf-2"), "distinct inputs give distinct leaves");
+    }
+
+    #[test]
+    fn the_canonical_node_encoding_is_a_bijection_on_short_nodes() {
+        // What a state snapshot and (later) a wire codec rest on: a short node has exactly one encoding, and every
+        // correctly-sized byte string decodes to exactly one short node.
+        let params = HashParams::standard();
+        let a = node(b"enc-a");
+        let bytes = a.to_short_bytes().expect("a short node encodes");
+        assert_eq!(bytes.len(), ELL_H * D * 2, "one u16 digit per coefficient");
+        assert_eq!(HashNode::from_short_bytes(&bytes).as_ref(), Some(&a), "…and decodes back exactly");
+        // Distinct nodes encode distinctly, and a hash output (the general case) round-trips too.
+        let parent = params.hash(&a, &node(b"enc-b"));
+        assert_ne!(bytes, parent.to_short_bytes().unwrap(), "distinct nodes have distinct encodings");
+        assert_eq!(HashNode::from_short_bytes(&parent.to_short_bytes().unwrap()).as_ref(), Some(&parent));
+        // A wrong length is refused rather than silently truncated.
+        assert!(HashNode::from_short_bytes(&bytes[..bytes.len() - 1]).is_none(), "short input refused");
+        assert!(HashNode::from_short_bytes(&[]).is_none(), "empty input refused");
+        // A non-short node has no encoding at all — the digits would not fit a u16.
+        let mut limbs = a.limbs().to_vec();
+        limbs.pop();
+        limbs.push(Poly::constant(BASE)); // exactly at the base: one too large for a digit
+        let long = HashNode::from_limbs(limbs);
+        assert!(!long.is_short() && long.to_short_bytes().is_none(), "a non-short node cannot be encoded");
     }
 
     #[test]
