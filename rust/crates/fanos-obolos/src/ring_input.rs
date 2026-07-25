@@ -2,7 +2,7 @@
 //! every sub-proof over the *same* note. It composes the four built primitives so that a single hidden note `cm`,
 //! its secret key `nsk`, its value node, and its value commitment `Cv` are shared across all of them:
 //!
-//! - **note-validity** ([`crate::ring_note`]) — `cm = hash(value_node, hash(nsk, nsk))`;
+//! - **note-validity** ([`crate::ring_note`]) — `cm = hash(value_node, hash(hash(nsk, nsk), rho))`;
 //! - **value-tie** ([`crate::ring_value_tie`]) — `value_node` encodes the amount in `Cv`;
 //! - **untraceability** ([`crate::ring_untraceable`]) — `cm` is a tree member under the public root, and the public
 //!   nullifier `nf = hash(nsk, cm)`.
@@ -24,20 +24,19 @@ use alloc::vec::Vec;
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 use crate::ring_hash::{HashNode, HashParams};
 use crate::ring_membership::{NodeWitness, commit_node, node_r};
-use crate::ring_note::{NoteProof, prove_note, verify_note};
+use crate::ring_note::{NoteProof, NoteScheme, prove_note, verify_note};
 use crate::ring_untraceable::{UntraceableProof, prove_untraceable, verify_untraceable};
 use crate::ring_value_tie::{ValueTieProof, prove_value_tie, verify_value_tie};
 
-/// The domain-separated SIS hash instances a spend uses.
+/// The domain-separated SIS hash instances a spend uses — the [`NoteScheme`] (how a note is built) plus the two
+/// ledger-level hashes (the tree it lives in and the nullifier it reveals).
 pub struct SpendScheme {
+    /// How a note commitment is built from `(value, nsk, rho)`.
+    pub note: NoteScheme,
     /// The note-commitment tree hash.
     pub tree_hp: HashParams,
     /// The nullifier hash `nf = hash(nsk, cm)`.
     pub nf_hp: HashParams,
-    /// The owner-derivation hash `owner = hash(nsk, nsk)`.
-    pub owner_hp: HashParams,
-    /// The note-commitment hash `cm = hash(value_node, owner)`.
-    pub note_hp: HashParams,
 }
 
 impl SpendScheme {
@@ -45,10 +44,9 @@ impl SpendScheme {
     #[must_use]
     pub fn standard() -> Self {
         Self {
+            note: NoteScheme::standard(),
             tree_hp: HashParams::standard(),
             nf_hp: HashParams::from_seed(b"FANOS-obolos-v1/nullifier"),
-            owner_hp: HashParams::from_seed(b"FANOS-obolos-v1/owner"),
-            note_hp: HashParams::from_seed(b"FANOS-obolos-v1/note"),
         }
     }
 }
@@ -69,8 +67,9 @@ fn sub(base: &[u8], tag: &[u8]) -> Vec<u8> {
     s
 }
 
-/// Prove the full spend of one input: the note `cm = hash(value_node, hash(nsk, nsk))` is a tree member with the
-/// public root, its nullifier is `nf = hash(nsk, cm)`, and `value_node` encodes the amount in `cv`. Returns the
+/// Prove the full spend of one input: the note `cm = hash(value_node, hash(hash(nsk, nsk), rho))` is a tree member
+/// with the public root, its nullifier is `nf = hash(nsk, cm)`, and `value_node` encodes the amount in `cv`. `rho`
+/// is the note's per-note uniqueness randomness (delivered to the spender with the note's opening). Returns the
 /// note commitment `cm` (the leaf the caller hashes to the root) and the public nullifier `nf`.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
@@ -79,6 +78,7 @@ pub fn prove_input(
     scheme: &SpendScheme,
     nsk: &HashNode,
     value_node: &HashNode,
+    rho: &HashNode,
     cv: &RingCommitment,
     rv: &RingRandomness,
     siblings: &[HashNode],
@@ -90,10 +90,10 @@ pub fn prove_input(
     let nsk_r = node_r(seed, "/nsk", 0);
     let value_r = node_r(seed, "/valnode", 0);
 
-    // Note validity — computes cm = hash(value_node, hash(nsk, nsk)). Its masking is domain-separated (/note).
+    // Note validity — computes cm = hash(value_node, hash(hash(nsk, nsk), rho)). Masking is domain-separated (/note).
     let nsk_w = NodeWitness { node: nsk, randomness: &nsk_r };
     let value_w = NodeWitness { node: value_node, randomness: &value_r };
-    let (cm, note) = prove_note(params, &scheme.owner_hp, &scheme.note_hp, &nsk_w, &value_w, &cm_r, &sub(seed, b"/note"))?;
+    let (cm, note) = prove_note(params, &scheme.note, &nsk_w, &value_w, rho, &cm_r, &sub(seed, b"/note"))?;
 
     // Value-tie — value_node encodes cv's amount (/vtie masking).
     let value_tie = prove_value_tie(params, cv, rv, value_node, &value_r, &sub(seed, b"/vtie"))?;
@@ -122,8 +122,7 @@ pub fn verify_input(
         // The note is well-formed over the SAME cm, nsk (from untraceability) and value_node.
         && verify_note(
             params,
-            &scheme.owner_hp,
-            &scheme.note_hp,
+            &scheme.note,
             proof.untraceable.cm_commitment(),
             proof.untraceable.nsk_commitment(),
             &proof.value_coms,
@@ -155,12 +154,13 @@ mod tests {
         let cv = RingCommitment::commit(&params, v, &rv);
         let vn = value_node(v);
         let nsk = HashNode::from_bytes(b"in-nsk");
+        let rho = HashNode::from_bytes(b"in-rho");
         let sib0 = HashNode::from_bytes(b"in-sib");
         let d0 = 0u64;
         let sibs = [sib0.clone()];
         let dirs = [d0];
         let (cm, nf, proof) =
-            prove_input(&params, &scheme, &nsk, &vn, &cv, &rv, &sibs, &dirs, b"seed").expect("input spend");
+            prove_input(&params, &scheme, &nsk, &vn, &rho, &cv, &rv, &sibs, &dirs, b"seed").expect("input spend");
         // The tree root cm hashes up to (matching what prove_input's membership computed).
         let root = {
             let (l, r) = if d0 == 1 { (sib0.clone(), cm.clone()) } else { (cm.clone(), sib0.clone()) };

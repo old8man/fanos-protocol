@@ -128,32 +128,119 @@ check would let limbs swap independently (invalid); and a non-constant `d` makes
 convolution whose result is generally *not short*, so the node **shortness** proofs reject it — the swap relies on
 that rather than proving `d` constant directly.
 
-## 4. Soundness scope and the remaining work
+### 3.4 Membership soundness — the sound path
 
-The membership proof is at its **structural core**: it chains the linear hash relations, the swap selections, and
-the leaf → root tie, all in zero knowledge and tested end-to-end. Two pieces complete it:
+`prove_path` chains the linear relations and ties leaf → root, but that alone is not sound: a prover could satisfy
+the linear system with **non-short** "nodes" and forge a path (and the swap's constant-`d` guarantee rests on
+shortness too). `prove_path_sound` adds a shortness proof for every *hidden* node — leaf, every sibling, every
+intermediate — and checks the public root's digits directly. That is `O(depth · ℓ · LOG_BASE · REPETITIONS)`
+binarity proofs: the known, inherent cost of lattice ZK Merkle membership, with recursive-SNARK compaction the
+future optimisation.
 
-1. **Node shortness in the path.** Every node must be proven short (`ring_shortness` per limb) — otherwise a prover
-   could satisfy the linear system with non-short "nodes" and forge a path (and the swap's constant-`d` guarantee
-   rests on it). This is `O(depth · ℓ · LOG_BASE · REPETITIONS)` binarity proofs — the known, inherent cost of
-   lattice ZK Merkle membership. Recursive-SNARK compaction is the future optimisation.
-2. **Nullifier + ownership.** `nf = PRF(nsk, cm)` (public `nf`, hidden `nsk, cm`) and note ownership, both
-   redesigned onto the SIS hash so they reduce to hash-step + shortness proofs, as the tree hash does.
+## 4. The ring-native note, and how a whole spend composes
+
+The BLAKE3 note ([`note.rs`](../rust/crates/fanos-obolos/src/note.rs)) is unusable inside a ZK proof, so the note
+is rebuilt out of the *same* SIS hash as the tree — domain-separated instances, so every note relation is a chain
+of linear hash steps ([`ring_note.rs`](../rust/crates/fanos-obolos/src/ring_note.rs), `NoteScheme`):
+
+```text
+tag        = hash_owner(nsk, nsk)          — the owner tag: one-way in the secret nullifier key (ownership)
+note_owner = hash_rho(tag, rho)            — the ONE-TIME note key: fresh per note
+cm         = hash_note(value_node, note_owner)   — the note commitment / tree leaf
+value_node = ⟨digits of v base 2^LOG_BASE⟩ — one digit per limb, so ℓ = 4 limbs cover 2⁵¹
+```
+
+### 4.1 Why `rho` is load-bearing
+
+Without it the leaf is `hash(value_node, tag)` — deterministic in *(amount, recipient)* — so two payments of the
+same amount to the same recipient produce the **identical leaf**, and two independent failures follow:
+
+- **privacy**: leaf equality is public on the tree, so an observer reads "same amount, same recipient" off
+  commitments that are meant to leak nothing;
+- **spendability**: an identical `cm` gives an identical nullifier `nf = hash(nsk, cm)`, so the second note is
+  rejected as a double-spend — value silently destroyed.
+
+A fresh per-note `rho` (the ring-native form of the BLAKE3 note's `rho`, and of a stealth address's one-time key)
+closes both. It reaches the recipient out of band with the note's opening, since spending requires it.
+
+> **Residual — position-binding.** `rho` makes *honest* collisions impossible by freshness, but a malicious sender
+> can deliberately reuse `rho` across two outputs to the same recipient, creating two identical leaves of which the
+> recipient can spend only one (a griefing vector, no inflation). The BLAKE3 design closes this structurally by
+> making the nullifier position-bound — `nf = H(nsk ‖ position ‖ cm)`, audit O-M1 — because every tree slot is
+> unique. The ring analogue is `nf = hash(nsk, hash(cm, pos_node))` with a `ring_linear` relation tying
+> `pos_node`'s digits to the path's already-committed direction bits (`position = Σ 2ʲ·d_j`). Tracked, not yet built.
+
+### 4.2 Per-input spend proof ([`ring_input`](../rust/crates/fanos-obolos/src/ring_input.rs))
+
+Three sub-proofs over **one** note, bound by *shared commitments* (the binding is the soundness — otherwise a
+spender could balance one note's amount while spending another's):
+
+| Sub-proof | Proves | Shares |
+|---|---|---|
+| [`ring_note`](../rust/crates/fanos-obolos/src/ring_note.rs) | `cm = hash(value_node, hash(hash(nsk,nsk), rho))` | verified against untraceability's `cm`/`nsk` commitments |
+| [`ring_value_tie`](../rust/crates/fanos-obolos/src/ring_value_tie.rs) | `value_node` encodes the amount in `Cv` | the same `value_node` commitment |
+| [`ring_untraceable`](../rust/crates/fanos-obolos/src/ring_untraceable.rs) | `cm` is a tree member under the root **and** `nf = hash(nsk, cm)` | the shared `cm`, `nsk` |
+
+The nullifier is a hash step with a **public output**: the verifier ties the committed hash output to the public
+`nf` via a revealed randomness, exactly as the path ties its top node to the public root.
+
+### 4.3 Per-output creation proof ([`ring_output`](../rust/crates/fanos-obolos/src/ring_output.rs))
+
+The mirror on the output side, and a soundness gap the value commitment alone leaves open: a transaction appends
+one new leaf per output and publishes one `Cv` per output, and **nothing tied them together**. A sender could
+balance an output at a small amount while appending a leaf encoding a larger one, then spend that leaf for the
+larger amount — value conjured, every other check satisfied. (The transparent reference has the same shape: it
+checks each output `Cv` opens to a claimed amount but never binds the appended leaf to it.) With `cm` and `Cv` both
+public, over hidden `value_node`, `note_owner`:
+
+```text
+cm = hash(value_node, note_owner)   public-output hash step
+value_node ↔ Cv                     the value-tie
+value_node, note_owner short        so cm's SIS opening is unique
+```
+
+Shortness makes the opening unique, the step binds `cm` to the committed `value_node`, the tie binds that same
+`value_node` to `Cv` — so the amount extractable from the leaf *is* the amount balanced for it. It deliberately does
+not constrain how `note_owner` was derived (the sender does not know the recipient's `nsk`); a sender who fixes it
+wrongly only makes its own output unspendable, never anyone else's and never any extra value.
+
+### 4.4 The whole transaction ([`ring_tx`](../rust/crates/fanos-obolos/src/ring_tx.rs))
+
+One `prove_input` per input, one `prove_output` per output, one `ring_confidential` amount proof — sharing each
+input's and output's `Cv` with the balance proof:
+
+| Property | proven by |
+|---|---|
+| confidentiality (amounts hidden, sound) | balance + range over the `Cv`s |
+| untraceability (which note) | membership + nullifier, per input |
+| ownership | `nf` derivable only with `nsk` (and `rho`), per input |
+| integrity (spend the note you balance) | shared `Cv`: input proof ↔ balance |
+| conservation (create only what you balance) | shared `Cv`: output proof ↔ balance, per output |
+
+`prove_shielded_tx` returns a `ProvenTx` — input leaves, **output leaves to append**, nullifiers, proof — the shape
+the ledger's `apply` consumes. The commitment tree those leaves live in is
+[`ring_tree`](../rust/crates/fanos-obolos/src/ring_tree.rs): a Merkle tree over the SIS hash yielding the root
+(anchor) and auth paths (siblings + directions) that `prove_path_sound` consumes.
 
 ## 5. Integration roadmap
 
-The backend is a set of verified libraries; wiring it into the ledger is the "libraries-ahead → wired" step
-(`docs/audit.md`):
+The proof stack is complete and verified; wiring it into the ledger is the "libraries-ahead → wired" step
+(`docs/audit.md`). In order:
 
-1. **Migrate the value commitment** in `tx` / `state` / `tree` / `build` / `wallet` / `codec` and downstream
+1. **Position-bound nullifier** (§4.1 residual) — the last soundness item inside the proof stack itself.
+2. **Ring-native shielded state** — `ring_tree` + a nullifier set + `apply(tx)` verifying `ring_tx` and appending
+   the proven output leaves: the ring successor to [`state.rs`](../rust/crates/fanos-obolos/src/state.rs), with the
+   same gate order (known anchor → fresh nullifiers → capacity → valid proof → commit) and the same rolling-anchor
+   window (audit O-M2).
+3. **Migrate the value commitment and note model** in `tx` / `build` / `wallet` / `codec` and downstream
    `fanos-dromos` from the flat-vector [`commit`](../rust/crates/fanos-obolos/src/commit.rs) to
-   [`ring_commit`](../rust/crates/fanos-obolos/src/ring_commit.rs).
-2. **Wire `ConfidentialProof: ShieldedProof`** — [`ring_confidential`](../rust/crates/fanos-obolos/src/ring_confidential.rs)
-   for amounts + the membership/nullifier proofs for untraceability — replacing the transparent proof as the
-   consensus relation, with `TransparentProof` retained as the degraded-mode oracle.
-3. **Calibrate** `REPETITIONS`, `CHALLENGE_BITS`, and `(K, ℓ, D, q)` to a bit-security target; add constant-time
+   [`ring_commit`](../rust/crates/fanos-obolos/src/ring_commit.rs) + SIS notes.
+4. **Wire `ring_tx` as `ShieldedProof`** — replacing the transparent proof as the consensus relation, with
+   `TransparentProof` retained as the degraded-mode oracle.
+5. **Calibrate** `REPETITIONS`, `CHALLENGE_BITS`, and `(K, ℓ, D, q)` to a bit-security target; add constant-time
    arithmetic and the merged-butterfly NTT; commission external cryptanalysis. Until then the backend stays
-   **[P]/[H]** and is never claimed as production-audited.
+   **[P]/[H]** and is never claimed as production-audited. A whole-transaction proof is *minutes* at real `bits`
+   (the inherent lattice-ZK cost); range/shortness aggregation and recursive-SNARK compaction are the perf frontier.
 
 ## 6. Verification status
 

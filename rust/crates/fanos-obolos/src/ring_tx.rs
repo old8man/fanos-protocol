@@ -43,6 +43,9 @@ use crate::ring_output::{OutputProof, prove_output, verify_output};
 pub struct TxInput {
     /// The spender's secret nullifier key.
     pub nsk: HashNode,
+    /// The note's per-note uniqueness randomness (delivered with the note's opening when it was created) — with
+    /// `nsk` it reproduces the note's one-time key, hence its leaf ([`crate::ring_note`]).
+    pub rho: HashNode,
     /// The input amount.
     pub value: u64,
     /// The re-randomisation of the input's value commitment.
@@ -59,11 +62,16 @@ pub struct TxOutput {
     pub value: u64,
     /// The output value-commitment randomness.
     pub rv: RingRandomness,
-    /// The recipient's owner tag (`hash(nsk, nsk)` of the recipient's nullifier key) bound into the created leaf.
-    /// The sender knows it from the recipient's address; it stays hidden on the ledger. The sender does **not**
-    /// know the recipient's `nsk`, so the output proof binds this owner into `cm` without deriving it — ownership
-    /// is established by the recipient's own spend proof later.
-    pub owner: HashNode,
+    /// The recipient's owner tag (`hash(nsk, nsk)` of the recipient's nullifier key), known to the sender from the
+    /// recipient's address. The sender does **not** know the recipient's `nsk`, so the output proof binds the
+    /// derived one-time key into `cm` without deriving it from `nsk` — ownership is established by the recipient's
+    /// own spend proof later.
+    pub owner_tag: HashNode,
+    /// A **fresh per-note** `rho`, which with `owner_tag` forms the note's one-time key
+    /// ([`crate::ring_note::NoteScheme::note_owner`]). It must be freshly sampled per output — that is what makes
+    /// two payments of the same amount to the same recipient distinct leaves — and delivered to the recipient with
+    /// the note's opening, since spending the note requires it.
+    pub rho: HashNode,
 }
 
 /// A complete zero-knowledge shielded-transaction proof: a spend proof per input, a note-creation proof per
@@ -132,6 +140,7 @@ pub fn prove_shielded_tx(
             scheme,
             &inp.nsk,
             &vn,
+            &inp.rho,
             &cv,
             &inp.rv,
             &inp.siblings,
@@ -145,15 +154,25 @@ pub fn prove_shielded_tx(
         input_r.push(inp.rv.clone());
     }
 
-    // Per output: prove the created leaf `cm = hash(value_node, owner)` is bound to its value commitment `Cv`, so
-    // the note the recipient later spends is worth exactly the amount balanced here (the conservation guard).
+    // Per output: prove the created leaf `cm = hash(value_node, note_owner)` is bound to its value commitment `Cv`,
+    // so the note the recipient later spends is worth exactly the amount balanced here (the conservation guard).
+    // The one-time key `note_owner = hash(owner_tag, rho)` is what makes each created leaf unique.
     let mut output_proofs = Vec::with_capacity(outputs.len());
     let mut output_cms = Vec::with_capacity(outputs.len());
     for (i, out) in outputs.iter().enumerate() {
         let cv = RingCommitment::commit(params, out.value, &out.rv);
         let vn = value_node(out.value);
-        let (cm, proof) =
-            prove_output(params, &scheme.note_hp, &cv, &out.rv, &vn, &out.owner, LOG_BASE as usize, &sub(seed, b"/out", i))?;
+        let note_owner = scheme.note.note_owner(&out.owner_tag, &out.rho);
+        let (cm, proof) = prove_output(
+            params,
+            &scheme.note.note_hp,
+            &cv,
+            &out.rv,
+            &vn,
+            &note_owner,
+            LOG_BASE as usize,
+            &sub(seed, b"/out", i),
+        )?;
         output_cms.push(cm);
         output_proofs.push(proof);
     }
@@ -197,7 +216,7 @@ pub fn verify_shielded_tx(
     }
     // Each output leaf is bound to its value commitment — a created note is worth exactly what it balances.
     for ((cv, cm), output_proof) in output_cvs.iter().zip(output_cms).zip(&proof.outputs) {
-        if !verify_output(params, &scheme.note_hp, cv, cm, LOG_BASE as usize, output_proof) {
+        if !verify_output(params, &scheme.note.note_hp, cv, cm, LOG_BASE as usize, output_proof) {
             return false;
         }
     }
@@ -220,12 +239,21 @@ mod tests {
         let rv_in = RingRandomness::from_seed(b"tx-rv-in");
         let rv_out = RingRandomness::from_seed(b"tx-rv-out");
         let nsk = HashNode::from_bytes(b"tx-nsk");
+        let rho_in = HashNode::from_bytes(b"tx-rho-in");
         let sib0 = HashNode::from_bytes(b"tx-sib");
-        let input = TxInput { nsk, value: v_in, rv: rv_in.clone(), siblings: alloc::vec![sib0.clone()], directions: alloc::vec![0] };
-        // The output is created for a recipient whose owner tag is hash(nsk_out, nsk_out).
+        let input = TxInput {
+            nsk,
+            rho: rho_in,
+            value: v_in,
+            rv: rv_in.clone(),
+            siblings: alloc::vec![sib0.clone()],
+            directions: alloc::vec![0],
+        };
+        // The output is created for a recipient whose owner tag is hash(nsk_out, nsk_out), with a fresh rho.
         let nsk_out = HashNode::from_bytes(b"tx-out-nsk");
-        let owner_out = scheme.owner_hp.hash(&nsk_out, &nsk_out);
-        let output = TxOutput { value: v_out, rv: rv_out.clone(), owner: owner_out };
+        let owner_tag = scheme.note.owner_hp.hash(&nsk_out, &nsk_out);
+        let output =
+            TxOutput { value: v_out, rv: rv_out.clone(), owner_tag, rho: HashNode::from_bytes(b"tx-rho-out") };
 
         let ProvenTx { input_cms, output_cms, nullifiers, proof } =
             prove_shielded_tx(&params, &scheme, &[input], &[output], fee, 16, b"seed").expect("shielded tx");
