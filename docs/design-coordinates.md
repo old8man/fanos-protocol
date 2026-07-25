@@ -325,6 +325,28 @@ converges to the *same* full occupancy in a handful of sweeps, and provably term
 
 Capacity therefore goes from `O(√P)` to the full `P`, at 1–2.3 probes per node.
 
+### ⚠️ What rank arbitration does and does not buy — an adversarial correction
+
+The section below claims rank arbitration works because "arrival order is attacker-controlled; rank is not". **Probing that
+claim refuted half of it.** Rank is a VRF output over an identity the attacker *chooses*, so it is attacker-*influenced*
+even though it is unforgeable for a fixed identity. Measured against the real VRF
+(`fanos-vrf/examples/grind_probe.rs`): finding an identity that collides with a **chosen victim** at a **lower rank** took
+**20 draws** on PG(2,2) and **8** on PG(2,4) — the analytic `~2P` — and each draw is a local, offline VRF evaluation.
+
+It was worse than that, because the admission proof compounded it. The Sybil challenge was `(coord, epoch)` with **no
+identity component**, so a solved proof was replayable by anyone claiming that point: the attacker could present the
+*incumbent's own* proof. Evicting a chosen node therefore cost ~20 VRF evaluations and **zero** proof-of-work.
+
+**Fixed:** `admission_challenge` now binds the identity, so a proof admits only the identity that solved it. Two honest
+caveats, both recorded rather than glossed:
+
+- A node carrying **no identity** (self-certification not in use) contributes an empty component and the challenge
+  degenerates to the old form, replayable among all such nodes. The defence requires the self-certifying path.
+- **Grinding itself remains cheap and cannot be priced.** Evaluating a VRF for a candidate identity is local and offline;
+  no admission gate sees it. So rank arbitration between an honest node and a Sybil-capable adversary rests on identities
+  being **scarce** — stake- or reputation-bound — not on the rank rule alone. The rank rule removes *arrival-order* control,
+  which is a real improvement over what preceded it, and that is the whole of what it removes.
+
 ### Wiring: rank arbitration replaces arrival order
 
 `Directory` now stores each entry's **rank** alongside its address (`insert_ranked`), and a contested point is decided by

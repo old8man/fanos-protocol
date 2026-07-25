@@ -1648,7 +1648,7 @@ impl<F: Field> OverlayNode<F> {
         self.membership.admission_difficulty = Some(difficulty);
         self.membership.admission_policy = Some(Box::new(PowAdmission::new(difficulty)));
         self.membership.admission_proof =
-            PowAdmission::new(difficulty).solve(&admission_challenge(self.coord.coords(), self.epoch));
+            PowAdmission::new(difficulty).solve(&admission_challenge(&self.membership.identity, self.coord.coords(), self.epoch));
         self
     }
 
@@ -2299,7 +2299,12 @@ impl<F: Field> OverlayNode<F> {
         // spec §7.5), sent to the *claimed* coordinate rather than the immediate relay hop —
         // `Announce` is flooded, so whoever forwarded it to us need not be the joiner itself.
         if self.config.require_admission {
-            let challenge = admission_challenge(coord, self.epoch);
+            // The challenge binds the announcer's IDENTITY, not merely its coordinate. Without that a solved proof is
+            // replayable by anyone claiming the same point: an attacker who wants a seat could present the *incumbent's
+            // own* proof and pay nothing. Measured cost of the surrounding attack before this binding — grind ~20
+            // identities until one collides with a chosen victim at a lower rank (`fanos-vrf/examples/grind_probe.rs`),
+            // reuse the victim's proof, and the rank rule evicts the victim for zero proof-of-work.
+            let challenge = admission_challenge(&id, coord, self.epoch);
             if !self.membership.admits(&challenge, &proof) {
                 return alloc::vec![Effect::Send {
                     to: coord,
@@ -2431,7 +2436,7 @@ impl<F: Field> OverlayNode<F> {
         // modest difficulty, and deterministic (sans-I/O replay is preserved).
         if let Some(difficulty) = self.membership.admission_difficulty {
             self.membership.admission_proof =
-                PowAdmission::new(difficulty).solve(&admission_challenge(new_coord, self.epoch));
+                PowAdmission::new(difficulty).solve(&admission_challenge(&self.membership.identity, new_coord, self.epoch));
         }
         // Preserve the hierarchical DESCENT chain across the reshuffle (spec §L1): only the level-0 VRF
         // transport coordinate moves each epoch; the deeper sub-cell levels are identity-hash-derived
@@ -2987,8 +2992,24 @@ fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>> {
 /// already rotates unpredictably under the flooded epoch-agreement gossip (`on_epoch_agree`), so the
 /// binding is real today, just not yet as strong as the full spec picture.
 #[must_use]
-pub fn admission_challenge(coord: Triple, epoch: Epoch) -> Vec<u8> {
-    let mut challenge = Vec::with_capacity(12 + 4);
+/// The Sybil-admission challenge a joiner solves and a receiver re-derives — bound to **identity, coordinate and epoch**.
+///
+/// The identity component is what stops a solved proof being **replayed by another node claiming the same point**.
+/// Without it an attacker could present the incumbent's own proof and pay nothing, which — combined with identity
+/// grinding, measured at ~20 draws to collide with a chosen victim at a lower rank
+/// (`fanos-vrf/examples/grind_probe.rs`) — made evicting a chosen node cost *zero* work.
+///
+/// **Honest limitation:** a node that carries no identity (self-certification not in use) contributes an empty component,
+/// and the challenge degenerates to the old `(coord, epoch)` form, replayable among all such nodes. The defence therefore
+/// requires the self-certifying membership path, and is one more reason to run it.
+///
+/// **What this does *not* fix, stated plainly:** identity grinding itself stays cheap, because evaluating a VRF for a
+/// candidate identity is local and offline — no admission gate can price it. Rank arbitration between an honest node and
+/// a Sybil-capable adversary therefore rests on identities being *scarce* (stake- or reputation-bound), not on the rank
+/// rule alone. See `docs/design-coordinates.md`.
+pub fn admission_challenge(id: &[u8], coord: Triple, epoch: Epoch) -> Vec<u8> {
+    let mut challenge = Vec::with_capacity(id.len() + 12 + 4);
+    challenge.extend_from_slice(id);
     challenge.extend_from_slice(&fanos_geometry::encode_triple(coord));
     challenge.extend_from_slice(&epoch.low32_be_bytes());
     challenge
@@ -3807,6 +3828,29 @@ mod tests {
             )),
             "the shard-set matching the in-flight nonce reconstructs and resolves the read"
         );
+    }
+
+    #[test]
+    fn an_admission_proof_is_bound_to_the_identity_that_solved_it() {
+        // Found by probing the rank rule adversarially rather than by review. The challenge used to be `(coord, epoch)`
+        // alone, so a solved proof was **replayable by any identity claiming that point** — an attacker could present the
+        // incumbent's own proof and pay nothing. Combined with identity grinding (measured at ~20 draws to collide with a
+        // chosen victim at a lower rank, `fanos-vrf/examples/grind_probe.rs`), that made eviction cost zero work.
+        let coord = Point::<F2>::at(3).coords();
+        let epoch = Epoch::new(4);
+        let mine = admission_challenge(b"identity-A", coord, epoch);
+        let theirs = admission_challenge(b"identity-B", coord, epoch);
+        assert_ne!(mine, theirs, "same point, same epoch, different identity ⇒ different challenge");
+
+        // A proof solved for one identity does not admit another.
+        let policy = PowAdmission::new(8);
+        let proof = policy.solve(&mine);
+        assert!(policy.admits(&mine, &proof), "it admits the identity that solved it");
+        assert!(!policy.admits(&theirs, &proof), "and is worthless to anyone else at the same point");
+
+        // The pre-existing bindings still hold: a different point or epoch is still a different challenge.
+        assert_ne!(mine, admission_challenge(b"identity-A", Point::<F2>::at(4).coords(), epoch));
+        assert_ne!(mine, admission_challenge(b"identity-A", coord, Epoch::new(5)));
     }
 
     #[test]

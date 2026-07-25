@@ -168,10 +168,11 @@ fn a_joiner_with_a_valid_pow_proof_is_admitted_normally() {
         ..Config::default()
     };
     let joiner_coord = Point::<F2>::at(JOINER_POINT).coords();
-    // Solve the SAME challenge `on_announce` will re-derive: (the joiner's own coordinate, epoch
-    // 0 — neither node advances the epoch in this test).
+    // Solve the SAME challenge `on_announce` will re-derive: (the joiner's identity, its own coordinate, epoch 0 —
+    // neither node advances the epoch in this test). This joiner sets no identity, so the identity component is empty;
+    // see `admission_challenge` on why that degenerates the replay defence and what restores it.
     let proof =
-        PowAdmission::new(DIFFICULTY).solve(&admission_challenge(joiner_coord, Epoch::ZERO));
+        PowAdmission::new(DIFFICULTY).solve(&admission_challenge(b"", joiner_coord, Epoch::ZERO));
     let joiner = OverlayNode::<F2>::new(Point::at(JOINER_POINT), Config::default())
         .with_admission_proof(proof);
     let (mut sim, joiner_coord, joined, sybil_rejected) = spawn_pair(2, receiver_config, joiner);
