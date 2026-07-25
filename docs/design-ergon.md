@@ -395,17 +395,28 @@ Fano structure detects at the cell level. Designing that is the next real geomet
 |---|---|
 | `TAG_TRANSPARENT` … `TAG_SLASH` | eight primitive `Effect`s at level 0; identical rules, now with typed footprints |
 | `HybridLedger::apply` dispatch | one `Term` interpreter; the eight-way `match` becomes eight effect implementations |
-| `AccessList` (declared) | **derived** by `fp(t)`; the declared form is deleted, removing a trust assumption |
+| `AccessList` (derived by a second eight-way match) | **derived by `fp(t)`** from the same structure that defines the transition — one match instead of two that must agree |
 | DROMOS conflict DAG | unchanged, and fed a tighter footprint |
 | blind ordering / anti-MEV | unchanged: ordering is still fixed before reveal, and a term reveals nothing extra |
 | OBOLOS shielded spend | the canonical `Prove`; the model generalises it rather than sitting beside it |
 | HERMES HTLC | `Gate (HashLock h) (Seq [...])` — the lock becomes a *predicate*, not a bespoke tag |
 | `fanos-holarch` Γ-gate | the natural home for `viable`'s coherence refinement [P] |
 
-The `AccessList` row is the one worth pausing on. Today a transaction *declares* its access list and the scheduler trusts
-it; a wrong declaration is a consensus fault. Under ERGON the footprint is computed from the term, so the trust assumption
-disappears — not mitigated, **deleted**. That is an unambiguous security improvement obtained as a side effect of the
-right structure, which is the usual sign that the structure is right.
+The `AccessList` row is the one worth pausing on, **and an earlier version of this document got it wrong.** It claimed
+transactions *declare* their access lists and the scheduler trusts them, so ERGON would delete a trust assumption. That is
+false about this codebase: `HybridLedger::access_of` already derives every access list by decoding the transaction. The
+overclaim is recorded rather than quietly edited, because a design doc that flatters its own proposal is worth less than
+one that can be checked.
+
+The real benefit is narrower and better evidenced. Today `access_of` and `apply` are **two hand-maintained eight-way
+matches over the same tags** — one computing what a transaction *touches*, the other what it *does* — and correctness
+requires them to agree. Add a write to `apply` and forget it in `access_of`, and the scheduler places two genuinely
+conflicting transactions in one wave and forks the state. That is not hypothetical: the shielded arm of `access_of` carries
+a comment recording exactly that defect (a missing `TREASURY` write, audit §3.7) and the fork it would have caused.
+
+Under ERGON the footprint is derived from the *same* structure that defines the transition, so there is one match to
+maintain instead of two that must be kept in step. A smaller claim than "deletes a trust assumption", and unlike that one
+it is true.
 
 ---
 

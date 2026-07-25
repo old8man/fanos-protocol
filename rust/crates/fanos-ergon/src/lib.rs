@@ -16,9 +16,21 @@
 //! speculate and roll back. Adopting a VM would not *add* expressiveness to FANOS; it would **spend** a structural
 //! property the platform already has in order to buy a familiar one.
 //!
-//! So footprints here are **derived by structural induction** on the term ([`Term::footprint`]) rather than declared by
-//! the submitter. That deletes a trust assumption rather than mitigating it: today a wrong declared access list is a
-//! consensus fault, and under ERGON there is nothing to declare.
+//! So footprints here are **derived by structural induction** on the term ([`Term::footprint`]).
+//!
+//! **A correction to an earlier claim in this module.** It previously said this "deletes a trust assumption" because a
+//! submitter's declared access list would otherwise be trusted. That is wrong about this codebase, and the error is worth
+//! recording rather than quietly editing: `fanos_dromos::HybridLedger` already *derives* every access list by decoding the
+//! transaction (`access_of`), so nothing is declared and nothing is trusted. The real benefit is narrower and better
+//! evidenced.
+//!
+//! What ERGON removes is a **drift hazard between two hand-maintained eight-way matches**. Today `access_of` and `apply`
+//! each switch over the same eight tags — one computing what a transaction *touches*, the other what it *does* — and they
+//! must agree. Add a write to `apply` and forget it in `access_of` and the scheduler lets two genuinely conflicting
+//! transactions share a wave, forking the state. That is not hypothetical: the shielded-transaction arm carries a comment
+//! recording exactly that defect (a missing `TREASURY` write, audit §3.7) and the fork it would have caused. Under ERGON
+//! the footprint comes from the *same* structure that defines the transition, so the two cannot drift apart — there is
+//! only one match to maintain.
 //!
 //! ## Why there is no gas
 //!
