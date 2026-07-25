@@ -1,0 +1,16 @@
+[package]
+name = "fanos-ergon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ERGON — the FANOS execution model (docs/design-ergon.md): a sans-I/O effect-term algebra whose footprints are derived rather than declared, whose composition depth is bounded by the SYNARC-Omega composition ceiling, and whose closure theorem makes safety compose by structural induction."
+keywords = ["execution", "effects", "algebra", "blockchain", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+
+[lints]
+workspace = true

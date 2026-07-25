@@ -1013,6 +1013,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanos-ergon"
+version = "0.1.0"
+
+[[package]]
 name = "fanos-ffi"
 version = "0.1.0"
 dependencies = [

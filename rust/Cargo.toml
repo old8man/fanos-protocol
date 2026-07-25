@@ -9,6 +9,7 @@
 resolver = "3"
 members = [
     "crates/fanos-field",
+    "crates/fanos-ergon",
     "crates/fanos-geometry",
     "crates/fanos-code",
     "crates/fanos-diakrisis",
@@ -126,6 +127,7 @@ fanos-incentives = { path = "crates/fanos-incentives", version = "0.1.0", defaul
 fanos-taxis = { path = "crates/fanos-taxis", version = "0.1.0" }
 fanos-obolos = { path = "crates/fanos-obolos", version = "0.1.0", default-features = false }
 fanos-dromos = { path = "crates/fanos-dromos", version = "0.1.0", default-features = false }
+fanos-ergon = { path = "crates/fanos-ergon", version = "0.1.0" }
 fanos-angelos = { path = "crates/fanos-angelos", version = "0.1.0", default-features = false }
 fanos-thesauros = { path = "crates/fanos-thesauros", version = "0.1.0", default-features = false }
 fanos-hermes = { path = "crates/fanos-hermes", version = "0.1.0", default-features = false }
