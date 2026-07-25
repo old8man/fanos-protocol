@@ -45,10 +45,23 @@ use fanos_primitives::hash::hash_xof;
 use crate::ring::{D, Poly};
 use crate::ring_commit::{RingCommitment, RingParams, RingRandomness};
 
-/// The wide masking bound `2²⁰` for the revealed randomness openings — far above the short (`≤ 2`) witness
-/// randomness they hide, and far below `q`, so binding holds and rejection almost never fires. Shared with the
-/// linear-relation proof ([`crate::ring_linear`]).
-pub(crate) const MASK_BOUND: i64 = 1 << 20;
+/// The wide masking bound for the revealed randomness openings — **derived from the opening count**, exactly as
+/// [`MASK_WIDE`](crate::ring_range_agg::MASK_WIDE) is, rather than from "comfortably above the witness".
+///
+/// The hidden part here is tiny (`‖γ·r‖∞ ≤ 1` for a monomial times ternary randomness, `≤ 2` for the product's
+/// `γ²r_z + γr_t`), so the per-coefficient rejection probability is only `≈ 1/B`. But one Fiat–Shamir transcript
+/// covers every round, so **all** of a proof's openings share a single accept event, and that probability compounds
+/// over `(n+1) · ELL · D · REPETITIONS` coefficients for a relation of width `n`:
+///
+/// ```text
+/// P(accept) ≈ (1 − 1/B)^((n+1) · ELL · D · REPETITIONS)
+/// ```
+///
+/// At `2²⁰` that is `0.82` for a hash step (`n = 12`) and `0.36` at `n = 64` — never a *failure* (32 attempts make
+/// that astronomically unlikely), but ~23% of the prover's work on every hash step was being redone, and more on
+/// wider relations. `2³⁰` keeps `P(accept) > 0.999` even at `n = 64`. The cost is a 10-bit wider extractable-opening
+/// norm, still far below `q = 2⁶⁴` and in the same regime as `MASK_WIDE = 2⁴⁰`.
+pub(crate) const MASK_BOUND: i64 = 1 << 30;
 
 /// Accept region for a linear opening `r_z = γ·r + r_b`: the hidden part `‖γ·r‖∞ ≤ 1`, so `‖r_z‖∞ ≤ B − 1`.
 pub(crate) const ACCEPT_LINEAR: i64 = MASK_BOUND - 1;
