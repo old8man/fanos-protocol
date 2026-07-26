@@ -462,11 +462,15 @@ impl NodeFleet {
         //   6 of 8        → the mover re-announces, peers re-key the live connection (`b17e5bb`)
         //   4 of 6        → the mover republishes its capability/load descriptors at the point it moved TO
         //
-        // The remaining link is peer-side and identified rather than guessed: a node that re-keys a moved connection knows
-        // its cell view changed, but nothing makes it re-scan, so it refreshes on its own `ROSTER_REFRESH` backoff — which
-        // can exceed the two-period window `FROZEN_SPAN` allows before calling a cell frozen. The last failure reads
-        // `[4, 5, 3, 3, 4]` with `occupied = 5 of 5`: placement fully resolved, one reader caught up, the rest not yet.
-        // Remove this guard when the cell-wide scenario passes with collisions allowed.
+        //   3 of 4        → a peer that learns of a move re-arms its roster refresh at the floor
+        //
+        // The residual is now precise, and it is a reachability limit rather than a missing signal: `PeerMoved` only reaches
+        // nodes holding a **live connection** to the mover. A node that never met it gets no signal and stays in whatever
+        // backoff it had relaxed to — up to `ROSTER_REFRESH_MAX` — so it learns only from its own directory scan. That is why
+        // the last failure reads `Refuted { frozen_for: 30s, last: [5, 3, 5, 4, 4] }`: two readers correct, three still on a
+        // long cadence, and genuinely no change across two discovery periods. Closing it needs the mover to be discoverable
+        // by nodes it has no connection to — the store-published descriptor is now correct, so what remains is the scan
+        // cadence. Remove this guard when the cell-wide scenario passes with collisions allowed.
         let mut taken: HashSet<fanos_geometry::Triple> = HashSet::new();
         let mut attempts = 0usize;
         while nodes.len() < count {

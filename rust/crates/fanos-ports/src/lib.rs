@@ -227,6 +227,22 @@ pub enum Notification {
     RendezvousLine(Triple),
     /// A peer was observed to go down (heartbeat timeout).
     PeerDown(Triple),
+    /// A **peer** moved to a different coordinate, proved on a live connection.
+    ///
+    /// Distinct from [`Reseated`](Self::Reseated), which is *this* node moving. Both change the cell's coordinate
+    /// composition, and anything that derives from that composition — the role assignment above all — must treat either as
+    /// a reason to re-derive promptly rather than on its own backoff.
+    ///
+    /// It exists because the composition can change without the peer *count* changing, so the one signal the role loop had
+    /// for "my view is behind" (`roster < peers()`) reads false: the node relaxes while its roster is short by the mover.
+    /// Measured as `[4, 5, 3, 3, 4]` with all five points held — placement fully resolved, one reader caught up, the rest
+    /// waiting out a backoff.
+    PeerMoved {
+        /// The coordinate the peer held.
+        old: Triple,
+        /// The coordinate it proved it now holds.
+        new: Triple,
+    },
     /// A local diagnosis verdict (spec §6.9).
     Verdict(fanos_diakrisis::Verdict),
     /// A mandatory self-observation: the node's encoded `CoherenceFrame` for this window

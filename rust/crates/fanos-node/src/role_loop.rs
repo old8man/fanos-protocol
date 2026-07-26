@@ -165,6 +165,30 @@ pub fn spawn_role_loop<F: Field>(
                         refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
                         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     }
+                    // A coordinate moved — this node's own (`Reseated`) or a peer's (`PeerMoved`). Either changes the
+                    // cell's composition, so the assignment is expected to move and the loop must re-derive at the FLOOR
+                    // rather than on whatever backoff it had reached.
+                    //
+                    // Nothing else would prompt it. The loop's one signal for "my view is behind" is `roster < peers()`,
+                    // and a peer moving changes the composition without changing the peer *count* — so that gate reads
+                    // false and the node relaxes while its roster is short by the mover. Measured before this arm existed:
+                    // `[4, 5, 3, 3, 4]` with all five points held, placement fully resolved, one reader caught up and the
+                    // rest waiting out a backoff.
+                    Ok(Notification::Reseated { .. } | Notification::PeerMoved { .. }) => {
+                        // Re-arm at the FLOOR; do **not** scan inline. Scanning here made things measurably worse — 0 of 3
+                        // where 4 of 6 had passed, with rosters collapsing to `[2, 2, 2, 4, 2]` and one trial failing to
+                        // resolve placement at all. A scan costs up to one `RESOLVE_TIMEOUT`, so re-scanning on every move
+                        // is exactly the overlapping-scan regime `ROSTER_REFRESH`'s 1/3 duty cycle exists to prevent: the
+                        // node ends up permanently scanning the cell and starves its own critical path.
+                        //
+                        // Resetting the backoff is the whole of what is needed. It says "look again soon" rather than "look
+                        // again now", which is the correct strength of signal: a composition change means the assignment is
+                        // *expected* to move, not that it has already.
+                        stable = 0;
+                        backoff = ROSTER_REFRESH;
+                        refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
+                        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 },

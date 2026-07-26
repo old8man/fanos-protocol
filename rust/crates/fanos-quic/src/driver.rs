@@ -285,6 +285,10 @@ struct Transport {
     endpoint: Endpoint,
     conns: ConnMap,
     input_tx: mpsc::Sender<Input>,
+    /// Transport-level events the layers above must see — currently a peer proving it moved. The driver publishes here
+    /// rather than routing through the engine because the event is about the *transport's* view of who is where, which the
+    /// engine has no part in forming.
+    events_tx: broadcast::Sender<Notification>,
     shaper: Shaper,
     /// Morph auto-fallback controller (§13.7), when a PROTEUS environment policy is configured; the send
     /// path records connection outcomes into it and rotates the shaper's morph on a trip.
@@ -1278,6 +1282,7 @@ fn spawn_inner(
         endpoint: endpoint.clone(),
         conns,
         input_tx: input_tx.clone(),
+        events_tx: events_tx.clone(),
         shaper,
         controller,
         identity,
@@ -1940,6 +1945,9 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                         {
                             map.insert(moved, addr);
                         }
+                        // Tell the layers above: the cell's coordinate composition changed without its peer *count*
+                        // changing, so nothing else would prompt a re-derivation until the mover's own backoff expired.
+                        let _ = t.events_tx.send(Notification::PeerMoved { old: from, new: moved });
                         from = moved;
                     }
                     continue;
