@@ -242,8 +242,7 @@ pub fn spawn_role_loop<F: Field>(
                         // understates the roster in exactly the way a genuine absence does, so two partial scans agree with
                         // each other while both disagree with the cell — and relaxing on that agreement is what left a
                         // frozen roster with nothing to indicate why. `complete` is the distinction that was missing.
-                        let behind = now.roster < peers() || !complete;
-                        if stable >= STABLE_BEFORE_BACKOFF && !behind {
+                        if may_relax(stable, now.roster, peers(), complete) {
                             backoff = (backoff * 2).min(ROSTER_REFRESH_MAX);
                         }
                     } else {
@@ -331,6 +330,24 @@ async fn genesis_assign<F: Field>(
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
 /// the live load directory), step the controller, publish this node's roles. `send` only fails if every
 /// receiver has dropped (the node is shutting down) — ignored.
+/// Whether the refresh may back off — i.e. whether there is *positive evidence* that looking again would find nothing new.
+///
+/// Three conditions, and each earned its place from a measured failure:
+///
+/// * `stable >= STABLE_BEFORE_BACKOFF` — one identical answer is not a pattern.
+/// * `roster >= peers` — the transport's peer table is a lower bound on membership that owes nothing to the overlay store,
+///   so a roster below it is *demonstrably* behind (`docs/design-testing.md` §5.3.2).
+/// * `complete` — the reads behind that answer actually concluded. Without this, two scans whose members timed out agree
+///   with each other while both disagree with the cell, and that agreement reads as stability: the loop relaxes, and the
+///   cell sits frozen short of its own membership. A repeat is only evidence when the reads behind it concluded.
+///
+/// Extracted so the decision can be pinned exhaustively rather than inspected: it is three booleans, and getting any one of
+/// them backwards is a cell that either never relaxes (scanning forever, starving its own critical path — §5.3.5) or
+/// relaxes on nothing.
+const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> bool {
+    stable >= STABLE_BEFORE_BACKOFF && roster >= peers && complete
+}
+
 /// Recompute and publish the assignment for `epoch`, reporting whether the directory reads it rests on were **complete**.
 ///
 /// The second value is the one that was missing. A read that timed out was indistinguishable from a member that published
@@ -441,5 +458,50 @@ mod tests {
         }
         assert_eq!(active, 3, "the cell assigns exactly the demanded 3 relays across its members");
         assert_eq!(demand_after, 3, "each controller tracked the setpoint");
+    }
+
+    #[test]
+    fn relaxing_needs_positive_evidence_on_all_three_counts() {
+        // The decision that left a cell frozen short of its own membership, pinned exhaustively. Each condition is a
+        // separate way to be wrong, and two of the three were measured the hard way.
+        const OK: u32 = STABLE_BEFORE_BACKOFF;
+
+        assert!(may_relax(OK, 5, 5, true), "settled, not behind, and the reads concluded: relax");
+
+        // One identical answer is not a pattern.
+        assert!(!may_relax(0, 5, 5, true));
+        assert!(!may_relax(OK - 1, 5, 5, true), "just short of the threshold still holds at the floor");
+
+        // The transport's peer table is a lower bound the overlay store owes nothing to, so a roster below it is
+        // DEMONSTRABLY behind — positive evidence of work left to do (§5.3.2, measured as a cell stuck at [2, 1, 2]).
+        assert!(!may_relax(OK, 4, 5, true), "roster below the transport's own peer count");
+        assert!(may_relax(OK, 6, 5, true), "a roster ABOVE it is not evidence of being behind");
+
+        // And the one this whole chain led to: a repeat is only evidence when the reads behind it concluded. Two scans
+        // whose members timed out agree with each other while both disagree with the cell.
+        assert!(!may_relax(OK, 5, 5, false), "an incomplete scan is not a settled answer, however often it repeats");
+        assert!(!may_relax(OK, 9, 0, false), "and no amount of apparent agreement substitutes for a concluded read");
+    }
+
+    #[test]
+    fn a_read_that_did_not_conclude_is_not_an_absence() {
+        // The primitive underneath it. `Absent` is actionable — the slot is empty, or its contents failed to authenticate.
+        // `Unknown` is not information at all, and collapsing the two is what made a partial scan indistinguishable from a
+        // small cell.
+        use crate::resolve::{Read, Scan};
+
+        assert_eq!(Read::found_or_absent(Some(7)), Read::Found(7), "a completed read that found something");
+        assert_eq!(Read::found_or_absent(None::<u8>), Read::Absent, "a completed read that found nothing is DEFINITE");
+        assert_ne!(Read::Absent, Read::Unknown::<u8>, "the distinction the old `Option` could not express");
+
+        let whole = Scan { found: alloc_pairs(&[1, 2]), unknown: 0 };
+        assert!(whole.complete(), "every read concluded");
+        let partial = Scan { found: alloc_pairs(&[1]), unknown: 1 };
+        assert!(!partial.complete(), "one inconclusive read makes the whole view partial");
+    }
+
+    /// Fixture: `(coord, value)` pairs for a `Scan`, coordinates being irrelevant to what is asserted.
+    fn alloc_pairs(values: &[u8]) -> Vec<(fanos_diaulos::Coord, u8)> {
+        values.iter().map(|&v| ([1, 0, 0], v)).collect()
     }
 }
