@@ -993,8 +993,28 @@ async fn reshuffle_loop<F: Field>(
 ) {
     book.adopt(at.epoch);
     loop {
-        match events.recv().await {
-            Ok(Notification::BeaconReady { epoch, seed }) => {
+        // Why the loop woke. A local enum rather than a `Notification` variant: "a peer's claim was recorded" is this
+        // loop's business, not something the engine has any reason to broadcast.
+        enum Wake {
+            /// The beacon advanced: re-derive for the new epoch.
+            Beacon(Epoch, [u8; 32]),
+            /// Something changed that could move the settled index — a new peer claim, or any engine notification.
+            Resettle,
+            /// The engine stopped.
+            Stop,
+        }
+        // Either reason re-settles. A peer completing a handshake is as good a reason as a beacon advancing, and the engine
+        // emits no notification for the former — without the book's own signal the loop would only ever move on a beacon.
+        let wake = tokio::select! {
+            event = events.recv() => match event {
+                Ok(Notification::BeaconReady { epoch, seed }) => Wake::Beacon(epoch, seed),
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Wake::Resettle,
+                Err(broadcast::error::RecvError::Closed) => Wake::Stop,
+            },
+            () = book.changed() => Wake::Resettle,
+        };
+        match wake {
+            Wake::Beacon(epoch, seed) => {
                 // Rotate the PROTEUS wire shape to the new epoch FIRST (§13.4 moving target): the polymorphism
                 // moves every epoch so a censor's classifier trained on the old shape is stale. Independent of
                 // whether the VRF coordinate also moves below — the shape rotates on every beacon round. A
@@ -1030,9 +1050,8 @@ async fn reshuffle_loop<F: Field>(
                     break;
                 }
             }
-            // Any other notification, or falling behind the broadcast: the peer set may have changed, so re-settle. This
-            // is the live half of collision resolution — the epoch trigger above only ever fires on a beacon.
-            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+            // The live half of collision resolution: the peer set may have changed, so re-settle against it.
+            Wake::Resettle => {
                 let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
                 let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
                     continue; // beaten on every point of the line; hold the current announcement rather than retract it
@@ -1044,7 +1063,7 @@ async fn reshuffle_loop<F: Field>(
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Closed) => break, // engine stopped
+            Wake::Stop => break,
         }
     }
 }

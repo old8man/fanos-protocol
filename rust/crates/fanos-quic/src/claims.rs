@@ -21,6 +21,8 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use tokio::sync::Notify;
+
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
 use fanos_primitives::collections::BoundedMap;
@@ -64,6 +66,14 @@ struct Best {
 #[derive(Clone)]
 pub(crate) struct ClaimBook {
     inner: Arc<Mutex<Book>>,
+    /// Signalled whenever a claim is recorded.
+    ///
+    /// The book is written by the `HELLO` verifier, which runs on a connection's own task, while settling runs on the
+    /// placement loop. Nothing else connects them: the engine emits no notification for a peer merely *completing a
+    /// handshake*, so without this the loop would only ever re-settle when a beacon advanced — and a node learns that a
+    /// better claim holds its point precisely by meeting the peer that holds it. `notify_one` rather than
+    /// `notify_waiters` so a record landing between two waits is remembered instead of lost.
+    changed: Arc<Notify>,
 }
 
 struct Book {
@@ -88,6 +98,7 @@ impl ClaimBook {
                 peers: BoundedMap::new(CAPACITY),
                 best: BoundedMap::new(CAPACITY),
             })),
+            changed: Arc::new(Notify::new()),
         }
     }
 
@@ -113,6 +124,7 @@ impl ClaimBook {
     /// peer install a witness that fails at the far end, turning its own forgery into *this* node's rejected handshake.
     pub(crate) fn record<F: Field>(&self, id: &[u8], public: VrfPublic, proof: VrfProof, output: &VrfOutput) {
         let key = hash_labeled("FANOS-v1/claim-book-peer", id);
+        self.changed.notify_one();
         let mut book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         book.peers.insert(key, PeerClaim { id: id.to_vec(), public, proof });
         // Index the peer's entire walk once. This is the whole reason the book exists rather than a scan per query.
@@ -151,6 +163,14 @@ impl ClaimBook {
         }
         let peer = book.peers.get(&best.holder)?;
         Some(DisplacementWitness { id: peer.id.clone(), public: peer.public, proof: peer.proof })
+    }
+
+    /// Wait until a claim is recorded.
+    ///
+    /// The other half of the placement loop's wake-up: it selects on this and on the engine's notifications, so a peer
+    /// arriving is as good a reason to re-settle as a beacon advancing.
+    pub(crate) async fn changed(&self) {
+        self.changed.notified().await;
     }
 
     /// The epoch this book holds claims for.

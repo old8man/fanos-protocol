@@ -1008,6 +1008,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_whether_a_collided_draw_now_resolves_itself() {
+        // The claim to check: with the probe index on the wire (`fanos_quic::claims`), a fleet whose coordinate draw
+        // COLLIDES should now resolve to distinct points by itself, retiring the injective-draw workaround in
+        // `NodeFleet::spawn`. At 7 nodes on `PG(2,4)`'s 21 points the draw collides in ~67% of runs, so a handful of trials
+        // exercises it. Reports the *preferred* points (what the draw gave) against the *held* points (where the nodes
+        // ended up): resolution shows as held > preferred.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        for trial in 0..4 {
+            let fleet = NodeFleet::spawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
+            let settled = fleet.until(|f| {
+                let held: HashSet<_> = f.nodes().iter().map(|n| n.health().address).collect();
+                held.len() == f.nodes().len()
+            }).await;
+            let held: HashSet<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
+            let rosters: Vec<_> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
+            fleet.shutdown();
+            println!("trial {trial}: held {}/7 distinct, all-distinct reached: {settled}, rosters {rosters:?}", held.len());
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
     async fn probe_roster_convergence_against_cell_occupancy() {
         // Hypothesis for the open finding: the capability/load directories ride the erasure-coded L4 store, whose
