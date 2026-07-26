@@ -93,16 +93,21 @@ pub async fn build_cell_setpoint<F: Field>(client: &Client, epoch: Epoch, capaci
 /// stays agnostic to the meter's storage). Mirrors [`crate::capdir::spawn_capability_publisher`]; ends when the
 /// notification stream closes. Must run inside a tokio runtime.
 #[must_use]
+/// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.
+///
+/// A coordinate moves — every epoch by the beacon reshuffle (spec §L3), and within an epoch when a better claim displaces
+/// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
+/// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
+/// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
 pub fn spawn_load_publisher(
     client: Client,
-    coord: Coord,
     load_source: impl Fn() -> Demand + Send + 'static,
 ) -> (JoinHandle<()>, oneshot::Receiver<()>) {
     let (ready_tx, ready_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
-        publish_load(&client, coord, epoch, load_source()).await;
+        publish_load(&client, client.address(), epoch, load_source()).await;
         // Signal the genesis load report, for the same reason as the capability publisher: the setpoint is derived
         // from these reports, and a setpoint of zero correctly assigns nobody — so assigning before the node's own
         // report lands produces an empty assignment that looks like a controller fault.
@@ -112,8 +117,13 @@ pub fn spawn_load_publisher(
                 Ok(Notification::BeaconReady { epoch: e, .. }) => {
                     if e > epoch {
                         epoch = e;
-                        publish_load(&client, coord, epoch, load_source()).await;
+                        publish_load(&client, client.address(), epoch, load_source()).await;
                     }
+                }
+                // The node MOVED — see the capability publisher: republishing only on a beacon left the report at the point
+                // the node had left, for up to a whole epoch.
+                Ok(Notification::Reseated { .. }) => {
+                    publish_load(&client, client.address(), epoch, load_source()).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,

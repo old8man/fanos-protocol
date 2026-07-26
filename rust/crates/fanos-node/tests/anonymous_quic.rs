@@ -486,7 +486,6 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         onion_seed[31] = i as u8;
         publishers.push(spawn_mix_publisher(
             node.as_ref().unwrap().client(),
-            Point::<F2>::at(i).coords(),
             onion_seed,
         ));
     }

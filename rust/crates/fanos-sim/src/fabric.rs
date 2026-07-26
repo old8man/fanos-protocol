@@ -455,13 +455,18 @@ impl NodeFleet {
         // contested node along its probe walk and it announces the point it reached, measured at 7/7 distinct across four
         // forced-collision trials with nodes visibly seated at probe index 1 and 4 (`fanos_quic::claims`).
         //
-        // What it guards now is **roster** convergence after a move, one layer above placement. A mover re-announces its
-        // HELLO to its live peers, which re-key the connection on the handshake's own verification (`verified_move`), and
-        // that measurably helped — with collisions allowed the cell-wide scenario went from roughly 1 pass in 3 to **6 of
-        // 8**. It is not closed: the two failures still read `occupied = 5 of 5` (placement fully resolved) with rosters
-        // frozen at `[4, 4, 4, 1, 4]` and `[1, 2, 3, 1, 2]`. The second looks unrelated to moving at all — every node is
-        // low, which is general discovery rather than one stale key — so the remaining gap needs its own diagnosis rather
-        // than another guess. Remove this guard when the cell-wide scenario passes with collisions allowed.
+        // What it guards now is **roster** convergence after a move, one layer above placement. Two links of that chain are
+        // fixed and each measurably helped, with collisions allowed:
+        //
+        //   1 pass in 3   → live resolution moves the node (`29e322b`)
+        //   6 of 8        → the mover re-announces, peers re-key the live connection (`b17e5bb`)
+        //   4 of 6        → the mover republishes its capability/load descriptors at the point it moved TO
+        //
+        // The remaining link is peer-side and identified rather than guessed: a node that re-keys a moved connection knows
+        // its cell view changed, but nothing makes it re-scan, so it refreshes on its own `ROSTER_REFRESH` backoff — which
+        // can exceed the two-period window `FROZEN_SPAN` allows before calling a cell frozen. The last failure reads
+        // `[4, 5, 3, 3, 4]` with `occupied = 5 of 5`: placement fully resolved, one reader caught up, the rest not yet.
+        // Remove this guard when the cell-wide scenario passes with collisions allowed.
         let mut taken: HashSet<fanos_geometry::Triple> = HashSet::new();
         let mut attempts = 0usize;
         while nodes.len() < count {

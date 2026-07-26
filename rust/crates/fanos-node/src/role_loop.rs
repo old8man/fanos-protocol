@@ -17,7 +17,6 @@
 use core::time::Duration;
 
 use fanos_core::roles::{Capability, Demand, Reputation, RoleController, RoleSet};
-use fanos_diaulos::Coord;
 use fanos_field::Field;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
 use fanos_quic::Client;
@@ -348,15 +347,14 @@ pub struct SelfOrgConfig {
 #[must_use]
 pub fn spawn_self_organization<F: Field>(
     client: Client,
-    coord: Coord,
     config: SelfOrgConfig,
     load_source: impl Fn() -> Demand + Send + 'static,
     peers: impl Fn() -> usize + Send + 'static,
 ) -> SelfOrganization {
     let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller } = config;
     let (capability_publisher, capability_ready) =
-        spawn_capability_publisher(client.clone(), coord, node_id, vrf_secret, capability);
-    let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), coord, load_source);
+        spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability);
+    let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source);
     let (role_loop, assigned) =
         spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers);
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }

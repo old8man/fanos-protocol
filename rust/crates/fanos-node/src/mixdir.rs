@@ -134,20 +134,26 @@ pub async fn build_cell_mix_directory<F: Field>(client: &Client, epoch: Epoch) -
 /// The task ends when the relay's notification stream closes (the node shut down). Must run inside a
 /// tokio runtime.
 #[must_use]
-pub fn spawn_mix_publisher(client: Client, coord: Coord, onion_seed: [u8; 32]) -> JoinHandle<()> {
+/// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.
+///
+/// A coordinate moves — every epoch by the beacon reshuffle (spec §L3), and within an epoch when a better claim displaces
+/// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
+/// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
+/// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
+pub fn spawn_mix_publisher(client: Client, onion_seed: [u8; 32]) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut driver = EpochDriver::new(coord, onion_seed);
+        let mut driver = EpochDriver::new(client.address(), onion_seed);
         let mut events = client.subscribe();
         // Publish the genesis-epoch key immediately, so a circuit drawn before the first beacon can still
         // seal to this relay. Every later republish is driven by the relay's own BeaconReady.
-        publish_mix_key(&client, coord, driver.epoch(), driver.public()).await;
+        publish_mix_key(&client, client.address(), driver.epoch(), driver.public()).await;
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch, .. }) => {
                     // Advance the mirror ratchet to the beacon epoch; a stale/replayed epoch reports 0
                     // steps and nothing is republished. On a real advance, republish the now-current key.
                     if driver.advance_to(epoch) > 0 {
-                        publish_mix_key(&client, coord, driver.epoch(), driver.public()).await;
+                        publish_mix_key(&client, client.address(), driver.epoch(), driver.public()).await;
                     }
                 }
                 // Other notifications are irrelevant to key rotation; a lagged stream only means we may

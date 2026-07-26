@@ -159,11 +159,8 @@ async fn the_publisher_task_keeps_each_relays_key_live() {
     // Every relay runs its publisher task, seeded with the same onion seed its router would use.
     let mut publishers = Vec::new();
     for (i, &coord) in roster.iter().enumerate() {
-        publishers.push(spawn_mix_publisher(
-            cell.nodes[i].client(),
-            coord,
-            onion_seed(i),
-        ));
+        let _ = coord; // the publisher now reads the node's live coordinate rather than being told one
+        publishers.push(spawn_mix_publisher(cell.nodes[i].client(), onion_seed(i)));
     }
 
     // The publishers write asynchronously; poll the discovered directory until every relay's genesis key

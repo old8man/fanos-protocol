@@ -110,9 +110,14 @@ pub async fn build_capability_directory<F: Field>(client: &Client, epoch: Epoch)
 /// [`crate::mixdir::spawn_mix_publisher`]. The task ends when the notification stream closes; must run inside a
 /// tokio runtime.
 #[must_use]
+/// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.
+///
+/// A coordinate moves — every epoch by the beacon reshuffle (spec §L3), and within an epoch when a better claim displaces
+/// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
+/// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
+/// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
 pub fn spawn_capability_publisher(
     client: Client,
-    coord: Coord,
     node_id: NodeId,
     vrf_secret: VrfSecret,
     capability: Capability,
@@ -121,7 +126,7 @@ pub fn spawn_capability_publisher(
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
-        publish_capability(&client, coord, epoch, &vrf_secret, node_id, capability).await;
+        publish_capability(&client, client.address(), epoch, &vrf_secret, node_id, capability).await;
         // The genesis advertisement is now readable, which the role loop must know before it assigns: a node cannot
         // be assigned from a roster that does not yet contain it. Signalling is deterministic where polling the
         // directory is not — each poll costs a full cell scan, so a retry loop cannot converge promptly.
@@ -131,8 +136,14 @@ pub fn spawn_capability_publisher(
                 Ok(Notification::BeaconReady { epoch: e, .. }) => {
                     if e > epoch {
                         epoch = e;
-                        publish_capability(&client, coord, epoch, &vrf_secret, node_id, capability).await;
+                        publish_capability(&client, client.address(), epoch, &vrf_secret, node_id, capability).await;
                     }
+                }
+                // The node MOVED. Republishing only on a beacon was the other half of the stale-descriptor defect: a
+                // within-epoch move left the advertisement at the point the node had left until the next epoch, so the
+                // cell's roster scan was short by exactly this node for up to a whole epoch.
+                Ok(Notification::Reseated { .. }) => {
+                    publish_capability(&client, client.address(), epoch, &vrf_secret, node_id, capability).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,

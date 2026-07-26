@@ -304,7 +304,7 @@ fn spawn_exit_role(
     // Advertise the exit through the overlay store so a proxy discovers it automatically (each epoch, so a
     // departed exit falls out of the live directory) — no hand-configured descriptor needed. The task runs
     // until the node stops; its handle is not retained (like the mix publisher's).
-    let _publisher = spawn_exit_publisher(handle.client(), address, public);
+    let _publisher = spawn_exit_publisher(handle.client(), public);
     Ok(())
 }
 
@@ -379,7 +379,6 @@ const ROLE_GAIN_SEVENTH: u8 = 7;
 /// decides the assignment.** A caller actuates [`Node::assigned_roles`], which changes as the cell rebalances.
 fn spawn_roles<F: Field + 'static>(
     handle: &NodeHandle,
-    coord: Triple,
     credentials: &NodeCredentials,
     roles: RoleSet,
     directory: &Directory,
@@ -388,7 +387,6 @@ fn spawn_roles<F: Field + 'static>(
     let peers = directory.clone();
     spawn_self_organization::<F>(
         handle.client(),
-        coord,
         SelfOrgConfig {
             // The node's id for role assignment **is** its coordinate-VRF public key. That makes the capability
             // advertisement self-certifying: the descriptor is signed by the key its id names, so a node cannot
@@ -628,7 +626,7 @@ impl Node {
         let address = handle.address();
         let local_addr = handle.local_addr();
         // Keep the relay's onion key live in the mix directory: publish genesis, then republish each epoch (E4∩E5).
-        let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), address, onion_seed));
+        let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), onion_seed));
         // The root epoch tick driving the live beacon clock (§L3, §7.6) — only when a beacon is configured.
         let epoch_driver = has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
 
@@ -640,7 +638,7 @@ impl Node {
         spawn_exit_role(&handle, address, exit)?;
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
-        let self_org = spawn_roles::<F>(&handle, address, &credentials, config.roles, &directory);
+        let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory);
 
         announce_node(&handle, &config);
 
