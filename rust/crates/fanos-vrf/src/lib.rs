@@ -43,7 +43,7 @@ pub mod vss;
 use alloc::vec::Vec;
 
 use fanos_field::Field;
-use fanos_geometry::Point;
+use fanos_geometry::{Plane, Point};
 use fanos_primitives::hash::label;
 use fanos_primitives::{BeaconSeed, Epoch, map_to_point};
 use vrf_r255::{Proof, PublicKey, SecretKey};
@@ -189,7 +189,34 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 /// only thing it could misreport is *how far along* the sequence it sits, and that is what [`displacement_is_forced`]
 /// makes it prove.
 ///
-/// ## Why the sequence is a permutation, and not another hash
+/// ## Why the walk stays on ONE LINE — the adversarial correction
+///
+/// An earlier version walked the *whole plane* by double hashing, which recovers capacity but sells a failure mode.
+/// Because the walk is a deterministic function of a **public** VRF output, an attacker who knows a victim's identity can
+/// compute its entire fallback sequence the moment the beacon lands, and — combined with grinding (~`N` local hashes to
+/// seat a Sybil at a chosen point, threat model B1) — **steer** the victim: seat low-ranked Sybils on `p₀ … p_{j−1}` and
+/// the victim deterministically lands on `p_j`. Before probing existed, that same spend merely made the victim
+/// *unroutable*: a denial of service, disruptive and detectable. Steering a victim onto a line the attacker occupies is
+/// **eclipse**, which is quieter and worse.
+///
+/// Confining the walk to one line through `p₀` — the line chosen by the node's *own* VRF output — removes the gain. The
+/// attacker can now only move a victim among points of a line **he did not choose**, and to exploit that he must occupy
+/// that line, which is the `N·H_{q+1}` coupon-collector cost he faced anyway. Probing stops being a lever.
+///
+/// The capacity cost is negligible where it matters, because a walk fails only if *every* point of the line is taken:
+///
+/// | plane | load 0.25 | load 0.5 | load 0.75 |
+/// |---|---|---|---|
+/// | `q = 7` (line 8) | 1.5e-5 | 3.9e-3 | 0.10 |
+/// | `q = 31` (line 32) | 5.4e-20 | 2.3e-10 | 1.0e-4 |
+/// | `q = 127` (line 128) | 8.6e-78 | 2.9e-39 | 1.0e-16 |
+///
+/// It is only poor on `PG(2,2)`, whose lines hold three points — one more way the base cell is a test fixture rather than
+/// a deployment. The honest summary: full-plane probing recovers marginally more capacity on a toy plane and hands a
+/// resourced adversary a steering primitive everywhere; line-restricted probing gives that up and keeps the capacity that
+/// exists at real `q`.
+///
+/// ## Why the sequence within the line is a permutation, and not another hash
 ///
 /// The obvious construction — `p_k = MapToPoint(H(probe ‖ output ‖ k))` — is a random *function*, so a node's own
 /// sequence repeats points and never enumerates the plane. Measured on that version: at `n = P = 7` it seated **5** of 7
@@ -213,9 +240,46 @@ pub fn probe_point<F: Field>(output: &VrfOutput, k: u16) -> Point<F> {
     if k == 0 {
         return first;
     }
-    let n = plane_points::<F>();
-    let step = usize::from(k).wrapping_mul(probe_stride::<F>(output)) % n;
-    Point::at((first.index() + step) % n)
+    // The line this node falls back along: one of the `q + 1` lines through its preferred point, chosen by its own output
+    // so the node has no say in which.
+    let through: Vec<_> = Plane::<F>::lines_through(first).collect();
+    let Some(&line) = through.get(probe_line_index(output) % through.len().max(1)) else {
+        return first;
+    };
+    // The points of that line, ordered by a stride coprime to the line size — a cyclic permutation of the line, for the
+    // same reason the plane walk needed one: a hash would revisit points and stall short of the free seat.
+    let pts: Vec<_> = Plane::<F>::points_on(line).collect();
+    let len = pts.len();
+    if len == 0 {
+        return first;
+    }
+    // Start at `first`'s own position on the line so `k` counts *away from* the preferred point.
+    let start = pts.iter().position(|p| *p == first).unwrap_or(0);
+    let stride = coprime_stride(probe_stride_seed(output), len);
+    let idx = (start + usize::from(k).wrapping_mul(stride)) % len;
+    pts.get(idx).copied().unwrap_or(first)
+}
+
+/// Which of the `q + 1` lines through the preferred point this node falls back along — derived, so unchoosable.
+fn probe_line_index(output: &VrfOutput) -> usize {
+    let d = fanos_primitives::hash::hash_labeled(label::COORD_PROBE, output);
+    usize::from(d[0]) | (usize::from(d[1]) << 8)
+}
+
+/// The raw stride seed for ordering a line's points.
+fn probe_stride_seed(output: &VrfOutput) -> usize {
+    let d = fanos_primitives::hash::hash_labeled(label::COORD, output);
+    usize::from(d[2]) | (usize::from(d[3]) << 8)
+}
+
+/// The smallest value at or above `seed mod (len-1) + 1` that is coprime to `len` — so stepping by it cycles through
+/// every point of the line rather than a sub-orbit.
+fn coprime_stride(seed: usize, len: usize) -> usize {
+    if len <= 2 {
+        return 1;
+    }
+    let start = 1 + (seed % (len - 1));
+    (0..len).map(|d| 1 + ((start - 1 + d) % (len - 1))).find(|&s| gcd(s, len) == 1).unwrap_or(1)
 }
 
 /// The number of points in `F`'s projective plane, `q² + q + 1`.
@@ -223,24 +287,6 @@ pub fn probe_point<F: Field>(output: &VrfOutput, k: u16) -> Point<F> {
 fn plane_points<F: Field>() -> usize {
     let q = F::Q as usize;
     q * q + q + 1
-}
-
-/// The node's probe **stride**: the smallest value at or above a hashed start that is coprime to the plane size, so the
-/// probe walk is a cyclic permutation of every point rather than a sub-cycle.
-///
-/// Searching upward keeps the derivation deterministic and total for composite `P`, where a bare `H mod P` could land on
-/// a divisor and confine the walk to a short orbit — the failure that a "random stride" would hit silently.
-#[must_use]
-fn probe_stride<F: Field>(output: &VrfOutput) -> usize {
-    let n = plane_points::<F>();
-    if n <= 2 {
-        return 1;
-    }
-    let digest = fanos_primitives::hash::hash_labeled(label::COORD_PROBE, output);
-    let start = 1 + (usize::from_be_bytes([
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-    ]) % (n - 1));
-    (0..n).map(|d| 1 + ((start - 1 + d) % (n - 1))).find(|&s| gcd(s, n) == 1).unwrap_or(1)
 }
 
 /// Binary-free Euclidean gcd, used only to pick a stride coprime to the plane size.
@@ -588,13 +634,20 @@ mod tests {
         assert_eq!(seq, (0..6).map(|k| probe_point::<F31>(&output, k)).collect::<Vec<_>>(), "deterministic");
         assert!(seq.windows(2).any(|w| matches!(w, [a, b] if a != b)), "it advances rather than repeating a point");
 
-        // The property double hashing buys, and the reason the first construction was replaced: the sequence visits
-        // EVERY point of the plane exactly once, so probing can always seat a node while any point is free.
-        let plane = 31 * 31 + 31 + 1;
-        let visited: alloc::collections::BTreeSet<_> = (0..u16::try_from(plane).unwrap_or(u16::MAX))
-            .map(|k| probe_point::<F31>(&output, k).index())
-            .collect();
-        assert_eq!(visited.len(), plane, "the probe walk is a cyclic permutation of all {plane} points");
+        // The walk covers exactly ONE LINE through the preferred point, as a cyclic permutation of it — every point of
+        // that line and no other. Confining it there is what denies an attacker a steering primitive: he can only move a
+        // victim among points of a line the VICTIM's output chose, and to exploit that he must occupy that line, which is
+        // the coupon-collector cost he already faced.
+        let line_size = 31 + 1;
+        let visited: alloc::collections::BTreeSet<_> =
+            (0..64u16).map(|k| probe_point::<F31>(&output, k).index()).collect();
+        assert_eq!(visited.len(), line_size, "the walk is a cyclic permutation of its line's {line_size} points");
+
+        // And every visited point really is collinear with the preferred one.
+        let first = probe_point::<F31>(&output, 0);
+        let on_a_common_line = Plane::<F31>::lines_through(first)
+            .any(|l| visited.iter().all(|&i| Plane::<F31>::points_on(l).any(|p| p.index() == i)));
+        assert!(on_a_common_line, "the whole walk lies on one line through the preferred point");
 
         // A different beacon reshuffles the whole sequence, not just its head — so a future epoch's fallbacks are as
         // unpredictable as its preference (§3.2 assumption 2 extends to every probe index).

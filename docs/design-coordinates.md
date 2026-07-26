@@ -403,12 +403,32 @@ target line — and that probability is not small:
 A cap tight enough to matter (`K ≤ 4` at `q = 31`) starts costing real seating failures at any load worth having, so the
 cap is a dial between two harms rather than a fix, and it is deliberately **not** applied.
 
-**There is no clean cryptographic mitigation, and the reason is structural.** The walk must be *verifiable*, so it cannot
-be secret; and it is computable from public data the moment the beacon is known, so it cannot be a race the victim wins.
-The defence is the same one everything else here reduces to: **identities must be scarce**, because every seat the
-attacker needs costs `~N` grinding *plus an admission*, and the steering cost is linear in `j`. At `q = 127` and a
-meaningful admission difficulty, steering a victim two hops costs real money; at `q = 2` it costs nothing, which is one
-more reason the base cell is a test fixture and not a deployment.
+**No cryptographic mitigation exists, and the reason is structural**: the walk must be *verifiable*, so it cannot be
+secret, and it is computable from public data the moment the beacon is known, so it cannot be a race the victim wins.
+
+**But a structural one does — and it is now the design.** Confine the walk to **one line through `p₀`**, the line chosen
+by the node's *own* VRF output. The attacker can then only move a victim among points of a line **he did not choose**, and
+to exploit that he must occupy that line — which is the `N·H_{q+1}` coupon-collector cost he already faced. Probing stops
+being a lever: it gives him nothing he was not already buying.
+
+The capacity given up is negligible where it matters, because a walk fails only if *every* point of the line is taken
+(probability `≈ load^{q+1}`):
+
+| plane | load 0.25 | load 0.5 | load 0.75 |
+|---|---|---|---|
+| `q = 7` (line 8) | 1.5e-5 | 3.9e-3 | 0.10 |
+| `q = 31` (line 32) | 5.4e-20 | 2.3e-10 | 1.0e-4 |
+| `q = 127` (line 128) | 8.6e-78 | 2.9e-39 | 1.0e-16 |
+
+Measured against the simulator after the change: **7/7 at `P = 21`, 15/15 at load 0.71, 200/200 at `P = 993`** — unchanged
+from the full-plane walk. The one regression is on `PG(2,2)` at load factor 1.00, which now seats **6 of 7** instead of 7,
+because that plane's lines hold three points. That is the toy plane, and one more reason the base cell is a test fixture
+rather than a deployment.
+
+So the honest summary of the redesign: full-plane probing recovers marginally more capacity **on a toy plane** and hands a
+resourced adversary a steering primitive **everywhere**; line-restricted probing gives that up and keeps the capacity that
+exists at real `q`. The residual defence remains the same one everything here reduces to — **identities must be scarce**,
+since every seat costs `~N` grinding *plus an admission*.
 
 Recorded here rather than in a commit message because it is a standing property of the design, not an incident.
 
