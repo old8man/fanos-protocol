@@ -42,6 +42,8 @@ pub mod rendezvous;
 pub mod rendezvous_host;
 pub mod rendezvous_relay;
 pub mod resolve;
+/// Differentially-private telemetry export over the overlay store (audit C7) — see [`telemetry_dir`].
+pub mod telemetry_dir;
 pub mod service_node;
 pub mod sybil;
 pub mod threshold_rendezvous;
@@ -90,4 +92,4 @@ pub use threshold_rendezvous::{
     ThresholdRendezvous, seal_request_intro, seal_request_to_line, split_delivery,
 };
 pub use threshold_service::{ThresholdService, intro_frame};
-pub use resolve::{NodeResolver, ResolvedService, publish_service, verify_descriptor};
+pub use resolve::{NodeResolver, Read, ResolvedService, Scan, publish_service, verify_descriptor};

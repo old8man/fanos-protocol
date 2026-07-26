@@ -582,6 +582,17 @@ pub struct NodeConfig {
     /// entirely. It remains the default only so no existing deployment changes behaviour silently, and a deployment that
     /// wants the anonymity the spec claims must raise it.
     pub plane_order: u32,
+    /// The **ε** for differentially-private telemetry export, or `None` to publish nothing (audit C7).
+    ///
+    /// Opt-in on purpose, and the default is silence. A node's coherence readings — its Φ, purity, the healing sequence —
+    /// describe the cell it sits in, so publishing them is a decision an operator makes rather than a behaviour an upgrade
+    /// introduces. `Some(ε)` starts the publisher in `telemetry_dir`, which routes every frame through
+    /// `CoherenceFrame::export` (privatize, then encode) at that budget.
+    ///
+    /// Smaller ε is more private and noisier; the mechanism's own docs carry the calibration. There is deliberately no
+    /// default value here — picking one would be choosing a privacy/utility trade-off on the operator's behalf, and the
+    /// honest options are "off" or "a number you chose".
+    pub telemetry_epsilon: Option<f64>,
     /// Where to persist the self-certifying identity; `None` = ephemeral (new identity each run).
     pub identity_path: Option<PathBuf>,
     /// Bootstrap peers seeded into the address book.
@@ -642,6 +653,7 @@ impl Default for NodeConfig {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             // `q = 2` for continuity — see the field's note on why that is a fixture and not a recommendation.
             plane_order: 2,
+            telemetry_epsilon: None, // silence by default: publishing a cell's coherence readings is an operator's decision
             identity_path: None,
             bootstrap: Vec::new(),
             roles: RoleSet::default(),

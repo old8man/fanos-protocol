@@ -377,6 +377,17 @@ const ROLE_GAIN_SEVENTH: u8 = 7;
 /// roles were whatever its config file said and the cell had no say, the "libraries-ahead / wiring-behind" pattern
 /// `docs/audit.md` tracks. The split it establishes is the intended one: **config declares the offer, the cell
 /// decides the assignment.** A caller actuates [`Node::assigned_roles`], which changes as the cell rebalances.
+/// Differentially-private telemetry export (audit C7), only when an ε is configured.
+///
+/// The mechanism and its sanctioned `CoherenceFrame::export` had existed with no caller since the audit named them, which
+/// made the guarantee decorative: there was nothing to privatize. `None` publishes nothing, which is the default — a node's
+/// coherence readings describe the cell it sits in, so emitting them is an operator's decision.
+fn spawn_telemetry_export(handle: &NodeHandle, epsilon: Option<f64>) -> Option<JoinHandle<()>> {
+    epsilon.map(|e| {
+        crate::telemetry_dir::spawn_coherence_publisher(handle.client(), fanos_telemetry::dp::PrivacyBudget::new(e))
+    })
+}
+
 fn spawn_roles<F: Field + 'static>(
     handle: &NodeHandle,
     credentials: &NodeCredentials,
@@ -627,6 +638,7 @@ impl Node {
         let local_addr = handle.local_addr();
         // Keep the relay's onion key live in the mix directory: publish genesis, then republish each epoch (E4∩E5).
         let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), onion_seed));
+        let _telemetry = spawn_telemetry_export(&handle, config.telemetry_epsilon);
         // The root epoch tick driving the live beacon clock (§L3, §7.6) — only when a beacon is configured.
         let epoch_driver = has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
 

@@ -185,7 +185,7 @@ impl ServiceResolver for NodeResolver {
 /// roster, two short scans in a row looked identical, and the role loop then treated a wrong assignment as settled — the
 /// cell froze short of its own membership with nothing to indicate why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Read<T> {
+pub enum Read<T> {
     /// Present and authentic.
     Found(T),
     /// A definite negative: the slot is empty, or its contents failed to decode or to authenticate. Nothing valid is
@@ -197,13 +197,14 @@ pub(crate) enum Read<T> {
 
 impl<T> Read<T> {
     /// `Found` if `value` is `Some`, else a **definite** `Absent`. For a read that completed and found nothing valid.
-    pub(crate) fn found_or_absent(value: Option<T>) -> Self {
+    #[must_use]
+    pub fn found_or_absent(value: Option<T>) -> Self {
         value.map_or(Self::Absent, Self::Found)
     }
 }
 
 /// The result of scanning a whole directory: what was found, and **how much was not established**.
-pub(crate) struct Scan<T> {
+pub struct Scan<T> {
     /// The records that resolved, in coordinate order.
     pub found: Vec<(Coord, T)>,
     /// How many reads did not conclude. Non-zero means this scan is a *partial view*, and anything derived from it must not
@@ -214,7 +215,8 @@ pub(crate) struct Scan<T> {
 
 impl<T> Scan<T> {
     /// Whether every read concluded, so the view is complete.
-    pub(crate) fn complete(&self) -> bool {
+    #[must_use]
+    pub fn complete(&self) -> bool {
         self.unknown == 0
     }
 }

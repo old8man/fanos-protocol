@@ -52,6 +52,8 @@ fanos-keygen.workspace = true
 fanos-vrf.workspace = true
 # The frame registry MixRelay classifies beacon vs onion traffic with.
 fanos-wire.workspace = true
+# The differentially-private telemetry export boundary (audit C7) — see `telemetry_dir`.
+fanos-telemetry.workspace = true
 rand_core.workspace = true
 # OS entropy to seed each dial's ephemeral handshake keys (a fresh CSPRNG per dial).
 getrandom = "0.4.3"
