@@ -217,6 +217,29 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 /// resourced adversary a steering primitive everywhere; line-restricted probing gives that up and keeps the capacity that
 /// exists at real `q`.
 ///
+/// ## The residual: an identical walk cannot be escaped
+///
+/// Two nodes whose outputs give the same preferred point **and** the same line **and** the same stride take the *same*
+/// walk, point for point. The better-ranked one then holds the better claim at every index ([`claim_beats`]), so the other
+/// is beaten everywhere on its own line and [`settle_index`] answers `None`: it cannot be seated at all. Measured among
+/// pairs that share a preferred point on `PG(2,7)`, this is **3.4%** of them, against the predicted
+/// `1/((q+1)·φ(q+1))` = 1/32 = 3.1% (`fanos_quic::claims`).
+///
+/// Provoked against a *chosen* victim it costs matching that triple and outranking it,
+/// `2·N·(q+1)·φ(q+1)` draws:
+///
+/// | plane | draws | vs. the pre-probing baseline (`N`) |
+/// |---|---|---|
+/// | `q = 7` | 3 648 | 64× harder |
+/// | `q = 31` | 1 016 832 | **1024× harder** |
+/// | `q = 127` | 2.7e8 | 16384× harder |
+///
+/// The baseline is the right comparison and it is what makes this acceptable: before probing existed, a *single*
+/// coordinate collision — `N` draws — already made a victim unroutable. So this residual is `2(q+1)·φ(q+1)` times harder
+/// than the DoS it replaced, not an amplification of it. Falling back to a plane-wide walk would close it and reopen the
+/// steering primitive line restriction exists to remove, which is the worse trade; a caller that gets `None` must announce
+/// nothing rather than pick an index it cannot prove.
+///
 /// ## Why the sequence within the line is a permutation, and not another hash
 ///
 /// The obvious construction — `p_k = MapToPoint(H(probe ‖ output ‖ k))` — is a random *function*, so a node's own
@@ -596,26 +619,43 @@ pub fn verify_coordinate_claim<F: Field>(
     claimed: &Point<F>,
     claim: &CoordinateClaim,
 ) -> bool {
-    let Some(output) = claimant_public.verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof) else {
-        return false;
-    };
+    verify_coordinate_claim_output::<F>(claimant_public, claimant_id, epoch, beacon, claimed, claim).is_some()
+}
+
+/// As [`verify_coordinate_claim`], but returning the claimant's **VRF output** on success.
+///
+/// The output is what every later comparison needs — it is the claimant's rank, and `probe_index_of` reads it to place any
+/// point on the claimant's walk. A verifier that intends to *remember* the peer (`fanos_quic::claims`) would otherwise have
+/// to rebuild the VRF input and verify a second time, and a second construction of that input is a second place for it to
+/// drift from this one.
+#[must_use]
+pub fn verify_coordinate_claim_output<F: Field>(
+    claimant_public: &VrfPublic,
+    claimant_id: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    claimed: &Point<F>,
+    claim: &CoordinateClaim,
+) -> Option<VrfOutput> {
+    let output = claimant_public.verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof)?;
     // The walk cycles after `probe_bound` steps, so an index at or beyond it names a point some lower index already
     // names — while demanding that many more witnesses. Rejecting it keeps a claim's chain as short as the point it
     // reaches actually requires, and denies a claimant the option of presenting a needlessly long one.
     if claim.index >= probe_bound::<F>() {
-        return false;
+        return None;
     }
     if probe_point::<F>(&output, claim.index) != *claimed {
-        return false;
+        return None;
     }
     if claim.witnesses.len() != usize::from(claim.index) {
-        return false;
+        return None;
     }
-    claim.witnesses.iter().enumerate().all(|(j, w)| {
+    let forced = claim.witnesses.iter().enumerate().all(|(j, w)| {
         u16::try_from(j).is_ok_and(|j| {
             displacement_is_forced::<F>(&output, j, &w.public, &w.id, epoch, beacon, &w.proof)
         })
-    })
+    });
+    forced.then_some(output)
 }
 
 /// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch_low32_be ‖ beacon_seed`

@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+mod claims;
 mod directory;
 mod driver;
 mod harness;

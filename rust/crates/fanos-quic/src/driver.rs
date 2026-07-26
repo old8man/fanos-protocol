@@ -35,6 +35,9 @@ use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
 use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
+use fanos_vrf::CoordinateClaim;
+
+use crate::claims::{self, ClaimBook};
 use crate::identity::{
     HelloResult, hello_bytes, hello_epoch, peer_cert_der, verifiable_coordinate_ranked, verify_hello,
 };
@@ -802,11 +805,17 @@ where
     let hello_cell = Arc::new(RwLock::new(Arc::new(hello_bytes::<F>(
         Epoch::ZERO,
         coord.coords(),
-        &proof,
+        &CoordinateClaim::direct(proof),
         capabilities,
     ))));
     let beacon_cell = Arc::new(RwLock::new(BeaconWindow::genesis()));
     let verify_beacon = beacon_cell.clone();
+    // Every peer whose claim this node verifies is remembered for the epoch, because coordinate resolution needs exactly
+    // that: the best claim on each point of this node's own walk, and a witness for every step it advances
+    // (`crate::claims`). The verifier closure is the only place holding a peer's certificate DER — the identity the
+    // coordinate VRF binds to — so it is where the recording happens.
+    let book = ClaimBook::new();
+    let verify_book = book.clone();
     let identity: Identity = Some(SelfCert {
         hello: hello_cell.clone(),
         verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
@@ -817,7 +826,16 @@ where
                 let window = verify_beacon.read().ok()?;
                 window.beacon_for(epoch)?
             };
-            verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities)
+            let result = verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities)?;
+            if let HelloResult::Established { peer, .. } = result {
+                // Recorded only on success, so the book holds nothing a remote verifier would reject. A peer proving a
+                // *past* epoch within the safe-stall window is deliberately not recorded: its claim is evidence about that
+                // epoch's placement, and admitting it here would let a retired placement justify a displacement now.
+                if epoch == verify_book.epoch() {
+                    verify_book.record::<F>(peer_cert, peer.public, peer.proof, &peer.output);
+                }
+            }
+            Some(result)
         }),
     });
     let dir_for_reshuffle = directory.clone();
@@ -834,15 +852,18 @@ where
     let local_addr = handle.local_addr();
     tokio::spawn(reshuffle_loop::<F>(
         creds.clone(),
-        capabilities,
-        coord.coords(),
-        local_addr,
-        dir_for_reshuffle,
-        hello_cell,
+        Placement { coord: coord.coords(), output: rank, index: 0, epoch: Epoch::ZERO, beacon: BeaconSeed::GENESIS },
+        Reseater {
+            capabilities,
+            local_addr,
+            directory: dir_for_reshuffle,
+            hello: hello_cell,
+            client: handle.client(),
+        },
         beacon_cell,
+        book,
         shaper,
         handle.subscribe(),
-        handle.client(),
     ));
     Ok(handle)
 }
@@ -891,20 +912,86 @@ impl BeaconWindow {
 /// (`Command::Reseat`), and republishes the node's HELLO + the beacon the peer-verifier checks against — so
 /// the unpredictable placement rotation that defends against eclipse / path-prediction (the load-bearing
 /// defence on the grindable q=2 base cell) is live end to end. Exits when the engine stops.
-#[allow(clippy::too_many_arguments)]
-async fn reshuffle_loop<F: Field>(
-    creds: NodeCredentials,
+/// Where this node currently sits, and the material to prove it.
+///
+/// Tracked as one value because the four move together: a placement is a `(coord, index)` pair justified by an `output`
+/// that is only meaningful for its `(epoch, beacon)`. Splitting them into loop-local variables is how a re-seat ends up
+/// publishing a claim for one epoch against the beacon of another.
+struct Placement {
+    coord: Triple,
+    output: fanos_vrf::VrfOutput,
+    index: u16,
+    epoch: Epoch,
+    beacon: BeaconSeed,
+}
+
+/// The three surfaces a re-seat has to move together, in one value.
+///
+/// Grouped because they are never touched apart: a placement that reached the engine but not the directory, or the
+/// directory but not the published HELLO, is a node peers cannot dial at a point it believes it holds.
+struct Reseater {
     capabilities: Capabilities,
-    genesis_coord: Triple,
     local_addr: SocketAddr,
     directory: Directory,
     hello: Arc<RwLock<Arc<Vec<u8>>>>,
+    client: Client,
+}
+
+impl Reseater {
+    /// Re-seat the node at `index` on its own probe walk: engine, directory, HELLO.
+    ///
+    /// Returns `false` only if the engine is gone, which ends the loop. The order matters and is the one the epoch
+    /// reshuffle has always used: seat the engine first, then rebind the directory (the new point bound *before* the old
+    /// one is cleared, so there is no window in which the node is unroutable), then publish the HELLO.
+    fn apply<F: Field>(&self, at: &mut Placement, index: u16, claim: &CoordinateClaim) -> bool {
+        let point = fanos_vrf::probe_point::<F>(&at.output, index).coords();
+        if !self.client.command(Command::Reseat { coord: point }) {
+            return false;
+        }
+        // Bound with this epoch's rank AND the probed index: the arbitration order is the claim *pair*, so a table
+        // recording only the rank would disagree with what every node's own `settle_index` concludes
+        // (`Directory::supersedes`).
+        self.directory.insert_claimed(point, self.local_addr, at.output, index);
+        if point != at.coord {
+            self.directory.remove(at.coord);
+        }
+        if let Ok(mut h) = self.hello.write() {
+            *h = Arc::new(hello_bytes::<F>(at.epoch, point, claim, self.capabilities));
+        }
+        at.coord = point;
+        at.index = index;
+        true
+    }
+}
+
+/// The per-epoch coordinate reshuffle **and live collision-resolution** driver (spec §L3 "epoch reshuffle", §3.2;
+/// tasks #102 and the probe-index wiring).
+///
+/// Two triggers, one mechanism:
+///
+/// * **`BeaconReady`** — re-derive `MapToPoint(VRF(vrf_sk, cert ‖ epoch ‖ seed))` for the new epoch, clear the claim book
+///   (a claim proves a placement for one epoch only), and re-seat. This is the unpredictable placement rotation that
+///   defends against eclipse and path-prediction.
+/// * **any other notification** — re-run [`claims::settle`] against the peers verified since the last check. A node learns
+///   of a better claim to its own point only by meeting the peer that holds it, so the moment a peer set changes is exactly
+///   the moment a settled index can become stale. There is no separate wake channel because there does not need to be:
+///   this loop already sees every notification, and settling is `q + 1` map lookups against a pre-indexed book.
+///
+/// The index only ever advances within an epoch (`settle_index` is monotone in information), so a node never retracts a
+/// point it has already announced — which is what makes acting on partial information safe.
+///
+/// Exits when the engine stops.
+#[allow(clippy::too_many_arguments)]
+async fn reshuffle_loop<F: Field>(
+    creds: NodeCredentials,
+    mut at: Placement,
+    seat: Reseater,
     beacon: Arc<RwLock<BeaconWindow>>,
+    book: ClaimBook,
     shaper: Shaper,
     mut events: broadcast::Receiver<Notification>,
-    client: Client,
 ) {
-    let mut current = genesis_coord;
+    book.adopt(at.epoch);
     loop {
         match events.recv().await {
             Ok(Notification::BeaconReady { epoch, seed }) => {
@@ -918,43 +1005,45 @@ async fn reshuffle_loop<F: Field>(
                         .rotate(epoch);
                 }
                 let seed = BeaconSeed::new(seed);
-                let (coord, proof, rank) = verifiable_coordinate_ranked::<F>(&creds, epoch, &seed);
-                let new_coord = coord.coords();
-                if new_coord == current {
-                    continue; // this epoch's VRF landed on the same point — nothing to move
-                }
-                // Re-seat the engine at the new coordinate; a dead engine (`false`) ends the loop.
-                if !client.command(Command::Reseat { coord: new_coord }) {
-                    break;
-                }
-                // Rebind the transport directory: bind the new point to our (unchanged) address and clear
-                // the vacated one, so peers dial us at our current coordinate and no stale binding lingers.
-                //
-                // Bound WITH this epoch's rank, so if another node's coordinate lands on the same point the arbitration
-                // is decided by the unforgeable VRF output rather than by which of us rebound last. The rank is
-                // epoch-specific, exactly like the point it accompanies.
-                directory.insert_ranked(new_coord, local_addr, rank);
-                directory.remove(current);
-                current = new_coord;
-                // Publish the new HELLO + beacon so subsequent handshakes prove/verify at this epoch. Write
-                // the beacon FIRST: a connection accepted between the two writes then verifies a peer against
-                // the newer beacon while announcing the older coordinate — harmless (the peer re-syncs on an
-                // epoch mismatch, §7.3), and never the reverse (verifying against a stale beacon). A poisoned
-                // lock skips this rotation's publish; the next `BeaconReady` retries.
+                let (_, proof, rank) = verifiable_coordinate_ranked::<F>(&creds, epoch, &seed);
+                // Publish the beacon BEFORE the HELLO: a connection accepted between the two then verifies a peer
+                // against the newer beacon while announcing the older coordinate — harmless (the peer re-syncs on an
+                // epoch mismatch, §7.3), and never the reverse (verifying against a stale beacon). A poisoned lock
+                // skips this rotation's publish; the next `BeaconReady` retries.
                 if let Ok(mut b) = beacon.write() {
                     b.adopt(epoch, seed);
                 }
-                if let Ok(mut h) = hello.write() {
-                    *h = Arc::new(hello_bytes::<F>(
-                        epoch,
-                        coord.coords(),
-                        &proof,
-                        capabilities,
-                    ));
+                at.epoch = epoch;
+                at.beacon = seed;
+                at.output = rank;
+                // The book's claims belong to the retired epoch; clearing it is what stops a peer's past placement from
+                // justifying a displacement now. Settling immediately afterwards therefore lands at index 0 and moves
+                // up again as this epoch's peers are met.
+                book.adopt(epoch);
+                let Some((index, claim)) = claims::settle::<F>(&book, &rank, proof) else {
+                    continue; // every point of this epoch's line is better claimed — announce nothing
+                };
+                if fanos_vrf::probe_point::<F>(&rank, index).coords() == at.coord && index == at.index {
+                    continue; // this epoch's VRF landed on the same point — nothing to move
+                }
+                if !seat.apply::<F>(&mut at, index, &claim) {
+                    break;
                 }
             }
-            // Some other notification, or we fell behind the broadcast — keep following either way.
-            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            // Any other notification, or falling behind the broadcast: the peer set may have changed, so re-settle. This
+            // is the live half of collision resolution — the epoch trigger above only ever fires on a beacon.
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
+                let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
+                    continue; // beaten on every point of the line; hold the current announcement rather than retract it
+                };
+                if index == at.index {
+                    continue; // still the right seat
+                }
+                if !seat.apply::<F>(&mut at, index, &claim) {
+                    break;
+                }
+            }
             Err(broadcast::error::RecvError::Closed) => break, // engine stopped
         }
     }
@@ -1611,6 +1700,9 @@ async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Op
             coord,
             version,
             capabilities,
+            // The claim material is recorded by the verifier closure itself (`spawn_self_certifying`), which is the only
+            // place holding the peer's certificate DER — the identity the coordinate VRF binds to.
+            peer: _,
         } => {
             send_hello_ack(conn, shaper, version, capabilities).await;
             Some(coord)
@@ -2029,7 +2121,8 @@ mod tests {
     #[tokio::test]
     async fn a_beacon_round_reshuffles_the_coordinate_and_rebinds_the_directory() {
         let creds = NodeCredentials::generate().expect("credentials");
-        let genesis = verifiable_coordinate::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS).0;
+        let (genesis, _, genesis_rank) =
+            verifiable_coordinate_ranked::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS);
         let genesis_coord = genesis.coords();
 
         // The epoch-1 beacon and the coordinate it deterministically yields — what the loop must land on.
@@ -2070,15 +2163,24 @@ mod tests {
         let shaper = Arc::new(RwLock::new(ProteusShaper::new(b"test-secret".to_vec(), Epoch::ZERO)));
         tokio::spawn(reshuffle_loop::<F2>(
             creds,
-            Capabilities::CORE,
-            genesis_coord,
-            local_addr,
-            directory.clone(),
-            hello.clone(),
+            Placement {
+                coord: genesis_coord,
+                output: genesis_rank,
+                index: 0,
+                epoch: Epoch::ZERO,
+                beacon: BeaconSeed::GENESIS,
+            },
+            Reseater {
+                capabilities: Capabilities::CORE,
+                local_addr,
+                directory: directory.clone(),
+                hello: hello.clone(),
+                client,
+            },
             beacon.clone(),
+            ClaimBook::new(),
             Some(shaper.clone()),
             events_tx.subscribe(),
-            client,
         ));
 
         events_tx
@@ -2128,7 +2230,8 @@ mod tests {
     #[tokio::test]
     async fn a_beacon_that_does_not_move_the_coordinate_is_a_noop() {
         let creds = NodeCredentials::generate().expect("credentials");
-        let genesis = verifiable_coordinate::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS).0;
+        let (genesis, _, genesis_rank) =
+            verifiable_coordinate_ranked::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS);
         let genesis_coord = genesis.coords();
 
         let hello = Arc::new(RwLock::new(Arc::new(vec![0u8])));
@@ -2147,15 +2250,18 @@ mod tests {
         };
         tokio::spawn(reshuffle_loop::<F2>(
             creds,
-            Capabilities::CORE,
-            genesis_coord,
-            local_addr,
-            directory,
-            hello,
+            Placement {
+                coord: genesis_coord,
+                output: genesis_rank,
+                index: 0,
+                epoch: Epoch::ZERO,
+                beacon: BeaconSeed::GENESIS,
+            },
+            Reseater { capabilities: Capabilities::CORE, local_addr, directory, hello, client },
             beacon,
+            ClaimBook::new(),
             None,
             events_tx.subscribe(),
-            client,
         ));
 
         // Re-announce the GENESIS beacon at epoch 0 → the same coordinate → the loop must NOT re-seat.

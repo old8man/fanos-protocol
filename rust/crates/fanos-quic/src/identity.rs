@@ -11,7 +11,7 @@ use fanos_field::Field;
 use fanos_geometry::{HierAddr, Point, Triple, decode_triple, derive_address, encode_triple};
 use fanos_primitives::hash::label;
 use fanos_primitives::{BeaconSeed, Epoch, map_to_point};
-use fanos_vrf::{PROOF_LEN, VrfProof, VrfPublic, prove_coordinate, verify_coordinate};
+use fanos_vrf::{CoordinateClaim, PROOF_LEN, VrfProof, VrfPublic, prove_coordinate, verify_coordinate};
 use fanos_wire::capability::{Capabilities, PROTOCOL_VERSION, negotiate_version};
 use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame};
 use quinn::Connection;
@@ -21,11 +21,22 @@ use x509_parser::certificate::X509Certificate;
 
 use crate::tls::{FANOS_VRF_OID, NodeCredentials};
 
-/// The byte length of a self-certifying HELLO **frame body** (spec §7.3/§7.4):
-/// `version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12) ‖ proof(80)`. The whole thing
-/// is carried as the body of a [`FrameType::Hello`] frame (audit #100 — previously these bytes went
-/// on the wire raw, with no version/capability negotiation and no frame envelope at all).
-pub(crate) const HELLO_BODY_LEN: usize = 2 + 4 + 4 + 8 + 12 + PROOF_LEN;
+/// The fixed head of a self-certifying HELLO **frame body** (spec §7.3/§7.4):
+/// `version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12)`, followed by the node's
+/// [`CoordinateClaim`]. The whole thing is carried as the body of a [`FrameType::Hello`] frame (audit #100 — previously
+/// these bytes went on the wire raw, with no version/capability negotiation and no frame envelope at all).
+pub(crate) const HELLO_HEAD_LEN: usize = 2 + 4 + 4 + 8 + 12;
+
+/// The shortest legal HELLO body: the head plus an **uncontested** claim, `proof(80) ‖ index(2)`.
+///
+/// The claim is what replaced a bare proof here, and the uncontested case — every node that meets no coordinate collision
+/// — costs exactly two bytes more than before, with the first 80 byte-identical. A displaced node additionally carries one
+/// witness per skipped step, which is why the body is variable-length at all.
+pub(crate) const HELLO_MIN_BODY_LEN: usize = HELLO_HEAD_LEN + PROOF_LEN + 2;
+
+/// Byte offset of the claim's probe index within the body — a fixed position, so a verifier can bound the index
+/// *before* decoding the variable-length witness list it implies. See [`verify_hello`].
+const CLAIM_INDEX_AT: usize = HELLO_HEAD_LEN + PROOF_LEN;
 
 /// The outcome of processing a peer's HELLO (spec §7.3/§7.4): either negotiation succeeded —
 /// carrying the peer's certified coordinate and the AGREED (min version, intersected capability)
@@ -35,17 +46,50 @@ pub(crate) const HELLO_BODY_LEN: usize = 2 + 4 + 4 + 8 + 12 + PROOF_LEN;
 /// stays the unchanged silent drop (`None` from [`verify_hello`]) — an impostor is never told
 /// exactly why its forged proof was rejected (spec §L0), whereas negotiation failure is an ordinary,
 /// disclosable protocol condition.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Not comparable, since [`PeerClaimed`] is not: asserting on a whole result would mean asserting on a group element's
+/// encoding, which is not what any caller or test is about. Match the variant and compare the fields that carry meaning.
+// The `Established` variant is much larger than `Incompatible`, which is fine here and not worth a box: one of these is
+// built per handshake and destructured immediately, never stored in a collection, so the size difference costs a stack
+// move on a path that has just done a VRF verification.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum HelloResult {
     /// Negotiation succeeded: the peer's certified coordinate and the agreed session parameters.
     Established {
         coord: Triple,
         version: u16,
         capabilities: Capabilities,
+        /// The peer's verified claim material — its VRF public, proof, output and the probe index it claims.
+        ///
+        /// Carried out of verification rather than recomputed by the caller: the output is the peer's rank *and* what
+        /// places any point on its walk, so a caller that remembers peers (`crate::claims::ClaimBook`) would otherwise
+        /// rebuild the VRF input and verify a second time — a second construction of that input being a second place for
+        /// it to drift.
+        peer: PeerClaimed,
     },
     /// Negotiation failed (version too old, or an empty capability intersection) — the
     /// [`ProtocolError`] to report before aborting.
     Incompatible(ProtocolError),
+}
+
+/// A peer's verified coordinate claim, as [`verify_hello`] recovered it.
+///
+/// Not comparable: neither `VrfPublic` nor `VrfProof` implements `Eq` (equality on a group element is a question about
+/// encodings, which `CoordinateClaim` answers explicitly where it needs to). Nothing here needs to compare two peers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeerClaimed {
+    /// The peer's VRF public key.
+    pub public: VrfPublic,
+    /// The proof that certified its coordinate this epoch.
+    pub proof: VrfProof,
+    /// The VRF output the proof yielded — the peer's rank.
+    ///
+    /// This is the whole of what a peer contributes to another node's resolution, and deliberately so: a claim to a point
+    /// is `(where the claimant's own walk reaches it, its rank)`, both functions of this output, so *where the peer
+    /// actually settled* is not needed and is not carried. That is what keeps `verify_coordinate_claim` non-recursive —
+    /// checking a witness never unfolds into the witness's own chain.
+    pub output: fanos_vrf::VrfOutput,
 }
 
 /// The self-certifying coordinate of a node from its certificate DER: `MapToPoint(H(cert))`.
@@ -140,25 +184,31 @@ pub fn hierarchical_coordinate<F: Field>(
 }
 
 /// Encode a self-certifying HELLO — the announcement a node sends on a fresh connection carrying
-/// its negotiation parameters and its proof of coordinate (spec §7.3/§7.4): frame body
-/// `version(2 BE) ‖ capabilities(4 BE) ‖ field_q(4 BE) ‖ epoch(8 BE) ‖ coord(12) ‖ proof(80)`,
+/// its negotiation parameters and its **claim** to a coordinate (spec §7.3/§7.4): frame body
+/// `version(2 BE) ‖ capabilities(4 BE) ‖ field_q(4 BE) ‖ epoch(8 BE) ‖ coord(12) ‖ claim`,
 /// wrapped as a [`FrameType::Hello`] frame. `field_q` is this node's plane order (`F::Q`) —
 /// informational parity, not itself negotiated (an intersection is meaningless for a scalar order).
 /// The peer verifies it — and negotiates against its own parameters — with [`verify_hello`].
+///
+/// The claim is `proof(80) ‖ index(2) ‖ witness*`. It replaced a bare proof so a node **displaced from its preferred
+/// point can announce where it went**: before this, the resolution machinery could tell a node it had to move but the wire
+/// could only ever say index 0, so probing was reachable from the simulator and not from a deployment, and a cell still
+/// seated only `O(q)` of its `q² + q + 1` points. An uncontested node — the overwhelming majority — pays two bytes.
 #[must_use]
 pub(crate) fn hello_bytes<F: Field>(
     epoch: Epoch,
     coord: Triple,
-    proof: &VrfProof,
+    claim: &CoordinateClaim,
     capabilities: Capabilities,
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(HELLO_BODY_LEN);
+    let claim_bytes = claim.to_bytes();
+    let mut body = Vec::with_capacity(HELLO_HEAD_LEN + claim_bytes.len());
     body.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     body.extend_from_slice(&capabilities.bits().to_be_bytes());
     body.extend_from_slice(&F::Q.to_be_bytes());
     body.extend_from_slice(&epoch.get().to_be_bytes());
     body.extend_from_slice(&encode_triple(coord));
-    body.extend_from_slice(&proof.to_bytes());
+    body.extend_from_slice(&claim_bytes);
     let mut out = Vec::new();
     encode_frame(FrameType::Hello.code(), &body, &mut out);
     out
@@ -167,12 +217,19 @@ pub(crate) fn hello_bytes<F: Field>(
 /// Parse a peer's HELLO, verify its coordinate proof against the peer's authenticated certificate
 /// `peer_cert_der`, and negotiate the session parameters against `my_capabilities` (spec §7.3/§7.4).
 ///
-/// The coordinate proof gate is unchanged from before negotiation existed: it binds the coordinate
-/// to *this* certificate, so a replayed proof from another identity does not verify, and a bad
-/// proof is a silent `None` (spec §L0 — an impostor is never told why). Only once the proof checks
-/// out does negotiation run: `None` on a canonical-decode failure or a bad proof (silent drop, as
-/// before); `Some(HelloResult::Incompatible(err))` on a version or capability mismatch (the caller
-/// reports `err` and aborts); `Some(HelloResult::Established { .. })` otherwise.
+/// The coordinate gate binds the coordinate to *this* certificate, so a replayed proof from another
+/// identity does not verify, and a bad claim is a silent `None` (spec §L0 — an impostor is never told
+/// why). Only once it checks out does negotiation run: `None` on a canonical-decode failure or a bad
+/// claim (silent drop, as before); `Some(HelloResult::Incompatible(err))` on a version or capability
+/// mismatch (the caller reports `err` and aborts); `Some(HelloResult::Established { .. })` otherwise.
+///
+/// ## The claim is bounded before it is decoded
+///
+/// A claim states a probe index and must carry exactly that many witnesses, each ~`2 + |cert| + 32 + 80` bytes. The index
+/// is attacker-chosen and sits at a **fixed offset**, so it is read and bounded against `probe_bound::<F>()` *first* —
+/// before the witness list it implies is decoded, and therefore before it can size an allocation. `CoordinateClaim::from_bytes`
+/// would reject an out-of-range index too, but only after reserving for it, and `verify_coordinate_claim` only after that
+/// again: the cheapest rejection is the one that never allocates.
 ///
 /// `beacon` is the epoch's beacon seed ([`BeaconSeed::GENESIS`] at cold start).
 #[must_use]
@@ -187,7 +244,7 @@ pub(crate) fn verify_hello<F: Field>(
         return None;
     }
     let body = frame.body;
-    if body.len() != HELLO_BODY_LEN {
+    if body.len() < HELLO_MIN_BODY_LEN {
         return None;
     }
     let peer_version = u16::from_be_bytes(body.get(0..2)?.try_into().ok()?);
@@ -198,11 +255,22 @@ pub(crate) fn verify_hello<F: Field>(
     let _peer_field_q = u32::from_be_bytes(body.get(6..10)?.try_into().ok()?);
     let epoch = Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?));
     let coord = decode_triple(body.get(18..30)?)?;
-    let proof = VrfProof::from_bytes(body.get(30..HELLO_BODY_LEN)?.try_into().ok()?)?;
-    let point = Point::<F>::new(coord)?;
-    if !verify_peer_coordinate::<F>(peer_cert_der, epoch, beacon, &point, &proof) {
-        return None; // bad proof — silent drop, unchanged behaviour (spec §L0)
+    // Bound the claimed index from its fixed offset, before the witness list it implies is decoded.
+    let claimed_index = u16::from_be_bytes(body.get(CLAIM_INDEX_AT..CLAIM_INDEX_AT + 2)?.try_into().ok()?);
+    if claimed_index >= fanos_vrf::probe_bound::<F>() {
+        return None;
     }
+    let claim = CoordinateClaim::from_bytes(body.get(HELLO_HEAD_LEN..)?)?;
+    let point = Point::<F>::new(coord)?;
+    let public = vrf_public_from_cert(peer_cert_der)?;
+    let output = fanos_vrf::verify_coordinate_claim_output::<F>(
+        &public,
+        peer_cert_der,
+        epoch,
+        beacon,
+        &point,
+        &claim,
+    )?; // bad claim — silent drop, unchanged behaviour (spec §L0)
     let Some(version) = negotiate_version(PROTOCOL_VERSION, peer_version) else {
         return Some(HelloResult::Incompatible(ProtocolError::Unsupported));
     };
@@ -214,6 +282,7 @@ pub(crate) fn verify_hello<F: Field>(
         coord,
         version,
         capabilities,
+        peer: PeerClaimed { public, proof: claim.proof, output },
     })
 }
 
@@ -228,7 +297,7 @@ pub(crate) fn hello_epoch(hello: &[u8]) -> Option<Epoch> {
         return None;
     }
     let body = frame.body;
-    if body.len() != HELLO_BODY_LEN {
+    if body.len() < HELLO_MIN_BODY_LEN {
         return None;
     }
     Some(Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?)))
@@ -255,16 +324,16 @@ mod tests {
         version: u16,
         epoch: Epoch,
         coord: Triple,
-        proof: &VrfProof,
+        claim: &CoordinateClaim,
         capabilities: Capabilities,
     ) -> Vec<u8> {
-        let mut body = Vec::with_capacity(HELLO_BODY_LEN);
+        let mut body = Vec::with_capacity(HELLO_MIN_BODY_LEN);
         body.extend_from_slice(&version.to_be_bytes());
         body.extend_from_slice(&capabilities.bits().to_be_bytes());
         body.extend_from_slice(&F::Q.to_be_bytes());
         body.extend_from_slice(&epoch.get().to_be_bytes());
         body.extend_from_slice(&encode_triple(coord));
-        body.extend_from_slice(&proof.to_bytes());
+        body.extend_from_slice(&claim.to_bytes());
         let mut out = Vec::new();
         encode_frame(FrameType::Hello.code(), &body, &mut out);
         out
@@ -278,18 +347,21 @@ mod tests {
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
 
         let sender_caps = Capabilities::CORE | Capabilities::APHANTOS_FULL | Capabilities::CALYPSO;
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, sender_caps);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), sender_caps);
 
         // The receiver offers CORE + APHANTOS_FULL only (no CALYPSO) — the intersection drops it.
         let receiver_caps = Capabilities::CORE | Capabilities::APHANTOS_FULL;
         let result = verify_hello::<F2>(creds.cert_der(), &hello, &beacon, receiver_caps);
+        let Some(HelloResult::Established { coord: got, version, capabilities, .. }) = result else {
+            unreachable!("a valid HELLO with an overlapping capability set establishes")
+        };
         assert_eq!(
-            result,
-            Some(HelloResult::Established {
-                coord: coord.coords(),
-                version: PROTOCOL_VERSION,
-                capabilities: Capabilities::CORE | Capabilities::APHANTOS_FULL,
-            }),
+            (got, version, capabilities),
+            (
+                coord.coords(),
+                PROTOCOL_VERSION,
+                Capabilities::CORE | Capabilities::APHANTOS_FULL
+            ),
             "negotiates the true intersection, not either side's full offer"
         );
     }
@@ -302,7 +374,7 @@ mod tests {
         let epoch = Epoch::new(7);
         let beacon = BeaconSeed::new([0x77; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
 
         assert_eq!(hello_epoch(&hello), Some(epoch), "the proven epoch is recoverable without verifying");
         // Selecting that epoch's beacon, the proof verifies even after the cell has moved on — the essence of
@@ -325,19 +397,15 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::new([0x12; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
 
         let full_node_caps =
             Capabilities::CORE | Capabilities::APHANTOS_FULL | Capabilities::CALYPSO;
         let result = verify_hello::<F2>(creds.cert_der(), &hello, &beacon, full_node_caps);
-        assert_eq!(
-            result,
-            Some(HelloResult::Established {
-                coord: coord.coords(),
-                version: PROTOCOL_VERSION,
-                capabilities: Capabilities::CORE,
-            })
-        );
+        let Some(HelloResult::Established { coord: got, version, capabilities, .. }) = result else {
+            unreachable!("CORE always intersects")
+        };
+        assert_eq!((got, version, capabilities), (coord.coords(), PROTOCOL_VERSION, Capabilities::CORE));
     }
 
     #[test]
@@ -348,13 +416,13 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::new([0x13; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, Capabilities::APHANTOS_LITE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::APHANTOS_LITE);
 
         let result =
             verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::APHANTOS_FULL);
-        assert_eq!(
-            result,
-            Some(HelloResult::Incompatible(ProtocolError::Unsupported))
+        assert!(
+            matches!(result, Some(HelloResult::Incompatible(ProtocolError::Unsupported))),
+            "an empty capability intersection is a disclosable negotiation failure"
         );
     }
 
@@ -365,15 +433,140 @@ mod tests {
         let beacon = BeaconSeed::new([0x14; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
         // Version 0 predates MIN_SUPPORTED_VERSION (1) — negotiate_version returns None.
-        let hello =
-            hello_bytes_with_version::<F2>(0, epoch, coord.coords(), &proof, Capabilities::CORE);
+        let hello = hello_bytes_with_version::<F2>(
+            0,
+            epoch,
+            coord.coords(),
+            &CoordinateClaim::direct(proof),
+            Capabilities::CORE,
+        );
 
         let result = verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::CORE);
-        assert_eq!(
-            result,
-            Some(HelloResult::Incompatible(ProtocolError::Unsupported)),
+        assert!(
+            matches!(result, Some(HelloResult::Incompatible(ProtocolError::Unsupported))),
             "a too-old version is incompatible even though capabilities would have matched"
         );
+    }
+
+    #[test]
+    fn a_displaced_node_is_accepted_at_the_point_it_probed_to() {
+        // The property this whole wire change exists for: before it, a node could *detect* that it had to move but the
+        // HELLO could only ever say index 0, so a cell seated `O(q)` of its `q² + q + 1` points and the resolution
+        // machinery was reachable from the simulator and not from a deployment.
+        //
+        // Two identities that draw the same preferred point; the worse-ranked one announces its NEXT probe point, carrying
+        // the better-ranked one as the witness that forced it there.
+        let epoch = Epoch::new(4);
+        let beacon = BeaconSeed::new([0x21; 32]);
+        let mut pool: Vec<NodeCredentials> = Vec::new();
+        let mut pair = None;
+        for _ in 0..400 {
+            let fresh = NodeCredentials::generate().unwrap();
+            let (_, _, rank) = verifiable_coordinate_ranked::<F2>(&fresh, epoch, &beacon);
+            if let Some(i) = pool.iter().position(|c| {
+                let (_, _, other) = verifiable_coordinate_ranked::<F2>(c, epoch, &beacon);
+                fanos_vrf::probe_point::<F2>(&other, 0) == fanos_vrf::probe_point::<F2>(&rank, 0)
+                    // Same preference, but NOT the same whole walk — a shared walk means the loser is beaten everywhere
+                    // and has no seat at all (see `fanos_vrf::probe_point`'s residual note).
+                    && fanos_vrf::probe_point::<F2>(&other, 1) != fanos_vrf::probe_point::<F2>(&rank, 1)
+            }) {
+                let held = pool.swap_remove(i);
+                let (_, _, held_rank) = verifiable_coordinate_ranked::<F2>(&held, epoch, &beacon);
+                pair = Some(if fanos_vrf::claim_beats((0, &held_rank), (0, &rank)) {
+                    (fresh, held) // (loser, winner)
+                } else {
+                    (held, fresh)
+                });
+                break;
+            }
+            pool.push(fresh);
+        }
+        let Some((loser, winner)) = pair else {
+            unreachable!("two of 400 identities collide on one of PG(2,2)'s seven points")
+        };
+
+        let (_, loser_proof, loser_rank) = verifiable_coordinate_ranked::<F2>(&loser, epoch, &beacon);
+        let (_, winner_proof, _) = verifiable_coordinate_ranked::<F2>(&winner, epoch, &beacon);
+        let displaced = fanos_vrf::probe_point::<F2>(&loser_rank, 1);
+        let claim = CoordinateClaim {
+            proof: loser_proof,
+            index: 1,
+            witnesses: vec![fanos_vrf::DisplacementWitness {
+                id: winner.cert_der().to_vec(),
+                public: vrf_public_from_cert(winner.cert_der()).unwrap(),
+                proof: winner_proof,
+            }],
+        };
+        let hello = hello_bytes::<F2>(epoch, displaced.coords(), &claim, Capabilities::CORE);
+        assert!(
+            hello.len() > HELLO_MIN_BODY_LEN,
+            "a witnessed claim is longer than the uncontested body it extends"
+        );
+        let result = verify_hello::<F2>(loser.cert_der(), &hello, &beacon, Capabilities::CORE);
+        let Some(HelloResult::Established { coord, .. }) = result else {
+            unreachable!("a witnessed displacement must be accepted")
+        };
+        assert_eq!(coord, displaced.coords(), "and accepted at the PROBED point, not the preferred one");
+        assert_ne!(
+            coord,
+            fanos_vrf::probe_point::<F2>(&loser_rank, 0).coords(),
+            "the whole point: this is not the point its own draw preferred"
+        );
+
+        // The same claim announced at index 1 but WITHOUT its witness is refused — the wire carries the justification, not
+        // just the number.
+        let unwitnessed = CoordinateClaim { proof: loser_proof, index: 1, witnesses: Vec::new() };
+        assert!(
+            verify_hello::<F2>(
+                loser.cert_der(),
+                &hello_bytes::<F2>(epoch, displaced.coords(), &unwitnessed, Capabilities::CORE),
+                &beacon,
+                Capabilities::CORE
+            )
+            .is_none(),
+            "an unjustified index is a silent drop"
+        );
+        // And the uncontested claim still names the preferred point, unchanged from before this existed.
+        let direct = CoordinateClaim::direct(loser_proof);
+        let preferred = fanos_vrf::probe_point::<F2>(&loser_rank, 0);
+        assert!(
+            verify_hello::<F2>(
+                loser.cert_der(),
+                &hello_bytes::<F2>(epoch, preferred.coords(), &direct, Capabilities::CORE),
+                &beacon,
+                Capabilities::CORE
+            )
+            .is_some(),
+            "index 0 is exactly the claim that was already valid"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_probe_index_is_refused_before_the_witness_list_is_decoded() {
+        // The claimed index is attacker-chosen and sits at a fixed offset, and each witness it implies is ~2 + |cert| + 112
+        // bytes. Bounding it against `probe_bound::<F>()` first is what stops a `u16` on the wire from sizing an
+        // allocation; `CoordinateClaim::from_bytes` would also reject it, but only after reserving for it.
+        let creds = NodeCredentials::generate().unwrap();
+        let epoch = Epoch::new(2);
+        let beacon = BeaconSeed::new([0x22; 32]);
+        let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
+        assert!(verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::CORE).is_some());
+
+        // `probe_bound::<F2>()` is q + 1 = 3, so 3 and above name a point some lower index already names.
+        assert_eq!(fanos_vrf::probe_bound::<F2>(), 3);
+        let (frame, _) = decode_frame(&hello).unwrap();
+        for claimed in [3u16, 64, u16::MAX] {
+            let mut body = frame.body.to_vec();
+            let at = HELLO_HEAD_LEN + PROOF_LEN;
+            body[at..at + 2].copy_from_slice(&claimed.to_be_bytes());
+            let mut framed = Vec::new();
+            encode_frame(FrameType::Hello.code(), &body, &mut framed);
+            assert!(
+                verify_hello::<F2>(creds.cert_der(), &framed, &beacon, Capabilities::CORE).is_none(),
+                "index {claimed} is at or past the line's length and must be refused"
+            );
+        }
     }
 
     #[test]
@@ -386,11 +579,11 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::new([0x15; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
 
         // Verify against a DIFFERENT certificate than the one the proof was produced for.
         let result = verify_hello::<F2>(other.cert_der(), &hello, &beacon, Capabilities::CORE);
-        assert_eq!(result, None, "an impostor's HELLO is a silent drop");
+        assert!(result.is_none(), "an impostor's HELLO is a silent drop");
     }
 
     #[test]
@@ -400,17 +593,11 @@ mod tests {
         // Truncated body.
         let mut short = Vec::new();
         encode_frame(FrameType::Hello.code(), &[0u8; 10], &mut short);
-        assert_eq!(
-            verify_hello::<F2>(creds.cert_der(), &short, &beacon, Capabilities::CORE),
-            None
-        );
+        assert!(verify_hello::<F2>(creds.cert_der(), &short, &beacon, Capabilities::CORE).is_none());
         // Right length, wrong frame type (e.g. a Ping).
         let mut wrong_type = Vec::new();
-        encode_frame(FrameType::Ping.code(), &[0u8; HELLO_BODY_LEN], &mut wrong_type);
-        assert_eq!(
-            verify_hello::<F2>(creds.cert_der(), &wrong_type, &beacon, Capabilities::CORE),
-            None
-        );
+        encode_frame(FrameType::Ping.code(), &[0u8; HELLO_MIN_BODY_LEN], &mut wrong_type);
+        assert!(verify_hello::<F2>(creds.cert_der(), &wrong_type, &beacon, Capabilities::CORE).is_none());
     }
 
     #[test]
@@ -424,15 +611,15 @@ mod tests {
         let beacon = BeaconSeed::new([0x17; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
         let caps = Capabilities::CORE | Capabilities::CALYPSO;
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &proof, caps);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), caps);
 
         let (frame, n) = decode_frame(&hello).unwrap();
         assert_eq!(n, hello.len(), "the frame consumes the whole buffer");
         assert_eq!(frame.frame_type(), Some(FrameType::Hello));
         let body = frame.body;
-        assert_eq!(body.len(), HELLO_BODY_LEN);
+        assert_eq!(body.len(), HELLO_MIN_BODY_LEN, "an uncontested claim is the shortest legal body");
 
-        // version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12) ‖ proof(80), in that order.
+        // version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12) ‖ proof(80) ‖ index(2), in that order.
         assert_eq!(
             u16::from_be_bytes(body[0..2].try_into().unwrap()),
             PROTOCOL_VERSION,
@@ -459,9 +646,14 @@ mod tests {
             "coord at offset 18"
         );
         assert_eq!(
-            body[30..HELLO_BODY_LEN].len(),
+            body[HELLO_HEAD_LEN..HELLO_HEAD_LEN + PROOF_LEN].len(),
             PROOF_LEN,
-            "proof at offset 30, PROOF_LEN bytes"
+            "the claim's proof still sits at offset 30 for PROOF_LEN bytes — byte-identical to the pre-claim layout"
+        );
+        assert_eq!(
+            u16::from_be_bytes(body[HELLO_HEAD_LEN + PROOF_LEN..].try_into().unwrap()),
+            0,
+            "and an uncontested node's index is the two bytes that follow"
         );
     }
 
