@@ -210,3 +210,109 @@ fn a_zero_leak_slope_is_masking_and_not_starvation() {
         }
     }
 }
+
+/// The **timing** half of the flow-correlation attack — the one this file's own header describes and did not measure.
+///
+/// The header promises "for every relay, the Pearson correlation between its input-rate and output-rate time series".
+/// What was implemented is a *volume delta*: does total emission grow with load? Those are different attacks against
+/// different halves of the defence:
+///
+/// * **volume** — masked by *displacement* (a real forward takes a cover slot, so the total is unchanged);
+/// * **timing** — masked by *mixing* (a relay holds each onion a Poisson delay, so emission times do not track arrival
+///   times).
+///
+/// A relay that forwards immediately leaks its circuit even at perfectly constant volume: the GPA watches *when* cells
+/// leave, not how many. So the timing channel is where the mix delay earns its place, and it was untested.
+fn gpa_timing_correlation(mix: Option<(Duration, Duration)>) -> f64 {
+    const BIN_MS: u64 = 100;
+    let (cell, _) = run_and_tap(mix, 0); // shape only; re-run below with real traffic
+    let (client, service) = (cell[0], cell[40]);
+
+    let mut sim = Sim::new(0x77AA);
+    let relays = spawn_nyx_cell(&mut sim, mix);
+    if mix.is_some() {
+        sim.inject_all(&Command::StartHeartbeat);
+    }
+    sim.observe_frames();
+    // A BURSTY flow: bursts are what a timing attack keys on, and an even spread would hide the signal by construction.
+    for round in 0..8u64 {
+        for _ in 0..5 {
+            sim.inject(relays[0], Command::Send { to: relays[40], payload: b"burst".to_vec() });
+        }
+        sim.run_for(Duration::from_millis(if round % 2 == 0 { 100 } else { 900 }));
+    }
+    sim.run_for(Duration::from_millis(2_000));
+
+    let obs = sim.observed_frames();
+    let span = obs.iter().map(|o| o.t_ms).max().unwrap_or(0) / BIN_MS + 1;
+    let mut worst = 0.0f64;
+    for &relay in &relays {
+        if relay == client || relay == service {
+            continue; // endpoints are the acknowledged §8.1 residual, not what mixing defends
+        }
+        let mut ins = vec![0f64; span as usize];
+        let mut outs = vec![0f64; span as usize];
+        for o in obs {
+            let b = (o.t_ms / BIN_MS) as usize;
+            if o.to == relay && let Some(v) = ins.get_mut(b) {
+                *v += 1.0;
+            }
+            if o.from == relay && let Some(v) = outs.get_mut(b) {
+                *v += 1.0;
+            }
+        }
+        worst = worst.max(pearson(&ins, &outs).abs());
+    }
+    worst
+}
+
+/// Pearson correlation; `0.0` when either series is constant (no signal to read).
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len()) as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    let mut num = 0.0;
+    let (mut da, mut db) = (0.0, 0.0);
+    for (x, y) in a.iter().zip(b.iter()) {
+        num += (x - ma) * (y - mb);
+        da += (x - ma).powi(2);
+        db += (y - mb).powi(2);
+    }
+    if da <= f64::EPSILON || db <= f64::EPSILON {
+        return 0.0;
+    }
+    num / (da.sqrt() * db.sqrt())
+}
+
+#[test]
+#[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
+fn sweep_timing_correlation_against_the_mix_delay() {
+    println!("mix delay -> worst per-relay in/out rate correlation (cover 1000ms):");
+    for ms in [0u64, 50, 120, 250, 500, 1_000, 2_000] {
+        let m = if ms == 0 { None } else { Some((Duration::from_millis(ms), Duration::from_millis(1_000))) };
+        println!("  {ms:>5} ms -> r = {:.3}", gpa_timing_correlation(m));
+    }
+    println!("cover interval sweep (mix 50ms):");
+    for ms in [150u64, 300, 1_000, 3_000] {
+        let r = gpa_timing_correlation(Some((Duration::from_millis(50), Duration::from_millis(ms))));
+        println!("  cover {ms:>5} ms -> r = {r:.3}");
+    }
+}
+
+#[test]
+fn the_timing_channel_is_measured_too_and_at_the_shipping_defaults() {
+    let undefended = gpa_timing_correlation(None);
+    let shipped = gpa_timing_correlation(Some((Duration::from_millis(50), Duration::from_millis(1_000))));
+    println!("GPA in/out rate correlation — undefended {undefended:.3}, SHIPPED {shipped:.3}");
+    assert!(
+        undefended > 0.5,
+        "an immediate-forwarding relay's output times track its input times (r = {undefended:.3})"
+    );
+    assert!(
+        shipped < undefended - 0.3,
+        "mixing must break the per-hop timing correlation at the SHIPPING delay, not only at a chosen one \
+         (shipped r = {shipped:.3}, undefended r = {undefended:.3})"
+    );
+}

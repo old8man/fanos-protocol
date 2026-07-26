@@ -20,14 +20,41 @@ use crate::error::NodeError;
 pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 
 /// Default mean Poisson mixing delay a **relay** holds each forwarded onion hop for (spec §L5/V7): a batch of
-/// onions then leaves reordered, breaking the per-hop timing correlation a global passive adversary (T2) uses.
+/// onions then leaves **reordered**, so which cell is which is not readable from arrival order.
 /// Non-zero by default so the shipping relay actually defends (closing audit S1-H1); an operator trading
 /// anonymity for latency can lower it, and it is inert on a non-relay (only a relay runs the mixnet).
+///
+/// **Measured correction (2026-07-26).** This constant used to claim it breaks "the per-hop timing correlation a global
+/// passive adversary (T2) uses". **It does not, and the measurement is flat.** Sweeping it against the GPA's
+/// input-rate/output-rate correlation (`fanos-sim/tests/traffic_analysis.rs`) gives *the same* `r = 0.583` at 50 ms,
+/// 120 ms, 250 ms, 500 ms, 1000 ms and 2000 ms. The reason is structural: a relay emits on **cover slots**, so emission
+/// *times* are set by [`DEFAULT_COVER_INTERVAL`] — the mix delay only chooses *which* queued cell fills a slot, never
+/// *when* slots occur, so it cannot move that correlation at all.
+///
+/// What it does defend is **intra-batch ordering** — a distinct attack, and one this measurement does not cover. The
+/// rate-correlation channel belongs entirely to the cover schedule.
 pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
 
 /// Default mean interval between a **relay**'s constant-size **cover cells** (spec §L5/V8): the router's send
 /// rate and packet size then reveal nothing about whether it is carrying real traffic (audit E1/S1-H1). Non-zero
 /// by default so the GPA defence is on; an operator trading anonymity for bandwidth can raise or zero it.
+///
+/// **This constant, not the mix delay, is the timing defence** — and the trade is steep enough to be chosen against data
+/// rather than picked. Measured worst per-relay input/output rate correlation a GPA can read
+/// (`fanos-sim/tests/traffic_analysis.rs`, `sweep_timing_correlation_against_the_mix_delay`):
+///
+/// | cover interval | GPA rate correlation |
+/// |---|---|
+/// | 150 ms | 0.273 |
+/// | 300 ms | 0.403 |
+/// | **1000 ms (this default)** | **0.583** |
+/// | 3000 ms | 1.000 — no defence at all |
+///
+/// So the shipping default leaves a **substantial residual timing signal**, and 3 s removes the defence entirely. The
+/// volume channel is fully masked at any of these (leak slope 0.000, since displacement does not depend on the rate), so
+/// timing is the binding constraint. Lowering this buys anonymity linearly in bandwidth; the value is deliberately left
+/// as an operator's decision rather than moved silently, but it should be made **against this table**, and a deployment
+/// facing a genuine global passive adversary should not run it at 1 s.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
