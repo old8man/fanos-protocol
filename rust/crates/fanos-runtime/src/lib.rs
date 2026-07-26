@@ -17,6 +17,8 @@
 
 extern crate alloc;
 
+/// Every `encode_*`/`parse_*` for the overlay's wire bodies — see [`frames`].
+mod frames;
 /// The DIAKRISIS self-healing reflex, split out of [`overlay`] — see [`healer`].
 mod healer;
 /// The cell's membership view and admission gate — see [`membership`].
