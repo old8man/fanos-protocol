@@ -174,20 +174,32 @@ pub fn spawn_role_loop<F: Field>(
                     // false and the node relaxes while its roster is short by the mover. Measured before this arm existed:
                     // `[4, 5, 3, 3, 4]` with all five points held, placement fully resolved, one reader caught up and the
                     // rest waiting out a backoff.
+                    // This node moved (`Reseated`), or a peer we hold a connection to moved (`PeerMoved`). Either changes
+                    // the cell's coordinate composition, so the assignment is *expected* to move and any relaxation this
+                    // loop had reached should be undone.
+                    //
+                    // `MemberJoined` — a coordinate entering the membership view from a flooded `Announce`, which is the one
+                    // signal that reaches a node that never met the mover — is **deliberately NOT here**, and that is a
+                    // measured decision rather than an oversight. Adding it made convergence worse in both forms tried:
+                    // scanning inline gave 0 of 3 (rosters collapsing to `[2, 2, 2, 4, 2]`), and re-arming the interval gave
+                    // 1 of 4 (`[2, 2, 1, 3, 2]`). The reason is the one §5.3.5 already records: `MemberJoined` fires once per
+                    // newly-learned member, so acting on it holds every node at the refresh floor throughout discovery, and
+                    // the steady-state scan then competes with the critical path until a seven-node cell fails to converge
+                    // at all. More scanning cannot be the fix when scanning is what starves convergence.
+                    //
+                    // So the residual stands, with a sharper shape: a node that never met a mover must end up with a correct
+                    // roster **without** scanning more — the flood should update its view directly, rather than prompt it to
+                    // go and look.
                     Ok(Notification::Reseated { .. } | Notification::PeerMoved { .. }) => {
-                        // Re-arm at the FLOOR; do **not** scan inline. Scanning here made things measurably worse — 0 of 3
-                        // where 4 of 6 had passed, with rosters collapsing to `[2, 2, 2, 4, 2]` and one trial failing to
-                        // resolve placement at all. A scan costs up to one `RESOLVE_TIMEOUT`, so re-scanning on every move
-                        // is exactly the overlapping-scan regime `ROSTER_REFRESH`'s 1/3 duty cycle exists to prevent: the
-                        // node ends up permanently scanning the cell and starves its own critical path.
-                        //
-                        // Resetting the backoff is the whole of what is needed. It says "look again soon" rather than "look
-                        // again now", which is the correct strength of signal: a composition change means the assignment is
-                        // *expected* to move, not that it has already.
+                        // Undo relaxation only. Not inline (a scan costs up to one `RESOLVE_TIMEOUT`), and not by re-arming
+                        // at the floor when already there — a fresh `interval_at(now + backoff, …)` pushes the next tick a
+                        // full period out, so "re-arm" would *delay* the soonest available look.
                         stable = 0;
-                        backoff = ROSTER_REFRESH;
-                        refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
-                        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        if backoff > ROSTER_REFRESH {
+                            backoff = ROSTER_REFRESH;
+                            refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
+                            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
