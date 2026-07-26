@@ -415,6 +415,29 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
+        Self::spawn_inner_fleet::<F>(count, link, roles, true).await
+    }
+
+    /// As [`spawn`](Self::spawn), but taking the coordinate draw **as it comes** — collisions included.
+    ///
+    /// The condition must be reproducible on demand, not waited for: a scenario that hopes to meet a collision measures
+    /// whatever the draw happened to give, and four consecutive passes of a cell-wide test looked like success while being a
+    /// 13% coincidence. This is how a collided draw is *forced*, which is what turned live coordinate resolution from
+    /// "seems fine" into a measurement.
+    pub async fn spawn_as_drawn<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+    ) -> Result<Self, fanos_node::NodeError> {
+        Self::spawn_inner_fleet::<F>(count, link, roles, false).await
+    }
+
+    async fn spawn_inner_fleet<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+        injective: bool,
+    ) -> Result<Self, fanos_node::NodeError> {
         let fabric = Fabric::new(link);
         let (_shares, commitment) = fanos_vrf::vss::deal(
             &[0xF1; 32],
@@ -425,29 +448,23 @@ impl NodeFleet {
         .ok_or(fanos_node::NodeError::Identity)?;
         let mut nodes: Vec<fanos_node::Node> = Vec::with_capacity(count);
         let mut addrs = Vec::with_capacity(count);
-        let mut taken: HashSet<fanos_geometry::Triple> = HashSet::new();
-        // Retries until the whole draw is INJECTIVE. A coordinate is `MapToPoint(VRF(sk, …))`, i.e. a uniform draw over
-        // the plane's `q² + q + 1` points, so a fleet collides with probability `1 - P!/((P-n)!·Pⁿ)` — at 5 nodes on
-        // `PG(2,4)`'s 21 points that is **40.2% of runs**. Two nodes sharing a point are mutually unroutable: the one
-        // that loses the directory arbitration receives nothing, so it can never see the whole cell however long it
-        // waits. A fixture that lets that happen turns every cell-wide assertion into a coin flip on the draw — and a
-        // frozen, split roster is indistinguishable from a resolution defect, which is a diagnosis this file has already
-        // paid for once (§5.3.4a).
+        // An injective draw, retried until achieved — and the reason has CHANGED, which is why it is spelled out.
         //
-        // Resolving a collision *live* is `fanos_vrf::settle_index`, which is complete and consistent but not yet
-        // reachable from the wire (the `HELLO` frame carries only probe index 0 — `docs/open-tasks.md` Tier A). Until it
-        // is, an injective fixture is what isolates resolution from the draw; the same construction is used by
-        // `fanos-quic/tests/self_certifying.rs::spawn_distinct`, for the same reason.
-        // An injective draw is impossible past the plane's point count, and a retry loop must never be the thing that
-        // discovers that. `attempts` additionally bounds the pathological tail: the expected number of draws is
-        // `n·H_P/(P-n)`-ish, and 64 per seat is orders of magnitude past it for every fixture here.
-        if count > fanos_geometry::Plane::<F>::N as usize {
-            return Err(fanos_node::NodeError::Identity);
-        }
+        // It used to exist because a collided node stayed unroutable forever, making every cell-wide assertion a coin flip
+        // on the draw (40.2% collide at 5 nodes on `PG(2,4)`'s 21 points). That is fixed: live resolution now moves a
+        // contested node along its probe walk and it announces the point it reached, measured at 7/7 distinct across four
+        // forced-collision trials with nodes visibly seated at probe index 1 and 4 (`fanos_quic::claims`).
+        //
+        // What it guards now is the *next* defect, one layer up: after a node moves, its peers keep the stale binding.
+        // `Reseater::apply` clears the vacated point from the mover's OWN directory, and nothing tells the rest of the cell,
+        // so roster convergence stalls — measured, with placement fully resolved (`occupied = 5 of 5`), at
+        // `Refuted { frozen_for: 30s, last: [4, 4, 3, 4, 2] }`. Until a mover announces its move, an injective draw is what
+        // keeps a cell-wide scenario measuring what it claims to measure. Remove this again when that lands.
+        let mut taken: HashSet<fanos_geometry::Triple> = HashSet::new();
         let mut attempts = 0usize;
         while nodes.len() < count {
             attempts += 1;
-            if attempts > 64 * count.max(1) {
+            if attempts > 64 * count.max(1) || count > fanos_geometry::Plane::<F>::N as usize {
                 return Err(fanos_node::NodeError::Identity);
             }
             let socket = fabric.bind();
@@ -468,10 +485,8 @@ impl NodeFleet {
                 fanos_quic::Fabric::Abstract(socket),
             )
             .await?;
-            if !taken.insert(node.health().address) {
-                // A collided draw: drop this node and try again with fresh credentials. The socket is abandoned with it,
-                // which costs nothing on a modelled fabric.
-                node.shutdown();
+            if injective && !taken.insert(node.health().address) {
+                node.shutdown(); // collided draw: retry with fresh credentials
                 continue;
             }
             nodes.push(node);
@@ -1123,9 +1138,27 @@ mod tests {
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
+        // Let the PLACEMENT settle before counting occupied points. This used to sample immediately after spawn, which was
+        // correct only while a collided node stayed put: now that live resolution moves it along its probe walk
+        // (`fanos_quic::claims`), an early sample counts the *pre-resolution* draw and asserts rosters against a target the
+        // cell is in the middle of leaving behind. Measured as `Refuted { last: [2, 4, 3, 4, 4] }` against `occupied = 4`
+        // while the cell was converging on 5.
+        let placed = fleet
+            .until_settled(
+                |f| {
+                    let held: HashSet<_> = f.nodes().iter().map(|n| n.health().address).collect();
+                    held.len() == f.nodes().len()
+                },
+                |f| f.nodes().iter().map(|n| n.health().address).collect::<Vec<_>>(),
+            )
+            .await;
         let coords: HashSet<fanos_geometry::Triple> =
             fleet.nodes().iter().map(|node| node.health().address).collect();
         let occupied = coords.len();
+        assert!(
+            !placed.is_refuted() || occupied > 1,
+            "the draw must leave more than one point occupied once placement settles: {placed:?}"
+        );
         // Convergence is *polled* rather than measured inside a fixed window: a window long enough to survive machine
         // contention makes every run pay for the worst case, and one sized for an idle machine is a false red — the same
         // mistake §5.3.4 removed from the real-socket suites. Settling is then checked over a short window afterwards.
@@ -1268,17 +1301,39 @@ mod tests {
     #[tokio::test]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_a_collided_draw_now_resolves_itself() {
-        // The claim to check: with the probe index on the wire (`fanos_quic::claims`), a fleet whose coordinate draw
-        // COLLIDES should now resolve to distinct points by itself, retiring the injective-draw workaround in
-        // `NodeFleet::spawn`. At 7 nodes on `PG(2,4)`'s 21 points the draw collides in ~67% of runs, so a handful of trials
-        // exercises it. Reports the *preferred* points (what the draw gave) against the *held* points (where the nodes
-        // ended up): resolution shows as held > preferred.
+        // Forces the condition with `spawn_as_drawn` — at 7 nodes on `PG(2,4)`'s 21 points a draw collides in ~67% of runs,
+        // and hoping to meet one is how a 13% coincidence passed for success.
+        //
+        // **RESOLVED 2026-07-26. Four trials, every one reaching 7/7 distinct:**
+        //
+        //   trial 0: held 7/7, all-distinct: true, index [0, 0, 1, 0, 0, 0, 0]
+        //   trial 1: held 7/7, all-distinct: true, index [0, 0, 0, 0, 1, 0, None]
+        //   trial 2: held 7/7, all-distinct: true, index [0, 0, 0, 0, 0, 1, 4]
+        //   trial 3: held 7/7, all-distinct: true  (injective draw — nothing to resolve)
+        //
+        // Nodes are visibly seated at probe index 1 and 4: they advanced along their own walks and announced where they
+        // landed. Runtime fell from ~700 s (waiting out the deadline) to 1.13 s.
+        //
+        // Three wrong hypotheses preceded it, each killed by adding an observable rather than by argument, and the cause was
+        // one line: **`spawn_inner` bound our coordinate to our own address unranked, overwriting the bootstrap seed** — the
+        // only route to whoever already held that point. The node then had no contender in its claim book, `settle_index`
+        // saw nothing to move for, and both members of a colliding pair sat at index 0 each believing it held the point.
+        // The first attempt at the fix read the directory *after* `spawn_inner` and so always answered "us", doing nothing.
+        //
+        // Dead hypotheses, kept because each was instructively wrong: reachability (refuted — every node, stuck ones
+        // included, had verified several peers' claims) and settle-on-join (changed nothing — the fleet never crosses an
+        // epoch boundary, so every node was already free to move).
+        //
+        // **The next defect is one layer up:** after a node moves, peers keep the stale binding, since `Reseater::apply`
+        // clears the vacated point from the mover's own directory and nothing tells the rest of the cell. With placement
+        // fully resolved (`occupied = 5 of 5`) roster convergence still froze at
+        // `Refuted { frozen_for: 30s, last: [4, 4, 3, 4, 2] }`. That is what `NodeFleet::spawn`'s injective draw now guards.
         use fanos_field::F4;
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         for trial in 0..4 {
-            let fleet = NodeFleet::spawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
+            let fleet = NodeFleet::spawn_as_drawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
             let settled = fleet.until(|f| {
                 let held: HashSet<_> = f.nodes().iter().map(|n| n.health().address).collect();
                 held.len() == f.nodes().len()

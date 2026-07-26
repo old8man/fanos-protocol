@@ -878,13 +878,34 @@ where
         }),
     });
     let dir_for_reshuffle = directory.clone();
+    // Snapshot who holds our point **before** `spawn_inner` runs, because `spawn_inner` binds our coordinate to our own
+    // address unranked — which overwrites the bootstrap seed. Reading it afterwards always answers "us", which is precisely
+    // how the first attempt at this fix silently did nothing.
+    let seeded_at_our_point = directory.resolve(coord.coords());
     let handle =
         spawn_inner(engine, directory, shaper.clone(), controller, identity, server, client, bind)?
             .with_claims(book.clone());
-    // Re-bind our genesis point *with* its rank. `spawn_inner` binds the coordinate before any rank is available to it,
-    // and an unranked self-binding is one any newcomer displaces (`Directory::insert_ranked`) — which for our own point
-    // is precisely the eviction the rank rule exists to prevent. Same address, so this is a rebind, not a collision.
-    dir_for_reshuffle.insert_ranked(coord.coords(), handle.local_addr(), rank);
+    // Re-bind our genesis point *with* its rank — unless someone else's address is already there.
+    //
+    // `spawn_inner` binds the coordinate before any rank is available to it, and an unranked self-binding is one any
+    // newcomer displaces, which for our own point is the eviction the rank rule exists to prevent. But binding
+    // *unconditionally* is what stopped coordinate resolution from ever happening. A node whose point is already held by a
+    // bootstrap-seeded address overwrote that seed with its own ranked entry — the seed being unranked, it always won — and
+    // in doing so **deleted its only route to the incumbent**. It then had no contender in its claim book, `settle_index`
+    // saw nothing to move for, and both nodes sat at index 0 each believing it held the point. Measured:
+    // `index [0, 0, 0, 0, 0, 0, 0]` on a draw with two contested points.
+    //
+    // So: if the point resolves to a *different* address, leave that binding alone. Being unbound is the honest state for a
+    // contested node — it is what the arbitration would have produced anyway — and it keeps the one route by which this node
+    // can ask the incumbent for its claim.
+    let contender_at_our_point = seeded_at_our_point.filter(|addr| *addr != handle.local_addr());
+    match contender_at_our_point {
+        // Contested: restore the incumbent's binding, which `spawn_inner` just overwrote. Being unbound ourselves is the
+        // honest state — it is what the arbitration would have produced — and it keeps the one route by which we can ask
+        // the incumbent for its claim.
+        Some(addr) => dir_for_reshuffle.insert(coord.coords(), addr),
+        None => dir_for_reshuffle.insert_ranked(coord.coords(), handle.local_addr(), rank),
+    }
     // Drive the per-epoch coordinate reshuffle off the live beacon (spec §L3, §3.2): on each `BeaconReady`
     // the loop re-derives this node's VRF coordinate for the new epoch, re-seats the engine, rebinds its
     // directory coordinate, and publishes the fresh HELLO + beacon so subsequent connections prove/verify
@@ -911,6 +932,7 @@ where
         book,
         shaper,
         handle.subscribe(),
+        contender_at_our_point,
     ));
     Ok(handle)
 }
@@ -1044,8 +1066,17 @@ async fn reshuffle_loop<F: Field>(
     book: ClaimBook,
     shaper: Shaper,
     mut events: broadcast::Receiver<Notification>,
+    contested: Option<SocketAddr>,
 ) {
     book.adopt(at.epoch);
+    // A contested point is only resolvable by learning the incumbent's *claim*, and dialing is by coordinate — so the one
+    // pair that must meet is the pair coordinate-addressed introduction cannot introduce. Sending to our own point reaches
+    // whoever the directory says holds it, which is exactly the incumbent: the HELLO exchange that follows records its
+    // claim (`crate::claims`), which wakes this loop, which then settles onto a point it can prove.
+    if let Some(addr) = contested {
+        tracing::debug!(?addr, coord = ?at.coord, "our point is already held; asking its holder for its claim");
+        seat.client.command(Command::Send { to: at.coord, payload: Vec::new() });
+    }
     loop {
         // Why the loop woke. A local enum rather than a `Notification` variant: "a peer's claim was recorded" is this
         // loop's business, not something the engine has any reason to broadcast.
@@ -2274,6 +2305,7 @@ mod tests {
             ClaimBook::new(),
             Some(shaper.clone()),
             events_tx.subscribe(),
+            None,
         ));
 
         events_tx
@@ -2362,6 +2394,7 @@ mod tests {
             ClaimBook::new(),
             None,
             events_tx.subscribe(),
+            None,
         ));
 
         // Re-announce the GENESIS beacon at epoch 0 → the same coordinate → the loop must NOT re-seat.
