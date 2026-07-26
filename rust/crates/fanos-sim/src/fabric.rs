@@ -365,7 +365,31 @@ impl NodeFleet {
         .ok_or(fanos_node::NodeError::Identity)?;
         let mut nodes: Vec<fanos_node::Node> = Vec::with_capacity(count);
         let mut addrs = Vec::with_capacity(count);
-        for _ in 0..count {
+        let mut taken: HashSet<fanos_geometry::Triple> = HashSet::new();
+        // Retries until the whole draw is INJECTIVE. A coordinate is `MapToPoint(VRF(sk, …))`, i.e. a uniform draw over
+        // the plane's `q² + q + 1` points, so a fleet collides with probability `1 - P!/((P-n)!·Pⁿ)` — at 5 nodes on
+        // `PG(2,4)`'s 21 points that is **40.2% of runs**. Two nodes sharing a point are mutually unroutable: the one
+        // that loses the directory arbitration receives nothing, so it can never see the whole cell however long it
+        // waits. A fixture that lets that happen turns every cell-wide assertion into a coin flip on the draw — and a
+        // frozen, split roster is indistinguishable from a resolution defect, which is a diagnosis this file has already
+        // paid for once (§5.3.4a).
+        //
+        // Resolving a collision *live* is `fanos_vrf::settle_index`, which is complete and consistent but not yet
+        // reachable from the wire (the `HELLO` frame carries only probe index 0 — `docs/open-tasks.md` Tier A). Until it
+        // is, an injective fixture is what isolates resolution from the draw; the same construction is used by
+        // `fanos-quic/tests/self_certifying.rs::spawn_distinct`, for the same reason.
+        // An injective draw is impossible past the plane's point count, and a retry loop must never be the thing that
+        // discovers that. `attempts` additionally bounds the pathological tail: the expected number of draws is
+        // `n·H_P/(P-n)`-ish, and 64 per seat is orders of magnitude past it for every fixture here.
+        if count > fanos_geometry::Plane::<F>::N as usize {
+            return Err(fanos_node::NodeError::Identity);
+        }
+        let mut attempts = 0usize;
+        while nodes.len() < count {
+            attempts += 1;
+            if attempts > 64 * count.max(1) {
+                return Err(fanos_node::NodeError::Identity);
+            }
             let socket = fabric.bind();
             let addr = socket.addr();
             // Bootstrap from whoever is already up — the real discovery path, not a seeded table.
@@ -384,6 +408,12 @@ impl NodeFleet {
                 fanos_quic::Fabric::Abstract(socket),
             )
             .await?;
+            if !taken.insert(node.health().address) {
+                // A collided draw: drop this node and try again with fresh credentials. The socket is abandoned with it,
+                // which costs nothing on a modelled fabric.
+                node.shutdown();
+                continue;
+            }
             nodes.push(node);
             addrs.push(addr);
         }
@@ -942,9 +972,13 @@ mod tests {
         // mutually unroutable, so no node can ever see the whole cell. Enlarging the plane, with everything else held
         // fixed, is decisive: PG(2,4) at the same 7 nodes gives 7 distinct coordinates and rosters [7; 7].
         //
-        // The assertion therefore compares each node's roster against the number of **occupied** coordinates, never
-        // against the node count: that isolates resolution from the draw. Requiring injectivity would make the test a
-        // coin flip — `injective_probability(21, 7) ≈ 0.33` — which is the trap the first version of it fell into.
+        // The assertion compares each node's roster against the number of **occupied** coordinates rather than the node
+        // count. That was not enough on its own: comparing against `occupied` fixes the target NUMBER but not the fact
+        // that the node which loses a collision's arbitration is unroutable and therefore cannot see the whole cell
+        // however long it waits. Measured, this failed in ~40% of runs at `N = 5` on `PG(2,4)`'s 21 points, while the
+        // comment here claimed it was draw-independent. `NodeFleet::spawn` now draws INJECTIVELY, which is what actually
+        // isolates resolution from the draw; the `occupied` comparison stays because it keeps the assertion honest if
+        // that ever changes.
         // Five, not seven. The assertion is draw-independent (roster vs *occupied* points), so it does not need a
         // full plane's worth of nodes — and seven real composed nodes is the most expensive fixture in this file, which
         // on a contended host is the difference between a signal and a timeout.
