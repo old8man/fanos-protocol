@@ -16,7 +16,7 @@ use fanos_field::F2;
 use fanos_geometry::{Line, Point, Triple};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::Epoch;
-use fanos_runtime::Duration;
+use fanos_runtime::{Command, Duration};
 use fanos_sim::Sim;
 
 /// Spawn a `ThresholdRouter` at every Fano point (threshold `t`), returning the public-key directory
@@ -189,4 +189,140 @@ fn below_threshold_the_hop_cannot_be_peeled_and_nothing_is_delivered() {
             .any(|(_, from, bytes)| from == ANONYMOUS && bytes == payload),
         "below threshold the hop cannot be peeled — nothing is delivered"
     );
+}
+
+/// **The GPA timing channel on the SHIPPING engine.**
+///
+/// `traffic_analysis.rs` measures this on `NyxNode` — the *Lite* profile. But `fanos_node`'s `DEFAULT_MIX_DELAY` /
+/// `DEFAULT_COVER_INTERVAL` feed **`ThresholdRouter`**, the Full profile the node actually builds, and audit E6 records
+/// that the two differ on exactly this mechanism: constant-rate displacement was done on `ThresholdRouter` while "the Lite
+/// `NyxNode` path remains additive". So the flagship "strong against a GPA" claim had a timing measurement on the *weaker*
+/// engine and none on the shipping one.
+///
+/// The metric is the one `traffic_analysis` arrived at after two wrong attempts: worst per-relay Pearson correlation
+/// between input-rate and output-rate series, **maximised over the adversary's observation timescale** (it chooses), and
+/// restricted to bin widths with at least 30 samples (Pearson over a handful of points reaches 1.000 by chance).
+#[test]
+#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+fn measure_gpa_timing_on_the_shipping_router() {
+    const SPAN_MS: u64 = 10_000;
+    const MIN_BINS: u64 = 30;
+
+    let run = |mix: Duration, cover: Duration| -> f64 {
+        let mut sim = Sim::new(0x9C1);
+        let mut pubs = BTreeMap::new();
+        for i in 0..7 {
+            let point = Point::<F2>::at(i);
+            let mut rng = SeedRng::from_seed(&[0xA0, i as u8]);
+            let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+            let mut onion_seed = [0xC5u8; 32];
+            onion_seed[31] = i as u8;
+            pubs.insert(point.coords(), OnionKeyRatchet::new(onion_seed, Epoch::ZERO).public().clone());
+            let mut r = ThresholdRouter::<F2>::new(point, &secret, 2, onion_seed).with_mixing(mix);
+            if cover.as_nanos() > 0 {
+                r = r.with_cover(cover);
+            }
+            sim.add(Box::new(r));
+        }
+        if cover.as_nanos() > 0 {
+            sim.inject_all(&Command::StartHeartbeat);
+        }
+        sim.observe_frames();
+
+        // A bursty flow through the cell — bursts are what a timing attack keys on.
+        let hop_lines: Vec<Triple> = vec![Line::<F2>::at(0).coords(), Line::<F2>::at(1).coords()];
+        for round in 0..8u64 {
+            for _ in 0..5 {
+                let onion = build_onion(&hop_lines, 2, b"burst", &pubs);
+                let Some(entry) = combiner_for::<F2>(hop_lines[0]) else { continue };
+                sim.inject(entry, Command::Emit { to: entry, frame: launch_frame(hop_lines[0], &onion) });
+            }
+            sim.run_for(Duration::from_millis(if round % 2 == 0 { 100 } else { 900 }));
+        }
+        sim.run_for(Duration::from_millis(2_000));
+
+        let obs = sim.observed_frames();
+        let mut worst = 0.0f64;
+        for bin in [25u64, 50, 100, 250, 500].into_iter().filter(|b| SPAN_MS / b >= MIN_BINS) {
+            let span = obs.iter().map(|o| o.t_ms).max().unwrap_or(0) / bin + 1;
+            // EXCLUDE the entry combiner: it is the injection point, and `Command::Emit` is a RAW launch that bypasses
+            // the constant-rate outbox by design (it is the client's launch primitive, not a relay forward). Its
+            // emissions therefore track the injection schedule by construction — including it measures my own test
+            // harness, not the defence. `traffic_analysis.rs` excludes endpoints for the same reason: endpoint exposure
+            // is the acknowledged §8.1 residual (`P_link = P_hop²`), and cover defends the INTERIOR hops.
+            let entry = combiner_for::<F2>(hop_lines[0]);
+            for i in 0..7 {
+                let relay = Point::<F2>::at(i).coords();
+                if Some(relay) == entry {
+                    continue;
+                }
+                let mut ins = vec![0f64; span as usize];
+                let mut outs = vec![0f64; span as usize];
+                for o in obs {
+                    let b = (o.t_ms / bin) as usize;
+                    if o.to == relay && let Some(v) = ins.get_mut(b) { *v += 1.0 }
+                    if o.from == relay && let Some(v) = outs.get_mut(b) { *v += 1.0 }
+                }
+                worst = worst.max(pearson(&ins, &outs).abs());
+            }
+        }
+        worst
+    };
+
+    // Sanity FIRST: is cover actually emitting in this harness? A schedule that emits nothing would read as
+    // "undefended" at any parameter, and reporting that as a finding about the defence would be measuring my own setup.
+    let volume = |mix: Duration, cover: Duration| -> usize {
+        let mut sim = Sim::new(0x9C2);
+        for i in 0..7 {
+            let point = Point::<F2>::at(i);
+            let mut rng = SeedRng::from_seed(&[0xA0, i as u8]);
+            let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+            let mut onion_seed = [0xC5u8; 32];
+            onion_seed[31] = i as u8;
+            let mut r = ThresholdRouter::<F2>::new(point, &secret, 2, onion_seed).with_mixing(mix);
+            if cover.as_nanos() > 0 {
+                r = r.with_cover(cover);
+            }
+            sim.add(Box::new(r));
+        }
+        if cover.as_nanos() > 0 {
+            sim.inject_all(&Command::StartHeartbeat);
+        }
+        sim.observe_frames();
+        sim.run_for(Duration::from_millis(SPAN_MS));
+        sim.observed_frames().len()
+    };
+    let idle_bare = volume(Duration::from_millis(0), Duration::from_millis(0));
+    let idle_cover = volume(Duration::from_millis(50), Duration::from_millis(1_000));
+    println!("idle frames over {SPAN_MS} ms — no cover {idle_bare}, cover 1000ms {idle_cover}");
+    assert!(
+        idle_cover > idle_bare + 20,
+        "cover must genuinely emit in this harness, else the correlation below measures an undefended relay at any \
+         parameter (bare {idle_bare}, with cover {idle_cover})"
+    );
+
+    println!("ThresholdRouter (the SHIPPING engine) — GPA in/out rate correlation:");
+    println!("  no defence                       r = {:.3}", run(Duration::from_millis(0), Duration::from_millis(0)));
+    println!("  SHIPPING (mix 50ms, cover 1000ms) r = {:.3}", run(Duration::from_millis(50), Duration::from_millis(1_000)));
+    println!("  aggressive (mix 120ms, cover 150ms) r = {:.3}", run(Duration::from_millis(120), Duration::from_millis(150)));
+}
+
+/// Pearson correlation; `0.0` when either series is constant.
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len()) as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    let mut num = 0.0;
+    let (mut da, mut db) = (0.0, 0.0);
+    for (x, y) in a.iter().zip(b.iter()) {
+        num += (x - ma) * (y - mb);
+        da += (x - ma).powi(2);
+        db += (y - mb).powi(2);
+    }
+    if da <= f64::EPSILON || db <= f64::EPSILON {
+        return 0.0;
+    }
+    num / (da.sqrt() * db.sqrt())
 }

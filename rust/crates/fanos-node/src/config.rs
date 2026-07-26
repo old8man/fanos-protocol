@@ -40,8 +40,40 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
 /// by default so the GPA defence is on; an operator trading anonymity for bandwidth can raise or zero it.
 ///
 /// **This constant, not the mix delay, is the timing defence** — and the trade is steep enough to be chosen against data
-/// rather than picked. Measured worst per-relay input/output rate correlation a GPA can read
-/// (`fanos-sim/tests/traffic_analysis.rs`, `sweep_timing_correlation_against_the_mix_delay`):
+/// rather than picked.
+///
+/// ## ⚠️ MEASURED ON THE SHIPPING ENGINE: the timing channel is essentially undefended
+///
+/// The first version of this note measured `fanos_aphantos::NyxNode` — the *Lite* engine — and guessed the Full profile
+/// would be **better**, since audit E6 records displacement as "done on `ThresholdRouter`" while "the Lite `NyxNode` path
+/// remains additive". **The guess was backwards.** Measured on `ThresholdRouter`, the engine these constants actually feed
+/// (`fanos-sim/tests/threshold_routing.rs::measure_gpa_timing_on_the_shipping_router`):
+///
+/// | configuration | GPA per-hop rate correlation |
+/// |---|---|
+/// | no defence at all | `r = 1.000` |
+/// | **these defaults (mix 50 ms, cover 1000 ms)** | **`r = 0.975`** |
+/// | aggressive (mix 120 ms, cover 150 ms) | `r = 0.898` |
+///
+/// The shipping configuration reduces a global passive adversary's per-hop timing correlation by **2.5%**. That is not a
+/// weak defence, it is effectively none — and it is *worse* than the Lite engine's 0.643 on the same metric.
+///
+/// The measurement is validated three ways, because a result this bad deserves the scrutiny before it is believed: cover
+/// genuinely emits in the harness (217 idle frames against 0 without it, so this is masking-versus-nothing and not
+/// starvation); the entry combiner is excluded, since `Command::Emit` is a raw launch that bypasses the outbox by design
+/// and its emissions track the injection schedule by construction; and the correlation is maximised over the adversary's
+/// observation timescale but restricted to bin widths with ≥ 30 samples.
+///
+/// **The volume channel is fine** — displacement holds emitted volume independent of load (leak slope 0.000). So the two
+/// halves of the flagship claim are in very different states, and only the volume half was ever measured.
+///
+/// This contradicts spec §8.2's "strong against a GPA" **for the profile that ships**, and the honest conclusion is the
+/// one at the bottom of this comment: a fixed-clock cover schedule is the wrong instrument for the timing channel. It
+/// cannot be tuned into one.
+///
+/// For reference, the same metric on the *Lite* `NyxNode` engine
+/// (`fanos-sim/tests/traffic_analysis.rs::sweep_timing_correlation_against_the_mix_delay`) — better, but still far from
+/// zero:
 ///
 /// | cover interval | GPA rate correlation |
 /// |---|---|
@@ -61,10 +93,12 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
 /// slope 0.000 — displacement does not depend on rate), which makes timing the binding constraint and this table the
 /// real GPA exposure.
 ///
-/// Lowering the interval buys little here (0.643 → 0.475 for a 3× bandwidth increase), so the honest conclusion is not
-/// "tune this down" but that **constant-rate cover on a fixed clock is the wrong instrument for the timing channel** — a
-/// relay's emission times track its input envelope at some timescale regardless of the slot period. Closing it properly
-/// needs emission decoupled from arrival, not a faster clock. Recorded as a design gap rather than a tuning note.
+/// Lowering the interval buys little on either engine — 0.643 → 0.475 on Lite, 0.975 → 0.898 on the shipping router, both
+/// for a ~6× bandwidth increase. So the conclusion is **not** a tuning note: **constant-rate cover on a fixed clock is
+/// the wrong instrument for the timing channel.** A relay's emission times track its input envelope at some timescale
+/// regardless of the slot period, because the queue length does. Closing this needs emission **decoupled from arrival** —
+/// a continuous-time (Poisson) mix, where each cell's delay is independently exponential and cover is itself Poisson, so
+/// the output process is independent of the input rate. Recorded as an open design gap, not a dial.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
