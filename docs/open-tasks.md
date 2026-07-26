@@ -178,38 +178,50 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
   error vocabulary. (Was item 12.)
 - **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
   loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
-- **10. S1-M3 + capdir's own residual are ONE gap, and the mechanism to close both now exists.** The finding, from
-  comparing the two directories:
-  - `mixdir` publishes its onion key **unsigned**, so a forged key makes that member unable to peel (liveness-DoS, not
-    deanonymization — a hop still needs `t` genuine members). That is S1-M3.
-  - `capdir` *does* sign, and its own doc records the residual that remains: a signature proves **someone** with that VRF
-    key signed the record, not that the key is **entitled to that coordinate**. So a forger publishing a self-consistent
-    record signed by their own key at another node's slot passes. Signing was never the missing piece.
-  - **Both are the same missing binding**, and `fanos_vrf::verify_coordinate_claim` is exactly it: the publisher includes
-    its `CoordinateClaim`, and the reader checks it against *the slot's* coordinate. A key that cannot prove entitlement to
-    the coordinate is rejected, which is the property both directories were reaching for.
-  - **The piece that used to be missing is present.** Verification needs the epoch beacon at the *reader*, which is why an
-    earlier scoping pass concluded this needed plumbing through three resolvers. The node already tracks it —
-    `node.rs`'s `LiveBeacon = Arc<Mutex<Option<(Epoch, [u8; 32])>>>` — so the fix is to thread that handle into
-    `build_mix_directory` / `build_capability_directory` and verify, not to invent a channel.
-  - Supersedes the earlier "coordinate-owned namespace in the store's write path" sketch: a storage-layer ACL would police
-    *who wrote*, while what actually matters is whether a **reader** can tell a genuine record from a forged one. The check
-    belongs at the read, where the trust decision is made.
-  - ⚠️ **ATTEMPTED AND REVERTED 2026-07-26, because the binding needs a mode distinction the plan missed.** A working
-    implementation (bound record + reader verification + a `NodeHandle::coordinate_prover` closure so no signing key reaches
-    a publisher) built and linted clean, then failed its own integration tests **correctly**: only 2 of 5 relays' records
-    verified.
-    - **Why: the binding requires VRF-derived coordinates.** It proves the slot's coordinate lies on the publisher's own
-      probe walk, and a **pinned** coordinate has no relation to that node's VRF output. `fanos-quic`'s cell harness pins
-      coordinates by design, and so does any deployment with `config.vrf_coordinates == false` — the same split
-      `on_announce` already makes for audit C3, which this plan did not account for. On `PG(2,2)` a line holds 3 of 7
-      points, so ~3/7 of pinned nodes happen to pass, which is exactly the 2-of-5 observed.
-    - **So the fix needs two modes, not one check**, and the mode must come from the same place `on_announce` gets it
-      rather than from a caller-supplied boolean — a `verify: bool` parameter is a footgun that reads as "disable the
-      security check here".
-    - Reverted rather than shipped half-wired: a security check that silently rejects two thirds of honest records is worse
-      than the documented liveness-DoS it replaces. The pieces that worked are worth rebuilding once the mode question is
-      settled — the bound-record format, and the prover closure that keeps the VRF secret inside the driver.
+- **10. S1-M3 + capdir's residual — DONE** (`46f9bc9` for `mixdir`, and the `capdir` half + shared authority after it). The
+  two were one gap and are closed by one mechanism, `fanos_node::bound::Entitlement`: a record carries the credential its
+  coordinate is *derived from* (identity bytes ‖ VRF public ‖ VRF proof) and the reader checks that the slot's coordinate lies
+  on that publisher's own probe walk.
+  - **`mixdir`** published its onion key unsigned, so anyone who could write to the store could plant a key at every point of
+    the plane and *be* the mixnet. Now bound: on PG(2,7) a lifted record is refused at 49 of the other 56 points, and it is
+    tied to its epoch and beacon so a past epoch's record cannot be replayed forward.
+  - **`capdir`** *did* sign, and signing was never the missing piece — a signature proves *someone* holding that key signed
+    those bytes, so a forger with a fresh key at another node's slot joined the roster as that member. Now bound the same way,
+    with the descriptor authenticated against **the very key just proven entitled** (two copies of one key would be a
+    cross-check waiting to be forgotten).
+  - **One extra half, found while writing it:** a coordinate binding alone still lets an *entitled* publisher advertise under
+    another member's id — owning a point says nothing about which name you claim while sitting there. A node's
+    role-assignment id **is** its coordinate-VRF public key (`node.rs`'s `SelfOrgConfig`), so `parse_bound_advertisement`
+    requires `desc.node_id == entitled.public`, and the name inside the slot is unforgeable too. Pinned by
+    `an_entitled_publisher_cannot_advertise_under_another_members_id`.
+  - **The mode question the reverted attempt raised, settled.** `Option<BeaconSeed>` at every reader and
+    `Option<CoordinateProver>` at every publisher: having a beacon *is* the VRF mode, and its absence is an **absent
+    mechanism**, not a disabled check — nothing in a pinned cell can supply one, so `verify: bool` (which reads as "disable
+    the security check here") never appears.
+  - **⚠️ The trap that cost the most, and is now documented in `bound.rs` and asserted in the suite: the mode cannot be
+    inferred from below.** Deriving it from `NodeHandle::claims` — a claim book exists iff the node has a self-certifying
+    identity — looks like the same predicate and is not one: **a pinned harness gives its nodes identities while seating none
+    of them on a point it could prove.** An assertion added to the pinned QUIC suite reported `true` there and killed the
+    derivation immediately. It is a deployment property of the cell, stated by whoever configured it.
+  - Threading the mode through the hidden-service host driver hit eight positional arguments, three of them
+    `(Vec<u8>, u8, bool)`; `HostedService` now groups what is hosted and under which regime.
+  - Superseded, as the earlier revision predicted: a storage-layer write ACL would police *who wrote*, while what matters is
+    whether a **reader** can tell a genuine record from a forged one. The check belongs at the read.
+- **10b. `dromos_quic` stalls at HEAD — a live e2e gate that is currently red, and it is NOT a timing budget.** Found while
+  baselining the item-10 work (the rule from `simulator-instrument-integrity`: establish the baseline *before* attributing a
+  failure — which is what stopped this being reported as a regression).
+  - **Measured, both runs uncontended, both tests already holding `common::serial_cell`:** at `46f9bc9` **2 of 2 fail in
+    482.15 s**; with the item-10 working tree **1 of 2 fails in 244.40 s**. `HANG_CEILING` is 240 s, so 482 s is exactly two
+    serialized tests each burning the whole ceiling. The suite's own comment records that each passes **alone in ~4–27 s**.
+  - So this is a **genuine stall**, not host contention and not a ceiling to widen — the fixture lock that would fix
+    contention is already held. It is also flaky across runs (the private-transfer test passed in one run and failed in the
+    other), which points at a race rather than a deterministic deadlock.
+  - **Where to look first:** both assertions are OBOLOS shielded-pool counts (`spent_count() == 1 && note_count() == 2`), and
+    the immediately preceding commits are the obolos ring/ledger wiring (`6daf833`, `2d8c255`). A shielded-pool state
+    assertion that never converges is consistent with that wiring being mid-flight. Confirm by bisecting `dromos_quic`
+    across those commits before touching the consensus path.
+  - Not caused by item 10, which strictly improves it (2 failures → 1). Recorded rather than silently ridden past: an e2e
+    gate that is red at HEAD cannot verify anything built on top of it.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so

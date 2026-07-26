@@ -421,6 +421,9 @@ fn spawn_roles<F: Field + 'static>(
             capability: Capability::new(offered, ROLE_CAPACITY_WEIGHT),
             capacity: Demand::per_role(|_| ROLE_CAPACITY_PER_NODE),
             controller: RoleController::new(Demand::default(), Demand::default(), ROLE_GAIN_SEVENTH),
+            // A `Node` runs VRF coordinates, so it publishes a coordinate-bound advertisement and verifies everyone
+            // else's (`crate::bound`). `None` only in a pinned cell, where the proof cannot exist.
+            prover: handle.coordinate_prover(),
         },
         // Until a telemetry-driven load sensor lands, a node reports the load it is itself serving: one unit per role
         // it offers. That is honest — it is the load this node accounts for — and makes the cell setpoint the count

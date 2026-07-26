@@ -19,7 +19,7 @@ use core::time::Duration;
 use fanos_core::roles::{Capability, Demand, Reputation, RoleController, RoleSet};
 use fanos_field::Field;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
-use fanos_quic::Client;
+use fanos_quic::{Client, CoordinateProver};
 use fanos_runtime::Notification;
 use fanos_vrf::VrfSecret;
 use tokio::sync::{broadcast, oneshot, watch};
@@ -132,6 +132,8 @@ pub fn spawn_role_loop<F: Field>(
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
     peers: impl Fn() -> usize + Send + 'static,
+    // See `assign_epoch`: whether a roster record must prove the coordinate it sits at.
+    vrf: bool,
 ) -> (JoinHandle<()>, watch::Receiver<Assignment>) {
     let (roles_tx, roles_rx) = watch::channel(Assignment::NONE);
     let handle = tokio::spawn(async move {
@@ -139,7 +141,7 @@ pub fn spawn_role_loop<F: Field>(
         let mut events = client.subscribe();
         let mut cur = Epoch::ZERO;
         let mut seed = BeaconSeed::GENESIS;
-        genesis_assign::<F>(&client, &mut live, capacity, ready, &roles_tx).await;
+        genesis_assign::<F>(&client, &mut live, capacity, ready, vrf, &roles_tx).await;
         // The refresh is a fixed-point iteration over the roster, so it is polled at a rate proportional to how fast it
         // is still moving: back off geometrically while the assignment is unchanged, snap back to the floor the moment
         // it moves. Converged cells therefore stop paying for it (a fixed 5 s scan forever is two cell-wide directory
@@ -157,7 +159,7 @@ pub fn spawn_role_loop<F: Field>(
                     Ok(Notification::BeaconReady { epoch, seed: s }) if epoch > cur => {
                         cur = epoch;
                         seed = BeaconSeed::new(s);
-                        (settled, _) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
+                        (settled, _) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, vrf, &roles_tx).await;
                         // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
                         // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
                         stable = 0;
@@ -214,7 +216,7 @@ pub fn spawn_role_loop<F: Field>(
                 // compute the same assignment, exactly as on a beacon advance — the refresh adds no new randomness, it
                 // just stops the cell being stuck with a startup-race view of itself.
                 _ = refresh.tick() => {
-                    let (now, complete) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
+                    let (now, complete) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, vrf, &roles_tx).await;
                     if now == settled {
                         stable = next_stable(stable, true, complete);
                         // Local stability is *not* evidence of the global fixed point, and conflating the two is the
@@ -314,6 +316,8 @@ async fn genesis_assign<F: Field>(
     live: &mut LiveRoleController,
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
+    // See `assign_epoch`: whether a roster record must prove the coordinate it sits at.
+    vrf: bool,
     roles_tx: &watch::Sender<Assignment>,
 ) {
     let (capability_ready, load_ready) = ready;
@@ -324,7 +328,7 @@ async fn genesis_assign<F: Field>(
     if tokio::time::timeout(GENESIS_READY_TIMEOUT, both).await.is_err() {
         return; // the store is not answering; the beacon's first round will assign instead
     }
-    assign_epoch::<F>(client, live, Epoch::ZERO, &BeaconSeed::GENESIS, capacity, roles_tx).await;
+    assign_epoch::<F>(client, live, Epoch::ZERO, &BeaconSeed::GENESIS, capacity, vrf, roles_tx).await;
 }
 
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
@@ -385,13 +389,15 @@ async fn assign_epoch<F: Field>(
     epoch: Epoch,
     beacon: &BeaconSeed,
     capacity: Demand,
+    // Whether this cell's coordinates are VRF-derived, so a roster record must prove the slot it sits at (`crate::bound`).
+    vrf: bool,
     roles_tx: &watch::Sender<Assignment>,
 ) -> (Assignment, bool) {
     // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
     // assignment's worst-case latency is one RESOLVE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
     let ((members, caps_complete), (setpoint, load_complete)) = tokio::join!(
-        build_capability_directory::<F>(client, epoch),
+        build_capability_directory::<F>(client, epoch, vrf.then_some(*beacon)),
         build_cell_setpoint::<F>(client, epoch, capacity)
     );
     let roles = live.step(&members, epoch, beacon, setpoint);
@@ -425,6 +431,16 @@ pub struct SelfOrgConfig {
     pub capacity: Demand,
     /// The demand controller (its initial demand, floor, and loop gain).
     pub controller: RoleController,
+    /// This node's coordinate prover, which **states the cell's coordinate regime** — see [`crate::bound`].
+    ///
+    /// `Some` ⇒ VRF-derived coordinates: the node publishes a capability advertisement bound to the coordinate it sits at,
+    /// and its roster reads verify the same binding on everyone else's. `None` ⇒ a pinned cell, where no publisher can
+    /// produce such a proof and no reader can check one.
+    ///
+    /// It is *this node's* prover but the *cell's* regime, and that is sound because the regime is a property of the
+    /// deployment: every node in a cell is configured the same way, so "I can prove my coordinate" and "my peers can prove
+    /// theirs" are the same fact. Obtained from [`fanos_quic::NodeHandle::coordinate_prover`].
+    pub prover: Option<CoordinateProver>,
 }
 
 /// Spawn a node's **entire self-organizing subsystem** on plane `F` — the single call `Node::start` makes to
@@ -439,12 +455,12 @@ pub fn spawn_self_organization<F: Field>(
     load_source: impl Fn() -> Demand + Send + 'static,
     peers: impl Fn() -> usize + Send + 'static,
 ) -> SelfOrganization {
-    let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller } = config;
+    let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller, prover } = config;
     let (capability_publisher, capability_ready) =
-        spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability);
+        spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability, prover.clone());
     let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source);
     let (role_loop, assigned) =
-        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers);
+        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, prover.is_some());
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
 }
 

@@ -30,8 +30,9 @@ use tokio::task::JoinHandle;
 
 use crate::EpochDriver;
 use fanos_primitives::BeaconSeed;
-use fanos_vrf::{VrfProof, VrfPublic, coordinate_output, probe_index_of};
+use fanos_vrf::{VrfProof, VrfPublic};
 
+use crate::bound::Entitlement;
 use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
 
 /// How a publisher obtains its coordinate proof: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
@@ -40,43 +41,12 @@ use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
 /// is `fanos_quic::NodeHandle::coordinate_prover`, where the credentials already live.
 pub use fanos_quic::CoordinateProver;
 
-/// A published mix-key record **bound to the coordinate it sits at** (S1-M3):
-/// `id_len(2) ‖ id ‖ vrf_public(32) ‖ proof(80) ‖ key`.
-///
-/// A reader recovers the publisher's VRF output from `proof` over `(id, epoch, beacon)` and checks that the **slot's**
-/// coordinate lies on that output's own probe walk. A key published at a coordinate the publisher's walk cannot reach is
-/// refused, so a forged entry is rejected at the *read* — where the trust decision is actually made — rather than policed at
-/// the write.
-///
-/// ## What it proves, what it does not, and where it does not apply
-///
-/// It forces a forger to hold an identity whose *line* passes through the target point: a line contains `q + 1` of
-/// `q² + q + 1` points, so a random identity reaches a chosen point with probability `≈ 1/q` — about `q` grinding draws,
-/// against **zero** for the unsigned record it replaces. A cost, not an impossibility.
-///
-/// It deliberately omits the exact probe *index*, which would need the publisher's witness chain (`CoordinateClaim`) and
-/// would raise the cost to the full `N` draws of hitting a chosen point. That is the stronger form and the natural
-/// follow-up.
-///
-/// **It applies only where coordinates are VRF-derived.** A *pinned* coordinate has no relation to the node's VRF output,
-/// so no publisher in a pinned cell can produce a bound record and no reader can verify one — the same VRF-versus-pinned
-/// split `OverlayNode::on_announce` makes for audit C3. That is why the resolver takes `Option<BeaconSeed>` rather than a
-/// `verify: bool`: having a beacon *is* the VRF mode, and the absence of one is not a disabled check but an absent
-/// mechanism. `fanos_node::Node` always runs VRF coordinates; the `fanos-quic` cell harness always pins them.
-fn bound_record(id: &[u8], public: &VrfPublic, proof: &VrfProof, key: &HybridKemPublic) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + id.len() + 32 + 80 + 32);
-    out.extend_from_slice(&u16::try_from(id.len()).unwrap_or(u16::MAX).to_be_bytes());
-    out.extend_from_slice(id);
-    out.extend_from_slice(&public.to_bytes());
-    out.extend_from_slice(&proof.to_bytes());
-    out.extend_from_slice(&key.encode());
-    out
-}
-
-/// Parse and **verify** a bound record against the coordinate its slot names (sans-I/O).
+/// Parse and **verify** a coordinate-bound onion-key record against the coordinate its slot names (sans-I/O).
 ///
 /// `None` on malformed bytes, a proof that does not verify for `(id, epoch, beacon)`, or a coordinate the publisher's own
-/// probe walk never reaches. This is the whole trust check; the resolver only fetches bytes and calls it.
+/// probe walk never reaches. The binding, what it costs an attacker, and why it applies only under VRF coordinates are all
+/// in [`crate::bound`]; this is the mix directory's payload on top of it. The whole trust check — the resolver only fetches
+/// bytes and calls this.
 #[must_use]
 pub fn parse_bound_record<F: Field>(
     bytes: &[u8],
@@ -84,16 +54,8 @@ pub fn parse_bound_record<F: Field>(
     epoch: Epoch,
     beacon: &BeaconSeed,
 ) -> Option<HybridKemPublic> {
-    let id_len = usize::from(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?));
-    let id = bytes.get(2..2 + id_len)?;
-    let public = VrfPublic::from_bytes(bytes.get(2 + id_len..2 + id_len + 32)?.try_into().ok()?)?;
-    let proof = VrfProof::from_bytes(bytes.get(2 + id_len + 32..2 + id_len + 112)?.try_into().ok()?)?;
-    let key = HybridKemPublic::decode(bytes.get(2 + id_len + 112..)?)?;
-
-    let point = Point::<F>::new(coord)?;
-    let output = coordinate_output(&public, id, epoch, beacon, &proof)?;
-    probe_index_of::<F>(&output, &point)?;
-    Some(key)
+    let (_, payload) = Entitlement::open::<F>(bytes, coord, epoch, beacon)?;
+    HybridKemPublic::decode(payload)
 }
 
 /// Publish this node's onion key as a **coordinate-bound** record (S1-M3), at its live coordinate slot.
@@ -105,7 +67,7 @@ pub async fn publish_bound_mix_key(
 ) -> bool {
     let (id, vrf_public, vrf_proof) = proof;
     client
-        .put(mix_key_slot(client.address(), epoch), bound_record(id, vrf_public, vrf_proof, public))
+        .put(mix_key_slot(client.address(), epoch), Entitlement::encode(id, vrf_public, vrf_proof, &public.encode()))
         .await
 }
 
@@ -290,6 +252,7 @@ pub fn spawn_mix_publisher(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use fanos_vrf::{coordinate_output, probe_index_of};
     use fanos_field::F7;
     use fanos_pqcrypto::{HybridKemSecret, SeedRng};
     use fanos_vrf::{VrfSecret, prove_coordinate, probe_point};
@@ -363,7 +326,7 @@ mod tests {
         // it. Every point of the publisher's own walk qualifies — the check is walk membership, not a single index.
         let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
         let (id, public, proof, key) = relay(5, epoch, &beacon);
-        let record = bound_record(&id, &public, &proof, &key);
+        let record = Entitlement::encode(&id, &public, &proof, &key.encode());
         let output = coordinate_output(&public, &id, epoch, &beacon, &proof).unwrap();
 
         for k in 0..fanos_vrf::probe_bound::<F7>() {
@@ -381,7 +344,7 @@ mod tests {
         // A point off the publisher's line cannot be proven, so the record is a definite Absent rather than a Found.
         let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
         let (id, public, proof, key) = relay(5, epoch, &beacon);
-        let record = bound_record(&id, &public, &proof, &key);
+        let record = Entitlement::encode(&id, &public, &proof, &key.encode());
         let output = coordinate_output(&public, &id, epoch, &beacon, &proof).unwrap();
 
         let mut refused = 0;
@@ -403,7 +366,7 @@ mod tests {
         // different beacon — does not verify. Without this, last epoch's key survives its own rotation (audit E4).
         let beacon = BeaconSeed::GENESIS;
         let (id, public, proof, key) = relay(9, Epoch::new(4), &beacon);
-        let record = bound_record(&id, &public, &proof, &key);
+        let record = Entitlement::encode(&id, &public, &proof, &key.encode());
         let output = coordinate_output(&public, &id, Epoch::new(4), &beacon, &proof).unwrap();
         let mine = probe_point::<F7>(&output, 0).coords();
 

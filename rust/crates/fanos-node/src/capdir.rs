@@ -8,24 +8,28 @@
 //! central registry, no hand-built map. This is the exact pattern the mix directory ([`crate::mixdir`]) uses
 //! for onion keys, applied to capabilities.
 //!
-//! Trust (identical to [`crate::mixdir`]): the descriptor is signed with the node's coordinate-VRF key, so a
-//! forged capability published at another node's slot fails [`CapabilityDescriptor::verify`] and is dropped;
-//! at worst it makes that member absent from the roster (a liveness fault — the cell assigns over whoever
-//! *did* verify), never a security break. Binding the published VRF key to the node's cert-derived coordinate
-//! is the same later-hardening step [`crate::mixdir`] notes.
+//! Trust (identical to [`crate::mixdir`], and built on the same [`crate::bound`] check): the descriptor is signed with the
+//! node's coordinate-VRF key **and** the record proves that key is entitled to the coordinate its slot names. Signing alone
+//! was never enough and this module's own doc used to say so: a signature proves *someone* holding that key signed those
+//! bytes, so a forger publishing a self-consistent descriptor signed by their own fresh key at another node's slot passed
+//! every check and joined the roster as that member. With the binding, the two halves close on each other — the descriptor
+//! is authenticated against the very key just proven entitled to the coordinate, and a record that cannot prove entitlement
+//! is simply absent from the roster (a liveness fault, which the assignment already tolerates by running over whoever *did*
+//! verify).
 
 use fanos_core::roles::{Capability, CapabilityDescriptor};
 use fanos_diaulos::Coord;
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point};
-use fanos_primitives::NodeId;
-use fanos_quic::Client;
+use fanos_primitives::{BeaconSeed, NodeId};
+use fanos_quic::{Client, CoordinateProver};
 use fanos_rendezvous::Epoch;
 use fanos_runtime::Notification;
-use fanos_vrf::{VrfPublic, VrfSecret};
+use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::bound::Entitlement;
 use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch capability advertisement lives at — domain-separated, keyed by
@@ -57,6 +61,47 @@ pub fn parse_advertisement(bytes: &[u8], epoch: Epoch) -> Option<(NodeId, Capabi
     let vrf_public = VrfPublic::from_bytes(bytes.get(..32)?.try_into().ok()?)?;
     let desc = CapabilityDescriptor::from_bytes(bytes.get(32..)?)?;
     if desc.epoch != epoch || !desc.verify(&vrf_public) {
+        return None;
+    }
+    Some((desc.node_id, desc.capability))
+}
+
+/// The **coordinate-bound** advertisement: an [`Entitlement`] over the signed descriptor.
+///
+/// The VRF public is carried once, inside the entitlement, and the descriptor is authenticated against *it* — never against
+/// a second copy alongside. Two copies of one key is a cross-check waiting to be forgotten, and forgetting it here would let
+/// a forger prove entitlement with one key while the descriptor was signed by another.
+fn bound_advertisement(
+    prove: &(Vec<u8>, VrfPublic, VrfProof),
+    vrf_secret: &VrfSecret,
+    node_id: NodeId,
+    epoch: Epoch,
+    capability: Capability,
+) -> Vec<u8> {
+    let (id, public, proof) = prove;
+    let desc = CapabilityDescriptor::sign(node_id, epoch, capability, vrf_secret);
+    Entitlement::encode(id, public, proof, &desc.to_bytes())
+}
+
+/// Parse and **verify** a coordinate-bound advertisement against the coordinate its slot names (sans-I/O).
+///
+/// Three things must hold, and the third is the one signing alone never gave: the bytes are well formed, the descriptor's
+/// epoch matches the slot's, and the publisher's VRF key is entitled to this coordinate — with the descriptor's signature
+/// checked against *that* entitled key. See [`crate::bound`] for what the binding costs an attacker.
+#[must_use]
+pub fn parse_bound_advertisement<F: Field>(
+    bytes: &[u8],
+    coord: Coord,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> Option<(NodeId, Capability)> {
+    let (entitled, payload) = Entitlement::open::<F>(bytes, coord, epoch, beacon)?;
+    let desc = CapabilityDescriptor::from_bytes(payload)?;
+    // The roster's *identity* is bound too, not just its coordinate. A node's role-assignment id **is** its coordinate-VRF
+    // public key (`node.rs`'s `SelfOrgConfig`), so requiring them equal means an entitled publisher cannot advertise under
+    // some other member's id — which it otherwise could, since owning a coordinate says nothing about which id you claim
+    // while sitting there. Without this, the binding would secure the slot and leave the name inside it forgeable.
+    if desc.epoch != epoch || desc.node_id.0 != entitled.public.to_bytes() || !desc.verify(&entitled.public) {
         return None;
     }
     Some((desc.node_id, desc.capability))
@@ -98,9 +143,10 @@ pub fn cell_cap_coords<F: Field>() -> Vec<Coord> {
 pub(crate) async fn build_capability_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
+    beacon: Option<BeaconSeed>,
 ) -> (Vec<(NodeId, Capability)>, bool) {
     let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
-        read_capability(&client, coord, epoch).await
+        read_capability::<F>(&client, coord, epoch, beacon).await
     })
     .await;
     // The second value is what the caller could not previously know: whether this is the whole cell or only the part that
@@ -113,11 +159,21 @@ pub(crate) async fn build_capability_directory<F: Field>(
 ///
 /// The timeout is the whole point: `resolve_capability` answers `Option`, so a slow store read and an unpublished
 /// descriptor are the same value, and a roster built from those reads silently shrinks under load.
-async fn read_capability(client: &Client, coord: Coord, epoch: Epoch) -> Read<(NodeId, Capability)> {
+/// `Some(beacon)` reads a **coordinate-bound** record ([`parse_bound_advertisement`]); `None` a pinned cell's unbound one.
+/// Not a `verify: bool` — see [`crate::bound`]: having a beacon *is* the VRF mode, and its absence is an absent mechanism.
+async fn read_capability<F: Field>(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Read<(NodeId, Capability)> {
     let slot = cap_slot(coord, epoch);
     match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(slot)).await {
         // Completed: present-and-valid, or a definite negative (absent, malformed, or failing authentication).
-        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| parse_advertisement(&b, epoch))),
+        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| match beacon {
+            Some(seed) => parse_bound_advertisement::<F>(&b, coord, epoch, &seed),
+            None => parse_advertisement(&b, epoch),
+        })),
         Err(_) => Read::Unknown,
     }
 }
@@ -135,34 +191,55 @@ async fn read_capability(client: &Client, coord: Coord, epoch: Epoch) -> Read<(N
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
 #[must_use]
+/// `prover` states the cell's mode, exactly as [`crate::mixdir::spawn_mix_publisher`] does: `Some` publishes a
+/// **coordinate-bound** advertisement (and the readers in the same deployment verify one), `None` the unbound record a pinned
+/// cell can produce. See [`crate::bound`] for why the mode is stated rather than inferred.
 pub fn spawn_capability_publisher(
     client: Client,
     node_id: NodeId,
     vrf_secret: VrfSecret,
     capability: Capability,
+    prover: Option<CoordinateProver>,
 ) -> (JoinHandle<()>, oneshot::Receiver<()>) {
     let (ready_tx, ready_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
-        publish_capability(&client, client.address(), epoch, &vrf_secret, node_id, capability).await;
+        let mut seed = BeaconSeed::GENESIS;
+        // One publish path, chosen per write rather than per spawn: the beacon changes every epoch, so a bound record must
+        // be re-proven against the current one — a proof captured once would verify only in the epoch it was made.
+        let publish = |epoch: Epoch, seed: BeaconSeed| {
+            let client = client.clone();
+            let vrf_secret = vrf_secret.clone();
+            let prover = prover.clone();
+            async move {
+                let coord = client.address();
+                let bytes = match prover.as_ref() {
+                    Some(prove) => bound_advertisement(&prove(epoch, &seed), &vrf_secret, node_id, epoch, capability),
+                    None => advertisement(&vrf_secret, node_id, epoch, capability),
+                };
+                client.put(cap_slot(coord, epoch), bytes).await
+            }
+        };
+        publish(epoch, seed).await;
         // The genesis advertisement is now readable, which the role loop must know before it assigns: a node cannot
         // be assigned from a roster that does not yet contain it. Signalling is deterministic where polling the
         // directory is not — each poll costs a full cell scan, so a retry loop cannot converge promptly.
         let _ = ready_tx.send(());
         loop {
             match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: e, .. }) => {
+                Ok(Notification::BeaconReady { epoch: e, seed: s }) => {
                     if e > epoch {
                         epoch = e;
-                        publish_capability(&client, client.address(), epoch, &vrf_secret, node_id, capability).await;
+                        seed = BeaconSeed::new(s);
+                        publish(epoch, seed).await;
                     }
                 }
                 // The node MOVED. Republishing only on a beacon was the other half of the stale-descriptor defect: a
                 // within-epoch move left the advertisement at the point the node had left until the next epoch, so the
                 // cell's roster scan was short by exactly this node for up to a whole epoch.
                 Ok(Notification::Reseated { .. }) => {
-                    publish_capability(&client, client.address(), epoch, &vrf_secret, node_id, capability).await;
+                    publish(epoch, seed).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -177,7 +254,7 @@ pub fn spawn_capability_publisher(
 mod tests {
     use super::*;
     use fanos_core::roles::{Role, RoleSet};
-    use fanos_field::F2;
+    use fanos_field::{F2, F7};
 
     #[test]
     fn cap_slots_are_deterministic_distinct_and_domain_separated() {
@@ -210,6 +287,108 @@ mod tests {
         // Garbage / truncated bytes are rejected, never panic.
         assert_eq!(parse_advertisement(&bytes[..40], epoch), None);
         assert_eq!(parse_advertisement(b"", epoch), None);
+    }
+
+    /// A member with a VRF-derived coordinate, exactly as `Node::start` builds one: its role-assignment id **is** its
+    /// coordinate-VRF public key.
+    fn member(seed: u8, epoch: Epoch, beacon: &BeaconSeed) -> (VrfSecret, (Vec<u8>, VrfPublic, VrfProof)) {
+        let sk = VrfSecret::from_seed([seed; 32]);
+        let id = format!("member-{seed}").into_bytes();
+        let (_, proof) = fanos_vrf::prove_coordinate::<F7>(&sk, &id, epoch, beacon);
+        (sk.clone(), (id, sk.public(), proof))
+    }
+
+    fn cap() -> Capability {
+        Capability::new(RoleSet::of(&[Role::Relay]), 6)
+    }
+
+    #[test]
+    fn a_bound_advertisement_verifies_only_on_its_publishers_walk() {
+        // The residual this module's own doc used to record, now closed: a signature proves *someone* signed, entitlement
+        // proves the key belongs at that coordinate. Accepted on every point of the publisher's own walk; refused elsewhere.
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (sk, prove) = member(5, epoch, &beacon);
+        let node_id = NodeId(sk.public().to_bytes());
+        let record = bound_advertisement(&prove, &sk, node_id, epoch, cap());
+        let output = fanos_vrf::coordinate_output(&prove.1, &prove.0, epoch, &beacon, &prove.2).unwrap();
+
+        let mut refused = 0;
+        for i in 0..Plane::<F7>::N as usize {
+            let p = Point::<F7>::at(i);
+            let got = parse_bound_advertisement::<F7>(&record, p.coords(), epoch, &beacon);
+            if fanos_vrf::probe_index_of::<F7>(&output, &p).is_some() {
+                assert_eq!(got, Some((node_id, cap())), "a point on the publisher's own walk verifies");
+            } else {
+                assert_eq!(got, None, "a coordinate the publisher cannot prove is refused");
+                refused += 1;
+            }
+        }
+        // PG(2,7): 57 points, a line holds q + 1 = 8, so 49 of the 57 are unreachable for this publisher.
+        assert_eq!(refused, 49, "the forgery is refused at 49 of the plane's 57 points");
+    }
+
+    #[test]
+    fn an_entitled_publisher_cannot_advertise_under_another_members_id() {
+        // The half a coordinate binding alone leaves open, and the reason `desc.node_id` is cross-checked against the
+        // entitled key: owning a coordinate says nothing about which *id* you claim while sitting there. Without the check
+        // an entitled node could enter the roster as any member it liked and collect that member's role assignment.
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (sk, prove) = member(5, epoch, &beacon);
+        let (victim, _) = member(9, epoch, &beacon);
+        let output = fanos_vrf::coordinate_output(&prove.1, &prove.0, epoch, &beacon, &prove.2).unwrap();
+        let mine = fanos_vrf::probe_point::<F7>(&output, 0).coords();
+
+        // Signed by the entitled key, at a coordinate that key owns — but naming the victim's id.
+        let forged = bound_advertisement(&prove, &sk, NodeId(victim.public().to_bytes()), epoch, cap());
+        assert_eq!(
+            parse_bound_advertisement::<F7>(&forged, mine, epoch, &beacon),
+            None,
+            "an id that is not the entitled key's own is refused"
+        );
+        // The honest record at the same coordinate still verifies, so this is not the coordinate check firing.
+        let honest = bound_advertisement(&prove, &sk, NodeId(sk.public().to_bytes()), epoch, cap());
+        assert!(parse_bound_advertisement::<F7>(&honest, mine, epoch, &beacon).is_some(), "the honest record verifies");
+    }
+
+    #[test]
+    fn a_bound_advertisement_is_tied_to_its_epoch_and_beacon() {
+        // Both are in the VRF input, so a record cannot be replayed out of the epoch it was made for, nor into a cell that
+        // reshuffled onto a different beacon.
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (sk, prove) = member(5, epoch, &beacon);
+        let record = bound_advertisement(&prove, &sk, NodeId(sk.public().to_bytes()), epoch, cap());
+        let output = fanos_vrf::coordinate_output(&prove.1, &prove.0, epoch, &beacon, &prove.2).unwrap();
+        let mine = fanos_vrf::probe_point::<F7>(&output, 0).coords();
+
+        assert!(parse_bound_advertisement::<F7>(&record, mine, epoch, &beacon).is_some(), "its own epoch and beacon");
+        assert_eq!(parse_bound_advertisement::<F7>(&record, mine, Epoch::new(4), &beacon), None, "a replayed epoch");
+        let other = BeaconSeed::new([0x11; 32]);
+        assert_eq!(parse_bound_advertisement::<F7>(&record, mine, epoch, &other), None, "a different beacon");
+    }
+
+    #[test]
+    fn the_two_modes_are_not_interchangeable_in_either_direction() {
+        // What makes a mode mismatch *loud*. Both parsers are total functions over arbitrary bytes, so a reader in the wrong
+        // mode does not misread a record — it finds nothing, and the roster is empty rather than subtly wrong. Asserted
+        // because it currently holds by wire-shape accident (the bound form's `id_len` prefix lands where the unbound form
+        // expects a VRF public), and a future layout change could make the two collide without any test noticing.
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (sk, prove) = member(5, epoch, &beacon);
+        let node_id = NodeId(sk.public().to_bytes());
+        let output = fanos_vrf::coordinate_output(&prove.1, &prove.0, epoch, &beacon, &prove.2).unwrap();
+        let mine = fanos_vrf::probe_point::<F7>(&output, 0).coords();
+
+        let bound = bound_advertisement(&prove, &sk, node_id, epoch, cap());
+        let unbound = advertisement(&sk, node_id, epoch, cap());
+        assert_eq!(parse_advertisement(&bound, epoch), None, "the unbound reader does not accept a bound record");
+        assert_eq!(
+            parse_bound_advertisement::<F7>(&unbound, mine, epoch, &beacon),
+            None,
+            "and the bound reader does not accept an unbound one"
+        );
+        // Each in its own mode still verifies, so the above is the mode mismatch and not a broken fixture.
+        assert_eq!(parse_advertisement(&unbound, epoch), Some((node_id, cap())));
+        assert_eq!(parse_bound_advertisement::<F7>(&bound, mine, epoch, &beacon), Some((node_id, cap())));
     }
 
     #[test]
