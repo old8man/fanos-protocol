@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD f752495`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD 6ad6fa7`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -178,16 +178,23 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
   error vocabulary. (Was item 12.)
 - **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
   loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
-- **10. S1-M3** — mix-key store slots are unauthenticated (`fanos-node/src/mixdir.rs`, `mix_key_slot` keys a slot by
-  `coord ‖ epoch` with no writer check; the module doc already calls this out as "a later hardening step"). Liveness-DoS,
-  not deanonymization. **Design finding from a scoping pass** — do not implement it inside `mixdir`:
-  - `publish_mix_key`/`resolve_mix_key`/`build_mix_directory` have **no beacon in scope**, so the natural
-    self-certifying record (carry the publisher's `fanos_vrf::CoordinateClaim` and check it with
-    `verify_coordinate_claim`) needs the epoch beacon plumbed through all three plus their callers.
-  - The better home is the **store's write path**, which already knows the authenticated QUIC peer certificate. One rule —
-    a *coordinate-owned namespace*, where a slot keyed by a coordinate accepts a `put` only from the peer whose verified
-    coordinate is that coordinate — covers `mixdir` and every other coordinate-keyed slot at once, instead of each
-    subsystem re-deriving the check. That makes this a storage-authorization feature, and it should be built as one.
+- **10. S1-M3 + capdir's own residual are ONE gap, and the mechanism to close both now exists.** The finding, from
+  comparing the two directories:
+  - `mixdir` publishes its onion key **unsigned**, so a forged key makes that member unable to peel (liveness-DoS, not
+    deanonymization — a hop still needs `t` genuine members). That is S1-M3.
+  - `capdir` *does* sign, and its own doc records the residual that remains: a signature proves **someone** with that VRF
+    key signed the record, not that the key is **entitled to that coordinate**. So a forger publishing a self-consistent
+    record signed by their own key at another node's slot passes. Signing was never the missing piece.
+  - **Both are the same missing binding**, and `fanos_vrf::verify_coordinate_claim` is exactly it: the publisher includes
+    its `CoordinateClaim`, and the reader checks it against *the slot's* coordinate. A key that cannot prove entitlement to
+    the coordinate is rejected, which is the property both directories were reaching for.
+  - **The piece that used to be missing is present.** Verification needs the epoch beacon at the *reader*, which is why an
+    earlier scoping pass concluded this needed plumbing through three resolvers. The node already tracks it —
+    `node.rs`'s `LiveBeacon = Arc<Mutex<Option<(Epoch, [u8; 32])>>>` — so the fix is to thread that handle into
+    `build_mix_directory` / `build_capability_directory` and verify, not to invent a channel.
+  - Supersedes the earlier "coordinate-owned namespace in the store's write path" sketch: a storage-layer ACL would police
+    *who wrote*, while what actually matters is whether a **reader** can tell a genuine record from a forged one. The check
+    belongs at the read, where the trust decision is made.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
