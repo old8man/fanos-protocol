@@ -195,6 +195,21 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
   - Supersedes the earlier "coordinate-owned namespace in the store's write path" sketch: a storage-layer ACL would police
     *who wrote*, while what actually matters is whether a **reader** can tell a genuine record from a forged one. The check
     belongs at the read, where the trust decision is made.
+  - ⚠️ **ATTEMPTED AND REVERTED 2026-07-26, because the binding needs a mode distinction the plan missed.** A working
+    implementation (bound record + reader verification + a `NodeHandle::coordinate_prover` closure so no signing key reaches
+    a publisher) built and linted clean, then failed its own integration tests **correctly**: only 2 of 5 relays' records
+    verified.
+    - **Why: the binding requires VRF-derived coordinates.** It proves the slot's coordinate lies on the publisher's own
+      probe walk, and a **pinned** coordinate has no relation to that node's VRF output. `fanos-quic`'s cell harness pins
+      coordinates by design, and so does any deployment with `config.vrf_coordinates == false` — the same split
+      `on_announce` already makes for audit C3, which this plan did not account for. On `PG(2,2)` a line holds 3 of 7
+      points, so ~3/7 of pinned nodes happen to pass, which is exactly the 2-of-5 observed.
+    - **So the fix needs two modes, not one check**, and the mode must come from the same place `on_announce` gets it
+      rather than from a caller-supplied boolean — a `verify: bool` parameter is a footgun that reads as "disable the
+      security check here".
+    - Reverted rather than shipped half-wired: a security check that silently rejects two thirds of honest records is worse
+      than the documented liveness-DoS it replaces. The pieces that worked are worth rebuilding once the mode question is
+      settled — the bound-record format, and the prover closure that keeps the VRF secret inside the driver.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
