@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD e243ac4`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD 474cda1`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -35,23 +35,26 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   material. Compose with `note`/`nullifier`/`tx`/`note_cipher`/`state` and the §5.D-2 sighash signatures; reconcile the
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
-### 2. Wire the probe index onto the HELLO frame
-- **Now also blocking a test fixture.** `NodeFleet::spawn` had to be made draw-injective (`e243ac4`) precisely because
-  collisions cannot be resolved live yet; that workaround retires when this lands.
-- **Problem.** The coordinate-resolution primitive is complete and now internally consistent (`afc253b`: one
-  lexicographic claim order shared by `settle_index`, `displacement_is_forced`, and `Directory::supersedes`), with
-  `CoordinateClaim`/`DisplacementWitness`/`verify_coordinate_claim` and a canonical encoding. But **the wire carries only
-  `k = 0`**: `fanos-quic/src/identity.rs:28` fixes `HELLO_BODY_LEN` at `version(2) ‖ caps(4) ‖ field_q(4) ‖ epoch(8) ‖
-  coord(12) ‖ proof(80)`, and `verify_hello` calls the single-proof `verify_peer_coordinate`. So a node can *detect* it
-  must move but cannot *announce* the point it moved to, `CoordinateClaim` has no consumer outside `fanos-vrf`, and the
-  measured capacity (200/200 at `P=993` vs the bare draw's 181) is reachable **only from the simulator**. The shipping
-  cell still seats ~`q` nodes.
-- **Task.** Carry the claim instead of the bare proof: a direct claim encodes as `proof(80) ‖ index(2)`, so the common
-  case costs two bytes and the first 80 are byte-identical to what is there now. `verify_hello` runs
-  `verify_coordinate_claim`; the driver runs `settle_index` against `Directory::claim_at` and binds via
-  `insert_claimed`. Bound the claim body **before** decoding (peek the index at its fixed offset and reject
-  `index >= probe_bound::<F>()`) — an attacker-chosen `u16` index otherwise sizes a witness vector. Version-gate the
-  format change through the existing `negotiate_version`.
+### 2. Live coordinate resolution — the wire is DONE, the driver is NOT
+- **Done** (`79bd9fc`, `474cda1`). `HELLO` carries a `CoordinateClaim` (`proof(80) ‖ index(2) ‖ witness*`) instead of a bare
+  proof, so a displaced node can announce where it went; an uncontested node pays two bytes and the first 80 are
+  byte-identical to the old layout. `fanos-quic::claims::ClaimBook` keeps the peer claims resolution needs — the best claim
+  per point (indexed once per peer at insert, since scanning per query measured 77× slower) and a witness per step —
+  cleared on an epoch change, since a claim proves a placement for one `(epoch, beacon)` only. The attacker-chosen index is
+  bounded from its fixed offset *before* the witness list it implies is decoded. Unit-verified end to end: a real collision
+  built from generated credentials, the loser's HELLO accepted **at its probed point and not at the one its draw
+  preferred**, the same index without its witness a silent drop, an out-of-range index refused.
+- **Open, with a measurement.** A live displaced node still does not advance. Forcing the collision (7 nodes on `PG(2,4)`,
+  `fanos-sim::fabric::measure_whether_a_collided_draw_now_resolves_itself`): **three of three collided draws stayed
+  collided** (held 6/7, all-distinct never reached), the fourth draw being injective. So the capacity result (200/200 at
+  `P=993`) is still simulator-only and `NodeFleet::spawn`'s injective draw is still load-bearing.
+- **The lead, not a guess.** In each failure the stuck node's roster is far below its peers' (`[6, 6, 6, 1, 6, 6, 6]`). A
+  node that loses the directory arbitration holds no binding, so it is unreachable *by coordinate*; a node that hears from
+  almost nobody records almost no claims, so it never learns a better claim holds its point. Candidate fixes: have the
+  loser keep learning through the connections it *originates*, or let the directory answer for a displaced claimant.
+  **Diagnose which before building either** — and note the trap this already sprung: four consecutive passes of the
+  cell-wide test with the workaround off looked like success and were a 13% coincidence at ~60% injective per draw. Force
+  the condition; do not wait to meet it.
 
 ---
 
