@@ -453,6 +453,14 @@ pub struct Health {
     /// contested point with a low count failed to hear of its rival; one with a high count heard and did not move. Same
     /// symptom, different defect, and without this they are indistinguishable from outside.
     pub verified_claims: Option<usize>,
+    /// The **probe index** of this node's own coordinate claim, if it is bound with one.
+    ///
+    /// The third observable this investigation needed, and it closes the last gap: `0` means the node is at the point its
+    /// own draw preferred, `> 0` means it advanced along its probe walk. A contested node still reading `0` decided not to
+    /// move (`fanos_vrf::settle_index` did not advance — the book lacks the *specific* rival, or the rule says stay); one
+    /// reading `> 0` while its coordinate looks wrong failed to *apply* the move. Two defects, one symptom, and without
+    /// this they are indistinguishable — the same trap `verified_claims` was added for.
+    pub probe_index: Option<u16>,
     /// The advertised roles.
     pub roles: RoleSet,
 }
@@ -713,9 +721,11 @@ impl Node {
     /// A current health snapshot.
     #[must_use]
     pub fn health(&self) -> Health {
+        let address = self.address();
         Health {
-            address: self.address(),
+            address,
             verified_claims: self.handle.verified_claims(),
+            probe_index: self.directory.claim_at(address).map(|(index, _)| index),
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
             roles: self.roles,

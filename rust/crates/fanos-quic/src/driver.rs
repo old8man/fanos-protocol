@@ -892,7 +892,14 @@ where
     let local_addr = handle.local_addr();
     tokio::spawn(reshuffle_loop::<F>(
         creds.clone(),
-        Placement { coord: coord.coords(), output: rank, index: 0, epoch: Epoch::ZERO, beacon: BeaconSeed::GENESIS },
+        Placement {
+            coord: coord.coords(),
+            output: rank,
+            index: 0,
+            epoch: Epoch::ZERO,
+            beacon: BeaconSeed::GENESIS,
+            joining: true,
+        },
         Reseater {
             capabilities,
             local_addr,
@@ -963,6 +970,13 @@ struct Placement {
     index: u16,
     epoch: Epoch,
     beacon: BeaconSeed,
+    /// Whether this node is still **joining** — it has not yet lived through an epoch boundary.
+    ///
+    /// This is what makes moving safe, and it is a sharper condition than a timer. Committee membership, shard placement
+    /// and routing are all derived *at a boundary*, so a node that joined after the current one is in none of those sets:
+    /// nothing above it has derived anything from its coordinate yet, and it may re-seat freely. The moment the first
+    /// `BeaconReady` arrives, the cell commits to wherever it then sits, and it must stop.
+    joining: bool,
 }
 
 /// The three surfaces a re-seat has to move together, in one value.
@@ -1076,6 +1090,9 @@ async fn reshuffle_loop<F: Field>(
                 at.epoch = epoch;
                 at.beacon = seed;
                 at.output = rank;
+                // The cell commits to placements at a boundary, so from here this node is established and holds its point
+                // for the epoch. Everything below re-derives; nothing may move again until the settling window exists.
+                at.joining = false;
                 // The book's claims belong to the retired epoch; clearing it is what stops a peer's past placement from
                 // justifying a displacement now. Settling immediately afterwards therefore lands at index 0 and moves
                 // up again as this epoch's peers are met.
@@ -1090,25 +1107,30 @@ async fn reshuffle_loop<F: Field>(
                     break;
                 }
             }
-            // A recorded claim does **not** move an established node yet, and the reason is that its safety is
-            // UNVERIFIED rather than established either way.
+            // A recorded claim moves this node **only while it is still joining** — before the first epoch boundary it
+            // lives through. That is the increment `docs/design-coordinates.md` calls settle-on-join, and the safety
+            // argument is structural rather than a timeout: committee membership, shard placement and every routing table
+            // are derived at a *boundary*, so a node that joined after the current one is in none of those sets. Nothing
+            // above it has derived anything from its coordinate, so re-seating invalidates nothing.
             //
-            // Moving a coordinate mid-epoch is not obviously safe: the coordinate is the key TAXIS committee membership,
-            // erasure-shard placement and every routing table derive from, and all of them re-derive at an epoch boundary,
-            // where *every* node moves at once by a beacon all of them can compute. A single node moving in between
-            // invalidates state the rest of the cell still holds.
-            //
-            // An attempt to measure this on `fanos-node/tests/dromos_quic.rs` produced a false positive worth recording:
-            // enabling it "failed both consensus tests in 482 s" and disabling it "passed both in 5.6 s". Establishing the
-            // baseline afterwards showed **HEAD fails both in 482 s too** — the machine was contended, every 480 s result
-            // was the timeout confound those tests document, and the 5.6 s pass was the single uncontended run. So there is
-            // no evidence of harm, and none of safety. The conservative branch is the one that does not change where a
-            // running node sits.
-            //
-            // The book is still recorded and still worth recording: it is what a settling decision will read, and the claim
-            // it produces is verified and carried on the wire (`crate::identity`). What this needs is either an uncontended
-            // measurement, or the design that makes the question moot — a bounded **settling window** at the start of an
-            // epoch, before coordinate-keyed layers commit.
+            // An **established** node still does not move, and must not: it is in those sets, and moving mid-epoch leaves
+            // the rest of the cell holding state for a position it has left. Fixing *that* case needs the settling window
+            // (a bounded phase at the start of each epoch, before the layers above commit), which is designed and not yet
+            // built. Whether moving an established node is in fact harmful is **unverified** rather than disproven — the
+            // measurement that appeared to show it breaking consensus was a load artefact the baseline refuted — and "do
+            // not move a node the cell has committed to" is the right default while that is open.
+            Wake::Resettle if at.joining => {
+                let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
+                let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
+                    continue; // beaten on every point of the line; hold the current announcement rather than retract it
+                };
+                if index == at.index {
+                    continue; // still the right seat
+                }
+                if !seat.apply::<F>(&mut at, index, &claim) {
+                    break;
+                }
+            }
             Wake::Resettle => {}
             Wake::Stop => break,
         }
@@ -2239,6 +2261,7 @@ mod tests {
                 index: 0,
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
+                joining: true,
             },
             Reseater {
                 capabilities: Capabilities::CORE,
@@ -2326,6 +2349,7 @@ mod tests {
                 index: 0,
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
+                joining: true,
             },
             Reseater {
                 capabilities: Capabilities::CORE,

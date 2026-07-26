@@ -1288,9 +1288,12 @@ mod tests {
             // The localising observable: whose claims did each node actually verify? A node still on a contested point with
             // a low count never heard of its rival; a high count means it heard and did not move.
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
+            // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
+            // `None` = not bound at all (it lost the arbitration and holds no directory entry).
+            let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
             fleet.shutdown();
             println!(
-                "trial {trial}: held {}/7 distinct, all-distinct: {settled}, rosters {rosters:?}, claims {claims:?}",
+                "trial {trial}: held {}/7, all-distinct: {settled}, rosters {rosters:?}, claims {claims:?}, index {idx:?}",
                 held.len()
             );
         }
