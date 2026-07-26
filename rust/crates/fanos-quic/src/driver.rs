@@ -317,7 +317,17 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Dropping the handle (or calling [`NodeHandle::shutdown`]) closes the endpoint and lets the
 /// actors wind down.
 pub struct NodeHandle {
-    addr: Triple,
+    /// Peer coordinate claims verified this epoch — the input coordinate resolution runs on. `None` for a node with no
+    /// self-certifying identity, which never resolves and therefore has no book.
+    claims: Option<ClaimBook>,
+    /// The node's **live** overlay coordinate.
+    ///
+    /// Shared and mutable because a coordinate moves: every epoch by the beacon reshuffle (spec §L3), and within an epoch
+    /// when a better claim displaces this node from its point. It was a plain field set at spawn, so every layer above —
+    /// `NodeHandle::address`, `Client::address`, `fanos_node::Node::health().address` — reported the *genesis* coordinate
+    /// forever, from the first reshuffle onward. That is a defect in the shipped reshuffle, not only in probing: an
+    /// operator surface that names a node's position must name where it actually is.
+    addr: Arc<Mutex<Triple>>,
     local_addr: SocketAddr,
     input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
@@ -328,10 +338,29 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
-    /// This node's overlay coordinate.
+    /// This node's overlay coordinate, as of now.
     #[must_use]
     pub fn address(&self) -> Triple {
-        self.addr
+        *self.addr.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Attach the claim book a self-certifying node resolves against, so layers above can observe it.
+    ///
+    /// Set here rather than threaded through `spawn_inner` because the book belongs to the *identity* — a node without a
+    /// self-certifying identity never resolves a coordinate and has nothing to record.
+    #[must_use]
+    fn with_claims(mut self, book: ClaimBook) -> Self {
+        self.claims = Some(book);
+        self
+    }
+
+    /// How many peers' coordinate claims this node has verified this epoch, or `None` without a self-certifying identity.
+    ///
+    /// The observable that lets a scenario tell "it never heard of its rival" apart from "it heard and did not move" — two
+    /// failures with the same symptom and different causes.
+    #[must_use]
+    pub fn verified_claims(&self) -> Option<usize> {
+        self.claims.as_ref().map(ClaimBook::len)
     }
 
     /// The UDP socket address the node is actually bound to (its directory entry).
@@ -388,7 +417,7 @@ impl NodeHandle {
     #[must_use]
     pub fn client(&self) -> Client {
         Client {
-            addr: self.addr,
+            addr: self.addr.clone(),
             input_tx: self.input_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
             events_tx: self.events_tx.clone(),
@@ -437,17 +466,18 @@ enum Control {
 /// builds on: the single-consumer `next_notification` bottleneck is gone.
 #[derive(Clone)]
 pub struct Client {
-    addr: Triple,
+    /// The node's live coordinate — the same shared cell [`NodeHandle`] holds, not a copy of it.
+    addr: Arc<Mutex<Triple>>,
     input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
 }
 
 impl Client {
-    /// This node's overlay coordinate.
+    /// This node's overlay coordinate, as of now — the same shared cell [`NodeHandle::address`] reads.
     #[must_use]
     pub fn address(&self) -> Triple {
-        self.addr
+        *self.addr.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Inject a fire-and-forget command (`Input::Command`). `false` once the engine has stopped.
@@ -515,6 +545,7 @@ async fn router_loop(
     mut notify_rx: mpsc::UnboundedReceiver<Notification>,
     mut ctrl_rx: mpsc::UnboundedReceiver<Control>,
     events_tx: broadcast::Sender<Notification>,
+    seat: Arc<Mutex<Triple>>,
 ) {
     let mut gets: GetWaiters = HashMap::new();
     let mut puts: PutWaiters = HashMap::new();
@@ -531,6 +562,14 @@ async fn router_loop(
             note = notify_rx.recv() => {
                 let Some(note) = note else { break };
                 match &note {
+                    // The engine is the only authority on where this node sits, and it has always said so — this
+                    // notification existed with no consumer, which is why every layer above reported the coordinate it was
+                    // *spawned* at, for the whole life of the node, however many times it reshuffled. Tracking it here
+                    // rather than in whoever sent the `Reseat` is the point: recovery, the placement loop and a direct
+                    // command are all sources, and each maintaining its own copy is how the stale one survived.
+                    Notification::Reseated { new, .. } => {
+                        *seat.lock().unwrap_or_else(PoisonError::into_inner) = *new;
+                    }
                     Notification::Retrieved { key, value } => {
                         if let Some(waiters) = gets.remove(key) {
                             for (_, tx) in waiters {
@@ -840,7 +879,8 @@ where
     });
     let dir_for_reshuffle = directory.clone();
     let handle =
-        spawn_inner(engine, directory, shaper.clone(), controller, identity, server, client, bind)?;
+        spawn_inner(engine, directory, shaper.clone(), controller, identity, server, client, bind)?
+            .with_claims(book.clone());
     // Re-bind our genesis point *with* its rank. `spawn_inner` binds the coordinate before any rank is available to it,
     // and an unranked self-binding is one any newcomer displaces (`Directory::insert_ranked`) — which for our own point
     // is precisely the eviction the rank rule exists to prevent. Same address, so this is a rebind, not a collision.
@@ -1050,19 +1090,26 @@ async fn reshuffle_loop<F: Field>(
                     break;
                 }
             }
-            // The live half of collision resolution: the peer set may have changed, so re-settle against it.
-            Wake::Resettle => {
-                let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
-                let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
-                    continue; // beaten on every point of the line; hold the current announcement rather than retract it
-                };
-                if index == at.index {
-                    continue; // still the right seat
-                }
-                if !seat.apply::<F>(&mut at, index, &claim) {
-                    break;
-                }
-            }
+            // A recorded claim does **not** move an established node yet, and the reason is that its safety is
+            // UNVERIFIED rather than established either way.
+            //
+            // Moving a coordinate mid-epoch is not obviously safe: the coordinate is the key TAXIS committee membership,
+            // erasure-shard placement and every routing table derive from, and all of them re-derive at an epoch boundary,
+            // where *every* node moves at once by a beacon all of them can compute. A single node moving in between
+            // invalidates state the rest of the cell still holds.
+            //
+            // An attempt to measure this on `fanos-node/tests/dromos_quic.rs` produced a false positive worth recording:
+            // enabling it "failed both consensus tests in 482 s" and disabling it "passed both in 5.6 s". Establishing the
+            // baseline afterwards showed **HEAD fails both in 482 s too** — the machine was contended, every 480 s result
+            // was the timeout confound those tests document, and the 5.6 s pass was the single uncontended run. So there is
+            // no evidence of harm, and none of safety. The conservative branch is the one that does not change where a
+            // running node sits.
+            //
+            // The book is still recorded and still worth recording: it is what a settling decision will read, and the claim
+            // it produces is verified and carried on the wire (`crate::identity`). What this needs is either an uncontended
+            // measurement, or the design that makes the question moot — a bounded **settling window** at the start of an
+            // epoch, before coordinate-keyed layers commit.
+            Wake::Resettle => {}
             Wake::Stop => break,
         }
     }
@@ -1169,6 +1216,9 @@ fn spawn_inner(
     // Identity-keyed distrust, shared between the engine loop (which sees verdicts) and the accept path (which sees who
     // is seated where) — audit R-M1.
     let distrust: Arc<Distrust> = Arc::new(Distrust::default());
+    // The one live coordinate cell every handle and client above shares. A copy per layer is what let the reported
+    // coordinate go stale at the first reshuffle.
+    let seat = Arc::new(Mutex::new(addr));
 
     // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
@@ -1195,10 +1245,10 @@ fn spawn_inner(
         distrust,
     ));
     // The router owns the notification stream: it correlates get/put replies and fans events out.
-    tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone()));
+    tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone(), seat.clone()));
 
     Ok(NodeHandle {
-        addr,
+        addr: seat,
         local_addr,
         input_tx,
         ctrl_tx,
@@ -1206,6 +1256,7 @@ fn spawn_inner(
         events_rx,
         endpoint,
         reflexive,
+        claims: None,
     })
 }
 
@@ -2172,7 +2223,7 @@ mod tests {
         let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
         let (events_tx, _events_rx0) = broadcast::channel::<Notification>(8);
         let client = Client {
-            addr: genesis_coord,
+            addr: Arc::new(Mutex::new(genesis_coord)),
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
@@ -2262,7 +2313,7 @@ mod tests {
         let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
         let (events_tx, _rx0) = broadcast::channel::<Notification>(8);
         let client = Client {
-            addr: genesis_coord,
+            addr: Arc::new(Mutex::new(genesis_coord)),
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
@@ -2276,7 +2327,13 @@ mod tests {
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
             },
-            Reseater { capabilities: Capabilities::CORE, local_addr, directory, hello, client },
+            Reseater {
+                capabilities: Capabilities::CORE,
+                local_addr,
+                directory,
+                hello,
+                client,
+            },
             beacon,
             ClaimBook::new(),
             None,

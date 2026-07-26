@@ -72,7 +72,8 @@ pub(crate) struct ClaimBook {
     /// placement loop. Nothing else connects them: the engine emits no notification for a peer merely *completing a
     /// handshake*, so without this the loop would only ever re-settle when a beacon advanced — and a node learns that a
     /// better claim holds its point precisely by meeting the peer that holds it. `notify_one` rather than
-    /// `notify_waiters` so a record landing between two waits is remembered instead of lost.
+    /// `notify_waiters` so a record landing between two waits is remembered instead of lost — and signalled *after* the
+    /// write completes, so a woken waiter cannot read the book as it was.
     changed: Arc<Notify>,
 }
 
@@ -124,7 +125,6 @@ impl ClaimBook {
     /// peer install a witness that fails at the far end, turning its own forgery into *this* node's rejected handshake.
     pub(crate) fn record<F: Field>(&self, id: &[u8], public: VrfPublic, proof: VrfProof, output: &VrfOutput) {
         let key = hash_labeled("FANOS-v1/claim-book-peer", id);
-        self.changed.notify_one();
         let mut book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         book.peers.insert(key, PeerClaim { id: id.to_vec(), public, proof });
         // Index the peer's entire walk once. This is the whole reason the book exists rather than a scan per query.
@@ -139,6 +139,12 @@ impl ClaimBook {
                 book.best.insert(point, candidate);
             }
         }
+        // Signal AFTER the write, and after releasing the lock. Signalling first is a race that looks harmless and is not:
+        // the waiter wakes, settles against the book as it was, finds nothing to do, and waits again — and if that record
+        // was the only one coming (the common case, a two-node collision) nothing ever wakes it again. This ordering bug
+        // was live between `474cda1` and here, and it is a candidate cause of the failed live-resolution measurement.
+        drop(book);
+        self.changed.notify_one();
     }
 
     /// The best claim any recorded peer holds to `point` — the contender oracle `fanos_vrf::settle_index` consumes.
@@ -183,20 +189,17 @@ impl ClaimBook {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner).epoch
     }
 
-    /// The number of peers whose claims are recorded. Test-only: no production surface reports it yet, and a count with
-    /// no reader is the shape this codebase keeps removing.
-    #[cfg(test)]
+    /// The number of peers whose coordinate claims are recorded this epoch.
+    ///
+    /// Reported on the node's health surface, and not only as a diagnostic: it is the input coordinate resolution runs on,
+    /// so a node that cannot advance off a contested point and has a *low* count is failing for a different reason than one
+    /// with a high count. The simulator asserts on it for exactly that reason — a symptom that cannot be localised is a
+    /// measurement, not a test.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner).peers.len()
     }
 
-    /// Whether no peer claim is recorded.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 /// Assemble this node's own claim at the index its walk settles on, given what it has verified.
@@ -354,7 +357,7 @@ mod tests {
         book.adopt(Epoch::new(7)); // idempotent
         assert_eq!(book.len(), 1, "re-announcing the same epoch keeps the book");
         book.adopt(Epoch::new(8));
-        assert!(book.is_empty(), "a new epoch discards every claim");
+        assert_eq!(book.len(), 0, "a new epoch discards every claim");
         assert!(book.contender::<F7>(&probe_point::<F7>(&output, 0)).is_none());
     }
 

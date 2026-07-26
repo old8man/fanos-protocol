@@ -1008,6 +1008,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reseat_moves_the_coordinate_every_layer_reports() {
+        // The instrument check, and it is not hypothetical: `Node::health().address` was a field captured at spawn while
+        // the engine reseated underneath it, so from the first epoch reshuffle onward every layer reported the GENESIS
+        // coordinate forever. Three "collided draws never resolve" measurements were taken through that frozen field before
+        // the cause was noticed — a blind instrument does not merely fail to find defects, it manufactures them.
+        //
+        // So: drive a re-seat and assert the reported coordinate follows. A simulator whose observables can go stale
+        // silently cannot be trusted about anything it reports.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+        use fanos_runtime::Command;
+
+        let fleet = NodeFleet::spawn::<F4>(1, Link::ideal(), RoleSet::default()).await.expect("one node starts");
+        let node = fleet.node(0).expect("the node");
+        let before = node.health().address;
+        // Any free point of the plane that is not the current one.
+        let target = (0..fanos_geometry::Plane::<F4>::N as usize)
+            .map(|i| fanos_geometry::Point::<F4>::at(i).coords())
+            .find(|&p| p != before)
+            .expect("a plane has more than one point");
+        assert!(node.command(Command::Reseat { coord: target }), "the engine accepts a re-seat");
+
+        let moved = fleet.until(|f| f.nodes().first().is_some_and(|n| n.health().address == target)).await;
+        let after = node.health().address;
+        fleet.shutdown();
+        assert!(moved, "a re-seat must move the reported coordinate: {before:?} → {target:?}, still reads {after:?}");
+        assert_eq!(after, target, "and every layer reads the same live value");
+    }
+
+    #[tokio::test]
+    async fn a_node_records_the_claims_of_peers_it_meets() {
+        // The observable that makes a resolution failure *localisable*: `verified_claims` counts peers whose coordinate
+        // claim this node has checked, which is the input `fanos_vrf::settle_index` runs on. A node stuck on a contested
+        // point with a low count never heard of its rival; one with a high count heard and did not move. Same symptom, two
+        // different defects — and before this metric existed they were indistinguishable from outside, which is why the
+        // live-resolution investigation could only report the symptom.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        let fleet = NodeFleet::spawn::<F4>(3, Link::ideal(), RoleSet::default()).await.expect("fleet starts");
+        // Every node is self-certifying here, so every node has a book.
+        for (i, n) in fleet.nodes().iter().enumerate() {
+            assert!(n.health().verified_claims.is_some(), "node {i} is self-certifying and must have a claim book");
+        }
+        let recorded = fleet
+            .until(|f| f.nodes().iter().any(|n| n.health().verified_claims.is_some_and(|c| c > 0)))
+            .await;
+        let counts: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
+        fleet.shutdown();
+        assert!(recorded, "a node that completes a handshake must record the peer's verified claim, saw {counts:?}");
+    }
+
+    #[tokio::test]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_a_collided_draw_now_resolves_itself() {
         // The claim to check: with the probe index on the wire (`fanos_quic::claims`), a fleet whose coordinate draw
@@ -1027,8 +1080,14 @@ mod tests {
             }).await;
             let held: HashSet<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
             let rosters: Vec<_> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
+            // The localising observable: whose claims did each node actually verify? A node still on a contested point with
+            // a low count never heard of its rival; a high count means it heard and did not move.
+            let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
             fleet.shutdown();
-            println!("trial {trial}: held {}/7 distinct, all-distinct reached: {settled}, rosters {rosters:?}", held.len());
+            println!(
+                "trial {trial}: held {}/7 distinct, all-distinct: {settled}, rosters {rosters:?}, claims {claims:?}",
+                held.len()
+            );
         }
     }
 

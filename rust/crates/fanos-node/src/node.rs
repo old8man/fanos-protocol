@@ -414,7 +414,6 @@ fn spawn_roles<F: Field + 'static>(
 pub struct Node {
     handle: NodeHandle,
     directory: Directory,
-    address: Triple,
     local_addr: SocketAddr,
     roles: RoleSet,
     /// The background task republishing this node's mix onion key each epoch — present only for a relay
@@ -447,6 +446,13 @@ pub struct Health {
     pub local_addr: SocketAddr,
     /// The number of peers currently in the address book.
     pub known_peers: usize,
+    /// Peers whose **coordinate claim** this node has verified this epoch, or `None` without a self-certifying identity.
+    ///
+    /// Distinct from `known_peers`, and the distinction is the point: the address book says who this node can *dial*, while
+    /// this says whose claim to a point it has *checked* — the input coordinate resolution runs on. A node stuck on a
+    /// contested point with a low count failed to hear of its rival; one with a high count heard and did not move. Same
+    /// symptom, different defect, and without this they are indistinguishable from outside.
+    pub verified_claims: Option<usize>,
     /// The advertised roles.
     pub roles: RoleSet,
 }
@@ -633,7 +639,6 @@ impl Node {
         Ok(Self {
             handle,
             directory,
-            address,
             local_addr,
             roles: config.roles,
             _mix_publisher: mix_publisher,
@@ -682,10 +687,15 @@ impl Node {
         self.live_beacon.lock().ok().and_then(|live| *live)
     }
 
-    /// The node's overlay coordinate.
+    /// The node's overlay coordinate, **as of now**.
+    ///
+    /// Read through the handle rather than from a field captured at spawn: a coordinate moves every epoch by the beacon
+    /// reshuffle (spec §L3) and within an epoch when a better claim displaces this node from its point. A cached copy
+    /// reported the genesis coordinate forever, from the first reshuffle onward, which made every position this surface
+    /// showed wrong for the whole life of the node.
     #[must_use]
     pub fn address(&self) -> Triple {
-        self.address
+        self.handle.address()
     }
 
     /// The bound network address (useful when the config requested an ephemeral port).
@@ -704,7 +714,8 @@ impl Node {
     #[must_use]
     pub fn health(&self) -> Health {
         Health {
-            address: self.address,
+            address: self.address(),
+            verified_claims: self.handle.verified_claims(),
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
             roles: self.roles,
