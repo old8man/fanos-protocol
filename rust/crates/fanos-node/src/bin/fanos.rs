@@ -70,6 +70,27 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
 /// Build a [`NodeConfig`] from a `--config <file>` base (if any) with individual CLI flags overriding it,
 /// so an operator can keep a config file and tweak one setting on the command line. Shared by `fanos node`
 /// and `fanos proxy` — both run a full node, they differ only in what they do with its `Client`.
+/// Warn when anonymity is requested on a plane that cannot provide it.
+///
+/// An adversary's flow-matching floor in a linkability measurement is `1/K` for `K` concurrent circuits, and `K` comes
+/// from the **plane**, not the mix schedule: `PG(2,2)` has only 4 lines with *distinct* combiners, so it supports 2
+/// circuits and the best any schedule achieves is a coin flip (`fanos_node::config::plane_order`).
+///
+/// Under-delivering an anonymity request in silence is the worse failure. An operator who is told can raise the order or
+/// accept the limit knowingly; one who is not told believes the profile's name.
+fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
+    if config.plane_order > 2 {
+        return;
+    }
+    eprintln!(
+        "warning: anonymity requested on plane order {q} — PG(2,{q}) supports only 2 concurrent circuits, so a passive \
+         adversary's flow-matching floor is a COIN FLIP (0.50) regardless of the mix schedule. Pass \
+         `--plane-order 4|7|31` for the anonymity the profile implies (every node of a cell must agree on it); see \
+         fanos_node::config::plane_order.",
+        q = config.plane_order
+    );
+}
+
 fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     let mut config = match flag(args, "--config") {
         Some(path) => NodeConfig::from_config_str(&std::fs::read_to_string(path)?)?,
@@ -82,6 +103,15 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     }
     if let Some(p) = flag(args, "--identity") {
         config.identity_path = Some(PathBuf::from(p));
+    }
+    // The cell's projective plane order. Exposed because it is the parameter that BOUNDS anonymity — an adversary's
+    // flow-matching floor is `1/K` for `K` concurrent circuits, and `K` comes from the plane, not the mix schedule
+    // (`fanos_node::config::plane_order`). Every node of a cell must agree on it, so it belongs in the same
+    // out-of-band configuration as the bootstrap set rather than being negotiated.
+    if let Some(s) = flag(args, "--plane-order") {
+        config.plane_order = s
+            .parse::<u32>()
+            .map_err(|_| NodeError::Config(format!("bad --plane-order '{s}' (expected 2, 4, 7 or 31)")))?;
     }
     for value in flag_all(args, "--bootstrap") {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -244,6 +274,9 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     let exit_via = parse_exit_via(args)?;
 
     let config = node_config_from_args(args)?;
+    if anon.is_some() {
+        warn_if_plane_cannot_anonymize(&config);
+    }
     let mut node = Node::start_on_plane(config).await?;
     let health = node.health();
     // The clearnet exit to route non-`.fanos` targets through: the `--exit-via` override, else an exit
@@ -1115,11 +1148,11 @@ fn print_help() {
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
          \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
          \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N] \\\n\
-         \x20             [--beacon-params FILE]\n\
+         \x20             [--plane-order 2|4|7|31] [--beacon-params FILE]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
-         \x20             [--bootstrap ...] [--listen ADDR]\n\
+         \x20             [--bootstrap ...] [--listen ADDR] [--plane-order 2|4|7|31]\n\
          \x20 fanos host  --forward HOST:PORT --host-key FILE [--epoch N] [--beacon HEX64] [--threshold T] \\\n\
          \x20             [--descriptor-pow BITS] [--config FILE] [--bootstrap ...] [--listen ADDR]\n\
          \x20             (host a hidden service on the anonymous rendezvous §3b: forward each incoming\n\
