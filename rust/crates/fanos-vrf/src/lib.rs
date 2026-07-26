@@ -282,14 +282,19 @@ fn coprime_stride(seed: usize, len: usize) -> usize {
     (0..len).map(|d| 1 + ((start - 1 + d) % (len - 1))).find(|&s| gcd(s, len) == 1).unwrap_or(1)
 }
 
-/// The number of points in `F`'s projective plane, `q² + q + 1`.
+/// The number of points on a line of `F`'s plane, `q + 1` — and hence the length of a probe walk.
+///
+/// The walk is confined to one line (see [`probe_point`]), so it **cycles** after this many steps: index `k` and
+/// `k + (q+1)` name the same point. Every bound on a probe index is therefore this, not the plane size. Getting that
+/// wrong is not merely wasteful — a claim at index `k + (q+1)` is equivalent to one at `k` but demands `q+1` more
+/// witnesses, so an honest node would build an absurd chain to reach a point one step away.
 #[must_use]
-fn plane_points<F: Field>() -> usize {
-    let q = F::Q as usize;
-    q * q + q + 1
+pub const fn probe_bound<F: Field>() -> u16 {
+    // `q + 1` fits a `u16` for every plane this code can represent.
+    (F::Q + 1) as u16
 }
 
-/// Binary-free Euclidean gcd, used only to pick a stride coprime to the plane size.
+/// Binary-free Euclidean gcd, used only to pick a stride coprime to a line's length.
 #[must_use]
 const fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
@@ -353,12 +358,12 @@ pub fn displacement_is_forced<F: Field>(
 /// advance, which is a *convergence* question rather than a correctness one — every intermediate position is a claim it
 /// can legitimately prove. Re-run it whenever occupancy changes or the beacon advances.
 ///
-/// The walk is bounded by the plane size, since [`probe_point`] is a cyclic permutation of every point: past that bound
-/// the plane is genuinely full and the node cannot be seated at all, which is the honest answer rather than a loop.
+/// The walk is bounded by [`probe_bound`] — the line's length — since [`probe_point`] cycles through exactly that many
+/// points. Past it every point of the node's line is taken and it cannot be seated at all, which is the honest answer
+/// rather than a loop over repeats.
 #[must_use]
 pub fn settle_index<F: Field>(output: &VrfOutput, occupant: impl Fn(&Point<F>) -> Option<VrfOutput>) -> Option<u16> {
-    let bound = u16::try_from(plane_points::<F>()).unwrap_or(u16::MAX);
-    (0..bound).find(|&k| match occupant(&probe_point::<F>(output, k)) {
+    (0..probe_bound::<F>()).find(|&k| match occupant(&probe_point::<F>(output, k)) {
         None => true,
         Some(held) => !outranks(&held, output),
     })
@@ -761,8 +766,20 @@ mod tests {
         // Two consecutive preferences held by lower-ranked nodes ⇒ index 2.
         assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0 || *p == p1).then_some(lower)), Some(2));
 
-        // A genuinely full plane is reported as such rather than looping forever.
+        // A genuinely full line is reported as such rather than looping forever.
         assert_eq!(settle_index::<F31>(&mine, |_| Some(lower)), None);
+
+        // The bound is the LINE's length, not the plane's. A walk that cycles after `q+1` steps must never return an
+        // index beyond it: index `k + (q+1)` names the same point as `k` but would demand `q+1` more witnesses, so an
+        // honest node would build an absurd chain to reach a point one step away.
+        assert_eq!(probe_bound::<F31>(), 32, "q + 1 for PG(2,31)");
+        let occupied_until = |p: &Point<F31>| {
+            let head: Vec<_> = (0..30u16).map(|k| probe_point::<F31>(&mine, k)).collect();
+            head.contains(p).then_some(lower)
+        };
+        let Some(settled) = settle_index::<F31>(&mine, occupied_until) else { unreachable!("two points free") };
+        assert!(settled < probe_bound::<F31>(), "the index never exceeds the line it walks");
+        assert_eq!(settled, 30, "and it is the first free step, not a wrapped equivalent");
     }
 
     #[test]
