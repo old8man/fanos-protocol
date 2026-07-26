@@ -15,7 +15,7 @@
 //!    member of `L`'s `q+1`-node multicast bus and receives anything delivered to `L`
 //!    *passively* — no active anonymous polling. `R` is hidden as **1-of-`(q+1)`** on `L`.
 //! 2. **The reply is threshold-routed to `L`.** The peer wraps the reply in a threshold onion
-//!    ([`crate::threshold::seal_onion`]) whose **final hop line is `L`**. Every return hop is a
+//!    ([`crate::threshold_onion::seal_onion`]) whose **final hop line is `L`**. Every return hop is a
 //!    line, peeled `t`-of-`(q+1)`; below `t` a corrupt subset learns *nothing* about the next hop
 //!    (real ZK, [`crate::threshold`]).
 //! 3. **Only `R` can read it — not even `L`'s members.** The reply is first **end-to-end sealed**
@@ -53,7 +53,8 @@ use fanos_pqcrypto::kem::CIPHERTEXT_LEN;
 use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng};
 use fanos_primitives::hash_labeled;
 
-use crate::threshold::{HopLine, ThresholdError, seal_onion};
+use crate::threshold::ThresholdError;
+use crate::threshold_onion::{HopLine, seal_onion};
 
 /// AEAD nonce width (matches [`crate::threshold`]).
 const NONCE_LEN: usize = 12;
@@ -206,7 +207,7 @@ pub fn parse_deaddrop(payload: &[u8]) -> Option<&[u8]> {
 /// public), `return_hops` (the return circuit ending at `L`, built by the receiver so it controls
 /// its own path home), and `threshold`. `L`'s combiner recognizes the [`DEADDROP_TAG`] and multicasts
 /// only the end-to-end ciphertext to `points_on(L)`; only the receiver opens it. `seed` MUST be fresh
-/// per reply (see [`seal_to_receiver`] and [`crate::threshold::seal_onion`]).
+/// per reply (see [`seal_to_receiver`] and [`crate::threshold_onion::seal_onion`]).
 ///
 /// # Errors
 /// Propagates [`ThresholdError`] from the end-to-end seal or the onion build (e.g. [`ThresholdError::TooLong`]
@@ -235,7 +236,7 @@ mod tests {
     use fanos_geometry::Point;
 
     use super::*;
-    use crate::threshold::{ThresholdPeel, member_partial, peel_onion, peel_onion_with_shares};
+    use crate::threshold_onion::{ThresholdPeel, member_partial, peel_onion, peel_onion_with_shares};
 
     /// A line of `n` KEM keypairs (a stand-in for a directory of the line's members).
     fn line_members(n: usize, seed: u8) -> Vec<(HybridKemSecret, HybridKemPublic)> {

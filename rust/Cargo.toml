@@ -9,6 +9,7 @@
 resolver = "3"
 members = [
     "crates/fanos-field",
+    "crates/fanos-threshold",
     "crates/fanos-ergon",
     "crates/fanos-geometry",
     "crates/fanos-code",
@@ -108,6 +109,7 @@ fanos-holarch = { path = "crates/fanos-holarch", version = "0.1.0" }
 fanos-wire = { path = "crates/fanos-wire", version = "0.1.0", default-features = false }
 fanos-wire-derive = { path = "crates/fanos-wire-derive", version = "0.1.0" }
 fanos-primitives = { path = "crates/fanos-primitives", version = "0.1.0", default-features = false }
+fanos-threshold = { path = "crates/fanos-threshold", version = "0.1.0", default-features = false }
 fanos-pqcrypto = { path = "crates/fanos-pqcrypto", version = "0.1.0" }
 fanos-onoma = { path = "crates/fanos-onoma", version = "0.1.0", default-features = false }
 fanos-core = { path = "crates/fanos-core", version = "0.1.0", default-features = false }

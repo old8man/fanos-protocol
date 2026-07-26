@@ -3,7 +3,7 @@
 //! **TAXIS** (τάξις, "order / arrangement") is FANOS's consensus-ordering and ledger layer. It does not
 //! invent a new consensus — it *derives* one from the projective geometry load-bearing everywhere else in
 //! FANOS, and composes primitives that already exist: the projective erasure code and data-availability
-//! sampler ([`fanos_code`]), the threshold KEM-seal ([`fanos_aphantos::ThresholdSealed`]), the epoch beacon
+//! sampler ([`fanos_code`]), the threshold KEM-seal ([`fanos_threshold::ThresholdSealed`]), the epoch beacon
 //! and hashing ([`fanos_primitives`]), hybrid-PQ signatures ([`fanos_pqcrypto`]), and anonymous VOPRF
 //! credits ([`fanos_incentives`]). The full derivation is `docs/design-taxis.md`.
 //!

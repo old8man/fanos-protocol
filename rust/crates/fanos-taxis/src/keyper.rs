@@ -27,7 +27,7 @@
 
 use alloc::vec::Vec;
 
-use fanos_aphantos::ThresholdError;
+use fanos_threshold::ThresholdError;
 use fanos_pqcrypto::kem::{HybridKemPublic, PUBLIC_LEN};
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};

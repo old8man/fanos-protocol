@@ -19,7 +19,7 @@ fanos-code = { workspace = true, features = ["std"] }
 fanos-primitives = { workspace = true, features = ["std", "wire"] }
 # The threshold KEM-seal (Shamir t-of-(q+1), per-member hybrid-KEM) that the anti-MEV encrypted
 # mempool seals each transaction under — reused verbatim, no new crypto (spec §5.2, §10.1 anti-MEV).
-fanos-aphantos.workspace = true
+fanos-threshold = { workspace = true, features = [] }
 # Hybrid PQ signatures (Ed25519+ML-DSA-65) for votes/blocks, and the hybrid KEM for mempool sealing.
 fanos-pqcrypto.workspace = true
 # The post-quantum Merkle-VRF (iVRF, `pqvrf`) — the FULL-UNIQUENESS sortition ticket for secret leader

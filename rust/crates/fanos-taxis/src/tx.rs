@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 
-use fanos_aphantos::{ThresholdError, ThresholdSealed};
+use fanos_threshold::{ThresholdError, ThresholdSealed};
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::shamir::Share;
 use fanos_primitives::{Epoch, hash::hash_xof, hash_labeled};

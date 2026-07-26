@@ -8,7 +8,7 @@
 //! 1. The previous hop routes the onion to this line's **combiner** — the canonical first member of
 //!    the line (`points_on(line).next()`), so no coordination is needed to agree on who combines.
 //! 2. The combiner asks the line's other members for their *partial decryption* of the layer
-//!    ([`crate::threshold::member_partial`]) and contributes its own.
+//!    ([`crate::threshold_onion::member_partial`]) and contributes its own.
 //! 3. Once `≥ t` partials are in, the combiner reconstructs the layer key and peels: either it
 //!    forwards the inner onion to the *next* line's combiner, or it delivers the payload.
 //!
@@ -29,7 +29,7 @@ use fanos_primitives::Epoch;
 use fanos_primitives::shamir::Share;
 use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
-use crate::threshold::{self, ThresholdPeel};
+use crate::threshold_onion::{self as threshold, ThresholdPeel};
 
 /// Internal frame tags (the onion travels as opaque overlay bytes; these are its sub-types). They live in
 /// the **0xE0–0xEF range, deliberately outside the wire [`FrameType`](fanos_wire::FrameType) code space
@@ -490,7 +490,7 @@ impl<F: Field> ThresholdRouter<F> {
                 Some(c) => {
                     // Re-pad the inner onion to the constant bucket so the forwarded packet is the
                     // same size as the one we received — no cross-hop size correlation.
-                    let padded = threshold::pad_onion(&onion).unwrap_or(onion);
+                    let padded = threshold::pad(&onion).unwrap_or(onion);
                     self.forward_send(c, encode_onion(next, &padded))
                 }
                 None => Vec::new(),
@@ -744,7 +744,7 @@ fn decode_rep(body: &[u8]) -> Option<(u64, Share)> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::threshold::{HopLine, member_partial, seal_onion};
+    use crate::threshold_onion::{HopLine, member_partial, seal_onion};
     use fanos_field::F2;
     use fanos_pqcrypto::SeedRng;
 

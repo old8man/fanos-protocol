@@ -1,0 +1,18 @@
+[package]
+name = "fanos-threshold"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Threshold-KEM-sealed layers: Shamir shares each sealed to a member's hybrid PQ public key, so below threshold a packet holder learns nothing (spec §5.2, §5.7)."
+keywords = ["threshold-cryptography", "post-quantum", "secret-sharing", "no-std", "fanos"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+fanos-primitives = { workspace = true, features = ["aead"] }
+fanos-pqcrypto.workspace = true
+
+[dev-dependencies]
+fanos-primitives = { workspace = true, features = ["std", "aead"] }
