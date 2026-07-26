@@ -33,7 +33,7 @@ pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 ///
 /// What it does defend is **intra-batch ordering** — a distinct attack, and one this measurement does not cover. The
 /// rate-correlation channel belongs entirely to the cover schedule.
-pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
+pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 
 /// Default mean interval between a **relay**'s constant-size **cover cells** (spec §L5/V8): the router's send
 /// rate and packet size then reveal nothing about whether it is carrying real traffic (audit E1/S1-H1). Non-zero
@@ -97,7 +97,7 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
 /// regardless of the slot period, because the queue length does. Closing this needs emission **decoupled from arrival** —
 /// a continuous-time (Poisson) mix, where each cell's delay is independently exponential and cover is itself Poisson, so
 /// the output process is independent of the input rate. Recorded as an open design gap, not a dial.
-pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
 /// `beacon = Some(..)` the node composes an [`OverlayBeaconNode`](crate::OverlayBeaconNode): it

@@ -482,6 +482,37 @@ fn linkability_shipping(mix: Duration, cover: Duration, runs: u64) -> (f64, f64)
     (total / runs as f64, 1.0 / K as f64)
 }
 
+/// Confirm the knee with enough seeds to change a shipping default on.
+///
+/// With `K = 5` each mis-matched circuit moves the mean by `0.2/runs`, so 8 runs resolve to 0.025 — fine for locating a
+/// knee, not enough to justify moving a security constant. This re-measures the two candidate points at 24 runs.
+#[test]
+#[ignore = "confirmation, not an assertion — run with --ignored --nocapture"]
+fn confirm_the_knee_with_enough_seeds_to_move_a_default() {
+    for (name, mix, cover) in [("current default 50/1000", 50u64, 1_000u64), ("candidate     120/500", 120, 500)] {
+        let (a, chance) = linkability_shipping(Duration::from_millis(mix), Duration::from_millis(cover), 24);
+        println!("  {name} -> matching accuracy {a:.3}  (chance {chance:.2})");
+    }
+}
+
+/// Where is the KNEE of the anonymity/cost curve on the shipping engine?
+///
+/// The defaults sit at 0.33 against a 0.20 floor and a heavy schedule reaches chance — but heavy costs 10× the cover
+/// bandwidth and 10× the added latency. If an intermediate schedule reaches chance, the default is simply mis-set; if the
+/// curve is smooth all the way, it is a genuine trade and belongs to the operator. Measuring rather than assuming which.
+#[test]
+#[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
+fn sweep_the_shipping_engine_for_the_anonymity_cost_knee() {
+    println!("ThresholdRouter, PG(2,7), 5 circuits, chance 0.20 — mix/cover -> matching accuracy:");
+    for (mix, cover) in [(50u64, 1_000u64), (120, 500), (120, 300), (250, 300), (250, 150), (500, 150), (500, 100)] {
+        let (a, _) = linkability_shipping(Duration::from_millis(mix), Duration::from_millis(cover), 8);
+        // Relative cost against the defaults: cover bandwidth scales as 1000/cover, latency as mix/50.
+        let bw = 1_000.0 / cover as f64;
+        let lat = mix as f64 / 50.0;
+        println!("  mix {mix:>4} / cover {cover:>5} -> {a:.2}   (cover bandwidth ×{bw:.1}, added latency ×{lat:.1})");
+    }
+}
+
 #[test]
 #[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
 fn measure_linkability_on_the_shipping_engine() {
