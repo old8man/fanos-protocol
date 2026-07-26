@@ -765,13 +765,42 @@ mod tests {
         }
     }
 
+    /// The **best claim held on each point** by the first `arrived` nodes, keyed by point.
+    ///
+    /// This is the table a directory maintains as HELLOs land, and the only input `fanos_vrf::settle_index` takes: a claim
+    /// to `p` is `(where the claimant's own walk reaches p, its rank)`, ordered by `fanos_vrf::claim_beats`. Building it
+    /// once per peer set is the point — a directory that instead recomputes a peer's walk per query turns an O(q) lookup
+    /// into an O(P) rebuild, which measured as a 77× slowdown on the `P=993` fixture below.
+    fn best_claim_table(
+        walks: &[Vec<fanos_geometry::Triple>],
+        outputs: &[fanos_vrf::VrfOutput],
+        arrived: usize,
+    ) -> HashMap<fanos_geometry::Triple, (u16, fanos_vrf::VrfOutput)> {
+        let mut table = HashMap::new();
+        for (j, w) in walks.iter().enumerate().take(arrived) {
+            let Some(out) = outputs.get(j) else { continue };
+            for (k, t) in w.iter().enumerate() {
+                let Ok(k) = u16::try_from(k) else { continue };
+                let entry = table.entry(*t).or_insert((k, *out));
+                if fanos_vrf::claim_beats((k, out), (entry.0, &entry.1)) {
+                    *entry = (k, *out);
+                }
+            }
+        }
+        table
+    }
+
     #[test]
-    fn uncoordinated_local_settling_converges_to_full_occupancy() {
-        // The property that decides whether the rule is *usable* rather than merely sound. The previous measurement
-        // seated nodes in a globally-sorted rank order, which no node can compute — it needs the whole membership. Here
-        // every node instead runs `settle_index` against only the occupancy it can *see*, in an arbitrary arrival order,
-        // repeatedly, exactly as a live node would when peers appear. Two questions: does it terminate, and does it
-        // reach the same full occupancy as the global order?
+    fn uncoordinated_local_settling_is_monotone_one_shot_and_injective() {
+        // The property that decides whether the rule is *usable* rather than merely sound. A node can only run it against
+        // the peers it has actually seen, in whatever order they appear, so the questions are: does a node's answer ever
+        // have to be taken back, and do independent local answers agree?
+        //
+        // Under the lexicographic claim rule (`fanos_vrf::claim_beats`) a claim to a point is a function of the claimant's
+        // VRF output alone — not of where anyone settled — which buys three things the old occupancy rule lacked and this
+        // measures directly: settling is ONE-SHOT (no iteration to a fixed point), MONOTONE under arrival (an index only
+        // ever advances as peers appear, so a node never retracts a position it already proved), and INJECTIVE (no two
+        // nodes settle on one point, since the order is total).
         use fanos_field::{F2, F4, F31};
         use fanos_primitives::{BeaconSeed, Epoch};
         use fanos_vrf::{VrfSecret, probe_point, settle_index};
@@ -789,55 +818,67 @@ mod tests {
                 })
                 .collect();
 
-            // `seats[i]` is node i's current index; occupancy is derived from it, so a node displaced by a newcomer is
-            // observed as gone from its old point on the next sweep — the live behaviour, not a one-shot assignment.
-            let mut seats: Vec<Option<u16>> = vec![None; outputs.len()];
-            let mut sweeps = 0u32;
-            loop {
-                sweeps += 1;
-                let mut moved = false;
-                for i in 0..outputs.len() {
-                    let occupancy = |probe: &dyn Fn(usize, u16) -> fanos_geometry::Triple,
-                                     target: fanos_geometry::Triple| {
-                        seats.iter().enumerate().find_map(|(j, s)| {
-                            let k = (*s)?;
-                            (j != i && probe(j, k) == target).then(|| outputs.get(j).copied()).flatten()
-                        })
-                    };
-                    let Some(mine) = outputs.get(i) else { continue };
-                    let settled = match points {
-                        7 => {
-                            let probe = |j: usize, k: u16| {
-                                outputs.get(j).map_or_else(fanos_geometry::Triple::default, |o| probe_point::<F2>(o, k).coords())
-                            };
-                            settle_index::<F2>(mine, |p| occupancy(&probe, p.coords()))
-                        }
-                        21 => {
-                            let probe = |j: usize, k: u16| {
-                                outputs.get(j).map_or_else(fanos_geometry::Triple::default, |o| probe_point::<F4>(o, k).coords())
-                            };
-                            settle_index::<F4>(mine, |p| occupancy(&probe, p.coords()))
-                        }
-                        _ => {
-                            let probe = |j: usize, k: u16| {
-                                outputs.get(j).map_or_else(fanos_geometry::Triple::default, |o| probe_point::<F31>(o, k).coords())
-                            };
-                            settle_index::<F31>(mine, |p| occupancy(&probe, p.coords()))
-                        }
-                    };
-                    if seats.get(i).copied().flatten() != settled {
-                        moved = true;
-                        if let Some(slot) = seats.get_mut(i) {
-                            *slot = settled;
-                        }
+            // Each node's walk, once. A claim to a point is `(where my walk reaches it, my rank)`, so indexing the walks by
+            // point gives the *best claim per point* — which is exactly the table a directory maintains from the HELLOs it
+            // has collected, and the only input the rule takes. Recomputing a peer's walk per query instead is what a
+            // directory must not do: it turns an O(q) lookup into an O(P) rebuild.
+            macro_rules! walk_of {
+                ($F:ty, $out:expr) => {
+                    (0..fanos_vrf::probe_bound::<$F>())
+                        .map(|k| probe_point::<$F>($out, k).coords())
+                        .collect::<Vec<_>>()
+                };
+            }
+            let walks: Vec<Vec<fanos_geometry::Triple>> = outputs
+                .iter()
+                .map(|o| match points {
+                    7 => walk_of!(F2, o),
+                    21 => walk_of!(F4, o),
+                    _ => walk_of!(F31, o),
+                })
+                .collect();
+            let best_claims = |arrived: usize| best_claim_table(&walks, &outputs, arrived);
+            macro_rules! settle_on {
+                ($F:ty, $mine:expr, $table:expr) => {
+                    settle_index::<$F>($mine, |p: &fanos_geometry::Point<$F>| {
+                        $table.get(&p.coords()).copied().filter(|(_, o)| o != $mine)
+                    })
+                };
+            }
+            macro_rules! per_plane {
+                ($mine:expr, $table:expr) => {
+                    match points {
+                        7 => settle_on!(F2, $mine, $table),
+                        21 => settle_on!(F4, $mine, $table),
+                        _ => settle_on!(F31, $mine, $table),
                     }
-                }
-                assert!(sweeps < 200, "settling must converge, not oscillate (P={points}, n={n})");
-                if !moved {
-                    break;
+                };
+            }
+
+            // Peers arrive one at a time; after each arrival every node re-evaluates against what it can see.
+            let mut prev: Vec<Option<u16>> = vec![None; outputs.len()];
+            for arrived in 1..=outputs.len() {
+                let table = best_claims(arrived);
+                for (i, mine) in outputs.iter().enumerate().take(arrived) {
+                    let now = per_plane!(mine, table);
+                    // MONOTONE: more peers can only make more points contested, so an index never retreats. This is what
+                    // makes an intermediate answer safe to act on — a node that has already announced index `k` is never
+                    // asked to un-announce it.
+                    if let (Some(before), Some(after)) = (prev.get(i).copied().flatten(), now) {
+                        assert!(
+                            after >= before,
+                            "index went backwards at P={points} node {i}: {before} → {after} on arrival {arrived}"
+                        );
+                    }
+                    // ONE-SHOT: re-running against the same peer set is a no-op, so there is nothing to converge to.
+                    assert_eq!(now, per_plane!(mine, table), "settling is not a function of the peer set alone");
+                    if let Some(slot) = prev.get_mut(i) {
+                        *slot = now;
+                    }
                 }
             }
 
+            let seats = prev;
             let held: HashSet<fanos_geometry::Triple> = seats
                 .iter()
                 .enumerate()
@@ -851,14 +892,18 @@ mod tests {
                     })
                 })
                 .collect();
+            let seated = seats.iter().filter(|s| s.is_some()).count();
             println!(
-                "P={points:>4} n={n:>3}  local settling → {:>3}/{n} distinct in {sweeps} sweeps  (bare E={:.2})",
+                "P={points:>4} n={n:>3}  local settling → {seated:>3}/{n} seated, {:>3} distinct  (bare E={:.2})",
                 held.len(),
                 expected_distinct(points, n)
             );
-            let expected = if points == 7 { 6 } else { n as usize };
+            // INJECTIVE: every seated node holds a point of its own. This is the capacity claim, and unlike the old rule
+            // it is structural rather than an outcome of iterating.
+            assert_eq!(held.len(), seated, "two nodes settled on one point at P={points}");
+            let expected = if points == 7 { 5 } else { n as usize };
             assert_eq!(
-                held.len(),
+                seated,
                 expected,
                 "local settling seats {expected} of {n} at P={points} — line-restricted, see probing_recovers"
             );

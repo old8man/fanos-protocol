@@ -40,6 +40,7 @@ pub mod shuffle;
 pub mod rlwe;
 pub mod vss;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use fanos_field::Field;
@@ -236,28 +237,54 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 /// any length — necessary because `q + 1` need not be prime (`q = 31` gives a line of 32 points).
 #[must_use]
 pub fn probe_point<F: Field>(output: &VrfOutput, k: u16) -> Point<F> {
-    let first = coordinate_from_output::<F>(output);
     if k == 0 {
-        return first;
+        // The preferred point needs no line: it is the walk's own starting position, so this fast path agrees with
+        // `probe_walk` by construction rather than by coincidence.
+        return coordinate_from_output::<F>(output);
     }
+    let walk = probe_walk::<F>(output);
+    walk.get(usize::from(k) % walk.len().max(1)).copied().unwrap_or_else(|| coordinate_from_output::<F>(output))
+}
+
+/// Where this node's own walk reaches `p`, or `None` if `p` is not on its line.
+///
+/// The inverse view of [`probe_point`], and the reason a claim to a point is checkable by anyone: the index is a function
+/// of the peer's VRF **output** alone, so a verifier learns how far along `p` sits for that peer without being told, and
+/// without needing to know where the peer actually settled. That is what keeps [`verify_coordinate_claim`]
+/// **non-recursive**.
+#[must_use]
+pub fn probe_index_of<F: Field>(output: &VrfOutput, p: &Point<F>) -> Option<u16> {
+    if coordinate_from_output::<F>(output) == *p {
+        return Some(0); // same fast path as `probe_point`, same reason
+    }
+    let k = probe_walk::<F>(output).iter().position(|q| q == p)?;
+    u16::try_from(k).ok()
+}
+
+/// The node's full probe walk: the `q + 1` points of its line, in the order its own output visits them.
+///
+/// **One sequence, two views.** [`probe_point`] reads it forwards and [`probe_index_of`] reads it backwards, so the two
+/// cannot disagree about where a point sits — a class of defect this code has already paid for once (see
+/// [`displacement_is_forced`]).
+fn probe_walk<F: Field>(output: &VrfOutput) -> Vec<Point<F>> {
+    let first = coordinate_from_output::<F>(output);
     // The line this node falls back along: one of the `q + 1` lines through its preferred point, chosen by its own output
     // so the node has no say in which.
     let through: Vec<_> = Plane::<F>::lines_through(first).collect();
     let Some(&line) = through.get(probe_line_index(output) % through.len().max(1)) else {
-        return first;
+        return vec![first];
     };
-    // The points of that line, ordered by a stride coprime to the line size — a cyclic permutation of the line, for the
-    // same reason the plane walk needed one: a hash would revisit points and stall short of the free seat.
     let pts: Vec<_> = Plane::<F>::points_on(line).collect();
     let len = pts.len();
     if len == 0 {
-        return first;
+        return vec![first];
     }
-    // Start at `first`'s own position on the line so `k` counts *away from* the preferred point.
+    // Ordered by a stride coprime to the line size — a cyclic permutation of the line, for the same reason the plane walk
+    // needed one: a hash would revisit points and stall short of the free seat. Start at `first`'s own position so `k`
+    // counts *away from* the preferred point.
     let start = pts.iter().position(|p| *p == first).unwrap_or(0);
     let stride = coprime_stride(probe_stride_seed(output), len);
-    let idx = (start + usize::from(k).wrapping_mul(stride)) % len;
-    pts.get(idx).copied().unwrap_or(first)
+    (0..len).map(|k| pts.get((start + k.wrapping_mul(stride)) % len).copied().unwrap_or(first)).collect()
 }
 
 /// Which of the `q + 1` lines through the preferred point this node falls back along — derived, so unchoosable.
@@ -314,19 +341,57 @@ const fn gcd(mut a: usize, mut b: usize) -> usize {
 #[must_use]
 pub fn outranks(a: &VrfOutput, b: &VrfOutput) -> bool { a < b }
 
-/// Whether a claimant at probe index `k` was **forced** off its `j`-th preference by `witness`, for `j < k`.
+/// The total order on **claims to one point**: reaching it in fewer probe steps wins, and equal steps are broken by rank.
+///
+/// A node's claim to `p` is the pair `(probe_index_of(output, p), output)`, and both halves are unforgeable functions of
+/// its VRF output — so every node computes the same verdict for the same pair of contenders, from public data, with no
+/// negotiation. Ties are impossible: equal index *and* equal output means the same VRF, i.e. the same node.
+///
+/// Lexicographic order is deliberate and matches how the rest of the platform arbitrates (SYNARC-Ω U.14 B3). Ranking by
+/// index first means a node that merely *wants* a point yields it to one whose walk arrives earlier — the cheaper claim,
+/// and the one needing no witnesses at all — instead of rank alone deciding, which is what left a displaced holder
+/// squatting a point its preferrer could prove and it could not.
+#[must_use]
+pub fn claim_beats(challenger: (u16, &VrfOutput), incumbent: (u16, &VrfOutput)) -> bool {
+    challenger.0 < incumbent.0 || (challenger.0 == incumbent.0 && outranks(challenger.1, incumbent.1))
+}
+
+/// Whether a claimant at probe index `k` was **forced** off its `j`-th point by `witness`, for `j < k`.
 ///
 /// The claimant's probe sequence is fixed by its own output, so the one degree of freedom left is claiming a larger `k`
 /// than reality — landing further along a sequence it cannot choose, but which it might still prefer. This closes it: a
-/// claim to index `k` is accepted only with `k` witnesses, the `j`-th showing that some **lower-ranked** node prefers the
-/// claimant's `j`-th point. A lower-ranked node preferring `p` displaces the claimant from `p`, so each step is a public
-/// fact rather than an assertion.
+/// claim to index `k` is accepted only with `k` witnesses, the `j`-th holding a **better claim** ([`claim_beats`]) to the
+/// claimant's `j`-th point. Each step is then a public fact rather than an assertion.
 ///
-/// Verification is deliberately **non-recursive**: the witness proves only its own *preference* (`probe_point(·, 0)`), not
-/// where it finally settled, so checking a chain of length `k` costs `k` independent VRF verifications and never unfolds
-/// into the witnesses' own chains. The price is that a witness which was itself displaced from `p` still displaces the
-/// claimant — a phantom collision that can leave a point empty. That costs *occupancy efficiency*, never correctness or
-/// security, and it cannot be manufactured: the claimant does not choose which witnesses exist.
+/// Verification is **non-recursive**: the witness's claim is `probe_index_of(witness_output, p_j)`, a function of its own
+/// output, so checking a chain of length `k` costs `k` independent VRF verifications and never unfolds into the witnesses'
+/// own chains. What it does *not* need is where the witness finally settled — which is exactly why the predicate can be
+/// the same one [`settle_index`] uses.
+///
+/// ## The defect this replaced, and the measurement that found it
+///
+/// The original rule accepted only a witness that **preferred** `p_j` (index 0) *and* outranked the claimant, while
+/// `settle_index` advanced past any point merely **held** by a better-ranked node. Two different predicates: a holder
+/// displaced *onto* `p_j` does not prefer it, so it pushed the claimant off without supplying the witness the claimant
+/// needed. The doc claimed the price was "occupancy efficiency, never correctness or security". That was **wrong** — the
+/// node could neither hold its point nor prove any later one, so it could not be seated at all, and its HELLO would be
+/// rejected. Measured over settled populations with *complete* information, the best case
+/// (`examples/unprovable_displacement.rs`):
+///
+/// | plane | nodes | displaced | **unprovable** | first instance |
+/// |---|---|---|---|---|
+/// | `PG(2,2)` | 5 | 261 | 47 (18.0%) | index 2 |
+/// | `PG(2,4)` | 12 | 572 | 100 (17.5%) | index 2 |
+/// | `PG(2,7)` | 30 | 769 | 166 (21.6%) | **index 1** |
+///
+/// Index 1 at `PG(2,7)`: displaced a single step and already unprovable, so it was not an artefact of deep chains.
+///
+/// Under this rule the count is **0 by construction** — the predicate that moves a node is the predicate that justifies
+/// it. The cost is occupancy: 2812 of 3000 seated versus the old rule's 3000, but 166 of those were inadmissible, so the
+/// comparison is 2812 against 2834 — 0.8%, spent on phantom yields (a node vacates `p` for a contender that settles
+/// elsewhere). The security-relevant quantity is unchanged and, measured, marginally better: a node can prove any index up
+/// to its first unbeaten one and none beyond, and that prefix is **1.28** points wide on average against the old rule's
+/// **1.30** (`PG(2,7)`, load 0.53).
 #[must_use]
 pub fn displacement_is_forced<F: Field>(
     claimant: &VrfOutput,
@@ -340,32 +405,46 @@ pub fn displacement_is_forced<F: Field>(
     let Some(witness_output) = witness_public.verify(&beacon_alpha(witness_id, epoch, beacon), witness_proof) else {
         return false;
     };
-    // Strictly lower rank, and its *preference* is the point the claimant is being displaced from. Equality of outputs
-    // would mean the same VRF, i.e. the same node — never a displacement.
-    outranks(&witness_output, claimant)
-        && probe_point::<F>(&witness_output, 0) == probe_point::<F>(claimant, j)
+    let contested = probe_point::<F>(claimant, j);
+    // A point off the witness's own line is one it has no claim to, so it can displace nobody from it.
+    let Some(reached) = probe_index_of::<F>(&witness_output, &contested) else {
+        return false;
+    };
+    claim_beats((reached, &witness_output), (j, claimant))
 }
 
-/// The probe index a node settles at, given whatever occupancy it can observe — the sans-I/O core of live resolution.
+/// The probe index a node settles at, given whatever peers it can observe — the sans-I/O core of live resolution.
 ///
-/// `occupant(p)` reports the VRF output of the node currently holding `p`, or `None` if the point looks free. The walk
-/// stops at the first index whose point is **not held by a lower-ranked node**: an empty point is free, and so is one
-/// held by a *higher*-ranked node, because that node is the one who must move. That asymmetry is what makes the rule
-/// consistent without agreement — two nodes evaluating the same collision reach opposite, complementary conclusions
-/// from the same public ranks, so exactly one of them moves.
+/// `contender(p)` reports the **best claim any other node has to `p`** as `(probe_index_of(their_output, p),
+/// their_output)`, or `None` if nobody the caller knows of reaches `p`. The walk stops at the first index whose point no
+/// contender claims better ([`claim_beats`]).
 ///
-/// It is monotone in information: a node that has observed fewer peers may settle too early and later discover it must
-/// advance, which is a *convergence* question rather than a correctness one — every intermediate position is a claim it
-/// can legitimately prove. Re-run it whenever occupancy changes or the beacon advances.
+/// This is the *same* predicate [`displacement_is_forced`] checks, which is the whole point: a node advances exactly where
+/// it can prove it had to, so **no node is ever forced to a position it cannot justify**. Deriving the two independently
+/// is what produced the defect recorded on `displacement_is_forced`.
+///
+/// Three properties follow from the claim being a function of outputs alone, none of which the previous
+/// occupancy-based rule had:
+///
+/// * **One-shot.** A claim to `p` does not depend on where anyone settled, so there is no iteration to a fixed point and
+///   no dependence on the order in which nodes arrive or learn of each other.
+/// * **Injective.** Two nodes settling on `p` would each have to hold the best claim to it, and the order is total.
+/// * **Monotone in information.** A node that has seen fewer peers may settle too early and later advance — a convergence
+///   question, not a correctness one, since every intermediate position is one it can prove. Re-run it whenever the peer
+///   set changes or the beacon advances.
 ///
 /// The walk is bounded by [`probe_bound`] — the line's length — since [`probe_point`] cycles through exactly that many
-/// points. Past it every point of the node's line is taken and it cannot be seated at all, which is the honest answer
-/// rather than a loop over repeats.
+/// points. Past it every point of the node's line is better claimed and it cannot be seated at all, which is the honest
+/// answer rather than a loop over repeats.
 #[must_use]
-pub fn settle_index<F: Field>(output: &VrfOutput, occupant: impl Fn(&Point<F>) -> Option<VrfOutput>) -> Option<u16> {
-    (0..probe_bound::<F>()).find(|&k| match occupant(&probe_point::<F>(output, k)) {
+pub fn settle_index<F: Field>(
+    output: &VrfOutput,
+    contender: impl Fn(&Point<F>) -> Option<(u16, VrfOutput)>,
+) -> Option<u16> {
+    (0..probe_bound::<F>()).find(|&k| match contender(&probe_point::<F>(output, k)) {
         None => true,
-        Some(held) => !outranks(&held, output),
+        // The claimant's own claim to its `k`-th point is `k` by definition of the walk.
+        Some((reached, theirs)) => !claim_beats((reached, &theirs), (k, output)),
     })
 }
 
@@ -621,7 +700,7 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use fanos_field::F31;
+    use fanos_field::{F7, F31};
 
     #[test]
     fn probe_zero_is_exactly_the_existing_coordinate() {
@@ -746,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn settling_takes_the_first_point_no_lower_ranked_node_holds() {
+    fn settling_takes_the_first_point_no_better_claim_reaches() {
         let sk = VrfSecret::from_seed([33u8; 32]);
         let (_, mine) = sk.prove(&beacon_alpha(b"me", Epoch::ZERO, &BeaconSeed::GENESIS));
         let p0 = probe_point::<F31>(&mine, 0);
@@ -755,25 +834,38 @@ mod tests {
         // Nothing observed anywhere: the preference stands, and nothing changes for an uncontested node.
         assert_eq!(settle_index::<F31>(&mine, |_| None), Some(0));
 
-        // A LOWER-ranked node on the preference displaces this node to the next index.
         let mut lower = mine;
         lower[0] = 0;
-        assert!(outranks(&lower, &mine) || lower == mine);
         let lower = if outranks(&lower, &mine) { lower } else { [0u8; OUTPUT_LEN] };
-        assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0).then_some(lower)), Some(1));
-
-        // A HIGHER-ranked node on the preference does NOT: it is the one that must move. This complementarity is what
-        // lets both sides act from public ranks alone, with exactly one of them yielding.
         let mut higher = mine;
         higher[0] = 0xff;
         let higher = if outranks(&mine, &higher) { higher } else { [0xffu8; OUTPUT_LEN] };
-        assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0).then_some(higher)), Some(0));
 
-        // Two consecutive preferences held by lower-ranked nodes ⇒ index 2.
-        assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0 || *p == p1).then_some(lower)), Some(2));
+        // At EQUAL index, rank decides: a lower-ranked contender on the preference displaces this node...
+        assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0).then_some((0, lower))), Some(1));
+        // ...and a higher-ranked one does not — it is the one that must move. This complementarity is what lets both
+        // sides act from public data alone, with exactly one of them yielding.
+        assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0).then_some((0, higher))), Some(0));
+
+        // INDEX BEATS RANK, the change that closes the unprovable-displacement gap: a contender reaching this node's
+        // `p1` at its own index 0 displaces it even while ranking WORSE, because the cheaper claim wins the point. Under
+        // the old rank-only rule this settled at 1 and the node could not prove it.
+        assert_eq!(
+            settle_index::<F31>(&mine, |p| if *p == p0 {
+                Some((0, lower))
+            } else if *p == p1 {
+                Some((0, higher))
+            } else {
+                None
+            }),
+            Some(2)
+        );
+
+        // Conversely a contender that reaches the point LATER than this node loses it, rank notwithstanding.
+        assert_eq!(settle_index::<F31>(&mine, |p| (*p == p0).then_some((3, lower))), Some(0));
 
         // A genuinely full line is reported as such rather than looping forever.
-        assert_eq!(settle_index::<F31>(&mine, |_| Some(lower)), None);
+        assert_eq!(settle_index::<F31>(&mine, |_| Some((0, lower))), None);
 
         // The bound is the LINE's length, not the plane's. A walk that cycles after `q+1` steps must never return an
         // index beyond it: index `k + (q+1)` names the same point as `k` but would demand `q+1` more witnesses, so an
@@ -781,11 +873,112 @@ mod tests {
         assert_eq!(probe_bound::<F31>(), 32, "q + 1 for PG(2,31)");
         let occupied_until = |p: &Point<F31>| {
             let head: Vec<_> = (0..30u16).map(|k| probe_point::<F31>(&mine, k)).collect();
-            head.contains(p).then_some(lower)
+            head.contains(p).then_some((0, lower))
         };
         let Some(settled) = settle_index::<F31>(&mine, occupied_until) else { unreachable!("two points free") };
         assert!(settled < probe_bound::<F31>(), "the index never exceeds the line it walks");
         assert_eq!(settled, 30, "and it is the first free step, not a wrapped equivalent");
+    }
+
+    #[test]
+    fn the_forward_and_inverse_views_of_a_walk_agree_everywhere() {
+        // `probe_point` reads the walk forwards, `probe_index_of` backwards. Independent derivations of the same sequence
+        // are exactly what produced the unprovable-displacement defect, so this pins them together exhaustively: every
+        // index round-trips, and no point off the walk is claimed to be on it.
+        for seed in 0..24u8 {
+            let sk = VrfSecret::from_seed([seed; 32]);
+            let (_, out) = sk.prove(&beacon_alpha(b"walker", Epoch::new(2), &BeaconSeed::GENESIS));
+            let walk: Vec<_> = (0..probe_bound::<F7>()).map(|k| probe_point::<F7>(&out, k)).collect();
+            for (k, p) in walk.iter().enumerate() {
+                assert_eq!(
+                    probe_index_of::<F7>(&out, p),
+                    u16::try_from(k).ok(),
+                    "seed {seed}: the inverse view disagrees at step {k}"
+                );
+            }
+            // A walk is a permutation of its line, never a repeat — the property the double hashing exists to give.
+            let distinct: alloc::collections::BTreeSet<_> = walk.iter().map(Point::coords).collect();
+            assert_eq!(distinct.len(), walk.len(), "seed {seed}: the walk revisits a point");
+            // And every point NOT on the walk is reported as unreachable, so no node can claim a step it never takes.
+            let off = (0..Plane::<F7>::N)
+                .filter_map(|i| {
+                    let p = Point::<F7>::at(i as usize);
+                    (!walk.contains(&p)).then_some(p)
+                })
+                .filter(|p| probe_index_of::<F7>(&out, p).is_some())
+                .count();
+            assert_eq!(off, 0, "seed {seed}: a point off the line is reported as on the walk");
+        }
+    }
+
+    #[test]
+    fn every_index_settling_chooses_is_one_the_verifier_accepts() {
+        // The regression test for the defect this rule replaced: `settle_index` and `verify_coordinate_claim` must agree
+        // about when a node may move, or a node is pushed off a point it can hold and off to one it cannot prove. Built
+        // over a real population with real keys, since the whole question is whether two independently-derived predicates
+        // read the same facts.
+        const N: usize = 24;
+        let epoch = Epoch::new(4);
+        let beacon = BeaconSeed::GENESIS;
+        let peers: Vec<(Vec<u8>, VrfPublic, VrfProof, VrfOutput)> = (0..N)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = u8::try_from(i).unwrap_or(0);
+                let sk = VrfSecret::from_seed(seed);
+                let id = alloc::format!("peer-{i}").into_bytes();
+                let (proof, output) = sk.prove(&beacon_alpha(&id, epoch, &beacon));
+                (id, sk.public(), proof, output)
+            })
+            .collect();
+
+        let mut displaced = 0;
+        for (i, (my_id, my_public, my_proof, mine)) in peers.iter().enumerate() {
+            // The best claim any *other* peer holds to a point — exactly what a directory can compute from HELLOs.
+            let contender = |p: &Point<F7>| {
+                peers
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .filter_map(|(_, (_, _, _, o))| probe_index_of::<F7>(o, p).map(|k| (k, *o)))
+                    .reduce(|a, b| if claim_beats((b.0, &b.1), (a.0, &a.1)) { b } else { a })
+            };
+            let Some(k) = settle_index::<F7>(mine, contender) else { continue };
+            if k > 0 {
+                displaced += 1;
+            }
+            // Build the claim the node would actually send: one witness per skipped index, taken from what it observed.
+            let witnesses: Vec<DisplacementWitness> = (0..k)
+                .filter_map(|j| {
+                    let pj = probe_point::<F7>(mine, j);
+                    peers
+                        .iter()
+                        .enumerate()
+                        .filter(|&(w, _)| w != i)
+                        .find(|(_, (_, _, _, o))| {
+                            probe_index_of::<F7>(o, &pj).is_some_and(|kw| claim_beats((kw, o), (j, mine)))
+                        })
+                        .map(|(_, (id, public, proof, _))| DisplacementWitness {
+                            id: id.clone(),
+                            public: *public,
+                            proof: *proof,
+                        })
+                })
+                .collect();
+            assert_eq!(witnesses.len(), usize::from(k), "a witness exists for every step settling took");
+            let claim = CoordinateClaim { proof: *my_proof, index: k, witnesses };
+            assert!(
+                verify_coordinate_claim::<F7>(
+                    my_public,
+                    my_id,
+                    epoch,
+                    &beacon,
+                    &probe_point::<F7>(mine, k),
+                    &claim
+                ),
+                "peer {i} settled at index {k} but the verifier rejects the claim"
+            );
+        }
+        assert!(displaced >= 3, "the fixture must actually exercise displacement, saw {displaced}");
     }
 
     #[test]
