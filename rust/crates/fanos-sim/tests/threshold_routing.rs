@@ -8,12 +8,13 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::collections::BTreeMap;
+use std::collections as alloc_set;
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::threshold::{HopLine, seal_onion};
 use fanos_aphantos::threshold_router::{ANONYMOUS, combiner_for, launch_frame, line_member_coords};
-use fanos_field::F2;
-use fanos_geometry::{Line, Point, Triple};
+use fanos_field::{F2, F7};
+use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::Epoch;
 use fanos_runtime::{Command, Duration};
@@ -340,4 +341,188 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
         return 0.0;
     }
     num / (da.sqrt() * db.sqrt())
+}
+
+// ── Linkability on the SHIPPING engine ──────────────────────────────────────────────────────────────────────────────
+//
+// The named follow-up from `traffic_analysis.rs`, which measured the valid metric on `NyxNode` (Lite) for want of a
+// large-enough router harness. `ThresholdRouter` is generic over the field, so `PG(2,7)` gives the same 57 points and the
+// same room for five concurrent flows — and this is the engine `fanos_node` actually builds.
+
+/// A `PG(2,7)` cell of `ThresholdRouter`s with the given schedule, plus the onion-public directory.
+fn spawn_f7_routers(
+    sim: &mut Sim,
+    mix: Duration,
+    cover: Duration,
+) -> BTreeMap<Triple, HybridKemPublic> {
+    let mut pubs = BTreeMap::new();
+    let n = Plane::<F7>::points().count();
+    for i in 0..n {
+        let point = Point::<F7>::at(i);
+        let mut rng = SeedRng::from_seed(&[0xB7, i as u8]);
+        let (secret, _identity) = HybridKemSecret::generate(&mut rng);
+        let mut onion_seed = [0xD7u8; 32];
+        onion_seed[31] = i as u8;
+        pubs.insert(point.coords(), OnionKeyRatchet::new(onion_seed, Epoch::ZERO).public().clone());
+        let mut r = ThresholdRouter::<F7>::new(point, &secret, 2, onion_seed).with_mixing(mix);
+        if cover.as_nanos() > 0 {
+            r = r.with_cover(cover);
+        }
+        sim.add(Box::new(r));
+    }
+    pubs
+}
+
+/// Seal an onion over `PG(2,7)` hop lines.
+fn build_onion_f7(hop_lines: &[Triple], t: u8, payload: &[u8], pubs: &BTreeMap<Triple, HybridKemPublic>) -> Vec<u8> {
+    let member_vecs: Vec<Vec<&HybridKemPublic>> = hop_lines
+        .iter()
+        .map(|&line| line_member_coords::<F7>(line).iter().filter_map(|c| pubs.get(c)).collect())
+        .collect();
+    let hops: Vec<HopLine<'_>> = hop_lines
+        .iter()
+        .zip(&member_vecs)
+        .map(|(&line, members)| HopLine { line, members })
+        .collect();
+    seal_onion(&hops, t, payload, b"f7-linkability-seed").unwrap()
+}
+
+/// The adversary's flow-matching accuracy over `K` concurrent circuits on the shipping engine, averaged over seeds.
+fn linkability_shipping(mix: Duration, cover: Duration, runs: u64) -> (f64, f64) {
+    const K: usize = 5;
+    const BIN_MS: u64 = 200;
+    const SPAN_MS: u64 = 8_000;
+    let mut total = 0.0;
+    for seed in 0..runs {
+        let mut sim = Sim::new(0xF71 + seed);
+        let pubs = spawn_f7_routers(&mut sim, mix, cover);
+        if cover.as_nanos() > 0 {
+            sim.inject_all(&Command::StartHeartbeat);
+        }
+        sim.observe_frames();
+
+        // K circuits whose entry AND exit combiners are all DISTINCT. Taking lines by index does not give this: any two
+        // lines of a projective plane meet in exactly one point, so line-derived combiners collide — measured, the naive
+        // choice gave 10 endpoint slots over only 7 distinct points, with one circuit's entry being another's exit. That
+        // makes matching meaningless and produced a 0.00 accuracy even undefended, which is how the harness announced it
+        // was broken rather than the engine.
+        let mut used: alloc_set::BTreeSet<Triple> = alloc_set::BTreeSet::new();
+        let mut lines: Vec<Triple> = Vec::new();
+        for i in 0..Plane::<F7>::points().count() {
+            let line = Line::<F7>::at(i).coords();
+            if let Some(c) = combiner_for::<F7>(line)
+                && used.insert(c)
+            {
+                lines.push(line);
+            }
+            if lines.len() == 2 * K {
+                break;
+            }
+        }
+        assert!(lines.len() == 2 * K, "need {} lines with distinct combiners, found {}", 2 * K, lines.len());
+        let circuits: Vec<(Triple, Triple)> =
+            (0..K).filter_map(|i| Some((*lines.get(i)?, *lines.get(i + K)?))).collect();
+        let mut round = 0u64;
+        let mut t = 0u64;
+        while t < SPAN_MS {
+            for (i, (entry_line, exit_line)) in circuits.iter().enumerate() {
+                if round.is_multiple_of(i as u64 + 1)
+                    && let Some(entry) = combiner_for::<F7>(*entry_line)
+                {
+                    let onion = build_onion_f7(&[*entry_line, *exit_line], 2, b"flow", &pubs);
+                    sim.inject(entry, Command::Emit { to: entry, frame: launch_frame(*entry_line, &onion) });
+                }
+            }
+            sim.run_for(Duration::from_millis(200));
+            t += 200;
+            round += 1;
+        }
+        sim.run_for(Duration::from_millis(2_000));
+
+        // Score (entry combiner emissions) against (exit combiner receipts) — the endpoints of each circuit.
+        let obs = sim.observed_frames();
+        let bins = (SPAN_MS / BIN_MS) as usize + 12;
+        let series = |node: Triple, out: bool| -> Vec<f64> {
+            let mut v = vec![0f64; bins];
+            for o in obs.iter().filter(|o| if out { o.from == node } else { o.to == node }) {
+                if let Some(sl) = v.get_mut((o.t_ms / BIN_MS) as usize) {
+                    *sl += 1.0;
+                }
+            }
+            v
+        };
+        let ins: Vec<Vec<f64>> = circuits
+            .iter()
+            .filter_map(|(e, _)| combiner_for::<F7>(*e).map(|c| series(c, true)))
+            .collect();
+        let outs: Vec<Vec<f64>> = circuits
+            .iter()
+            .filter_map(|(_, x)| combiner_for::<F7>(*x).map(|c| series(c, false)))
+            .collect();
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+        for (i, a) in ins.iter().enumerate() {
+            for (j, b) in outs.iter().enumerate() {
+                pairs.push((pearson(a, b).abs(), i, j));
+            }
+        }
+        pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let (mut ti, mut tj) = ([false; K], [false; K]);
+        let mut correct = 0usize;
+        for (_, i, j) in pairs {
+            if !ti[i] && !tj[j] {
+                ti[i] = true;
+                tj[j] = true;
+                if i == j {
+                    correct += 1;
+                }
+            }
+        }
+        total += correct as f64 / K as f64;
+    }
+    (total / runs as f64, 1.0 / K as f64)
+}
+
+#[test]
+#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+fn measure_linkability_on_the_shipping_engine() {
+    let (undefended, chance) = linkability_shipping(Duration::from_millis(0), Duration::from_millis(0), 8);
+    let (shipped, _) = linkability_shipping(Duration::from_millis(50), Duration::from_millis(1_000), 8);
+    let (heavy, _) = linkability_shipping(Duration::from_millis(500), Duration::from_millis(100), 8);
+    // Diagnose FIRST, and keep it: an undefended baseline at or below chance means the harness carried nothing, and the
+    // adversary cannot match circuits that never traversed. This check is what caught the endpoint collision that made the
+    // first version of this measurement read 0.00 — i.e. perfect anonymity — when in fact nothing was being measured.
+    {
+        let mut sim = Sim::new(0xF7D);
+        let pubs = spawn_f7_routers(&mut sim, Duration::from_millis(0), Duration::from_millis(0));
+        sim.observe_frames();
+        let entry_line = Line::<F7>::at(0).coords();
+        let exit_line = Line::<F7>::at(5).coords();
+        let entry = combiner_for::<F7>(entry_line);
+        let exit = combiner_for::<F7>(exit_line);
+        let onion = build_onion_f7(&[entry_line, exit_line], 2, b"probe", &pubs);
+        if let Some(e) = entry {
+            sim.inject(e, Command::Emit { to: e, frame: launch_frame(entry_line, &onion) });
+        }
+        sim.run_for(Duration::from_millis(3_000));
+        let obs = sim.observed_frames();
+        let at_exit = obs.iter().filter(|o| Some(o.to) == exit).count();
+        println!(
+            "harness check — total frames {}, frames reaching the exit combiner {} (entry {:?}, exit {:?})",
+            obs.len(),
+            at_exit,
+            entry,
+            exit
+        );
+    }
+
+    println!("ThresholdRouter (SHIPPING engine), PG(2,7), 5 circuits, chance {chance:.2}:");
+    println!("  no defence                        {undefended:.2}");
+    println!("  SHIPPING (mix 50ms, cover 1000ms) {shipped:.2}");
+    println!("  heavy    (mix 500ms, cover 100ms) {heavy:.2}");
+    assert!(
+        undefended > chance + 0.3,
+        "the undefended baseline must be attackable, or this measures nothing (got {undefended:.2}, chance {chance:.2})"
+    );
+    assert!(shipped < undefended - 0.3, "the shipping schedule must materially reduce matching (got {shipped:.2})");
+    assert!(heavy <= shipped, "a heavier schedule must not be worse (heavy {heavy:.2}, shipping {shipped:.2})");
 }
