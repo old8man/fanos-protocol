@@ -216,7 +216,7 @@ pub fn spawn_role_loop<F: Field>(
                 _ = refresh.tick() => {
                     let (now, complete) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
                     if now == settled {
-                        stable = stable.saturating_add(1);
+                        stable = next_stable(stable, true, complete);
                         // Local stability is *not* evidence of the global fixed point, and conflating the two is the
                         // same error one level up. A solitary assignment is the one value that cannot distinguish "the
                         // cell really is just me" from "I have not discovered anyone yet" — so a node holding one has no
@@ -247,7 +247,7 @@ pub fn spawn_role_loop<F: Field>(
                         }
                     } else {
                         settled = now;
-                        stable = 0;
+                        stable = next_stable(stable, false, complete);
                         backoff = ROSTER_REFRESH;
                     }
                     refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
@@ -330,22 +330,47 @@ async fn genesis_assign<F: Field>(
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
 /// the live load directory), step the controller, publish this node's roles. `send` only fails if every
 /// receiver has dropped (the node is shutting down) — ignored.
-/// Whether the refresh may back off — i.e. whether there is *positive evidence* that looking again would find nothing new.
+/// How many consecutive **complete** repeats of the assignment this node has now seen — the evidence half, kept apart from
+/// the retry cadence ([`may_relax`]).
 ///
-/// Three conditions, and each earned its place from a measured failure:
+/// Three cases, and the middle one is the whole reason this is a named function rather than an inline `+= 1`:
 ///
-/// * `stable >= STABLE_BEFORE_BACKOFF` — one identical answer is not a pattern.
-/// * `roster >= peers` — the transport's peer table is a lower bound on membership that owes nothing to the overlay store,
-///   so a roster below it is *demonstrably* behind (`docs/design-testing.md` §5.3.2).
-/// * `complete` — the reads behind that answer actually concluded. Without this, two scans whose members timed out agree
-///   with each other while both disagree with the cell, and that agreement reads as stability: the loop relaxes, and the
-///   cell sits frozen short of its own membership. A repeat is only evidence when the reads behind it concluded.
+/// * the answer **changed** ⇒ 0. Whatever was accumulating is void.
+/// * the scan was **incomplete** ⇒ unchanged. Two partial views agreeing with each other say nothing about the cell, so
+///   this must not accumulate — but neither should it destroy evidence gathered when the reads *did* conclude.
+/// * a **complete repeat** ⇒ one more. The only case that is evidence of anything.
 ///
-/// Extracted so the decision can be pinned exhaustively rather than inspected: it is three booleans, and getting any one of
-/// them backwards is a cell that either never relaxes (scanning forever, starving its own critical path — §5.3.5) or
-/// relaxes on nothing.
+/// Extracted because the property "a node that cannot read never comes to believe its assignment is settled" had no guard:
+/// reintroducing the defect (accumulate on any repeat) left all 101 tests green.
+const fn next_stable(stable: u32, repeated: bool, complete: bool) -> u32 {
+    if !complete {
+        stable
+    } else if repeated {
+        stable.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// Whether the refresh may lengthen its period — i.e. whether looking again *soon* would be wasted effort.
+///
+/// This is deliberately **not** the same question as "is the assignment settled", and conflating the two is what the
+/// `complete` flag exposed. There are two unrelated reasons a node has nothing useful to gain from scanning sooner:
+///
+/// * **It is settled.** `stable >= STABLE_BEFORE_BACKOFF` (one identical answer is not a pattern) *and* `roster >= peers`
+///   — the transport's peer table is a lower bound the overlay store owes nothing to, so a roster below it is
+///   *demonstrably* behind (`docs/design-testing.md` §5.3.2, measured as a cell stuck at `[2, 1, 2]`).
+/// * **It cannot read.** `!complete`: the scan's reads timed out. Scanning *harder* cannot fix a store that is not
+///   answering, and it adds exactly the load that stopped it answering — §5.3.5 measured a seven-node cell failing to
+///   converge at all under that regime. An inconclusive read is a congestion signal, and the response to congestion is to
+///   retry less often, not more.
+///
+/// The soundness half lives at the call site rather than here: `stable` only accumulates on a **complete** repeat, so a
+/// node that cannot read never comes to *believe* its assignment is settled, however long it backs off. It slows down
+/// without deciding anything — and recovers on its own, since the first complete scan that finds more members changes the
+/// assignment and resets the period to the floor.
 const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> bool {
-    stable >= STABLE_BEFORE_BACKOFF && roster >= peers && complete
+    !complete || (stable >= STABLE_BEFORE_BACKOFF && roster >= peers)
 }
 
 /// Recompute and publish the assignment for `epoch`, reporting whether the directory reads it rests on were **complete**.
@@ -461,9 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn relaxing_needs_positive_evidence_on_all_three_counts() {
-        // The decision that left a cell frozen short of its own membership, pinned exhaustively. Each condition is a
-        // separate way to be wrong, and two of the three were measured the hard way.
+    fn the_refresh_lengthens_only_when_looking_sooner_would_be_wasted() {
+        // Two unrelated reasons to scan less often, pinned apart because conflating them is what left a cell frozen short
+        // of its own membership: the answer is settled, or the store is not answering. Each was measured the hard way.
         const OK: u32 = STABLE_BEFORE_BACKOFF;
 
         assert!(may_relax(OK, 5, 5, true), "settled, not behind, and the reads concluded: relax");
@@ -477,10 +502,12 @@ mod tests {
         assert!(!may_relax(OK, 4, 5, true), "roster below the transport's own peer count");
         assert!(may_relax(OK, 6, 5, true), "a roster ABOVE it is not evidence of being behind");
 
-        // And the one this whole chain led to: a repeat is only evidence when the reads behind it concluded. Two scans
-        // whose members timed out agree with each other while both disagree with the cell.
-        assert!(!may_relax(OK, 5, 5, false), "an incomplete scan is not a settled answer, however often it repeats");
-        assert!(!may_relax(OK, 9, 0, false), "and no amount of apparent agreement substitutes for a concluded read");
+        // An incomplete scan lengthens the period, and that is the RIGHT direction: a store that is not answering is not
+        // fixed by asking it more often, and asking more often is what stopped it answering (§5.3.5). The soundness half is
+        // at the call site — `stable` only accumulates on a complete repeat — so backing off here never turns into
+        // believing a partial answer.
+        assert!(may_relax(0, 0, 9, false), "cannot read ⇒ retry less often, regardless of how it looks");
+        assert!(may_relax(OK, 5, 5, false), "and completeness is checked before stability, not after it");
     }
 
     #[test]
@@ -503,5 +530,29 @@ mod tests {
     /// Fixture: `(coord, value)` pairs for a `Scan`, coordinates being irrelevant to what is asserted.
     fn alloc_pairs(values: &[u8]) -> Vec<(fanos_diaulos::Coord, u8)> {
         values.iter().map(|&v| ([1, 0, 0], v)).collect()
+    }
+
+    #[test]
+    fn evidence_of_a_settled_assignment_accumulates_only_on_a_complete_repeat() {
+        // The soundness half, and it had no guard until this: reintroducing "accumulate on any repeat" left all 101 tests
+        // green. A node that cannot read must never come to *believe* its assignment is settled, however long it waits.
+        assert_eq!(next_stable(2, true, true), 3, "a complete repeat is evidence");
+        assert_eq!(next_stable(2, false, true), 0, "a complete change voids what was accumulating");
+
+        // The case the whole chain led to: two partial views agreeing with each other are not evidence about the cell.
+        assert_eq!(next_stable(2, true, false), 2, "an incomplete repeat accumulates NOTHING");
+        for n in 0..STABLE_BEFORE_BACKOFF + 5 {
+            assert_eq!(next_stable(n, true, false), n, "however many times it repeats: {n}");
+        }
+        // ...and it does not destroy evidence gathered while the reads did conclude, either.
+        assert_eq!(next_stable(2, false, false), 2, "an inconclusive scan is not a change, and not a reset");
+
+        // Composed with the cadence rule: unable to read ⇒ slow down, but never cross the settled threshold by doing so.
+        let mut stable = 0;
+        for _ in 0..20 {
+            stable = next_stable(stable, true, false);
+        }
+        assert!(stable < STABLE_BEFORE_BACKOFF, "twenty unreadable scans must not add up to a settled answer");
+        assert!(may_relax(stable, 0, 9, false), "though the node does back off, which is the congestion response");
     }
 }
