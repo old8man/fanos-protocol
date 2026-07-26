@@ -3,14 +3,14 @@
 //! NYX is FANOS's evolution of onion routing (spec Part V). It changes three things at once:
 //!
 //! * a hop is not a node but a **line** — a threshold group `t` of `q+1`, so no single node
-//!   peels a layer and endpoint linkage drops to `P_hop²` ([`security`], [`sheaf`]);
+//!   peels a layer and endpoint linkage drops to `P_hop²` ([`security`], and `sheaf` — see below);
 //! * a path is not a random chain but a **geometric flag**, uniform by `PGL` transitivity and
 //!   verifiable by algebra ([`path`]);
 //! * **path integrity** comes from a **holonomic ratchet** on the incidence bundle ([`ratchet`]) — a
 //!   path authenticator, not a source of forward secrecy (forward secrecy is a seed-hygiene property;
 //!   see the [`ratchet`] and `fanos_aphantos::threshold` module docs).
 //!
-//! [`tessera::Tessera`] assembles these into a nested onion; [`mixing`] and [`profile`] provide
+//! `tessera::Tessera` assembles these into a nested onion; [`mixing`] and [`profile`] provide
 //! Poisson mixing and the configurable λ dial (one substrate, Tor-class to Nym+).
 //!
 //! The cryptographic primitives (ChaCha20-Poly1305, Shamir, BLAKE3) are vetted; the FANOS
@@ -24,20 +24,34 @@ extern crate alloc;
 
 mod mathfns;
 
+pub mod error;
 pub mod guard;
 pub mod mixing;
 pub mod path;
 pub mod profile;
 pub mod ratchet;
 pub mod security;
+
+// The **transparent** onion forms, behind a non-default feature. Both carry Shamir shares in the CLEAR, so their
+// below-threshold guarantee holds only if every share reaches its member over a private channel — an assumption the live
+// path does not make. Production seals each share to its member's hybrid-KEM public key
+// (`fanos_aphantos::threshold::ThresholdSealed`), which needs the post-quantum KEM and therefore cannot live in this
+// `no_std` crate. Leaving these merely `pub` and documented was a footgun: an integrator reaching for the obvious name
+// `fanos_nyx::Tessera` got the lower-assurance variant, and nothing failed to compile to tell them. Enabling
+// `transparent-onion` is now a deliberate act — the simulator and the reference derivations want it; a deployment does not.
+#[cfg(feature = "transparent-onion")]
 pub mod sheaf;
+#[cfg(feature = "transparent-onion")]
 pub mod tessera;
 
 pub use guard::GuardSet;
 pub use path::{Circuit, build_circuit, build_circuit_via_guard};
 pub use profile::{MixConfig, NyxConfig, Profile};
 pub use ratchet::{Ratchet, circuit_holonomy, verify_holonomy};
-pub use sheaf::{NyxError, ThresholdLayer};
+pub use error::NyxError;
+#[cfg(feature = "transparent-onion")]
+pub use sheaf::ThresholdLayer;
+#[cfg(feature = "transparent-onion")]
 pub use tessera::{PeelResult, Tessera};
 
 #[cfg(test)]
@@ -46,6 +60,8 @@ mod tests {
     //! End-to-end: build a geometric circuit, onion-route a payload through threshold hops,
     //! verify the holonomy, and confirm the security/anonymity numbers.
     use super::*;
+    // Pathed through `crate::` rather than the re-exports, which are feature-gated: the transparent modules are always
+    // compiled (private without `transparent-onion`), so the crate's own tests cover them at every feature setting.
     use fanos_field::F31;
     use fanos_geometry::Point;
 

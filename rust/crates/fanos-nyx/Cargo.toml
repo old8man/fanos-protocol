@@ -25,9 +25,17 @@ std = ["fanos-geometry/std", "fanos-primitives/std"]
 alloc = ["fanos-geometry/alloc", "fanos-primitives/alloc"]
 # For no_std targets: supply the float backend used by the mixing entropy.
 libm = ["dep:libm"]
+# Expose the TRANSPARENT onion forms (`sheaf`, `tessera`) — Shamir shares in the clear, superseded on the live path by
+# `fanos_aphantos::threshold::ThresholdSealed`. Off by default so an integrator cannot reach the lower-assurance variant by
+# picking the obvious name; on for the simulator and the reference derivations, which study the construction itself.
+transparent-onion = []
 
 [dev-dependencies]
 proptest.workspace = true
+# Self dev-dependency so the crate's OWN tests see the transparent forms while a dependent's default build does not. This is
+# the Cargo idiom for a test-only feature: without it the gate would have to be `cfg(any(test, feature))`, which integration
+# tests in `tests/` cannot see (they link the library as an external crate, built without `cfg(test)`).
+fanos-nyx = { path = ".", features = ["transparent-onion"] }
 
 [lints]
 workspace = true

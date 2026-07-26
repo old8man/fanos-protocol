@@ -19,7 +19,7 @@ use fanos_primitives::shamir;
 
 use crate::path::Circuit;
 use crate::ratchet::circuit_holonomy;
-use crate::sheaf::NyxError;
+use crate::error::NyxError;
 
 const CMD_DELIVER: u8 = 0;
 const CMD_NEXT: u8 = 1;
