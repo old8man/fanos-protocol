@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD afc253b`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD e243ac4`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -36,6 +36,8 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
 ### 2. Wire the probe index onto the HELLO frame
+- **Now also blocking a test fixture.** `NodeFleet::spawn` had to be made draw-injective (`e243ac4`) precisely because
+  collisions cannot be resolved live yet; that workaround retires when this lands.
 - **Problem.** The coordinate-resolution primitive is complete and now internally consistent (`afc253b`: one
   lexicographic claim order shared by `settle_index`, `displacement_is_forced`, and `Directory::supersedes`), with
   `CoordinateClaim`/`DisplacementWitness`/`verify_coordinate_claim` and a canonical encoding. But **the wire carries only
@@ -91,14 +93,15 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
 - **Task.** Build the node telemetry export surface and route every export through `privatize` with the configured
   `PrivacyBudget`. Build the export *first* — there is nothing to privatize today.
 
-### 6. One Merkle tree in `fanos-primitives`
-- **Problem.** Verified: no `fanos-primitives/src/merkle.rs`, and three divergent implementations with incompatible
-  odd-node rules and proof formats — `fanos-thesauros/src/content.rs:88` (odd node promoted; `MerkleStep` proofs),
-  `fanos-taxis/src/crosscell.rs:96` (odd tail **duplicated**, the **CVE-2012-2459** ambiguity class unless the leaf count
-  is externally bound; index-parity proofs), `fanos-vrf/src/pqvrf.rs:61` (perfect tree).
-- **Task.** One domain-separated `merkle` module in `fanos-primitives` (`hash_labeled`, one odd rule, one proof type, leaf
-  count bound into the root); thesauros + crosscell adopt it; pqvrf reuses it as the perfect-tree case.
-  (`obolos/tree.rs` is a genuinely different incremental-frontier structure — leave it.)
+### 6. One Merkle tree in `fanos-primitives` — **DONE** (`bfe3fdd`)
+`fanos_primitives::merkle` binds the leaf count into the root (killing the CVE-2012-2459 class by construction) and
+demands an exact proof length. crosscell and thesauros adopted it; `CrossCellReceipt` gained a `count` field.
+**`pqvrf` deliberately did not**: a perfect tree with a publicly fixed height is already unambiguous and already
+length-bound, and adopting would change every root for no gain — so the "three divergent implementations" framing was
+partly wrong, two of the three being sound by different appropriate mechanisms. The real defects were confined to the
+unbounded proof fold (both crosscell and thesauros — 65 535 hashes from one receipt, and in thesauros the prover is an
+untrusted storage provider), the `[0u8; 32]` empty root, thesauros carrying the sibling *side* on the wire, and a one-leaf
+CID equalling a bare leaf hash. Conformance vectors regenerated.
 
 ### 7. Split `fanos-runtime/src/overlay.rs` + extract `ThresholdSealed`
 - **Problem (a).** `overlay.rs` is **4,048 lines** (it has grown since this file last claimed 3,870). The `OverlayNode`
@@ -123,11 +126,21 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
 
 ## Tier D — lower-severity anonymity residuals (documented in `docs/audit.md`)
 
+- **9b. NYX transparent-sheaf footgun — DONE** (`decc4d8`). `sheaf`/`tessera` are behind a non-default
+  `transparent-onion` feature; `NyxError` moved to its own module so gating the construction did not gate the crate's
+  error vocabulary. (Was item 12.)
 - **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
   loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
 - **10. S1-M3** — mix-key store slots are unauthenticated (`fanos-node/src/mixdir.rs`, `mix_key_slot` keys a slot by
-  `coord ‖ epoch` with no writer check): bind a published mix key to its cert-derived coord, rejecting a `put` unless the
-  writer identity hashes to `coord`. Liveness-DoS, not deanonymization.
+  `coord ‖ epoch` with no writer check; the module doc already calls this out as "a later hardening step"). Liveness-DoS,
+  not deanonymization. **Design finding from a scoping pass** — do not implement it inside `mixdir`:
+  - `publish_mix_key`/`resolve_mix_key`/`build_mix_directory` have **no beacon in scope**, so the natural
+    self-certifying record (carry the publisher's `fanos_vrf::CoordinateClaim` and check it with
+    `verify_coordinate_claim`) needs the epoch beacon plumbed through all three plus their callers.
+  - The better home is the **store's write path**, which already knows the authenticated QUIC peer certificate. One rule —
+    a *coordinate-owned namespace*, where a slot keyed by a coordinate accepts a `put` only from the peer whose verified
+    coordinate is that coordinate — covers `mixdir` and every other coordinate-keyed slot at once, instead of each
+    subsystem re-deriving the check. That makes this a storage-authorization feature, and it should be built as one.
 - **11. ct_len hop-position leak (S1-M6)** — the threshold-onion per-layer length header is cleartext
   (`fanos-aphantos/src/threshold.rs:234`, already documented there as a residual), so a *peeling* relay learns its hop
   position. Optional: flat-header Sphinx-style per-layer length encryption (the `sealed.rs` path already AEAD-encrypts the
@@ -137,6 +150,25 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   cannot pick the lower-assurance variant.
 
 ---
+
+## Two test defects found while doing the above — both mine, both from the same gap
+
+Recorded because the cause was one habit, not two accidents: **every gate I ran was `cargo test -p <crate> --lib`, which
+does not run `tests/*.rs`.** Running `cargo test --workspace --tests` (78 suites) surfaced both immediately.
+
+1. **`fanos-quic/tests/self_certifying.rs::an_impostor_at_the_resolved_address_is_rejected`** had been failing
+   deterministically (0.02 s) since `fdf3075` earlier the same session. It poisoned the directory with the *unranked*
+   `Directory::insert` over a binding the driver had made *with* a rank — which rank arbitration correctly refuses, so the
+   poisoning silently stopped working and the test's premise evaporated. A test whose **setup** depends on behaviour you
+   just changed fails by becoming vacuous, not by asserting something false. Fixed by modelling a stale entry the way one
+   actually arises (B vacates, C rebinds) and asserting *both* halves.
+2. **`fanos-sim::fabric::the_whole_cell_resolves_every_member`** failed in **40.2%** of runs, and the comment above the
+   assertion claimed it was draw-independent. Comparing rosters against *occupied* coordinates fixes the target number but
+   not the fact that the node losing a collision's arbitration is unroutable and can never see the whole cell.
+   `NodeFleet::spawn` now draws injectively (`e243ac4`).
+
+**Standing rule from both:** gate with `cargo test -p <crate>` (all targets), never `--lib`. And a deterministic
+sub-second failure is never a load flake, however high the load average.
 
 ## Corrections to the previous revision of this file
 
