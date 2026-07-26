@@ -272,6 +272,30 @@ where
     }
 }
 
+/// One hidden service's hosting parameters: **what** is hosted, and **under which coordinate regime**.
+///
+/// Grouped rather than passed positionally because the four travel together through every layer of the host driver, and
+/// because `(Vec<u8>, u8, bool)` at a call site is three chances to get the order wrong silently.
+pub struct HostedService {
+    /// The service's static keypair — its anonymous identity, and what a client addresses it by.
+    pub service: StaticKeypair,
+    /// Seeds the dead-drop line selection and each epoch's reply key. Deterministic, so a restart re-derives both.
+    pub host_secret: Vec<u8>,
+    /// The rendezvous registration threshold: how many of the meeting line's points must hold a share.
+    pub threshold: u8,
+    /// Whether this cell's coordinates are **VRF-derived**, in which case each mix-key record must prove the slot's
+    /// coordinate lies on its publisher's probe walk (S1-M3, [`mixdir::parse_bound_record`]).
+    ///
+    /// A deployment property of the cell, so it is stated by whoever configured it: [`crate::Node`] always sets
+    /// `OverlayConfig::vrf_coordinates`, a pinned harness never does. It cannot be inferred from below — a pinned harness
+    /// still gives its nodes self-certifying identities, so "has an identity" and "sits on a provable point" come apart, and
+    /// reading the mode off the identity rejected every honest record in exactly that setup.
+    ///
+    /// `false` is an **absent mechanism**, not a disabled check: where coordinates are pinned, no publisher can produce such
+    /// a proof and no reader can check one.
+    pub vrf_coordinates: bool,
+}
+
 /// Spawn the production **hidden-service host** driver (§3b): host `service` anonymously so clients reach it
 /// at its rotating meeting line even though this node is (in general) *not* that line's combiner. Each epoch
 /// it rebuilds the cell mix directory, computes the meeting combiner and its own beacon-blinded dead-drop
@@ -289,9 +313,7 @@ where
 pub fn spawn_rendezvous_host<H, Fut>(
     client: Client,
     coord: Triple,
-    service: StaticKeypair,
-    host_secret: Vec<u8>,
-    threshold: u8,
+    hosted: HostedService,
     initial: (Epoch, [u8; 32]),
     handler: H,
 ) -> JoinHandle<()>
@@ -299,6 +321,7 @@ where
     H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let HostedService { service, host_secret, threshold, vrf_coordinates } = hosted;
     let service_public = service.public().clone();
     let (epoch_tx, epoch_rx) = unbounded_channel::<HostEpoch>();
     // The accept loop opens forwarded dead-drops (its key ring fed per epoch) and hands each session to the
@@ -316,14 +339,19 @@ where
     tokio::spawn(async move {
         let mut events = client.subscribe();
         let (mut epoch, mut seed) = initial;
-        rotate_host(&client, coord, &service_public, &host_secret, threshold, epoch, seed, &epoch_tx).await;
+        rotate_host(
+            &client, coord, &service_public, &host_secret, threshold, vrf_coordinates, epoch, seed, &epoch_tx,
+        )
+        .await;
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch: reached, seed: s }) if reached > epoch => {
                     epoch = reached;
                     seed = s;
-                    rotate_host(&client, coord, &service_public, &host_secret, threshold, epoch, seed, &epoch_tx)
-                        .await;
+                    rotate_host(
+                        &client, coord, &service_public, &host_secret, threshold, vrf_coordinates, epoch, seed, &epoch_tx,
+                    )
+                    .await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -338,9 +366,7 @@ where
 pub fn spawn_rendezvous_host_rpc<H>(
     client: Client,
     coord: Triple,
-    service: StaticKeypair,
-    host_secret: Vec<u8>,
-    threshold: u8,
+    hosted: HostedService,
     initial: (Epoch, [u8; 32]),
     handler: H,
 ) -> JoinHandle<()>
@@ -348,7 +374,7 @@ where
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    spawn_rendezvous_host(client, coord, service, host_secret, threshold, initial, move |stream| {
+    spawn_rendezvous_host(client, coord, hosted, initial, move |stream| {
         run_rpc(handler.clone(), stream)
     })
 }
@@ -364,15 +390,20 @@ async fn rotate_host(
     service_public: &HybridKemPublic,
     host_secret: &[u8],
     threshold: u8,
+    // See `HostedService::vrf_coordinates` — whether a mix-key record must prove the slot it sits at.
+    vrf_coordinates: bool,
     epoch: Epoch,
     seed: [u8; 32],
     epoch_tx: &UnboundedSender<HostEpoch>,
 ) {
-    let dir = build_cell_mix_directory::<F2>(client, epoch).await;
+    // The same beacon this host derives its dead-drop line from, one line down.
+    let beacon = BeaconSeed::new(seed);
+    // The mix directory's binding mode is the cell's, so it is read from the client rather than configured here: a record
+    // must prove its slot exactly where coordinates are VRF-derived (S1-M3, `mixdir::parse_bound_record`).
+    let dir = build_cell_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
     if dir.is_empty() {
         return;
     }
-    let beacon = BeaconSeed::new(seed);
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &beacon).coords();
     let Some(point) = Point::<F2>::new(coord) else { return };
     // The dead-drop line: beacon-blinded, through this node's own point — forwarded requests come home here.

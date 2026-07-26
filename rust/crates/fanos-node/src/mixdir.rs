@@ -29,7 +29,85 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::EpochDriver;
+use fanos_primitives::BeaconSeed;
+use fanos_vrf::{VrfProof, VrfPublic, coordinate_output, probe_index_of};
+
 use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
+
+/// How a publisher obtains its coordinate proof: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
+///
+/// A closure rather than the VRF secret, so a signing key never reaches a publisher or a fixture that spawns one — its home
+/// is `fanos_quic::NodeHandle::coordinate_prover`, where the credentials already live.
+pub use fanos_quic::CoordinateProver;
+
+/// A published mix-key record **bound to the coordinate it sits at** (S1-M3):
+/// `id_len(2) ‖ id ‖ vrf_public(32) ‖ proof(80) ‖ key`.
+///
+/// A reader recovers the publisher's VRF output from `proof` over `(id, epoch, beacon)` and checks that the **slot's**
+/// coordinate lies on that output's own probe walk. A key published at a coordinate the publisher's walk cannot reach is
+/// refused, so a forged entry is rejected at the *read* — where the trust decision is actually made — rather than policed at
+/// the write.
+///
+/// ## What it proves, what it does not, and where it does not apply
+///
+/// It forces a forger to hold an identity whose *line* passes through the target point: a line contains `q + 1` of
+/// `q² + q + 1` points, so a random identity reaches a chosen point with probability `≈ 1/q` — about `q` grinding draws,
+/// against **zero** for the unsigned record it replaces. A cost, not an impossibility.
+///
+/// It deliberately omits the exact probe *index*, which would need the publisher's witness chain (`CoordinateClaim`) and
+/// would raise the cost to the full `N` draws of hitting a chosen point. That is the stronger form and the natural
+/// follow-up.
+///
+/// **It applies only where coordinates are VRF-derived.** A *pinned* coordinate has no relation to the node's VRF output,
+/// so no publisher in a pinned cell can produce a bound record and no reader can verify one — the same VRF-versus-pinned
+/// split `OverlayNode::on_announce` makes for audit C3. That is why the resolver takes `Option<BeaconSeed>` rather than a
+/// `verify: bool`: having a beacon *is* the VRF mode, and the absence of one is not a disabled check but an absent
+/// mechanism. `fanos_node::Node` always runs VRF coordinates; the `fanos-quic` cell harness always pins them.
+fn bound_record(id: &[u8], public: &VrfPublic, proof: &VrfProof, key: &HybridKemPublic) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + id.len() + 32 + 80 + 32);
+    out.extend_from_slice(&u16::try_from(id.len()).unwrap_or(u16::MAX).to_be_bytes());
+    out.extend_from_slice(id);
+    out.extend_from_slice(&public.to_bytes());
+    out.extend_from_slice(&proof.to_bytes());
+    out.extend_from_slice(&key.encode());
+    out
+}
+
+/// Parse and **verify** a bound record against the coordinate its slot names (sans-I/O).
+///
+/// `None` on malformed bytes, a proof that does not verify for `(id, epoch, beacon)`, or a coordinate the publisher's own
+/// probe walk never reaches. This is the whole trust check; the resolver only fetches bytes and calls it.
+#[must_use]
+pub fn parse_bound_record<F: Field>(
+    bytes: &[u8],
+    coord: Coord,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> Option<HybridKemPublic> {
+    let id_len = usize::from(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?));
+    let id = bytes.get(2..2 + id_len)?;
+    let public = VrfPublic::from_bytes(bytes.get(2 + id_len..2 + id_len + 32)?.try_into().ok()?)?;
+    let proof = VrfProof::from_bytes(bytes.get(2 + id_len + 32..2 + id_len + 112)?.try_into().ok()?)?;
+    let key = HybridKemPublic::decode(bytes.get(2 + id_len + 112..)?)?;
+
+    let point = Point::<F>::new(coord)?;
+    let output = coordinate_output(&public, id, epoch, beacon, &proof)?;
+    probe_index_of::<F>(&output, &point)?;
+    Some(key)
+}
+
+/// Publish this node's onion key as a **coordinate-bound** record (S1-M3), at its live coordinate slot.
+pub async fn publish_bound_mix_key(
+    client: &Client,
+    proof: &(Vec<u8>, VrfPublic, VrfProof),
+    epoch: Epoch,
+    public: &HybridKemPublic,
+) -> bool {
+    let (id, vrf_public, vrf_proof) = proof;
+    client
+        .put(mix_key_slot(client.address(), epoch), bound_record(id, vrf_public, vrf_proof, public))
+        .await
+}
 
 /// The overlay store slot a node's per-epoch onion key is published at — domain-separated from every
 /// other use of the store, keyed by the node's coordinate **and the epoch**. Tagging the slot with the
@@ -110,9 +188,13 @@ pub fn cell_mix_coords<F: Field>() -> Vec<Coord> {
 /// This is the “live directory from membership” the anonymous profile needs (audit #54): no central
 /// directory, no hand-built map — the cell advertises itself through the overlay store, one relay per
 /// epoch-tagged slot, and a client reads the current epoch's advertisement.
-pub async fn build_cell_mix_directory<F: Field>(client: &Client, epoch: Epoch) -> MixDirectory {
+pub async fn build_cell_mix_directory<F: Field>(
+    client: &Client,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> MixDirectory {
     let scan = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
-        read_mix_key(&client, coord, epoch).await
+        read_mix_key_in_mode::<F>(&client, coord, epoch, beacon).await
     })
     .await;
     let mut dir = MixDirectory::new();
@@ -122,17 +204,29 @@ pub async fn build_cell_mix_directory<F: Field>(client: &Client, epoch: Epoch) -
     dir
 }
 
-/// As [`resolve_mix_key`], distinguishing a read that **did not conclude** from a definite absence.
+/// One slot read, in whichever mode the cell runs.
 ///
-/// The caller here draws a circuit from whatever resolved, and a relay missing from the directory is simply not drawn — so
-/// a partial scan costs *anonymity set*, not correctness. Keeping the distinction anyway: the resolver is shared, and a
-/// caller that later wants to know whether it saw the whole cell should not have to re-derive it.
-async fn read_mix_key(client: &Client, coord: Coord, epoch: Epoch) -> Read<HybridKemPublic> {
+/// `Some(beacon)` means coordinates are **VRF-derived**, so a record must prove the slot's coordinate is on its
+/// publisher's walk ([`parse_bound_record`]) — a forged entry is a definite `Absent`. `None` means a **pinned** cell, where
+/// no publisher can produce such a proof and no reader can check one, so the legacy unbound record is read as-is.
+///
+/// The mode is an `Option<BeaconSeed>` rather than a `verify: bool` deliberately: having a beacon *is* the VRF mode, and
+/// its absence is an absent mechanism rather than a disabled check. Nothing in a pinned cell can supply one.
+async fn read_mix_key_in_mode<F: Field>(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Read<HybridKemPublic> {
     match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(mix_key_slot(coord, epoch))).await {
-        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| HybridKemPublic::decode(&b))),
+        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| match beacon {
+            Some(seed) => parse_bound_record::<F>(&b, coord, epoch, &seed),
+            None => HybridKemPublic::decode(&b),
+        })),
         Err(_) => Read::Unknown,
     }
 }
+
 
 /// Keep a relay's onion key **live** in the directory: spawn the task that (re)publishes the relay at
 /// `coord` its current forward-secure onion public each epoch, so [`build_cell_mix_directory`] always
@@ -152,20 +246,35 @@ async fn read_mix_key(client: &Client, coord: Coord, epoch: Epoch) -> Read<Hybri
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
 #[must_use]
-pub fn spawn_mix_publisher(client: Client, onion_seed: [u8; 32]) -> JoinHandle<()> {
+pub fn spawn_mix_publisher(
+    client: Client,
+    onion_seed: [u8; 32],
+    prover: Option<CoordinateProver>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut driver = EpochDriver::new(client.address(), onion_seed);
         let mut events = client.subscribe();
-        // Publish the genesis-epoch key immediately, so a circuit drawn before the first beacon can still
-        // seal to this relay. Every later republish is driven by the relay's own BeaconReady.
-        publish_mix_key(&client, client.address(), driver.epoch(), driver.public()).await;
+        // A coordinate-**bound** record (S1-M3), which a `Node` can always produce because it always runs VRF coordinates.
+        // Genesis first, so a circuit drawn before the first beacon can still seal to this relay.
+        let mut beacon = BeaconSeed::GENESIS;
+        // `Some` ⇒ VRF coordinates, so publish a bound record; `None` ⇒ a pinned cell, where no proof is possible and the
+        // legacy unbound record is all there is. Symmetric with the reader's `Option<BeaconSeed>`: on both ends, the
+        // `Option` says whether the mechanism exists here, not whether someone chose to use it.
+        let publish = async |client: &Client, epoch: Epoch, beacon: &BeaconSeed, key: &HybridKemPublic| match &prover {
+            Some(prove) => publish_bound_mix_key(client, &prove(epoch, beacon), epoch, key).await,
+            None => publish_mix_key(client, client.address(), epoch, key).await,
+        };
+        publish(&client, driver.epoch(), &beacon, driver.public()).await;
         loop {
             match events.recv().await {
-                Ok(Notification::BeaconReady { epoch, .. }) => {
+                Ok(Notification::BeaconReady { epoch, seed }) => {
+                    // The record binds `(id, epoch, beacon)`, so a republish must use the beacon of the epoch it publishes
+                    // for — carrying the old one forward would produce a record no reader can verify.
+                    beacon = BeaconSeed::new(seed);
                     // Advance the mirror ratchet to the beacon epoch; a stale/replayed epoch reports 0
                     // steps and nothing is republished. On a real advance, republish the now-current key.
                     if driver.advance_to(epoch) > 0 {
-                        publish_mix_key(&client, client.address(), driver.epoch(), driver.public()).await;
+                        publish(&client, driver.epoch(), &beacon, driver.public()).await;
                     }
                 }
                 // Other notifications are irrelevant to key rotation; a lagged stream only means we may
@@ -178,8 +287,12 @@ pub fn spawn_mix_publisher(client: Client, onion_seed: [u8; 32]) -> JoinHandle<(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use fanos_field::F7;
+    use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+    use fanos_vrf::{VrfSecret, prove_coordinate, probe_point};
 
     #[test]
     fn mix_key_slots_are_deterministic_distinct_and_domain_separated() {
@@ -230,4 +343,77 @@ mod tests {
         let want: Vec<_> = (0..7).map(|i| Point::<F2>::at(i).coords()).collect();
         assert_eq!(roster, want, "roster member i is Point::at(i)");
     }
+
+    /// An identity with its coordinate proof for `(epoch, beacon)`, and an onion key to advertise.
+    fn relay(seed: u8, epoch: Epoch, beacon: &BeaconSeed) -> (Vec<u8>, VrfPublic, VrfProof, HybridKemPublic) {
+        let sk = VrfSecret::from_seed([seed; 32]);
+        let id = alloc_id(seed);
+        let (_, proof) = prove_coordinate::<F7>(&sk, &id, epoch, beacon);
+        let (_, key) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[seed, 0xAA]));
+        (id, sk.public(), proof, key)
+    }
+
+    fn alloc_id(seed: u8) -> Vec<u8> {
+        format!("relay-{seed}").into_bytes()
+    }
+
+    #[test]
+    fn a_bound_record_verifies_at_a_coordinate_on_its_publishers_walk() {
+        // The property S1-M3 is about: the record is only accepted where its publisher can prove the coordinate belongs to
+        // it. Every point of the publisher's own walk qualifies — the check is walk membership, not a single index.
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (id, public, proof, key) = relay(5, epoch, &beacon);
+        let record = bound_record(&id, &public, &proof, &key);
+        let output = coordinate_output(&public, &id, epoch, &beacon, &proof).unwrap();
+
+        for k in 0..fanos_vrf::probe_bound::<F7>() {
+            let mine = probe_point::<F7>(&output, k).coords();
+            assert!(
+                parse_bound_record::<F7>(&record, mine, epoch, &beacon).is_some(),
+                "step {k} of the publisher's own walk must verify"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_planted_at_another_coordinate_is_refused() {
+        // The forgery the unbound slot accepted for free: publishing a key at a relay's slot to make it unable to peel.
+        // A point off the publisher's line cannot be proven, so the record is a definite Absent rather than a Found.
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (id, public, proof, key) = relay(5, epoch, &beacon);
+        let record = bound_record(&id, &public, &proof, &key);
+        let output = coordinate_output(&public, &id, epoch, &beacon, &proof).unwrap();
+
+        let mut refused = 0;
+        for i in 0..Plane::<F7>::N as usize {
+            let p = Point::<F7>::at(i);
+            if probe_index_of::<F7>(&output, &p).is_none() {
+                assert!(parse_bound_record::<F7>(&record, p.coords(), epoch, &beacon).is_none());
+                refused += 1;
+            }
+        }
+        // A line holds q+1 of q²+q+1 points, so on PG(2,7) that is 8 of 57 provable and 49 refused. If this were 0 the
+        // test would be asserting nothing.
+        assert_eq!(refused, 49, "every point off the publisher's line is refused");
+    }
+
+    #[test]
+    fn a_record_is_bound_to_its_epoch_and_its_beacon() {
+        // The proof is over `(id, epoch, beacon)`, so a record replayed into another epoch — or verified against a
+        // different beacon — does not verify. Without this, last epoch's key survives its own rotation (audit E4).
+        let beacon = BeaconSeed::GENESIS;
+        let (id, public, proof, key) = relay(9, Epoch::new(4), &beacon);
+        let record = bound_record(&id, &public, &proof, &key);
+        let output = coordinate_output(&public, &id, Epoch::new(4), &beacon, &proof).unwrap();
+        let mine = probe_point::<F7>(&output, 0).coords();
+
+        assert!(parse_bound_record::<F7>(&record, mine, Epoch::new(4), &beacon).is_some(), "its own epoch verifies");
+        assert!(parse_bound_record::<F7>(&record, mine, Epoch::new(5), &beacon).is_none(), "a replayed epoch does not");
+        assert!(
+            parse_bound_record::<F7>(&record, mine, Epoch::new(4), &BeaconSeed::new([7u8; 32])).is_none(),
+            "nor a different beacon"
+        );
+        let truncated = record.get(..20).expect("a record is longer than 20 bytes");
+        assert!(parse_bound_record::<F7>(truncated, mine, Epoch::new(4), &beacon).is_none(), "nor a truncation");
+}
 }

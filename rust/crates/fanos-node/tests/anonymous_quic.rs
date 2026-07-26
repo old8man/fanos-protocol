@@ -23,7 +23,7 @@ use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
 use fanos_node::{
-    AnonRouteParams, CellNode, FanosDialer, OverlayBeaconNode, RendezvousRoute, StaticResolver,
+    AnonRouteParams, CellNode, FanosDialer, HostedService, OverlayBeaconNode, RendezvousRoute, StaticResolver,
     serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
@@ -484,10 +484,11 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     for (i, node) in nodes.iter().enumerate() {
         let mut onion_seed = [0xC4u8; 32];
         onion_seed[31] = i as u8;
-        publishers.push(spawn_mix_publisher(
-            node.as_ref().unwrap().client(),
-            onion_seed,
-        ));
+        let n = node.as_ref().unwrap();
+        // This mixnet is PINNED (`spawn_pinned`), so no publisher here can prove its coordinate and no reader can check
+        // one: `None` on both ends. The host driver below is told the same, and that symmetry is the whole design — the
+        // binding exists exactly where VRF coordinates do (S1-M3, `mixdir::parse_bound_record`).
+        publishers.push(spawn_mix_publisher(n.client(), onion_seed, n.coordinate_prover()));
     }
     tokio::time::sleep(StdDuration::from_millis(800)).await; // let the keys publish
 
@@ -504,9 +505,13 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     let _driver = spawn_rendezvous_host_rpc(
         host.client(),
         Point::<F2>::at(host_index).coords(),
-        service,
-        b"driver-host-secret".to_vec(),
-        t as u8,
+        // Pinned coordinates: no mix-key record in this cell can prove its slot, and none is asked to.
+        HostedService {
+            service,
+            host_secret: b"driver-host-secret".to_vec(),
+            threshold: t as u8,
+            vrf_coordinates: false,
+        },
         (epoch, [0x5E; 32]), // the genesis (epoch, beacon-seed) — TEST_BEACON's bytes
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();

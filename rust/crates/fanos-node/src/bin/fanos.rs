@@ -22,7 +22,7 @@ use fanos_node::{
     AnonRouteParams, BeaconParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
     NodeConfig,
     NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
-    build_cell_mix_directory, identity, publish_service, serve_proxy, spawn_rendezvous_host,
+    HostedService, build_cell_mix_directory, identity, publish_service, serve_proxy, spawn_rendezvous_host,
 };
 // Only the (feature-gated) `fanos vpn` command dials clearnet by IP with an empty resolver.
 #[cfg(feature = "vpn")]
@@ -422,9 +422,8 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     let _driver = spawn_rendezvous_host(
         node.client(),
         node.address(),
-        service,
-        host_secret,
-        threshold,
+        // A `Node` always runs VRF coordinates, so each mix-key record must prove the slot it sits at (S1-M3).
+        HostedService { service, host_secret, threshold, vrf_coordinates: true },
         (epoch, *beacon.as_bytes()),
         handler,
     );
@@ -551,7 +550,9 @@ async fn build_proxy_dialer(
         let (epoch, beacon) = node
             .live_beacon()
             .map_or((epoch, cfg.beacon), |(e, s)| (e, BeaconSeed::new(s)));
-        let directory = build_cell_mix_directory::<F2>(&node.client(), epoch).await;
+        // `Some(beacon)` — the live beacon resolved just above. A forged mix key at another relay's slot is
+        // refused rather than sealed to (S1-M3).
+        let directory = build_cell_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
         let need = usize::from(cfg.threshold) + 1;
         if directory.len() < need {
             return Err(NodeError::Config(format!(

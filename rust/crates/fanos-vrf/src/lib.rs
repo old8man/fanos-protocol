@@ -715,6 +715,24 @@ pub fn verify_coordinate<F: Field>(
     verify_coordinate_rank::<F>(public, node_id, epoch, beacon, claimed, proof).is_some()
 }
 
+/// Verify a coordinate proof and return the **output** it commits to, with no constraint on where that output lands.
+///
+/// The counterpart to [`verify_coordinate_rank`], which additionally requires the output's *preferred* point to equal a
+/// claimed coordinate — probe index 0. Use this one where the caller judges the placement itself: whether the coordinate is
+/// on the output's walk at all ([`probe_index_of`]), or at a specific index with witnesses ([`verify_coordinate_claim`]).
+/// Returning the output rather than a bool keeps the VRF input built in exactly one place — rebuilding `beacon_alpha` at a
+/// call site is a second place for it to drift.
+#[must_use]
+pub fn coordinate_output(
+    public: &VrfPublic,
+    node_id: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    proof: &VrfProof,
+) -> Option<VrfOutput> {
+    public.verify(&beacon_alpha(node_id, epoch, beacon), proof)
+}
+
 /// As [`verify_coordinate`], but returning the verified **rank** — the VRF output itself — on success.
 ///
 /// The rank is what a collision is arbitrated by (`fanos_quic::Directory::insert_ranked`), and it is already computed

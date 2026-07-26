@@ -388,6 +388,19 @@ fn spawn_telemetry_export(handle: &NodeHandle, epsilon: Option<f64>) -> Option<J
     })
 }
 
+/// Keep this relay's onion key live in the mix directory as a **coordinate-bound** record (S1-M3).
+///
+/// Only for a relay — a node that does not relay has no onion key to advertise — and only with a self-certifying identity,
+/// which is also the only case where a coordinate can be proven at all. The prover is the handle's own closure over its
+/// credentials, so no signing key reaches this publisher.
+fn spawn_mix_export(handle: &NodeHandle, relay: bool, onion_seed: [u8; 32]) -> Option<JoinHandle<()>> {
+    if !relay {
+        return None;
+    }
+    let prover = handle.coordinate_prover()?;
+    Some(spawn_mix_publisher(handle.client(), onion_seed, Some(prover)))
+}
+
 fn spawn_roles<F: Field + 'static>(
     handle: &NodeHandle,
     credentials: &NodeCredentials,
@@ -637,7 +650,7 @@ impl Node {
         let address = handle.address();
         let local_addr = handle.local_addr();
         // Keep the relay's onion key live in the mix directory: publish genesis, then republish each epoch (E4∩E5).
-        let mix_publisher = relay.then(|| spawn_mix_publisher(handle.client(), onion_seed));
+        let mix_publisher = spawn_mix_export(&handle, relay, onion_seed);
         let _telemetry = spawn_telemetry_export(&handle, config.telemetry_epsilon);
         // The root epoch tick driving the live beacon clock (§L3, §7.6) — only when a beacon is configured.
         let epoch_driver = has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
@@ -1102,13 +1115,21 @@ mod tests {
         // The publisher republishes asynchronously; poll the directory (draining notifications so the
         // engine makes progress) until the relay's own onion key appears.
         let client = node.client();
-        let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO).await;
+        // `Some(GENESIS)`: a `Node` always runs VRF coordinates, so its publisher writes bound records and this
+        // reader must verify them (S1-M3). Passing `None` here read the bound record as a bare key and found nothing.
+        //
+        // This is the only live test of the *bound* path: every QUIC harness pins coordinates and so takes the unbound
+        // branch. It exercises the bound one because `Node::start` sets `OverlayConfig::vrf_coordinates` and the publisher
+        // therefore has a prover — assert the publisher below, since a `None` prover would silently emit bare keys that this
+        // reader then would not find.
+        let genesis = fanos_primitives::BeaconSeed::GENESIS;
+        let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await;
         for _ in 0..30 {
             if !dir.is_empty() {
                 break;
             }
             let _ = tokio::time::timeout(Duration::from_millis(100), node.next_notification()).await;
-            dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO).await;
+            dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await;
         }
         assert!(
             !dir.is_empty(),

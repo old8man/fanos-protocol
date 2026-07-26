@@ -77,7 +77,11 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
 
     // A client on node 0 discovers the whole live roster from the store — no hand-built directory.
     let reader = cell.nodes[0].client();
-    let dir = build_cell_mix_directory::<F2>(&reader, epoch).await;
+    // `None` below is not a disabled check: this harness *pins* coordinates, so no publisher here can prove the slot it
+    // writes to and no reader can check one (S1-M3). Note that these nodes *do* hold self-certifying identities — having an
+    // identity and sitting on a provable point are different things, and conflating them is what made an earlier attempt at
+    // the binding reject every honest record here.
+    let dir = build_cell_mix_directory::<F2>(&reader, epoch, None).await;
     assert_eq!(dir.len(), 7, "every live relay is discovered");
     for (i, &coord) in roster.iter().enumerate() {
         assert_eq!(
@@ -90,7 +94,7 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
 
     // Epoch-scoping: nothing was published for a later epoch, so its directory is empty — a client for
     // that epoch resolves a distinct slot and finds nobody, never a stale key from a past epoch.
-    let future = build_cell_mix_directory::<F2>(&reader, Epoch::new(1)).await;
+    let future = build_cell_mix_directory::<F2>(&reader, Epoch::new(1), None).await;
     assert_eq!(
         future.len(),
         0,
@@ -121,7 +125,7 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
         );
     }
 
-    let dir = build_cell_mix_directory::<F2>(&cell.nodes[6].client(), epoch).await;
+    let dir = build_cell_mix_directory::<F2>(&cell.nodes[6].client(), epoch, None).await;
     assert_eq!(
         dir.len(),
         present,
@@ -160,19 +164,20 @@ async fn the_publisher_task_keeps_each_relays_key_live() {
     let mut publishers = Vec::new();
     for (i, &coord) in roster.iter().enumerate() {
         let _ = coord; // the publisher now reads the node's live coordinate rather than being told one
-        publishers.push(spawn_mix_publisher(cell.nodes[i].client(), onion_seed(i)));
+        // `None`: this harness PINS coordinates, so no publisher here can prove one and the reader reads unbound.
+        publishers.push(spawn_mix_publisher(cell.nodes[i].client(), onion_seed(i), None));
     }
 
     // The publishers write asynchronously; poll the discovered directory until every relay's genesis key
     // has landed (bounded — a real store ack is fast over loopback QUIC), then assert the full roster.
     let reader = cell.nodes[0].client();
-    let mut dir = build_cell_mix_directory::<F2>(&reader, epoch).await;
+    let mut dir = build_cell_mix_directory::<F2>(&reader, epoch, None).await;
     for _ in 0..40 {
         if dir.len() == roster.len() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        dir = build_cell_mix_directory::<F2>(&reader, epoch).await;
+        dir = build_cell_mix_directory::<F2>(&reader, epoch, None).await;
     }
     assert_eq!(
         dir.len(),

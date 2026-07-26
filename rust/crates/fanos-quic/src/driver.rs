@@ -35,7 +35,7 @@ use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
 use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
-use fanos_vrf::CoordinateClaim;
+use fanos_vrf::{CoordinateClaim, VrfProof, VrfPublic};
 
 use crate::claims::{self, ClaimBook};
 use crate::identity::{
@@ -185,7 +185,16 @@ struct SelfCert {
     /// connection (an `Arc` swap, no copy under the lock).
     hello: Arc<RwLock<Arc<Vec<u8>>>>,
     verify: HelloVerifier,
+    /// Prove this node's coordinate for an arbitrary `(epoch, beacon)`: identity bytes, VRF public, and proof.
+    ///
+    /// A **closure over the credentials**, so the secret never leaves this module while anything that must publish a
+    /// coordinate-bound record (`fanos_node::mixdir`) can obtain the proof a reader will check. Handing out the VRF secret
+    /// instead would put a signing key in every publisher and every fixture that spawns one.
+    prove: CoordinateProver,
 }
+
+/// See [`SelfCert::prove`]: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
+pub type CoordinateProver = Arc<dyn Fn(Epoch, &BeaconSeed) -> (Vec<u8>, VrfPublic, VrfProof) + Send + Sync>;
 
 /// The identity mode. `None` ⇒ HELLO + directory-trust (unauthenticated coordinate); `Some(_)` ⇒
 /// self-certifying, exchanging + verifying VRF proof-of-coordinate HELLOs.
@@ -323,7 +332,15 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 pub struct NodeHandle {
     /// Peer coordinate claims verified this epoch — the input coordinate resolution runs on. `None` for a node with no
     /// self-certifying identity, which never resolves and therefore has no book.
+    ///
+    /// **Not** a test for "this cell's coordinates are VRF-derived", though it reads like one. A harness can pin every
+    /// coordinate while still giving each node a self-certifying identity, so this is `Some` and yet no node sits on a point
+    /// it could prove. Deriving the coordinate-binding mode from this rejected every honest record in exactly that setup —
+    /// the mode is a deployment property of the cell, known above this layer, and it is passed in (see
+    /// `fanos_node::rendezvous_host::HostedService`), never inferred here.
     claims: Option<ClaimBook>,
+    /// The self-certifying identity, for [`coordinate_prover`](Self::coordinate_prover). `None` under directory trust.
+    identity: Identity,
     /// The node's **live** overlay coordinate.
     ///
     /// Shared and mutable because a coordinate moves: every epoch by the beacon reshuffle (spec §L3), and within an epoch
@@ -356,6 +373,15 @@ impl NodeHandle {
     fn with_claims(mut self, book: ClaimBook) -> Self {
         self.claims = Some(book);
         self
+    }
+
+    /// This node's coordinate prover, or `None` without a self-certifying identity.
+    ///
+    /// `NodeHandle` is deliberately not `Clone` — dropping it shuts the node down — so a background publisher cannot hold
+    /// one. It holds this instead: a closure over the credentials, which is the point of the indirection.
+    #[must_use]
+    pub fn coordinate_prover(&self) -> Option<CoordinateProver> {
+        self.identity.as_ref().map(|id| id.prove.clone())
     }
 
     /// How many peers' coordinate claims this node has verified this epoch, or `None` without a self-certifying identity.
@@ -678,7 +704,7 @@ pub async fn spawn(
         directory,
         None, // shaper
         None, // controller
-        None, // identity
+        &None, // identity
         server,
         client,
         default_bind().into(),
@@ -859,8 +885,13 @@ where
     // coordinate VRF binds to — so it is where the recording happens.
     let book = ClaimBook::new();
     let verify_book = book.clone();
+    let prover_creds = creds.clone();
     let identity: Identity = Some(SelfCert {
         hello: hello_cell.clone(),
+        prove: Arc::new(move |epoch, beacon| {
+            let (_, proof) = crate::identity::verifiable_coordinate::<F>(&prover_creds, epoch, beacon);
+            (prover_creds.cert_der().to_vec(), prover_creds.vrf_secret().public(), proof)
+        }),
         verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
             // Select the beacon for the epoch the peer proves — the current one, or a recent last-good epoch
             // within the accepted window (safe-stall, R-C1). Outside the window ⇒ reject; poisoned ⇒ reject.
@@ -887,7 +918,7 @@ where
     // how the first attempt at this fix silently did nothing.
     let seeded_at_our_point = directory.resolve(coord.coords());
     let handle =
-        spawn_inner(engine, directory, shaper.clone(), controller, identity, server, client, bind)?
+        spawn_inner(engine, directory, shaper.clone(), controller, &identity, server, client, bind)?
             .with_claims(book.clone());
     // Re-bind our genesis point *with* its rank — unless someone else's address is already there.
     //
@@ -1188,7 +1219,7 @@ pub async fn spawn_shaped(
         directory,
         Some(shaper),
         controller,
-        None, // identity
+        &None, // identity
         server,
         client,
         default_bind().into(),
@@ -1235,7 +1266,7 @@ fn spawn_inner(
     directory: Directory,
     shaper: Shaper,
     controller: MaybeController,
-    identity: Identity,
+    identity: &Identity,
     mut server_cfg: ServerConfig,
     mut client_cfg: ClientConfig,
     fabric: Fabric,
@@ -1285,7 +1316,7 @@ fn spawn_inner(
         events_tx: events_tx.clone(),
         shaper,
         controller,
-        identity,
+        identity: identity.clone(),
         me: addr,
         reflexive: reflexive.clone(),
         peer_addrs,
@@ -1316,6 +1347,7 @@ fn spawn_inner(
         endpoint,
         reflexive,
         claims: None,
+        identity: identity.clone(),
     })
 }
 

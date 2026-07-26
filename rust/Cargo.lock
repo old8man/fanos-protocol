@@ -908,6 +908,7 @@ dependencies = [
  "fanos-ports",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-threshold",
  "fanos-wire",
  "proptest",
  "rand_core 0.10.1",
@@ -1088,6 +1089,7 @@ version = "0.1.0"
 dependencies = [
  "fanos-aphantos",
  "fanos-calypso",
+ "fanos-code",
  "fanos-core",
  "fanos-diaulos",
  "fanos-dromos",
@@ -1105,6 +1107,7 @@ dependencies = [
  "fanos-runtime",
  "fanos-session",
  "fanos-taxis",
+ "fanos-telemetry",
  "fanos-vpn",
  "fanos-vrf",
  "fanos-wire",
@@ -1122,6 +1125,7 @@ dependencies = [
  "blake3",
  "fanos-field",
  "fanos-geometry",
+ "fanos-nyx",
  "fanos-primitives",
  "libm",
  "proptest",
@@ -1327,13 +1331,13 @@ version = "0.1.0"
 name = "fanos-taxis"
 version = "0.1.0"
 dependencies = [
- "fanos-aphantos",
  "fanos-code",
  "fanos-field",
  "fanos-geometry",
  "fanos-incentives",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-threshold",
  "fanos-vrf",
  "fanos-wire",
  "fanos-wire-derive",
@@ -1358,6 +1362,14 @@ dependencies = [
 name = "fanos-thesauros"
 version = "0.1.0"
 dependencies = [
+ "fanos-primitives",
+]
+
+[[package]]
+name = "fanos-threshold"
+version = "0.1.0"
+dependencies = [
+ "fanos-pqcrypto",
  "fanos-primitives",
 ]
 
