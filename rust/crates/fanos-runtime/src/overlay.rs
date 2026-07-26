@@ -7,17 +7,13 @@
 //! same code runs under the simulator and a real transport.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use fanos_code::{da, erasure, lrc};
 use fanos_core::{AdmissionPolicy, ChildSummary, ParentCell, PowAdmission};
-use fanos_diakrisis::coherence::phi_equicorrelated;
-use fanos_diakrisis::monitor::BehaviorMonitor;
-use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
-use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple, fano, next_hop};
 use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
@@ -41,6 +37,7 @@ const PUBLISH_SHARD: u8 = 2;
 /// The DHT key-digest / storage-address length (BLAKE3-256) — the one canonical digest width.
 const DIGEST: usize = fanos_primitives::DIGEST_LEN;
 
+use crate::healer::Healer;
 use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
 /// The single heartbeat timer token.
@@ -48,7 +45,7 @@ const HEARTBEAT: TimerToken = TimerToken(0);
 
 /// The behavioural-coherence observation window, in heartbeat samples: the cell's `Γ_net` is read from the
 /// last this-many per-node relay-activity samples. Bounded, so the self-model memory is `7 × this`.
-const BEHAVIOR_WINDOW: usize = 8;
+pub(crate) const BEHAVIOR_WINDOW: usize = 8;
 
 /// Homeostatic **decoupling** control (audit C6). `Decouple` must actually lower the cell's integration,
 /// not merely notify: the node carries a mutable shed factor in `[0, DECOUPLE_MAX]` that scales its
@@ -56,16 +53,16 @@ const BEHAVIOR_WINDOW: usize = 8;
 /// over-coupled round genuinely restores headroom, and the reflexive loop lowers `Φ` (spec §2.7/§6.5).
 /// Over-coupling raises the factor by `DECOUPLE_STEP` per round (capped); once back in band it decays by
 /// `DECOUPLE_DECAY` toward zero (re-integration).
-const DECOUPLE_STEP: f64 = 0.25;
-const DECOUPLE_MAX: f64 = 0.6;
-const DECOUPLE_DECAY: f64 = 0.5;
+pub(crate) const DECOUPLE_STEP: f64 = 0.25;
+pub(crate) const DECOUPLE_MAX: f64 = 0.6;
+pub(crate) const DECOUPLE_DECAY: f64 = 0.5;
 /// Hysteresis dwell for the over-coupling shed (audit #122). The measured `Γ_net` must read over-coupled
 /// for this many *consecutive* self-driven diagnoses before `Decouple` actuates. Diagnosis now runs every
 /// heartbeat (not a one-shot injected command), so a single transient over-threshold reading — e.g. a
 /// coincidental correlation inside an otherwise decorrelated burst flood — must not trigger a shed: the
 /// DDoS response acts on *sustained* over-coupling (structure), never momentary load. Crash/Byzantine
 /// healing is unaffected — this gates only the `Decouple` action.
-const DECOUPLE_DWELL: u32 = 3;
+pub(crate) const DECOUPLE_DWELL: u32 = 3;
 
 /// §6.4 endpoint cross-attestation window and firm-stale threshold, pinned by the simulator sweep
 /// (`fanos-sim/tests/endpoint_attestation_research.rs`). The detector flags a witness only when it
@@ -74,8 +71,8 @@ const DECOUPLE_DWELL: u32 = 3;
 /// a crash transient (all nodes stale on a dead peer within one heartbeat of each other), so churn cannot
 /// persist across it; `ENDPOINT_MIN_STALE = ⌈(N−1)/2⌉ = 3` is a firm honest majority that still catches any
 /// colluder minority (tolerates up to 3 vouch-fabricators, exceeding the plain `corroboration_quorum`).
-const ENDPOINT_WINDOW: usize = 5;
-const ENDPOINT_MIN_STALE: usize = 3;
+pub(crate) const ENDPOINT_WINDOW: usize = 5;
+pub(crate) const ENDPOINT_MIN_STALE: usize = 3;
 
 /// §6.5 partition sensor (V14). A cell **line** counts as carrying live connectivity iff its worst pairwise
 /// channel loss (measured, the #106 grey substrate) is below this — a fully-cut channel (`loss → 1`) or a
@@ -87,7 +84,7 @@ const LINE_CUT_LOSS: f64 = 0.5;
 /// transient — a just-healed node whose loss EWMA still lags, so its `q+1` lines read cut for a round or two
 /// while it reads alive — does not persist, so it never false-fires; only a sustained lossy line-cover (a real
 /// incipient split with nodes still alive) survives. `4` heartbeats > the EWMA recovery window.
-const PARTITION_DWELL: u32 = 4;
+pub(crate) const PARTITION_DWELL: u32 = 4;
 
 /// §6.3 grey-detection loss EWMA smoothing factor. Each heartbeat folds one per-neighbour ping-answered
 /// sample; `0.25` averages over ~4 rounds (~2 s at the default heartbeat), enough to distinguish a grey
@@ -467,544 +464,7 @@ impl Membership {
     }
 }
 
-/// The DIAKRISIS self-healing reflex factored out of [`OverlayNode`] (audit #125 decompose): the node's
-/// **verified reflex layer** (see [[synarc-node-architecture]]) — behavioural coherence self-model, the
-/// over-coupling homeostat, and the crash/Byzantine healing state (reroute / repair / quarantine) with the
-/// live polar cross-attestation it diagnoses from. The facade owns the *liveness sensing* (the `peers`
-/// substrate + `coord_alive`/`cell_liveness`/`health_view` + the `witnessed` corroboration cache) and
-/// hands this a **sensed** cell snapshot (`self_index, degraded, alive_count`); this owns everything the
-/// reflex then does with it. Not generic over `F`: its state is all concrete, and the few methods that
-/// need the cell's index-addressed geometry take `<F>` per call.
-struct Healer {
-    /// Live polar cross-attestation (spec §6.4, §6.2): the freshest `DiagAttest` report gossiped by each
-    /// OTHER cell member — its own honest reading of the 3 channel rates it mediates (`polar::polar_class`),
-    /// and when it arrived. [`attested_pairwise_rates`](Healer::attested_pairwise_rates) assembles these
-    /// (falling back to this node's own reading for any member it hasn't freshly heard from) into the
-    /// `Observation.pairwise_rates` matrix `diagnose` feeds the 14 free polar sum-rule alarms. An honest
-    /// report's 3 values always agree (`polar::mediator_attestation`); an equivocating member's disagree
-    /// internally, and `polar::violated_classes` then localizes exactly it.
-    attested: BTreeMap<Triple, ([f64; 3], Instant)>,
-    /// Self-healing routing state: to reach the (down) key coordinate, contact the value coordinate — the
-    /// co-linear survivor from the projective LRC reroute (spec §L4).
-    reroute: BTreeMap<Triple, Triple>,
-    /// Nodes whose shard this cell has regenerated by peeling (spec §6.3), for observability.
-    repaired: BTreeSet<Triple>,
-    /// Members locally distrusted after a polar-rule violation (spec §6.2); their frames are dropped
-    /// pending parental re-provisioning.
-    quarantined: BTreeMap<Triple, Instant>,
-    /// Mandatory per-node self-observation (`fanos_telemetry`): every diagnosis folds the cell's health
-    /// into a `CoherenceFrame` and records it into bounded local history. Not optional — the reflexive loop
-    /// cannot diagnose without observing (docs/design-telemetry.md).
-    observer: SelfObserver,
-    /// The behavioural coherence monitor: a bounded window of per-node relay activity, read as the cell's
-    /// real `Γ_net` so the [`Homeostat`] runs on *measured* correlation, not the liveness proxy (base cell).
-    monitor: BehaviorMonitor,
-    /// The coherence homeostat this node runs on its behavioural self-model — the sense→act seam, with the
-    /// monitor sensing and `diagnose` actuating its band-keeping decision.
-    homeostat: Homeostat,
-    /// Per-peer **data-relay** activity (`Route` frames) accumulated since the last behavioural sample —
-    /// the raw counts the coherence self-model is built from. Control chatter (pings, gossip) is excluded,
-    /// so this reflects *load*, not liveness.
-    activity: BTreeMap<Triple, u32>,
-    /// This node's own relay activity (`Route` frames it originated) since the last sample — the self slot
-    /// of the behavioural sample vector.
-    self_activity: u32,
-    /// The mutable **decoupling** shed factor `∈ [0, DECOUPLE_MAX]` (audit C6): scales this node's effective
-    /// correlation down so a `Decouple` actually lowers `Φ`. `decoupled`/`escalated_coherence` dedup the
-    /// homeostat notifications (which previously re-fired every diagnose).
-    decoupling: f64,
-    /// Dedup: currently in the shed (decoupled) regime — so `Decoupled` fires once on entry, not each round.
-    decoupled: bool,
-    /// Dedup: currently escalated on a coherence collapse — so `Escalated` fires once on entry.
-    escalated_coherence: bool,
-    /// Consecutive self-driven diagnoses that read over-coupled (`Verdict::Systemic`); resets to 0 on any
-    /// non-over-coupled diagnosis. The `Decouple` shed only actuates once this reaches [`DECOUPLE_DWELL`] —
-    /// the hysteresis that keeps the now-continuous reflex from shedding on a transient reading (#122).
-    overcoupling_streak: u32,
-    /// The most recent per-point relay-load sample (§6.7): the behavioural sample folded into the monitor
-    /// each heartbeat, RETAINED here (the monitor consumes it, then `activity` is cleared) so a diagnosis can
-    /// read the cell's current load vector for the projective load-balance prescription. All `N` points are
-    /// observable from one node because its `q+1` lines cover the plane.
-    last_sample: [f64; 7],
-    /// Dedup: currently in the under-coupled (`Bind`) regime, so `Rebalance` fires once on entry (§6.7), not
-    /// each round; cleared when the cell returns to the in-band collective-subject (`Hold`).
-    rebalancing: bool,
-    /// The §6.4 endpoint cross-attestation window: the last [`ENDPOINT_WINDOW`] rounds of per-witness
-    /// liveness fresh-masks (bit `p` ⇔ that witness gossiped point `p` fresh), reconstructed each heartbeat
-    /// from the corroborated `witnessed` substrate + own direct view. `attest_endpoints` reads it through
-    /// [`polar::fabricators_by_persistent_freshness`] to catch a colluding vouch-fabricator keeping a dead
-    /// node believed-alive — the third-order fault the plain corroboration quorum, which only *counts*
-    /// vouchers, cannot see. Bounded (`≤ ENDPOINT_WINDOW` tiny arrays), so it adds no unbounded state.
-    endpoint_window: VecDeque<[Option<u8>; 7]>,
-    /// §6.5 partition-sensor hysteresis: consecutive diagnoses whose loss-weighted line graph is
-    /// disconnected. `Verdict::Partition` is trusted only once this reaches [`PARTITION_DWELL`], so a
-    /// recovery-loss transient never false-fires (resets to 0 on any connected reading).
-    partition_streak: u32,
-    /// The coherence `Φ` computed on the last diagnosis — exposed so the facade can spend the coarse
-    /// `⌊log₉Φ⌋` reroute budget on a received cell escalation (audit R-C2) without re-diagnosing.
-    last_phi: f64,
-    /// The explicit cell members (transport coord by position) when this reflex runs a cell **embedded**
-    /// in a larger plane — mirroring the facade's [`OverlayNode::cell_members`], so behavioural sampling,
-    /// polar attestation, and the healing actuators (reroute/repair/quarantine) all map cell position `i`
-    /// to the real member coordinate. `None` on the base cell, where position `i` is `Point::at(i)`.
-    cell_members: Option<[Triple; 7]>,
-}
-
-impl Healer {
-    /// Cell position `i` (`0..7`) → transport coordinate: the explicit member when embedded, else the base
-    /// plane's `Point::at(i)`. The Healer's counterpart to [`OverlayNode::cell_coord`], so the reflex's
-    /// coord lookups and actuator targets are correct for a cell seated anywhere.
-    fn cell_coord<F: Field>(&self, i: usize) -> Triple {
-        self.cell_members
-            .as_ref()
-            .and_then(|members| members.get(i).copied())
-            .unwrap_or_else(|| Point::<F>::at(i).coords())
-    }
-
-    /// The `Φ` this reflex computed on its last diagnosis (a healthy 1.0 until the first one).
-    fn last_phi(&self) -> f64 {
-        self.last_phi
-    }
-
-    /// Create the reflex with the given self-observer (built by the facade, which knows the cell id and
-    /// window). Monitor/homeostat take their base-cell defaults; all healing state starts empty.
-    fn new(observer: SelfObserver) -> Self {
-        Self {
-            attested: BTreeMap::new(),
-            reroute: BTreeMap::new(),
-            repaired: BTreeSet::new(),
-            quarantined: BTreeMap::new(),
-            observer,
-            monitor: BehaviorMonitor::new(7, BEHAVIOR_WINDOW),
-            homeostat: Homeostat::conservative(),
-            activity: BTreeMap::new(),
-            self_activity: 0,
-            decoupling: 0.0,
-            decoupled: false,
-            escalated_coherence: false,
-            overcoupling_streak: 0,
-            last_sample: [0.0; 7],
-            rebalancing: false,
-            endpoint_window: VecDeque::new(),
-            partition_streak: 0,
-            last_phi: 1.0,
-            cell_members: None,
-        }
-    }
-
-    /// Count a data-relay (`Route`) frame from `from` toward its behavioural activity — the load signal
-    /// folded into the coherence self-model on the next heartbeat sample. Control chatter is excluded.
-    fn record_relay(&mut self, from: Triple) {
-        let a = self.activity.entry(from).or_insert(0);
-        *a = a.saturating_add(1);
-    }
-
-    /// Count a relay this node *originated* toward its own activity (the self slot of the sample vector).
-    fn record_origination(&mut self) {
-        self.self_activity = self.self_activity.saturating_add(1);
-    }
-
-    /// The transport coordinate to actually send to when addressing `to`: the self-healing co-linear
-    /// survivor if `to` is being rerouted around (spec §L4), else `to` itself.
-    fn reroute_target(&self, to: Triple) -> Triple {
-        self.reroute.get(&to).copied().unwrap_or(to)
-    }
-
-    /// A recovered node (churn rejoin, spec §3.3) no longer needs rerouting or repair — clear both.
-    fn clear_healing(&mut self, coord: Triple) {
-        self.reroute.remove(&coord);
-        self.repaired.remove(&coord);
-    }
-
-    /// Whether `from`'s frames must be dropped this instant because it is locally quarantined (spec §6.2,
-    /// §6.4) — true only within the bounded [`QUARANTINE_TTL`] window; once that elapses the member is
-    /// re-admitted here (removed) for re-evaluation, so a transient fault is not a permanent exile (C5).
-    fn is_quarantined(&mut self, from: Triple, now: Instant) -> bool {
-        if let Some(&since) = self.quarantined.get(&from) {
-            if now.since(since) <= QUARANTINE_TTL {
-                return true;
-            }
-            self.quarantined.remove(&from); // window elapsed — re-admit; re-diagnosis re-quarantines if bad
-        }
-        false
-    }
-
-    /// The current self-healing reroute table (down node → co-linear survivor), for observation.
-    fn reroutes(&self) -> impl Iterator<Item = (Triple, Triple)> + '_ {
-        self.reroute.iter().map(|(&k, &v)| (k, v))
-    }
-
-    /// Fold witness `from`'s polar cross-attestation into the `attested` store (spec §6.4): its 3 reported
-    /// channel rates (for the pairs it mediates, `polar::polar_class`) and when they arrived. A
-    /// short/malformed body is dropped whole, not partially applied (matching the canonical-decode-failure
-    /// convention elsewhere, spec §7.5). Freshness is enforced at *read* time by
-    /// [`attested_pairwise_rates`](Healer::attested_pairwise_rates), not here.
-    fn apply_diag_attest(&mut self, now: Instant, from: Triple, body: &[u8]) {
-        let mut rates = [0.0f64; 3];
-        for (i, slot) in rates.iter_mut().enumerate() {
-            let Some(bytes) = body
-                .get(i * 8..i * 8 + 8)
-                .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            else {
-                return; // short/malformed body — drop, do not partially apply
-            };
-            *slot = f64::from_le_bytes(bytes);
-        }
-        self.attested.insert(from, (rates, now));
-    }
-
-    /// Fold this window's per-node relay activity into the behavioural coherence [`monitor`](Self::monitor),
-    /// then reset the accumulators. Base Fano cell only (`self_index` is `Some`), where the 7-point index
-    /// geometry applies; the sample's `i`-th slot is point `i`'s relay activity (this node's own for its
-    /// index, else the peer's).
-    fn sample_behavior<F: Field>(&mut self, self_index: Option<usize>) {
-        let Some(self_index) = self_index else {
-            return;
-        };
-        let mut sample = [0.0f64; 7];
-        for (i, slot) in sample.iter_mut().enumerate() {
-            *slot = if i == self_index {
-                f64::from(self.self_activity)
-            } else {
-                let coord = self.cell_coord::<F>(i);
-                f64::from(self.activity.get(&coord).copied().unwrap_or(0))
-            };
-        }
-        self.monitor.record(&sample);
-        // Retain this window's load vector for the §6.7 projective load-balance prescription — the monitor
-        // consumes `sample` into its coherence window, but the diagnosis needs the raw per-point loads, and
-        // `activity` is about to be cleared.
-        self.last_sample = sample;
-        self.activity.clear();
-        self.self_activity = 0;
-    }
-
-    /// This node's **effective** equicorrelated correlation: the `healthy` baseline scaled down by the
-    /// current `decoupling` shed factor (audit C6). Everything that computes `Φ`/`P` from a scalar
-    /// correlation reads this, so a `Decouple` genuinely lowers the cell's integration.
-    fn effective_correlation(&self, healthy: f64) -> f64 {
-        healthy * (1.0 - self.decoupling)
-    }
-
-    /// Assemble the live `7×7` polar cross-attestation matrix (spec §6.4) for `diagnose`'s structural
-    /// check: for each polar point `k`, the 3 rates in its class default to this node's own honest reading
-    /// of `degraded` (`polar::mediator_attestation` — always internally consistent, for ANY liveness
-    /// pattern), then are overridden by `k`'s own freshly-gossiped `DiagAttest`, if any (fresh within
-    /// `timeout`) — the mediator is the authoritative witness of the channels it mediates. An honest
-    /// override reproduces the same self-consistent triple; an equivocating one's disagrees internally by
-    /// construction — and `polar::violated_classes` then localizes exactly that mediator, since each class
-    /// here is filled atomically from ONE source (fallback or attestation), never a mix.
-    fn attested_pairwise_rates<F: Field>(
-        &self,
-        now: Instant,
-        degraded: u8,
-        timeout: Duration,
-    ) -> [[f64; 7]; 7] {
-        let mut matrix = [[0.0f64; 7]; 7];
-        for k in 0..7usize {
-            let coord = self.cell_coord::<F>(k);
-            let triple = match self.attested.get(&coord) {
-                Some((rates, seen)) if now.since(*seen) <= timeout => *rates,
-                _ => polar::mediator_attestation(k, degraded),
-            };
-            for ((a, b), rate) in polar::polar_class(k).into_iter().zip(triple) {
-                // `a`, `b` are Fano point indices (< 7) by construction of `polar_class`; `.get_mut`
-                // avoids raw bracket indexing rather than asserting that invariant with an allow.
-                if let Some(cell) = matrix.get_mut(a).and_then(|row| row.get_mut(b)) {
-                    *cell = rate;
-                }
-                if let Some(cell) = matrix.get_mut(b).and_then(|row| row.get_mut(a)) {
-                    *cell = rate;
-                }
-            }
-        }
-        matrix
-    }
-
-    /// Fold this window's cell health into a `CoherenceFrame`, record it in local history, and return the
-    /// effect that publishes its wire bytes. The exact 3-bit syndrome comes from `degraded`; the coherence
-    /// scalars from the equicorrelated liveness model at the *effective* (post-shed) correlation
-    /// (docs/design-telemetry.md §2). `epoch` is the cell's AGREED epoch, so cross-node roll-up buckets
-    /// consistently (audit A3).
-    fn emit_observation(
-        &mut self,
-        now: Instant,
-        epoch: Epoch,
-        alive_count: usize,
-        degraded: u8,
-        healthy_correlation: f64,
-    ) -> Effect {
-        let correlation = self.effective_correlation(healthy_correlation);
-        let frame = self.observer.observe_liveness(
-            now.as_nanos(),
-            epoch.get(),
-            alive_count,
-            correlation,
-            degraded,
-            polar_gap_from_liveness(degraded), // spectral gap Δ (T-226(v)) from this window's health topology
-            -1,                                // cascade forecast: none from liveness alone
-        );
-        Effect::Notify(Notification::Observed(frame.encode().to_vec()))
-    }
-
-    /// Diagnose the sensed cell snapshot (`self_index, degraded, alive_count`, produced by the facade's
-    /// liveness sensing) and actuate any healing — the DIAKRISIS reflex proper. Feeds the *measured*
-    /// behavioural `Γ_net` (the #74 unification) plus the live polar cross-attestation into `diagnose`,
-    /// runs the verdict→plan→actuate path (over-coupling gated by the [`DECOUPLE_DWELL`] hysteresis, #122),
-    /// then the homeostat's re-integration/escalation bands, and finally the mandatory self-observation.
-    #[allow(clippy::too_many_arguments)] // the sensed cell snapshot: index, degraded, alive, lines, config, epoch
-    fn diagnose<F: Field>(
-        &mut self,
-        now: Instant,
-        self_index: usize,
-        degraded: u8,
-        alive_count: usize,
-        healthy_lines: Option<u8>,
-        config: &Config,
-        epoch: Epoch,
-    ) -> Vec<Effect> {
-        // The base node senses liveness, and — the #74 unification — the *measured* behavioural coherence
-        // `Γ_net` (the relay-activity self-model). Feeding `Γ_net` into `diagnose` makes its Systemic
-        // (over-coupling) verdict fire on the same signal the homeostat acts on, so there is one
-        // over-coupling authority, not a dormant liveness-only arm beside a separate behavioural check.
-        // (Partition/cascade still need the global cross-attestation view, not this local sense alone.)
-        let measured = self.monitor.coherence();
-        // The structural (Byzantine) check (spec §6.4 + §6.2): the live polar cross-attestation matrix,
-        // assembled from gossiped `DiagAttest` reports (§98). `diagnose` runs the 14 free polar sum-rules
-        // against it FIRST, ahead of the syndrome localizer — an equivocating mediator's own report is
-        // internally inconsistent and is caught and localized here; an honest cell's is always consistent,
-        // so this never pre-empts the ordinary crash/churn path below, however many members are down.
-        let pairwise_rates =
-            self.attested_pairwise_rates::<F>(now, degraded, config.liveness_timeout);
-        // §6.5 partition sensor (V14): `healthy_lines` names which cell lines carry live inter-node
-        // connectivity, derived from the *measured* per-channel loss (the #106 grey substrate) — an
-        // INDEPENDENT signal, not the node-liveness `degraded` mask (that would be redundant with the crash
-        // path). Persistence guard: a disconnected loss-weighted graph is only trusted after
-        // [`PARTITION_DWELL`] consecutive readings, so a recovery-loss transient (a just-healed node whose
-        // lines still read cut for a round) never false-fires; below the dwell we present the cell as fully
-        // connected so no premature `Verdict::Partition` escapes. Partition-resistance (one lossy line still
-        // reads λ₂=4) means only a sustained lossy line-COVER — a real incipient split, nodes still alive —
-        // ever reaches the verdict.
-        // A partition candidate is only meaningful when the cell is ALL-ALIVE: if any node is down
-        // (`degraded != 0`) the disconnection is explained by the crash and handled by the node-fault path, so
-        // it must NOT build the partition streak (else a crash+recovery churn would accumulate the streak and
-        // false-fire on the recovery transient). Only a sustained *all-alive* disconnection — a real incipient
-        // split, nodes still up — accumulates.
-        let disconnected =
-            degraded == 0 && healthy_lines.is_some_and(|h| !partition::is_connected(h));
-        self.partition_streak = if disconnected {
-            self.partition_streak.saturating_add(1)
-        } else {
-            0
-        };
-        let trusted_lines = match healthy_lines {
-            Some(_) if disconnected && self.partition_streak < PARTITION_DWELL => Some(0x7F),
-            other => other,
-        };
-        let verdict = diagnose(&Observation {
-            degraded,
-            pairwise_rates: Some(pairwise_rates),
-            coherence: measured.clone(),
-            healthy_lines: trusted_lines,
-        });
-
-        // Hysteresis for the over-coupling shed (audit #122): count consecutive over-coupled diagnoses,
-        // resetting on any non-over-coupled one. `Decouple` actuates only once this reaches DECOUPLE_DWELL,
-        // so the now-continuous reflex sheds on *sustained* over-coupling, not a single transient reading.
-        self.overcoupling_streak = if matches!(verdict, fanos_diakrisis::Verdict::Systemic) {
-            self.overcoupling_streak.saturating_add(1)
-        } else {
-            0
-        };
-
-        let mut effects = alloc::vec![Effect::Notify(Notification::Verdict(verdict.clone()))];
-        if config.self_healing {
-            // Φ from the cell's live membership on the equicorrelated stratum, at the *effective*
-            // (post-shed) correlation — so a prior `Decouple` has genuinely lowered it (audit C6). Gates
-            // the reroute-depth budget.
-            let phi = phi_equicorrelated(
-                alive_count,
-                self.effective_correlation(config.healthy_correlation),
-            );
-            self.last_phi = phi; // exposed to the facade's parent-stratum reflex (R-C2)
-            let plan = plan_healing(&verdict, self_index, degraded, phi);
-            if !plan.is_empty() {
-                self.observer.note_healing();
-            }
-            // Over-coupling actuation (`Decouple`) flows through this verdict→plan path, gated by the dwell
-            // hysteresis above; `apply_healing_plan` raises the mutable decoupling state and dedups the
-            // notification (audit C6/#122). Crash/Byzantine actions in the plan are never gated.
-            let decouple_ready = self.overcoupling_streak >= DECOUPLE_DWELL;
-            effects.extend(self.apply_healing_plan::<F>(now, &plan, decouple_ready));
-
-            // The homeostat covers the bands the Systemic verdict does not: **re-integration** once the
-            // measured `Γ_net` is back in (or below) the band (Bind/Hold — decay the shed), and
-            // **escalation** on a coherence *collapse* (`P ≤ 2/N`). Over-coupling is the verdict path's.
-            if let Some(coherence) = measured {
-                let m = coherence.measures();
-                match self
-                    .homeostat
-                    .control(m.purity, coherence.mean_correlation(), coherence.n())
-                {
-                    BandControl::Escalate => {
-                        if !self.escalated_coherence {
-                            self.escalated_coherence = true;
-                            self.observer.note_healing();
-                            effects.push(Effect::Notify(Notification::Escalated(0)));
-                        }
-                    }
-                    BandControl::Decouple { .. } => {
-                        // Actuated via the verdict→plan path above; only clear the escalation latch.
-                        self.escalated_coherence = false;
-                    }
-                    band @ (BandControl::Bind { .. } | BandControl::Hold) => {
-                        // In or below the band: let any prior shedding decay back toward the baseline
-                        // coupling, and notify `Bound` once when fully re-integrated.
-                        self.decoupling *= DECOUPLE_DECAY;
-                        if self.decoupling < 1e-9 {
-                            self.decoupling = 0.0;
-                        }
-                        self.escalated_coherence = false;
-                        if self.decoupled && self.decoupling == 0.0 {
-                            self.decoupled = false;
-                            effects.push(Effect::Notify(Notification::Bound));
-                        }
-                        // §6.7 differential-DDoS response: the under-coupled `Bind` (`Aggregate`) band is the
-                        // regime a load hotspot induces by decorrelating the cell. Publish the projective load
-                        // state the node sensed — its per-point relay load over the whole cell (observable
-                        // because its q+1 lines cover the plane) — once on ENTERING the band (deduped). The
-                        // derived response is `loadbalance::balance_exact(loads)` = the uniform mean, driving
-                        // the hotspot into the whole cell at the projective contraction `λ₂ = 2/9`. `Hold` is
-                        // the healthy in-band collective subject: clear the latch so a later Bind re-publishes.
-                        if matches!(band, BandControl::Bind { .. }) {
-                            if !self.rebalancing {
-                                self.rebalancing = true;
-                                let loads = self.last_sample.map(|x| x.round() as u32);
-                                effects.push(Effect::Notify(Notification::Rebalance { loads }));
-                            }
-                        } else {
-                            self.rebalancing = false;
-                        }
-                    }
-                }
-            }
-        }
-        // Mandatory self-observation: diagnosis cannot happen without observing.
-        effects.push(self.emit_observation(
-            now,
-            epoch,
-            alive_count,
-            degraded,
-            config.healthy_correlation,
-        ));
-        effects
-    }
-
-    /// Apply a [`HealingPlan`], mutating the reroute / repaired / quarantine state and emitting a
-    /// notification for each *new* corrective action (idempotent across repeated rounds).
-    fn apply_healing_plan<F: Field>(
-        &mut self,
-        now: Instant,
-        plan: &fanos_diakrisis::HealingPlan,
-        decouple_ready: bool,
-    ) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        for action in &plan.actions {
-            match *action {
-                HealingAction::Reroute { around, via } => {
-                    let around_c = self.cell_coord::<F>(around);
-                    let via_c = self.cell_coord::<F>(via);
-                    if self.reroute.insert(around_c, via_c) != Some(via_c) {
-                        effects.push(Effect::Notify(Notification::Rerouted {
-                            around: around_c,
-                            via: via_c,
-                        }));
-                    }
-                }
-                HealingAction::Repair { node, .. } => {
-                    let node_c = self.cell_coord::<F>(node);
-                    if self.repaired.insert(node_c) {
-                        effects.push(Effect::Notify(Notification::Repaired(node_c)));
-                    }
-                }
-                HealingAction::Quarantine { node } => {
-                    let node_c = self.cell_coord::<F>(node);
-                    effects.extend(self.quarantine(node_c, now));
-                }
-                HealingAction::Decouple => {
-                    // Real correlation-shedding (audit C6), gated by the dwell hysteresis (#122): only once
-                    // over-coupling has held for DECOUPLE_DWELL consecutive diagnoses do we raise the
-                    // mutable decoupling factor (capped), lowering the effective correlation feeding `Φ`
-                    // next round. Notify once on *entering* the shed regime (dedup), not each round.
-                    if decouple_ready {
-                        self.decoupling = (self.decoupling + DECOUPLE_STEP).min(DECOUPLE_MAX);
-                        if !self.decoupled {
-                            self.decoupled = true;
-                            effects.push(Effect::Notify(Notification::Decoupled));
-                        }
-                    }
-                }
-                HealingAction::Escalate { unrecoverable } => {
-                    effects.push(Effect::Notify(Notification::Escalated(unrecoverable)));
-                }
-            }
-        }
-        effects
-    }
-
-    /// Locally quarantine `node_c` (spec §6.2/§6.4): drop its frames for the bounded re-admission window,
-    /// emitting a `Quarantined` notification only on a *new* distrust (idempotent across rounds). The single
-    /// quarantine actuator shared by the mediator model (`violated_classes`, via the healing plan) and the
-    /// endpoint fabrication detector ([`attest_endpoints`]) — one reason for a member's frames to be dropped.
-    /// Clear any quarantine tag on `node_c`, re-admitting it immediately rather than at TTL expiry.
-    ///
-    /// Used when a coordinate's **occupant changes** (audit R-M1): a tag belongs to an identity, and the arriving
-    /// identity has not earned its predecessor's distrust. Silent — re-admission is the absence of a verdict, not a
-    /// verdict, so it emits no notification.
-    fn readmit(&mut self, node_c: Triple) {
-        self.quarantined.remove(&node_c);
-    }
-
-    fn quarantine(&mut self, node_c: Triple, now: Instant) -> Option<Effect> {
-        self.quarantined
-            .insert(node_c, now)
-            .is_none()
-            .then_some(Effect::Notify(Notification::Quarantined(node_c)))
-    }
-
-    /// The **§6.4 endpoint cross-attestation, live** (#106). Fold this heartbeat's per-witness liveness
-    /// fresh-masks (built by the facade from the corroborated `witnessed` substrate) into the bounded window
-    /// and, once it is full, run the directional fabrication detector: quarantine any witness that
-    /// *persistently* vouches a node fresh while a firm consensus reports it stale — a colluding
-    /// vouch-fabricator keeping a dead node believed-alive, the fault the plain corroboration quorum (which
-    /// only counts vouchers) is defeated by. `subjects` are the points the judge cannot itself directly
-    /// confirm alive (`!own_fresh_mask`), so a node it can see is never adjudicated — the honest-node
-    /// safeguard. Dual to the quorum; complements the mediator model's equivocation catch. Below a full
-    /// window there is not enough history to judge persistence, so nothing fires (churn-safe cold start).
-    fn attest_endpoints<F: Field>(
-        &mut self,
-        now: Instant,
-        round: [Option<u8>; 7],
-        subjects: u8,
-    ) -> Vec<Effect> {
-        self.endpoint_window.push_back(round);
-        while self.endpoint_window.len() > ENDPOINT_WINDOW {
-            self.endpoint_window.pop_front();
-        }
-        if self.endpoint_window.len() < ENDPOINT_WINDOW {
-            return Vec::new();
-        }
-        let window: Vec<[Option<u8>; 7]> = self.endpoint_window.iter().copied().collect();
-        let mut effects = Vec::new();
-        for idx in polar::fabricators_by_persistent_freshness(&window, ENDPOINT_MIN_STALE, subjects)
-        {
-            let node_c = self.cell_coord::<F>(idx);
-            effects.extend(self.quarantine(node_c, now));
-        }
-        effects
-    }
-}
-
+/// *ideally* lives, before the cell's actual occupancy is consulted. It is a distinct type from a node
 /// A projective point in the **content-address domain** (`MapToPoint(H(key))`, spec §L4): where a key
 /// *ideally* lives, before the cell's actual occupancy is consulted. It is a distinct type from a node
 /// coordinate on purpose (audit C4/#126): it carries no way to become a send target directly, so the
@@ -1105,7 +565,7 @@ fn cell_id<F: Field>() -> CellId {
 /// matrix `Γ_net`, which is a different quantity that must not be substituted here (audit #74). A fully
 /// healthy cell has uniform line rates `γ̄ = 3`, giving the theorem's maximal `Δ = (2/3)·3 = 2`; each
 /// degraded point lowers the incident axes' flux and so slows recovery, exactly as T-226(v) predicts.
-fn polar_gap_from_liveness(degraded: u8) -> f64 {
+pub(crate) fn polar_gap_from_liveness(degraded: u8) -> f64 {
     let mut line_rates = [0.0f64; fano::N];
     for (rate, points) in line_rates.iter_mut().zip(fano::LINE_POINTS.iter()) {
         let live = points

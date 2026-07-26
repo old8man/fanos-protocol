@@ -17,6 +17,8 @@
 
 extern crate alloc;
 
+/// The DIAKRISIS self-healing reflex, split out of [`overlay`] — see [`healer`].
+mod healer;
 pub mod overlay;
 
 // The sans-I/O contract now lives in the leaf crate `fanos-ports` (audit #73/#125); re-exported here as
