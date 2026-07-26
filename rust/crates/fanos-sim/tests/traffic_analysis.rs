@@ -359,3 +359,164 @@ fn the_timing_channel_is_measured_too_and_at_the_shipping_defaults() {
          (shipped r = {shipped:.3}, undefended r = {undefended:.3})"
     );
 }
+
+// ── The VALID experiment: linkability among concurrent flows ────────────────────────────────────────────────────────
+//
+// The retracted metric asked "is a lone flow visible", which conservation answers yes to for any design. Anonymity asks
+// something else: among several **concurrent** flows, can the adversary MATCH inputs to outputs better than chance? That
+// is the confusion cover and mixing exist to create, and it cannot be measured with one flow.
+//
+// The adversary here is the canonical one: it sees every frame's `(t, from, to)`, builds a rate series for each flow's
+// entry and each flow's exit, scores every (entry, exit) pair by correlation, and takes the best assignment. Its accuracy
+// against chance `1/K` is the anonymity loss.
+//
+// ⚠️ Engine: this uses `NyxNode` (the **Lite** profile), because `PG(2,7)`'s 57 points give room for several
+// simultaneous flows while the `ThresholdRouter` harness has 7. Running the same metric on the shipping engine is the
+// named follow-up — and after the 18fce2e retraction, the engine is stated rather than assumed.
+
+/// One flow's entry and exit coordinates.
+struct Flow {
+    client: Triple,
+    service: Triple,
+}
+
+/// Rate series of frames emitted by `node`, in `bin_ms` bins.
+fn emit_series(obs: &[FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<f64> {
+    let mut v = vec![0f64; bins];
+    for o in obs.iter().filter(|o| o.from == node) {
+        if let Some(slot) = v.get_mut((o.t_ms / bin_ms) as usize) {
+            *slot += 1.0;
+        }
+    }
+    v
+}
+
+/// Rate series of frames *received* by `node`.
+fn recv_series(obs: &[FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<f64> {
+    let mut v = vec![0f64; bins];
+    for o in obs.iter().filter(|o| o.to == node) {
+        if let Some(slot) = v.get_mut((o.t_ms / bin_ms) as usize) {
+            *slot += 1.0;
+        }
+    }
+    v
+}
+
+/// The adversary's matching accuracy over `K` concurrent flows: the fraction it assigns correctly, against chance `1/K`.
+fn linkability_seeded(mix: Option<(Duration, Duration)>, seed: u64) -> (f64, f64) {
+    const K: usize = 5;
+    const BIN_MS: u64 = 200;
+    const SPAN_MS: u64 = 8_000;
+
+    let mut sim = Sim::new(0x4B1 + seed);
+    let cell = spawn_nyx_cell(&mut sim, mix);
+    if mix.is_some() {
+        sim.inject_all(&Command::StartHeartbeat);
+    }
+    sim.observe_frames();
+
+    // K flows on disjoint endpoint pairs, each with its OWN burst rhythm — distinct rhythms are what makes matching
+    // possible at all, so this is the adversary's best case, not a soft one.
+    let flows: Vec<Flow> = (0..K).map(|i| Flow { client: cell[i], service: cell[K + i] }).collect();
+    let mut t = 0u64;
+    let mut round = 0u64;
+    while t < SPAN_MS {
+        for (i, f) in flows.iter().enumerate() {
+            // flow i fires every (i+1) rounds — distinct duty cycles the adversary can key on
+            if round.is_multiple_of(i as u64 + 1) {
+                sim.inject(f.client, Command::Send { to: f.service, payload: b"flow".to_vec() });
+            }
+        }
+        sim.run_for(Duration::from_millis(200));
+        t += 200;
+        round += 1;
+    }
+    sim.run_for(Duration::from_millis(2_000));
+
+    let obs = sim.observed_frames();
+    let bins = (SPAN_MS / BIN_MS) as usize + 12;
+    // Score every (entry, exit) pair, then greedily assign best-first — the adversary's natural strategy.
+    let entries: Vec<Vec<f64>> = flows.iter().map(|f| emit_series(obs, f.client, BIN_MS, bins)).collect();
+    let exits: Vec<Vec<f64>> = flows.iter().map(|f| recv_series(obs, f.service, BIN_MS, bins)).collect();
+    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        for (j, x) in exits.iter().enumerate() {
+            pairs.push((pearson(e, x).abs(), i, j));
+        }
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut taken_i = [false; K];
+    let mut taken_j = [false; K];
+    let mut correct = 0usize;
+    for (_, i, j) in pairs {
+        if !taken_i[i] && !taken_j[j] {
+            taken_i[i] = true;
+            taken_j[j] = true;
+            if i == j {
+                correct += 1;
+            }
+        }
+    }
+    (correct as f64 / K as f64, 1.0 / K as f64)
+}
+
+/// Mean matching accuracy over several seeds — with `K = 5`, a single run moves in steps of 0.2, so one draw is not a
+/// result. Averaging is the difference between a number and an anecdote.
+fn linkability(mix: Option<(Duration, Duration)>) -> (f64, f64) {
+    const RUNS: u64 = 12;
+    let mut acc = 0.0;
+    let mut chance = 0.0;
+    for seed in 0..RUNS {
+        let (a, c) = linkability_seeded(mix, seed);
+        acc += a;
+        chance = c;
+    }
+    (acc / RUNS as f64, chance)
+}
+
+#[test]
+#[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
+fn sweep_linkability_against_the_schedule() {
+    // Is the residual linkability TUNABLE? The retracted metric could not answer this, because it penalised
+    // conservation at every setting. This one can.
+    println!("flow-matching accuracy over 5 concurrent flows (chance 0.20):");
+    for (name, mix, cover) in [
+        ("undefended", 0u64, 0u64),
+        ("SHIPPING  (50/1000)", 50, 1_000),
+        ("moderate  (120/300)", 120, 300),
+        ("aggressive(250/150)", 250, 150),
+        ("heavy     (500/100)", 500, 100),
+    ] {
+        let m = if cover == 0 { None } else { Some((Duration::from_millis(mix), Duration::from_millis(cover))) };
+        println!("  {name:<22} accuracy {:.2}", linkability(m).0);
+    }
+}
+
+#[test]
+fn the_adversary_cannot_match_concurrent_flows_much_better_than_chance() {
+    let (undefended, chance) = linkability(None);
+    let (defended, _) = linkability(Some((Duration::from_millis(50), Duration::from_millis(1_000))));
+    println!(
+        "flow-matching accuracy over 5 concurrent flows — chance {chance:.2}, undefended {undefended:.2}, \
+         shipping defaults {defended:.2}"
+    );
+    // The undefended baseline must actually be attackable, or the experiment proves nothing about the defence.
+    assert!(
+        undefended > chance,
+        "an undefended cell must leak the matching (got {undefended:.2} vs chance {chance:.2}) — otherwise this \
+         measures nothing"
+    );
+    // A real, measured reduction — this is what the retracted metric could not see, because it penalised conservation at
+    // every setting rather than the implementation.
+    assert!(
+        defended < undefended - 0.3,
+        "the defence must materially reduce matching (defended {defended:.2}, undefended {undefended:.2})"
+    );
+    // And the honest other half: it does NOT reach chance, so linkability remains. Pinned so a regression toward
+    // 'undefended' and an improvement toward chance are both visible.
+    assert!(
+        defended > chance,
+        "if this ever reaches chance the claim has strengthened and this bound should be tightened \
+         (defended {defended:.2}, chance {chance:.2})"
+    );
+}
