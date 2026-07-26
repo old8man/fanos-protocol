@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD 24dc4fe`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD a23ed82`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -123,14 +123,19 @@ unbounded proof fold (both crosscell and thesauros — 65 535 hashes from one re
 untrusted storage provider), the `[0u8; 32]` empty root, thesauros carrying the sibling *side* on the wire, and a one-leaf
 CID equalling a bare leaf hash. Conformance vectors regenerated.
 
-### 7. Split `fanos-runtime/src/overlay.rs` + extract `ThresholdSealed`
-- **Problem (a).** `overlay.rs` is **4,048 lines** (it has grown since this file last claimed 3,870). The `OverlayNode`
-  decomposition already exists at the type level (`Config`/`Store`/`Router`/`Membership`/`Healer`) — only the module split
-  never happened.
-- **Problem (b).** Verified: `fanos-taxis` (consensus) imports `ThresholdSealed`/`ThresholdError` from `fanos-aphantos`
-  (the onion router) — `keyper.rs:30`, `tx.rs:15` — the one bad edge in an otherwise clean 5-layer dependency DAG.
-- **Task.** Mechanical split of `overlay.rs` into `store/router/membership/healer/hier/node.rs` (lib.rs re-exports, zero
-  API change); extract `aphantos/{threshold,sealed}.rs` into a low-layer crate both aphantos and taxis import.
+### 7. Split `fanos-runtime/src/overlay.rs` (7b — the `ThresholdSealed` edge — is DONE)
+- **7b DONE** (`a23ed82`). `fanos-taxis` no longer depends on `fanos-aphantos` at all: the KEM **seal** is its own `no_std`
+  crate `fanos-threshold` (two low-layer deps), while the **circuit** layer — `seal_onion`, `HopLine`,
+  `circuit_line_holonomy`, needing geometry and NYX's ratchet — stays in aphantos as `threshold_onion`. Splitting the file
+  rather than moving it was forced by the code: moving the whole thing would have recreated the inversion one hop over
+  (`taxis → threshold → nyx`). A facade keeps `fanos_aphantos::threshold::{…}` resolving to both halves, so no caller
+  churned. `sealed.rs` deliberately stayed put — it needs `fanos-nyx` and `fanos-wire`, whatever the task doc guessed.
+  - *Method note worth carrying:* reading a module's `use` lines is **not** its dependency list. Half of `threshold.rs`'s
+    references were fully-qualified paths the imports never mentioned, and the first attempt at the move compiled the new
+    crate against deps it did not declare.
+- **7a still open.** `overlay.rs` is 4,048 lines; the `OverlayNode` decomposition exists at the type level
+  (`Config`/`Store`/`Router`/`Membership`/`Healer`) and only the module split never happened. Mechanical, compiler-verified,
+  and a good fit for a contended machine since it needs no wall-clock measurement.
 
 ### 8. Coherence / meta-holon reconciliation (E→L / L→O / Ω2 / Ω9)
 - **Problem.** The cross-block coherence contracts (`platform.md §1.2`, §9) are asserted but not reconciled in one place:
