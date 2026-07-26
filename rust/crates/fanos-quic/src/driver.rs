@@ -1287,6 +1287,7 @@ fn spawn_inner(
         directory,
         distrust: distrust.clone(),
     };
+    tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe()));
     tokio::spawn(accept_loop(transport.clone()));
     tokio::spawn(transport_loop(transport, send_rx));
     tokio::spawn(engine_loop(
@@ -1841,6 +1842,51 @@ async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Op
     }
 }
 
+/// Tell every live peer when this node moves, by re-sending its (already updated) `HELLO` on each open connection.
+///
+/// The other half of `read_frames`' `Hello` arm. A move is only useful if the peers this node already has hear about it:
+/// they hold the connection filed under the coordinate proved at handshake time, and nothing else would ever correct it.
+/// New connections were never the problem — they read the fresh HELLO anyway.
+///
+/// Driven off `Notification::Reseated` rather than from whoever issued the move, for the same reason the reported
+/// coordinate is: the engine is the authority on where this node sits, and every mover — the placement loop, recovery, a
+/// direct command — should be announced identically.
+async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notification>) {
+    loop {
+        match events.recv().await {
+            Ok(Notification::Reseated { .. }) => {
+                let Some(hello) = t.identity.as_ref().and_then(|id| id.hello.read().ok().map(|h| h.clone())) else {
+                    continue;
+                };
+                // Snapshot the peer set, then send outside the lock: a send awaits, and holding a `std::sync::Mutex`
+                // across an await is how a transport deadlocks itself.
+                let peers: Vec<Connection> = match t.conns.lock() {
+                    Ok(map) => map.values().cloned().collect(),
+                    Err(_) => continue,
+                };
+                for conn in peers {
+                    send_hello(&conn, &t.shaper, &hello).await;
+                }
+            }
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// The peer's **new** coordinate from a mid-connection `HELLO`, if it verifies and actually differs from `known`.
+///
+/// `None` when there is no self-certifying identity to check against (a build that never verified coordinates cannot start
+/// trusting them here), when the claim does not verify, or when the peer re-announced the point it already held.
+fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) -> Option<Triple> {
+    let id = t.identity.as_ref()?;
+    let cert = peer_cert_der(conn)?;
+    match (id.verify)(&cert, frame)? {
+        HelloResult::Established { coord, .. } => (coord != known).then_some(coord),
+        HelloResult::Incompatible(_) => None,
+    }
+}
+
 /// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.
 async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
     let mut stream = conn.accept_uni().await.ok()?;
@@ -1851,6 +1897,10 @@ async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
 
 /// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
 async fn read_frames(conn: Connection, from: Triple, t: Transport) {
+    // Mutable because a peer may **move**: a coordinate is not fixed for the life of a connection (spec §L3 reshuffle, and
+    // within an epoch when a better claim displaces the peer). A verified move re-keys this connection and re-attributes
+    // every frame after it, so the peer stays reachable at the point it actually holds.
+    let mut from = from;
     // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
     // wrongly-shaped stream is skipped without sinking the connection.
     while let Ok(mut stream) = conn.accept_uni().await {
@@ -1865,6 +1915,35 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
         // attributed to `from`, the peer's cryptographically-proven coordinate.
         if let Ok((decoded, _)) = decode_frame(&frame) {
             match decoded.frame_type() {
+                // A peer announcing that it **moved**: the same `HELLO` body, arriving mid-connection.
+                //
+                // Without this, a live connection stays filed under the coordinate the peer proved at handshake time and
+                // nothing is filed under its new one — so a node that resolved a coordinate collision became unreachable to
+                // the peers it already had. Measured before this existed: with placement fully resolved (`occupied = 5 of
+                // 5`) roster convergence still froze at `[4, 4, 3, 4, 2]`.
+                //
+                // Re-keying is gated on **exactly the handshake's own check** (`SelfCert::verify` — a coordinate claim
+                // proved against the peer's authenticated certificate), so a peer can only ever move *itself*, and only to
+                // a point it can prove. Re-keying on an unverified announcement would be a coordinate-hijack primitive.
+                //
+                // The live connection is preserved rather than dropped, which is the design's own principle: a live
+                // connection *is* the reachability, and the peer that accepted it may hold no listen address for us.
+                Some(FrameType::Hello) => {
+                    if let Some(moved) = verified_move(&t, &conn, &frame, from) {
+                        tracing::debug!(?from, ?moved, "peer moved; re-keying its live connection");
+                        if let Ok(mut map) = t.conns.lock() {
+                            map.remove(&from);
+                            map.insert(moved, conn.clone());
+                        }
+                        if let Ok(mut map) = t.peer_addrs.lock()
+                            && let Some(addr) = map.remove(&from)
+                        {
+                            map.insert(moved, addr);
+                        }
+                        from = moved;
+                    }
+                    continue;
+                }
                 // A peer reporting the public address it observes us at — one vote toward our reflexive
                 // address (a peer gets exactly one, keyed by its coordinate).
                 Some(FrameType::ObservedAddr) => {

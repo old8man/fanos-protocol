@@ -455,11 +455,13 @@ impl NodeFleet {
         // contested node along its probe walk and it announces the point it reached, measured at 7/7 distinct across four
         // forced-collision trials with nodes visibly seated at probe index 1 and 4 (`fanos_quic::claims`).
         //
-        // What it guards now is the *next* defect, one layer up: after a node moves, its peers keep the stale binding.
-        // `Reseater::apply` clears the vacated point from the mover's OWN directory, and nothing tells the rest of the cell,
-        // so roster convergence stalls — measured, with placement fully resolved (`occupied = 5 of 5`), at
-        // `Refuted { frozen_for: 30s, last: [4, 4, 3, 4, 2] }`. Until a mover announces its move, an injective draw is what
-        // keeps a cell-wide scenario measuring what it claims to measure. Remove this again when that lands.
+        // What it guards now is **roster** convergence after a move, one layer above placement. A mover re-announces its
+        // HELLO to its live peers, which re-key the connection on the handshake's own verification (`verified_move`), and
+        // that measurably helped — with collisions allowed the cell-wide scenario went from roughly 1 pass in 3 to **6 of
+        // 8**. It is not closed: the two failures still read `occupied = 5 of 5` (placement fully resolved) with rosters
+        // frozen at `[4, 4, 4, 1, 4]` and `[1, 2, 3, 1, 2]`. The second looks unrelated to moving at all — every node is
+        // low, which is general discovery rather than one stale key — so the remaining gap needs its own diagnosis rather
+        // than another guess. Remove this guard when the cell-wide scenario passes with collisions allowed.
         let mut taken: HashSet<fanos_geometry::Triple> = HashSet::new();
         let mut attempts = 0usize;
         while nodes.len() < count {
