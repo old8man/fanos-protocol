@@ -7,10 +7,10 @@
 //! same code runs under the simulator and a real transport.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use fanos_code::{da, erasure, lrc};
+use fanos_code::erasure;
 use fanos_core::{AdmissionPolicy, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
@@ -18,15 +18,21 @@ use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple, fano};
 use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
-use fanos_wire::{FrameType, ProtocolError, Wire, decode_frame};
+use fanos_wire::{FrameType, decode_frame};
 
 
 /// Hierarchical addressing, routing and escalation — see [`hier`].
 mod hier;
+/// Liveness sensing: heartbeat, aliveness view, loss/health snapshots — see [`liveness`].
+mod liveness;
+/// Joining, announcing, epoch advance and re-seat — see [`membership_ops`].
+mod membership_ops;
+/// Content storage and retrieval — see [`storage`].
+mod storage;
 
 /// Storage `Publish` sub-type: the **full value**, sent origin → responsible node, which then
 /// erasure-codes it and distributes the shards. Carries no meaningful shard index (`0`).
-const PUBLISH_ORIGIN: u8 = 0;
+pub(super) const PUBLISH_ORIGIN: u8 = 0;
 
 /// The upward hop budget for a cell escalation (audit R-C2): a residue is handed up at most this many strata
 /// before it is terminal (external help required), bounding the recursion at the HOLARCH depth ceiling so an
@@ -37,7 +43,7 @@ pub(super) const ESCALATE_TTL: u8 = 3;
 /// what replaces full replication: a value is `erasure::encode`d into `N=7` shards, one per Fano point, each
 /// placed at the point's [`nearest_occupied`](OverlayNode::nearest_occupied) home, so the cell holds the
 /// value at `N/K ≈ 2.33×` redundancy (vs `N×` full replication) while any `≤3`-point loss still recovers it.
-const PUBLISH_SHARD: u8 = 2;
+pub(super) const PUBLISH_SHARD: u8 = 2;
 /// The DHT key-digest / storage-address length (BLAKE3-256) — the one canonical digest width.
 pub(crate) const DIGEST: usize = fanos_primitives::DIGEST_LEN;
 
@@ -46,18 +52,15 @@ pub(crate) const DIGEST: usize = fanos_primitives::DIGEST_LEN;
 // public name.
 pub use crate::frames::{admission_challenge, descriptor_message};
 
-use crate::frames::{
-    LookupBody, announce_body, descriptor_signature_ok, encode, encode_diag_attest, encode_error,
-    encode_lookup, encode_publish, encode_value, fold_seed, parse_announce, parse_digest, parse_u64,
-};
+use crate::frames::encode;
 use crate::healer::Healer;
 use crate::membership::Membership;
 use crate::router::{Peer, Router};
-use crate::store::{PendingGet, PendingSample, Store};
+use crate::store::Store;
 use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
 /// The single heartbeat timer token.
-const HEARTBEAT: TimerToken = TimerToken(0);
+pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
 
 /// The behavioural-coherence observation window, in heartbeat samples: the cell's `Γ_net` is read from the
 /// last this-many per-node relay-activity samples. Bounded, so the self-model memory is `7 × this`.
@@ -105,7 +108,7 @@ pub(crate) const PARTITION_DWELL: u32 = 4;
 /// §6.3 grey-detection loss EWMA smoothing factor. Each heartbeat folds one per-neighbour ping-answered
 /// sample; `0.25` averages over ~4 rounds (~2 s at the default heartbeat), enough to distinguish a grey
 /// node's sustained drop rate from a single lost `Pong` without lagging a real onset.
-const LOSS_EWMA_ALPHA: f64 = 0.25;
+pub(super) const LOSS_EWMA_ALPHA: f64 = 0.25;
 /// §6.3 grey-localization tolerance, pinned by the simulator sweep
 /// (`fanos-sim/tests/endpoint_attestation_research.rs`): the minimum by which a grey node's WORST incident
 /// channel loss must exceed the cell's baseline (median channel loss) for `polar::grey_endpoint` to localize
@@ -125,16 +128,16 @@ pub(crate) const MAX_STORE_ENTRIES: usize = 4096;
 /// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
 pub(crate) const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
-const MAX_PENDING_GETS: usize = 1024;
+pub(super) const MAX_PENDING_GETS: usize = 1024;
 /// The most distinct shard-versions a single in-flight read accumulates before evicting the lowest (#115
 /// Phase B). A read groups gathered shards by their write-version and reconstructs the highest recoverable
 /// one (last-writer-wins); honestly there are only a handful in flight (the cell converges to one version),
 /// so this bounds a Byzantine peer that sprays fabricated versions to grow the accumulator (A4 DoS).
-const MAX_READ_VERSIONS: usize = 8;
+pub(super) const MAX_READ_VERSIONS: usize = 8;
 /// How many distinct Fano lines a [`Command::SampleAvailability`] probes (spec §L4.3). `3` gives an
 /// independent-sampling false-available bound of `(1/7)³ ≈ 0.3%`, and — since `≥2` distinct passing samples
 /// certify availability against any withholding adversary (`fanos_code::da`) — a comfortable margin.
-const DA_SAMPLES: usize = 3;
+pub(super) const DA_SAMPLES: usize = 3;
 
 /// How long a locally-distrusted (Byzantine) member stays quarantined before it is re-admitted for
 /// re-evaluation. Quarantine is an *operational* safeguard, not a proven permanent exclusion (spec §6.2):
@@ -230,7 +233,7 @@ pub(crate) type VersionedShards = BTreeMap<u64, ShardAccumulator>;
 /// last-writer-wins): iterate versions descending, returning the first that [`erasure::reconstruct`]s — so a
 /// stale version that happens to complete first can never mask a fresher one, and mixed-version shards are
 /// never combined into one (garbage) value. `None` until some version's set is recoverable.
-fn reconstruct_highest(by_version: &VersionedShards) -> Option<Vec<u8>> {
+pub(super) fn reconstruct_highest(by_version: &VersionedShards) -> Option<Vec<u8>> {
     by_version.values().rev().find_map(erasure::reconstruct)
 }
 
@@ -261,7 +264,7 @@ fn reconstruct_highest(by_version: &VersionedShards) -> Option<Vec<u8>> {
 /// meaningful), so the distinction is one of ROLE — enforced by requiring the explicit resolution step —
 /// not of geometry.
 #[derive(Clone, Copy)]
-struct ContentPoint<F: Field>(Point<F>);
+pub(super) struct ContentPoint<F: Field>(Point<F>);
 
 /// The base overlay node engine, generic over the cell's field `F`.
 pub struct OverlayNode<F: Field> {
@@ -325,7 +328,7 @@ pub struct OverlayNode<F: Field> {
 /// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
 /// point coordinates, so every node in the cell derives the *same* id and their coherence frames
 /// agree on which cell they describe.
-fn cell_id<F: Field>() -> CellId {
+pub(super) fn cell_id<F: Field>() -> CellId {
     let mut input = Vec::with_capacity(7 * 12);
     for i in 0..7usize {
         for x in Point::<F>::at(i).coords() {
@@ -461,252 +464,21 @@ impl<F: Field> OverlayNode<F> {
         self
     }
 
-    /// Whether `coord` is live, corroborated across its line-witnesses (spec §6.4). Our own direct
-    /// observation is fully trusted; otherwise a **quorum** of distinct fresh witnesses is required,
-    /// so a lossy link cannot forge a PeerDown *and* a lone Byzantine liar cannot forge liveness.
-    fn coord_alive(&self, coord: Triple, now: Instant) -> bool {
-        let timeout = self.config.liveness_timeout;
-        // Trust our own eyes first.
-        if let Some(seen) = self.peers.get(&coord).and_then(|p| p.last_seen)
-            && now.since(seen) <= timeout
-        {
-            return true;
-        }
-        // Otherwise: a quorum of distinct witnesses must vouch for it within the window.
-        let fresh = self.witnessed.get(&coord).map_or(0, |witnesses| {
-            witnesses
-                .values()
-                .filter(|&&seen| now.since(seen) <= timeout)
-                .count()
-        });
-        if fresh >= self.config.corroboration_quorum {
-            return true;
-        }
-        // Startup grace: if nothing has been observed about this peer yet, assume alive briefly.
-        let unobserved = self.peers.get(&coord).and_then(|p| p.last_seen).is_none()
-            && self.witnessed.get(&coord).is_none_or(BTreeMap::is_empty);
-        unobserved && now.since(self.started_at) <= timeout
-    }
 
-    fn on_heartbeat(&mut self, now: Instant) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        let ping = encode(FrameType::Ping, &[]);
-        let neighbours: Vec<Triple> = self.peers.keys().copied().collect();
-        // §6.3 grey detection: fold last round's per-neighbour ping outcome into the loss EWMA, then mark this
-        // round's ping outstanding (the loop below pings every neighbour). Done before building the gossip so
-        // the `DiagLoss` row carries this round's fresh loss estimate.
-        for coord in &neighbours {
-            if let Some(peer) = self.peers.get_mut(coord) {
-                let miss = f64::from(u8::from(peer.awaiting_pong));
-                peer.loss = LOSS_EWMA_ALPHA * miss + (1.0 - LOSS_EWMA_ALPHA) * peer.loss;
-                peer.awaiting_pong = true;
-            }
-        }
-        // A health-view (how stale this node's direct observation of each cell point is), a polar
-        // cross-attestation (its honest per-channel rate report for the 3 channels it mediates), and its
-        // measured per-neighbour loss vector (§6.3 grey): all base-cell-only, read from the SAME snapshot this
-        // window, so the three stay mutually consistent (spec §6.4, §6.8, §6.2, §6.3).
-        let gossip_attest = self.cell_liveness(now).map(|(self_index, degraded, _)| {
-            (
-                encode(FrameType::DiagGossip, &self.health_view(now)),
-                encode(
-                    FrameType::DiagAttest,
-                    &encode_diag_attest(self_index, degraded),
-                ),
-                encode(FrameType::DiagLoss, &self.loss_view()),
-            )
-        });
-        // Detect newly-down peers (by the corroborated view), and (re-)ping + gossip everyone.
-        for coord in neighbours {
-            let alive = self.coord_alive(coord, now);
-            if let Some(peer) = self.peers.get_mut(&coord)
-                && !alive
-                && !peer.reported_down
-            {
-                peer.reported_down = true;
-                effects.push(Effect::Notify(Notification::PeerDown(coord)));
-            }
-            effects.push(Effect::Send {
-                to: coord,
-                frame: ping.clone(),
-            });
-            if let Some((gossip, attest, loss)) = &gossip_attest {
-                effects.push(Effect::Send {
-                    to: coord,
-                    frame: gossip.clone(),
-                });
-                effects.push(Effect::Send {
-                    to: coord,
-                    frame: attest.clone(),
-                });
-                effects.push(Effect::Send {
-                    to: coord,
-                    frame: loss.clone(),
-                });
-            }
-        }
-        // Read repair: advance any Get whose current replica has gone silent past the read timeout.
-        self.sweep_pending_gets(now, &mut effects);
-        // Fold this window's relay activity into the behavioural coherence self-model.
-        self.healer.sample_behavior::<F>(self.self_index);
-        // Close the reflex loop (audit #122): having sensed this window (liveness, behaviour, and the
-        // peers' gossiped attestations accumulated since the last beat), run DIAKRISIS diagnosis and
-        // actuate any healing — every heartbeat. This makes the self-healing layer self-driving off the
-        // engine's own cadence under ANY driver; before this it depended on a `Command::Diagnose` no
-        // production driver ever sends, so a deployed node's namesake reflex (reroute/repair/quarantine/
-        // decouple/escalate) was inert. `Command::Diagnose` remains for an out-of-band forced diagnosis.
-        effects.extend(self.on_diagnose(now));
-        effects.push(Effect::ArmTimer {
-            token: HEARTBEAT,
-            after: self.config.heartbeat,
-        });
-        effects
-    }
 
-    /// Account a permanent data loss (audit R-C3) for `digest` at a read's `Retrieved(None)` conclusion: if
-    /// this node PROVABLY held a shard of it (so the value was stored) **and** the down shard-homes form a
-    /// stopping set the `[7,3,4]` code cannot tolerate — so the corroborated-alive points can no longer
-    /// reconstruct it — record it in the durable [`loss_ledger`] and emit [`Notification::DataLost`]. This
-    /// turns silent permanent loss into accounted, visible loss.
-    ///
-    /// Timing-safe and R-H1-immune: it keys off the **corroborated-liveness** `degraded` mask (spec §6.4), not
-    /// response latency or the append-only membership set — a slow peer never triggers a false loss, and a
-    /// crashed peer that lingers in `members` is still counted down. Base `N = 7` cell only (where the code
-    /// lives); off it the fine-grained placement is out of scope. Idempotent per key (the ledger is append-only).
-    fn account_data_loss(&mut self, now: Instant, digest: [u8; DIGEST], effects: &mut Vec<Effect>) {
-        if !self.store.entries.contains_key(&digest) || self.store.loss_ledger.contains_key(&digest) {
-            return; // never held a shard (cannot attest the key was stored), or already accounted
-        }
-        // The shard-homes that are down (not corroborated-alive). If they form a stopping set the [7,3,4] code
-        // cannot recover, the value is gone for good — no future read completes.
-        let Some((_, degraded, _)) = self.cell_liveness(now) else {
-            return; // off the base Fano cell — not this layer's placement domain
-        };
-        if !lrc::is_recoverable_fano(degraded) {
-            let epoch = self.epoch();
-            self.store.loss_ledger.insert(digest, epoch);
-            effects.push(Effect::Notify(Notification::DataLost { key: digest, epoch }));
-        }
-    }
 
-    /// Conclude reads that have not assembled a reconstructable shard-set within `read_timeout` as
-    /// `Retrieved(None)` (spec §L4). Under erasure the read fans out to every shard home at once, so a
-    /// timeout means too few shards came back to recover the value (enough nodes down / withholding, or the
-    /// key was never stored) — there is no further replica to walk. A held key whose live shard-homes can no
-    /// longer reconstruct is additionally accounted a permanent loss ([`account_data_loss`], R-C3).
-    fn sweep_pending_gets(&mut self, now: Instant, effects: &mut Vec<Effect>) {
-        let timeout = self.config.read_timeout;
-        let stale: Vec<[u8; DIGEST]> = self
-            .store
-            .pending
-            .iter()
-            .filter(|(_, p)| now.since(p.issued) > timeout)
-            .map(|(digest, _)| *digest)
-            .collect();
-        for digest in stale {
-            self.store.pending.remove(&digest);
-            self.account_data_loss(now, digest, effects); // R-C3: a held-but-unrecoverable key is accounted lost
-            effects.push(Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            }));
-        }
-        // Conclude timed-out DA samples (§L4.3): a sample that never saw every sampled line present within the
-        // timeout is inconclusive → `available = false` (a passing sample would have concluded early).
-        let stale_samples: Vec<[u8; DIGEST]> = self
-            .store
-            .pending_samples
-            .iter()
-            .filter(|(_, s)| now.since(s.issued) > timeout)
-            .map(|(digest, _)| *digest)
-            .collect();
-        for digest in stale_samples {
-            if let Some(sample) = self.store.pending_samples.remove(&digest) {
-                effects.push(Effect::Notify(Notification::Availability {
-                    key: digest,
-                    available: da::samples_pass(sample.present, &sample.lines),
-                }));
-            }
-        }
-    }
 
-    /// Encode this node's direct-observation ages over the Fano cell: `7 × u16` little-endian
-    /// milliseconds since it last heard each point (`u16::MAX` = never / stale). Self reads `0`.
-    fn health_view(&self, now: Instant) -> Vec<u8> {
-        let mut body = Vec::with_capacity(14);
-        for i in 0..7usize {
-            let coord = self.cell_coord(i);
-            let age = if coord == self.coord.coords() {
-                0
-            } else {
-                match self.peers.get(&coord).and_then(|p| p.last_seen) {
-                    Some(seen) => {
-                        (now.since(seen).as_nanos() / 1_000_000).min(u64::from(u16::MAX)) as u16
-                    }
-                    None => u16::MAX,
-                }
-            };
-            body.extend_from_slice(&age.to_le_bytes());
-        }
-        body
-    }
 
-    /// This node's measured **per-neighbour loss** row (§6.3 grey), one `u8` per Fano point (`loss × 255`,
-    /// saturating). Self reads `0`; a point this node does not neighbour reads `0` (no measurement). The body
-    /// of the `DiagLoss` frame flooded each heartbeat.
-    fn loss_view(&self) -> Vec<u8> {
-        let self_c = self.coord.coords();
-        (0..7usize)
-            .map(|i| {
-                let coord = self.cell_coord(i);
-                if coord == self_c {
-                    0
-                } else {
-                    self.peers
-                        .get(&coord)
-                        .map_or(0, |p| (p.loss.clamp(0.0, 1.0) * 255.0) as u8)
-                }
-            })
-            .collect()
-    }
 
-    /// Store witness `from`'s gossiped `DiagLoss` row — its measured loss toward each cell point — for the
-    /// grey-detection matrix assembly ([`grey_rate_matrix`](Self::grey_rate_matrix)). Malformed (short) bodies
-    /// are ignored.
-    fn apply_diag_loss(&mut self, now: Instant, from: Triple, body: &[u8]) {
-        if let Some(slice) = body.get(..7)
-            && let Ok(row) = <[u8; 7]>::try_from(slice)
-        {
-            self.loss_reports.insert(from, (row, now));
-        }
-    }
 
-    /// Fold witness `from`'s health-view into the corroborated `witnessed` map: for each cell point
-    /// the gossip reports a fresh direct observation of, remember the freshest time *this witness*
-    /// vouched for it. Keeping witnesses distinct is what makes the quorum Byzantine-robust — a lone
-    /// liar is one entry, not a majority.
-    fn apply_health_view(&mut self, now: Instant, from: Triple, body: &[u8]) {
-        for i in 0..7usize {
-            let (Some(&lo), Some(&hi)) = (body.get(i * 2), body.get(i * 2 + 1)) else {
-                break;
-            };
-            let age_ms = u16::from_le_bytes([lo, hi]);
-            if age_ms == u16::MAX {
-                continue; // the gossiper had no fresh observation of point i
-            }
-            let observed = Instant(now.as_nanos().saturating_sub(u64::from(age_ms) * 1_000_000));
-            let coord = self.cell_coord(i);
-            let slot = self
-                .witnessed
-                .entry(coord)
-                .or_default()
-                .entry(from)
-                .or_insert(observed);
-            if observed > *slot {
-                *slot = observed;
-            }
-        }
-    }
+
+
+
+
+
+
+
+
 
     fn on_message(&mut self, now: Instant, from: Triple, frame: &[u8]) -> Vec<Effect> {
         // A locally-quarantined (Byzantine) member's frames are dropped (spec §6.2, §6.4) — but only for
@@ -923,651 +695,43 @@ impl<F: Field> OverlayNode<F> {
         Effect::Send { to: actual, frame }
     }
 
-    /// The DHT storage address of `key`: the digest and the **ideal** responsible point (spec §L4). The
-    /// point is a [`ContentPoint`], not a routing target — the *actual* responsible node is
-    /// [`responsible_point`](Self::responsible_point) applied to this ideal (the nearest occupied point),
-    /// since a real cell rarely occupies every point exactly.
-    fn address_of(key: &[u8]) -> ([u8; DIGEST], ContentPoint<F>) {
-        // The one storage-address rule (`fanos_primitives`): digest keys the store, point routes to it —
-        // both on the STORAGE domain, so they can never drift to different hashes (audit C7).
-        (storage_digest(key), ContentPoint(storage_point::<F>(key)))
-    }
 
-    /// The node responsible for an ideal storage point: the nearest **occupied** point at or after
-    /// `ideal`'s canonical index, wrapping the ring — consistent hashing on projective coordinates
-    /// (spec §L0 "the responsible node is the nearest occupied point"). This is the sole bridge from the
-    /// content-address domain ([`ContentPoint`]) to a node coordinate: on a full cell it is `ideal` itself;
-    /// on a sparse or churning cell — the *normal* condition, since independent VRF placement covers only a
-    /// fraction of a plane's points — it routes the key to a live member instead of a never-occupied point
-    /// where a `Put`/`Get` would be a silent send-to-nobody (audit #123). The occupied set is this node
-    /// plus every announced member, so all nodes sharing a membership view resolve the same responsible
-    /// node.
-    fn responsible_point(&self, ideal: ContentPoint<F>) -> Triple {
-        self.nearest_occupied(ideal.0.index())
-    }
 
-    /// The occupied points of this cell, by canonical index: this node, every cell peer we have heard from
-    /// (its algebraic slot is filled by a live node — liveness populates this even before any JOIN/Announce),
-    /// and every announced member. A never-occupied point is simply absent; a heard-then-crashed occupant is
-    /// handled downstream by `routed_send`'s reroute. Always contains this node.
-    fn occupied_points(&self) -> BTreeSet<usize> {
-        let mut occupied: BTreeSet<usize> = self
-            .peers
-            .iter()
-            .filter(|(_, p)| p.last_seen.is_some())
-            .filter_map(|(&c, _)| Point::<F>::new(c).map(|pt| pt.index()))
-            .chain(
-                self.membership
-                    .members
-                    .keys()
-                    .filter_map(|&c| Point::<F>::new(c).map(|pt| pt.index())),
-            )
-            .collect();
-        occupied.insert(self.coord.index());
-        occupied
-    }
 
-    /// The consistent-hashing home of the point at canonical index `ideal_idx`: the smallest occupied index
-    /// `>= ideal_idx`, else wrap to the smallest occupied (successor on the index ring). This is the seam
-    /// both content-routing ([`responsible_point`](Self::responsible_point)) and erasure shard-placement
-    /// ([`distribute_shards`](Self::distribute_shards)) share — a shard for a point lands at that point when
-    /// occupied, else its nearest-occupied successor. The occupied set always contains this node, so this is
-    /// total (the `map_or` default is unreachable, kept only for totality).
-    fn nearest_occupied(&self, ideal_idx: usize) -> Triple {
-        let occupied = self.occupied_points();
-        occupied
-            .range(ideal_idx..)
-            .next()
-            .or_else(|| occupied.iter().next())
-            .map_or_else(
-                || Point::<F>::at(ideal_idx).coords(),
-                |&i| Point::<F>::at(i).coords(),
-            )
-    }
 
-    /// `Command::Put` — erasure-code the value and distribute its shards across the cell (spec §L4). The
-    /// write is stamped with a version (the responsible node's `now`) so a later write supersedes it
-    /// (last-writer-wins) and a reader never mixes two writes' shards.
-    fn on_put(&mut self, now: Instant, key: &[u8], value: &[u8]) -> Vec<Effect> {
-        let (digest, ideal) = Self::address_of(key);
-        let primary = self.responsible_point(ideal);
-        if primary == self.coord.coords() {
-            // We are the responsible node: refuse an over-size value without distributing or claiming it
-            // stored; otherwise erasure-code it into per-point shards, place each at its home, and ack.
-            if value.len() > MAX_VALUE_LEN {
-                return Vec::new();
-            }
-            let mut effects = self.distribute_shards(&digest, value, now.as_nanos());
-            effects.push(Effect::Notify(Notification::Stored(digest)));
-            effects
-        } else {
-            // Route the full value to the responsible node, which stamps the version and distributes shards.
-            alloc::vec![self.routed_send(
-                primary,
-                encode_publish(PUBLISH_ORIGIN, 0, 0, &digest, value)
-            )]
-        }
-    }
 
-    /// `Command::Get` — gather a recoverable erasure shard-set from the cell and reconstruct (spec §L4).
-    ///
-    /// Under the projective LRC no single node holds the value: it lives as `N=7` shards, one per point.
-    /// The read seeds any shards THIS node holds, and if they alone reconstruct (a small/degenerate cell)
-    /// answers at once; otherwise it fans a `Lookup` out to *every* cell peer simultaneously and accumulates
-    /// their shards ([`on_value`](Self::on_value)) until the present set is [`erasure::reconstruct`]-able —
-    /// which tolerates any `≤3`-point loss, so the read succeeds even with several nodes down or withholding.
-    /// The heartbeat sweep concludes `Retrieved(None)` if a recoverable set never assembles within the read
-    /// timeout. The in-flight accumulator is tracked in the [`Store`]'s `pending` map.
-    fn on_get(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
-        let (digest, _ideal) = Self::address_of(key);
-        // Seed the accumulator with any shards this node already holds (grouped by write-version); short-
-        // circuit if the highest recoverable version reconstructs from local shards alone.
-        let mut by_version = BTreeMap::new();
-        self.store.seed_versions(&digest, &mut by_version);
-        if let Some(value) = reconstruct_highest(&by_version) {
-            return alloc::vec![Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: Some(value),
-            })];
-        }
-        // Cap in-flight reads (A4 DoS backstop): once [`MAX_PENDING_GETS`] distinct reads are outstanding,
-        // refuse a *new* one — concluding `Retrieved(None)` — rather than track it, so a flood of
-        // distinct-key `Get`s cannot grow the pending map without bound. A repeat Get for an already-pending
-        // digest is allowed through (it refreshes the existing entry, no growth).
-        if self.store.pending.len() >= MAX_PENDING_GETS && !self.store.pending.contains_key(&digest)
-        {
-            return alloc::vec![Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            })];
-        }
-        // Fan a `Lookup` out to every cell peer at once — each is a potential shard home. Sent directly
-        // (not rerouted): a down peer simply does not reply, and the erasure redundancy tolerates it.
-        let peers: Vec<Triple> = self.peers.keys().copied().collect();
-        if peers.is_empty() {
-            // No peer to gather from and the local shards did not reconstruct — the value is unreachable.
-            return alloc::vec![Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            })];
-        }
-        // A fresh per-request nonce correlates this read's replies (audit C4); a repeat Get for the same
-        // key supersedes the old one with a new nonce, so the old read's in-flight replies go stale.
-        self.store.seq = self.store.seq.wrapping_add(1);
-        let nonce = self.store.seq;
-        self.store.pending.insert(
-            digest,
-            PendingGet {
-                issued: now,
-                by_version,
-                nonce,
-                queried: u16::try_from(peers.len()).unwrap_or(u16::MAX),
-                negatives: 0,
-            },
-        );
-        peers
-            .into_iter()
-            .map(|peer| Effect::Send {
-                to: peer,
-                frame: encode_lookup(&digest, nonce),
-            })
-            .collect()
-    }
 
-    /// `Command::SampleAvailability` — the light-client DA sample (spec §L4.3): probe a few unpredictable
-    /// Fano lines to certify the value's shards are present, without downloading it. Seeds the `present` mask
-    /// from local shards, picks `DA_SAMPLES` distinct lines ([`da::sample_lines`]) from an unpredictable seed
-    /// (fold of the digest ⊕ a fresh nonce — so a withholding adversary cannot pre-position the lone external
-    /// line), and probes only the sampled points' shard homes. Concludes `available` as soon as every sampled
-    /// line is fully present ([`da::samples_pass`]); the sweep concludes it (unavailable) after the timeout.
-    fn on_sample(&mut self, now: Instant, key: &[u8]) -> Vec<Effect> {
-        let (digest, _ideal) = Self::address_of(key);
-        self.store.seq = self.store.seq.wrapping_add(1);
-        let nonce = self.store.seq;
-        let lines = da::sample_lines(fold_seed(&digest) ^ nonce, DA_SAMPLES);
-        // Seed the DA `present` mask from any shards this node itself holds.
-        let mut present = 0u8;
-        if let Some(held) = self.store.entries.get(&digest) {
-            for &i in held.keys() {
-                if usize::from(i) < erasure::N {
-                    present |= 1 << i;
-                }
-            }
-        }
-        // Probe the distinct shard homes of the sampled lines' points (self is already seeded).
-        let me = self.coord.coords();
-        let mut targets: BTreeSet<Triple> = BTreeSet::new();
-        for &l in &lines {
-            let Some(points) = fano::LINE_POINTS.get(l) else {
-                continue;
-            };
-            for &p in points {
-                let home = self.nearest_occupied(usize::from(p));
-                if home != me {
-                    targets.insert(home);
-                }
-            }
-        }
-        // Already satisfied locally, or nobody else to probe — conclude now.
-        if da::samples_pass(present, &lines) || targets.is_empty() {
-            return alloc::vec![Effect::Notify(Notification::Availability {
-                key: digest,
-                available: da::samples_pass(present, &lines),
-            })];
-        }
-        // A4 DoS cap (shared spirit with reads): bound the in-flight sample map.
-        if self.store.pending_samples.len() >= MAX_PENDING_GETS
-            && !self.store.pending_samples.contains_key(&digest)
-        {
-            return alloc::vec![Effect::Notify(Notification::Availability {
-                key: digest,
-                available: false,
-            })];
-        }
-        self.store.pending_samples.insert(
-            digest,
-            PendingSample {
-                issued: now,
-                nonce,
-                lines,
-                present,
-            },
-        );
-        targets
-            .into_iter()
-            .map(|t| Effect::Send {
-                to: t,
-                frame: encode_lookup(&digest, nonce),
-            })
-            .collect()
-    }
 
-    /// Erasure-code `value` into `N=7` point-shards and place each at its point's nearest-occupied home
-    /// (spec §L4 projective LRC): shard `i` → [`nearest_occupied`](Self::nearest_occupied)`(i)`. Shards homed
-    /// at this node are stored locally; the rest are sent as `PUBLISH_SHARD` frames carrying the point index.
-    /// On a full Fano cell this is shard `i` → point `i` (one shard per node, `N/K ≈ 2.33×` redundancy vs
-    /// `N×` full replication); on a sparse cell several shards may share a home (graceful degradation — the
-    /// cell simply has fewer independent failure domains).
-    fn distribute_shards(
-        &mut self,
-        digest: &[u8; DIGEST],
-        value: &[u8],
-        version: u64,
-    ) -> Vec<Effect> {
-        let me = self.coord.coords();
-        let shards = erasure::encode(value);
-        let mut effects = Vec::new();
-        for (i, shard) in shards.into_iter().enumerate() {
-            let home = self.nearest_occupied(i);
-            #[allow(clippy::cast_possible_truncation)] // i < N = 7
-            let index = i as u8;
-            if home == me {
-                self.store.insert_shard(*digest, index, version, shard);
-            } else {
-                effects.push(Effect::Send {
-                    to: home,
-                    frame: encode_publish(PUBLISH_SHARD, index, version, digest, &shard),
-                });
-            }
-        }
-        effects
-    }
 
-    fn on_publish(&mut self, now: Instant, from: Triple, body: &[u8]) -> Vec<Effect> {
-        let Some(&flag) = body.first() else {
-            return Vec::new();
-        };
-        let Some(&index) = body.get(1) else {
-            return Vec::new();
-        };
-        let Some(version) = parse_u64(body, 2) else {
-            return Vec::new();
-        };
-        let Some(digest) = parse_digest(body.get(10..10 + DIGEST)) else {
-            return Vec::new();
-        };
-        let payload = body.get(10 + DIGEST..).unwrap_or(&[]);
-        // A4 DoS caps: a refused publish (over-size, or a new key over the store cap) is dropped without an
-        // Ack or distribution — a relayed flood of distinct digests cannot exhaust this node's memory.
-        if !self.store.admits(&digest, payload.len()) {
-            return Vec::new();
-        }
-        match flag {
-            PUBLISH_ORIGIN => {
-                // We are the responsible node: stamp this write's version (our distribution time),
-                // erasure-distribute the full value across the cell, and acknowledge the origin.
-                let mut effects = self.distribute_shards(&digest, payload, now.as_nanos());
-                effects.push(Effect::Send {
-                    to: from,
-                    frame: encode(FrameType::Ack, &digest),
-                });
-                effects
-            }
-            PUBLISH_SHARD => {
-                // A single versioned shard for Fano point `index` — store it, keeping the higher version.
-                self.store
-                    .insert_shard(digest, index, version, payload.to_vec());
-                Vec::new()
-            }
-            _ => Vec::new(),
-        }
-    }
 
-    fn on_lookup(&self, from: Triple, body: &[u8]) -> Vec<Effect> {
-        // Canonical derived codec (audit A1): rejects a short or trailing-byte Lookup.
-        let Ok(LookupBody { key: digest, nonce }) = LookupBody::from_wire(body) else {
-            return Vec::new();
-        };
-        // Return EVERY shard this node holds for the key, one `Value` each carrying its write-version (the
-        // reader groups by version, then point index). No shard → a single `found=false` "not here".
-        match self.store.entries.get(&digest) {
-            Some(held) if !held.is_empty() => held
-                .iter()
-                .map(|(&index, (version, shard))| Effect::Send {
-                    to: from,
-                    frame: encode_value(&digest, true, index, *version, shard, nonce),
-                })
-                .collect(),
-            _ => alloc::vec![Effect::Send {
-                to: from,
-                frame: encode_value(&digest, false, 0, 0, &[], nonce),
-            }],
-        }
-    }
 
-    /// A `Value` reply carrying one versioned erasure shard (spec §L4). Accumulate it into the in-flight
-    /// read's version-grouped shard-set and, once the **highest** recoverable version reconstructs, deliver
-    /// that value (last-writer-wins) and retire the read. A `found=false` reply (the peer holds no shard) is
-    /// not accumulated; once every queried peer has said so, or the read times out, the value is absent.
-    fn on_value(&mut self, now: Instant, body: &[u8]) -> Vec<Effect> {
-        let Some(digest) = parse_digest(body.get(..DIGEST)) else {
-            return Vec::new();
-        };
-        let found = body.get(DIGEST).copied().unwrap_or(0) != 0;
-        let index = body.get(DIGEST + 1).copied().unwrap_or(0);
-        let Some(version) = parse_u64(body, DIGEST + 2) else {
-            return Vec::new();
-        };
-        let Some(nonce) = parse_u64(body, DIGEST + 10) else {
-            return Vec::new();
-        };
-        // A `Value` may answer an in-flight DA sample (§L4.3) rather than a read — the distinct per-request
-        // nonce disambiguates. Route it there first: mark the point present and, once every sampled line is
-        // present, conclude the value available.
-        if let Some(sample) = self.store.pending_samples.get_mut(&digest)
-            && sample.nonce == nonce
-        {
-            if found && usize::from(index) < erasure::N {
-                sample.present |= 1u8 << index;
-            }
-            if da::samples_pass(sample.present, &sample.lines) {
-                self.store.pending_samples.remove(&digest);
-                return alloc::vec![Effect::Notify(Notification::Availability {
-                    key: digest,
-                    available: true,
-                })];
-            }
-            return Vec::new();
-        }
-        // Otherwise correlate on the per-request nonce, NOT merely the key: a reply is accepted only for the
-        // read currently in flight for this key. A stale/replayed `Value` from a prior get (old nonce), or one
-        // with no in-flight read at all, is ignored — so it can never drain a later same-key get with an old
-        // shard (read-your-writes, audit C4).
-        let Some(pending) = self.store.pending.get_mut(&digest) else {
-            return Vec::new();
-        };
-        if pending.nonce != nonce {
-            return Vec::new();
-        }
-        if !found {
-            // A peer holds no shard for this key. Once every queried peer has said so and no version's shards
-            // reconstruct, conclude the value absent immediately (a fast miss, not a timeout wait).
-            pending.negatives = pending.negatives.saturating_add(1);
-            if pending.negatives >= pending.queried
-                && reconstruct_highest(&pending.by_version).is_none()
-            {
-                self.store.pending.remove(&digest);
-                let mut effects = alloc::vec![];
-                self.account_data_loss(now, digest, &mut effects); // R-C3: all peers answered, none can supply it
-                effects.push(Effect::Notify(Notification::Retrieved { key: digest, value: None }));
-                return effects;
-            }
-            return Vec::new();
-        }
-        // shard bytes follow: digest(32) ‖ found(1) ‖ index(1) ‖ version(8) ‖ nonce(8) ‖ shard.
-        let shard = body.get(DIGEST + 18..).unwrap_or(&[]).to_vec();
-        if let Some(slot) = pending
-            .by_version
-            .entry(version)
-            .or_default()
-            .get_mut(index as usize)
-        {
-            *slot = Some(shard);
-        }
-        // Bound the version-grouped accumulator against a Byzantine peer spraying fabricated versions: keep
-        // only the highest [`MAX_READ_VERSIONS`] (the freshest are what last-writer-wins wants anyway).
-        while pending.by_version.len() > MAX_READ_VERSIONS {
-            if let Some(&lowest) = pending.by_version.keys().next() {
-                pending.by_version.remove(&lowest);
-            }
-        }
-        // Deliver the highest write-version whose shard-set is now recoverable (a stale version completing
-        // first can never mask a fresher one; mixed-version shards are never combined into a garbage value).
-        if let Some(value) = reconstruct_highest(&pending.by_version) {
-            self.store.pending.remove(&digest);
-            return alloc::vec![Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: Some(value),
-            })];
-        }
-        Vec::new()
-    }
 
-    fn on_ack(body: &[u8]) -> Vec<Effect> {
-        match parse_digest(body.get(..DIGEST)) {
-            Some(digest) => alloc::vec![Effect::Notify(Notification::Stored(digest))],
-            None => Vec::new(),
-        }
-    }
 
-    /// Flood `frame` to every cell neighbour (the substrate for JOIN and beacon propagation).
-    fn flood(&self, frame: &[u8]) -> Vec<Effect> {
-        self.peers
-            .keys()
-            .map(|&peer| Effect::Send {
-                to: peer,
-                frame: frame.to_vec(),
-            })
-            .collect()
-    }
 
-    /// `Command::Join` — record our own info and flood an announcement (carrying our overlay address)
-    /// so every member learns our keys and how to route to us hierarchically.
-    fn on_join(&mut self, info: Vec<u8>) -> Vec<Effect> {
-        let coord = self.coord.coords();
-        let frame = encode(
-            FrameType::Announce,
-            &announce_body(
-                coord,
-                &self.router.address,
-                &self.membership.identity,
-                &self.membership.descriptor_sig,
-                &self.membership.admission_proof,
-                &info,
-            ),
-        );
-        let effects = self.flood(&frame);
-        self.membership.members.insert(coord, info);
-        effects
-    }
 
-    /// A received announcement: on first sight of a member, record it, notify, and re-flood so the
-    /// key propagates cell-wide; on a repeat, drop (the monotone guard terminates the flood).
-    fn on_announce(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((coord, hier, id, sig, proof, info)) = parse_announce::<F>(body) else {
-            return Vec::new();
-        };
-        // Validate: a member coordinate must be a real, canonical projective point of this plane.
-        // Rejecting the zero vector and out-of-range triples both prevents state poisoning and
-        // bounds `members` by the plane size `N` — a peer cannot grow it without limit with forged
-        // coordinates (spec §7.8 membership). The hierarchical address was already validated by
-        // `parse_announce` (canonical points, bounded depth), so a forged one is dropped before here.
-        let Some(coord) = Point::<F>::new(coord).map(|p| p.coords()) else {
-            return Vec::new();
-        };
-        // Sybil admission (opt-in, spec §L3, §7.8 JOIN step 2): the FIRST gate, ahead of
-        // self-certification and membership — a per-admission cost is exactly what the
-        // structural centrality cap alone does not provide (`sybil_cost.rs`). Fails **closed**:
-        // requiring admission with no policy installed rejects every peer, never silently
-        // admits. A rejection is not admitted to `members` and is told why (`SYBIL_REJECT`,
-        // spec §7.5), sent to the *claimed* coordinate rather than the immediate relay hop —
-        // `Announce` is flooded, so whoever forwarded it to us need not be the joiner itself.
-        if self.config.require_admission {
-            // The challenge binds the announcer's IDENTITY, not merely its coordinate. Without that a solved proof is
-            // replayable by anyone claiming the same point: an attacker who wants a seat could present the *incumbent's
-            // own* proof and pay nothing. Measured cost of the surrounding attack before this binding — grind ~20
-            // identities until one collides with a chosen victim at a lower rank (`fanos-vrf/examples/grind_probe.rs`),
-            // reuse the victim's proof, and the rank rule evicts the victim for zero proof-of-work.
-            let challenge = admission_challenge(&id, coord, self.epoch);
-            if !self.membership.admits(&challenge, &proof) {
-                return alloc::vec![Effect::Send {
-                    to: coord,
-                    frame: encode_error(ProtocolError::SybilReject),
-                }];
-            }
-        }
-        // Self-certified membership (opt-in) drops the whole announcement unless BOTH hold:
-        //  1. the overlay address is the identity's own derived descent chain — else it is a
-        //     routing-table poisoning attempt (a peer claiming an address it did not earn to attract a
-        //     target's `RouteHier` traffic); forging a match costs `≈ N^k` grinding (threat §79/B1);
-        //  2. the descriptor signature binds this exact transport `coord` to the identity — else it is a
-        //     transport hijack (re-announcing another identity's address at the attacker's own endpoint),
-        //     which without the identity's private key cannot be signed (threat §80).
-        // Under VRF coordinates (`config.vrf_coordinates`, spec §A7) the level-0 point is the beacon-seated
-        // VRF coordinate, NOT the hash `address_point(id, 0)`, so the chain check starts at level 1 — level
-        // 0's authenticity is the proof-of-coordinate HELLO + the descriptor signature (check 2). Without
-        // this skip a legitimate VRF announcement fails check 1 and is rejected (audit C3).
-        // Neither `members` nor the router's peer table is written on failure.
-        let min_level = usize::from(self.config.vrf_coordinates);
-        if self.config.require_self_certified_membership
-            && (!fanos_primitives::address_matches_identity_from::<F>(&id, &hier, min_level)
-                || !descriptor_signature_ok::<F>(coord, &hier, &id, &sig))
-        {
-            return Vec::new();
-        }
-        // First sight only. A repeat must NOT overwrite the stored key bundle — otherwise any peer
-        // could silently replace a member's advertised keys in our local view (and suppress the
-        // re-flood, diverging the cell). Ignore repeats entirely; the monotone guard ends the flood.
-        if self.membership.members.contains_key(&coord) {
-            return Vec::new();
-        }
-        self.membership.members.insert(coord, info.clone());
-        // Seed the hierarchical routing table: this overlay address is reachable via `coord`. A
-        // descended sub-cell member thus becomes routable cell-wide from its announcement alone (§L1);
-        // a depth-1 announcer adds its own direct entry, so `send_hier` also delivers within one plane.
-        self.learn_hier_peer(hier.clone(), coord);
-        let frame = encode(
-            FrameType::Announce,
-            &announce_body(coord, &hier, &id, &sig, &proof, &info),
-        );
-        let mut effects = self.flood(&frame);
-        effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
-        effects
-    }
 
-    /// `Command::AdvanceEpoch` — bump the epoch and flood the epoch-agreement gossip so the cell adopts
-    /// it. This carries only the epoch ordinal ([`FrameType::EpochAgree`]), never randomness — under a
-    /// live threshold-DVRF beacon the composite drives this from an authoritative `Beacon` round instead
-    /// and suppresses the flood (audit #102).
-    fn on_advance_epoch(&mut self) -> Vec<Effect> {
-        self.epoch = self.epoch.next();
-        let mut effects = self.flood(&encode(FrameType::EpochAgree, &self.epoch.low32_be_bytes()));
-        effects.push(Effect::Notify(Notification::EpochAdvanced(self.epoch)));
-        effects
-    }
 
-    /// A received epoch-agreement gossip: adopt it iff strictly newer (monotone), then re-flood and
-    /// notify. The 4-byte body is the epoch ordinal — see [`FrameType::EpochAgree`].
-    fn on_epoch_agree(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some(bytes) = body.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
-            return Vec::new();
-        };
-        let epoch = Epoch::from_low32_be_bytes(bytes);
-        if epoch <= self.epoch {
-            return Vec::new(); // not newer — drop (terminates the flood)
-        }
-        self.epoch = epoch;
-        let mut effects = self.flood(&encode(FrameType::EpochAgree, &epoch.low32_be_bytes()));
-        effects.push(Effect::Notify(Notification::EpochAdvanced(epoch)));
-        effects
-    }
 
-    /// `Command::Reseat` — re-seat this node at `new_coord` for the per-epoch reshuffle (spec §L3 "epoch
-    /// reshuffle", §3.2). The driver supplies the new VRF-derived coordinate (the engine is crypto-free and
-    /// cannot compute it); this re-derives the node's cell neighbours and Fano index for the new placement,
-    /// moves the level-0 of its hierarchical address to `new_coord` while **preserving the deeper descent
-    /// levels** (identity-hash, epoch-stable — §L1), re-announces so the cell relearns how to route to it, and
-    /// emits
-    /// [`Notification::Reseated`] (a driver rebuilds its HELLO proof-of-coordinate; the simulator re-keys
-    /// the node). The unpredictable reshuffle is the load-bearing anti-eclipse / anti-path-prediction
-    /// defence (§3.2 assumption 2), the one q=2 grinding does not provide.
-    ///
-    /// **STORAGE is deliberately preserved.** Content addressing is epoch-stable (`MapToPoint(H(k))`, §L4)
-    /// and the store is full-cell-replicated, so a within-cell reshuffle is a *placement* move, not a data
-    /// migration ("fixed points, flowing nodes"): the node still holds every value it held and keeps serving
-    /// them across the transition — that preservation **is** the one-epoch grace window (audit C2), so no
-    /// key is lost on rotation. A per-shard prune of values a node is no longer a replica for belongs to the
-    /// erasure-coded store (#115), where a replica can compute its own line-membership; under full
-    /// replication every cell member is a replica for every key, so within a cell there is nothing to prune.
-    ///
-    /// A no-op if `new_coord` is not a canonical projective point or already equals this coordinate.
-    fn on_reseat(&mut self, new_coord: Triple) -> Vec<Effect> {
-        let Some(new_pt) = Point::<F>::new(new_coord) else {
-            return Vec::new(); // not a canonical projective point — ignore
-        };
-        if new_pt == self.coord {
-            return Vec::new(); // already seated here
-        }
-        let old = self.coord.coords();
-        // Re-derive the cell neighbour set for the new coordinate — with fresh liveness, exactly as a join
-        // does: the node re-discovers which neighbours are live at its new position over the next heartbeat
-        // round, so no stale "alive" carries over from the old placement into the responsibility set.
-        let mut peers = BTreeMap::new();
-        for line in Plane::<F>::lines_through(new_pt) {
-            for member in Plane::<F>::points_on(line) {
-                if member != new_pt {
-                    peers.entry(member.coords()).or_insert(Peer {
-                        last_seen: None,
-                        reported_down: false,
-                        loss: 0.0,
-                        awaiting_pong: false,
-                    });
-                }
-            }
-        }
-        self.peers = peers;
-        self.self_index = if Plane::<F>::N == 7 {
-            (0..7).find(|&i| Point::<F>::at(i) == new_pt)
-        } else {
-            None
-        };
-        self.coord = new_pt;
-        // Re-solve our Sybil-admission proof for the NEW `(coordinate, epoch)` (spec §L3), so a peer's
-        // per-epoch admission check keeps passing as we reshuffle: seizing a coordinate costs a fresh PoW
-        // *each epoch*, never a one-time grind (the "re-paid every epoch" cost of `anti_eclipse_reshuffle`).
-        // `self.epoch` is already the new epoch here — the composite drives the overlay to the beacon epoch
-        // before issuing this `Reseat`. Only when PoW admission is in use (`with_admission_pow`); cheap at a
-        // modest difficulty, and deterministic (sans-I/O replay is preserved).
-        if let Some(difficulty) = self.membership.admission_difficulty {
-            self.membership.admission_proof =
-                PowAdmission::new(difficulty).solve(&admission_challenge(&self.membership.identity, new_coord, self.epoch));
-        }
-        // Preserve the hierarchical DESCENT chain across the reshuffle (spec §L1): only the level-0 VRF
-        // transport coordinate moves each epoch; the deeper sub-cell levels are identity-hash-derived
-        // (`fanos_primitives::address_point`, epoch-INDEPENDENT), so a descended node keeps its sub-cell
-        // placement. Resetting to a bare `root(new_pt)` here would silently drop a multi-level node's descent
-        // chain every epoch (the depth-1 case is unchanged — its path is just `[new_pt]`). Learned peers ARE
-        // cleared (via `Router::new`): every other node reshuffled too, so the transport-coord-keyed routing
-        // table is stale and re-learns from the fresh `Announce`s below.
-        let mut path: Vec<Point<F>> = self.router.address.points().to_vec();
-        match path.first_mut() {
-            Some(level0) => *level0 = new_pt,
-            None => path.push(new_pt),
-        }
-        self.router = Router::new(new_pt);
-        if let Some(addr) = HierAddr::from_path(path) {
-            self.router.address = addr;
-        }
-        // Drop our now-stale self-entry at the old coordinate and re-announce at the new one (spec §7.8), so
-        // the cell relearns our placement; then signal the reshuffle for the driver (rebuild HELLO) and the
-        // simulator (re-key routing). The store, membership view of others, witnessed liveness, and epoch
-        // are all preserved.
-        let info = self.membership.members.remove(&old).unwrap_or_default();
-        let mut effects = self.on_join(info);
-        // Re-establish the liveness heartbeat at the new coordinate. A driver's heartbeat is not
-        // coordinate-keyed, so this merely resets its interval; but under a coordinate-addressed transport
-        // (the simulator) the timer armed at the OLD coordinate is now orphaned, so the reflex would fall
-        // silent after a reshuffle without this — the node must keep pinging from its new placement.
-        if self.heartbeating {
-            effects.push(Effect::ArmTimer {
-                token: HEARTBEAT,
-                after: self.config.heartbeat,
-            });
-        }
-        effects.push(Effect::Notify(Notification::Reseated {
-            old,
-            new: new_coord,
-        }));
-        effects
-    }
 
-    /// The current membership view (coordinate → announced info), for onion routing / observation.
-    pub fn members(&self) -> impl Iterator<Item = (Triple, &[u8])> + '_ {
-        self.membership
-            .members
-            .iter()
-            .map(|(&c, i)| (c, i.as_slice()))
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// The current beacon epoch.
     #[must_use]
@@ -1898,6 +1062,8 @@ pub(crate) type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    // Codec helpers the tests build frames with; scoped here so the library build does not carry them.
+    use crate::frames::{announce_body, encode_publish, encode_value};
     use super::*;
     use fanos_field::{F2, F7};
 
