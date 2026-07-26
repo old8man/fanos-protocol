@@ -15,7 +15,7 @@ use fanos_core::{AdmissionPolicy, ChildSummary, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_field::Field;
-use fanos_geometry::{HierAddr, Plane, Point, Triple, fano, next_hop};
+use fanos_geometry::{HierAddr, Plane, Point, Triple, fano};
 use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, ProtocolError, Wire, decode_frame, encode_frame};
@@ -35,9 +35,12 @@ const ESCALATE_TTL: u8 = 3;
 /// value at `N/K ≈ 2.33×` redundancy (vs `N×` full replication) while any `≤3`-point loss still recovers it.
 const PUBLISH_SHARD: u8 = 2;
 /// The DHT key-digest / storage-address length (BLAKE3-256) — the one canonical digest width.
-const DIGEST: usize = fanos_primitives::DIGEST_LEN;
+pub(crate) const DIGEST: usize = fanos_primitives::DIGEST_LEN;
 
 use crate::healer::Healer;
+use crate::membership::Membership;
+use crate::router::{HierRoute, Peer, Router};
+use crate::store::{PendingGet, PendingSample, Store};
 use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 
 /// The single heartbeat timer token.
@@ -105,9 +108,9 @@ const GREY_TOL: f64 = 0.10;
 /// not to constrain honest use. When full, a *new* key is refused rather than an existing one evicted,
 /// so an attacker cannot displace already-stored replicas (LRC availability is preserved); overwriting
 /// an existing key is always allowed (it does not grow the map).
-const MAX_STORE_ENTRIES: usize = 4096;
+pub(crate) const MAX_STORE_ENTRIES: usize = 4096;
 /// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
-const MAX_VALUE_LEN: usize = 65_536;
+pub(crate) const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
 const MAX_PENDING_GETS: usize = 1024;
 /// The most distinct shard-versions a single in-flight read accumulates before evicting the lowest (#115
@@ -200,50 +203,15 @@ impl Default for Config {
 }
 
 /// A key's held erasure shards at this node: Fano point index → (write-version, shard bytes) — §L4.
-type HeldShards = BTreeMap<u8, (u64, Vec<u8>)>;
+pub(crate) type HeldShards = BTreeMap<u8, (u64, Vec<u8>)>;
 /// A [`erasure::reconstruct`]-shaped accumulator: one optional shard per Fano point.
 type ShardAccumulator = [Option<Vec<u8>>; erasure::N];
 /// Shards gathered during a read, grouped by their write-version (highest recoverable one wins).
-type VersionedShards = BTreeMap<u64, ShardAccumulator>;
+pub(crate) type VersionedShards = BTreeMap<u64, ShardAccumulator>;
 
-/// An in-flight `Get` gathering erasure shards from the cell (spec §L4). No single node holds the value, so
-/// the read fans a `Lookup` to every shard home and accumulates their replies — grouped by write-version, so
-/// shards of two concurrent writes are never mixed into one (garbage) reconstruction — until the highest
-/// recoverable version delivers (last-writer-wins), or the read times out / all peers report a miss.
-#[derive(Clone, Debug)]
-struct PendingGet {
-    issued: Instant,
-    /// Gathered shards grouped by write-version: `version → [shard per Fano point]`. A write stamps all its
-    /// shards with one version, so grouping keeps a reconstruction internally consistent even while two
-    /// writers race; the read reconstructs the **highest** version whose shard-set is recoverable
-    /// ([`reconstruct_highest`]). Bounded by [`MAX_READ_VERSIONS`] (evict lowest) against version-spray DoS.
-    by_version: VersionedShards,
-    /// The per-request nonce this read is correlated on: a `Value` reply resolves it only if the reply
-    /// echoes this exact nonce, so a stale/replayed reply from a prior get for the same key cannot drain
-    /// it with an old value (audit C4).
-    nonce: u64,
-    /// How many `Lookup`s this read fanned out — the peers it is awaiting shard replies from.
-    queried: u16,
-    /// How many of those peers have replied `found=false` (they hold no shard for this key). Once this
-    /// reaches [`queried`](Self::queried) and the gathered shards still do not reconstruct, the value is
-    /// concluded absent immediately — a fast miss, instead of waiting out the read timeout.
-    negatives: u16,
-}
 
-/// An in-flight [`Command::SampleAvailability`] (spec §L4.3): the distinct Fano lines being sampled and the
-/// mask of points confirmed present so far. The sample probes only the sampled lines' shard homes (a cheap
-/// availability check, not a full download); it concludes **available** as soon as every sampled line is
-/// fully present, else the read-timeout sweep concludes it unavailable.
-#[derive(Clone, Debug)]
-struct PendingSample {
-    issued: Instant,
-    /// The per-request nonce correlating probe replies (shared with the read path's `Value` frames, C4).
-    nonce: u64,
-    /// The distinct Fano lines this sample is checking (from `da::sample_lines`).
-    lines: Vec<usize>,
-    /// Points confirmed present (bit `i` ⇒ point `i`'s shard was returned): the DA `present` mask.
-    present: u8,
-}
+
+
 
 /// Reconstruct the **highest** write-version whose gathered shard-set is recoverable (spec §L4
 /// last-writer-wins): iterate versions descending, returning the first that [`erasure::reconstruct`]s — so a
@@ -253,216 +221,21 @@ fn reconstruct_highest(by_version: &VersionedShards) -> Option<Vec<u8>> {
     by_version.values().rev().find_map(erasure::reconstruct)
 }
 
-/// The DHT-storage concern factored out of [`OverlayNode`] (audit #125 decompose): this node's local
-/// slice of the cell's distributed store plus its in-flight read-repair bookkeeping. The *orchestration*
-/// of a Put/Get — resolving the responsible cell member, replicating across the cell — stays on
-/// `OverlayNode`, which owns the membership view; this owns the local state and the read-repair walk.
-#[derive(Default)]
-struct Store {
-    /// Key digest → this node's held **erasure shards** for that key: `point index → (write-version, shard
-    /// bytes)`. A value is `erasure::encode`d into `N=7` point-shards, each stamped with the write's version
-    /// and placed at its point's nearest-occupied home (spec §L4 projective LRC, #115); on a full Fano cell a
-    /// node holds one shard (its own point), on a sparse cell several. Each index keeps the **highest**
-    /// version seen (last-writer-wins), so a lookup returns each point's freshest shard.
-    entries: BTreeMap<[u8; DIGEST], HeldShards>,
-    /// In-flight `Get`s awaiting shards, keyed by digest — the gather-and-reconstruct accumulator.
-    pending: BTreeMap<[u8; DIGEST], PendingGet>,
-    /// In-flight DA samples ([`Command::SampleAvailability`]), keyed by digest (spec §L4.3).
-    pending_samples: BTreeMap<[u8; DIGEST], PendingSample>,
-    /// The **durable loss ledger** (audit R-C3): digests this node held a shard of that became permanently
-    /// unrecoverable — more shard-homes gone than the `[7,3,4]` code tolerates — and the epoch each loss was
-    /// accounted. Bounded by the store's own [`MAX_STORE_ENTRIES`] (it is a subset of held keys). Makes loss
-    /// visible and auditable instead of silent; a production node persists it. Append-only (an audit trail).
-    loss_ledger: BTreeMap<[u8; DIGEST], Epoch>,
-    /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
-    seq: u64,
-}
 
-impl Store {
-    /// Whether the local slice admits a shard of `shard_len` for `digest` under the A4 DoS caps: within
-    /// [`MAX_VALUE_LEN`], and either the key already exists (adding/overwriting a shard of a held key — no
-    /// key growth) or the store is below [`MAX_STORE_ENTRIES`] — so a `Publish` flood of distinct digests
-    /// cannot displace already-stored shards, while shards of already-held keys always pass.
-    fn admits(&self, digest: &[u8; DIGEST], shard_len: usize) -> bool {
-        shard_len <= MAX_VALUE_LEN
-            && (self.entries.len() < MAX_STORE_ENTRIES || self.entries.contains_key(digest))
-    }
 
-    /// Store one erasure shard for `digest` at Fano point `index`, keeping the **higher** write-version if
-    /// this point already holds one (last-writer-wins) — so a stale replayed shard never overwrites a fresh
-    /// one, and the store converges to the newest write's shards.
-    fn insert_shard(&mut self, digest: [u8; DIGEST], index: u8, version: u64, shard: Vec<u8>) {
-        let per_index = self.entries.entry(digest).or_default();
-        if per_index
-            .get(&index)
-            .is_none_or(|(held, _)| version >= *held)
-        {
-            per_index.insert(index, (version, shard));
-        }
-    }
 
-    /// Seed this node's held shards for `digest` into a read's version-grouped accumulator (each point's
-    /// shard into its version's slot) — the local contribution before the network replies arrive.
-    fn seed_versions(&self, digest: &[u8; DIGEST], by_version: &mut VersionedShards) {
-        if let Some(held) = self.entries.get(digest) {
-            for (&i, (version, shard)) in held {
-                if let Some(slot) = by_version.entry(*version).or_default().get_mut(i as usize) {
-                    *slot = Some(shard.clone());
-                }
-            }
-        }
-    }
-}
 
-/// What we know about a cell neighbour.
-#[derive(Clone, Copy, Debug)]
-struct Peer {
-    last_seen: Option<Instant>,
-    reported_down: bool,
-    /// EWMA of this channel's per-round **loss** (spec §6.3 grey detection): each heartbeat samples whether
-    /// last round's `Ping` was answered (0) or not (1) and folds it at [`LOSS_EWMA_ALPHA`]. A grey neighbour —
-    /// heartbeat-present but dropping a fraction of its `Pong`s — settles at an elevated loss while an honest
-    /// one stays near the network floor; gossiped as `DiagLoss` and localized by `polar::grey_endpoint`.
-    loss: f64,
-    /// Whether this round's `Ping` is still outstanding (no `Pong` seen since it was sent) — the per-round
-    /// loss sample the heartbeat folds into [`loss`](Self::loss).
-    awaiting_pong: bool,
-}
 
-/// The forwarding decision for a `RouteHier` frame at a node (see [`Router::route`]).
-enum HierRoute {
-    /// This node is in the destination cell — deliver the payload locally.
-    Deliver,
-    /// Forward to this transport coordinate, one hop closer to the destination.
-    Forward(Triple),
-    /// Not the destination and no known peer is closer — drop (a routing hole).
-    Drop,
-}
 
-/// The hierarchical-routing concern factored out of [`OverlayNode`] (audit #125 decompose): this node's
-/// own overlay address plus its learned longest-prefix routing table, and the pure `RouteHier` forwarding
-/// decision over them. Transport — the physical `coord` — stays on the facade: a flat transport underlays
-/// this structured overlay and the two need not coincide past depth 1. This owns the addressing state and
-/// the routing decision; the facade orchestrates the frame flow (an `Announce` carries the address out,
-/// `on_announce` seeds a learned peer from one received).
-struct Router<F: Field> {
-    /// This node's hierarchical address (§L1). Defaults to the depth-1 `root(coord)` — the ordinary
-    /// single-plane case — and is deepened only when the node descends into a sub-cell on a collision
-    /// (§L0). It governs hierarchical (`RouteHier`) forwarding; single-plane routing is unchanged.
-    address: HierAddr<F>,
-    /// Learned hierarchical routing table: **transport coordinate → the overlay [`HierAddr`] reachable
-    /// there**. Empty on a single-plane node (transport ≡ overlay); populated as the node learns sub-cell
-    /// gateways and siblings (a deployment seed, or a JOIN/Announce). `RouteHier` forwarding is greedy
-    /// longest-prefix over the addresses ([`next_hop`]), then resolved back to the transport coordinate to
-    /// send on — this is what lets a node route *through* cells it is not a member of, and it decouples the
-    /// node's transport coordinate (`coord`) from its overlay address (`address`), as a flat transport
-    /// underlays a structured overlay. **Keyed by transport coordinate** (one overlay address per physical
-    /// endpoint), so — exactly like [`OverlayNode::members`] — it is bounded by the plane size `N`: a peer
-    /// cannot grow it without limit by announcing many forged addresses (audit C1/C2 DoS class). Like
-    /// `members` it is an attacker-*writable* discovered view; safety does not rest on its integrity —
-    /// delivery is decided by this node's own cert-bound `address`, so a poisoned entry can only misroute
-    /// or blackhole (a bounded DoS), never impersonate a destination. Cert-verifying an announced address
-    /// against its coordinate (poisoning resistance) is the QUIC-layer follow-up.
-    peers: BTreeMap<Triple, HierAddr<F>>,
-}
 
-impl<F: Field> Router<F> {
-    /// Seat this node at its default depth-1 overlay address `root(coord)`, with an empty routing table.
-    /// A deployment that descends into a sub-cell or assigns overlay position independently of transport
-    /// re-seats the address afterwards ([`OverlayNode::with_hier_address`]).
-    fn new(coord: Point<F>) -> Self {
-        Self {
-            address: HierAddr::root(coord),
-            peers: BTreeMap::new(),
-        }
-    }
 
-    /// Register a hierarchical peer reachable in one hop — the transport coordinate that reaches it and the
-    /// overlay [`HierAddr`] it serves — replacing any existing address for that coordinate. This *is* the
-    /// hierarchical routing table: `RouteHier` frames are forwarded greedily over it. A single-plane node
-    /// needs none (transport ≡ overlay); a deployment or the membership layer seeds it for depth > 1.
-    fn learn_peer(&mut self, addr: HierAddr<F>, transport: Triple) {
-        self.peers.insert(transport, addr);
-    }
 
-    /// Resolve the forwarding decision for hierarchical destination `dst` (§L1). If this node is already
-    /// in `dst`'s cell it delivers. Otherwise, with **learned peers**, it routes greedily by longest
-    /// shared prefix ([`next_hop`]) and resolves the chosen overlay address to its transport coordinate —
-    /// the physical hop one level closer, so forwarding converges in `≤ dst.depth − commonPrefix` hops. A
-    /// node with **no learned peers** (the bootstrap origin, or a single populated plane) targets `dst`'s
-    /// own point at the divergence level directly. No closer peer and not the destination ⇒ drop (hole).
-    fn route(&self, dst: &HierAddr<F>) -> HierRoute {
-        if self.address.common_prefix(dst) == dst.depth() {
-            return HierRoute::Deliver;
-        }
-        if !self.peers.is_empty() {
-            let reachable: Vec<HierAddr<F>> = self.peers.values().cloned().collect();
-            return match next_hop(&self.address, dst, &reachable) {
-                Some(next) => self
-                    .peers
-                    .iter()
-                    .find(|(_, a)| **a == next)
-                    .map_or(HierRoute::Drop, |(t, _)| HierRoute::Forward(*t)),
-                None => HierRoute::Drop,
-            };
-        }
-        dst.point_at(self.address.common_prefix(dst))
-            .map_or(HierRoute::Drop, |p| HierRoute::Forward(p.coords()))
-    }
-}
 
-/// The membership concern factored out of [`OverlayNode`] (audit #125 decompose): this node's own
-/// long-term **credentials** for joining a cell — its identity bundle, signed descriptor, and Sybil
-/// admission proof — plus the [`AdmissionPolicy`] it checks *others* against, and the learned **key view**
-/// of who else is in the cell. The facade orchestrates the JOIN/Announce frame flow (flood, self-cert,
-/// re-flood); this owns the credential/view state and the invariant that must not be got wrong — the
-/// fail-closed admission check ([`admits`](Membership::admits)).
-#[derive(Default)]
-struct Membership {
-    /// This node's long-term identity bytes (spec §L0): its hybrid **signature public-key bundle**
-    /// `Ed25519(32) ‖ ML-DSA-65(1952)`, which both derives its self-certifying address (`MapToPoint`) and
-    /// verifies its descriptor signature. Carried in this node's `Announce`. Empty when self-certification
-    /// is not in use (the address is trusted without proof).
-    identity: Vec<u8>,
-    /// The signature over this node's descriptor `coord ‖ hier ‖ id`, produced once by its hybrid signing
-    /// key at deployment (the secret never enters the engine). Carried in the `Announce` and checked by
-    /// peers under self-certified membership, so an attacker cannot announce a *different* transport
-    /// coordinate for an identity's address without that identity's private key (§79/§80, the
-    /// transport-hijack defence). Empty when unsigned.
-    descriptor_sig: Vec<u8>,
-    /// This node's own Sybil-admission proof (spec §L3), attached to its `Announce` when it joins. Empty
-    /// when admission is not in use for this deployment — a peer that requires admission then rejects it
-    /// (fail closed), exactly as an empty `identity`/`descriptor_sig` is rejected under
-    /// `require_self_certified_membership`.
-    admission_proof: Vec<u8>,
-    /// This node's Sybil admission policy (spec §L3): checked against a peer's announced proof when
-    /// `config.require_admission` is set. `None` even with the flag set means this node enforces the check
-    /// but has no policy to check *against* — it then rejects every peer (fail closed, never fail open)
-    /// rather than silently admitting for want of configuration.
-    admission_policy: Option<Box<dyn AdmissionPolicy>>,
-    /// The PoW difficulty this node solves its OWN admission proof at (spec §L3). `Some(d)` when the node
-    /// runs PoW admission via [`OverlayNode::with_admission_pow`]: its proof is then **re-solved for the
-    /// new `(coordinate, epoch)` on every reshuffle** ([`on_reseat`](OverlayNode::on_reseat)), so a peer's
-    /// per-epoch admission check keeps passing as the coordinate rotates — the "re-paid every epoch" cost
-    /// that makes a grinded seat un-maintainable (`anti_eclipse_reshuffle`). `None` = the proof is fixed
-    /// (set once via [`with_admission_proof`](OverlayNode::with_admission_proof)) or absent.
-    admission_difficulty: Option<u32>,
-    /// The membership view: cell coordinate → announced info (public keys, capabilities), learned by
-    /// flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
-    members: BTreeMap<Triple, Vec<u8>>,
-}
 
-impl Membership {
-    /// Whether an announced `proof` admits a joiner under this node's installed policy (spec §L3, §7.8).
-    /// **Fails closed**: with no policy installed this returns `false`, so a node that *requires* admission
-    /// but was handed no policy rejects every peer rather than silently admitting for want of
-    /// configuration. The caller gates this on `config.require_admission`.
-    fn admits(&self, challenge: &[u8], proof: &[u8]) -> bool {
-        self.admission_policy
-            .as_deref()
-            .is_some_and(|policy| policy.admits(challenge, proof))
-    }
-}
+
+
+
+
 
 /// *ideally* lives, before the cell's actual occupancy is consulted. It is a distinct type from a node
 /// A projective point in the **content-address domain** (`MapToPoint(H(key))`, spec §L4): where a key
