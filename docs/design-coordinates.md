@@ -447,3 +447,91 @@ Two consequences worth stating plainly rather than leaving implicit:
   deployment `rank_at` is populated by this node's own binding plus hole-punch and bootstrap entries. Driving
   `settle_index` across a whole cell therefore wants the **membership** layer's occupancy set (`MemberJoined`, which
   already carries coordinates), not the transport directory alone. That is the next unit.
+
+
+## The settling window — why a coordinate may not move mid-epoch, and what to do instead
+
+*Added 2026-07-26, after the probe index reached the wire (`79bd9fc`) and live resolution did not follow.*
+
+### The constraint
+
+A coordinate is not merely an address. It is the key from which the cell derives **TAXIS committee membership**,
+**erasure-shard placement**, and **every routing table** — and all three re-derive at an *epoch boundary*, where every node
+moves at once by a beacon all of them can compute. That is what makes the reshuffle safe: the movement is simultaneous and
+predictable-once-the-beacon-lands.
+
+A single node moving *between* boundaries has no such property. It invalidates state the rest of the cell still holds, so
+it stops being reachable at the position its peers committed to, while continuing to believe it holds a different one. So:
+
+> **Invariant.** Within an epoch, a seated node's coordinate is constant.
+
+Collisions, however, are only *discovered* by meeting peers, which happens during the epoch. A node cannot know at the
+boundary that its point is contested, because a peer's coordinate for the new epoch is `VRF(their_sk, …‖beacon_e)` — it is
+computable only by that peer, and the proof from the previous epoch says nothing about this one. Discovery is therefore
+inherently mid-epoch, while movement must not be. That is the whole tension, and it is not an implementation gap.
+
+### What the invariant costs if nothing else changes
+
+A node that loses its point is simply not seated: the directory refuses its binding (`Directory::supersedes`), so it sits
+out the epoch and re-draws at the next boundary. The cost is capacity, and it has a closed form. With `n` nodes on
+`P = q² + q + 1` points at load `ρ = n/P`, the chance a given node shares its point with someone is
+
+```
+P(contested) = 1 − (1 − 1/P)^(n−1) ≈ 1 − e^(−ρ)
+```
+
+**independent of the plane order** — it depends on load alone:
+
+| load `ρ` | nodes idle for the epoch |
+|---|---|
+| 0.25 | **22.1 %** |
+| 0.50 | **39.3 %** |
+
+(Checked at `q = 31` and `q = 127`; both match `1 − e^{−ρ}` to three digits, as the approximation requires.)
+
+### The window, and the trade that justifies its size
+
+Split each epoch into a **settling phase** `[T_e, T_e + W)` and a **committed phase** `[T_e + W, T_{e+1})`:
+
+1. On the boundary every node re-derives its point for the new epoch and announces it at probe index 0 — which it already
+   does today.
+2. Through `W` it collects peers' claims (`fanos_quic::claims::ClaimBook`, already built and already recording) and may
+   re-seat freely, because no coordinate-keyed layer has committed yet.
+3. At `T_e + W` the placement is **committed**: the node re-announces its settled point, and the layers above derive from it.
+
+This adds no new outage. The reshuffle *already* invalidates every routing table at the boundary, so a convergence period
+already exists there; the window bounds and names it rather than introducing it. What is new is that the layers above need
+to be told when placement is final — a `PlacementCommitted { epoch }` signal — instead of assuming the coordinate is usable
+the moment the beacon lands.
+
+The window is worth it exactly when its duty cost is below the capacity it buys back:
+
+```
+W / E  <  1 − e^(−ρ)        ⇒  W < E · (1 − e^(−ρ))
+```
+
+At `E = DEFAULT_EPOCH_PERIOD = 600 s` and `ρ = 0.5` that permits `W < 236 s`. The window only needs to span the discovery
+timescale — `fanos_sim::fabric::FROZEN_SPAN = 2 × ROSTER_REFRESH = 30 s`, the same derived constant the harness uses to
+decide a cell has stopped changing — for a duty cost of **5 %** against **39 %** of nodes recovered. Nearly an order of
+magnitude of margin, so the choice is not delicate.
+
+### Why not the alternatives
+
+* **Move the node anyway.** Rejected on the invariant above. Whether it is *tolerable* is unverified rather than disproven:
+  the measurement that appeared to show it breaking consensus was a load artefact the baseline refuted (HEAD failed
+  identically). Even so, "not moving a running node" is the correct default while the question is open.
+* **Pre-settle for the next epoch.** Impossible, and deliberately so: the next epoch's beacon is unknown until it lands,
+  which is exactly the unpredictability that stops an adversary pre-aiming a placement (§3.2 assumption 2).
+* **Let two nodes share a point.** Harmless for shard placement (it reads as redundancy) but not for routing or committee
+  identity, both of which need one holder per point. It is also the status quo, and it is what costs the `1 − e^{−ρ}` above.
+* **Settle only on join.** A strictly weaker version of the window that is safe *today*, because a node that has not yet
+  announced has no coordinate-keyed state depending on it. Worth having as the first increment: it fixes the joining case,
+  which is the whole of the cold-start and the whole of the simulator's fleet scenario, and it needs no new signal. It does
+  not fix an established node whose point becomes contested by a later arrival.
+
+### Status
+
+Not implemented. The wire (`CoordinateClaim` on `HELLO`), the state (`ClaimBook`), and the decision procedure
+(`fanos_vrf::settle_index` + `claims::settle`) are all in place and unit-verified; what is missing is the phase boundary and
+the `PlacementCommitted` signal the layers above must respect. **Settle-on-join is the increment to build first** — safe
+under the invariant, and it is what the failing simulator measurement is actually blocked on.
