@@ -207,21 +207,28 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     `(Vec<u8>, u8, bool)`; `HostedService` now groups what is hosted and under which regime.
   - Superseded, as the earlier revision predicted: a storage-layer write ACL would police *who wrote*, while what matters is
     whether a **reader** can tell a genuine record from a forged one. The check belongs at the read.
-- **10b. `dromos_quic` stalls at HEAD — a live e2e gate that is currently red, and it is NOT a timing budget.** Found while
-  baselining the item-10 work (the rule from `simulator-instrument-integrity`: establish the baseline *before* attributing a
-  failure — which is what stopped this being reported as a regression).
-  - **Measured, both runs uncontended, both tests already holding `common::serial_cell`:** at `46f9bc9` **2 of 2 fail in
-    482.15 s**; with the item-10 working tree **1 of 2 fails in 244.40 s**. `HANG_CEILING` is 240 s, so 482 s is exactly two
-    serialized tests each burning the whole ceiling. The suite's own comment records that each passes **alone in ~4–27 s**.
-  - So this is a **genuine stall**, not host contention and not a ceiling to widen — the fixture lock that would fix
-    contention is already held. It is also flaky across runs (the private-transfer test passed in one run and failed in the
-    other), which points at a race rather than a deterministic deadlock.
-  - **Where to look first:** both assertions are OBOLOS shielded-pool counts (`spent_count() == 1 && note_count() == 2`), and
-    the immediately preceding commits are the obolos ring/ledger wiring (`6daf833`, `2d8c255`). A shielded-pool state
-    assertion that never converges is consistent with that wiring being mid-flight. Confirm by bisecting `dromos_quic`
-    across those commits before touching the consensus path.
-  - Not caused by item 10, which strictly improves it (2 failures → 1). Recorded rather than silently ridden past: an e2e
-    gate that is red at HEAD cannot verify anything built on top of it.
+- **10b. TAXIS consensus liveness is RED at HEAD — two distinct defects, both reproducible, neither caused by item 10.**
+  Found while baselining item 10 (the rule from `simulator-instrument-integrity`: establish the baseline *before* attributing
+  a failure — which is the only reason this was not reported as a regression in that work).
+  - **Defect A — `sortition: Some` never finalizes a single block.** `taxis_quic::a_transaction_finalizes_and_executes_over_a_real_quic_cell`
+    fails at its *first* liveness witness (`taxis_quic.rs:152`, "the cell finalized a block over real QUIC") after the full
+    240 s. Its state machine is `Accounts`, so **no shielded pool and no OBOLOS code is involved** — this is core consensus.
+    The discriminator is the SSLE secret-leader path: this suite sets `sortition: Some(SortitionParams { .. })`.
+  - **Defect B — `sortition: None` finalizes blocks but the submitted transaction executes erratically.** `dromos_quic`
+    reaches heights 1–2, and across two runs of the same binary observed **6 of 7 validators executed with the 7th stranded
+    at genesis forever** (`0:h1/s1/n2 1:h0/s0/n1 2:h2/s1/n2 …`, unchanged from the 3-second mark) and then **0 of 7 executed
+    while blocks still committed** (`0:h1/s0/n1 1:h0/s0/n1 …`). Flaky between those two shapes, which points at a race in tx
+    inclusion/gossip rather than a deterministic rejection. The test's own sanity block already proves the transaction is
+    valid against genesis, so this is the live path.
+  - **Corrects the previous revision of this entry, which blamed the OBOLOS ledger wiring** (`6daf833`, `2d8c255`). That was
+    a guess from commit adjacency and it is wrong: `taxis_quic` fails over `Accounts`, which touches none of it.
+  - **The 240 s ceiling was actively hiding both.** Each cell reaches a *fixed point* within ~3 s, so `HANG_CEILING` was
+    burning 240 s per test to rediscover a state that had stopped moving — and reporting it as "did not finish in time",
+    which reads as *slow*. That is how it was twice diagnosed as host contention and answered with more headroom. Fixed by
+    `common::converge` (below); the same failure now reports in **51 s with the per-validator trace**.
+  - Next: bisect defect A across the SSLE commits, and instrument tx inclusion for defect B. Both need the live driver's
+    round/leader state exposed — `TaxisHandle::snapshot` returns only `(height, state)`, which cannot distinguish "no leader
+    proposed" from "proposed and did not gather".
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
@@ -242,6 +249,19 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
 ---
 
 ## Simulator hardening (the standing directive, applied to the harness itself)
+
+**A third verdict for the real-socket suites (`tests/common::converge`).** `HANG_CEILING` separated "expected latency" from
+"liveness backstop" — a real fix — but left a state neither expresses: **the system has stopped changing.** A wait that ends
+at the ceiling can only ever say "too slow", so a wedged cell and a loaded one produce the same message, and the wedged one
+was twice answered with more headroom. `converge` reports **Reached / Refuted / Inconclusive**: refuted the moment the
+observation has been unchanged for `FROZEN_SPAN`, with the frozen trace attached.
+- `FROZEN_SPAN` is **derived**: `2 × fanos_node::taxis_driver::ROUND_TIMEOUT_MAX` (now `pub` for exactly this). A driver
+  between round attempts shows no change for just under one round timeout, so one period cannot tell "between attempts"
+  from "stopped" — two can. Same argument and same factor of two as `fanos_sim::fabric::FROZEN_SPAN`, which was derived as a
+  *single* period first and refuted by the simulator.
+- The trace is **per validator**, because the first defect it exposed was one validator out of seven — a cell-wide "not yet"
+  cannot say that.
+- Measured: a wedged cell now fails in 51 s naming the stuck node, against 241 s saying only "did not converge".
 
 Each defect class found this session is now an **assertion in the simulator**, not a one-off measurement — and two of them
 were defects *in the instrument*:

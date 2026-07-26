@@ -14,7 +14,6 @@
 
 mod common;
 
-use std::time::Duration;
 
 use fanos_dromos::HybridLedger;
 use fanos_field::F2;
@@ -36,6 +35,31 @@ const ALICE_NSK: [u8; 32] = [0xA1; 32];
 const BOB_NSK: [u8; 32] = [0xB0; 32];
 const SEED: BeaconSeed = BeaconSeed::new([0x11; 32]);
 const EPOCH: Epoch = Epoch::new(1);
+
+/// The whole cell's execution state: `(every node has executed the transfer, a per-validator trace)`.
+///
+/// The trace carries **every** field the condition tests, for the reason `common::converge` documents: a trace that omits
+/// part of the state makes a moving system look frozen. Rendered per validator index, because the defect this shape exposed
+/// was one validator out of seven — a cell-wide "not yet" cannot say that.
+async fn cell_state(handles: &[fanos_node::TaxisHandle<HybridLedger>]) -> (bool, String) {
+    let mut all = true;
+    let mut trace = String::new();
+    for (i, h) in handles.iter().enumerate() {
+        let cell = if let Some((height, ledger)) = h.snapshot().await {
+            let (spent, notes) = (ledger.shielded().spent_count(), ledger.shielded().note_count());
+            all &= height >= 1 && spent == 1 && notes == 2;
+            format!("{i}:h{height}/s{spent}/n{notes}")
+        } else {
+            all = false;
+            format!("{i}:down")
+        };
+        if i > 0 {
+            trace.push(' ');
+        }
+        trace.push_str(&cell);
+    }
+    (all, trace)
+}
 
 fn make_node(coord: Point<F2>) -> Box<dyn Engine + Send> {
     Box::new(OverlayNode::<F2>::new(coord, Config::default()))
@@ -148,29 +172,15 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     // Wait until EVERY node's shielded pool reflects the private transfer: Alice's note nullified (spent_count
     // 1) and Bob's note created (note_count 2 — the genesis note plus Bob's). Convergence across all seven is
     // the cross-node witness that the private transfer executed over live consensus without forking.
-    // Generous deadline: the shielded payload (~7 KB) is far larger than a plain transfer, so the block and its
-    // reveals carry more over the loopback — normal convergence is ~2 s, but the ceiling stays wide. Sized for a
-    // *loaded* machine on purpose: seven real-QUIC nodes competing with the rest of a parallel workspace run missed a
-    // 60 s ceiling while passing in ~3 s alone, and a poll-until ceiling tuned to the idle case converts contention
-    // into a false red. The healthy path pays nothing for the headroom.
-    let deadline = tokio::time::Instant::now() + common::HANG_CEILING;
-    loop {
-        assert!(tokio::time::Instant::now() <= deadline, "the private transfer did not execute across the cell in time");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let mut all_executed = true;
-        for h in &handles {
-            match h.snapshot().await {
-                Some((height, ledger)) if height >= 1 && ledger.shielded().spent_count() == 1 && ledger.shielded().note_count() == 2 => {}
-                _ => {
-                    all_executed = false;
-                    break;
-                }
-            }
-        }
-        if all_executed {
-            break;
-        }
-    }
+    // Three-valued (`common::converge`): reached, or **refuted** the moment the cell stops changing, or inconclusive at the
+    // ceiling. The old shape was a bare poll-until-`HANG_CEILING`, which can only ever report "too slow" — so a cell that
+    // reached a *wrong fixed point* in three seconds was read as contention and answered with more headroom, twice, while
+    // each run burned the full 240 s to rediscover the same frozen state. The trace names every validator, so a refutation
+    // says which one is stuck instead of only that the cell did not converge.
+    common::converge("the private transfer executes across the whole cell", || async {
+        cell_state(&handles).await
+    })
+    .await;
 
     // Final agreement: every node's shielded pool is identical — one note spent, two notes total, and the
     // transparent half untouched (this was a purely private transfer).
@@ -236,27 +246,12 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
     cell.nodes[0].client().command(Command::Emit { to: target, frame: tx_to_frame(&sealed) });
 
     // Every node's shielded pool converges to "Alice spent, Bob created" — the cross-node witness that a
-    // network-submitted transaction propagated to the whole cell and executed over live consensus. Ceiling sized for a
-    // loaded machine for the same reason as its sibling above: this is the test that measurably missed 60 s under a
-    // parallel workspace run while passing in ~3 s alone.
-    let deadline = tokio::time::Instant::now() + common::HANG_CEILING;
-    loop {
-        assert!(tokio::time::Instant::now() <= deadline, "the network-submitted transfer did not reach the cell in time");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let mut all_executed = true;
-        for h in &handles {
-            match h.snapshot().await {
-                Some((height, ledger)) if height >= 1 && ledger.shielded().spent_count() == 1 && ledger.shielded().note_count() == 2 => {}
-                _ => {
-                    all_executed = false;
-                    break;
-                }
-            }
-        }
-        if all_executed {
-            break;
-        }
-    }
+    // network-submitted transaction propagated to the whole cell and executed over live consensus. Same three-valued
+    // verdict as its sibling above.
+    common::converge("a network-submitted transfer reaches the whole cell", || async {
+        cell_state(&handles).await
+    })
+    .await;
 
     for h in &handles {
         let (_, ledger) = h.snapshot().await.expect("a live node snapshot");

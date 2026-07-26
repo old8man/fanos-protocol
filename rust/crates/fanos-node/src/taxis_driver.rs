@@ -56,7 +56,12 @@ const ROUND_TIMEOUT_BASE: Duration = Duration::from_millis(1_500);
 /// time rather than prematurely advanced, which under a fixed timeout **livelocks** the height (each premature
 /// advance reshuffles the leader before the in-flight round can commit). Bounded so a truly failed leader is
 /// still skipped in finite time. Reset to [`ROUND_TIMEOUT_BASE`] the moment the height advances (progress).
-const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
+///
+/// Public because it is the **longest quiet period consensus can legitimately produce**, which is exactly what an
+/// integration harness needs to tell "still working" apart from "wedged": a driver merely between round attempts shows no
+/// state change for just under this, so the harness's frozen threshold is derived as twice it
+/// (`tests/common::FROZEN_SPAN`) rather than picked. Changing this changes that, which is the point.
+pub const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
 
 /// Cap on the tx-gossip dedup set (commitments of transactions this node has already ingested + flooded). A
 /// remote-chosen value (a sealed transaction's commitment) keys it, so it is bounded against a flood; a

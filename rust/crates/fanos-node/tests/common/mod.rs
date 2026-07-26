@@ -20,6 +20,20 @@
 //! So (2) becomes one constant, sized for a *loaded* machine, and the healthy path pays nothing for the headroom because
 //! it exits as soon as its condition holds. A test that genuinely needs to pin latency asserts it **separately and
 //! explicitly** — that keeps the claim visible instead of hiding it inside a timeout argument.
+//!
+//! ## The third quantity, and why the ceiling alone hid a real defect for 240 s at a time
+//!
+//! There is a state (2) cannot express: **the system has stopped changing.** A wait that ends at the ceiling reports
+//! "did not finish in time", which reads as *slow* — so a cell that reached a wrong fixed point in three seconds was
+//! diagnosed as contention and given more headroom, twice, while `HANG_CEILING` dutifully burned 240 s per test to
+//! rediscover the same frozen state. The measured case: six of seven validators executed a private transfer and the
+//! seventh sat at genesis height forever, unchanged from the 3-second mark onward.
+//!
+//! [`converge`] adds the missing verdict, the same three-valued discipline `fanos_sim::fabric::Settled` uses:
+//! **Reached** (the condition held), **Refuted** (the observation has not changed for [`FROZEN_SPAN`] — report it now,
+//! with the frozen trace, because more waiting cannot help), or **Inconclusive** (the ceiling, which stays as the
+//! backstop for a system still visibly making progress). A measurement that did not finish is not a result; a
+//! measurement that stopped moving is.
 
 // Both lints here are artifacts of how Cargo compiles a shared test module: this file is built *separately into every*
 // integration-test binary, and each binary uses only the part it needs.
@@ -30,16 +44,75 @@
 // duplicating these into five test files, which is the exact defect this module removes.
 #![allow(unreachable_pub, dead_code)]
 
+use std::future::Future;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::Instant;
 
 /// The liveness backstop for any real-socket wait: long enough that machine contention cannot trip it, short enough that
 /// a genuine hang still fails the run rather than wedging it.
 ///
 /// This is deliberately **not** a latency budget. Assert latency explicitly where it matters.
 pub const HANG_CEILING: Duration = Duration::from_secs(240);
+
+/// How long an observation must sit **unchanged** before it is a refutation rather than an unfinished wait.
+///
+/// Derived, not chosen: twice [`fanos_node::taxis_driver::ROUND_TIMEOUT_MAX`], the longest quiet period consensus can
+/// legitimately produce. A driver between round attempts shows no state change for just under one round timeout, so one
+/// period cannot distinguish "between attempts" from "stopped" — two can. (The same argument, and the same factor of two,
+/// as `fanos_sim::fabric::FROZEN_SPAN` over the roster-refresh period; it was derived as a single period there first and
+/// the simulator refuted it.)
+///
+/// At 48 s this is a fifth of [`HANG_CEILING`], so a wedged cell fails five times sooner *and* says why, while a cell
+/// still making progress keeps the full ceiling.
+pub const FROZEN_SPAN: Duration = fanos_node::taxis_driver::ROUND_TIMEOUT_MAX.saturating_mul(2);
+
+/// How often [`converge`] samples. One driver tick, so a state change cannot hide between polls.
+const POLL: Duration = Duration::from_millis(150);
+
+/// Poll `observe` until the system reaches the condition, stops changing, or runs out of ceiling.
+///
+/// `observe` returns `(reached, trace)`: whether the condition holds, and a rendering of the observed state used **only**
+/// to detect that it has stopped changing and to report it. Two states are "the same" when their traces are equal, so the
+/// trace must contain everything the condition depends on — a trace that omits part of the state makes a moving system
+/// look frozen.
+///
+/// Panics with the frozen trace on refutation, or with the last trace at the ceiling. The distinction is in the message,
+/// because the two demand opposite responses: a frozen system needs a bug fixed, a slow one needs headroom.
+pub async fn converge<F, Fut>(what: &str, mut observe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = (bool, String)>,
+{
+    let started = Instant::now();
+    let mut last = String::new();
+    let mut last_change = Instant::now();
+    loop {
+        let (reached, trace) = observe().await;
+        if reached {
+            return;
+        }
+        if trace != last {
+            last = trace;
+            last_change = Instant::now();
+        }
+        let now = Instant::now();
+        assert!(
+            now.duration_since(last_change) <= FROZEN_SPAN,
+            "{what}: REFUTED — the observed state has not changed for {:?} (a fixed point, not a slow one). \
+             Frozen at: {last}",
+            now.duration_since(last_change)
+        );
+        assert!(
+            now.duration_since(started) <= HANG_CEILING,
+            "{what}: INCONCLUSIVE — still changing at the {HANG_CEILING:?} ceiling, so this is latency rather than a \
+             wedge. Last seen: {last}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
 
 /// Serializes tests that stand up a **whole real-QUIC cell**.
 ///
