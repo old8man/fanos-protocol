@@ -177,10 +177,52 @@ impl ServiceResolver for NodeResolver {
 /// **Order is preserved deliberately.** These directories feed deterministic cell-wide agreement (the role
 /// assignment consumes the roster), so the result must not depend on which lookup finished first. Results are
 /// re-sorted into `coords` order before returning.
-pub(crate) async fn resolve_directory<T, Fut, R>(client: &Client, coords: Vec<Coord>, resolve: R) -> Vec<(Coord, T)>
+/// What one directory read concluded — three-valued, because two of the three used to be one value.
+///
+/// A resolver that answers `Option<T>` cannot distinguish "nothing is published here" from "I could not find out", and the
+/// difference is load-bearing: a *definite* absence is information the caller can act on, while a read that did not
+/// conclude is not a result at all. Collapsing them meant a slow store read under contention silently shrank the cell's
+/// roster, two short scans in a row looked identical, and the role loop then treated a wrong assignment as settled — the
+/// cell froze short of its own membership with nothing to indicate why.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Read<T> {
+    /// Present and authentic.
+    Found(T),
+    /// A definite negative: the slot is empty, or its contents failed to decode or to authenticate. Nothing valid is
+    /// published here, and a caller may rely on that.
+    Absent,
+    /// The read did not conclude — it timed out. **Not** a negative, and not evidence of anything.
+    Unknown,
+}
+
+impl<T> Read<T> {
+    /// `Found` if `value` is `Some`, else a **definite** `Absent`. For a read that completed and found nothing valid.
+    pub(crate) fn found_or_absent(value: Option<T>) -> Self {
+        value.map_or(Self::Absent, Self::Found)
+    }
+}
+
+/// The result of scanning a whole directory: what was found, and **how much was not established**.
+pub(crate) struct Scan<T> {
+    /// The records that resolved, in coordinate order.
+    pub found: Vec<(Coord, T)>,
+    /// How many reads did not conclude. Non-zero means this scan is a *partial view*, and anything derived from it must not
+    /// be treated as a settled answer — the same distinction `fanos_sim::fabric::Settled` draws for an observation that ran
+    /// out of time.
+    pub unknown: usize,
+}
+
+impl<T> Scan<T> {
+    /// Whether every read concluded, so the view is complete.
+    pub(crate) fn complete(&self) -> bool {
+        self.unknown == 0
+    }
+}
+
+pub(crate) async fn resolve_directory<T, Fut, R>(client: &Client, coords: Vec<Coord>, resolve: R) -> Scan<T>
 where
     R: Fn(Client, Coord) -> Fut + Clone + Send + 'static,
-    Fut: core::future::Future<Output = Option<T>> + Send,
+    Fut: core::future::Future<Output = Read<T>> + Send,
     T: Send + 'static,
 {
     let mut set = tokio::task::JoinSet::new();
@@ -189,13 +231,17 @@ where
         set.spawn(async move { (index, coord, resolve(client, coord).await) });
     }
     let mut found = Vec::new();
+    let mut unknown = 0usize;
     while let Some(joined) = set.join_next().await {
-        if let Ok((index, coord, Some(value))) = joined {
-            found.push((index, coord, value));
+        match joined {
+            Ok((index, coord, Read::Found(value))) => found.push((index, coord, value)),
+            Ok((_, _, Read::Absent)) => {}
+            // A task that panicked told us nothing either, so it counts as inconclusive rather than as an absence.
+            Ok((_, _, Read::Unknown)) | Err(_) => unknown += 1,
         }
     }
     found.sort_by_key(|(index, _, _)| *index);
-    found.into_iter().map(|(_, coord, value)| (coord, value)).collect()
+    Scan { found: found.into_iter().map(|(_, coord, value)| (coord, value)).collect(), unknown }
 }
 
 #[cfg(test)]

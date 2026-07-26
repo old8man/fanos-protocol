@@ -26,7 +26,7 @@ use fanos_vrf::{VrfPublic, VrfSecret};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::resolve::{RESOLVE_TIMEOUT, resolve_directory};
+use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch capability advertisement lives at — domain-separated, keyed by
 /// the node's coordinate **and** the epoch (so each epoch's advertisement has its own address and a stale one
@@ -95,12 +95,31 @@ pub fn cell_cap_coords<F: Field>() -> Vec<Coord> {
 /// for `epoch`, or whose advertisement fails to verify, is simply absent, and the assignment runs over the
 /// present, authenticated set. Deterministic across nodes given the same live set (the design's agreed-input
 /// requirement).
-pub async fn build_capability_directory<F: Field>(client: &Client, epoch: Epoch) -> Vec<(NodeId, Capability)> {
-    let resolved = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
-        resolve_capability(&client, coord, epoch).await
+pub(crate) async fn build_capability_directory<F: Field>(
+    client: &Client,
+    epoch: Epoch,
+) -> (Vec<(NodeId, Capability)>, bool) {
+    let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+        read_capability(&client, coord, epoch).await
     })
     .await;
-    resolved.into_iter().map(|(_, member)| member).collect()
+    // The second value is what the caller could not previously know: whether this is the whole cell or only the part that
+    // answered in time. An assignment derived from a partial view is not a settled answer (`role_loop`).
+    let complete = scan.complete();
+    (scan.found.into_iter().map(|(_, member)| member).collect(), complete)
+}
+
+/// As [`resolve_capability`], distinguishing a read that **did not conclude** from a definite absence.
+///
+/// The timeout is the whole point: `resolve_capability` answers `Option`, so a slow store read and an unpublished
+/// descriptor are the same value, and a roster built from those reads silently shrinks under load.
+async fn read_capability(client: &Client, coord: Coord, epoch: Epoch) -> Read<(NodeId, Capability)> {
+    let slot = cap_slot(coord, epoch);
+    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(slot)).await {
+        // Completed: present-and-valid, or a definite negative (absent, malformed, or failing authentication).
+        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| parse_advertisement(&b, epoch))),
+        Err(_) => Read::Unknown,
+    }
 }
 
 /// Keep a node's capability advertisement **live**: spawn the task that (re)publishes its signed descriptor at

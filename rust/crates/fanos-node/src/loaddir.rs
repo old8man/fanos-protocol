@@ -23,7 +23,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capdir::cell_cap_coords;
-use crate::resolve::{RESOLVE_TIMEOUT, resolve_directory};
+use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch load report lives at — domain-separated, keyed by coordinate and
 /// epoch (each epoch's report at its own address).
@@ -79,13 +79,29 @@ pub async fn resolve_load(client: &Client, coord: Coord, epoch: Epoch) -> Option
 /// and apply the per-node `capacity` ([`cell_setpoint`]). A member absent from the store simply contributes
 /// zero load. Every node computes the identical setpoint from the identical roster reads — the agreed input the
 /// deterministic assignment needs.
-pub async fn build_cell_setpoint<F: Field>(client: &Client, epoch: Epoch, capacity: Demand) -> Demand {
-    let resolved = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
-        resolve_load(&client, coord, epoch).await
+///
+/// Also reports whether the scan was **complete**. A member whose report did not resolve in time contributes zero exactly
+/// as a genuine absence does, so the setpoint is *understated* by a partial read — and a setpoint derived from a partial
+/// read is not a settled answer, however many times it repeats.
+pub(crate) async fn build_cell_setpoint<F: Field>(
+    client: &Client,
+    epoch: Epoch,
+    capacity: Demand,
+) -> (Demand, bool) {
+    let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+        read_load(&client, coord, epoch).await
     })
     .await;
-    let loads: Vec<Demand> = resolved.into_iter().map(|(_, load)| load).collect();
-    cell_setpoint(&loads, capacity)
+    let loads: Vec<Demand> = scan.found.iter().map(|(_, load)| *load).collect();
+    (cell_setpoint(&loads, capacity), scan.complete())
+}
+
+/// As [`resolve_load`], distinguishing a read that **did not conclude** from a definite absence.
+async fn read_load(client: &Client, coord: Coord, epoch: Epoch) -> Read<Demand> {
+    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(load_slot(coord, epoch))).await {
+        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| parse_load(&b))),
+        Err(_) => Read::Unknown,
+    }
 }
 
 /// Keep a node's load report **live**: spawn the task that publishes `load_source()`'s current observed load

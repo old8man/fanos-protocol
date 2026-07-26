@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::EpochDriver;
-use crate::resolve::{RESOLVE_TIMEOUT, resolve_directory};
+use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch onion key is published at — domain-separated from every
 /// other use of the store, keyed by the node's coordinate **and the epoch**. Tagging the slot with the
@@ -111,15 +111,27 @@ pub fn cell_mix_coords<F: Field>() -> Vec<Coord> {
 /// directory, no hand-built map — the cell advertises itself through the overlay store, one relay per
 /// epoch-tagged slot, and a client reads the current epoch's advertisement.
 pub async fn build_cell_mix_directory<F: Field>(client: &Client, epoch: Epoch) -> MixDirectory {
-    let resolved = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
-        resolve_mix_key(&client, coord, epoch).await
+    let scan = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
+        read_mix_key(&client, coord, epoch).await
     })
     .await;
     let mut dir = MixDirectory::new();
-    for (coord, public) in resolved {
+    for (coord, public) in scan.found {
         dir.insert(coord, public);
     }
     dir
+}
+
+/// As [`resolve_mix_key`], distinguishing a read that **did not conclude** from a definite absence.
+///
+/// The caller here draws a circuit from whatever resolved, and a relay missing from the directory is simply not drawn — so
+/// a partial scan costs *anonymity set*, not correctness. Keeping the distinction anyway: the resolver is shared, and a
+/// caller that later wants to know whether it saw the whole cell should not have to re-derive it.
+async fn read_mix_key(client: &Client, coord: Coord, epoch: Epoch) -> Read<HybridKemPublic> {
+    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(mix_key_slot(coord, epoch))).await {
+        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| HybridKemPublic::decode(&b))),
+        Err(_) => Read::Unknown,
+    }
 }
 
 /// Keep a relay's onion key **live** in the directory: spawn the task that (re)publishes the relay at

@@ -157,7 +157,7 @@ pub fn spawn_role_loop<F: Field>(
                     Ok(Notification::BeaconReady { epoch, seed: s }) if epoch > cur => {
                         cur = epoch;
                         seed = BeaconSeed::new(s);
-                        settled = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
+                        (settled, _) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
                         // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
                         // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
                         stable = 0;
@@ -214,7 +214,7 @@ pub fn spawn_role_loop<F: Field>(
                 // compute the same assignment, exactly as on a beacon advance — the refresh adds no new randomness, it
                 // just stops the cell being stuck with a startup-race view of itself.
                 _ = refresh.tick() => {
-                    let now = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
+                    let (now, complete) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, &roles_tx).await;
                     if now == settled {
                         stable = stable.saturating_add(1);
                         // Local stability is *not* evidence of the global fixed point, and conflating the two is the
@@ -238,7 +238,11 @@ pub fn spawn_role_loop<F: Field>(
                         // scan competes with the node's critical path, and under machine contention a seven-node
                         // real-QUIC consensus cell then fails to converge *at all* — not slowly, at any ceiling
                         // (`docs/design-testing.md` §5.3.5). Steady-state cost must be zero, not a trickle.
-                        let behind = now.roster < peers();
+                        // A repeat is only evidence when the reads behind it CONCLUDED. A scan whose members timed out
+                        // understates the roster in exactly the way a genuine absence does, so two partial scans agree with
+                        // each other while both disagree with the cell — and relaxing on that agreement is what left a
+                        // frozen roster with nothing to indicate why. `complete` is the distinction that was missing.
+                        let behind = now.roster < peers() || !complete;
                         if stable >= STABLE_BEFORE_BACKOFF && !behind {
                             backoff = (backoff * 2).min(ROSTER_REFRESH_MAX);
                         }
@@ -327,6 +331,12 @@ async fn genesis_assign<F: Field>(
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
 /// the live load directory), step the controller, publish this node's roles. `send` only fails if every
 /// receiver has dropped (the node is shutting down) — ignored.
+/// Recompute and publish the assignment for `epoch`, reporting whether the directory reads it rests on were **complete**.
+///
+/// The second value is the one that was missing. A read that timed out was indistinguishable from a member that published
+/// nothing, so an assignment computed over a partial view looked exactly like one computed over the whole cell — and two
+/// such in a row read as "settled", which grew the refresh backoff and left the cell frozen short of its own membership.
+/// Only a *complete* view is evidence of anything.
 async fn assign_epoch<F: Field>(
     client: &Client,
     live: &mut LiveRoleController,
@@ -334,17 +344,17 @@ async fn assign_epoch<F: Field>(
     beacon: &BeaconSeed,
     capacity: Demand,
     roles_tx: &watch::Sender<Assignment>,
-) -> Assignment {
+) -> (Assignment, bool) {
     // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
     // assignment's worst-case latency is one RESOLVE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
-    let (members, setpoint) = tokio::join!(
+    let ((members, caps_complete), (setpoint, load_complete)) = tokio::join!(
         build_capability_directory::<F>(client, epoch),
         build_cell_setpoint::<F>(client, epoch, capacity)
     );
     let roles = live.step(&members, epoch, beacon, setpoint);
     let _ = roles_tx.send(roles);
-    roles
+    (roles, caps_complete && load_complete)
 }
 
 /// The running self-organizing subsystem of a node: the three background tasks (capability publisher, load
