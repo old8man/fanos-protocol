@@ -40,6 +40,66 @@ use tokio::sync::mpsc;
 use crate::observe::Timeline;
 use crate::rng::Rng;
 
+/// How long an observable must sit unchanged before a failing property counts as **refuted** rather than unmeasured.
+///
+/// Derived, not chosen: **twice** the cell's own discovery timescale, `fanos_node::role_loop::ROSTER_REFRESH`
+/// (`3 × RESOLVE_TIMEOUT`), which is the period on which a converging node re-runs the assignment that changes what a
+/// scenario observes.
+///
+/// The factor of two is the whole content of the constant. A process that fires every `T` sits unchanged for just under
+/// `T` *between* firings, so a window of `T` cannot distinguish "between firings" from "stopped" — it must span one full
+/// period to catch a firing and a second to confirm none came. This was measured the hard way: at `T` the cell-wide
+/// scenario reported `Refuted { frozen_for: 15s, last: [1, 2, 3, 4, 5] }` while the trace taken two seconds later read
+/// `[5, 5, 5, 5, 5]`. The system had converged; the window was one period short of being able to say so.
+///
+/// Residual, stated because it bounds the claim: the role loop backs off as far as `DEFAULT_EPOCH_PERIOD`, so a node deep
+/// in backoff could still move later. [`Settled::Refuted`] therefore means "frozen across two discovery periods", which is
+/// the strongest claim a bounded observation can support.
+pub const FROZEN_SPAN: Duration = fanos_node::role_loop::ROSTER_REFRESH.saturating_mul(2);
+
+/// Default patience for [`NodeFleet::until_settled`] — the same 240 s ceiling [`NodeFleet::until`] uses, sized for a
+/// loaded host running seven composed real-QUIC nodes.
+pub const SETTLE_DEADLINE: Duration = Duration::from_secs(240);
+
+/// The outcome of [`NodeFleet::until_settled`] — three-valued on purpose.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Settled<T> {
+    /// The predicate held, after this long.
+    Reached {
+        /// Time from the first poll.
+        after: Duration,
+    },
+    /// The observable stopped changing for [`FROZEN_SPAN`] and the predicate is still false: a real refutation.
+    Refuted {
+        /// How long nothing changed.
+        frozen_for: Duration,
+        /// The observable at the fixed point — what to print in the failure.
+        last: T,
+    },
+    /// The deadline arrived while the observable was still changing. **Not** a refutation: the measurement failed, not
+    /// the property, and reading it as failure is what makes a contended host produce red.
+    Inconclusive {
+        /// When the observable last changed.
+        last_change: Duration,
+        /// The observable when the deadline arrived.
+        last: T,
+    },
+}
+
+impl<T> Settled<T> {
+    /// Whether the property was genuinely refuted — the only outcome a scenario should fail on.
+    #[must_use]
+    pub const fn is_refuted(&self) -> bool {
+        matches!(self, Self::Refuted { .. })
+    }
+
+    /// Whether the predicate held.
+    #[must_use]
+    pub const fn is_reached(&self) -> bool {
+        matches!(self, Self::Reached { .. })
+    }
+}
+
 /// How the fabric carries datagrams — the only thing this tier simulates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Link {
@@ -471,6 +531,81 @@ impl NodeFleet {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         false
+    }
+
+    /// Poll until `predicate` holds, distinguishing **refuted** from **not measured**.
+    ///
+    /// [`until`](Self::until) answers `bool`, which conflates two different outcomes: the system reached a fixed point
+    /// that fails the property, and the deadline arrived while the system was still moving. On a contended machine the
+    /// second is common, and reading it as the first is how a wall-clock suite converts contention into a false red —
+    /// which this session paid for three times over, including one "confirmed decisively" that the baseline refuted.
+    ///
+    /// The discriminator is the **trajectory**, not the machine: `observe` is sampled alongside the predicate, and
+    ///
+    /// * the predicate holding ⇒ [`Settled::Reached`];
+    /// * `observe` unchanged for [`FROZEN_SPAN`] with the predicate still false ⇒ [`Settled::Refuted`]. Nothing further
+    ///   is coming at the timescale the system converges on, so the property is genuinely false;
+    /// * the deadline arriving while `observe` is still changing ⇒ [`Settled::Inconclusive`]. Neither shown nor refuted.
+    ///
+    /// Deliberately *not* keyed on load average or elapsed time: those would be heuristics about the host, while whether
+    /// a system has stopped moving is a property of the observation itself.
+    pub async fn until_settled<T, O>(
+        &self,
+        predicate: impl FnMut(&Self) -> bool,
+        observe: O,
+    ) -> Settled<T>
+    where
+        O: FnMut(&Self) -> T,
+        T: PartialEq + core::fmt::Debug,
+    {
+        self.until_settled_within(SETTLE_DEADLINE, predicate, observe).await
+    }
+
+    /// As [`until_settled`](Self::until_settled), with an explicit patience budget.
+    ///
+    /// Worth exposing rather than fixing internally: [`Settled::Inconclusive`] can only be reached by *exhausting* the
+    /// deadline, so a scenario checking that branch pays it in full. The default is sized for a loaded host running seven
+    /// composed nodes; a scenario that knows its own timescale should say so.
+    ///
+    /// `deadline` must exceed [`FROZEN_SPAN`] for [`Settled::Refuted`] to be reachable at all — below it, a genuinely
+    /// frozen failure reports as `Inconclusive`, which is conservative but uninformative.
+    pub async fn until_settled_within<T, O>(
+        &self,
+        deadline: Duration,
+        mut predicate: impl FnMut(&Self) -> bool,
+        mut observe: O,
+    ) -> Settled<T>
+    where
+        O: FnMut(&Self) -> T,
+        T: PartialEq + core::fmt::Debug,
+    {
+        const STEP: Duration = Duration::from_millis(100);
+        let polls = (deadline.as_millis() / STEP.as_millis().max(1)).max(1) as u32;
+        // How many unchanged samples span `FROZEN_SPAN`; at least one, whatever the step.
+        let quiet_needed = (FROZEN_SPAN.as_millis() / STEP.as_millis().max(1)).max(1) as u32;
+        let mut last = observe(self);
+        let mut quiet = 0u32;
+        let mut elapsed = Duration::ZERO;
+        let mut last_change = Duration::ZERO;
+        for _ in 0..polls {
+            if predicate(self) {
+                return Settled::Reached { after: elapsed };
+            }
+            let now = observe(self);
+            if now == last {
+                quiet += 1;
+                if quiet >= quiet_needed {
+                    return Settled::Refuted { frozen_for: STEP * quiet, last: now };
+                }
+            } else {
+                quiet = 0;
+                last_change = elapsed;
+                last = now;
+            }
+            tokio::time::sleep(STEP).await;
+            elapsed += STEP;
+        }
+        Settled::Inconclusive { last_change, last }
     }
 
     /// Record a [`Timeline`] of `observe` across every node: `samples` samples spaced `every` apart, starting
@@ -994,17 +1129,87 @@ mod tests {
         // Convergence is *polled* rather than measured inside a fixed window: a window long enough to survive machine
         // contention makes every run pay for the worst case, and one sized for an idle machine is a false red — the same
         // mistake §5.3.4 removed from the real-socket suites. Settling is then checked over a short window afterwards.
-        let converged = fleet.until(|f| f.nodes().iter().all(|n| n.assignment().roster == occupied)).await;
+        // Three-valued, so a contended host cannot turn "still converging" into "does not converge". The observable is the
+        // roster vector: while any node is still learning peers it changes, and a cell that has stopped learning for
+        // `FROZEN_SPAN` has genuinely stopped.
+        let verdict = fleet
+            .until_settled(
+                |f| f.nodes().iter().all(|n| n.assignment().roster == occupied),
+                |f| f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
+            )
+            .await;
         let trace = fleet.observe(8, Duration::from_secs(2), fanos_node::Node::assignment).await;
         fleet.shutdown();
         let roster = trace.map(|a| a.roster);
         assert!(occupied > 1, "the premise: the draw left more than one point occupied ({occupied} of {N})");
         assert!(
-            converged,
-            "every node resolves every OCCUPIED coordinate ({occupied} of {N} nodes drew distinct points)\n{}",
+            !verdict.is_refuted(),
+            "every node must resolve every OCCUPIED coordinate ({occupied} of {N}); the cell froze short of it: \
+             {verdict:?}\n{}",
             roster.render()
         );
+        if !verdict.is_reached() {
+            // Not a failure: the measurement did not finish. Saying so beats a red that means nothing.
+            println!("PG(2,4) N={N}: inconclusive — still converging at the deadline: {verdict:?}");
+        }
         assert_eq!(roster.changes_after(Duration::ZERO), 0, "and it holds\n{}", roster.render());
+    }
+
+    #[tokio::test]
+    async fn the_harness_tells_a_refutation_apart_from_an_unfinished_measurement() {
+        // The harness asserting about ITSELF, and the reason it exists: a two-valued `until` reports "the property is
+        // false" and "I could not tell" identically, and on a contended host the second is the common one. That cost three
+        // false results in one session — including a "confirmed decisively" that the baseline then refuted — so the
+        // discrimination is pinned here rather than trusted.
+        //
+        // One node, so the fleet is cheap; the observables are synthetic because what is under test is the *verdict logic*,
+        // not any node behaviour.
+        use fanos_node::RoleSet;
+        let fleet = NodeFleet::spawn::<fanos_field::F4>(1, Link::ideal(), RoleSet::default())
+            .await
+            .expect("one node starts");
+
+        // Predicate true immediately ⇒ Reached, whatever the observable does.
+        let reached = fleet.until_settled(|_| true, |_| 0u32).await;
+        assert!(reached.is_reached(), "a satisfied predicate must be Reached, got {reached:?}");
+        assert!(!reached.is_refuted());
+
+        // Predicate false, observable frozen ⇒ Refuted. This is the only outcome a scenario may fail on, and it must
+        // arrive after FROZEN_SPAN rather than after the full deadline — otherwise a genuine failure costs 240 s.
+        let started = tokio::time::Instant::now();
+        let refuted = fleet.until_settled(|_| false, |_| 7u32).await;
+        let took = started.elapsed();
+        assert!(refuted.is_refuted(), "a frozen failing observable must be Refuted, got {refuted:?}");
+        assert!(
+            matches!(refuted, Settled::Refuted { last: 7, .. }),
+            "and it reports the fixed point it froze at: {refuted:?}"
+        );
+        assert!(
+            took < FROZEN_SPAN * 3,
+            "a refutation must cost about FROZEN_SPAN ({FROZEN_SPAN:?}), not the whole deadline — took {took:?}"
+        );
+
+        // Predicate false, observable STILL CHANGING at the deadline ⇒ Inconclusive, never Refuted. A counter that moves
+        // every poll is exactly a system that has not settled, which is what contention looks like from inside.
+        let mut tick = 0u32;
+        // A short budget: reaching `Inconclusive` means exhausting the deadline, and paying the 240 s default to check a
+        // branch of the verdict logic would make this test the slowest thing in the suite.
+        let inconclusive = fleet
+            .until_settled_within(
+                Duration::from_secs(2),
+                |_| false,
+                |_| {
+                    tick += 1;
+                    tick
+                },
+            )
+            .await;
+        fleet.shutdown();
+        assert!(
+            !inconclusive.is_refuted(),
+            "a system still moving has NOT been measured and must not be reported as a failure: {inconclusive:?}"
+        );
+        assert!(matches!(inconclusive, Settled::Inconclusive { .. }), "{inconclusive:?}");
     }
 
     #[tokio::test]

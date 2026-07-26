@@ -232,7 +232,7 @@ pub fn spawn_role_loop<F: Field>(
 /// [`RESOLVE_TIMEOUT`] (the two directory scans run concurrently), so a 3× period bounds the refresh at a **1/3 duty
 /// cycle**. Anything near 1× and the scans overlap — the node is then permanently scanning the cell, which measurably
 /// destabilised timing-sensitive real-socket tests running alongside it and would be a traffic beacon in production.
-const ROSTER_REFRESH: Duration = Duration::from_secs(3 * crate::resolve::RESOLVE_TIMEOUT.as_secs());
+pub const ROSTER_REFRESH: Duration = Duration::from_secs(3 * crate::resolve::RESOLVE_TIMEOUT.as_secs());
 
 /// The ceiling the refresh backs off to, **derived** as one [`DEFAULT_EPOCH_PERIOD`](crate::config::DEFAULT_EPOCH_PERIOD).
 ///
