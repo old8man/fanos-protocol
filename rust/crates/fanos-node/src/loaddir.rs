@@ -92,13 +92,13 @@ pub async fn build_cell_setpoint<F: Field>(client: &Client, epoch: Epoch, capaci
 /// each epoch (the node wires `load_source` to its `LoadMeter`, however it shares it — a closure so this module
 /// stays agnostic to the meter's storage). Mirrors [`crate::capdir::spawn_capability_publisher`]; ends when the
 /// notification stream closes. Must run inside a tokio runtime.
-#[must_use]
 /// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.
 ///
 /// A coordinate moves — every epoch by the beacon reshuffle (spec §L3), and within an epoch when a better claim displaces
 /// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
+#[must_use]
 pub fn spawn_load_publisher(
     client: Client,
     load_source: impl Fn() -> Demand + Send + 'static,

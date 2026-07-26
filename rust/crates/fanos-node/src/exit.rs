@@ -327,13 +327,13 @@ pub async fn build_cell_exit_directory<F: Field>(
 /// public key each epoch, so [`build_cell_exit_directory`] always sees it while the node runs. Publishes
 /// the genesis-epoch key at once, then follows the node's `BeaconReady` stream (the exit's identity is
 /// seed-pinned, so the same key is refreshed at each new epoch's slot). Ends when the node shuts down.
-#[must_use]
 /// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.
 ///
 /// A coordinate moves — every epoch by the beacon reshuffle (spec §L3), and within an epoch when a better claim displaces
 /// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
+#[must_use]
 pub fn spawn_exit_publisher(client: Client, public: HybridKemPublic) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = client.subscribe();

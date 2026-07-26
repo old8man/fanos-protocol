@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD f09d9d6`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD 24dc4fe`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -50,20 +50,25 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   | `4b53a9a` | mover republishes capability/load at the point it moved **to** (and on `Reseated`, not only on a beacon) | 4 of 6 |
   | `f09d9d6` | peers re-arm their roster refresh on `PeerMoved` — re-arm, **not** scan inline | 3 of 4 |
 
-- **The residual, and the next step.** `PeerMoved` only reaches nodes holding a *live connection* to the mover; one that
-  never met it stays in whatever backoff it had relaxed to (up to `ROSTER_REFRESH_MAX` = one epoch) and learns only from its
-  own directory scan. Hence `Refuted { frozen_for: 30s, last: [5, 3, 5, 4, 4] }` — two readers correct, three on a long
-  cadence, genuinely no change across two discovery periods.
-  - **The mechanism already exists and is unused.** `OverlayNode::on_announce` learns a mover's new coordinate from the
-    *flood* — first-sight insert into `membership.members`, then re-flood — so every node does hear about it without a
-    direct connection. It just **emits no notification**, so the role loop cannot re-arm on it. Emitting one on a
-    first-sight member is the natural close, and it also addresses the frozen-roster class (`[1, 1, 2]`) directly.
-  - **Second defect found in the same read, worth fixing with it:** the *old* coordinate is never removed from
-    `membership.members`, so after a move every node's view carries a phantom member at a point nobody holds. Bounded by
-    the plane size, so not a leak, but it makes membership a superset of reality.
-  - **Do not scan inline on the new event.** Tried: calling `assign_epoch` per move made things measurably worse (0 of 3,
-    rosters collapsing to `[2, 2, 2, 4, 2]`) because a scan costs up to one `RESOLVE_TIMEOUT` and per-move scanning is the
-    overlapping-scan regime `ROSTER_REFRESH`'s 1/3 duty cycle exists to prevent. Re-arm at the floor instead.
+- **The residual is NOT about moving at all — it is a read that cannot fail visibly.** Two hypotheses were tried and both
+  made convergence *worse*, which is what redirected the search: acting on `MemberJoined` gave 0 of 3 (scan inline) and
+  1 of 4 (re-arm), because it fires per newly-learned member and holds every node at the refresh floor throughout
+  discovery — and §5.3.5 already records that the steady-state scan then starves the critical path. **More scanning cannot
+  be the fix when scanning is what starves convergence** (`24dc4fe`).
+  - **The actual defect.** `capdir::resolve_capability` ends in `tokio::time::timeout(...).ok()??`, and
+    `resolve::resolve_directory` keeps only the `Some`s — so a **timed-out read, a decode failure and a genuine absence are
+    one value**. Under load a slow store read silently *shrinks* the roster; two short scans in a row look identical, so
+    the role loop marks the assignment `stable`, grows its backoff, and the cell freezes short. That predicts every
+    observation, including the ones that refuted the move-propagation story: rosters low across *all* nodes
+    (`[2, 2, 1, 3, 2]`), worse under contention, and unimproved by scanning more (each scan is equally likely to time out,
+    and concurrent scans raise the odds).
+  - **The fix is today's own discipline, one layer down in production code.** A three-valued read — found / absent /
+    unknown — and an assignment computed over an *incomplete* read must not count as evidence of stability: no `stable`
+    increment, no backoff growth. Exactly the `Reached`/`Refuted`/`Inconclusive` distinction the simulator harness now
+    makes (`fanos_sim::fabric::Settled`), for exactly the same reason: a measurement that did not finish is not a result.
+  - Scope: `resolve_directory`'s resolver signature returns `Option<T>`, so this touches `capdir`, `loaddir` and the other
+    callers plus the role loop's stability gate. A full cycle, not a patch.
+
 - **`NodeFleet::spawn`'s injective draw is the honest indicator.** While it is there, this is not closed; it goes when the
   cell-wide scenario passes with collisions allowed. Its stated reason has been rewritten five times as the chain advanced,
   which is itself the record of where the boundary is.

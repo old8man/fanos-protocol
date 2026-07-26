@@ -109,13 +109,13 @@ pub async fn build_capability_directory<F: Field>(client: &Client, epoch: Epoch)
 /// stream, republishing the descriptor (re-signed for the new epoch) on every real advance. Mirrors
 /// [`crate::mixdir::spawn_mix_publisher`]. The task ends when the notification stream closes; must run inside a
 /// tokio runtime.
-#[must_use]
 /// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.
 ///
 /// A coordinate moves — every epoch by the beacon reshuffle (spec §L3), and within an epoch when a better claim displaces
 /// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
+#[must_use]
 pub fn spawn_capability_publisher(
     client: Client,
     node_id: NodeId,
