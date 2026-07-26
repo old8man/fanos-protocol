@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD a23ed82`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD 1ef497b`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -133,9 +133,23 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
   - *Method note worth carrying:* reading a module's `use` lines is **not** its dependency list. Half of `threshold.rs`'s
     references were fully-qualified paths the imports never mentioned, and the first attempt at the move compiled the new
     crate against deps it did not declare.
-- **7a still open.** `overlay.rs` is 4,048 lines; the `OverlayNode` decomposition exists at the type level
-  (`Config`/`Store`/`Router`/`Membership`/`Healer`) and only the module split never happened. Mechanical, compiler-verified,
-  and a good fit for a contended machine since it needs no wall-clock measurement.
+- **7a: 4,048 → 2,900 lines (−28%), in four slices, zero API change.** `overlay.rs` is now `overlay/` with
+  `healer` (`9cb113c`), `store`/`router`/`membership` (`cad9eb5`), `frames` (`3942199`) and `overlay/hier.rs`
+  (`1ef497b`) — 1,344 lines in six modules named for what they do.
+  - **What the slices taught, in order.** Cut by **items** (doc/attr block → brace match), never by line offsets: the
+    first slice landed mid-doc-comment and orphaned half of `ContentPoint`'s documentation. Start each new module with an
+    **empty** import list and let the compiler name what it needs; copying the facade's `use` block dragged in a dozen
+    unused imports. Never blanket-rewrite visibility — a `pub(crate) fn` sweep silently demoted two *public* functions
+    (`descriptor_message`, `admission_challenge`) that `fanos-sim` reaches by path.
+  - **Splitting an impl is CHEAPER than lifting a type**, which is the opposite of what it looks like. A **child** module
+    reaches its parent's private items, so `overlay/hier.rs` widened no field at all, where extracting whole types needed
+    five `pub(crate)`. The rule is one-way: a parent cannot see a child's privates, so the four methods the facade
+    dispatches to are `pub(super)` — which names one module, not the crate.
+  - **Remaining, and it is a decision rather than a next step.** `overlay/mod.rs` is `OverlayNode`, its ~1,400-line impl,
+    and `impl Engine`. The natural further cuts are `storage` (`on_put`/`on_get`/`on_sample`/`on_publish`/`on_lookup`/
+    `on_value`/`distribute_shards`), `membership` (`flood`/`on_join`/`on_announce`/`on_reseat`/epoch), and `liveness`
+    (`on_heartbeat`/`health_view`/`loss_view`/`sweep_pending_gets`) — each a child module on the pattern `hier` now
+    establishes. Worth doing deliberately; not worth drifting into.
 
 ### 8. Coherence / meta-holon reconciliation (E→L / L→O / Ω2 / Ω9)
 - **Problem.** The cross-block coherence contracts (`platform.md §1.2`, §9) are asserted but not reconciled in one place:
