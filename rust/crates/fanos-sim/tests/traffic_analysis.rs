@@ -142,3 +142,71 @@ fn constant_rate_cover_collapses_the_gpa_flow_correlation_on_interior_relays() {
         "the defense must materially erase the GPA's volume signal (defended {defended:.3} vs undefended {undefended:.3})"
     );
 }
+
+/// **Do the SHIPPING defaults actually defend?** The test above measures the GPA defence at a hand-picked schedule
+/// (mix 120 ms, cover 150 ms). `fanos_node::config` ships `DEFAULT_MIX_DELAY = 50 ms` and
+/// `DEFAULT_COVER_INTERVAL = 1000 ms` — a cover schedule **6.7× sparser** than the one measured.
+///
+/// That matters because the mechanism is *displacement*: a real forward takes the slot a cover cell would have used, so
+/// emitted volume stays constant. Displacement only masks a flow while cover slots are at least as frequent as real
+/// forwards; past that the excess must be **added**, and the volume signal returns. A default that is measured at one
+/// schedule and shipped at another is exactly how a defence becomes decorative.
+#[test]
+fn the_shipping_defaults_are_measured_not_assumed() {
+    // The shipping values, read as the node's config declares them.
+    let ship_mix = Duration::from_millis(50);
+    let ship_cover = Duration::from_millis(1_000);
+
+    let undefended = gpa_volume_leak_slope(None);
+    let tested = gpa_volume_leak_slope(Some((Duration::from_millis(120), Duration::from_millis(150))));
+    let shipped = gpa_volume_leak_slope(Some((ship_mix, ship_cover)));
+
+    println!("GPA volume leak slope — undefended {undefended:.3}, tested-schedule {tested:.3}, SHIPPED {shipped:.3}");
+    assert!(undefended > 0.5, "sanity: the undefended baseline still leaks");
+    assert!(
+        shipped < 0.25,
+        "the SHIPPING defaults must collapse the leak slope, not merely the schedule the suite happened to pick \
+         (shipped {shipped:.3}, tested schedule {tested:.3}, undefended {undefended:.3})"
+    );
+}
+
+/// Disambiguate a zero leak slope: **masked, or never emitted?**
+///
+/// `gpa_volume_leak_slope` measures *extra frames per extra real cell*, which reads zero both when cover perfectly
+/// displaces the flow and when the flow never left the relay at all. Those are opposite outcomes — one is the defence
+/// working, the other is the defence eating the traffic — and the slope cannot tell them apart. So this measures the
+/// absolute interior volume alongside it.
+#[test]
+fn a_zero_leak_slope_is_masking_and_not_starvation() {
+    let schedules = [
+        ("undefended", None),
+        ("tested (mix 120ms, cover 150ms)", Some((Duration::from_millis(120), Duration::from_millis(150)))),
+        ("SHIPPED (mix 50ms, cover 1000ms)", Some((Duration::from_millis(50), Duration::from_millis(1_000)))),
+    ];
+    for (name, mix) in schedules {
+        let (cell, e0) = run_and_tap(mix, 0);
+        let (_, ehi) = run_and_tap(mix, 40);
+        let (client, service) = (cell[0], cell[40]);
+        let interior = |v: &Vec<usize>| -> usize {
+            cell.iter().zip(v.iter()).filter(|(n, _)| **n != client && **n != service).map(|(_, c)| *c).sum()
+        };
+        let (idle, loaded) = (interior(&e0), interior(&ehi));
+        let delta = loaded as i64 - idle as i64;
+        println!("{name:<34} interior frames: idle {idle:>5}, with 40 real cells {loaded:>5}  (delta {delta:+})");
+
+        if mix.is_none() {
+            // The baseline: every real cell shows up as extra emissions on the two interior hops it traverses.
+            assert_eq!(idle, 0, "an undefended relay emits nothing when idle — it has no cover to emit");
+            assert!(delta >= 80, "and every real cell is visible on the wire (delta {delta})");
+        } else {
+            // Cover is RUNNING — this is what separates masking from starvation. A schedule that emitted nothing
+            // would also show delta ≈ 0, and would be a defence that works by eating the traffic.
+            assert!(idle > 100, "{name}: cover must actually be emitting when idle (idle {idle})");
+            // And real traffic DISPLACES rather than adds: the total is unchanged, which is the whole mechanism.
+            assert!(
+                delta.abs() <= 8,
+                "{name}: real forwards must take cover slots, not add to them (delta {delta})"
+            );
+        }
+    }
+}
