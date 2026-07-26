@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD ef18e81`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD f09d9d6`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -35,29 +35,38 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   material. Compose with `note`/`nullifier`/`tx`/`note_cipher`/`state` and the §5.D-2 sighash signatures; reconcile the
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
-### 2. Live coordinate resolution — the wire is DONE, the driver is NOT
-- **Done** (`79bd9fc`, `474cda1`). `HELLO` carries a `CoordinateClaim` (`proof(80) ‖ index(2) ‖ witness*`) instead of a bare
-  proof, so a displaced node can announce where it went; an uncontested node pays two bytes and the first 80 are
-  byte-identical to the old layout. `fanos-quic::claims::ClaimBook` keeps the peer claims resolution needs — the best claim
-  per point (indexed once per peer at insert, since scanning per query measured 77× slower) and a witness per step —
-  cleared on an epoch change, since a claim proves a placement for one `(epoch, beacon)` only. The attacker-chosen index is
-  bounded from its fixed offset *before* the witness list it implies is decoded. Unit-verified end to end: a real collision
-  built from generated credentials, the loser's HELLO accepted **at its probed point and not at the one its draw
-  preferred**, the same index without its witness a silent drop, an out-of-range index refused.
-- **Open, with a measurement.** A live displaced node still does not advance. Forcing the collision (7 nodes on `PG(2,4)`,
-  `fanos-sim::fabric::measure_whether_a_collided_draw_now_resolves_itself`): **three of three collided draws stayed
-  collided** (held 6/7, all-distinct never reached), the fourth draw being injective. So the capacity result (200/200 at
-  `P=993`) is still simulator-only and `NodeFleet::spawn`'s injective draw is still load-bearing.
-- **The lead was WRONG, and the real blocker is a design question.** The reachability hypothesis (`4bb60f3`) is refuted:
-  `Health::verified_claims` shows every node, stuck ones included, verified several peers' claims — `[6, 2, 4, 5, 5, 5, 4]`.
-  They heard and did not move. The within-epoch re-seat is now **deliberately unwired**: a coordinate is the key TAXIS
-  committee membership, shard placement and every routing table derive from, and all of them re-derive at an epoch
-  boundary where *every* node moves at once. Moving one node in between invalidates state the rest of the cell holds.
-  Whether that is tolerable is **unverified** — an attempt to measure it produced a false positive (482 s failing vs 5.6 s
-  passing) that the baseline refuted, since HEAD fails identically under the same load.
-- **What it needs**, in order: (a) an *uncontended* measurement, now that `until_settled` reports "inconclusive" instead of
-  red; or (b) the design that makes the question moot — a bounded **settling window** at the start of each epoch, before
-  coordinate-keyed layers commit. (b) is the stronger answer and the one to design.
+### 2. Live coordinate resolution — WORKING; one residual in roster propagation
+- **Placement: DONE.** A contested node advances along its probe walk and announces the point it reached. Measured with
+  the collision *forced* (`NodeFleet::spawn_as_drawn`): **4 of 4 trials reach 7/7 distinct**, nodes visibly seated at probe
+  index 1, 3 and 4. Runtime fell from ~700 s to ~1 s. The cause had been one line — `spawn_inner` bound the coordinate to
+  the node's own address unranked, overwriting the bootstrap seed that was its only route to the incumbent, so it deleted
+  the information it needed (`29e322b`).
+- **Roster propagation after a move: 3 of 4.** Four links found and fixed, each measured:
+
+  | | change | cell-wide scenario, collisions allowed |
+  |---|---|---|
+  | `29e322b` | live resolution moves the node | 1 pass in 3 |
+  | `b17e5bb` | mover re-announces; peers re-key the live connection on the handshake's own check | 6 of 8 |
+  | `4b53a9a` | mover republishes capability/load at the point it moved **to** (and on `Reseated`, not only on a beacon) | 4 of 6 |
+  | `f09d9d6` | peers re-arm their roster refresh on `PeerMoved` — re-arm, **not** scan inline | 3 of 4 |
+
+- **The residual, and the next step.** `PeerMoved` only reaches nodes holding a *live connection* to the mover; one that
+  never met it stays in whatever backoff it had relaxed to (up to `ROSTER_REFRESH_MAX` = one epoch) and learns only from its
+  own directory scan. Hence `Refuted { frozen_for: 30s, last: [5, 3, 5, 4, 4] }` — two readers correct, three on a long
+  cadence, genuinely no change across two discovery periods.
+  - **The mechanism already exists and is unused.** `OverlayNode::on_announce` learns a mover's new coordinate from the
+    *flood* — first-sight insert into `membership.members`, then re-flood — so every node does hear about it without a
+    direct connection. It just **emits no notification**, so the role loop cannot re-arm on it. Emitting one on a
+    first-sight member is the natural close, and it also addresses the frozen-roster class (`[1, 1, 2]`) directly.
+  - **Second defect found in the same read, worth fixing with it:** the *old* coordinate is never removed from
+    `membership.members`, so after a move every node's view carries a phantom member at a point nobody holds. Bounded by
+    the plane size, so not a leak, but it makes membership a superset of reality.
+  - **Do not scan inline on the new event.** Tried: calling `assign_epoch` per move made things measurably worse (0 of 3,
+    rosters collapsing to `[2, 2, 2, 4, 2]`) because a scan costs up to one `RESOLVE_TIMEOUT` and per-move scanning is the
+    overlapping-scan regime `ROSTER_REFRESH`'s 1/3 duty cycle exists to prevent. Re-arm at the floor instead.
+- **`NodeFleet::spawn`'s injective draw is the honest indicator.** While it is there, this is not closed; it goes when the
+  cell-wide scenario passes with collisions allowed. Its stated reason has been rewritten five times as the chain advanced,
+  which is itself the record of where the boundary is.
 
 ---
 
