@@ -210,10 +210,29 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
 - **10b. TAXIS consensus liveness is RED at HEAD — two distinct defects, both reproducible, neither caused by item 10.**
   Found while baselining item 10 (the rule from `simulator-instrument-integrity`: establish the baseline *before* attributing
   a failure — which is the only reason this was not reported as a regression in that work).
-  - **Defect A — `sortition: Some` never finalizes a single block.** `taxis_quic::a_transaction_finalizes_and_executes_over_a_real_quic_cell`
-    fails at its *first* liveness witness (`taxis_quic.rs:152`, "the cell finalized a block over real QUIC") after the full
-    240 s. Its state machine is `Accounts`, so **no shielded pool and no OBOLOS code is involved** — this is core consensus.
-    The discriminator is the SSLE secret-leader path: this suite sets `sortition: Some(SortitionParams { .. })`.
+  - **Defect A — `sortition: Some` never finalizes a single block. ROOT CAUSE FOUND: the SSLE min-ticket lottery is gated on
+    N-fold DA reconstruction.** `taxis_quic::a_transaction_finalizes_and_executes_over_a_real_quic_cell` fails at its *first*
+    liveness witness (`taxis_quic.rs:152`) after the full 240 s. Its state machine is `Accounts`, so **no shielded pool and no
+    OBOLOS code is involved** — this is core consensus.
+    - **Three experiments localize it exactly.** `sortition: None` in the same suite passes in **7.71 s**. Broadcasting the
+      full block instead of the DA skeleton (`taxis_driver.rs`, one line) makes SSLE pass in **35.09 s**. The engine-level
+      `consensus_sim` SSLE tests pass — because its `shards_for` hands every replica the **complete** shard set.
+    - **The mechanism.** The driver never gives the engine a skeleton: it buffers it in `da.pending`, samples the other
+      shards over the network, and calls `step_msg(Propose(full))` only after `try_reconstruct` succeeds
+      (`taxis_driver.rs:600-625`). Under SSLE **all-propose**, that is 7 proposals × 6 sampled shards per replica per
+      height — while the engine's collection window is `COLLECT_WINDOW_TICKS = 1` (one 150 ms tick) and opens on the
+      *first* reconstructed proposal. So each replica ranks whatever tiny, **different** subset reconstructed inside one
+      tick, the PREPAREs split, no quorum forms, and the round times out — forever.
+    - **The design error, stated plainly:** `on_propose` runs the DA gate at `consensus.rs:855` and computes the ticket at
+      `consensus.rs:862`. The lottery ranks **tickets**, which ride in the skeleton (`Block::skeleton` preserves `witness`).
+      Requiring the *body* of every losing proposal before it may be ranked is both unnecessary and the stall itself.
+    - **Fix:** let the skeleton enter the lottery (rank from the witness, no body), and require availability only for the
+      block actually prepared — `prepare_round0_min` picks the lowest ticket **whose body is available**. Happy-path DA work
+      drops from N proposals to 1, and every replica ranks the same full set because skeletons arrive without sampling.
+    - **⚠️ The simulator could not have caught this, which is its own defect** (`simulator-fidelity-directive`: the sim must
+      differ from production *only* in transport). `consensus_sim::shards_for` returns `block.da_shards()` — the whole set,
+      instantly — so the sim models a proposal as arriving complete while production disperses one shard and samples the
+      rest. Closing that gap is part of the fix, or the next defect of this class hides the same way.
   - **Defect B — `sortition: None` finalizes blocks but the submitted transaction executes erratically.** `dromos_quic`
     reaches heights 1–2, and across two runs of the same binary observed **6 of 7 validators executed with the 7th stranded
     at genesis forever** (`0:h1/s1/n2 1:h0/s0/n1 2:h2/s1/n2 …`, unchanged from the 3-second mark) and then **0 of 7 executed
