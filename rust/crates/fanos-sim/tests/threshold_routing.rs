@@ -199,11 +199,26 @@ fn below_threshold_the_hop_cannot_be_peeled_and_nothing_is_delivered() {
 /// `NyxNode` path remains additive". So the flagship "strong against a GPA" claim had a timing measurement on the *weaker*
 /// engine and none on the shipping one.
 ///
-/// The metric is the one `traffic_analysis` arrived at after two wrong attempts: worst per-relay Pearson correlation
-/// between input-rate and output-rate series, **maximised over the adversary's observation timescale** (it chooses), and
-/// restricted to bin widths with at least 30 samples (Pearson over a handful of points reaches 1.000 by chance).
+/// ## ⚠️ THE METRIC BELOW IS INVALID — kept as a worked counter-example
+///
+/// It reports `r = 0.975` for the shipping configuration against `1.000` undefended, which reads as "no defence". **It is
+/// not a valid test**, for two reasons that took three revisions to see:
+///
+/// 1. **It penalises conservation.** A relay neither drops nor manufactures real cells, so over a window much longer than
+///    the mix delay, cells-out must equal cells-in. Maximising the correlation over the adversary's bin width therefore
+///    drives it toward 1 for *any* finite delay. An **ideal** independent-exponential mix at mean 50 ms also leaves
+///    `r ≈ 0.71` at 100 ms bins — so the number measures the mean and the conservation law, not the implementation.
+/// 2. **One flow is an anonymity set of one.** This harness pushes a single flow through the cell and asks whether it is
+///    visible. It necessarily is. Anonymity is whether an adversary can *match* inputs to outputs among **concurrent**
+///    flows; a one-flow experiment deletes the confusion that cover and mixing exist to create.
+///
+/// The valid experiment is a **linkability** measurement over several simultaneous flows — how much better than chance the
+/// adversary matches them — and it has **not** been run. This is left in place, `#[ignore]`d and labelled, because a
+/// deleted mistake teaches nothing and someone will otherwise re-derive the same metric and reach the same wrong
+/// conclusion. The generalisable rule: **a metric an ideal implementation also fails is measuring the physics, not the
+/// implementation** — check the ideal reference before reporting a defect.
 #[test]
-#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+#[ignore = "INVALID METRIC — kept as a worked counter-example, see the note above. Run with --ignored --nocapture"]
 fn measure_gpa_timing_on_the_shipping_router() {
     const SPAN_MS: u64 = 10_000;
     const MIN_BINS: u64 = 30;

@@ -344,6 +344,7 @@ fn sweep_timing_correlation_against_the_mix_delay() {
 }
 
 #[test]
+#[ignore = "INVALID METRIC — see threshold_routing::measure_gpa_timing_on_the_shipping_router. Kept as a counter-example."]
 fn the_timing_channel_is_measured_too_and_at_the_shipping_defaults() {
     let undefended = gpa_timing_correlation(None);
     let shipped = gpa_timing_correlation(Some((Duration::from_millis(50), Duration::from_millis(1_000))));

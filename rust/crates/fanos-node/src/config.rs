@@ -42,34 +42,32 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
 /// **This constant, not the mix delay, is the timing defence** — and the trade is steep enough to be chosen against data
 /// rather than picked.
 ///
-/// ## ⚠️ MEASURED ON THE SHIPPING ENGINE: the timing channel is essentially undefended
+/// ## ⚠️ RETRACTION — my GPA timing measurement was not a valid test, and its conclusion is withdrawn
 ///
-/// The first version of this note measured `fanos_aphantos::NyxNode` — the *Lite* engine — and guessed the Full profile
-/// would be **better**, since audit E6 records displacement as "done on `ThresholdRouter`" while "the Lite `NyxNode` path
-/// remains additive". **The guess was backwards.** Measured on `ThresholdRouter`, the engine these constants actually feed
-/// (`fanos-sim/tests/threshold_routing.rs::measure_gpa_timing_on_the_shipping_router`):
+/// An earlier version of this comment reported that the shipping configuration reduces a global passive adversary's
+/// per-hop timing correlation only from `1.000` to `0.975`, called the timing channel "essentially undefended", and said
+/// it contradicted spec §8.2. **That conclusion is withdrawn: the metric measured something no design can defend.**
 ///
-/// | configuration | GPA per-hop rate correlation |
-/// |---|---|
-/// | no defence at all | `r = 1.000` |
-/// | **these defaults (mix 50 ms, cover 1000 ms)** | **`r = 0.975`** |
-/// | aggressive (mix 120 ms, cover 150 ms) | `r = 0.898` |
+/// Two independent errors, both mine:
 ///
-/// The shipping configuration reduces a global passive adversary's per-hop timing correlation by **2.5%**. That is not a
-/// weak defence, it is effectively none — and it is *worse* than the Lite engine's 0.643 on the same metric.
+/// 1. **The metric penalises conservation, not weak mixing.** A relay neither drops nor manufactures real cells, so over
+///    any window much longer than the mix delay, cells-out *must* equal cells-in. Maximising in/out rate correlation over
+///    the adversary's bin width therefore drives it toward 1 for *any* finite delay. Checked against an **ideal**
+///    independent-exponential mix: mean 50 ms leaves `r = 0.712` at 100 ms bins, and the correlation only vanishes once
+///    the mean exceeds the bin. The shipping router is performing about as well as a perfect mix at its mean — the number
+///    was measuring the mean, and the conservation law, not a defect.
+/// 2. **A single flow has an anonymity set of one.** My harness pushed one flow through the cell and asked whether it was
+///    visible. It is, necessarily. Anonymity is not "is a lone flow invisible" but "among several concurrent flows, can
+///    the adversary *match* inputs to outputs better than chance". Cover and mixing exist to create that confusion, and a
+///    one-flow experiment removes the very thing being tested.
 ///
-/// The measurement is validated three ways, because a result this bad deserves the scrutiny before it is believed: cover
-/// genuinely emits in the harness (217 idle frames against 0 without it, so this is masking-versus-nothing and not
-/// starvation); the entry combiner is excluded, since `Command::Emit` is a raw launch that bypasses the outbox by design
-/// and its emissions track the injection schedule by construction; and the correlation is maximised over the adversary's
-/// observation timescale but restricted to bin widths with ≥ 30 samples.
+/// So the correct experiment is a **linkability** measurement over concurrent flows, and it has not been run. What
+/// survives from the work is narrower and still worth having: the **volume** channel is genuinely masked (leak slope
+/// 0.000, displacement being rate-independent), measured on both engines; and the mix delay's original doc claim — that it
+/// breaks per-hop timing correlation — remains wrong for the reason below, since that correlation is not what it moves.
 ///
-/// **The volume channel is fine** — displacement holds emitted volume independent of load (leak slope 0.000). So the two
-/// halves of the flagship claim are in very different states, and only the volume half was ever measured.
-///
-/// This contradicts spec §8.2's "strong against a GPA" **for the profile that ships**, and the honest conclusion is the
-/// one at the bottom of this comment: a fixed-clock cover schedule is the wrong instrument for the timing channel. It
-/// cannot be tuned into one.
+/// The lesson, since it cost three revisions: a metric that an *ideal* implementation also fails is measuring the
+/// physics, not the implementation. Check the ideal reference before reporting a defect.
 ///
 /// For reference, the same metric on the *Lite* `NyxNode` engine
 /// (`fanos-sim/tests/traffic_analysis.rs::sweep_timing_correlation_against_the_mix_delay`) — better, but still far from
