@@ -26,8 +26,8 @@ pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 ///
 /// **Measured correction (2026-07-26).** This constant used to claim it breaks "the per-hop timing correlation a global
 /// passive adversary (T2) uses". **It does not, and the measurement is flat.** Sweeping it against the GPA's
-/// input-rate/output-rate correlation (`fanos-sim/tests/traffic_analysis.rs`) gives *the same* `r = 0.583` at 50 ms,
-/// 120 ms, 250 ms, 500 ms, 1000 ms and 2000 ms. The reason is structural: a relay emits on **cover slots**, so emission
+/// input-rate/output-rate correlation (`fanos-sim/tests/traffic_analysis.rs`) gives *the same* `r = 0.643` at 50 ms,
+/// 120 ms, 250 ms, 500 ms, 1000 ms and 2000 ms, against 1.000 with no mixing at all. The reason is structural: a relay emits on **cover slots**, so emission
 /// *times* are set by [`DEFAULT_COVER_INTERVAL`] — the mix delay only chooses *which* queued cell fills a slot, never
 /// *when* slots occur, so it cannot move that correlation at all.
 ///
@@ -45,16 +45,26 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(50);
 ///
 /// | cover interval | GPA rate correlation |
 /// |---|---|
-/// | 150 ms | 0.273 |
-/// | 300 ms | 0.403 |
-/// | **1000 ms (this default)** | **0.583** |
+/// | 150 ms | 0.500 |
+/// | 300 ms | 0.475 |
+/// | **1000 ms (this default)** | **0.643** |
 /// | 3000 ms | 1.000 — no defence at all |
 ///
-/// So the shipping default leaves a **substantial residual timing signal**, and 3 s removes the defence entirely. The
-/// volume channel is fully masked at any of these (leak slope 0.000, since displacement does not depend on the rate), so
-/// timing is the binding constraint. Lowering this buys anonymity linearly in bandwidth; the value is deliberately left
-/// as an operator's decision rather than moved silently, but it should be made **against this table**, and a deployment
-/// facing a genuine global passive adversary should not run it at 1 s.
+/// The correlation is **maximised over the adversary's observation timescale**, because the adversary picks it — and
+/// restricted to bin widths with at least 30 samples, because Pearson over a handful of points reaches 1.000 by chance.
+/// Both constraints matter and both were got wrong first: a single 100 ms bin **understates** the exposure (0.583) since it
+/// is not the attacker's choice, and an unconstrained maximum **overstates** it (1.000 everywhere) on five-sample bins.
+///
+/// The honest reading is worse than "a substantial residual", and it is not what §8.2's "strong against a GPA" implies:
+/// **no configuration measured brings this channel near zero.** The best tested value leaves `r ≈ 0.48`, the shipping
+/// default `r ≈ 0.64`, and 3 s removes the defence entirely. The volume channel *is* fully masked at all of these (leak
+/// slope 0.000 — displacement does not depend on rate), which makes timing the binding constraint and this table the
+/// real GPA exposure.
+///
+/// Lowering the interval buys little here (0.643 → 0.475 for a 3× bandwidth increase), so the honest conclusion is not
+/// "tune this down" but that **constant-rate cover on a fixed clock is the wrong instrument for the timing channel** — a
+/// relay's emission times track its input envelope at some timescale regardless of the slot period. Closing it properly
+/// needs emission decoupled from arrival, not a faster clock. Recorded as a design gap rather than a tuning note.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With

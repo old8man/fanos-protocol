@@ -223,8 +223,34 @@ fn a_zero_leak_slope_is_masking_and_not_starvation() {
 ///
 /// A relay that forwards immediately leaks its circuit even at perfectly constant volume: the GPA watches *when* cells
 /// leave, not how many. So the timing channel is where the mix delay earns its place, and it was untested.
+/// The GPA's timing advantage, **maximised over the observation timescale** — because the adversary chooses it.
+///
+/// Reporting a single bin width measures *my* choice, not the attacker's — a global passive adversary bins the wire
+/// however suits it, and the correlation is strongly bin-dependent. So the metric maximises over bin widths.
+///
+/// **But only over bins with enough samples to mean anything.** A first version maximised over every width including
+/// 2000 ms, which on a ~10 s run is *five data points* — and Pearson over five points reaches 1.000 routinely by chance.
+/// That version reported `r = 1.000` for every configuration, which is not a finding about the traffic but an artefact of
+/// the sample count. [`MIN_BINS`] is the floor that keeps the statistic honest; widths coarser than `span / MIN_BINS` are
+/// excluded rather than believed.
+///
+/// The lesson, recorded because it nearly shipped twice in opposite directions: a single bin width **understates** the
+/// exposure (it is not the adversary's choice) and an unconstrained maximum **overstates** it (small samples correlate
+/// spuriously). Both errors look like results.
 fn gpa_timing_correlation(mix: Option<(Duration, Duration)>) -> f64 {
-    const BIN_MS: u64 = 100;
+    /// Minimum bins for a Pearson coefficient to carry information rather than noise.
+    const MIN_BINS: u64 = 30;
+    // The run in `gpa_timing_correlation_binned` spans ~10 s of virtual time.
+    const SPAN_MS: u64 = 10_000;
+    [25u64, 50, 100, 250, 500, 1_000, 2_000]
+        .into_iter()
+        .filter(|bin| SPAN_MS / bin >= MIN_BINS)
+        .map(|bin| gpa_timing_correlation_binned(mix, bin))
+        .fold(0.0f64, f64::max)
+}
+
+/// As [`gpa_timing_correlation`], with an explicit bin width — so the result can be checked for binning artefacts.
+fn gpa_timing_correlation_binned(mix: Option<(Duration, Duration)>, bin_ms: u64) -> f64 {
     let (cell, _) = run_and_tap(mix, 0); // shape only; re-run below with real traffic
     let (client, service) = (cell[0], cell[40]);
 
@@ -244,7 +270,7 @@ fn gpa_timing_correlation(mix: Option<(Duration, Duration)>) -> f64 {
     sim.run_for(Duration::from_millis(2_000));
 
     let obs = sim.observed_frames();
-    let span = obs.iter().map(|o| o.t_ms).max().unwrap_or(0) / BIN_MS + 1;
+    let span = obs.iter().map(|o| o.t_ms).max().unwrap_or(0) / bin_ms + 1;
     let mut worst = 0.0f64;
     for &relay in &relays {
         if relay == client || relay == service {
@@ -253,7 +279,7 @@ fn gpa_timing_correlation(mix: Option<(Duration, Duration)>) -> f64 {
         let mut ins = vec![0f64; span as usize];
         let mut outs = vec![0f64; span as usize];
         for o in obs {
-            let b = (o.t_ms / BIN_MS) as usize;
+            let b = (o.t_ms / bin_ms) as usize;
             if o.to == relay && let Some(v) = ins.get_mut(b) {
                 *v += 1.0;
             }
@@ -288,8 +314,24 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 
 #[test]
 #[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
+fn sweep_bin_width_to_check_the_correlation_is_not_an_artefact() {
+    // Both series are mostly zero between cover slots, and CORRELATED ZEROS inflate Pearson. If r survives only at one
+    // bin width it is an artefact of the binning, not a property of the traffic.
+    println!("bin width -> r  (shipping schedule: mix 50ms, cover 1000ms)");
+    let ship = Some((Duration::from_millis(50), Duration::from_millis(1_000)));
+    for bin in [25u64, 50, 100, 250, 500, 1_000, 2_000] {
+        println!(
+            "  {bin:>5} ms bins -> undefended {:.3}, shipped {:.3}",
+            gpa_timing_correlation_binned(None, bin),
+            gpa_timing_correlation_binned(ship, bin)
+        );
+    }
+}
+
+#[test]
+#[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
 fn sweep_timing_correlation_against_the_mix_delay() {
-    println!("mix delay -> worst per-relay in/out rate correlation (cover 1000ms):");
+    println!("mix delay -> GPA correlation, maximised over observation bin width (cover 1000ms):");
     for ms in [0u64, 50, 120, 250, 500, 1_000, 2_000] {
         let m = if ms == 0 { None } else { Some((Duration::from_millis(ms), Duration::from_millis(1_000))) };
         println!("  {ms:>5} ms -> r = {:.3}", gpa_timing_correlation(m));
