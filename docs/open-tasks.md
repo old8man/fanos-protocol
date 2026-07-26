@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD 1ef497b`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD f752495`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -106,7 +106,15 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
 
 ## Tier C — coherence & architecture quality
 
-### 5. Telemetry differential-privacy export path (C7)
+### 5. Telemetry differential-privacy export path (C7) — **DONE** (`f752495`)
+`fanos-node::telemetry_dir` publishes the privatized `CoherenceFrame` to a coordinate-and-epoch store slot, driven off
+`Notification::Observed` so the export cadence *is* the diagnosis cadence. Off by default
+(`NodeConfig::telemetry_epsilon: Option<f64>`) with deliberately no default ε — picking one chooses a privacy/utility
+trade-off on the operator's behalf. The entropy source is the subtle part: `privatize` requires an *infallible* RNG, so
+`FreshEntropy` reads a 32-byte OS seed (returning `None`, and skipping the export, if that fails) then expands by
+domain-separated XOF — because panicking would down a node and a predictable fallback would void the ε.
+
+### 5-OLD. Telemetry differential-privacy export path (C7)
 - **Problem.** Verified: `fanos-telemetry::dp::privatize` (the ε-DP mechanism) has **no caller anywhere outside its own
   crate**. The node has no telemetry *export* path at all, so the DP guarantee is decorative and no operator-facing
   metrics ship.
@@ -180,10 +188,19 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     a *coordinate-owned namespace*, where a slot keyed by a coordinate accepts a `put` only from the peer whose verified
     coordinate is that coordinate — covers `mixdir` and every other coordinate-keyed slot at once, instead of each
     subsystem re-deriving the check. That makes this a storage-authorization feature, and it should be built as one.
-- **11. ct_len hop-position leak (S1-M6)** — the threshold-onion per-layer length header is cleartext
-  (`fanos-aphantos/src/threshold.rs:234`, already documented there as a residual), so a *peeling* relay learns its hop
-  position. Optional: flat-header Sphinx-style per-layer length encryption (the `sealed.rs` path already AEAD-encrypts the
-  length).
+- **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
+  is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
+  - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
+    `ct_len = total − 18 − members × SEALED_SHARE_LEN` — and `members` is cleartext while `total` is the layer the relay is
+    holding. The field is **redundant**; hiding it hides nothing. The leak is that layers *shrink with depth*, not that a
+    number names the size.
+  - **The real fix is already paid for.** The honest construction is a Sphinx-shape fixed slot array — a constant-size
+    header of `D` per-hop slots, each hop decrypting its slot, shifting, and re-padding — which leaks no depth by
+    construction. The objection is normally bandwidth, and here it is void: `pad_onion` already pads **every** onion to
+    `THRESHOLD_ONION_LEN` = 20 480 B on every hop, and a fixed slot array costs the same bytes. At `q = 2` that width holds
+    5 hops, at `q = 4` three, at `q = 7` two — which also makes explicit a max-depth the current design leaves implicit.
+  - So this is a contained redesign of the layer layout at unchanged wire cost, not an optional expensive extra. Worth
+    doing; worth doing deliberately.
 - **12. NYX transparent-sheaf footgun** — `fanos-nyx` `sheaf.rs`/`tessera.rs` (cleartext-Shamir transparent onions,
   superseded on the live path) are still `pub` (`lib.rs:33-34`): gate behind a sim feature or rename so an integrator
   cannot pick the lower-assurance variant.
