@@ -1,6 +1,6 @@
 # FANOS — open tasks (handoff)
 
-**As of** `HEAD 474cda1`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
+**As of** `HEAD ef18e81`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
 reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
 done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
 (all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
@@ -48,13 +48,16 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   `fanos-sim::fabric::measure_whether_a_collided_draw_now_resolves_itself`): **three of three collided draws stayed
   collided** (held 6/7, all-distinct never reached), the fourth draw being injective. So the capacity result (200/200 at
   `P=993`) is still simulator-only and `NodeFleet::spawn`'s injective draw is still load-bearing.
-- **The lead, not a guess.** In each failure the stuck node's roster is far below its peers' (`[6, 6, 6, 1, 6, 6, 6]`). A
-  node that loses the directory arbitration holds no binding, so it is unreachable *by coordinate*; a node that hears from
-  almost nobody records almost no claims, so it never learns a better claim holds its point. Candidate fixes: have the
-  loser keep learning through the connections it *originates*, or let the directory answer for a displaced claimant.
-  **Diagnose which before building either** — and note the trap this already sprung: four consecutive passes of the
-  cell-wide test with the workaround off looked like success and were a 13% coincidence at ~60% injective per draw. Force
-  the condition; do not wait to meet it.
+- **The lead was WRONG, and the real blocker is a design question.** The reachability hypothesis (`4bb60f3`) is refuted:
+  `Health::verified_claims` shows every node, stuck ones included, verified several peers' claims — `[6, 2, 4, 5, 5, 5, 4]`.
+  They heard and did not move. The within-epoch re-seat is now **deliberately unwired**: a coordinate is the key TAXIS
+  committee membership, shard placement and every routing table derive from, and all of them re-derive at an epoch
+  boundary where *every* node moves at once. Moving one node in between invalidates state the rest of the cell holds.
+  Whether that is tolerable is **unverified** — an attempt to measure it produced a false positive (482 s failing vs 5.6 s
+  passing) that the baseline refuted, since HEAD fails identically under the same load.
+- **What it needs**, in order: (a) an *uncontended* measurement, now that `until_settled` reports "inconclusive" instead of
+  red; or (b) the design that makes the question moot — a bounded **settling window** at the start of each epoch, before
+  coordinate-keyed layers commit. (b) is the stronger answer and the one to design.
 
 ---
 
@@ -153,6 +156,29 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
   cannot pick the lower-assurance variant.
 
 ---
+
+## Simulator hardening (the standing directive, applied to the harness itself)
+
+Each defect class found this session is now an **assertion in the simulator**, not a one-off measurement — and two of them
+were defects *in the instrument*:
+
+- **A blind observable manufactures defects.** `Node::health().address` was a field captured at spawn while the engine
+  reseated every epoch, so every layer named the node's birth position forever. Three "collided draws never resolve"
+  measurements were taken through it and are void. Pinned by
+  `fabric::a_reseat_moves_the_coordinate_every_layer_reports`, which failed at 245 s against the old code and passes in
+  0.11 s (`4bb60f3`). `Notification::Reseated` had existed with no consumer — the engine always announced its re-seats and
+  nothing listened.
+- **A symptom that cannot be localised is a measurement, not a test.** `Health::verified_claims` separates "never heard of
+  the rival" from "heard and did not move", two defects with one symptom. Pinned by
+  `fabric::a_node_records_the_claims_of_peers_it_meets`; it refuted a hypothesis immediately (`4bb60f3`).
+- **A timeout is not a refutation.** `NodeFleet::until_settled` is three-valued — `Reached` / `Refuted` / `Inconclusive` —
+  discriminating on the trajectory rather than on load average, so a contended host reports "still converging" instead of
+  red. Pinned by `fabric::the_harness_tells_a_refutation_apart_from_an_unfinished_measurement`, all three branches
+  (`ef18e81`). Its `FROZEN_SPAN` is derived from `role_loop::ROSTER_REFRESH` × **2**, the factor being the content: a
+  process firing every `T` is unchanged for just under `T` between firings, so `T` alone cannot tell "between firings" from
+  "stopped". The sim proved that by refuting my first derivation.
+- **Establish the baseline before attributing a failure.** `git stash push -- <own paths only>`, run, pop. Two hypotheses
+  died to this in one session; both would otherwise have shipped as findings.
 
 ## Two test defects found while doing the above — both mine, both from the same gap
 
