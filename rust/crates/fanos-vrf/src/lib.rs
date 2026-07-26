@@ -223,17 +223,17 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 /// nodes, better than the bare draw's 4.62 but still short, because 7 draws from 7 points cover only ~4.6 of them. The
 /// probing was re-colliding with itself.
 ///
-/// This is **double hashing**, the classic fix: walk the canonical point index by a fixed stride,
+/// This is **double hashing**, the classic fix, applied within the line:
 ///
 /// ```text
-/// p_k = Point::at((i₀ + k·s) mod P),   i₀ = index(MapToPoint(output)),   s coprime to P
+/// p_k = line[(start + k·s) mod (q+1)],   start = position of MapToPoint(output) on its line,   gcd(s, q+1) = 1
 /// ```
 ///
-/// `gcd(s, P) = 1` makes `k ↦ (i₀ + k·s) mod P` a **cyclic permutation of all `P` points**, so the sequence enumerates
-/// the whole plane and probing seats every node whenever `n ≤ P`. Both `i₀` and `s` derive from the node's own output, so
-/// the permutation is verifiable and unchoosable; the stride is searched upward from a hashed start until coprime, which
-/// terminates immediately in practice and is deterministic for any `P` — necessary because `P = q² + q + 1` need not be
-/// prime (`P = 21 = 3·7` for `q = 4`).
+/// A stride coprime to the walk's length makes `k ↦ (start + k·s) mod len` a **cyclic permutation of the line's `q + 1`
+/// points**, so the sequence enumerates that line and probing seats the node whenever any point of it is free. Both the
+/// line and the stride derive from the node's own output, so the permutation is verifiable and unchoosable; the stride is
+/// searched upward from a hashed start until coprime, which terminates immediately in practice and is deterministic for
+/// any length — necessary because `q + 1` need not be prime (`q = 31` gives a line of 32 points).
 #[must_use]
 pub fn probe_point<F: Field>(output: &VrfOutput, k: u16) -> Point<F> {
     let first = coordinate_from_output::<F>(output);
@@ -520,6 +520,12 @@ pub fn verify_coordinate_claim<F: Field>(
     let Some(output) = claimant_public.verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof) else {
         return false;
     };
+    // The walk cycles after `probe_bound` steps, so an index at or beyond it names a point some lower index already
+    // names — while demanding that many more witnesses. Rejecting it keeps a claim's chain as short as the point it
+    // reaches actually requires, and denies a claimant the option of presenting a needlessly long one.
+    if claim.index >= probe_bound::<F>() {
+        return false;
+    }
     if probe_point::<F>(&output, claim.index) != *claimed {
         return false;
     }
@@ -834,6 +840,45 @@ mod tests {
             !verify_coordinate_claim::<F31>(&l_sk.public(), &[loser], epoch, &beacon, &at_two, &reused),
             "one witness cannot justify two steps of a permutation walk"
         );
+    }
+
+    #[test]
+    fn a_claim_index_beyond_the_line_is_refused_even_though_it_names_a_real_point() {
+        // Stale-after-redesign check. Once the walk is confined to a line it cycles after `q + 1` steps, so an index at
+        // or beyond that names a point some LOWER index already names — while demanding that many more witnesses. The
+        // point is real and the arithmetic is consistent, which is exactly why this needs an explicit refusal rather than
+        // failing naturally: nothing else would catch it.
+        let sk = VrfSecret::from_seed([44u8; 32]);
+        let epoch = Epoch::new(2);
+        let beacon = BeaconSeed::GENESIS;
+        let (proof, output) = sk.prove(&beacon_alpha(b"n", epoch, &beacon));
+        let bound = probe_bound::<F31>();
+
+        // Index `bound` names exactly the same point as index 0 — the walk has come full circle.
+        assert_eq!(probe_point::<F31>(&output, bound), probe_point::<F31>(&output, 0));
+
+        // A claim at that index, with a chain of the required length, is refused on the index alone.
+        let padded = CoordinateClaim { proof, index: bound, witnesses: Vec::new() };
+        assert!(!verify_coordinate_claim::<F31>(
+            &sk.public(),
+            b"n",
+            epoch,
+            &beacon,
+            &probe_point::<F31>(&output, bound),
+            &padded
+        ));
+
+        // And the uncontested claim at index 0 for that same point still verifies, so the refusal is about the index and
+        // not the point.
+        let direct = CoordinateClaim::direct(proof);
+        assert!(verify_coordinate_claim::<F31>(
+            &sk.public(),
+            b"n",
+            epoch,
+            &beacon,
+            &probe_point::<F31>(&output, 0),
+            &direct
+        ));
     }
 
     #[test]

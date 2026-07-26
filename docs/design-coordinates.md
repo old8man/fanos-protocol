@@ -263,7 +263,9 @@ p_k = Point::at((i₀ + k·s) mod P),   i₀ = index(MapToPoint(output)),   gcd(
 
 Both `i₀` and the stride `s` derive from the node's *own* VRF output, so the walk is verifiable and unchoosable, and a new
 beacon reshuffles the entire sequence — assumption 2 extends to **every** probe index, not just `k = 0`. `gcd(s, P) = 1`
-makes `k ↦ (i₀ + k·s) mod P` a cyclic permutation of all `P` points, so probing seats a node whenever any point is free.
+makes the walk a cyclic permutation of its **line's `q + 1` points**, so probing seats a node whenever any point of that
+line is free. (This paragraph described a *plane-wide* walk until the steering analysis below replaced it with a
+line-restricted one; the double-hashing construction is unchanged, only the domain it walks.)
 
 Two details that are load-bearing rather than fussy:
 
