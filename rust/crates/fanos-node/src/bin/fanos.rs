@@ -152,7 +152,7 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
 async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let config = node_config_from_args(args)?;
-    let mut node = Node::start::<F2>(config).await?;
+    let mut node = Node::start_on_plane(config).await?;
     let health = node.health();
     let [x, y, z] = health.address;
     info!(coord = ?health.address, local_addr = %health.local_addr, peers = health.known_peers, "fanos node up");
@@ -244,7 +244,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     let exit_via = parse_exit_via(args)?;
 
     let config = node_config_from_args(args)?;
-    let mut node = Node::start::<F2>(config).await?;
+    let mut node = Node::start_on_plane(config).await?;
     let health = node.health();
     // The clearnet exit to route non-`.fanos` targets through: the `--exit-via` override, else an exit
     // discovered from the live cell directory (none ⇒ clearnet targets are refused).
@@ -363,7 +363,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     let address = Address::from_bundle(&bundle);
 
     let config = node_config_from_args(args)?;
-    let mut node = Node::start::<F2>(config).await?;
+    let mut node = Node::start_on_plane(config).await?;
     let health = node.health();
 
     // Publish the descriptor so clients resolve `<name>.fanos` → the service key. The coordinate is a
@@ -440,7 +440,7 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
     let exit_via = parse_exit_via(args)?;
 
     let config = node_config_from_args(args)?;
-    let mut node = Node::start::<F2>(config).await?;
+    let mut node = Node::start_on_plane(config).await?;
     // Every UDP flow leaves via the exit; without one the datapath could relay nothing.
     let exit = match exit_via {
         Some(e) => Some(e),

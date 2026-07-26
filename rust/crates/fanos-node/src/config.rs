@@ -551,6 +551,19 @@ const _: () = {
 pub struct NodeConfig {
     /// The address to bind the QUIC endpoint to (e.g. `0.0.0.0:9000`).
     pub listen: SocketAddr,
+    /// The projective plane order `q` this node's cell runs on — `PG(2, q)` has `q² + q + 1` points, one per node.
+    ///
+    /// **This exists because the binary was pinned to `q = 2`.** `Node::start` has always been generic over the plane, but
+    /// `fanos.rs` instantiated `F2` at every call site, so every deployment ran the **smallest possible cell: 7 points,
+    /// 3-point lines, threshold 2**. For anonymity that is the binding constraint — a mixnet's protection is bounded by the
+    /// size of the set a flow hides in, and no schedule tuning reaches past 7 relays. The library being general while the
+    /// binary pinned the minimum is the "libraries ahead, wiring behind" pattern this project's audits keep finding, and
+    /// here it capped a headline property rather than an internal one.
+    ///
+    /// Supported orders are prime powers (`PG(2,q)` exists only then): 2, 4, 7, 31. `q = 2` remains the default so no
+    /// existing deployment changes behaviour silently, but it is a **test fixture**, and a deployment that wants the
+    /// anonymity the spec claims should raise it.
+    pub plane_order: u32,
     /// Where to persist the self-certifying identity; `None` = ephemeral (new identity each run).
     pub identity_path: Option<PathBuf>,
     /// Bootstrap peers seeded into the address book.
@@ -609,6 +622,8 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            // `q = 2` for continuity — see the field's note on why that is a fixture and not a recommendation.
+            plane_order: 2,
             identity_path: None,
             bootstrap: Vec::new(),
             roles: RoleSet::default(),

@@ -461,6 +461,27 @@ impl Node {
         Self::start_over::<F>(config, Fabric::Udp(listen)).await
     }
 
+    /// Start on the plane `config.plane_order` names, dispatching to the right [`Field`] at run time.
+    ///
+    /// The binary used to call `start::<F2>` directly, pinning every deployment to `PG(2,2)` — 7 points, the smallest
+    /// plane there is — while `start` itself was always generic. For a mixnet that pin is the binding constraint: a flow
+    /// hides in the set of relays available, and no amount of schedule tuning reaches past seven of them.
+    ///
+    /// # Errors
+    /// [`NodeError::Config`] if `plane_order` is not a supported prime power. `PG(2,q)` exists only for prime powers, so
+    /// an unsupported order is refused here rather than producing a cell whose geometry does not close.
+    pub async fn start_on_plane(config: NodeConfig) -> Result<Self, NodeError> {
+        match config.plane_order {
+            2 => Self::start::<fanos_field::F2>(config).await,
+            4 => Self::start::<fanos_field::F4>(config).await,
+            7 => Self::start::<fanos_field::F7>(config).await,
+            31 => Self::start::<fanos_field::F31>(config).await,
+            q => Err(NodeError::Config(format!(
+                "plane order {q} is not a supported prime power — PG(2,q) exists only for prime powers; use 2, 4, 7 or 31"
+            ))),
+        }
+    }
+
     /// Start a node over an explicit transport [`Fabric`] — the **simulation entry point**.
     ///
     /// Identical to [`start`](Self::start) in every respect except where datagrams come from. Pass
@@ -785,6 +806,28 @@ mod tests {
         assert!(matches!(a, Err(NodeError::Resolve(_))));
         assert!(matches!(b, Err(NodeError::Resolve(_))));
         node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn the_plane_is_configurable_and_an_impossible_order_is_refused() {
+        // The binary pinned `F2` at every call site, so every deployment ran PG(2,2) — 7 points, the smallest plane there
+        // is — while `start` was always generic. For a mixnet that is the binding constraint: a flow hides in the set of
+        // relays available, and no schedule tuning reaches past seven of them.
+        for q in [2u32, 4, 7] {
+            let node = Node::start_on_plane(NodeConfig { plane_order: q, ..NodeConfig::default() })
+                .await
+                .unwrap_or_else(|e| panic!("plane order {q} must start: {e}"));
+            assert!(node.health().local_addr.port() > 0, "the node on PG(2,{q}) is live");
+            node.shutdown();
+        }
+
+        // PG(2,q) exists only for prime powers, so a non-prime-power order is refused at the port rather than producing a
+        // cell whose geometry does not close. 6 and 10 are the classical non-existence cases (Bruck–Ryser, and order 10
+        // by exhaustive search).
+        for q in [0u32, 1, 6, 10] {
+            let err = Node::start_on_plane(NodeConfig { plane_order: q, ..NodeConfig::default() }).await;
+            assert!(err.is_err(), "plane order {q} has no projective plane and must be refused");
+        }
     }
 
     #[tokio::test]
