@@ -127,7 +127,7 @@ pub fn verify(chunk: &Cid, beacon: &[u8], k: usize, leaves: usize, response: &[L
     // valid byte encoding per (chunk, beacon), and a permuted/duplicated variant cannot pass as a distinct proof
     // (which, without this, lets a provider replay one proof of holding many times against one settlement).
     for (lp, &index) in response.iter().zip(&expected) {
-        if lp.index != index || !verify_leaf(chunk, index, &lp.bytes, &lp.path) {
+        if lp.index != index || !verify_leaf(chunk, index, &lp.bytes, &lp.path, leaves) {
             return false;
         }
     }
@@ -142,15 +142,17 @@ pub fn chunk_leaf_count(chunk: &[u8]) -> usize {
 }
 
 /// Canonical bytes of one leaf proof: `index(4, LE) ‖ bytes_len(4, LE) ‖ bytes ‖ steps(2, LE) ‖
-/// [ sibling(32) ‖ on_right(1) ] × steps`.
+/// [ sibling(32) ] × steps`.
+///
+/// The per-step side flag is gone: the side follows from the leaf index, so carrying it let a prover propose a path shape
+/// the commitment never authorised.
 fn encode_leaf_proof(lp: &LeafProof, out: &mut Vec<u8>) {
     out.extend_from_slice(&u32::try_from(lp.index).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(&u32::try_from(lp.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(&lp.bytes);
     out.extend_from_slice(&u16::try_from(lp.path.len()).unwrap_or(u16::MAX).to_le_bytes());
-    for step in &lp.path {
-        out.extend_from_slice(&step.sibling);
-        out.push(u8::from(step.sibling_on_right));
+    for sibling in &lp.path {
+        out.extend_from_slice(sibling);
     }
 }
 
@@ -175,13 +177,8 @@ fn decode_leaf_proof(bytes: &[u8]) -> Option<(LeafProof, &[u8])> {
     let mut path = MerkleProof::with_capacity(steps);
     let mut off = leaf_end.checked_add(2)?;
     for _ in 0..steps {
-        let sibling = bytes.get(off..off + 32)?.try_into().ok()?;
-        let flag = *bytes.get(off + 32)?;
-        if flag > 1 {
-            return None; // non-canonical boolean
-        }
-        path.push(crate::content::MerkleStep { sibling, sibling_on_right: flag == 1 });
-        off = off.checked_add(33)?;
+        path.push(bytes.get(off..off + 32)?.try_into().ok()?);
+        off = off.checked_add(32)?;
     }
     Some((LeafProof { index, bytes: leaf_bytes, path }, bytes.get(off..)?))
 }

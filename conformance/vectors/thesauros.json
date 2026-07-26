@@ -4,29 +4,32 @@
     "leaf_size": 4096,
     "chunk_size": 262144,
     "leaf_label": "FANOS-v1/thesauros-leaf",
-    "node_label": "FANOS-v1/thesauros-node",
+    "node_label": "FANOS-v1/merkle-node",
     "leaf_hash": "leaf_hash(index, bytes) = hash_labeled(leaf_label, index_as_u64_le(8) || bytes)",
     "node_hash": "node_hash(left, right) = hash_labeled(node_label, left(32) || right(32))",
-    "root": "binary Merkle fold of the leaf hashes; a lone odd node at any level is promoted unchanged; empty object = one empty leaf, cid = leaf_hash(0, [])",
-    "cid": "the Merkle root (32 bytes)"
+    "root": "binary Merkle fold of the leaf hashes, duplicating a lone odd node at any level, then WRAPPED with the leaf count: root = hash_labeled(root_label, count_as_u64_be(8) || fold(32)). The count binding is what removes the CVE-2012-2459 ambiguity (unwrapped, [a,b,c] and [a,b,c,c] fold identically) and what fixes the authentication-path length at ceil(log2(count)).",
+    "cid": "the count-bound Merkle root (32 bytes). NOTE: a one-leaf object's CID is NOT its bare leaf hash.",
+    "root_label": "FANOS-v1/merkle-root",
+    "path_length": "exactly ceil(log2(count)) siblings; any other length must be rejected without hashing",
+    "path_side": "derived from the leaf index parity at each level, never carried in the proof"
   },
   "single_leaf": {
-    "comment": "An object smaller than one leaf is a single leaf; its CID is that leaf's position-bound hash.",
+    "comment": "An object smaller than one leaf is a single leaf; its CID is the count-bound root over that one position-bound leaf hash — deliberately NOT the leaf hash itself, so an id and a leaf hash cannot collide.",
     "input_hex": "544845534155524f532d763120636f6e666f726d616e6365",
     "input_utf8": "THESAUROS-v1 conformance",
-    "cid_hex": "08d188caddc77d94f74ffad43faf9dbfe30f580c7d0b7c6904fde7a9a1757352"
+    "cid_hex": "9310d25f3c05124ad5f1fbf8a851b200b25650c4c36060ad01baf74253bcdd49"
   },
   "two_leaf": {
-    "comment": "0xAB repeated 4096 (one full leaf) then 0xCD x100 (a partial second leaf). CID = node_hash(leaf_hash(0, leaf0), leaf_hash(1, leaf1)). The proof-of-retrievability response for leaf index 1 is the 100 leaf bytes plus a 1-step Merkle path whose sibling is leaf 0's hash (on the left).",
+    "comment": "0xAB repeated 4096 (one full leaf) then 0xCD x100 (a partial second leaf). CID = root_label-wrapped node_hash(leaf0, leaf1) with count 2.",
     "leaf0_byte": 171,
     "leaf0_len": 4096,
     "leaf1_byte": 205,
     "leaf1_len": 100,
-    "cid_hex": "ef5852c9ae5a18e782390d8a0390fcaeb24870b512f3f0a6cbf49a77ec5e4dab",
+    "cid_hex": "5bc90dcc4bc71c80480c718d4c6eb5a953ae0e40b9ab4f9089c29fa108b1f006",
     "leaf1_proof": {
       "steps": 1,
       "sibling0_hex": "42c328b17f0d442090c2fa24124d373b9d933bd561adfd3fc778ddc4faf65e62",
-      "sibling0_on_right": false
+      "side_note": "leaf 1 is odd, so its sibling is the LEFT child — derived from the index, not carried"
     }
   },
   "por": {
@@ -34,8 +37,14 @@
     "chunk_leaves": 16,
     "beacon_utf8": "epoch-42-beacon",
     "k": 5,
-    "chunk_cid_hex": "67dde567cf60cc8c1cf1fcfb0f275c381b0c8469cc33e14370d0fa2895a64605",
-    "challenge_indices": [2, 10, 11, 12, 13],
+    "chunk_cid_hex": "31f091aa2d630bf9fd65ec1b930d14fe2593b36d5f4d541f93d2980fe83d4785",
+    "challenge_indices": [
+      4,
+      10,
+      13,
+      14,
+      15
+    ],
     "required_samples_examples": {
       "comment": "k = ceil(lambda*ln2 / -ln(1-f_tol))",
       "lambda30_ftol0.10": 198,
@@ -47,7 +56,7 @@
     "comment": "An object of CHUNK*2 + 500 bytes, byte i = (i*7) mod 256, split into 3 chunks (2 full + 1 partial). The manifest encodes count(4, LE) || [ cid(32) || len(4, LE) ] x count; its own CID is chunk_cid(manifest.encode()).",
     "object_len": 524788,
     "chunk_count": 3,
-    "chunk0_cid_hex": "acb392e6be89ba2603c51ff71585906947575f47c92329c0858499eafda29f08",
-    "manifest_cid_hex": "77bee73e33cd5dea7db2e1d4ecf960ff03389d29b3ffb09269e8b1df14647858"
+    "chunk0_cid_hex": "ff7464d155857d8dfb6648c505b8aa28dfd39ebe20003e8de9d5b67e20219c16",
+    "manifest_cid_hex": "6225c46db36386c4c0e8e9c5e1a657f66f2bf24bdce2311faa3b1eb42960c0d9"
   }
 }

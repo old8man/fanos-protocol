@@ -18,15 +18,14 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash_labeled;
+use fanos_primitives::{hash_labeled, merkle};
 
 use crate::checkpoint::ExecCertificate;
 
+/// This subsystem's own leaf label. Deliberately local: [`merkle`] owns the internal-node label, so a leaf of *this*
+/// tree can be neither an internal node nor a leaf of any other subsystem's tree.
 const LEAF_LABEL: &str = "FANOS-v1/taxis-crossmsg-leaf";
-const NODE_LABEL: &str = "FANOS-v1/taxis-merkle-node";
 const STATE_LABEL: &str = "FANOS-v1/taxis-state-root";
-/// The Merkle root of an empty outbox (a cell that emitted no cross-cell messages this height).
-const EMPTY_ROOT: [u8; 32] = [0u8; 32];
 
 /// A cross-cell message: an outbound payload from this cell to `dest_cell`, uniquely identified by `nonce`
 /// (the destination de-duplicates by `(source_cell, nonce)` for replay protection).
@@ -82,81 +81,6 @@ impl CrossMsg {
     }
 }
 
-/// Hash two Merkle children into their parent (domain-separated from leaves).
-fn node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(left);
-    buf[32..].copy_from_slice(right);
-    hash_labeled(NODE_LABEL, &buf)
-}
-
-/// The Merkle root over `leaves`, padding each level's odd tail by duplicating the last node. Empty ⇒
-/// [`EMPTY_ROOT`].
-#[must_use]
-fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-    if leaves.is_empty() {
-        return EMPTY_ROOT;
-    }
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        let mut i = 0;
-        while i < level.len() {
-            let left = level.get(i).copied().unwrap_or(EMPTY_ROOT);
-            let right = level.get(i + 1).copied().unwrap_or(left); // duplicate-last on an odd tail
-            next.push(node(&left, &right));
-            i += 2;
-        }
-        level = next;
-    }
-    level.first().copied().unwrap_or(EMPTY_ROOT)
-}
-
-/// The Merkle authentication path (sibling hashes, bottom-up) for the leaf at `index`, or `None` if out of
-/// range. The path length is the tree height; each step pairs with the sibling, duplicating the last node on an
-/// odd tail exactly as [`merkle_root`] does.
-#[must_use]
-fn merkle_prove(leaves: &[[u8; 32]], index: usize) -> Option<Vec<[u8; 32]>> {
-    if index >= leaves.len() {
-        return None;
-    }
-    let mut path = Vec::new();
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
-    let mut idx = index;
-    while level.len() > 1 {
-        let sibling = if idx.is_multiple_of(2) {
-            level.get(idx + 1).copied().unwrap_or_else(|| level.get(idx).copied().unwrap_or(EMPTY_ROOT))
-        } else {
-            level.get(idx - 1).copied().unwrap_or(EMPTY_ROOT)
-        };
-        path.push(sibling);
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        let mut i = 0;
-        while i < level.len() {
-            let left = level.get(i).copied().unwrap_or(EMPTY_ROOT);
-            let right = level.get(i + 1).copied().unwrap_or(left);
-            next.push(node(&left, &right));
-            i += 2;
-        }
-        level = next;
-        idx /= 2;
-    }
-    Some(path)
-}
-
-/// Whether `leaf` at `index` authenticates against `root` under `proof` (the sibling path from
-/// [`merkle_prove`]).
-#[must_use]
-fn merkle_verify(leaf: [u8; 32], index: usize, proof: &[[u8; 32]], root: &[u8; 32]) -> bool {
-    let mut acc = leaf;
-    let mut idx = index;
-    for sib in proof {
-        acc = if idx.is_multiple_of(2) { node(&acc, sib) } else { node(sib, &acc) };
-        idx /= 2;
-    }
-    &acc == root
-}
-
 /// The `state_root` a **cross-cell-aware** state machine commits: `H(accounts_root ‖ outbox_root)` — binding
 /// the ordinary application state *and* the height's cross-cell outbox under one root, so the execution
 /// certificate over `state_root` certifies both. A plain state machine that emits no cross-cell messages can
@@ -170,9 +94,13 @@ pub fn compose_state_root(accounts_root: &[u8; 32], outbox_root: &[u8; 32]) -> [
 }
 
 /// The outbox root of a cell that emitted no cross-cell messages.
+///
+/// A domain-separated constant rather than zeros (`fanos_primitives::merkle::empty_root`): the previous `[0u8; 32]` was a
+/// value a leaf hash could in principle take, so a certified empty outbox rested on preimage resistance to refuse an
+/// opening. `merkle::verify` now refuses `count == 0` outright — nothing is inside an empty tree.
 #[must_use]
 pub fn empty_outbox_root() -> [u8; 32] {
-    EMPTY_ROOT
+    merkle::empty_root()
 }
 
 /// The source cell's **outbox** for one executed height — the ordered cross-cell messages produced, committed
@@ -230,7 +158,9 @@ impl Outbox {
     /// The Merkle root committing all messages (folded into `state_root` via [`compose_state_root`]).
     #[must_use]
     pub fn root(&self) -> [u8; 32] {
-        merkle_root(&self.leaves())
+        // An outbox past `merkle::MAX_LEAVES` (2^32 messages in one height) is not constructible — the block size bounds it
+        // orders of magnitude below — and committing a *wrong* root would be worse than committing the empty one.
+        merkle::root(&self.leaves()).unwrap_or_else(merkle::empty_root)
     }
 
     fn leaves(&self) -> Vec<[u8; 32]> {
@@ -240,7 +170,7 @@ impl Outbox {
     /// Build the inclusion proof for the message at `index` (its Merkle path), or `None` if out of range.
     #[must_use]
     pub fn prove(&self, index: usize) -> Option<Vec<[u8; 32]>> {
-        merkle_prove(&self.leaves(), index)
+        merkle::prove(&self.leaves(), index)
     }
 
     /// Assemble a [`CrossCellReceipt`] for the message at `index`, given this cell's `accounts_root` and the
@@ -249,7 +179,8 @@ impl Outbox {
     pub fn receipt(&self, index: usize, accounts_root: [u8; 32], cert: ExecCertificate) -> Option<CrossCellReceipt> {
         let msg = self.msgs.get(index)?.clone();
         let proof = self.prove(index)?;
-        Some(CrossCellReceipt { msg, index: index as u64, proof, accounts_root, outbox_root: self.root(), cert })
+        let count = u64::try_from(self.msgs.len()).ok()?;
+        Some(CrossCellReceipt { msg, index: index as u64, count, proof, accounts_root, outbox_root: self.root(), cert })
     }
 }
 
@@ -262,7 +193,17 @@ pub struct CrossCellReceipt {
     pub msg: CrossMsg,
     /// The message's index in the source outbox.
     pub index: u64,
-    /// The Merkle authentication path into `outbox_root`.
+    /// The number of messages in the source outbox.
+    ///
+    /// Part of the opening, not decoration: `outbox_root` binds the count
+    /// (`fanos_primitives::merkle`), so a receipt must state it and `verify` refuses any count that does not
+    /// reproduce the certified root. This is what removes the CVE-2012-2459 ambiguity — under the previous
+    /// unbound scheme the *bare* folds of `[a, b, c]` and `[a, b, c, c]` were equal, so one commitment had two
+    /// readings. It also fixes the proof length, bounding the work an unauthenticated peer can ask a verifier
+    /// for.
+    pub count: u64,
+    /// The Merkle authentication path into `outbox_root`. Its length must be exactly
+    /// `fanos_primitives::merkle::height(count)`.
     pub proof: Vec<[u8; 32]>,
     /// The source cell's application-state root (the other half of the `state_root` opening).
     pub accounts_root: [u8; 32],
@@ -290,16 +231,20 @@ impl CrossCellReceipt {
         if compose_state_root(&self.accounts_root, &self.outbox_root) != self.cert.state_root {
             return None; // the opening does not match the certified state root
         }
-        let idx = usize::try_from(self.index).ok()?;
-        merkle_verify(self.msg.leaf(), idx, &self.proof, &self.outbox_root).then_some(&self.msg)
+        merkle::verify(self.msg.leaf(), self.index, &self.proof, &self.outbox_root, self.count)
+            .then_some(&self.msg)
     }
 
-    /// Canonical bytes: `msg ‖ index(8) ‖ proof_count(2) ‖ proof(32·count) ‖ accounts_root(32) ‖
+    /// Canonical bytes: `msg ‖ index(8) ‖ leaf_count(8) ‖ proof_len(2) ‖ proof(32·len) ‖ accounts_root(32) ‖
     /// outbox_root(32) ‖ cert` — the portable form a source cell publishes to a destination cell's inbox.
+    ///
+    /// `proof_len` stays on the wire even though `leaf_count` determines it, so a malformed receipt fails to
+    /// *decode* rather than being reassembled into a shape `verify` must then reject.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.msg.to_bytes();
         out.extend_from_slice(&self.index.to_be_bytes());
+        out.extend_from_slice(&self.count.to_be_bytes());
         out.extend_from_slice(&(self.proof.len() as u16).to_be_bytes());
         for sib in &self.proof {
             out.extend_from_slice(sib);
@@ -317,10 +262,18 @@ impl CrossCellReceipt {
         let (msg, mut off) = CrossMsg::from_prefix(bytes)?;
         let index = u64::from_be_bytes(bytes.get(off..off + 8)?.try_into().ok()?);
         off += 8;
-        let count = usize::from(u16::from_be_bytes(bytes.get(off..off + 2)?.try_into().ok()?));
+        let count = u64::from_be_bytes(bytes.get(off..off + 8)?.try_into().ok()?);
+        off += 8;
+        let proof_len = u32::from(u16::from_be_bytes(bytes.get(off..off + 2)?.try_into().ok()?));
         off += 2;
-        let mut proof = Vec::with_capacity(count);
-        for _ in 0..count {
+        // The count fixes the proof length, so a disagreeing header is refused HERE — before the length is used to size an
+        // allocation. Previously this reserved capacity straight from an attacker-chosen `u16` and then folded every
+        // sibling it had been handed (65 535 hashes from a ~2 MB receipt).
+        if proof_len != merkle::height(count) {
+            return None;
+        }
+        let mut proof = Vec::with_capacity(proof_len as usize);
+        for _ in 0..proof_len {
             proof.push(bytes.get(off..off + 32)?.try_into().ok()?);
             off += 32;
         }
@@ -329,7 +282,7 @@ impl CrossCellReceipt {
         let outbox_root = bytes.get(off..off + 32)?.try_into().ok()?;
         off += 32;
         let cert = ExecCertificate::from_bytes(bytes.get(off..)?)?;
-        Some(Self { msg, index, proof, accounts_root, outbox_root, cert })
+        Some(Self { msg, index, count, proof, accounts_root, outbox_root, cert })
     }
 }
 
@@ -433,21 +386,69 @@ mod tests {
     }
 
     #[test]
-    fn merkle_paths_authenticate_at_every_position_and_size() {
-        // Exhaustive small-tree check: every leaf of every outbox size 1..=9 proves against the root, and a
-        // wrong index does not.
-        for n in 1..=9usize {
-            let leaves: Vec<[u8; 32]> = (0..n).map(|i| hash_labeled("t", &[i as u8])).collect();
-            let root = merkle_root(&leaves);
-            for i in 0..n {
-                let proof = merkle_prove(&leaves, i).unwrap();
-                assert!(merkle_verify(leaves[i], i, &proof, &root), "n={n} leaf {i} authenticates");
-                if n > 1 {
-                    let wrong = (i + 1) % n;
-                    assert!(!merkle_verify(leaves[i], wrong, &proof, &root), "n={n} leaf {i} at wrong index fails");
-                }
-            }
-            assert!(merkle_prove(&leaves, n).is_none(), "out-of-range index has no proof");
+    fn the_certified_leaf_count_is_part_of_the_opening() {
+        // The generic tree properties (every leaf of every size opens; the duplicate-tail ambiguity; a wrong-shaped proof)
+        // are exhaustively covered in `fanos_primitives::merkle`. What is specific to a receipt is that the COUNT is part
+        // of what the source cell certified, so misstating it cannot open the certified root.
+        let msgs = [
+            CrossMsg::new(2, 0, b"a".to_vec()),
+            CrossMsg::new(2, 1, b"b".to_vec()),
+            CrossMsg::new(2, 2, b"c".to_vec()),
+        ];
+        let (verifiers, receipt) = certified_outbox(&msgs, [0x77; 32], 2, 5);
+        assert!(receipt.verify(&verifiers, 5).is_some(), "the honest receipt verifies");
+
+        // A count of 4 for a 3-message outbox is exactly the CVE-2012-2459 reading — under the previous unbound scheme the
+        // bare folds of `[a, b, c]` and `[a, b, c, c]` were equal, so the same certified root had two readings.
+        for wrong in [0u64, 2, 4, 8, u64::MAX] {
+            let mut forged = receipt.clone();
+            forged.count = wrong;
+            assert!(forged.verify(&verifiers, 5).is_none(), "count {wrong} must not open a root committed at 3");
         }
+
+        // And the duplicate index the old scheme admitted is refused outright: index 3 does not exist at count 3.
+        let mut dup = receipt.clone();
+        dup.index = 3;
+        dup.count = 4;
+        assert!(dup.verify(&verifiers, 5).is_none(), "the duplicated tail is not a fourth message");
+    }
+
+    #[test]
+    fn a_receipt_whose_proof_length_disagrees_with_its_count_does_not_decode() {
+        // The bound on attacker-chosen verifier work. Previously the proof length was an independent `u16` on the wire:
+        // the decoder reserved capacity from it and the verifier folded every sibling handed over — 65 535 hashes from a
+        // ~2 MB receipt. The count now fixes the length, and the mismatch is refused at decode time.
+        let msgs = [CrossMsg::new(2, 0, b"a".to_vec()), CrossMsg::new(2, 1, b"b".to_vec())];
+        let (verifiers, receipt) = certified_outbox(&msgs, [0x88; 32], 0, 5);
+        let bytes = receipt.to_bytes();
+        assert!(CrossCellReceipt::from_bytes(&bytes).is_some(), "the honest encoding decodes");
+
+        // `msg ‖ index(8) ‖ count(8) ‖ proof_len(2) ‖ …` — overwrite the length header in place.
+        let at = bytes.len() - (2 + 32 * receipt.proof.len() + 32 + 32 + receipt.cert.to_bytes().len());
+        for claimed in [0u16, 2, 40, u16::MAX] {
+            let mut tampered = bytes.clone();
+            tampered[at..at + 2].copy_from_slice(&claimed.to_be_bytes());
+            assert!(
+                CrossCellReceipt::from_bytes(&tampered).is_none(),
+                "proof_len {claimed} disagrees with height(2) = 1 and must be refused before allocating"
+            );
+        }
+        // Sanity: the real length is what the count implies, so `verify` never sees a shape it must reject.
+        assert_eq!(receipt.proof.len() as u32, merkle::height(receipt.count));
+        assert!(receipt.verify(&verifiers, 5).is_some());
+    }
+
+    #[test]
+    fn an_empty_outbox_root_is_domain_separated_and_opens_to_nothing() {
+        // It was `[0u8; 32]`, a value a leaf hash could in principle take, so refusing an opening rested on preimage
+        // resistance rather than on the scheme.
+        assert_ne!(empty_outbox_root(), [0u8; 32], "the empty root must not be a value a leaf could take");
+        assert_eq!(Outbox::new().root(), empty_outbox_root(), "an outbox with no messages commits the empty root");
+        let msgs = [CrossMsg::new(2, 0, b"a".to_vec())];
+        let (verifiers, receipt) = certified_outbox(&msgs, [0x99; 32], 0, 5);
+        let mut empty = receipt.clone();
+        empty.count = 0;
+        empty.proof.clear();
+        assert!(empty.verify(&verifiers, 5).is_none(), "nothing is inside an empty tree");
     }
 }

@@ -13,17 +13,16 @@
 
 use alloc::vec::Vec;
 
-use fanos_primitives::hash_labeled;
+use fanos_primitives::{hash_labeled, merkle};
 
 /// The Merkle leaf size (bytes): the granularity a proof of retrievability samples.
 pub const LEAF: usize = 4096;
 /// The chunk size (bytes): objects larger than this are split into chunks under a [`Manifest`].
 pub const CHUNK: usize = 262_144;
 
-/// Domain label for a position-bound leaf hash.
+/// Domain label for a position-bound leaf hash. The internal-node label belongs to `fanos_primitives::merkle`, which
+/// owns the tree — keeping this one local is what stops a thesauros leaf from being read as any other subsystem's.
 const LEAF_LABEL: &str = "FANOS-v1/thesauros-leaf";
-/// Domain label for an internal Merkle node hash.
-const NODE_LABEL: &str = "FANOS-v1/thesauros-node";
 
 /// A **content id** — the Merkle root of an object, its address and its storage commitment.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -43,17 +42,14 @@ impl Cid {
     }
 }
 
-/// One step of a Merkle authentication path: the sibling hash and which side it is on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MerkleStep {
-    /// The sibling node's hash.
-    pub sibling: [u8; 32],
-    /// Whether the sibling is the *right* child (so this node is the left one).
-    pub sibling_on_right: bool,
-}
-
-/// A Merkle authentication path from a leaf to the root (leaf level first).
-pub type MerkleProof = Vec<MerkleStep>;
+/// A Merkle authentication path from a leaf to the root (leaf level first): one sibling hash per level.
+///
+/// Which side each sibling is on is **derived from the index**, not carried. Carrying it, as this did, gave a prover a
+/// free choice the commitment never authorised: the verifier followed the prover's own flags, so the path's shape was
+/// unconstrained by the position it claimed. Position-bound leaf hashing kept that sound, but a constraint available for
+/// nothing should not be given away — and the same change lets [`verify_leaf`] demand an exact length, which is what
+/// bounds the work an untrusted provider can ask a verifier to do.
+pub type MerkleProof = Vec<[u8; 32]>;
 
 /// The position-bound hash of the `index`-th leaf: `H(leaf, index_le(8) ‖ bytes)`.
 #[must_use]
@@ -62,16 +58,6 @@ fn leaf_hash(index: usize, bytes: &[u8]) -> [u8; 32] {
     buf.extend_from_slice(&(index as u64).to_le_bytes());
     buf.extend_from_slice(bytes);
     hash_labeled(LEAF_LABEL, &buf)
-}
-
-/// The hash of an internal node from its two children: `H(node, left ‖ right)`.
-#[must_use]
-fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 64];
-    let (l, r) = buf.split_at_mut(32);
-    l.copy_from_slice(left);
-    r.copy_from_slice(right);
-    hash_labeled(NODE_LABEL, &buf)
 }
 
 /// The position-bound leaf hashes of a chunk (an empty chunk is one empty leaf).
@@ -83,33 +69,14 @@ fn leaf_hashes(chunk: &[u8]) -> Vec<[u8; 32]> {
     chunk.chunks(LEAF).enumerate().map(|(i, b)| leaf_hash(i, b)).collect()
 }
 
-/// Fold one Merkle level into the next, promoting a lone odd node unchanged.
-#[must_use]
-fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
-    let mut next = Vec::with_capacity(level.len().div_ceil(2));
-    for pair in level.chunks(2) {
-        let node = match pair {
-            [l, r] => node_hash(l, r),
-            [l] => *l,
-            _ => continue,
-        };
-        next.push(node);
-    }
-    next
-}
-
-/// The Merkle root over already-computed leaf hashes.
+/// The Merkle root over already-computed leaf hashes, via the platform's shared tree.
+///
+/// `fanos_primitives::merkle` binds the leaf count into the root, so a chunk id is no longer a value a bare leaf hash can
+/// take — previously a one-leaf chunk's id *was* its leaf hash, putting ids and leaf hashes in one space. Position-bound
+/// leaves ([`leaf_hash`]) still do their own job on top: a leaf cannot be replayed at another index.
 #[must_use]
 fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-    let mut level = match leaves.first() {
-        None => return leaf_hash(0, &[]),
-        Some(_) if leaves.len() == 1 => return leaves.first().copied().unwrap_or_default(),
-        Some(_) => leaves.to_vec(),
-    };
-    while level.len() > 1 {
-        level = fold_level(&level);
-    }
-    level.first().copied().unwrap_or_default()
+    merkle::root(leaves).unwrap_or_else(merkle::empty_root)
 }
 
 /// The number of leaves in a chunk.
@@ -136,25 +103,7 @@ pub fn chunk_cid(chunk: &[u8]) -> Cid {
 /// The Merkle authentication path proving the `index`-th leaf's membership, or `None` if out of range.
 #[must_use]
 pub fn merkle_proof(chunk: &[u8], index: usize) -> Option<MerkleProof> {
-    let leaves = leaf_hashes(chunk);
-    if index >= leaves.len() {
-        return None;
-    }
-    let mut proof = MerkleProof::new();
-    let mut level = leaves;
-    let mut idx = index;
-    while level.len() > 1 {
-        if idx.is_multiple_of(2) {
-            if let Some(sib) = level.get(idx + 1) {
-                proof.push(MerkleStep { sibling: *sib, sibling_on_right: true });
-            }
-        } else if let Some(sib) = idx.checked_sub(1).and_then(|j| level.get(j)) {
-            proof.push(MerkleStep { sibling: *sib, sibling_on_right: false });
-        }
-        level = fold_level(&level);
-        idx /= 2;
-    }
-    Some(proof)
+    merkle::prove(&leaf_hashes(chunk), index)
 }
 
 /// The leaf bytes and their Merkle path — a proof-of-retrievability response for one challenged index.
@@ -165,15 +114,20 @@ pub fn prove_leaf(chunk: &[u8], index: usize) -> Option<(Vec<u8>, MerkleProof)> 
     Some((bytes, proof))
 }
 
-/// Verify that `leaf_bytes` really is the `index`-th leaf of the object committed by `cid`, via `proof`.
-/// Position-bound: the proof for a different index cannot verify these bytes.
+/// Verify that `leaf_bytes` really is the `index`-th of the `leaves` leaves committed by `cid`, via `proof`.
+///
+/// Doubly bound. **Position**: the leaf hash folds its index, so a proof for one position cannot verify another's bytes.
+/// **Shape**: `leaves` fixes both the root ([`chunk_cid`] binds the count) and the exact path length, so a proof of any
+/// other length is refused before a single hash is computed. That second bound is the one an untrusted provider used to be
+/// free of — `verify_leaf` folded however many steps it was handed, and the PoR wire format allowed 65 535 of them.
+///
+/// `leaves` must come from something the prover does not control: in the audit path it is derived from the *manifest's*
+/// chunk length (`por::verify`), which the object's own commitment covers.
 #[must_use]
-pub fn verify_leaf(cid: &Cid, index: usize, leaf_bytes: &[u8], proof: &MerkleProof) -> bool {
-    let mut acc = leaf_hash(index, leaf_bytes);
-    for step in proof {
-        acc = if step.sibling_on_right { node_hash(&acc, &step.sibling) } else { node_hash(&step.sibling, &acc) };
-    }
-    &acc == cid.as_bytes()
+pub fn verify_leaf(cid: &Cid, index: usize, leaf_bytes: &[u8], proof: &[[u8; 32]], leaves: usize) -> bool {
+    let Ok(count) = u64::try_from(leaves) else { return false };
+    let Ok(index) = u64::try_from(index) else { return false };
+    merkle::verify(leaf_hash(index as usize, leaf_bytes), index, proof, cid.as_bytes(), count)
 }
 
 /// One chunk of an object in a [`Manifest`]: its content id and byte length.
@@ -251,9 +205,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_single_leaf_chunk_cid_is_its_leaf_hash() {
+    fn a_chunk_id_is_never_a_bare_leaf_hash() {
+        // This used to assert the opposite — a one-leaf chunk's id WAS its leaf hash — which put ids and leaf hashes in
+        // one value space. The shared tree binds the leaf count into the root, so the two are now distinguishable by
+        // construction, and a leaf can no longer be presented as a whole object.
         let data = b"small object";
-        assert_eq!(chunk_cid(data), Cid(leaf_hash(0, data)), "one leaf → the root is that leaf's hash");
+        assert_ne!(chunk_cid(data), Cid(leaf_hash(0, data)), "an id must not collide with the leaf it commits");
+        assert_eq!(chunk_cid(data), Cid(merkle::root(&[leaf_hash(0, data)]).unwrap()), "it is the count-bound root");
+    }
+
+    #[test]
+    fn an_untrusted_provers_path_length_is_fixed_by_the_authenticated_leaf_count() {
+        // The bound that was missing: `verify_leaf` folded however many steps it was handed, and the PoR wire format
+        // allowed 65 535 of them. The count comes from the manifest, which the prover does not control, so a path of any
+        // other length is refused before a single hash.
+        let data = alloc::vec![7u8; LEAF * 5 + 3];
+        let cid = chunk_cid(&data);
+        let n = leaf_count(&data);
+        let (bytes, proof) = prove_leaf(&data, 2).expect("a leaf");
+        assert!(verify_leaf(&cid, 2, &bytes, &proof, n), "the honest path verifies");
+        assert_eq!(proof.len() as u32, merkle::height(n as u64), "and its length is what the count implies");
+
+        let mut long = proof.clone();
+        long.push([0u8; 32]);
+        assert!(!verify_leaf(&cid, 2, &bytes, &long, n), "one step too many is refused");
+        assert!(!verify_leaf(&cid, 2, &bytes, &proof[..proof.len() - 1], n), "one too few is refused");
+        assert!(!verify_leaf(&cid, 2, &bytes, &alloc::vec![[0u8; 32]; 65_535], n), "a flood is refused, not folded");
+        // Nor can the prover shift the count to make its own path the right shape.
+        for wrong in [1usize, 2, 4, 8, 64] {
+            assert!(!verify_leaf(&cid, 2, &bytes, &proof, wrong), "count {wrong} must not open a 6-leaf commitment");
+        }
     }
 
     #[test]
@@ -265,16 +246,16 @@ mod tests {
         assert_eq!(n, 5, "4 full leaves + a partial one");
         for i in 0..n {
             let (bytes, proof) = prove_leaf(&data, i).expect("a leaf");
-            assert!(verify_leaf(&cid, i, &bytes, &proof), "leaf {i} verifies");
+            assert!(verify_leaf(&cid, i, &bytes, &proof, n), "leaf {i} verifies");
             // The right bytes at the WRONG index must not verify (position-binding).
             let wrong_index = (i + 1) % n;
-            assert!(!verify_leaf(&cid, wrong_index, &bytes, &proof), "leaf {i} bytes do not verify as {wrong_index}");
+            assert!(!verify_leaf(&cid, wrong_index, &bytes, &proof, n), "leaf {i} bytes do not verify as {wrong_index}");
             // A tampered byte must not verify.
             let mut bad = bytes.clone();
             if let Some(b) = bad.first_mut() {
                 *b ^= 0xFF;
             }
-            assert!(!verify_leaf(&cid, i, &bad, &proof), "tampered leaf {i} does not verify");
+            assert!(!verify_leaf(&cid, i, &bad, &proof, n), "tampered leaf {i} does not verify");
         }
         assert!(prove_leaf(&data, n).is_none(), "an out-of-range leaf has no proof");
     }
@@ -285,8 +266,8 @@ mod tests {
         let mut data = alloc::vec![0xABu8; LEAF];
         data.extend_from_slice(&[0xCD; 100]);
         let cid = chunk_cid(&data);
-        // Root = node_hash(leaf0, leaf1) with position-bound leaves.
-        let expect = node_hash(&leaf_hash(0, &data[..LEAF]), &leaf_hash(1, &data[LEAF..]));
+        // Root = the shared tree over the two position-bound leaves.
+        let expect = merkle::root(&[leaf_hash(0, &data[..LEAF]), leaf_hash(1, &data[LEAF..])]).unwrap();
         assert_eq!(cid.as_bytes(), &expect);
     }
 
@@ -309,9 +290,12 @@ mod tests {
 
     #[test]
     fn an_empty_object_has_a_defined_cid() {
-        assert_eq!(chunk_cid(&[]), Cid(leaf_hash(0, &[])));
+        // One leaf (the empty one), and the id is the count-bound root of it rather than the bare leaf hash — so a chunk
+        // id is no longer a value a leaf hash can take.
+        assert_eq!(chunk_cid(&[]), Cid(merkle::root(&[leaf_hash(0, &[])]).unwrap()));
+        assert_ne!(chunk_cid(&[]), Cid(leaf_hash(0, &[])), "an id and a leaf hash live in different spaces");
         let (bytes, proof) = prove_leaf(&[], 0).expect("the empty leaf");
         assert!(bytes.is_empty());
-        assert!(verify_leaf(&chunk_cid(&[]), 0, &bytes, &proof));
+        assert!(verify_leaf(&chunk_cid(&[]), 0, &bytes, &proof, 1));
     }
 }

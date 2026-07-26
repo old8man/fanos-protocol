@@ -70,8 +70,18 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     let mut b = spawn_distinct(&dir, &[a.address()]).await;
     let c = spawn_distinct(&dir, &[a.address(), b.address()]).await;
 
-    // Poison the address book: B's coordinate now resolves to C's socket (a MITM / stale entry).
+    // A naive overwrite no longer poisons anything, and that is the rank rule working: B's binding was made *with* its
+    // verified rank when B spawned, and an unranked write carries no evidence, so it cannot evict a proven claim
+    // (`Directory::supersedes`). This assertion is the reason the test below has to reach for a realistic stale entry.
     dir.insert(b.address(), c.local_addr());
+    assert_eq!(dir.resolve(b.address()), Some(b.local_addr()), "an unranked write must not evict a proven binding");
+
+    // The realistic stale entry: B vacates its point (an epoch reshuffle does exactly this) and C is bound there
+    // afterwards, so a send to B's *old* coordinate reaches C. Nothing about that is forgery — it is why the dialer must
+    // still check the certificate against the coordinate it asked for.
+    dir.remove(b.address());
+    dir.insert(b.address(), c.local_addr());
+    assert_eq!(dir.resolve(b.address()), Some(c.local_addr()), "a vacated point is free to rebind");
 
     // A dials "B" but reaches C, whose certificate certifies C's coordinate, not B's → A rejects
     // the connection and the frame is dropped. B receives nothing.

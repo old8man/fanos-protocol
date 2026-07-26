@@ -29,6 +29,8 @@ pub mod epoch;
 pub mod hash;
 pub mod keys;
 pub mod maptopoint;
+/// One domain-separated, count-binding Merkle tree for the whole platform — see [`merkle`].
+pub mod merkle;
 pub mod shamir;
 pub mod vrf;
 
