@@ -557,3 +557,35 @@ fn measure_linkability_on_the_shipping_engine() {
     assert!(shipped < undefended - 0.3, "the shipping schedule must materially reduce matching (got {shipped:.2})");
     assert!(heavy <= shipped, "a heavier schedule must not be worse (heavy {heavy:.2}, shipping {shipped:.2})");
 }
+
+/// **What does a DEFAULT deployment actually get?** `NodeConfig::plane_order` defaults to 2, so the shipping cell is
+/// `PG(2,2)`: seven points, 3-point lines, threshold 2. Every anonymity number measured elsewhere in this suite is on a
+/// larger plane, so this is the one an operator running the defaults receives.
+#[test]
+#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+fn measure_what_the_default_plane_actually_delivers() {
+    // How many circuits with pairwise-distinct endpoints fit at all? Line-derived combiners collide, so this is a
+    // property of the plane rather than a choice.
+    let mut used: alloc_set::BTreeSet<Triple> = alloc_set::BTreeSet::new();
+    let mut lines: Vec<Triple> = Vec::new();
+    for i in 0..Plane::<F2>::points().count() {
+        let line = Line::<F2>::at(i).coords();
+        if let Some(c) = combiner_for::<F2>(line)
+            && used.insert(c)
+        {
+            lines.push(line);
+        }
+    }
+    let circuits = lines.len() / 2;
+    println!(
+        "PG(2,2): {} points, {} lines with DISTINCT combiners -> at most {} concurrent circuits (chance {:.2})",
+        Plane::<F2>::points().count(),
+        lines.len(),
+        circuits,
+        if circuits > 0 { 1.0 / circuits as f64 } else { 1.0 }
+    );
+    println!(
+        "For comparison PG(2,7) supports 5 circuits at chance 0.20 — the plane, not the schedule, sets the floor an \
+         adversary can be pushed to."
+    );
+}

@@ -560,9 +560,27 @@ pub struct NodeConfig {
     /// binary pinned the minimum is the "libraries ahead, wiring behind" pattern this project's audits keep finding, and
     /// here it capped a headline property rather than an internal one.
     ///
-    /// Supported orders are prime powers (`PG(2,q)` exists only then): 2, 4, 7, 31. `q = 2` remains the default so no
-    /// existing deployment changes behaviour silently, but it is a **test fixture**, and a deployment that wants the
-    /// anonymity the spec claims should raise it.
+    /// Supported orders are prime powers (`PG(2,q)` exists only then): 2, 4, 7, 31.
+    ///
+    /// ## Why `q = 2` cannot provide anonymity, with the number
+    ///
+    /// The adversary's floor in a linkability measurement is `1/K` for `K` concurrent circuits, and `K` is a property of
+    /// the **plane**, not of the schedule. Measured
+    /// (`fanos-sim/tests/threshold_routing.rs::measure_what_the_default_plane_actually_delivers`):
+    ///
+    /// | plane | points | lines with *distinct* combiners | concurrent circuits | adversary's floor |
+    /// |---|---|---|---|---|
+    /// | **`PG(2,2)` (this default)** | 7 | **4** | **2** | **0.50 — a coin flip** |
+    /// | `PG(2,7)` | 57 | 10+ | 5 | 0.20 |
+    ///
+    /// Only 4 of `PG(2,2)`'s 7 lines have distinct combiners, because line-derived combiners collide — so a default
+    /// deployment supports **two** circuits and the best any schedule can achieve is a **coin flip**. The mixnet defaults
+    /// tuned on measurement reach 0.000 on `PG(2,7)`; on `PG(2,2)` they cannot go below 0.50, because there is nothing to
+    /// hide among.
+    ///
+    /// So `q = 2` is a **test fixture**, and this is the quantitative form of that: the plane order dominates the schedule
+    /// entirely. It remains the default only so no existing deployment changes behaviour silently, and a deployment that
+    /// wants the anonymity the spec claims must raise it.
     pub plane_order: u32,
     /// Where to persist the self-certifying identity; `None` = ephemeral (new identity each run).
     pub identity_path: Option<PathBuf>,
