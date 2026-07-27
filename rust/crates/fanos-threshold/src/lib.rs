@@ -43,7 +43,9 @@ const TAG_LEN: usize = 16;
 /// A Shamir share of a 32-byte key: `x(1) ‖ y(32)`.
 pub const SHARE_LEN: usize = 1 + 32;
 /// A KEM-sealed share: `kem_ct ‖ AEAD(share)`.
-const SEALED_SHARE_LEN: usize = CIPHERTEXT_LEN + SHARE_LEN + TAG_LEN;
+/// One KEM-sealed share slot: `kem_ciphertext ‖ AEAD(share)`. Fixed-size, which is what lets a fixed-slot onion
+/// header compute its width from the plane's line size alone (`fanos_aphantos::slots::slot_len`).
+pub const SEALED_SHARE_LEN: usize = CIPHERTEXT_LEN + SHARE_LEN + TAG_LEN;
 
 /// Errors from sealing or opening a threshold layer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

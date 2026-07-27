@@ -118,28 +118,32 @@ the last propagation link.
 - **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
   loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
 
-- **11. Hop-position leak (S1-M6) — measured, and the fix is a fixed-slot layout, not better padding.**
-  - **Measured, and now pinned** by `threshold_onion::a_peeling_relay_can_currently_infer_its_hop_position_s1_m6`, a
-    deliberate *characterization* test: it asserts the leak is still present so the fix cannot land silently and cannot
-    regress unnoticed. When the fixed-slot layout replaces the nested one, this test is replaced by its opposite.
-  - A 4-hop circuit over 3-member lines yields per-hop sizes `[20480, 10689, 7135, 3581]`. The outermost is
-    `THRESHOLD_ONION_LEN` because `pad_onion` padded it — **so exactly one hop is protected, and that is the entire current
-    defence.** From hop 1 on, the size falls by a *constant* 3554 bytes, so a relay does not merely learn that layers remain:
-    `remaining = round(size / 3554)` recovers its position exactly, at every measured depth.
-  - **It is not the `ct_len` field**, which is what this task originally named. That field is redundant —
-    `ct_len = total − 18 − members × SEALED_SHARE_LEN`, with `members` cleartext and `total` the layer the relay is holding —
-    so encrypting it hides nothing. The leak is structural: `seal_onion` nests, so each layer's plaintext *contains the
-    entire inner onion*.
-  - **And it cannot be fixed by padding each layer.** A nested layer padded to a constant would contain a full-width inner
-    onion, so the total would grow with depth instead. Constant per-layer size and constant total size are incompatible
-    under nesting — which is exactly why the fix is a fixed-slot array and not a padding change.
-  - **The construction, and why it is simpler here than textbook Sphinx.** A constant header of `D` slots; each hop reads
-    slot 0, shifts the array left, and appends a pseudorandom slot, so the width never changes. Sphinx needs precomputed
-    ρ-filler because its header is one stream encrypted per hop; here each slot is **independently** threshold-sealed to its
-    own hop line, so filler needs no consistency — an unused slot is indistinguishable random bytes to anyone who cannot
-    decapsulate it, and no honest path ever opens one. The payload becomes a separate constant-width block, re-encrypted
-    size-preservingly per hop.
-  - **Budget, and the max-depth it makes explicit.** `pad_onion` already spends `THRESHOLD_ONION_LEN = 20 480` B on every
-    hop, so the slot array is free at the same width. A slot costs `line_size × SEALED_SHARE_LEN + NONCE_LEN + CMD_LEN`
-    ≈ 3554 B at `line_size = 3` (the measured per-hop step above is exactly this), giving `D = 5` at `q = 2`, 3 at `q = 4`,
-    2 at `q = 7`. The current design leaves that ceiling implicit; the fix states it.
+- **11. Hop-position leak (S1-M6) — the layout is BUILT and unit-verified; wiring it in is the open part.**
+  - **The leak, measured** (`threshold_onion::a_peeling_relay_can_currently_infer_its_hop_position_s1_m6`, a deliberate
+    characterization test asserting the defect is still present, so a fix cannot land silently): per-hop sizes
+    `[20480, 10689, 7135, 3581]` on a 4-hop circuit over 3-member lines. Only the outermost onion is padded, so **exactly one
+    hop is protected**; from hop 1 on the size falls by a constant 3554 B and `round(size / 3554)` gives a relay its position.
+  - **`fanos_aphantos::slots` is the fix, and it is done and tested** — constant-width packet, per-hop slot shift, `D`
+    derived per plane (5 hops at `q = 2`, 3 at `q = 4`, 2 at `q = 7`), size-preserving payload layers. See
+    `docs/design-anonymity-substrate.md` for the construction and why it is simpler than textbook Sphinx.
+  - **A second-order leak found while building it, and fixed:** framing. A relay holds the whole header, so if an unused slot
+    fails to *parse* as a sealed layer while a real one succeeds, the relay counts the parseable slots and recovers the
+    remaining depth — the original leak through the back door. Measured: **2 of 5 slots parsed on a 2-hop circuit**, exactly
+    the real hop count. Pure keystream filler is therefore wrong; filler must reproduce `members`/`ct_len` and randomize only
+    what is genuinely opaque. This is the kind of thing a constant-*width* test cannot see, and it is now its own test.
+  - **⚠️ Wiring it into `seal_onion`/`peel_onion` was attempted and WITHDRAWN.** All 43 `fanos-aphantos` unit tests passed,
+    including the constant-width and filler-framing assertions — and four live tests in `anonymous_quic` then failed by
+    timing out with no session completing. Not shipped in that state.
+  - **Ruled out by measurement, so do not re-try these:**
+    - *Payload capacity.* Doubling `THRESHOLD_ONION_LEN` to 40 960 did **not** fix it. (The budget question below is real
+      and separate — it just is not this failure.)
+    - *Ragged hop lines.* `fanos_rendezvous::create_forward` builds every hop from `line_member_coords` and requires all
+      `q + 1` keys present, so hop member counts are uniform and the new equal-width precondition holds.
+    - *The peel paths.* Instrumented `member_partial` and the peel to print on every failure: **zero** hits.
+  - **Next step, and the gap in my own instrumentation that made this slow:** the seal side was never instrumented, and
+    `create_forward` swallows the error with `.ok()?`. Instrument each of `seal_onion`'s error returns — depth over
+    `depth_for`, zero/ragged line size, slot-width mismatch — and re-run one `anonymous_quic` test. That is one measurement.
+  - **A real budget constraint to settle regardless.** A fixed array reserves all `D` slots even for a one-hop circuit, so
+    payload capacity falls to `THRESHOLD_ONION_LEN − PREAMBLE_LEN − D × slot_len` = 2 704 B at `q = 2`. Some structures this
+    protocol nests *inside* an onion payload are larger (sealing to a 3-member line is 3 507 B alone), so wiring needs either
+    a wider cell or fragmentation above a fixed cell — which is the trade Sphinx makes and answers the same way.

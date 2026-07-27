@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod node;
 pub mod nostos;
 pub mod sealed;
+pub mod slots;
 pub mod threshold_onion;
 
 /// The threshold construction as one surface, over two crates.

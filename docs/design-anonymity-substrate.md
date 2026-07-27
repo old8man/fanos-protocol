@@ -480,3 +480,76 @@ CALYPSO (VLDB 2021); Briar BRP; SybilGuard (SIGCOMM 2006) / SybilLimit (IEEE S&P
 
 **One honest-caveat check outstanding:** Jambha et al. (Amrita 2024) — title-adjacent, full text unretrieved,
 must be read before printing a NOSTOS novelty claim (§7).
+
+---
+
+## The fixed-slot onion layout — the design that closes the hop-position leak (S1-M6)
+
+**Status: built and unit-verified (`fanos_aphantos::slots`), NOT yet wired into `seal_onion`/`peel_onion`.** A first
+wiring attempt passed all 43 `fanos-aphantos` unit tests and then broke four live anonymity tests over real QUIC, so it was
+withdrawn rather than shipped. What is ruled out and what to instrument next is recorded in `docs/open-tasks.md` §11.
+
+### What leaked, measured
+
+The nested layout wrapped each hop's routing command around the *entire* inner onion, so a layer's plaintext shrank with
+depth. On a 4-hop circuit over 3-member lines the per-hop sizes were `[20480, 10689, 7135, 3581]`. Only the outermost onion
+was padded, so **exactly one hop was protected**; from hop 1 on the size fell by a constant 3554 bytes and a relay recovered
+its position exactly as `round(size / 3554)`.
+
+### Two fixes that do not work, and why
+
+**Encrypting `ct_len` achieves nothing.** The field is redundant: `ct_len = total − 18 − members × SEALED_SHARE_LEN`, with
+`members` cleartext and `total` the layer the relay is holding. Hiding a number that can be recomputed hides nothing. The
+leak was never the field; it was the structure.
+
+**Padding each nested layer to a constant makes it worse.** A padded layer carries a full-width inner onion, so the *total*
+grows with depth instead. Constant per-layer size and constant total size are **incompatible under nesting** — which is why
+this is a layout change, not a padding change.
+
+### The layout
+
+```text
+onion = slots(2) ‖ slot_len(4) ‖ slot[0] ‖ … ‖ slot[D-1] ‖ payload_block
+```
+
+Each hop reads **slot 0**, shifts the array one slot left, appends a pseudorandom filler slot, and strips one
+size-preserving layer from the payload block. Slot `k` as built is hop `k`'s, and after `k` shifts it has arrived at
+position 0. The two cleartext preamble fields are network parameters (`D` and the plane's line size), not circuit facts, so
+neither reveals the actual depth `h`.
+
+`D = depth_for(line_size)` is **derived per plane, not fixed globally**. The invariant needed is that every packet on a
+given network looks alike, and the line size is already network-wide (`q + 1`). One global constant cannot serve both ends
+of the range: the budget is fixed, so a wide plane's slots are large and few, and forcing a Fano deployment down to a wide
+plane's depth would discard anonymity it has paid for. The trade is legible — **5 hops at `q = 2`, 3 at `q = 4`, 2 at
+`q = 7`** — and exceeding it is now an error rather than, as before, a silent leak.
+
+### Why this is simpler than textbook Sphinx
+
+Sphinx precomputes ρ-filler because its header is one stream encrypted under each hop's key in turn: the bytes a hop
+appends must be exactly what the sender accounted for, or the MAC fails. Here each slot is **independently**
+threshold-sealed to its own hop line, so nothing links one slot to another. An unused slot is indistinguishable random
+bytes to anyone who cannot decapsulate it, and no honest path ever opens one — so filler needs no consistency and a hop may
+append whatever it likes. The filler is derived from that hop's own layer key rather than an RNG, which keeps the transform
+deterministic under the simulator at no cost, since it need only be unpredictable to *other* parties.
+
+Two details worth stating because they are easy to get wrong:
+
+- **The command is one fixed width for both kinds.** `CMD_NEXT` carries a 12-byte line coordinate and `CMD_DELIVER` a
+  32-byte holonomy tag; the shorter is padded. Otherwise the final hop is distinguishable from every intermediate hop —
+  the same leak, one step smaller.
+- **The hop's payload key travels inside its sealed command**, rather than being derived from the threshold layer key
+  (which would need the seal to hand its reconstructed key back) or from the command bytes (which would give two hops
+  forwarding to the same next line a shared keystream).
+
+### Cost
+
+None on the wire. The packet is exactly `THRESHOLD_ONION_LEN` — the bucket the previous layout already padded its outermost onion to on
+every hop. Once wired, the forwarding paths that re-pad need not: constant width becomes a property of the
+construction rather than a step a forwarder could omit, and under the nested layout that step was the only thing standing
+between a relay and its depth.
+
+**A payload budget the nested layout did not have.** A fixed array reserves all `D` slots even for a one-hop circuit, so
+payload capacity falls from ~20 KiB to `THRESHOLD_ONION_LEN − PREAMBLE_LEN − D × slot_len` — 2 704 B at `q = 2`. That is
+smaller than some structures this protocol nests *inside* an onion payload (sealing to a 3-member line alone costs
+3 × 1 169 = 3 507 B), so wiring this in needs either a wider cell or payload fragmentation. Sphinx makes the same trade and
+answers it with fragmentation above a fixed cell.
