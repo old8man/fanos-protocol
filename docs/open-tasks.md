@@ -7,12 +7,35 @@ durable finding belongs in the design or audit doc it concerns (`docs/audit.md`,
 **Check the claim before doing the work.** A task list is a cache; this one has gone stale twice. Each item names the file and
 symbol its claim rests on so the check is cheap.
 
-No open CRITICAL/HIGH security item remains (`docs/audit.md`, all four passes RESOLVED). What follows are capability,
-coherence and quality gaps.
+No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes RESOLVED). The 2026-07-27 architecture audit
+(`docs/audit-2026-07-27-architecture.md`) adds the items below marked **[A]**.
 
 ---
 
 ## Tier A — headline frontiers
+
+### [A] Close the "libraries ahead of wiring" gap — measured, 2026-07-27
+34 of 43 crates are reachable from the shipped node. These make claims in prose that no transport-level test covers:
+- **Not in the binary at all:** `fanos-angelos` (L11 messenger — a headline product), `fanos-ergon` (the effect-algebra "no
+  gas" claim), `fanos-holarch` (the Γ gate that *scores* the platform), `fanos-observatory`.
+- **In the binary, never exercised over a transport** (absent from `fanos-node/tests` and `fanos-sim/tests`): `fanos-hermes`
+  (cross-chain HTLC, claimed "live on the ledger"), `fanos-proteus` (traffic morphing — censorship resistance), `fanos-vpn`,
+  `fanos-session`, `fanos-stream`, `fanos-threshold`.
+- This is the shape of every defect found this session: correct in isolation, then unreachable, mis-wired or starved live.
+  Each entry needs one live test or an honest downgrade of the claim.
+- *Measure reachability transitively over `Cargo.toml`* — checking only `fanos-node/src` falsely reports `fanos-proteus` as
+  unwired (it is reached via `fanos-quic`'s shaper).
+
+### [A] Run the ZK proof stack on a schedule
+`cargo test -p fanos-obolos --release -- --ignored` → 7 passed, 84 s: the currency's proofs are sound at real
+`bits = LOG_BASE = 16`. But the default `cargo test` does not include them, so nothing re-checks soundness after a change.
+Needs a nightly or pre-release job. Also worth separating the two things `#[ignore]` currently conflates: *measurements* (15 in
+`fanos-sim`, must never gate) from *cost-gated assertions* (13 in `fanos-obolos`, must gate somewhere).
+
+### [A] Thin unit coverage in three crates
+`fanos-holarch` 987 lines / **0.14** ratio / 8 tests — and it is the viability gate, so a gate that cannot be trusted to gate.
+`fanos-observatory` 2 394 / 0.16 / 17. `fanos-runtime` 3 433 / 0.29 / 29 — the overlay engine; mitigated by `fanos-sim` (267)
+and `fanos-quic` (68) but the thinnest own-coverage of any core crate.
 
 ### 1. OBOLOS diversified / stealth one-time addresses (O-M4)
 - **Problem.** The key hierarchy is *half* built. `fanos-obolos/src/wallet.rs` has the full viewing hierarchy —
