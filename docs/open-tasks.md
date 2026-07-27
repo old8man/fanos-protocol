@@ -42,9 +42,16 @@ draw until it actually collides — a earlier version spent a whole trial on an 
 | 0 | 7 of 7 | one at `1` | 4–7 | `[1,2,3,3,4,5,**6**]` | `[5,2,6,3,4,5,5]` | never |
 | 1 | 6 of 7 | two `None`, two at `1` | 3–6 | `[1,2,2,2,3,3,**4**]` | `[1,2,2,2,4,2,4]` | never |
 
-- **The roster is downstream; `known_peers` is the defect.** It reaches `n` in the control and stalls at 6 and 4 when a
-  collision has to be resolved — and in trial 1 the rosters track it almost element-for-element. A cell that has not finished
-  connecting cannot assemble a directory over coordinates it cannot reach.
+- **↩︎ CORRECTION — `known_peers` is NOT established as the defect; I read the metric without validating it.** It is
+  `self.directory.len()`, the **address book** (who this node can *dial*), not overlay membership — which is why it reads as a
+  perfect staircase `[1,2,3,4,5,6,7]` even in the fully-*converged* control: it is seeded in spawn order. Decisively, node 0
+  holds **one** entry in that control and still assembles a roster of **7**, because store reads route through the overlay
+  rather than by direct dial. So address-book size does not gate roster convergence and "the roster is downstream of
+  `known_peers`" does not follow.
+  - What *is* real: the control's book reaches `n` while the collision runs top out at 6 and 5, so collisions do impair the
+    address book. That is a genuine difference and worth explaining — it is just not shown to be the cause.
+  - **Net: the roster failure under collisions is reproducible; its causal chain is NOT established.** Do not build on
+    `known_peers` without first fixing a metric that means "this node can reach coordinate X".
 - **Claims are healthy (3–7 verified per node), so this is not "it never heard of its rival".** That hypothesis is refuted
   again here, as it was for placement.
 - **Placement is *mostly* fine and is not the primary cause.** Trial 0 reaches 7 of 7 distinct — a node visibly advanced to
