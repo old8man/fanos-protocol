@@ -272,10 +272,24 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
       every round, but a minority re-preparing a losing block can never reach a quorum.
     - So the missing rule is the converse of defect C: a validator must be able to **abandon** a lock once the cell has
       demonstrably finalized something else at that height. It has no proof today — it never gathered the winning commit
-      quorum, and checkpoint state-sync needs a checkpoint a partially-progressing cell does not produce. Candidate:
-      treat a valid COMMIT certificate for a different block at the same height as proof to abandon the lock and adopt
-      that finalization, fetching the body through the `NeedSkeleton` path that now exists. This must be designed against
-      the no-fork suites, not bolted on — it is the one remaining rule and it is a safety-critical one.
+      quorum, and checkpoint state-sync needs a checkpoint a partially-progressing cell does not produce.
+    - **⚠️ Two candidate rules were implemented and then REVERTED, because no scenario could be built that needs them.**
+      Recorded so the next attempt starts from this rather than repeating it.
+      1. *Adopt a certified parent.* Every block records the quorum COMMIT certificate that finalized its parent, so a
+         proposal for height `h+1` is self-authenticating proof of what `h` finalized — and today the link check discards
+         it. Implemented (`adopt_certified_parent`, plus a `certified` map to carry the certificate into `finalize`, since
+         `collect_cert` can only build one from votes this validator never received).
+      2. *Admit an already-certified block ahead of the round gates.* A validator holding a commit certificate refuses the
+         very block it is waiting for, because by the time the body arrives its round has moved on and the block's proposer
+         is no longer the leader. Implemented as an early branch in `on_propose`.
+      - Both are well-motivated by measurement and both are plausibly correct. **Neither is exercised:** every test,
+        including a purpose-built partition scenario with a deliberately short recovery window, passes with each rule
+        disabled. Shipping unexercised consensus code that claims to close a safety-critical hole is worse than not
+        shipping it, so they were reverted rather than left in.
+      - The blocker is the *scenario*, not the rule. `a_partitioned_minority_rejoins_without_forking_the_contested_height`
+        was written for this and does not reproduce it — the minority rejoins through the existing catch-up path. What is
+        needed is a cell where a minority locks on a losing proposal **and** no catch-up path is available, which is what
+        the live cell manages and the sim does not yet. Build that first; the rules are already written down here.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so

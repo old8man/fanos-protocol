@@ -274,6 +274,35 @@ impl Cluster {
         }
     }
 
+    /// Fetch a block body a validator is **committed to but has never received** (`ShardMsg::NeedSkeleton` in the driver).
+    ///
+    /// Votes carry only a hash, so a validator can be locked on — or hold a commit certificate for — a block it never
+    /// saw. It asks the cell for the skeleton, and any holder answers from `skeleton_of`, after which ordinary sampling
+    /// takes over. Modelled here because without it the sim cannot express recovery at all: a partitioned validator
+    /// rejoins knowing *what* finalized and not *which bytes*.
+    fn fetch_awaited_bodies(&mut self) {
+        for i in 0..N {
+            if self.crashed[i] {
+                continue;
+            }
+            let Some(want) = self.engines.get(i).and_then(ConsensusEngine::awaited_body) else { continue };
+            if self.samplers.get(i).is_some_and(|s| s.is_sampling(&want)) {
+                continue;
+            }
+            // Any reachable peer that holds the block answers with its skeleton.
+            let skeleton = (0..N)
+                .filter(|&p| p != i && !self.crashed[p] && self.partition[p] == self.partition[i])
+                .find_map(|p| self.engines.get(p).and_then(|e| e.skeleton_of(&want)));
+            let Some(skeleton) = skeleton else { continue };
+            let outs = self.engines[i].step(Input::Skeleton { block: skeleton.clone() });
+            self.collect(i, outs);
+            if let Some(s) = self.samplers.get_mut(i) {
+                s.begin(skeleton);
+            }
+        }
+        self.run();
+    }
+
     /// One DA exchange round for every validator: ask for what is missing, answer from whoever holds it, and admit any
     /// block that becomes recoverable — the same sequence `taxis_driver` performs, over this bus instead of QUIC.
     fn exchange_shards(&mut self) {
@@ -426,6 +455,9 @@ impl Cluster {
             self.drain_dispersal();
             self.exchange_shards();
         }
+        // Recovery runs regardless of the dispersal model: it is about a body never received, not one being sampled.
+        self.fetch_awaited_bodies();
+        self.exchange_shards();
     }
 
     fn timeout(&mut self) {
@@ -1476,4 +1508,52 @@ fn a_height_still_finalizes_after_a_prepare_quorum_that_never_committed() {
 
     assert_eq!(c.honest_count_at(0), N, "the cell recovers and every validator finalizes height 0");
     assert_eq!(c.hashes_at(0).len(), 1, "and on one block — releasing a lock must not fork the height");
+}
+
+#[test]
+fn a_partitioned_minority_rejoins_without_forking_the_contested_height() {
+    // A minority is cut off while the majority finalizes a height, then rejoins. It must converge on the same head and the
+    // same executed state, and must not fork the height it missed.
+    //
+    // Written while chasing a live failure where validators sat locked on a proposal that *lost* — and it does NOT
+    // reproduce that. It passes with or without either candidate rule for abandoning such a lock, because the minority here
+    // rejoins through the existing catch-up path instead. That is worth knowing and worth keeping: it pins partition-heal
+    // convergence, which nothing else asserted, and it records that the live residual needs a scenario this is not.
+    let mut c = Cluster::new(&genesis());
+    let minority = [5usize, 6];
+
+    // Partition the minority off, then let both sides run: the majority finalizes height 0, the minority does not.
+    c.split(&minority);
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"losing-lock");
+    c.submit_all(&tx);
+    for _ in 0..4 {
+        c.tick();
+        c.timeout();
+    }
+    let majority_finalized = c.honest_count_at(0);
+    assert!(majority_finalized >= 4, "the majority side finalized height 0 (got {majority_finalized})");
+
+    // Heal, and allow only a SHORT window — the point of the scenario. Checkpoint state-sync eventually rescues a lagging
+    // validator, but a checkpoint needs an execution-attestation quorum over several heights, and the live failure this
+    // models happens in a cell one block old with no checkpoint to offer. So the only evidence available here is the
+    // commit certificate a next-height proposal carries, and the recovery must work off that alone.
+    c.heal_partition();
+    for _ in 0..3 {
+        c.tick();
+        c.timeout();
+    }
+
+    // Convergence, not block-by-block replay, is the property. A validator that rejoins by adopting a certified state
+    // legitimately never finalizes the missed height itself — asserting `honest_count_at(0) == N` would demand it replay
+    // history it was proven a snapshot of, and that assertion failed here for exactly that reason while every validator
+    // had in fact caught up.
+    let head = c.engines[0].chain().next_height();
+    let root = c.engines[0].chain().state_root();
+    assert!(head > 1, "the cell made real progress past the contested height (reached {head})");
+    for (i, e) in c.engines.iter().enumerate() {
+        assert_eq!(e.chain().next_height(), head, "validator {i} rejoined the chain at the same height");
+        assert_eq!(e.chain().state_root(), root, "validator {i} agrees on the executed state root — no fork");
+    }
+    // And the contested height agreed on one block among those that finalized it directly.
+    assert_eq!(c.hashes_at(0).len(), 1, "rejoining must not fork the contested height");
 }
