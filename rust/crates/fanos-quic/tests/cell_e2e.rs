@@ -170,3 +170,72 @@ async fn a_large_app_frame_fans_out_to_every_cell_point() {
         n.shutdown();
     }
 }
+
+/// **Every ordered pair** of cell points can deliver to each other, not just outward from one node.
+///
+/// `a_large_app_frame_fans_out_to_every_cell_point` covers one sender. That cannot see a *directional* gap, and a
+/// directional gap is exactly what the live DA symptom looks like: a validator requested shards from all six peers every
+/// tick for 48 s and got none, while four other validators recovered the same block by answering each other. Peers that
+/// demonstrably held and served their shard answered some requesters and not others.
+///
+/// `Command::Emit` resolves the destination coordinate through the sender's own directory, so what each node knows is
+/// per-node state — and a missing entry drops the frame silently, with the sender's `command` still returning `true`.
+/// Consensus hides that: votes are broadcast, so a quorum forms while one pair never talks.
+#[tokio::test]
+async fn every_ordered_pair_of_cell_points_can_deliver() {
+    use fanos_runtime::{Command, Notification};
+
+    let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
+    let n = cell.nodes.len();
+    let coords: Vec<_> = cell.nodes.iter().map(fanos_quic::NodeHandle::address).collect();
+
+    // A shielded block's DA shard is 6203 bytes on the live path; use that size, since it is the traffic that stalled.
+    let mut streams: Vec<_> = cell.nodes.iter().map(|node| node.client().subscribe()).collect();
+    for (from, node) in cell.nodes.iter().enumerate() {
+        for (to, &coord) in coords.iter().enumerate() {
+            if from == to {
+                continue;
+            }
+            // The payload names its ordered pair, so a receiver can tell exactly which senders reached it.
+            let mut body = vec![u8::try_from(from).unwrap_or(0), u8::try_from(to).unwrap_or(0)];
+            body.resize(6203, 0x5A);
+            let mut frame = Vec::new();
+            fanos_wire::encode_frame(fanos_wire::FrameType::App.code(), &body, &mut frame);
+            assert!(node.client().command(Command::Emit { to: coord, frame }), "point {from} queued its frame for {to}");
+        }
+    }
+
+    // Collect what each node actually received and report every missing pair at once — one run names the whole gap
+    // rather than failing on the first hole.
+    let mut missing = Vec::new();
+    for (to, rx) in streams.iter_mut().enumerate() {
+        let mut seen = vec![false; n];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline
+            && seen.iter().enumerate().filter(|&(i, _)| i != to).any(|(_, &s)| !s)
+        {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(Notification::App { body, .. })) if body.len() == 6203 => {
+                    if let (Some(&f), Some(&t)) = (body.first(), body.get(1))
+                        && usize::from(t) == to
+                        && let Some(slot) = seen.get_mut(usize::from(f))
+                    {
+                        *slot = true;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        for (from, &got) in seen.iter().enumerate() {
+            if from != to && !got {
+                missing.push((from, to));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{} of {} ordered pairs never delivered: {missing:?}", missing.len(), n * (n - 1));
+
+    for n in cell.nodes {
+        n.shutdown();
+    }
+}
