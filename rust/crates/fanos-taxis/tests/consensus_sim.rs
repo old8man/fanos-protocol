@@ -1637,3 +1637,57 @@ fn a_validator_short_one_commit_vote_rejoins_the_chain() {
     }
     assert_eq!(c.hashes_at(0).len(), 1, "one block at the contested height — rejoining must not fork it");
 }
+
+
+#[test]
+fn a_validator_that_misses_one_height_rejoins_with_no_further_transactions() {
+    // The small-gap case, and the quiescent one — neither covered by the state-sync test above, which crashes a
+    // validator at genesis for six heights and lets it adopt a checkpoint. Two things differ here and both matter.
+    //
+    // The gap is **one height**, so the two repair paths the driver documents may both decline it: `awaited_body`
+    // covers a validator committed to a block it never received, and state sync serves *checkpoints*, which a young
+    // cell has not formed. A validator that simply never saw a proposal is neither.
+    //
+    // And nothing is submitted after the gap. A live cell measured on `dromos_quic` showed 5 of 7 validators
+    // executing a second transaction while 2 sat at the earlier height for a full frozen span; submitting a third
+    // transaction brought all 7 level. This pins the property the deterministic model should have: rejoining must
+    // not depend on someone happening to send more traffic.
+    const LAG: usize = 6;
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"gap-0");
+    c.submit_all(&tx);
+    c.tick();
+    assert_eq!(c.honest_count_at(0), N, "every validator has height 0 before the gap opens");
+
+    // It misses exactly one height — crashed across the round, so it sees neither the proposal nor the votes, and
+    // `submit_all` skips it so its mempool never holds the transaction either.
+    c.crashed[LAG] = true;
+    let tx2 = c.seal(Transfer { from: ALICE, to: BOB, amount: 50, nonce: 1 }, b"gap-1");
+    c.submit_all(&tx2);
+    c.tick();
+    c.timeout();
+    c.crashed[LAG] = false;
+    let ahead = c.engines[0].chain().next_height();
+    let behind = c.engines[LAG].chain().next_height();
+    assert!(behind < ahead, "the gap actually opened: laggard at {behind}, cell at {ahead}");
+
+    // Drive with NO further submissions.
+    for _ in 0..12 {
+        c.tick();
+        c.timeout();
+    }
+
+    let cell = c.engines[0].chain().next_height();
+    assert_eq!(
+        c.engines[LAG].chain().next_height(),
+        cell,
+        "the laggard rejoined without anyone submitting more work"
+    );
+    assert_eq!(c.engines[LAG].chain().state().balance(&ALICE), 850, "it holds the state it never executed");
+    assert_eq!(c.engines[LAG].chain().state().balance(&BOB), 150);
+    let root = c.engines[0].chain().state_root();
+    assert_eq!(c.engines[LAG].chain().state_root(), root, "and it is on the same chain, not a fork of it");
+    for h in 0..cell {
+        assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
+    }
+}

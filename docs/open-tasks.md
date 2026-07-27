@@ -36,11 +36,23 @@ Measured 2026-07-27 by the new HERMES suite, which is the first test to submit a
 can see this. After the first transaction, 5 of 7 validators executed the second one and **2 sat at the previous height for
 the full 48 s frozen span** — exactly the quorum advancing and the remainder stuck. Submitting a third transaction (so block
 production continues) brought all 7 to height 22 with identical state.
-- So a validator that misses a block advances only when the *next* proposal arrives. With an empty mempool the chain goes
-  quiet and the straggler keeps stale state indefinitely — safe, but the cell has not converged, and nothing pulls it
-  forward. State-sync exists (§3.9) but is not triggered by a gap this small.
 - The two sibling `dromos_quic` tests cannot see it: they submit one transaction, so "everyone reached height 1" is the
   fixed point. A one-transaction test cannot distinguish "converged" from "stopped".
+
+**Narrowed in the deterministic model, and the suspect is named.** `consensus_sim::a_validator_that_misses_one_height_rejoins_with_no_further_transactions`
+builds exactly this case — one missed height, nothing submitted afterwards — and **it passes**: the laggard rejoins, holds
+the state it never executed, and shares the cell's state root. So the mechanism is sound; the live path is what diverges.
+
+Which mechanism repairs it was measured rather than assumed, by disabling each in turn:
+- body recovery (`fetch_awaited_bodies` / `NeedSkeleton`) **off** → still passes. Not this one: the laggard never voted on
+  the missed block, so it awaits no body.
+- the catch-up exchange (`SyncReq` / `SyncResp`) **off** → the laggard sits at height 1 while the cell reaches 18. That is
+  the **exact live signature** — `v6:...@1` beside `v0:...@11`.
+
+So the live investigation has one place to look: `taxis_driver` does wire both messages, and a `SyncResp` is a *directed*
+reply (`Output::SendTo` → one peer's coordinate) rather than a broadcast. Every other consensus message in that driver is
+a broadcast. A directed reply that never lands would reproduce this precisely, and nothing tests that path over a
+transport.
 
 ### [A] `#[ignore]` conflates two incompatible things
 34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
