@@ -247,8 +247,20 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
       into the transport. The driver now owns only the I/O, and its `DaState`/`PendingDa`/`try_reconstruct` are gone.
       Five unit tests, including one that asserts the fixture block genuinely needs more than one shard — without it an
       empty payload reconstructs from a single shard and every exchange test would be vacuous.
-    - Next: drive `consensus_sim` through the real `Sampler` with per-validator shard holdings, so this reproduces in
-      milliseconds instead of a 100 s QUIC run. The component is now in a shape that allows it.
+    - **`consensus_sim` now drives the real `Sampler`** — one per validator, ONE shard dispersed to each, gathered by
+      request/response over the bus, with dispersal *staggered* per (validator, block) so a request can reach a peer that
+      holds nothing yet. The lookalike `shards_for`-hands-you-everything model is gone.
+    - **And it does NOT reproduce the residual, which is itself the finding.** Both shapes pass, including the exact
+      `dromos` shape — `sortition: None`, one proposer, dispersed bodies, **unanimity** asserted on both finalization and
+      `Sampler::in_flight() == 0` (`every_validator_recovers_a_dispersed_block_not_merely_a_quorum`, verified to fail
+      0-of-7 when sampling is disabled). So the sampling *logic* is sound and the divergence is in the live message path,
+      not the decision procedure.
+    - **The live asymmetry to chase next, stated precisely.** A stuck validator (node 0 in one run) *did* receive
+      skeletons and *did* hold its own shard — its bitmap read `1......` — and requested the other six every tick for
+      48 s with no answer, while validators 1, 2, 3 and 6 recovered the same block by answering *each other*. Peers that
+      demonstrably hold and serve their shards answered some requesters and not others. That is a directional delivery
+      question about `Command::Emit` between specific coordinate pairs, so the next observable is per-pair: whether the
+      stuck node's `Request` frames arrive at each peer, and whether that peer's `Deliver` arrives back.
   - **Two of my own errors on the way, both caught by the instrument rather than by reading:**
     - `rank_round0` first called `prepare_round0_min()` unconditionally, which prepares on *first sight* — precisely the
       PREPARE-splitting the collection window exists to prevent. Two engine tests went red immediately.

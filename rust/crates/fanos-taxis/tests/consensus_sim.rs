@@ -17,6 +17,7 @@ use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::committee::{epoch_seal_line, leader, leader_line, leader_ticket, line_members};
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
+use fanos_taxis::da::Sampler;
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_taxis::state::StateMachine;
@@ -105,8 +106,14 @@ struct Cluster {
     /// the complete shard set instantly. A sim that differs from production in anything but transport cannot pin what
     /// production does (`docs/design-testing.md`; the standing fidelity rule).
     da_delay: u32,
-    /// Bodies in flight: `(ticks remaining, receiver, full block)`. Drained by [`tick`](Self::tick).
-    deferred: Vec<(u32, usize, Block)>,
+    /// One **real** [`Sampler`] per validator, so the sim exercises production's DA component rather than a lookalike.
+    samplers: Vec<Sampler>,
+    /// Shards not yet dispersed: `(ticks remaining, validator, block hash, shard)`. Drained by [`tick`](Self::tick).
+    ///
+    /// Dispersal is *staggered* on purpose. A replica requests a missing shard the moment a skeleton arrives, so with
+    /// simultaneous dispersal every peer already holds its shard and every first request succeeds — which is the one
+    /// arrangement that cannot exhibit the race that deadlocked a live cell.
+    dispersing: Vec<(u32, usize, [u8; 32], Vec<u8>)>,
     /// Validators that never receive block bodies (Propose), to exercise the commit-cert-before-body path.
     deaf_propose: BTreeSet<usize>,
     /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
@@ -150,7 +157,8 @@ impl Cluster {
             crashed: vec![false; N],
             withholding: BTreeSet::new(),
             da_delay: 0,
-            deferred: Vec::new(),
+            samplers: (0..N).map(|i| Sampler::new(u8::try_from(i).unwrap_or(0))).collect(),
+            dispersing: Vec::new(),
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
@@ -207,13 +215,13 @@ impl Cluster {
         }
     }
 
-    /// How long validator `to` takes to gather enough shards to reconstruct `block`, in ticks.
+    /// How many ticks before validator `to` is dispersed its own shard of `block`.
     ///
-    /// **Per (validator, block), not uniform** — and that distinction is the whole fidelity of this model. Each replica
-    /// samples the shards it is missing from its peers *independently*, so bodies reconstruct at different times on
-    /// different replicas. A uniform delay is worthless as an instrument: every replica then ranks the identical
-    /// complete set at the identical tick and the lottery cannot split, so the test passes with the defect present. It
-    /// did — this model was written with a uniform delay first and pinned nothing.
+    /// **Per (validator, block), not uniform** — and that distinction is the whole fidelity of this model. A proposer
+    /// disperses peer by peer, so shards land at different times, and it is that stagger which lets a replica's request
+    /// arrive at a peer that has nothing to answer with yet. A uniform delay is worthless as an instrument: every
+    /// replica then holds its shard at the identical tick and every first request succeeds. Measured — this model was
+    /// written with a uniform delay first and pinned nothing at all.
     ///
     /// Deterministic in `(to, block)`, so a failure reproduces exactly.
     fn sampling_latency(&self, to: usize, block: &Block) -> u32 {
@@ -222,9 +230,20 @@ impl Cluster {
         1 + spread % self.da_delay
     }
 
-    /// Model production's dispersal for one proposal: rank the skeleton now, deliver the body after sampling.
+    /// Model production's dispersal for one proposal: the skeleton is broadcast, and ONE shard goes to each validator.
+    ///
+    /// A withholding proposer omits a hyperoval's worth of shards — the minimal unrecoverable erasure pattern — so the
+    /// block can never be reconstructed by anyone, which is what withholding means.
     fn disperse(&mut self, from: usize, block: &Block) {
         let skeleton = block.skeleton();
+        let hash = block.hash();
+        let all = block.da_shards();
+        let present: u8 = if self.withholding.contains(&block.header.proposer) {
+            let hyperoval = (0u8..=0x7F).find(|&m| !is_recoverable_fano(m)).unwrap_or(0);
+            (!hyperoval) & 0x7F
+        } else {
+            0x7F
+        };
         for i in 0..N {
             if self.crashed[i]
                 || (from != usize::MAX && self.partition[from] != self.partition[i])
@@ -232,32 +251,68 @@ impl Cluster {
             {
                 continue;
             }
+            // Rank the skeleton immediately: it needs no sampling, and the SSLE round-0 lottery ranks the ticket it
+            // carries rather than the body.
             let outs = self.engines[i].step(Input::Skeleton { block: skeleton.clone() });
             self.collect(i, outs);
-            self.deferred.push((self.sampling_latency(i, block), i, block.clone()));
+            if let Some(s) = self.samplers.get_mut(i) {
+                s.begin(skeleton.clone());
+            }
+            if present & (1 << i) != 0
+                && let Some(shard) = all.get(i)
+            {
+                self.dispersing.push((self.sampling_latency(i, block), i, hash, shard.clone()));
+            }
         }
     }
 
-    /// Deliver every body whose sampling latency has elapsed, counting the rest down one tick.
-    fn drain_deferred(&mut self) {
-        let due: Vec<(usize, Block)> = self
-            .deferred
+    /// One DA exchange round for every validator: ask for what is missing, answer from whoever holds it, and admit any
+    /// block that becomes recoverable — the same sequence `taxis_driver` performs, over this bus instead of QUIC.
+    fn exchange_shards(&mut self) {
+        for i in 0..N {
+            if self.crashed[i] {
+                continue;
+            }
+            let wanted = self.samplers.get(i).map(Sampler::outstanding).unwrap_or_default();
+            for (hash, missing) in wanted {
+                for index in missing {
+                    let peer = usize::from(index);
+                    // A partition drops the request or its answer; a crashed peer answers nothing.
+                    if self.crashed[peer] || self.partition[i] != self.partition[peer] {
+                        continue;
+                    }
+                    let Some(shard) = self.samplers.get(peer).and_then(|s| s.serve(&hash, index)) else { continue };
+                    let full = self.samplers.get_mut(i).and_then(|s| s.accept(hash, index, shard));
+                    if let Some(full) = full {
+                        let shards = Box::new(full.da_shards().map(Some));
+                        let outs = self.engines[i].step(Input::Propose { block: full, shards });
+                        self.collect(i, outs);
+                    }
+                }
+            }
+        }
+        self.run();
+    }
+
+    /// Deliver every dispersed shard whose latency has elapsed, counting the rest down one tick.
+    fn drain_dispersal(&mut self) {
+        let due: Vec<(usize, [u8; 32], Vec<u8>)> = self
+            .dispersing
             .iter_mut()
-            .filter_map(|(left, to, b)| {
+            .filter_map(|(left, to, h, shard)| {
                 *left = left.saturating_sub(1);
-                (*left == 0).then(|| (*to, b.clone()))
+                (*left == 0).then(|| (*to, *h, shard.clone()))
             })
             .collect();
-        self.deferred.retain(|(left, _, _)| *left > 0);
-        for (to, block) in due {
+        self.dispersing.retain(|(left, _, _, _)| *left > 0);
+        for (to, hash, shard) in due {
             if self.crashed[to] {
                 continue;
             }
-            let shards = Box::new(self.shards_for(&block));
-            let outs = self.engines[to].step(Input::Propose { block, shards });
-            self.collect(to, outs);
+            if let Some(s) = self.samplers.get_mut(to) {
+                s.hold(hash, shard);
+            }
         }
-        self.run();
     }
 
     fn deliver(&mut self, from: usize, msg: &ConsensusMsg) {
@@ -349,7 +404,8 @@ impl Cluster {
         }
         self.run();
         if self.da_delay > 0 {
-            self.drain_deferred();
+            self.drain_dispersal();
+            self.exchange_shards();
         }
     }
 
@@ -470,6 +526,36 @@ fn ssle_finalizes_when_bodies_arrive_by_da_sampling_rather_than_whole() {
         assert_eq!(e.chain().state().balance(&ALICE), 900, "the transfer executed");
         assert_eq!(e.chain().state().balance(&BOB), 100);
         assert_eq!(e.chain().state_root(), root, "all replicas agree on the state root");
+    }
+}
+
+#[test]
+fn every_validator_recovers_a_dispersed_block_not_merely_a_quorum() {
+    // The shape `dromos_quic`'s private-transfer test asserts and the live path fails: `sortition: None`, one proposer
+    // per round, DA-dispersed bodies — and **unanimity**, not a quorum. A quorum finalizing is not enough, because a
+    // validator that gathers the commit certificate without ever recovering the body wedges at genesis forever while
+    // the rest of the cell moves on. Measured live as one stuck validator, then three, then only-the-proposer executing.
+    //
+    // Asserted on the samplers too: `in_flight() == 0` says every validator actually recovered the payload, which is
+    // strictly stronger than "it finalized" and is the thing that was failing.
+    let mut c = Cluster::new(&genesis());
+    c.with_da_delay(4); // a wider dispersal stagger than the SSLE case, so first requests reliably find nothing
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"da-unanimity");
+    c.submit_all(&tx);
+    for _ in 0..12 {
+        c.tick();
+    }
+
+    assert_eq!(c.honest_count_at(0), N, "EVERY validator finalizes height 0, not just a quorum");
+    assert_eq!(c.hashes_at(0).len(), 1, "and on one block");
+    for (i, s) in c.samplers.iter().enumerate() {
+        assert_eq!(s.in_flight(), 0, "validator {i} recovered every body it was sampling");
+    }
+    let root = c.engines[0].chain().state_root();
+    for (i, e) in c.engines.iter().enumerate() {
+        assert_eq!(e.chain().state().balance(&BOB), 100, "validator {i} executed the transfer");
+        assert_eq!(e.chain().state_root(), root, "and agrees on the state root");
     }
 }
 
