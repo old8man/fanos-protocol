@@ -187,6 +187,33 @@ View-change / round advance follows Tendermint's locking rule: a validator that 
 prepares a conflicting block at a higher round if shown a newer `PC`, which §2.1 makes impossible for two
 different blocks at the same height — so safety holds across rounds, and the beacon re-election gives liveness.
 
+### 4.1 Proof-of-lock — why the locking rule needed a companion {#pol}
+
+The locking rule is safe on its own but not live on its own, and the gap is **sub-quorum locking**. Re-preparing a
+locked value (`reprepare_lock`) restores the `PC` only if a *quorum* holds the same lock; below that, the locked
+minority refuses every fresh proposal while the rest keep producing them, and no `PC` can re-form for anything.
+Measured on a live seven-node cell: **three locked, five needed — `rejects.locked` five apiece and no other
+rejection anywhere**, for as long as the observation lasted.
+
+Re-proposing the locked value is Tendermint's remedy, and this block layout blocks it: a header commits to its
+`proposer` and a receiver checks that against the round's entitled leader, so only the *original* proposer can
+re-offer a locked block byte-identically — and it may not be entitled when the re-offer is needed.
+
+So entitlement is replaced by **justification**. A re-proposal carries `Block::pol`, a `Phase::Prepare` quorum
+certificate over that very block, riding outside the hashed header (like `LeaderWitness`) so the block's identity
+is unchanged. A receiver admits *any* proposer whose block carries a valid one — strictly stronger evidence than
+holding a rota slot, since a polka proves the cell was already willing to prepare exactly that block. Symmetrically,
+a validator locked on a block it holds may re-offer it whatever the rota says.
+
+**Both halves are required, and the asymmetry is silent.** With only the receiver relaxed, the failure rate did not
+move: the rota reaches a locked validator in 3 rounds of 7 while the round timeout doubles toward 24 s, so the
+receiver was accepting a justified re-proposal nobody was entitled to send. Rate went from 3 failures in 6 runs to
+1 in 8 once the sender side matched.
+
+Safety is unchanged and needs no new argument: a `pol` can only re-offer a block that already gathered a `PC`, so
+it never introduces a value the cell had not already been willing to prepare, and §2.1 still forbids two `PC`s at
+one height.
+
 ---
 
 ## 5. Anti-MEV — the threshold-encrypted mempool
