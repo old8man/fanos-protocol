@@ -32,6 +32,19 @@ No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes 
 Needs a nightly or pre-release job. Also worth separating the two things `#[ignore]` currently conflates: *measurements* (15 in
 `fanos-sim`, must never gate) from *cost-gated assertions* (13 in `fanos-obolos`, must gate somewhere).
 
+### [A] Split `fanos-quic/src/driver.rs` — 2 125 production lines, eight concerns
+The workspace's largest production file, larger than `overlay/mod.rs` is *after* its split, and never split. Concerns:
+PROTEUS shaping; identity/self-certification; coordinate placement & reseating; handle/client API; the spawn surface;
+connection & frame plumbing; NAT traversal; the custom UDP fabric. Cleanest first cuts, none needing an API change: `placement`
+(reseating), `fabric` (`impl quinn::AsyncUdpSocket`), `holepunch`, `shaping`. Method: `docs/design-testing.md`
+§"Refactoring a large module".
+
+### [A] Collapse seven `spawn*` entry points into one builder
+`spawn`, `spawn_shaped`, and five `spawn_self_certifying{,_with_capabilities,_persistent,_persistent_on,_persistent_over}` —
+the latter five all funnel into `self_certifying_inner` and differ only in which of `{bind, credentials, capabilities, proteus,
+fabric}` they take. The names encode the parameter list, so each new axis has meant a new public function. Also re-read the 25
+remaining `allow(clippy::too_many_arguments)` the same way: twice this session such a lint was pointing at a missing *type*.
+
 ### [A] Thin unit coverage in three crates
 `fanos-holarch` 987 lines / **0.14** ratio / 8 tests — and it is the viability gate, so a gate that cannot be trusted to gate.
 `fanos-observatory` 2 394 / 0.16 / 17. `fanos-runtime` 3 433 / 0.29 / 29 — the overlay engine; mitigated by `fanos-sim` (267)

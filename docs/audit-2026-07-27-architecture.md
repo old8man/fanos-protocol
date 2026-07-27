@@ -110,3 +110,67 @@ Stated so it is not mistaken for completeness: no formal review of the cryptogra
 `docs/crypto-audit-readiness.md` and the independent pass recorded in `docs/audit.md`), no performance/throughput
 characterisation beyond the DROMOS wave metric, and no review of the spec documents against each other — only spec-vs-code
 where a claim was measurable.
+
+---
+
+# Part 2 — code architecture
+
+## 4. What is well-factored
+
+**Error discipline is uniform: one error enum per crate, no duplication.** 14 distinct `*Error` types (`WireError`,
+`QuicError`, `NodeError`, `ThresholdError`, …), each defined once, each with `Display` + `std::error::Error` and `From`
+conversions at the boundaries. No crate leaks another's error type as its own.
+
+**The abstraction seams are real and small: 21 traits for 43 crates.** `Engine` and `StateMachine` (the two sans-I/O cores),
+`Wire` (codec), `Dialer`/`UdpDialer`/`OverlayTransport` (transport substitution — this is what lets the simulator differ only
+in transport), `MorphCodec` + `AdmissionPolicy` (pluggable policy SPIs), `SystemProbe`/`Scenario` (measurement),
+`ShieldedProof`/`ReRandomizable`/`ProofSize` (the ZK surface), `TunReader`/`TunWriter` (VPN datapath). Each names a
+substitution point that is actually substituted somewhere — none is speculative.
+
+**`overlay.rs` stayed split.** 4 048 → `overlay/` with `mod.rs` at 1 061 production lines and five siblings. The method notes
+that came out of it are in `docs/design-testing.md`.
+
+## 5. Findings
+
+### 5.1 MEDIUM — `fanos-quic/src/driver.rs` is the workspace's god-object: 2 125 production lines, eight concerns
+
+It is now the largest production file in the repo — larger than `overlay/mod.rs` is *after* being split, and it has never been
+split. Eight separable concerns, with natural boundaries already visible in its own section comments:
+
+| concern | representative items |
+|---|---|
+| PROTEUS shaping | `ProteusConfig`, `shape_out`/`shape_in`, `apply_outcome`, `MorphController` |
+| identity / self-certification | `SelfCert`, `HelloVerifier`, `CoordinateProver`, `hello_exchange`, `read_verified_hello` |
+| coordinate placement & reseating | `BeaconWindow`, `Placement`, `Reseater`, `reshuffle_loop`, `announce_moves`, `verified_move` |
+| handle & client API | `NodeHandle`, `Client`, `Control`, `GetWaiters`/`PutWaiters`, `router_loop` |
+| spawn surface | `spawn`, five `spawn_self_certifying*`, `self_certifying_inner`, `spawn_shaped` |
+| connection & frame plumbing | `Transport`, `accept_loop`, `read_frames`, `send_framed`, `ConnMap` |
+| NAT traversal | `broker_holepunch`, `accept_holepunch`, `encode_punch`/`decode_punch`, `Reflexive` |
+| custom UDP fabric | `Fabric`, `PassThroughFabric`, `impl quinn::AsyncUdpSocket`, `WritablePoller` |
+
+The precedent and the method exist (the overlay split, `docs/design-testing.md` §"Refactoring a large module"): cut by items,
+child modules see the parent's privates so splitting an impl is cheaper than lifting a type. `placement` (reseating), `fabric`
+(the UDP socket impl), `holepunch` and `shaping` are the four cleanest first cuts and none of them needs an API change.
+
+### 5.2 MEDIUM — seven `spawn*` entry points where one builder belongs
+
+`spawn`, `spawn_shaped`, and five `spawn_self_certifying{,_with_capabilities,_persistent,_persistent_on,_persistent_over}` —
+all five of the latter funnel into one `self_certifying_inner` and differ only in which of `{bind, credentials, capabilities,
+proteus, fabric}` they accept. **The names encode the parameter list, which is the tell.** Each new axis has so far meant a new
+public function, so the surface grows multiplicatively with options.
+
+This is the same lint-shaped signal this session hit twice elsewhere: a `too_many_arguments` warning pointing at a missing
+*type* rather than a missing suppression (resolved as `HostedService` in one case, and the `(Vec<u8>, u8, bool)` triple in
+another). 25 `allow(clippy::too_many_arguments)` remain in the workspace and are worth reading the same way.
+
+### 5.3 LOW — `fanos-node/src/bin/fanos.rs` at 1 226 production lines
+
+A CLI binary that size is carrying logic that belongs in the library, which also puts it outside most of the test surface
+(binaries are harder to test than libs). It is where the 11 of 13 production panic sites live — not a coincidence.
+
+### 5.4 Observation — `fanos-obolos` exposes 357 public items
+
+The largest public surface in the workspace (next is `fanos-node` at 255, `fanos-taxis` at 232). For the currency crate this
+may be inherent — the ZK statement types, the ring/SIS parameters and the note algebra are all legitimately public — but it is
+worth one pass asking which of the 357 are load-bearing for callers versus incidental. A narrower surface is a smaller
+compatibility obligation for the crate that most needs to stay stable.
