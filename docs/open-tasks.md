@@ -105,11 +105,27 @@ received it, so they have nothing to reject and go on proposing alternatives. Qu
 Crucially **no `unavailable` reject appears** — the four are not refusing the block for want of its body, they never saw
 the proposal at all.
 
-That makes the missing mechanism specific. `reprepare_lock` has the three re-PREPARE their locked value on round entry,
-but a PREPARE carries only a hash, and the body-fetch trigger (`awaited_body` → `NeedSkeleton`) covers a validator
-*committed* to a block it lacks — not one merely seeing peers vote for one. So the four see votes for a hash they cannot
-resolve and never ask for it. Widening that trigger to "peers are voting for a block I do not hold" is the candidate fix,
-and it is a consensus change that wants care rather than a quick patch.
+`awaited_body` is now widened to that third case — a block peers are voting for and this validator does not hold — and it
+is kept because its trigger is real. But instrumentation says it is **not** what the four validators were missing:
+`WANT-VOTED` fires 41 times on a failing run while the driver's `ASK` fires **zero** times, because the guard
+`!da.is_sampling(&want)` is already true. The four *did* receive the skeleton and *are* sampling; they simply never
+complete the shard set.
+
+**Two fixes for that were tried and both are measured regressions — do not retry them.** Baseline: the suite fails in
+~55 s, passing runs take 10–13 s.
+| change | result |
+|---|---|
+| request each missing shard from **every** peer, not just its custodian | **0 of 3 passed**, every run exhausting the 240 s ceiling |
+| additionally ask the block's **proposer** (which provably holds it whole) | **0 of 4 passed**, 150–167 s each |
+
+That reframes the problem, and it is the useful thing this attempt produced: **the cell is already near its transport
+capacity with a 9 KB block**, so a recovery path that adds request traffic pushes it over rather than helping. The single
+custodian per shard is a genuine structural weakness (`ConsensusEngine::shard_of` now lets any holder answer for an index
+it can produce), but it is not the binding constraint — capacity is.
+- Next hypotheses, in order of what the evidence supports: shard *size* (a 9 KB block's shards may exceed what one
+  `Command::Emit` moves comfortably on a saturated loopback — measure the shard byte count and the emit latency); the
+  dispersal being one-shot per proposal with no pacing; and whether `PENDING_CAP`/`HELD_CAP` evict a block still being
+  sampled.
 
 Size is what makes it *likely* rather than what makes it happen: a 9 KB block is slower to disperse, so the window in
 which only some validators hold it is wider.

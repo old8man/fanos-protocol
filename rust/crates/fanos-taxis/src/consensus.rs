@@ -735,10 +735,40 @@ impl<S: StateMachine> ConsensusEngine<S> {
     ///
     /// So the driver asks for it: `Some(hash)` means "fetch this block's skeleton from a peer that has it", after which
     /// the ordinary DA sampling and admission path takes over. `None` when nothing is missing.
+    /// A third case joined the two above: a block this validator is neither committed to nor locked on, but which
+    /// **its peers are voting for** and it has never received.
+    ///
+    /// It exists because neither of the other two fires for a validator that is merely *watching* a block gather
+    /// votes, and that is the state a lock split leaves the majority in. Measured on a live cell: three of seven
+    /// received a height's proposal and locked on it, the other four never saw it; quorum is five, so the three
+    /// refused every later proposal (`rejects.locked`, 5 each, and nothing else anywhere) while the four proposed
+    /// alternatives none of the three could join. A PREPARE carries only a hash, so the votes told the four
+    /// nothing they could act on.
+    ///
+    /// Asking on that evidence is safe: a vote is signature-checked before it reaches `prepares`/`commits`, so the
+    /// hash is one a real validator staked its signature on, and whatever body arrives is still verified against
+    /// the header's `da_commit` and every ordinary proposal check before admission.
     #[must_use]
     pub fn awaited_body(&self) -> Option<[u8; 32]> {
-        let want = self.pending_finalize.get(&self.height()).copied().or(self.locked_block)?;
-        (!self.proposals.contains_key(&want)).then_some(want)
+        let height = self.height();
+        if let Some(want) = self.pending_finalize.get(&height).copied().or(self.locked_block)
+            && !self.proposals.contains_key(&want)
+        {
+            return Some(want);
+        }
+        // The hash peers are backing hardest at this height that we do not hold. Ties break by hash — arbitrary,
+        // but identical on every validator, so a split cell converges on asking for the same body.
+        let mut tally: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        for sv in self.prepares.iter().chain(&self.commits) {
+            let hash = sv.vote.block_hash;
+            if sv.vote.height == height
+                && !self.proposals.contains_key(&hash)
+                && self.recent_bodies.get(&hash).is_none()
+            {
+                *tally.entry(hash).or_insert(0) += 1;
+            }
+        }
+        tally.into_iter().max_by_key(|&(hash, n)| (n, hash)).map(|(hash, _)| hash)
     }
 
     /// The **skeleton** of a block this validator holds, so it can answer a peer stuck waiting for that body.
