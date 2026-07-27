@@ -138,10 +138,24 @@ building a fresh one — and it is **not expressible in this design as it stands
 - Attempted and reverted: re-proposing the locked block from `maybe_propose`. It cannot work for that reason, and the
   attempt is what surfaced it.
 
-**So the fix is a proof-of-lock, not a re-proposal.** A re-proposal must carry a PREPARE-quorum certificate for the value,
-and `on_propose` must admit a non-leader proposer when that certificate validates — safe, because a polka certificate
-proves the cell was already willing to prepare exactly that block. `Certificate` already exists for `Phase::Prepare`, so
-the machinery is present; what is missing is carrying it on the proposal and relaxing the entitlement check against it.
+**The proof-of-lock is implemented and it cuts the failure rate roughly threefold, but does not close it.** `Block::pol`
+carries a `Phase::Prepare` quorum certificate over the block, `on_propose` admits *any* proposer whose block comes with a
+valid one, and a locked validator holding its block may re-offer it regardless of the round's rota. Measured across
+`a_hash_locked` runs: **1 of 8 failing** with the fix, against **3 of 6** before (and one further failure in a
+full-`dromos_quic` run). No regression elsewhere: `taxis_quic` 2/2, `anonymous_quic` 5/5, `mix_directory_quic` 3/3,
+`consensus_sim` 31/31, taxis unit 86/86.
+
+The order the two halves went in is worth keeping, because the first alone did nothing: with only the receiver relaxed,
+`maybe_propose` still returned early for a non-entitled validator, so a locked validator could re-offer its block only in
+the rounds where the rota happened to reach it — 3 in 7, while the round timeout doubles toward 24 s. The receiver
+accepted a justified re-proposal that nobody was ever entitled to send. Rate unchanged at 3 of 6 until the sender side
+was made symmetric.
+
+**Residual.** Something still stalls occasionally, and the surviving failures run 90–110 s where a healthy run is 10–25 s,
+so the cell is converging *slowly* rather than never — which is a different shape from the original permanent freeze.
+Next: instrument how many rounds a failing run burns and which validator finally re-offers, and check whether the
+doubling round timeout (`ROUND_TIMEOUT_MAX` 24 s) is what makes the remaining window too tight, since a re-offer can only
+happen on a round entry.
 
 Size is what makes it *likely* rather than what makes it happen: a 9 KB block is slower to disperse, so the window in
 which only some validators hold it is wider.

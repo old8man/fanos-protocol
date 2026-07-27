@@ -507,6 +507,9 @@ pub struct ConsensusEngine<S: StateMachine> {
     // frozen at genesis. Bounded because the key is a block hash; an evicted body is simply unavailable here, and the
     // requester asks the rest of the cell.
     recent_bodies: BoundedMap<[u8; 32], Block>,
+    /// The PREPARE-quorum certificate that set [`locked_block`](Self::locked_block) — the **proof of lock** a
+    /// re-proposal carries, so a validator other than the block's original proposer can re-offer it.
+    locked_cert: Option<Certificate>,
     /// The height at which each still-premature transaction was **first** deferred, so retention is bounded by
     /// [`REVEAL_WINDOW`] rather than being unbounded: a far-future nonce cannot be re-queued forever.
     deferred_since: BoundedMap<TxCommit, u64>,
@@ -591,6 +594,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             rejects: ProposalRejects::default(),
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
+            locked_cert: None,
             deferred_since: BoundedMap::new(RECENT_BODY_CAP),
             round0_window: None,
             reveals: BTreeMap::new(),
@@ -923,7 +927,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
         } else {
             leader(&self.seed, height, self.round) as u8 == self.me
         };
-        if !entitled || self.proposed_round == Some(self.round) {
+        // A validator **locked** on a block it holds may re-offer it whatever the round's rota says, because it
+        // carries the proof: `on_propose` admits any proposer whose block comes with a PREPARE-quorum
+        // certificate over that block. Without this the two halves do not meet — the receiver would accept a
+        // justified re-proposal that no one is ever entitled to send, since the rota reaches a locked validator
+        // only 3 rounds in 7 while the round timeout doubles toward 24 s. Duplicate re-offers are byte-identical
+        // and deduplicated by hash on arrival.
+        let can_reoffer = self
+            .locked_block
+            .is_some_and(|h| self.proposals.contains_key(&h) && self.locked_cert.is_some());
+        if (!entitled && !can_reoffer) || self.proposed_round == Some(self.round) {
             return Vec::new();
         }
         // A freshly state-synced validator adopted its parent's state without locally finalizing it, so it holds
@@ -933,10 +946,28 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if height > 0 && self.last_finalized_cert.is_none() {
             return Vec::new();
         }
-        // Order the mempool blindly by commitment (the proposer never sees contents — anti-MEV).
-        let mut sealed = self.mempool.clone();
-        sealed.sort_by_key(SealedTx::commit);
-        let mut block = Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed);
+        // **Re-propose the value this validator is locked on**, carrying the certificate that locked it.
+        //
+        // `reprepare_lock`'s liveness argument requires a *quorum* locked on the same block; below that, no
+        // number of rounds can re-form the PREPARE quorum, because every fresh proposal differs from the locked
+        // block and the locked minority refuses it. Measured live: three of seven locked, five needed, and the
+        // four unlocked ones proposed alternatives the three refused — `rejects.locked`, five each, nothing else.
+        //
+        // Safe by construction: the block already gathered a PREPARE quorum (that is what locked it), so this
+        // can only re-offer a value the cell was already willing to prepare, never a conflicting one. The
+        // transactions it omits stay in the mempool for the next height, exactly as if this proposal had lost.
+        let locked = self.locked_block.and_then(|h| {
+            let block = self.proposals.get(&h)?.clone();
+            Some((block, self.locked_cert.clone()?))
+        });
+        let mut block = if let Some((locked, cert)) = locked {
+            Block { pol: Some(Box::new(cert)), witness: None, ..locked }
+        } else {
+            // Order the mempool blindly by commitment (the proposer never sees contents — anti-MEV).
+            let mut sealed = self.mempool.clone();
+            sealed.sort_by_key(SealedTx::commit);
+            Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed)
+        };
         // Record the certificate that finalized the parent as this block's `last_commit`, so its execution
         // rewards exactly that (agreed) finalizer set. None before the first finalization (genesis child).
         if let Some(cert) = &self.last_finalized_cert {
@@ -1095,11 +1126,22 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let sortition_round0 = self.sortition.is_some() && self.round == 0;
         // Proposer entitlement: SSLE round 0 admits *any* elected-line member (all-propose); otherwise only
         // the single public deterministic leader. Plus the usual link + structure checks.
-        let proposer_ok = if sortition_round0 {
-            is_line_member(&self.seed, height, 0, usize::from(block.header.proposer))
-        } else {
-            leader(&self.seed, height, self.round) as u8 == block.header.proposer
-        };
+        // A **proof of lock** justifies any proposer: a PREPARE-quorum certificate over this very block at this
+        // height proves the cell was already willing to prepare it, which is stronger evidence than holding this
+        // round's leader slot. Without it only the original proposer could re-offer a locked block, since the
+        // header commits to `proposer` — and it may not be entitled in the round where the re-offer is needed.
+        let pol_ok = block.pol.as_ref().is_some_and(|c| {
+            c.phase == Phase::Prepare
+                && c.height == height
+                && c.block_hash == bh
+                && c.verify(self.params.quorum, &self.verifiers)
+        });
+        let proposer_ok = pol_ok
+            || if sortition_round0 {
+                is_line_member(&self.seed, height, 0, usize::from(block.header.proposer))
+            } else {
+                leader(&self.seed, height, self.round) as u8 == block.header.proposer
+            };
         let links = block.header.height == height
             && block.header.parent == self.chain.head()
             && block.header.epoch == self.epoch;
@@ -1336,8 +1378,11 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if !cert.verify(self.params.quorum, &self.verifiers) {
             return Vec::new();
         }
-        // Prepared: lock the block and commit to it.
+        // Prepared: lock the block and commit to it. The certificate that justified the lock is retained as the
+        // proof-of-lock a later re-proposal needs (see `Block::pol`) — it can only be rebuilt here, because
+        // `collect_cert` reads the *current* round's votes and the lock outlives its round.
         self.locked_block = Some(block_hash);
+        self.locked_cert = Some(cert.clone());
         self.sent_commit.insert(self.round);
         let vote =
             Vote { height: self.height(), round: self.round, block_hash, phase: Phase::Commit, voter: self.me };
@@ -1468,6 +1513,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.sent_prepare.clear();
         self.sent_commit.clear();
         self.locked_block = None;
+        self.locked_cert = None;
         // Round-0 sortition working state (the registered VRF config in `sortition` persists across heights).
         self.round0_tickets.clear();
         self.round0_window = None;

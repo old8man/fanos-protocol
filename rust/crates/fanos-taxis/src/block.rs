@@ -122,6 +122,20 @@ pub struct Block {
     /// Tendermint-style `LastCommit`). `None` at genesis / height 1. Committed by the header's
     /// `last_commit_root`, so unlike the [`witness`](Self::witness) it **is** part of the block hash.
     pub last_commit: Option<Certificate>,
+    /// The **proof of lock**: a `Phase::Prepare` quorum certificate over *this* block, attached when a
+    /// validator re-proposes a value it is locked on in a later round. Rides outside the hashed header, like
+    /// the [`witness`](Self::witness), so a re-proposal is byte-identical in identity to the original.
+    ///
+    /// It exists because a block header commits to its `proposer`, and a receiver checks that against the
+    /// round's entitled leader — so without a justification only the *original* proposer could ever re-offer a
+    /// locked block, and it may not be entitled in the round where the re-offer is needed. A polka certificate
+    /// is that justification: it proves a quorum was already willing to prepare exactly this block, which is
+    /// strictly stronger evidence than being this round's leader. Tendermint's proof-of-lock, in the shape this
+    /// block layout allows.
+    ///
+    /// Boxed because `ConsensusMsg::Propose` carries a whole `Block`: a second inline certificate pushes that
+    /// variant well past its siblings, which is a real cost on every message rather than only on a re-proposal.
+    pub pol: Option<Box<Certificate>>,
 }
 
 impl Block {
@@ -141,7 +155,7 @@ impl Block {
         let da_commit = commit_shards(&erasure::encode(&encode_payload(&sealed_txs)));
         let header =
             BlockHeader { parent, height, epoch, proposer, tx_root, da_commit, last_commit_root: commit_last(None) };
-        Self { header, sealed_txs, witness: None, last_commit: None }
+        Self { header, sealed_txs, witness: None, last_commit: None, pol: None }
     }
 
     /// Attach the parent block's commit certificate as this block's `last_commit`, updating the header's
@@ -153,6 +167,13 @@ impl Block {
     pub fn with_last_commit(mut self, cert: Certificate) -> Self {
         self.header.last_commit_root = commit_last(Some(&cert));
         self.last_commit = Some(cert);
+        self
+    }
+
+    /// Attach a [`pol`](Self::pol) — the PREPARE-quorum certificate justifying a re-proposal of this block.
+    #[must_use]
+    pub fn with_pol(mut self, pol: Certificate) -> Self {
+        self.pol = Some(Box::new(pol));
         self
     }
 
@@ -183,6 +204,7 @@ impl Block {
             header: self.header.clone(),
             sealed_txs: Vec::new(),
             witness: self.witness.clone(),
+            pol: self.pol.clone(),
             last_commit: self.last_commit.clone(),
         }
     }
@@ -210,6 +232,9 @@ impl Block {
         // Length-prefixed witness: empty var-bytes ⇒ no sortition witness (a public-fallback block).
         let witness_bytes = self.witness.as_ref().map(LeaderWitness::to_bytes).unwrap_or_default();
         fanos_primitives::codec::put_var_bytes(&mut out, &witness_bytes);
+        // Length-prefixed proof-of-lock (empty ⇒ None), last so the earlier sections decode unchanged.
+        let pol_bytes = self.pol.as_ref().map(|c| c.to_bytes()).unwrap_or_default();
+        fanos_primitives::codec::put_var_bytes(&mut out, &pol_bytes);
         out
     }
 
@@ -233,8 +258,11 @@ impl Block {
         let witness_bytes = r.var_bytes()?;
         let witness =
             if witness_bytes.is_empty() { None } else { Some(LeaderWitness::from_bytes(witness_bytes)?) };
+        let pol_bytes = r.var_bytes()?;
+        let pol =
+            if pol_bytes.is_empty() { None } else { Some(Box::new(Certificate::from_bytes(pol_bytes)?)) };
         r.finish()?;
-        Some(Self { header, sealed_txs, witness, last_commit })
+        Some(Self { header, sealed_txs, witness, last_commit, pol })
     }
 
     /// The ordered transaction commitments — what the proposer ordered by (blind to contents).
