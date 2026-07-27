@@ -214,13 +214,48 @@ impl RecoveryWatcher {
 
 /// Announce the node to its cell after start: kick off the heartbeat (cover traffic) if configured, and JOIN
 /// with the offered role set so the cell learns what this node serves (spec §7.8 JOIN).
-fn announce_node(handle: &NodeHandle, config: &NodeConfig) {
+/// Returns the move announcer, so a coordinate change is announced cell-wide too — see [`spawn_move_announcer`].
+fn announce_node(handle: &NodeHandle, config: &NodeConfig) -> Option<JoinHandle<()>> {
     if config.start_heartbeat {
         handle.command(Command::StartHeartbeat);
     }
-    if config.roles.any() {
-        handle.command(Command::Join { info: vec![config.roles.encode()] });
+    if !config.roles.any() {
+        return None;
     }
+    let info = vec![config.roles.encode()];
+    handle.command(Command::Join { info: info.clone() });
+    Some(spawn_move_announcer(handle.client(), info))
+}
+
+/// Re-announce this node to the whole cell whenever its coordinate **moves**, so membership converges after a
+/// collision is resolved.
+///
+/// A move already re-sends the HELLO on every **open connection** (`fanos_quic`'s move announcer) and republishes the
+/// capability/load records at the new point. Neither reaches a peer this node is *not yet connected to*, and that peer is
+/// exactly the one that needs telling: it holds no address for the mover, so it never dials, never connects, and never
+/// learns — permanently.
+///
+/// An `Announce` is the path that does reach it, because `OverlayNode::on_announce` **re-floods on first sight**, so the
+/// new coordinate propagates transitively through peers that *are* connected. The re-flood also terminates on its own: the
+/// monotone guard drops a repeat for a coordinate already in `members`, so this costs one wave per genuine move.
+///
+/// Measured before this: with the draw forced to collide, `known_peers` stalled at 4–6 of 7 and the roster never agreed
+/// (`[1,2,2,2,4,2,4]`), while an injective draw over the same code reached `[7; 7]` in 24 s. The roster is downstream —
+/// a cell that has not finished connecting cannot assemble a directory over coordinates it cannot reach.
+#[must_use]
+fn spawn_move_announcer(client: Client, info: Vec<u8>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut events = client.subscribe();
+        loop {
+            match events.recv().await {
+                Ok(Notification::Reseated { .. }) => {
+                    client.command(Command::Join { info: info.clone() });
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 /// Spawn the recovery auto-trigger for a beacon-carrying node (`None` for a bare node), deriving the cell's
@@ -454,6 +489,8 @@ pub struct Node {
     /// The recovery auto-trigger (audit §4 R-C1) — present only with a beacon; fires proactive reshare /
     /// escalates re-genesis on a beacon freeze. Held for the node's lifetime.
     _recovery_trigger: Option<JoinHandle<()>>,
+    /// Re-announces this node to the cell on every coordinate move — see [`spawn_move_announcer`].
+    _move_announcer: Option<JoinHandle<()>>,
     /// The **self-organizing role subsystem** — the capability/load publishers and the per-epoch assignment loop.
     /// Held for the node's lifetime; [`assigned_roles`](Self::assigned_roles) reads the current assignment.
     self_org: SelfOrganization,
@@ -668,7 +705,7 @@ impl Node {
         // The self-organizing role subsystem (see [`spawn_roles`]).
         let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory);
 
-        announce_node(&handle, &config);
+        let move_announcer = announce_node(&handle, &config);
 
         Ok(Self {
             handle,
@@ -679,6 +716,7 @@ impl Node {
             _epoch_driver: epoch_driver,
             _beacon_tracker: beacon_tracker,
             _recovery_trigger: recovery_trigger,
+            _move_announcer: move_announcer,
             self_org,
             live_beacon,
         })

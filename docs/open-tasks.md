@@ -51,12 +51,20 @@ draw until it actually collides — a earlier version spent a whole trial on an 
   probe index 1 — and its rosters still never agree. So an earlier revision of this entry, which named `probe_index = None` as
   the primary defect, was reading trial-1-only evidence: the two `None`s there are a *second*, rarer failure and they are not
   what breaks trial 0.
-- **The mechanism this points at is the documented 4th link:** a mover's new coordinate reaches peers by re-keying the **live
-  connection** (`b17e5bb`, `f09d9d6`), so a peer that has not yet connected to the mover never learns where it went, never
-  connects, and `known_peers` stalls below `n` permanently. The fix has to make a move discoverable to a node with *no*
-  existing connection — an announce/flood path — not only re-key the connections that already exist.
-- Next: instrument which coordinate each node holds for each peer after a move, and confirm the stalled pairs are exactly
-  those with no connection at move time. `NodeFleet::spawn`'s injective draw stays until trial-0-shaped runs agree.
+- **One real hole found and closed, which did NOT close the item.** A mover's new coordinate reached peers only by re-keying
+  the **live connection** (`b17e5bb`, `f09d9d6`) — so a peer not yet connected to the mover could never learn where it went,
+  never dial, and never connect. `spawn_move_announcer` now issues an overlay `Announce` on every `Reseated`, which is the
+  path that *does* reach such a peer: `on_announce` re-floods on **first sight** of a coordinate, so the move propagates
+  transitively through peers that are connected, and the monotone guard bounds it to one wave per genuine move.
+  - **Verified by inspection, not by the measurement.** With it, both forced-collision trials reach 7 of 7 distinct (one was
+    6 of 7 before) and trial-1 rosters rose from `[1,2,2,2,4,2,4]` to `[6,4,4,5,5,6,6]` — but **`agreed` is still `None` in
+    every trial**, and with n = 2 on different random draws that improvement is not a claim worth making. No regression:
+    114 `fanos-node` lib tests, membership suite, clippy clean workspace-wide.
+- **So a second cause remains, and `known_peers` is still the thing to chase.** It reaches `n` only in the injective control.
+  Next step, and it should be **deterministic** rather than another 5-minute stochastic fleet run: a membership test over the
+  in-memory sim transport where node C has no connection to mover A, A moves, and C must end up holding A's new coordinate.
+  That proves or refutes the remaining link in milliseconds. `NodeFleet::spawn`'s injective draw stays until a
+  forced-collision run reaches `agreed`.
 
 ---
 
