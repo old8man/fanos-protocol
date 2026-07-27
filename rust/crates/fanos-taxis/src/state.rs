@@ -29,9 +29,24 @@ const STATE_ROOT_LABEL: &str = "FANOS-v1/taxis-state-root";
 pub enum ExecOutcome {
     /// The transaction was valid and mutated the state.
     Applied,
-    /// The transaction was well-formed but invalid against the current state (bad nonce, insufficient
-    /// balance, …) — it is recorded as included-but-rejected, not a consensus failure.
+    /// The transaction was well-formed but invalid against the current state (a *stale* nonce, insufficient
+    /// balance, …) — it is recorded as included-but-rejected, not a consensus failure. Terminal: replaying it
+    /// against a later state cannot help.
     Rejected,
+    /// The transaction is well-formed and not yet applicable, but **will be** once an earlier transaction from
+    /// the same sender lands: its nonce is *ahead* of the account, not behind.
+    ///
+    /// This distinction is load-bearing rather than pedantic, because anti-MEV ordering is **blind**. A proposer
+    /// sees only commitments, so it cannot order a sender's transactions by nonce, and a block routinely carries
+    /// nonce 2 ahead of nonce 1. Collapsing "premature" into [`Rejected`](Self::Rejected) then loses the later
+    /// transaction outright: the engine drops every *included* commitment from the mempool at finalize, keyed on
+    /// inclusion rather than outcome, so a premature transaction is never executed and never retryable. That is
+    /// the normal case for any wallet sending a second transaction before the first is included, and it was
+    /// measured as four transfers from one account executing exactly one.
+    ///
+    /// The engine returns a deferred transaction to the mempool, so a later block can carry it once its
+    /// predecessor has executed.
+    Deferred,
     /// The transaction bytes did not parse under this state machine's format.
     Malformed,
 }
@@ -166,8 +181,13 @@ impl StateMachine for Accounts {
         let Ok(t) = Transfer::from_wire(&tx.payload) else {
             return ExecOutcome::Malformed;
         };
-        // Replay protection: the transfer must name the sender's current nonce.
-        if self.nonce(&t.from) != t.nonce {
+        // Replay protection: the transfer must name the sender's current nonce. A nonce *ahead* of it is not
+        // invalid, only early — under blind ordering that is the common case, so it is deferred, not rejected.
+        let expected = self.nonce(&t.from);
+        if t.nonce > expected {
+            return ExecOutcome::Deferred;
+        }
+        if t.nonce != expected {
             return ExecOutcome::Rejected;
         }
         // Sufficient funds (a transfer to self is a no-op that still consumes the nonce).

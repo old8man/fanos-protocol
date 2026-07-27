@@ -32,6 +32,7 @@ use fanos_primitives::{BeaconSeed, Epoch, codec};
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 
 use crate::block::{Block, LeaderWitness};
+use crate::state::ExecOutcome;
 use crate::chain::Chain;
 use crate::checkpoint::{ExecCertificate, ExecVote};
 use crate::committee::{
@@ -506,6 +507,9 @@ pub struct ConsensusEngine<S: StateMachine> {
     // frozen at genesis. Bounded because the key is a block hash; an evicted body is simply unavailable here, and the
     // requester asks the rest of the cell.
     recent_bodies: BoundedMap<[u8; 32], Block>,
+    /// The height at which each still-premature transaction was **first** deferred, so retention is bounded by
+    /// [`REVEAL_WINDOW`] rather than being unbounded: a far-future nonce cannot be re-queued forever.
+    deferred_since: BoundedMap<TxCommit, u64>,
     // Ticks elapsed since the round-0 collection window opened (the first proposal was buffered), or `None`
     // while it has not opened. The window closes — and the min-ticket is prepared — at `COLLECT_WINDOW_TICKS`
     // or when all line members have proposed (early exit), whichever comes first. Reset per height.
@@ -587,6 +591,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             rejects: ProposalRejects::default(),
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
+            deferred_since: BoundedMap::new(RECENT_BODY_CAP),
             round0_window: None,
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
@@ -1393,10 +1398,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.exec_queue.push(block.clone());
         // Validate any reveals that arrived early for this block's transactions, now that we hold the committee.
         out.extend(self.drain_pending_reveals(&block));
-        out.extend(self.try_execute());
-
-        // Drop included transactions from the mempool and reset the per-height working state.
+        // Drop included transactions from the mempool **before** executing. Execution returns premature
+        // transactions to the pool, and this retain is keyed on inclusion — run afterwards it would take them
+        // straight back out, which is the whole defect in miniature. The retain reads no execution state, so
+        // the order is free to be the correct one.
         self.mempool.retain(|t| !included.contains(&t.commit()));
+        out.extend(self.try_execute());
         self.reset_round_state();
         out
     }
@@ -1559,6 +1566,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // heights — a deterministic, finalized-height-keyed signal that no more reveals will be waited for.
             let past_window = self.chain.next_height() > block.header.height + REVEAL_WINDOW;
             let mut opened = Vec::new();
+            // The sealed transaction each opened one came from, paired **by construction**: an undecryptable
+            // transaction is skipped below, so the two vectors are not index-aligned with `block.sealed_txs`
+            // and a deferred outcome could not otherwise be matched back to the entry to re-queue.
+            let mut opened_from: Vec<SealedTx> = Vec::new();
             let mut ready = true;
             for tx in &block.sealed_txs {
                 let shares: Vec<Share> =
@@ -1574,7 +1585,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 // share-validity oracle. This tolerates a Byzantine committee member that reveals a validly-
                 // signed but off-polynomial share: the subset excluding it still opens.
                 match open_from_subset(tx, &shares, t) {
-                    Some(txn) => opened.push(txn),
+                    Some(txn) => {
+                        opened.push(txn);
+                        opened_from.push(tx.clone());
+                    }
                     None => {
                         // No t-subset opens yet. A Byzantine share among the ≥ t present can hide a decryptable
                         // honest subset that needs one more reveal, so — until the window elapses — we do NOT
@@ -1616,7 +1630,29 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
             // One call, not a loop: `apply_block` lets a state machine schedule the block's independent transactions in
             // parallel (DROMOS does) while a plain ledger keeps the identical serial semantics via the default.
-            self.chain.execute_block(&opened);
+            let outcomes = self.chain.execute_block(&opened);
+            // Return premature transactions to the mempool. Blind ordering means a proposer cannot order a
+            // sender's transactions by a nonce it cannot see, so a block routinely carries nonce 2 ahead of
+            // nonce 1; without this the later one is dropped at finalize (keyed on inclusion, not outcome) and
+            // is never executed and never retryable — measured as four transfers from one account executing
+            // exactly one.
+            //
+            // Bounded by the engine's existing give-up horizon rather than a new constant: a transaction still
+            // premature `REVEAL_WINDOW` blocks after its first deferral is dropped, the same horizon that
+            // already decides when an undecryptable transaction stops being waited for.
+            for (sealed, outcome) in opened_from.iter().zip(&outcomes) {
+                if *outcome != ExecOutcome::Deferred {
+                    self.deferred_since.remove(&sealed.commit());
+                    continue;
+                }
+                let first = *self.deferred_since.get(&sealed.commit()).unwrap_or(&block.header.height);
+                if block.header.height.saturating_sub(first) <= REVEAL_WINDOW {
+                    self.deferred_since.insert(sealed.commit(), first);
+                    self.submit(sealed.clone());
+                } else {
+                    self.deferred_since.remove(&sealed.commit());
+                }
+            }
             // Attest the executed state at this height — the checkpoint that makes divergence detectable.
             out.push(self.emit_exec_vote(block.header.height));
             // Retain a servable snapshot of the just-executed state so a lagging peer can state-sync to it

@@ -201,8 +201,13 @@ impl ProverAuth {
 pub enum TokenError {
     /// The key does not bind to the `from` account, or the signature is invalid.
     Unauthorized,
-    /// The nonce does not match the sender's current one (replay or out-of-order).
+    /// The nonce is *behind* the sender's current one — a replay. Terminal.
     BadNonce,
+    /// The nonce is *ahead* of the sender's current one: the transfer is not yet applicable, and becomes
+    /// applicable once the sender's earlier transfers execute. Distinct from [`BadNonce`](Self::BadNonce)
+    /// because anti-MEV ordering is blind — a proposer cannot order a sender's transfers by a nonce it cannot
+    /// see, so this is the ordinary case rather than an error, and it must be retried rather than dropped.
+    NonceAhead,
     /// The sender's balance is below the amount.
     InsufficientFunds,
 }
@@ -257,7 +262,11 @@ impl TokenLedger {
             return Err(TokenError::Unauthorized);
         }
         let t = &st.transfer;
-        if self.nonce(&t.from) != t.nonce {
+        let expected = self.nonce(&t.from);
+        if t.nonce > expected {
+            return Err(TokenError::NonceAhead);
+        }
+        if t.nonce != expected {
             return Err(TokenError::BadNonce);
         }
         if self.balance(&t.from) < t.amount {
@@ -414,16 +423,26 @@ mod tests {
         let (_b, _bv, bob) = account(2);
         let mut ledger = TokenLedger::new();
         ledger.credit(alice, 100);
-        // Wrong nonce.
-        let bad_nonce = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 10, nonce: 5 }, &alice_sk, alice_vk.clone());
-        assert_eq!(ledger.apply(&bad_nonce), Err(TokenError::BadNonce));
+        // A nonce *ahead* of the account is premature, not invalid: under blind anti-MEV ordering a proposer
+        // cannot order a sender's transfers by a nonce it cannot see, so this must be retryable rather than a
+        // terminal rejection — the distinction the two error variants exist to carry.
+        let ahead = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 10, nonce: 5 }, &alice_sk, alice_vk.clone());
+        assert_eq!(ledger.apply(&ahead), Err(TokenError::NonceAhead));
         // Overspend.
         let overspend = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 1000, nonce: 0 }, &alice_sk, alice_vk.clone());
         assert_eq!(ledger.apply(&overspend), Err(TokenError::InsufficientFunds));
         // A replay of a good transfer is caught by the nonce.
+        let alice_vk_2 = alice_vk.clone();
         let good = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 10, nonce: 0 }, &alice_sk, alice_vk);
         assert_eq!(ledger.apply(&good), Ok(()));
-        assert_eq!(ledger.apply(&good), Err(TokenError::BadNonce), "a replay is rejected");
+        assert_eq!(ledger.apply(&good), Err(TokenError::BadNonce), "a replay is rejected — behind, so terminal");
+        // And the premature transfer becomes applicable once the account reaches its nonce, which is what makes
+        // deferring it correct rather than merely lenient.
+        for n in 1..5 {
+            let fill = SignedTransfer::sign(Transfer { from: alice, to: bob, amount: 1, nonce: n }, &alice_sk, alice_vk_2.clone());
+            assert_eq!(ledger.apply(&fill), Ok(()), "nonce {n} lands");
+        }
+        assert_eq!(ledger.apply(&ahead), Ok(()), "the once-premature transfer now applies unchanged");
     }
 
     #[test]

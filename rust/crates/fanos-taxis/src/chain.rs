@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use fanos_pqcrypto::HybridVerifier;
 
 use crate::block::{BlockHeader, GENESIS_PARENT};
-use crate::state::StateMachine;
+use crate::state::{ExecOutcome, StateMachine};
 use crate::tx::Transaction;
 
 /// The finalized chain over a state machine `S`: an append-only run of committed headers plus the state
@@ -117,8 +117,8 @@ impl<S: StateMachine> Chain<S> {
 
     /// Execute a whole block's transactions through [`StateMachine::apply_block`], so a state machine with a parallel
     /// executor is actually used on the live path.
-    pub fn execute_block(&mut self, txs: &[Transaction]) {
-        let _ = self.state.apply_block(txs);
+    pub fn execute_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
+        self.state.apply_block(txs)
     }
 }
 

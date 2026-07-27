@@ -1692,8 +1692,8 @@ fn a_validator_that_misses_one_height_rejoins_with_no_further_transactions() {
     }
 }
 
-/// **A burst of transactions from one account loses all but the first** — an open defect, reproduced here so it
-/// is pinned rather than remembered. Marked ignored because it fails: it is the reproduction, not a guard.
+/// **A burst of transactions from one account executes in full.** This was an open defect until the outcome type
+/// learned to say "premature"; it is kept as the guard for that.
 ///
 /// Anti-MEV ordering is *blind*: the proposer sees only commitments, so it cannot order a sender's transactions
 /// by nonce, and a block routinely carries nonce 2 before nonce 1. Execution rejects the out-of-order ones —
@@ -1701,16 +1701,16 @@ fn a_validator_that_misses_one_height_rejoins_with_no_further_transactions() {
 /// from the mempool (`mempool.retain(|t| !included.contains(&t.commit()))`), and that drop is keyed on
 /// inclusion, not on outcome. So the premature transactions are gone: never executed, never retryable.
 ///
-/// Measured: four transfers of 100 from ALICE submitted together, driven for 12 rounds to height 24 — **one**
-/// executes. Live over QUIC the same shape lost one of four (three landed across separate blocks). This is not
-/// an edge case; it is what happens whenever a client sends a second transaction before the first is included.
+/// Measured before the fix: four transfers of 100 from ALICE submitted together, driven for 12 rounds to height
+/// 24 — **one** executed. Live over QUIC the same shape lost one of four (three landed across separate blocks).
+/// It was never an edge case; it is what happens whenever a client sends a second transaction before the first
+/// is included.
 ///
-/// `ExecOutcome` is where the conflation lives: `Rejected` documents "bad nonce, insufficient balance, …" as one
+/// `ExecOutcome` was where the conflation lived: `Rejected` documented "bad nonce, insufficient balance, …" as one
 /// terminal verdict, when a nonce *ahead* of the account is not invalid but premature — it becomes valid the
-/// moment its predecessor lands. The fix is a fourth outcome for that case, returned by `Accounts` and
-/// `TokenLedger`, with the engine returning those transactions to the mempool instead of dropping them.
+/// moment its predecessor lands. `ExecOutcome::Deferred` now says so, `Accounts` and `TokenLedger` return it, and
+/// the engine puts those transactions back in the mempool instead of dropping them.
 #[test]
-#[ignore = "reproduces an open defect: blind ordering + drop-on-inclusion loses a sender's later transactions"]
 fn a_burst_from_one_account_executes_every_transaction() {
     let mut c = Cluster::new(&genesis());
     let txs: Vec<_> = (0..4u64)

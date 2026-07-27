@@ -35,7 +35,7 @@ use crate::storage::{
     AUDIT_PERIOD, MAX_DEAL_DURATION, MAX_DEAL_SIZE, STORAGE_ESCROW, StorageMarket, StorageTx, deal_id,
     leaves_for_size,
 };
-use crate::token::{ProverAuth, SignedTransfer, TokenLedger, account_id};
+use crate::token::{TokenError, ProverAuth, SignedTransfer, TokenLedger, account_id};
 
 /// The shared state key every shielded operation touches — so shielded spends serialize against each other
 /// (they mutate the one nullifier set / commitment tree) while parallelizing against disjoint transparent work.
@@ -544,7 +544,12 @@ impl HybridLedger {
             Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
                 Some(st) => {
                     let ok = verdict.unwrap_or_else(|| st.verify());
-                    outcome(self.tokens.apply_with_verdict(&st, ok).is_ok())
+                    match self.tokens.apply_with_verdict(&st, ok) {
+                        Ok(()) => ExecOutcome::Applied,
+                        // Premature, not invalid: the engine returns it to the mempool for a later block.
+                        Err(TokenError::NonceAhead) => ExecOutcome::Deferred,
+                        Err(_) => ExecOutcome::Rejected,
+                    }
                 }
                 None => ExecOutcome::Malformed,
             },
