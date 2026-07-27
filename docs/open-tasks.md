@@ -27,33 +27,36 @@ RESOLVED. What follows are the remaining *capability*, *coherence*, and *quality
   material. Compose with `note`/`nullifier`/`tx`/`note_cipher`/`state` and the §5.D-2 sighash signatures; reconcile the
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
-### 2. A node that loses a coordinate collision can stay permanently unbound
+### 2. After a coordinate collision the cell never fully connects, so the roster cannot complete
 Live coordinate resolution is done (`docs/design-coordinates.md`, `29e322b`), and so is the read-triage fix this item used to
-prescribe — `resolve_directory` returns `Scan<T>`, reads are three-valued (`Read::{Found,Absent,Unknown}`), and
-`role_loop::may_relax` refuses to treat an *incomplete* scan as evidence of stability (`2e088a4`, `416b4f7`, `24dc4fe`). That
-worked: at full occupancy with an injective draw, rosters now reach **`[7; 7]`, agreed in 24–116 s**, where they previously
-froze at `[4, 4, 3, 4, 2]`.
+prescribe — `resolve_directory` returns `Scan<T>`, reads are three-valued, and `role_loop::may_relax` refuses to treat an
+*incomplete* scan as evidence of stability (`2e088a4`, `416b4f7`, `24dc4fe`). That worked: with an **injective** draw, rosters
+reach `[7; 7]` and agree in 24–116 s, where they previously froze at `[4, 4, 3, 4, 2]`.
 
-**What remains is one measured failure, and it is not about propagation.** `measure_roster_convergence_with_collisions_allowed`
-(fabric, `#[ignore]`d measurement) runs `spawn_as_drawn` — collisions permitted — and reports:
+**The residual, measured with collisions FORCED** (`measure_roster_convergence_with_collisions_allowed`, which now retries the
+draw until it actually collides — a earlier version spent a whole trial on an injective draw and proved nothing):
 
-| trial | distinct | probe index | final rosters | agreed |
-|---|---|---|---|---|
-| 0 | 7 of 7 | all `Some(0)` — *no collision occurred* | `[7, 7, 7, 7, 7, 7, 7]` | 24 s |
-| 1 | **6 of 7** | `[0, 0, 0, **None**, 0, **2**, 0]` | `[3, 5, 5, 4, 1, 5, 6]` | **never** |
+| trial | distinct | probe index | claims verified | **known_peers** | final rosters | agreed |
+|---|---|---|---|---|---|---|
+| control (injective) | 7 of 7 | all `0` | — | `[1,2,3,4,5,6,**7**]` | `[7,7,7,7,7,7,7]` | **24 s** |
+| 0 | 7 of 7 | one at `1` | 4–7 | `[1,2,3,3,4,5,**6**]` | `[5,2,6,3,4,5,5]` | never |
+| 1 | 6 of 7 | two `None`, two at `1` | 3–6 | `[1,2,2,2,3,3,**4**]` | `[1,2,2,2,4,2,4]` | never |
 
-- **The primary defect: `probe_index = None` — a node that lost the arbitration holds no directory entry at all.** It should
-  advance its own probe walk and bind at the next point it can prove, which `settle_index` exists to do and which node 5
-  visibly did (index 2). Node 3 did neither and stayed unbound.
-- Everything else follows from that. **A node with no coordinate cannot publish**, so no scan can ever see it and the roster
-  cannot complete — which is why `agreed` is `None` rather than late. The roster numbers are a *symptom*; chasing them is
-  chasing the wrong layer, exactly as this item's earlier revisions did.
-- **Trial 0 is the control and it is essential**: an injective draw over the same code converges in 24 s. So the collision
-  path is the whole of the residual.
-- **The instrument needs one improvement before the next attempt:** `spawn_as_drawn` takes the draw as it comes, so trial 0
-  spent 160 s measuring a case with nothing to resolve. Force the condition — retry the draw until `distinct < n` — or the
-  measurement is half wasted and can silently pass by never colliding.
-- `NodeFleet::spawn`'s injective draw stays until trial-1-shaped runs converge; it is the honest indicator of exactly this.
+- **The roster is downstream; `known_peers` is the defect.** It reaches `n` in the control and stalls at 6 and 4 when a
+  collision has to be resolved — and in trial 1 the rosters track it almost element-for-element. A cell that has not finished
+  connecting cannot assemble a directory over coordinates it cannot reach.
+- **Claims are healthy (3–7 verified per node), so this is not "it never heard of its rival".** That hypothesis is refuted
+  again here, as it was for placement.
+- **Placement is *mostly* fine and is not the primary cause.** Trial 0 reaches 7 of 7 distinct — a node visibly advanced to
+  probe index 1 — and its rosters still never agree. So an earlier revision of this entry, which named `probe_index = None` as
+  the primary defect, was reading trial-1-only evidence: the two `None`s there are a *second*, rarer failure and they are not
+  what breaks trial 0.
+- **The mechanism this points at is the documented 4th link:** a mover's new coordinate reaches peers by re-keying the **live
+  connection** (`b17e5bb`, `f09d9d6`), so a peer that has not yet connected to the mover never learns where it went, never
+  connects, and `known_peers` stalls below `n` permanently. The fix has to make a move discoverable to a node with *no*
+  existing connection — an announce/flood path — not only re-key the connections that already exist.
+- Next: instrument which coordinate each node holds for each peer after a move, and confirm the stalled pairs are exactly
+  those with no connection at move time. `NodeFleet::spawn`'s injective draw stays until trial-0-shaped runs agree.
 
 ---
 

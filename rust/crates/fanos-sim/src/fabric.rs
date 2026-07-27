@@ -1382,15 +1382,33 @@ mod tests {
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         for trial in 0..2 {
-            let fleet = NodeFleet::spawn_as_drawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
+            // Force the condition rather than hope for it. `spawn_as_drawn` takes the draw as it comes, so a trial can spend
+            // its whole budget on an injective draw with nothing to resolve — which is exactly what trial 0 did on the first
+            // run, and a measurement that can silently pass by never exercising its path is not a measurement.
+            let fleet = loop {
+                let fleet = NodeFleet::spawn_as_drawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
+                let drawn: HashSet<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
+                if drawn.len() < fleet.nodes().len() {
+                    break fleet; // at least two nodes drew the same point
+                }
+                fleet.shutdown();
+            };
             let trace = fleet.observe(40, Duration::from_secs(4), fanos_node::Node::assignment).await;
             let coords: Vec<fanos_geometry::Triple> = fleet.nodes().iter().map(|n| n.health().address).collect();
             let distinct: HashSet<fanos_geometry::Triple> = coords.iter().copied().collect();
             let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
+            // The observables that separate the candidate causes for an unbound node (`index = None`), because "it never
+            // heard of its rival" and "it heard and had nowhere to go" look identical in the index alone:
+            //   * `claims` — how many peers' coordinate claims this node verified. Low ⇒ it never learned of the contender.
+            //   * `peers`  — how many peers it knows at all, which bounds the above.
+            // A node with high `claims` and `index = None` heard everything and still failed to place, which is the
+            // line-restricted walk being exhausted (or the settle path declining to bind at all).
+            let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
+            let peers: Vec<_> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
             fleet.shutdown();
             let roster = trace.map(|a| a.roster);
             println!(
-                "trial {trial}: {} distinct of 7, index {idx:?} → final rosters {:?} agreed={:?}",
+                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} peers {peers:?} → final rosters {:?} agreed={:?}",
                 distinct.len(),
                 roster.last(),
                 roster.stable_agreement_at().map(|d| d.as_secs())
