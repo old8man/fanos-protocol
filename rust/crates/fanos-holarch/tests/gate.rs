@@ -234,3 +234,86 @@ fn t77_composition_gain_is_twice_the_cross_block_energy() {
     assert!((gain - 2.0 * cross_energy).abs() < 1e-15, "T-77: gain {gain} ≠ 2‖γ_cross‖² {}", 2.0 * cross_energy);
 }
 
+
+
+/// The platform's **species signature**, measured rather than asserted: FANOS is thick on intEriority *and*
+/// on Logic at once, which is the one structural claim `spec/platform.md` §1.1 makes against both of its
+/// parent lineages.
+///
+/// Half of that claim had no measure at all until now — `Gamma` could read `Coh_E` and nothing else — so the
+/// "and on L" half was unfalsifiable prose sitting beside a CI-checked number. The exact form of "thick on
+/// both **at once**" is `min(Coh_E, Coh_L)`: a design can raise either alone by leaning on that lineage, and
+/// only a genuine synthesis raises the *smaller* of the two. FANOS maximises it among every declared
+/// instance — not by exceeding each parent on that parent's own dominant axis (it does not, and a synthesis
+/// should not: E 0.269 vs the mixnet's 0.275, L 0.269 vs the blockchain's 0.289), but by refusing either
+/// lineage's thin axis.
+#[test]
+fn the_species_signature_is_thick_on_both_e_and_l() {
+    let (fanos, w1, w2, w3) = (fanos_platform(), mixnet(), blockchain(), agent_platform());
+    let (gf, g1, g2) = (fanos.gamma(), w1.gamma(), w2.gamma());
+
+    // Integration exceeds *both parents* — the composition gains what §1.2 attributes to the cross-block.
+    // (W3 is a sibling instance, not a parent, and its Φ is higher; the claim is about the lineage.)
+    let (phi, phi1, phi2) = (gf.phi(), g1.phi(), g2.phi());
+    assert!(phi > phi1 && phi > phi2, "Φ={phi:.3} must exceed both parents (W1 {phi1:.3}, W2 {phi2:.3})");
+
+    // Each parent's *thin* axis is the one the synthesis restores.
+    let (e_f, e_2) = (gf.coh(Aspect::E), g2.coh(Aspect::E));
+    let (l_f, l_1) = (gf.coh(Aspect::L), g1.coh(Aspect::L));
+    assert!(e_f > e_2, "interiority {e_f:.3} must exceed the transparent ledger's thin {e_2:.3}");
+    assert!(l_f > l_1, "logic {l_f:.3} must exceed the pure mixnet's thin {l_1:.3}");
+    assert!(
+        gf.differentiation() > g2.differentiation(),
+        "D {:.3} must exceed the blockchain's thin {:.3}",
+        gf.differentiation(),
+        g2.differentiation()
+    );
+
+    // "At once": the *smaller* of the two axes is what a synthesis must raise, and FANOS raises it highest.
+    let both = |i: &fanos_holarch::Instance| {
+        let g = i.gamma();
+        g.coh(Aspect::E).min(g.coh(Aspect::L))
+    };
+    let mine = both(&fanos);
+    for other in [&w1, &w2, &w3] {
+        assert!(
+            mine > both(other),
+            "min(Coh_E, Coh_L) = {mine:.3} must exceed {}'s {:.3} — otherwise the E∧L synthesis buys nothing \
+             the sibling lineages do not already have",
+            other.name,
+            both(other)
+        );
+    }
+
+    // The spec's published numbers, pinned *last* on purpose: a regression pin that runs before the semantic
+    // assertions masks them. Falsifying this test by thinning FANOS's L budget first tripped the Φ drift
+    // check, which says nothing about whether the signature assertion above can fail at all.
+    assert!((phi - 1.563).abs() < 5e-3, "Φ drifted from the published 1.563: {phi}");
+    assert!((phi1 - 1.529).abs() < 5e-3, "W1's Φ drifted from the published 1.529: {phi1}");
+    assert!((phi2 - 1.489).abs() < 5e-3, "W2's Φ drifted from the published 1.489: {phi2}");
+}
+
+/// `Coh` is a share of one whole: bounded in `[1/7, 1]` for every aspect of every declared `Γ`, and equal to
+/// the E-only reading `differentiation` is built on. Pins the generalisation against the special case it
+/// replaced, so the V4 gate cannot drift away from the measure the signature above uses.
+#[test]
+fn per_aspect_coherence_is_a_bounded_share_agreeing_with_coh_e() {
+    for inst in [fanos_platform(), mixnet(), blockchain(), agent_platform()] {
+        let g = inst.gamma();
+        assert!((g.coh(Aspect::E) - g.coh_e()).abs() < 1e-15, "{}: coh(E) must be coh_e", inst.name);
+        for a in Aspect::ALL {
+            let c = g.coh(a);
+            assert!(
+                (1.0 / N as f64 - 1e-12..=1.0 + 1e-12).contains(&c),
+                "{}: Coh_{} = {c} must lie in [1/7, 1]",
+                inst.name,
+                a.glyph()
+            );
+        }
+    }
+    // The corners: a pure aspect owns everything, the grey mesh splits evenly.
+    assert!((Gamma::pure_aspect(Aspect::L).coh(Aspect::L) - 1.0).abs() < 1e-12);
+    for a in Aspect::ALL {
+        assert!((Gamma::grey().coh(a) - 1.0 / N as f64).abs() < 1e-12, "grey must give every aspect 1/7");
+    }
+}

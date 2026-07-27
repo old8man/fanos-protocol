@@ -211,19 +211,30 @@ impl Gamma {
         1.0 / (N as f64 * self.purity())
     }
 
-    /// **Coh_E = (γ_EE² + 2Σ_{i≠E}γ_Ei²) / P** — how much of the total structure is bound up in
-    /// interiority (`axiom-septicity`); `Coh_E ∈ [1/7, 1]`.
+    /// **Coh_a = (γ_aa² + 2Σ_{i≠a}γ_ai²) / P** — the share of the whole structure bound up in aspect `a`
+    /// (`axiom-septicity`); `Coh_a ∈ [1/7, 1]`, and `Σ_a Coh_a = 2 − (Σ_a γ_aa²)/P`.
+    ///
+    /// Generalised from the E-only form this started as, because the platform's species signature is a claim
+    /// about **two** aspects — thick on intEriority *and* on Logic at once (`spec/platform.md` §1.1) — and
+    /// only the first half of that was measurable. A claim whose subject has no measure cannot be checked,
+    /// and this one is the platform's central differentiator against both of its parents.
     #[must_use]
-    pub fn coh_e(&self) -> f64 {
-        let e = Aspect::E.index();
-        let row = &self.m[e];
-        let mut num = row[e] * row[e];
+    pub fn coh(&self, a: Aspect) -> f64 {
+        let k = a.index();
+        let row = &self.m[k];
+        let mut num = row[k] * row[k];
         for (j, &v) in row.iter().enumerate() {
-            if j != e {
+            if j != k {
                 num += 2.0 * v * v;
             }
         }
         num / self.purity()
+    }
+
+    /// **Coh_E** — interiority's share, the measure [`Self::differentiation`] (V4) reads.
+    #[must_use]
+    pub fn coh_e(&self) -> f64 {
+        self.coh(Aspect::E)
     }
 
     /// **D = 1 + (N−1)·Coh_E** — differentiation (V4); the grey matrix gives `1 + 6/7 ≈ 1.857`, and

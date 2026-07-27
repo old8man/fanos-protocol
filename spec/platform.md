@@ -36,6 +36,17 @@ HOLARCH fixes the alphabet of concerns at **seven** (A/S/D/L/E/O/U) by the uniqu
 | **O** Foundation | transport (QUIC), the L4 erasure store, **stake**, data availability, the cover-traffic budget, energy |
 | **U** Unity | identity and orchestration: the canonical head (fork-choice), the epoch beacon, the directory, ONOMA naming — what makes the parts one platform |
 
+**The signature has a measure, and it is `min(Coh_E, Coh_L)`.** Half of this claim used to be prose: the Γ-calculator could read `Coh_E` (V4 is built on it) and nothing else, so "thick on E" was a CI number while "and on L" was unfalsifiable. Generalising the share to any aspect makes the claim checkable, and the *right* form of "at once" is the **smaller** of the two — either alone is bought by leaning on that lineage, and only a synthesis raises the minimum. Measured over the declared instances:
+
+| instance | `Coh_E` | `Coh_L` | `min` | `Φ` |
+|---|---|---|---|---|
+| **FANOS (E∧L)** | 0.269 | 0.269 | **0.269** | **1.563** |
+| W1 mixnet | 0.275 | 0.252 | 0.252 | 1.529 |
+| W2 blockchain | 0.177 | 0.289 | 0.177 | 1.489 |
+| W3 agent platform | 0.265 | 0.237 | 0.237 | 1.592 |
+
+FANOS does **not** beat either parent on that parent's own dominant axis, and a synthesis should not — it declines each lineage's *thin* axis instead, and is the only instance whose two axes are balanced (0.269 / 0.269). Pinned in `fanos-holarch`, `tests/gate.rs::the_species_signature_is_thick_on_both_e_and_l`; verified to fail by thinning the platform's L budget to the mixnet's.
+
 The load-bearing observation: **the mixnet dominant aspect (E) and the blockchain dominant aspect (L) are different axes.** A pure blockchain (W2) has thin E (`D_diff` barely reaches 2 — `holarch.md` §16: "transparent-by-design systems structurally live with thin interiority"); a pure mixnet (W1) has thin L. Their composition is not a compromise between two thin profiles — it is a holon **thick on both E and L at once**, which no mainstream system in either lineage achieves. This is the platform's породная сигнатура (species signature), and §1.3 shows it lands inside the viability window precisely *because* the two axes reinforce rather than compete.
 
 ### 1.2 The cross-block: where the integration lives {#crossblock}
