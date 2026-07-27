@@ -82,6 +82,26 @@ to the point it left. That is now fixed, but it does **not** explain the laggard
 deliberately (`Point::at(me)`, chosen rather than VRF-accepted, "which the Fano-cell BFT structure requires"), and the
 QUIC cell fixture seats its nodes the same way. No reseat happens in either.
 
+### [A] CRITICAL — the live cell finalizes its first block and stalls on the second, about half the time
+Measured 2026-07-28, four consecutive runs of `cargo test -p fanos-node --test dromos_quic --features validator
+a_hash_locked` on an **idle** host (load average 3.75): **2 passed, 2 failed**. Every failure carries the identical
+signature — all seven validators at `next_height() == 1` with the HTLC still `Locked`, i.e. exactly one block finalized
+and the second never. The verdict's own evidence rules out starvation: 295 ms for the slowest of 321 completed
+observations, on a machine doing nothing else.
+
+**Why nothing caught it.** No other real-QUIC suite requires a *second* finalized block. `dromos_quic`'s two siblings, both
+`taxis_quic` tests, and `anonymous_quic` all reach their fixed point at height 1 — one transaction, one block, assert. The
+HERMES contract suite is the first that needs two rounds of consensus (lock, then claim), and it is where this appears.
+The deterministic simulator reaches height 24+ reliably in the same shape, so the defect is in the live driver or its
+transport, not in the engine's logic.
+
+**Where to look.** The engine has no empty-mempool guard — `maybe_propose` builds and broadcasts a block from a possibly
+empty mempool — so a quiescent cell should still advance. The two guards that *do* abstain are worth checking first:
+`proposed_round == Some(round)` (one proposal per round) and the `last_finalized_cert.is_none()` abstention a
+freshly-state-synced validator takes. Round-timeout backoff doubles to `ROUND_TIMEOUT_MAX` (24 s) on non-progress and
+resets on a height change, so a cell that has stopped advancing waits ever longer to retry — which would turn a brief
+stall into the observed permanent one.
+
 ### [A] The verification gate itself is load-sensitive — one flake per full-workspace run
 Measured 2026-07-28 on the current tree: `cargo test --workspace --features validator` → 43 suites, **756 tests, one
 failure**. The failing one was the HERMES contract suite, with all seven validators frozen at the lock height; in

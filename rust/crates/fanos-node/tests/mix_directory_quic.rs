@@ -10,6 +10,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+
+mod common;
+
 use std::time::Duration;
 
 use fanos_field::F2;
@@ -60,6 +63,9 @@ async fn publish_until(client: &fanos_quic::Client, coord: [u32; 3], epoch: Epoc
 /// with. A different epoch's directory is empty — the slots are epoch-tagged (forward secrecy, audit E4).
 #[tokio::test]
 async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic() {
+    // One whole-cell fixture at a time: three tests in this file each stand up a seven-node QUIC cell, so
+    // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
+    let _serial = common::serial_cell().await;
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
     let roster = cell_mix_coords::<F2>();
     let epoch = Epoch::ZERO;
@@ -111,6 +117,9 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
 /// down or not-yet-published relay degrades to a smaller mixnet, never a failed lookup.
 #[tokio::test]
 async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
+    // One whole-cell fixture at a time: three tests in this file each stand up a seven-node QUIC cell, so
+    // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
+    let _serial = common::serial_cell().await;
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
     let roster = cell_mix_coords::<F2>();
     let epoch = Epoch::new(3);
@@ -156,6 +165,9 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
 /// `EpochDriver` unit tests; here we confirm the async task publishes over real QUIC.)
 #[tokio::test]
 async fn the_publisher_task_keeps_each_relays_key_live() {
+    // One whole-cell fixture at a time: three tests in this file each stand up a seven-node QUIC cell, so
+    // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
+    let _serial = common::serial_cell().await;
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
     let roster = cell_mix_coords::<F2>();
     let epoch = Epoch::ZERO;

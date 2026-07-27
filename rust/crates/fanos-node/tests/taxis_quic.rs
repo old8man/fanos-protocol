@@ -82,6 +82,7 @@ fn vrf_seed(i: usize) -> [u8; 32] {
 
 #[tokio::test]
 async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // A genuine seven-node Fano cell over mutual-TLS QUIC, membership established (routing by coordinate works).
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
 
