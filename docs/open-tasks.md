@@ -1,23 +1,15 @@
-# FANOS — open tasks (handoff)
+# FANOS — open tasks
 
-**As of** `HEAD 6ad6fa7`, 2026-07-26. Every item below was **re-verified against the current tree** on this date by
-reading the code, not by trusting the previous revision of this file — which had drifted badly (four entries were already
-done or rested on a retracted measurement; see *Corrections* at the end). **No open CRITICAL/HIGH security item remains**
-(all four audit passes are consolidated in `docs/audit.md`, every finding RESOLVED). What follows are the remaining
-*capability*, *coherence*, and *quality* gaps.
+**This file lists only what is still open.** Closed work is not kept here — its rationale lives in the commit that closed
+it, and any durable engineering finding is written into the design or audit doc it belongs to (`docs/audit.md`,
+`docs/design-testing.md`, `docs/design-coordinates.md`, …). A task list that accumulates completed items stops being
+readable as a task list, which is what happened to the previous revision of this file.
 
 **Verification rule for whoever picks this up:** check the claim before doing the work. A task list is a cache, and this
-one has gone stale twice. Each item below names the file and symbol its claim rests on so the check is cheap.
+one has gone stale twice. Each item names the file and symbol its claim rests on, so the check is cheap.
 
-**Already done — DO NOT redo** (each verified present): validator-in-the-binary (`fanos validator` / `taxis-deal`,
-`ValidatorConfig`, `spawn_taxis`); the production anonymous host (`fanos host` + `spawn_rendezvous_host`, audit A5);
-bonded-stake state + slashing (`fanos-dromos::stake` `StakeLedger`/`SlashTx`/`apply_stake`, T-H5); the adaptive round
-timeout (`taxis_driver::next_round_timeout`, §5.B livelock); peer-sampled DA (`taxis_driver::try_reconstruct`, T-H4);
-`#[derive(Wire)]` across 12 crates; `fanos-primitives::BoundedMap`; the ERGON execution-model algebra (`fanos-ergon`,
-derived footprints — §3.7 access-list drift); OBOLOS spend-auth signatures (`derive_spend_auth (ask,ak)`, §5.D-2);
-position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viability gate (S5-C1 — see correction 1)**;
-**the OBOLOS incoming-viewing key (O-M3 — see correction 2)**; **the configurable plane order** (`--plane-order`,
-`Node::start_on_plane`, `8df2b08` — partially closes item 9).
+No open CRITICAL/HIGH security item remains; all four audit passes are consolidated in `docs/audit.md` with every finding
+RESOLVED. What follows are the remaining *capability*, *coherence*, and *quality* gaps.
 
 ---
 
@@ -35,12 +27,10 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
   material. Compose with `note`/`nullifier`/`tx`/`note_cipher`/`state` and the §5.D-2 sighash signatures; reconcile the
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
-### 2. Live coordinate resolution — WORKING; one residual in roster propagation
-- **Placement: DONE.** A contested node advances along its probe walk and announces the point it reached. Measured with
-  the collision *forced* (`NodeFleet::spawn_as_drawn`): **4 of 4 trials reach 7/7 distinct**, nodes visibly seated at probe
-  index 1, 3 and 4. Runtime fell from ~700 s to ~1 s. The cause had been one line — `spawn_inner` bound the coordinate to
-  the node's own address unranked, overwriting the bootstrap seed that was its only route to the incumbent, so it deleted
-  the information it needed (`29e322b`).
+### 2. Roster propagation after a within-epoch coordinate move — 3 of 4 links
+Live coordinate resolution itself is done and measured (see `docs/design-coordinates.md` and `29e322b`). What remains is
+the last propagation link.
+
 - **Roster propagation after a move: 3 of 4.** Four links found and fixed, each measured:
 
   | | change | cell-wide scenario, collisions allowed |
@@ -75,16 +65,8 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
 
 ---
 
-## Tier B — platform capability (deliver a shipped headline claim)
+## Tier B — platform capability
 
-### 3. Wire the DROMOS parallel scheduler into live execution
-- **Problem.** `execute_block` (deterministic, serial-equivalent, double-spend-safe, stochastically tested) has **only
-  `#[cfg(test)]` callers** — verified: every hit in `fanos-dromos/src/hybrid.rs` (1525, 1747, 1759, 1782) is inside the
-  test module. Live consensus runs the serial `apply` loop, so the "high-speed L1 / vertical parallelism" throughput claim
-  (`platform.md §3`) delivers zero real speedup.
-- **Task.** Dispatch scheduler waves onto a real thread pool and wire `execute_block` into the consensus execute path
-  (post-reveal; ordering stays serial/blind). Consume ERGON-derived footprints (`fanos-ergon::Term::footprint`) as the
-  conflict source so the scheduler and the transition cannot drift. Benchmark the speedup; keep determinism KATs green.
 
 ### 4. Anonymity: the binding constraint is the plane, not the schedule
 - **Status.** This replaces the previous "the GPA timing channel is essentially undefended" task, whose measurement was
@@ -106,58 +88,18 @@ position-bound nullifier (O-M1); rolling anchor window (O-M2); **the Γ-viabilit
 
 ## Tier C — coherence & architecture quality
 
-### 5. Telemetry differential-privacy export path (C7) — **DONE** (`f752495`)
-`fanos-node::telemetry_dir` publishes the privatized `CoherenceFrame` to a coordinate-and-epoch store slot, driven off
-`Notification::Observed` so the export cadence *is* the diagnosis cadence. Off by default
-(`NodeConfig::telemetry_epsilon: Option<f64>`) with deliberately no default ε — picking one chooses a privacy/utility
-trade-off on the operator's behalf. The entropy source is the subtle part: `privatize` requires an *infallible* RNG, so
-`FreshEntropy` reads a 32-byte OS seed (returning `None`, and skipping the export, if that fails) then expands by
-domain-separated XOF — because panicking would down a node and a predictable fallback would void the ε.
+### 7a. Decompose `fanos-runtime/src/overlay/mod.rs`
+`overlay.rs` is now `overlay/` — six modules, 4,048 → 2,900 lines, zero API change (`9cb113c`, `cad9eb5`, `3942199`,
+`1ef497b`, `998470f`), and the `ThresholdSealed` dependency edge is gone (`a23ed82`).
 
-### 5-OLD. Telemetry differential-privacy export path (C7)
-- **Problem.** Verified: `fanos-telemetry::dp::privatize` (the ε-DP mechanism) has **no caller anywhere outside its own
-  crate**. The node has no telemetry *export* path at all, so the DP guarantee is decorative and no operator-facing
-  metrics ship.
-- **Task.** Build the node telemetry export surface and route every export through `privatize` with the configured
-  `PrivacyBudget`. Build the export *first* — there is nothing to privatize today.
-
-### 6. One Merkle tree in `fanos-primitives` — **DONE** (`bfe3fdd`)
-`fanos_primitives::merkle` binds the leaf count into the root (killing the CVE-2012-2459 class by construction) and
-demands an exact proof length. crosscell and thesauros adopted it; `CrossCellReceipt` gained a `count` field.
-**`pqvrf` deliberately did not**: a perfect tree with a publicly fixed height is already unambiguous and already
-length-bound, and adopting would change every root for no gain — so the "three divergent implementations" framing was
-partly wrong, two of the three being sound by different appropriate mechanisms. The real defects were confined to the
-unbounded proof fold (both crosscell and thesauros — 65 535 hashes from one receipt, and in thesauros the prover is an
-untrusted storage provider), the `[0u8; 32]` empty root, thesauros carrying the sibling *side* on the wire, and a one-leaf
-CID equalling a bare leaf hash. Conformance vectors regenerated.
-
-### 7. Split `fanos-runtime/src/overlay.rs` (7b — the `ThresholdSealed` edge — is DONE)
-- **7b DONE** (`a23ed82`). `fanos-taxis` no longer depends on `fanos-aphantos` at all: the KEM **seal** is its own `no_std`
-  crate `fanos-threshold` (two low-layer deps), while the **circuit** layer — `seal_onion`, `HopLine`,
-  `circuit_line_holonomy`, needing geometry and NYX's ratchet — stays in aphantos as `threshold_onion`. Splitting the file
-  rather than moving it was forced by the code: moving the whole thing would have recreated the inversion one hop over
-  (`taxis → threshold → nyx`). A facade keeps `fanos_aphantos::threshold::{…}` resolving to both halves, so no caller
-  churned. `sealed.rs` deliberately stayed put — it needs `fanos-nyx` and `fanos-wire`, whatever the task doc guessed.
-  - *Method note worth carrying:* reading a module's `use` lines is **not** its dependency list. Half of `threshold.rs`'s
-    references were fully-qualified paths the imports never mentioned, and the first attempt at the move compiled the new
-    crate against deps it did not declare.
-- **7a: 4,048 → 2,900 lines (−28%), in four slices, zero API change.** `overlay.rs` is now `overlay/` with
-  `healer` (`9cb113c`), `store`/`router`/`membership` (`cad9eb5`), `frames` (`3942199`) and `overlay/hier.rs`
-  (`1ef497b`) — 1,344 lines in six modules named for what they do.
-  - **What the slices taught, in order.** Cut by **items** (doc/attr block → brace match), never by line offsets: the
-    first slice landed mid-doc-comment and orphaned half of `ContentPoint`'s documentation. Start each new module with an
-    **empty** import list and let the compiler name what it needs; copying the facade's `use` block dragged in a dozen
-    unused imports. Never blanket-rewrite visibility — a `pub(crate) fn` sweep silently demoted two *public* functions
-    (`descriptor_message`, `admission_challenge`) that `fanos-sim` reaches by path.
-  - **Splitting an impl is CHEAPER than lifting a type**, which is the opposite of what it looks like. A **child** module
-    reaches its parent's private items, so `overlay/hier.rs` widened no field at all, where extracting whole types needed
-    five `pub(crate)`. The rule is one-way: a parent cannot see a child's privates, so the four methods the facade
-    dispatches to are `pub(super)` — which names one module, not the crate.
-  - **Remaining, and it is a decision rather than a next step.** `overlay/mod.rs` is `OverlayNode`, its ~1,400-line impl,
-    and `impl Engine`. The natural further cuts are `storage` (`on_put`/`on_get`/`on_sample`/`on_publish`/`on_lookup`/
-    `on_value`/`distribute_shards`), `membership` (`flood`/`on_join`/`on_announce`/`on_reseat`/epoch), and `liveness`
-    (`on_heartbeat`/`health_view`/`loss_view`/`sweep_pending_gets`) — each a child module on the pattern `hier` now
-    establishes. Worth doing deliberately; not worth drifting into.
+- **Remaining, and it is a decision rather than a next step.** `overlay/mod.rs` is `OverlayNode`, its ~1,400-line impl, and
+  `impl Engine`. The natural further cuts are `storage` (`on_put`/`on_get`/`on_sample`/`on_publish`/`on_lookup`/`on_value`/
+  `distribute_shards`), `membership` (`flood`/`on_join`/`on_announce`/`on_reseat`/epoch), and `liveness`
+  (`on_heartbeat`/`health_view`/`loss_view`/`sweep_pending_gets`) — each a child module on the pattern `hier` established.
+  Worth doing deliberately; not worth drifting into.
+- The method notes earned by the completed slices (cut by items not offsets; start each module with an empty import list;
+  never blanket-rewrite visibility; splitting an impl is cheaper than lifting a type) are recorded in
+  `docs/design-testing.md` §"Refactoring a large module".
 
 ### 8. Coherence / meta-holon reconciliation (E→L / L→O / Ω2 / Ω9)
 - **Problem.** The cross-block coherence contracts (`platform.md §1.2`, §9) are asserted but not reconciled in one place:
@@ -173,122 +115,9 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
 
 ## Tier D — lower-severity anonymity residuals (documented in `docs/audit.md`)
 
-- **9b. NYX transparent-sheaf footgun — DONE** (`decc4d8`). `sheaf`/`tessera` are behind a non-default
-  `transparent-onion` feature; `NyxError` moved to its own module so gating the construction did not gate the crate's
-  error vocabulary. (Was item 12.)
 - **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
   loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
-- **10. S1-M3 + capdir's residual — DONE** (`46f9bc9` for `mixdir`, and the `capdir` half + shared authority after it). The
-  two were one gap and are closed by one mechanism, `fanos_node::bound::Entitlement`: a record carries the credential its
-  coordinate is *derived from* (identity bytes ‖ VRF public ‖ VRF proof) and the reader checks that the slot's coordinate lies
-  on that publisher's own probe walk.
-  - **`mixdir`** published its onion key unsigned, so anyone who could write to the store could plant a key at every point of
-    the plane and *be* the mixnet. Now bound: on PG(2,7) a lifted record is refused at 49 of the other 56 points, and it is
-    tied to its epoch and beacon so a past epoch's record cannot be replayed forward.
-  - **`capdir`** *did* sign, and signing was never the missing piece — a signature proves *someone* holding that key signed
-    those bytes, so a forger with a fresh key at another node's slot joined the roster as that member. Now bound the same way,
-    with the descriptor authenticated against **the very key just proven entitled** (two copies of one key would be a
-    cross-check waiting to be forgotten).
-  - **One extra half, found while writing it:** a coordinate binding alone still lets an *entitled* publisher advertise under
-    another member's id — owning a point says nothing about which name you claim while sitting there. A node's
-    role-assignment id **is** its coordinate-VRF public key (`node.rs`'s `SelfOrgConfig`), so `parse_bound_advertisement`
-    requires `desc.node_id == entitled.public`, and the name inside the slot is unforgeable too. Pinned by
-    `an_entitled_publisher_cannot_advertise_under_another_members_id`.
-  - **The mode question the reverted attempt raised, settled.** `Option<BeaconSeed>` at every reader and
-    `Option<CoordinateProver>` at every publisher: having a beacon *is* the VRF mode, and its absence is an **absent
-    mechanism**, not a disabled check — nothing in a pinned cell can supply one, so `verify: bool` (which reads as "disable
-    the security check here") never appears.
-  - **⚠️ The trap that cost the most, and is now documented in `bound.rs` and asserted in the suite: the mode cannot be
-    inferred from below.** Deriving it from `NodeHandle::claims` — a claim book exists iff the node has a self-certifying
-    identity — looks like the same predicate and is not one: **a pinned harness gives its nodes identities while seating none
-    of them on a point it could prove.** An assertion added to the pinned QUIC suite reported `true` there and killed the
-    derivation immediately. It is a deployment property of the cell, stated by whoever configured it.
-  - Threading the mode through the hidden-service host driver hit eight positional arguments, three of them
-    `(Vec<u8>, u8, bool)`; `HostedService` now groups what is hosted and under which regime.
-  - Superseded, as the earlier revision predicted: a storage-layer write ACL would police *who wrote*, while what matters is
-    whether a **reader** can tell a genuine record from a forged one. The check belongs at the read.
-- **10b. TAXIS consensus liveness — defect A FIXED, one residual. The root cause was DA sampling with no retry.**
-  - **The real defect, and it caused both symptoms.** A replica requests a missing shard the instant a skeleton arrives,
-    but the proposer emits skeleton-then-shard peer by peer, so the request routinely reaches peer `p` **before** `p` has
-    been dispersed its own shard. `p` holds nothing, answers nothing, and **there was no retry** — the requester waited
-    forever for a shard its peer had held all along. One proposal in flight loses that race *sometimes*; under SSLE
-    all-propose there are N proposals racing at once and it loses reliably. Fixed by `resample_pending` on each driver
-    tick (idempotent: a `Request` for a held shard is answered, for an unheld one dropped, so it converges the moment the
-    peer is dispersed).
-  - **A second, independent defect fixed on the way: the SSLE lottery was gated on the body it does not rank.**
-    `on_propose` ran the DA gate before computing the ticket, and the driver admitted a proposal only after
-    reconstruction — so ranking a *losing* proposal required its whole payload. Now `Input::Skeleton` ranks from the
-    witness (which `Block::skeleton` already carries) and availability is required only for the block actually prepared.
-    Happy-path DA work drops from N proposals to 1, and replicas rank the same set because skeletons need no sampling.
-  - **Measured:** `taxis_quic` went from **no block in 240 s** to green in **6.5–10.7 s**. `dromos_quic`'s
-    network-submission test also went green — same root cause.
-  - **Defect C — a locked validator never released its lock, so one lost round of COMMIT votes ended the chain. FIXED.**
-    This was the actual cause of the private-transfer failure, after DA had been eliminated.
-    - `check_prepared` locks a validator on a block the moment a PREPARE quorum forms; `locked_block` was cleared **only**
-      by `reset_round_state`, i.e. only on finalizing a height. `on_timeout` advanced the round and left the lock. So a
-      PREPARE quorum without a COMMIT quorum wedged the height forever: every later proposal is a different block, the
-      `locked_block` gate refuses it, no quorum forms for anything. Measured live as six of seven validators reporting
-      `locked: 3` refusals with a clear DA path and an empty queue.
-    - **Leader rotation looks like the escape and is not.** A block header commits to
-      `(parent, height, epoch, proposer, tx_root, da_commit, last_commit_root)` and *not* to the round, so a re-proposal
-      by the same proposer is byte-identical and a locked validator accepts it — which does recover a cell whose mempool
-      is unchanged, and is why the first reproduction attempt passed. It fails exactly when the mempool moves underneath,
-      which is the ordinary case: a client submits into a running cell, so the locked block was empty and everything
-      after it carries the transaction.
-    - **Fix:** `reprepare_lock` — on entering a round, re-PREPARE the block you are locked on (Tendermint's rule). Safe by
-      construction rather than by argument: it only ever prepares the block already locked, never a conflicting one.
-      Liveness follows because a quorum locked on the same block re-prepares it together, so the PREPARE quorum re-forms
-      and the COMMIT quorum follows. Requires the body, so a validator locked on a hash it never received recovers by
-      sampling or state sync instead.
-    - Verified: `a_height_still_finalizes_after_a_prepare_quorum_that_never_committed` reproduces the wedge (0 of 7) and
-      passes with the fix; **both randomized Byzantine no-fork suites pass in release**, which is the check that matters
-      for a change to when PREPAREs are cast; and `dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end`
-      is **green after four iterations red**.
-  - **`ConsensusEngine::rejects()` / `ProposalRejects` added, and it is what found defect C.** Counters (not logs — the
-    engine is `no_std` and sans-I/O) for each refusal reason, with the fused entitlement/link/structure/last_commit gate
-    split apart so the counter says *which* half fired. A rejected block and an unprepared one look identical from
-    outside — the round times out, the height stalls — and they have nothing in common as fixes.
-  - **Defect D — a validator committed to a block it never received could not fetch it. FIXED (partially closes the
-    residual).** Votes carry only a block *hash*, so a validator locks on — or gathers a commit certificate for — a block
-    it has never seen. It then cannot move in either direction: `reprepare_lock` rightly abstains rather than vote to
-    prepare something it cannot execute, and the `locked_block` gate refuses every conflicting proposal. State sync does
-    **not** cover this: `on_sync_req` serves a *checkpoint*, and a cell one block into its life has none. Measured as four
-    of seven validators frozen at genesis with `locked: 2`, an empty sampler, and nothing to sync from.
-    - Fix: `ConsensusEngine::awaited_body()` names the block, `ShardMsg::NeedSkeleton` asks the cell for it, and
-      `skeleton_of` answers. The reply is an ordinary `Propose(skeleton)`, so recovery re-enters the normal sampling and
-      admission path instead of needing one of its own.
-    - **A second gap found by the first fix not working:** the validators best placed to answer were exactly the ones that
-      could not. `reset_round_state` clears `proposals` on every finalization and the chain retains only headers, so a
-      validator that finalized the block had thrown the body away. `recent_bodies` (bounded, 64) retains recently
-      finalized bodies for precisely this.
-  - **Defect E — a validator short one COMMIT vote was stuck forever, and `f+1` of them halted the chain. FIXED. This
-    closes 10b: both `dromos_quic` tests now pass, three consecutive runs, ~10.8 s each.**
-    - Quorum is `2f+1 = 5` of 7, and a validator finalizes only by gathering that many COMMIT votes **itself**. Votes are
-      never retransmitted and there is no way to ask for them, so a validator that receives `quorum − 1` is locked on the
-      winning block, holds its body, and is missing nothing but a signature it can never obtain. `collect_cert` filters by
-      the *current* round, so re-voting cannot rebuild the certificate either.
-    - **Why it escalates from a nuisance to a halt.** With **one** validator short the cell still has a quorum, keeps making
-      blocks, and its later blocks carry the proof — so it recovers on its own, which is why a one-validator test passes.
-      With **`f+1`** short the remaining validators are *below quorum*: the chain halts and the cell can no longer produce
-      the very evidence that would rescue them. Reachable from nothing worse than transient message loss.
-    - **Fix:** `adopt_certified_parent`. Every block records the quorum COMMIT certificate that finalized its parent, so a
-      proposal for height `h+1` already proves what `h` finalized — the same evidence `check_committed` acts on, verified
-      against the same quorum, so it adds no trust. Today the link check discards it because the proposal names a height we
-      have not reached. Adoption also releases the lock as a consequence (`reset_round_state`), not as a special case.
-    - The certificate is carried into `finalize` (`certified`) rather than rebuilt: `collect_cert` can only assemble one
-      from votes this validator received, and in exactly this situation it did not — a rebuilt certificate would verify
-      nowhere and its own later proposals would be refused.
-    - **Verified, and verified to be *needed*:** `a_validator_short_one_commit_vote_rejoins_the_chain` reproduces the halt
-      deterministically in 2.2 s, and with the rule disabled a short validator is stranded at genesis. Both randomized
-      Byzantine no-fork suites pass in release.
-    - **The harness gained what made this findable:** `Cluster::drop_to` drops one phase's votes **addressed to specific
-      validators**. The pre-existing cell-wide `drop_phase` cannot express it — denying the quorum to everyone finalizes
-      nothing and the cell simply retries. The condition that wedges a real cell is *asymmetric*, and that asymmetry is the
-      whole content of the defect.
-    - **Two earlier iterations reverted this same rule for being unexercised, and that was correct at the time:** the
-      scenarios then available (a partitioned 2-node minority; a single short validator) both recover without it. A minority
-      below quorum cannot even lock, and a single short validator is rescued by the still-advancing cell. Only `f+1` short
-      produces the deadlock. The rule was right and the scenario was missing.
+
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
@@ -302,107 +131,3 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     5 hops, at `q = 4` three, at `q = 7` two — which also makes explicit a max-depth the current design leaves implicit.
   - So this is a contained redesign of the layer layout at unchanged wire cost, not an optional expensive extra. Worth
     doing; worth doing deliberately.
-- **12. NYX transparent-sheaf footgun** — `fanos-nyx` `sheaf.rs`/`tessera.rs` (cleartext-Shamir transparent onions,
-  superseded on the live path) are still `pub` (`lib.rs:33-34`): gate behind a sim feature or rename so an integrator
-  cannot pick the lower-assurance variant.
-
----
-
-## Simulator hardening (the standing directive, applied to the harness itself)
-
-**App-frame fan-out is now asserted at the transport level** (`fanos-quic/tests/cell_e2e.rs`,
-`a_large_app_frame_fans_out_to_every_cell_point`). `Command::Emit` is fire-and-forget and reports only whether the *local*
-input queue accepted the frame, so anything lost past that point was silently gone and nothing in the suite noticed —
-the only caller that did was a consensus cell that stopped finalizing. Both live sizes are pinned: 43 bytes (a
-plain-transfer block's DA shard) and 6203 bytes (a shielded block's). It earns its place by having **refuted** a
-plausible hypothesis rather than confirming one.
-
-**The sim now models DA dispersal, because not modelling it hid a total consensus liveness failure**
-(`consensus_sim::Cluster::da_delay`). `shards_for` handed every replica the complete shard set instantly, so the sim
-delivered proposals whole while production disperses one shard and samples the rest — a violation of the standing
-"differ only in transport" rule, and it let every engine-level SSLE test pass while the cell finalized nothing over QUIC.
-- Skeletons land immediately (they need no sampling); bodies land `sampling_latency(validator, block)` ticks later.
-- **The latency must be per (validator, block), and that is the whole fidelity of the model.** Written with a *uniform*
-  delay first, the test passed with the defect fully present — every replica then ranks the identical complete set at the
-  identical tick and the lottery cannot split. Independent per-replica sampling is what produces the divergence.
-- Verified it can fail: with skeleton ranking removed, `ssle_finalizes_when_bodies_arrive_by_da_sampling_rather_than_whole`
-  reports 0 of 7 finalizing. **0.59 s to reproduce what took 240 s over QUIC.**
-
-**A third verdict for the real-socket suites (`tests/common::converge`).** `HANG_CEILING` separated "expected latency" from
-"liveness backstop" — a real fix — but left a state neither expresses: **the system has stopped changing.** A wait that ends
-at the ceiling can only ever say "too slow", so a wedged cell and a loaded one produce the same message, and the wedged one
-was twice answered with more headroom. `converge` reports **Reached / Refuted / Inconclusive**: refuted the moment the
-observation has been unchanged for `FROZEN_SPAN`, with the frozen trace attached.
-- `FROZEN_SPAN` is **derived**: `2 × fanos_node::taxis_driver::ROUND_TIMEOUT_MAX` (now `pub` for exactly this). A driver
-  between round attempts shows no change for just under one round timeout, so one period cannot tell "between attempts"
-  from "stopped" — two can. Same argument and same factor of two as `fanos_sim::fabric::FROZEN_SPAN`, which was derived as a
-  *single* period first and refuted by the simulator.
-- The trace is **per validator**, because the first defect it exposed was one validator out of seven — a cell-wide "not yet"
-  cannot say that.
-- Measured: a wedged cell now fails in 51 s naming the stuck node, against 241 s saying only "did not converge".
-
-Each defect class found this session is now an **assertion in the simulator**, not a one-off measurement — and two of them
-were defects *in the instrument*:
-
-- **A blind observable manufactures defects.** `Node::health().address` was a field captured at spawn while the engine
-  reseated every epoch, so every layer named the node's birth position forever. Three "collided draws never resolve"
-  measurements were taken through it and are void. Pinned by
-  `fabric::a_reseat_moves_the_coordinate_every_layer_reports`, which failed at 245 s against the old code and passes in
-  0.11 s (`4bb60f3`). `Notification::Reseated` had existed with no consumer — the engine always announced its re-seats and
-  nothing listened.
-- **A symptom that cannot be localised is a measurement, not a test.** `Health::verified_claims` separates "never heard of
-  the rival" from "heard and did not move", two defects with one symptom. Pinned by
-  `fabric::a_node_records_the_claims_of_peers_it_meets`; it refuted a hypothesis immediately (`4bb60f3`).
-- **A timeout is not a refutation.** `NodeFleet::until_settled` is three-valued — `Reached` / `Refuted` / `Inconclusive` —
-  discriminating on the trajectory rather than on load average, so a contended host reports "still converging" instead of
-  red. Pinned by `fabric::the_harness_tells_a_refutation_apart_from_an_unfinished_measurement`, all three branches
-  (`ef18e81`). Its `FROZEN_SPAN` is derived from `role_loop::ROSTER_REFRESH` × **2**, the factor being the content: a
-  process firing every `T` is unchanged for just under `T` between firings, so `T` alone cannot tell "between firings" from
-  "stopped". The sim proved that by refuting my first derivation.
-- **Establish the baseline before attributing a failure.** `git stash push -- <own paths only>`, run, pop. Two hypotheses
-  died to this in one session; both would otherwise have shipped as findings.
-
-## Two test defects found while doing the above — both mine, both from the same gap
-
-Recorded because the cause was one habit, not two accidents: **every gate I ran was `cargo test -p <crate> --lib`, which
-does not run `tests/*.rs`.** Running `cargo test --workspace --tests` (78 suites) surfaced both immediately.
-
-1. **`fanos-quic/tests/self_certifying.rs::an_impostor_at_the_resolved_address_is_rejected`** had been failing
-   deterministically (0.02 s) since `fdf3075` earlier the same session. It poisoned the directory with the *unranked*
-   `Directory::insert` over a binding the driver had made *with* a rank — which rank arbitration correctly refuses, so the
-   poisoning silently stopped working and the test's premise evaporated. A test whose **setup** depends on behaviour you
-   just changed fails by becoming vacuous, not by asserting something false. Fixed by modelling a stale entry the way one
-   actually arises (B vacates, C rebinds) and asserting *both* halves.
-2. **`fanos-sim::fabric::the_whole_cell_resolves_every_member`** failed in **40.2%** of runs, and the comment above the
-   assertion claimed it was draw-independent. Comparing rosters against *occupied* coordinates fixes the target number but
-   not the fact that the node losing a collision's arbitration is unroutable and can never see the whole cell.
-   `NodeFleet::spawn` now draws injectively (`e243ac4`).
-
-**Standing rule from both:** gate with `cargo test -p <crate>` (all targets), never `--lib`. And a deterministic
-sub-second failure is never a load flake, however high the load average.
-
-## Corrections to the previous revision of this file
-
-Recorded rather than silently edited, because the pattern matters more than the entries: **a handoff doc drifts exactly
-the way the code it describes does**, and a task list that flatters its own currency wastes an implementer's day.
-
-1. **"Γ-viability gate does not exist (no `architecture/` dir)" — false.** `fanos-holarch` exists and delivers it:
-   `aspect`/`gamma`/`instance`/`panel`/`verdict` + `ablate`, with `instance::fanos_platform()` scoring the platform's
-   declared budgets. `tests/gate.rs` asserts V1–V4, reproduces the `platform.md §1.2` estimate to 5e-3 (P = 0.3704,
-   Φ = 1.563, D = 2.615), checks the corpus reference corners, requires each ablation to break its targeted invariant, and
-   asserts all 7 σ-panel checks. It gates CI through the `cargo test --workspace` step. The one residual is cosmetic:
-   §1.2 prints `P ≈ 0.36` where the calculator computes 0.3704.
-2. **"OBOLOS has no incoming-viewing key (O-M3)" — false.** `wallet.rs` has `IncomingViewingKey` with `scan()` and a
-   `to_incoming()` downgrade. Only O-M4 (stealth/diversified addresses) is open, and it is now Tier A item 1.
-3. **"The GPA timing channel is essentially undefended" — retracted.** `c896d2d` retracted `18fce2e`. The metric
-   (per-hop in/out rate correlation) penalised **conservation**: a relay neither drops nor manufactures real cells, so over
-   a window ≫ the mix delay cells-out must equal cells-in, and an ideal independent-exponential mix at 50 ms scores
-   `r = 0.712` on it. Two invalid variants are kept `#[ignore]`d in `fanos-sim/tests/traffic_analysis.rs` as labelled
-   counter-examples. The lesson is a standing rule: **compute the ideal reference before reporting a defect**.
-4. **"3,870-line `overlay.rs`"** — it is 4,048.
-
-*Notes for the implementer.* A **concurrent teammate** is active in `fanos-keygen/src/recovery.rs` and `fanos-obolos`
-(`lib.rs`, `ring_tx.rs`, `ring_output.rs`) — never stage those. `fanos-vrf` is no longer contended. Every change must keep
-`cargo clippy --workspace --all-targets --features validator -- -D warnings` and `cargo test --workspace` green (42
-crates, 1,600+ tests); the repo is hand-formatted, so **never run `cargo fmt`**. Standing directives apply: math-grounded
-(derive, no magic thresholds), maximal crate reuse, no deferring — implement in full, then verify.

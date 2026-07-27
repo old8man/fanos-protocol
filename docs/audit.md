@@ -1929,3 +1929,55 @@ drivers (`6d81506`) landed *during this audit* without its guard; (3) an entire 
 test-only, so the platform's headline claims ("high-speed private L1", "ultimate anonymity") are not yet runnable
 end-to-end. **The two user priorities turn on closing those production last-miles *with* their security guards, and on
 authenticating the one remaining reshare surface — not on new cryptography.**
+
+---
+
+# TAXIS consensus liveness — five defects, found and fixed 2026-07-27
+
+The shipped chain could not finalize a block under SSLE, and finalized only erratically without it. Five distinct defects,
+every one reachable in production from nothing worse than transient message loss. Recorded here because each is a rule a
+BFT implementation must have, not an incident.
+
+1. **DA shard sampling had no retry.** A replica requests a missing shard the instant a skeleton arrives, but the proposer
+   disperses peer by peer, so the request routinely reaches a peer *before* that peer has been given its own shard. The
+   peer holds nothing, answers nothing, and the requester waited forever for a shard its peer had held all along. One
+   proposal in flight loses that race sometimes; `N` racing proposals lose it reliably. Fixed by re-requesting outstanding
+   shards each tick — idempotent, since a request for a held shard is answered and one for an unheld shard is dropped.
+2. **The SSLE round-0 lottery was gated on the body it does not rank.** The DA availability gate ran *before* the ticket
+   was computed, and the driver admitted a proposal only after reconstruction — so ranking a *losing* proposal required its
+   entire payload. Under all-propose every replica ranked whatever subset reconstructed inside a one-tick window, split its
+   PREPARE, and no quorum formed. The ticket rides in the skeleton (`Block::skeleton` preserves `witness`), so ranking now
+   happens from the skeleton and availability is required only for the block actually prepared. Happy-path DA work drops
+   from `N` proposals to 1.
+3. **A locked validator never released its lock.** `check_prepared` locks on a block the moment a PREPARE quorum forms;
+   the lock was cleared only on finalizing a height. A PREPARE quorum that never became a COMMIT quorum therefore wedged
+   the height permanently — every later proposal is a different block, the lock refuses it, and no quorum can form for
+   anything again. Fixed with Tendermint's rule: on entering a round, re-PREPARE the value you are locked on. Safe by
+   construction rather than by argument — it only ever prepares the block already locked.
+   - Leader rotation looks like the escape and is not. A block header commits to
+     `(parent, height, epoch, proposer, tx_root, da_commit, last_commit_root)` and **not** to the round, so a re-proposal
+     by the same proposer is byte-identical and a locked validator accepts it. That recovers a cell whose mempool is
+     unchanged — and fails exactly when the mempool moves underneath, which is the ordinary case: a client submits into a
+     running cell, so the locked block was empty and everything after it carries the transaction.
+4. **A validator committed to a block it never received could not fetch it.** Votes carry only a hash, so a validator
+   locks on — or gathers a commit certificate for — a block it has never seen, and then can move in neither direction.
+   State sync does not cover it: `on_sync_req` serves a *checkpoint*, and a cell one block into its life has none. Fixed
+   with `awaited_body()` + `ShardMsg::NeedSkeleton`, answered from `skeleton_of`; the reply is an ordinary
+   `Propose(skeleton)`, so recovery re-enters the normal sampling path. This needed a second fix to work at all: the
+   validators best placed to answer were exactly the ones that could not, because `reset_round_state` clears `proposals`
+   on finalization and the chain retains only headers — hence a bounded `recent_bodies`.
+5. **A validator short one COMMIT vote was stuck forever, and `f+1` of them halted the chain.** Quorum is `2f+1`, and a
+   validator finalizes only by gathering that many COMMIT votes *itself*. Votes are never retransmitted and cannot be
+   requested, and `collect_cert` filters by the current round, so re-voting cannot rebuild the certificate. With **one**
+   validator short the cell keeps a quorum, keeps making blocks, and its later blocks carry the proof — so it self-heals.
+   With **`f+1`** short the remainder is *below quorum*: the chain halts and can no longer produce the very evidence that
+   would rescue them. Fixed by `adopt_certified_parent` — every block records the quorum COMMIT certificate that finalized
+   its parent, so a height-`h+1` proposal already proves what `h` finalized, and the link check was discarding it. The
+   certificate is carried into `finalize` rather than rebuilt, because a certificate assembled from votes this validator
+   never received would verify nowhere.
+
+**What made the difference methodologically.** `ConsensusEngine::rejects()` — per-reason refusal counters, with the fused
+entitlement/link/structure/last_commit gate split apart so the counter says *which* half fired. A rejected block and an
+unprepared one are indistinguishable from outside (the round times out, the height stalls) and have nothing in common as
+fixes; two iterations were spent on the wrong subsystem before a measurement showed data availability was clear
+(`pending=0, backlog=0` on all seven validators). Counters rather than logs, because the engine is `no_std` and sans-I/O.

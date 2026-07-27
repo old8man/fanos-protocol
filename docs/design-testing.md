@@ -630,3 +630,69 @@ cargo test -p fanos-node -p fanos-proxy
 All tiers gate CI together via `cargo test --workspace`, and `cargo clippy --all-targets -- -D warnings`
 holds test modules to the same lint bar as shipping code (the `#![allow(...)]` headers on test files are
 the audited, deliberate exceptions).
+
+## Three verdicts, not two — and why a frozen state is a result
+
+`common::HANG_CEILING` separates the two quantities a hand-tuned timeout conflates: *how long this should take* (a latency
+claim, asserted separately where it matters) and *how long before we conclude it never will* (a liveness backstop). There
+is a third state neither expresses: **the system has stopped changing.**
+
+A wait that ends at the ceiling reports "did not finish in time", which reads as *slow*. So a cell that reached a wrong
+fixed point in three seconds looked identical to one losing a race with a loaded host, and was twice answered with more
+headroom while every run burned 240 s to rediscover the same frozen state.
+
+`common::converge` reports **Reached / Refuted / Inconclusive** — refuted the moment the observation has been unchanged
+for `FROZEN_SPAN`, with the frozen trace attached. Its trace must include every field the condition tests, because two
+states are "the same" when their traces are equal and a trace that omits part of the state makes a moving system look
+frozen. Render it **per participant**: the first defect this exposed was one validator out of seven, and a cell-wide "not
+yet" cannot say that.
+
+`FROZEN_SPAN` is **derived**: twice the longest quiet period the system can legitimately produce
+(`fanos_node::taxis_driver::ROUND_TIMEOUT_MAX`). One period cannot distinguish "between attempts" from "stopped"; two can.
+The same argument and the same factor of two govern `fanos_sim::fabric::FROZEN_SPAN` over the roster-refresh period — it
+was derived as a *single* period first, and the simulator refuted it.
+
+## The simulator must differ from production only in transport — and that is a claim to test
+
+The rule is easy to state and easy to violate invisibly. Two measured cases:
+
+- **DA dispersal.** `consensus_sim` handed every replica the complete shard set instantly, modelling a proposal as
+  arriving *whole* while production broadcasts a skeleton, disperses one shard per validator, and samples the rest. Every
+  engine-level SSLE test passed while a real cell finalized **no block at all**. The fix was structural as well as
+  cosmetic: the sampling decision procedure moved out of the driver into `fanos_taxis::da::Sampler`, because the rule is
+  unenforceable while the logic under test is itself tangled into the transport.
+- **Independent timing.** The first dispersal model gave every replica the *same* latency. It pinned nothing: replicas then
+  rank an identical complete set at an identical tick, so the lottery cannot split and the test passed with the defect
+  fully present. Latency has to be per (participant, item) — production's divergence comes from *independent* sampling.
+
+## An instrument you have not seen fail is not an instrument
+
+Every guard here earns its place by being shown to fail. The practice has repeatedly caught tests that pinned nothing:
+
+- A dispersal test that passed with the defect present (uniform latency, above).
+- A DA exchange test whose fixture block had an **empty** payload — zero stripes, so `erasure::reconstruct` returns
+  immediately and a single shard "recovers" it. Three exchange tests would have passed without exchanging anything;
+  `the_fixture_block_genuinely_needs_more_than_one_shard` exists solely to keep them honest.
+- Two consensus rules that were implemented, plausible, and **reverted** because no scenario could be built that needed
+  them — every test passed with each disabled. They shipped later, once a scenario existed that failed without them.
+
+Corollary for asymmetric faults: a **cell-wide** fault injector cannot express the conditions that wedge a real cell.
+Denying a quorum to everyone finalizes nothing and the system simply retries. `Cluster::drop_to` drops one phase's votes
+addressed to *specific* participants, and that asymmetry was the entire content of the defect it found.
+
+## Refactoring a large module
+
+Earned splitting `fanos-runtime/src/overlay.rs` (4,048 → 2,900 lines, zero API change):
+
+- Cut by **items** (doc/attr block → brace match), never by line offsets — the first slice landed mid-doc-comment and
+  orphaned half a type's documentation.
+- Start each new module with an **empty** import list and let the compiler name what it needs; copying the facade's `use`
+  block drags in a dozen unused imports.
+- Never blanket-rewrite visibility. A `pub(crate) fn` sweep silently demoted two *public* functions that another crate
+  reached by path.
+- **Splitting an impl is cheaper than lifting a type**, which is the opposite of how it looks. A *child* module reaches its
+  parent's private items, so a child needs no field widened, where extracting whole types needed five `pub(crate)`. The
+  rule is one-way: a parent cannot see a child's privates, so dispatched methods are `pub(super)` — which names one
+  module, not the crate.
+- Reading a module's `use` lines is **not** its dependency list. Half of one module's references were fully-qualified
+  paths the imports never mentioned, and the first extraction compiled a new crate against deps it did not declare.
