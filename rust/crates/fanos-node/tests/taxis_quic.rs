@@ -13,6 +13,8 @@
 
 mod common;
 
+use core::fmt::Write as _;
+
 use std::time::Duration;
 
 use fanos_field::F2;
@@ -205,4 +207,97 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     for p in publishers {
         p.abort();
     }
+}
+
+/// **A validator that joins after the cell has moved on reaches its executed state** — over real QUIC, with six
+/// validators (quorum is 5 of 7) having carried the chain without it.
+///
+/// It was written to cover the directed reply, and the falsification says it does not. `SyncResp` is the one
+/// consensus message this driver sends to a single peer's coordinate (`Output::SendTo`) rather than broadcasting,
+/// and the deterministic simulator showed that exchange is what repairs a gap there — remove it and the laggard
+/// sits at height 1 while the cell reaches 18. So the obvious expectation was that deleting the directed emit
+/// would fail this test. **It does not: the test passes unchanged with that emit deleted.** Whatever carries a
+/// late joiner over QUIC, it is not the directed reply — most likely ordinary consensus following, since a height
+/// h+1 block's `last_commit` certifies h and the cell emits blocks continuously.
+///
+/// So the test is kept for what it *does* witness, under its own name: a late joiner arrives at the cell's exact
+/// executed state, on the cell's chain rather than a private one. Covering the directed reply needs a gap that
+/// ordinary following cannot close, and a first attempt at that (four transfers) hit something else entirely —
+/// the cell executed three of them and froze at height 20 with the fourth unexecuted, on a host that was
+/// demonstrably answering. That is its own thread, recorded rather than folded in here.
+#[tokio::test]
+async fn a_validator_joining_late_reaches_the_cells_executed_state() {
+    const LATE: usize = 6;
+
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
+    let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
+
+    let keys = gen_keys();
+    let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+    let registry = KeyperRegistry::new(
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+    );
+    let keyper_commit = registry.commit();
+    let params_for = |i: usize, k: Keys| TaxisParams {
+        cell: CellParams::FANO,
+        me: i as u8,
+        signer: k.sig,
+        kem_secret: k.kem,
+        verifiers: verifiers.clone(),
+        keyper_commit,
+        seed: SEED,
+        epoch: EPOCH,
+        genesis_state: genesis(),
+        reward_per_block: 0,
+        sortition: None,
+        slash_sealer: None,
+    };
+
+    // Only six drivers start. The seventh node exists on the overlay (so the cell is routable) but runs no
+    // consensus yet — the same shape as a validator that was down while its cell carried on.
+    let mut keys = keys.into_iter().enumerate().collect::<Vec<_>>();
+    let late_keys = keys.remove(LATE).1;
+    let mut handles: Vec<_> =
+        keys.into_iter().map(|(i, k)| spawn_taxis::<F2, Accounts>(cell.nodes[i].client(), params_for(i, k))).collect();
+
+    let tx = Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx();
+    let sealed = seal_to_keyper_line(&registry, &tx, EPOCH, &SEED, CellParams::FANO, b"late-join-tx")
+        .expect("seal to the committed keyper line");
+    for h in &handles {
+        assert!(h.submit(sealed.clone()).await, "submitted the sealed tx to a live driver");
+    }
+
+    // The six-validator cell executes without the seventh.
+    common::converge("the quorum executes without the absent validator", || async {
+        let mut trace = String::new();
+        let mut all = true;
+        for (i, h) in handles.iter().enumerate() {
+            if let Some((height, state)) = h.snapshot().await {
+                all &= height >= 1 && state.balance(&BOB) == 100;
+                let _ = write!(trace, "v{i}:h{height}/b{} ", state.balance(&BOB));
+            } else {
+                all = false;
+                let _ = write!(trace, "v{i}:down ");
+            }
+        }
+        (all, trace)
+    })
+    .await;
+
+    // Now the seventh joins, at genesis, into a cell that has moved on.
+    handles.push(spawn_taxis::<F2, Accounts>(cell.nodes[LATE].client(), params_for(LATE, late_keys)));
+
+    common::converge("the late validator catches up to the cell it never saw", || async {
+        let Some((height, state)) = handles[LATE].snapshot().await else {
+            return (false, "late:down".to_owned());
+        };
+        (height >= 1 && state.balance(&BOB) == 100, format!("late:h{height}/b{}", state.balance(&BOB)))
+    })
+    .await;
+
+    // It is on the cell's chain, not a private one: the same executed balances the quorum agreed.
+    let (height, state) = handles[LATE].snapshot().await.expect("a live snapshot of the late validator");
+    assert!(height >= 1, "the late validator advanced past genesis");
+    assert_eq!(state.balance(&BOB), 100, "it holds the transfer it never saw proposed");
+    assert_eq!(state.balance(&ALICE), 900, "and the matching debit — one executed state, not a reconstruction");
 }

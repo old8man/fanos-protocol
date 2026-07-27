@@ -49,10 +49,17 @@ Which mechanism repairs it was measured rather than assumed, by disabling each i
 - the catch-up exchange (`SyncReq` / `SyncResp`) **off** → the laggard sits at height 1 while the cell reaches 18. That is
   the **exact live signature** — `v6:...@1` beside `v0:...@11`.
 
-So the live investigation has one place to look: `taxis_driver` does wire both messages, and a `SyncResp` is a *directed*
-reply (`Output::SendTo` → one peer's coordinate) rather than a broadcast. Every other consensus message in that driver is
-a broadcast. A directed reply that never lands would reproduce this precisely, and nothing tests that path over a
-transport.
+**The directed-reply suspect is cleared, by falsification rather than by a passing test.**
+`taxis_quic::a_validator_joining_late_reaches_the_cells_executed_state` stands up six validators (quorum is 5 of 7), lets
+them execute, then joins the seventh — which reaches the cell's exact executed state in ~6.5 s. But deleting the directed
+emit from the driver leaves that test passing **unchanged**, so it does not cover the path it was written for. Whatever
+carries a late joiner over QUIC is not `SyncResp`; most likely ordinary consensus following, since a height h+1 block's
+`last_commit` certifies h and the cell emits blocks continuously. The test is kept under a name that says what it
+actually witnesses.
+- Covering the directed reply needs a gap ordinary following cannot close. A first attempt — four transfers instead of
+  one — hit something else: **the cell executed three of them and froze at height 20 with the fourth unexecuted**, across
+  all six validators, on a host that was demonstrably answering (321 observations, slowest 289 ms). That is a separate
+  thread and is the more interesting one.
 
 *Ruled out on the way:* the driver's validator→coordinate map was built once at spawn and never updated, so a reseated
 peer would have been silently evicted from consensus — its votes dropped as "a frame from a stranger", its own addressed
