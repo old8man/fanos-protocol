@@ -610,8 +610,11 @@ fn on_shard<S: StateMachine>(
             }
         }
         ShardMsg::Request { block, index } => {
-            if let Some(shard) = da.serve(&block, index) {
-                let deliver = ShardMsg::Deliver { block, index: me, data: shard.clone() };
+            // Our own shard if we hold it, else re-derive the requested one from the whole block if we have it.
+            // Without the fallback a shard has exactly one custodian, so a dispersal that never arrived is
+            // unobtainable however many peers hold the block — including the proposer, which built it.
+            if let Some(shard) = da.serve(&block, index).or_else(|| engine.shard_of(&block, index)) {
+                let deliver = ShardMsg::Deliver { block, index, data: shard.clone() };
                 client.command(Command::Emit { to: from, frame: shard_to_frame(&deliver) });
             }
         }

@@ -751,6 +751,23 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.proposals.get(hash).or_else(|| self.recent_bodies.get(hash)).map(Block::skeleton)
     }
 
+    /// **Any** data-availability shard of a block this validator holds in full.
+    ///
+    /// A shard normally has exactly one custodian — the validator whose index it is — so a dispersal that never
+    /// arrived leaves that shard unobtainable, however many peers hold the whole block. The proposer is the
+    /// sharpest case: it built the block, holds every byte of it, and could answer for any index, yet retains
+    /// only its own. Measured consequence: a cell split `[7, 6, 6, 7, 6, 6, 6]` on a block carrying a 9 KB
+    /// transaction, where the two validators that had it could not help the five that did not.
+    ///
+    /// Shards are re-derived from the payload rather than stored, so this costs an encode and no memory, and the
+    /// requester still checks what arrives against the header's `da_commit` — serving more widely cannot weaken
+    /// the availability guarantee, only make it reachable.
+    #[must_use]
+    pub fn shard_of(&self, hash: &[u8; 32], index: u8) -> Option<Vec<u8>> {
+        let block = self.proposals.get(hash).or_else(|| self.recent_bodies.get(hash))?;
+        block.da_shards().get(usize::from(index)).cloned()
+    }
+
     /// Why proposals have been refused so far — see [`ProposalRejects`]. Cumulative; diff two reads for a rate.
     #[must_use]
     pub fn rejects(&self) -> ProposalRejects {

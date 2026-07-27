@@ -95,7 +95,26 @@ HERMES contract suite is the first that needs two rounds of consensus (lock, the
 The deterministic simulator reaches height 24+ reliably in the same shape, so the defect is in the live driver or its
 transport, not in the engine's logic.
 
-**Narrowed by three probes, 2026-07-28 — it is the block's *size*, and the suspect is DA availability.**
+**Root cause located, 2026-07-28: a lock split that never heals, because the majority never obtains the locked block.**
+Instrumenting every `ProposalRejects` counter on a failing run gives exactly one reason and nothing else:
+
+    15 rejects, all `locked`, all at height 1 — 5 each from validators 0, 2 and 3. The other four reject nothing.
+
+So three validators received the height-1 proposal, locked on it, and refuse every later one; the other four never
+received it, so they have nothing to reject and go on proposing alternatives. Quorum is 5: neither side can reach it.
+Crucially **no `unavailable` reject appears** — the four are not refusing the block for want of its body, they never saw
+the proposal at all.
+
+That makes the missing mechanism specific. `reprepare_lock` has the three re-PREPARE their locked value on round entry,
+but a PREPARE carries only a hash, and the body-fetch trigger (`awaited_body` → `NeedSkeleton`) covers a validator
+*committed* to a block it lacks — not one merely seeing peers vote for one. So the four see votes for a hash they cannot
+resolve and never ask for it. Widening that trigger to "peers are voting for a block I do not hold" is the candidate fix,
+and it is a consensus change that wants care rather than a quick patch.
+
+Size is what makes it *likely* rather than what makes it happen: a 9 KB block is slower to disperse, so the window in
+which only some validators hold it is wider.
+
+**Superseded reading, kept so it is not re-derived** — three probes first suggested DA availability:
 
 | cell | driven with | 40 s of heights |
 |---|---|---|
