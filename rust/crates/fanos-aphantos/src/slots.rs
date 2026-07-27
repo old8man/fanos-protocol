@@ -68,14 +68,38 @@ pub const TARGET_DEPTH: usize = 3;
 /// deployment down to a wide plane's depth would throw away anonymity it has paid for.
 ///
 /// It is also the ceiling the nested layout left **implicit** — there, a sender could build any depth and simply leak more.
-/// Here exceeding it is an error, and the trade is legible: 5 hops at `q = 2`, 3 at `q = 4`, 2 at `q = 7`.
+/// Here exceeding it is an error.
+///
+/// **The payload floor is one slot's worth, and it is derived rather than chosen.** The largest thing this protocol nests
+/// *inside* an onion payload is a threshold seal to a hop line — `line_size × SEALED_SHARE_LEN` plus a small header — which is
+/// what a slot costs. So reserving one slot of payload reserves exactly one nested seal, and the arithmetic is
+/// `(D + 1) × slot_len ≤ budget`.
+///
+/// Without that floor, [`TARGET_DEPTH`] alone is correct on narrow planes and silently breaks wide ones: at `q = 4` it gave
+/// **2 642 B** of payload against **5 944 B** for one nested seal, and at `q = 7` **1 572** against **9 451**. That is the same
+/// failure that broke every full anonymous session at `q = 2` under budget-filling — sessions fail while a single forward onion
+/// still delivers — so it would have shipped the identical defect to anyone running `--plane-order 4`.
+///
+/// Resulting depths: **3 hops at `q = 2` and `q = 3`, 2 at `q = 4`, 1 at `q = 7`.** The last is honest rather than acceptable:
+/// at that width `THRESHOLD_ONION_LEN` cannot carry a multi-hop circuit *and* a usable payload, and the answer is a wider cell
+/// for wide planes (the budget is a per-deployment parameter) — not a thinner payload.
 #[must_use]
 pub const fn depth_for(line_size: usize) -> usize {
+    // `n` slots fit in the bucket; one is reserved for the payload, so `n - 1` may carry hops.
     match (THRESHOLD_ONION_LEN - PREAMBLE_LEN).checked_div(slot_len(line_size)) {
-        Some(n) if n < TARGET_DEPTH => n,
+        Some(0) | None => 0,
+        Some(n) if n - 1 < TARGET_DEPTH => n - 1,
         Some(_) => TARGET_DEPTH,
-        None => 0,
     }
+}
+
+/// The largest structure this protocol nests inside an onion payload: a threshold seal to one hop line.
+///
+/// Exists so the payload floor in [`depth_for`] is a *derived* quantity a test can assert against, rather than a constant
+/// someone has to trust.
+#[must_use]
+pub const fn nested_seal_len(line_size: usize) -> usize {
+    NONCE_LEN + 2 + 4 + AEAD_TAG_LEN + line_size * SEALED_SHARE_LEN
 }
 
 /// The fixed-width command inside a slot: `tag(1) ‖ operand(32) ‖ payload_key(32)`.
@@ -270,6 +294,9 @@ pub fn unpack_payload(block: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A NOSTOS reply circuit: one intermediate mix line, then the delivery line.
+    const REPLY_HOPS: usize = 2;
+
     #[test]
     fn the_budget_fits_and_states_its_own_depth_ceiling() {
         // The layout is only free if it fits the width the previous one already spent. At the Fano line size it does, with
@@ -281,9 +308,26 @@ mod tests {
             assert!(payload_len(line_size).is_some(), "line {line_size}: a payload block remains");
         }
         // The target depth where the plane affords it, less where it does not.
+        // Every supported plane must leave room for one nested threshold seal, which is the largest thing the protocol puts
+        // inside an onion payload. Without this the depth policy is right on narrow planes and silently breaks wide ones.
+        for line_size in [3usize, 4, 5, 6, 8] {
+            let payload = payload_len(line_size).unwrap_or(0);
+            assert!(
+                payload >= nested_seal_len(line_size),
+                "line {line_size}: payload {payload} must hold one nested seal of {}",
+                nested_seal_len(line_size)
+            );
+        }
+        // A NOSTOS reply is two hops (one mix line, then the delivery line), so a plane can host the anonymity substrate
+        // only if it affords at least two. This is the constraint the plane-order decision turns on.
+        for (q, line_size) in [(2usize, 3usize), (3, 4), (4, 5)] {
+            assert!(depth_for(line_size) >= REPLY_HOPS, "q = {q} must afford a {REPLY_HOPS}-hop reply circuit");
+        }
+        assert!(depth_for(8) < REPLY_HOPS, "q = 7 cannot, inside this bucket — a wider cell is required there");
         assert_eq!(depth_for(3), TARGET_DEPTH, "q = 2 affords the target depth");
-        assert_eq!(depth_for(5), TARGET_DEPTH, "q = 4 affords it too");
-        assert_eq!(depth_for(8), 2, "q = 7 can only carry two hops in the bucket");
+        assert_eq!(depth_for(4), TARGET_DEPTH, "q = 3 affords it too");
+        assert_eq!(depth_for(5), 2, "q = 4 affords only two hops once the payload floor is honoured");
+        assert_eq!(depth_for(8), 1, "q = 7 affords only one — the bucket is too narrow for a circuit there");
         // And the payload is what the policy is for: budget-filling left 2.4 KiB, which is smaller than structures this
         // protocol nests *inside* an onion payload (sealing to a 3-member line alone is ~3.5 KiB).
         assert!(payload_len(3).unwrap() > 8192, "capping depth leaves a real payload: {:?}", payload_len(3));

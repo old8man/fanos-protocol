@@ -301,10 +301,15 @@ mod tests {
         // The receiver's ephemeral reply key (the end-to-end seal target).
         let (reply_keys, reply_pub) = ReplyKeys::generate(b"reply-keypair-seed");
 
-        // Two return hops: one intermediate mix line, then the delivery line L. Each is a line of
-        // q+1 = 8 members with a KEM keypair apiece.
-        let mix = line_members(8, 40);
-        let drop = line_members(8, 41);
+        // Two return hops: one intermediate mix line, then the delivery line L.
+        //
+        // Lines of 3 (the Fano plane), not 8. A reply needs **two** slots of the fixed-slot onion header, and
+        // `slots::depth_for` reserves one nested threshold seal of payload — so a plane whose lines hold 8 points carries
+        // only a single hop inside `THRESHOLD_ONION_LEN` and cannot express this circuit at all. That is a genuine budget
+        // constraint on wide planes (recorded against the plane-order decision), not a property of the reply mechanism this
+        // test is about.
+        let mix = line_members(3, 40);
+        let drop = line_members(3, 41);
         let mix_pub: Vec<&HybridKemPublic> = mix.iter().map(|(_, p)| p).collect();
         let drop_pub: Vec<&HybridKemPublic> = drop.iter().map(|(_, p)| p).collect();
         let return_hops = [

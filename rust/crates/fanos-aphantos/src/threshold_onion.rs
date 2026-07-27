@@ -428,7 +428,7 @@ mod tests {
         // A 3-hop circuit; each hop is a line of 5 members with threshold 3.
         let t = 3u8;
         let lines: Vec<Vec<(HybridKemSecret, HybridKemPublic)>> =
-            (0..3).map(|h| line(5, 20 + h as u8)).collect();
+            (0..3).map(|h| line(3, 20 + h as u8)).collect();
         // Borrow the public keys per hop (outlives the HopLine slice below).
         let pubs: Vec<Vec<&HybridKemPublic>> = lines
             .iter()
@@ -482,7 +482,7 @@ mod tests {
     fn holo_circuit(base: u8) -> (Vec<Vec<(HybridKemSecret, HybridKemPublic)>>, Vec<fanos_geometry::Triple>) {
         use fanos_geometry::Point;
         let lines: Vec<Vec<(HybridKemSecret, HybridKemPublic)>> =
-            (0..3).map(|h| line(5, base + h as u8)).collect();
+            (0..3).map(|h| line(3, base + h as u8)).collect();
         let hop_lines: Vec<fanos_geometry::Triple> =
             (0..3).map(|h| Point::<fanos_field::F2>::at(h).coords()).collect();
         (lines, hop_lines)

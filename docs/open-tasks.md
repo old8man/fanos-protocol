@@ -1,19 +1,18 @@
 # FANOS — open tasks
 
-**This file lists only what is still open.** Closed work is not kept here — its rationale lives in the commit that closed
-it, and any durable engineering finding is written into the design or audit doc it belongs to (`docs/audit.md`,
-`docs/design-testing.md`, `docs/design-coordinates.md`, …). A task list that accumulates completed items stops being
-readable as a task list, which is what happened to the previous revision of this file.
+**Only open items live here.** A closed task is deleted, not annotated: its rationale is in the commit that closed it, and any
+durable finding belongs in the design or audit doc it concerns (`docs/audit.md`, `docs/design-testing.md`,
+`docs/design-anonymity-substrate.md`, `docs/design-coordinates.md`).
 
-**Verification rule for whoever picks this up:** check the claim before doing the work. A task list is a cache, and this
-one has gone stale twice. Each item names the file and symbol its claim rests on, so the check is cheap.
+**Check the claim before doing the work.** A task list is a cache; this one has gone stale twice. Each item names the file and
+symbol its claim rests on so the check is cheap.
 
-No open CRITICAL/HIGH security item remains; all four audit passes are consolidated in `docs/audit.md` with every finding
-RESOLVED. What follows are the remaining *capability*, *coherence*, and *quality* gaps.
+No open CRITICAL/HIGH security item remains (`docs/audit.md`, all four passes RESOLVED). What follows are capability,
+coherence and quality gaps.
 
 ---
 
-## Tier A — headline frontiers (fundamental research + build)
+## Tier A — headline frontiers
 
 ### 1. OBOLOS diversified / stealth one-time addresses (O-M4)
 - **Problem.** The key hierarchy is *half* built. `fanos-obolos/src/wallet.rs` has the full viewing hierarchy —
@@ -27,89 +26,45 @@ RESOLVED. What follows are the remaining *capability*, *coherence*, and *quality
   material. Compose with `note`/`nullifier`/`tx`/`note_cipher`/`state` and the §5.D-2 sighash signatures; reconcile the
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
-### 2. After a coordinate collision the cell never fully connects, so the roster cannot complete
-Live coordinate resolution is done (`docs/design-coordinates.md`, `29e322b`), and so is the read-triage fix this item used to
-prescribe — `resolve_directory` returns `Scan<T>`, reads are three-valued, and `role_loop::may_relax` refuses to treat an
-*incomplete* scan as evidence of stability (`2e088a4`, `416b4f7`, `24dc4fe`). That worked: with an **injective** draw, rosters
-reach `[7; 7]` and agree in 24–116 s, where they previously froze at `[4, 4, 3, 4, 2]`.
-
-**The residual, measured with collisions FORCED** (`measure_roster_convergence_with_collisions_allowed`, which now retries the
-draw until it actually collides — a earlier version spent a whole trial on an injective draw and proved nothing):
-
-| trial | distinct | probe index | claims verified | **known_peers** | final rosters | agreed |
-|---|---|---|---|---|---|---|
-| control (injective) | 7 of 7 | all `0` | — | `[1,2,3,4,5,6,**7**]` | `[7,7,7,7,7,7,7]` | **24 s** |
-| 0 | 7 of 7 | one at `1` | 4–7 | `[1,2,3,3,4,5,**6**]` | `[5,2,6,3,4,5,5]` | never |
-| 1 | 6 of 7 | two `None`, two at `1` | 3–6 | `[1,2,2,2,3,3,**4**]` | `[1,2,2,2,4,2,4]` | never |
-
-- **↩︎ CORRECTION — `known_peers` is NOT established as the defect; I read the metric without validating it.** It is
-  `self.directory.len()`, the **address book** (who this node can *dial*), not overlay membership — which is why it reads as a
-  perfect staircase `[1,2,3,4,5,6,7]` even in the fully-*converged* control: it is seeded in spawn order. Decisively, node 0
-  holds **one** entry in that control and still assembles a roster of **7**, because store reads route through the overlay
-  rather than by direct dial. So address-book size does not gate roster convergence and "the roster is downstream of
-  `known_peers`" does not follow.
-  - What *is* real: the control's book reaches `n` while the collision runs top out at 6 and 5, so collisions do impair the
-    address book. That is a genuine difference and worth explaining — it is just not shown to be the cause.
-  - **Net: the roster failure under collisions is reproducible; its causal chain is NOT established.** Do not build on
-    `known_peers` without first fixing a metric that means "this node can reach coordinate X".
-- **Claims are healthy (3–7 verified per node), so this is not "it never heard of its rival".** That hypothesis is refuted
-  again here, as it was for placement.
-- **Placement is *mostly* fine and is not the primary cause.** Trial 0 reaches 7 of 7 distinct — a node visibly advanced to
-  probe index 1 — and its rosters still never agree. So an earlier revision of this entry, which named `probe_index = None` as
-  the primary defect, was reading trial-1-only evidence: the two `None`s there are a *second*, rarer failure and they are not
-  what breaks trial 0.
-- **One real hole found and closed, which did NOT close the item.** A mover's new coordinate reached peers only by re-keying
-  the **live connection** (`b17e5bb`, `f09d9d6`) — so a peer not yet connected to the mover could never learn where it went,
-  never dial, and never connect. `spawn_move_announcer` now issues an overlay `Announce` on every `Reseated`, which is the
-  path that *does* reach such a peer: `on_announce` re-floods on **first sight** of a coordinate, so the move propagates
-  transitively through peers that are connected, and the monotone guard bounds it to one wave per genuine move.
-  - **Verified by inspection, not by the measurement.** With it, both forced-collision trials reach 7 of 7 distinct (one was
-    6 of 7 before) and trial-1 rosters rose from `[1,2,2,2,4,2,4]` to `[6,4,4,5,5,6,6]` — but **`agreed` is still `None` in
-    every trial**, and with n = 2 on different random draws that improvement is not a claim worth making. No regression:
-    114 `fanos-node` lib tests, membership suite, clippy clean workspace-wide.
-- **So a second cause remains, and `known_peers` is still the thing to chase.** It reaches `n` only in the injective control.
-  Next step, and it should be **deterministic** rather than another 5-minute stochastic fleet run: a membership test over the
-  in-memory sim transport where node C has no connection to mover A, A moves, and C must end up holding A's new coordinate.
-  That proves or refutes the remaining link in milliseconds. `NodeFleet::spawn`'s injective draw stays until a
-  forced-collision run reaches `agreed`.
+### 2. Roster never converges when a coordinate collision has to be resolved
+- **Reproduce:** `fanos_sim::fabric` → `measure_roster_convergence_with_collisions_allowed` (`#[ignore]`d; forces a colliding
+  draw). Rosters stall (e.g. `[6,4,4,5,5,6,6]`) and `agreed` is `None`; the injective control reaches `[7; 7]` in 24 s.
+- **Not the cause** (each measured, do not re-test): placement — trials reach 7 of 7 distinct with nodes visibly advanced along
+  their probe walks; claim propagation — 3–7 peers' claims verified per node; the three-valued read fix — already in
+  (`Scan<T>`, `role_loop::may_relax`), and it is what made the injective case converge.
+- **Not established:** `known_peers` is `Directory::len()` (the dial book, seeded in spawn order — a staircase even when
+  converged), so it cannot carry the conclusion. **Prerequisite: an observable meaning "this node can reach coordinate X".**
+- `NodeFleet::spawn`'s injective draw stays until a forced-collision run reaches `agreed`.
 
 ---
 
 ## Tier B — platform capability
 
-
-### 4. Anonymity: the binding constraint is the plane, not the schedule
-- **Status.** This replaces the previous "the GPA timing channel is essentially undefended" task, whose measurement was
-  **retracted** (`c896d2d` retracting `18fce2e`) — see correction 3. What survives measurement:
-  - **Closed.** The mix schedule was calibrated on a valid metric (linkability among *concurrent* flows vs the `1/K`
-    chance floor): `DEFAULT_MIX_DELAY` 50 → 120 ms, `DEFAULT_COVER_INTERVAL` 1 s → 500 ms, on a knee sweep.
-  - **Closed.** The plane is configurable and no longer silently caps anonymity (`--plane-order`, plus a warning when
-    `--profile anonymous` runs on order 2, `8df2b08`).
-  - **Open — deployment decision, not code.** `plane_order` still *defaults* to 2, where `PG(2,2)` has only 4 lines with
-    distinct combiners ⇒ 2 concurrent circuits ⇒ a passive adversary's flow-matching floor is **0.50 regardless of the
-    schedule**. Raising the default is a network-wide compatibility change (every node of a cell must agree), so it is
-    deliberately warned about rather than changed unilaterally.
-- **Task.** Decide the default. If it is to stay 2, say so in `spec/platform.md` next to the anonymity claim, because the
-  profile's name currently promises more than order 2 can deliver. Any *further* timing work must first exhibit a metric an
-  ideal mix passes — the retracted one penalised conservation, which an ideal exponential mix at 50 ms also fails
-  (`r = 0.712`).
+### 4. Settle the default plane order — now constrained by the onion payload floor
+- `plane_order` defaults to **2**, where `PG(2,2)` has 4 lines with distinct combiners ⇒ 2 concurrent circuits ⇒ a passive
+  adversary's flow-matching floor is **0.50 regardless of the mix schedule** (`8df2b08` made the order selectable and warns on
+  under-delivery; the schedule itself is calibrated and closed).
+- **New hard constraint:** the fixed-slot onion reserves one nested threshold seal of payload, so circuit depth falls as the
+  plane widens — `slots::depth_for`: **3 hops at q=2 and q=3, 2 at q=4, 1 at q=7**. Raising the default to 4 buys a larger
+  anonymity set and costs a hop; q=7 cannot carry a circuit at all inside `THRESHOLD_ONION_LEN`.
+- **Task:** decide (2, 3 or 4), and if it stays 2 say so in `spec/platform.md` beside the anonymity claim, because
+  `--profile anonymous` currently promises more than order 2 delivers. Document per-cell anonymity-set size as first-class
+  (absorbs the old item 9). If a wide plane is wanted, `THRESHOLD_ONION_LEN` must grow with it — a wider cell buys more slots,
+  not more payload, so the budget is the knob, not the depth.
+- Any further timing work must first exhibit a metric an *ideal* mix passes; the previous one penalised conservation and was
+  retracted.
 
 ---
 
 ## Tier C — coherence & architecture quality
 
 ### 7a. Decompose `fanos-runtime/src/overlay/mod.rs`
-`overlay.rs` is now `overlay/` — six modules, 4,048 → 2,900 lines, zero API change (`9cb113c`, `cad9eb5`, `3942199`,
-`1ef497b`, `998470f`), and the `ThresholdSealed` dependency edge is gone (`a23ed82`).
-
-- **Remaining, and it is a decision rather than a next step.** `overlay/mod.rs` is `OverlayNode`, its ~1,400-line impl, and
-  `impl Engine`. The natural further cuts are `storage` (`on_put`/`on_get`/`on_sample`/`on_publish`/`on_lookup`/`on_value`/
-  `distribute_shards`), `membership` (`flood`/`on_join`/`on_announce`/`on_reseat`/epoch), and `liveness`
-  (`on_heartbeat`/`health_view`/`loss_view`/`sweep_pending_gets`) — each a child module on the pattern `hier` established.
-  Worth doing deliberately; not worth drifting into.
-- The method notes earned by the completed slices (cut by items not offsets; start each module with an empty import list;
-  never blanket-rewrite visibility; splitting an impl is cheaper than lifting a type) are recorded in
-  `docs/design-testing.md` §"Refactoring a large module".
+`overlay.rs` is now `overlay/` (six modules, −28%, zero API change). What remains is `OverlayNode`, its ~1,400-line impl and
+`impl Engine`. Natural cuts, each a child module on the pattern `hier` established: `storage`
+(`on_put`/`on_get`/`on_sample`/`on_publish`/`on_lookup`/`on_value`/`distribute_shards`), `membership`
+(`flood`/`on_join`/`on_announce`/`on_reseat`/epoch), `liveness`
+(`on_heartbeat`/`health_view`/`loss_view`/`sweep_pending_gets`). A decision to take deliberately, not to drift into. Method
+notes: `docs/design-testing.md` §"Refactoring a large module".
 
 ### 8. Coherence / meta-holon reconciliation (E→L / L→O / Ω2 / Ω9)
 - **Problem.** The cross-block coherence contracts (`platform.md §1.2`, §9) are asserted but not reconciled in one place:
@@ -120,14 +75,3 @@ draw until it actually collides — a earlier version spent a whole trial on an 
   — which already encodes a budget set and is what the gate scores, so any table that disagrees with it is a real
   divergence, not a documentation gap. Reconcile the staking framing against the shipped `StakeLedger`; add
   `SUBJECT_DEPTH_MAX` / CALM annotations where a live enforcement point exists.
-
----
-
-## Tier D — lower-severity anonymity residuals (documented in `docs/audit.md`)
-
-- **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
-  loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
-
-- **11. Hop-position leak (S1-M6) — CLOSED.** `fanos_aphantos::slots` is live: `seal_onion`/`peel_onion` build and peel a
-  constant-width packet, so every hop at every depth is handed identical bytes. `anonymous_quic` 5/5 over real QUIC.
-  Construction, the two forced design decisions, and the payload trade are in `docs/design-anonymity-substrate.md`.
