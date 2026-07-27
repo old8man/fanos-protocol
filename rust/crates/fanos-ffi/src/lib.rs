@@ -165,26 +165,17 @@ pub unsafe extern "C" fn fanos_lookup(
     let Some(key) = (unsafe { as_slice(key, key_len) }) else {
         return FANOS_ERR_NULL;
     };
-    if out_len.is_null() || (out.is_null() && out_cap != 0) {
+    // Validate the caller's out-buffer *before* the lookup: a malformed triple is an argument error, not a
+    // verdict about the key.
+    if !out_buffer_is_valid(out, out_cap, out_len) {
         return FANOS_ERR_NULL;
     }
     let Some(value) = handle.rt.block_on(handle.node.client().get(key.to_vec())) else {
         return FANOS_ERR_NOTFOUND;
     };
-    // SAFETY: `out_len` is non-null (checked above).
-    unsafe { *out_len = value.len() };
-    if value.len() > out_cap {
-        return FANOS_ERR_BUFFER;
-    }
-    // Only copy a non-empty value: an empty value with a size-probe call (`out` null, `out_cap` 0) would
-    // otherwise pass a null `dst` to `copy_nonoverlapping`, which is UB even for a zero count. When the value
-    // is empty there is nothing to write and `out_len` (0) already conveys it.
-    if !value.is_empty() {
-        // SAFETY: `out` has `out_cap >= value.len() > 0` writable bytes (checked), and the source is a
-        // distinct Vec — so `out` is non-null here.
-        unsafe { ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
-    }
-    FANOS_OK
+    // SAFETY: the caller guarantees `out`/`out_len` are writable for the stated capacity, and the value is a
+    // freshly-read Vec distinct from the caller's buffer.
+    unsafe { write_out(&value, out, out_cap, out_len) }
 }
 
 /// Read the node's current [`FanosHealth`] (spec §11.2 `fanos_diagnose`). A null handle yields a zeroed
@@ -313,22 +304,14 @@ pub unsafe extern "C" fn fanos_service_host(
     let Some(seed_bytes) = (unsafe { as_slice(seed, seed_len) }) else {
         return ptr::null_mut();
     };
-    if addr_out.is_null() {
-        return ptr::null_mut();
-    }
     // The deterministic service identity and its self-certifying `.fanos` name.
     let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(seed_bytes));
     let bundle = bundle_from_kem_public(keypair.public());
     let name = Address::from_bundle(&bundle).to_name();
-    let name_bytes = name.as_bytes();
-    // Write the name plus a NUL terminator into the caller's buffer, or fail if it doesn't fit.
-    if name_bytes.len() + 1 > addr_out_cap {
+    // Check the caller's buffer up front — before standing anything up — but write into it only once the
+    // service is actually hosted, so a failed call leaves it untouched, as the null return implies.
+    if !cstr_fits(&name, addr_out, addr_out_cap) {
         return ptr::null_mut();
-    }
-    // SAFETY: `addr_out` has `addr_out_cap > name_bytes.len()` writable bytes; the source is a distinct str.
-    unsafe {
-        ptr::copy_nonoverlapping(name_bytes.as_ptr(), addr_out.cast::<u8>(), name_bytes.len());
-        *addr_out.add(name_bytes.len()) = 0;
     }
 
     // Host the service: each accepted client session is forwarded onto the accept queue (its own fresh OS
@@ -363,6 +346,9 @@ pub unsafe extern "C" fn fanos_service_host(
     if published.is_err() {
         return ptr::null_mut();
     }
+    // SAFETY: `cstr_fits` held above — `addr_out` is non-null with room for the name and its terminator, and
+    // the name is a local `String` distinct from the caller's buffer.
+    unsafe { write_cstr(&name, addr_out) };
     Box::into_raw(Box::new(FanosService {
         handle: handle.rt.handle().clone(),
         incoming: rx,
@@ -418,15 +404,15 @@ pub unsafe extern "C" fn fanos_stream_read(
     let Some(stream) = (unsafe { stream.as_mut() }) else {
         return FANOS_ERR_NULL;
     };
-    if len == 0 {
+    // The read is capped at `i32::MAX` so the returned byte count always fits the C return type.
+    // SAFETY: the caller guarantees `buf` has `len` writable bytes; a null buffer with a non-zero length is
+    // rejected rather than borrowed.
+    let Some(dst) = (unsafe { as_slice_mut(buf, len.min(i32::MAX as usize)) }) else {
+        return FANOS_ERR_NULL;
+    };
+    if dst.is_empty() {
         return 0;
     }
-    if buf.is_null() {
-        return FANOS_ERR_NULL;
-    }
-    let cap = len.min(i32::MAX as usize);
-    // SAFETY: `buf` is non-null with `cap <= len` writable bytes.
-    let dst = unsafe { slice::from_raw_parts_mut(buf, cap) };
     match stream.handle.block_on(stream.stream.read(dst)) {
         Ok(n) => n as c_int, // n <= cap <= i32::MAX
         Err(_) => FANOS_ERR_IO,
@@ -475,6 +461,15 @@ pub unsafe extern "C" fn fanos_stream_free(stream: *mut FanosStream) {
     drop(unsafe { Box::from_raw(stream) });
 }
 
+// ---- The runtime-free half of the ABI ------------------------------------------------------------------
+//
+// Every raw-pointer operation in this crate that is *not* a handle dereference lives below: borrowing the
+// caller's buffers, and copying results back into them. Keeping it separate from the async dispatch above is
+// what makes the crate's memory-safety-critical surface *executable* under Miri — Miri cannot run the handle
+// paths (they need a real reactor: `kqueue`/`epoll` are unsupported foreign calls), so a raw-pointer contract
+// checked only through a live node is a contract Miri never sees. Each function pairs a safe predicate that
+// *decides* with an unsafe routine that *writes*, so the decision is testable without a pointer at all.
+
 /// Borrow `[ptr, ptr+len)` as a slice, or `None` if `ptr` is null with a non-zero length. A null pointer
 /// with a zero length is an empty slice (valid).
 ///
@@ -486,6 +481,72 @@ unsafe fn as_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     }
     // SAFETY: the caller guarantees `ptr` points to `len` readable bytes.
     Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+/// Borrow `[ptr, ptr+len)` as a mutable slice under the same convention as [`as_slice`].
+///
+/// # Safety
+/// If `ptr` is non-null it must point to at least `len` writable bytes, unaliased for the borrow.
+unsafe fn as_slice_mut<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [u8]> {
+    if ptr.is_null() {
+        return (len == 0).then_some(&mut []);
+    }
+    // SAFETY: the caller guarantees `ptr` points to `len` writable, unaliased bytes.
+    Some(unsafe { slice::from_raw_parts_mut(ptr, len) })
+}
+
+/// Whether a caller's out-buffer triple is well-formed: a writable slot for the length, and either a buffer
+/// with capacity or the size-probe form (a null buffer with zero capacity). A null buffer with a non-zero
+/// capacity is a lie about capacity and is rejected.
+fn out_buffer_is_valid(out: *const u8, out_cap: usize, out_len: *const usize) -> bool {
+    !out_len.is_null() && (!out.is_null() || out_cap == 0)
+}
+
+/// Copy `value` into a caller's out-buffer under the ABI's size-probe contract: `out_len` always receives the
+/// value's *true* length (so a caller that guessed too small can resize and retry), and the bytes are copied
+/// only if they fit. Returns [`FANOS_OK`], [`FANOS_ERR_BUFFER`] if the value is larger than `out_cap`, or
+/// [`FANOS_ERR_NULL`] for a malformed triple.
+///
+/// # Safety
+/// `out_len` must be null or point to a writable `usize`; if `out` is non-null it must point to `out_cap`
+/// writable bytes, distinct from `value`.
+unsafe fn write_out(value: &[u8], out: *mut u8, out_cap: usize, out_len: *mut usize) -> c_int {
+    if !out_buffer_is_valid(out, out_cap, out_len) {
+        return FANOS_ERR_NULL;
+    }
+    // SAFETY: `out_len` is non-null (checked) and the caller guarantees it is writable.
+    unsafe { *out_len = value.len() };
+    if value.len() > out_cap {
+        return FANOS_ERR_BUFFER;
+    }
+    // Only copy a non-empty value: a size probe passes `out` null, and a null `dst` is UB for
+    // `copy_nonoverlapping` even at a zero count. An empty value has nothing to write and the reported
+    // length (0) already conveys it.
+    if !value.is_empty() {
+        // SAFETY: `out_cap >= value.len() > 0` writable bytes, so `out` is non-null here, and the caller
+        // guarantees the source is a distinct allocation.
+        unsafe { ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+    }
+    FANOS_OK
+}
+
+/// Whether `text` *and* its NUL terminator fit in a caller's C-string buffer of capacity `cap`.
+fn cstr_fits(text: &str, out: *const c_char, cap: usize) -> bool {
+    !out.is_null() && text.len() < cap
+}
+
+/// Write `text` into a caller's buffer as a NUL-terminated C string.
+///
+/// # Safety
+/// [`cstr_fits`] must hold for `text`, `out` and the buffer's capacity: `out` non-null with at least
+/// `text.len() + 1` writable bytes, distinct from `text`.
+unsafe fn write_cstr(text: &str, out: *mut c_char) {
+    // SAFETY: the caller guarantees `out` is non-null with `text.len() + 1` writable bytes, so both the copy
+    // and the terminator one past it are in bounds.
+    unsafe {
+        ptr::copy_nonoverlapping(text.as_bytes().as_ptr(), out.cast::<u8>(), text.len());
+        *out.add(text.len()) = 0;
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens a node; Miri has no reactor (kqueue/epoll are unsupported foreign calls)")]
     fn open_diagnose_join_and_free() {
         let _serial = serial();
         let node = open_loopback();
@@ -538,7 +600,8 @@ mod tests {
 
     #[test]
     fn null_and_default_handling() {
-        // Null handles are rejected, never dereferenced.
+        // Every entry point rejects a null handle, never dereferences it. All thirteen are covered: a C
+        // caller reaching any of them with a null handle is the single most likely ABI mistake.
         // SAFETY: all pointers are null / valid; the functions must tolerate the nulls.
         unsafe {
             assert_eq!(fanos_join(ptr::null_mut()), FANOS_ERR_NULL);
@@ -555,10 +618,158 @@ mod tests {
             assert_eq!(fanos_diagnose(ptr::null_mut()).port, 0);
             // Freeing null is a no-op.
             fanos_free(ptr::null_mut());
+            // The service and stream surface: a null owning handle yields a null handle / an error, and the
+            // frees tolerate null.
+            assert!(fanos_service_connect(ptr::null_mut(), ptr::null()).is_null());
+            assert!(
+                fanos_service_host(ptr::null_mut(), ptr::null(), 0, ptr::null_mut(), 0).is_null()
+            );
+            assert!(fanos_service_accept(ptr::null_mut()).is_null());
+            fanos_service_free(ptr::null_mut());
+            assert_eq!(fanos_stream_read(ptr::null_mut(), ptr::null_mut(), 0), FANOS_ERR_NULL);
+            assert_eq!(fanos_stream_write(ptr::null_mut(), ptr::null(), 0), FANOS_ERR_NULL);
+            fanos_stream_free(ptr::null_mut());
         }
     }
 
     #[test]
+    fn a_non_utf8_config_string_is_rejected_without_opening_anything() {
+        // The config bytes are decoded before any runtime is built, so an undecodable string is a pure
+        // argument failure — no node, no port, no teardown.
+        let cfg = CString::new(vec![b'l', 0xff, 0xfe]).unwrap();
+        // SAFETY: a valid NUL-terminated C string (of invalid UTF-8 bytes).
+        assert!(unsafe { fanos_open(cfg.as_ptr()) }.is_null(), "invalid UTF-8 cannot be a config");
+    }
+
+    // ---- The runtime-free ABI boundary ------------------------------------------------------------------
+    //
+    // These exercise every raw-pointer operation in the crate that is not a handle dereference, with no
+    // reactor involved — so `cargo miri test -p fanos-ffi --lib` executes them and checks the crate's
+    // `unsafe` for UB. That matters because this is the workspace's *only* crate with `unsafe`: every other
+    // crate denies it, so a Miri job pointed anywhere else checks code that cannot contain the bug.
+
+    #[test]
+    fn a_null_pointer_borrows_as_a_slice_only_at_length_zero() {
+        let bytes = [1u8, 2, 3];
+        let mut buf = [0u8; 2];
+        // SAFETY: the non-null pointers address live buffers of exactly the stated lengths.
+        unsafe {
+            assert_eq!(as_slice(ptr::null(), 0), Some(&[][..]), "null + 0 is the empty slice");
+            assert_eq!(as_slice(ptr::null(), 1), None, "a null pointer with a length is a lie");
+            assert_eq!(as_slice(bytes.as_ptr(), 3), Some(&bytes[..]));
+            assert_eq!(as_slice_mut(ptr::null_mut(), 0).map(|s| s.len()), Some(0));
+            assert!(as_slice_mut(ptr::null_mut(), 1).is_none());
+            assert_eq!(as_slice_mut(buf.as_mut_ptr(), 2).map(|s| s.len()), Some(2));
+        }
+    }
+
+    #[test]
+    fn a_size_probe_reports_the_required_length_and_writes_nothing() {
+        let value = b"nine-byte";
+        // The probe form: no buffer at all, only a length slot. It must learn the exact allocation it needs.
+        let mut need = usize::MAX;
+        // SAFETY: `need` is a writable `usize`; a null buffer with zero capacity is the probe form.
+        let rc = unsafe { write_out(value, ptr::null_mut(), 0, &raw mut need) };
+        assert_eq!(rc, FANOS_ERR_BUFFER, "a probe cannot hold the value");
+        assert_eq!(need, value.len(), "the probe learns the exact length to allocate");
+
+        // A real buffer that is too small behaves identically, and is left untouched.
+        let mut short = [0u8; 4];
+        let mut need = 0usize;
+        // SAFETY: `short` has 4 writable bytes and `need` is writable.
+        let rc = unsafe { write_out(value, short.as_mut_ptr(), short.len(), &raw mut need) };
+        assert_eq!(rc, FANOS_ERR_BUFFER);
+        assert_eq!(need, value.len());
+        assert_eq!(short, [0u8; 4], "a rejected write leaves the caller's buffer untouched");
+    }
+
+    #[test]
+    fn a_buffer_one_byte_short_is_rejected_rather_than_overrun() {
+        // The boundary the capacity check must get exactly right: a value one byte longer than the buffer.
+        // Kept in its own heap allocation of exactly that size, so an off-by-one in the check shows up as a
+        // Miri-visible overrun instead of a silent write into a stack frame's slack.
+        let value = b"ten-bytes!";
+        let mut out = vec![0u8; value.len() - 1];
+        let mut need = 0usize;
+        // SAFETY: `out` has `value.len() - 1` writable bytes, distinct from `value`; `need` is writable.
+        let rc = unsafe { write_out(value, out.as_mut_ptr(), out.len(), &raw mut need) };
+        assert_eq!(rc, FANOS_ERR_BUFFER, "one byte short is too short");
+        assert_eq!(need, value.len(), "the caller still learns the length it needs");
+        assert!(out.iter().all(|&b| b == 0), "a rejected write touches nothing");
+    }
+
+    #[test]
+    fn an_exactly_sized_buffer_is_filled_without_overrunning() {
+        // Sized to the value exactly, in its own heap allocation: under Miri a one-byte overrun is caught
+        // here, where a stack array would leave it in bounds of the frame.
+        let value = b"exact-fit";
+        let mut out = vec![0u8; value.len()];
+        let mut len = 0usize;
+        // SAFETY: `out` has exactly `value.len()` writable bytes, distinct from `value`; `len` is writable.
+        let rc = unsafe { write_out(value, out.as_mut_ptr(), out.len(), &raw mut len) };
+        assert_eq!(rc, FANOS_OK);
+        assert_eq!(len, value.len());
+        assert_eq!(&out[..], value, "the whole value is copied out");
+    }
+
+    #[test]
+    fn an_empty_value_never_forms_a_copy_from_a_null_buffer() {
+        // An empty value must skip the copy rather than rely on the count: `core::ptr`'s validity rule is
+        // that "for memory accesses of size zero, *every non-null pointer* is valid" — null is not, even at a
+        // zero count. Unlike the two overrun tests above, Miri does *not* currently flag a zero-count copy
+        // from a null `dst` (verified by deleting the guard: the suite still passed), so this test pins the
+        // observable contract — OK with a reported length of 0 — while the guard itself rests on the
+        // documented rule rather than on a tool that would catch its removal.
+        let mut len = usize::MAX;
+        // SAFETY: `len` is writable; a null buffer with zero capacity is the probe form.
+        let rc = unsafe { write_out(&[], ptr::null_mut(), 0, &raw mut len) };
+        assert_eq!(rc, FANOS_OK, "an empty value fits any capacity, including none");
+        assert_eq!(len, 0, "the reported length conveys the emptiness");
+    }
+
+    #[test]
+    fn a_malformed_out_buffer_is_rejected_before_anything_is_written() {
+        let value = b"value";
+        let mut out = [0u8; 8];
+        let mut len = 0usize;
+        // A null length slot leaves the caller nowhere to learn the length: an argument error.
+        assert!(!out_buffer_is_valid(out.as_ptr(), out.len(), ptr::null()));
+        // SAFETY: `out` is writable; the null length slot must be rejected, not dereferenced.
+        let rc = unsafe { write_out(value, out.as_mut_ptr(), out.len(), ptr::null_mut()) };
+        assert_eq!(rc, FANOS_ERR_NULL);
+        assert_eq!(out, [0u8; 8], "a rejected call writes nothing");
+        // A null buffer with a non-zero capacity is a lie about capacity.
+        assert!(!out_buffer_is_valid(ptr::null(), 8, &raw const len));
+        // SAFETY: `len` is writable; the null buffer must be rejected, not written through.
+        assert_eq!(unsafe { write_out(value, ptr::null_mut(), 8, &raw mut len) }, FANOS_ERR_NULL);
+        // The two well-formed shapes: a real buffer, and a zero-capacity size probe.
+        assert!(out_buffer_is_valid(out.as_ptr(), out.len(), &raw const len));
+        assert!(out_buffer_is_valid(ptr::null(), 0, &raw const len));
+    }
+
+    #[test]
+    fn a_c_string_is_written_with_its_terminator_and_only_when_it_fits() {
+        let name = "abcdef.fanos";
+        let probe = [0 as c_char; 4];
+        // Capacity must hold the text *and* the terminator, so an exactly-text-sized buffer does not fit.
+        assert!(!cstr_fits(name, ptr::null(), 1024), "a null buffer never fits");
+        assert!(!cstr_fits(name, probe.as_ptr(), name.len()), "no room for the terminator");
+        assert!(cstr_fits(name, probe.as_ptr(), name.len() + 1), "text plus terminator is enough");
+
+        // Written into an allocation sized to exactly text + NUL, then read back the way C reads it (by
+        // scanning to the terminator) — so an off-by-one terminator is either a Miri error or a bad string.
+        let mut buf = vec![0 as c_char; name.len() + 1];
+        assert!(cstr_fits(name, buf.as_ptr(), buf.len()));
+        // SAFETY: `cstr_fits` holds — `buf` is non-null with `name.len() + 1` writable bytes, and `name` is a
+        // distinct `&'static str`.
+        unsafe { write_cstr(name, buf.as_mut_ptr()) };
+        // SAFETY: `write_cstr` NUL-terminated the buffer, so it is a valid C string for the read.
+        let read_back = unsafe { CStr::from_ptr(buf.as_ptr()) };
+        assert_eq!(read_back.to_str().unwrap(), name, "the name round-trips as a C string");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "opens a node; Miri has no reactor (kqueue/epoll are unsupported foreign calls)")]
     fn lookup_of_a_missing_key_is_not_found_and_reports_length() {
         let _serial = serial();
         let node = open_loopback();
@@ -575,6 +786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens a node; Miri has no reactor (kqueue/epoll are unsupported foreign calls)")]
     fn lookup_of_an_empty_value_with_a_size_probe_is_safe() {
         // An empty value probed with a null buffer + zero capacity must not pass a null `dst` to
         // `copy_nonoverlapping` (UB even for a zero count) — it returns OK with length 0, or NOTFOUND if the
@@ -597,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens a node; Miri has no reactor (kqueue/epoll are unsupported foreign calls)")]
     fn publish_then_lookup_round_trips_through_the_c_abi() {
         let _serial = serial();
         // A value published through the C ABI is recovered through it — the full store path (put → get)

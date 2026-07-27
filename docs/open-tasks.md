@@ -26,11 +26,33 @@ No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes 
 - *Measure reachability transitively over `Cargo.toml`* — checking only `fanos-node/src` falsely reports `fanos-proteus` as
   unwired (it is reached via `fanos-quic`'s shaper).
 
-### [A] Run the ZK proof stack on a schedule
-`cargo test -p fanos-obolos --release -- --ignored` → 7 passed, 84 s: the currency's proofs are sound at real
-`bits = LOG_BASE = 16`. But the default `cargo test` does not include them, so nothing re-checks soundness after a change.
-Needs a nightly or pre-release job. Also worth separating the two things `#[ignore]` currently conflates: *measurements* (15 in
-`fanos-sim`, must never gate) from *cost-gated assertions* (13 in `fanos-obolos`, must gate somewhere).
+### [A] `#[ignore]` conflates two incompatible things
+34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
+**never** gate, and *cost-gated assertions* (13 in `fanos-obolos`, 2 each in `taxis`/`quic`/`ffi`) that must gate **somewhere**.
+So "run the ignored tests" cannot mean one thing, and the nightly `heavy` job has to name packages instead of selecting a
+category. Distinguish them — a `measure_` name convention plus a required-vs-optional split, or a cargo feature per class.
+
+### [A] The real-QUIC suites are load-sensitive, and CI runners are the load case
+Measured 2026-07-27, both runs minutes apart on the same tree: `fanos-node --test anonymous_quic` in isolation →
+**5 passed, 2.69 s**; during a full `cargo test --workspace --features validator` with a large unrelated build occupying the
+machine → **4 of 5 failed, 242 s** (the rest of the run was clean: 741 passed across 40 suites). The suites do not fail on
+logic, they fail on starvation — QUIC handshake timeouts under CPU contention.
+- **Why it matters now:** CI (§2.0) runs the whole workspace on a 2-core hosted runner, i.e. permanently in the starved
+  regime. A gate that flakes teaches people to ignore it, which is how the repo got a formatter gate nobody looked at.
+- **Do not "fix" with longer timeouts** — that hides starvation instead of bounding it, and the numbers above give no
+  principled multiplier. The decision is how the harness bounds concurrency for *transport-bound* suites specifically:
+  a serial marker on that class, or `--test-threads` scoped to them, so their concurrency is a property of the suite rather
+  than of whatever else shares the machine. Same root question as the `#[ignore]` conflation above: the harness has no way to
+  say what *class* a test belongs to.
+
+### [A] No machine-checked formatting convention
+`cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's
+100-column default, and as the *first* gate step it hid every gate below it — see `docs/audit-2026-07-27-architecture.md` §2.0).
+Nothing now enforces any width. The house style is ~120 columns: **15 768** lines exceed 100, **1 395** exceed 120, but only
+**84** exceed 140 — and that tail concentrates in six files (22 in `fanos-obolos/tests/scenarios.rs`, 10 in
+`fanos-observatory/src/bin/lab.rs`, 9 in `fanos-dromos/src/naming.rs`). So a 140-column ceiling costs 84 rewraps and is
+enforceable today; a 120-column one costs 1 395 and is the mechanical reformat that was rejected. Decide the bound, fix the
+tail, add the check.
 
 ### [A] Split `fanos-quic/src/driver.rs` — 2 125 production lines, eight concerns
 The workspace's largest production file, larger than `overlay/mod.rs` is *after* its split, and never split. Concerns:

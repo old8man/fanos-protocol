@@ -76,8 +76,9 @@ void fanos_stream_free(FanosStream *stream);
 
 /* Host a hidden service whose identity derives from `seed` (seed_len bytes). Writes the service's
  * "<addr>.fanos" name (NUL-terminated) into `addr_out` (capacity addr_out_cap, >= ~70). Returns an owning
- * service handle, or NULL (bad argument / addr_out too small / publish failed). Free with
- * fanos_service_free, before fanos_free. */
+ * service handle, or NULL (bad argument / addr_out too small / publish failed); on failure `addr_out` is
+ * left untouched, so a NULL return means nothing was written. Free with fanos_service_free, before
+ * fanos_free. */
 FanosService *fanos_service_host(FanosNode *node, const uint8_t *seed, size_t seed_len,
                                  char *addr_out, size_t addr_out_cap);
 

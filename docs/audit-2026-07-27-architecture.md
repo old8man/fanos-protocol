@@ -37,6 +37,49 @@ test targets, so test code is held to the same bar as shipping code.
 
 ## 2. Findings
 
+### 2.0 CRITICAL — every CI job failed before it verified anything (fixed)
+
+Measured, not read. All three jobs in `.github/workflows/ci.yml` died on their own arguments:
+
+- **`gate` died at its first step.** `cargo fmt --all --check` exits 1 with **2 650 diff hunks** across the workspace — the
+  source is hand-wrapped denser than rustfmt's 100-column default (15 768 lines exceed 100 columns; the house width is ~120,
+  with only 84 lines past 140). Everything after that step — clippy, the entire test suite, the V1–V22 reference verifier,
+  three simulator scenarios, the benchmark compile — **never ran**.
+- **`portability` and `miri` both named `fanos-crypto`, a package that does not exist** (cargo: *"a workspace member with a
+  similar name exists: `fanos-pqcrypto`"*). Both failed at package resolution.
+
+So the platform had **no working continuous verification of any kind**, while every quality claim in this repository rests on
+the word "verified". This is the finding that precedes the others: it is why §2.2 and §2.4 below could be true unnoticed.
+
+Three further defects, each of which would have kept a job red after the obvious name fix:
+
+1. `cargo build -p fanos-runtime --no-default-features --features libm` **does not build for wasm32** — the overlay engine
+   imports `fanos_code::{da, erasure}`, which are `alloc`-gated. The CI line contradicted the embedded build
+   (`--features alloc,libm`) that the crate's own manifest documents.
+2. Clippy and the tests ran **without `--features validator`**, so the ledger/consensus paths were neither linted nor tested —
+   including the five consensus liveness defects fixed earlier the same day. Neither configuration is a superset: three
+   `cfg(not(feature = "validator"))` fallbacks are visible only to the default build, so both must run.
+3. **Miri was pointed away from the only `unsafe` in the workspace.** `fanos-ffi` is the sole crate containing any (57 sites —
+   it is the C ABI); the other 42 deny or forbid it via `[workspace.lints]`, 36 escalating to `forbid`. The job checked
+   `fanos-diakrisis`, `fanos-field` and the nonexistent crate — code that *cannot* contain the bug the tool looks for.
+
+**Resolution.** The formatter step is deleted rather than satisfied: reformatting 2 650 hunks would overwrite deliberately
+hand-wrapped source, and a gate that has never passed catches nothing while hiding every gate below it. Both feature
+configurations are now linted and tested; every portability line is verified to build with exactly the features listed; a
+nightly `heavy` job runs the real-parameter ZK proofs (§2.2) and the real-QUIC end-to-end paths (§2.4), closing both.
+
+Miri was made load-bearing rather than merely re-aimed. Its target crate's raw-pointer contracts were only reachable through a
+live node — and Miri cannot drive a reactor (`kqueue`/`epoll` are unsupported foreign calls), so it saw none of them. The
+runtime-free half of the ABI is now factored out (borrowing caller buffers, the size-probe copy-out, the C-string terminator),
+the handle paths are `cfg_attr(miri, ignore)`d, and Miri executes 11 tests over the actual `unsafe` in 1.7 s.
+
+That the job *can fail* was verified by injecting defects, not argued: an off-by-one in the copy-out capacity check and a
+terminator written one byte late are both reported as out-of-bounds writes. The first attempt at this proof **failed** — the
+suite passed with the injected off-by-one, because no test probed the `value.len() == out_cap + 1` boundary. A boundary test
+now closes that gap. A third injection (deleting the empty-value guard, so a zero-count copy takes a null `dst`) is *not*
+caught by Miri; `core::ptr`'s rule is that only a **non-null** pointer is valid even for zero-sized accesses, so the guard
+stands on the documented contract, and the test comment now says that instead of claiming a tool would catch its removal.
+
 ### 2.1 HIGH — "libraries ahead of wiring" persists, and is now quantified
 
 Past passes named this as a meta-pattern without a number. It has one.
@@ -77,6 +120,9 @@ The residual is process, not soundness: the default `cargo test` covers the stat
 nothing re-checks the currency's real-parameter soundness after a change unless someone remembers. 84 s in release is cheap
 enough for a nightly or pre-release job, and the finding is that it does not have one.
 
+**Closed** by the nightly `heavy` job (§2.0) — `cargo test -p fanos-obolos --release -- --ignored`, plus a manual
+`workflow_dispatch` trigger for pre-release runs.
+
 ### 2.3 MEDIUM — thin unit coverage where it matters most
 
 | crate | prod lines | ratio | tests | note |
@@ -92,6 +138,10 @@ Everything else sits at 0.4–1.9. `fanos-ports` (368 lines, 0 tests) is pure tr
 15 in `fanos-sim` (measurements and probes — legitimate, they print rather than assert), 13 in `fanos-obolos` (§2.2), 2 each in
 `taxis`, `quic`, `ffi`. Nothing runs them on a schedule. Two categories are conflated under one attribute — *measurements*,
 which should never gate, and *cost-gated assertions*, which must gate somewhere. They should be distinguishable.
+
+**Partly closed** by the nightly `heavy` job (§2.0): the cost-gated assertions in `fanos-obolos` (13) and `fanos-ffi` (2) now
+gate nightly. The residual is the conflation itself — `fanos-sim`'s 15 measurements share one attribute with assertions that
+must gate, so "run the ignored tests" cannot mean one thing.
 
 ### 2.5 LOW — suppressed-lint inventory
 
