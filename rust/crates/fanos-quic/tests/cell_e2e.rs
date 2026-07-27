@@ -109,3 +109,64 @@ async fn a_stored_value_survives_losing_a_node() {
         n.shutdown();
     }
 }
+
+/// A **large** App frame fanned out to every other cell point arrives at every one of them.
+///
+/// The property the DA path depends on and nothing asserted. `Command::Emit` is fire-and-forget — it reports only
+/// whether the *local* input queue accepted the frame — so a frame lost anywhere past that point is silently gone, and
+/// the only caller that noticed was a consensus cell that stopped finalizing.
+///
+/// Sized like a real DA shard of a shielded block: measured at **6203 bytes** on the live path, against 43 bytes for a
+/// plain-transfer block. That two-orders-of-magnitude gap is why every small-payload suite passed while the shielded one
+/// wedged, with validators holding their own dispersed shard and never obtaining a single one from a peer across 48 s of
+/// retries. Both sizes are asserted here so a regression says which one broke.
+#[tokio::test]
+async fn a_large_app_frame_fans_out_to_every_cell_point() {
+    use fanos_runtime::{Command, Notification};
+
+    let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
+    let n = cell.nodes.len();
+
+    for &bytes in &[43usize, 6203] {
+        // A distinct payload per size, so a receiver can tell which fan-out it is seeing. `Emit` takes a *wire frame*,
+        // not raw bytes — an unparseable frame is dropped on receipt, which is itself worth knowing.
+        let body: Vec<u8> = (0..bytes).map(|i| u8::try_from((i + bytes) % 251).unwrap_or(0)).collect();
+        let mut frame = Vec::new();
+        fanos_wire::encode_frame(fanos_wire::FrameType::App.code(), &body, &mut frame);
+        let mut streams: Vec<_> = cell.nodes.iter().map(|n| n.client().subscribe()).collect();
+        for (i, node) in cell.nodes.iter().enumerate() {
+            if i != 0 {
+                assert!(
+                    cell.nodes[0].client().command(Command::Emit { to: node.address(), frame: frame.clone() }),
+                    "the local input queue accepted the {bytes}-byte frame for point {i}"
+                );
+            }
+        }
+
+        // Count arrivals with a generous ceiling: this asserts delivery, not latency.
+        let mut arrived = 0;
+        for (i, rx) in streams.iter_mut().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            let got = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Ok(Notification::App { body: got, .. }) = rx.recv().await
+                        && got == body
+                    {
+                        return;
+                    }
+                }
+            })
+            .await;
+            if got.is_ok() {
+                arrived += 1;
+            }
+        }
+        assert_eq!(arrived, n - 1, "every one of the {} peers received the {bytes}-byte frame", n - 1);
+    }
+
+    for n in cell.nodes {
+        n.shutdown();
+    }
+}

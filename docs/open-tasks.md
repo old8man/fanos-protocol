@@ -222,11 +222,23 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     Happy-path DA work drops from N proposals to 1, and replicas rank the same set because skeletons need no sampling.
   - **Measured:** `taxis_quic` went from **no block in 240 s** to green in **6.5–10.7 s**. `dromos_quic`'s
     network-submission test also went green — same root cause.
-  - **Residual:** `dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end` still refutes, and it is a
-    *different* mechanism — blocks commit (`h1`) while the shielded transfer executes **nowhere** (`s0/n1` on all seven),
-    frozen. Blocks finalizing without the transaction executing points at the anti-MEV **reveal** gather (execution waits
-    on keyper shares and drops the tx after the reveal window), not at DA. Note it submits to every validator while its
-    now-passing sibling emits to one.
+  - **Residual: `dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end`.** Still refutes. What is now
+    *established*, all measured on the live path:
+    - Only the **proposer** finalizes (`6:h1`, everyone else `h0`); the others hold the commit certificate and wedge
+      waiting for a body. So it is DA availability, **not** the anti-MEV reveal as the previous revision guessed.
+    - Rounds do advance — five distinct blocks sit pending at height 0, one per rotated leader.
+    - Dispersal is **accepted and answered**: every proposer `Emit` returns `true`, shard `Request`s arrive at their
+      target with `held=true`, and the target responds.
+    - Yet a replica's shard bitmap sits at `1......` (its own shard only) for 48 s of per-tick retries, occasionally
+      reaching `11....1`. Shards are requested, answered, and largely do not land.
+    - Recovery is **pattern**-dependent, not count-dependent: `erasure::reconstruct` gates on
+      `lrc::is_recoverable_fano(mask)` with `K = 3, N = 7`, so *which* shards are present decides it.
+    - **REFUTED — frame size.** A shielded block's shard frame is **6203 bytes** against 43 for a plain-transfer block,
+      which looked like the whole explanation for "every small-payload suite passes, the shielded one wedges". It is not:
+      a new transport test fans both sizes out to all six peers and both arrive, in 0.62 s. `MAX_FRAME` is 1 MiB and the
+      overlay maps `Emit` straight to `Effect::Send`.
+    - Next: model **partial** sampling in `consensus_sim` (it now models dispersal latency but still hands over the full
+      shard set), so this reproduces deterministically instead of over a 50 s QUIC run.
   - **Two of my own errors on the way, both caught by the instrument rather than by reading:**
     - `rank_round0` first called `prepare_round0_min()` unconditionally, which prepares on *first sight* — precisely the
       PREPARE-splitting the collection window exists to prevent. Two engine tests went red immediately.
@@ -254,6 +266,13 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
 ---
 
 ## Simulator hardening (the standing directive, applied to the harness itself)
+
+**App-frame fan-out is now asserted at the transport level** (`fanos-quic/tests/cell_e2e.rs`,
+`a_large_app_frame_fans_out_to_every_cell_point`). `Command::Emit` is fire-and-forget and reports only whether the *local*
+input queue accepted the frame, so anything lost past that point was silently gone and nothing in the suite noticed —
+the only caller that did was a consensus cell that stopped finalizing. Both live sizes are pinned: 43 bytes (a
+plain-transfer block's DA shard) and 6203 bytes (a shielded block's). It earns its place by having **refuted** a
+plausible hypothesis rather than confirming one.
 
 **The sim now models DA dispersal, because not modelling it hid a total consensus liveness failure**
 (`consensus_sim::Cluster::da_delay`). `shards_for` handed every replica the complete shard set instantly, so the sim
