@@ -222,66 +222,36 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     Happy-path DA work drops from N proposals to 1, and replicas rank the same set because skeletons need no sampling.
   - **Measured:** `taxis_quic` went from **no block in 240 s** to green in **6.5–10.7 s**. `dromos_quic`'s
     network-submission test also went green — same root cause.
-  - **Residual: `dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end`.** Still refutes. What is now
-    *established*, all measured on the live path:
-    - Only the **proposer** finalizes (`6:h1`, everyone else `h0`); the others hold the commit certificate and wedge
-      waiting for a body. So it is DA availability, **not** the anti-MEV reveal as the previous revision guessed.
-    - Rounds do advance — five distinct blocks sit pending at height 0, one per rotated leader.
-    - Dispersal is **accepted and answered**: every proposer `Emit` returns `true`, shard `Request`s arrive at their
-      target with `held=true`, and the target responds.
-    - Yet a replica's shard bitmap sits at `1......` (its own shard only) for 48 s of per-tick retries, occasionally
-      reaching `11....1`. Shards are requested, answered, and largely do not land.
-    - Recovery is **pattern**-dependent, not count-dependent: `erasure::reconstruct` gates on
-      `lrc::is_recoverable_fano(mask)` with `K = 3, N = 7`, so *which* shards are present decides it.
-    - **REFUTED — frame size.** A shielded block's shard frame is **6203 bytes** against 43 for a plain-transfer block,
-      which looked like the whole explanation for "every small-payload suite passes, the shielded one wedges". It is not:
-      a new transport test fans both sizes out to all six peers and both arrive, in 0.62 s. `MAX_FRAME` is 1 MiB and the
-      overlay maps `Emit` straight to `Effect::Send`.
-    - **The pattern is stable across runs and it is unanimity that fails, not consensus.** A quorum finalizes and
-      executes; one or two validators sit at genesis forever holding the commit certificate without a body. Measured
-      thrice: `1:h0` alone stuck (6 of 7 executed), then `0,4,5:h0` (4 of 7), and the private-transfer test consistently
-      at only the proposer. So the sibling's single green run after the resample fix was luck, not a fix — corrected here.
-    - **`fanos_taxis::da::Sampler` extracted (sans-I/O), which is the structural half of the fix.** The sampling decision
-      procedure was inline in the driver, which is exactly why the simulator could not exercise it and why a total
-      liveness failure was invisible: the sim cannot "differ only in transport" while the logic under test *is* tangled
-      into the transport. The driver now owns only the I/O, and its `DaState`/`PendingDa`/`try_reconstruct` are gone.
-      Five unit tests, including one that asserts the fixture block genuinely needs more than one shard — without it an
-      empty payload reconstructs from a single shard and every exchange test would be vacuous.
-    - **`consensus_sim` now drives the real `Sampler`** — one per validator, ONE shard dispersed to each, gathered by
-      request/response over the bus, with dispersal *staggered* per (validator, block) so a request can reach a peer that
-      holds nothing yet. The lookalike `shards_for`-hands-you-everything model is gone.
-    - **And it does NOT reproduce the residual, which is itself the finding.** Both shapes pass, including the exact
-      `dromos` shape — `sortition: None`, one proposer, dispersed bodies, **unanimity** asserted on both finalization and
-      `Sampler::in_flight() == 0` (`every_validator_recovers_a_dispersed_block_not_merely_a_quorum`, verified to fail
-      0-of-7 when sampling is disabled). So the sampling *logic* is sound and the divergence is in the live message path,
-      not the decision procedure.
-    - **⚠️ DA IS NOT THE CAUSE OF THIS FAILURE. Two iterations were spent on the wrong subsystem; here is the measurement
-      that ends it.** With the sampler instrumented, at the frozen fixed point **every one of the seven validators reports
-      `pending=0, backlog=0`** — no node is waiting for a body and no node has an unprocessed queue. Availability is
-      *clear* while the cell is wedged.
-    - The per-pair questions raised in the previous revision are all answered, and all negative: requests **do** arrive
-      (534 of them), they **are** served (576 of 580, only 4 misses), all seven coordinates appear as requesters in
-      roughly equal numbers, and every ordered pair of cell points delivers a 6203-byte frame in 0.71 s
-      (`cell_e2e::every_ordered_pair_of_cell_points_can_deliver`). There is no directional gap.
-    - **What is actually happening:** two validators finalize height 0, five never do, and the shielded transfer executes
-      **nowhere** — including on the two that finalized. Since nothing is pending, the transaction-carrying block is not
-      being *awaited*; it is being proposed and then not prepared. Both an empty 43-byte block and a 6203-byte
-      payload-carrying block are dispersed each round, so the payload block is reaching the cell and failing a gate in
-      `on_propose` (or failing to gather PREPAREs), after which the round times out and the cycle repeats forever.
-    - **This also reverses a correction I made in `eab901e`.** I had discarded the reveal/execution hypothesis on the
-      reasoning that "blocks commit without executing ⇒ DA". `pending=0` shows that inference was invalid. Both the
-      admission gates (`valid_seal`, `verify_structure`, `valid_last_commit`) and the anti-MEV reveal gather are live
-      candidates again.
-    - Next observable: instrument `on_propose`'s reject reasons directly — which gate drops the payload block, on how many
-      validators. That is one measurement and it decides between "rejected on admission" and "accepted but never
-      prepared", which have nothing in common as fixes.
-  - **Two of my own errors on the way, both caught by the instrument rather than by reading:**
-    - `rank_round0` first called `prepare_round0_min()` unconditionally, which prepares on *first sight* — precisely the
-      PREPARE-splitting the collection window exists to prevent. Two engine tests went red immediately.
-    - I added an eviction timer for a winner whose body never arrives, keyed off the collection window. The window is one
-      tick and sampling takes several, so it evicted **every honest proposer in turn** until the lottery was empty.
-      Removed: the round timeout is already the correct backstop, and it is the one a withheld public proposal has always
-      used. An eviction timer here would have to be derived from sampling latency, which a sans-I/O engine cannot see.
+  - **Defect C — a locked validator never released its lock, so one lost round of COMMIT votes ended the chain. FIXED.**
+    This was the actual cause of the private-transfer failure, after DA had been eliminated.
+    - `check_prepared` locks a validator on a block the moment a PREPARE quorum forms; `locked_block` was cleared **only**
+      by `reset_round_state`, i.e. only on finalizing a height. `on_timeout` advanced the round and left the lock. So a
+      PREPARE quorum without a COMMIT quorum wedged the height forever: every later proposal is a different block, the
+      `locked_block` gate refuses it, no quorum forms for anything. Measured live as six of seven validators reporting
+      `locked: 3` refusals with a clear DA path and an empty queue.
+    - **Leader rotation looks like the escape and is not.** A block header commits to
+      `(parent, height, epoch, proposer, tx_root, da_commit, last_commit_root)` and *not* to the round, so a re-proposal
+      by the same proposer is byte-identical and a locked validator accepts it — which does recover a cell whose mempool
+      is unchanged, and is why the first reproduction attempt passed. It fails exactly when the mempool moves underneath,
+      which is the ordinary case: a client submits into a running cell, so the locked block was empty and everything
+      after it carries the transaction.
+    - **Fix:** `reprepare_lock` — on entering a round, re-PREPARE the block you are locked on (Tendermint's rule). Safe by
+      construction rather than by argument: it only ever prepares the block already locked, never a conflicting one.
+      Liveness follows because a quorum locked on the same block re-prepares it together, so the PREPARE quorum re-forms
+      and the COMMIT quorum follows. Requires the body, so a validator locked on a hash it never received recovers by
+      sampling or state sync instead.
+    - Verified: `a_height_still_finalizes_after_a_prepare_quorum_that_never_committed` reproduces the wedge (0 of 7) and
+      passes with the fix; **both randomized Byzantine no-fork suites pass in release**, which is the check that matters
+      for a change to when PREPAREs are cast; and `dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end`
+      is **green after four iterations red**.
+  - **`ConsensusEngine::rejects()` / `ProposalRejects` added, and it is what found defect C.** Counters (not logs — the
+    engine is `no_std` and sans-I/O) for each refusal reason, with the fused entitlement/link/structure/last_commit gate
+    split apart so the counter says *which* half fired. A rejected block and an unprepared one look identical from
+    outside — the round times out, the height stalls — and they have nothing in common as fixes.
+  - **Residual: the sibling `a_transaction_submitted_over_the_network_to_one_validator_reaches_the_whole_cell`.** Now fails
+    differently and less severely: **4 of 7 executed** (`1,2,4,6` at h1/s1/n2) with three validators stranded at genesis,
+    where before the whole cell wedged. Unanimity still fails. Next: read `rejects()` on the three stranded validators —
+    the counters now exist, so this is one measurement rather than an investigation.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so

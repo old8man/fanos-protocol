@@ -18,6 +18,7 @@ use fanos_taxis::committee::{epoch_seal_line, leader, leader_line, leader_ticket
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
 use fanos_taxis::da::Sampler;
+use fanos_taxis::Phase;
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_taxis::state::StateMachine;
@@ -114,6 +115,12 @@ struct Cluster {
     /// simultaneous dispersal every peer already holds its shard and every first request succeeds — which is the one
     /// arrangement that cannot exhibit the race that deadlocked a live cell.
     dispersing: Vec<(u32, usize, [u8; 32], Vec<u8>)>,
+    /// Drop every vote in this phase while set — a network hiccup that lands *between* PREPARE and COMMIT.
+    ///
+    /// The one condition that wedges a locking consensus permanently, and nothing exercised it: a PREPARE quorum forms
+    /// (so every validator locks) while the COMMIT quorum does not (so the height never finalizes and the lock is never
+    /// released). Every subsequent round's proposal is then a *different* block, which the locked validators refuse.
+    drop_phase: Option<Phase>,
     /// Validators that never receive block bodies (Propose), to exercise the commit-cert-before-body path.
     deaf_propose: BTreeSet<usize>,
     /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
@@ -159,6 +166,7 @@ impl Cluster {
             da_delay: 0,
             samplers: (0..N).map(|i| Sampler::new(u8::try_from(i).unwrap_or(0))).collect(),
             dispersing: Vec::new(),
+            drop_phase: None,
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
@@ -315,6 +323,11 @@ impl Cluster {
         }
     }
 
+    /// Start or stop dropping votes of one phase.
+    fn set_drop_phase(&mut self, phase: Option<Phase>) {
+        self.drop_phase = phase;
+    }
+
     fn deliver(&mut self, from: usize, msg: &ConsensusMsg) {
         if let ConsensusMsg::Propose(b) = msg
             && !self.proposed.iter().any(|p| p.hash() == b.hash())
@@ -327,6 +340,12 @@ impl Cluster {
         {
             let b = b.clone();
             self.disperse(from, &b);
+            return;
+        }
+        // A dropped phase never reaches anyone — the hiccup is in the network, not in a validator.
+        if let ConsensusMsg::Vote(sv) = msg
+            && self.drop_phase == Some(sv.vote.phase)
+        {
             return;
         }
         for i in 0..N {
@@ -1418,4 +1437,43 @@ fn b1_only_authenticated_reveals_are_buffered() {
     let genuine = RevealMsg::signed(commit, 0, share_bytes(1, &[0x66; 32]), &keys[0].sig);
     let _ = engine.step(Input::Reveal(genuine));
     assert_eq!(engine.pending_reveal_count(), 1, "a member-signed reveal is buffered");
+}
+
+#[test]
+fn a_height_still_finalizes_after_a_prepare_quorum_that_never_committed() {
+    // THE LIVENESS DEFECT `dromos_quic` was actually hitting, reproduced deterministically.
+    //
+    // `check_prepared` locks a validator on a block the moment a PREPARE quorum forms, and `locked_block` is cleared
+    // ONLY by `reset_round_state` — that is, only on finalizing a height. `on_timeout` advances the round and leaves the
+    // lock in place. So if a PREPARE quorum forms while the COMMIT quorum does not, every validator is locked on a block
+    // that will never finalize, and every later round proposes a *different* block which the locked validators refuse.
+    // The height is wedged permanently. Measured live as six of seven validators reporting `locked: 3` refusals with a
+    // clear DA path and an empty queue.
+    //
+    // The recovery this asserts is what any locking consensus needs: a validator must be able to release a lock on
+    // evidence that the cell has moved on, or a single lost round of COMMIT votes ends the chain.
+    let mut c = Cluster::new(&genesis());
+
+    // Round 0 with an EMPTY mempool: proposals and PREPAREs flow, so every validator locks on an empty block — but no
+    // COMMIT is delivered. Empty matters. A block header commits to `(parent, height, epoch, proposer, tx_root,
+    // da_commit, last_commit_root)` and NOT to the round, so a re-proposal by the same proposer is byte-identical and a
+    // locked validator can accept it — which is why leader rotation alone recovers a *static* mempool. Here the mempool
+    // changes underneath, so every later proposal differs from the locked block and the lock can never be matched again.
+    c.set_drop_phase(Some(Phase::Commit));
+    c.tick();
+    assert_eq!(c.honest_count_at(0), 0, "no COMMIT quorum, so nothing finalized yet");
+
+    // Now the transaction arrives — exactly the live sequence, where a client submits into a running cell.
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"lock-release");
+    c.submit_all(&tx);
+
+    // The network heals and rounds advance. A locking consensus that cannot release must stall here forever.
+    c.set_drop_phase(None);
+    for _ in 0..8 {
+        c.timeout();
+        c.tick();
+    }
+
+    assert_eq!(c.honest_count_at(0), N, "the cell recovers and every validator finalizes height 0");
+    assert_eq!(c.hashes_at(0).len(), 1, "and on one block — releasing a lock must not fork the height");
 }

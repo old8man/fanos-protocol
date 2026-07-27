@@ -72,6 +72,35 @@ pub const REVEAL_WINDOW: u64 = 4;
 /// availability is *verified* in-engine rather than trusted as a driver-supplied bit.
 pub type DaShards = [Option<Vec<u8>>; erasure::N];
 
+/// Why proposals were refused, as counters — the observable that tells a **rejected** block apart from an **unprepared**
+/// one.
+///
+/// Both look identical from outside: the round times out and the height never advances. They have nothing in common as
+/// fixes, and distinguishing them by reading the code does not work — a stalled cell was attributed to data availability
+/// for two rounds of investigation before a measurement showed availability was clear.
+///
+/// Counters rather than log lines because this engine is `no_std` and sans-I/O: it has nowhere to write. A driver reads
+/// them and reports; a test asserts on them.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalRejects {
+    /// The proposer was not entitled to propose this `(height, round)`.
+    pub proposer: u64,
+    /// The block did not link to our head at our height and epoch.
+    pub link: u64,
+    /// `tx_root` / `da_commit` / `last_commit_root` did not match the block's own contents.
+    pub structure: u64,
+    /// The recorded `last_commit` was not a valid quorum certificate for the parent.
+    pub last_commit: u64,
+    /// A transaction was not sealed to this epoch's keyper line (anti-MEV admission).
+    pub seal: u64,
+    /// The payload could not be reconstructed from the sampled shards, or failed `da_commit`.
+    pub unavailable: u64,
+    /// An SSLE round-0 proposal carried no verifiable sortition witness.
+    pub witness: u64,
+    /// The block conflicted with the one this validator is locked on.
+    pub locked: u64,
+}
+
 /// Serialize a Shamir share as `x(1) ‖ y`.
 fn share_to_bytes(s: &Share) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + s.y().len());
@@ -455,6 +484,8 @@ pub struct ConsensusEngine<S: StateMachine> {
     // line-member proposal is buffered here (all-propose); the LOWEST ticket is prepared when the collection
     // window closes. Reset per height.
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
+    // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
+    rejects: ProposalRejects,
     // Ticks elapsed since the round-0 collection window opened (the first proposal was buffered), or `None`
     // while it has not opened. The window closes — and the min-ticket is prepared — at `COLLECT_WINDOW_TICKS`
     // or when all line members have proposed (early exit), whichever comes first. Reset per height.
@@ -533,6 +564,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             locked_block: None,
             sortition: None,
             round0_tickets: BTreeMap::new(),
+            rejects: ProposalRejects::default(),
             round0_window: None,
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
@@ -660,6 +692,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
         tx.epoch == self.epoch
             && usize::from(tx.line) == epoch_seal_line(&self.seed, tx.epoch)
             && tx.member_count() == self.params.line_size()
+    }
+
+    /// Why proposals have been refused so far — see [`ProposalRejects`]. Cumulative; diff two reads for a rate.
+    #[must_use]
+    pub fn rejects(&self) -> ProposalRejects {
+        self.rejects
     }
 
     /// Step the engine on one input, returning the actions to take.
@@ -914,6 +952,17 @@ impl<S: StateMachine> ConsensusEngine<S> {
             && block.header.parent == self.chain.head()
             && block.header.epoch == self.epoch;
         if !proposer_ok || !links || !block.verify_structure() || !self.valid_last_commit(&block) {
+            // Counted separately, because "the proposer had no right to propose" and "the block does not link to my
+            // head" are different failures with different fixes, and a fused condition cannot say which fired.
+            if !proposer_ok {
+                self.rejects.proposer += 1;
+            } else if !links {
+                self.rejects.link += 1;
+            } else if !block.verify_structure() {
+                self.rejects.structure += 1;
+            } else {
+                self.rejects.last_commit += 1;
+            }
             if block.header.height > height {
                 self.note_height(block.header.height); // a proposal for a height ahead of us — we are behind
             }
@@ -923,6 +972,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // keyper line. A block carrying even one malformed seal is refused, so a Byzantine proposer cannot
         // slip in a transaction that no honest committee can ever decrypt (which would stall execution).
         if !block.sealed_txs.iter().all(|tx| self.valid_seal(tx)) {
+            self.rejects.seal += 1;
             return Vec::new();
         }
         // Data-availability gate (spec §L4.3 / §10.1), verified IN-ENGINE: reconstruct the payload from the
@@ -931,6 +981,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // the commitment — either way `reconstruct_payload` returns `None` and the validator withholds PREPARE.
         // The engine no longer trusts a driver-supplied availability bit; it checks the shards cryptographically.
         if block.reconstruct_payload(shards).is_none() {
+            self.rejects.unavailable += 1;
             return Vec::new();
         }
         // SSLE round 0: the proposal must carry a valid sortition witness (verified against the proposer's
@@ -938,6 +989,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // so a witness probe cannot be answered faster than a genuine proposal. An unverifiable witness ⇒ ignore.
         let ticket = if sortition_round0 {
             let Some(t) = self.verify_witness(&block) else {
+                self.rejects.witness += 1;
                 return Vec::new();
             };
             Some(t)
@@ -964,6 +1016,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if let Some(locked) = self.locked_block
             && locked != bh
         {
+            self.rejects.locked += 1;
             return Vec::new();
         }
         if self.sent_prepare.contains(&self.round) {
@@ -1549,6 +1602,43 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // Proposals already seen this height stay valid bodies (same parent/height); only the round advances.
         // A fresh round may re-elect this validator as leader; `proposed_round` is compared against the new
         // round, so no reset is needed for it to propose again.
-        self.maybe_propose()
+        let mut out = self.reprepare_lock();
+        out.extend(self.maybe_propose());
+        out
+    }
+
+    /// Re-PREPARE the block this validator is **locked** on, in the round just entered.
+    ///
+    /// Without this a locking consensus deadlocks the moment a PREPARE quorum forms without a COMMIT quorum. The lock is
+    /// set by [`check_prepared`] and released only by [`reset_round_state`] — that is, only on finalizing a height — so
+    /// every later round's proposal is refused by the `locked_block` gate, no quorum can form for anything, and the
+    /// height never advances again.
+    ///
+    /// Leader rotation alone is not the escape, though it looks like one: a block header commits to
+    /// `(parent, height, epoch, proposer, tx_root, da_commit, last_commit_root)` and **not** to the round, so a
+    /// re-proposal by the same proposer is byte-identical and a locked validator can accept it — which does recover a
+    /// cell whose mempool is unchanged. It fails precisely when the mempool moves underneath, since every later proposal
+    /// then differs from the locked block and can never match it. That is the ordinary case: a client submits into a
+    /// running cell, so the block that got locked was empty and everything after it carries the transaction.
+    ///
+    /// This is Tendermint's rule — on entering a round, prevote the value you are locked on — and it is safe by
+    /// construction rather than by argument: it only ever prepares the block already locked, never a conflicting one.
+    /// Liveness follows because a quorum locked on the same block re-prepares it together, so the PREPARE quorum re-forms
+    /// in the new round and the COMMIT quorum follows.
+    ///
+    /// Requires the body: a validator that locked on a hash whose block it never received cannot vote to prepare
+    /// something it cannot execute, and it recovers by sampling or by state sync.
+    fn reprepare_lock(&mut self) -> Vec<Output> {
+        let Some(bh) = self.locked_block else { return Vec::new() };
+        if self.sent_prepare.contains(&self.round) || !self.proposals.contains_key(&bh) {
+            return Vec::new();
+        }
+        self.sent_prepare.insert(self.round);
+        let vote =
+            Vote { height: self.height(), round: self.round, block_hash: bh, phase: Phase::Prepare, voter: self.me };
+        let sv = SignedVote::sign(vote, &self.signer);
+        let mut out = self.accept_vote(sv.clone());
+        out.push(Output::Send(ConsensusMsg::Vote(sv)));
+        out
     }
 }
