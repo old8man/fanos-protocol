@@ -70,6 +70,16 @@ pub const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
 /// flood-dedup cache).
 const SEEN_TX_CAP: usize = 8192;
 
+/// Send a DA message to every other validator in the cell.
+fn broadcast_shard(client: &Client, coords: &[Triple], me: u8, msg: &ShardMsg) {
+    let frame = shard_to_frame(msg);
+    for (p, &to) in coords.iter().enumerate() {
+        if u8::try_from(p).unwrap_or(u8::MAX) != me {
+            client.command(Command::Emit { to, frame: frame.clone() });
+        }
+    }
+}
+
 /// Emit a sampling request to every validator holding a shard this node still needs for `block`.
 fn request_shards(client: &Client, coords: &[Triple], block: [u8; 32], missing: &[u8]) {
     for &index in missing {
@@ -298,6 +308,16 @@ where
                     // permanently, and the same suite executing on 0 of 7 in the next run). Under SSLE all-propose there
                     // are N proposals racing at once and it loses reliably: no block ever finalized.
                     resample_pending(&client, &coords, &da);
+                    // Ask for a body this validator is committed to but has never seen. Votes carry only a hash, so it
+                    // can be locked on — or hold a commit certificate for — a block it never received, and then it will
+                    // neither prepare it (it cannot execute what it does not have) nor accept any conflicting proposal.
+                    // Measured live as four of seven validators frozen at genesis on `locked` refusals with an empty
+                    // sampler. State sync does not cover it: that serves checkpoints, and a cell one block old has none.
+                    if let Some(want) = engine.awaited_body()
+                        && !da.is_sampling(&want)
+                    {
+                        broadcast_shard(&client, &coords, me, &ShardMsg::NeedSkeleton { block: want });
+                    }
                     let outs = engine.step(Input::Tick);
                     drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                 }
@@ -571,6 +591,13 @@ fn on_shard<S: StateMachine>(
             if let Some(shard) = da.serve(&block, index) {
                 let deliver = ShardMsg::Deliver { block, index: me, data: shard.clone() };
                 client.command(Command::Emit { to: from, frame: shard_to_frame(&deliver) });
+            }
+        }
+        // A peer is committed to a block it never received. If we hold it, hand back the skeleton — the requester then
+        // samples and admits it on the ordinary path, so this recovery needs no path of its own.
+        ShardMsg::NeedSkeleton { block } => {
+            if let Some(skeleton) = engine.skeleton_of(&block) {
+                client.command(Command::Emit { to: from, frame: to_frame(&ConsensusMsg::Propose(skeleton)) });
             }
         }
     }

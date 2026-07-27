@@ -148,6 +148,12 @@ impl Sampler {
         Some(full)
     }
 
+    /// Whether `block` is already being sampled — so a recovery request is not re-sent while one is in flight.
+    #[must_use]
+    pub fn is_sampling(&self, block: &[u8; 32]) -> bool {
+        self.pending.contains_key(block)
+    }
+
     /// How many blocks are still being sampled — an observable for tests and operator surfaces.
     #[must_use]
     pub fn in_flight(&self) -> usize {

@@ -43,6 +43,16 @@ pub enum ShardMsg {
         /// The requested shard index.
         index: u8,
     },
+    /// Ask any holder of `block` for its **skeleton** — the recovery path for a validator that locked on a hash, or
+    /// gathered a commit certificate for one, without ever receiving the block.
+    ///
+    /// Votes carry only a hash, so a validator can be committed to a block it has never seen. Without this it is wedged:
+    /// it will not prepare a block it cannot execute, and its lock refuses every conflicting proposal. The answer is an
+    /// ordinary `Propose(skeleton)`, so recovery re-enters the normal sampling path rather than needing one of its own.
+    NeedSkeleton {
+        /// The block hash whose skeleton is wanted.
+        block: [u8; 32],
+    },
 }
 
 impl ShardMsg {
@@ -50,11 +60,14 @@ impl ShardMsg {
     #[must_use]
     pub fn block(&self) -> [u8; 32] {
         match self {
-            ShardMsg::Deliver { block, .. } | ShardMsg::Request { block, .. } => *block,
+            ShardMsg::Deliver { block, .. } | ShardMsg::Request { block, .. } | ShardMsg::NeedSkeleton { block } => {
+                *block
+            }
         }
     }
 
-    /// Canonical bytes: `tag(1) ‖ block(32) ‖ index(1)`, plus `len(4) ‖ data` for a `Deliver`.
+    /// Canonical bytes: `tag(1) ‖ block(32)`, plus `index(1)` for a `Deliver`/`Request` and `len(4) ‖ data` for a
+    /// `Deliver`. `NeedSkeleton` names a whole block, so it carries no index.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -71,6 +84,10 @@ impl ShardMsg {
                 out.extend_from_slice(block);
                 out.push(*index);
             }
+            ShardMsg::NeedSkeleton { block } => {
+                out.push(2);
+                out.extend_from_slice(block);
+            }
         }
         out
     }
@@ -80,9 +97,11 @@ impl ShardMsg {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let (tag, rest) = bytes.split_first()?;
         let block: [u8; 32] = rest.get(..32)?.try_into().ok()?;
-        let index = *rest.get(32)?;
+        // The index is read per-variant, not up front: `NeedSkeleton` has none, and reading it unconditionally would
+        // impose a 33-byte floor that rejects the shortest valid message.
         match tag {
             0 => {
+                let index = *rest.get(32)?;
                 let len = u32::from_be_bytes(rest.get(33..37)?.try_into().ok()?) as usize;
                 let end = 37usize.checked_add(len)?;
                 if rest.len() != end {
@@ -91,10 +110,17 @@ impl ShardMsg {
                 Some(ShardMsg::Deliver { block, index, data: rest.get(37..end)?.to_vec() })
             }
             1 => {
+                let index = *rest.get(32)?;
                 if rest.len() != 33 {
                     return None;
                 }
                 Some(ShardMsg::Request { block, index })
+            }
+            2 => {
+                if rest.len() != 32 {
+                    return None; // trailing bytes ⇒ non-canonical
+                }
+                Some(ShardMsg::NeedSkeleton { block })
             }
             _ => None,
         }

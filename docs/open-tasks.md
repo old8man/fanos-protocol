@@ -248,10 +248,34 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     engine is `no_std` and sans-I/O) for each refusal reason, with the fused entitlement/link/structure/last_commit gate
     split apart so the counter says *which* half fired. A rejected block and an unprepared one look identical from
     outside — the round times out, the height stalls — and they have nothing in common as fixes.
-  - **Residual: the sibling `a_transaction_submitted_over_the_network_to_one_validator_reaches_the_whole_cell`.** Now fails
-    differently and less severely: **4 of 7 executed** (`1,2,4,6` at h1/s1/n2) with three validators stranded at genesis,
-    where before the whole cell wedged. Unanimity still fails. Next: read `rejects()` on the three stranded validators —
-    the counters now exist, so this is one measurement rather than an investigation.
+  - **Defect D — a validator committed to a block it never received could not fetch it. FIXED (partially closes the
+    residual).** Votes carry only a block *hash*, so a validator locks on — or gathers a commit certificate for — a block
+    it has never seen. It then cannot move in either direction: `reprepare_lock` rightly abstains rather than vote to
+    prepare something it cannot execute, and the `locked_block` gate refuses every conflicting proposal. State sync does
+    **not** cover this: `on_sync_req` serves a *checkpoint*, and a cell one block into its life has none. Measured as four
+    of seven validators frozen at genesis with `locked: 2`, an empty sampler, and nothing to sync from.
+    - Fix: `ConsensusEngine::awaited_body()` names the block, `ShardMsg::NeedSkeleton` asks the cell for it, and
+      `skeleton_of` answers. The reply is an ordinary `Propose(skeleton)`, so recovery re-enters the normal sampling and
+      admission path instead of needing one of its own.
+    - **A second gap found by the first fix not working:** the validators best placed to answer were exactly the ones that
+      could not. `reset_round_state` clears `proposals` on every finalization and the chain retains only headers, so a
+      validator that finalized the block had thrown the body away. `recent_bodies` (bounded, 64) retains recently
+      finalized bodies for precisely this.
+  - **⚠️ Residual, stated accurately: unanimity in `dromos_quic` is FLAKY, and it is not one test.** Across runs, *either*
+    dromos test can pass while the other refutes — the private-transfer test passed three consecutive runs after the lock
+    fix and then failed, while its sibling went green in the same run. So neither is "fixed"; what varies is which cell
+    happens to strand validators. Counts have improved (whole-cell wedge → 4 of 7 → 5 of 7 → 3 of 7 across runs) but the
+    property the tests assert — every validator executes — is not yet reliable.
+    - **The measured shape of what remains:** the stranded validators report `locked: 2` with **`await=None`**, i.e. they
+      are locked on a block whose body they *do* hold, while the rest of the cell finalized a **different** block. Nothing
+      is missing and nothing is pending; they are simply locked on a proposal that lost. `reprepare_lock` re-prepares it
+      every round, but a minority re-preparing a losing block can never reach a quorum.
+    - So the missing rule is the converse of defect C: a validator must be able to **abandon** a lock once the cell has
+      demonstrably finalized something else at that height. It has no proof today — it never gathered the winning commit
+      quorum, and checkpoint state-sync needs a checkpoint a partially-progressing cell does not produce. Candidate:
+      treat a valid COMMIT certificate for a different block at the same height as proof to abandon the lock and adopt
+      that finalization, fetching the body through the `NeedSkeleton` path that now exists. This must be designed against
+      the no-fork suites, not bolted on — it is the one remaining rule and it is a safety-critical one.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so

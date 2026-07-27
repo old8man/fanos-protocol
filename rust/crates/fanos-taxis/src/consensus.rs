@@ -25,6 +25,7 @@ use fanos_code::erasure;
 use fanos_pqcrypto::kem::HybridKemSecret;
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
+use fanos_primitives::collections::BoundedMap;
 use fanos_primitives::shamir::Share;
 use fanos_primitives::{BeaconSeed, Epoch, codec};
 
@@ -453,6 +454,13 @@ impl Sortition {
 /// is deliberately short (one tick) so a single silent line member costs one tick, not a full round timeout.
 const COLLECT_WINDOW_TICKS: u32 = 1;
 
+/// How many recently finalized block bodies to retain for serving a lagging peer (see `recent_bodies`).
+///
+/// A cell's heights advance far faster than a stuck validator takes to notice and ask, so this only has to cover the
+/// window between finalization and a recovery request — but it is the whole reason a stuck validator can be helped at
+/// all, so it is generous rather than tight.
+const RECENT_BODY_CAP: usize = 64;
+
 /// One validator's sans-I/O consensus engine over a state machine `S`.
 pub struct ConsensusEngine<S: StateMachine> {
     params: CellParams,
@@ -486,6 +494,14 @@ pub struct ConsensusEngine<S: StateMachine> {
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
     // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
     rejects: ProposalRejects,
+    // Recently **finalized** bodies, retained to serve a peer stuck on a block it never received.
+    //
+    // `reset_round_state` clears `proposals` on every finalization and the chain keeps only headers, so without this the
+    // validators best placed to help — the ones that already finalized — are exactly the ones that have thrown the block
+    // away. Measured: a recovery request reached peers that all answered nothing, and four of seven validators stayed
+    // frozen at genesis. Bounded because the key is a block hash; an evicted body is simply unavailable here, and the
+    // requester asks the rest of the cell.
+    recent_bodies: BoundedMap<[u8; 32], Block>,
     // Ticks elapsed since the round-0 collection window opened (the first proposal was buffered), or `None`
     // while it has not opened. The window closes — and the min-ticket is prepared — at `COLLECT_WINDOW_TICKS`
     // or when all line members have proposed (early exit), whichever comes first. Reset per height.
@@ -565,6 +581,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sortition: None,
             round0_tickets: BTreeMap::new(),
             rejects: ProposalRejects::default(),
+            recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             round0_window: None,
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
@@ -692,6 +709,36 @@ impl<S: StateMachine> ConsensusEngine<S> {
         tx.epoch == self.epoch
             && usize::from(tx.line) == epoch_seal_line(&self.seed, tx.epoch)
             && tx.member_count() == self.params.line_size()
+    }
+
+    /// The block whose **body** this validator is stuck waiting for, if any.
+    ///
+    /// A validator locks on a block hash, or gathers a commit certificate for one, from **votes alone** — votes are small
+    /// and carry only the hash, so neither requires ever having seen the block. If the body then never arrives it cannot
+    /// make progress in either direction: [`reprepare_lock`](Self::reprepare_lock) rightly abstains rather than vote to
+    /// prepare something it cannot execute, and the `locked_block` gate refuses every conflicting proposal. The height is
+    /// stuck on a block it can never obtain.
+    ///
+    /// State sync does not cover this. `on_sync_req` serves a *checkpoint*, and a cell one block into its life has none —
+    /// measured live as four of seven validators frozen at genesis with `locked: 2` refusals, an empty sampler and
+    /// nothing to sync from.
+    ///
+    /// So the driver asks for it: `Some(hash)` means "fetch this block's skeleton from a peer that has it", after which
+    /// the ordinary DA sampling and admission path takes over. `None` when nothing is missing.
+    #[must_use]
+    pub fn awaited_body(&self) -> Option<[u8; 32]> {
+        let want = self.pending_finalize.get(&self.height()).copied().or(self.locked_block)?;
+        (!self.proposals.contains_key(&want)).then_some(want)
+    }
+
+    /// The **skeleton** of a block this validator holds, so it can answer a peer stuck waiting for that body.
+    ///
+    /// The skeleton rather than the block: it carries the header and witness a requester needs to sample and verify the
+    /// payload, and keeps the recovery on the same data-availability path as a first delivery instead of shipping a whole
+    /// block around.
+    #[must_use]
+    pub fn skeleton_of(&self, hash: &[u8; 32]) -> Option<Block> {
+        self.proposals.get(hash).or_else(|| self.recent_bodies.get(hash)).map(Block::skeleton)
     }
 
     /// Why proposals have been refused so far — see [`ProposalRejects`]. Cumulative; diff two reads for a rate.
@@ -1256,6 +1303,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return Vec::new();
         };
         self.pending_finalize.remove(&height);
+        // Retain the body before `reset_round_state` drops it: a validator that never received this block is still
+        // committed to it and can only recover by asking someone who has it.
+        self.recent_bodies.insert(block_hash, block.clone());
         let included: BTreeSet<TxCommit> = block.sealed_txs.iter().map(SealedTx::commit).collect();
         // Capture the canonical commit certificate that finalized this block — BEFORE `chain.finalize` advances
         // `self.height()`, which `collect_cert` filters votes by. The NEXT block this validator proposes records
