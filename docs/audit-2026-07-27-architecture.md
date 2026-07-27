@@ -84,6 +84,26 @@ stands on the documented contract, and the test comment now says that instead of
 
 Past passes named this as a meta-pattern without a number. It has one.
 
+**Corrected 2026-07-27, and now a checked number rather than a remembered one** (`fanos-cli/tests/architecture.rs`
+computes the closure over the manifests; `cargo test -p fanos-cli --test architecture`). The figures below stand — 34 of 43
+crates in the node's closure, 38 of 43 reachable from *some* shipped binary — but two thirds of the *list* did not, and
+every error had the same cause: grepping for a crate's name where it is reached through an intermediary, which is the
+exact trap this section's own method note warns about.
+
+- `fanos-holarch` and `fanos-observatory` were listed as "not in the binary at all". Both are reachable: holarch through
+  `fanos-cli`'s `fanos-verify` (the V1–V22 verifier CI runs), and observatory owns two binaries of its own.
+- Of the six listed as "never exercised over any transport", **three are**: `fanos-session` is used by
+  `fanos-node/src/{diaulos,rendezvous,rendezvous_host}.rs`, `fanos-stream` through `fanos-diaulos`, and `fanos-threshold`
+  through `fanos-aphantos`'s sealing — all driven end-to-end by `diaulos_quic` and `anonymous_quic`.
+
+**What genuinely remains, after measurement:** two orphans linked by *nothing* — `fanos-angelos` (the L11 messenger, a
+headline product) and `fanos-ergon` (the effect-algebra execution model; DROMOS executes without it) — and two crates that
+ship inside the node with no transport-level test: `fanos-hermes` (reached via `fanos-dromos/src/hermes.rs`, but no QUIC
+suite submits an HTLC) and `fanos-vpn` (feature-gated, and CI does not build the feature). `fanos-bench`, `fanos-ffi` and
+`fanos-wasm` are embedding surfaces whose lack of an internal consumer is correct, not a gap.
+
+Original text, kept for the record:
+
 **34 of 43 crates are reachable from the shipped node.** Not in the binary at all, excluding legitimate tooling
 (`cli`, `bench`, `sim`) and embedding surfaces (`ffi`, `wasm`):
 

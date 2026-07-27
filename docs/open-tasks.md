@@ -14,17 +14,22 @@ No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes 
 
 ## Tier A — headline frontiers
 
-### [A] Close the "libraries ahead of wiring" gap — measured, 2026-07-27
-34 of 43 crates are reachable from the shipped node. These make claims in prose that no transport-level test covers:
-- **Not in the binary at all:** `fanos-angelos` (L11 messenger — a headline product), `fanos-ergon` (the effect-algebra "no
-  gas" claim), `fanos-holarch` (the Γ gate that *scores* the platform), `fanos-observatory`.
-- **In the binary, never exercised over a transport** (absent from `fanos-node/tests` and `fanos-sim/tests`): `fanos-hermes`
-  (cross-chain HTLC, claimed "live on the ledger"), `fanos-proteus` (traffic morphing — censorship resistance), `fanos-vpn`,
-  `fanos-session`, `fanos-stream`, `fanos-threshold`.
-- This is the shape of every defect found this session: correct in isolation, then unreachable, mis-wired or starved live.
-  Each entry needs one live test or an honest downgrade of the claim.
-- *Measure reachability transitively over `Cargo.toml`* — checking only `fanos-node/src` falsely reports `fanos-proteus` as
-  unwired (it is reached via `fanos-quic`'s shaper).
+### [A] Close the "libraries ahead of wiring" gap — four items, measured and guarded
+The list is now computed, not remembered: `fanos-cli/tests/architecture.rs` takes the closure over the manifests and fails
+if a crate is linked by nothing (or if a listed orphan gets wired). 34 of 43 crates sit in the node's closure, 38 of 43 are
+reachable from some shipped binary. The earlier prose version of this item was wrong in two thirds of its list — see
+`docs/audit-2026-07-27-architecture.md` §2.1 — because it grepped for crate names where the crate is reached through an
+intermediary. What genuinely remains:
+
+| crate | claim it carries | gap |
+|---|---|---|
+| `fanos-angelos` | L11 messenger, a headline product | **orphan** — linked by nothing at all |
+| `fanos-ergon` | the effect-algebra "no gas, derived footprints" model | **orphan** — DROMOS executes without it |
+| `fanos-hermes` | cross-chain HTLC, "live on the ledger" | in the node via `fanos-dromos/src/hermes.rs`; no QUIC suite submits an HTLC |
+| `fanos-vpn` | the full-tunnel datapath | feature-gated, and CI does not build `--features vpn` |
+
+Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
+surfaces and are exempt by construction.
 
 ### [A] `#[ignore]` conflates two incompatible things
 34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
