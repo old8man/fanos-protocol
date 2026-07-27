@@ -79,19 +79,6 @@ fn warm(a: &Node, b: &Node) {
     });
 }
 
-/// One request/response over a dialed stream: write `request`, signal end, read the whole response.
-async fn exchange(stream: &mut DuplexStream, request: &[u8]) -> Vec<u8> {
-    tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(request).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        buf
-    })
-    .await
-    .expect("DIAULOS exchange over QUIC completed in time")
-}
-
 #[tokio::test]
 async fn diaulos_request_response_over_quic() {
     let _serial = serial();
@@ -121,7 +108,7 @@ async fn diaulos_request_response_over_quic() {
 
     let mut drng = SeedRng::from_seed(b"quic-diaulos-cli");
     let mut stream = dial_service(b.client(), a_addr, &service_public, &mut drng);
-    let response = exchange(&mut stream, b"quic diaulos").await;
+    let response = common::exchange(&mut stream, b"quic diaulos").await;
     assert_eq!(
         response, b"QUIC DIAULOS",
         "the encrypted response arrived end-to-end over the real QUIC transport"
@@ -182,7 +169,7 @@ async fn diaulos_full_duplex_service_over_quic() {
 
     let mut drng = SeedRng::from_seed(b"quic-duplex-cli");
     let mut stream = dial_service(b.client(), a_addr, &service_public, &mut drng);
-    let response = exchange(&mut stream, b"hi").await;
+    let response = common::exchange(&mut stream, b"hi").await;
     assert_eq!(
         response, b"BANNER:HI",
         "the service's unsolicited banner and streamed echo arrived over real QUIC"
@@ -231,7 +218,7 @@ async fn diaulos_serves_two_clients_concurrently() {
     let mut st1 = dial_service(c1.client(), s_addr, &service_public, &mut r1);
     let mut st2 = dial_service(c2.client(), s_addr, &service_public, &mut r2);
 
-    let (resp1, resp2) = tokio::join!(exchange(&mut st1, b"one"), exchange(&mut st2, b"two"));
+    let (resp1, resp2) = tokio::join!(common::exchange(&mut st1, b"one"), common::exchange(&mut st2, b"two"));
     assert_eq!(resp1, b"echo:one", "client 1 got its own answer");
     assert_eq!(resp2, b"echo:two", "client 2 got its own answer");
 
@@ -276,7 +263,7 @@ async fn fanos_dialer_reaches_a_service_by_name() {
         .dial(&Target::Name("svc.fanos".to_owned(), 80))
         .await
         .expect("dial by name");
-    let response = exchange(&mut stream, b"via dialer").await;
+    let response = common::exchange(&mut stream, b"via dialer").await;
     assert_eq!(
         response, b"VIA DIALER",
         "reached the service through the SOCKS5 Dialer"

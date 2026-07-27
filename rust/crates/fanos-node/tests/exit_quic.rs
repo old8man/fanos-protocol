@@ -160,14 +160,7 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
     // does), so this also exercises the DIAULOS flush-on-write fix — without it a sub-segment write is
     // never shipped until the stream closes and this would hang.
     let sent = b"through the exit to the clearnet";
-    let echoed = tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(sent).await.unwrap();
-        let mut buf = vec![0u8; sent.len()];
-        stream.read_exact(&mut buf).await.unwrap();
-        buf
-    })
-    .await
-    .expect("the exit relayed the payload to the TCP target and back in time");
+    let echoed = common::echo(&mut stream, sent).await;
     assert_eq!(
         echoed, sent,
         "the payload round-tripped: client → exit → TCP echo → exit → client"
@@ -297,14 +290,7 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
         .expect("the dialer reached the clearnet target through the exit");
 
     let sent = b"proxy dialer -> exit -> clearnet";
-    let echoed = tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(sent).await.unwrap();
-        let mut buf = vec![0u8; sent.len()];
-        stream.read_exact(&mut buf).await.unwrap();
-        buf
-    })
-    .await
-    .expect("round-trip through the dialer's exit path");
+    let echoed = common::echo(&mut stream, sent).await;
     assert_eq!(echoed, sent, "clearnet round-trip via the proxy dialer's exit");
 
     // Without an exit configured, the same clearnet target is refused (a `.fanos`-only dialer).

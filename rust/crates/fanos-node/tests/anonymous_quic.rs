@@ -40,7 +40,6 @@ use fanos_rendezvous::{
 /// line) and the client (which dials it) so both compute the same line (audit E5).
 const TEST_BEACON: BeaconSeed = BeaconSeed::new([0x5E; 32]);
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, Triple};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A minimal engine that injects a **raw** wire frame on command: `Command::Send { to, payload }` →
 /// `Effect::Send { to, frame: payload }`, verbatim. Unlike `OverlayNode` (which wraps the payload in
@@ -224,15 +223,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         .await
         .expect("anonymous dial by name");
 
-    let response = tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(b"GET /anon").await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).await.unwrap();
-        resp
-    })
-    .await
-    .expect("the anonymous session completed in time");
+    let response = common::exchange(&mut stream, b"GET /anon").await;
 
     assert_eq!(
         response, b"anon-quic-200:GET /anon",
@@ -343,15 +334,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         .await
         .expect("fresh anonymous dial by name");
 
-    let response = tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(b"GET /cell").await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).await.unwrap();
-        resp
-    })
-    .await
-    .expect("the fresh anonymous session completed in time");
+    let response = common::exchange(&mut stream, b"GET /cell").await;
 
     assert_eq!(
         response, b"anon-quic-200:GET /cell",
@@ -442,15 +425,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         .await
         .expect("anonymous dial to an off-combiner service");
 
-    let response = tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(b"GET /off").await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).await.unwrap();
-        resp
-    })
-    .await
-    .expect("the off-combiner anonymous session completed in time");
+    let response = common::exchange(&mut stream, b"GET /off").await;
 
     assert_eq!(
         response, b"anon-quic-200:GET /off",
@@ -536,15 +511,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         .dial(&Target::Name("driver.fanos".to_owned(), 80))
         .await
         .expect("anonymous dial to a driver-hosted service");
-    let response = tokio::time::timeout(common::HANG_CEILING, async {
-        stream.write_all(b"GET /driver").await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).await.unwrap();
-        resp
-    })
-    .await
-    .expect("the driver-hosted anonymous session completed in time");
+    let response = common::exchange(&mut stream, b"GET /driver").await;
     assert_eq!(
         response, b"anon-quic-200:GET /driver",
         "the spawn_rendezvous_host driver registered + served an off-combiner client end-to-end",

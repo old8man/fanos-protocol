@@ -32,18 +32,28 @@ No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes 
 So "run the ignored tests" cannot mean one thing, and the nightly `heavy` job has to name packages instead of selecting a
 category. Distinguish them — a `measure_` name convention plus a required-vs-optional split, or a cargo feature per class.
 
-### [A] The real-QUIC suites are load-sensitive, and CI runners are the load case
-Measured 2026-07-27, both runs minutes apart on the same tree: `fanos-node --test anonymous_quic` in isolation →
-**5 passed, 2.69 s**; during a full `cargo test --workspace --features validator` with a large unrelated build occupying the
-machine → **4 of 5 failed, 242 s** (the rest of the run was clean: 741 passed across 40 suites). The suites do not fail on
-logic, they fail on starvation — QUIC handshake timeouts under CPU contention.
-- **Why it matters now:** CI (§2.0) runs the whole workspace on a 2-core hosted runner, i.e. permanently in the starved
-  regime. A gate that flakes teaches people to ignore it, which is how the repo got a formatter gate nobody looked at.
-- **Do not "fix" with longer timeouts** — that hides starvation instead of bounding it, and the numbers above give no
-  principled multiplier. The decision is how the harness bounds concurrency for *transport-bound* suites specifically:
-  a serial marker on that class, or `--test-threads` scoped to them, so their concurrency is a property of the suite rather
-  than of whatever else shares the machine. Same root question as the `#[ignore]` conflation above: the harness has no way to
-  say what *class* a test belongs to.
+### [A] Combiner-forwarded anonymous sessions stall under host contention — and only those
+Isolated 2026-07-27 by the progress-bounded waits in `fanos-node/tests/common/mod.rs`, which report *what the bytes did*
+instead of "did not finish in 240 s". On a host loaded by an unrelated build, one run of `anonymous_quic`:
+
+| test | path | result |
+|---|---|---|
+| `an_onion_reaches_the_meeting_line_over_real_quic` | direct | ok |
+| `a_full_anonymous_session_completes_over_real_quic` | direct | ok |
+| `a_fresh_anonymous_session_completes_over_a_cell_of_composites` | direct | ok |
+| `a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding` | **combiner-forwarded** | **0 bytes / 48 s** |
+| `the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic` | **combiner-forwarded** | **0 bytes / 48 s** |
+
+The split is exactly by path, not by cost, and the *same process* delivered 23 and 46 bytes on the direct flows while the
+forwarded ones moved none — so the host was scheduling work and this is a stall, not starvation. Idle, all five pass in
+~4 s. These are the same two tests that failed the first full `cargo test --workspace --features validator` run.
+- **Hypothesis to test first:** the forwarding hop awaits something that is only satisfied promptly when the machine is
+  idle — a lock ordering, or a reply that races a timer — since a purely slow path would deliver *late*, not *never*.
+- **Do not "fix" with longer timeouts.** A wait that ends without bytes is not a slow wait; the numbers above give no
+  principled multiplier, and 240 s already failed to be one.
+- Under total starvation (3–4× oversubscription, nothing anywhere moves) the same waits correctly report INCONCLUSIVE
+  rather than a wedge. The residual instrument gap: a host that starves only *midway* still reads as a wedge, because the
+  discriminator asks whether the process has *ever* delivered.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's

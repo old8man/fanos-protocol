@@ -46,8 +46,10 @@
 
 use std::future::Future;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 
@@ -111,6 +113,161 @@ where
              wedge. Last seen: {last}"
         );
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Complete a request/response exchange over a real stream, bounded by **progress** rather than by elapsed time.
+///
+/// [`HANG_CEILING`] measures elapsed time, and a descheduled process spends elapsed time without being given any — so a
+/// flat `timeout(HANG_CEILING, ..)` wrapped around a whole exchange cannot separate a wedged session from a starved
+/// machine, and raises the same panic for both. Measured on `anonymous_quic`, 2026-07-27: **2.69 s** alone; **143.4 s**
+/// with the host oversubscribed 2× — a **53× dilation** that leaves only 1.7× of the ceiling unspent; and four of five
+/// tests tripping the ceiling outright during a full workspace run. That is precisely the failure [`HANG_CEILING`]'s own
+/// contract claims it cannot have, so the contract is quantitatively false, not merely optimistic.
+///
+/// Bytes are the observable a total-elapsed bound lacks, so the bound here is [`FROZEN_SPAN`] **since the last byte
+/// moved**: a transfer that keeps delivering keeps resetting the window and still finishes, while one that stops is
+/// reported in one span instead of burning the whole ceiling to say "too slow". The ceiling remains as the outer
+/// backstop for the case progress cannot rule out — a transfer that trickles forever without ever stopping.
+///
+/// It would be convenient if contention merely *slowed* a transfer, so that any stall meant a defect. Measured at 3× and
+/// 4× oversubscription, it does not: these exchanges deliver **zero** bytes for the whole window. That is why a stalled
+/// window is not a verdict by itself, and why [`DELIVERED`] exists — the discriminator is whether anything *else* in the
+/// process moved during the same window.
+///
+/// This is the same three-valued discipline as [`converge`], applied where the observable is a byte count rather than a
+/// polled state.
+pub async fn exchange<S>(stream: &mut S, request: &[u8]) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    within_span(async {
+        stream.write_all(request).await.expect("the request is written to the stream");
+        stream.shutdown().await.expect("the request half closes");
+    })
+    .await
+    .expect("REFUTED — the request neither wrote nor half-closed within one span of granted time");
+
+    let started = Instant::now();
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match read_within_span(stream, &mut chunk, response.len()).await {
+            0 => return response,
+            n => response.extend_from_slice(chunk.get(..n).expect("a read never exceeds the buffer it filled")),
+        }
+        assert!(
+            started.elapsed() <= HANG_CEILING,
+            "INCONCLUSIVE — still receiving at the {HANG_CEILING:?} ceiling ({} bytes so far), so this is a trickle \
+             rather than a wedge",
+            response.len()
+        );
+    }
+}
+
+/// Round-trip `sent` through a stream that **stays open**, bounded by progress exactly as [`exchange`] is.
+///
+/// Distinct from [`exchange`] because the request half is deliberately not closed: these suites use the echo to prove
+/// bytes flow *before* either side finishes, which is what caught the DIAULOS flush-on-write defect (a sub-segment write
+/// that was never shipped until close). Closing the stream would delete the very property under test.
+pub async fn echo<S>(stream: &mut S, sent: &[u8]) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    within_span(stream.write_all(sent))
+        .await
+        .expect("REFUTED — the payload did not write within one span of granted time")
+        .expect("the payload is written to the stream");
+
+    let started = Instant::now();
+    let mut received = vec![0u8; sent.len()];
+    let mut filled = 0;
+    while filled < sent.len() {
+        let rest = received.get_mut(filled..).expect("`filled` never passes the buffer it counts");
+        match read_within_span(stream, rest, filled).await {
+            0 => panic!("REFUTED — the stream closed after {filled} of {} echoed bytes", sent.len()),
+            n => filled += n,
+        }
+        assert!(
+            started.elapsed() <= HANG_CEILING,
+            "INCONCLUSIVE — still echoing at the {HANG_CEILING:?} ceiling ({filled} of {} bytes), so this is a trickle \
+             rather than a wedge",
+            sent.len()
+        );
+    }
+    received
+}
+
+/// Bytes delivered to *any* progress-bounded wait anywhere in this process.
+///
+/// This is the discriminator a single flow cannot supply on its own. "No bytes arrived here" has two readings — this
+/// session is wedged, or the host never scheduled the work — and they demand opposite responses. Whether this process
+/// has *ever* delivered a byte separates them from the experiment already running, with no threshold: if it has, the
+/// host demonstrably moves data and the fault is specific to this session; if it never has, the run produced no
+/// evidence about the system at all.
+///
+/// Its limit, stated because an instrument that overstates itself is the defect it exists to prevent: a host that
+/// starves only *after* some traffic has flowed will be read as a wedge. Both regimes measured here come out right —
+/// nothing ever moves at 3–4× oversubscription, and a lone stalled flow after a healthy one is a wedge — but a run that
+/// degrades midway can still mislead. The counter deliberately compares against *ever*, not against a window snapshot:
+/// the window form was refuted by its own probe, since a stalled flow with no concurrent traffic reported "nothing
+/// moved" on a completely idle host.
+static DELIVERED: AtomicU64 = AtomicU64::new(0);
+
+/// One read bounded by [`FROZEN_SPAN`] of granted time. Returns the byte count (0 at end of stream).
+async fn read_within_span<S>(stream: &mut S, into: &mut [u8], so_far: usize) -> usize
+where
+    S: AsyncRead + Unpin,
+{
+    let read = within_span(stream.read(into))
+        .await
+        .unwrap_or_else(|| {
+            let moved = DELIVERED.load(Ordering::Relaxed);
+            assert!(
+                moved > 0,
+                "INCONCLUSIVE — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes, and no flow in \
+                 this process has ever moved one: the host may simply not have scheduled the work, so this run says \
+                 nothing about the system. Re-run it alone; if it passes, the host was the variable."
+            );
+            panic!(
+                "REFUTED — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes, though this process \
+                 has delivered {moved} bytes on other flows: the host can move data, so this session is wedged."
+            )
+        })
+        .expect("the stream is readable");
+    DELIVERED.fetch_add(read as u64, Ordering::Relaxed);
+    read
+}
+
+/// Drive `work` to completion within [`FROZEN_SPAN`] of **granted** time; `None` if the budget drained first.
+///
+/// The span is charged one [`POLL`] per tick this task actually got to run, **not** by wall clock, and that distinction
+/// is the whole point. A descheduled process spends wall clock without being given any, so a wall-clock window shrinks
+/// precisely when the host is least able to make progress — which is how the first version of this helper came to report
+/// `REFUTED — a stalled transfer` for a session that was merely starved (measured at 3× and 4× host oversubscription,
+/// against 5 of 5 passing in 3.4 s idle). Reporting a wedge that is not there is worse than the "too slow" verdict it
+/// replaced: it sends the reader hunting a defect the machine invented.
+///
+/// Charging by granted time is the right denomination — everything here shares one runtime, and a host that never
+/// schedules the task never drains the budget, which is correct, because it has produced no evidence either way. But it
+/// is **not** by itself a defence against starvation, and measurement is what says so: at 4× oversubscription this loop
+/// stretched a 48 s window to only 79 s of wall clock (1.66×), against a work dilation nearer 53× on the same host.
+/// Timers are precisely the thing that keeps running when the worker threads cannot, so a timer-derived budget barely
+/// compensates. Separating starvation from a wedge is [`DELIVERED`]'s job, not this one's.
+///
+/// `work` is pinned and polled across ticks rather than re-created, so a future that is not cancel-safe — a stream read
+/// mid-segment — cannot lose what it already consumed to the sampling.
+async fn within_span<F: Future>(work: F) -> Option<F::Output> {
+    tokio::pin!(work);
+    let mut granted = Duration::ZERO;
+    loop {
+        tokio::select! {
+            done = &mut work => return Some(done),
+            () = tokio::time::sleep(POLL) => granted += POLL,
+        }
+        if granted >= FROZEN_SPAN {
+            return None;
+        }
     }
 }
 
