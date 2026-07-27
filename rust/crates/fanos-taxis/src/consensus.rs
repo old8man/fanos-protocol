@@ -494,6 +494,10 @@ pub struct ConsensusEngine<S: StateMachine> {
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
     // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
     rejects: ProposalRejects,
+    // Commit certificates learned from **another block's `last_commit`** rather than from votes we gathered, keyed by the
+    // height they finalize. See `adopt_certified_parent`; carried into `finalize` because `collect_cert` can only build a
+    // certificate from votes this validator actually received, and in exactly this situation it did not.
+    certified: BTreeMap<u64, Certificate>,
     // Recently **finalized** bodies, retained to serve a peer stuck on a block it never received.
     //
     // `reset_round_state` clears `proposals` on every finalization and the chain keeps only headers, so without this the
@@ -581,6 +585,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sortition: None,
             round0_tickets: BTreeMap::new(),
             rejects: ProposalRejects::default(),
+            certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             round0_window: None,
             reveals: BTreeMap::new(),
@@ -921,6 +926,48 @@ impl<S: StateMachine> ConsensusEngine<S> {
         verify_leader_ticket(root, s.height, index, &self.seed, height, self.round, &witness.output, &witness.proof)
     }
 
+    /// Adopt the finalization of **our** height when a block from a *higher* height proves it.
+    ///
+    /// Every block above genesis records, as its `last_commit`, the quorum COMMIT certificate that finalized its parent.
+    /// A proposal for height `h+1` is therefore self-authenticating proof of what height `h` finalized — the same evidence
+    /// [`check_committed`] acts on, verified the same way against the same quorum, so this adds no trust. Without it the
+    /// proof arrives and is **discarded**: the proposal is for a height we have not reached, the link check refuses it, and
+    /// the certificate inside goes with it.
+    ///
+    /// ## The deadlock this breaks
+    ///
+    /// Quorum is `2f+1`, and a validator finalizes only by gathering that many COMMIT votes **itself**. Votes are never
+    /// retransmitted, so a validator that receives `quorum - 1` of them is locked on the winning block, holds its body,
+    /// and is missing nothing but a signature it can never obtain. `collect_cert` filters by the *current* round, so
+    /// re-voting cannot rebuild the certificate either.
+    ///
+    /// With one validator short, the cell still has a quorum and advances, and its later blocks carry the proof — so it
+    /// recovers. With `f+1` short the remaining validators are **below quorum**, the chain halts, and the cell can no
+    /// longer produce the very evidence that would rescue them. That circularity is the deadlock, and it is reachable from
+    /// nothing worse than transient message loss.
+    ///
+    /// Finalizing clears the lock ([`reset_round_state`]), so adoption releases it as a consequence rather than a special
+    /// case. If the body is missing the decision is remembered (`pending_finalize`) and
+    /// [`awaited_body`](Self::awaited_body) drives the fetch.
+    fn adopt_certified_parent(&mut self, block: &Block) -> Vec<Output> {
+        let height = self.height();
+        if block.header.height <= height {
+            return Vec::new();
+        }
+        let Some(cert) = block.last_commit.clone() else { return Vec::new() };
+        if cert.height != height
+            || cert.phase != Phase::Commit
+            || !cert.verify(self.params.quorum, &self.verifiers)
+        {
+            return Vec::new();
+        }
+        let bh = cert.block_hash;
+        // Carry the certificate into `finalize`: the next block this validator proposes records it as `last_commit`, and
+        // one rebuilt from votes we never received would not verify at any peer.
+        self.certified.insert(height, cert);
+        self.finalize(bh)
+    }
+
     /// Rank a round-0 proposal **skeleton** into the min-ticket lottery, without its payload.
     ///
     /// Checks everything a skeleton can carry — the proposer is an elected line member, the block links to our head at
@@ -932,6 +979,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
     ///
     /// A no-op outside SSLE round 0, where there is no lottery to rank into.
     fn on_skeleton(&mut self, block: &Block) -> Vec<Output> {
+        // First, and regardless of sortition: a skeleton carries `last_commit`, so it can prove what our height finalized
+        // without our ever obtaining its payload.
+        let adopted = self.adopt_certified_parent(block);
+        if !adopted.is_empty() {
+            return adopted;
+        }
         if self.sortition.is_none() || self.round != 0 || self.sent_prepare.contains(&0) {
             return Vec::new();
         }
@@ -1012,6 +1065,11 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
             if block.header.height > height {
                 self.note_height(block.header.height); // a proposal for a height ahead of us — we are behind
+                // Before discarding it: a block from a higher height carries the certificate that finalized ours.
+                let adopted = self.adopt_certified_parent(&block);
+                if !adopted.is_empty() {
+                    return adopted;
+                }
             }
             return Vec::new();
         }
@@ -1313,7 +1371,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // finalizer set the block reward is credited to at execution (`StateMachine::apply_block_reward`), which
         // is what lets the reward be part of committed state at all (a per-node split could differ across
         // validators and so could never be part of the state root).
-        self.last_finalized_cert = Some(self.collect_cert(Phase::Commit, block_hash));
+        self.last_finalized_cert = Some(
+            self.certified.remove(&height).unwrap_or_else(|| self.collect_cert(Phase::Commit, block_hash)),
+        );
         self.chain.finalize(block.header.clone());
 
         let mut out = alloc::vec![Output::Committed { height, block_hash }];

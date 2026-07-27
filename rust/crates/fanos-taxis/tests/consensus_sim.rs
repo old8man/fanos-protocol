@@ -115,6 +115,14 @@ struct Cluster {
     /// simultaneous dispersal every peer already holds its shard and every first request succeeds — which is the one
     /// arrangement that cannot exhibit the race that deadlocked a live cell.
     dispersing: Vec<(u32, usize, [u8; 32], Vec<u8>)>,
+    /// Drop votes of one phase **destined for specific validators** — a targeted loss, not a cell-wide outage.
+    ///
+    /// The global `drop_phase` cannot express the condition that wedges a real cell, because it denies the quorum to
+    /// everyone equally and so nothing finalizes at all. What actually happens is asymmetric: a quorum of `2f+1 = 5`
+    /// forms for a block and finalizes it, while one or two validators receive only `quorum - 1` of those COMMIT votes.
+    /// Those validators are locked on the block, hold its body, and are missing nothing but a signature — and TAXIS does
+    /// not retransmit votes, so they are stuck at that height forever while the cell moves on.
+    drop_to: Option<(Phase, BTreeSet<usize>)>,
     /// Drop every vote in this phase while set — a network hiccup that lands *between* PREPARE and COMMIT.
     ///
     /// The one condition that wedges a locking consensus permanently, and nothing exercised it: a PREPARE quorum forms
@@ -166,6 +174,7 @@ impl Cluster {
             da_delay: 0,
             samplers: (0..N).map(|i| Sampler::new(u8::try_from(i).unwrap_or(0))).collect(),
             dispersing: Vec::new(),
+            drop_to: None,
             drop_phase: None,
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
@@ -357,6 +366,11 @@ impl Cluster {
         self.drop_phase = phase;
     }
 
+    /// Start or stop dropping `phase` votes addressed to `targets` (see [`Self::drop_to`]).
+    fn set_drop_to(&mut self, drop: Option<(Phase, &[usize])>) {
+        self.drop_to = drop.map(|(p, t)| (p, t.iter().copied().collect()));
+    }
+
     fn deliver(&mut self, from: usize, msg: &ConsensusMsg) {
         if let ConsensusMsg::Propose(b) = msg
             && !self.proposed.iter().any(|p| p.hash() == b.hash())
@@ -389,6 +403,14 @@ impl Cluster {
             // A validator deaf to proposals still receives votes/reveals — it can gather a commit certificate
             // without ever seeing the body (the async case the wedge-fix must survive).
             if matches!(msg, ConsensusMsg::Propose(_)) && self.deaf_propose.contains(&i) {
+                continue;
+            }
+            // A targeted vote loss: this validator specifically does not hear this phase.
+            if let ConsensusMsg::Vote(sv) = msg
+                && let Some((phase, targets)) = &self.drop_to
+                && *phase == sv.vote.phase
+                && targets.contains(&i)
+            {
                 continue;
             }
             let input = self.msg_to_input(from, msg);
@@ -1547,6 +1569,9 @@ fn a_partitioned_minority_rejoins_without_forking_the_contested_height() {
     // legitimately never finalizes the missed height itself — asserting `honest_count_at(0) == N` would demand it replay
     // history it was proven a snapshot of, and that assertion failed here for exactly that reason while every validator
     // had in fact caught up.
+    for i in 0..N {
+        eprintln!("DIAG me={i} h={} await={:?} rej={:?}", c.engines[i].chain().next_height(), c.engines[i].awaited_body().is_some(), c.engines[i].rejects());
+    }
     let head = c.engines[0].chain().next_height();
     let root = c.engines[0].chain().state_root();
     assert!(head > 1, "the cell made real progress past the contested height (reached {head})");
@@ -1556,4 +1581,59 @@ fn a_partitioned_minority_rejoins_without_forking_the_contested_height() {
     }
     // And the contested height agreed on one block among those that finalized it directly.
     assert_eq!(c.hashes_at(0).len(), 1, "rejoining must not fork the contested height");
+}
+
+#[test]
+fn a_validator_short_one_commit_vote_rejoins_the_chain() {
+    // THE SCENARIO THE LIVE `dromos_quic` RESIDUAL IS, reproduced deterministically.
+    //
+    // Quorum is `2f+1 = 5` of 7. A block gets its five COMMIT votes and the cell finalizes it — while ONE validator
+    // receives only four of them. That validator is locked on the winning block, holds its body, and is missing nothing
+    // but a signature. TAXIS does not retransmit votes and offers no way to ask for them, so it is stuck at that height
+    // forever while the cell advances. Measured live as validators reporting `locked` refusals with `await=None`: nothing
+    // pending, nothing unavailable, the right block in hand.
+    //
+    // A global vote outage cannot express this — denying the quorum to everyone finalizes nothing and the cell simply
+    // retries. The loss has to be asymmetric, which is why `drop_to` exists.
+    //
+    // The recovery asserted here needs no new evidence on the wire: every block records the quorum COMMIT certificate that
+    // finalized its parent, so the next height's proposal already proves what this height finalized.
+    // THREE validators short, not one, and that is the whole difference. With one stuck the cell still has 6 ≥ quorum, so
+    // it keeps making blocks and the stuck validator rejoins from what they carry. With three stuck only 4 remain — below
+    // the quorum of 5 — so the cell **halts** and can never produce the evidence that would rescue them. That circularity
+    // is the live deadlock, and it is why a one-validator version of this test passes while the cell does not.
+    let mut c = Cluster::new(&genesis());
+    let short = [4usize, 5, 6];
+    c.set_drop_to(Some((Phase::Commit, &short)));
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"short-one-vote");
+    c.submit_all(&tx);
+    c.tick();
+
+    // The cell finalized; the short validators did not — and crucially they are not missing a body or a shard. They hold
+    // the winning block, are locked on it, and lack only a signature they can never obtain.
+    assert!(c.honest_count_at(0) >= 1, "the cell reached a commit quorum among the validators that did hear it");
+    for &i in &short {
+        assert_eq!(c.engines[i].chain().next_height(), 0, "validator {i} has not finalized the height");
+        assert_eq!(c.engines[i].awaited_body(), None, "validator {i} is not waiting on a body — it holds the block");
+    }
+
+    // The loss ends. The cell keeps making blocks, and the stuck validator must rejoin from what those blocks carry.
+    c.set_drop_to(None);
+    for _ in 0..6 {
+        c.tick();
+        c.timeout();
+    }
+
+    let head = c.engines[0].chain().next_height();
+    let root = c.engines[0].chain().state_root();
+    assert!(head >= 1, "the cell finalized the contested height");
+    for &i in &short {
+        assert_eq!(
+            c.engines[i].chain().next_height(),
+            head,
+            "validator {i}, short a COMMIT vote, rejoined at the cell's height"
+        );
+        assert_eq!(c.engines[i].chain().state_root(), root, "validator {i} agrees on the executed state — no fork");
+    }
+    assert_eq!(c.hashes_at(0).len(), 1, "one block at the contested height — rejoining must not fork it");
 }

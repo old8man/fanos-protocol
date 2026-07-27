@@ -261,35 +261,34 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
       could not. `reset_round_state` clears `proposals` on every finalization and the chain retains only headers, so a
       validator that finalized the block had thrown the body away. `recent_bodies` (bounded, 64) retains recently
       finalized bodies for precisely this.
-  - **⚠️ Residual, stated accurately: unanimity in `dromos_quic` is FLAKY, and it is not one test.** Across runs, *either*
-    dromos test can pass while the other refutes — the private-transfer test passed three consecutive runs after the lock
-    fix and then failed, while its sibling went green in the same run. So neither is "fixed"; what varies is which cell
-    happens to strand validators. Counts have improved (whole-cell wedge → 4 of 7 → 5 of 7 → 3 of 7 across runs) but the
-    property the tests assert — every validator executes — is not yet reliable.
-    - **The measured shape of what remains:** the stranded validators report `locked: 2` with **`await=None`**, i.e. they
-      are locked on a block whose body they *do* hold, while the rest of the cell finalized a **different** block. Nothing
-      is missing and nothing is pending; they are simply locked on a proposal that lost. `reprepare_lock` re-prepares it
-      every round, but a minority re-preparing a losing block can never reach a quorum.
-    - So the missing rule is the converse of defect C: a validator must be able to **abandon** a lock once the cell has
-      demonstrably finalized something else at that height. It has no proof today — it never gathered the winning commit
-      quorum, and checkpoint state-sync needs a checkpoint a partially-progressing cell does not produce.
-    - **⚠️ Two candidate rules were implemented and then REVERTED, because no scenario could be built that needs them.**
-      Recorded so the next attempt starts from this rather than repeating it.
-      1. *Adopt a certified parent.* Every block records the quorum COMMIT certificate that finalized its parent, so a
-         proposal for height `h+1` is self-authenticating proof of what `h` finalized — and today the link check discards
-         it. Implemented (`adopt_certified_parent`, plus a `certified` map to carry the certificate into `finalize`, since
-         `collect_cert` can only build one from votes this validator never received).
-      2. *Admit an already-certified block ahead of the round gates.* A validator holding a commit certificate refuses the
-         very block it is waiting for, because by the time the body arrives its round has moved on and the block's proposer
-         is no longer the leader. Implemented as an early branch in `on_propose`.
-      - Both are well-motivated by measurement and both are plausibly correct. **Neither is exercised:** every test,
-        including a purpose-built partition scenario with a deliberately short recovery window, passes with each rule
-        disabled. Shipping unexercised consensus code that claims to close a safety-critical hole is worse than not
-        shipping it, so they were reverted rather than left in.
-      - The blocker is the *scenario*, not the rule. `a_partitioned_minority_rejoins_without_forking_the_contested_height`
-        was written for this and does not reproduce it — the minority rejoins through the existing catch-up path. What is
-        needed is a cell where a minority locks on a losing proposal **and** no catch-up path is available, which is what
-        the live cell manages and the sim does not yet. Build that first; the rules are already written down here.
+  - **Defect E — a validator short one COMMIT vote was stuck forever, and `f+1` of them halted the chain. FIXED. This
+    closes 10b: both `dromos_quic` tests now pass, three consecutive runs, ~10.8 s each.**
+    - Quorum is `2f+1 = 5` of 7, and a validator finalizes only by gathering that many COMMIT votes **itself**. Votes are
+      never retransmitted and there is no way to ask for them, so a validator that receives `quorum − 1` is locked on the
+      winning block, holds its body, and is missing nothing but a signature it can never obtain. `collect_cert` filters by
+      the *current* round, so re-voting cannot rebuild the certificate either.
+    - **Why it escalates from a nuisance to a halt.** With **one** validator short the cell still has a quorum, keeps making
+      blocks, and its later blocks carry the proof — so it recovers on its own, which is why a one-validator test passes.
+      With **`f+1`** short the remaining validators are *below quorum*: the chain halts and the cell can no longer produce
+      the very evidence that would rescue them. Reachable from nothing worse than transient message loss.
+    - **Fix:** `adopt_certified_parent`. Every block records the quorum COMMIT certificate that finalized its parent, so a
+      proposal for height `h+1` already proves what `h` finalized — the same evidence `check_committed` acts on, verified
+      against the same quorum, so it adds no trust. Today the link check discards it because the proposal names a height we
+      have not reached. Adoption also releases the lock as a consequence (`reset_round_state`), not as a special case.
+    - The certificate is carried into `finalize` (`certified`) rather than rebuilt: `collect_cert` can only assemble one
+      from votes this validator received, and in exactly this situation it did not — a rebuilt certificate would verify
+      nowhere and its own later proposals would be refused.
+    - **Verified, and verified to be *needed*:** `a_validator_short_one_commit_vote_rejoins_the_chain` reproduces the halt
+      deterministically in 2.2 s, and with the rule disabled a short validator is stranded at genesis. Both randomized
+      Byzantine no-fork suites pass in release.
+    - **The harness gained what made this findable:** `Cluster::drop_to` drops one phase's votes **addressed to specific
+      validators**. The pre-existing cell-wide `drop_phase` cannot express it — denying the quorum to everyone finalizes
+      nothing and the cell simply retries. The condition that wedges a real cell is *asymmetric*, and that asymmetry is the
+      whole content of the defect.
+    - **Two earlier iterations reverted this same rule for being unexercised, and that was correct at the time:** the
+      scenarios then available (a partitioned 2-node minority; a single short validator) both recover without it. A minority
+      below quorum cannot even lock, and a single short validator is rescued by the still-advancing cell. Only `f+1` short
+      produces the deadlock. The rule was right and the scenario was missing.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
