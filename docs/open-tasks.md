@@ -122,10 +122,26 @@ That reframes the problem, and it is the useful thing this attempt produced: **t
 capacity with a 9 KB block**, so a recovery path that adds request traffic pushes it over rather than helping. The single
 custodian per shard is a genuine structural weakness (`ConsensusEngine::shard_of` now lets any holder answer for an index
 it can produce), but it is not the binding constraint — capacity is.
-- Next hypotheses, in order of what the evidence supports: shard *size* (a 9 KB block's shards may exceed what one
-  `Command::Emit` moves comfortably on a saturated loopback — measure the shard byte count and the emit latency); the
-  dispersal being one-shot per proposal with no pacing; and whether `PENDING_CAP`/`HELD_CAP` evict a block still being
-  sampled.
+**Size is refuted, and the real obstacle is structural.** Measured sealed transaction sizes: the *shielded* transfer whose
+suite passes reliably is **18 473 bytes**, twice the HTLC lock (**9 101**) whose suite stalls. Size is not the variable, so
+every size-derived hypothesis above is dead.
+
+What `reprepare_lock`'s own doc requires is the answer: *"liveness follows because a **quorum** locked on the same block
+re-prepares it together."* With three of seven locked and five needed, no number of rounds can re-form the PREPARE quorum.
+The standard remedy is Tendermint's **valid-value rule** — a proposer re-proposes the value it is locked on instead of
+building a fresh one — and it is **not expressible in this design as it stands**:
+
+- a block header commits to `proposer`, and `on_propose` requires `leader(seed, height, round) == header.proposer` outside
+  SSLE round 0. So a validator cannot re-propose *another* validator's locked block: the header would name the wrong
+  proposer and be refused on `rejects.proposer`. Only the original proposer can re-offer it byte-identically, which the
+  `reprepare_lock` doc already notes, and it may not be entitled in the later round.
+- Attempted and reverted: re-proposing the locked block from `maybe_propose`. It cannot work for that reason, and the
+  attempt is what surfaced it.
+
+**So the fix is a proof-of-lock, not a re-proposal.** A re-proposal must carry a PREPARE-quorum certificate for the value,
+and `on_propose` must admit a non-leader proposer when that certificate validates — safe, because a polka certificate
+proves the cell was already willing to prepare exactly that block. `Certificate` already exists for `Phase::Prepare`, so
+the machinery is present; what is missing is carrying it on the proposal and relaxing the entitlement check against it.
 
 Size is what makes it *likely* rather than what makes it happen: a 9 KB block is slower to disperse, so the window in
 which only some validators hold it is wider.
