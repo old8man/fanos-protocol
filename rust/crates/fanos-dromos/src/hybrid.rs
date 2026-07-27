@@ -571,16 +571,46 @@ impl HybridLedger {
             },
             Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
                 Some(StorageTx::Open { params, payment }) => outcome(self.open_deal(&params, &payment)),
+                // Same premature-versus-invalid distinction as the HTLC arms below: blind ordering can put a
+                // proof or a close ahead of the `Open` that creates the deal, and a deal this ledger has never
+                // held may simply not have been opened *yet*.
                 Some(StorageTx::Prove { deal_id, prover_auth, response }) => {
-                    outcome(self.prove_deal(&deal_id, &prover_auth, &response))
+                    if self.storage.deals.contains_key(&deal_id) {
+                        outcome(self.prove_deal(&deal_id, &prover_auth, &response))
+                    } else {
+                        ExecOutcome::Deferred
+                    }
                 }
-                Some(StorageTx::Close { deal_id, auth }) => outcome(self.close_deal(&deal_id, &auth)),
+                Some(StorageTx::Close { deal_id, auth }) => {
+                    if self.storage.deals.contains_key(&deal_id) {
+                        outcome(self.close_deal(&deal_id, &auth))
+                    } else {
+                        ExecOutcome::Deferred
+                    }
+                }
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
                 Some(HtlcTx::Lock { terms, payment }) => outcome(self.lock_htlc(&terms, &payment)),
-                Some(HtlcTx::Claim { htlc_id, preimage }) => outcome(self.claim_htlc(&htlc_id, &preimage)),
-                Some(HtlcTx::Refund { htlc_id }) => outcome(self.refund_htlc(&htlc_id)),
+                // A contract this ledger has never held is *premature*, not invalid: blind anti-MEV ordering
+                // routinely puts a claim ahead of the lock that funds it — measured as `[Rejected, Applied]`
+                // for `[claim, lock]` in one block, with the recipient paid nothing and the escrow stranded
+                // until the timeout. Deferring re-queues it for a later block; a contract that is present but
+                // unclaimable (wrong preimage, already resolved, past its timeout) stays a terminal rejection.
+                Some(HtlcTx::Claim { htlc_id, preimage }) => {
+                    if self.htlcs.state(&htlc_id).is_none() {
+                        ExecOutcome::Deferred
+                    } else {
+                        outcome(self.claim_htlc(&htlc_id, &preimage))
+                    }
+                }
+                Some(HtlcTx::Refund { htlc_id }) => {
+                    if self.htlcs.state(&htlc_id).is_none() {
+                        ExecOutcome::Deferred
+                    } else {
+                        outcome(self.refund_htlc(&htlc_id))
+                    }
+                }
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_STAKE, body)) => match StakeTx::from_bytes(body) {
@@ -2079,4 +2109,37 @@ mod tests {
         assert_eq!(ledger.tokens().balance(&a1), 500, "an empty treasury pays no reward");
         assert_eq!(ledger.tokens().balance(&TREASURY), 0);
     }
+    /// **A claim ordered ahead of its lock is deferred, not lost.** Anti-MEV ordering is blind, so a proposer
+    /// cannot keep a contract's funding ahead of its claim — it sees only commitments. Measured before the fix:
+    /// `[claim, lock]` in one block gave `[Rejected, Applied]`, the recipient was paid nothing, and the escrow
+    /// sat stranded until the timeout while the claim was dropped from the mempool as "included".
+    #[test]
+    fn a_claim_ordered_ahead_of_its_lock_is_deferred_rather_than_lost() {
+        use fanos_hermes::hashlock;
+        let (alice_sk, alice_vk, alice) = account(1);
+        let (_b, _bv, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 10_000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.begin_block(50);
+        let secret = [0x5E; 32];
+        let terms = HtlcTerms { sender: alice, recipient: bob, amount: 1000, hashlock: hashlock(&secret), timeout: 100 };
+        let id = htlc_id(&terms, 0);
+        let payment = SignedTransfer::sign(Transfer { from: alice, to: HTLC_ESCROW, amount: 1000, nonce: 0 }, &alice_sk, alice_vk);
+        let lock = Transaction::new(HybridLedger::htlc_payload(&HtlcTx::Lock { terms, payment: Box::new(payment) }));
+        let claim = Transaction::new(HybridLedger::htlc_payload(&HtlcTx::Claim { htlc_id: id, preimage: secret }));
+        // Blind ordering puts the claim first.
+        let outcomes = ledger.apply_block(&[claim.clone(), lock]);
+        assert_eq!(
+            outcomes,
+            vec![ExecOutcome::Deferred, ExecOutcome::Applied],
+            "the claim is premature, not invalid — the engine re-queues a deferred transaction"
+        );
+        assert_eq!(ledger.tokens().balance(&bob), 0, "and it has not paid yet");
+
+        // Re-applied against the state its lock left behind, it pays — which is what makes deferring correct.
+        assert_eq!(ledger.apply_block(&[claim]), vec![ExecOutcome::Applied]);
+        assert_eq!(ledger.tokens().balance(&bob), 1000, "the recipient is paid once the ordering resolves");
+    }
+
 }

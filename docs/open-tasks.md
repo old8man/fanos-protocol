@@ -31,6 +31,21 @@ intermediary. What genuinely remains:
 Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
 surfaces and are exempt by construction.
 
+### [A] Finish the premature-versus-invalid sweep across the ledger dispatch
+`ExecOutcome::Deferred` now covers the three order-dependent cases that were measured: a transparent nonce ahead of its
+account, an HTLC claim/refund ahead of its lock, and a storage prove/close ahead of its open. The same question applies to
+the rest of `HybridLedger::apply_with_verdict`, and each needs deciding on its own merits rather than by analogy:
+- **`TAG_SHIELD`** — a shield whose funding transfer is ordered later in the block fails on balance. Deferring it means
+  deferring on `InsufficientFunds`, which is *not* obviously right: unlike a nonce or a missing object, an unfunded
+  transaction has no identifiable pending prerequisite, so retaining it re-consumes block space for `REVEAL_WINDOW`
+  blocks and multiplies the cost of a spam flood by that factor. There is no fee to price it (ERGON is gasless).
+- **`TAG_NAME`** — whether a renewal ahead of its registration, or a transfer ahead of its purchase, can occur.
+- **Shielded (`TAG_SHIELDED`)** is already safe by construction and needs nothing: the rolling anchor window
+  (`MAX_ANCHORS`, Zcash-style) accepts any recent root, and a wallet cannot prove membership against a root that does not
+  exist yet. A double-spent nullifier is genuinely terminal.
+- The general rule the sweep should apply: a rejection is premature iff *re-executing it unchanged against a later state
+  could succeed*. Replay, double-spend, bad signature and malformed bytes never can; a missing prerequisite can.
+
 ### [A] A quiescent chain leaves a straggler behind
 Measured 2026-07-27 by the new HERMES suite, which is the first test to submit a *second* transaction and so the first that
 can see this. After the first transaction, 5 of 7 validators executed the second one and **2 sat at the previous height for
