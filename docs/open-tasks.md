@@ -31,6 +31,28 @@ intermediary. What genuinely remains:
 Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
 surfaces and are exempt by construction.
 
+### [A] CRITICAL — a burst of transactions from one account loses all but the first
+Reproduced deterministically: `consensus_sim::a_burst_from_one_account_executes_every_transaction` (`#[ignore]`d, it is the
+reproduction, not a guard). Four transfers of 100 from ALICE submitted together, driven to height 24 → **one executes**.
+Live over QUIC the same shape lost one of four.
+
+**Why it is systemic, not an edge case.** Anti-MEV ordering is *blind*: a proposer sees only commitments, so it cannot
+order a sender's transactions by nonce, and a block routinely carries nonce 2 before nonce 1. Execution rejects the
+premature ones — correctly — but `on_finalize` has already dropped every *included* commitment from the mempool
+(`consensus.rs`: `mempool.retain(|t| !included.contains(&t.commit()))`), and that drop is keyed on **inclusion, not
+outcome**. The premature transactions are gone: never executed, never retryable. This happens whenever a client sends a
+second transaction before the first is included — the normal case for any wallet.
+
+**Where the conflation lives.** `ExecOutcome::Rejected` documents "bad nonce, insufficient balance, …" as one terminal
+verdict. A nonce *ahead* of the account is not invalid but *premature*: it becomes valid the moment its predecessor lands.
+Under blind ordering that distinction is load-bearing, not pedantic.
+
+**The fix.** A fourth outcome (`Deferred`) returned by `Accounts` and `TokenLedger` for a future nonce, and the engine
+returning those transactions to the mempool rather than dropping them. Two care points: the sealed↔opened pairing is not
+1:1 (an undecryptable transaction is skipped when building `opened`), so the outcome must be matched back to its
+`SealedTx` by construction rather than by index; and retention must be bounded, or a flood of far-future nonces grows the
+pool.
+
 ### [A] A quiescent chain leaves a straggler behind
 Measured 2026-07-27 by the new HERMES suite, which is the first test to submit a *second* transaction and so the first that
 can see this. After the first transaction, 5 of 7 validators executed the second one and **2 sat at the previous height for
