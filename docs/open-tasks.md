@@ -27,41 +27,33 @@ RESOLVED. What follows are the remaining *capability*, *coherence*, and *quality
   material. Compose with `note`/`nullifier`/`tx`/`note_cipher`/`state` and the §5.D-2 sighash signatures; reconcile the
   three docs above. (The ZK backend stays the separate `[P]` frontier; this is the key structure it inherits.)
 
-### 2. Roster propagation after a within-epoch coordinate move — 3 of 4 links
-Live coordinate resolution itself is done and measured (see `docs/design-coordinates.md` and `29e322b`). What remains is
-the last propagation link.
+### 2. A node that loses a coordinate collision can stay permanently unbound
+Live coordinate resolution is done (`docs/design-coordinates.md`, `29e322b`), and so is the read-triage fix this item used to
+prescribe — `resolve_directory` returns `Scan<T>`, reads are three-valued (`Read::{Found,Absent,Unknown}`), and
+`role_loop::may_relax` refuses to treat an *incomplete* scan as evidence of stability (`2e088a4`, `416b4f7`, `24dc4fe`). That
+worked: at full occupancy with an injective draw, rosters now reach **`[7; 7]`, agreed in 24–116 s**, where they previously
+froze at `[4, 4, 3, 4, 2]`.
 
-- **Roster propagation after a move: 3 of 4.** Four links found and fixed, each measured:
+**What remains is one measured failure, and it is not about propagation.** `measure_roster_convergence_with_collisions_allowed`
+(fabric, `#[ignore]`d measurement) runs `spawn_as_drawn` — collisions permitted — and reports:
 
-  | | change | cell-wide scenario, collisions allowed |
-  |---|---|---|
-  | `29e322b` | live resolution moves the node | 1 pass in 3 |
-  | `b17e5bb` | mover re-announces; peers re-key the live connection on the handshake's own check | 6 of 8 |
-  | `4b53a9a` | mover republishes capability/load at the point it moved **to** (and on `Reseated`, not only on a beacon) | 4 of 6 |
-  | `f09d9d6` | peers re-arm their roster refresh on `PeerMoved` — re-arm, **not** scan inline | 3 of 4 |
+| trial | distinct | probe index | final rosters | agreed |
+|---|---|---|---|---|
+| 0 | 7 of 7 | all `Some(0)` — *no collision occurred* | `[7, 7, 7, 7, 7, 7, 7]` | 24 s |
+| 1 | **6 of 7** | `[0, 0, 0, **None**, 0, **2**, 0]` | `[3, 5, 5, 4, 1, 5, 6]` | **never** |
 
-- **The residual is NOT about moving at all — it is a read that cannot fail visibly.** Two hypotheses were tried and both
-  made convergence *worse*, which is what redirected the search: acting on `MemberJoined` gave 0 of 3 (scan inline) and
-  1 of 4 (re-arm), because it fires per newly-learned member and holds every node at the refresh floor throughout
-  discovery — and §5.3.5 already records that the steady-state scan then starves the critical path. **More scanning cannot
-  be the fix when scanning is what starves convergence** (`24dc4fe`).
-  - **The actual defect.** `capdir::resolve_capability` ends in `tokio::time::timeout(...).ok()??`, and
-    `resolve::resolve_directory` keeps only the `Some`s — so a **timed-out read, a decode failure and a genuine absence are
-    one value**. Under load a slow store read silently *shrinks* the roster; two short scans in a row look identical, so
-    the role loop marks the assignment `stable`, grows its backoff, and the cell freezes short. That predicts every
-    observation, including the ones that refuted the move-propagation story: rosters low across *all* nodes
-    (`[2, 2, 1, 3, 2]`), worse under contention, and unimproved by scanning more (each scan is equally likely to time out,
-    and concurrent scans raise the odds).
-  - **The fix is today's own discipline, one layer down in production code.** A three-valued read — found / absent /
-    unknown — and an assignment computed over an *incomplete* read must not count as evidence of stability: no `stable`
-    increment, no backoff growth. Exactly the `Reached`/`Refuted`/`Inconclusive` distinction the simulator harness now
-    makes (`fanos_sim::fabric::Settled`), for exactly the same reason: a measurement that did not finish is not a result.
-  - Scope: `resolve_directory`'s resolver signature returns `Option<T>`, so this touches `capdir`, `loaddir` and the other
-    callers plus the role loop's stability gate. A full cycle, not a patch.
-
-- **`NodeFleet::spawn`'s injective draw is the honest indicator.** While it is there, this is not closed; it goes when the
-  cell-wide scenario passes with collisions allowed. Its stated reason has been rewritten five times as the chain advanced,
-  which is itself the record of where the boundary is.
+- **The primary defect: `probe_index = None` — a node that lost the arbitration holds no directory entry at all.** It should
+  advance its own probe walk and bind at the next point it can prove, which `settle_index` exists to do and which node 5
+  visibly did (index 2). Node 3 did neither and stayed unbound.
+- Everything else follows from that. **A node with no coordinate cannot publish**, so no scan can ever see it and the roster
+  cannot complete — which is why `agreed` is `None` rather than late. The roster numbers are a *symptom*; chasing them is
+  chasing the wrong layer, exactly as this item's earlier revisions did.
+- **Trial 0 is the control and it is essential**: an injective draw over the same code converges in 24 s. So the collision
+  path is the whole of the residual.
+- **The instrument needs one improvement before the next attempt:** `spawn_as_drawn` takes the draw as it comes, so trial 0
+  spent 160 s measuring a case with nothing to resolve. Force the condition — retry the draw until `distinct < n` — or the
+  measurement is half wasted and can silently pass by never colliding.
+- `NodeFleet::spawn`'s injective draw stays until trial-1-shaped runs converge; it is the honest indicator of exactly this.
 
 ---
 

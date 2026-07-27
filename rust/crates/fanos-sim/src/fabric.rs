@@ -1350,7 +1350,6 @@ mod tests {
                 held.len() == f.nodes().len()
             }).await;
             let held: HashSet<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
-            let rosters: Vec<_> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
             // The localising observable: whose claims did each node actually verify? A node still on a contested point with
             // a low count never heard of its rival; a high count means it heard and did not move.
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
@@ -1358,9 +1357,43 @@ mod tests {
             // `None` = not bound at all (it lost the arbitration and holds no directory entry).
             let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
             fleet.shutdown();
+            // Deliberately NOT reporting rosters here. The `until` predicate waits for distinct *addresses*, so a roster
+            // sampled at that instant is read before the role loop has assigned anything — it prints `[0, 0, …]` and looks
+            // like broken propagation when it is only an early read. Roster convergence has its own probe
+            // (`probe_roster_convergence_against_cell_occupancy`), which waits for it.
             println!(
-                "trial {trial}: held {}/7, all-distinct: {settled}, rosters {rosters:?}, claims {claims:?}, index {idx:?}",
+                "trial {trial}: held {}/7, all-distinct: {settled}, claims {claims:?}, index {idx:?}",
                 held.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_roster_convergence_with_collisions_allowed() {
+        // THE COMBINATION ITEM 2 TURNS ON, and which no other test covered: a draw that is allowed to **collide**, plus
+        // roster convergence. Two separate measurements each answered half of it — `spawn_as_drawn` reaches 7/7 distinct
+        // addresses, and `spawn` (injective draw) reaches full rosters `[7; 7]` — but a cell that has to *resolve* a
+        // collision and *then* propagate its roster is the case the injective draw in `NodeFleet::spawn` exists to avoid.
+        //
+        // While that guard is there, item 2 is not closed. It goes when this passes.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        for trial in 0..2 {
+            let fleet = NodeFleet::spawn_as_drawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
+            let trace = fleet.observe(40, Duration::from_secs(4), fanos_node::Node::assignment).await;
+            let coords: Vec<fanos_geometry::Triple> = fleet.nodes().iter().map(|n| n.health().address).collect();
+            let distinct: HashSet<fanos_geometry::Triple> = coords.iter().copied().collect();
+            let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
+            fleet.shutdown();
+            let roster = trace.map(|a| a.roster);
+            println!(
+                "trial {trial}: {} distinct of 7, index {idx:?} → final rosters {:?} agreed={:?}",
+                distinct.len(),
+                roster.last(),
+                roster.stable_agreement_at().map(|d| d.as_secs())
             );
         }
     }
