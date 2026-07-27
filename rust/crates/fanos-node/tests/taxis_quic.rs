@@ -302,3 +302,4 @@ async fn a_validator_joining_late_reaches_the_cells_executed_state() {
     assert_eq!(state.balance(&BOB), 100, "it holds the transfer it never saw proposed");
     assert_eq!(state.balance(&ALICE), 900, "and the matching debit — one executed state, not a reconstruction");
 }
+

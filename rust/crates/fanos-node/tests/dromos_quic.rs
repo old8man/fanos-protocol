@@ -420,3 +420,4 @@ async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
     })
     .await;
 }
+

@@ -95,12 +95,23 @@ HERMES contract suite is the first that needs two rounds of consensus (lock, the
 The deterministic simulator reaches height 24+ reliably in the same shape, so the defect is in the live driver or its
 transport, not in the engine's logic.
 
-**Where to look.** The engine has no empty-mempool guard — `maybe_propose` builds and broadcasts a block from a possibly
-empty mempool — so a quiescent cell should still advance. The two guards that *do* abstain are worth checking first:
-`proposed_round == Some(round)` (one proposal per round) and the `last_finalized_cert.is_none()` abstention a
-freshly-state-synced validator takes. Round-timeout backoff doubles to `ROUND_TIMEOUT_MAX` (24 s) on non-progress and
-resets on a height change, so a cell that has stopped advancing waits ever longer to retry — which would turn a brief
-stall into the observed permanent one.
+**Narrowed by three probes, 2026-07-28 — it is the block's *size*, and the suspect is DA availability.**
+
+| cell | driven with | 40 s of heights |
+|---|---|---|
+| `Accounts` | one small transfer | reaches **14**, no stall over ~5 s |
+| `HybridLedger` | nothing at all | reaches **9**, pauses ≤ 10 s |
+| `HybridLedger` | one **9 101-byte** HTLC lock | reaches 6–7 and **stalls 25 s+** |
+
+So a quiescent cell advances fine and the state machine is not the variable: what stalls it is a block carrying a large
+transaction. The stalled sample is split — `[7, 6, 6, 7, 6, 6, 6]` — which is the signature of **body availability**, not
+of agreement: some validators hold the block and some do not. A 9 KB transaction is dispersed as erasure shards and must
+be sampled back; `resample_pending` and `NeedSkeleton` retry exist in the driver, and are evidently not enough at this
+size.
+- The deterministic simulator models dispersal (`sampling_latency`, `Sampler`) and reaches height 24+ in the same shape,
+  so the fidelity gap is in *what it models about size* — its shards are exchanged by construction rather than raced.
+- Next: instrument `Sampler` occupancy on the live path, and check whether a 9 KB block's shard set is ever completed by
+  the validators that lag. Compare against the ~1 KB shielded transfer, which does not stall.
 
 ### [A] The verification gate itself is load-sensitive — one flake per full-workspace run
 Measured 2026-07-28 on the current tree: `cargo test --workspace --features validator` → 43 suites, **756 tests, one
