@@ -82,6 +82,25 @@ to the point it left. That is now fixed, but it does **not** explain the laggard
 deliberately (`Point::at(me)`, chosen rather than VRF-accepted, "which the Fano-cell BFT structure requires"), and the
 QUIC cell fixture seats its nodes the same way. No reseat happens in either.
 
+### [A] The verification gate itself is load-sensitive — one flake per full-workspace run
+Measured 2026-07-28 on the current tree: `cargo test --workspace --features validator` → 43 suites, **756 tests, one
+failure**. The failing one was the HERMES contract suite, with all seven validators frozen at the lock height; in
+isolation the same suite passes in 20–30 s, repeatedly.
+
+The verdict now carries the evidence to judge it, which is the point of the progress-bounded waits: **321 observations
+completed inside the frozen window, the slowest taking 269 ms** against single-digit milliseconds idle. So the host was
+answering, roughly 30× slower than idle, and the cell still made no progress in that window.
+
+- That suite is structurally more exposed than its two siblings: it needs *two* rounds of consensus (lock, then claim), so
+  it spends twice as long in the contended window. A one-transaction test's fixed point is reached before contention
+  matters.
+- **Do not fix it by widening a timeout** — the frozen span is already counted in observations rather than wall clock, and
+  it still refuted. The binding constraint is that `cargo test` runs several real-QUIC cell fixtures against one loopback
+  and one scheduler. The decision is how the harness bounds concurrency for *transport-bound* suites: `serial_cell`
+  already does this within a binary, but nothing coordinates across binaries.
+- CI runs exactly this command on a 2-core runner, i.e. permanently in the contended regime. A gate that flakes teaches
+  people to ignore it — which is how this repository acquired a formatter gate nobody looked at (§2.0).
+
 ### [A] `#[ignore]` conflates two incompatible things
 34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
 **never** gate, and *cost-gated assertions* (13 in `fanos-obolos`, 2 each in `taxis`/`quic`/`ffi`) that must gate **somewhere**.

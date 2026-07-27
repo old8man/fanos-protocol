@@ -186,6 +186,41 @@ production block: the check is the `#[cfg(test)]`-boundary count in §1, which i
 `25 allow(clippy::too_many_arguments)` is worth a second look for a different reason: this session found that such a lint was
 twice pointing at a **missing type** rather than a missing suppression (`HostedService`, and the `(Vec<u8>, u8, bool)` triple).
 
+### 2.6 CRITICAL — blind ordering met drop-on-inclusion, and a sender's later transactions were lost (fixed)
+
+Found after this audit was written, by following a live symptom into the deterministic simulator. Two individually-correct
+behaviours composed into losing user transactions outright:
+
+- **Anti-MEV ordering is blind.** A proposer sees only commitments, so it *cannot* order a sender's transactions by nonce,
+  and a block routinely carries nonce 2 ahead of nonce 1. Execution rejected the premature one — rightly.
+- **`on_finalize` dropped every *included* commitment from the mempool**, keyed on inclusion rather than outcome, and it
+  ran *before* the execution that would have re-queued anything.
+
+Measured: four transfers of 100 from one account, submitted together and driven to height 24, executed **one**. Live over
+QUIC the same shape lost one of four. This is not a stress case — it is what happens whenever a wallet sends a second
+transaction before the first is included.
+
+The conflation lived in the outcome type: `ExecOutcome::Rejected` documented "bad nonce, insufficient balance, …" as one
+terminal verdict, when a nonce *ahead* of an account is not invalid but **premature** — it becomes valid the moment its
+predecessor lands. `ExecOutcome::Deferred` now names that, `Accounts` and `TokenLedger` return it
+(`TokenError::NonceAhead`, split out of `BadNonce`, which now means only a replay), and the engine returns those
+transactions to the mempool.
+
+Three things are worth carrying forward from the fix:
+
+1. **The class is wider than the instance.** The same shape held for an HTLC claim ordered ahead of its lock
+   (`[claim, lock]` → `[Rejected, Applied]`, recipient paid nothing, escrow stranded until the timeout) and a storage
+   proof ahead of its deal. Both now defer. The shielded path was checked and is safe by construction — its rolling anchor
+   window accepts any recent root, and no wallet can prove membership against a root that does not exist yet.
+2. **The general rule**: a rejection is premature iff *re-executing the transaction unchanged against a later state could
+   succeed*. Replay, double-spend, bad signature and malformed bytes never can; a missing prerequisite can. `TAG_SHIELD`
+   and `TAG_NAME` remain to be decided against it, and one of them is a genuine trade-off rather than an oversight —
+   deferring on insufficient funds has no identifiable pending prerequisite, so it re-consumes block space for
+   `REVEAL_WINDOW` blocks with no fee to price it (ERGON is gasless).
+3. **A one-transaction test cannot see any of this.** Both sibling `dromos_quic` suites submit exactly one transaction, so
+   "every validator reached height 1" is their fixed point. The defect needed a *second* transaction from the same sender
+   to exist at all — which is the ordinary case in production and was absent from every test in the repository.
+
 ---
 
 ## 3. What this audit does not cover
