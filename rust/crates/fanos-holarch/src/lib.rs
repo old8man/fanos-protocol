@@ -36,14 +36,22 @@
 //!
 //! A design is **viable** iff all four hold — a bounded window `P ∈ (2/7, 3/7]`, `Φ ≥ 1`, `D ≥ 2`.
 //!
+//! **Three of the four are independent; V1 is implied by V3.** Purity decomposes exactly as
+//! `P = (Σ_i γ_ii²)(1 + Φ)`, and at trace 1 Cauchy–Schwarz gives `Σ_i γ_ii² ≥ 1/7`, so `Φ ≥ 1` forces
+//! `P ≥ 2/7` — with equality only at the single degenerate point where `Φ = 1` *and* the diagonal is
+//! exactly uniform. V1 can therefore never fail while V3 holds. It is kept as a cheap, separately-named
+//! guard (it is what fails first as a design dissolves toward the grey mesh, and it names *why*), but the
+//! window has three independent walls, not four, and no perturbation can exhibit V1 in isolation.
+//!
 //! ## FANOS is the E∧L synthesis
 //!
 //! FANOS is the join of a mixnet holon (int**E**riority is the anonymity resource — the unobservable
 //! pool/keys/delays) and a blockchain holon (**L**ogic-dominant — a consensus law-machine). Its
 //! declared budget ([`fanos_platform`]) is therefore thick on *both* E and L, and lands inside the
 //! window with margin. [`Panel::run`] recomputes the verdict, the [`Sigma`] stress panel, and the four
-//! **Ω4 ablations** — each of which must break exactly the one invariant it targets, since a design you
-//! cannot break on demand was never really constrained by that invariant.
+//! **Ω4 ablations** — a design you cannot break on demand was never really constrained by that invariant.
+//! Three of them are selective (they break their target and nothing else); the fourth cannot be, for the
+//! reason above.
 //!
 //! ## On floating point
 //!

@@ -59,6 +59,8 @@ HOLARCH's four invariants (`holarch.md` §6, all [T]) become the platform's arch
 | **V3 Integration** `Φ ≥ 1` [T] | `≥ 1` | *fragmentation* — the subsystems are an archipelago with thin interfaces; the currency doesn't actually ride the mixnet, the naming doesn't actually bind the ledger |
 | **V4 Differentiation** `D ≥ 2` [T] | `≥ 2` | *rigidity* — no degraded mode; if the shielded pool or a cell fails there is no transparent/federated fallback to retreat to |
 
+**Three walls, not four: V1 is implied by V3.** Purity decomposes exactly as `P = (Σ_i γ_ii²)(1 + Φ)` — `Φ` is *defined* as the ratio of off-diagonal to diagonal power — and at `Tr Γ = 1` Cauchy–Schwarz gives `Σ_i γ_ii² ≥ 1/7`. So `Φ ≥ 1` forces `P ≥ 2/7`, with equality only at the single degenerate point where `Φ = 1` *and* the diagonal is exactly uniform. Distinctness therefore cannot fail while integration holds: V1 is a derived guard that names *why* a dissolving design fails, not a fourth independent constraint. This is why the Ω4 ablation calculus can exhibit V2, V3 and V4 in isolation but never V1 — `mud` necessarily takes integration with it (`fanos-holarch`, `tests/gate.rs::v1_distinctness_is_implied_by_v3_integration`, checked against 2 000 matrices of the model's own family).
+
 The anti-domination ceiling (V2 ≤ ~3/7) is the same *облик* (shape) of law that BFT already imposes on TAXIS (`f < n/3`) — `holarch.md` §6 marks this KOНСОНАНС [И]: one fraction, two bases (validator weight vs pattern purity), a structural rhyme, never an identity. FANOS is the rare system where the anti-domination law is enforced at **both** levels — the network's quorums *and* the platform's architecture.
 
 ### 1.4 The depth ceiling governs L1/L2 scaling {#depth}

@@ -127,11 +127,25 @@ enough for a nightly or pre-release job, and the finding is that it does not hav
 
 | crate | prod lines | ratio | tests | note |
 |---|---|---|---|---|
-| `fanos-holarch` | 987 | **0.14** | 8 | this is the *viability gate*; a gate with 8 tests cannot be trusted to gate |
+| `fanos-holarch` | 987 | **0.14** | 9 | see below — the ratio misjudged this one |
 | `fanos-observatory` | 2 394 | **0.16** | 17 | |
 | `fanos-runtime` | 3 433 | **0.29** | 29 | the overlay engine — mitigated by `fanos-sim` (267 tests) and `fanos-quic` (68), but its own unit coverage is the thinnest of any core crate |
 
 Everything else sits at 0.4–1.9. `fanos-ports` (368 lines, 0 tests) is pure trait/type declaration and needs none.
+
+**Correction, 2026-07-27: the ratio was the wrong instrument for `fanos-holarch`.** Its tests are dense rather than thin —
+the gate with margin, the corpus reference corners, PSD validity for every instance *and* every ablation including a
+rejection case, the binding-boundary headroom, and the T-77 composition identity. What was actually wrong was narrower and
+would not have shown up as a ratio at all: `each_ablation_breaks_its_targeted_invariant` asserted only that the target
+broke, while the doc beside it claimed each ablation breaks *exactly* one invariant. Asserting the full break-set showed
+that **three of the four did not** — `mud` also broke V3, `monolith` also broke V4, `fragmentation` also broke V4 — so
+none of those three demonstrated its invariant to be independently binding, which is the entire purpose of the Ω4
+calculus. `monolith` and `fragmentation` are now selective (the monolith eats the *data* flow, which is E-rich, instead of
+the L/U-dominant control flow; fragmentation keeps interiority thick inside its island instead of thinning it along with
+the coupling). `mud` cannot be, and the reason is a theorem rather than a defect: `P = (Σγ_ii²)(1 + Φ)` and
+`Σγ_ii² ≥ 1/7` at trace 1, so `Φ ≥ 1 ⇒ P ≥ 2/7` — **V1 is implied by V3**, and the viable window has three independent
+walls, not four. Recorded in `spec/platform.md` §1.3 and pinned over 2 000 matrices of the model's own family. Lesson for
+the rest of this table: a test-to-code ratio cannot see an assertion that is weaker than the claim it is labelled with.
 
 ### 2.4 MEDIUM — 34 `#[ignore]`d tests are a second, invisible test suite
 

@@ -103,10 +103,14 @@ remaining `allow(clippy::too_many_arguments)` the same way: twice this session s
   red until the readiness item above is done. Four of the five variants are `async` awaiting nothing, which is what the
   `allow(clippy::unused_async)` suppressions cover — the lint is right, but removing them is what exposes the race.
 
-### [A] Thin unit coverage in three crates
-`fanos-holarch` 987 lines / **0.14** ratio / 8 tests — and it is the viability gate, so a gate that cannot be trusted to gate.
-`fanos-observatory` 2 394 / 0.16 / 17. `fanos-runtime` 3 433 / 0.29 / 29 — the overlay engine; mitigated by `fanos-sim` (267)
-and `fanos-quic` (68) but the thinnest own-coverage of any core crate.
+### [A] Thin unit coverage — in two crates, not three
+`fanos-observatory` 2 394 lines / **0.16** ratio / 17 tests. `fanos-runtime` 3 433 / 0.29 / 29 — the overlay engine;
+mitigated by `fanos-sim` (267) and `fanos-quic` (68) but the thinnest own-coverage of any core crate.
+
+`fanos-holarch` is **struck from this list**: its tests turned out to be dense, not thin, and the real defect there was an
+assertion weaker than its own doc claim — invisible to a ratio. Fixed (`docs/audit-2026-07-27-architecture.md` §2.3), and
+it produced a theorem: V1 is implied by V3, so the viability window has three independent walls, not four. Treat the
+remaining two rows the same way — look for claims that no assertion checks, not for a line count.
 
 ### 1. OBOLOS diversified / stealth one-time addresses (O-M4)
 - **Problem.** The key hierarchy is *half* built. `fanos-obolos/src/wallet.rs` has the full viewing hierarchy —

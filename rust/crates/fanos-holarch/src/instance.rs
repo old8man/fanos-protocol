@@ -4,18 +4,36 @@ use crate::aspect::{Aspect, N};
 use crate::gamma::{Budget, Gamma};
 use crate::verdict::Invariant;
 
-/// A targeted perturbation of an [`Instance`] — each must break *exactly* the one invariant it aims at
-/// (T-124b): a design you cannot break on demand was never really constrained by that invariant.
+/// A targeted perturbation of an [`Instance`] — a design you cannot break on demand was never really
+/// constrained by that invariant (T-124b).
+///
+/// Three of the four are **selective**: [`Monolith`](Self::Monolith), [`Fragmentation`](Self::Fragmentation)
+/// and [`Blind`](Self::Blind) each break their target and leave the other three standing, which is what
+/// shows V2, V3 and V4 to be independently binding. [`Mud`](Self::Mud) cannot be, and no perturbation
+/// could be: `V3 ⇒ V1` is an identity of the model, not a property of the design (see
+/// [`crate::Gamma::purity`] — `P = (Σγ_ii²)(1 + Φ)` and `Σγ_ii² ≥ 1/7` at trace 1, so `Φ ≥ 1` forces
+/// `P ≥ 2/7`). Breaking distinctness therefore *requires* breaking integration first, and V1 is a
+/// derived guard rather than a fourth independent constraint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ablation {
     /// **Mud** — 80% of activity outside any flow: the unstructured background swamps the signal, so
-    /// purity falls through the noise floor (breaks **V1**).
+    /// purity falls through the noise floor (breaks **V1** — and necessarily **V3** with it, see above).
     Mud,
     /// **Monolith** — one global mode eats the system with no background to reflect in: purity spikes
-    /// past the dominance ceiling (breaks **V2**).
+    /// past the dominance ceiling (breaks **V2**, and only V2).
+    ///
+    /// The mode that eats the system is the **data** flow, not control. Both push `P` past 3/7, but a
+    /// control-flow monolith also drags `D` to 1.70 and so breaks V4 as collateral — the FANOS control
+    /// budget is L/U-dominant, so interiority collapses with it. The data flow is E-rich (`E` carries
+    /// 1.5 of it), which keeps `D = 3.37` and isolates the perturbation to the one invariant it names.
     Monolith,
     /// **Fragmentation** — the flows lose their shared carriers and retreat to disjoint islands, so the
-    /// parts stop cohering (breaks **V3**).
+    /// parts stop cohering (breaks **V3**, and only V3).
+    ///
+    /// Interiority stays *thick inside its island* rather than being thinned along with the coupling.
+    /// Detaching it (the first form of this ablation gave `E` a budget of 0.35) drops `D` to 1.25 and
+    /// breaks V4 too, which is a different experiment: it no longer shows that integration alone is
+    /// binding. Kept load-bearing at 2.5, the islands give `Φ = 0.72` with `D = 3.12`.
     Fragmentation,
     /// **Blind** — interiority is unplugged from every flow, so nothing differentiates inside (breaks
     /// **V4**).
@@ -78,9 +96,10 @@ impl Instance {
     pub fn ablate(&self, a: Ablation) -> Gamma {
         match a {
             Ablation::Mud => Gamma::from_modes(&self.budgets, self.lambdas, 0.80),
-            Ablation::Monolith => Gamma::from_modes(&self.budgets, [0.96, 0.02, 0.02], 0.04),
+            Ablation::Monolith => Gamma::from_modes(&self.budgets, [0.02, 0.96, 0.02], 0.04),
             Ablation::Fragmentation => {
-                // control={L,U}, data={A,D}, supply={O,S}; E barely attached to the data island.
+                // control={L,U}, data={A,D}, supply={O,S}; E stays thick inside the data island, so this
+                // breaks cohesion without also unplugging interiority (which would be the Blind experiment).
                 let mut b = [Budget::new(0.0, 0.0, 0.0); N];
                 b[Aspect::L.index()] = Budget::new(1.0, 0.0, 0.0);
                 b[Aspect::U.index()] = Budget::new(1.0, 0.0, 0.0);
@@ -88,7 +107,7 @@ impl Instance {
                 b[Aspect::D.index()] = Budget::new(0.0, 1.0, 0.0);
                 b[Aspect::O.index()] = Budget::new(0.0, 0.0, 1.0);
                 b[Aspect::S.index()] = Budget::new(0.0, 0.0, 1.0);
-                b[Aspect::E.index()] = Budget::new(0.0, 0.35, 0.0);
+                b[Aspect::E.index()] = Budget::new(0.0, 2.5, 0.0);
                 Gamma::from_modes(&b, self.lambdas, 0.10)
             }
             Ablation::Blind => {
