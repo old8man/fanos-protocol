@@ -320,6 +320,22 @@ pub enum Input {
         /// far more frequent small inputs (votes, reveals) stay cheap to move — a proposal is rare.
         shards: Box<DaShards>,
     },
+    /// A proposal **skeleton** received off the wire — header, sortition witness and `last_commit`, no payload.
+    ///
+    /// Exists so the SSLE round-0 min-ticket lottery can rank a proposal from the thing it actually ranks: the
+    /// **ticket**, which rides in the skeleton's witness. The alternative is what shipped, and it deadlocked the cell —
+    /// the driver disperses one shard per validator and admits a proposal only once it has *sampled the rest and
+    /// reconstructed the body*, so under all-propose every replica ranked whatever different subset of the N proposals
+    /// happened to reconstruct inside one collection tick, split its PREPARE, and no quorum ever formed.
+    ///
+    /// A skeleton is **rank-only** and can never be prepared: its `sealed_txs` is empty, so it cannot pass
+    /// [`Block::verify_structure`], and the body it names enters `proposals` solely through the full
+    /// [`Input::Propose`] path with every gate applied. The engine prepares a ranked block only once that body is
+    /// present, so ranking an unvalidated skeleton costs nothing in safety.
+    Skeleton {
+        /// The skeleton (`Block::skeleton`): the full header and witness with an empty payload.
+        block: Block,
+    },
     /// A vote received off the wire.
     Vote(SignedVote),
     /// A reveal received off the wire.
@@ -656,6 +672,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 out
             }
             Input::Propose { block, shards } => self.on_propose(block, &shards),
+            Input::Skeleton { block } => self.on_skeleton(&block),
             Input::Vote(sv) => self.accept_vote(sv),
             Input::Reveal(r) => self.on_reveal(&r),
             Input::ExecVote(v) => self.on_exec_vote(v),
@@ -819,6 +836,66 @@ impl<S: StateMachine> ConsensusEngine<S> {
         verify_leader_ticket(root, s.height, index, &self.seed, height, self.round, &witness.output, &witness.proof)
     }
 
+    /// Rank a round-0 proposal **skeleton** into the min-ticket lottery, without its payload.
+    ///
+    /// Checks everything a skeleton can carry — the proposer is an elected line member, the block links to our head at
+    /// our height and epoch, its `last_commit` matches its header commitment, and its sortition witness verifies against
+    /// the proposer's pre-registered root — and then buffers the ticket. It deliberately does **not** run
+    /// [`Block::verify_structure`] (a skeleton's payload is empty, so `tx_root`/`da_commit` cannot match) nor the
+    /// anti-MEV seal check (there are no transactions here to check); both are applied in full to the *body* before
+    /// anything is prepared, which is the only place they can decide a vote.
+    ///
+    /// A no-op outside SSLE round 0, where there is no lottery to rank into.
+    fn on_skeleton(&mut self, block: &Block) -> Vec<Output> {
+        if self.sortition.is_none() || self.round != 0 || self.sent_prepare.contains(&0) {
+            return Vec::new();
+        }
+        let height = self.height();
+        if !is_line_member(&self.seed, height, 0, usize::from(block.header.proposer))
+            || block.header.height != height
+            || block.header.parent != self.chain.head()
+            || block.header.epoch != self.epoch
+            || !block.last_commit_matches()
+            || !self.valid_last_commit(block)
+        {
+            if block.header.height > height {
+                self.note_height(block.header.height); // a skeleton for a height ahead of us — we are behind
+            }
+            return Vec::new();
+        }
+        let Some(ticket) = self.verify_witness(block) else {
+            return Vec::new();
+        };
+        self.rank_round0(block.header.proposer, ticket, block.hash(), height)
+    }
+
+    /// Enter `(proposer, ticket)` into the round-0 lottery and prepare if the outcome is already decided.
+    ///
+    /// Shared by the skeleton and full-block paths so one rule governs the lottery: buffer the ticket, open the
+    /// collection window on the first entry, and short-circuit the wait once **every** elected line member has been
+    /// ranked — at which point the minimum is final and no further waiting can change it.
+    fn rank_round0(&mut self, proposer: u8, ticket: [u8; 32], bh: [u8; 32], height: u64) -> Vec<Output> {
+        self.round0_tickets.entry(proposer).or_insert((ticket, bh));
+        if self.round0_window.is_none() {
+            self.round0_window = Some(0);
+        }
+        let line_size = line_members(leader_line(&self.seed, height, 0)).len();
+        if self.round0_tickets.len() >= line_size {
+            return self.prepare_round0_min();
+        }
+        // Otherwise the lottery is still open, and preparing now would be the very defect the window exists to prevent:
+        // the first proposal seen is not the minimum, and honest replicas seeing different firsts would split their
+        // PREPAREs and stall the round.
+        //
+        // The one exception is a body arriving *after* the window already expired — the winner was ranked from its
+        // skeleton and we have been waiting for exactly this payload, so it must be able to trigger the PREPARE rather
+        // than wait for the next tick.
+        if self.round0_window.is_some_and(|w| w >= COLLECT_WINDOW_TICKS) {
+            return self.prepare_round0_min();
+        }
+        Vec::new()
+    }
+
     /// Validate a proposal and either prepare it (round ≥ 1 / no sortition) or buffer it into the round-0
     /// min-ticket lottery (SSLE). Every validity gate — proposer entitlement, link, structure, anti-MEV seal,
     /// data-availability — is applied identically in both modes *before* a proposal can influence the outcome.
@@ -877,20 +954,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return self.finalize(bh);
         }
         if let Some(ticket) = ticket {
-            // Round-0 lottery: buffer the ticket and (re)open the collection window. Do NOT prepare yet —
-            // preparing the first proposal seen would let honest replicas split their PREPAREs across different
-            // members and stall the round. We prepare the LOWEST ticket once the window closes.
-            self.round0_tickets.entry(proposer).or_insert((ticket, bh));
-            if self.round0_window.is_none() {
-                self.round0_window = Some(0);
-            }
-            // Early exit: once every elected line member has proposed, the min is final — prepare immediately,
-            // so the happy path adds no waiting beyond proposal propagation.
-            let line_size = line_members(leader_line(&self.seed, height, 0)).len();
-            if self.round0_tickets.len() >= line_size {
-                return self.prepare_round0_min();
-            }
-            return Vec::new();
+            // Round-0 lottery: rank this ticket (never prepare on first sight — that would split honest PREPAREs
+            // across members and stall the round). The body is now in `proposals`, so if this block is the current
+            // minimum, `rank_round0` prepares it here.
+            return self.rank_round0(proposer, ticket, bh, height);
         }
         // Round ≥ 1 (or sortition disabled): the single-leader immediate prepare (the pre-SSLE path, unchanged).
         // Safety lock: never prepare a block conflicting with the one we are locked on this height.
@@ -921,6 +988,13 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let Some((_, bh)) = self.round0_tickets.values().min_by_key(|&&(t, _)| t).copied() else {
             return Vec::new(); // nothing collected yet
         };
+        // The lottery ranks skeletons, so the winner's *body* may not be here yet. Wait for it rather than prepare a
+        // higher ticket: every replica ranks the same skeleton set, so all of them wait for the same block and the
+        // outcome stays agreed. A winner that never delivers is evicted by `tick_round0_window` on window expiry, so
+        // this waits for propagation, never indefinitely.
+        if !self.proposals.contains_key(&bh) {
+            return Vec::new();
+        }
         // Respect the Tendermint lock (a no-op in round 0 — no prior lock can exist — but kept for uniformity).
         if let Some(locked) = self.locked_block
             && locked != bh
@@ -947,10 +1021,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return Vec::new(); // not opened — no round-0 proposal buffered yet
         };
         self.round0_window = Some(w + 1);
-        if w + 1 >= COLLECT_WINDOW_TICKS && !self.round0_tickets.is_empty() {
-            return self.prepare_round0_min();
+        if w + 1 < COLLECT_WINDOW_TICKS || self.round0_tickets.is_empty() {
+            return Vec::new();
         }
-        Vec::new()
+        // Past expiry: prepare the minimum as soon as its body is in hand. Retried every tick, because the window
+        // bounds how long we wait for further *skeletons* — which arrive without sampling — and not how long the
+        // winner's payload takes to reconstruct.
+        //
+        // Deliberately no eviction timer for a winner whose body never comes. The round timeout already covers it: the
+        // round advances and round 1's public fallback proposes, which is the same bounded cost a withheld public
+        // proposal has always had (`a_withheld_block_never_finalizes_and_the_round_advances`). An eviction timer here
+        // would have to be derived from DA sampling latency, which this sans-I/O engine cannot observe — and a timer
+        // guessed at instead was measured evicting every honest proposer in turn, one per tick, until the lottery was
+        // empty and the height could never be led at all.
+        self.prepare_round0_min()
     }
 
     /// Ingest a vote, store it (de-duplicated), and drive the phase transitions it may complete.

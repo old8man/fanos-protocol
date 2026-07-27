@@ -31,6 +31,15 @@ impl<K: Ord + Copy, V> BoundedMap<K, V> {
         Self { map: BTreeMap::new(), order: VecDeque::new(), capacity: capacity.max(1) }
     }
 
+    /// Iterate the live entries in key order.
+    ///
+    /// Key order rather than insertion order: the bound is FIFO but a reader wants a deterministic, total order over the
+    /// entries, and every caller so far is sweeping all of them (re-requesting the DA shards still missing from each
+    /// block being sampled) rather than caring which arrived first.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.map.iter()
+    }
+
     /// Insert `(key, value)`. A **new** key takes a fresh slot, evicting the oldest entry if the map was at
     /// capacity; a **known** key just updates its value, leaving the size and eviction order untouched.
     /// Returns the evicted `(key, value)`, if a new key pushed the map over capacity.

@@ -93,6 +93,20 @@ struct Cluster {
     committed: Vec<Vec<(u64, [u8; 32])>>,
     crashed: Vec<bool>,
     withholding: BTreeSet<u8>,
+    /// **DA dispersal latency**, in ticks, or `0` for the historical "a proposal arrives whole" model.
+    ///
+    /// Production never delivers a full block: the driver broadcasts the small *skeleton*, disperses one erasure shard
+    /// per validator, and admits the proposal to the engine only once it has **sampled the rest from peers and
+    /// reconstructed the body** (`fanos_node::taxis_driver::begin_sampling`/`try_reconstruct`). This models that: the
+    /// skeleton lands immediately (it needs no sampling), and the body lands `da_delay` ticks later.
+    ///
+    /// It exists because the sim's fidelity gap here hid a **total** SSLE liveness failure — a cell that finalized no
+    /// block at all over real QUIC while every engine-level SSLE test passed, because `shards_for` handed each replica
+    /// the complete shard set instantly. A sim that differs from production in anything but transport cannot pin what
+    /// production does (`docs/design-testing.md`; the standing fidelity rule).
+    da_delay: u32,
+    /// Bodies in flight: `(ticks remaining, receiver, full block)`. Drained by [`tick`](Self::tick).
+    deferred: Vec<(u32, usize, Block)>,
     /// Validators that never receive block bodies (Propose), to exercise the commit-cert-before-body path.
     deaf_propose: BTreeSet<usize>,
     /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
@@ -135,6 +149,8 @@ impl Cluster {
             committed: vec![Vec::new(); N],
             crashed: vec![false; N],
             withholding: BTreeSet::new(),
+            da_delay: 0,
+            deferred: Vec::new(),
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
@@ -191,11 +207,72 @@ impl Cluster {
         }
     }
 
+    /// How long validator `to` takes to gather enough shards to reconstruct `block`, in ticks.
+    ///
+    /// **Per (validator, block), not uniform** — and that distinction is the whole fidelity of this model. Each replica
+    /// samples the shards it is missing from its peers *independently*, so bodies reconstruct at different times on
+    /// different replicas. A uniform delay is worthless as an instrument: every replica then ranks the identical
+    /// complete set at the identical tick and the lottery cannot split, so the test passes with the defect present. It
+    /// did — this model was written with a uniform delay first and pinned nothing.
+    ///
+    /// Deterministic in `(to, block)`, so a failure reproduces exactly.
+    fn sampling_latency(&self, to: usize, block: &Block) -> u32 {
+        let h = block.hash();
+        let spread = u32::from(h[0]).wrapping_add(u32::try_from(to).unwrap_or(0).wrapping_mul(31));
+        1 + spread % self.da_delay
+    }
+
+    /// Model production's dispersal for one proposal: rank the skeleton now, deliver the body after sampling.
+    fn disperse(&mut self, from: usize, block: &Block) {
+        let skeleton = block.skeleton();
+        for i in 0..N {
+            if self.crashed[i]
+                || (from != usize::MAX && self.partition[from] != self.partition[i])
+                || self.deaf_propose.contains(&i)
+            {
+                continue;
+            }
+            let outs = self.engines[i].step(Input::Skeleton { block: skeleton.clone() });
+            self.collect(i, outs);
+            self.deferred.push((self.sampling_latency(i, block), i, block.clone()));
+        }
+    }
+
+    /// Deliver every body whose sampling latency has elapsed, counting the rest down one tick.
+    fn drain_deferred(&mut self) {
+        let due: Vec<(usize, Block)> = self
+            .deferred
+            .iter_mut()
+            .filter_map(|(left, to, b)| {
+                *left = left.saturating_sub(1);
+                (*left == 0).then(|| (*to, b.clone()))
+            })
+            .collect();
+        self.deferred.retain(|(left, _, _)| *left > 0);
+        for (to, block) in due {
+            if self.crashed[to] {
+                continue;
+            }
+            let shards = Box::new(self.shards_for(&block));
+            let outs = self.engines[to].step(Input::Propose { block, shards });
+            self.collect(to, outs);
+        }
+        self.run();
+    }
+
     fn deliver(&mut self, from: usize, msg: &ConsensusMsg) {
         if let ConsensusMsg::Propose(b) = msg
             && !self.proposed.iter().any(|p| p.hash() == b.hash())
         {
             self.proposed.push(b.clone());
+        }
+        // With the dispersal model on, a proposal is not a single delivery: the skeleton lands now and the body later.
+        if self.da_delay > 0
+            && let ConsensusMsg::Propose(b) = msg
+        {
+            let b = b.clone();
+            self.disperse(from, &b);
+            return;
         }
         for i in 0..N {
             if self.crashed[i] {
@@ -215,6 +292,11 @@ impl Cluster {
             let outs = self.engines[i].step(input);
             self.collect(i, outs);
         }
+    }
+
+    /// Enable the production DA-dispersal model at `delay` ticks of sampling latency (see [`Self::da_delay`]).
+    fn with_da_delay(&mut self, delay: u32) {
+        self.da_delay = delay;
     }
 
     /// Push one message onto the bus and drain to quiescence (for injecting an adversary's message — it reaches
@@ -266,6 +348,9 @@ impl Cluster {
             self.collect(i, outs);
         }
         self.run();
+        if self.da_delay > 0 {
+            self.drain_deferred();
+        }
     }
 
     fn timeout(&mut self) {
@@ -346,6 +431,43 @@ fn a_transaction_finalizes_and_executes_in_agreed_order() {
     let root = c.engines[0].chain().state_root();
     for e in &c.engines {
         assert_eq!(e.chain().state().balance(&ALICE), 900);
+        assert_eq!(e.chain().state().balance(&BOB), 100);
+        assert_eq!(e.chain().state_root(), root, "all replicas agree on the state root");
+    }
+}
+
+#[test]
+fn ssle_finalizes_when_bodies_arrive_by_da_sampling_rather_than_whole() {
+    // THE REGRESSION TEST FOR A TOTAL LIVENESS FAILURE, and for the fidelity gap that hid it.
+    //
+    // Every other SSLE test here delivers each proposal as a complete block, which production never does: the driver
+    // broadcasts the skeleton, disperses one erasure shard per validator, and admits the proposal only after sampling
+    // the rest and reconstructing the body. Under all-propose that is N proposals each needing a sampling round trip,
+    // against a one-tick collection window — so every replica ranked a different subset of the lottery, split its
+    // PREPARE, and the cell finalized NOTHING. Measured over real QUIC: no block in 240 s, while every engine-level
+    // SSLE test passed.
+    //
+    // With `da_delay`, the sim runs production's shape: skeletons land at once, bodies land later. The lottery must
+    // therefore rank from skeletons — the ticket rides in the witness — and require availability only for the block it
+    // actually prepares. If ranking is ever gated on the body again, this test goes red and the QUIC suite does not
+    // have to spend 240 s to say so.
+    let mut c = Cluster::new(&genesis());
+    c.enable_sortition_all();
+    c.with_da_delay(2); // bodies arrive two ticks after their skeletons
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"ssle-da");
+    c.submit_all(&tx);
+    // Ticks, not one: the winner is ranked from its skeleton in the first, and its body cannot arrive before the
+    // third. A cell that only finalizes when proposals arrive whole never finalizes here at all.
+    for _ in 0..6 {
+        c.tick();
+    }
+
+    assert_eq!(c.honest_count_at(0), N, "every honest validator finalizes height 0 despite dispersed bodies");
+    assert_eq!(c.hashes_at(0).len(), 1, "and on ONE block — ranking from skeletons kept the lottery agreed");
+    let root = c.engines[0].chain().state_root();
+    for e in &c.engines {
+        assert_eq!(e.chain().state().balance(&ALICE), 900, "the transfer executed");
         assert_eq!(e.chain().state().balance(&BOB), 100);
         assert_eq!(e.chain().state_root(), root, "all replicas agree on the state root");
     }

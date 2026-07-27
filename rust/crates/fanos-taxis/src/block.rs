@@ -261,10 +261,20 @@ impl Block {
     pub fn verify_structure(&self) -> bool {
         let tx_root_ok = self.header.tx_root == tx_root(&self.tx_commits());
         let da_ok = self.header.da_commit == commit_shards(&self.da_shards());
-        // The recorded last_commit must match the header's commitment (a proposer cannot record one finalizer
-        // set in the header and ship a different one). Its *validity* as a quorum cert is checked by consensus.
-        let last_ok = self.header.last_commit_root == commit_last(self.last_commit.as_ref());
-        tx_root_ok && da_ok && last_ok
+        tx_root_ok && da_ok && self.last_commit_matches()
+    }
+
+    /// The recorded `last_commit` matches the header's commitment to it.
+    ///
+    /// A proposer cannot record one finalizer set in the header and ship a different one. Its *validity* as a quorum
+    /// certificate is checked by consensus, not here.
+    ///
+    /// Split out of [`verify_structure`] because it is the one structural check a **skeleton** can still answer: the
+    /// other two commit to a payload the skeleton does not carry, while `last_commit` rides along with it
+    /// (`Block::skeleton`). The SSLE round-0 lottery ranks skeletons, so it needs exactly this much.
+    #[must_use]
+    pub fn last_commit_matches(&self) -> bool {
+        self.header.last_commit_root == commit_last(self.last_commit.as_ref())
     }
 
     /// Reconstruct a block's payload from a **subset** of its shards (an erased point is `None`) and verify

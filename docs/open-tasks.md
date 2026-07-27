@@ -207,47 +207,33 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
     `(Vec<u8>, u8, bool)`; `HostedService` now groups what is hosted and under which regime.
   - Superseded, as the earlier revision predicted: a storage-layer write ACL would police *who wrote*, while what matters is
     whether a **reader** can tell a genuine record from a forged one. The check belongs at the read.
-- **10b. TAXIS consensus liveness is RED at HEAD — two distinct defects, both reproducible, neither caused by item 10.**
-  Found while baselining item 10 (the rule from `simulator-instrument-integrity`: establish the baseline *before* attributing
-  a failure — which is the only reason this was not reported as a regression in that work).
-  - **Defect A — `sortition: Some` never finalizes a single block. ROOT CAUSE FOUND: the SSLE min-ticket lottery is gated on
-    N-fold DA reconstruction.** `taxis_quic::a_transaction_finalizes_and_executes_over_a_real_quic_cell` fails at its *first*
-    liveness witness (`taxis_quic.rs:152`) after the full 240 s. Its state machine is `Accounts`, so **no shielded pool and no
-    OBOLOS code is involved** — this is core consensus.
-    - **Three experiments localize it exactly.** `sortition: None` in the same suite passes in **7.71 s**. Broadcasting the
-      full block instead of the DA skeleton (`taxis_driver.rs`, one line) makes SSLE pass in **35.09 s**. The engine-level
-      `consensus_sim` SSLE tests pass — because its `shards_for` hands every replica the **complete** shard set.
-    - **The mechanism.** The driver never gives the engine a skeleton: it buffers it in `da.pending`, samples the other
-      shards over the network, and calls `step_msg(Propose(full))` only after `try_reconstruct` succeeds
-      (`taxis_driver.rs:600-625`). Under SSLE **all-propose**, that is 7 proposals × 6 sampled shards per replica per
-      height — while the engine's collection window is `COLLECT_WINDOW_TICKS = 1` (one 150 ms tick) and opens on the
-      *first* reconstructed proposal. So each replica ranks whatever tiny, **different** subset reconstructed inside one
-      tick, the PREPAREs split, no quorum forms, and the round times out — forever.
-    - **The design error, stated plainly:** `on_propose` runs the DA gate at `consensus.rs:855` and computes the ticket at
-      `consensus.rs:862`. The lottery ranks **tickets**, which ride in the skeleton (`Block::skeleton` preserves `witness`).
-      Requiring the *body* of every losing proposal before it may be ranked is both unnecessary and the stall itself.
-    - **Fix:** let the skeleton enter the lottery (rank from the witness, no body), and require availability only for the
-      block actually prepared — `prepare_round0_min` picks the lowest ticket **whose body is available**. Happy-path DA work
-      drops from N proposals to 1, and every replica ranks the same full set because skeletons arrive without sampling.
-    - **⚠️ The simulator could not have caught this, which is its own defect** (`simulator-fidelity-directive`: the sim must
-      differ from production *only* in transport). `consensus_sim::shards_for` returns `block.da_shards()` — the whole set,
-      instantly — so the sim models a proposal as arriving complete while production disperses one shard and samples the
-      rest. Closing that gap is part of the fix, or the next defect of this class hides the same way.
-  - **Defect B — `sortition: None` finalizes blocks but the submitted transaction executes erratically.** `dromos_quic`
-    reaches heights 1–2, and across two runs of the same binary observed **6 of 7 validators executed with the 7th stranded
-    at genesis forever** (`0:h1/s1/n2 1:h0/s0/n1 2:h2/s1/n2 …`, unchanged from the 3-second mark) and then **0 of 7 executed
-    while blocks still committed** (`0:h1/s0/n1 1:h0/s0/n1 …`). Flaky between those two shapes, which points at a race in tx
-    inclusion/gossip rather than a deterministic rejection. The test's own sanity block already proves the transaction is
-    valid against genesis, so this is the live path.
-  - **Corrects the previous revision of this entry, which blamed the OBOLOS ledger wiring** (`6daf833`, `2d8c255`). That was
-    a guess from commit adjacency and it is wrong: `taxis_quic` fails over `Accounts`, which touches none of it.
-  - **The 240 s ceiling was actively hiding both.** Each cell reaches a *fixed point* within ~3 s, so `HANG_CEILING` was
-    burning 240 s per test to rediscover a state that had stopped moving — and reporting it as "did not finish in time",
-    which reads as *slow*. That is how it was twice diagnosed as host contention and answered with more headroom. Fixed by
-    `common::converge` (below); the same failure now reports in **51 s with the per-validator trace**.
-  - Next: bisect defect A across the SSLE commits, and instrument tx inclusion for defect B. Both need the live driver's
-    round/leader state exposed — `TaxisHandle::snapshot` returns only `(height, state)`, which cannot distinguish "no leader
-    proposed" from "proposed and did not gather".
+- **10b. TAXIS consensus liveness — defect A FIXED, one residual. The root cause was DA sampling with no retry.**
+  - **The real defect, and it caused both symptoms.** A replica requests a missing shard the instant a skeleton arrives,
+    but the proposer emits skeleton-then-shard peer by peer, so the request routinely reaches peer `p` **before** `p` has
+    been dispersed its own shard. `p` holds nothing, answers nothing, and **there was no retry** — the requester waited
+    forever for a shard its peer had held all along. One proposal in flight loses that race *sometimes*; under SSLE
+    all-propose there are N proposals racing at once and it loses reliably. Fixed by `resample_pending` on each driver
+    tick (idempotent: a `Request` for a held shard is answered, for an unheld one dropped, so it converges the moment the
+    peer is dispersed).
+  - **A second, independent defect fixed on the way: the SSLE lottery was gated on the body it does not rank.**
+    `on_propose` ran the DA gate before computing the ticket, and the driver admitted a proposal only after
+    reconstruction — so ranking a *losing* proposal required its whole payload. Now `Input::Skeleton` ranks from the
+    witness (which `Block::skeleton` already carries) and availability is required only for the block actually prepared.
+    Happy-path DA work drops from N proposals to 1, and replicas rank the same set because skeletons need no sampling.
+  - **Measured:** `taxis_quic` went from **no block in 240 s** to green in **6.5–10.7 s**. `dromos_quic`'s
+    network-submission test also went green — same root cause.
+  - **Residual:** `dromos_quic::a_private_transfer_executes_over_live_consensus_end_to_end` still refutes, and it is a
+    *different* mechanism — blocks commit (`h1`) while the shielded transfer executes **nowhere** (`s0/n1` on all seven),
+    frozen. Blocks finalizing without the transaction executing points at the anti-MEV **reveal** gather (execution waits
+    on keyper shares and drops the tx after the reveal window), not at DA. Note it submits to every validator while its
+    now-passing sibling emits to one.
+  - **Two of my own errors on the way, both caught by the instrument rather than by reading:**
+    - `rank_round0` first called `prepare_round0_min()` unconditionally, which prepares on *first sight* — precisely the
+      PREPARE-splitting the collection window exists to prevent. Two engine tests went red immediately.
+    - I added an eviction timer for a winner whose body never arrives, keyed off the collection window. The window is one
+      tick and sampling takes several, so it evicted **every honest proposer in turn** until the lottery was empty.
+      Removed: the round timeout is already the correct backstop, and it is the one a withheld public proposal has always
+      used. An eviction timer here would have to be derived from sampling latency, which a sans-I/O engine cannot see.
 - **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
   is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
   - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
@@ -268,6 +254,17 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
 ---
 
 ## Simulator hardening (the standing directive, applied to the harness itself)
+
+**The sim now models DA dispersal, because not modelling it hid a total consensus liveness failure**
+(`consensus_sim::Cluster::da_delay`). `shards_for` handed every replica the complete shard set instantly, so the sim
+delivered proposals whole while production disperses one shard and samples the rest — a violation of the standing
+"differ only in transport" rule, and it let every engine-level SSLE test pass while the cell finalized nothing over QUIC.
+- Skeletons land immediately (they need no sampling); bodies land `sampling_latency(validator, block)` ticks later.
+- **The latency must be per (validator, block), and that is the whole fidelity of the model.** Written with a *uniform*
+  delay first, the test passed with the defect fully present — every replica then ranks the identical complete set at the
+  identical tick and the lottery cannot split. Independent per-replica sampling is what produces the divergence.
+- Verified it can fail: with skeleton ranking removed, `ssle_finalizes_when_bodies_arrive_by_da_sampling_rather_than_whole`
+  reports 0 of 7 finalizing. **0.59 s to reproduce what took 240 s over QUIC.**
 
 **A third verdict for the real-socket suites (`tests/common::converge`).** `HANG_CEILING` separated "expected latency" from
 "liveness backstop" — a real fix — but left a state neither expresses: **the system has stopped changing.** A wait that ends

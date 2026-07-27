@@ -304,6 +304,18 @@ where
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    // Re-request the shards still missing from every block being sampled, BEFORE stepping the engine,
+                    // so a reply can land within this tick's window.
+                    //
+                    // Sampling had no retry, and that was the deeper defect behind both TAXIS liveness failures. A
+                    // replica requests a missing shard the instant a skeleton arrives, but the proposer emits
+                    // skeleton-then-shard peer by peer, so the request routinely reaches peer `p` *before* `p` has been
+                    // dispersed its own shard. `p` holds nothing, answers nothing, and with no retry the requester waits
+                    // forever for a shard that its peer has held all along. One proposal in flight loses that race
+                    // sometimes (measured: a 7-node cell executing on 6 of 7 validators, the seventh stranded at genesis
+                    // permanently, and the same suite executing on 0 of 7 in the next run). Under SSLE all-propose there
+                    // are N proposals racing at once and it loses reliably: no block ever finalized.
+                    resample_pending(&client, &coords, me, &da);
                     let outs = engine.step(Input::Tick);
                     drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                 }
@@ -541,6 +553,12 @@ fn on_skeleton<S: StateMachine>(
     if da.pending.contains_key(&hash) {
         return; // already sampling this block
     }
+    // Rank the skeleton into the SSLE round-0 lottery **before** sampling its body, because the lottery ranks the
+    // *ticket* and the ticket rides in the skeleton. Admitting a proposal only after reconstruction is what deadlocked
+    // an all-propose round: N proposals each needed a sampling round trip, the collection window is one tick, and so
+    // every replica ranked a different subset and split its PREPARE. A no-op outside SSLE round 0.
+    let ranked = engine.step(Input::Skeleton { block: skeleton.clone() });
+    drive(engine, client, coords, me, ranked, events, last_ckpt, slash_sealer, seen, da);
     let mut shards: Box<DaShards> = Box::new(core::array::from_fn(|_| None));
     // Seed with my own dispersed shard, if I already hold it.
     if let Some(mine) = da.held.get(&hash)
@@ -593,6 +611,22 @@ fn on_shard<S: StateMachine>(
             {
                 let deliver = ShardMsg::Deliver { block, index: me, data: shard.clone() };
                 client.command(Command::Emit { to: from, frame: shard_to_frame(&deliver) });
+            }
+        }
+    }
+}
+
+/// Re-request every shard still missing from each block being sampled.
+///
+/// Idempotent and cheap: a `Request` for a shard the peer holds is answered with one `Deliver`, and one for a shard it
+/// does not hold is dropped — so retrying costs a message and converges the moment the peer has been dispersed its own.
+/// Bounded by `DA_PENDING_CAP` blocks × the cell size.
+fn resample_pending(client: &Client, coords: &[Triple], me: u8, da: &DaState) {
+    for (&hash, pending) in da.pending.iter() {
+        for (p, &to) in coords.iter().enumerate() {
+            let Ok(idx) = u8::try_from(p) else { continue };
+            if idx != me && pending.shards.get(p).is_none_or(Option::is_none) {
+                client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block: hash, index: idx }) });
             }
         }
     }
