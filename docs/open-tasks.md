@@ -39,11 +39,30 @@ connection & frame plumbing; NAT traversal; the custom UDP fabric. Cleanest firs
 (reseating), `fabric` (`impl quinn::AsyncUdpSocket`), `holepunch`, `shaping`. Method: `docs/design-testing.md`
 §"Refactoring a large module".
 
+### [A] Make node readiness explicit — `Node::start` is correct only if nothing yields at spawn
+**Blocks the builder below.** Two opposing, undocumented startup-ordering sensitivities, satisfied today only by an accident:
+`spawn_self_certifying_persistent_over` (used by `Node::start` and the simulator) is synchronous, while the other four
+self-certifying variants are `async` awaiting nothing. So the deployed node never yields at spawn and every harness does.
+Measured in isolation with one unified `spawn()`:
+
+| `spawn()` | node role-loop test | live `anonymous_quic` |
+|---|---|---|
+| sync | passes 2.1 s | **fails 4 of 5** |
+| async + one `yield_now()` | **fails 10.6 s** | passes |
+
+Do **not** fix by choosing a yield placement — that re-encodes the race in a second accident. Make readiness explicit:
+`spawn` returns a handle whose tasks are spawned but not running, and a caller needing a peer to serve awaits evidence (a
+notification, a successful dial), as `establish_membership` already does for membership. Detail in
+`docs/audit-2026-07-27-architecture.md` §6.
+
 ### [A] Collapse seven `spawn*` entry points into one builder
 `spawn`, `spawn_shaped`, and five `spawn_self_certifying{,_with_capabilities,_persistent,_persistent_on,_persistent_over}` —
 the latter five all funnel into `self_certifying_inner` and differ only in which of `{bind, credentials, capabilities, proteus,
 fabric}` they take. The names encode the parameter list, so each new axis has meant a new public function. Also re-read the 25
 remaining `allow(clippy::too_many_arguments)` the same way: twice this session such a lint was pointing at a missing *type*.
+- **Written once and reverted** (clippy clean, `fanos-quic` 6 suites + `fanos-node` 114 green) because it flips the live tests
+  red until the readiness item above is done. Four of the five variants are `async` awaiting nothing, which is what the
+  `allow(clippy::unused_async)` suppressions cover — the lint is right, but removing them is what exposes the race.
 
 ### [A] Thin unit coverage in three crates
 `fanos-holarch` 987 lines / **0.14** ratio / 8 tests — and it is the viability gate, so a gate that cannot be trusted to gate.

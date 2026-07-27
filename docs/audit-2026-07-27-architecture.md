@@ -174,3 +174,48 @@ The largest public surface in the workspace (next is `fanos-node` at 255, `fanos
 may be inherent — the ZK statement types, the ring/SIS parameters and the note algebra are all legitimately public — but it is
 worth one pass asking which of the 357 are load-bearing for callers versus incidental. A narrower surface is a smaller
 compatibility obligation for the crate that most needs to stay stable.
+
+---
+
+# Part 3 — a latent fragility found by attempting a refactor
+
+## 6. HIGH — `Node::start` is correct only in the absence of a suspension point at spawn
+
+Attempting §5.2 (collapse the seven `spawn*` entry points into one builder) surfaced something the audit's static
+measurements could not: **two opposing, undocumented startup-ordering sensitivities, which the current code satisfies only by
+accident.**
+
+The accident is the async/sync split of the five functions. `spawn_self_certifying_persistent_over` — the one `Node::start`
+and the simulator use — is **synchronous**. The other four, used by the test harness and the QUIC suites, are **`async` while
+awaiting nothing**. So the deployed node never yields at spawn, and every harness does.
+
+Measured, each in isolation, with a single builder replacing all five:
+
+| `spawn()` shape | `fanos-node` role-loop test | live `anonymous_quic` |
+|---|---|---|
+| synchronous (honest — the inner call awaits nothing) | **passes**, 2.1 s | **fails**, 4 of 5 |
+| `async` + one `yield_now()` (matches the four old async variants) | **fails**, 10.6 s | passes |
+
+Both failures reproduce in isolation, so neither is the contention artefact this suite is prone to. Baselined at HEAD: both
+green.
+
+**What this means.** `Node::start`'s role assignment depends on the driver tasks *not* being polled between `spawn` and the
+rest of its own setup, while a multi-node live cell depends on them *being* polled before it is used. Neither is written down,
+neither is asserted, and any innocuous refactor that adds or removes an `await` on that path silently breaks one of them. That
+is a latent bug in the shipped node, not merely a refactoring obstacle.
+
+**Not fixed by choosing a yield placement.** Tuning which caller yields would be exactly "compromising around a known
+defect": it leaves the race in place and re-encodes it in a second accident. The fix is to make readiness *explicit* — `spawn`
+returns a handle whose tasks are spawned but not necessarily running, and a caller that needs a peer serving awaits evidence of
+that (a notification, a successful dial), which is what the harness's `establish_membership` already does for membership. Then
+neither behaviour depends on suspension-point placement.
+
+**Status:** the builder was written, all 8 call sites ported, clippy clean workspace-wide, `fanos-quic` 6 suites and
+`fanos-node` 114 lib tests green — then **reverted**, because it cannot ship while it flips live tests red, and shipping it
+would have meant tuning a race. The finding is the deliverable; §5.2 stays open behind it.
+
+**Method note.** I first attributed the live failure to the fake `async` being "accidentally load-bearing" — an appealing
+explanation, built on a *contended* flake, which an isolated run refuted (the fully synchronous configuration passes the
+three-node capability test 3/3 in 2.0 s on its own). Only the second, isolated round produced the table above. Third time this
+session that a contended real-socket suite produced a false attribution; the rule stands — **baseline in isolation before
+explaining anything.**
