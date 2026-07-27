@@ -25,11 +25,32 @@ intermediary. What genuinely remains:
 |---|---|---|
 | `fanos-angelos` | L11 messenger, a headline product | **orphan** — linked by nothing at all |
 | `fanos-ergon` | the effect-algebra "no gas, derived footprints" model | **orphan** — DROMOS executes without it |
-| `fanos-hermes` | cross-chain HTLC, "live on the ledger" | in the node via `fanos-dromos/src/hermes.rs`; no QUIC suite submits an HTLC |
-| `fanos-vpn` | the full-tunnel datapath | feature-gated, and CI does not build `--features vpn` |
+| ~~`fanos-hermes`~~ | cross-chain HTLC, "live on the ledger" | **closed** — `dromos_quic::a_hash_locked_contract_is_funded_and_claimed_over_live_consensus` funds and claims a contract across the whole cell over real QUIC |
+| `fanos-vpn` | the full-tunnel datapath | CI now compiles `--features vpn`; **the datapath itself is still exercised by nothing** |
 
 Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
 surfaces and are exempt by construction.
+
+### [A] A quiescent chain leaves a straggler behind
+Measured 2026-07-27 by the new HERMES suite, which is the first test to submit a *second* transaction and so the first that
+can see this. After the first transaction, 5 of 7 validators executed the second one and **2 sat at the previous height for
+the full 48 s frozen span** — exactly the quorum advancing and the remainder stuck. Submitting a third transaction (so block
+production continues) brought all 7 to height 22 with identical state.
+- So a validator that misses a block advances only when the *next* proposal arrives. With an empty mempool the chain goes
+  quiet and the straggler keeps stale state indefinitely — safe, but the cell has not converged, and nothing pulls it
+  forward. State-sync exists (§3.9) but is not triggered by a gap this small.
+- The two sibling `dromos_quic` tests cannot see it: they submit one transaction, so "everyone reached height 1" is the
+  fixed point. A one-transaction test cannot distinguish "converged" from "stopped".
+
+### [A] `converge` cannot tell starvation from a wedge — the byte-level waits can
+`common::converge` refutes when its trace has not changed for `FROZEN_SPAN` of **wall clock**, so on a contended host it
+reports `REFUTED — a fixed point, not a slow one` about a cell that was simply never scheduled. Measured: the HERMES suite
+passes in 48 s at load average 57 and reports REFUTED with all seven validators frozen at height 1 at load average 83 —
+where nothing was running at all, which is not a fixed point.
+- The fix pattern already exists one layer down: `read_within_span` charges its budget in *granted* time and consults
+  `DELIVERED` ("has anything in this process ever moved?") before claiming a wedge. `converge` has neither. Give it both —
+  the observation trace is the natural witness, since a cell where *some* other observation advanced is a cell being
+  scheduled.
 
 ### [A] `#[ignore]` conflates two incompatible things
 34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must

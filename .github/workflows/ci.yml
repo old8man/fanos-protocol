@@ -48,6 +48,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy — validator features
         run: cargo clippy --workspace --all-targets --features validator -- -D warnings
+      # A third configuration, compile-only: the VPN datapath is behind `vpn` because it pulls a real TUN
+      # device, so neither clippy run above sees a line of it. A feature nobody builds is a feature that
+      # rots — this is the cheapest possible guard against that, and it is not a substitute for exercising
+      # the datapath (nothing does yet).
+      - name: Clippy — the vpn feature (real TUN device)
+        run: cargo clippy -p fanos-node --features vpn --all-targets -- -D warnings
       - name: Tests — default features
         run: cargo test --workspace
       - name: Tests — validator features (ledger · consensus · TAXIS)

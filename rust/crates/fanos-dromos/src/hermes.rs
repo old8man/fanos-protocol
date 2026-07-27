@@ -9,11 +9,15 @@
 
 use std::collections::BTreeMap;
 
-use fanos_hermes::{Htlc, HtlcState, HtlcTerms};
+use fanos_hermes::{Htlc, HtlcState};
 use fanos_primitives::codec::{Reader, put_map, put_var_bytes, read_map};
 use fanos_primitives::hash_labeled;
 
 use crate::token::SignedTransfer;
+
+// `HtlcTx::Lock` carries these in its public signature, so a caller outside this crate cannot construct one
+// without them — re-exported here rather than left as an undeclared dependency on `fanos-hermes`.
+pub use fanos_hermes::htlc::{HtlcTerms, hashlock};
 
 /// The keyless sink holding all locked HTLC funds — entered by a signed transfer, left only by `move_system` on
 /// a valid claim or a timed-out refund.
@@ -114,6 +118,29 @@ pub struct HtlcBook {
 }
 
 impl HtlcBook {
+    /// The state of one contract, or `None` if this book has never held it.
+    ///
+    /// [`state_root`](Self::state_root) commits to every contract at once, which is what consensus needs and
+    /// exactly what a caller asking about *one* contract cannot use: two books differing in any contract
+    /// differ in the root, and a book missing the contract entirely is indistinguishable from a book where it
+    /// resolved. A counterparty deciding whether to reveal a preimage is asking about one id.
+    #[must_use]
+    pub fn state(&self, id: &[u8; 32]) -> Option<HtlcState> {
+        self.htlcs.get(id).map(Htlc::state)
+    }
+
+    /// How many contracts this book holds, live or resolved.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.htlcs.len()
+    }
+
+    /// Whether the book holds no contracts at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.htlcs.is_empty()
+    }
+
     /// A commitment over all contracts (sorted by id): `H( [ id ‖ state ] × )`.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {

@@ -14,6 +14,8 @@
 
 mod common;
 
+use core::fmt::Write as _;
+
 
 use fanos_dromos::HybridLedger;
 use fanos_field::F2;
@@ -27,6 +29,8 @@ use fanos_quic::spawn_cell;
 use fanos_runtime::{Command, Config, Engine, OverlayNode};
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_dromos::TokenLedger;
+use fanos_dromos::hermes::{HTLC_ESCROW, HtlcTerms, HtlcTx, hashlock, htlc_id};
+use fanos_dromos::token::{SignedTransfer, Transfer, account_id};
 use fanos_taxis::wire::tx_to_frame;
 use fanos_taxis::{CellParams, Transaction};
 
@@ -268,4 +272,151 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
         assert_eq!(ledger.shielded().spent_count(), 1, "Alice's note is nullified on every node");
         assert_eq!(ledger.shielded().note_count(), 2, "Bob's note was created on every node");
     }
+}
+
+/// The **transparent** party to the hash-locked contract: a deterministic account funded at genesis, so every
+/// validator agrees on the same starting balance without any node minting on its own.
+fn htlc_party(tag: u8) -> (HybridSigSecret, HybridVerifier) {
+    HybridSigSecret::generate(&mut SeedRng::from_seed(&[0x41, tag]))
+}
+
+/// A genesis ledger that also funds the HTLC sender transparently. Kept separate from [`genesis_ledger`] so the
+/// two shielded tests keep the exact state they assert against.
+fn htlc_genesis_ledger(sender: &[u8; 32]) -> HybridLedger {
+    let mut tokens = TokenLedger::new();
+    tokens.credit(*sender, 1000);
+    tokens.credit(account_id(&htlc_party(2).1), 1000);
+    let mut ledger = HybridLedger::new(tokens);
+    ledger.mint_shielded(alice_note().commitment(ledger.params())).expect("mint the genesis note");
+    ledger
+}
+
+/// **HERMES over live consensus**: a hash-locked contract funded, gossiped, ordered, executed and *claimed*
+/// across the whole seven-node cell over real QUIC (`spec/platform.md` §8).
+///
+/// The crate's own tests prove the HTLC state machine and two-chain atomicity in isolation. What no test
+/// covered was the claim the platform actually makes — that cross-chain custody is **live on the ledger** —
+/// because nothing ever submitted an HTLC through consensus. `fanos-hermes` sat inside the shipped node,
+/// reached only through `fanos-dromos/src/hermes.rs`, with no path from a network ingress to its state.
+///
+/// Both halves matter and are asserted separately. The **lock** must move real value into escrow on every
+/// validator (a lock that only records terms would leave the escrow empty and the claim would pay nothing),
+/// and the **claim** must release exactly that value to the recipient against the preimage. Submitted the
+/// same way its sibling above is — one ingress point, one validator, sealed to the keyper line — so the
+/// contract has to reach every mempool by gossip rather than by seven direct submissions.
+#[tokio::test]
+async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
+    let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
+
+    let (sender_sk, sender_vk) = htlc_party(0);
+    let (_, recipient_vk) = htlc_party(1);
+    let sender = account_id(&sender_vk);
+    let recipient = account_id(&recipient_vk);
+    let preimage = [0x5Au8; 32];
+    let terms = HtlcTerms { sender, recipient, amount: 1000, hashlock: hashlock(&preimage), timeout: 1_000_000 };
+    let id = htlc_id(&terms, 0);
+
+    let keys = gen_keys();
+    let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+    let registry = KeyperRegistry::new(
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+    );
+    let keyper_commit = registry.commit();
+
+    let mut handles = Vec::with_capacity(N);
+    for (i, k) in keys.into_iter().enumerate() {
+        let params = TaxisParams {
+            cell: CellParams::FANO,
+            me: i as u8,
+            signer: k.sig,
+            kem_secret: k.kem,
+            verifiers: verifiers.clone(),
+            keyper_commit,
+            seed: SEED,
+            epoch: EPOCH,
+            genesis_state: htlc_genesis_ledger(&sender),
+            reward_per_block: 0,
+            sortition: None,
+            slash_sealer: None,
+        };
+        handles.push(spawn_taxis::<F2, HybridLedger>(cell.nodes[i].client(), params));
+    }
+
+    // Submit each stage through one ingress point, to a different validator each time — the cell must gossip
+    // it to every mempool, and the second stage must find the state the first one left.
+    let submit = |tx: Transaction, to: usize, seed: &'static [u8]| {
+        let sealed = seal_to_keyper_line(&registry, &tx, EPOCH, &SEED, CellParams::FANO, seed)
+            .expect("seal the HTLC transaction to the keyper line");
+        cell.nodes[0].client().command(Command::Emit { to: Point::<F2>::at(to).coords(), frame: tx_to_frame(&sealed) });
+    };
+
+    // 1. Lock: the sender's transparent balance moves into escrow behind the hashlock.
+    let payment = SignedTransfer::sign(Transfer { from: sender, to: HTLC_ESCROW, amount: 1000, nonce: 0 }, &sender_sk, sender_vk);
+    let lock = HtlcTx::Lock { terms, payment: Box::new(payment) };
+    submit(Transaction::new(HybridLedger::htlc_payload(&lock)), 3, b"htlc-lock-seed");
+
+    common::converge("the hash-locked contract is funded on every validator", || async {
+        let mut trace = String::new();
+        let mut all = true;
+        for (i, h) in handles.iter().enumerate() {
+            let escrow = match h.snapshot().await {
+                Some((_, l)) => l.htlc_escrow(),
+                None => return (false, format!("{trace} v{i}:down")),
+            };
+            all &= escrow == 1000;
+            let _ = write!(trace, "v{i}:{escrow} ");
+        }
+        (all, trace)
+    })
+    .await;
+    for h in &handles {
+        let (_, l) = h.snapshot().await.expect("a live node snapshot");
+        assert_eq!(l.tokens().balance(&sender), 0, "the sender's balance moved into escrow, not merely a record");
+        assert!(l.htlcs().state(&id).is_some(), "the contract is keyed by its id on every validator");
+    }
+
+    // 2. Claim: revealing the preimage releases exactly the locked value to the recipient.
+    let claim = HtlcTx::Claim { htlc_id: id, preimage };
+
+    // A second, independent contract, submitted right behind the claim. It is not decoration: a validator
+    // that missed a block advances only when the *next* proposal arrives, so a chain whose mempool has gone
+    // empty leaves a straggler behind indefinitely. Measured on this very test — 5 of 7 reached the claim
+    // while 2 sat at the lock height for the full frozen span, and with block production continuing all 7
+    // reached height 22. Keeping the chain moving is what makes a whole-cell assertion reachable at all.
+    let (s2, v2) = htlc_party(2);
+    let a2 = account_id(&v2);
+    let t2 = HtlcTerms { sender: a2, recipient, amount: 500, hashlock: hashlock(&[0x77; 32]), timeout: 1_000_000 };
+    let p2 = SignedTransfer::sign(Transfer { from: a2, to: HTLC_ESCROW, amount: 500, nonce: 0 }, &s2, v2);
+    let lock2 = HtlcTx::Lock { terms: t2, payment: Box::new(p2) };
+
+    // Re-emit while it is outstanding. A single ingress frame that the cell drops under load leaves the
+    // mempool empty and the chain quiescent at the lock height — measured, on a contended host, with all
+    // seven validators frozen at height 1. That is the transport's luck, not the ledger's behaviour, and a
+    // real client resubmits an unconfirmed transaction for exactly the same reason. Both submissions are
+    // idempotent: a replayed claim finds the contract already resolved, a replayed lock finds its id taken.
+    let mut polls = 0u32;
+    common::converge("the preimage releases the escrow on every validator", || {
+        polls += 1;
+        if polls % 40 == 1 {
+            submit(Transaction::new(HybridLedger::htlc_payload(&claim)), 5, b"htlc-claim-seed");
+            submit(Transaction::new(HybridLedger::htlc_payload(&lock2)), 2, b"htlc-lock2-seed");
+        }
+        async {
+        let mut trace = String::new();
+        let mut all = true;
+        for (i, h) in handles.iter().enumerate() {
+            // The recipient's balance, not the global escrow: the second contract locks its own 500, so an
+            // "escrow is empty" condition would be asserting that the *other* contract had also resolved.
+            let (paid, st, ht) = match h.snapshot().await {
+                Some((height, l)) => (l.tokens().balance(&recipient), l.htlcs().state(&id), height),
+                None => return (false, format!("{trace} v{i}:down")),
+            };
+            all &= paid == 1000;
+            let _ = write!(trace, "v{i}:{paid}/{st:?}@{ht} ");
+        }
+        (all, trace)
+        }
+    })
+    .await;
 }
