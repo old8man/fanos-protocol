@@ -140,9 +140,22 @@ the last propagation link.
     - *Ragged hop lines.* `fanos_rendezvous::create_forward` builds every hop from `line_member_coords` and requires all
       `q + 1` keys present, so hop member counts are uniform and the new equal-width precondition holds.
     - *The peel paths.* Instrumented `member_partial` and the peel to print on every failure: **zero** hits.
-  - **Next step, and the gap in my own instrumentation that made this slow:** the seal side was never instrumented, and
-    `create_forward` swallows the error with `.ok()?`. Instrument each of `seal_onion`'s error returns — depth over
-    `depth_for`, zero/ragged line size, slot-width mismatch — and re-run one `anonymous_quic` test. That is one measurement.
+  - **Also ruled out — and this is the sharpest narrowing, so start here.** With the wiring applied:
+    - `fanos-rendezvous` **17/17 pass**, including `seal_forward_to_host::<F2>` — an end-to-end seal of the very structure the
+      live dialer sends. So the seal path itself is fine.
+    - `fanos-sim` passes, **including `anonymous_rendezvous` (4 tests)**, and `fanos-calypso` 44. The sim differs from
+      production only in transport, so the whole anonymous composition works over the in-memory transport.
+    - No length guard anywhere on the live path: every `THRESHOLD_ONION_LEN` reference in `fanos-node`/`fanos-aphantos`
+      outside tests is the re-export itself.
+    - Live circuit depth is `(1, 1)` — 2 hops, against a 5-hop ceiling at `q = 2`. Not depth.
+  - So the failure is **specific to the real-QUIC composition** and is not in the onion construction. The remaining suspects
+    are the parts only `anonymous_quic` exercises: the NOSTOS dead-drop reply path over QUIC, the per-epoch onion-key ratchet
+    on live `MixRelay`s, and `ThresholdRouter` cover traffic. Instrument at the **router**, not the onion: log every
+    peel/forward decision in `ThresholdRouter` for one `anonymous_quic` run. The onion-level instrumentation already came
+    back with **zero** failures across a full 240 s run, which is why the next probe has to move up a layer.
+  - *The gap that cost the most this iteration:* I instrumented only the peel side, while `create_forward` swallows a seal
+    error with `.ok()?` — so "no output" was ambiguous between "no failures" and "not reached". Instrument both ends of a
+    path before reading silence as evidence.
   - **A real budget constraint to settle regardless.** A fixed array reserves all `D` slots even for a one-hop circuit, so
     payload capacity falls to `THRESHOLD_ONION_LEN − PREAMBLE_LEN − D × slot_len` = 2 704 B at `q = 2`. Some structures this
     protocol nests *inside* an onion payload are larger (sealing to a 3-member line is 3 507 B alone), so wiring needs either
