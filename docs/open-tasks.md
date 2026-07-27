@@ -25,7 +25,6 @@ intermediary. What genuinely remains:
 |---|---|---|
 | `fanos-angelos` | L11 messenger, a headline product | **orphan** — linked by nothing at all |
 | `fanos-ergon` | the effect-algebra "no gas, derived footprints" model | **orphan** — DROMOS executes without it |
-| ~~`fanos-hermes`~~ | cross-chain HTLC, "live on the ledger" | **closed** — `dromos_quic::a_hash_locked_contract_is_funded_and_claimed_over_live_consensus` funds and claims a contract across the whole cell over real QUIC |
 | `fanos-vpn` | the full-tunnel datapath | CI now compiles `--features vpn`; **the datapath itself is still exercised by nothing** |
 
 Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
@@ -46,48 +45,16 @@ the rest of `HybridLedger::apply_with_verdict`, and each needs deciding on its o
 - The general rule the sweep should apply: a rejection is premature iff *re-executing it unchanged against a later state
   could succeed*. Replay, double-spend, bad signature and malformed bytes never can; a missing prerequisite can.
 
-### [A] A quiescent chain leaves a straggler behind
-Measured 2026-07-27 by the new HERMES suite, which is the first test to submit a *second* transaction and so the first that
-can see this. After the first transaction, 5 of 7 validators executed the second one and **2 sat at the previous height for
-the full 48 s frozen span** — exactly the quorum advancing and the remainder stuck. Submitting a third transaction (so block
-production continues) brought all 7 to height 22 with identical state.
-- The two sibling `dromos_quic` tests cannot see it: they submit one transaction, so "everyone reached height 1" is the
-  fixed point. A one-transaction test cannot distinguish "converged" from "stopped".
-
-**Narrowed in the deterministic model, and the suspect is named.** `consensus_sim::a_validator_that_misses_one_height_rejoins_with_no_further_transactions`
-builds exactly this case — one missed height, nothing submitted afterwards — and **it passes**: the laggard rejoins, holds
-the state it never executed, and shares the cell's state root. So the mechanism is sound; the live path is what diverges.
-
-Which mechanism repairs it was measured rather than assumed, by disabling each in turn:
-- body recovery (`fetch_awaited_bodies` / `NeedSkeleton`) **off** → still passes. Not this one: the laggard never voted on
-  the missed block, so it awaits no body.
-- the catch-up exchange (`SyncReq` / `SyncResp`) **off** → the laggard sits at height 1 while the cell reaches 18. That is
-  the **exact live signature** — `v6:...@1` beside `v0:...@11`.
-
-**The directed-reply suspect is cleared, by falsification rather than by a passing test.**
-`taxis_quic::a_validator_joining_late_reaches_the_cells_executed_state` stands up six validators (quorum is 5 of 7), lets
-them execute, then joins the seventh — which reaches the cell's exact executed state in ~6.5 s. But deleting the directed
-emit from the driver leaves that test passing **unchanged**, so it does not cover the path it was written for. Whatever
-carries a late joiner over QUIC is not `SyncResp`; most likely ordinary consensus following, since a height h+1 block's
-`last_commit` certifies h and the cell emits blocks continuously. The test is kept under a name that says what it
-actually witnesses.
-- Covering the directed reply needs a gap ordinary following cannot close. A first attempt — four transfers instead of
-  one — hit something else: **the cell executed three of them and froze at height 20 with the fourth unexecuted**, across
-  all six validators, on a host that was demonstrably answering (321 observations, slowest 289 ms). That is a separate
-  thread and is the more interesting one.
-
-*Ruled out on the way:* the driver's validator→coordinate map was built once at spawn and never updated, so a reseated
-peer would have been silently evicted from consensus — its votes dropped as "a frame from a stranger", its own addressed
-to the point it left. That is now fixed, but it does **not** explain the laggard: `fanos validator` pins its coordinate
-deliberately (`Point::at(me)`, chosen rather than VRF-accepted, "which the Fano-cell BFT structure requires"), and the
-QUIC cell fixture seats its nodes the same way. No reseat happens in either.
-
-### [A] CRITICAL — the live cell finalizes its first block and stalls on the second, about half the time
-Measured 2026-07-28, four consecutive runs of `cargo test -p fanos-node --test dromos_quic --features validator
-a_hash_locked` on an **idle** host (load average 3.75): **2 passed, 2 failed**. Every failure carries the identical
-signature — all seven validators at `next_height() == 1` with the HTLC still `Locked`, i.e. exactly one block finalized
-and the second never. The verdict's own evidence rules out starvation: 295 ms for the slowest of 321 completed
+### [A] A sub-quorum lock split still stalls a live cell about 1 run in 8
+**Largely fixed; this is the residual.** Originally 2 of 4 runs of `cargo test -p fanos-node --test dromos_quic
+--features validator a_hash_locked` failed on an **idle** host (load average 3.75), every failure with all seven
+validators at `next_height() == 1` and the HTLC still `Locked`. The proof-of-lock (`docs/design-taxis.md` §4.1) took that
+to **1 in 8**. Starvation was ruled out throughout by the verdict's own evidence: 295 ms for the slowest of 321 completed
 observations, on a machine doing nothing else.
+
+It also subsumes an earlier item, now deleted: "a quiescent chain leaves a straggler behind" was the same lock split seen
+from the other side (5 of 7 executing a second transaction while 2 sat at the previous height). A quiescent cell in fact
+advances perfectly well — measured reaching height 9 with no transactions at all, and 14 with one.
 
 **Why nothing caught it.** No other real-QUIC suite requires a *second* finalized block. `dromos_quic`'s two siblings, both
 `taxis_quic` tests, and `anonymous_quic` all reach their fixed point at height 1 — one transaction, one block, assert. The
@@ -118,10 +85,11 @@ complete the shard set.
 | request each missing shard from **every** peer, not just its custodian | **0 of 3 passed**, every run exhausting the 240 s ceiling |
 | additionally ask the block's **proposer** (which provably holds it whole) | **0 of 4 passed**, 150–167 s each |
 
-That reframes the problem, and it is the useful thing this attempt produced: **the cell is already near its transport
-capacity with a 9 KB block**, so a recovery path that adds request traffic pushes it over rather than helping. The single
-custodian per shard is a genuine structural weakness (`ConsensusEngine::shard_of` now lets any holder answer for an index
-it can produce), but it is not the binding constraint — capacity is.
+Both results stand as evidence that **adding request traffic to this recovery path measurably hurts**, which is worth
+knowing before anyone proposes more of it. The conclusion drawn from them at the time — that transport capacity was the
+binding constraint — did not survive: the binding constraint is the lock split below. The single custodian per shard
+remains a genuine structural weakness, and `ConsensusEngine::shard_of` lets any holder answer for an index it can produce,
+but it is not what stalls the cell.
 **Size is refuted, and the real obstacle is structural.** Measured sealed transaction sizes: the *shielded* transfer whose
 suite passes reliably is **18 473 bytes**, twice the HTLC lock (**9 101**) whose suite stalls. Size is not the variable, so
 every size-derived hypothesis above is dead.
