@@ -67,6 +67,15 @@ const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
 /// `state_root`, with a block-height clock for the registry's expiries.
 #[derive(Clone, Debug)]
 pub struct HybridLedger {
+    /// Waves in the last block's conflict schedule, or `0` if no block has run through the parallel executor.
+    ///
+    /// A **local metric, never consensus state**: it is not hashed into `state_root` and not carried in `snapshot`, so two
+    /// validators that schedule identically-rooted state with different core counts still agree. It exists because
+    /// "vertical parallelism" is a throughput claim and a claim needs a number: one wave means the whole block committed
+    /// with no serialization, `n` waves means the block was `n` dependent steps deep. It is also the only way to observe
+    /// that the parallel executor ran at all — the schedule is serial-equivalent by construction, so no *outcome* can
+    /// distinguish it from the serial default, and it was reachable from nothing but its own tests for exactly that reason.
+    waves_last_block: usize,
     tokens: TokenLedger,
     shielded: ShieldedState,
     names: NameRegistry,
@@ -83,6 +92,7 @@ impl HybridLedger {
     #[must_use]
     pub fn new(genesis_tokens: TokenLedger) -> Self {
         Self {
+            waves_last_block: 0,
             tokens: genesis_tokens,
             shielded: ShieldedState::new(),
             names: NameRegistry::new(),
@@ -483,6 +493,7 @@ impl HybridLedger {
         // split across cores — a validator with more cores computes the *same* block, so consensus is preserved.
         let access = self.access_lists(txs);
         let waves = schedule(&access);
+        self.waves_last_block = waves.len();
         let verdicts = self.verify_batch(txs);
         let mut outcomes = vec![ExecOutcome::Malformed; txs.len()];
         for wave in &waves {
@@ -493,6 +504,12 @@ impl HybridLedger {
             }
         }
         outcomes
+    }
+
+    /// Waves in the last block's conflict schedule — see [`HybridLedger::waves_last_block`]. `0` before any block.
+    #[must_use]
+    pub fn waves_last_block(&self) -> usize {
+        self.waves_last_block
     }
 
     /// Verify every parallelizable transaction's signature or proof **concurrently** — the stateless, expensive
@@ -770,6 +787,16 @@ impl HybridLedger {
 }
 
 impl StateMachine for HybridLedger {
+    /// Execute the block through the **parallel scheduler** rather than one transaction at a time.
+    ///
+    /// This is the hook that puts `spec/platform.md` §3.1's vertical parallelism on the live consensus path: waves of
+    /// conflict-free transactions, with the expensive stateless verification (hybrid PQ signatures, shielded ZK proofs)
+    /// batched across a thread pool before the serial commit. Serial-equivalent by construction and pinned as such by
+    /// `execute_block_matches_serial_execution_and_parallelizes_independent_work` and the determinism KATs.
+    fn apply_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
+        self.execute_block(txs)
+    }
+
     /// Set the registry's clock to the block being executed, and finalize any storage deals whose audit deadline
     /// has now lapsed (auto-refunding the consumer — audit AT-H2).
     fn begin_block(&mut self, height: u64) {
@@ -863,6 +890,9 @@ impl StateMachine for HybridLedger {
         let audit_beacon = r.array::<32>()?;
         r.finish()?;
         Some(Self {
+            // A restored snapshot has executed no block here, so the metric starts at zero rather than being carried: it
+            // describes *this* validator's last scheduling pass, not the state it adopted.
+            waves_last_block: 0,
             tokens,
             shielded,
             names,

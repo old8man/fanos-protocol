@@ -62,6 +62,25 @@ pub trait StateMachine {
     /// Apply one transaction (already reconstructed and in committed order) to the state.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome;
 
+    /// Apply a whole block's transactions, in committed order, returning one outcome per transaction.
+    ///
+    /// The default is exactly the serial loop the engine used to run inline, so no state machine has to change. It exists
+    /// so a state machine that can do better is *able* to: DROMOS derives each transaction's access list, partitions the
+    /// block into conflict-free waves, and verifies the expensive stateless half — hybrid PQ signatures and shielded
+    /// zero-knowledge proofs — across a thread pool before committing in schedule order
+    /// (`fanos_dromos::HybridLedger::execute_block`).
+    ///
+    /// **An override MUST be serial-equivalent**, because the state root is consensus. Every validator must reach the
+    /// identical state regardless of how many cores it has, so an override may only reorder work whose result provably
+    /// does not depend on the order — which is what the conflict schedule establishes and what its determinism tests pin.
+    ///
+    /// This hook is the whole reason the parallel executor is reachable at all: it was written, proven serial-equivalent
+    /// and stochastically tested, and then called from **nothing but its own tests**, so the "vertical parallelism"
+    /// throughput claim delivered zero real speedup on the live path.
+    fn apply_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
+        txs.iter().map(|tx| self.apply(tx)).collect()
+    }
+
     /// A binding 32-byte commitment to the entire current state — the ledger's verifiable summary, and what
     /// the execution checkpoint ([`crate::checkpoint`]) certifies. A **cross-cell-aware** state machine folds
     /// its cross-cell outbox in here — `crate::crosscell::compose_state_root(app_root, outbox.root())` — so the

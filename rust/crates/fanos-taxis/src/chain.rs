@@ -114,6 +114,12 @@ impl<S: StateMachine> Chain<S> {
     pub fn execute(&mut self, tx: &Transaction) {
         let _ = self.state.apply(tx);
     }
+
+    /// Execute a whole block's transactions through [`StateMachine::apply_block`], so a state machine with a parallel
+    /// executor is actually used on the live path.
+    pub fn execute_block(&mut self, txs: &[Transaction]) {
+        let _ = self.state.apply_block(txs);
+    }
 }
 
 #[cfg(test)]

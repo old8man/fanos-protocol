@@ -189,6 +189,16 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
         assert!(height >= 1, "the node advanced past genesis");
         assert_eq!(ledger.shielded().spent_count(), 1, "Alice's note is nullified on every node");
         assert_eq!(ledger.shielded().note_count(), 2, "Bob's note was created on every node");
+        // The DROMOS **parallel** executor ran on the live consensus path, not the serial fallback.
+        //
+        // Asserted because no outcome can distinguish them: the conflict schedule is serial-equivalent by construction,
+        // so a block executes to the identical state either way. `execute_block` was proven, stochastically tested — and
+        // then called from nothing but its own tests, so the vertical-parallelism throughput claim delivered no real
+        // speedup. `waves_last_block` is `0` until the scheduler runs, which is exactly the wiring this pins.
+        assert!(
+            ledger.waves_last_block() > 0,
+            "the parallel scheduler executed this block (waves > 0), rather than the serial default"
+        );
     }
 }
 

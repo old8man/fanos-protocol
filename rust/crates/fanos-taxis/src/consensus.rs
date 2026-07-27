@@ -1614,9 +1614,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
                     .collect();
                 self.chain.apply_block_reward(&beneficiaries, self.reward_per_block);
             }
-            for txn in &opened {
-                self.chain.execute(txn);
-            }
+            // One call, not a loop: `apply_block` lets a state machine schedule the block's independent transactions in
+            // parallel (DROMOS does) while a plain ledger keeps the identical serial semantics via the default.
+            self.chain.execute_block(&opened);
             // Attest the executed state at this height — the checkpoint that makes divergence detectable.
             out.push(self.emit_exec_vote(block.header.height));
             // Retain a servable snapshot of the just-executed state so a lagging peer can state-sync to it
