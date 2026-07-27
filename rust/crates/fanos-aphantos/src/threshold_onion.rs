@@ -10,7 +10,9 @@ use alloc::vec::Vec;
 use fanos_primitives::shamir::Share;
 use fanos_primitives::hash_labeled;
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
-use fanos_threshold::{NONCE_LEN, ThresholdError, ThresholdSealed, pad_onion};
+use fanos_threshold::{NONCE_LEN, ThresholdError, ThresholdSealed};
+
+use crate::slots;
 
 /// The seal's own surface, re-exported so a caller working at the onion level reaches both halves through one path.
 pub use fanos_threshold::THRESHOLD_ONION_LEN;
@@ -118,51 +120,72 @@ pub fn seal_onion(
     let hop_lines: Vec<fanos_geometry::Triple> = hops.iter().map(|h| h.line).collect();
     let holoseed = hash_labeled(HOLOSEED_LABEL, seed);
     let holonomy = circuit_line_holonomy(&hop_lines, &holoseed);
-    let mut inner = payload.to_vec();
+    let line_size = hops.first().map_or(0, |h| h.members.len());
+    if line_size == 0 || hops.iter().any(|h| h.members.len() != line_size) {
+        // Every hop line of a projective plane holds the same q+1 points, so a ragged circuit is a caller error — and a
+        // header cannot have a fixed slot width without it.
+        return Err(ThresholdError::Malformed);
+    }
+    if hops.len() > slots::depth_for(line_size) {
+        // The depth ceiling the fixed-slot layout makes explicit; the nested layout accepted any depth and leaked it.
+        return Err(ThresholdError::TooLong);
+    }
     let last = hops.len() - 1;
-    for (k, hop) in hops.iter().enumerate().rev() {
-        // Routing command: forward to the next line, or deliver.
-        let mut cmd = Vec::with_capacity(1 + HOLONOMY_LEN + 12 + inner.len());
-        if k == last {
+    let tag = |k: usize, label: &str| {
+        let mut s = seed.to_vec();
+        s.extend_from_slice(label.as_bytes());
+        s.extend_from_slice(&(k as u32).to_be_bytes());
+        s
+    };
+    let payload_keys: Vec<[u8; 32]> =
+        (0..hops.len()).map(|k| hash_labeled("FANOS-v1/threshold-onion-pkey", &tag(k, "p"))).collect();
+
+    // The payload block, layered in REVERSE hop order: hop 0 peels first, so its layer is outermost.
+    let mut block = slots::pack_payload(payload, line_size, &tag(0, "block"))?;
+    for key in payload_keys.iter().rev() {
+        slots::xor_payload(&mut block, key);
+    }
+
+    let mut header = Vec::with_capacity(slots::header_len(line_size));
+    for (k, hop) in hops.iter().enumerate() {
+        let mut cmd = Vec::with_capacity(slots::CMD_LEN);
+        let operand: Vec<u8> = if k == last {
             cmd.push(CMD_DELIVER);
-            cmd.extend_from_slice(&holonomy);
-        } else if let Some(next) = hops.get(k + 1) {
+            holonomy.to_vec()
+        } else {
             cmd.push(CMD_NEXT);
-            cmd.extend_from_slice(&fanos_geometry::encode_triple(next.line));
-        }
-        cmd.extend_from_slice(&inner);
-
-        // Per-hop key material from the seed (labelled by hop index for separation).
-        let tag = |label: &str| {
-            let mut s = seed.to_vec();
-            s.extend_from_slice(label.as_bytes());
-            s.extend_from_slice(&(k as u32).to_be_bytes());
-            s
+            fanos_geometry::encode_triple(hops.get(k + 1).ok_or(ThresholdError::Malformed)?.line).to_vec()
         };
-        let key = hash_labeled("FANOS-v1/threshold-onion-key", &tag("k"));
-        let nonce_full = hash_labeled("FANOS-v1/threshold-onion-nonce", &tag("n"));
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(
-            nonce_full
-                .get(..NONCE_LEN)
-                .ok_or(ThresholdError::Malformed)?,
-        );
-        let key_rnd = sharing_randomness(&tag("r"), threshold);
-        let kem_seed = tag("kem");
+        cmd.extend_from_slice(&operand);
+        cmd.resize(slots::CMD_KEY_AT, 0); // one width for both commands, so the final hop is not distinguishable
+        cmd.extend_from_slice(payload_keys.get(k).ok_or(ThresholdError::Malformed)?);
 
+        let key = hash_labeled("FANOS-v1/threshold-onion-key", &tag(k, "k"));
+        let nonce_full = hash_labeled("FANOS-v1/threshold-onion-nonce", &tag(k, "n"));
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(nonce_full.get(..NONCE_LEN).ok_or(ThresholdError::Malformed)?);
         let sealed = ThresholdSealed::seal(
             &cmd,
             &key,
             &nonce,
             threshold,
             hop.members,
-            &key_rnd,
-            &kem_seed,
+            &sharing_randomness(&tag(k, "r"), threshold),
+            &tag(k, "kem"),
         )?;
-        inner = sealed.to_bytes();
+        let bytes = sealed.to_bytes();
+        if bytes.len() != slots::slot_len(line_size) {
+            return Err(ThresholdError::Malformed);
+        }
+        header.extend_from_slice(&bytes);
     }
-    // Pad the outermost packet to the constant bucket (each forwarded hop is re-padded likewise).
-    pad_onion(&inner)
+    for k in hops.len()..slots::depth_for(line_size) {
+        header.extend_from_slice(&slots::filler_slot(
+            &hash_labeled("FANOS-v1/threshold-onion-pad-slot", &tag(k, "f")),
+            line_size,
+        ));
+    }
+    Ok(slots::Packet::new(slots::slot_len(line_size), header, block).to_bytes())
 }
 
 /// `(threshold − 1) · 32` bytes of deterministic sharing randomness from a seed.
@@ -181,12 +204,14 @@ pub fn peel_onion(
     onion: &[u8],
     members: &[(usize, &HybridKemSecret)],
 ) -> Result<ThresholdPeel, ThresholdError> {
-    let sealed = ThresholdSealed::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
+    let packet = slots::Packet::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
+    let sealed = ThresholdSealed::from_bytes(packet.slot(0).ok_or(ThresholdError::Malformed)?)
+        .ok_or(ThresholdError::Malformed)?;
     let shares: Vec<Share> = members
         .iter()
         .filter_map(|(i, sk)| sealed.member_share(*i, sk))
         .collect();
-    peel_command(&sealed, &shares)
+    peel_packet(packet, &sealed, &shares)
 }
 
 /// Peel one threshold hop from **already-gathered member shares** (the form an autonomous combiner
@@ -196,30 +221,44 @@ pub fn peel_onion_with_shares(
     onion: &[u8],
     shares: &[Share],
 ) -> Result<ThresholdPeel, ThresholdError> {
-    let sealed = ThresholdSealed::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
-    peel_command(&sealed, shares)
+    let packet = slots::Packet::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
+    let sealed = ThresholdSealed::from_bytes(packet.slot(0).ok_or(ThresholdError::Malformed)?)
+        .ok_or(ThresholdError::Malformed)?;
+    peel_packet(packet, &sealed, shares)
 }
 
-fn peel_command(
+/// Process one hop of a fixed-slot packet: open slot 0, strip one payload layer, and hand on a packet of **identical**
+/// width — the header shifted one slot left with a fresh, correctly-framed filler slot appended.
+fn peel_packet(
+    mut packet: slots::Packet,
     sealed: &ThresholdSealed,
     shares: &[Share],
 ) -> Result<ThresholdPeel, ThresholdError> {
     let cmd = sealed.open(shares)?;
-    let (&tag, rest) = cmd.split_first().ok_or(ThresholdError::Malformed)?;
+    if cmd.len() != slots::CMD_LEN {
+        return Err(ThresholdError::Malformed);
+    }
+    let tag = *cmd.first().ok_or(ThresholdError::Malformed)?;
+    let operand = cmd.get(1..1 + HOLONOMY_LEN).ok_or(ThresholdError::Malformed)?;
+    let pkey = cmd
+        .get(slots::CMD_KEY_AT..slots::CMD_KEY_AT + 32)
+        .ok_or(ThresholdError::Malformed)?
+        .to_vec();
+    slots::xor_payload(&mut packet.payload, &pkey);
     match tag {
         CMD_DELIVER => {
-            let holonomy_bytes = rest.get(..HOLONOMY_LEN).ok_or(ThresholdError::Malformed)?;
             let mut holonomy = [0u8; HOLONOMY_LEN];
-            holonomy.copy_from_slice(holonomy_bytes);
-            let payload = rest.get(HOLONOMY_LEN..).ok_or(ThresholdError::Malformed)?.to_vec();
+            holonomy.copy_from_slice(operand);
+            let payload = slots::unpack_payload(&packet.payload).ok_or(ThresholdError::Malformed)?;
             Ok(ThresholdPeel::Deliver { payload, holonomy })
         }
         CMD_NEXT => {
-            let next =
-                fanos_geometry::decode_triple(rest.get(..12).ok_or(ThresholdError::Malformed)?)
-                    .ok_or(ThresholdError::Malformed)?;
-            let onion = rest.get(12..).ok_or(ThresholdError::Malformed)?.to_vec();
-            Ok(ThresholdPeel::Forward { next, onion })
+            let next = fanos_geometry::decode_triple(operand.get(..12).ok_or(ThresholdError::Malformed)?)
+                .ok_or(ThresholdError::Malformed)?;
+            // Framed like a real slot, or a relay counts the parseable slots and reads off the remaining depth.
+            let line_size = slots::line_size_of(packet.slot_len).ok_or(ThresholdError::Malformed)?;
+            packet.shift_in(&slots::filler_slot(&pkey, line_size));
+            Ok(ThresholdPeel::Forward { next, onion: packet.to_bytes() })
         }
         _ => Err(ThresholdError::Malformed),
     }
@@ -235,7 +274,9 @@ pub fn member_partial(
     member_index: usize,
     secret: &HybridKemSecret,
 ) -> Option<Share> {
-    ThresholdSealed::from_bytes(onion)?.member_share(member_index, secret)
+    // Slot 0 is always this hop's — every hop shifts the header, so a member never searches for its slot.
+    let packet = slots::Packet::from_bytes(onion)?;
+    ThresholdSealed::from_bytes(packet.slot(0)?)?.member_share(member_index, secret)
 }
 
 #[cfg(test)]
@@ -243,7 +284,7 @@ pub fn member_partial(
 mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
-    use fanos_threshold::THRESHOLD_ONION_LEN;
+    use fanos_threshold::{THRESHOLD_ONION_LEN, pad_onion};
 
     fn line(n: usize, seed: u8) -> Vec<(HybridKemSecret, HybridKemPublic)> {
         (0..n)
@@ -276,24 +317,15 @@ mod tests {
     }
 
     #[test]
-    fn a_peeling_relay_can_currently_infer_its_hop_position_s1_m6() {
-        // **CHARACTERIZATION OF A KNOWN DEFECT (S1-M6), not a property we want.** This asserts the leak is still present,
-        // so the fix cannot land silently and cannot regress unnoticed. When the fixed-slot layout replaces the nested one,
-        // this test is replaced by its opposite: every hop sees the same number of bytes.
-        //
-        // The leak is NOT the cleartext `ct_len` field, which is what the task originally named. That field is redundant —
-        // `ct_len = total − 18 − members × SEALED_SHARE_LEN`, and `members` is cleartext while `total` is the layer the
-        // relay is holding — so encrypting it hides nothing. The leak is structural: `seal_onion` nests, so each layer's
-        // plaintext *contains the entire inner onion*, and the remaining depth is readable off its length.
-        //
-        // Nor can it be fixed by padding each nested layer to a constant: a layer would then contain a full-width inner
-        // onion, so the total would grow with depth instead. Constant per-layer size and constant total size are
-        // incompatible under nesting, which is precisely why the fix is a Sphinx-shape fixed slot array — a constant
-        // header of `D` slots that each hop shifts — rather than better padding.
-        let (onion, lines) = circuit(4, 3);
+    fn no_hop_can_infer_its_position_from_the_packet_it_is_handed_s1_m6() {
+        // S1-M6: every hop, at every depth, is handed a packet of identical size, so the bytes say nothing about how far
+        // along the circuit a relay sits. This test replaces its own opposite — the nested layout it succeeds measured
+        // `[20480, 10689, 7135, 3581]` on this very circuit, where only the outermost onion was padded and
+        // `round(size / 3554)` gave a relay its position.
+        let (onion, lines) = circuit(3, 3);
         let mut sizes = alloc::vec![onion.len()];
         let mut current = onion;
-        for hop in lines.iter().take(3) {
+        for hop in lines.iter().take(2) {
             let partials: Vec<Share> = [0usize, 1]
                 .iter()
                 .filter_map(|&i| hop.get(i).and_then(|(sk, _)| member_partial(&current, i, sk)))
@@ -303,28 +335,19 @@ mod tests {
                     sizes.push(inner.len());
                     current = inner;
                 }
-                ThresholdPeel::Deliver { .. } => panic!("a 4-hop circuit forwards three times"),
+                ThresholdPeel::Deliver { .. } => panic!("a 3-hop circuit forwards twice"),
             }
         }
-
-        // Measured on a 4-hop circuit over 3-member lines: `[20480, 10689, 7135, 3581]`.
-        //
-        // The outermost onion is `THRESHOLD_ONION_LEN` because `pad_onion` padded it — so the **first** hop is protected,
-        // and that is the whole extent of the current defence. Every inner onion is handed on un-padded.
-        assert_eq!(sizes[0], THRESHOLD_ONION_LEN, "only the outermost onion is padded");
-
-        // From hop 1 on, the size falls by a CONSTANT per hop — one layer's worth — so a relay does not merely learn
-        // "some layers remain", it computes exactly how many, and hence exactly where it sits on the path.
-        let inner = &sizes[1..];
-        let step = inner[0] - inner[1];
-        for pair in inner.windows(2) {
-            assert_eq!(pair[0] - pair[1], step, "a uniform per-hop step makes the position exact: {sizes:?}");
+        let first = sizes[0];
+        for (k, &size) in sizes.iter().enumerate() {
+            assert_eq!(size, first, "hop {k} is handed the same {first} bytes as every other: {sizes:?}");
         }
-        // Concretely: remaining hops = round(size / step) + 1, exact at every measured depth.
-        for (k, &size) in inner.iter().enumerate() {
-            let remaining = (size + step / 2) / step;
-            assert_eq!(remaining, inner.len() - k, "hop {k} recovers its remaining depth exactly from {size} bytes");
-        }
+        assert_eq!(
+            first,
+            slots::PREAMBLE_LEN + slots::header_len(3) + slots::payload_len(3).unwrap(),
+            "and the width is the plane's, not an accident of this payload"
+        );
+        assert_eq!(first, THRESHOLD_ONION_LEN, "which is the bucket the previous layout already paid for");
     }
 
     #[test]
@@ -439,7 +462,7 @@ mod tests {
             match peel_onion(&onion, &members).unwrap() {
                 ThresholdPeel::Forward { onion: inner, .. } => {
                     // Re-pad the inner onion as the router does: every hop's packet is the same size.
-                    onion = pad_onion(&inner).unwrap();
+                    onion = inner;
                     assert_eq!(
                         onion.len(),
                         THRESHOLD_ONION_LEN,
@@ -490,7 +513,7 @@ mod tests {
                 .map(|(i, (sk, _))| (i, sk))
                 .collect();
             match peel_onion(&onion, &members).unwrap() {
-                ThresholdPeel::Forward { onion: inner, .. } => onion = pad_onion(&inner).unwrap(),
+                ThresholdPeel::Forward { onion: inner, .. } => onion = inner,
                 ThresholdPeel::Deliver { holonomy, .. } => {
                     delivered = Some(holonomy);
                     break;
@@ -545,7 +568,7 @@ mod tests {
                 .map(|(i, (sk, _))| (i, sk))
                 .collect();
             match peel_onion(&onion, &members).unwrap() {
-                ThresholdPeel::Forward { onion: inner, .. } => onion = pad_onion(&inner).unwrap(),
+                ThresholdPeel::Forward { onion: inner, .. } => onion = inner,
                 ThresholdPeel::Deliver { holonomy, .. } => {
                     assert_eq!(holonomy, tag, "the delivered tag is the sealed authenticator");
                     return;

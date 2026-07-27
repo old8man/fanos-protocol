@@ -48,8 +48,19 @@ use alloc::vec::Vec;
 use fanos_primitives::hash::hash_xof;
 use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, THRESHOLD_ONION_LEN, ThresholdError};
 
+/// The circuit depth the layout targets, when the plane's budget allows it.
+///
+/// A **policy**, not a budget maximum, and the distinction is load-bearing. Filling the cell with slots leaves almost
+/// nothing for the payload — and worse, it makes the payload *shrink* as the cell grows, since a wider cell buys more slots
+/// rather than more room. Measured: doubling `THRESHOLD_ONION_LEN` to 40 960 took the payload from 2 444 B to **1 288 B**.
+/// An experiment that widened the cell to test for a payload shortage therefore tested nothing, and wrongly cleared it.
+///
+/// Three hops is the depth that actually buys anonymity (it is what Tor uses), and capping there leaves ~9.6 KiB of payload
+/// at `q = 2` instead of 2.4.
+pub const TARGET_DEPTH: usize = 3;
+
 /// The number of slots in every header on a plane whose lines hold `line_size` points — and so the ceiling on circuit
-/// depth there.
+/// depth there: [`TARGET_DEPTH`], or fewer if the plane's slots are too wide to fit that many.
 ///
 /// Derived per plane rather than fixed globally, because the invariant the layout needs is that *every packet on a given
 /// network looks alike*, and the line size is already a network-wide parameter (`q + 1`). A single global constant cannot
@@ -61,7 +72,8 @@ use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, THRESHOLD_ONION_LEN, Threshol
 #[must_use]
 pub const fn depth_for(line_size: usize) -> usize {
     match (THRESHOLD_ONION_LEN - PREAMBLE_LEN).checked_div(slot_len(line_size)) {
-        Some(n) => n,
+        Some(n) if n < TARGET_DEPTH => n,
+        Some(_) => TARGET_DEPTH,
         None => 0,
     }
 }
@@ -268,10 +280,13 @@ mod tests {
             assert!(header_len(line_size) + PREAMBLE_LEN <= THRESHOLD_ONION_LEN, "line {line_size}: header fits");
             assert!(payload_len(line_size).is_some(), "line {line_size}: a payload block remains");
         }
-        assert_eq!(depth_for(3), 5, "q = 2 (3 points per line) carries 5 hops");
-        assert_eq!(depth_for(5), 3, "q = 4 carries 3");
-        assert_eq!(depth_for(8), 2, "q = 7 carries 2");
-        assert!(payload_len(3).unwrap() > 2048, "the Fano plane leaves a usable payload: {:?}", payload_len(3));
+        // The target depth where the plane affords it, less where it does not.
+        assert_eq!(depth_for(3), TARGET_DEPTH, "q = 2 affords the target depth");
+        assert_eq!(depth_for(5), TARGET_DEPTH, "q = 4 affords it too");
+        assert_eq!(depth_for(8), 2, "q = 7 can only carry two hops in the bucket");
+        // And the payload is what the policy is for: budget-filling left 2.4 KiB, which is smaller than structures this
+        // protocol nests *inside* an onion payload (sealing to a 3-member line alone is ~3.5 KiB).
+        assert!(payload_len(3).unwrap() > 8192, "capping depth leaves a real payload: {:?}", payload_len(3));
     }
 
     #[test]

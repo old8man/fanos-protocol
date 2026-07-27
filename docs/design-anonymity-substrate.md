@@ -483,11 +483,9 @@ must be read before printing a NOSTOS novelty claim (§7).
 
 ---
 
-## The fixed-slot onion layout — the design that closes the hop-position leak (S1-M6)
+## The fixed-slot onion layout — closing the hop-position leak (S1-M6)
 
-**Status: built and unit-verified (`fanos_aphantos::slots`), NOT yet wired into `seal_onion`/`peel_onion`.** A first
-wiring attempt passed all 43 `fanos-aphantos` unit tests and then broke four live anonymity tests over real QUIC, so it was
-withdrawn rather than shipped. What is ruled out and what to instrument next is recorded in `docs/open-tasks.md` §11.
+**Status: live.** `fanos_aphantos::slots` is the packet layout `seal_onion`/`peel_onion` build and peel.
 
 ### What leaked, measured
 
@@ -517,11 +515,20 @@ size-preserving layer from the payload block. Slot `k` as built is hop `k`'s, an
 position 0. The two cleartext preamble fields are network parameters (`D` and the plane's line size), not circuit facts, so
 neither reveals the actual depth `h`.
 
-`D = depth_for(line_size)` is **derived per plane, not fixed globally**. The invariant needed is that every packet on a
-given network looks alike, and the line size is already network-wide (`q + 1`). One global constant cannot serve both ends
-of the range: the budget is fixed, so a wide plane's slots are large and few, and forcing a Fano deployment down to a wide
-plane's depth would discard anonymity it has paid for. The trade is legible — **5 hops at `q = 2`, 3 at `q = 4`, 2 at
-`q = 7`** — and exceeding it is now an error rather than, as before, a silent leak.
+`D = depth_for(line_size)` is **a policy capped by the plane's budget**, not the budget maximum, and not a global constant.
+
+Two decisions are folded in there, and both were forced by measurement:
+
+- **Per plane, not global.** The invariant needed is that every packet on a given network looks alike, and the line size is
+  already network-wide (`q + 1`). A single global constant cannot serve both ends of the range: the budget is fixed, so a
+  wide plane's slots are large and few, and a fixed `D = 4` simply fails to fit on `q = 7`.
+- **A target depth, not "fill the budget".** Filling it leaves almost nothing for the payload, and has a perverse
+  consequence: payload *shrinks* as the cell grows, because a wider cell buys more slots rather than more room. Measured —
+  doubling `THRESHOLD_ONION_LEN` to 40 960 took the payload from 2 444 B to **1 288 B**. That is also why an experiment
+  which widened the cell to test for a payload shortage tested nothing and wrongly cleared it. `TARGET_DEPTH = 3` is the
+  depth that actually buys anonymity (it is what Tor uses) and leaves ~9.6 KiB of payload at `q = 2`.
+
+Exceeding the ceiling is now an error rather than, as before, a silent leak.
 
 ### Why this is simpler than textbook Sphinx
 
@@ -549,7 +556,24 @@ construction rather than a step a forwarder could omit, and under the nested lay
 between a relay and its depth.
 
 **A payload budget the nested layout did not have.** A fixed array reserves all `D` slots even for a one-hop circuit, so
-payload capacity falls from ~20 KiB to `THRESHOLD_ONION_LEN − PREAMBLE_LEN − D × slot_len` — 2 704 B at `q = 2`. That is
-smaller than some structures this protocol nests *inside* an onion payload (sealing to a 3-member line alone costs
-3 × 1 169 = 3 507 B), so wiring this in needs either a wider cell or payload fragmentation. Sphinx makes the same trade and
-answers it with fragmentation above a fixed cell.
+payload capacity is `THRESHOLD_ONION_LEN − PREAMBLE_LEN − D × slot_len` rather than most of the cell. This is not
+hypothetical: at budget-filling depth it was 2 444 B, which is *smaller than structures this protocol nests inside an onion
+payload* (sealing to a 3-member line alone costs 3 × 1 169 = 3 507 B), and it broke every full anonymous session while a
+single forward onion still delivered. `TARGET_DEPTH` is what makes it fit.
+
+The whole trade at `q = 2`, where a slot costs 3 606 B:
+
+| `D` | header | payload | status |
+|---|---|---|---|
+| 3 | 10 818 | **9 656** | `TARGET_DEPTH`; verified — `anonymous_quic` 5/5 |
+| 4 | 14 424 | 6 050 | headroom for one more intermediate hop; **unverified** |
+| 5 | 18 030 | 2 444 | what budget-filling chose, and what broke every full session |
+
+A circuit is `depth` intermediate hops **plus** its destination line, so `D = 3` means at most **2** intermediate hops —
+exactly the CLI default (`--fwd-depth 2`). That leaves no headroom, so the depth is validated at config time: an operator
+raising it gets a message naming the ceiling, because `create_forward` swallows the over-depth error with `.ok()?` and the
+failure is otherwise a dial that quietly never connects.
+
+If deeper circuits are wanted, `D = 4` is available at 6 KiB of payload and needs re-verifying against the reply path;
+beyond that the answer is fragmentation above a fixed cell — the trade Sphinx makes and answers the same way — **not** a
+wider cell, which as shown above makes the payload smaller, not larger.

@@ -617,10 +617,27 @@ fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
     if threshold == 0 {
         return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
     }
+    // A circuit is `depth` intermediate hops plus its destination line, so it costs `depth + 1` slots of the fixed-slot
+    // onion header. Checked here because the failure is otherwise **silent**: `create_forward` swallows the over-depth error
+    // with `.ok()?`, so an operator who raises this past the ceiling gets dials that quietly never connect rather than a
+    // message saying why. The default of 2 sits exactly at the ceiling for the Fano plane.
+    let line_size = fanos_geometry::fano::LINE_SIZE;
+    let max_depth = fanos_aphantos::slots::depth_for(line_size).saturating_sub(1);
+    let (fwd_depth, reply_depth) = (usize_flag("--fwd-depth", 2)?, usize_flag("--reply-depth", 2)?);
+    for (name, depth) in [("--fwd-depth", fwd_depth), ("--reply-depth", reply_depth)] {
+        if depth > max_depth {
+            return Err(NodeError::Config(format!(
+                "{name} is {depth}, but the onion header carries at most {} hops on this plane, so {max_depth} \
+                 intermediate hops. A deeper circuit needs payload fragmentation, not a wider cell — widening the cell buys \
+                 more slots and so a SMALLER payload.",
+                max_depth + 1
+            )));
+        }
+    }
     Ok(AnonConfig {
         threshold,
-        fwd_depth: usize_flag("--fwd-depth", 2)?,
-        reply_depth: usize_flag("--reply-depth", 2)?,
+        fwd_depth,
+        reply_depth,
         beacon: match flag(args, "--beacon") {
             Some(s) => parse_beacon_hex(s)?,
             None => BeaconSeed::GENESIS,
