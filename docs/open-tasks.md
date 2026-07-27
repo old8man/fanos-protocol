@@ -42,16 +42,6 @@ production continues) brought all 7 to height 22 with identical state.
 - The two sibling `dromos_quic` tests cannot see it: they submit one transaction, so "everyone reached height 1" is the
   fixed point. A one-transaction test cannot distinguish "converged" from "stopped".
 
-### [A] `converge` cannot tell starvation from a wedge — the byte-level waits can
-`common::converge` refutes when its trace has not changed for `FROZEN_SPAN` of **wall clock**, so on a contended host it
-reports `REFUTED — a fixed point, not a slow one` about a cell that was simply never scheduled. Measured: the HERMES suite
-passes in 48 s at load average 57 and reports REFUTED with all seven validators frozen at height 1 at load average 83 —
-where nothing was running at all, which is not a fixed point.
-- The fix pattern already exists one layer down: `read_within_span` charges its budget in *granted* time and consults
-  `DELIVERED` ("has anything in this process ever moved?") before claiming a wedge. `converge` has neither. Give it both —
-  the observation trace is the natural witness, since a cell where *some* other observation advanced is a cell being
-  scheduled.
-
 ### [A] `#[ignore]` conflates two incompatible things
 34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
 **never** gate, and *cost-gated assertions* (13 in `fanos-obolos`, 2 each in `taxis`/`quic`/`ffi`) that must gate **somewhere**.

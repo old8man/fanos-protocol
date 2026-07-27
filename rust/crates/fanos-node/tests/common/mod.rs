@@ -85,6 +85,24 @@ const POLL: Duration = Duration::from_millis(150);
 ///
 /// Panics with the frozen trace on refutation, or with the last trace at the ceiling. The distinction is in the message,
 /// because the two demand opposite responses: a frozen system needs a bug fixed, a slow one needs headroom.
+///
+/// ## The frozen span is counted in observations, not in wall clock
+///
+/// A wall-clock window shrinks precisely when the host is least able to make progress, so it refutes a starved system as
+/// confidently as a wedged one. Measured on the HERMES cell suite: it converges in 48 s at load average 57, and at load
+/// average 83 reported `REFUTED — a fixed point, not a slow one` about a cell that was never scheduled at all.
+///
+/// The budget is therefore charged one [`POLL`] per *completed observation*, so a span is `FROZEN_SPAN / POLL` samples
+/// rather than a duration. This is not the same trick as charging by timer ticks — that was tried one layer down and
+/// stretched a 48 s window to only 79 s at 4× oversubscription, because timers are exactly what keeps running when the
+/// worker threads cannot. An observation is *real work the host must schedule*: it wakes seven validators and awaits their
+/// snapshots. When the host slows that down tenfold, the window stretches tenfold with it, automatically and with no
+/// tuning factor.
+///
+/// The verdict also carries the evidence a reader needs to second-guess it: how many observations completed inside the
+/// frozen window, and the slowest one. A cell standing still while its nodes answer 320 snapshot rounds promptly is a
+/// wedge; one whose observations have themselves blown out to seconds is a starved host, and the message says which
+/// without pretending to a threshold that separates them.
 pub async fn converge<F, Fut>(what: &str, mut observe: F)
 where
     F: FnMut() -> Fut,
@@ -92,28 +110,36 @@ where
 {
     let started = Instant::now();
     let mut last = String::new();
-    let mut last_change = Instant::now();
+    let mut granted = Duration::ZERO;
+    let mut samples = 0u32;
+    let mut slowest = Duration::ZERO;
     loop {
+        let sampled_at = Instant::now();
         let (reached, trace) = observe().await;
+        let took = sampled_at.elapsed();
         if reached {
             return;
         }
         if trace != last {
             last = trace;
-            last_change = Instant::now();
+            granted = Duration::ZERO;
+            samples = 0;
+            slowest = Duration::ZERO;
         }
-        let now = Instant::now();
+        samples += 1;
+        slowest = slowest.max(took);
         assert!(
-            now.duration_since(last_change) <= FROZEN_SPAN,
-            "{what}: REFUTED — the observed state has not changed for {:?} (a fixed point, not a slow one). \
-             Frozen at: {last}",
-            now.duration_since(last_change)
+            granted < FROZEN_SPAN,
+            "{what}: REFUTED — the observed state has not changed across {samples} observations (a fixed point, not a \
+             slow one). The slowest of them took {slowest:?}, so judge for yourself whether this host was answering. \
+             Frozen at: {last}"
         );
         assert!(
-            now.duration_since(started) <= HANG_CEILING,
+            started.elapsed() <= HANG_CEILING,
             "{what}: INCONCLUSIVE — still changing at the {HANG_CEILING:?} ceiling, so this is latency rather than a \
              wedge. Last seen: {last}"
         );
+        granted += POLL;
         tokio::time::sleep(POLL).await;
     }
 }
