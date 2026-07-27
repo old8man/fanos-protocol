@@ -101,12 +101,16 @@ impl<F: Field> RendezvousRelay<F> {
     /// relay forwards matching client requests through. Only **primary** (coordinate-hiding) registrations
     /// are accepted — a non-empty `forward_circuit` with self-provisioned keys; a bare-host registration
     /// (direct-coordinate fallback) is ignored here (its forwarding is a separate, weaker path). Bounded FIFO.
-    fn register_host(&mut self, reg: HostRegister) {
+    /// Returns the effect announcing the binding, or nothing when the registration was refused — so a caller
+    /// that must know the route exists has an observable instead of a duration to guess.
+    fn register_host(&mut self, reg: HostRegister) -> Vec<Effect> {
         if reg.forward_circuit.is_empty() || reg.forward_keys.is_empty() {
-            return;
+            return Vec::new();
         }
+        let service_tag = reg.service_tag;
         // The `BoundedMap` bounds this against a registration flood (a re-registration refreshes the route).
-        self.hosts.insert(reg.service_tag, reg);
+        self.hosts.insert(service_tag, reg);
+        vec![Effect::Notify(Notification::HostRegistered { service_tag })]
     }
 
     /// The next `(e2e_seed, onion_seed)` pair for a host-forward — two independent fresh draws (the NOSTOS
@@ -186,8 +190,7 @@ impl<F: Field> RendezvousRelay<F> {
         }
         // 2. A host registration → bind it (primary, coordinate-hiding registrations only).
         if let Some(reg) = parse_host_register(&payload) {
-            self.register_host(reg);
-            return Vec::new();
+            return self.register_host(reg);
         }
         // 3. A client request naming a registered host → re-seal to that host's dead-drop and forward.
         if let Some(req) = Request::decode(&payload)

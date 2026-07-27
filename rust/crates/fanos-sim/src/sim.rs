@@ -61,6 +61,9 @@ fn note_desc(note: &Notification) -> String {
         Notification::Delivered { from, .. } => format!("Delivered from {}", fmt_coord(*from)),
         Notification::App { from, .. } => format!("App from {}", fmt_coord(*from)),
         Notification::RendezvousLine(l) => format!("RendezvousLine {}", fmt_coord(*l)),
+        Notification::HostRegistered { service_tag } => {
+            format!("HostRegistered {}", short_digest(service_tag))
+        }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
         Notification::Verdict(v) => format!("Verdict {v:?}"),
         Notification::Rerouted { around, via } => {

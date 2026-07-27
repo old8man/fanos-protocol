@@ -49,6 +49,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use fanos_quic::NodeHandle;
+use fanos_runtime::Notification;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
@@ -267,6 +269,31 @@ async fn within_span<F: Future>(work: F) -> Option<F::Output> {
         }
         if granted >= FROZEN_SPAN {
             return None;
+        }
+    }
+}
+
+/// Wait until `node`'s rendezvous relay binds a §3b host registration, and return the tag it bound.
+///
+/// The observable that replaced a 500 ms sleep captioned "let the registration reach and bind at the combiner". A
+/// registration carries no acknowledgement by design, so a test that dials before the binding exists sends a request the
+/// combiner silently drops — and the client then waits for a reply that will never come, indistinguishable from a wedge.
+/// That guess was the actual cause of the only two `anonymous_quic` tests that ever failed under load: both are the
+/// combiner-forwarded ones, both were the only tests carrying a fixed sleep, and the three without one never failed.
+///
+/// Bounded the same way as the other waits here: by whether notifications keep arriving, not by wall clock.
+pub async fn host_registered(node: &mut NodeHandle) -> [u8; 32] {
+    loop {
+        let Some(note) = within_span(node.next_notification()).await else {
+            panic!(
+                "REFUTED — no notification of any kind in {FROZEN_SPAN:?} of granted time while waiting for a host \
+                 registration to bind"
+            )
+        };
+        match note {
+            Some(Notification::HostRegistered { service_tag }) => return service_tag,
+            Some(_) => {}
+            None => panic!("the relay node shut down before a host registration bound"),
         }
     }
 }

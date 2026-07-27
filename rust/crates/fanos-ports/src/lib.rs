@@ -225,6 +225,18 @@ pub enum Notification {
     },
     /// The rendezvous line computed for a send (for observation, spec §L1).
     RendezvousLine(Triple),
+    /// A hidden service's **host registration** was bound at this node's rendezvous relay (§3b): it will now forward
+    /// client requests carrying `service_tag` through the operator's dead-drop route.
+    ///
+    /// The observable that §3b readiness otherwise lacks. A registration is deliberately unacknowledged — an ack would be
+    /// an oracle telling a prober which tags a combiner holds — so from the operator's side, "the route has not arrived
+    /// yet" and "this service will never be reachable" are the same silence, and anything waiting on the former has to
+    /// guess a duration. This is the combiner's own side of that binding, told to *its* operator only, and it discloses
+    /// nothing further: the relay learns the dead-drop line, never the host's coordinate.
+    HostRegistered {
+        /// The service tag whose forward route was bound.
+        service_tag: [u8; 32],
+    },
     /// A peer was observed to go down (heartbeat timeout).
     PeerDown(Triple),
     /// A **peer** moved to a different coordinate, proved on a live connection.

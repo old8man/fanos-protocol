@@ -14,7 +14,6 @@
 
 mod common;
 
-use std::time::Duration as StdDuration;
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
@@ -24,7 +23,7 @@ use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, HostedService, OverlayBeaconNode, RendezvousRoute, StaticResolver,
-    serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
+    build_cell_mix_directory, serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
@@ -405,8 +404,10 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
             resp
         },
     );
-    // Let the one-hop registration reach and bind at the combiner before the client dials.
-    tokio::time::sleep(StdDuration::from_millis(500)).await;
+    // Wait for the binding itself, not for a duration: the combiner silently drops a request whose tag it has not
+    // bound yet, and the client then waits forever for a reply that was never forwarded.
+    let bound = common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held")).await;
+    assert_eq!(bound, tag, "the combiner bound this service's forward route");
 
     // A third node dials by name — it neither is the combiner nor knows where the service is.
     let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
@@ -465,7 +466,13 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         // binding exists exactly where VRF coordinates do (S1-M3, `mixdir::parse_bound_record`).
         publishers.push(spawn_mix_publisher(n.client(), onion_seed, n.coordinate_prover()));
     }
-    tokio::time::sleep(StdDuration::from_millis(800)).await; // let the keys publish
+    // Wait for the mix keys to be readable, not for a duration: the host driver below builds its directory from this
+    // store, and an empty read makes it register a route through nothing.
+    common::converge("every cell mix key is published", || async {
+        let dir = build_cell_mix_directory::<F2>(&nodes[0].as_ref().unwrap().client(), fanos_rendezvous::Epoch::ZERO, None).await;
+        (dir.len() == 7, format!("mix keys readable: {}", dir.len()))
+    })
+    .await;
 
     let mut skp = SeedRng::from_seed(b"driver-svc");
     let service = StaticKeypair::generate(&mut skp);
@@ -494,7 +501,8 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
             resp
         },
     );
-    tokio::time::sleep(StdDuration::from_millis(800)).await; // let it build the directory + register
+    // Same observable as the manual case: the driver's registration has actually bound at the combiner.
+    common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held")).await;
 
     let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
     let client_node = nodes[client_index].take().unwrap();

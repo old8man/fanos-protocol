@@ -44,16 +44,23 @@ instead of "did not finish in 240 s". On a host loaded by an unrelated build, on
 | `a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding` | **combiner-forwarded** | **0 bytes / 48 s** |
 | `the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic` | **combiner-forwarded** | **0 bytes / 48 s** |
 
-The split is exactly by path, not by cost, and the *same process* delivered 23 and 46 bytes on the direct flows while the
-forwarded ones moved none — so the host was scheduling work and this is a stall, not starvation. Idle, all five pass in
-~4 s. These are the same two tests that failed the first full `cargo test --workspace --features validator` run.
-- **Hypothesis to test first:** the forwarding hop awaits something that is only satisfied promptly when the machine is
-  idle — a lock ordering, or a reply that races a timer — since a purely slow path would deliver *late*, not *never*.
-- **Do not "fix" with longer timeouts.** A wait that ends without bytes is not a slow wait; the numbers above give no
-  principled multiplier, and 240 s already failed to be one.
-- Under total starvation (3–4× oversubscription, nothing anywhere moves) the same waits correctly report INCONCLUSIVE
-  rather than a wedge. The residual instrument gap: a host that starves only *midway* still reads as a wedge, because the
-  discriminator asks whether the process has *ever* delivered.
+The split was by path, not by cost, and the *same process* delivered 23 and 46 bytes on the direct flows while the
+forwarded ones moved none. These are also the two tests that failed the first full `cargo test --workspace --features
+validator` run. Idle, all five pass in ~2–5 s, repeatedly.
+
+**Held as unconfirmed, deliberately.** The observation above is a *single* run, and this host cannot support a controlled
+one: an unrelated project's test binary was measured at **1202 % CPU** (12 of 16 cores) during the follow-ups, so every
+"N× oversubscription" experiment here was really N× plus an unknown, time-varying neighbour. Under load I could add, all
+four exchange-driven tests starve alike and report INCONCLUSIVE — the path split did not reproduce. One candidate cause
+was removed on the way (both forwarded tests were the only ones synchronising on a fixed sleep; those are now waits on
+`Notification::HostRegistered` and on the mix directory actually being readable), but removing the sleeps entirely does
+*not* fail idle, so the sleep is not shown to have been the cause either.
+- **What would settle it:** a quiet host, or a way to apply load to the cell without loading the observer. Until then this
+  is one observation, not a defect.
+- **Do not "fix" with longer timeouts.** A wait that ends without bytes is not a slow wait, and 240 s already failed to be
+  a principled multiplier.
+- Residual instrument gap: a host that starves only *midway* still reads as a wedge, because the discriminator asks
+  whether the process has *ever* delivered.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's
