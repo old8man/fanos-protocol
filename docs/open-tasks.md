@@ -54,6 +54,12 @@ reply (`Output::SendTo` → one peer's coordinate) rather than a broadcast. Ever
 a broadcast. A directed reply that never lands would reproduce this precisely, and nothing tests that path over a
 transport.
 
+*Ruled out on the way:* the driver's validator→coordinate map was built once at spawn and never updated, so a reseated
+peer would have been silently evicted from consensus — its votes dropped as "a frame from a stranger", its own addressed
+to the point it left. That is now fixed, but it does **not** explain the laggard: `fanos validator` pins its coordinate
+deliberately (`Point::at(me)`, chosen rather than VRF-accepted, "which the Fano-cell BFT structure requires"), and the
+QUIC cell fixture seats its nodes the same way. No reseat happens in either.
+
 ### [A] `#[ignore]` conflates two incompatible things
 34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
 **never** gate, and *cost-gated assertions* (13 in `fanos-obolos`, 2 each in `taxis`/`quic`/`ffi`) that must gate **somewhere**.

@@ -220,7 +220,16 @@ where
     let (query_tx, mut query_rx) = mpsc::channel::<oneshot::Sender<(u64, S)>>(16);
     let events_for_task = events_tx.clone();
     // Validator index p ↔ overlay coordinate Point::at(p) — the whole cell's addresses, once.
-    let coords: Vec<Triple> = (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect();
+    // The validator index → overlay coordinate map. It starts at the canonical seating (validator `i` at
+    // `Point::at(i)`) and is *maintained*, because the overlay reseats nodes: a coordinate collision or an
+    // epoch reshuffle moves a peer, and `fanos-quic` proves the move on a live connection and reports it.
+    //
+    // A static map is not a simplification here, it is a silent eviction. Every consensus message this driver
+    // sends is addressed by coordinate, and every one it receives is accepted only from a coordinate in this
+    // list — so a peer that moved would have its votes dropped as "a frame from a stranger" while the votes
+    // addressed to it went to the point it left. The cell would carry on without it, tolerating two such
+    // losses and halting at the third, with no error anywhere: the moved validator is simply gone.
+    let mut coords: Vec<Triple> = (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect();
     let me = params.me;
 
     // **Drainer task.** The client's `subscribe()` stream is a *lossy* broadcast: a subscriber that falls
@@ -235,7 +244,11 @@ where
     let drainer = tokio::spawn(async move {
         loop {
             match broadcast_rx.recv().await {
-                Ok(note @ (Notification::App { .. } | Notification::BeaconReady { .. })) => {
+                Ok(
+                    note @ (Notification::App { .. }
+                    | Notification::BeaconReady { .. }
+                    | Notification::PeerMoved { .. }),
+                ) => {
                     if note_tx.send(note).is_err() {
                         break; // the engine task ended
                     }
@@ -373,6 +386,15 @@ where
                     },
                     // Fixed-epoch cell: the seed/epoch are pinned at construction. A future rotation policy
                     // would re-derive the leader schedule + keyper line here at a height boundary.
+                    // A peer proved it moved (§L1 reseating). Re-point its slot so the fan-out reaches it and its
+                    // messages are still recognised as a validator's. Keyed by the coordinate it *held*, which is
+                    // this map's own entry for it — a mover this driver never learned about would be
+                    // indistinguishable from a stranger, which is exactly the state this arm exists to prevent.
+                    Some(Notification::PeerMoved { old, new }) => {
+                        if let Some(slot) = coords.iter_mut().find(|c| **c == old) {
+                            *slot = new;
+                        }
+                    }
                     Some(_) => {}
                     None => break, // the drainer stopped (client shut down)
                 },
