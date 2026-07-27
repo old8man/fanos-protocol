@@ -28,6 +28,7 @@ pub mod chain;
 pub mod checkpoint;
 pub mod committee;
 pub mod consensus;
+pub mod da;
 pub mod crosscell;
 pub mod hierarchy;
 pub mod incentive;

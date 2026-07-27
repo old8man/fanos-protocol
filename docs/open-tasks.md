@@ -237,8 +237,18 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
       which looked like the whole explanation for "every small-payload suite passes, the shielded one wedges". It is not:
       a new transport test fans both sizes out to all six peers and both arrive, in 0.62 s. `MAX_FRAME` is 1 MiB and the
       overlay maps `Emit` straight to `Effect::Send`.
-    - Next: model **partial** sampling in `consensus_sim` (it now models dispersal latency but still hands over the full
-      shard set), so this reproduces deterministically instead of over a 50 s QUIC run.
+    - **The pattern is stable across runs and it is unanimity that fails, not consensus.** A quorum finalizes and
+      executes; one or two validators sit at genesis forever holding the commit certificate without a body. Measured
+      thrice: `1:h0` alone stuck (6 of 7 executed), then `0,4,5:h0` (4 of 7), and the private-transfer test consistently
+      at only the proposer. So the sibling's single green run after the resample fix was luck, not a fix — corrected here.
+    - **`fanos_taxis::da::Sampler` extracted (sans-I/O), which is the structural half of the fix.** The sampling decision
+      procedure was inline in the driver, which is exactly why the simulator could not exercise it and why a total
+      liveness failure was invisible: the sim cannot "differ only in transport" while the logic under test *is* tangled
+      into the transport. The driver now owns only the I/O, and its `DaState`/`PendingDa`/`try_reconstruct` are gone.
+      Five unit tests, including one that asserts the fixture block genuinely needs more than one shard — without it an
+      empty payload reconstructs from a single shard and every exchange test would be vacuous.
+    - Next: drive `consensus_sim` through the real `Sampler` with per-validator shard holdings, so this reproduces in
+      milliseconds instead of a 100 s QUIC run. The component is now in a shape that allows it.
   - **Two of my own errors on the way, both caught by the instrument rather than by reading:**
     - `rank_round0` first called `prepare_round0_min()` unconditionally, which prepares on *first sight* — precisely the
       PREPARE-splitting the collection window exists to prevent. Two engine tests went red immediately.

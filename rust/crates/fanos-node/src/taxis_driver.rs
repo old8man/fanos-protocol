@@ -31,7 +31,8 @@ use fanos_primitives::{BeaconSeed, BoundedMap, Epoch};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
 use fanos_taxis::checkpoint::ExecCertificate;
-use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output};
+use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
+use fanos_taxis::da::Sampler;
 use fanos_taxis::state::StateMachine;
 use fanos_taxis::wire::{ShardMsg, TaxisApp, parse_app_body, shard_to_frame, to_frame, tx_to_frame};
 use fanos_taxis::{Block, CellParams, SealedTx, SlashEvidence};
@@ -69,31 +70,12 @@ pub const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
 /// flood-dedup cache).
 const SEEN_TX_CAP: usize = 8192;
 
-/// Cap on the number of blocks whose own DA shard this node retains to serve peers' sampling requests.
-const DA_HELD_CAP: usize = 512;
-/// Cap on skeletons awaiting DA reconstruction (shards still being sampled) — bounded against a proposal flood.
-const DA_PENDING_CAP: usize = 64;
-
-/// A skeleton block awaiting **DA reconstruction**: the shards gathered so far (this node's own dispersed shard
-/// plus those sampled from peers). Once enough arrive, [`try_reconstruct`] rebuilds the full block and admits it
-/// to the consensus engine exactly like an ordinary proposal.
-struct PendingDa {
-    skeleton: Block,
-    shards: Box<DaShards>,
-}
-
-/// The driver's **data-availability transport** state (spec §6). Kept entirely in the driver: the consensus
-/// engine only ever sees a fully-reconstructed block, so its finality logic is untouched by DA sampling.
-struct DaState {
-    /// This node's own shard for recent blocks (received via the proposer's dispersal), served on request.
-    held: BoundedMap<[u8; 32], Vec<u8>>,
-    /// Skeletons whose payload is still being sampled from peers, keyed by block hash.
-    pending: BoundedMap<[u8; 32], PendingDa>,
-}
-
-impl DaState {
-    fn new() -> Self {
-        Self { held: BoundedMap::new(DA_HELD_CAP), pending: BoundedMap::new(DA_PENDING_CAP) }
+/// Emit a sampling request to every validator holding a shard this node still needs for `block`.
+fn request_shards(client: &Client, coords: &[Triple], block: [u8; 32], missing: &[u8]) {
+    for &index in missing {
+        if let Some(&to) = coords.get(usize::from(index)) {
+            client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block, index }) });
+        }
     }
 }
 
@@ -299,7 +281,7 @@ where
         // re-circulate. Bounded ([`SEEN_TX_CAP`]) against a commitment flood.
         let mut seen_txs: BoundedMap<[u8; 32], ()> = BoundedMap::new(SEEN_TX_CAP);
         // Data-availability transport (spec §6): dispersed shards this node serves + skeletons it is sampling.
-        let mut da = DaState::new();
+        let mut da = Sampler::new(me);
 
         loop {
             tokio::select! {
@@ -315,7 +297,7 @@ where
                     // sometimes (measured: a 7-node cell executing on 6 of 7 validators, the seventh stranded at genesis
                     // permanently, and the same suite executing on 0 of 7 in the next run). Under SSLE all-propose there
                     // are N proposals racing at once and it loses reliably: no block ever finalized.
-                    resample_pending(&client, &coords, me, &da);
+                    resample_pending(&client, &coords, &da);
                     let outs = engine.step(Input::Tick);
                     drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                 }
@@ -451,7 +433,7 @@ fn drive<S: StateMachine>(
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
-    da: &mut DaState,
+    da: &mut Sampler,
 ) {
     let mut queue: VecDeque<Output> = outs.into_iter().collect();
     while let Some(out) = queue.pop_front() {
@@ -477,7 +459,7 @@ fn drive<S: StateMachine>(
                     }
                     // Keep my own shard to serve samplers; deliver the FULL block (which I hold) to my own engine.
                     if let Some(mine) = shards.get(usize::from(me)) {
-                        da.held.insert(hash, mine.clone());
+                        da.hold(hash, mine.clone());
                     }
                 } else {
                     let frame = to_frame(&msg);
@@ -542,7 +524,7 @@ fn on_skeleton<S: StateMachine>(
     client: &Client,
     coords: &[Triple],
     me: u8,
-    da: &mut DaState,
+    da: &mut Sampler,
     events: &broadcast::Sender<TaxisEvent>,
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
@@ -550,31 +532,17 @@ fn on_skeleton<S: StateMachine>(
     skeleton: Block,
 ) {
     let hash = skeleton.hash();
-    if da.pending.contains_key(&hash) {
-        return; // already sampling this block
-    }
     // Rank the skeleton into the SSLE round-0 lottery **before** sampling its body, because the lottery ranks the
     // *ticket* and the ticket rides in the skeleton. Admitting a proposal only after reconstruction is what deadlocked
     // an all-propose round: N proposals each needed a sampling round trip, the collection window is one tick, and so
     // every replica ranked a different subset and split its PREPARE. A no-op outside SSLE round 0.
     let ranked = engine.step(Input::Skeleton { block: skeleton.clone() });
     drive(engine, client, coords, me, ranked, events, last_ckpt, slash_sealer, seen, da);
-    let mut shards: Box<DaShards> = Box::new(core::array::from_fn(|_| None));
-    // Seed with my own dispersed shard, if I already hold it.
-    if let Some(mine) = da.held.get(&hash)
-        && let Some(slot) = shards.get_mut(usize::from(me))
-    {
-        *slot = Some(mine.clone());
+    if !da.begin(skeleton) {
+        return; // already sampling this block — do not discard the shards gathered so far
     }
-    // Sample every other shard from the validator that holds it.
-    for (p, &to) in coords.iter().enumerate() {
-        let Ok(idx) = u8::try_from(p) else { continue };
-        if idx != me {
-            client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block: hash, index: idx }) });
-        }
-    }
-    da.pending.insert(hash, PendingDa { skeleton, shards });
-    try_reconstruct(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, hash);
+    request_shards(client, coords, hash, &da.missing(&hash));
+    admit_if_recovered(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, hash);
 }
 
 /// Handle a received DA **shard** message: store a delivered shard (feeding any pending reconstruction, and
@@ -585,7 +553,7 @@ fn on_shard<S: StateMachine>(
     client: &Client,
     coords: &[Triple],
     me: u8,
-    da: &mut DaState,
+    da: &mut Sampler,
     events: &broadcast::Sender<TaxisEvent>,
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
@@ -595,20 +563,12 @@ fn on_shard<S: StateMachine>(
 ) {
     match msg {
         ShardMsg::Deliver { block, index, data } => {
-            if index == me {
-                da.held.insert(block, data.clone()); // dispersed to me — I now serve this shard
+            if let Some(full) = da.accept(block, index, data) {
+                admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, full);
             }
-            if let Some(pending) = da.pending.get_mut(&block)
-                && let Some(slot) = pending.shards.get_mut(usize::from(index))
-            {
-                *slot = Some(data);
-            }
-            try_reconstruct(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, block);
         }
         ShardMsg::Request { block, index } => {
-            if index == me
-                && let Some(shard) = da.held.get(&block)
-            {
+            if let Some(shard) = da.serve(&block, index) {
                 let deliver = ShardMsg::Deliver { block, index: me, data: shard.clone() };
                 client.command(Command::Emit { to: from, frame: shard_to_frame(&deliver) });
             }
@@ -621,39 +581,47 @@ fn on_shard<S: StateMachine>(
 /// Idempotent and cheap: a `Request` for a shard the peer holds is answered with one `Deliver`, and one for a shard it
 /// does not hold is dropped — so retrying costs a message and converges the moment the peer has been dispersed its own.
 /// Bounded by `DA_PENDING_CAP` blocks × the cell size.
-fn resample_pending(client: &Client, coords: &[Triple], me: u8, da: &DaState) {
-    for (&hash, pending) in da.pending.iter() {
-        for (p, &to) in coords.iter().enumerate() {
-            let Ok(idx) = u8::try_from(p) else { continue };
-            if idx != me && pending.shards.get(p).is_none_or(Option::is_none) {
-                client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block: hash, index: idx }) });
-            }
-        }
+fn resample_pending(client: &Client, coords: &[Triple], da: &Sampler) {
+    for (block, missing) in da.outstanding() {
+        request_shards(client, coords, block, &missing);
     }
 }
 
 /// Try to reconstruct a buffered skeleton from the shards gathered so far. On success, rebuild the full block and
 /// admit it to the engine exactly like an ordinary proposal, driving the resulting outputs (its PREPARE, …).
 #[allow(clippy::too_many_arguments)]
-fn try_reconstruct<S: StateMachine>(
+fn admit_if_recovered<S: StateMachine>(
     engine: &mut ConsensusEngine<S>,
     client: &Client,
     coords: &[Triple],
     me: u8,
-    da: &mut DaState,
+    da: &mut Sampler,
     events: &broadcast::Sender<TaxisEvent>,
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
     hash: [u8; 32],
 ) {
-    let full = {
-        let Some(pending) = da.pending.get(&hash) else { return };
-        let Some(payload) = pending.skeleton.reconstruct_payload(&pending.shards) else { return };
-        pending.skeleton.clone().with_sealed_txs(payload)
-    };
-    da.pending.remove(&hash);
-    // `from` (here `me`) is unused for a Propose; the reconstructed block carries its own proposer index.
+    if let Some(full) = da.reconstruct(&hash) {
+        admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, full);
+    }
+}
+
+/// Admit a **reconstructed** block to the engine exactly like an ordinary proposal, driving the outputs it produces.
+#[allow(clippy::too_many_arguments)]
+fn admit<S: StateMachine>(
+    engine: &mut ConsensusEngine<S>,
+    client: &Client,
+    coords: &[Triple],
+    me: u8,
+    da: &mut Sampler,
+    events: &broadcast::Sender<TaxisEvent>,
+    last_ckpt: &mut Option<u64>,
+    slash_sealer: Option<&SlashSealer>,
+    seen: &mut BoundedMap<[u8; 32], ()>,
+    full: Block,
+) {
+    // `from` is unused for a Propose; the reconstructed block carries its own proposer index.
     let outs = step_msg(engine, &ConsensusMsg::Propose(full), me);
     drive(engine, client, coords, me, outs, events, last_ckpt, slash_sealer, seen, da);
 }
