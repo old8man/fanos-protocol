@@ -243,6 +243,7 @@ pub fn member_partial(
 mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
+    use fanos_threshold::THRESHOLD_ONION_LEN;
 
     fn line(n: usize, seed: u8) -> Vec<(HybridKemSecret, HybridKemPublic)> {
         (0..n)
@@ -255,6 +256,75 @@ mod tests {
 
     fn randomness(n: usize) -> Vec<u8> {
         (0..n).map(|i| ((i * 131 + 7) % 251) as u8).collect()
+    }
+
+    /// Build a `hops`-deep circuit over lines of `line_size` members and return the onion plus the per-hop secrets.
+    fn circuit(hops: usize, line_size: usize) -> (Vec<u8>, Vec<Vec<(HybridKemSecret, HybridKemPublic)>>) {
+        use fanos_geometry::Point;
+        let lines: Vec<Vec<(HybridKemSecret, HybridKemPublic)>> =
+            (0..hops).map(|h| line(line_size, u8::try_from(h).unwrap_or(0) + 90)).collect();
+        let pubs: Vec<Vec<&HybridKemPublic>> =
+            lines.iter().map(|l| l.iter().map(|(_, p)| p).collect()).collect();
+        let hop_lines: Vec<HopLine<'_>> = (0..hops)
+            .map(|h| HopLine {
+                line: Point::<fanos_field::F2>::at(h % 7).coords(),
+                members: pubs.get(h).map_or(&[][..], Vec::as_slice),
+            })
+            .collect();
+        let onion = seal_onion(&hop_lines, 2, b"payload", b"depth-seed").unwrap();
+        (onion, lines)
+    }
+
+    #[test]
+    fn a_peeling_relay_can_currently_infer_its_hop_position_s1_m6() {
+        // **CHARACTERIZATION OF A KNOWN DEFECT (S1-M6), not a property we want.** This asserts the leak is still present,
+        // so the fix cannot land silently and cannot regress unnoticed. When the fixed-slot layout replaces the nested one,
+        // this test is replaced by its opposite: every hop sees the same number of bytes.
+        //
+        // The leak is NOT the cleartext `ct_len` field, which is what the task originally named. That field is redundant —
+        // `ct_len = total − 18 − members × SEALED_SHARE_LEN`, and `members` is cleartext while `total` is the layer the
+        // relay is holding — so encrypting it hides nothing. The leak is structural: `seal_onion` nests, so each layer's
+        // plaintext *contains the entire inner onion*, and the remaining depth is readable off its length.
+        //
+        // Nor can it be fixed by padding each nested layer to a constant: a layer would then contain a full-width inner
+        // onion, so the total would grow with depth instead. Constant per-layer size and constant total size are
+        // incompatible under nesting, which is precisely why the fix is a Sphinx-shape fixed slot array — a constant
+        // header of `D` slots that each hop shifts — rather than better padding.
+        let (onion, lines) = circuit(4, 3);
+        let mut sizes = alloc::vec![onion.len()];
+        let mut current = onion;
+        for hop in lines.iter().take(3) {
+            let partials: Vec<Share> = [0usize, 1]
+                .iter()
+                .filter_map(|&i| hop.get(i).and_then(|(sk, _)| member_partial(&current, i, sk)))
+                .collect();
+            match peel_onion_with_shares(&current, &partials).unwrap() {
+                ThresholdPeel::Forward { onion: inner, .. } => {
+                    sizes.push(inner.len());
+                    current = inner;
+                }
+                ThresholdPeel::Deliver { .. } => panic!("a 4-hop circuit forwards three times"),
+            }
+        }
+
+        // Measured on a 4-hop circuit over 3-member lines: `[20480, 10689, 7135, 3581]`.
+        //
+        // The outermost onion is `THRESHOLD_ONION_LEN` because `pad_onion` padded it — so the **first** hop is protected,
+        // and that is the whole extent of the current defence. Every inner onion is handed on un-padded.
+        assert_eq!(sizes[0], THRESHOLD_ONION_LEN, "only the outermost onion is padded");
+
+        // From hop 1 on, the size falls by a CONSTANT per hop — one layer's worth — so a relay does not merely learn
+        // "some layers remain", it computes exactly how many, and hence exactly where it sits on the path.
+        let inner = &sizes[1..];
+        let step = inner[0] - inner[1];
+        for pair in inner.windows(2) {
+            assert_eq!(pair[0] - pair[1], step, "a uniform per-hop step makes the position exact: {sizes:?}");
+        }
+        // Concretely: remaining hops = round(size / step) + 1, exact at every measured depth.
+        for (k, &size) in inner.iter().enumerate() {
+            let remaining = (size + step / 2) / step;
+            assert_eq!(remaining, inner.len() - k, "hop {k} recovers its remaining depth exactly from {size} bytes");
+        }
     }
 
     #[test]

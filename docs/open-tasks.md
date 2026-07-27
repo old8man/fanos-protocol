@@ -118,16 +118,28 @@ the last propagation link.
 - **9. 3-member anonymity set at F2** — *partially closed* by `8df2b08` (the order is now selectable and under-delivery is
   loud). Residual: document per-cell set size as first-class, and settle the default (item 4).
 
-- **11. ct_len hop-position leak (S1-M6)** — a *peeling* relay learns its hop position, because the threshold-onion layer
-  is variable-sized by depth. **Two findings that change the task, so do not implement the fix as previously written:**
-  - **Encrypting `ct_len` achieves nothing.** The layer is `nonce(12) ‖ members(2) ‖ ct_len(4) ‖ ciphertext ‖ share*`, so
-    `ct_len = total − 18 − members × SEALED_SHARE_LEN` — and `members` is cleartext while `total` is the layer the relay is
-    holding. The field is **redundant**; hiding it hides nothing. The leak is that layers *shrink with depth*, not that a
-    number names the size.
-  - **The real fix is already paid for.** The honest construction is a Sphinx-shape fixed slot array — a constant-size
-    header of `D` per-hop slots, each hop decrypting its slot, shifting, and re-padding — which leaks no depth by
-    construction. The objection is normally bandwidth, and here it is void: `pad_onion` already pads **every** onion to
-    `THRESHOLD_ONION_LEN` = 20 480 B on every hop, and a fixed slot array costs the same bytes. At `q = 2` that width holds
-    5 hops, at `q = 4` three, at `q = 7` two — which also makes explicit a max-depth the current design leaves implicit.
-  - So this is a contained redesign of the layer layout at unchanged wire cost, not an optional expensive extra. Worth
-    doing; worth doing deliberately.
+- **11. Hop-position leak (S1-M6) — measured, and the fix is a fixed-slot layout, not better padding.**
+  - **Measured, and now pinned** by `threshold_onion::a_peeling_relay_can_currently_infer_its_hop_position_s1_m6`, a
+    deliberate *characterization* test: it asserts the leak is still present so the fix cannot land silently and cannot
+    regress unnoticed. When the fixed-slot layout replaces the nested one, this test is replaced by its opposite.
+  - A 4-hop circuit over 3-member lines yields per-hop sizes `[20480, 10689, 7135, 3581]`. The outermost is
+    `THRESHOLD_ONION_LEN` because `pad_onion` padded it — **so exactly one hop is protected, and that is the entire current
+    defence.** From hop 1 on, the size falls by a *constant* 3554 bytes, so a relay does not merely learn that layers remain:
+    `remaining = round(size / 3554)` recovers its position exactly, at every measured depth.
+  - **It is not the `ct_len` field**, which is what this task originally named. That field is redundant —
+    `ct_len = total − 18 − members × SEALED_SHARE_LEN`, with `members` cleartext and `total` the layer the relay is holding —
+    so encrypting it hides nothing. The leak is structural: `seal_onion` nests, so each layer's plaintext *contains the
+    entire inner onion*.
+  - **And it cannot be fixed by padding each layer.** A nested layer padded to a constant would contain a full-width inner
+    onion, so the total would grow with depth instead. Constant per-layer size and constant total size are incompatible
+    under nesting — which is exactly why the fix is a fixed-slot array and not a padding change.
+  - **The construction, and why it is simpler here than textbook Sphinx.** A constant header of `D` slots; each hop reads
+    slot 0, shifts the array left, and appends a pseudorandom slot, so the width never changes. Sphinx needs precomputed
+    ρ-filler because its header is one stream encrypted per hop; here each slot is **independently** threshold-sealed to its
+    own hop line, so filler needs no consistency — an unused slot is indistinguishable random bytes to anyone who cannot
+    decapsulate it, and no honest path ever opens one. The payload becomes a separate constant-width block, re-encrypted
+    size-preservingly per hop.
+  - **Budget, and the max-depth it makes explicit.** `pad_onion` already spends `THRESHOLD_ONION_LEN = 20 480` B on every
+    hop, so the slot array is free at the same width. A slot costs `line_size × SEALED_SHARE_LEN + NONCE_LEN + CMD_LEN`
+    ≈ 3554 B at `line_size = 3` (the measured per-hop step above is exactly this), giving `D = 5` at `q = 2`, 3 at `q = 4`,
+    2 at `q = 7`. The current design leaves that ceiling implicit; the fix states it.
