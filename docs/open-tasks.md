@@ -255,12 +255,26 @@ CID equalling a bare leaf hash. Conformance vectors regenerated.
       `Sampler::in_flight() == 0` (`every_validator_recovers_a_dispersed_block_not_merely_a_quorum`, verified to fail
       0-of-7 when sampling is disabled). So the sampling *logic* is sound and the divergence is in the live message path,
       not the decision procedure.
-    - **The live asymmetry to chase next, stated precisely.** A stuck validator (node 0 in one run) *did* receive
-      skeletons and *did* hold its own shard — its bitmap read `1......` — and requested the other six every tick for
-      48 s with no answer, while validators 1, 2, 3 and 6 recovered the same block by answering *each other*. Peers that
-      demonstrably hold and serve their shards answered some requesters and not others. That is a directional delivery
-      question about `Command::Emit` between specific coordinate pairs, so the next observable is per-pair: whether the
-      stuck node's `Request` frames arrive at each peer, and whether that peer's `Deliver` arrives back.
+    - **⚠️ DA IS NOT THE CAUSE OF THIS FAILURE. Two iterations were spent on the wrong subsystem; here is the measurement
+      that ends it.** With the sampler instrumented, at the frozen fixed point **every one of the seven validators reports
+      `pending=0, backlog=0`** — no node is waiting for a body and no node has an unprocessed queue. Availability is
+      *clear* while the cell is wedged.
+    - The per-pair questions raised in the previous revision are all answered, and all negative: requests **do** arrive
+      (534 of them), they **are** served (576 of 580, only 4 misses), all seven coordinates appear as requesters in
+      roughly equal numbers, and every ordered pair of cell points delivers a 6203-byte frame in 0.71 s
+      (`cell_e2e::every_ordered_pair_of_cell_points_can_deliver`). There is no directional gap.
+    - **What is actually happening:** two validators finalize height 0, five never do, and the shielded transfer executes
+      **nowhere** — including on the two that finalized. Since nothing is pending, the transaction-carrying block is not
+      being *awaited*; it is being proposed and then not prepared. Both an empty 43-byte block and a 6203-byte
+      payload-carrying block are dispersed each round, so the payload block is reaching the cell and failing a gate in
+      `on_propose` (or failing to gather PREPAREs), after which the round times out and the cycle repeats forever.
+    - **This also reverses a correction I made in `eab901e`.** I had discarded the reveal/execution hypothesis on the
+      reasoning that "blocks commit without executing ⇒ DA". `pending=0` shows that inference was invalid. Both the
+      admission gates (`valid_seal`, `verify_structure`, `valid_last_commit`) and the anti-MEV reveal gather are live
+      candidates again.
+    - Next observable: instrument `on_propose`'s reject reasons directly — which gate drops the payload block, on how many
+      validators. That is one measurement and it decides between "rejected on admission" and "accepted but never
+      prepared", which have nothing in common as fixes.
   - **Two of my own errors on the way, both caught by the instrument rather than by reading:**
     - `rank_round0` first called `prepare_round0_min()` unconditionally, which prepares on *first sight* — precisely the
       PREPARE-splitting the collection window exists to prevent. Two engine tests went red immediately.
