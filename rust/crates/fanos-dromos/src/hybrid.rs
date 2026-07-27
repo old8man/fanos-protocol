@@ -839,7 +839,14 @@ impl StateMachine for HybridLedger {
         self.finalize_lapsed_deals();
         // Prune terminal HTLCs (audit §3.4): a Claimed/Refunded htlc resolves no further, so keeping it only
         // grows the book + state root without bound. A Locked htlc holds real escrow (self-limiting) and stays
-        // until it resolves; a claim/refund for a pruned id is rejected (not found). Deterministic across the cell.
+        // until it resolves. Deterministic across the cell.
+        //
+        // A claim for a pruned id now reads as *deferred* rather than rejected, because the book cannot tell
+        // "already resolved" from "not locked yet" — both are simply absent — and the second reading is the one
+        // blind ordering makes common. The cost of preferring it is bounded and small: such a claim is
+        // re-proposed for at most `REVEAL_WINDOW` blocks before the engine drops it, and only if it was included
+        // at all. Distinguishing the two would need a resolved-id set, which is exactly the unbounded growth
+        // this pruning exists to prevent.
         self.htlcs.htlcs.retain(|_, h| h.state() == HtlcState::Locked);
     }
 
