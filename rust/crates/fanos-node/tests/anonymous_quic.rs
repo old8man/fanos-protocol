@@ -104,6 +104,7 @@ async fn await_anonymous(node: &mut NodeHandle, want: &[u8]) -> bool {
 
 #[tokio::test]
 async fn an_onion_reaches_the_meeting_line_over_real_quic() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let dir = Directory::new();
     let t = 2usize; // 2-of-3 per Fano line
 
@@ -155,6 +156,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
 
 #[tokio::test]
 async fn a_full_anonymous_session_completes_over_real_quic() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let dir = Directory::new();
     let t = 2usize;
 
@@ -263,6 +265,7 @@ async fn spawn_composite(
 
 #[tokio::test]
 async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The full deployed shape: a Fano cell of `CellNode`s (each overlay + beacon + mix router), an
     // anonymous service on one, and a DIFFERENT cell node dialing it with a FRESH per-dial route via
     // `FanosDialer::anonymous_fresh`. Unlike the fixed-route test above, the client is a real overlay
@@ -345,6 +348,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
 
 #[tokio::test]
 async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The §3b general case — no cheat: the service operator is NOT the node at its meeting combiner (it
     // cannot choose its VRF coordinate). It registers an anonymous forward route (its own dead-drop line)
     // with the combiner by onion; the combiner re-seals each client request to that dead-drop; the operator
@@ -438,6 +442,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
 
 #[tokio::test]
 async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The full operator driver (§3b): `spawn_rendezvous_host` builds the cell directory, registers an
     // anonymous forward route each epoch, and runs the accept loop — no manual registration. Proves the
     // driver glue over real QUIC end-to-end.
