@@ -939,9 +939,33 @@ fn ensure_beacon(
         return Ok(());
     }
     if config.bootstrap.is_empty() {
+        // A cell with no one to join is a cell this host is *starting*, and someone has to hold its epoch clock
+        // at the first instant. Dealing it here is right for a private cell and **wrong for a public network**,
+        // so the difference is stated rather than assumed: coordinates derive from the beacon, so whoever holds
+        // its shares influences where every joining node lands. A founder who deals 1-of-1 and then invites the
+        // public holds that power over everyone who arrives, whether or not they ever use it.
+        //
+        // The alternative is not theoretical — `fanos-keygen` runs a real Byzantine-robust DKG (Feldman/Pedersen
+        // with a GJKR complaint round) in which no party ever sees the whole key. It needs a set of founding
+        // nodes to run *between*, which is why it cannot be what a single `fanos init` does, and exactly why
+        // this path must not be walked into by default for a network meant to be public.
+        if !assume_yes {
+            eprintln!("\nThis host is starting a new cell, so it must hold the cell's epoch beacon.");
+            eprintln!("  Coordinates derive from that beacon, so its holder influences where joining nodes land.");
+            eprintln!("  For a private or test cell that is fine — you are the only operator.");
+            eprintln!("  For a network you intend to open to others, deal it across the founding nodes with the");
+            eprintln!("  distributed key generation instead, so no single party ever holds it.");
+            if !ask_yes_no("this is a private/test cell — deal the beacon here?", true) {
+                config.roles.relay = false;
+                eprintln!("  relay role dropped. Run the DKG across your founding nodes, then set");
+                eprintln!("  `beacon_params = <file>` and re-enable `relay`.");
+                return Ok(());
+            }
+        }
         deal_own_beacon(&beacon_path)?;
         eprintln!("\n  dealt this cell's epoch beacon → {}", beacon_path.display());
         eprintln!("  give {} to every other node joining this cell.", fanos_node::setup::BEACON_FILE);
+        eprintln!("  ! you now hold this cell's epoch clock. That is a governance position, not just a file.");
         return Ok(());
     }
     let given = if assume_yes {
