@@ -165,12 +165,6 @@ answering, roughly 30× slower than idle, and the cell still made no progress in
 - CI runs exactly this command on a 2-core runner, i.e. permanently in the contended regime. A gate that flakes teaches
   people to ignore it — which is how this repository acquired a formatter gate nobody looked at (§2.0).
 
-### [A] `#[ignore]` conflates two incompatible things
-34 ignored tests carry one attribute for two purposes: *measurements* (15 in `fanos-sim`) that print rather than assert and must
-**never** gate, and *cost-gated assertions* (13 in `fanos-obolos`, 2 each in `taxis`/`quic`/`ffi`) that must gate **somewhere**.
-So "run the ignored tests" cannot mean one thing, and the nightly `heavy` job has to name packages instead of selecting a
-category. Distinguish them — a `measure_` name convention plus a required-vs-optional split, or a cargo feature per class.
-
 ### [A] Combiner-forwarded anonymous sessions stall under host contention — and only those
 Isolated 2026-07-27 by the progress-bounded waits in `fanos-node/tests/common/mod.rs`, which report *what the bytes did*
 instead of "did not finish in 240 s". On a host loaded by an unrelated build, one run of `anonymous_quic`:
@@ -200,6 +194,16 @@ was removed on the way (both forwarded tests were the only ones synchronising on
   a principled multiplier.
 - Residual instrument gap: a host that starves only *midway* still reads as a wedge, because the discriminator asks
   whether the process has *ever* delivered.
+
+### [A] Verify the nightly `heavy` job's class selection actually runs
+`ci.yml`'s `heavy` job now selects cost-gated assertions by class rather than by package:
+`cargo test --workspace --features validator --release -- --ignored --skip measure_ --skip probe_ --skip sweep_
+--test-threads 1`, and `fanos-cli/tests/ignored_tests.rs` guarantees the `--skip` set selects exactly the assertions.
+Unverified as written, because it needs a full **release** build of the workspace plus the twelve assertions serially —
+minutes of compute this host could not spare while other work was measured. What is known: the OBOLOS proofs pass in 38 s
+release/serial, the two C ABI end-to-end paths in 0.17 s, and `the_fabric_seam_carries_real_node_traffic` and the two
+randomized no-fork searches have never been run in that configuration. Run it once with `workflow_dispatch` (or locally)
+before trusting the nightly.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's

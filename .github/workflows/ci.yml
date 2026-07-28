@@ -120,12 +120,11 @@ jobs:
       - name: Miri — the C ABI's raw-pointer surface
         run: cargo miri test -p fanos-ffi --lib
 
-  # Suites whose cost rules them out of the per-push gate: the real-parameter zero-knowledge proofs, and the
-  # multi-node real-QUIC end-to-end paths, which are unreliable when a full-workspace run saturates the
-  # loopback transport and so are `#[ignore]`d there. Nightly, and on demand. Both commands are verified as
-  # written: 7 proofs in 38 s (release, serial), and 2 end-to-end C ABI paths in 0.17 s.
+  # Every assertion whose cost rules it out of the per-push gate: the real-parameter zero-knowledge proofs, the
+  # multi-node real-QUIC end-to-end paths (unreliable when a full-workspace run saturates the loopback, hence
+  # `#[ignore]`d there), and the randomized no-fork searches. Nightly, and on demand.
   heavy:
-    name: zero-knowledge · real-QUIC end-to-end
+    name: cost-gated assertions
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -135,7 +134,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: OBOLOS shielded-transaction proofs at real parameters
-        run: cargo test -p fanos-obolos --release -- --ignored --test-threads 1
-      - name: C ABI service host/connect over real QUIC
-        run: cargo test -p fanos-ffi -- --ignored --test-threads 1
+      # Selected by *class*, not by package. `#[ignore]` carries two meanings here — a measurement that prints
+      # for a person to read and must never gate, and a cost-gated assertion that must gate somewhere — and
+      # `fanos-cli/tests/ignored_tests.rs` holds the workspace to the naming convention that separates them, so
+      # this `--skip` set provably selects exactly the assertions. Release, because the zero-knowledge proofs
+      # are minutes in debug and ~40 s optimised; serial, because several stand up whole real-QUIC cells.
+      - name: Cost-gated assertions (every ignored test that is not a measurement)
+        run: cargo test --workspace --features validator --release -- --ignored --skip measure_ --skip probe_ --skip sweep_ --test-threads 1

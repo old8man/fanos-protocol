@@ -488,7 +488,7 @@ fn linkability_shipping(mix: Duration, cover: Duration, runs: u64) -> (f64, f64)
 /// knee, not enough to justify moving a security constant. This re-measures the two candidate points at 24 runs.
 #[test]
 #[ignore = "confirmation, not an assertion — run with --ignored --nocapture"]
-fn confirm_the_knee_with_enough_seeds_to_move_a_default() {
+fn measure_the_knee_with_enough_seeds_to_move_a_default() {
     for (name, mix, cover) in [("current default 50/1000", 50u64, 1_000u64), ("candidate     120/500", 120, 500)] {
         let (a, chance) = linkability_shipping(Duration::from_millis(mix), Duration::from_millis(cover), 24);
         println!("  {name} -> matching accuracy {a:.3}  (chance {chance:.2})");
