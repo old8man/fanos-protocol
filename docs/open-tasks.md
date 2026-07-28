@@ -246,9 +246,21 @@ and the answer was neither of the two the null return suggested:
 With those bounds the flake rate went from 3 in 15 to **1 in 6**, the stalls stopped, and the survivor fails *later* and
 elsewhere — `"the host received the client's bytes"`, i.e. the echo after a successful dial. So what remains is a data-path
 flake, not a resolution one, and the resolution story is closed.
-- Next: the accepted stream's first read returning 0 or an error. `fanos_service_accept` and `fanos_stream_read` block by
-  design (an accept *should* wait), so the question is whether the client's write is lost between `serve`'s channel and
-  the accepted `DuplexStream`, not whether something needs a timeout.
+**A third defect found and fixed, and it changes the residual's shape.** `serve` reaps a session the instant its handler
+returns (`spawn_client_session`: `handler(stream).await; done_tx.send(from)`), and `fanos_service_host`'s handler returned
+as soon as it queued the stream for `fanos_service_accept`. So the bridge feeding the accepted `DuplexStream` was torn
+down while the C caller still held it — the accepted stream's peer end dropped, and the first read returned 0. It mostly
+worked because the client's bytes were usually already buffered before the reap. The handler now parks on a guard the
+accepted handle owns, so the session is reaped when the caller frees the stream, which is when it should be.
+
+That is correct on its own merits, and it converts the failure rather than removing it: **7 of 8 release runs pass**
+(against 5 of 6 before, statistically the same), and the survivor no longer fails fast with EOF — it **stalls**, because
+the stream is now legitimately open and waiting for bytes that sometimes never arrive.
+- So the residual is exactly that: the client's write occasionally does not reach the host's accepted stream. Not an
+  early close, not a resolution failure, not a missing timeout — the three the investigation has already eliminated.
+- The stall is honest but unhelpful in a test. `fanos_stream_read` blocks by design (a stream read should), so bounding
+  it belongs in the *test*, not the ABI — and the bound should be a progress-based one, as `fanos-node/tests/common`
+  already does for its real-socket waits, rather than a duration guess.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's

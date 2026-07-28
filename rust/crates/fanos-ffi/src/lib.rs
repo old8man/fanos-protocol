@@ -33,7 +33,7 @@ use fanos_onoma::Address;
 use fanos_pqcrypto::rng::SeedRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Success.
 pub const FANOS_OK: c_int = 0;
@@ -233,6 +233,9 @@ pub unsafe extern "C" fn fanos_free(node: *mut FanosNode) {
 pub struct FanosStream {
     handle: Handle,
     stream: DuplexStream,
+    /// For a stream from [`fanos_service_accept`]: the guard whose drop lets the hosting handler return, and
+    /// so lets `serve` reap the session. `None` for a dialed stream, which owns no session on this side.
+    _session: Option<oneshot::Sender<()>>,
 }
 
 /// Connect to a CALYPSO hidden service by its `.fanos` `addr` (spec §11.2 `fanos_service_connect`): resolve
@@ -273,10 +276,7 @@ pub unsafe extern "C" fn fanos_service_connect(
         let _guard = handle.rt.enter();
         dial_service(handle.node.client(), coord, &public, &mut rng)
     };
-    Box::into_raw(Box::new(FanosStream {
-        handle: handle.rt.handle().clone(),
-        stream,
-    }))
+    Box::into_raw(Box::new(FanosStream { handle: handle.rt.handle().clone(), stream, _session: None }))
 }
 
 /// An owning handle to a hosted hidden service: the accept channel its incoming client streams arrive on,
@@ -284,7 +284,7 @@ pub unsafe extern "C" fn fanos_service_connect(
 /// [`fanos_service_host`]. Free with [`fanos_service_free`] (before its node).
 pub struct FanosService {
     handle: Handle,
-    incoming: mpsc::Receiver<DuplexStream>,
+    incoming: mpsc::Receiver<(DuplexStream, oneshot::Sender<()>)>,
 }
 
 /// Capacity of a hosted service's accept queue — incoming client streams buffer here until
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn fanos_service_host(
 
     // Host the service: each accepted client session is forwarded onto the accept queue (its own fresh OS
     // entropy seeds every session's ephemeral keys), and the descriptor is published for name resolution.
-    let (tx, rx) = mpsc::channel::<DuplexStream>(ACCEPT_QUEUE);
+    let (tx, rx) = mpsc::channel::<(DuplexStream, oneshot::Sender<()>)>(ACCEPT_QUEUE);
     let mut serve_seed = [0u8; 32];
     if getrandom::fill(&mut serve_seed).is_err() {
         return ptr::null_mut();
@@ -339,10 +339,21 @@ pub unsafe extern "C" fn fanos_service_host(
             handle.node.client(),
             keypair,
             SeedRng::from_seed(&serve_seed),
+            // The handler must outlive the accepted stream. `serve` reaps a session the moment its handler
+            // returns (`spawn_client_session`: `handler(stream).await; done_tx.send(from)`), which tears down the
+            // bridge feeding this `DuplexStream` — so queueing the stream and returning hands the C caller a
+            // stream whose peer end is being dropped underneath it. It mostly worked because the client's bytes
+            // were already buffered before the reap; when the reap won, the first read returned 0 (EOF) and the
+            // echo assertion failed. So the handler now parks on a guard the accepted handle owns, and the
+            // session is reaped when the caller frees the stream — which is exactly when it should be.
             move |stream| {
                 let tx = tx.clone();
                 async move {
-                    let _ = tx.send(stream).await;
+                    let (guard, released) = oneshot::channel::<()>();
+                    if tx.send((stream, guard)).await.is_ok() {
+                        // Resolves (as an error) when the accepted handle is freed and drops the guard.
+                        let _ = released.await;
+                    }
                 }
             },
         );
@@ -382,9 +393,12 @@ pub unsafe extern "C" fn fanos_service_accept(service: *mut FanosService) -> *mu
         return ptr::null_mut();
     };
     match service.handle.block_on(service.incoming.recv()) {
-        Some(stream) => Box::into_raw(Box::new(FanosStream {
+        // The guard rides with the stream: holding it keeps the hosting handler parked, and freeing this handle
+        // drops it, which is what lets `serve` reap the session — after the stream is done with, not before.
+        Some((stream, guard)) => Box::into_raw(Box::new(FanosStream {
             handle: service.handle.clone(),
             stream,
+            _session: Some(guard),
         })),
         None => ptr::null_mut(),
     }
