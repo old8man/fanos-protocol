@@ -102,8 +102,13 @@ pub struct ConsensusProbe {
     pub locked: bool,
     /// Whether it actually holds the locked block's body (locked without it cannot even re-prepare).
     pub holds_locked_body: bool,
-    /// Whether it is waiting on a body it has asked peers for.
-    pub awaiting_body: bool,
+    /// The **first four bytes** of the body it is waiting for, if any.
+    ///
+    /// The identity, not merely the fact. A cell in which every validator awaits the *same* block is one whose body
+    /// never reached anyone — a dispersal failure. A cell in which each awaits a *different* one is not stuck on a body
+    /// at all; it is failing to converge, and the waits are a symptom. The two demand opposite investigations and a
+    /// boolean cannot tell them apart, which cost one round of this hunt.
+    pub awaiting_body: Option<[u8; 4]>,
     /// The highest height it has *seen* evidence of — above `height`, it knows it is behind.
     pub max_seen_height: u64,
     /// Why it has been refusing proposals.
@@ -120,8 +125,8 @@ impl core::fmt::Display for ConsensusProbe {
         if self.locked {
             f.write_str(if self.holds_locked_body { " lock" } else { " lock-nobody" })?;
         }
-        if self.awaiting_body {
-            write!(f, " await")?;
+        if let Some(h) = self.awaiting_body {
+            write!(f, " await:{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3])?;
         }
         let r = &self.rejects;
         let total = r.proposer + r.link + r.locked + r.structure + r.last_commit + r.seal + r.witness + r.unavailable;
@@ -912,7 +917,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             round: self.round,
             locked: self.locked_block.is_some(),
             holds_locked_body: self.locked_block.is_some_and(|h| self.proposals.contains_key(&h)),
-            awaiting_body: self.awaited_body().is_some(),
+            awaiting_body: self.awaited_body().map(|h| [h[0], h[1], h[2], h[3]]),
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
         }
@@ -1509,6 +1514,56 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
         };
         out.extend(transitions);
+        out.extend(self.maybe_advance_round());
+        out
+    }
+
+    /// Jump to the round `f + 1` validators have already reached — **round synchronization**, and it was missing.
+    ///
+    /// Rounds advanced here by exactly one thing: this validator's own timeout firing. Nothing ever moved a validator
+    /// toward the round its peers were on. Since local timers are independent, and the round timeout doubles toward
+    /// 24 s, validators drift apart on ordinary scheduling noise and then have **no mechanism to re-converge**.
+    ///
+    /// That is not a cosmetic divergence, because proposer entitlement is round-dependent: `on_propose` judges a
+    /// proposal against `leader(seed, height, self.round)` using the **receiver's** round, and the block header
+    /// deliberately does not carry the sender's (a header must stay round-independent, or a re-proposal would not be
+    /// byte-identical and a locked validator could never accept one). So a proposer that is legitimate at its own round
+    /// is an impostor at a peer one round ahead, and the proposal is not merely ignored — it is counted as an
+    /// entitlement violation and discarded. A drifted cell rejects the very proposals it makes to itself.
+    ///
+    /// Measured across every frozen trace in this investigation: hundreds of `rejects.proposer`, rounds climbing to 13,
+    /// and validators sitting at different rounds in the same snapshot (`v0` at 12 while six peers were at 13).
+    ///
+    /// `f + 1` is the threshold because it guarantees at least one **honest** validator has genuinely reached that
+    /// round, so the jump follows real progress rather than a Byzantine minority's claim. Jumping forward is safe by
+    /// the same argument that makes timeouts safe: the lock and all committed state persist across rounds, and votes
+    /// are round-tagged, so no certificate can be assembled from votes of a round we skipped.
+    fn maybe_advance_round(&mut self) -> Vec<Output> {
+        let height = self.height();
+        // Each peer's highest round at this height, above ours.
+        let mut highest: BTreeMap<u8, u32> = BTreeMap::new();
+        for sv in self.prepares.iter().chain(&self.commits) {
+            if sv.vote.height == height && sv.vote.round > self.round && sv.vote.voter != self.me {
+                let slot = highest.entry(sv.vote.voter).or_insert(0);
+                *slot = (*slot).max(sv.vote.round);
+            }
+        }
+        let threshold = self.params.f + 1;
+        if highest.len() < threshold {
+            return Vec::new();
+        }
+        // The highest round that `f + 1` validators have all reached: sort descending, take the `f + 1`-th.
+        let mut rounds: Vec<u32> = highest.into_values().collect();
+        rounds.sort_unstable_by(|a, b| b.cmp(a));
+        let Some(&target) = rounds.get(threshold - 1) else { return Vec::new() };
+        if target <= self.round {
+            return Vec::new();
+        }
+        self.round = target;
+        // Exactly what a timeout does on arrival at a new round — re-offer the lock, propose if now entitled. Round-0
+        // sortition state is not reset: a jump is always *forward*, and round 0 is behind us by construction.
+        let mut out = self.reprepare_lock();
+        out.extend(self.maybe_propose());
         out
     }
 

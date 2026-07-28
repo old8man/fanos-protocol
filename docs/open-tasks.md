@@ -66,6 +66,30 @@ Whichever way it goes, it is a decision to make explicitly rather than by attrit
 **Process note for the next investigator:** the failure message carries the whole `ConsensusProbe` trace, which is the
 diagnosis. Do not filter test output through `grep -E "FAILED|^---- "` — that drops exactly the line worth reading.
 
+### [A] ROOT CAUSE: TAXIS had no round synchronization — FIXED
+The defect the whole live-stall investigation was circling. `self.round` advanced by exactly one thing — this
+validator's own timeout firing. **Nothing** ever moved a validator toward the round its peers were on. Local timers are
+independent and the round timeout doubles toward 24 s, so validators drift apart on ordinary scheduling noise and then
+have no mechanism to re-converge.
+
+That is not cosmetic, because proposer entitlement is round-dependent: `on_propose` judges a proposal against
+`leader(seed, height, self.round)` using the **receiver's** round, and the block header deliberately carries no round
+(it must not — a header committing to the round would make a re-proposal differ byte for byte, and a locked validator
+could never accept one). A proposer legitimate at its own round is therefore an impostor to a peer one round ahead, and
+the proposal is not merely ignored: it is counted as a proposer-entitlement violation and discarded. **A drifted cell
+rejects the proposals it makes to itself.**
+
+Every symptom of this investigation follows: hundreds of `rejects.proposer` in every frozen trace; rounds climbing to
+13; validators sitting at different rounds in one snapshot (`v0` at 12 while six peers were at 13); and validators
+watching three different blocks, because each admitted a different subset of proposals according to its own round.
+
+Fixed with the standard rule: on seeing `f + 1` validators voting at a round above ours, jump to the highest round
+`f + 1` of them have reached. `f + 1` guarantees at least one honest validator genuinely got there. Jumping forward is
+safe by the same argument as a timeout — locks and committed state persist across rounds, and votes are round-tagged,
+so no certificate can be assembled from a round we skipped. Both randomized no-fork searches still pass.
+
+Pinned by `a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached`, verified load-bearing.
+
 ### [A] CORRECTION: the eviction fix is a latent-defect fix, not the demonstrated live cause
 Checked my own arithmetic after committing, and it does not support the attribution. `Sampler::reconstruct` **removes**
 the entry, so `pending` holds only skeletons that never reconstructed — not every skeleton ever seen. And under SSLE

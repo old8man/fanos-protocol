@@ -1643,6 +1643,51 @@ fn a_validator_short_one_commit_vote_rejoins_the_chain() {
 
 
 #[test]
+fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
+    // Round synchronization, which this engine did not have. Rounds advanced by exactly one thing — a validator's own
+    // timeout firing — so nothing ever moved a validator toward the round its peers were on. Local timers are
+    // independent and the round timeout doubles toward 24 s, so validators drift on ordinary scheduling noise and then
+    // have no way back to each other.
+    //
+    // The damage is not cosmetic, because proposer entitlement is round-dependent and the block header deliberately
+    // carries no round (it must not: a header that committed to the round would make a re-proposal differ byte for
+    // byte, and a locked validator could never accept one). `on_propose` therefore judges every proposal against the
+    // **receiver's** round — so a proposer legitimate at its own round is an impostor one round ahead, and the
+    // proposal is counted as an entitlement violation rather than merely ignored. A drifted cell rejects the proposals
+    // it makes to itself. Measured live as hundreds of `rejects.proposer` with validators sitting at different rounds
+    // in one snapshot.
+    let mut c = Cluster::new(&genesis());
+    // COMMIT withheld so nothing finalizes: a finalization resets the round to 0 and would erase the drift being
+    // built. Six validators then time out repeatedly while the seventh's timer never fires — the drift, isolated.
+    c.set_drop_phase(Some(Phase::Commit));
+    let straggler = 6usize;
+    c.crashed[straggler] = true;
+    for _ in 0..5 {
+        c.timeout();
+    }
+    c.crashed[straggler] = false;
+    c.set_drop_phase(None);
+    let ahead = c.engines[0].round();
+    assert!(ahead >= 3, "the cell advanced several rounds without the straggler, reached {ahead}");
+    let _ = ahead;
+    assert_eq!(c.engines[straggler].round(), 0, "and the straggler is still at round 0 — the drift is real");
+
+    // One round of ordinary traffic **with the straggler listening**. It missed rounds 1..5 entirely (it was down
+    // while they were broadcast), so the votes that teach it where the cell is have to be produced now.
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }, b"round-sync");
+    c.submit_all(&tx);
+    c.timeout();
+    c.tick();
+
+    assert!(
+        c.engines[straggler].round() >= ahead || c.engines[straggler].chain().next_height() > 0,
+        "the straggler must reach its peers' round (or finalize past the height) — it sat at round {} while the cell \
+         was at {ahead}, and every proposal it hears is judged against its own stale round",
+        c.engines[straggler].round()
+    );
+}
+
+#[test]
 fn a_peer_stuck_between_the_checkpoint_and_the_head_is_offered_the_certificate() {
     // `finalize` retains the certificate it collects so a stuck peer can be handed it (`offer_commit_cert`), replacing
     // a `remove` that had kept the map small on its own. Retention therefore needs a bound, and it is the same window
