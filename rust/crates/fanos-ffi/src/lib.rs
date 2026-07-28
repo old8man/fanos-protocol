@@ -595,6 +595,35 @@ mod tests {
         SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Read from a stream, failing with `what` if nothing arrives — rather than blocking the test forever.
+    ///
+    /// `fanos_stream_read` blocks by design (a stream read should), so the bound belongs here rather than in the
+    /// ABI. It is [`STORE_TIMEOUT`], the same "a network operation that has not answered by now will not" horizon
+    /// the ABI applies to its store calls: the write this waits on has already been acknowledged by the sender, so
+    /// a delay past that horizon is a lost payload, not a slow one.
+    ///
+    /// The read runs on its own thread because there is nothing to poll — the pointer is passed as an address
+    /// since a raw pointer is not `Send`, and the handle outlives the thread by construction (the caller frees it
+    /// after this returns).
+    fn read_bounded(stream: *mut FanosStream, what: &str) -> Vec<u8> {
+        let address = stream as usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            // SAFETY: `address` is the caller's live `FanosStream`, which outlives this read.
+            let n = unsafe { fanos_stream_read(address as *mut FanosStream, buf.as_mut_ptr(), buf.len()) };
+            let _ = tx.send(if n > 0 { buf[..n as usize].to_vec() } else { Vec::new() });
+        });
+        let Ok(bytes) = rx.recv_timeout(STORE_TIMEOUT) else {
+            panic!(
+                "{what}: nothing arrived within {STORE_TIMEOUT:?} — the sender's write was acknowledged, so this \
+                 is a lost payload rather than a slow one"
+            )
+        };
+        assert!(!bytes.is_empty(), "{what}: end-of-stream or an error arrived instead of the payload");
+        bytes
+    }
+
     /// Open a node on an ephemeral loopback port for a test; free with [`fanos_free`].
     fn open_loopback() -> *mut FanosNode {
         let cfg = CString::new("listen = 127.0.0.1:0").unwrap();
@@ -1095,19 +1124,15 @@ mod tests {
             assert_eq!(fanos_stream_write(client, msg.as_ptr(), msg.len()), msg.len() as c_int);
             let incoming = fanos_service_accept(service);
             assert!(!incoming.is_null(), "A accepted the client's stream");
-            let mut buf = [0u8; 64];
-            let n = fanos_stream_read(incoming, buf.as_mut_ptr(), buf.len());
-            assert!(n > 0, "the host received the client's bytes");
-            assert_eq!(&buf[..n as usize], msg);
+            let got = read_bounded(incoming, "the host received the client's bytes");
+            assert_eq!(got, msg);
             assert_eq!(
-                fanos_stream_write(incoming, buf.as_ptr(), n as usize),
-                n,
+                fanos_stream_write(incoming, got.as_ptr(), got.len()),
+                got.len() as c_int,
                 "the host echoes the bytes back"
             );
-            let mut out = [0u8; 64];
-            let m = fanos_stream_read(client, out.as_mut_ptr(), out.len());
-            assert!(m > 0, "the echo came back to the client");
-            assert_eq!(&out[..m as usize], msg, "the payload round-trips client → host → client");
+            let echoed = read_bounded(client, "the echo came back to the client");
+            assert_eq!(echoed, msg, "the payload round-trips client → host → client");
 
             fanos_stream_free(incoming);
             fanos_stream_free(client);

@@ -258,9 +258,20 @@ That is correct on its own merits, and it converts the failure rather than remov
 the stream is now legitimately open and waiting for bytes that sometimes never arrive.
 - So the residual is exactly that: the client's write occasionally does not reach the host's accepted stream. Not an
   early close, not a resolution failure, not a missing timeout — the three the investigation has already eliminated.
-- The stall is honest but unhelpful in a test. `fanos_stream_read` blocks by design (a stream read should), so bounding
-  it belongs in the *test*, not the ABI — and the bound should be a progress-based one, as `fanos-node/tests/common`
-  already does for its real-socket waits, rather than a duration guess.
+**The residual now names itself.** The test's reads are bounded (a `read_bounded` helper: the blocking read runs on its own
+thread, waited on for `STORE_TIMEOUT` — the ABI's own "a network operation that has not answered by now will not"
+horizon), so the surviving failure reports:
+
+> `the host received the client's bytes: nothing arrived within 5s — the sender's write was acknowledged, so this is a
+> lost payload rather than a slow one`
+
+Rate unchanged at **1 in 8**, but a five-second named failure instead of a 300-second stall. What is left is a single,
+sharply-stated question: a `fanos_stream_write` that returned the full byte count, whose bytes never reach the host's
+accepted stream. Everything around it has been eliminated — the name resolves, the store call is bounded, the session is
+no longer reaped early, and the stream is open rather than at EOF.
+- Look at the DIAULOS segment path next: `fanos-node`'s own history records a defect of exactly this shape ("StreamSender
+  sealed only full segments, so a sub-segment write without a close was never shipped", fixed by flush-on-write). The
+  payload here is 23 bytes — a sub-segment write — so the question is whether that flush can lose a race.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's
