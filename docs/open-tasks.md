@@ -49,7 +49,25 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
-### [A] A sub-quorum lock split still stalls a live cell about 1 run in 8
+### [A] The residual stall is *not* the lock split — both healing changes measured neutral or worse
+The lock-split mechanism is now fully addressed and **neither half moved the live rate**, which is the finding:
+
+| change | interleaved A/B | verdict |
+|---|---|---|
+| `Block::pol` — a locked validator may re-offer its value, any proposer carrying the certificate is heard | 3 of 6 failing → 1 of 8, but measured sequentially | improvement plausible, not A/B-confirmed |
+| `valid_value` — a polka is recorded on *observation*, so an unlocked proposer offers the prepared value | **5 of 6 vs 4 of 6** | neutral; kept on correctness grounds, not performance |
+| suppressing the round-timeout backoff while a re-offer is held | **0 of 4 vs 2 of 3** | **regression, reverted** |
+
+So after both healing changes the failure rate is where it was, and the cause must be re-established rather than assumed.
+The `rejects.locked`-only signature that motivated all of this was captured *before* them; nothing since has re-read the
+counters on a current failure.
+- **Next, and it is cheap:** re-instrument `ProposalRejects` on a failing run. If `locked` still dominates, the healing is
+  not reaching the split; if the counters have moved to something else, the residual was never the lock split after the
+  first fix and the investigation has been chasing a resolved cause.
+- Keep the two changes regardless: both are standard consensus rules that closed real gaps (a locked value that only its
+  original proposer could re-offer; an observed polka that no unlocked proposer could act on), and neither regressed.
+
+### [A] The lock-split healing, for the record
 **Largely fixed; this is the residual.** Originally 2 of 4 runs of `cargo test -p fanos-node --test dromos_quic
 --features validator a_hash_locked` failed on an **idle** host (load average 3.75), every failure with all seven
 validators at `next_height() == 1` and the HTLC still `Locked`. The proof-of-lock (`docs/design-taxis.md` §4.1) took that
