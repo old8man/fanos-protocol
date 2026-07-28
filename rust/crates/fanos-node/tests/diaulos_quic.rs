@@ -278,3 +278,52 @@ async fn fanos_dialer_reaches_a_service_by_name() {
     a.shutdown();
     b.shutdown();
 }
+
+/// **Interactive streaming over real QUIC: a write with no half-close, read by the peer.**
+///
+/// Every other exchange in this suite — and in `common::exchange` — writes, *closes its write half*, and reads to
+/// end-of-stream. That is the request/response shape, and it means the peer's read can terminate on EOF. Nothing
+/// here covered the interactive shape, where the stream stays open and the reader must be woken by the data
+/// alone: the sub-segment flush is the only thing that ships it, and a lost segment must be recovered by
+/// retransmission rather than by the close.
+///
+/// It is the shape the C ABI's hosted-service example uses, and the only one observed losing a payload — about 2
+/// runs in 10, with the sender's write returning its full count and the session layer exonerated by 200 clean
+/// rounds over an in-process transport. This puts it under test without the FFI's two runtimes and accept queue,
+/// so a failure here is a streaming defect and a pass narrows it to those.
+#[tokio::test]
+async fn an_interactive_write_without_half_close_reaches_the_peer() {
+    let _serial = common::serial_cell().await;
+    let a = start(vec![]).await;
+    let (a_addr, a_net) = (a.address(), a.local_addr());
+    let b = start_distinct(vec![Peer { coord: a_addr, addr: a_net }], &[a_addr]).await;
+
+    let mut srng = SeedRng::from_seed(b"quic-interactive-key");
+    let service = StaticKeypair::generate(&mut srng);
+    let service_public = service.public().clone();
+    serve(
+        a.client(),
+        service,
+        SeedRng::from_seed(b"quic-interactive-srv"),
+        |mut stream| async move {
+            // Echo forever, never closing first: the client keeps its write half open, so this handler must be
+            // woken by data rather than by end-of-stream.
+            let mut buf = vec![0u8; 256];
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 || stream.write_all(buf.get(..n).unwrap_or(&[])).await.is_err() {
+                    break;
+                }
+                let _ = stream.flush().await;
+            }
+        },
+    );
+
+    let mut drng = SeedRng::from_seed(b"quic-interactive-cli");
+    let mut stream = dial_service(b.client(), a_addr, &service_public, &mut drng);
+    let sent = b"c-abi service host echo"; // the same 23-byte sub-segment payload
+    let echoed = common::echo(&mut stream, sent).await;
+    assert_eq!(echoed, sent, "an interactive write round-trips without either side half-closing");
+
+    a.shutdown();
+    b.shutdown();
+}

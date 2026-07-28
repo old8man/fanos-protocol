@@ -312,12 +312,27 @@ and lookup failures entirely; every remaining failure is the same one, at the sa
 finds nothing within 5 s. The session + reliable-stream pair is **exonerated** — `a_sub_segment_write_is_never_lost_across_the_session_pair`
 runs that exact shape 200 times over an in-process channel transport with no losses — so the fault is below them, in
 `fanos-node::serve`'s coordinate demux or the QUIC datagram path.
-- The demux is the first suspect and for a stated reason: it delivers with `try_send` and its own comment says "drop this
-  datagram if the session's bounded inbound queue is full". A dropped datagram is normally covered by retransmission
-  (RTO 60 ms initially), so what must be checked is whether a drop can be *acked* — a segment acknowledged but never
-  delivered is lost permanently, and it matches the signature exactly.
-- The retransmit budget is worth a second look regardless: `RTO_BACKOFF_MULT` is **4**, not TCP's 2, so the attempts land
-  at 60 ms, 240 ms, 960 ms, 3.84 s — only four fit inside five seconds.
+**The streaming path is exonerated too, by a test that did not exist.** Every exchange in this repository — including
+`common::exchange` — writes, *half-closes*, and reads to end-of-stream. Nothing covered the **interactive** shape, where
+the stream stays open and the reader must be woken by the data alone, which is exactly the shape the C ABI example uses
+and the only one observed losing a payload. `diaulos_quic::an_interactive_write_without_half_close_reaches_the_peer` now
+covers it — same 23-byte sub-segment payload, `serve` + `dial_service` over real QUIC, no half-close on either side — and
+it passes **8 runs of 8**.
+
+So the residual is bounded to what is left unique to the FFI, and nothing else:
+1. **A tokio runtime per node.** `fanos_open` builds one each, so the two-node example runs two multi-threaded runtimes
+   (~32 worker threads on 16 cores) where every async test shares one.
+2. **Blocking calls from outside the runtime.** `fanos_stream_write`/`_read`/`fanos_service_accept` each `Handle::block_on`
+   from the caller's thread, so the session drivers must make progress on worker threads while that thread is parked.
+3. The accept-queue indirection (`serve` handler → mpsc → `fanos_service_accept`).
+
+Everything else is now excluded by measurement rather than by argument: publication and lookup (fixed by the readiness
+point), `offer` drops (counter reads 0), the session + reliable-stream pair (200 clean rounds in-process), and the
+streaming path over real QUIC with the demux (8 clean runs).
+- Next: reduce (1) — have the second node share the first's runtime in a test build, or run the FFI example's calls from a
+  runtime thread — and see whether the flake survives. That is a two-line experiment and it decides between (1)+(2) and (3).
+- `RTO_BACKOFF_MULT` is worth noting regardless: it is **4**, not TCP's 2, so retransmits land at 60 ms, 240 ms, 960 ms,
+  3.84 s — only four attempts fit inside a five-second wait.
 
 Superseded reading, kept so it is not re-derived:
 
