@@ -199,18 +199,31 @@ was removed on the way (both forwarded tests were the only ones synchronising on
 - Residual instrument gap: a host that starves only *midway* still reads as a wedge, because the discriminator asks
   whether the process has *ever* delivered.
 
-### [A] `host_a_service_and_serve_a_client_over_the_c_abi` hangs in **release**
-Found by running the nightly command for real (2026-07-28). In debug the two C ABI end-to-end tests pass as a pair in
-**0.17 s**; optimised, `connect_to_a_hosted_service_and_echo_over_the_c_abi` passes and this one **never returns** —
-observed alive at **34 minutes** with no output, process still running.
+### [A] `host_a_service_and_serve_a_client_over_the_c_abi` fails when run as a serial pair in release
+**Corrected diagnosis, 2026-07-28.** The first reading — "hangs in release, probably a blocking call with no free
+runtime thread" — is wrong on both counts, and narrowing it took three runs:
 
-It is skipped in the nightly job, visibly and temporarily, because the set runs serially in one command and `fanos-ffi`
-sorts ahead of `fanos-obolos`: one stuck test cost the zero-knowledge proofs their entire run. The job also has
-`timeout-minutes: 45` now, so a future hang is a red build rather than a wedged runner.
-- Both tests drive `fanos_service_accept` / `fanos_stream_read`, which block the calling thread on
-  `Handle::block_on`. A release-only hang in a blocking-inside-async shape usually means the runtime has no thread free
-  to make progress on the future being awaited — worth checking whether the accept path can be reached from a runtime
-  worker, and whether the debug build's extra slack is what hides it.
+| how it is run | result |
+|---|---|
+| release, alone | **passes in 0.01 s** |
+| debug, the pair, `--test-threads 1` | **both pass in 0.11 s** |
+| release, the pair, `--test-threads 1` | `connect_*` passes, this one **fails after 150 s** |
+| release, whole workspace, serial | appeared to hang — 34 minutes with no output |
+
+It does not hang: it panics on `assert!(!client.is_null(), "B dialed the hosted service")` after the dial retry loop
+(60 × 500 ms) exhausts. So `fanos_service_connect` returned null thirty seconds running, which means the `.fanos` name
+never resolved — an ONOMA descriptor lookup, not a blocked thread. The workspace run's apparent hang is the same failure
+with the retry loop plus the rest of the serial set in front of it.
+
+- Both tests hold `SERIAL` and free their handles, so the interference is something that outlives `fanos_free`: a lingering
+  `serve` task, a QUIC endpoint still bound to a coordinate the next test reseats onto, or a store entry from the previous
+  service. Release timing changes the overlap; debug's extra slack hides it.
+- **Do not "fix" it with a settle sleep.** The observable is the descriptor resolving, and the retry loop already waits
+  30 s for it — a longer wait measures nothing new. What is missing is knowing *why* resolution fails: instrument
+  `NodeResolver::resolve` for the name it looks up and the coordinates it queries, and compare the pair-in-release run
+  against the alone-in-release one.
+- Skipped in the nightly job with `timeout-minutes: 45` alongside, so neither the skip nor a future hang can quietly cost
+  the zero-knowledge proofs their run.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's

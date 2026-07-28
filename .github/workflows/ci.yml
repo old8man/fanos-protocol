@@ -143,9 +143,10 @@ jobs:
       # this `--skip` set provably selects exactly the assertions. Release, because the zero-knowledge proofs
       # are minutes in debug and ~40 s optimised; serial, because several stand up whole real-QUIC cells.
       #
-      # `host_a_service_and_serve_a_client_over_the_c_abi` is skipped, and only in release: it passes in debug
-      # (the pair completes in 0.17 s) and **hangs indefinitely** optimised — observed alive at 34 minutes with
-      # no progress. Skipping it is temporary and deliberately visible; the hang is an open item, and leaving it
-      # in would mean the proofs this job exists to run never start.
+      # `host_a_service_and_serve_a_client_over_the_c_abi` is skipped, temporarily and deliberately visibly. It
+      # passes alone in release (0.01 s) and as a debug pair (0.11 s), and fails as a *release* pair after 150 s:
+      # node B's `.fanos` dial never resolves, so the retry loop exhausts. In the full serial set that read as a
+      # 34-minute hang, and since `fanos-ffi` sorts ahead of `fanos-obolos` it cost the zero-knowledge proofs
+      # their entire run. Open item; `timeout-minutes` above is the backstop either way.
       - name: Cost-gated assertions (every ignored test that is not a measurement)
         run: cargo test --workspace --features validator --release -- --ignored --skip measure_ --skip probe_ --skip sweep_ --skip host_a_service_and_serve_a_client --test-threads 1
