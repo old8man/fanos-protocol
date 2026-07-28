@@ -150,6 +150,35 @@ size.
 - Next: instrument `Sampler` occupancy on the live path, and check whether a 9 KB block's shard set is ever completed by
   the validators that lag. Compare against the ~1 KB shielded transfer, which does not stall.
 
+### [A] Store placement is a successor rule over a *per-node, time-varying* occupancy set
+A value written before a membership change can become **unreachable**, not merely slower to find. Located 2026-07-28 while
+chasing the C ABI flake, and it explains a class rather than one test.
+
+`OverlayNode::responsible_point(key)` is `nearest_occupied(ideal_index)` — the first *occupied* point at or after the key's
+ideal index, wrapping around. And `occupied_points()` is **this node's current view**: itself, peers it has heard from, and
+announced members. So:
+
+- A hosts a service and publishes its descriptor while its view is `{A}`. A is therefore responsible for every key, and
+  stores it locally; no shard goes anywhere else, because there is nowhere else it knows of.
+- B joins. Both views become `{A, B}`. A key whose ideal index falls between them now resolves to **B**, which never
+  received it.
+- B's `Get` asks the point its own view names, finds nothing, and reports `NOTFOUND` — for the full 30 s of the C ABI
+  test's retries. Measured: 1 run in 10.
+
+The design accepts view-dependence deliberately (`occupied_points`' own doc: "a never-occupied point is simply absent; a
+heard-then-crashed occupant is handled downstream by `routed_send`'s reroute"), and on a converged cell every view agrees
+so the rule is consistent. The gap is the *formation* window, and a sparse cell is permanently in it — the C ABI example
+is two nodes on seven points, which is what an embedder following that example gets.
+
+- **Erasure shards do not cover it.** They are placed at per-point homes *as the writer understands them*, so a write made
+  under a one-node view leaves nothing to reconstruct from.
+- **The bounded fix is a read fan-out**, not a re-placement: a `Get` that misses at the computed home tries the next
+  occupied successors, bounded by the cell size. That is how a DHT normally absorbs view skew, it needs no write-side
+  bookkeeping, and it is cheap on a cell of seven. Re-placing on every membership change is the alternative and is much
+  more invasive.
+- Worth checking whether this is also behind the mix-directory and rendezvous-descriptor flakes seen elsewhere in this
+  list — all three are "a value published by one node, read by another, intermittently absent".
+
 ### [A] The verification gate itself is load-sensitive — one flake per full-workspace run
 Measured twice on the current tree with `cargo test --workspace --features validator`:
 - 43 suites, **756 tests, one failure** — the HERMES contract, all seven validators frozen at the lock height.
