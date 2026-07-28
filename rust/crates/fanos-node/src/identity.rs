@@ -28,11 +28,27 @@ pub fn load_or_generate(path: Option<&Path>) -> Result<NodeCredentials, NodeErro
         }
         Some(p) => {
             let creds = NodeCredentials::generate().map_err(|_| NodeError::Identity)?;
-            std::fs::write(p, creds.to_bytes())?;
+            write_secret(p, &creds.to_bytes())?;
             Ok(creds)
         }
         None => NodeCredentials::generate().map_err(|_| NodeError::Identity),
     }
+}
+
+/// Write a node's long-term secret so that only its owner can read it.
+///
+/// The mode is set **at creation**, not applied afterwards: a key created world-readable and `chmod`-ed a
+/// microsecond later *was* world-readable, and on a shared host that window is the whole of the exposure. Before
+/// this, `load_or_generate` used a plain `fs::write` and the identity landed at the process umask — 0644 on a
+/// stock system, which makes a node's permanent identity readable by every account on the machine. Found by
+/// running `fanos init` and looking at what it had produced.
+fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f =
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.write_all(bytes)?;
+    Ok(())
 }
 
 /// The overlay coordinate a set of credentials resolves to over the field `F` — its **genesis** verifiable

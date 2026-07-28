@@ -824,6 +824,16 @@ impl NodeConfig {
                         .map_err(|_| NodeError::Config(format!("bad admission_difficulty '{value}'")))?;
                     config.admission_difficulty = Some(bits);
                 }
+                // A **path**, not the material. Beacon provisioning is genesis material with a secret share in it,
+                // and inlining it here would put a key into the file an operator copies between hosts. The daemon
+                // needs *some* way to be told, though: `--beacon-params` alone means a relay can never run under
+                // an init system, because a service unit's argv is not something an operator edits per host.
+                "beacon_params" => {
+                    let text = std::fs::read_to_string(value).map_err(|e| {
+                        NodeError::Config(format!("beacon_params '{value}': {e}"))
+                    })?;
+                    config.beacon = Some(BeaconParams::from_config_str(&text)?);
+                }
                 "proteus_environment" => {
                     config.proteus_environment = Some(Environment::from_name(value).ok_or_else(|| {
                         NodeError::Config(format!(

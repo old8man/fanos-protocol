@@ -112,6 +112,14 @@ fn current_uid() -> u32 {
     })
 }
 
+/// The port a fresh install listens on unless the operator says otherwise.
+///
+/// A *stable* number, and that is the point. `NodeConfig::default()` binds port 0 — an ephemeral port, correct
+/// for a test that only needs some socket, and wrong for an installed node: it would take a different port at
+/// every restart, so the seed address it prints for peers to dial is stale the moment it is restarted. A daemon
+/// needs an address others can write down. 9931 is in the unassigned range and not claimed by IANA.
+pub const DEFAULT_PORT: u16 = 9931;
+
 /// Find a UDP port this node can actually bind, starting from `preferred`.
 ///
 /// Probed rather than assumed. A default port that is already taken is the single most common reason a
@@ -167,26 +175,109 @@ impl ServiceManager {
         }
     }
 
-    /// The commands an operator runs to enable and start the installed unit, in order.
-    #[must_use]
-    pub fn activation(self, unit: &Path) -> Vec<String> {
+    /// The `systemctl` invocation for this manager: system-wide, or with `--user`.
+    fn systemctl(self) -> Vec<String> {
         match self {
-            Self::SystemdSystem => vec![
-                "systemctl daemon-reload".to_owned(),
-                "systemctl enable --now fanos.service".to_owned(),
-            ],
-            Self::SystemdUser => vec![
-                "systemctl --user daemon-reload".to_owned(),
-                "systemctl --user enable --now fanos.service".to_owned(),
-                // Without lingering, a user unit stops at logout — which on a server is "it worked until I closed
-                // the terminal", the most confusing possible failure.
-                "loginctl enable-linger".to_owned(),
-            ],
-            Self::Launchd => vec![format!("launchctl load -w {}", unit.display())],
+            Self::SystemdUser => vec!["systemctl".to_owned(), "--user".to_owned()],
+            _ => vec!["systemctl".to_owned()],
+        }
+    }
+
+    /// The commands that enable and start the installed unit, in order — as **argv lists**, so a caller runs
+    /// them directly rather than through a shell.
+    ///
+    /// Structured rather than printed because these are meant to be *executed*: an operator who has just asked
+    /// for a node installed does not want a list of commands to copy, and a string handed to a shell is an
+    /// injection surface for every path in it.
+    #[must_use]
+    pub fn activation(self, unit: &Path) -> Vec<Vec<String>> {
+        match self {
+            Self::SystemdSystem | Self::SystemdUser => {
+                let sc = self.systemctl();
+                let mut out = vec![
+                    [sc.clone(), vec!["daemon-reload".to_owned()]].concat(),
+                    [sc, vec!["enable".to_owned(), "--now".to_owned(), UNIT_NAME.to_owned()]].concat(),
+                ];
+                if self == Self::SystemdUser {
+                    // Without lingering, a user unit stops at logout — which on a server is "it worked until I
+                    // closed the terminal", the most confusing failure this could ship.
+                    out.push(vec!["loginctl".to_owned(), "enable-linger".to_owned()]);
+                }
+                out
+            }
+            Self::Launchd => {
+                vec![vec![
+                    "launchctl".to_owned(),
+                    "load".to_owned(),
+                    "-w".to_owned(),
+                    unit.display().to_string(),
+                ]]
+            }
+            Self::None => Vec::new(),
+        }
+    }
+
+    /// Stop the running service without uninstalling it.
+    #[must_use]
+    pub fn stop(self, unit: &Path) -> Vec<Vec<String>> {
+        match self {
+            Self::SystemdSystem | Self::SystemdUser => {
+                vec![[self.systemctl(), vec!["stop".to_owned(), UNIT_NAME.to_owned()]].concat()]
+            }
+            Self::Launchd => vec![vec![
+                "launchctl".to_owned(),
+                "unload".to_owned(),
+                unit.display().to_string(),
+            ]],
+            Self::None => Vec::new(),
+        }
+    }
+
+    /// Start an already-installed service.
+    #[must_use]
+    pub fn start(self, unit: &Path) -> Vec<Vec<String>> {
+        match self {
+            Self::SystemdSystem | Self::SystemdUser => {
+                vec![[self.systemctl(), vec!["start".to_owned(), UNIT_NAME.to_owned()]].concat()]
+            }
+            Self::Launchd => vec![vec![
+                "launchctl".to_owned(),
+                "load".to_owned(),
+                "-w".to_owned(),
+                unit.display().to_string(),
+            ]],
+            Self::None => Vec::new(),
+        }
+    }
+
+    /// Stop **and** disable the service, so it does not come back at the next boot.
+    ///
+    /// Both, and in that order: stopping alone leaves a unit that returns on reboot, which is the removal an
+    /// operator thinks they performed and did not.
+    #[must_use]
+    pub fn deactivation(self, unit: &Path) -> Vec<Vec<String>> {
+        match self {
+            Self::SystemdSystem | Self::SystemdUser => {
+                let sc = self.systemctl();
+                vec![
+                    [sc.clone(), vec!["disable".to_owned(), "--now".to_owned(), UNIT_NAME.to_owned()]].concat(),
+                    [sc, vec!["daemon-reload".to_owned()]].concat(),
+                ]
+            }
+            Self::Launchd => vec![vec![
+                "launchctl".to_owned(),
+                "unload".to_owned(),
+                "-w".to_owned(),
+                unit.display().to_string(),
+            ]],
             Self::None => Vec::new(),
         }
     }
 }
+
+/// The systemd unit's name — one constant, because a name that disagrees between install and removal leaves a
+/// service an operator cannot get rid of with this tool.
+pub const UNIT_NAME: &str = "fanos.service";
 
 /// Render a systemd unit that runs `exe` against `config`.
 ///
@@ -275,6 +366,12 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     let _ = writeln!(s, "listen = {}", config.listen);
     let _ = writeln!(s, "identity = {}", identity.display());
     let _ = writeln!(s, "role = {}", config.roles);
+    if let Some(dir) = identity.parent() {
+        let beacon = dir.join(BEACON_FILE);
+        if beacon.exists() {
+            let _ = writeln!(s, "beacon_params = {}", beacon.display());
+        }
+    }
     let _ = writeln!(s, "plane_order = {}", config.plane_order);
     let _ = writeln!(s);
     if config.bootstrap.is_empty() {
@@ -325,6 +422,9 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     }
     s
 }
+
+/// The file a node's beacon provisioning is written to inside its config directory.
+pub const BEACON_FILE: &str = "beacon.params";
 
 /// The roles a node offers by default when the operator expresses no preference.
 ///
@@ -385,6 +485,19 @@ mod tests {
         assert_eq!(back.telemetry_epsilon, None, "an omitted ε must stay omitted, not become a number");
         assert_eq!(back.admission_difficulty, None, "an omitted PoW must stay omitted");
         assert!(back.bootstrap.is_empty(), "the bootstrap comment must not parse as a peer");
+    }
+
+    #[test]
+    fn the_default_port_is_stable_rather_than_ephemeral() {
+        // The wizard prints a seed address for other operators to dial. Built on `NodeConfig::default()`, which
+        // binds port 0, that address would name a port the node abandons at its next restart — so the whole
+        // point of publishing it is lost. Caught by running `fanos init` and reading `listen = 0.0.0.0:0`.
+        assert_ne!(DEFAULT_PORT, 0, "an installed node must not take an ephemeral port");
+        assert_eq!(
+            NodeConfig::default().listen.port(),
+            0,
+            "if the library default stops being ephemeral, this constant's reason for existing has changed"
+        );
     }
 
     #[test]
@@ -479,13 +592,19 @@ mod tests {
     }
 
     #[test]
-    fn every_manager_that_has_a_unit_path_also_says_how_to_activate_it() {
+    fn every_manager_that_has_a_unit_path_can_be_installed_started_stopped_and_removed() {
+        // A supervisor this tool can install into but not remove from is a supervisor it should not touch: the
+        // operator would be left with a service only manual surgery gets rid of.
         for m in [ServiceManager::SystemdSystem, ServiceManager::SystemdUser, ServiceManager::Launchd] {
             let path = m.unit_path(Path::new("/home/op")).expect("a real manager has a unit path");
-            assert!(!m.activation(&path).is_empty(), "{m:?} writes a unit but tells nobody how to start it");
+            assert!(!m.activation(&path).is_empty(), "{m:?} installs a unit but cannot start it");
+            assert!(!m.stop(&path).is_empty(), "{m:?} can start but not stop");
+            assert!(!m.start(&path).is_empty(), "{m:?} can stop but not start again");
+            assert!(!m.deactivation(&path).is_empty(), "{m:?} can install but not remove");
         }
         assert!(ServiceManager::None.unit_path(Path::new("/home/op")).is_none());
         assert!(ServiceManager::None.activation(Path::new("/x")).is_empty());
+        assert!(ServiceManager::None.deactivation(Path::new("/x")).is_empty());
     }
 
     #[test]
@@ -493,6 +612,41 @@ mod tests {
         // Without it the unit stops at logout, which on a server presents as "it worked until I closed the
         // terminal" — the most confusing failure this wizard could ship.
         let acts = ServiceManager::SystemdUser.activation(Path::new("/home/op/.config/systemd/user/fanos.service"));
-        assert!(acts.iter().any(|a| a.contains("enable-linger")), "a user unit must survive logout: {acts:?}");
+        assert!(
+            acts.iter().any(|a| a.iter().any(|w| w == "enable-linger")),
+            "a user unit must survive logout: {acts:?}"
+        );
+    }
+
+    #[test]
+    fn removal_disables_and_does_not_merely_stop() {
+        // Stopping alone leaves a unit that returns at the next boot — the removal an operator believes they
+        // performed and did not.
+        for m in [ServiceManager::SystemdSystem, ServiceManager::SystemdUser] {
+            let cmds = m.deactivation(Path::new("/x"));
+            let flat: Vec<String> = cmds.iter().map(|c| c.join(" ")).collect();
+            assert!(flat.iter().any(|c| c.contains("disable")), "{m:?} removal must disable: {flat:?}");
+        }
+        let mac = ServiceManager::Launchd.deactivation(Path::new("/x"));
+        assert!(
+            mac.iter().any(|c| c.iter().any(|w| w == "-w")),
+            "launchctl unload without -w leaves the agent enabled: {mac:?}"
+        );
+    }
+
+    #[test]
+    fn a_user_manager_always_carries_the_user_flag() {
+        // A `--user` unit addressed with a system-wide systemctl silently operates on a different (empty)
+        // manager, so every command reports success and nothing happens.
+        for cmds in [
+            ServiceManager::SystemdUser.activation(Path::new("/x")),
+            ServiceManager::SystemdUser.stop(Path::new("/x")),
+            ServiceManager::SystemdUser.start(Path::new("/x")),
+            ServiceManager::SystemdUser.deactivation(Path::new("/x")),
+        ] {
+            for cmd in cmds.iter().filter(|c| c.first().is_some_and(|p| p == "systemctl")) {
+                assert!(cmd.contains(&"--user".to_owned()), "user-manager command without --user: {cmd:?}");
+            }
+        }
     }
 }

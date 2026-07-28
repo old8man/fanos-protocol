@@ -9,7 +9,7 @@
 //!   * `fanos help`  — usage.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -53,6 +53,10 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("validator") => cmd_validator(args.get(2..).unwrap_or(&[])).await,
         Some("pay") => cmd_pay(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
+        Some("init") => cmd_init(args.get(2..).unwrap_or(&[])),
+        Some(v @ ("start" | "stop" | "restart")) => cmd_service_lifecycle(v),
+        Some("uninstall") => cmd_uninstall(args.get(2..).unwrap_or(&[])),
+        Some("status") => cmd_status(args.get(2..).unwrap_or(&[])),
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
         Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
@@ -665,6 +669,505 @@ fn parse_beacon_hex(s: &str) -> Result<BeaconSeed, NodeError> {
     Ok(BeaconSeed::new(bytes))
 }
 
+// ============================== first-run setup ==============================
+
+/// Ask a yes/no question, defaulting to `yes_default` when the operator just presses return.
+///
+/// Non-interactive input (a pipe, a provisioning script) takes the default rather than blocking forever: a setup
+/// tool that hangs waiting for a terminal that will never appear is worse than one that makes the documented
+/// choice and says which.
+fn ask_yes_no(question: &str, yes_default: bool) -> bool {
+    let hint = if yes_default { "[Y/n]" } else { "[y/N]" };
+    eprint!("  {question} {hint} ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).unwrap_or(0) == 0 {
+        eprintln!("{}", if yes_default { "yes (no terminal)" } else { "no (no terminal)" });
+        return yes_default;
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => yes_default,
+    }
+}
+
+/// Ask a free-text question, returning `default` on an empty answer or a closed stdin.
+fn ask_line(question: &str, default: &str) -> String {
+    if default.is_empty() {
+        eprint!("  {question}: ");
+    } else {
+        eprint!("  {question} [{default}]: ");
+    }
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).unwrap_or(0) == 0 {
+        eprintln!("{default} (no terminal)");
+        return default.to_owned();
+    }
+    let answered = line.trim();
+    if answered.is_empty() { default.to_owned() } else { answered.to_owned() }
+}
+
+/// Write `contents` to `path`, creating parents, and restrict it to its owner when `secret`.
+///
+/// The permission is set **before** the bytes land, not after: a key written world-readable and chmod-ed a
+/// microsecond later was world-readable, and on a shared host that is the whole of the exposure.
+fn write_file(path: &Path, contents: &str, secret: bool) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if secret {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut f, contents.as_bytes())?;
+    } else {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
+/// The address to listen on: the operator's if given, otherwise the first port in a window from the default that
+/// this host can actually bind.
+///
+/// Probed rather than assumed, because a taken default port is the commonest reason a freshly-installed daemon
+/// never comes up — and it fails after the operator has walked away. Exhausting the window is reported as an
+/// error rather than answered with a port we know does not bind.
+fn choose_listen(args: &[String]) -> Result<SocketAddr, NodeError> {
+    /// How many consecutive ports to try before giving up and asking the operator.
+    const WINDOW: u16 = 64;
+    if let Some(s) = flag(args, "--listen") {
+        return s.parse().map_err(|_| NodeError::Config(format!("bad --listen '{s}'")));
+    }
+    let default_port = fanos_node::setup::DEFAULT_PORT;
+    let port = fanos_node::setup::free_udp_port(default_port, WINDOW).ok_or_else(|| {
+        NodeError::Config(format!(
+            "no free UDP port in {default_port}..{} — pass --listen ADDR explicitly",
+            default_port.saturating_add(WINDOW)
+        ))
+    })?;
+    if port != default_port {
+        eprintln!("\n  note: UDP {default_port} is taken; using {port} instead.");
+    }
+    Ok(SocketAddr::from(([0, 0, 0, 0], port)))
+}
+
+/// `fanos init [--yes] [--force] [--no-service] [--role …] [--listen ADDR] [--bootstrap …] [--telemetry ε]`
+///
+/// Turn a freshly-installed binary into a running node. Everything determinable is determined — where files
+/// belong on this OS and under this user, which port actually binds, whether there is an init system we may write
+/// to — and the operator answers only what cannot be derived: what this node offers, and whose cell it joins.
+///
+/// `--yes` takes every default without asking, which is what a provisioning script wants; the same path is taken
+/// automatically when stdin is not a terminal, so the tool never hangs waiting for a human who is not there.
+fn cmd_init(args: &[String]) -> Result<(), NodeError> {
+    let assume_yes = has_flag(args, "--yes");
+    let force = has_flag(args, "--force");
+    let paths = fanos_node::setup::Paths::detect();
+
+    eprintln!("fanos init — setting this host up as a FANOS node\n");
+    eprintln!("  configuration : {}", paths.config.display());
+    eprintln!("  identity      : {}", paths.identity.display());
+    eprintln!("  state         : {}", paths.data.display());
+
+    // Refuse to overwrite a live deployment. An `init` that silently replaced a running node's identity would
+    // change its coordinate, and the cell would see the old one simply vanish.
+    if paths.config.exists() && !force {
+        return Err(NodeError::Config(format!(
+            "{} already exists — this host is already set up.\n  Re-run with --force to replace it (this \
+             regenerates nothing: an existing identity file is kept).",
+            paths.config.display()
+        )));
+    }
+
+    // --- what cannot be derived ---
+    let mut config = NodeConfig {
+        roles: fanos_node::setup::default_roles(),
+        ..NodeConfig::default()
+    };
+    if let Some(r) = flag(args, "--role") {
+        config.roles = RoleSet::parse(r)?;
+    } else if !assume_yes {
+        eprintln!("\nWhat should this node offer the network?");
+        eprintln!("  relay      — carry other nodes' traffic (the network's substance)");
+        eprintln!("  storage    — hold shards of the distributed store");
+        eprintln!("  service    — host addressable services");
+        eprintln!("  rendezvous — help clients and hidden services meet");
+        eprintln!("  exit       — carry traffic to the clear internet UNDER THIS HOST'S ADDRESS");
+        let answer = ask_line("roles (comma-separated)", &config.roles.to_string());
+        config.roles = RoleSet::parse(&answer)?;
+    }
+    if config.roles.exit {
+        eprintln!(
+            "\n  ! This node will act as an exit. Traffic other people send leaves to the clear internet from\n    \
+             this host's IP address, and complaints arrive here. Make sure that is what you intend."
+        );
+    }
+
+    config.listen = choose_listen(args)?;
+
+    // --- joining, or starting a new cell ---
+    for value in flag_all(args, "--bootstrap") {
+        for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            config.bootstrap.push(Peer::parse(part)?);
+        }
+    }
+    if config.bootstrap.is_empty() && !assume_yes {
+        eprintln!("\nJoin an existing cell, or start a new one?");
+        eprintln!("  Paste seed peers as `x:y:z@host:port` (comma-separated), or leave empty to start fresh.");
+        let answer = ask_line("bootstrap peers", "");
+        for part in answer.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            config.bootstrap.push(Peer::parse(part)?);
+        }
+    }
+
+    // --- health telemetry: opt-in, and it stays opt-in ---
+    match flag(args, "--telemetry") {
+        Some(s) => {
+            let eps: f64 =
+                s.parse().map_err(|_| NodeError::Config(format!("bad --telemetry '{s}'")))?;
+            config.telemetry_epsilon = Some(eps);
+        }
+        None => {
+            if !assume_yes {
+                eprintln!("\nPublish this node's health readings (differentially private, ε-noised)?");
+                eprintln!("  They describe the cell you sit in, so this is your call, and the default is no.");
+                if ask_yes_no("publish health readings?", false) {
+                    config.telemetry_epsilon = Some(1.0);
+                }
+            }
+        }
+    }
+
+    // --- identity: generated once, kept forever ---
+    // The directories first. `load_or_generate` writes the key where it is told and does not invent a home for
+    // it, so on a host that has never run FANOS the very first write fails with a bare ENOENT — which is what
+    // this wizard exists to prevent an operator from ever meeting. Found by running it, not by reading it.
+    if let Some(parent) = paths.identity.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(&paths.data)?;
+    let credentials = identity::load_or_generate(Some(&paths.identity))?;
+    let [x, y, z] = identity::coordinate::<F2>(&credentials);
+    config.identity_path = Some(paths.identity.clone());
+
+    ensure_beacon(&mut config, &paths, assume_yes)?;
+
+    // --- write ---
+    let rendered = fanos_node::setup::render_config(&config, &paths.identity);
+    write_file(&paths.config, &rendered, false)?;
+    eprintln!("\n  wrote {}", paths.config.display());
+    eprintln!("  coordinate {x}:{y}:{z}");
+
+    // --- the daemon ---
+    if has_flag(args, "--no-service") {
+        eprintln!("\nSkipping service installation (--no-service). Run it in the foreground with:");
+        eprintln!("  fanos node --config {}", paths.config.display());
+        return Ok(());
+    }
+    install_service(&paths, assume_yes)?;
+
+    eprintln!("\nDone. This node's seed address, for others joining your cell:");
+    eprintln!("  {x}:{y}:{z}@<this-host>:{}", config.listen.port());
+    eprintln!("Check on it with:  fanos status");
+    Ok(())
+}
+
+/// Make sure a relaying node has the epoch beacon it needs, or stop being a relay.
+///
+/// `Node::start` refuses to relay without beacon parameters, and that check is right — which made a
+/// wizard-written config unstartable, the exact failure this command exists to prevent. Which way out is correct
+/// depends on something the operator has already told us:
+///
+///   * **starting a new cell** (no bootstrap peers) — there is no one to receive a beacon from, so this host *is*
+///     the authority for it. Deal it here, 1-of-1, which is what `fanos beacon-deal 1 1` would produce.
+///   * **joining an existing cell** — the beacon is that cell's genesis material and cannot be invented; a
+///     locally-dealt one would put this node on a different epoch clock from every peer. So it is asked for, and
+///     if it is not to hand the relay role is dropped **with the reason**, rather than writing a configuration
+///     that fails at first start.
+fn ensure_beacon(
+    config: &mut NodeConfig,
+    paths: &fanos_node::setup::Paths,
+    assume_yes: bool,
+) -> Result<(), NodeError> {
+    let beacon_path = paths.config.with_file_name(fanos_node::setup::BEACON_FILE);
+    if !config.roles.relay || beacon_path.exists() {
+        return Ok(());
+    }
+    if config.bootstrap.is_empty() {
+        deal_own_beacon(&beacon_path)?;
+        eprintln!("\n  dealt this cell's epoch beacon → {}", beacon_path.display());
+        eprintln!("  give {} to every other node joining this cell.", fanos_node::setup::BEACON_FILE);
+        return Ok(());
+    }
+    let given = if assume_yes {
+        String::new()
+    } else {
+        eprintln!("\nThis cell's epoch beacon is genesis material held by whoever started it.");
+        eprintln!("  Ask them for the `.beacon` file; without it this node cannot relay.");
+        ask_line("path to the beacon file (empty to skip relaying)", "")
+    };
+    if given.is_empty() {
+        config.roles.relay = false;
+        eprintln!("  no beacon — dropping the relay role. This node will still store and serve.");
+        eprintln!("  Add `beacon_params = <file>` to the config and re-enable `relay` when you have it.");
+    } else {
+        std::fs::copy(&given, &beacon_path)?;
+        eprintln!("  installed the beacon → {}", beacon_path.display());
+    }
+    Ok(())
+}
+
+/// Deal this host its own 1-of-1 epoch beacon and write it where the config will point.
+///
+/// Only ever for a cell this host is *starting*. A single-operator bootstrap holds the whole key for the moment
+/// of dealing, which is exactly what `fanos beacon-deal` documents about itself; a trust-minimized cell runs the
+/// networked DKG instead so no one party ever sees it.
+fn deal_own_beacon(path: &Path) -> Result<(), NodeError> {
+    let mut secret = [0u8; 32];
+    let mut rng_seed = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let (shares, commitment) = deal(&secret, 1, 1, &mut DeterministicRng::new(&rng_seed))
+        .ok_or_else(|| NodeError::Config("could not deal a 1-of-1 beacon".to_owned()))?;
+    let share = shares.first().cloned();
+    let params = BeaconParams { commitment, threshold: 1, share };
+    // Secret: it carries this cell's beacon share.
+    write_file(path, &params.to_config_string(), true)
+}
+
+/// Install and (with consent) start the platform's service unit.
+///
+/// The unit is *written* here; activation is the operator's, because enabling a boot service is a change to the
+/// machine and a setup tool should say what it is about to do. With `--yes` it proceeds, which is what a
+/// provisioning run means by the flag.
+fn install_service(paths: &fanos_node::setup::Paths, assume_yes: bool) -> Result<(), NodeError> {
+    use fanos_node::setup::ServiceManager;
+    let manager = ServiceManager::detect();
+    if manager == ServiceManager::None {
+        eprintln!("\nNo supervisor found (no systemd, no launchd). Run the node yourself with:");
+        eprintln!("  fanos node --config {}", paths.config.display());
+        return Ok(());
+    }
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let Some(unit_path) = manager.unit_path(&home) else { return Ok(()) };
+    let exe = std::env::current_exe()?;
+
+    let unit = match manager {
+        ServiceManager::Launchd => fanos_node::setup::render_launchd_plist(
+            &exe,
+            &paths.config,
+            &paths.data,
+            &paths.data.join("fanos.log"),
+        ),
+        ServiceManager::SystemdSystem => {
+            fanos_node::setup::render_systemd_unit(&exe, &paths.config, &paths.data, false)
+        }
+        ServiceManager::SystemdUser => {
+            fanos_node::setup::render_systemd_unit(&exe, &paths.config, &paths.data, true)
+        }
+        ServiceManager::None => return Ok(()),
+    };
+
+    eprintln!("\nInstall a service so the node starts at boot and restarts on failure?");
+    eprintln!("  unit: {}", unit_path.display());
+    if !assume_yes && !ask_yes_no("write it?", true) {
+        eprintln!("  skipped. Run in the foreground: fanos node --config {}", paths.config.display());
+        return Ok(());
+    }
+    write_file(&unit_path, &unit, false)?;
+    eprintln!("  wrote {}", unit_path.display());
+    run_steps("activating", &manager.activation(&unit_path));
+    Ok(())
+}
+
+/// Run a sequence of argv commands, reporting each.
+///
+/// Executed, not printed. An operator who asked for a node installed wants a running node, and a list of commands
+/// to paste is the same work handed back to them. Run directly rather than through a shell: every one of these
+/// carries a filesystem path, and a shell would make each of those an injection surface.
+///
+/// A failing step is reported and the sequence continues, because these are independent facts about the system —
+/// `loginctl enable-linger` failing on a host without logind must not prevent the unit from having been enabled.
+fn run_steps(what: &str, steps: &[Vec<String>]) {
+    if steps.is_empty() {
+        return;
+    }
+    eprintln!("\n{what}:");
+    for step in steps {
+        let Some((program, rest)) = step.split_first() else { continue };
+        let shown = step.join(" ");
+        match std::process::Command::new(program).args(rest).status() {
+            Ok(status) if status.success() => eprintln!("  ✓ {shown}"),
+            Ok(status) => eprintln!("  ! {shown} — exited {status}"),
+            Err(e) => eprintln!("  ! {shown} — could not run: {e}"),
+        }
+    }
+}
+
+/// `fanos start` / `fanos stop` / `fanos restart`: drive the installed service.
+fn cmd_service_lifecycle(verb: &str) -> Result<(), NodeError> {
+    use fanos_node::setup::ServiceManager;
+    let manager = ServiceManager::detect();
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let Some(unit) = manager.unit_path(&home) else {
+        return Err(NodeError::Config(
+            "no service manager on this host — run the node in the foreground with `fanos node --config …`"
+                .to_owned(),
+        ));
+    };
+    if !unit.exists() {
+        return Err(NodeError::Config(format!(
+            "no service installed at {} — run `fanos init` first",
+            unit.display()
+        )));
+    }
+    match verb {
+        "start" => run_steps("starting", &manager.start(&unit)),
+        "stop" => run_steps("stopping", &manager.stop(&unit)),
+        _ => {
+            run_steps("stopping", &manager.stop(&unit));
+            run_steps("starting", &manager.start(&unit));
+        }
+    }
+    Ok(())
+}
+
+/// `fanos uninstall [--purge] [--yes]`: take FANOS off this machine.
+///
+/// Two levels, and the distinction is the node's **identity**. Removing the service leaves the configuration and
+/// the identity key in place, so reinstalling returns the *same* node to the network at the same coordinate — the
+/// operator's peers keep their seed addresses. `--purge` deletes those too, which is not an undo: the coordinate
+/// is derived from the key, so a purged node comes back as a stranger.
+#[allow(clippy::unnecessary_wraps)] // uniform with every other `cmd_*`, which the dispatch table requires
+fn cmd_uninstall(args: &[String]) -> Result<(), NodeError> {
+    use fanos_node::setup::ServiceManager;
+    let assume_yes = has_flag(args, "--yes");
+    let purge = has_flag(args, "--purge");
+    let paths = fanos_node::setup::Paths::detect();
+    let manager = ServiceManager::detect();
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+
+    eprintln!("fanos uninstall — removing FANOS from this host\n");
+    if let Some(unit) = manager.unit_path(&home).filter(|u| u.exists()) {
+        eprintln!("  service : {}", unit.display());
+        if assume_yes || ask_yes_no("stop, disable and remove the service?", true) {
+            run_steps("removing the service", &manager.deactivation(&unit));
+            match std::fs::remove_file(&unit) {
+                Ok(()) => eprintln!("  ✓ removed {}", unit.display()),
+                Err(e) => eprintln!("  ! could not remove {}: {e}", unit.display()),
+            }
+            // The unit file is gone; systemd still holds it in memory until told.
+            run_steps("reloading", &[[manager_reload(manager)].concat()]);
+        }
+    } else {
+        eprintln!("  service : none installed");
+    }
+
+    if !purge {
+        eprintln!("\nKept (so a reinstall returns the *same* node at the same coordinate):");
+        eprintln!("  {}", paths.config.display());
+        eprintln!("  {}", paths.identity.display());
+        eprintln!("  {}", paths.data.display());
+        eprintln!("\nTo remove those as well: fanos uninstall --purge");
+        return Ok(());
+    }
+
+    eprintln!("\n  ! --purge deletes this node's identity key. Its coordinate is derived from that key, so");
+    eprintln!("    reinstalling afterwards joins the network as a different node. Peers holding your seed");
+    eprintln!("    address will not find you again. This cannot be undone.");
+    if !assume_yes && !ask_yes_no("delete configuration, identity and state?", false) {
+        eprintln!("  kept.");
+        return Ok(());
+    }
+    for target in [&paths.config, &paths.identity] {
+        match std::fs::remove_file(target) {
+            Ok(()) => eprintln!("  ✓ removed {}", target.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("  ! {}: {e}", target.display()),
+        }
+    }
+    match std::fs::remove_dir_all(&paths.data) {
+        Ok(()) => eprintln!("  ✓ removed {}", paths.data.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("  ! {}: {e}", paths.data.display()),
+    }
+    eprintln!("\nFANOS is off this host.");
+    Ok(())
+}
+
+/// The manager's "re-read your unit files" command, as an argv list.
+fn manager_reload(manager: fanos_node::setup::ServiceManager) -> Vec<String> {
+    use fanos_node::setup::ServiceManager;
+    match manager {
+        ServiceManager::SystemdSystem => vec!["systemctl".to_owned(), "daemon-reload".to_owned()],
+        ServiceManager::SystemdUser => {
+            vec!["systemctl".to_owned(), "--user".to_owned(), "daemon-reload".to_owned()]
+        }
+        ServiceManager::Launchd | ServiceManager::None => Vec::new(),
+    }
+}
+
+/// `fanos status [--config FILE]`: report what this host is set up to be, and whether it is running.
+///
+/// Deliberately answerable **without** contacting the node: the first question an operator has is "did my setup
+/// take", and a status command that can only answer by connecting cannot distinguish "not configured" from
+/// "configured and down" — which are opposite problems.
+fn cmd_status(args: &[String]) -> Result<(), NodeError> {
+    let paths = fanos_node::setup::Paths::detect();
+    let config_path = flag(args, "--config").map_or(paths.config.clone(), PathBuf::from);
+
+    if !config_path.exists() {
+        println!("not set up — no configuration at {}", config_path.display());
+        println!("run: fanos init");
+        return Ok(());
+    }
+    let config = NodeConfig::from_config_str(&std::fs::read_to_string(&config_path)?)?;
+    println!("configuration : {}", config_path.display());
+    println!("listen        : {}", config.listen);
+    println!("roles         : {}", config.roles);
+    println!("plane order   : q = {}", config.plane_order);
+    println!(
+        "bootstrap     : {}",
+        if config.bootstrap.is_empty() {
+            "none (this node starts its own cell)".to_owned()
+        } else {
+            config.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        }
+    );
+    match &config.identity_path {
+        Some(p) if p.exists() => {
+            let credentials = identity::load_or_generate(Some(p))?;
+            let [x, y, z] = identity::coordinate::<F2>(&credentials);
+            println!("coordinate    : {x}:{y}:{z}");
+            println!("seed address  : {x}:{y}:{z}@<this-host>:{}", config.listen.port());
+        }
+        Some(p) => println!("identity      : {} (missing — it will be generated at first start)", p.display()),
+        None => println!("identity      : ephemeral (no path configured)"),
+    }
+    println!(
+        "telemetry     : {}",
+        config.telemetry_epsilon.map_or_else(|| "not published".to_owned(), |e| format!("published, ε = {e}"))
+    );
+
+    // Liveness, read the one way that needs no cooperation from the node: whether its port is still held.
+    let bindable = std::net::UdpSocket::bind(config.listen).is_ok();
+    println!(
+        "daemon        : {}",
+        if bindable {
+            "NOT running (its port is free)"
+        } else {
+            "running (its port is held)"
+        }
+    );
+    Ok(())
+}
+
 /// Print (and optionally persist) a node's self-certifying coordinate.
 fn cmd_id(args: &[String]) -> Result<(), NodeError> {
     let path = flag(args, "--identity").map(PathBuf::from);
@@ -1162,6 +1665,19 @@ fn print_help() {
         "fanos — the FANOS node\n\
          \n\
          USAGE:\n\
+         \n\
+           GETTING STARTED (one command on a fresh host)\n\
+           fanos init  [--yes] [--force] [--no-service] [--role relay,storage,…] [--listen ADDR] \\\n\
+                       [--bootstrap x:y:z@host:port,…] [--telemetry EPSILON]\n\
+                       (detect this OS, pick a free port, generate an identity, write the config,\n\
+                        install a service and start it — `--yes` takes every default, for provisioning)\n\
+           fanos status                     — what this host is set up as, and whether it is running\n\
+           fanos start | stop | restart     — drive the installed service\n\
+           fanos uninstall [--purge] [--yes]\n\
+                       (remove the service; --purge also deletes config, identity and state — the\n\
+                        coordinate is derived from the identity, so a purged node returns as a stranger)\n\
+         \n\
+         ADVANCED:\n\
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
          \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
