@@ -66,6 +66,21 @@ Whichever way it goes, it is a decision to make explicitly rather than by attrit
 **Process note for the next investigator:** the failure message carries the whole `ConsensusProbe` trace, which is the
 diagnosis. Do not filter test output through `grep -E "FAILED|^---- "` — that drops exactly the line worth reading.
 
+### [A] Operator surface — the control socket closes the read half; the monitor is still next
+`fanos status` now asks the **running node** over a local Unix socket (`admin.sock`, mode 0600 in the state
+directory) and reports what the node itself sees: coordinate, peers, verified claims, probe index. Verbs are
+`ping | health | roles | shutdown`. Filesystem permissions are the authentication — the control plane is not
+addressable from the network at all, which is the property that matters for a process whose job is accepting
+traffic from strangers.
+
+Remaining, in order:
+1. **`OverlayCoherenceSource`** — the observatory still watches a *simulated* cell. `read_coherence` has no caller,
+   so nodes publish ε-private coherence frames that nothing consumes. The same `SnapshotSource` trait the live
+   source implements is the seam; this is the last thing between the panel and a real deployment.
+2. **`fanos node --metrics-listen`** — `render_openmetrics` exists and nothing serves it, so a deployment cannot be
+   scraped. The control socket could carry it as a fifth verb, which needs no new listener.
+3. **Coherence in `status`** — Φ/P/R belongs beside the peer count, and needs (1).
+
 ### [A] ROOT CAUSE: TAXIS had no round synchronization — FIXED
 The defect the whole live-stall investigation was circling. `self.round` advanced by exactly one thing — this
 validator's own timeout firing. **Nothing** ever moved a validator toward the round its peers were on. Local timers are

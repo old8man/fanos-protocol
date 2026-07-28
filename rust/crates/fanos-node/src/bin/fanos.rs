@@ -56,7 +56,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("init") => cmd_init(args.get(2..).unwrap_or(&[])),
         Some(v @ ("start" | "stop" | "restart")) => cmd_service_lifecycle(v),
         Some("uninstall") => cmd_uninstall(args.get(2..).unwrap_or(&[])),
-        Some("status") => cmd_status(args.get(2..).unwrap_or(&[])),
+        Some("status") => cmd_status(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
         Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
@@ -195,6 +195,16 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
         health.local_addr, health.known_peers
     );
 
+    // The control socket, so an operator can ask this process anything while it runs. Its absence is not fatal:
+    // a node that cannot bind its admin socket is still a working node, and refusing to run over a control
+    // channel would be the tool getting in the way of the thing it exists to serve.
+    let (admin_tx, mut admin_rx) = tokio::sync::mpsc::channel::<fanos_node::admin::Envelope>(16);
+    let admin_socket = fanos_node::admin::socket_path(&data_dir_for(args));
+    match fanos_node::admin::serve(&admin_socket, admin_tx) {
+        Ok(_task) => eprintln!("control socket: {}", admin_socket.display()),
+        Err(e) => eprintln!("control socket unavailable ({e}) — `fanos status` will fall back to the config"),
+    }
+
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
@@ -204,6 +214,21 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
                 info!("shutdown signal received");
                 break;
             }
+            Some((req, reply)) = admin_rx.recv() => {
+                use fanos_node::admin::Request;
+                let stop = matches!(req, Request::Shutdown);
+                let body = match req {
+                    Request::Ping => "pong\n".to_owned(),
+                    Request::Health => fanos_node::admin::render_health(&node.health()),
+                    Request::Roles => format!("{:?}\n", node.assigned_roles()),
+                    Request::Shutdown => "shutting down\n".to_owned(),
+                };
+                let _ = reply.send(body);
+                if stop {
+                    info!("shutdown requested over the control socket");
+                    break;
+                }
+            }
             note = node.next_notification() => match note {
                 Some(n) => log_notification(&n),
                 None => break,
@@ -211,8 +236,22 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
         }
     }
     node.shutdown();
+    // Take the control socket with us. The serving task clears it when its accept loop ends, but a clean exit
+    // leaves the process before that task is polled again — so without this a normal shutdown leaves the path
+    // behind. Not fatal (`serve` clears a stale socket, and `ask` reads a refused connection as "not running"),
+    // but a state directory that is tidy after a clean stop is one an operator can trust at a glance.
+    let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos node down");
     Ok(())
+}
+
+/// Where this invocation's state lives — the directory the control socket goes in.
+///
+/// `--data` if given, else the platform layout this host was set up with, so `fanos status` finds the socket of a
+/// node started by the service unit without being told where to look.
+fn data_dir_for(args: &[String]) -> PathBuf {
+    flag(args, "--data")
+        .map_or_else(|| fanos_node::setup::Paths::detect().data, PathBuf::from)
 }
 
 /// Run local SOCKS5 (and optional HTTP-CONNECT) proxy listeners that tunnel `CONNECT <name>.fanos:port`
@@ -1118,7 +1157,7 @@ fn manager_reload(manager: fanos_node::setup::ServiceManager) -> Vec<String> {
 /// Deliberately answerable **without** contacting the node: the first question an operator has is "did my setup
 /// take", and a status command that can only answer by connecting cannot distinguish "not configured" from
 /// "configured and down" — which are opposite problems.
-fn cmd_status(args: &[String]) -> Result<(), NodeError> {
+async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     let paths = fanos_node::setup::Paths::detect();
     let config_path = flag(args, "--config").map_or(paths.config.clone(), PathBuf::from);
 
@@ -1155,16 +1194,27 @@ fn cmd_status(args: &[String]) -> Result<(), NodeError> {
         config.telemetry_epsilon.map_or_else(|| "not published".to_owned(), |e| format!("published, ε = {e}"))
     );
 
-    // Liveness, read the one way that needs no cooperation from the node: whether its port is still held.
-    let bindable = std::net::UdpSocket::bind(config.listen).is_ok();
-    println!(
-        "daemon        : {}",
-        if bindable {
-            "NOT running (its port is free)"
-        } else {
-            "running (its port is held)"
-        }
-    );
+    // Ask the node itself if it is there. A held port says *something* is running; only the node can say what it
+    // sees — how many peers it has, whose claims it verified, which point it actually sits on. Falling back to
+    // the port is deliberate rather than lazy: a node built before this socket existed, or one that could not
+    // bind it, must still report as running rather than as missing.
+    let socket = fanos_node::admin::socket_path(&paths.data);
+    let live = fanos_node::admin::ask(&socket, "health").await.unwrap_or(None);
+    if let Some(body) = live {
+        println!("daemon        : running");
+        println!("\n--- as the node itself reports ---");
+        print!("{body}");
+    } else {
+        let bindable = std::net::UdpSocket::bind(config.listen).is_ok();
+        println!(
+            "daemon        : {}",
+            if bindable {
+                "NOT running (its port is free)"
+            } else {
+                "running, but not answering its control socket (an older build, or it could not bind one)"
+            }
+        );
+    }
     Ok(())
 }
 
