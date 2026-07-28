@@ -269,9 +269,30 @@ Rate unchanged at **1 in 8**, but a five-second named failure instead of a 300-s
 sharply-stated question: a `fanos_stream_write` that returned the full byte count, whose bytes never reach the host's
 accepted stream. Everything around it has been eliminated — the name resolves, the store call is bounded, the session is
 no longer reaped early, and the stream is open rather than at EOF.
-- Look at the DIAULOS segment path next: `fanos-node`'s own history records a defect of exactly this shape ("StreamSender
-  sealed only full segments, so a sub-segment write without a close was never shipped", fixed by flush-on-write). The
-  payload here is 23 bytes — a sub-segment write — so the question is whether that flush can lose a race.
+**Mechanism located: `fanos-session::offer` reports success when it drops.**
+
+```rust
+fn offer(tx: &Sender<Vec<u8>>, payload: Vec<u8>) -> bool {
+    !matches!(tx.try_send(payload), Err(TrySendError::Closed(_)))
+}
+```
+
+`Err(TrySendError::Full(_))` returns `true` — the payload is discarded and the caller is told the transport is fine. That
+is precisely "the write was acknowledged and the bytes never arrived", and it is on the path every session write takes
+(`for payload in payloads { if !offer(&outbound, payload) { return } }`).
+
+The write path itself is sound — `session.write(chunk); session.flush();` with a reactive emit, so a sub-segment write does
+ship (that flush was a previous fix and it holds). What is not sound is that a full outbound channel loses a segment
+silently.
+
+- **This is survivable only because DIAULOS is reliable above it** (selective repeat + SACK): a dropped segment should be
+  retransmitted on a later `poll_payloads`. So the question the 1-in-8 rate poses is not "can a segment be dropped" — it
+  demonstrably can — but **why the retransmission does not recover it within 5 s**, or whether the drop happens somewhere
+  the retransmit does not cover (e.g. a handshake payload, before the reliability window exists).
+- **Do not simply switch to `send().await`.** The loop calling `offer` also drives the inbound half; blocking it on a full
+  outbound channel invites a deadlock, which is presumably why `try_send` is there. The fix wants the drop to be *visible*
+  (a counter the session exposes) before it is changed, so that the retransmission hypothesis can be measured rather than
+  assumed.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's
