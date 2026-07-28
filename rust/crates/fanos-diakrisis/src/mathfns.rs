@@ -22,6 +22,27 @@ pub(crate) fn sqrt(x: f64) -> f64 {
     }
 }
 
+/// Base-2 logarithm, dispatched like [`sqrt`].
+///
+/// Needed by the admission control law, whose whole derivation is in bits: proof-of-work at `b` bits admits
+/// attempts at rate `2^-b`, so the inverse of that relation is a `log2`.
+#[inline]
+#[must_use]
+pub(crate) fn log2(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.log2()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::log2(x)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-diakrisis on no_std requires the `libm` feature for log2")
+    }
+}
+
 /// `base^exp` for a non-negative integer exponent, by square-and-multiply. Pure
 /// multiplication, so it needs no math backend (works identically on `std` and `no_std`).
 #[inline]
