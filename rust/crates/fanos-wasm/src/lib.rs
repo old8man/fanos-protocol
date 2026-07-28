@@ -13,7 +13,7 @@
 //! `verifyPoint`) that a JS host drives, supplying WebSocket transport and the beacon. The client uses only the
 //! deterministic, seed-based key derivation, so it needs no ambient RNG at call time.
 //!
-//! ```ignore
+//! ```js
 //! // In JS, after `wasm-pack build --features wasm`:
 //! const id = new FanosIdentity(seed32);          // an identity from a 32-byte seed
 //! const point = id.point(epoch, beacon32);       // the network's computed placement (0..6 on the base cell)

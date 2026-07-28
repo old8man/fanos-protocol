@@ -199,15 +199,18 @@ was removed on the way (both forwarded tests were the only ones synchronising on
 - Residual instrument gap: a host that starves only *midway* still reads as a wedge, because the discriminator asks
   whether the process has *ever* delivered.
 
-### [A] Verify the nightly `heavy` job's class selection actually runs
-`ci.yml`'s `heavy` job now selects cost-gated assertions by class rather than by package:
-`cargo test --workspace --features validator --release -- --ignored --skip measure_ --skip probe_ --skip sweep_
---test-threads 1`, and `fanos-cli/tests/ignored_tests.rs` guarantees the `--skip` set selects exactly the assertions.
-Unverified as written, because it needs a full **release** build of the workspace plus the twelve assertions serially —
-minutes of compute this host could not spare while other work was measured. What is known: the OBOLOS proofs pass in 38 s
-release/serial, the two C ABI end-to-end paths in 0.17 s, and `the_fabric_seam_carries_real_node_traffic` and the two
-randomized no-fork searches have never been run in that configuration. Run it once with `workflow_dispatch` (or locally)
-before trusting the nightly.
+### [A] `host_a_service_and_serve_a_client_over_the_c_abi` hangs in **release**
+Found by running the nightly command for real (2026-07-28). In debug the two C ABI end-to-end tests pass as a pair in
+**0.17 s**; optimised, `connect_to_a_hosted_service_and_echo_over_the_c_abi` passes and this one **never returns** —
+observed alive at **34 minutes** with no output, process still running.
+
+It is skipped in the nightly job, visibly and temporarily, because the set runs serially in one command and `fanos-ffi`
+sorts ahead of `fanos-obolos`: one stuck test cost the zero-knowledge proofs their entire run. The job also has
+`timeout-minutes: 45` now, so a future hang is a red build rather than a wedged runner.
+- Both tests drive `fanos_service_accept` / `fanos_stream_read`, which block the calling thread on
+  `Handle::block_on`. A release-only hang in a blocking-inside-async shape usually means the runtime has no thread free
+  to make progress on the future being awaited — worth checking whether the accept path can be reached from a runtime
+  worker, and whether the debug build's extra slack is what hides it.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's
