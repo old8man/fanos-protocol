@@ -61,8 +61,12 @@ Six of seven complete the whole scenario. The failure is a **single straggler**,
 means its own `max_seen_height` exceeds its height, so it knows the cell moved on, and `await` means it is waiting on a
 body. So the question is no longer "why does consensus not progress" — it does — but **why catch-up does not run for a
 validator that has already detected it is behind**. Candidates, in order:
-- its `max_seen_height` is 2 while the cell is at 8, so it stopped hearing the cell entirely after one height — a
-  transport/membership question, not a consensus one;
+- **its `max_seen_height` is 2 while the cell is at 8** — and this is almost certainly the answer. `note_height` fires
+  from proposals, votes, skeletons and exec-votes alike, so a validator receiving *any* current cell traffic would
+  record 8. Recording 2 means it heard nothing above height 2 for the remaining ~200 s. It is not failing to ask; it
+  cannot hear the answer. That points at the overlay/transport — a node that stops receiving — not at consensus, and
+  not at the catch-up protocol, which asked exactly as designed. Ruled out along the way: the `SyncResp` snapshot
+  exceeding a frame (`MAX_FRAME` is 1 MiB, the test ledger is orders of magnitude smaller).
 - `certified[1]` is pruned on every peer once a checkpoint forms above it (`prune_sync_retention`), so the
   `CommitCert` answer is unavailable and only `SyncResp` can serve it;
 - `awaited_body` may be occupying the validator ahead of the sync path.
