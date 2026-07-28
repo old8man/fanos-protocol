@@ -1643,6 +1643,55 @@ fn a_validator_short_one_commit_vote_rejoins_the_chain() {
 
 
 #[test]
+fn a_peer_stuck_between_the_checkpoint_and_the_head_is_offered_the_certificate() {
+    // `finalize` retains the certificate it collects so a stuck peer can be handed it (`offer_commit_cert`), replacing
+    // a `remove` that had kept the map small on its own. Retention therefore needs a bound, and it is the same window
+    // as `recent_bodies` — a certificate is useless to a stuck peer without the body it finalizes.
+    //
+    // **What this does and does not cover**, because the difference cost three rewrites to find. It covers retention
+    // itself: removing it (going back to consuming the certificate in `finalize`) fails this test and the stuck-peer
+    // test with it. It does **not** cover the retention *window*, and cannot — in this cell the execution checkpoint
+    // tracks the head to within one height, so `prune_sync_retention` runs constantly, `certified` never approaches its
+    // bound, and an over-aggressive floor still leaves the single relevant height retained. Every version of this test
+    // that claimed otherwise passed its own falsification.
+    //
+    // That is worth knowing rather than papering over: the unbounded growth the window guards against requires
+    // checkpoints to *stall*, which nothing here produces. The bound stays as cheap insurance; its trigger is untested.
+    let mut c = Cluster::new(&genesis());
+    for _ in 0..12 {
+        c.tick();
+        c.timeout();
+    }
+    let head = c.engines[0].chain().next_height();
+    assert!(head >= 4, "the cell advanced enough heights to test retention, reached {head}");
+
+    // Counted **by message**, not by "the reply was non-empty". A first version of this test asserted the latter and
+    // was worthless: once a checkpoint forms, `SyncReq` is answered by `SyncResp` from the snapshot path, so an
+    // over-aggressive certificate floor still left every request answered — the falsification passed. The certificate
+    // path has to be named to be tested.
+    // The boundary is exact, and stating it is what makes the assertion bite. `on_sync_req` prefers the checkpoint,
+    // so a request below the checkpoint height is answered by `SyncResp` from the snapshot path; only at or above it
+    // does the retained certificate become the applicable answer. **Every** such height must be served, not merely one.
+    let ckpt = c.engines[0].latest_checkpoint().map_or(0, |c| c.height);
+    assert!(head > ckpt, "the cell has finalized past its checkpoint, so the certificate path is exercised at all");
+    for h in ckpt..head {
+        let replies = c.engines[0].step(Input::SyncReq { from: 1, have_height: h });
+        assert!(
+            replies.iter().any(|o| {
+                matches!(o, Output::SendTo { msg: ConsensusMsg::CommitCert(cert), .. } if cert.height == h)
+            }),
+            "height {h} is at or above the checkpoint {ckpt} and below the head {head}, so a peer stuck there can only \
+             be freed by the retained COMMIT certificate — and it was not offered"
+        );
+    }
+    // And nothing is invented for a height the cell has not reached.
+    assert!(
+        c.engines[0].step(Input::SyncReq { from: 1, have_height: head }).is_empty(),
+        "a request at our own height has nothing newer to offer"
+    );
+}
+
+#[test]
 fn a_stuck_validator_that_never_sees_a_newer_block_still_rejoins_from_the_commit_certificate() {
     // The case both existing repair paths structurally cannot reach, and the reason `ConsensusMsg::CommitCert`
     // exists. A validator finalizes only by gathering `2f+1` COMMIT votes itself, and TAXIS never retransmits a

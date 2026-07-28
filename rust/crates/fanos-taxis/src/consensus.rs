@@ -1661,7 +1661,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
             .unwrap_or_else(|| self.collect_cert(Phase::Commit, block_hash));
         // Retained, not consumed: a peer short of this height's COMMIT quorum can be handed this exact certificate,
         // and after `chain.finalize` below no validator can rebuild it from votes again.
+        //
+        // Bounded to the same window as `recent_bodies`, and that is not an arbitrary pairing: a certificate is only
+        // useful to a stuck peer alongside the body it finalizes, so retaining one past the other buys nothing. Without
+        // this the map grows one entry per height forever whenever execution checkpoints stop forming —
+        // `prune_sync_retention` is the only other thing that trims it, and it runs only when one does.
         self.certified.insert(height, finalizer.clone());
+        if let Some(floor) = height.checked_sub(RECENT_BODY_CAP as u64) {
+            self.certified.retain(|&h, _| h >= floor);
+        }
         self.last_finalized_cert = Some(finalizer);
         self.chain.finalize(block.header.clone());
 
