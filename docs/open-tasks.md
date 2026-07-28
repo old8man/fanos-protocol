@@ -151,9 +151,14 @@ size.
   the validators that lag. Compare against the ~1 KB shielded transfer, which does not stall.
 
 ### [A] The verification gate itself is load-sensitive — one flake per full-workspace run
-Measured 2026-07-28 on the current tree: `cargo test --workspace --features validator` → 43 suites, **756 tests, one
-failure**. The failing one was the HERMES contract suite, with all seven validators frozen at the lock height; in
-isolation the same suite passes in 20–30 s, repeatedly.
+Measured twice on the current tree with `cargo test --workspace --features validator`:
+- 43 suites, **756 tests, one failure** — the HERMES contract, all seven validators frozen at the lock height.
+- 45 suites, **759 tests, two failures in one suite** — the HERMES contract *and* `a_private_transfer_executes_over_live_
+  consensus_end_to_end`, which had never failed before. Immediately afterwards, `dromos_quic` alone passed **3 of 3
+  twice** (53 s, 38 s).
+
+So the count grows with what else shares the machine, and the suite that fails is whichever real-QUIC one the contention
+lands on — the second run's casualty was a single-transaction test, which the lock-split residual cannot explain.
 
 The verdict now carries the evidence to judge it, which is the point of the progress-bounded waits: **321 observations
 completed inside the frozen window, the slowest taking 269 ms** against single-digit milliseconds idle. So the host was
