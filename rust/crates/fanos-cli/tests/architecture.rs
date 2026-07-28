@@ -19,13 +19,35 @@ use std::path::{Path, PathBuf};
 /// linked by code *outside* this repository, so having no internal consumer is correct. **Orphans** are the
 /// real "library ahead of its wiring": built, tested in isolation, and reachable from nothing the project
 /// ships — the platform makes a claim in prose that no deployed path exercises.
-const UNLINKED: &[(&str, &str)] = &[
-    ("fanos-bench", "embedding surface: the benchmark harness, run by `cargo bench`, linked by nothing"),
-    ("fanos-ffi", "embedding surface: the C ABI, for foreign callers rather than our own binaries"),
-    ("fanos-wasm", "embedding surface: the wasm entry points, same reason as the C ABI"),
-    ("fanos-angelos", "ORPHAN: the L11 messenger — a headline product no shipped binary can reach"),
-    ("fanos-ergon", "ORPHAN: the effect-algebra execution model — DROMOS executes without it"),
+/// Crates that are **legitimately** linked by nothing this project ships.
+///
+/// An embedding surface exists to be called from outside — a C header, a wasm entry point, a benchmark harness.
+/// Nothing of ours linking it is the expected shape, not a defect, and this list is stable by design.
+const EMBEDDING_SURFACE: &[(&str, &str)] = &[
+    ("fanos-bench", "the benchmark harness, run by `cargo bench`, linked by nothing"),
+    ("fanos-ffi", "the C ABI, for foreign callers rather than our own binaries"),
+    ("fanos-wasm", "the wasm entry points, same reason as the C ABI"),
 ];
+
+/// Crates that are **orphans** — real capability nobody can reach. A defect list, and a ratchet.
+///
+/// Kept separate from [`EMBEDDING_SURFACE`] because the two mean opposite things and one list conflated them.
+/// An embedding surface is finished; an orphan is a product with no door. `fanos-angelos` is a complete
+/// messenger — sessions, double ratchet, groups, media, call signalling, a bot SDK — and no shipped binary can
+/// reach a line of it.
+///
+/// The list may **shrink and never grow** (asserted below). Deleting the crate is the other admissible way to
+/// shrink it; for these two it is the wrong one, because the work is real and what is missing is a driver and a
+/// verb, not the capability.
+const ORPHANS: &[(&str, &str)] = &[
+    ("fanos-angelos", "the L11 messenger: sans-I/O and complete; needs a node driver + CLI verb (plan I.1)"),
+    ("fanos-ergon", "the effect-algebra execution model: DROMOS executes without it (plan I.1)"),
+];
+
+/// Every crate that is allowed to be unlinked, for either reason.
+fn unlinked() -> Vec<(&'static str, &'static str)> {
+    EMBEDDING_SURFACE.iter().chain(ORPHANS).copied().collect()
+}
 
 /// Parse one manifest's *normal* workspace dependencies (dev- and build-dependencies are not shipping
 /// edges, and counting them would make every crate look wired by its own test harness).
@@ -104,13 +126,14 @@ fn every_crate_is_reachable_from_a_shipped_binary_or_declared_unlinked() {
 
     let reachable = closure(&deps, &binaries);
     let unreachable: BTreeSet<String> = deps.keys().filter(|c| !reachable.contains(*c)).cloned().collect();
-    let declared: BTreeSet<String> = UNLINKED.iter().map(|(c, _)| (*c).to_owned()).collect();
+    let declared: BTreeSet<String> = unlinked().iter().map(|(c, _)| (*c).to_owned()).collect();
 
     let unexpected: Vec<&String> = unreachable.difference(&declared).collect();
     assert!(
         unexpected.is_empty(),
         "these crates are linked by nothing the project ships: {unexpected:?}\n\
-         Either wire them into a binary, or add each to UNLINKED with the reason it is exempt."
+         Either wire them into a binary, or add each to EMBEDDING_SURFACE (if it exists to be called from \
+         outside) or ORPHANS (if it is capability with no door) with the reason."
     );
     let wired: Vec<&String> = declared.difference(&unreachable).collect();
     assert!(
@@ -140,5 +163,39 @@ fn the_reachability_figures_are_what_the_audit_states() {
     assert_eq!(total, 43, "the workspace crate count changed");
     assert_eq!(from_node.len(), 34, "reachable from fanos-node (itself included): {from_node:?}");
     assert_eq!(from_any.len(), 38, "reachable from any shipped binary");
-    assert_eq!(total - from_any.len(), UNLINKED.len(), "the unlinked set must account for the remainder");
+    assert_eq!(total - from_any.len(), unlinked().len(), "the unlinked set must account for the remainder");
+}
+
+/// The orphan list may shrink and never grow.
+///
+/// A ratchet rather than a rule that could be satisfied by writing a better excuse. An orphan is capability
+/// nobody can reach: it reads as a shipped feature, it is maintained and compiled and tested, and no user can
+/// touch it. Two is the count at the time this ratchet was set (2026-07-29); the only admissible directions are
+/// wiring one up or deleting it.
+#[test]
+fn the_orphan_list_only_shrinks() {
+    const AT_RATCHET: usize = 2;
+    assert!(
+        ORPHANS.len() <= AT_RATCHET,
+        "the orphan list grew to {} — a new crate was added that nothing can reach. Wire it, or delete it; \
+         adding a row is not one of the options.",
+        ORPHANS.len()
+    );
+    // …and when it shrinks, lower the ratchet, so the gain is locked in rather than left as slack.
+    assert!(
+        ORPHANS.len() == AT_RATCHET,
+        "an orphan was resolved — lower AT_RATCHET to {} so the ground gained cannot be given back.",
+        ORPHANS.len()
+    );
+}
+
+/// An embedding surface is not an orphan, and the two lists must not overlap.
+#[test]
+fn the_two_exemptions_stay_distinct() {
+    for (crate_name, _) in EMBEDDING_SURFACE {
+        assert!(
+            !ORPHANS.iter().any(|(o, _)| o == crate_name),
+            "`{crate_name}` is listed as both an embedding surface and an orphan — they mean opposite things"
+        );
+    }
 }

@@ -39,10 +39,23 @@ thin. New control loops built on this foundation would inherit its blindness.
 
 An unused capability is not neutral: it reads as a guarantee and is not one. The rule is **delete, not defer**.
 
-**Guarantee: Invariant.** `fanos-cli/tests/architecture.rs` already computes manifest reachability from the
-binaries. Extend it to *symbol* reachability — every `pub` item in a workspace crate must be reachable from
-some binary, test, or an explicit `INTENTIONALLY_UNREACHABLE` list with a reason per entry. Mechanically
-checkable, and it fails the moment a new orphan appears.
+**Guarantee: Invariant** — **half already held, and that is the finding.**
+
+The symbol half is done and was done before this plan: `unreachable_pub = "warn"` is in `[workspace.lints.rust]`
+and CI runs `-D warnings`, so every `pub` item unreachable from outside its crate is already a build failure.
+A workspace build under the lint reports **zero**. The check I planned to write exists, in the compiler, which
+is where it belongs — a hand-rolled reachability script would have been strictly worse and could not have been
+right (a first pass of exactly that counted 554 "orphans", all of them public API a crate legitimately exposes).
+
+What remains is the **crate** half, and it is a defect list rather than a lint: `fanos-angelos` (a complete
+messenger — sessions, double ratchet, groups, media, call signalling, a bot SDK) and `fanos-ergon` are linked by
+nothing shipped. `architecture.rs` now separates `EMBEDDING_SURFACE` (a C ABI or wasm entry point is *finished*
+when nothing of ours links it) from `ORPHANS` (capability with no door), because one list conflated two opposite
+meanings — and puts a **ratchet** on the orphan count: it may shrink and never grow, and resolving one requires
+lowering the ratchet so the ground cannot be given back.
+
+Wiring `fanos-angelos` needs a node driver over the anonymous transport plus a CLI verb. That is the next
+substantive item in this phase.
 
 ### I.2 — Every frame that is sent is handled
 
