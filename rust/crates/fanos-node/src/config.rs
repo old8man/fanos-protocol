@@ -386,6 +386,25 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, NodeError> {
         .collect()
 }
 
+/// A whole-second duration from a config value, rejecting zero — a period of zero is never what an operator
+/// meant, and taken literally it is a busy loop.
+fn parse_duration_secs(value: &str, key: &str) -> Result<Duration, NodeError> {
+    let n: u64 = value.parse().map_err(|_| NodeError::Config(format!("bad {key} '{value}' (expected seconds)")))?;
+    if n == 0 {
+        return Err(NodeError::Config(format!("{key} must be greater than zero")));
+    }
+    Ok(Duration::from_secs(n))
+}
+
+/// A millisecond duration from a config value. Zero **is** meaningful here (no mixing delay, no cover traffic),
+/// so it is accepted — the operator is turning the mechanism off, which is a legitimate choice with a cost.
+fn parse_duration_millis(value: &str, key: &str) -> Result<Duration, NodeError> {
+    let n: u64 = value
+        .parse()
+        .map_err(|_| NodeError::Config(format!("bad {key} '{value}' (expected milliseconds)")))?;
+    Ok(Duration::from_millis(n))
+}
+
 fn parse_seed_hex(s: &str) -> Result<[u8; 32], NodeError> {
     let bytes = s.as_bytes();
     if bytes.len() != 64 {
@@ -425,6 +444,13 @@ pub struct Peer {
     pub coord: Triple,
     /// The peer's network address.
     pub addr: SocketAddr,
+}
+
+/// The inverse of [`Peer::parse`] — the `x:y:z@host:port` seed form.
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}@{}", self.coord[0], self.coord[1], self.coord[2], self.addr)
+    }
 }
 
 impl Peer {
@@ -483,6 +509,36 @@ pub struct RoleSet {
     pub rendezvous: bool,
 }
 
+/// The inverse of [`RoleSet::parse`] — the comma list a config file carries.
+///
+/// Written as a `Display` rather than an `encode`-style method because the round trip is the point: a generated
+/// config is read back by the daemon that wrote it, and a printer that disagrees with the parser produces a node
+/// whose advertised roles quietly change at the next restart. Asserted both ways in `setup`'s tests.
+impl fmt::Display for RoleSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = [
+            ("relay", self.relay),
+            ("storage", self.storage),
+            ("service", self.service),
+            ("exit", self.exit),
+            ("rendezvous", self.rendezvous),
+        ];
+        let mut first = true;
+        for (name, on) in names {
+            if on {
+                if !first {
+                    f.write_str(",")?;
+                }
+                f.write_str(name)?;
+                first = false;
+            }
+        }
+        // An empty set has no name in the grammar, and `role = ` would fail to parse. `none` is the honest token
+        // for "advertises nothing", and it round-trips.
+        if first { f.write_str("none") } else { Ok(()) }
+    }
+}
+
 impl RoleSet {
     /// Whether any role is advertised.
     #[must_use]
@@ -523,6 +579,9 @@ impl RoleSet {
         let mut roles = Self::default();
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part {
+                // The token the printer emits for an empty set; without it a rendered `role = none` would fail to
+                // parse and the round trip would break exactly where it is least visible.
+                "none" => {}
                 "relay" => roles.relay = true,
                 "storage" => roles.storage = true,
                 "service" => roles.service = true,
@@ -727,6 +786,43 @@ impl NodeConfig {
                              tls-tunnel, masque-h3, fronted, webrtc, pluggable)"
                         ))
                     })?;
+                }
+                // Everything below is settable on the command line too, and *had* to be, which was the defect: a
+                // daemon started by an init system has no argv an operator later edits. A setting reachable only
+                // through a flag is a setting a service unit cannot express, so the file was the narrower surface
+                // of the two — exactly backwards for the deployment that matters.
+                "plane_order" => {
+                    let q: u32 = value
+                        .parse()
+                        .map_err(|_| NodeError::Config(format!("bad plane_order '{value}'")))?;
+                    if !matches!(q, 2 | 4 | 7 | 31) {
+                        return Err(NodeError::Config(format!(
+                            "plane_order '{q}' is not a supported projective order (expected 2, 4, 7 or 31)"
+                        )));
+                    }
+                    config.plane_order = q;
+                }
+                // Opt-in by construction: absent means no export, and a node does not begin emitting its coherence
+                // readings because it was upgraded. `0` is refused rather than silently meaning "no noise".
+                "telemetry_epsilon" => {
+                    let eps: f64 = value
+                        .parse()
+                        .map_err(|_| NodeError::Config(format!("bad telemetry_epsilon '{value}'")))?;
+                    if !(eps.is_finite() && eps > 0.0) {
+                        return Err(NodeError::Config(format!(
+                            "telemetry_epsilon '{value}' must be a finite positive ε (omit the key to publish nothing)"
+                        )));
+                    }
+                    config.telemetry_epsilon = Some(eps);
+                }
+                "epoch_period" => config.epoch_period = parse_duration_secs(value, "epoch_period")?,
+                "mix_mean_delay" => config.mix_mean_delay = parse_duration_millis(value, "mix_mean_delay")?,
+                "cover_interval" => config.cover_interval = parse_duration_millis(value, "cover_interval")?,
+                "admission_difficulty" => {
+                    let bits: u32 = value
+                        .parse()
+                        .map_err(|_| NodeError::Config(format!("bad admission_difficulty '{value}'")))?;
+                    config.admission_difficulty = Some(bits);
                 }
                 "proteus_environment" => {
                     config.proteus_environment = Some(Environment::from_name(value).ok_or_else(|| {
