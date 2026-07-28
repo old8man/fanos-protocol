@@ -81,6 +81,72 @@ pub type DaShards = [Option<Vec<u8>>; erasure::N];
 /// fixes, and distinguishing them by reading the code does not work — a stalled cell was attributed to data availability
 /// for two rounds of investigation before a measurement showed availability was clear.
 ///
+/// A compact snapshot of a validator's consensus position, for reporting a **frozen cell**.
+///
+/// A stalled height looks identical from outside whatever caused it, and the outside is all a live-network test could
+/// see: it printed the ledger state and the height, so every stall — a lock split, a missing body, a validator that
+/// silently fell behind — produced the same message, and each one cost a bespoke instrumentation pass to tell apart.
+/// These six fields separate them at the point of failure, which is the only moment the state still exists.
+///
+/// Read them together: `max_seen_height > height` is a validator that *knows* it is behind (so the question is why
+/// catch-up has not run, not why consensus has not); `locked` with `!holds_locked_body` is stuck on a block it cannot
+/// execute; `locked` with the body and a high `round` is a lock split; and the reject counters say what it is refusing
+/// while it waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsensusProbe {
+    /// The height this validator is trying to finalize.
+    pub height: u64,
+    /// The round within that height — high means repeated timeouts.
+    pub round: u32,
+    /// Whether it is locked on a block (so it will refuse every conflicting proposal).
+    pub locked: bool,
+    /// Whether it actually holds the locked block's body (locked without it cannot even re-prepare).
+    pub holds_locked_body: bool,
+    /// Whether it is waiting on a body it has asked peers for.
+    pub awaiting_body: bool,
+    /// The highest height it has *seen* evidence of — above `height`, it knows it is behind.
+    pub max_seen_height: u64,
+    /// Why it has been refusing proposals.
+    pub rejects: ProposalRejects,
+}
+
+impl core::fmt::Display for ConsensusProbe {
+    /// Dense on purpose: one validator per column in a frozen-cell trace across a whole cell.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "h{}r{}", self.height, self.round)?;
+        if self.max_seen_height > self.height {
+            write!(f, " behind({})", self.max_seen_height)?;
+        }
+        if self.locked {
+            f.write_str(if self.holds_locked_body { " lock" } else { " lock-nobody" })?;
+        }
+        if self.awaiting_body {
+            write!(f, " await")?;
+        }
+        let r = &self.rejects;
+        let total = r.proposer + r.link + r.locked + r.structure + r.last_commit + r.seal + r.witness + r.unavailable;
+        if total > 0 {
+            write!(f, " rej[")?;
+            for (name, n) in [
+                ("prop", r.proposer),
+                ("link", r.link),
+                ("lock", r.locked),
+                ("struct", r.structure),
+                ("lastc", r.last_commit),
+                ("seal", r.seal),
+                ("wit", r.witness),
+                ("unavail", r.unavailable),
+            ] {
+                if n > 0 {
+                    write!(f, "{name}={n} ")?;
+                }
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
+    }
+}
+
 /// Counters rather than log lines because this engine is `no_std` and sans-I/O: it has nowhere to write. A driver reads
 /// them and reports; a test asserts on them.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -836,6 +902,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
     #[must_use]
     pub fn rejects(&self) -> ProposalRejects {
         self.rejects
+    }
+
+    /// A compact snapshot of **why this validator is where it is** — see [`ConsensusProbe`].
+    #[must_use]
+    pub fn probe(&self) -> ConsensusProbe {
+        ConsensusProbe {
+            height: self.height(),
+            round: self.round,
+            locked: self.locked_block.is_some(),
+            holds_locked_body: self.locked_block.is_some_and(|h| self.proposals.contains_key(&h)),
+            awaiting_body: self.awaited_body().is_some(),
+            max_seen_height: self.max_seen_height,
+            rejects: self.rejects,
+        }
     }
 
     /// Step the engine on one input, returning the actions to take.

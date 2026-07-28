@@ -31,7 +31,7 @@ use fanos_primitives::{BeaconSeed, BoundedMap, Epoch};
 use fanos_quic::Client;
 use fanos_runtime::{Command, Notification};
 use fanos_taxis::checkpoint::ExecCertificate;
-use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
+use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, ConsensusProbe, Input, Output};
 use fanos_taxis::da::Sampler;
 use fanos_taxis::state::StateMachine;
 use fanos_taxis::wire::{ShardMsg, TaxisApp, parse_app_body, shard_to_frame, to_frame, tx_to_frame};
@@ -182,6 +182,7 @@ pub struct TaxisHandle<S> {
     submit: mpsc::Sender<SealedTx>,
     events: broadcast::Sender<TaxisEvent>,
     query: mpsc::Sender<oneshot::Sender<(u64, S)>>,
+    probe: mpsc::Sender<oneshot::Sender<ConsensusProbe>>,
 }
 
 impl<S> TaxisHandle<S> {
@@ -202,6 +203,15 @@ impl<S> TaxisHandle<S> {
         self.query.send(tx).await.ok()?;
         rx.await.ok()
     }
+
+    /// Snapshot **why this validator sits where it does** — see [`ConsensusProbe`]. `None` if the driver has
+    /// stopped. Distinct from [`snapshot`](Self::snapshot) because a frozen cell's ledger state is exactly what
+    /// does *not* change: judging a stall needs the consensus position, and it exists only while the stall does.
+    pub async fn probe(&self) -> Option<ConsensusProbe> {
+        let (tx, rx) = oneshot::channel();
+        self.probe.send(tx).await.ok()?;
+        rx.await.ok()
+    }
 }
 
 /// Spawn the live TAXIS driver for one validator on plane `F`, bound to `client`. Returns a [`TaxisHandle`].
@@ -218,6 +228,7 @@ where
     let (submit_tx, mut submit_rx) = mpsc::channel::<SealedTx>(64);
     let (events_tx, _) = broadcast::channel::<TaxisEvent>(256);
     let (query_tx, mut query_rx) = mpsc::channel::<oneshot::Sender<(u64, S)>>(16);
+    let (probe_tx, mut probe_rx) = mpsc::channel::<oneshot::Sender<ConsensusProbe>>(16);
     let events_for_task = events_tx.clone();
     // Validator index p ↔ overlay coordinate Point::at(p) — the whole cell's addresses, once.
     // The validator index → overlay coordinate map. It starts at the canonical seating (validator `i` at
@@ -359,6 +370,9 @@ where
                 Some(reply) = query_rx.recv() => {
                     let _ = reply.send((engine.chain().next_height(), engine.chain().state().clone()));
                 }
+                Some(reply) = probe_rx.recv() => {
+                    let _ = reply.send(engine.probe());
+                }
                 note = note_rx.recv() => match note {
                     Some(Notification::App { body, from }) => match parse_app_body(&body) {
                         // A proposal arrives DA-dispersed: a payload-less skeleton (the full block rides as
@@ -419,7 +433,7 @@ where
         }
     });
 
-    TaxisHandle { task, submit: submit_tx, events: events_tx, query: query_tx }
+    TaxisHandle { task, submit: submit_tx, events: events_tx, query: query_tx, probe: probe_tx }
 }
 
 /// Map a received consensus message to the engine input and step it. A `Propose` carries the full block, so

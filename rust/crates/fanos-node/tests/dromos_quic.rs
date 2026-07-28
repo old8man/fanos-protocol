@@ -408,12 +408,19 @@ async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
         for (i, h) in handles.iter().enumerate() {
             // The recipient's balance, not the global escrow: the second contract locks its own 500, so an
             // "escrow is empty" condition would be asserting that the *other* contract had also resolved.
-            let (paid, st, ht) = match h.snapshot().await {
-                Some((height, l)) => (l.tokens().balance(&recipient), l.htlcs().state(&id), height),
+            let (paid, st) = match h.snapshot().await {
+                Some((_, l)) => (l.tokens().balance(&recipient), l.htlcs().state(&id)),
                 None => return (false, format!("{trace} v{i}:down")),
             };
             all &= paid == 1000;
-            let _ = write!(trace, "v{i}:{paid}/{st:?}@{ht} ");
+            // The consensus position, not just the ledger's: a frozen cell's ledger is precisely what has stopped
+            // changing, so it cannot say *why*. See `ConsensusProbe`.
+            match h.probe().await {
+                Some(p) => {
+                    let _ = write!(trace, "v{i}:{paid}/{st:?} {p} | ");
+                }
+                None => return (false, format!("{trace} v{i}:down")),
+            }
         }
         (all, trace)
         }
