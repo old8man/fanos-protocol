@@ -49,6 +49,23 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
+### [A] A ~1-in-8 test sits in the per-push CI gate, and it should not be hidden
+`a_hash_locked_contract_is_funded_and_claimed_over_live_consensus` is **not** `#[ignore]`d, so it runs in the `gate`
+job on every push, where it fails both under full-workspace loopback saturation and — at a lower rate — in isolation.
+A gate that fails one push in eight blocks merges at random and trains people to re-run rather than read.
+
+The repo's own convention would move it: two sibling real-QUIC tests are `#[ignore]`d into the nightly `heavy` job for
+exactly this reason, with the rationale written down. **Deliberately not doing that yet.** Ignoring it would convert a
+known liveness defect into an unobserved one, and the defect is real — it is the thread that produced the sampler
+eviction fix below. The honest options, in preference order:
+1. keep hunting until the isolated rate is zero, then the saturation question is CI tuning rather than cover;
+2. if it must move, move it *with* a recorded isolated failure rate, so nobody later reads `#[ignore]` as "flaky, safe".
+
+Whichever way it goes, it is a decision to make explicitly rather than by attrition.
+
+**Process note for the next investigator:** the failure message carries the whole `ConsensusProbe` trace, which is the
+diagnosis. Do not filter test output through `grep -E "FAILED|^---- "` — that drops exactly the line worth reading.
+
 ### [A] The sampler evicted the very block the cell converged on — FIXED
 The strongest finding of this investigation, and it explains the `await` that appears in **every** frozen trace.
 `Sampler::pending` is bounded (`PENDING_CAP = 64`) because its key is a remote-chosen block hash, and `BoundedMap`
