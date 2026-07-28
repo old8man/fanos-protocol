@@ -366,6 +366,17 @@ pub(crate) fn polar_gap_from_liveness(degraded: u8) -> f64 {
     spectral_gap(&line_rates)
 }
 
+/// The most admission work this engine will do **inline**, in proof-of-work bits.
+///
+/// Derived from the engine's own cadence rather than chosen: a solve blocks the step it happens in, so it must
+/// finish well inside one observation window. At roughly `10^7` hashes a second a 500 ms window is about `2^22`;
+/// 20 bits (~`10^6` hashes, ~0.1 s) leaves the margin that keeps a slow host from stalling its cell to pay an
+/// entry fee.
+///
+/// Past this the refusal is reported and nothing is spent. That is the boundary between a defence and a remote
+/// CPU-exhaustion primitive: without it, any peer could name a number and make honest nodes grind instead of run.
+pub const MAX_INLINE_ADMISSION_BITS: u32 = 20;
+
 impl<F: Field> OverlayNode<F> {
     /// Create a node at `coord`. Its cell neighbours are derived algebraically (the points on
     /// its `q+1` lines) — no discovery walk (spec §L1).
@@ -588,20 +599,62 @@ impl<F: Field> OverlayNode<F> {
             // diagnostics for a log, and the engine has nowhere to write. Surfacing this one is what makes an
             // *adaptive* admission price safe to run at all: without it, a joiner priced out between minting its
             // proof and presenting it is refused forever with no way to learn the number that would work.
-            Some(FrameType::Error) => Self::on_error(frame.body),
+            Some(FrameType::Error) => self.on_error(frame.body),
             _ => Vec::new(),
         }
     }
 
-    /// Decode an `Error` frame and surface the one kind a node can act on.
-    fn on_error(body: &[u8]) -> Vec<Effect> {
+    /// Decode an `Error` frame, act on the one kind a node can act on, and surface it either way.
+    ///
+    /// A refusal that names a price this node can afford is repaid **here**: the admission difficulty is raised
+    /// and the proof re-minted, exactly as [`on_reseat`](Self::reseat) already does when the coordinate moves.
+    /// Above [`MAX_INLINE_ADMISSION_BITS`] it is only reported, because the work would block the engine.
+    fn on_error(&mut self, body: &[u8]) -> Vec<Effect> {
         let Some(err) = crate::frames::parse_error(body) else { return Vec::new() };
         if err.code != fanos_wire::ProtocolError::SybilReject.code() {
             return Vec::new();
         }
-        alloc::vec![Effect::Notify(Notification::AdmissionRefused {
-            required: crate::frames::decode_required_difficulty(&err.reason),
-        })]
+        let required = crate::frames::decode_required_difficulty(&err.reason);
+        if let Some(bits) = required {
+            self.repay_admission(bits);
+        }
+        alloc::vec![Effect::Notify(Notification::AdmissionRefused { required })]
+    }
+
+    /// Re-mint this node's admission proof at `required`, if that is a price worth and safe to pay here.
+    ///
+    /// Three guards, and each answers a way this could be turned against the node that is trying to join:
+    ///
+    /// * **Never below what we already pay.** A peer claiming a *lower* difficulty cannot talk this node into
+    ///   weakening a proof its own operator configured.
+    /// * **Never above [`MAX_INLINE_ADMISSION_BITS`].** "Solve harder" on demand is otherwise a remote
+    ///   CPU-exhaustion primitive aimed at honest joiners: a hostile peer names a huge number and the engine
+    ///   grinds instead of running the cell. Past the bound the refusal is reported and nothing is spent.
+    /// * **Monotone, so repetition is free.** A proof at difficulty `d` satisfies every requirement `≤ d`
+    ///   (`admission::a_solution_for_high_difficulty_also_satisfies_lower_thresholds`), so one solve serves
+    ///   every peer, and a crowd of peers all demanding the maximum costs exactly one solve rather than one
+    ///   each.
+    fn repay_admission(&mut self, required: u32) {
+        let current = self.membership.admission_difficulty.unwrap_or(0);
+        if required <= current || required > MAX_INLINE_ADMISSION_BITS {
+            return;
+        }
+        let coord = self.coord.coords();
+        self.membership.admission_difficulty = Some(required);
+        self.membership.admission_proof = PowAdmission::new(required)
+            .solve(&admission_challenge(&self.membership.identity, coord, self.epoch));
+    }
+
+    /// This node's current admission proof — for tests that assert it was (or was not) re-minted.
+    #[cfg(test)]
+    pub(crate) fn admission_proof_for_test(&self) -> &[u8] {
+        &self.membership.admission_proof
+    }
+
+    /// The difficulty this node currently pays — for tests that assert it did (or did not) move.
+    #[cfg(test)]
+    pub(crate) fn admission_difficulty_for_test(&self) -> Option<u32> {
+        self.membership.admission_difficulty
     }
 
 
@@ -1082,6 +1135,57 @@ mod tests {
     use crate::frames::{announce_body, encode_publish, encode_value};
     use super::*;
     use fanos_field::{F2, F7};
+
+    #[test]
+    fn a_refusal_that_names_an_affordable_price_is_repaid_on_the_spot() {
+        // The point of carrying the price: a joiner one number away from admission repays it and re-announces,
+        // instead of waiting for a human to notice.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default())
+            .with_identity(alloc::vec![7u8; 8])
+            .with_admission_pow(4);
+        let before = node.admission_proof_for_test().to_vec();
+        let refusal = crate::frames::encode_error_with(
+            fanos_wire::ProtocolError::SybilReject,
+            9u32.to_le_bytes().to_vec(),
+        );
+        node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
+        assert_ne!(node.admission_proof_for_test(), &before[..], "the proof was not re-minted at the new price");
+        assert_eq!(node.admission_difficulty_for_test(), Some(9), "and the node now pays the price it was told");
+    }
+
+    #[test]
+    fn a_peer_cannot_talk_a_node_into_paying_less() {
+        // A hostile or broken peer naming a *lower* difficulty must not weaken a proof the operator configured.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default())
+            .with_identity(alloc::vec![7u8; 8])
+            .with_admission_pow(12);
+        let refusal = crate::frames::encode_error_with(
+            fanos_wire::ProtocolError::SybilReject,
+            2u32.to_le_bytes().to_vec(),
+        );
+        node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
+        assert_eq!(node.admission_difficulty_for_test(), Some(12), "the node lowered its own admission cost");
+    }
+
+    #[test]
+    fn an_extortionate_demand_is_reported_and_not_paid() {
+        // The security boundary. "Solve harder" on demand, unbounded, is a remote CPU-exhaustion primitive
+        // pointed at honest joiners: a peer names a huge number and the engine grinds instead of running its
+        // cell. Past `MAX_INLINE_ADMISSION_BITS` the refusal is surfaced and nothing is spent.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default())
+            .with_identity(alloc::vec![7u8; 8])
+            .with_admission_pow(4);
+        let refusal = crate::frames::encode_error_with(
+            fanos_wire::ProtocolError::SybilReject,
+            (MAX_INLINE_ADMISSION_BITS + 1).to_le_bytes().to_vec(),
+        );
+        let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
+        assert_eq!(node.admission_difficulty_for_test(), Some(4), "the engine paid an extortionate demand");
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::AdmissionRefused { .. }))),
+            "and it must still be reported, so a driver or operator can decide"
+        );
+    }
 
     #[test]
     fn a_refused_join_surfaces_the_price_that_would_have_passed() {

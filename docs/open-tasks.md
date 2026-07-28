@@ -83,11 +83,17 @@ To install it, in order:
 1. ~~dispatch `FrameType::Error` and surface the refusal~~ — **DONE**: the overlay now decodes `Error`, and a
    `SybilReject` becomes `Notification::AdmissionRefused { required }`. Only that error is surfaced; the rest are
    diagnostics a sans-I/O engine has nowhere to write and no business waking a driver for.
-2. have the driver re-solve at that difficulty and re-announce, bounded so a hostile peer cannot drive unbounded
-   work by repeatedly demanding more. **This bound is the security question of the step** — an unbounded
-   "solve harder" is a remote CPU-exhaustion primitive pointed at honest nodes.
+2. ~~re-solve at that difficulty, bounded~~ — **DONE**, and in the engine rather than the driver, following the
+   precedent already there: `reseat` re-mints the proof inline when the coordinate moves. Three guards, each
+   answering a way the mechanism could be turned against the joiner — never below what the operator configured
+   (a peer cannot talk a node into a weaker proof); never above `MAX_INLINE_ADMISSION_BITS` (derived from the
+   engine's own 500 ms window, so a solve cannot block the cell — without it "solve harder" on demand is a
+   remote CPU-exhaustion primitive); and monotone, so a crowd all demanding the maximum costs one solve, not one
+   each.
 3. only then install `AdaptivePowAdmission` and drive `LiveDifficulty` from the healer's
-   `AdmissionController::observe`.
+   `AdmissionController::observe`. **The remaining question is what the healer should do with a stress reading
+   from a cell it is itself part of** — a node under attack raises its own price, which is right; a node that
+   *mis*-measures raises it too, and nothing yet cross-checks one node's reading against its cell's.
 
 Weighed and rejected as a *substitute*: carrying the price in the pre-announce exchange. It is a fine
 optimization — the joiner solves right the first time — but the price can change between learning it and
