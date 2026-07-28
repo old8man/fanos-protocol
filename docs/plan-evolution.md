@@ -50,11 +50,14 @@ checkable, and it fails the moment a new orphan appears.
 rejection the network ever sent arrived somewhere that did not read it. Found by accident while building
 something else.
 
-**Guarantee: Invariant.** A test over the source: every `FrameType` variant that appears in an `encode(...)`
-call must also appear in the dispatch `match`, or be listed as send-only with a reason. This would have caught
-`Error` on the day it was written.
+**Guarantee: Invariant.** — **DONE** (`fanos-cli/tests/frame_handling.rs`). Every `FrameType` variant must be
+matched on somewhere, or declared with a reason.
 
-**Suspicion to check first:** `Error` is unlikely to be the only one-directional path.
+**The suspicion was right, and larger than expected.** Eleven of thirty-one codes — `Goaway`, `Join`, `Bridge`,
+`StreamOpen`, `StreamData`, `StreamFin`, `PartialDec`, `Cover`, `SvcAnnounce`, `DiagSyndrome`, `DiagVerdict` —
+were defined and referenced *nowhere*. A third of the registry named a protocol the implementation does not
+speak; every one had a working mechanism under another name. All eleven deleted, and the exception list is now
+empty, which is its intended steady state.
 
 ### I.3 — The simulator runs the composed node, not the engines
 

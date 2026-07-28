@@ -19,7 +19,6 @@ pub enum FrameType {
     HelloAck = 0x01,
     Ping = 0x02,
     Pong = 0x03,
-    Goaway = 0x04,
     Error = 0x05,
     /// A peer reports the source address it **observes** this node's connection arriving from — the
     /// reflexive/public address for NAT traversal (#119). Body: the observed [`SocketAddr`] encoded as
@@ -40,7 +39,6 @@ pub enum FrameType {
     /// when a direct connection / hole-punch cannot be made, so any pair behind NAT can still communicate.
     Relay = 0x09,
     // 0x1* Membership
-    Join = 0x10,
     Announce = 0x11,
     BeaconReq = 0x12,
     Beacon = 0x13,
@@ -79,23 +77,16 @@ pub enum FrameType {
     Value = 0x21,
     Publish = 0x22,
     Ack = 0x23,
-    Bridge = 0x24,
     // 0x3* Direct route
     Route = 0x30,
-    StreamOpen = 0x31,
-    StreamData = 0x32,
-    StreamFin = 0x33,
     /// Hierarchical route: `HierAddr(dst) ‖ payload` — forwarded cell-to-cell toward a multi-level
     /// destination (§L1 recursion). Degenerates to `Route` for a depth-1 (single-plane) address.
     RouteHier = 0x34,
     // 0x4* APHANTOS / NYX
     Tessera = 0x40,
-    PartialDec = 0x41,
-    Cover = 0x42,
     // 0x5* Rendezvous / CALYPSO
     RdvIntro = 0x50,
     RdvReply = 0x51,
-    SvcAnnounce = 0x52,
     /// A client registers its coordinate with a [rendezvous relay] so the relay forwards anonymous
     /// replies delivered at its combiner to the client (audit #54; the sender is the client).
     RdvRegister = 0x53,
@@ -126,8 +117,6 @@ pub enum FrameType {
     PorosReshare = 0x5A,
     // 0x6* DIAKRISIS
     DiagGossip = 0x60,
-    DiagSyndrome = 0x61,
-    DiagVerdict = 0x62,
     /// A node's live polar-class cross-attestation (audit #98, spec §6.4): the rates it honestly
     /// reports for the 3 channels it mediates (`fanos_diakrisis::polar::polar_class`), flooded on
     /// the heartbeat like [`DiagGossip`](Self::DiagGossip). Feeds the 14 free polar sum-rule
@@ -168,13 +157,11 @@ impl FrameType {
             0x01 => Self::HelloAck,
             0x02 => Self::Ping,
             0x03 => Self::Pong,
-            0x04 => Self::Goaway,
             0x05 => Self::Error,
             0x06 => Self::ObservedAddr,
             0x07 => Self::ConnectReq,
             0x08 => Self::PunchTo,
             0x09 => Self::Relay,
-            0x10 => Self::Join,
             0x11 => Self::Announce,
             0x12 => Self::BeaconReq,
             0x13 => Self::Beacon,
@@ -191,18 +178,11 @@ impl FrameType {
             0x21 => Self::Value,
             0x22 => Self::Publish,
             0x23 => Self::Ack,
-            0x24 => Self::Bridge,
             0x30 => Self::Route,
-            0x31 => Self::StreamOpen,
-            0x32 => Self::StreamData,
-            0x33 => Self::StreamFin,
             0x34 => Self::RouteHier,
             0x40 => Self::Tessera,
-            0x41 => Self::PartialDec,
-            0x42 => Self::Cover,
             0x50 => Self::RdvIntro,
             0x51 => Self::RdvReply,
-            0x52 => Self::SvcAnnounce,
             0x53 => Self::RdvRegister,
             0x54 => Self::SvcShareReq,
             0x55 => Self::SvcPartial,
@@ -212,8 +192,6 @@ impl FrameType {
             0x59 => Self::PorosResponse,
             0x5A => Self::PorosReshare,
             0x60 => Self::DiagGossip,
-            0x61 => Self::DiagSyndrome,
-            0x62 => Self::DiagVerdict,
             0x63 => Self::DiagAttest,
             0x64 => Self::DiagLoss,
             0x65 => Self::CellEscalate,
@@ -320,14 +298,14 @@ mod tests {
     #[test]
     fn groups_match_high_nibble() {
         assert_eq!(FrameType::Hello.group(), 0x0);
-        assert_eq!(FrameType::Join.group(), 0x1);
+        assert_eq!(FrameType::Announce.group(), 0x1);
         assert_eq!(FrameType::Tessera.group(), 0x4);
-        assert_eq!(FrameType::DiagVerdict.group(), 0x6);
+        assert_eq!(FrameType::DiagGossip.group(), 0x6);
     }
 
     #[test]
     fn registry_round_trips() {
-        for code in [0x00u64, 0x05, 0x13, 0x1A, 0x1B, 0x1C, 0x24, 0x40, 0x62, 0x63] {
+        for code in [0x00u64, 0x05, 0x13, 0x1A, 0x1B, 0x1C, 0x40, 0x63] {
             let ft = FrameType::from_code(code).unwrap();
             assert_eq!(ft.code(), code);
         }
