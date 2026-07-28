@@ -615,9 +615,15 @@ mod tests {
             let _ = tx.send(if n > 0 { buf[..n as usize].to_vec() } else { Vec::new() });
         });
         let Ok(bytes) = rx.recv_timeout(STORE_TIMEOUT) else {
+            // The session layer drops an outbound payload when the transport channel is full and still reports
+            // success (`fanos_session::offer`), relying on DIAULOS retransmission to recover it. So the count
+            // decides which question this failure is: a non-zero one makes it "why did retransmission not
+            // recover within the window", and a zero one rules that mechanism out entirely.
             panic!(
                 "{what}: nothing arrived within {STORE_TIMEOUT:?} — the sender's write was acknowledged, so this \
-                 is a lost payload rather than a slow one"
+                 is a lost payload rather than a slow one. Outbound payloads dropped for a full transport channel \
+                 during this process: {}",
+                fanos_node::dropped_payloads()
             )
         };
         assert!(!bytes.is_empty(), "{what}: end-of-stream or an error arrived instead of the payload");

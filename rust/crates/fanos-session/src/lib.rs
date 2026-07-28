@@ -155,8 +155,33 @@ pub fn dial_over_transport<T: OverlayTransport>(
 /// A **full** channel *drops* the datagram — the peer's DIAULOS layer retransmits unacked cells, so a
 /// queue that sheds under a flood is exactly the audit-A4b memory bound (and mirrors the overlay's own
 /// lossy delivery). A **closed** channel means the far end is gone, so the loop should stop.
+/// Outbound payloads discarded because the transport channel was full, process-wide — see [`offer`].
+static DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many outbound payloads this process has discarded for a full transport channel.
+///
+/// A diagnostic, not a control: [`offer`] cannot block (its caller also drives the inbound half, so waiting on a
+/// full outbound channel would deadlock the session), so it drops — and DIAULOS's selective repeat is what makes
+/// that survivable. The counter exists because "survivable in principle" and "recovered within the caller's
+/// patience" are different claims, and only one of them can be measured. A payload loss observed at the
+/// application level is a *retransmission* question exactly when this number moved, and something else entirely
+/// when it did not.
+#[must_use]
+pub fn dropped_payloads() -> u64 {
+    DROPPED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Offer a payload to the transport. `false` only when the channel is **closed** — a *full* channel discards the
+/// payload and still reports success, because the caller cannot wait (see [`dropped_payloads`]).
 fn offer(tx: &Sender<Vec<u8>>, payload: Vec<u8>) -> bool {
-    !matches!(tx.try_send(payload), Err(TrySendError::Closed(_)))
+    match tx.try_send(payload) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
 }
 
 /// Bridge the channel transport to a coordinate-addressed overlay: outbound payloads go to `peer`;
