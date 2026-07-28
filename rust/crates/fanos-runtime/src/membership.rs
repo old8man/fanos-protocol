@@ -45,7 +45,7 @@ pub(crate) struct Membership {
     /// per-epoch admission check keeps passing as the coordinate rotates — the "re-paid every epoch" cost
     /// that makes a grinded seat un-maintainable (`anti_eclipse_reshuffle`). `None` = the proof is fixed
     /// (set once via [`with_admission_proof`](OverlayNode::with_admission_proof)) or absent.
-    pub(crate) admission_difficulty: Option<u32>,
+    pub(crate) paid_difficulty: Option<u32>,
     /// The membership view: cell coordinate → announced info (public keys, capabilities), learned by
     /// flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
     pub(crate) members: BTreeMap<Triple, Vec<u8>>,

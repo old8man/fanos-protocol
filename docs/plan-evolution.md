@@ -89,7 +89,10 @@ establishes it. A rule that cannot be pointed at in the code is a rule that is n
 **Evidence.** One field is used both as "the price I demand of joiners" and "the difficulty I solved for
 myself". Found when a scenario test had to *pay* 24 bits to *demand* 24 bits, taking 48 seconds.
 
-**Guarantee: Invariant** (a type that cannot express the confusion).
+**Guarantee: Invariant** — **DONE**. Two builders, `demanding(bits)` and `paying(bits)`, and the field is
+`paid_difficulty`. The conflation was worse than untidy: a node's own proof must satisfy its *peers'* gates, so
+its own gate has nothing to do with it — coupled, raising the price you charge forced you to pay it yourself for
+nothing. Pinned by `what_a_node_demands_and_what_it_pays_are_independent`, falsified by re-coupling them.
 
 ---
 

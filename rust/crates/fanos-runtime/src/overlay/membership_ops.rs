@@ -226,7 +226,7 @@ impl<F: Field> OverlayNode<F> {
         // `self.epoch` is already the new epoch here — the composite drives the overlay to the beacon epoch
         // before issuing this `Reseat`. Only when PoW admission is in use (`with_admission_pow`); cheap at a
         // modest difficulty, and deterministic (sans-I/O replay is preserved).
-        if let Some(difficulty) = self.membership.admission_difficulty {
+        if let Some(difficulty) = self.membership.paid_difficulty {
             self.membership.admission_proof =
                 PowAdmission::new(difficulty).solve(&admission_challenge(&self.membership.identity, new_coord, self.epoch));
         }

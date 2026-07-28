@@ -635,26 +635,14 @@ impl<F: Field> OverlayNode<F> {
     ///   every peer, and a crowd of peers all demanding the maximum costs exactly one solve rather than one
     ///   each.
     fn repay_admission(&mut self, required: u32) {
-        let current = self.membership.admission_difficulty.unwrap_or(0);
+        let current = self.membership.paid_difficulty.unwrap_or(0);
         if required <= current || required > MAX_INLINE_ADMISSION_BITS {
             return;
         }
         let coord = self.coord.coords();
-        self.membership.admission_difficulty = Some(required);
+        self.membership.paid_difficulty = Some(required);
         self.membership.admission_proof = PowAdmission::new(required)
             .solve(&admission_challenge(&self.membership.identity, coord, self.epoch));
-    }
-
-    /// Demand `difficulty` of joiners **without** solving it ourselves — for tests only.
-    ///
-    /// `with_admission_pow` couples two separate things: the price this node demands of others, and the proof
-    /// it mints for itself. A test that wants a strict gate should not have to pay for one, and paying turned a
-    /// scenario test into a 48-second one.
-    #[cfg(test)]
-    pub(crate) fn demanding_for_test(mut self, difficulty: u32) -> Self {
-        self.config.require_admission = true;
-        self.membership.admission_policy = Some(Box::new(PowAdmission::new(difficulty)));
-        self
     }
 
     /// This node's current admission proof — for tests that assert it was (or was not) re-minted.
@@ -665,8 +653,8 @@ impl<F: Field> OverlayNode<F> {
 
     /// The difficulty this node currently pays — for tests that assert it did (or did not) move.
     #[cfg(test)]
-    pub(crate) fn admission_difficulty_for_test(&self) -> Option<u32> {
-        self.membership.admission_difficulty
+    pub(crate) fn paid_difficulty_for_test(&self) -> Option<u32> {
+        self.membership.paid_difficulty
     }
 
 
@@ -728,23 +716,40 @@ impl<F: Field> OverlayNode<F> {
     /// at ~`2^difficulty` hashes. Prefer this to wiring [`with_admission_policy`](Self::with_admission_policy)
     /// + [`with_admission_proof`](Self::with_admission_proof) by hand when the policy is PoW.
     #[must_use]
-    pub fn with_admission_pow(mut self, difficulty: u32) -> Self {
+    pub fn with_admission_pow(self, difficulty: u32) -> Self {
+        self.demanding(difficulty).paying(difficulty)
+    }
+
+    /// **Demand** `bits` of every joiner — install the admission gate at that floor.
+    ///
+    /// Adaptive above the floor: the coherence controller raises the live price as the cell's measured stress
+    /// rises, which is the only response FANOS has that acts on the *magnitude* of a flood rather than on its
+    /// aftermath (T-104: a cell survives iff `‖h‖ < κ·r_stab`, and everything else moves `κ`). It can never go
+    /// under the floor, so a stuck sensor or a compromised controller cannot open a door the operator closed.
+    /// At rest the live value equals the floor, so an unstressed node behaves exactly as a fixed gate did.
+    #[must_use]
+    pub fn demanding(mut self, bits: u32) -> Self {
         self.config.require_admission = true;
-        self.membership.admission_difficulty = Some(difficulty);
-        // **Adaptive, not fixed.** `difficulty` becomes the floor an operator guarantees, and the coherence
-        // controller may raise the live price above it as the cell's measured stress rises — the only response
-        // FANOS has that acts on the *magnitude* of a flood rather than on its aftermath (T-104: a cell
-        // survives iff `‖h‖ < κ·r_stab`, and everything else moves `κ`). It can never go under the floor, so a
-        // stuck sensor or a compromised controller cannot open a door the operator closed.
-        //
-        // At rest the live value equals the floor, so a node that is not under stress behaves exactly as the
-        // fixed gate did.
-        let live = LiveDifficulty::new(difficulty);
-        self.membership.admission_policy =
-            Some(Box::new(AdaptivePowAdmission::new(difficulty, live.clone())));
-        self.healer.set_admission(difficulty, live);
-        self.membership.admission_proof =
-            PowAdmission::new(difficulty).solve(&admission_challenge(&self.membership.identity, self.coord.coords(), self.epoch));
+        let live = LiveDifficulty::new(bits);
+        self.membership.admission_policy = Some(Box::new(AdaptivePowAdmission::new(bits, live.clone())));
+        self.healer.set_admission(bits, live);
+        self
+    }
+
+    /// **Pay** `bits` — mint this node's own admission proof at that difficulty, and re-mint it there whenever
+    /// the coordinate moves.
+    ///
+    /// Separate from [`demanding`](Self::demanding), and the separation is the point: a node's own proof has to
+    /// satisfy its *peers'* gates, and its own gate has nothing to do with it. While the two shared one number,
+    /// raising the price a node charged forced it to pay that same price itself — a cost with no purpose, and
+    /// one that made a scenario test spend 48 seconds minting a proof nobody was going to check.
+    ///
+    /// A peer that turns this node away raises it, bounded — see `repay_admission`.
+    #[must_use]
+    pub fn paying(mut self, bits: u32) -> Self {
+        self.membership.paid_difficulty = Some(bits);
+        self.membership.admission_proof = PowAdmission::new(bits)
+            .solve(&admission_challenge(&self.membership.identity, self.coord.coords(), self.epoch));
         self
     }
 
@@ -1173,7 +1178,7 @@ mod tests {
         );
         node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
         assert_ne!(node.admission_proof_for_test(), &before[..], "the proof was not re-minted at the new price");
-        assert_eq!(node.admission_difficulty_for_test(), Some(9), "and the node now pays the price it was told");
+        assert_eq!(node.paid_difficulty_for_test(), Some(9), "and the node now pays the price it was told");
     }
 
     #[test]
@@ -1187,7 +1192,7 @@ mod tests {
             2u32.to_le_bytes().to_vec(),
         );
         node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
-        assert_eq!(node.admission_difficulty_for_test(), Some(12), "the node lowered its own admission cost");
+        assert_eq!(node.paid_difficulty_for_test(), Some(12), "the node lowered its own admission cost");
     }
 
     #[test]
@@ -1203,10 +1208,37 @@ mod tests {
             (MAX_INLINE_ADMISSION_BITS + 1).to_le_bytes().to_vec(),
         );
         let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
-        assert_eq!(node.admission_difficulty_for_test(), Some(4), "the engine paid an extortionate demand");
+        assert_eq!(node.paid_difficulty_for_test(), Some(4), "the engine paid an extortionate demand");
         assert!(
             effects.iter().any(|e| matches!(e, Effect::Notify(Notification::AdmissionRefused { .. }))),
             "and it must still be reported, so a driver or operator can decide"
+        );
+    }
+
+    #[test]
+    fn what_a_node_demands_and_what_it_pays_are_independent() {
+        // The separation, asserted. A node's own proof has to satisfy its *peers'* gates; its own gate has
+        // nothing to do with it. While one number served both, charging more forced a node to pay more for no
+        // reason — a real cost, and the one that made a scenario test spend 48 seconds minting a proof nobody
+        // was going to check.
+        let strict_but_cheap = OverlayNode::<F2>::new(Point::at(0), Config::default())
+            .with_identity(alloc::vec![1u8; 8])
+            .paying(3)
+            .demanding(19);
+        assert_eq!(strict_but_cheap.paid_difficulty_for_test(), Some(3), "demanding must not raise what we pay");
+
+        // …and the converse: paying a lot does not oblige a node to charge a lot.
+        let generous_but_diligent = OverlayNode::<F2>::new(Point::at(0), Config::default())
+            .with_identity(alloc::vec![2u8; 8])
+            .demanding(1)
+            .paying(9);
+        assert_eq!(generous_but_diligent.paid_difficulty_for_test(), Some(9));
+        // The gate is the demand, not the payment: a 1-bit proof satisfies a 1-bit door.
+        let challenge = admission_challenge(&alloc::vec![2u8; 8], Point::<F2>::at(0).coords(), 0.into());
+        let cheap = PowAdmission::new(1).solve(&challenge);
+        assert!(
+            generous_but_diligent.membership.admission_policy.as_ref().is_some_and(|p| p.admits(&challenge, &cheap)),
+            "the gate charged what the node paid instead of what it demanded"
         );
     }
 
@@ -1245,8 +1277,8 @@ mod tests {
         // test whose scenario silently evaporates is worse than one that fails loudly.
         let mut refuser = OverlayNode::<F2>::new(Point::at(2), Config::default())
             .with_identity(alloc::vec![9u8; 8])
-            .with_admission_pow(4)
-            .demanding_for_test(STRICT);
+            .paying(4)
+            .demanding(STRICT);
         let challenge = admission_challenge(&identity, joiner_coord, 0.into());
         assert!(
             !PowAdmission::new(STRICT).admits(&challenge, joiner.admission_proof_for_test()),
