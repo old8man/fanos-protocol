@@ -645,6 +645,18 @@ impl<F: Field> OverlayNode<F> {
             .solve(&admission_challenge(&self.membership.identity, coord, self.epoch));
     }
 
+    /// Demand `difficulty` of joiners **without** solving it ourselves — for tests only.
+    ///
+    /// `with_admission_pow` couples two separate things: the price this node demands of others, and the proof
+    /// it mints for itself. A test that wants a strict gate should not have to pay for one, and paying turned a
+    /// scenario test into a 48-second one.
+    #[cfg(test)]
+    pub(crate) fn demanding_for_test(mut self, difficulty: u32) -> Self {
+        self.config.require_admission = true;
+        self.membership.admission_policy = Some(Box::new(PowAdmission::new(difficulty)));
+        self
+    }
+
     /// This node's current admission proof — for tests that assert it was (or was not) re-minted.
     #[cfg(test)]
     pub(crate) fn admission_proof_for_test(&self) -> &[u8] {
@@ -1184,6 +1196,63 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(e, Effect::Notify(Notification::AdmissionRefused { .. }))),
             "and it must still be reported, so a driver or operator can decide"
+        );
+    }
+
+    #[test]
+    fn one_peer_pricing_a_joiner_out_does_not_exclude_it_from_the_cell() {
+        // The answer to "what stops a node that mis-measures its stress from closing the network?" — and it is
+        // a property of the shape rather than machinery added on top. Admission is decided by **each peer for
+        // itself**: `members` is one node's own view, and `Announce` is flooded to all of them. So a peer whose
+        // sensor is wrong, or that is simply hostile, shuts its own door and no one else's.
+        //
+        // That is why no cross-check between nodes was built for this. A quorum on the admission price would be
+        // a new consensus to reach, a new thing to capture, and a new way for the cell to stall — to buy a
+        // property the geometry already provides.
+        let identity = alloc::vec![3u8; 8];
+        let joiner_coord = Point::<F2>::at(1).coords();
+        let joiner = OverlayNode::<F2>::new(Point::at(1), Config::default())
+            .with_identity(identity.clone())
+            .with_admission_pow(4);
+        let announce = encode(
+            FrameType::Announce,
+            &crate::frames::announce_body(
+                joiner_coord,
+                &joiner.router.address,
+                &identity,
+                &[],
+                joiner.admission_proof_for_test(),
+                &[1u8],
+            ),
+        );
+
+        // One peer demands a price this joiner has not paid; the other demands exactly what it did.
+        // Strict gate, cheap fixture: the refuser demands 20 bits without minting one itself. The premise is
+        // asserted below rather than assumed — a 4-bit proof satisfies a 20-bit gate once in 2^16 draws, and a
+        // test whose scenario silently evaporates is worse than one that fails loudly.
+        const STRICT: u32 = 20;
+        let mut refuser = OverlayNode::<F2>::new(Point::at(2), Config::default())
+            .with_identity(alloc::vec![9u8; 8])
+            .with_admission_pow(4)
+            .demanding_for_test(STRICT);
+        let challenge = admission_challenge(&identity, joiner_coord, 0.into());
+        assert!(
+            !PowAdmission::new(STRICT).admits(&challenge, joiner.admission_proof_for_test()),
+            "the cheap proof happened to satisfy the strict gate — re-run; there is nothing being tested here"
+        );
+        let mut admitter = OverlayNode::<F2>::new(Point::at(3), Config::default())
+            .with_identity(alloc::vec![8u8; 8])
+            .with_admission_pow(4);
+        refuser.step(Instant(0), Input::Message { from: joiner_coord, frame: announce.clone() });
+        admitter.step(Instant(0), Input::Message { from: joiner_coord, frame: announce });
+
+        assert!(
+            !refuser.members().any(|(c, _)| c == joiner_coord),
+            "the refusing peer admitted a joiner that did not pay its price"
+        );
+        assert!(
+            admitter.members().any(|(c, _)| c == joiner_coord),
+            "one peer's refusal must not travel — the joiner paid this peer's price and belongs in its view"
         );
     }
 

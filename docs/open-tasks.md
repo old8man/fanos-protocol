@@ -91,9 +91,16 @@ To install it, in order:
    remote CPU-exhaustion primitive); and monotone, so a crowd all demanding the maximum costs one solve, not one
    each.
 3. only then install `AdaptivePowAdmission` and drive `LiveDifficulty` from the healer's
-   `AdmissionController::observe`. **The remaining question is what the healer should do with a stress reading
-   from a cell it is itself part of** — a node under attack raises its own price, which is right; a node that
-   *mis*-measures raises it too, and nothing yet cross-checks one node's reading against its cell's.
+   `AdmissionController::observe`.
+
+**The open question is answered, and the answer is that no machinery is needed.** "What stops a node that
+mis-measures its stress from closing the network?" — the shape already does. Admission is decided by *each peer
+for itself*: `members` is one node's own view and `Announce` is flooded to all of them, so a peer whose sensor is
+wrong, or which is simply hostile, shuts its own door and no one else's. A joiner refused by one is admitted by
+the rest. Pinned by `one_peer_pricing_a_joiner_out_does_not_exclude_it_from_the_cell`.
+
+A quorum on the admission price would have bought that property at the cost of a new consensus to reach, a new
+thing to capture, and a new way for the cell to stall.
 
 Weighed and rejected as a *substitute*: carrying the price in the pre-announce exchange. It is a fine
 optimization — the joiner solves right the first time — but the price can change between learning it and
