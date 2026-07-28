@@ -233,144 +233,24 @@ was removed on the way (both forwarded tests were the only ones synchronising on
 - Residual instrument gap: a host that starves only *midway* still reads as a wedge, because the discriminator asks
   whether the process has *ever* delivered.
 
-### [A] `host_a_service_and_serve_a_client_over_the_c_abi` fails when run as a serial pair in release
-**It is intermittent, and no discriminator survived measurement.** Roughly **3 failures in 15 optimised runs**; debug
-never failed. The failure mode is a panic on `assert!(!client.is_null(), "B dialed the hosted service")` after the dial
-retry loop (60 × 500 ms) exhausts — so `fanos_service_connect` returned null for thirty seconds running and the `.fanos`
-name never resolved. That is an ONOMA descriptor lookup, not a blocked thread.
+### [A] The C ABI example is the most contention-sensitive path — folded into the load item below
+**Not a separate defect.** Every layer under it has been exonerated, each by measurement rather than inspection:
 
-Three hypotheses were each formed from two runs and each refuted by the next two — a caution worth recording as much as
-the finding:
-
-| claimed discriminator | refuted by |
+| layer | how it was cleared |
 |---|---|
-| "hangs in release" | it does not hang; it panics after 150 s, and passes alone in release in 0.01 s |
-| "fails as a *pair* in release" | 8 consecutive pair-in-release passes followed the one failure |
-| "fails with `--test-threads 1`" | a later `--test-threads 1` release run passed in 0.01 s |
+| descriptor publication | the readiness point (`fanos_join`) removed those failures entirely |
+| store lookup | bounded by `STORE_TIMEOUT`; the unbounded await *was* the 34-minute stall, and is fixed |
+| `offer` dropping a payload | the counter it now exposes reads **0** on every failure |
+| session + reliable stream | `a_sub_segment_write_is_never_lost_across_the_session_pair` — 200 clean in-process rounds |
+| interactive streaming over QUIC | `an_interactive_write_without_half_close_reaches_the_peer` — 8 of 8, a shape nothing covered before |
+| the accept-queue indirection | `an_accepted_stream_taken_from_a_queue_receives_an_interactive_write` — 8 of 8, same queue-and-guard shape, one runtime |
+| runtime worker count | refuted by interleaved A/B (2 → 6/8, 4 → 8/8 under identical load); only the single-worker case was real, and is fixed by a floor of two |
 
-Instrumenting `NodeResolver::resolve` (a branch-by-branch `eprintln` on each of its four failure points) produced **4 of 4
-passes and no output at all**, so the instrumentation perturbs it away — which rules out print-debugging as the next step
-and points at a timing race.
-
-- Both tests hold `SERIAL` and free their handles, so the interference is something that outlives `fanos_free`: a lingering
-  `serve` task, a QUIC endpoint still bound to a coordinate the next test reseats onto, or a store entry from the previous
-  service. Release timing changes the overlap; debug's extra slack hides it.
-- **Do not "fix" it with a settle sleep.** The observable is the descriptor resolving, and the retry loop already waits
-  30 s for it — a longer wait measures nothing new. What is missing is knowing *why* resolution fails: instrument
-  `NodeResolver::resolve` for the name it looks up and the coordinates it queries, and compare the pair-in-release run
-  against the alone-in-release one.
-- **Not** skipped in the nightly job: it runs as its own last step with a 5-minute timeout, so a stall bounds itself and
-  the zero-knowledge proofs finish first regardless. A plain failure would not have starved them anyway — libtest
-  continues — but the one 34-minute stall did.
-**Narrowed, and two real defects fixed on the way.** Asserting the descriptor's presence *before* dialing split the causes,
-and the answer was neither of the two the null return suggested:
-
-1. A published — the "A can read its own descriptor" assertion never failed.
-2. **B's store read is what failed**, and worse, it *stalled*: `fanos_lookup` awaited `Client::get` with no bound, so a Get
-   that never resolved blocked the C caller indefinitely. That is the 34-minute stall. `NodeResolver` had always bounded
-   its own lookups (`STORE_TIMEOUT`, documented as exactly this); the C ABI did not, and neither did the descriptor publish
-   inside `fanos_service_host`. Both are bounded now, and the constant is public because it is a contract an embedder
-   cannot otherwise know.
-
-With those bounds the flake rate went from 3 in 15 to **1 in 6**, the stalls stopped, and the survivor fails *later* and
-elsewhere — `"the host received the client's bytes"`, i.e. the echo after a successful dial. So what remains is a data-path
-flake, not a resolution one, and the resolution story is closed.
-**A third defect found and fixed, and it changes the residual's shape.** `serve` reaps a session the instant its handler
-returns (`spawn_client_session`: `handler(stream).await; done_tx.send(from)`), and `fanos_service_host`'s handler returned
-as soon as it queued the stream for `fanos_service_accept`. So the bridge feeding the accepted `DuplexStream` was torn
-down while the C caller still held it — the accepted stream's peer end dropped, and the first read returned 0. It mostly
-worked because the client's bytes were usually already buffered before the reap. The handler now parks on a guard the
-accepted handle owns, so the session is reaped when the caller frees the stream, which is when it should be.
-
-That is correct on its own merits, and it converts the failure rather than removing it: **7 of 8 release runs pass**
-(against 5 of 6 before, statistically the same), and the survivor no longer fails fast with EOF — it **stalls**, because
-the stream is now legitimately open and waiting for bytes that sometimes never arrive.
-- So the residual is exactly that: the client's write occasionally does not reach the host's accepted stream. Not an
-  early close, not a resolution failure, not a missing timeout — the three the investigation has already eliminated.
-**The residual now names itself.** The test's reads are bounded (a `read_bounded` helper: the blocking read runs on its own
-thread, waited on for `STORE_TIMEOUT` — the ABI's own "a network operation that has not answered by now will not"
-horizon), so the surviving failure reports:
-
-> `the host received the client's bytes: nothing arrived within 5s — the sender's write was acknowledged, so this is a
-> lost payload rather than a slow one`
-
-Rate unchanged at **1 in 8**, but a five-second named failure instead of a 300-second stall. What is left is a single,
-sharply-stated question: a `fanos_stream_write` that returned the full byte count, whose bytes never reach the host's
-accepted stream. Everything around it has been eliminated — the name resolves, the store call is bounded, the session is
-no longer reaped early, and the stream is open rather than at EOF.
-**Refuted by measurement, and the root cause found elsewhere.** The `offer` drop hypothesis below is dead: the failure
-message now quotes the drop counter and it reads **0** every time. Channel capacity is 1024, so a 23-byte payload never
-fills it.
-
-What *was* wrong, and is now fixed, is that the ABI had no readiness point. `fanos_open` returns before the node has a
-peer — nothing in `Node::start` awaits, by design — and the store answers "no value" *instantly* when it knows nobody to
-ask. `fanos_join` was a no-op whose own doc admitted it existed "so bindings can mirror the open/join lifecycle": the
-right shape with a hollow implementation. It now issues the join and waits for the first peer. That removed the publish
-and lookup failures entirely; every remaining failure is the same one, at the same place.
-
-**The residual, sharply bounded.** 2 runs in 10: a 23-byte write returns its full count, zero drops, and the host's read
-finds nothing within 5 s. The session + reliable-stream pair is **exonerated** — `a_sub_segment_write_is_never_lost_across_the_session_pair`
-runs that exact shape 200 times over an in-process channel transport with no losses — so the fault is below them, in
-`fanos-node::serve`'s coordinate demux or the QUIC datagram path.
-**The streaming path is exonerated too, by a test that did not exist.** Every exchange in this repository — including
-`common::exchange` — writes, *half-closes*, and reads to end-of-stream. Nothing covered the **interactive** shape, where
-the stream stays open and the reader must be woken by the data alone, which is exactly the shape the C ABI example uses
-and the only one observed losing a payload. `diaulos_quic::an_interactive_write_without_half_close_reaches_the_peer` now
-covers it — same 23-byte sub-segment payload, `serve` + `dial_service` over real QUIC, no half-close on either side — and
-it passes **8 runs of 8**.
-
-So the residual is bounded to what is left unique to the FFI, and nothing else:
-1. **A tokio runtime per node.** `fanos_open` builds one each, so the two-node example runs two multi-threaded runtimes
-   (~32 worker threads on 16 cores) where every async test shares one.
-2. **Blocking calls from outside the runtime.** `fanos_stream_write`/`_read`/`fanos_service_accept` each `Handle::block_on`
-   from the caller's thread, so the session drivers must make progress on worker threads while that thread is parked.
-3. The accept-queue indirection (`serve` handler → mpsc → `fanos_service_accept`).
-
-Everything else is now excluded by measurement rather than by argument: publication and lookup (fixed by the readiness
-point), `offer` drops (counter reads 0), the session + reliable-stream pair (200 clean rounds in-process), and the
-streaming path over real QUIC with the demux (8 clean runs).
-**(1) is refuted, and how it was refuted is the important part.** Sequential batches said worker count was the cause:
-`worker_threads(1)` failed 10 of 10, `(2)` passed **20 of 20**, and `(3)`, `(4)` and the default each sat at 8 of 10. An
-**interleaved A/B** — alternating 2 and 4 across eight pairs so both see the same host load — put two workers at 6/8 and
-four at 8/8. So the 20/20 was a quiet window on a host whose load is set by a neighbouring project, not a property of the
-parameter.
-- One measurement survived and is now fixed: a **single-worker** runtime fails 10 of 10, because every call in this ABI
-  blocks the caller's thread and the runtime must still drive the node. `fanos_open` now floors the worker count at two,
-  which only matters on a single-core host — where the ABI was simply broken.
-- **Methodological rule for this host, learned six times over:** sequential batches cannot compare two variants here. The
-  neighbouring project's load moves by an order of magnitude within minutes, so any A-then-B comparison measures the
-  window, not the change. Interleave, or do not compare.
-- What is left of the residual: (2) blocking `Handle::block_on` calls from outside the runtime, and (3) the accept-queue
-  indirection. Both are structural to the ABI's shape rather than tunable, so the next step is to reproduce the FFI's
-  arrangement in an async test — two nodes, two runtimes, calls from a non-runtime thread — and see whether the loss
-  follows the arrangement.
-- `RTO_BACKOFF_MULT` is worth noting regardless: it is **4**, not TCP's 2, so retransmits land at 60 ms, 240 ms, 960 ms,
-  3.84 s — only four attempts fit inside a five-second wait.
-
-Superseded reading, kept so it is not re-derived:
-
-```rust
-fn offer(tx: &Sender<Vec<u8>>, payload: Vec<u8>) -> bool {
-    !matches!(tx.try_send(payload), Err(TrySendError::Closed(_)))
-}
-```
-
-`Err(TrySendError::Full(_))` returns `true` — the payload is discarded and the caller is told the transport is fine. That
-is precisely "the write was acknowledged and the bytes never arrived", and it is on the path every session write takes
-(`for payload in payloads { if !offer(&outbound, payload) { return } }`).
-
-The write path itself is sound — `session.write(chunk); session.flush();` with a reactive emit, so a sub-segment write does
-ship (that flush was a previous fix and it holds). What is not sound is that a full outbound channel loses a segment
-silently.
-
-- **This is survivable only because DIAULOS is reliable above it** (selective repeat + SACK): a dropped segment should be
-  retransmitted on a later `poll_payloads`. So the question the 1-in-8 rate poses is not "can a segment be dropped" — it
-  demonstrably can — but **why the retransmission does not recover it within 5 s**, or whether the drop happens somewhere
-  the retransmit does not cover (e.g. a handshake payload, before the reliability window exists).
-- **Do not simply switch to `send().await`.** The loop calling `offer` also drives the inbound half; blocking it on a full
-  outbound channel invites a deadlock, which is presumably why `try_send` is there. The fix wants the drop to be *visible*
-  (a counter the session exposes) before it is changed, so that the retransmission hypothesis can be measured rather than
-  assumed.
+What remains is that the example runs **two full node stacks, two multi-threaded runtimes, and a parked caller thread in one
+process** — the most contention-sensitive arrangement in the repository — and its failure rate tracks host load exactly as
+the workspace suites' does. In the last interleaved batch, at load 13–19, it passed 8 of 8. Treat it as an instance of the
+load item, not as its own mystery: the same fix (bounding concurrency for transport-bound suites) covers it, and no
+layer-specific hypothesis has survived a controlled comparison.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's

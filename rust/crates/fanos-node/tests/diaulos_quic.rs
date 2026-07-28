@@ -11,6 +11,8 @@
 
 mod common;
 
+use tokio::sync::{mpsc, oneshot};
+
 use std::net::SocketAddr;
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
@@ -323,6 +325,59 @@ async fn an_interactive_write_without_half_close_reaches_the_peer() {
     let sent = b"c-abi service host echo"; // the same 23-byte sub-segment payload
     let echoed = common::echo(&mut stream, sent).await;
     assert_eq!(echoed, sent, "an interactive write round-trips without either side half-closing");
+
+    a.shutdown();
+    b.shutdown();
+}
+
+/// **The accept-queue arrangement, without the C ABI's two runtimes and blocking calls.**
+///
+/// `fanos_service_host` does not hand each session to a handler that serves it; it forwards the stream over an
+/// mpsc queue for `fanos_service_accept` to take, parking the handler on a guard so `serve` does not reap the
+/// session underneath the consumer. That indirection and the ABI's arrangement — a tokio runtime per node, every
+/// call blocking the caller's thread on `block_on` — are the last two candidates for a payload that is written,
+/// acknowledged, and never delivered (about 2 runs in 10 through the ABI).
+///
+/// This isolates the first from the second: the same queue-and-guard shape, entirely async on one runtime. A
+/// failure here indicts the indirection; a clean run leaves only the arrangement.
+#[tokio::test]
+async fn an_accepted_stream_taken_from_a_queue_receives_an_interactive_write() {
+    let _serial = common::serial_cell().await;
+    let a = start(vec![]).await;
+    let (a_addr, a_net) = (a.address(), a.local_addr());
+    let b = start_distinct(vec![Peer { coord: a_addr, addr: a_net }], &[a_addr]).await;
+
+    let mut srng = SeedRng::from_seed(b"quic-queue-key");
+    let service = StaticKeypair::generate(&mut srng);
+    let service_public = service.public().clone();
+    // Exactly `fanos_service_host`'s shape: queue the stream, park on a guard the consumer owns.
+    let (tx, mut incoming) = mpsc::channel::<(DuplexStream, oneshot::Sender<()>)>(64);
+    serve(a.client(), service, SeedRng::from_seed(b"quic-queue-srv"), move |stream| {
+        let tx = tx.clone();
+        async move {
+            let (guard, released) = oneshot::channel::<()>();
+            if tx.send((stream, guard)).await.is_ok() {
+                let _ = released.await;
+            }
+        }
+    });
+
+    let mut drng = SeedRng::from_seed(b"quic-queue-cli");
+    let mut client = dial_service(b.client(), a_addr, &service_public, &mut drng);
+    let sent = b"c-abi service host echo";
+    client.write_all(sent).await.expect("the client's write is accepted");
+    client.flush().await.expect("and flushed");
+
+    let (mut accepted, _guard) = tokio::time::timeout(common::HANG_CEILING, incoming.recv())
+        .await
+        .expect("a session arrived on the accept queue")
+        .expect("the queue is open");
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), accepted.read(&mut buf))
+        .await
+        .expect("the accepted stream received the client's write within five seconds")
+        .expect("the accepted stream is readable");
+    assert_eq!(buf.get(..n), Some(&sent[..]), "the interactive payload arrived intact");
 
     a.shutdown();
     b.shutdown();
