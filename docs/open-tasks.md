@@ -49,7 +49,30 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
-### [A] The residual stall is now ONE straggler that knows it is behind and does not catch up
+### [A] The sampler evicted the very block the cell converged on — FIXED
+The strongest finding of this investigation, and it explains the `await` that appears in **every** frozen trace.
+`Sampler::pending` is bounded (`PENDING_CAP = 64`) because its key is a remote-chosen block hash, and `BoundedMap`
+evicts in **insertion order**. Under SSLE all-propose a height costs one skeleton per validator per round, so a
+seven-validator cell overruns the map in nine rounds — and the first entry discarded is the earliest, which is round 0's
+min-ticket winner: the block the cell converged on. Later proposals that will never be chosen evict the one that was.
+
+The consequence is a loop, not a delay: once evicted the block leaves `outstanding()`, so no shard is ever requested for
+it again; the driver sees the validator still waiting and re-fetches the skeleton; the next round's proposals evict it
+again. Measured live as seven of seven validators at round 13 reporting `await` for a body none of them held.
+
+Fixed by an invariant rather than a bigger number: `Sampler::pin` protects exactly the one skeleton the engine has
+already committed to needing (`awaited_body`), and the driver pins it every tick. The flood defence the cap exists for is
+untouched — pinned by `pinning_protects_exactly_one_entry_and_not_the_cap`, and the defect itself by
+`the_awaited_skeleton_survives_a_flood_of_later_proposals`; both verified load-bearing by disabling the pin.
+
+### [A] Also closed on the way: a shard was only ever asked of its custodian
+`request_shards` addressed shard `i` solely to validator `i`. Correct while dispersal worked — but a validator reaches
+that recovery path *because* it did not, and then every custodian is as empty as the requester. Now the block's
+**proposer** is asked too: the one peer that built the block and can regenerate any index, a deterministic address
+rather than the blind rotation that preceded it (which itself replaced a whole-cell broadcast measured strictly worse,
+0 of 3 against 7 of 8).
+
+### [A] Superseded: the residual stall is ONE straggler that knows it is behind
 The probe changed the picture completely. The current residual failure reads:
 
 ```

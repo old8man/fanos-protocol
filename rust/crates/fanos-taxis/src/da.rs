@@ -55,13 +55,15 @@ pub struct Sampler {
     held: BoundedMap<[u8; 32], Vec<u8>>,
     /// Skeletons whose payload is still being sampled, keyed by block hash.
     pending: BoundedMap<[u8; 32], Pending>,
+    /// The one skeleton eviction must not take — see [`pin`](Sampler::pin).
+    pinned: Option<[u8; 32]>,
 }
 
 impl Sampler {
     /// A sampler for the validator at index `me`.
     #[must_use]
     pub fn new(me: u8) -> Self {
-        Self { me, held: BoundedMap::new(HELD_CAP), pending: BoundedMap::new(PENDING_CAP) }
+        Self { me, held: BoundedMap::new(HELD_CAP), pending: BoundedMap::new(PENDING_CAP), pinned: None }
     }
 
     /// Retain the shard dispersed to this validator for `block`, so peers can sample it from here.
@@ -86,8 +88,34 @@ impl Sampler {
         {
             *slot = Some(mine.clone());
         }
-        self.pending.insert(hash, Pending { skeleton, shards });
+        if let Some((evicted, victim)) = self.pending.insert(hash, Pending { skeleton, shards })
+            && self.pinned == Some(evicted)
+        {
+            // Evicting the one block this validator is stuck on would strand it: it leaves `outstanding`, so no shard
+            // is ever requested for it again. Put it back — the re-insert takes the next-oldest instead, which is by
+            // construction a skeleton nobody is waiting for. See [`pin`](Self::pin).
+            self.pending.insert(evicted, victim);
+        }
         true
+    }
+
+    /// Protect one skeleton from eviction: the block this validator is **stuck waiting for**, or `None`.
+    ///
+    /// [`PENDING_CAP`] bounds this map because its key is a remote-chosen block hash, and eviction is by insertion
+    /// order — which is exactly wrong for the block that matters. Under SSLE every line member proposes, so a height
+    /// costs one skeleton per validator per round; a seven-validator cell overruns a 64-entry map in nine rounds, and
+    /// the **first** entry discarded is the earliest — typically round 0's min-ticket winner, the block the cell
+    /// actually converged on. Later proposals that will never be chosen push out the one that was.
+    ///
+    /// The effect is not a slow recovery but a loop: once evicted the block leaves [`outstanding`](Self::outstanding),
+    /// so no shard is requested for it; the driver notices the validator is still waiting and re-fetches the skeleton;
+    /// the next round's proposals evict it again. Measured live as every validator in a cell reporting `await` at round
+    /// 13 for a body none of them held.
+    ///
+    /// Pinning is sound because the pinned entry is the one the engine has *already committed to needing*
+    /// (`ConsensusEngine::awaited_body`), and it is a single entry: the flood defence the cap exists for is untouched.
+    pub fn pin(&mut self, block: Option<[u8; 32]>) {
+        self.pinned = block;
     }
 
     /// The shard indices still missing for `block`, i.e. what to request. Empty if nothing is pending for it.
@@ -110,6 +138,17 @@ impl Sampler {
     #[must_use]
     pub fn outstanding(&self) -> Vec<([u8; 32], Vec<u8>)> {
         self.pending.iter().map(|(&h, _)| (h, self.missing(&h))).filter(|(_, m)| !m.is_empty()).collect()
+    }
+
+    /// The validator that **proposed** a block still being sampled — the one peer guaranteed to hold its whole payload.
+    ///
+    /// Every other peer is the custodian of a single shard and may never have been dispersed it; the proposer built the
+    /// block, so it can regenerate any index (`ConsensusEngine::shard_of`, the fallback behind [`serve`](Self::serve)).
+    /// A requester holding the skeleton therefore already knows an address that cannot be empty — and asking anywhere
+    /// else is what leaves it waiting for a shard nobody it asked has ever held.
+    #[must_use]
+    pub fn proposer_of(&self, block: &[u8; 32]) -> Option<u8> {
+        self.pending.get(block).map(|p| p.skeleton.header.proposer)
     }
 
     /// Answer a peer's request for shard `index` of `block` — `Some(shard)` only when it is **ours** and we hold it.
@@ -275,5 +314,61 @@ mod tests {
             }
         }
         assert_eq!(first.in_flight(), 0, "the retry recovered the block");
+    }
+
+    #[test]
+    fn the_awaited_skeleton_survives_a_flood_of_later_proposals() {
+        // The eviction that stranded a live cell. `pending` is bounded because its key is a remote-chosen block hash,
+        // and eviction is by **insertion order** — so the oldest skeleton goes first. Under SSLE every line member
+        // proposes, giving one skeleton per validator per round, and the block a cell converges on is round 0's
+        // min-ticket winner: the oldest one there is. Later proposals that will never be chosen evict the one that was.
+        //
+        // The consequence is a loop rather than a delay. Once evicted the block leaves `outstanding`, so no shard is
+        // ever requested for it again, and the validator waits forever on a body it is actively voting for. Measured
+        // live as seven of seven validators reporting `await` at round 13 for a block none of them held.
+        let awaited = Block::assemble([7u8; 32], 1, fanos_primitives::Epoch::ZERO, 0, Vec::new());
+        let hash = awaited.hash();
+        let mut s = Sampler::new(0);
+        assert!(s.begin(awaited.skeleton()));
+        s.pin(Some(hash));
+
+        // Two full caps' worth of later proposals — far past the point where insertion order would have discarded it.
+        for n in 0..(PENDING_CAP * 2) {
+            let mut parent = [7u8; 32];
+            parent[0] = u8::try_from(n % 251).unwrap_or(0);
+            parent[1] = u8::try_from(n / 251).unwrap_or(0);
+            s.begin(Block::assemble(parent, 1, fanos_primitives::Epoch::ZERO, 0, Vec::new()).skeleton());
+        }
+
+        assert!(s.is_sampling(&hash), "the awaited skeleton was evicted by proposals nobody is waiting for");
+        assert!(
+            s.outstanding().iter().any(|(h, _)| *h == hash),
+            "the awaited block must stay outstanding, or no shard is ever requested for it again"
+        );
+        assert_eq!(s.proposer_of(&hash), Some(awaited.header.proposer), "and its proposer stays addressable");
+    }
+
+    #[test]
+    fn pinning_protects_exactly_one_entry_and_not_the_cap() {
+        // The pin must not become an unbounded exemption: the cap exists against a remote-chosen key, and one protected
+        // entry is the whole concession. Everything else still evicts normally.
+        let mut s = Sampler::new(0);
+        let pinned = Block::assemble([9u8; 32], 1, fanos_primitives::Epoch::ZERO, 0, Vec::new());
+        assert!(s.begin(pinned.skeleton()));
+        s.pin(Some(pinned.hash()));
+        let mut early = Vec::new();
+        for n in 0..(PENDING_CAP * 2) {
+            let mut parent = [9u8; 32];
+            parent[0] = u8::try_from(n % 251).unwrap_or(0);
+            parent[1] = u8::try_from(n / 251).unwrap_or(0);
+            let b = Block::assemble(parent, 1, fanos_primitives::Epoch::ZERO, 0, Vec::new());
+            s.begin(b.skeleton());
+            if n < 4 {
+                early.push(b.hash());
+            }
+        }
+        assert!(s.is_sampling(&pinned.hash()), "the pinned entry survives");
+        assert!(early.iter().all(|h| !s.is_sampling(h)), "unpinned entries still evict — the cap still bounds memory");
+        assert!(s.in_flight() <= PENDING_CAP + 1, "the map never exceeds its cap by more than the pinned entry");
     }
 }
