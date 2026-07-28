@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
-use fanos_core::{AdmissionPolicy, ParentCell, PowAdmission};
+use fanos_core::{AdaptivePowAdmission, AdmissionPolicy, LiveDifficulty, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_field::Field;
@@ -731,7 +731,18 @@ impl<F: Field> OverlayNode<F> {
     pub fn with_admission_pow(mut self, difficulty: u32) -> Self {
         self.config.require_admission = true;
         self.membership.admission_difficulty = Some(difficulty);
-        self.membership.admission_policy = Some(Box::new(PowAdmission::new(difficulty)));
+        // **Adaptive, not fixed.** `difficulty` becomes the floor an operator guarantees, and the coherence
+        // controller may raise the live price above it as the cell's measured stress rises — the only response
+        // FANOS has that acts on the *magnitude* of a flood rather than on its aftermath (T-104: a cell
+        // survives iff `‖h‖ < κ·r_stab`, and everything else moves `κ`). It can never go under the floor, so a
+        // stuck sensor or a compromised controller cannot open a door the operator closed.
+        //
+        // At rest the live value equals the floor, so a node that is not under stress behaves exactly as the
+        // fixed gate did.
+        let live = LiveDifficulty::new(difficulty);
+        self.membership.admission_policy =
+            Some(Box::new(AdaptivePowAdmission::new(difficulty, live.clone())));
+        self.healer.set_admission(difficulty, live);
         self.membership.admission_proof =
             PowAdmission::new(difficulty).solve(&admission_challenge(&self.membership.identity, self.coord.coords(), self.epoch));
         self

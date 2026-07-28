@@ -22,6 +22,8 @@ use fanos_diakrisis::coherence::phi_equicorrelated;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
+use fanos_core::LiveDifficulty;
+use fanos_diakrisis::stability::{self, AdmissionController, inferred_disturbance};
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple};
@@ -63,6 +65,19 @@ pub(crate) struct Healer {
     /// The coherence homeostat this node runs on its behavioural self-model — the sense→act seam, with the
     /// monitor sensing and `diagnose` actuating its band-keeping decision.
     homeostat: Homeostat,
+    /// The DDoS admission-price controller (T-104): raises the cost of joining this node as its own measured
+    /// stress rises, and releases it at the cell's recovery constant. See `fanos_diakrisis::stability`.
+    admission: AdmissionController,
+    /// The previous window's `(purity, timestamp)`, so the disturbance can be inferred from the *rate* the
+    /// purity is moving rather than from its level. The level only moves after damage; the rate carries an
+    /// attack on the first window, which is the difference between a controller that saves a cell and one that
+    /// watches it die (measured — `stability::the_admission_law_saves_a_cell_that_would_otherwise_die`).
+    last_purity: Option<(f64, u64)>,
+    /// Where the controller's decision is published for the admission gate to read. `None` when this node runs
+    /// no proof-of-work admission, in which case there is no price to move.
+    live_difficulty: Option<LiveDifficulty>,
+    /// The operator's configured floor, which the controller may raise above but never go under.
+    admission_floor: u32,
     /// Per-peer **data-relay** activity (`Route` frames) accumulated since the last behavioural sample —
     /// the raw counts the coherence self-model is built from. Control chatter (pings, gossip) is excluded,
     /// so this reflects *load*, not liveness.
@@ -138,6 +153,10 @@ impl Healer {
             observer,
             monitor: BehaviorMonitor::new(7, BEHAVIOR_WINDOW),
             homeostat: Homeostat::conservative(),
+            admission: AdmissionController::new(),
+            last_purity: None,
+            live_difficulty: None,
+            admission_floor: 0,
             activity: BTreeMap::new(),
             self_activity: 0,
             decoupling: 0.0,
@@ -308,6 +327,52 @@ impl Healer {
         Effect::Notify(Notification::Observed(frame.encode().to_vec()))
     }
 
+    /// Publish this node's admission price here, at the operator's `floor`.
+    ///
+    /// Called once, when a proof-of-work gate is installed. Without it the controller runs on nothing and the
+    /// price never moves — which is the correct behaviour for a node that charges no entry fee.
+    pub(crate) fn set_admission(&mut self, floor: u32, live: LiveDifficulty) {
+        self.admission_floor = floor;
+        self.live_difficulty = Some(live);
+    }
+
+    /// Move this node's admission price to what its own measured stress justifies.
+    ///
+    /// The **actuator** of DDoS homeostasis. T-104 says a cell survives sustained noise iff `‖h‖ < κ·r_stab`,
+    /// and every other response — the homeostat's band control, the healing plan's reroute and repair — acts on
+    /// `κ` and on internal structure. This is the only one that acts on `‖h‖`, by making entry cost more.
+    ///
+    /// Everything it needs is already sensed or known: the purity and `N` from the measured `Γ_net`, the
+    /// regeneration rate from the homeostat's own gain, and the baseline dissipation from this window's
+    /// liveness topology. The one thing it must remember is the previous purity, because the disturbance is
+    /// inferred from the *rate*, not the level.
+    ///
+    /// A node with no proof-of-work admission has no price to move, so this is inert there rather than
+    /// pretending — and the controller can only ever raise the operator's floor, never open a door the
+    /// operator closed.
+    fn price_admission(&mut self, now: Instant, purity: f64, n: usize, lambda: f64) {
+        let Some(live) = self.live_difficulty.clone() else { return };
+        let nanos = now.as_nanos();
+        let Some((previous, then)) = self.last_purity.replace((purity, nanos)) else {
+            return; // the first window has no rate; a controller cannot act on one sample
+        };
+        let elapsed = nanos.saturating_sub(then);
+        if elapsed == 0 {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)] // a window is milliseconds; f64 holds it exactly
+        let seconds = elapsed as f64 / 1e9;
+        let kappa = self.homeostat.gain();
+        let rate = (purity - previous) / seconds;
+        let disturbance =
+            inferred_disturbance(purity, rate, lambda, kappa, stability::p_opt(n), n);
+        let stress = stability::stress(stability::stability_radius(purity, n), kappa, disturbance);
+        // The window is the retention unit: the excursion decays as `(1 − κ·Δt)` over it, and releasing the
+        // price faster than the cell recovers is precisely what makes the controller oscillate.
+        let retention = 1.0 - (kappa * seconds).clamp(0.0, 1.0);
+        live.set(self.admission.observe(self.admission_floor, stress, retention));
+    }
+
     /// Diagnose the sensed cell snapshot (`self_index, degraded, alive_count`, produced by the facade's
     /// liveness sensing) and actuate any healing — the DIAKRISIS reflex proper. Feeds the *measured*
     /// behavioural `Γ_net` (the #74 unification) plus the live polar cross-attestation into `diagnose`,
@@ -403,6 +468,7 @@ impl Healer {
             // **escalation** on a coherence *collapse* (`P ≤ 2/N`). Over-coupling is the verdict path's.
             if let Some(coherence) = measured {
                 let m = coherence.measures();
+                self.price_admission(now, m.purity, coherence.n(), polar_gap_from_liveness(degraded));
                 match self
                     .homeostat
                     .control(m.purity, coherence.mean_correlation(), coherence.n())

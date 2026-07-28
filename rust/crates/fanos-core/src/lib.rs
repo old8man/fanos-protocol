@@ -61,7 +61,7 @@ pub use fanos_geometry::{Line, Plane, Point};
 pub use fanos_primitives::{BeaconSeed, Epoch, HybridPublicKey, NodeId};
 pub use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
 
-pub use admission::{AdmissionPolicy, PowAdmission};
+pub use admission::{AdaptivePowAdmission, AdmissionPolicy, LiveDifficulty, PowAdmission};
 pub use hierarchy::Hierarchy;
 pub use membership::Member;
 pub use quorum::Quorum;
