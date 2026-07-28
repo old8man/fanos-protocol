@@ -143,10 +143,15 @@ jobs:
       # this `--skip` set provably selects exactly the assertions. Release, because the zero-knowledge proofs
       # are minutes in debug and ~40 s optimised; serial, because several stand up whole real-QUIC cells.
       #
-      # `host_a_service_and_serve_a_client_over_the_c_abi` is skipped, temporarily and deliberately visibly. It
-      # passes alone in release (0.01 s) and as a debug pair (0.11 s), and fails as a *release* pair after 150 s:
-      # node B's `.fanos` dial never resolves, so the retry loop exhausts. In the full serial set that read as a
-      # 34-minute hang, and since `fanos-ffi` sorts ahead of `fanos-obolos` it cost the zero-knowledge proofs
-      # their entire run. Open item; `timeout-minutes` above is the backstop either way.
+      # `host_a_service_and_serve_a_client_over_the_c_abi` runs as its own step below rather than in this set,
+      # because it is **intermittent in release** — roughly 3 failures in 15 optimised runs, always fast (0.01 s)
+      # when it passes and 150 s or worse when it does not, with no discriminator found across alone-vs-paired,
+      # thread count, or instrumentation. Once, in the full serial set, it did not return for 34 minutes; since
+      # `fanos-ffi` sorts ahead of `fanos-obolos` that stall cost the zero-knowledge proofs their entire run.
+      # Ordering it last means the assertions this job exists for finish first whatever it does, and its own short
+      # timeout bounds a stall. A plain *failure* would not starve them — libtest continues — only a stall would.
       - name: Cost-gated assertions (every ignored test that is not a measurement)
         run: cargo test --workspace --features validator --release -- --ignored --skip measure_ --skip probe_ --skip sweep_ --skip host_a_service_and_serve_a_client --test-threads 1
+      - name: C ABI service host (ordered last — see above)
+        timeout-minutes: 5
+        run: cargo test -p fanos-ffi --release -- --ignored --test-threads 1 host_a_service_and_serve_a_client

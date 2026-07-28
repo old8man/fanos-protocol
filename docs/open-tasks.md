@@ -200,20 +200,23 @@ was removed on the way (both forwarded tests were the only ones synchronising on
   whether the process has *ever* delivered.
 
 ### [A] `host_a_service_and_serve_a_client_over_the_c_abi` fails when run as a serial pair in release
-**Corrected diagnosis, 2026-07-28.** The first reading — "hangs in release, probably a blocking call with no free
-runtime thread" — is wrong on both counts, and narrowing it took three runs:
+**It is intermittent, and no discriminator survived measurement.** Roughly **3 failures in 15 optimised runs**; debug
+never failed. The failure mode is a panic on `assert!(!client.is_null(), "B dialed the hosted service")` after the dial
+retry loop (60 × 500 ms) exhausts — so `fanos_service_connect` returned null for thirty seconds running and the `.fanos`
+name never resolved. That is an ONOMA descriptor lookup, not a blocked thread.
 
-| how it is run | result |
+Three hypotheses were each formed from two runs and each refuted by the next two — a caution worth recording as much as
+the finding:
+
+| claimed discriminator | refuted by |
 |---|---|
-| release, alone | **passes in 0.01 s** |
-| debug, the pair, `--test-threads 1` | **both pass in 0.11 s** |
-| release, the pair, `--test-threads 1` | `connect_*` passes, this one **fails after 150 s** |
-| release, whole workspace, serial | appeared to hang — 34 minutes with no output |
+| "hangs in release" | it does not hang; it panics after 150 s, and passes alone in release in 0.01 s |
+| "fails as a *pair* in release" | 8 consecutive pair-in-release passes followed the one failure |
+| "fails with `--test-threads 1`" | a later `--test-threads 1` release run passed in 0.01 s |
 
-It does not hang: it panics on `assert!(!client.is_null(), "B dialed the hosted service")` after the dial retry loop
-(60 × 500 ms) exhausts. So `fanos_service_connect` returned null thirty seconds running, which means the `.fanos` name
-never resolved — an ONOMA descriptor lookup, not a blocked thread. The workspace run's apparent hang is the same failure
-with the retry loop plus the rest of the serial set in front of it.
+Instrumenting `NodeResolver::resolve` (a branch-by-branch `eprintln` on each of its four failure points) produced **4 of 4
+passes and no output at all**, so the instrumentation perturbs it away — which rules out print-debugging as the next step
+and points at a timing race.
 
 - Both tests hold `SERIAL` and free their handles, so the interference is something that outlives `fanos_free`: a lingering
   `serve` task, a QUIC endpoint still bound to a coordinate the next test reseats onto, or a store entry from the previous
@@ -222,8 +225,12 @@ with the retry loop plus the rest of the serial set in front of it.
   30 s for it — a longer wait measures nothing new. What is missing is knowing *why* resolution fails: instrument
   `NodeResolver::resolve` for the name it looks up and the coordinates it queries, and compare the pair-in-release run
   against the alone-in-release one.
-- Skipped in the nightly job with `timeout-minutes: 45` alongside, so neither the skip nor a future hang can quietly cost
-  the zero-knowledge proofs their run.
+- **Not** skipped in the nightly job: it runs as its own last step with a 5-minute timeout, so a stall bounds itself and
+  the zero-knowledge proofs finish first regardless. A plain failure would not have starved them anyway — libtest
+  continues — but the one 34-minute stall did.
+- What is left to try, given instrumentation perturbs it: capture the store `Get` at the transport layer instead (the
+  `fanos-quic` frame log), or make the test assert on the descriptor's presence in the store *before* dialing, which
+  would split "never published" from "published but unreachable".
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's
