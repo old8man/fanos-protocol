@@ -895,7 +895,7 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     let [x, y, z] = identity::coordinate::<F2>(&credentials);
     config.identity_path = Some(paths.identity.clone());
 
-    ensure_beacon(&mut config, &paths, assume_yes)?;
+    ensure_beacon(&mut config, &paths, assume_yes, has_flag(args, "--private-cell"))?;
 
     // --- write ---
     let rendered = fanos_node::setup::render_config(&config, &paths.identity);
@@ -933,6 +933,7 @@ fn ensure_beacon(
     config: &mut NodeConfig,
     paths: &fanos_node::setup::Paths,
     assume_yes: bool,
+    private_cell: bool,
 ) -> Result<(), NodeError> {
     let beacon_path = paths.config.with_file_name(fanos_node::setup::BEACON_FILE);
     if !config.roles.relay || beacon_path.exists() {
@@ -949,6 +950,21 @@ fn ensure_beacon(
         // with a GJKR complaint round) in which no party ever sees the whole key. It needs a set of founding
         // nodes to run *between*, which is why it cannot be what a single `fanos init` does, and exactly why
         // this path must not be walked into by default for a network meant to be public.
+        // `--yes` must **not** reach past this. Every other question in this wizard has a defensible default;
+        // this one does not, because taking it silently makes whoever ran the provisioning script the permanent
+        // holder of an open network's epoch clock. A convenience that hands over a governance position without
+        // saying so is worse than an inconvenience — so a non-interactive run must state its intent in the flag.
+        if assume_yes && !private_cell {
+            config.roles.relay = false;
+            eprintln!("\n  ! starting a new cell non-interactively, and no beacon was dealt.");
+            eprintln!("    Holding a cell's epoch beacon decides where every joining node lands, so it is not a");
+            eprintln!("    thing `--yes` may assume. Choose explicitly:");
+            eprintln!("      --private-cell   this is yours alone; deal the beacon here (1-of-1)");
+            eprintln!("      (public network) run the distributed key generation across the founding nodes, then");
+            eprintln!("                       set `beacon_params = <file>` and re-enable `relay`");
+            eprintln!("    Relay role dropped for now; this node will still store and serve.");
+            return Ok(());
+        }
         if !assume_yes {
             eprintln!("\nThis host is starting a new cell, so it must hold the cell's epoch beacon.");
             eprintln!("  Coordinates derive from that beacon, so its holder influences where joining nodes land.");
