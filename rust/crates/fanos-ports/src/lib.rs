@@ -263,6 +263,23 @@ pub enum Notification {
     /// wire bytes (not the struct) are carried so this stays a plain, `Eq` payload — the same bytes a
     /// node gossips or publishes (docs/design-telemetry.md).
     Observed(Vec<u8>),
+    /// This node's join was **refused by an admission gate**, with the difficulty that would have passed.
+    ///
+    /// Surfaced rather than swallowed because under an adaptive gate a refusal is not a verdict about the
+    /// joiner — it is a price that moved. A node whose proof was minted a moment before the cell raised its
+    /// cost is honest, correct, and one number away from being admitted; without this notification it has a
+    /// permanent unexplained refusal, which is the attacker's goal reached through the defence.
+    ///
+    /// `required` is `None` when the refusing peer said nothing (an older build, or a policy where difficulty
+    /// is not a number). A driver must read that as *no guidance* and not as zero: re-solving at zero against a
+    /// gate that wants work is an infinite loop.
+    ///
+    /// Re-solving is the **driver's** job, not the engine's — proof-of-work is compute, and this engine is
+    /// sans-I/O by construction.
+    AdmissionRefused {
+        /// The difficulty the refusing peer says it requires, in proof-of-work bits.
+        required: Option<u32>,
+    },
     /// Self-healing: traffic for the (down) node `around` is now served by the co-linear
     /// survivor `via` — the projective LRC reroute (spec §L4, §6.7).
     Rerouted {

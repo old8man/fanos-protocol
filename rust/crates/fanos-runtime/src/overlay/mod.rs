@@ -584,8 +584,24 @@ impl<F: Field> OverlayNode<F> {
                     payload: frame.body.to_vec(),
                 })]
             }
+            // A peer refused something we sent. Only admission refusals are actionable — the rest are
+            // diagnostics for a log, and the engine has nowhere to write. Surfacing this one is what makes an
+            // *adaptive* admission price safe to run at all: without it, a joiner priced out between minting its
+            // proof and presenting it is refused forever with no way to learn the number that would work.
+            Some(FrameType::Error) => Self::on_error(frame.body),
             _ => Vec::new(),
         }
+    }
+
+    /// Decode an `Error` frame and surface the one kind a node can act on.
+    fn on_error(body: &[u8]) -> Vec<Effect> {
+        let Some(err) = crate::frames::parse_error(body) else { return Vec::new() };
+        if err.code != fanos_wire::ProtocolError::SybilReject.code() {
+            return Vec::new();
+        }
+        alloc::vec![Effect::Notify(Notification::AdmissionRefused {
+            required: crate::frames::decode_required_difficulty(&err.reason),
+        })]
     }
 
 
@@ -1066,6 +1082,53 @@ mod tests {
     use crate::frames::{announce_body, encode_publish, encode_value};
     use super::*;
     use fanos_field::{F2, F7};
+
+    #[test]
+    fn a_refused_join_surfaces_the_price_that_would_have_passed() {
+        // The return path that makes an *adaptive* admission price safe to run. Without it a joiner priced out
+        // between minting its proof and presenting it is refused permanently, with the number that would work
+        // sitting unread in a frame nothing dispatched — the attacker's outcome, produced by the defence.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let refusal = crate::frames::encode_error_with(
+            fanos_wire::ProtocolError::SybilReject,
+            17u32.to_le_bytes().to_vec(),
+        );
+        let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
+        let told = effects.iter().find_map(|e| match e {
+            Effect::Notify(Notification::AdmissionRefused { required }) => Some(*required),
+            _ => None,
+        });
+        assert_eq!(told, Some(Some(17)), "the refusal must reach the node carrying its price: {effects:?}");
+    }
+
+    #[test]
+    fn a_refusal_without_a_price_is_no_guidance_rather_than_zero() {
+        // An older peer, or a policy where difficulty is not a number, says nothing. A driver that read that as
+        // `0` would re-solve at zero against a gate demanding work — an infinite loop.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let refusal =
+            crate::frames::encode_error_with(fanos_wire::ProtocolError::SybilReject, alloc::vec![]);
+        let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
+        let told = effects.iter().find_map(|e| match e {
+            Effect::Notify(Notification::AdmissionRefused { required }) => Some(*required),
+            _ => None,
+        });
+        assert_eq!(told, Some(None), "a silent refusal must surface as `None`, never as a difficulty");
+    }
+
+    #[test]
+    fn an_error_that_is_not_an_admission_refusal_is_not_surfaced() {
+        // Only the actionable one. The rest are diagnostics, and this engine is sans-I/O — it has nowhere to
+        // write a log and no business waking a driver for something it cannot act on.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let other =
+            crate::frames::encode_error_with(fanos_wire::ProtocolError::Malformed, alloc::vec![]);
+        let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: other });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::AdmissionRefused { .. }))),
+            "an unrelated error must not read as an admission refusal"
+        );
+    }
 
     #[test]
     fn node_derives_all_cell_neighbours_algebraically() {

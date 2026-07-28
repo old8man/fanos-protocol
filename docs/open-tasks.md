@@ -80,15 +80,18 @@ the new number, and has nothing that reads it — a permanent unexplained refusa
 reached through the defence.
 
 To install it, in order:
-1. dispatch `FrameType::Error` in the overlay and surface `SybilReject` as a `Notification` carrying the required
-   bits (the engine is sans-I/O, so re-solving belongs in the driver, not in the engine);
+1. ~~dispatch `FrameType::Error` and surface the refusal~~ — **DONE**: the overlay now decodes `Error`, and a
+   `SybilReject` becomes `Notification::AdmissionRefused { required }`. Only that error is surfaced; the rest are
+   diagnostics a sans-I/O engine has nowhere to write and no business waking a driver for.
 2. have the driver re-solve at that difficulty and re-announce, bounded so a hostile peer cannot drive unbounded
-   work by repeatedly demanding more;
+   work by repeatedly demanding more. **This bound is the security question of the step** — an unbounded
+   "solve harder" is a remote CPU-exhaustion primitive pointed at honest nodes.
 3. only then install `AdaptivePowAdmission` and drive `LiveDifficulty` from the healer's
    `AdmissionController::observe`.
 
-Better still, and worth weighing first: if the pre-announce exchange can carry the current price, the joiner
-solves correctly the first time and no retry path is needed at all.
+Weighed and rejected as a *substitute*: carrying the price in the pre-announce exchange. It is a fine
+optimization — the joiner solves right the first time — but the price can change between learning it and
+announcing, so the retry path is needed for correctness regardless. An optimization on top, not instead.
 
 ### [A] Operator surface — the control socket closes the read half; the monitor is still next
 `fanos status` now asks the **running node** over a local Unix socket (`admin.sock`, mode 0600 in the state

@@ -263,8 +263,8 @@ pub fn admission_challenge(id: &[u8], coord: Triple, epoch: Epoch) -> Vec<u8> {
 /// widening the derive's integer convention itself) is task #100's, not this one's, to settle.
 #[derive(fanos_wire_derive::Wire)]
 pub(crate) struct ErrorBody {
-    code: u64,
-    reason: Vec<u8>,
+    pub(crate) code: u64,
+    pub(crate) reason: Vec<u8>,
 }
 
 /// An `Error` frame carrying `err`'s numeric code **and a machine-readable reason**.
@@ -280,19 +280,17 @@ pub(crate) fn encode_error_with(err: ProtocolError, reason: Vec<u8>) -> Vec<u8> 
     encode(FrameType::Error, &ErrorBody { code: err.code(), reason }.to_wire())
 }
 
+/// Parse an `Error` frame body.
+pub(crate) fn parse_error(body: &[u8]) -> Option<ErrorBody> {
+    ErrorBody::from_wire(body).ok()
+}
+
 /// The required admission difficulty carried by a `SYBIL_REJECT`, if it carries one.
-///
-/// **Not yet consumed**, and deliberately visible as such: the overlay has no receive path for `Error` frames
-/// at all, so a rejected joiner today gets a frame nothing reads. Wiring the adaptive gate into a live node
-/// before that path exists would turn an honest joiner whose proof was minted a moment before the price rose
-/// into a permanent, unexplained refusal — the attacker's goal reached through the defence. So the encoder
-/// ships, this decoder ships, and the policy stays uninstalled until they meet.
 ///
 /// `None` for a rejection from a peer that does not send it (an older build, or a refusal for some other
 /// reason), which a joiner must treat as "no guidance" rather than as "zero" — retrying at zero would be an
 /// infinite loop against a gate that is asking for work.
 #[must_use]
-#[allow(dead_code)] // see the note above: the receive path is the missing half
 pub(crate) fn decode_required_difficulty(reason: &[u8]) -> Option<u32> {
     <[u8; 4]>::try_from(reason).ok().map(u32::from_le_bytes)
 }

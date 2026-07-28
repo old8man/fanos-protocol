@@ -65,6 +65,10 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        Notification::AdmissionRefused { required } => match required {
+            Some(bits) => format!("AdmissionRefused (needs {bits} bits)"),
+            None => "AdmissionRefused (no price given)".to_owned(),
+        },
         Notification::Verdict(v) => format!("Verdict {v:?}"),
         Notification::Rerouted { around, via } => {
             format!("Rerouted {}→via {}", fmt_coord(*around), fmt_coord(*via))
