@@ -329,8 +329,21 @@ So the residual is bounded to what is left unique to the FFI, and nothing else:
 Everything else is now excluded by measurement rather than by argument: publication and lookup (fixed by the readiness
 point), `offer` drops (counter reads 0), the session + reliable-stream pair (200 clean rounds in-process), and the
 streaming path over real QUIC with the demux (8 clean runs).
-- Next: reduce (1) — have the second node share the first's runtime in a test build, or run the FFI example's calls from a
-  runtime thread — and see whether the flake survives. That is a two-line experiment and it decides between (1)+(2) and (3).
+**(1) is refuted, and how it was refuted is the important part.** Sequential batches said worker count was the cause:
+`worker_threads(1)` failed 10 of 10, `(2)` passed **20 of 20**, and `(3)`, `(4)` and the default each sat at 8 of 10. An
+**interleaved A/B** — alternating 2 and 4 across eight pairs so both see the same host load — put two workers at 6/8 and
+four at 8/8. So the 20/20 was a quiet window on a host whose load is set by a neighbouring project, not a property of the
+parameter.
+- One measurement survived and is now fixed: a **single-worker** runtime fails 10 of 10, because every call in this ABI
+  blocks the caller's thread and the runtime must still drive the node. `fanos_open` now floors the worker count at two,
+  which only matters on a single-core host — where the ABI was simply broken.
+- **Methodological rule for this host, learned six times over:** sequential batches cannot compare two variants here. The
+  neighbouring project's load moves by an order of magnitude within minutes, so any A-then-B comparison measures the
+  window, not the change. Interleave, or do not compare.
+- What is left of the residual: (2) blocking `Handle::block_on` calls from outside the runtime, and (3) the accept-queue
+  indirection. Both are structural to the ABI's shape rather than tunable, so the next step is to reproduce the FFI's
+  arrangement in an async test — two nodes, two runtimes, calls from a non-runtime thread — and see whether the loss
+  follows the arrangement.
 - `RTO_BACKOFF_MULT` is worth noting regardless: it is **4**, not TCP's 2, so retransmits land at 60 ms, 240 ms, 960 ms,
   3.84 s — only four attempts fit inside a five-second wait.
 

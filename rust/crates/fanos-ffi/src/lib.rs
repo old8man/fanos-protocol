@@ -93,7 +93,17 @@ pub unsafe extern "C" fn fanos_open(config: *const c_char) -> *mut FanosNode {
             Err(_) => return ptr::null_mut(),
         }
     };
-    let Ok(rt) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
+    // **At least two workers.** Every call in this ABI blocks the *caller's* thread on `block_on`, so the runtime
+    // must be able to make progress on the node's drivers while that thread is parked. Measured on a
+    // single-worker runtime: the hosted-service round trip fails **10 times out of 10**. The default is the host's
+    // parallelism, which is already ≥ 2 on anything but a single-core machine — this floor is what makes such a
+    // machine work at all, and it costs nothing elsewhere.
+    //
+    // The count is deliberately *not* tuned below the default: an interleaved A/B over eight pairs put two
+    // workers at 6/8 and four at 8/8 under identical load, so the earlier reading that fewer was better came from
+    // comparing sequential batches across a varying host, not from the parameter.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
+    let Ok(rt) = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build() else {
         return ptr::null_mut();
     };
     match rt.block_on(Node::start::<F2>(config)) {
