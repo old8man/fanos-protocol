@@ -186,8 +186,16 @@ Measured twice on the current tree with `cargo test --workspace --features valid
   consensus_end_to_end`, which had never failed before. Immediately afterwards, `dromos_quic` alone passed **3 of 3
   twice** (53 s, 38 s).
 
+- 45 suites, **761 tests, one failure** — the HERMES contract only, *after* `anonymous_quic`'s five cell fixtures were
+  serialized. That suite failed **4 of 5** in the first run and passes inside the workspace run here for the first time.
+
 So the count grows with what else shares the machine, and the suite that fails is whichever real-QUIC one the contention
-lands on — the second run's casualty was a single-transaction test, which the lock-split residual cannot explain.
+lands on. The one intra-binary cause that *was* fixable is fixed: `anonymous_quic` was standing up to thirty-five real
+QUIC nodes concurrently, and serializing them cost nothing in wall time. The remaining failure is the sub-quorum
+lock-split residual at its known ~1-in-8 rate, so a single occurrence in one run is expected rather than informative.
+- What is left is genuinely external: this host's load is set by a neighbouring project's build and moves by an order of
+  magnitude within minutes. The lighter two-node fixtures (`diaulos_quic`, `exit_quic`, `proxy`) still run concurrently by
+  design — a two-node setup is not a cell — and no measurement implicates them.
 
 The verdict now carries the evidence to judge it, which is the point of the progress-bounded waits: **321 observations
 completed inside the frozen window, the slowest taking 269 ms** against single-digit milliseconds idle. So the host was
