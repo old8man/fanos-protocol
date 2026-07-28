@@ -1209,6 +1209,8 @@ mod tests {
         // That is why no cross-check between nodes was built for this. A quorum on the admission price would be
         // a new consensus to reach, a new thing to capture, and a new way for the cell to stall — to buy a
         // property the geometry already provides.
+        /// The price the refusing peer demands — high enough that a cheap proof does not satisfy it by chance.
+        const STRICT: u32 = 20;
         let identity = alloc::vec![3u8; 8];
         let joiner_coord = Point::<F2>::at(1).coords();
         let joiner = OverlayNode::<F2>::new(Point::at(1), Config::default())
@@ -1216,7 +1218,7 @@ mod tests {
             .with_admission_pow(4);
         let announce = encode(
             FrameType::Announce,
-            &crate::frames::announce_body(
+            &announce_body(
                 joiner_coord,
                 &joiner.router.address,
                 &identity,
@@ -1230,7 +1232,6 @@ mod tests {
         // Strict gate, cheap fixture: the refuser demands 20 bits without minting one itself. The premise is
         // asserted below rather than assumed — a 4-bit proof satisfies a 20-bit gate once in 2^16 draws, and a
         // test whose scenario silently evaporates is worse than one that fails loudly.
-        const STRICT: u32 = 20;
         let mut refuser = OverlayNode::<F2>::new(Point::at(2), Config::default())
             .with_identity(alloc::vec![9u8; 8])
             .with_admission_pow(4)
