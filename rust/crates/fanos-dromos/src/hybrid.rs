@@ -28,7 +28,7 @@ use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, 
 
 use crate::bridge::{POOL_SINK, ShieldTx};
 use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
-use crate::naming::{NameRegistry, NameTx, TREASURY};
+use crate::naming::{NameError, NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
 use crate::stake::{STAKE_SINK, SlashTx, StakeLedger, StakeTx, slot_key};
 use crate::storage::{
@@ -150,7 +150,8 @@ impl HybridLedger {
     /// Lock an HTLC: the sender's `payment` must fund the escrow with exactly the contract amount. Validates,
     /// opens the contract (a fresh id), then settles the payment (validate-then-settle, so a rejected lock moves
     /// no money).
-    fn lock_htlc(&mut self, terms: &HtlcTerms, payment: &SignedTransfer) -> bool {
+    /// `None` ⇒ premature (the funding nonce is ahead); `Some(ok)` ⇒ applied or terminally rejected.
+    fn lock_htlc(&mut self, terms: &HtlcTerms, payment: &SignedTransfer) -> Option<bool> {
         // A non-zero escrow floor (audit §3.4): an `amount == 0` lock passes the token check (`balance < 0` is
         // false) for only a signature, yet inserts a permanent `htlcs` entry. Requiring a real locked amount
         // makes growing the book cost the attacker locked capital.
@@ -160,17 +161,22 @@ impl HybridLedger {
             || payment.transfer.to != HTLC_ESCROW
             || payment.transfer.amount != terms.amount
         {
-            return false;
+            return Some(false);
         }
         let id = htlc_id(terms, payment.transfer.nonce);
         if self.htlcs.htlcs.contains_key(&id) {
-            return false;
+            return Some(false);
+        }
+        // Premature funding, checked only after the contract's own terms: a sound lock whose transfer is
+        // merely early is deferred, while a malformed one stays terminally rejected.
+        if self.tokens.is_premature(payment) {
+            return None;
         }
         if self.tokens.apply(payment).is_err() {
-            return false;
+            return Some(false);
         }
         self.htlcs.htlcs.insert(id, Htlc::new(*terms));
-        true
+        Some(true)
     }
 
     /// Claim an HTLC by revealing `preimage`: the contract's state machine checks the hashlock and the timeout
@@ -246,18 +252,24 @@ impl HybridLedger {
 
     /// Shield public tokens into the private pool: settle the payment to the pool sink and mint the note. The
     /// amount and the note's opening are public at entry; the note is privately spendable thereafter.
-    fn shield(&mut self, sx: &ShieldTx) -> bool {
+    /// `None` ⇒ premature (the funding nonce is ahead); `Some(ok)` ⇒ applied or terminally rejected.
+    fn shield(&mut self, sx: &ShieldTx) -> Option<bool> {
         if sx.payment.transfer.to != POOL_SINK || sx.payment.transfer.amount != sx.note.value {
-            return false;
+            return Some(false);
         }
         // Capacity guard so the (atomic) payment is never applied without the mint following.
         if self.shielded.note_count() >= (1u64 << fanos_obolos::TREE_DEPTH) {
-            return false;
+            return Some(false);
+        }
+        // Premature funding: the shield's own content is already checked, so this transfer is sound but not
+        // yet applicable — defer rather than lose it (`ExecOutcome::Deferred`).
+        if self.tokens.is_premature(&sx.payment) {
+            return None;
         }
         if self.tokens.apply(&sx.payment).is_err() {
-            return false;
+            return Some(false);
         }
-        self.shielded.mint(sx.note.commitment(&self.params)).is_some()
+        Some(self.shielded.mint(sx.note.commitment(&self.params)).is_some())
     }
 
     /// Apply a shielded submission, handling an **unshield**: after the shielded spend verifies and applies, any
@@ -353,7 +365,8 @@ impl HybridLedger {
     /// Open a storage deal: the consumer's `payment` must fund the escrow sink with exactly the price. Validates
     /// the transfer binds the consumer and targets the sink, opens the deal (a fresh id), then settles the
     /// payment — so a rejected open never moves money (the naming registry's validate→settle ordering).
-    fn open_deal(&mut self, params: &DealParams, payment: &SignedTransfer) -> bool {
+    /// `None` ⇒ premature (the funding nonce is ahead); `Some(ok)` ⇒ applied or terminally rejected.
+    fn open_deal(&mut self, params: &DealParams, payment: &SignedTransfer) -> Option<bool> {
         // Bound the deal's audit parameters (audit §3.3). `size` is attacker-chosen and sets `por::challenge`'s
         // leaf domain (`leaves_for_size`) on the deterministic prove path — bounding it to one chunk keeps the
         // leaf count (and hence the audit allocation) tiny, so a crafted oversized deal can never make
@@ -367,7 +380,7 @@ impl HybridLedger {
             || params.duration > MAX_DEAL_DURATION
             || params.price == 0
         {
-            return false;
+            return Some(false);
         }
         // A non-zero escrow floor (audit §3.4): `balance < amount` is false for `amount == 0`, so a `price = 0`
         // deal would cost a funds-less attacker only a signature yet still insert a permanent `deals` entry that
@@ -378,22 +391,26 @@ impl HybridLedger {
             || payment.transfer.to != STORAGE_ESCROW
             || payment.transfer.amount != params.price
         {
-            return false;
+            return Some(false);
         }
         let id = deal_id(params, payment.transfer.nonce);
         if self.storage.deals.contains_key(&id) {
-            return false;
+            return Some(false);
         }
         // Anchor the audit deadline at the current height so the deal can auto-complete + refund if the provider
         // stops proving (audit AT-H2), rather than sitting Active forever awaiting a manual close.
         let Some(deal) = Deal::open_at(*params, self.height) else {
-            return false;
+            return Some(false);
         };
+        // Premature funding, checked only after the deal's own bounds: see `lock_htlc`.
+        if self.tokens.is_premature(payment) {
+            return None;
+        }
         if self.tokens.apply(payment).is_err() {
-            return false;
+            return Some(false);
         }
         self.storage.deals.insert(id, deal);
-        true
+        Some(true)
     }
 
     /// Prove retrievability for a deal's current epoch: recompute the audit challenge from the block's beacon,
@@ -562,15 +579,23 @@ impl HybridLedger {
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
-                Some(name_tx) => outcome(self.names.apply(&name_tx, &mut self.tokens, self.height).is_ok()),
+                Some(name_tx) => match self.names.apply(&name_tx, &mut self.tokens, self.height) {
+                    Ok(()) => ExecOutcome::Applied,
+                    // The registry validates the operation *before* settling its payment, so a premature nonce
+                    // here means the operation itself was sound: defer it rather than lose it.
+                    Err(NameError::Payment(TokenError::NonceAhead)) => ExecOutcome::Deferred,
+                    Err(_) => ExecOutcome::Rejected,
+                },
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_SHIELD, body)) => match ShieldTx::from_bytes(body) {
-                Some(sx) => outcome(self.shield(&sx)),
+                Some(sx) => self.shield(&sx).map_or(ExecOutcome::Deferred, outcome),
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
-                Some(StorageTx::Open { params, payment }) => outcome(self.open_deal(&params, &payment)),
+                Some(StorageTx::Open { params, payment }) => {
+                    self.open_deal(&params, &payment).map_or(ExecOutcome::Deferred, outcome)
+                }
                 // Same premature-versus-invalid distinction as the HTLC arms below: blind ordering can put a
                 // proof or a close ahead of the `Open` that creates the deal, and a deal this ledger has never
                 // held may simply not have been opened *yet*.
@@ -591,7 +616,9 @@ impl HybridLedger {
                 None => ExecOutcome::Malformed,
             },
             Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
-                Some(HtlcTx::Lock { terms, payment }) => outcome(self.lock_htlc(&terms, &payment)),
+                Some(HtlcTx::Lock { terms, payment }) => {
+                    self.lock_htlc(&terms, &payment).map_or(ExecOutcome::Deferred, outcome)
+                }
                 // A contract this ledger has never held is *premature*, not invalid: blind anti-MEV ordering
                 // routinely puts a claim ahead of the lock that funds it — measured as `[Rejected, Applied]`
                 // for `[claim, lock]` in one block, with the recipient paid nothing and the escrow stranded
@@ -2120,6 +2147,50 @@ mod tests {
     /// cannot keep a contract's funding ahead of its claim — it sees only commitments. Measured before the fix:
     /// `[claim, lock]` in one block gave `[Rejected, Applied]`, the recipient was paid nothing, and the escrow
     /// sat stranded until the timeout while the claim was dropped from the mempool as "included".
+    /// **Deferral is a last resort, not a first check.** A transaction that is *both* malformed and premature must
+    /// be rejected: no later state makes a bad parameter good, so re-queueing it wastes block space for
+    /// `REVEAL_WINDOW` blocks and then drops it anyway.
+    ///
+    /// This is not hypothetical — the first version of the premature check ran *before* each handler's own
+    /// validation, and turned the out-of-range storage deals below from `Rejected` into `Deferred`. The existing
+    /// suite caught it, which is why the check now lives inside each handler, immediately before it settles the
+    /// payment and after everything it can judge on its own.
+    #[test]
+    fn a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred() {
+        use fanos_thesauros::{Cid, DealParams};
+        let (sk, vk, consumer) = account(1);
+        let (_p, _pv, provider) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        let open = |ledger: &mut HybridLedger, size: u64, nonce: u64| {
+            let params = DealParams {
+                cid: Cid::new([2u8; 32]),
+                size,
+                duration: 4,
+                replication: 3,
+                lambda_bits: 10,
+                f_tol_permille: 100,
+                k: 3,
+                price: 400,
+                provider,
+                consumer,
+            };
+            let payment = SignedTransfer::sign(
+                Transfer { from: consumer, to: STORAGE_ESCROW, amount: 400, nonce },
+                &sk,
+                vk.clone(),
+            );
+            ledger.apply(&Transaction::new(HybridLedger::storage_payload(&StorageTx::Open { params, payment })))
+        };
+        // Sound deal, premature nonce (the account is still at 0) ⇒ deferred, and it survives to be retried.
+        assert_eq!(open(&mut ledger, MAX_DEAL_SIZE, 7), ExecOutcome::Deferred, "sound but early ⇒ deferred");
+        // Malformed deal, equally premature nonce ⇒ rejected, because deferring could never help it.
+        assert_eq!(open(&mut ledger, MAX_DEAL_SIZE + 1, 7), ExecOutcome::Rejected, "malformed wins over early");
+        // And the same sound deal applies once its nonce is the account's.
+        assert_eq!(open(&mut ledger, MAX_DEAL_SIZE, 0), ExecOutcome::Applied, "the deferral was correct");
+    }
+
     #[test]
     fn a_claim_ordered_ahead_of_its_lock_is_deferred_rather_than_lost() {
         use fanos_hermes::hashlock;

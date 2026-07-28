@@ -281,6 +281,19 @@ impl TokenLedger {
         Ok(())
     }
 
+    /// Whether `st`'s nonce is **ahead** of its sender's — the transfer is not applicable yet, and becomes so
+    /// once the sender's earlier transfers execute.
+    ///
+    /// Exposed as a predicate because several transaction types fund themselves with a `SignedTransfer` and
+    /// return only success/failure: the storage `Open`, the HTLC `Lock`, a name purchase, a shield. Each must
+    /// answer "premature or invalid?" *before* doing its own work, since a deferral must leave the state
+    /// untouched, and under blind anti-MEV ordering a nonce ahead of its account is the ordinary case rather
+    /// than an error ([`fanos_taxis::ExecOutcome::Deferred`]).
+    #[must_use]
+    pub fn is_premature(&self, st: &SignedTransfer) -> bool {
+        st.transfer.nonce > self.nonce(&st.transfer.from)
+    }
+
     /// A **system** move — no signature, no nonce — from `from` to `to`, authorised by the caller rather than a
     /// key (e.g. an unshield's credit, authorised by a shielded proof; the keyless pool sink can only move this
     /// way). `false` (and unchanged) if `from` lacks `amount`. Not exposed outside the crate: only the bridge

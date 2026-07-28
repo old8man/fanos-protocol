@@ -30,20 +30,24 @@ intermediary. What genuinely remains:
 Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
 surfaces and are exempt by construction.
 
-### [A] Finish the premature-versus-invalid sweep across the ledger dispatch
-`ExecOutcome::Deferred` now covers the three order-dependent cases that were measured: a transparent nonce ahead of its
-account, an HTLC claim/refund ahead of its lock, and a storage prove/close ahead of its open. The same question applies to
-the rest of `HybridLedger::apply_with_verdict`, and each needs deciding on its own merits rather than by analogy:
-- **`TAG_SHIELD`** — a shield whose funding transfer is ordered later in the block fails on balance. Deferring it means
-  deferring on `InsufficientFunds`, which is *not* obviously right: unlike a nonce or a missing object, an unfunded
-  transaction has no identifiable pending prerequisite, so retaining it re-consumes block space for `REVEAL_WINDOW`
-  blocks and multiplies the cost of a spam flood by that factor. There is no fee to price it (ERGON is gasless).
-- **`TAG_NAME`** — whether a renewal ahead of its registration, or a transfer ahead of its purchase, can occur.
-- **Shielded (`TAG_SHIELDED`)** is already safe by construction and needs nothing: the rolling anchor window
-  (`MAX_ANCHORS`, Zcash-style) accepts any recent root, and a wallet cannot prove membership against a root that does not
-  exist yet. A double-spent nullifier is genuinely terminal.
-- The general rule the sweep should apply: a rejection is premature iff *re-executing it unchanged against a later state
-  could succeed*. Replay, double-spend, bad signature and malformed bytes never can; a missing prerequisite can.
+### [A] Decide whether `InsufficientFunds` is premature — the one case left, and it is a trade-off
+The sweep is otherwise done. `ExecOutcome::Deferred` now covers every order-dependent case in
+`HybridLedger::apply_with_verdict` that has an **identifiable pending prerequisite**: a transparent nonce ahead of its
+account, an HTLC claim/refund ahead of its lock, a storage prove/close ahead of its open, and the funding transfer of a
+shield, a name operation, an HTLC lock and a storage open (`TokenLedger::is_premature`). The shielded path needs nothing —
+its rolling anchor window accepts any recent root and no wallet can prove membership against a root that does not exist.
+
+What is left is deliberately undone: a transaction that fails on **balance** has no identifiable prerequisite, so
+deferring it re-consumes block space for `REVEAL_WINDOW` blocks and multiplies a spam flood by that factor, with no fee to
+price it (ERGON is gasless). Deciding it needs the spam-cost model, not more of this pattern.
+
+Two rules the sweep established, both worth keeping:
+- A rejection is premature **iff re-executing the transaction unchanged against a later state could succeed.** Replay,
+  double-spend, bad signature, malformed bytes never can; a missing prerequisite can.
+- **Deferral is a last resort, not a first check.** The check must run *after* everything a handler can judge on its own,
+  or a transaction that is both malformed and premature gets deferred — wasting `REVEAL_WINDOW` blocks before being
+  dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
+  by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
 ### [A] A sub-quorum lock split still stalls a live cell about 1 run in 8
 **Largely fixed; this is the residual.** Originally 2 of 4 runs of `cargo test -p fanos-node --test dromos_quic
