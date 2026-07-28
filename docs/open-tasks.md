@@ -66,7 +66,21 @@ Whichever way it goes, it is a decision to make explicitly rather than by attrit
 **Process note for the next investigator:** the failure message carries the whole `ConsensusProbe` trace, which is the
 diagnosis. Do not filter test output through `grep -E "FAILED|^---- "` — that drops exactly the line worth reading.
 
-### [A] The sampler evicted the very block the cell converged on — FIXED
+### [A] CORRECTION: the eviction fix is a latent-defect fix, not the demonstrated live cause
+Checked my own arithmetic after committing, and it does not support the attribution. `Sampler::reconstruct` **removes**
+the entry, so `pending` holds only skeletons that never reconstructed — not every skeleton ever seen. And under SSLE
+only round 0 is all-propose; rounds ≥ 1 contribute one proposal each. So a height burning 13 rounds produces on the
+order of twenty skeletons, of which only the failures accumulate — nowhere near the 64-entry cap.
+
+The eviction is real, the fix is correct, and the class is worth closing (see below). But the live symptom it was
+committed against — seven of seven validators reporting `await` at round 13 — was **not shown** to be eviction, and I
+wrote the commit as though it had been.
+
+Made falsifiable rather than argued: `DriverProbe` now reports `sampling=N/CAP`. The next live failure settles it — a
+validator stalled with the queue in single digits provably is not losing skeletons to eviction, and one stalled near the
+cap is.
+
+### [A] The sampler eviction — FIXED (latent)
 The strongest finding of this investigation, and it explains the `await` that appears in **every** frozen trace.
 `Sampler::pending` is bounded (`PENDING_CAP = 64`) because its key is a remote-chosen block hash, and `BoundedMap`
 evicts in **insertion order**. Under SSLE all-propose a height costs one skeleton per validator per round, so a

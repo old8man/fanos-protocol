@@ -200,6 +200,10 @@ pub struct DriverProbe {
     pub consensus: ConsensusProbe,
     /// Notifications dropped by the broadcast drainer (see the `lagged` counter in [`spawn_taxis`]). Cumulative.
     pub lagged: u64,
+    /// Skeletons still being sampled (`Sampler::in_flight`). Read against `fanos_taxis::da::PENDING_CAP`: a validator
+    /// stalled with this near the cap may be losing skeletons to eviction, and one stalled with it in single digits
+    /// provably is not. That distinction was argued rather than measured once already.
+    pub sampling: usize,
 }
 
 impl core::fmt::Display for DriverProbe {
@@ -207,6 +211,9 @@ impl core::fmt::Display for DriverProbe {
         write!(f, "{}", self.consensus)?;
         if self.lagged > 0 {
             write!(f, " LAGGED={}", self.lagged)?;
+        }
+        if self.sampling > 0 {
+            write!(f, " sampling={}/{}", self.sampling, fanos_taxis::da::PENDING_CAP)?;
         }
         Ok(())
     }
@@ -416,6 +423,7 @@ where
                     let _ = reply.send(DriverProbe {
                         consensus: engine.probe(),
                         lagged: lagged.load(Ordering::Relaxed),
+                        sampling: da.in_flight(),
                     });
                 }
                 note = note_rx.recv() => match note {
