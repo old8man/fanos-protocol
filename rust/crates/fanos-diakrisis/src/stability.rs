@@ -373,7 +373,7 @@ mod tests {
             "the ceiling demands {seconds_at_ten_million_per_second:.0}s of a single core — too much to join"
         );
         // …and it must be high enough to actually cost an attacker something.
-        assert!(MAX_ADMISSION_BITS >= 20, "a ceiling below ~20 bits is free at flood scale");
+        const { assert!(MAX_ADMISSION_BITS >= 20, "a ceiling below ~20 bits is free at flood scale") };
     }
 
     #[test]
