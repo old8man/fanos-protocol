@@ -29,7 +29,7 @@ use fanos_telemetry::dp::PrivacyBudget;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::resolve::{RESOLVE_TIMEOUT, Read};
+use crate::resolve::{STORE_TIMEOUT, Read};
 
 /// The store slot a node's privatized coherence frame is published at, keyed by its coordinate **and** the epoch.
 ///
@@ -145,7 +145,7 @@ pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceF
 /// Three-valued: a read that **timed out** is not the same as a node that published nothing, and collapsing them is how a
 /// monitor comes to believe a quiet cell is a healthy one. Same discipline as `capdir`'s `read_capability`.
 pub async fn read_coherence(client: &Client, coord: Coord, epoch: Epoch) -> Read<CoherenceFrame> {
-    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(coherence_slot(coord, epoch))).await {
+    match tokio::time::timeout(STORE_TIMEOUT, client.get(coherence_slot(coord, epoch))).await {
         Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| CoherenceFrame::decode(&b))),
         Err(_) => Read::Unknown,
     }

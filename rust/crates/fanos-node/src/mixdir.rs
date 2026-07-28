@@ -33,7 +33,7 @@ use fanos_primitives::BeaconSeed;
 use fanos_vrf::{VrfProof, VrfPublic};
 
 use crate::bound::Entitlement;
-use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
+use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
 
 /// How a publisher obtains its coordinate proof: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
 ///
@@ -105,7 +105,7 @@ pub async fn resolve_mix_key(
     coord: Coord,
     epoch: Epoch,
 ) -> Option<HybridKemPublic> {
-    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(mix_key_slot(coord, epoch)))
+    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(mix_key_slot(coord, epoch)))
         .await
         .ok()??;
     HybridKemPublic::decode(&bytes)
@@ -180,7 +180,7 @@ async fn read_mix_key_in_mode<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Read<HybridKemPublic> {
-    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(mix_key_slot(coord, epoch))).await {
+    match tokio::time::timeout(STORE_TIMEOUT, client.get(mix_key_slot(coord, epoch))).await {
         Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| match beacon {
             Some(seed) => parse_bound_record::<F>(&b, coord, epoch, &seed),
             None => HybridKemPublic::decode(&b),

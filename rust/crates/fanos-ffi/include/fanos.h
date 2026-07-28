@@ -48,6 +48,11 @@ FanosNode *fanos_open(const char *config);
 /* Ensure the node has joined the overlay (idempotent; it joins during fanos_open). FANOS_OK / FANOS_ERR_NULL. */
 int fanos_join(FanosNode *node);
 
+/* Every store call below (publish, lookup, and the descriptor publish inside fanos_service_host) is bounded:
+ * a peer that never answers makes the call fail rather than block, because a C caller has no way to interrupt a
+ * blocking FFI function. Measured before the bound: a lookup from a freshly-bootstrapped peer stalled with no
+ * output for 34 minutes. */
+
 /* Publish `val` (val_len bytes) under `key` (key_len bytes) in the overlay store. */
 int fanos_publish(FanosNode *node, const uint8_t *key, size_t key_len,
                   const uint8_t *val, size_t val_len);

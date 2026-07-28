@@ -28,7 +28,7 @@ use fanos_runtime::Notification;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::resolve::RESOLVE_TIMEOUT;
+use crate::resolve::STORE_TIMEOUT;
 
 /// A cell's checkpoint slot: the store address its latest execution certificate for `epoch` lives at.
 fn checkpoint_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
@@ -63,7 +63,7 @@ pub async fn publish_checkpoint(client: &Client, cell: u32, epoch: Epoch, cert: 
 
 /// Resolve the execution certificate `cell` published for `epoch`, or `None` if none/timeout/malformed.
 pub async fn resolve_checkpoint(client: &Client, cell: u32, epoch: Epoch) -> Option<ExecCertificate> {
-    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(checkpoint_slot(cell, epoch))).await.ok()??;
+    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(checkpoint_slot(cell, epoch))).await.ok()??;
     ExecCertificate::from_bytes(&bytes)
 }
 
@@ -107,7 +107,7 @@ fn alloc_vec(byte: u8) -> Vec<u8> { vec![byte] }
 /// contributes a *clean* block to the federated word (a child that says nothing is not accused), while a mis-parsed one
 /// would fabricate faults and could make the grammar accuse an innocent sibling.
 pub async fn resolve_health(client: &Client, cell: u32, epoch: Epoch) -> Option<Report> {
-    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(health_slot(cell, epoch))).await.ok()??;
+    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(cell, epoch))).await.ok()??;
     let [block] = <[u8; 1]>::try_from(bytes.as_slice()).ok()?;
     Some(Report { axes: block & 0x7F, bus_fault: block >> golay::AXES & 1 == 1 })
 }
@@ -188,7 +188,7 @@ pub async fn read_receipt(
     nonce: u64,
 ) -> Option<CrossCellReceipt> {
     let bytes =
-        tokio::time::timeout(RESOLVE_TIMEOUT, client.get(receipt_slot(dest_cell, source_cell, nonce))).await.ok()??;
+        tokio::time::timeout(STORE_TIMEOUT, client.get(receipt_slot(dest_cell, source_cell, nonce))).await.ok()??;
     CrossCellReceipt::from_bytes(&bytes)
 }
 

@@ -23,7 +23,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capdir::cell_cap_coords;
-use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
+use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch load report lives at — domain-separated, keyed by coordinate and
 /// epoch (each epoch's report at its own address).
@@ -71,7 +71,7 @@ pub async fn publish_load(client: &Client, coord: Coord, epoch: Epoch, load: Dem
 
 /// Resolve the load the node at `coord` reported for `epoch`, or `None` if none/timeout/malformed.
 pub async fn resolve_load(client: &Client, coord: Coord, epoch: Epoch) -> Option<Demand> {
-    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(load_slot(coord, epoch))).await.ok()??;
+    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(load_slot(coord, epoch))).await.ok()??;
     parse_load(&bytes)
 }
 
@@ -98,7 +98,7 @@ pub(crate) async fn build_cell_setpoint<F: Field>(
 
 /// As [`resolve_load`], distinguishing a read that **did not conclude** from a definite absence.
 async fn read_load(client: &Client, coord: Coord, epoch: Epoch) -> Read<Demand> {
-    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(load_slot(coord, epoch))).await {
+    match tokio::time::timeout(STORE_TIMEOUT, client.get(load_slot(coord, epoch))).await {
         Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| parse_load(&b))),
         Err(_) => Read::Unknown,
     }

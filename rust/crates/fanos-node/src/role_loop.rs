@@ -193,7 +193,7 @@ pub fn spawn_role_loop<F: Field>(
                     // roster **without** scanning more — the flood should update its view directly, rather than prompt it to
                     // go and look.
                     Ok(Notification::Reseated { .. } | Notification::PeerMoved { .. }) => {
-                        // Undo relaxation only. Not inline (a scan costs up to one `RESOLVE_TIMEOUT`), and not by re-arming
+                        // Undo relaxation only. Not inline (a scan costs up to one `STORE_TIMEOUT`), and not by re-arming
                         // at the floor when already there — a fresh `interval_at(now + backoff, …)` pushes the next tick a
                         // full period out, so "re-arm" would *delay* the soonest available look.
                         stable = 0;
@@ -269,10 +269,10 @@ pub fn spawn_role_loop<F: Field>(
 /// its startup race produced.
 ///
 /// The period is **derived from the work it schedules**, not chosen: one assignment costs up to one
-/// [`RESOLVE_TIMEOUT`] (the two directory scans run concurrently), so a 3× period bounds the refresh at a **1/3 duty
+/// [`STORE_TIMEOUT`] (the two directory scans run concurrently), so a 3× period bounds the refresh at a **1/3 duty
 /// cycle**. Anything near 1× and the scans overlap — the node is then permanently scanning the cell, which measurably
 /// destabilised timing-sensitive real-socket tests running alongside it and would be a traffic beacon in production.
-pub const ROSTER_REFRESH: Duration = Duration::from_secs(3 * crate::resolve::RESOLVE_TIMEOUT.as_secs());
+pub const ROSTER_REFRESH: Duration = Duration::from_secs(3 * crate::resolve::STORE_TIMEOUT.as_secs());
 
 /// The ceiling the refresh backs off to, **derived** as one [`DEFAULT_EPOCH_PERIOD`](crate::config::DEFAULT_EPOCH_PERIOD).
 ///
@@ -309,7 +309,7 @@ const GENESIS_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// that read like a controller fault and was actually a missing input.
 ///
 /// The publishers *signal* rather than the loop polling the directory. Polling looks equivalent and is not: each poll
-/// costs a full cell-wide scan bounded by [`RESOLVE_TIMEOUT`](crate::resolve), so a retry loop cannot converge
+/// costs a full cell-wide scan bounded by [`STORE_TIMEOUT`](crate::resolve), so a retry loop cannot converge
 /// promptly, and a node's first epoch would silently serve nothing.
 async fn genesis_assign<F: Field>(
     client: &Client,
@@ -394,7 +394,7 @@ async fn assign_epoch<F: Field>(
     roles_tx: &watch::Sender<Assignment>,
 ) -> (Assignment, bool) {
     // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
-    // assignment's worst-case latency is one RESOLVE_TIMEOUT, not two. That halving is what lets the refresh period
+    // assignment's worst-case latency is one STORE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
     let ((members, caps_complete), (setpoint, load_complete)) = tokio::join!(
         build_capability_directory::<F>(client, epoch, vrf.then_some(*beacon)),

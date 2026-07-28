@@ -118,12 +118,15 @@ pub async fn publish_service(
 /// `(coordinate, KEM key)` by fetching and authenticating the published descriptor (the real ONOMA
 /// path, as opposed to a fixed [`StaticResolver`](crate::diaulos::StaticResolver)). This is what a
 /// [`FanosDialer`](crate::diaulos::FanosDialer) uses in production.
-/// How long a store lookup (a descriptor or a mix key) waits before giving up, so a Get that never
-/// resolves fails the resolution instead of hanging the caller forever.
-pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long **any** overlay-store lookup waits before giving up, so a Get that never resolves fails its caller
+/// instead of hanging it forever.
+///
+/// Public because it is a contract an embedder needs: the C ABI's `fanos_lookup`/`fanos_publish` bound
+/// themselves by it, and a foreign caller has no other way to know that a store call returns.
+pub const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A [`ServiceResolver`] over the overlay store: resolves a service's rendezvous descriptor (and mix
-/// keys) by looking them up at their coordinate-derived store slots, bounded by [`RESOLVE_TIMEOUT`] so a
+/// keys) by looking them up at their coordinate-derived store slots, bounded by [`STORE_TIMEOUT`] so a
 /// missing service fails rather than hangs. This is the discovery side of the Direct profile.
 pub struct NodeResolver {
     client: Client,
@@ -154,7 +157,7 @@ impl ServiceResolver for NodeResolver {
             let slot = lookup_key(&address, epoch).to_vec();
             // Bound the store lookup: a Get that never resolves (unknown key, unreachable responsible
             // node) must fail the resolution rather than hang the dial forever.
-            let blob = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(slot))
+            let blob = tokio::time::timeout(STORE_TIMEOUT, client.get(slot))
                 .await
                 .ok()??;
             let resolved = verify_descriptor(&address, epoch, &blob, min_pow).ok()?;
@@ -167,12 +170,12 @@ impl ServiceResolver for NodeResolver {
 
 /// Resolve every coordinate of a cell-wide directory **concurrently**, preserving `coords` order.
 ///
-/// The sequential form this replaces cost `N × RESOLVE_TIMEOUT` whenever slots were unoccupied — a *miss* is the
+/// The sequential form this replaces cost `N × STORE_TIMEOUT` whenever slots were unoccupied — a *miss* is the
 /// expensive case, since it waits out the timeout, and a sparse cell is mostly misses. That made a cell-wide scan
 /// take tens of seconds on the 7-point test plane and, on a real plane (`N = q²+q+1`), longer than the epoch it was
 /// scanning for: the self-organizing role loop could not have completed a single epoch in production.
 ///
-/// Concurrent, the whole scan is bounded by *one* [`RESOLVE_TIMEOUT`] rather than `N` of them.
+/// Concurrent, the whole scan is bounded by *one* [`STORE_TIMEOUT`] rather than `N` of them.
 ///
 /// **Order is preserved deliberately.** These directories feed deterministic cell-wide agreement (the role
 /// assignment consumes the roster), so the result must not depend on which lookup finished first. Results are

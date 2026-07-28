@@ -33,7 +33,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::diaulos::{dial_service, serve};
-use crate::resolve::RESOLVE_TIMEOUT;
+use crate::resolve::STORE_TIMEOUT;
 
 /// Upper bound on the target header length (`host:port`) — bounds the read a malicious client can force
 /// before it has connected anywhere.
@@ -300,7 +300,7 @@ pub async fn resolve_exit_key(
     coord: Coord,
     epoch: Epoch,
 ) -> Option<HybridKemPublic> {
-    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(exit_key_slot(coord, epoch)))
+    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(exit_key_slot(coord, epoch)))
         .await
         .ok()??;
     HybridKemPublic::decode(&bytes)

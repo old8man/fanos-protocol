@@ -228,9 +228,22 @@ and points at a timing race.
 - **Not** skipped in the nightly job: it runs as its own last step with a 5-minute timeout, so a stall bounds itself and
   the zero-knowledge proofs finish first regardless. A plain failure would not have starved them anyway — libtest
   continues — but the one 34-minute stall did.
-- What is left to try, given instrumentation perturbs it: capture the store `Get` at the transport layer instead (the
-  `fanos-quic` frame log), or make the test assert on the descriptor's presence in the store *before* dialing, which
-  would split "never published" from "published but unreachable".
+**Narrowed, and two real defects fixed on the way.** Asserting the descriptor's presence *before* dialing split the causes,
+and the answer was neither of the two the null return suggested:
+
+1. A published — the "A can read its own descriptor" assertion never failed.
+2. **B's store read is what failed**, and worse, it *stalled*: `fanos_lookup` awaited `Client::get` with no bound, so a Get
+   that never resolved blocked the C caller indefinitely. That is the 34-minute stall. `NodeResolver` had always bounded
+   its own lookups (`STORE_TIMEOUT`, documented as exactly this); the C ABI did not, and neither did the descriptor publish
+   inside `fanos_service_host`. Both are bounded now, and the constant is public because it is a contract an embedder
+   cannot otherwise know.
+
+With those bounds the flake rate went from 3 in 15 to **1 in 6**, the stalls stopped, and the survivor fails *later* and
+elsewhere — `"the host received the client's bytes"`, i.e. the echo after a successful dial. So what remains is a data-path
+flake, not a resolution one, and the resolution story is closed.
+- Next: the accepted stream's first read returning 0 or an error. `fanos_service_accept` and `fanos_stream_read` block by
+  design (an accept *should* wait), so the question is whether the client's write is lost between `serve`'s channel and
+  the accepted `DuplexStream`, not whether something needs a timeout.
 
 ### [A] No machine-checked formatting convention
 `cargo fmt --all --check` was removed from CI (2 650 hunks: the source is deliberately hand-wrapped denser than rustfmt's

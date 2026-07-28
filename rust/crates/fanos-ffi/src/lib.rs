@@ -26,7 +26,8 @@ use std::{ptr, slice};
 use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
 use fanos_field::F2;
 use fanos_node::{
-    Epoch, Node, NodeConfig, NodeResolver, ServiceResolver, dial_service, publish_service, serve,
+    Epoch, Node, NodeConfig, NodeResolver, STORE_TIMEOUT, ServiceResolver, dial_service, publish_service,
+    serve,
 };
 use fanos_onoma::Address;
 use fanos_pqcrypto::rng::SeedRng;
@@ -135,9 +136,13 @@ pub unsafe extern "C" fn fanos_publish(
     else {
         return FANOS_ERR_NULL;
     };
-    let accepted = handle
-        .rt
-        .block_on(handle.node.client().put(key.to_vec(), val.to_vec()));
+    // Bounded, like every other store call: a Put whose responsible peer never answers must fail the call, not
+    // hang the C caller forever. A foreign caller has no way to interrupt a blocking FFI function.
+    let accepted = handle.rt.block_on(async {
+        tokio::time::timeout(STORE_TIMEOUT, handle.node.client().put(key.to_vec(), val.to_vec()))
+            .await
+            .unwrap_or(false)
+    });
     if accepted { FANOS_OK } else { FANOS_ERR_IO }
 }
 
@@ -170,7 +175,14 @@ pub unsafe extern "C" fn fanos_lookup(
     if !out_buffer_is_valid(out, out_cap, out_len) {
         return FANOS_ERR_NULL;
     }
-    let Some(value) = handle.rt.block_on(handle.node.client().get(key.to_vec())) else {
+    // Bounded for the same reason as the Put above — and this is the one that was measured hanging: an overlay
+    // Get from a freshly-bootstrapped peer intermittently never resolves, and without a bound the C caller waits
+    // on it indefinitely (observed as a 34-minute stall with no output). `fanos_node::NodeResolver` has always
+    // bounded its own lookups this way; the C ABI did not.
+    let found = handle.rt.block_on(async {
+        tokio::time::timeout(STORE_TIMEOUT, handle.node.client().get(key.to_vec())).await.ok().flatten()
+    });
+    let Some(value) = found else {
         return FANOS_ERR_NOTFOUND;
     };
     // SAFETY: the caller guarantees `out`/`out_len` are writable for the stated capacity, and the value is a
@@ -335,15 +347,18 @@ pub unsafe extern "C" fn fanos_service_host(
             },
         );
     }
-    let published = handle.rt.block_on(publish_service(
-        &handle.node.client(),
-        &bundle,
-        handle.node.address(),
-        Epoch::ZERO,
-        0,
-        &[],
-    ));
-    if published.is_err() {
+    // Bounded like the other store calls: `publish_service` awaits a store Put, and an unbounded one hangs the
+    // C caller with no way to interrupt it. This is the second such site the flake investigation found — the
+    // first was `fanos_lookup` — and it is the same rule: every store await in this ABI carries `STORE_TIMEOUT`.
+    let published = handle.rt.block_on(async {
+        tokio::time::timeout(
+            STORE_TIMEOUT,
+            publish_service(&handle.node.client(), &bundle, handle.node.address(), Epoch::ZERO, 0, &[]),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
+    });
+    if !published {
         return ptr::null_mut();
     }
     // SAFETY: `cstr_fits` held above — `addr_out` is non-null with room for the name and its terminator, and
@@ -553,6 +568,7 @@ unsafe fn write_cstr(text: &str, out: *mut c_char) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use fanos_onoma::lookup_key;
     use std::ffi::CString;
     use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
@@ -1001,6 +1017,47 @@ mod tests {
         let b = unsafe { fanos_open(b_cfg.as_ptr()) };
         assert!(!b.is_null());
 
+        // Split the two ways a dial-by-name can fail, before dialing. `fanos_service_connect` returning null
+        // says only "no stream": it cannot distinguish a descriptor that was never published from one published
+        // but unreachable from B, and this test has been observed failing intermittently in release with nothing
+        // but that null to go on. Reading the descriptor out of A's *own* store separates them — A published it
+        // and A can read it, or the publish itself is what failed.
+        let slot = lookup_key(&Address::parse(&name).expect("the hosted name parses"), Epoch::ZERO);
+        let mut published = false;
+        for _ in 0..60 {
+            let mut need = 0usize;
+            // SAFETY: `a` is live; `slot` is a valid 32-byte key; a null out-buffer with zero capacity is the
+            // size-probe form, which reports the length without writing.
+            let rc = unsafe {
+                fanos_lookup(a, slot.as_ptr(), slot.len(), ptr::null_mut(), 0, &raw mut need)
+            };
+            // OK or BUFFER both mean the key is present (BUFFER is the probe reporting a length it could not fit).
+            if rc == FANOS_OK || rc == FANOS_ERR_BUFFER {
+                published = true;
+                break;
+            }
+            sleep(Duration::from_millis(500));
+        }
+        assert!(published, "A published its service descriptor and can read it back from the overlay store");
+
+        // The same read from **B**, which is the one `fanos_service_connect` performs internally. It splits the
+        // remaining two causes: if B cannot read the slot the fault is the overlay store path between the two
+        // nodes, and if it can, the fault is inside the connect itself.
+        let mut b_reads_it = false;
+        for _ in 0..60 {
+            let mut need = 0usize;
+            // SAFETY: `b` is live; `slot` is a valid key; the null out-buffer with zero capacity is the probe form.
+            let rc = unsafe {
+                fanos_lookup(b, slot.as_ptr(), slot.len(), ptr::null_mut(), 0, &raw mut need)
+            };
+            if rc == FANOS_OK || rc == FANOS_ERR_BUFFER {
+                b_reads_it = true;
+                break;
+            }
+            sleep(Duration::from_millis(500));
+        }
+        assert!(b_reads_it, "B can read A's descriptor from the overlay store — the store path between them works");
+
         let cname = CString::new(name).unwrap();
         let mut client = ptr::null_mut();
         for _ in 0..60 {
@@ -1011,7 +1068,11 @@ mod tests {
             }
             sleep(Duration::from_millis(500));
         }
-        assert!(!client.is_null(), "B dialed the hosted service");
+        assert!(
+            !client.is_null(),
+            "B resolved and dialed the hosted service — the descriptor is in the store (asserted above), so a \
+             failure here is resolution or reachability from B, not publication"
+        );
 
         let msg = b"c-abi service host echo";
         // SAFETY: all handles are live; the buffers are valid for each call.

@@ -93,4 +93,4 @@ pub use threshold_rendezvous::{
     ThresholdRendezvous, seal_request_intro, seal_request_to_line, split_delivery,
 };
 pub use threshold_service::{ThresholdService, intro_frame};
-pub use resolve::{NodeResolver, Read, ResolvedService, Scan, publish_service, verify_descriptor};
+pub use resolve::{NodeResolver, Read, ResolvedService, STORE_TIMEOUT, Scan, publish_service, verify_descriptor};

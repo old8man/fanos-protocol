@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::bound::Entitlement;
-use crate::resolve::{RESOLVE_TIMEOUT, Read, resolve_directory};
+use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch capability advertisement lives at — domain-separated, keyed by
 /// the node's coordinate **and** the epoch (so each epoch's advertisement has its own address and a stale one
@@ -123,7 +123,7 @@ pub async fn publish_capability(
 /// Resolve and verify the capability the node at `coord` advertised for `epoch`, or `None` if none is
 /// published, the lookup times out, or the advertisement fails authentication.
 pub async fn resolve_capability(client: &Client, coord: Coord, epoch: Epoch) -> Option<(NodeId, Capability)> {
-    let bytes = tokio::time::timeout(RESOLVE_TIMEOUT, client.get(cap_slot(coord, epoch))).await.ok()??;
+    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(cap_slot(coord, epoch))).await.ok()??;
     parse_advertisement(&bytes, epoch)
 }
 
@@ -168,7 +168,7 @@ async fn read_capability<F: Field>(
     beacon: Option<BeaconSeed>,
 ) -> Read<(NodeId, Capability)> {
     let slot = cap_slot(coord, epoch);
-    match tokio::time::timeout(RESOLVE_TIMEOUT, client.get(slot)).await {
+    match tokio::time::timeout(STORE_TIMEOUT, client.get(slot)).await {
         // Completed: present-and-valid, or a definite negative (absent, malformed, or failing authentication).
         Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| match beacon {
             Some(seed) => parse_bound_advertisement::<F>(&b, coord, epoch, &seed),
