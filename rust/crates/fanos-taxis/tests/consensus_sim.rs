@@ -229,6 +229,7 @@ impl Cluster {
             ConsensusMsg::SyncResp { cert, head, snapshot } => {
                 Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
             }
+            ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
         }
     }
 
@@ -1110,7 +1111,9 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
                         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
                         // This trial exercises core-message safety; a lagging replica's catch-up is out of scope,
                         // and skipping it cannot cause a fork (an un-synced node simply does not advance).
-                        ConsensusMsg::SyncReq { .. } | ConsensusMsg::SyncResp { .. } => continue,
+                        ConsensusMsg::SyncReq { .. }
+                        | ConsensusMsg::SyncResp { .. }
+                        | ConsensusMsg::CommitCert(_) => continue,
                     };
                     for o in engines[i].step(input) {
                         match o {
@@ -1638,6 +1641,60 @@ fn a_validator_short_one_commit_vote_rejoins_the_chain() {
     assert_eq!(c.hashes_at(0).len(), 1, "one block at the contested height — rejoining must not fork it");
 }
 
+
+#[test]
+fn a_stuck_validator_that_never_sees_a_newer_block_still_rejoins_from_the_commit_certificate() {
+    // The case both existing repair paths structurally cannot reach, and the reason `ConsensusMsg::CommitCert`
+    // exists. A validator finalizes only by gathering `2f+1` COMMIT votes itself, and TAXIS never retransmits a
+    // vote — so a validator short of that quorum is missing signatures it can never obtain again. Two paths are
+    // meant to rescue it:
+    //
+    //   * `adopt_certified_parent` reads the certificate out of a **newer block**, which requires that block to
+    //     reach the stuck validator;
+    //   * `SyncResp` serves an execution **checkpoint**, which a cell in its first heights has not formed.
+    //
+    // Deny the first and the second is already absent: the short validators are also deaf to proposals from the
+    // moment they fall behind, so no later block ever reaches them. That is not a contrived condition — a
+    // validator whose proposal deliveries fail while votes still arrive is exactly a partial-connectivity fault,
+    // and it is the arrangement in which the cell holds the evidence and the laggard cannot be handed it.
+    //
+    // What rescues them is the certificate itself, sent on request: a quorum of signatures over
+    // `(height, block_hash)`, self-authenticating against the fixed committee, granting the requester nothing it
+    // could not have gathered from the votes it missed.
+    let mut c = Cluster::new(&genesis());
+    let short = [4usize, 5, 6];
+    c.set_drop_to(Some((Phase::Commit, &short)));
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"cert-only-rescue");
+    c.submit_all(&tx);
+    c.tick();
+
+    // Stuck exactly as documented: holding the winning block, locked on it, short only a signature.
+    for &i in &short {
+        assert_eq!(c.engines[i].chain().next_height(), 0, "validator {i} has not finalized the height");
+        assert_eq!(c.engines[i].awaited_body(), None, "validator {i} holds the block — it is short a vote, not a body");
+    }
+
+    // Now close the only door they could otherwise be rescued through, and confirm the other is already shut.
+    c.set_drop_to(None);
+    for &i in &short {
+        c.deaf_propose.insert(i);
+        assert!(c.engines[i].latest_checkpoint().is_none(), "validator {i} has no checkpoint to sync from");
+    }
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+
+    // They rejoined — and only the certificate could have carried them, since no newer block ever arrived.
+    let head = c.engines[0].chain().next_height();
+    let root = c.engines[0].chain().state_root();
+    assert!(head >= 1, "the cell finalized the contested height");
+    for &i in &short {
+        assert_eq!(c.engines[i].chain().next_height(), head, "validator {i} rejoined at the cell's height");
+        assert_eq!(c.engines[i].chain().state_root(), root, "validator {i} agrees on the executed state — no fork");
+    }
+    assert_eq!(c.hashes_at(0).len(), 1, "one block at the contested height — rejoining must not fork it");
+}
 
 #[test]
 fn a_validator_that_misses_one_height_rejoins_with_no_further_transactions() {

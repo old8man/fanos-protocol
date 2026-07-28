@@ -433,6 +433,7 @@ fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg
         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
         ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from, have_height: *have_height },
+        ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
         ConsensusMsg::SyncResp { cert, head, snapshot } => {
             Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
         }

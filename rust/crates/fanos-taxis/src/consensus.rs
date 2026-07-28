@@ -268,6 +268,10 @@ pub enum ConsensusMsg {
         /// The full state at `cert.height`, per [`StateMachine::snapshot`](crate::state::StateMachine::snapshot).
         snapshot: Vec<u8>,
     },
+    /// A peer's **commit-certificate answer** to a `SyncReq`: the quorum COMMIT certificate that finalized the
+    /// requester's *current* height. Serves the case [`SyncResp`](Self::SyncResp) structurally cannot — see
+    /// [`on_commit_cert`](ConsensusEngine::on_commit_cert).
+    CommitCert(Certificate),
 }
 
 impl ConsensusMsg {
@@ -304,6 +308,10 @@ impl ConsensusMsg {
                 out.extend_from_slice(head);
                 out.extend_from_slice(snapshot);
             }
+            Self::CommitCert(cert) => {
+                out.push(6);
+                out.extend_from_slice(&cert.to_bytes());
+            }
         }
         out
     }
@@ -330,6 +338,7 @@ impl ConsensusMsg {
                 let snapshot = r.rest().to_vec();
                 Some(Self::SyncResp { cert, head, snapshot })
             }
+            6 => Some(Self::CommitCert(Certificate::from_bytes(body)?)),
             _ => None,
         }
     }
@@ -383,6 +392,8 @@ pub enum Input {
         /// The requester's current next-height.
         have_height: u64,
     },
+    /// A commit certificate received off the wire, finalizing the height we are stuck on (verified before use).
+    CommitCert(Certificate),
     /// A catch-up response received off the wire (verified + adopted only if it beats our height).
     SyncResp {
         /// The offered certificate.
@@ -495,9 +506,14 @@ pub struct ConsensusEngine<S: StateMachine> {
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
     // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
     rejects: ProposalRejects,
-    // Commit certificates learned from **another block's `last_commit`** rather than from votes we gathered, keyed by the
-    // height they finalize. See `adopt_certified_parent`; carried into `finalize` because `collect_cert` can only build a
-    // certificate from votes this validator actually received, and in exactly this situation it did not.
+    // The canonical COMMIT certificate for each finalized height this validator can still produce, keyed by the height
+    // it finalizes. Two sources: one learned from **another block's `last_commit`** (see `adopt_certified_parent`,
+    // carried into `finalize` because `collect_cert` can only build a certificate from votes this validator actually
+    // received, and in exactly that situation it did not), and the one `finalize` itself collected from its own votes.
+    //
+    // Keeping the second is what lets this validator *answer* a stuck peer (`offer_commit_cert`): `collect_cert` filters
+    // by the current round and height, so once the chain advances the certificate is unrecoverable from raw votes — the
+    // moment of finalization is the only one at which it can be captured. Pruned with the rest of the catch-up retention.
     certified: BTreeMap<u64, Certificate>,
     // Recently **finalized** bodies, retained to serve a peer stuck on a block it never received.
     //
@@ -838,6 +854,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Input::ExecVote(v) => self.on_exec_vote(v),
             Input::Timeout => self.on_timeout(),
             Input::SyncReq { from, have_height } => self.on_sync_req(from, have_height),
+            Input::CommitCert(cert) => self.on_commit_cert(cert),
             Input::SyncResp { cert, head, snapshot } => self.on_sync_resp(cert, head, &snapshot),
         }
     }
@@ -866,10 +883,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// gains nothing it could not verify; the snapshot + certificate are self-authenticating.
     fn on_sync_req(&mut self, from: u8, have_height: u64) -> Vec<Output> {
         let Some(cert) = &self.checkpoint else {
-            return Vec::new();
+            return self.offer_commit_cert(from, have_height);
         };
         if cert.height <= have_height {
-            return Vec::new(); // nothing newer to offer
+            return self.offer_commit_cert(from, have_height);
         }
         let Some((root, head)) = self.sync_heads.get(&cert.height) else {
             return Vec::new(); // we do not retain the certified height's head/state (pruned or mid-flight)
@@ -881,6 +898,38 @@ impl<S: StateMachine> ConsensusEngine<S> {
             to: from,
             msg: ConsensusMsg::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() },
         }]
+    }
+
+    /// Answer a `SyncReq` with the COMMIT certificate that finalized the requester's current height, when the
+    /// checkpoint path has nothing to offer.
+    ///
+    /// **Why this exists at all.** A validator finalizes only by gathering `2f+1` COMMIT votes *itself*, and votes
+    /// are never retransmitted — so a validator one height behind is missing a set of signatures it can never
+    /// obtain again. Two paths were supposed to rescue it and neither reaches this case: `SyncResp` serves an
+    /// execution *checkpoint*, and a cell in its first heights has none; `adopt_certified_parent` reads the
+    /// certificate out of a **newer block**, which requires the cell to keep proposing without the lagging
+    /// validator — precisely what it may be unable to do, since the laggard is part of the quorum. That is a
+    /// circularity: the evidence that would free the validator can only be produced by a cell that has already
+    /// gone on without it.
+    ///
+    /// The certificate is that same evidence in retransmissible form. It is a quorum of signatures over
+    /// `(height, block_hash)`, self-authenticating against the fixed committee, so answering with one grants a
+    /// requester nothing it could not have gathered from the votes it missed — and a Byzantine peer cannot forge
+    /// one. Measured on a live cell before this existed: every validator at height 1 while a peer re-offered its
+    /// height-0 value into rejection, 501 `rejects.proposer` in one run and no path out.
+    fn offer_commit_cert(&self, to: u8, have_height: u64) -> Vec<Output> {
+        let Some(cert) = self.certified.get(&have_height).filter(|c| c.phase == Phase::Commit) else {
+            return Vec::new(); // we did not finalize that height ourselves (or have pruned it)
+        };
+        alloc::vec![Output::SendTo { to, msg: ConsensusMsg::CommitCert(cert.clone()) }]
+    }
+
+    /// Adopt a commit certificate offered by a peer — the counterpart of [`offer_commit_cert`](Self::offer_commit_cert).
+    ///
+    /// Verified exactly as one read out of a block's `last_commit`, through the same
+    /// [`adopt_commit_cert`](Self::adopt_commit_cert): the sender is not trusted, the quorum of signatures is.
+    fn on_commit_cert(&mut self, cert: Certificate) -> Vec<Output> {
+        self.adopt_commit_cert(cert)
     }
 
     /// Adopt a catch-up response — the load-bearing state-sync step. Every guard is mandatory:
@@ -947,9 +996,25 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // justified re-proposal that no one is ever entitled to send, since the rota reaches a locked validator
         // only 3 rounds in 7 while the round timeout doubles toward 24 s. Duplicate re-offers are byte-identical
         // and deduplicated by hash on arrival.
-        let can_reoffer = self
-            .locked_block
-            .is_some_and(|h| self.proposals.contains_key(&h) && self.locked_cert.is_some());
+        // …but only while no peer is known to have moved past us. A re-offer carries a PREPARE certificate for
+        // *our* height, and `on_propose` admits an out-of-rota proposer only if that certificate matches the
+        // **receiver's** height — so once the cell has advanced, every re-offer we send is refused by
+        // construction. Off-rota, that refusal is the only outcome: the proposal is not merely ignored, it is
+        // counted as a proposer-entitlement violation on every peer.
+        //
+        // Measured before this guard, on a live seven-validator cell: **501** `rejects.proposer` in one run,
+        // every node at height 1, against 130 proposals whose proof was for height 0 — a validator re-offering a
+        // value the cell had already left behind, once per round, forever. The lag signal `max_seen_height`
+        // already exists for exactly this knowledge and drives `maybe_request_sync`; a validator that knows it is
+        // behind should be asking to catch up, not proposing into a wall.
+        //
+        // This subtracts nothing from the mechanism's purpose. A re-offer exists to break a lock split *at the
+        // contested height*, and at that height no peer is ahead — so the guard is inert precisely when the
+        // re-offer can do its job, and silent exactly when it cannot.
+        let can_reoffer = self.max_seen_height <= height
+            && self
+                .locked_block
+                .is_some_and(|h| self.proposals.contains_key(&h) && self.locked_cert.is_some());
         if (!entitled && !can_reoffer) || self.proposed_round == Some(self.round) {
             return Vec::new();
         }
@@ -1053,11 +1118,22 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// case. If the body is missing the decision is remembered (`pending_finalize`) and
     /// [`awaited_body`](Self::awaited_body) drives the fetch.
     fn adopt_certified_parent(&mut self, block: &Block) -> Vec<Output> {
-        let height = self.height();
-        if block.header.height <= height {
+        if block.header.height <= self.height() {
             return Vec::new();
         }
         let Some(cert) = block.last_commit.clone() else { return Vec::new() };
+        self.adopt_commit_cert(cert)
+    }
+
+    /// Finalize this validator's current height from a quorum COMMIT certificate, wherever it came from — a newer
+    /// block's `last_commit` ([`adopt_certified_parent`](Self::adopt_certified_parent)) or a peer's direct answer to
+    /// our catch-up request ([`on_commit_cert`](Self::on_commit_cert)). One implementation, so the two sources cannot
+    /// drift apart on what makes a certificate acceptable.
+    ///
+    /// The certificate must be for *this* height, in the COMMIT phase, and carry a `Q`-quorum of valid committee
+    /// signatures. Nothing about the sender is trusted.
+    fn adopt_commit_cert(&mut self, cert: Certificate) -> Vec<Output> {
+        let height = self.height();
         if cert.height != height
             || cert.phase != Phase::Commit
             || !cert.verify(self.params.quorum, &self.verifiers)
@@ -1498,9 +1574,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // finalizer set the block reward is credited to at execution (`StateMachine::apply_block_reward`), which
         // is what lets the reward be part of committed state at all (a per-node split could differ across
         // validators and so could never be part of the state root).
-        self.last_finalized_cert = Some(
-            self.certified.remove(&height).unwrap_or_else(|| self.collect_cert(Phase::Commit, block_hash)),
-        );
+        let finalizer = self
+            .certified
+            .get(&height)
+            .cloned()
+            .unwrap_or_else(|| self.collect_cert(Phase::Commit, block_hash));
+        // Retained, not consumed: a peer short of this height's COMMIT quorum can be handed this exact certificate,
+        // and after `chain.finalize` below no validator can rebuild it from votes again.
+        self.certified.insert(height, finalizer.clone());
+        self.last_finalized_cert = Some(finalizer);
         self.chain.finalize(block.header.clone());
 
         let mut out = alloc::vec![Output::Committed { height, block_hash }];
@@ -1860,6 +1942,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// the (small) execution-to-certification lag.
     fn prune_sync_retention(&mut self, checkpoint_height: u64) {
         self.sync_heads.retain(|&h, _| h >= checkpoint_height);
+        self.certified.retain(|&h, _| h >= checkpoint_height);
         let live: BTreeSet<[u8; 32]> = self.sync_heads.values().map(|(r, _)| *r).collect();
         self.sync_states.retain(|r, _| live.contains(r));
     }

@@ -61,9 +61,19 @@ The lock-split mechanism is now fully addressed and **neither half moved the liv
 So after both healing changes the failure rate is where it was, and the cause must be re-established rather than assumed.
 The `rejects.locked`-only signature that motivated all of this was captured *before* them; nothing since has re-read the
 counters on a current failure.
-- **Next, and it is cheap:** re-instrument `ProposalRejects` on a failing run. If `locked` still dominates, the healing is
-  not reaching the split; if the counters have moved to something else, the residual was never the lock split after the
-  first fix and the investigation has been chasing a resolved cause.
+- **Done, and the counters had moved.** On a current failing run: **501 `proposer`**, 3 `locked`, 3 `link` — where before
+  the fixes it was `locked` and nothing else. All seven validators at height 1; 130 proposals carrying a PREPARE proof for
+  height **0**. The residual was a *proposal storm of my own making*: `can_reoffer` let a validator that had not yet
+  advanced re-offer its value once per round forever, and every peer past that height refused it as a proposer-entitlement
+  violation. Fixed by the guard the lag signal already made available — a re-offer is sound only while no peer is known to
+  be ahead (`max_seen_height <= height`), since past that point the refusal is by construction. Side effect: the
+  consensus simulator's own runtime fell from 92 s to 39 s, the same storm.
+- The investigation also surfaced a genuine gap, now closed and pinned: a validator short of a height's COMMIT quorum
+  could be rescued only by a **newer block** (`adopt_certified_parent`) or an execution **checkpoint** (`SyncResp`), and
+  neither reaches a validator whose proposal deliveries fail in a cell too young to have checkpointed. `ConsensusMsg::CommitCert`
+  answers its catch-up request with the quorum certificate itself — the retransmissible form of the votes TAXIS never
+  retransmits. This required `finalize` to *retain* the certificate it collects rather than consume it, because
+  `collect_cert` filters by the current round and height: finalization is the only moment at which it can be captured.
 - Keep the two changes regardless: both are standard consensus rules that closed real gaps (a locked value that only its
   original proposer could re-offer; an observed polka that no unlocked proposer could act on), and neither regressed.
 
