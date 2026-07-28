@@ -314,6 +314,8 @@ where
         // so a received transaction floods the cell exactly once and a committed (pruned) one does not
         // re-circulate. Bounded ([`SEEN_TX_CAP`]) against a commitment flood.
         let mut seen_txs: BoundedMap<[u8; 32], ()> = BoundedMap::new(SEEN_TX_CAP);
+        // Counts resample rounds, driving the rotating off-custodian ask (`RESAMPLE_FANOUT_PERIOD`).
+        let mut resample_round: u32 = 0;
         // Data-availability transport (spec §6): dispersed shards this node serves + skeletons it is sampling.
         let mut da = Sampler::new(me);
 
@@ -331,7 +333,7 @@ where
                     // sometimes (measured: a 7-node cell executing on 6 of 7 validators, the seventh stranded at genesis
                     // permanently, and the same suite executing on 0 of 7 in the next run). Under SSLE all-propose there
                     // are N proposals racing at once and it loses reliably: no block ever finalized.
-                    resample_pending(&client, &coords, &da);
+                    resample_pending(&client, &coords, me, &da, &mut resample_round);
                     // Ask for a body this validator is committed to but has never seen. Votes carry only a hash, so it
                     // can be locked on — or hold a commit certificate for — a block it never received, and then it will
                     // neither prepare it (it cannot execute what it does not have) nor accept any conflicting proposal.
@@ -655,12 +657,49 @@ fn on_shard<S: StateMachine>(
 ///
 /// Idempotent and cheap: a `Request` for a shard the peer holds is answered with one `Deliver`, and one for a shard it
 /// does not hold is dropped — so retrying costs a message and converges the moment the peer has been dispersed its own.
-/// Bounded by `DA_PENDING_CAP` blocks × the cell size.
-fn resample_pending(client: &Client, coords: &[Triple], da: &Sampler) {
+/// Bounded by [`fanos_taxis::da::PENDING_CAP`] blocks × the cell size.
+///
+/// After [`RESAMPLE_ESCALATE`] fruitless rounds the request stops addressing each shard's custodian and goes to the
+/// whole cell, because a custodian is only the right address while dispersal worked.
+fn resample_pending(client: &Client, coords: &[Triple], me: u8, da: &Sampler, round: &mut u32) {
+    *round = round.wrapping_add(1);
     for (block, missing) in da.outstanding() {
         request_shards(client, coords, block, &missing);
+        // …and one rotating additional peer, because a custodian is only the right address while dispersal worked.
+        // See `RESAMPLE_FANOUT_PERIOD`.
+        if (*round).is_multiple_of(RESAMPLE_FANOUT_PERIOD)
+            && let Some(&index) = missing.first()
+        {
+            let alt = usize::try_from(*round / RESAMPLE_FANOUT_PERIOD).unwrap_or(0) % coords.len();
+            if let Some(&to) = coords.get(alt)
+                && u8::try_from(alt).unwrap_or(u8::MAX) != me
+            {
+                client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block, index }) });
+            }
+        }
     }
 }
+
+/// How often the shard resampler additionally asks a peer that is **not** the shard's custodian, rotating.
+///
+/// Shard `i` is dispersed to validator `i`, so its custodian is the right address: one message per missing shard, and
+/// it converges the moment the custodian has been dispersed its own. But that assumes dispersal worked — and a
+/// validator only reaches this path because it *did not*. When a proposal reaches one validator and no one else, every
+/// other custodian is as empty as the requester, so every request is dropped and the sampler never reaches `K`.
+/// Measured live: seven validators at height 1 round 13, three locked on a block whose body they did not hold, frozen
+/// at the 240 s ceiling.
+///
+/// Asking elsewhere is sound because a validator holding the **full block** can regenerate any index
+/// (`ConsensusEngine::shard_of`, the fallback behind `Sampler::serve`) — the block's one holder can answer for every
+/// shard, it was simply never asked.
+///
+/// It must stay *thin*, and that is measured, not assumed. Broadcasting every missing shard to the whole cell each
+/// round made things strictly worse — 0 of 3 runs against 7 of 8 — and changed the failure's shape: instead of one
+/// validator holding the block and six locked around it, **no** validator held it and all seven awaited a body that no
+/// longer existed anywhere. The recovery traffic was drowning the dispersal it was trying to repair. So: one extra
+/// message, for one missing shard, every `RESAMPLE_FANOUT_PERIOD` rounds, to a rotating peer — the whole cell is still
+/// covered, at `1/N` the rate.
+const RESAMPLE_FANOUT_PERIOD: u32 = 4;
 
 /// Try to reconstruct a buffered skeleton from the shards gathered so far. On success, rebuild the full block and
 /// admit it to the engine exactly like an ordinary proposal, driving the resulting outputs (its PREPARE, …).

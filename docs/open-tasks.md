@@ -49,7 +49,25 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
-### [A] The residual stall is *not* the lock split — both healing changes measured neutral or worse
+### [A] The residual stall is now ONE straggler that knows it is behind and does not catch up
+The probe changed the picture completely. The current residual failure reads:
+
+```
+v0..v5 : 1000/None      h8r3                    ← six validators succeeded: recipient paid, contract resolved, height 8
+v6     : 0/Some(Locked)  h1r13 behind(2) await   ← one stuck at height 1
+```
+
+Six of seven complete the whole scenario. The failure is a **single straggler**, and it is not confused: `behind(2)`
+means its own `max_seen_height` exceeds its height, so it knows the cell moved on, and `await` means it is waiting on a
+body. So the question is no longer "why does consensus not progress" — it does — but **why catch-up does not run for a
+validator that has already detected it is behind**. Candidates, in order:
+- its `max_seen_height` is 2 while the cell is at 8, so it stopped hearing the cell entirely after one height — a
+  transport/membership question, not a consensus one;
+- `certified[1]` is pruned on every peer once a checkpoint forms above it (`prune_sync_retention`), so the
+  `CommitCert` answer is unavailable and only `SyncResp` can serve it;
+- `awaited_body` may be occupying the validator ahead of the sync path.
+
+### [A] Superseded: the residual stall is *not* the lock split — both healing changes measured neutral or worse
 The lock-split mechanism is now fully addressed and **neither half moved the live rate**, which is the finding:
 
 | change | interleaved A/B | verdict |

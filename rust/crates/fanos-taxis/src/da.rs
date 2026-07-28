@@ -39,7 +39,7 @@ use crate::consensus::DaShards;
 const HELD_CAP: usize = 512;
 
 /// Cap on skeletons awaiting reconstruction — same remote-key reasoning, against a proposal flood.
-const PENDING_CAP: usize = 64;
+pub const PENDING_CAP: usize = 64;
 
 /// A skeleton awaiting reconstruction: the shards gathered so far, this node's own plus those sampled from peers.
 struct Pending {
