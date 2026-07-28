@@ -1728,3 +1728,42 @@ fn a_burst_from_one_account_executes_every_transaction() {
         assert_eq!(e.chain().state().balance(&ALICE), 600, "and ALICE was debited for each");
     }
 }
+
+#[test]
+fn a_sub_quorum_lock_split_heals() {
+    // **The live stall, made deterministic.** Hide the PREPARE votes from four of seven validators for one
+    // round: the other three see the quorum, lock, and thereafter refuse every conflicting proposal, while the
+    // four — never having seen the polka — keep proposing fresh blocks. Quorum is 5, so neither side reaches it
+    // and `reprepare_lock` cannot help, because its liveness argument needs a *quorum* locked on one block.
+    //
+    // Measured live before the fix: 3 failures in 6 runs of the HERMES suite, all with `rejects.locked` five
+    // apiece and nothing else. The proof-of-lock (`Block::pol`) let a locked validator re-offer its value, which
+    // took it to 1 in 8 — a race, not a rule, because the unlocked majority prepares whichever proposal reaches
+    // it first and cannot vote twice in a round. `valid_value` closes it: a POL-justified proposal is an
+    // *observed* polka, so an unlocked proposer re-offers the cell's prepared value instead of a fresh one.
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"split");
+    c.submit_all(&tx);
+
+    // Four validators miss the PREPARE round entirely.
+    c.set_drop_to(Some((Phase::Prepare, &[3, 4, 5, 6])));
+    c.tick();
+    c.set_drop_to(None);
+
+    // Drive rounds. Without `valid_value` this needs a lucky ordering; with it, an unlocked proposer offers the
+    // value the cell already prepared and the quorum re-forms.
+    for _ in 0..20 {
+        c.tick();
+        c.timeout();
+    }
+
+    let height = c.engines[0].chain().next_height();
+    assert!(height >= 1, "the cell finalized past the split (height {height})");
+    for (i, e) in c.engines.iter().enumerate() {
+        assert_eq!(e.chain().next_height(), height, "validator {i} is level with the cell");
+        assert_eq!(e.chain().state().balance(&BOB), 100, "validator {i} executed the transfer");
+    }
+    for h in 0..height {
+        assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
+    }
+}

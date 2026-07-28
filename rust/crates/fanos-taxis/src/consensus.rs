@@ -510,6 +510,19 @@ pub struct ConsensusEngine<S: StateMachine> {
     /// The PREPARE-quorum certificate that set [`locked_block`](Self::locked_block) — the **proof of lock** a
     /// re-proposal carries, so a validator other than the block's original proposer can re-offer it.
     locked_cert: Option<Certificate>,
+    /// The block this validator knows the cell has already **prepared**, with the certificate proving it —
+    /// Tendermint's `validValue`/`validRound`, and the piece that makes a lock split heal deterministically.
+    ///
+    /// It is set by *observing* a polka, not only by locking on one: a proposal that arrives carrying a valid
+    /// [`Block::pol`] is such an observation. A validator that never saw the original PREPARE quorum therefore
+    /// still learns which value the cell was willing to prepare, and proposes *that* when its turn comes instead
+    /// of a fresh block the locked minority must refuse.
+    ///
+    /// Without it, healing is a race rather than a rule: the unlocked majority prepares whatever proposal reaches
+    /// it first in a round, and having voted it cannot vote again (a second PREPARE would be equivocation), so
+    /// convergence needs a round in which the locked minority's re-offer happens to arrive first. Measured live
+    /// at 1 failure in 8 runs with the re-offer alone.
+    valid_value: Option<([u8; 32], Certificate)>,
     /// The height at which each still-premature transaction was **first** deferred, so retention is bounded by
     /// [`REVEAL_WINDOW`] rather than being unbounded: a far-future nonce cannot be re-queued forever.
     deferred_since: BoundedMap<TxCommit, u64>,
@@ -595,6 +608,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
+            valid_value: None,
             deferred_since: BoundedMap::new(RECENT_BODY_CAP),
             round0_window: None,
             reveals: BTreeMap::new(),
@@ -802,6 +816,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
         block.da_shards().get(usize::from(index)).cloned()
     }
 
+    /// Whether this validator holds a value it will **re-offer** on the next round — a lock of its own, or a
+    /// polka it has observed ([`Block::pol`]).
+    ///
+    /// The driver uses it to decide whether to back the round timeout off. Exponential backoff is right when the
+    /// next attempt would be *identical* — a round that timed out because the network is slow gains nothing from
+    /// retrying sooner. It is wrong during a lock split, where the next attempt carries a **different** proposal
+    /// (the prepared value instead of a fresh block) and is the very thing that heals the height: backing off to
+    /// `ROUND_TIMEOUT_MAX` there means the cell waits 24 s between the attempts that would fix it, which is why
+    /// the split healed in the deterministic model — where rounds cost nothing — and not inside a live window.
+    #[must_use]
+    pub fn has_reoffer(&self) -> bool {
+        self.locked_block.is_some() || self.valid_value.is_some()
+    }
+
     /// Why proposals have been refused so far — see [`ProposalRejects`]. Cumulative; diff two reads for a rate.
     #[must_use]
     pub fn rejects(&self) -> ProposalRejects {
@@ -956,10 +984,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // Safe by construction: the block already gathered a PREPARE quorum (that is what locked it), so this
         // can only re-offer a value the cell was already willing to prepare, never a conflicting one. The
         // transactions it omits stay in the mempool for the next height, exactly as if this proposal had lost.
-        let locked = self.locked_block.and_then(|h| {
-            let block = self.proposals.get(&h)?.clone();
-            Some((block, self.locked_cert.clone()?))
-        });
+        // Prefer, in order: the value we are locked on, then any value we know the cell has already prepared
+        // (`valid_value` — a polka we merely *observed*), then a fresh block. The middle rung is what lets an
+        // unlocked proposer re-offer the minority's value instead of a fresh one it would have to refuse.
+        let locked = self
+            .locked_block
+            .and_then(|h| Some((self.proposals.get(&h)?.clone(), self.locked_cert.clone()?)))
+            .or_else(|| {
+                let (hash, cert) = self.valid_value.clone()?;
+                Some((self.proposals.get(&hash)?.clone(), cert))
+            });
         let mut block = if let Some((locked, cert)) = locked {
             Block { pol: Some(Box::new(cert)), witness: None, ..locked }
         } else {
@@ -1136,6 +1170,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 && c.block_hash == bh
                 && c.verify(self.params.quorum, &self.verifiers)
         });
+        if pol_ok
+            && let Some(cert) = block.pol.as_deref()
+        {
+            // A polka observed. Keep the newest one: a certificate from a later round supersedes an earlier
+            // view of what the cell was willing to prepare.
+            let newer = self.valid_value.as_ref().is_none_or(|(_, held)| cert.round >= held.round);
+            if newer {
+                self.valid_value = Some((bh, cert.clone()));
+            }
+        }
         let proposer_ok = pol_ok
             || if sortition_round0 {
                 is_line_member(&self.seed, height, 0, usize::from(block.header.proposer))
@@ -1514,6 +1558,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.sent_commit.clear();
         self.locked_block = None;
         self.locked_cert = None;
+        self.valid_value = None;
         // Round-0 sortition working state (the registered VRF config in `sortition` persists across heights).
         self.round0_tickets.clear();
         self.round0_window = None;

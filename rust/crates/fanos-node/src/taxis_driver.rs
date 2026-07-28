@@ -340,7 +340,12 @@ where
                     // This round did not finalize before its deadline: back off before injecting the next
                     // Timeout, so a slow (not failed) round is given more time rather than livelocked by a
                     // premature advance. A finalization anywhere resets it via the progress check below.
-                    round_timeout = next_round_timeout(round_timeout, false);
+                    // Back off only if the next attempt would be identical. With a value to re-offer — a lock, or
+                    // a polka observed via `Block::pol` — the next round proposes something *different*, and it
+                    // is what heals a sub-quorum lock split; waiting `ROUND_TIMEOUT_MAX` between those attempts
+                    // is what kept the split alive inside a live window while the deterministic model, where
+                    // rounds cost nothing, healed every time.
+                    round_timeout = next_round_timeout(round_timeout, engine.has_reoffer());
                     timeout_deadline = Instant::now() + round_timeout;
                 }
                 Some(tx) = submit_rx.recv() => {
