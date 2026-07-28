@@ -267,15 +267,32 @@ pub(crate) struct ErrorBody {
     reason: Vec<u8>,
 }
 
-/// An `Error` frame carrying `err`'s numeric code (spec §7.5), e.g. `SYBIL_REJECT` on a failed
-/// admission check.
-pub(crate) fn encode_error(err: ProtocolError) -> Vec<u8> {
-    encode(
-        FrameType::Error,
-        &ErrorBody {
-            code: err.code(),
-            reason: Vec::new(),
-        }
-        .to_wire(),
-    )
+/// An `Error` frame carrying `err`'s numeric code **and a machine-readable reason**.
+///
+/// Used for `SYBIL_REJECT` to carry the difficulty the joiner must actually meet. An adaptive admission price
+/// that is not communicated is a silent denial of service against exactly the honest peers the gate exists to
+/// protect: their proof was minted at yesterday's price, it is refused, and nothing tells them the number that
+/// would work. The reason field already existed and was always empty; this is what it is for.
+///
+/// Backward compatible in both directions — a peer that does not read the reason sees the same rejection it
+/// always did, and a peer that does gets a retry it can actually satisfy.
+pub(crate) fn encode_error_with(err: ProtocolError, reason: Vec<u8>) -> Vec<u8> {
+    encode(FrameType::Error, &ErrorBody { code: err.code(), reason }.to_wire())
+}
+
+/// The required admission difficulty carried by a `SYBIL_REJECT`, if it carries one.
+///
+/// **Not yet consumed**, and deliberately visible as such: the overlay has no receive path for `Error` frames
+/// at all, so a rejected joiner today gets a frame nothing reads. Wiring the adaptive gate into a live node
+/// before that path exists would turn an honest joiner whose proof was minted a moment before the price rose
+/// into a permanent, unexplained refusal — the attacker's goal reached through the defence. So the encoder
+/// ships, this decoder ships, and the policy stays uninstalled until they meet.
+///
+/// `None` for a rejection from a peer that does not send it (an older build, or a refusal for some other
+/// reason), which a joiner must treat as "no guidance" rather than as "zero" — retrying at zero would be an
+/// infinite loop against a gate that is asking for work.
+#[must_use]
+#[allow(dead_code)] // see the note above: the receive path is the missing half
+pub(crate) fn decode_required_difficulty(reason: &[u8]) -> Option<u32> {
+    <[u8; 4]>::try_from(reason).ok().map(u32::from_le_bytes)
 }

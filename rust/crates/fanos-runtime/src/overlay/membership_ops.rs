@@ -16,8 +16,8 @@ use fanos_primitives::Epoch;
 use fanos_wire::error::ProtocolError;
 use fanos_wire::FrameType;
 
-use crate::frames::{
-    admission_challenge, announce_body, descriptor_signature_ok, encode, encode_error, parse_announce,
+use crate::frames::{encode_error_with, 
+    admission_challenge, announce_body, descriptor_signature_ok, encode, parse_announce,
 };
 use crate::ports::{Effect, Notification};
 use crate::router::{Peer, Router};
@@ -89,9 +89,18 @@ impl<F: Field> OverlayNode<F> {
             // reuse the victim's proof, and the rank rule evicts the victim for zero proof-of-work.
             let challenge = admission_challenge(&id, coord, self.epoch);
             if !self.membership.admits(&challenge, &proof) {
+                // Carry the price back. Under the adaptive gate the difficulty moves with the cell's stress, so a
+                // joiner's proof can be honest work at a price that has since risen — and a rejection with no
+                // number is, for that peer, an unexplained permanent refusal. Telling them costs nothing they
+                // could not learn by trying again, which is the same argument that makes the adaptive price safe
+                // to expose at all.
+                let required = self.membership.required_difficulty();
                 return alloc::vec![Effect::Send {
                     to: coord,
-                    frame: encode_error(ProtocolError::SybilReject),
+                    frame: encode_error_with(
+                        ProtocolError::SybilReject,
+                        required.map(|bits| bits.to_le_bytes().to_vec()).unwrap_or_default(),
+                    ),
                 }];
             }
         }

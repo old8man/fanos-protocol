@@ -56,6 +56,15 @@ impl Membership {
     /// **Fails closed**: with no policy installed this returns `false`, so a node that *requires* admission
     /// but was handed no policy rejects every peer rather than silently admitting for want of
     /// configuration. The caller gates this on `config.require_admission`.
+    /// The difficulty the installed policy currently demands, when it can say.
+    ///
+    /// `None` for a policy with no notion of a price (a stake or web-of-trust profile, or no policy at all) —
+    /// which a rejection then carries as "no guidance" rather than as zero, since retrying at zero against a
+    /// gate that wants work is an infinite loop.
+    pub(crate) fn required_difficulty(&self) -> Option<u32> {
+        self.admission_policy.as_ref().and_then(|p| p.required_difficulty())
+    }
+
     pub(crate) fn admits(&self, challenge: &[u8], proof: &[u8]) -> bool {
         self.admission_policy
             .as_deref()

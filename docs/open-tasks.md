@@ -66,6 +66,30 @@ Whichever way it goes, it is a decision to make explicitly rather than by attrit
 **Process note for the next investigator:** the failure message carries the whole `ConsensusProbe` trace, which is the
 diagnosis. Do not filter test output through `grep -E "FAILED|^---- "` — that drops exactly the line worth reading.
 
+### [A] The adaptive admission gate is built and tested but DELIBERATELY NOT INSTALLED
+`fanos_core::AdaptivePowAdmission` reads its difficulty from a `LiveDifficulty` the coherence controller drives,
+so a cell under attack prices entry within one observation window. It never charges below the operator's floor —
+a stuck sensor or a compromised controller can only *raise* the price, never open a network its operator chose to
+close. `SYBIL_REJECT` now carries the required difficulty in the reason field its `ErrorBody` always had.
+
+**It is not installed in `Node::start`, and that is a safety decision, not an unfinished one.** The overlay has
+**no receive path for `Error` frames at all** — nothing dispatches `FrameType::Error`, so a rejected joiner
+already gets a frame nothing reads. Under a *static* difficulty that costs only a diagnostic. Under an adaptive
+one it is fatal to the honest: a joiner whose proof was minted a moment before the price rose is refused, is told
+the new number, and has nothing that reads it — a permanent unexplained refusal, which is the attacker's goal
+reached through the defence.
+
+To install it, in order:
+1. dispatch `FrameType::Error` in the overlay and surface `SybilReject` as a `Notification` carrying the required
+   bits (the engine is sans-I/O, so re-solving belongs in the driver, not in the engine);
+2. have the driver re-solve at that difficulty and re-announce, bounded so a hostile peer cannot drive unbounded
+   work by repeatedly demanding more;
+3. only then install `AdaptivePowAdmission` and drive `LiveDifficulty` from the healer's
+   `AdmissionController::observe`.
+
+Better still, and worth weighing first: if the pre-announce exchange can carry the current price, the joiner
+solves correctly the first time and no retry path is needed at all.
+
 ### [A] Operator surface — the control socket closes the read half; the monitor is still next
 `fanos status` now asks the **running node** over a local Unix socket (`admin.sock`, mode 0600 in the state
 directory) and reports what the node itself sees: coordinate, peers, verified claims, probe index. Verbs are
