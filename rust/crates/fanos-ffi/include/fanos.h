@@ -24,6 +24,7 @@ extern "C" {
 #define FANOS_ERR_IO       (-4) /* the operation reached the network but did not succeed */
 #define FANOS_ERR_BUFFER   (-5) /* the output buffer was too small (out_len holds the needed length) */
 #define FANOS_ERR_NOTFOUND (-6) /* a lookup found no value */
+#define FANOS_ERR_TIMEOUT  (-7) /* the call waited its bound and nothing arrived — retry is meaningful */
 
 /* Opaque node handle. */
 typedef struct FanosNode FanosNode;
@@ -69,10 +70,16 @@ FanosHealth fanos_diagnose(FanosNode *node);
  * (bad argument / name did not resolve / dial failed). Free with fanos_stream_free, before fanos_free. */
 FanosStream *fanos_service_connect(FanosNode *node, const char *addr);
 
-/* Read up to `len` bytes into `buf`. Returns the count (>= 0; 0 = EOF), FANOS_ERR_IO, or FANOS_ERR_NULL. */
+/* Read up to `len` bytes into `buf`. Bounded: no call in this ABI blocks indefinitely, because a C caller has
+ * no way to interrupt one — the sole exception is fanos_service_accept, which is a server's idle wait.
+ * Returns the count (> 0), 0 for end-of-stream (the peer finished writing), FANOS_ERR_TIMEOUT when nothing
+ * arrived within the bound (a retry is meaningful), FANOS_ERR_IO on transport failure, or FANOS_ERR_NULL.
+ * The three failure codes are deliberately distinct: collapsing "nothing yet" into EOF stops a live stream,
+ * and collapsing it into IO makes a caller spin on a dead one. */
 int fanos_stream_read(FanosStream *stream, uint8_t *buf, size_t len);
 
-/* Write all `len` bytes of `buf` (flushed). Returns `len` on success, FANOS_ERR_IO, or FANOS_ERR_NULL.
+/* Write all `len` bytes of `buf` (flushed). Bounded like the read: a peer that never drains leaves the write
+ * waiting on flow control. Returns `len` on success, FANOS_ERR_TIMEOUT, FANOS_ERR_IO, or FANOS_ERR_NULL.
  * `len` must not exceed INT_MAX. */
 int fanos_stream_write(FanosStream *stream, const uint8_t *buf, size_t len);
 

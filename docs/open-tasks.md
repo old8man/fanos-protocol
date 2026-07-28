@@ -298,7 +298,28 @@ Rate unchanged at **1 in 8**, but a five-second named failure instead of a 300-s
 sharply-stated question: a `fanos_stream_write` that returned the full byte count, whose bytes never reach the host's
 accepted stream. Everything around it has been eliminated — the name resolves, the store call is bounded, the session is
 no longer reaped early, and the stream is open rather than at EOF.
-**Mechanism located: `fanos-session::offer` reports success when it drops.**
+**Refuted by measurement, and the root cause found elsewhere.** The `offer` drop hypothesis below is dead: the failure
+message now quotes the drop counter and it reads **0** every time. Channel capacity is 1024, so a 23-byte payload never
+fills it.
+
+What *was* wrong, and is now fixed, is that the ABI had no readiness point. `fanos_open` returns before the node has a
+peer — nothing in `Node::start` awaits, by design — and the store answers "no value" *instantly* when it knows nobody to
+ask. `fanos_join` was a no-op whose own doc admitted it existed "so bindings can mirror the open/join lifecycle": the
+right shape with a hollow implementation. It now issues the join and waits for the first peer. That removed the publish
+and lookup failures entirely; every remaining failure is the same one, at the same place.
+
+**The residual, sharply bounded.** 2 runs in 10: a 23-byte write returns its full count, zero drops, and the host's read
+finds nothing within 5 s. The session + reliable-stream pair is **exonerated** — `a_sub_segment_write_is_never_lost_across_the_session_pair`
+runs that exact shape 200 times over an in-process channel transport with no losses — so the fault is below them, in
+`fanos-node::serve`'s coordinate demux or the QUIC datagram path.
+- The demux is the first suspect and for a stated reason: it delivers with `try_send` and its own comment says "drop this
+  datagram if the session's bounded inbound queue is full". A dropped datagram is normally covered by retransmission
+  (RTO 60 ms initially), so what must be checked is whether a drop can be *acked* — a segment acknowledged but never
+  delivered is lost permanently, and it matches the signature exactly.
+- The retransmit budget is worth a second look regardless: `RTO_BACKOFF_MULT` is **4**, not TCP's 2, so the attempts land
+  at 60 ms, 240 ms, 960 ms, 3.84 s — only four fit inside five seconds.
+
+Superseded reading, kept so it is not re-derived:
 
 ```rust
 fn offer(tx: &Sender<Vec<u8>>, payload: Vec<u8>) -> bool {

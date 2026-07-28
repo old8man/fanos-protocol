@@ -26,7 +26,7 @@ use std::{ptr, slice};
 use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
 use fanos_field::F2;
 use fanos_node::{
-    Epoch, Node, NodeConfig, NodeResolver, STORE_TIMEOUT, ServiceResolver, dial_service, publish_service,
+    Command, Epoch, Notification, Node, NodeConfig, NodeResolver, STORE_TIMEOUT, ServiceResolver, dial_service, publish_service,
     serve,
 };
 use fanos_onoma::Address;
@@ -49,6 +49,10 @@ pub const FANOS_ERR_IO: c_int = -4;
 pub const FANOS_ERR_BUFFER: c_int = -5;
 /// A lookup completed but found no value for the key.
 pub const FANOS_ERR_NOTFOUND: c_int = -6;
+/// The call waited [`STORE_TIMEOUT`] and nothing arrived — distinct from `0` (the stream ended) and from
+/// [`FANOS_ERR_IO`] (the transport failed), because the three demand different responses: retry, stop, or
+/// investigate.
+pub const FANOS_ERR_TIMEOUT: c_int = -7;
 
 /// An owning handle to a running FANOS node: a tokio runtime plus the node it drives. Opaque to C.
 pub struct FanosNode {
@@ -98,20 +102,48 @@ pub unsafe extern "C" fn fanos_open(config: *const c_char) -> *mut FanosNode {
     }
 }
 
-/// Ensure the node has joined the overlay. A node joins during [`fanos_open`] (bootstrapping from the peers
-/// in its config), so this is idempotent: it returns [`FANOS_OK`] for a live handle, or [`FANOS_ERR_NULL`]
-/// for a null one. It exists so bindings can mirror the `open`/`join` lifecycle of the API contract.
+/// **Join the overlay and wait until this node has a peer** — the ABI's readiness point.
+///
+/// Every store call needs one. `fanos_open` returns as soon as the node's drivers are spawned: nothing in
+/// `Node::start` awaits, by design ("endpoint creation is synchronous and every driver is `tokio::spawn`ed"), so
+/// the handle it returns has not yet joined anything. A `fanos_publish` issued immediately is placed under a
+/// one-node view of the cell, and a `fanos_lookup` is worse — the engine answers "no value" *instantly* when it
+/// knows no peers, because there is nobody to ask.
+///
+/// This call used to be a no-op that returned [`FANOS_OK`] for any live handle, with its own documentation
+/// admitting it existed only "so bindings can mirror the open/join lifecycle". That made the lifecycle
+/// decorative and left every embedder racing its own first write. It now does what its name says: issues the
+/// join, then waits for the first peer to be admitted.
+///
+/// Returns [`FANOS_OK`] once a peer is known (immediately, if one already is), [`FANOS_ERR_TIMEOUT`] if none
+/// appears within [`STORE_TIMEOUT`] — which is the honest answer for a lone first node, not an error to fear —
+/// or [`FANOS_ERR_NULL`] for a null handle. Idempotent: a second call on a joined node returns immediately.
 ///
 /// # Safety
 /// `node` must be null or a handle returned by [`fanos_open`] and not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fanos_join(node: *mut FanosNode) -> c_int {
     // SAFETY: the caller guarantees `node` is null or a live `fanos_open` handle.
-    if unsafe { node.as_ref() }.is_some() {
-        FANOS_OK
-    } else {
-        FANOS_ERR_NULL
-    }
+    let Some(handle) = (unsafe { node.as_mut() }) else {
+        return FANOS_ERR_NULL;
+    };
+    handle.node.command(Command::Join { info: Vec::new() });
+    handle.rt.block_on(async {
+        // Already joined: the address book naming a peer means an announcement has been processed.
+        if handle.node.health().known_peers > 0 {
+            return FANOS_OK;
+        }
+        let joined = tokio::time::timeout(STORE_TIMEOUT, async {
+            while let Some(note) = handle.node.next_notification().await {
+                if matches!(note, Notification::MemberJoined { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        if joined == Ok(true) { FANOS_OK } else { FANOS_ERR_TIMEOUT }
+    })
 }
 
 /// Publish `val` under `key` in the overlay store (the DHT surface). Returns [`FANOS_OK`] on acceptance,
@@ -442,9 +474,17 @@ pub unsafe extern "C" fn fanos_stream_read(
     if dst.is_empty() {
         return 0;
     }
-    match stream.handle.block_on(stream.stream.read(dst)) {
-        Ok(n) => n as c_int, // n <= cap <= i32::MAX
-        Err(_) => FANOS_ERR_IO,
+    // **Bounded.** No call in this ABI may block a foreign caller indefinitely — it has no way to interrupt one —
+    // so a read waits [`STORE_TIMEOUT`] and then says so. The three outcomes are deliberately distinguishable:
+    // `0` means the peer finished writing, `FANOS_ERR_TIMEOUT` means nothing arrived *yet* and the caller may
+    // retry, `FANOS_ERR_IO` means the transport failed. Collapsing "nothing yet" into either of the others is
+    // what a caller cannot recover from: it would stop a live stream or spin on a dead one.
+    match stream.handle.block_on(async {
+        tokio::time::timeout(STORE_TIMEOUT, stream.stream.read(dst)).await
+    }) {
+        Ok(Ok(n)) => n as c_int, // n <= cap <= i32::MAX
+        Ok(Err(_)) => FANOS_ERR_IO,
+        Err(_elapsed) => FANOS_ERR_TIMEOUT,
     }
 }
 
@@ -467,13 +507,19 @@ pub unsafe extern "C" fn fanos_stream_write(
     let Some(src) = (unsafe { as_slice(buf, len) }) else {
         return FANOS_ERR_NULL;
     };
+    // Bounded for the same reason as the read: a peer that never drains leaves `write_all` waiting on flow
+    // control, and a foreign caller cannot interrupt it.
     let result = stream.handle.block_on(async {
-        stream.stream.write_all(src).await?;
-        stream.stream.flush().await
+        tokio::time::timeout(STORE_TIMEOUT, async {
+            stream.stream.write_all(src).await?;
+            stream.stream.flush().await
+        })
+        .await
     });
     match result {
-        Ok(()) => len.min(i32::MAX as usize) as c_int,
-        Err(_) => FANOS_ERR_IO,
+        Ok(Ok(())) => len.min(i32::MAX as usize) as c_int,
+        Ok(Err(_)) => FANOS_ERR_IO,
+        Err(_elapsed) => FANOS_ERR_TIMEOUT,
     }
 }
 
@@ -595,39 +641,24 @@ mod tests {
         SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Read from a stream, failing with `what` if nothing arrives — rather than blocking the test forever.
+    /// Read from a stream, failing with `what` if the ABI reports that nothing arrived.
     ///
-    /// `fanos_stream_read` blocks by design (a stream read should), so the bound belongs here rather than in the
-    /// ABI. It is [`STORE_TIMEOUT`], the same "a network operation that has not answered by now will not" horizon
-    /// the ABI applies to its store calls: the write this waits on has already been acknowledged by the sender, so
-    /// a delay past that horizon is a lost payload, not a slow one.
-    ///
-    /// The read runs on its own thread because there is nothing to poll — the pointer is passed as an address
-    /// since a raw pointer is not `Send`, and the handle outlives the thread by construction (the caller frees it
-    /// after this returns).
+    /// No thread trick and no timeout of its own: [`fanos_stream_read`] is bounded by the ABI itself and
+    /// reports [`FANOS_ERR_TIMEOUT`] distinctly from end-of-stream, which is exactly what a caller needs to
+    /// tell "not yet" from "never". A test that had to invent its own bound was a sign the ABI was missing one.
     fn read_bounded(stream: *mut FanosStream, what: &str) -> Vec<u8> {
-        let address = stream as usize;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            // SAFETY: `address` is the caller's live `FanosStream`, which outlives this read.
-            let n = unsafe { fanos_stream_read(address as *mut FanosStream, buf.as_mut_ptr(), buf.len()) };
-            let _ = tx.send(if n > 0 { buf[..n as usize].to_vec() } else { Vec::new() });
-        });
-        let Ok(bytes) = rx.recv_timeout(STORE_TIMEOUT) else {
-            // The session layer drops an outbound payload when the transport channel is full and still reports
-            // success (`fanos_session::offer`), relying on DIAULOS retransmission to recover it. So the count
-            // decides which question this failure is: a non-zero one makes it "why did retransmission not
-            // recover within the window", and a zero one rules that mechanism out entirely.
-            panic!(
-                "{what}: nothing arrived within {STORE_TIMEOUT:?} — the sender's write was acknowledged, so this \
-                 is a lost payload rather than a slow one. Outbound payloads dropped for a full transport channel \
-                 during this process: {}",
-                fanos_node::dropped_payloads()
-            )
-        };
-        assert!(!bytes.is_empty(), "{what}: end-of-stream or an error arrived instead of the payload");
-        bytes
+        let mut buf = [0u8; 64];
+        // SAFETY: `stream` is a live handle and `buf` has `len()` writable bytes.
+        let n = unsafe { fanos_stream_read(stream, buf.as_mut_ptr(), buf.len()) };
+        assert_ne!(
+            n, FANOS_ERR_TIMEOUT,
+            "{what}: the ABI waited {STORE_TIMEOUT:?} and nothing arrived — the sender's write returned its full \
+             byte count, so this is a lost payload rather than a slow one. Outbound payloads dropped for a full \
+             transport channel during this process: {}",
+            fanos_node::dropped_payloads()
+        );
+        assert!(n > 0, "{what}: the stream ended or failed ({n}) instead of delivering the payload");
+        buf.get(..n as usize).unwrap_or(&[]).to_vec()
     }
 
     /// Open a node on an ephemeral loopback port for a test; free with [`fanos_free`].
@@ -1065,6 +1096,12 @@ mod tests {
         // SAFETY: `b_cfg` outlives the call.
         let b = unsafe { fanos_open(b_cfg.as_ptr()) };
         assert!(!b.is_null());
+        // **Join before reading anything.** `fanos_open` returns before the node has a peer, and the store answers
+        // "no value" instantly when it knows nobody to ask — so a lookup issued here would fail for a reason that
+        // has nothing to do with the value. This is the readiness point, and needing it is what the retry loops
+        // below were silently substituting for.
+        // SAFETY: `b` is a live handle.
+        assert_eq!(unsafe { fanos_join(b) }, FANOS_OK, "B joined the overlay and knows a peer");
 
         // Split the two ways a dial-by-name can fail, before dialing. `fanos_service_connect` returning null
         // says only "no stream": it cannot distinguish a descriptor that was never published from one published

@@ -803,4 +803,44 @@ mod tests {
             "an empty request yields an empty response, cleanly"
         );
     }
+    /// **A sub-segment write is never lost across the session + reliable-stream pair.** 200 rounds of the exact
+    /// shape that fails elsewhere: dial, write 23 bytes, flush, read on the peer.
+    ///
+    /// It exists as the deterministic half of a live investigation. The C ABI's host test loses that payload about
+    /// 2 runs in 10 — the client's write returns its full count, `offer` reports zero drops, and the host's read
+    /// finds nothing within 5 s. A failure here would have indicted these two crates; 200 clean rounds indict what
+    /// is *below* them instead, which is what makes this worth keeping rather than deleting: it is the boundary
+    /// marker for the next investigation, and a regression that moves the fault up into these crates will trip it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sub_segment_write_is_never_lost_across_the_session_pair() {
+        const ROUNDS: usize = 200;
+        for round in 0..ROUNDS {
+            let mut rng = SeedRng::from_seed(b"loss-key");
+            let keypair = StaticKeypair::generate(&mut rng);
+            let mut crng = SeedRng::from_seed(b"loss-client");
+            let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
+            let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+            let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
+            let mut client_stream = stream_over_channels(
+                client,
+                ChannelTransport { outbound: c2s_tx, inbound: s2c_rx },
+            );
+            let mut server_stream = serve_over_channels(
+                Arc::new(keypair),
+                SeedRng::from_seed(b"loss-server"),
+                ChannelTransport { outbound: s2c_tx, inbound: c2s_rx },
+            );
+            // Exactly the shape the C ABI test uses: a sub-segment write, then the peer reads it.
+            let msg = b"c-abi service host echo";
+            client_stream.write_all(msg).await.unwrap();
+            client_stream.flush().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(5), server_stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: nothing arrived within 5 s"))
+                .unwrap();
+            assert_eq!(buf.get(..n), Some(&msg[..]), "round {round}: wrong payload");
+        }
+    }
+
 }
