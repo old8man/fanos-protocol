@@ -22,6 +22,8 @@
 //! DA sampling is the erasure-store's concern, not the consensus datapath's.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
@@ -106,7 +108,7 @@ fn next_round_timeout(current: Duration, progressed: bool) -> Duration {
 /// The generic engine driver stays state-machine-agnostic; this closure carries the one DROMOS-specific step, so
 /// a caught equivocation is automatically sealed and gossiped into the cell's mempool to be applied on-chain.
 /// `None` for a driver that does not auto-submit slashes (a bare consensus test harness).
-pub type SlashSealer = std::sync::Arc<dyn Fn(&SlashEvidence) -> Option<SealedTx> + Send + Sync>;
+pub type SlashSealer = Arc<dyn Fn(&SlashEvidence) -> Option<SealedTx> + Send + Sync>;
 
 /// The identity + genesis a validator's engine is built from — the agreed cell configuration
 /// ([`ConsensusEngine::new`]). Everything a node needs to join a live TAXIS cell, gathered into one struct.
@@ -182,7 +184,32 @@ pub struct TaxisHandle<S> {
     submit: mpsc::Sender<SealedTx>,
     events: broadcast::Sender<TaxisEvent>,
     query: mpsc::Sender<oneshot::Sender<(u64, S)>>,
-    probe: mpsc::Sender<oneshot::Sender<ConsensusProbe>>,
+    probe: mpsc::Sender<oneshot::Sender<DriverProbe>>,
+}
+
+/// A validator's [`ConsensusProbe`] plus what only the **driver** can see: notifications lost before the engine
+/// ever saw them.
+///
+/// The two belong together in a frozen cell's report. A validator stalled with `lagged > 0` was starved of input,
+/// which is a transport question; one stalled with `lagged == 0` received everything the cell sent it, which makes
+/// it a consensus question. Without the second number the first reading cannot be ruled out, and an unfalsifiable
+/// explanation is worse than no explanation.
+#[derive(Clone, Copy, Debug)]
+pub struct DriverProbe {
+    /// The engine's own position — see [`ConsensusProbe`].
+    pub consensus: ConsensusProbe,
+    /// Notifications dropped by the broadcast drainer (see the `lagged` counter in [`spawn_taxis`]). Cumulative.
+    pub lagged: u64,
+}
+
+impl core::fmt::Display for DriverProbe {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.consensus)?;
+        if self.lagged > 0 {
+            write!(f, " LAGGED={}", self.lagged)?;
+        }
+        Ok(())
+    }
 }
 
 impl<S> TaxisHandle<S> {
@@ -207,7 +234,7 @@ impl<S> TaxisHandle<S> {
     /// Snapshot **why this validator sits where it does** — see [`ConsensusProbe`]. `None` if the driver has
     /// stopped. Distinct from [`snapshot`](Self::snapshot) because a frozen cell's ledger state is exactly what
     /// does *not* change: judging a stall needs the consensus position, and it exists only while the stall does.
-    pub async fn probe(&self) -> Option<ConsensusProbe> {
+    pub async fn probe(&self) -> Option<DriverProbe> {
         let (tx, rx) = oneshot::channel();
         self.probe.send(tx).await.ok()?;
         rx.await.ok()
@@ -228,7 +255,7 @@ where
     let (submit_tx, mut submit_rx) = mpsc::channel::<SealedTx>(64);
     let (events_tx, _) = broadcast::channel::<TaxisEvent>(256);
     let (query_tx, mut query_rx) = mpsc::channel::<oneshot::Sender<(u64, S)>>(16);
-    let (probe_tx, mut probe_rx) = mpsc::channel::<oneshot::Sender<ConsensusProbe>>(16);
+    let (probe_tx, mut probe_rx) = mpsc::channel::<oneshot::Sender<DriverProbe>>(16);
     let events_for_task = events_tx.clone();
     // Validator index p ↔ overlay coordinate Point::at(p) — the whole cell's addresses, once.
     // The validator index → overlay coordinate map. It starts at the canonical seating (validator `i` at
@@ -252,6 +279,14 @@ where
     // was here.)
     let mut broadcast_rx = client.subscribe();
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<Notification>();
+    // Consensus messages the drainer itself lost. The forwarding channel below is unbounded, but the *broadcast*
+    // it drains is not: if this task is descheduled long enough for the client to overrun the ring, tokio reports
+    // `Lagged(n)` and those `n` notifications are gone. TAXIS never retransmits a vote, so each one can be the
+    // difference between a height finalizing and a validator wedging — and until now the loss was **silent**, which
+    // is the one property that makes a defect unfalsifiable. Counting it does not prevent it; it makes the
+    // hypothesis testable from a frozen cell's own failure message (see `DriverProbe`).
+    let lagged = Arc::new(AtomicU64::new(0));
+    let lagged_drainer = Arc::clone(&lagged);
     let drainer = tokio::spawn(async move {
         loop {
             match broadcast_rx.recv().await {
@@ -264,7 +299,10 @@ where
                         break; // the engine task ended
                     }
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    lagged_drainer.fetch_add(n, Ordering::Relaxed);
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -373,7 +411,10 @@ where
                     let _ = reply.send((engine.chain().next_height(), engine.chain().state().clone()));
                 }
                 Some(reply) = probe_rx.recv() => {
-                    let _ = reply.send(engine.probe());
+                    let _ = reply.send(DriverProbe {
+                        consensus: engine.probe(),
+                        lagged: lagged.load(Ordering::Relaxed),
+                    });
                 }
                 note = note_rx.recv() => match note {
                     Some(Notification::App { body, from }) => match parse_app_body(&body) {
