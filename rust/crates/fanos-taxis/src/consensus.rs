@@ -816,20 +816,6 @@ impl<S: StateMachine> ConsensusEngine<S> {
         block.da_shards().get(usize::from(index)).cloned()
     }
 
-    /// Whether this validator holds a value it will **re-offer** on the next round — a lock of its own, or a
-    /// polka it has observed ([`Block::pol`]).
-    ///
-    /// The driver uses it to decide whether to back the round timeout off. Exponential backoff is right when the
-    /// next attempt would be *identical* — a round that timed out because the network is slow gains nothing from
-    /// retrying sooner. It is wrong during a lock split, where the next attempt carries a **different** proposal
-    /// (the prepared value instead of a fresh block) and is the very thing that heals the height: backing off to
-    /// `ROUND_TIMEOUT_MAX` there means the cell waits 24 s between the attempts that would fix it, which is why
-    /// the split healed in the deterministic model — where rounds cost nothing — and not inside a live window.
-    #[must_use]
-    pub fn has_reoffer(&self) -> bool {
-        self.locked_block.is_some() || self.valid_value.is_some()
-    }
-
     /// Why proposals have been refused so far — see [`ProposalRejects`]. Cumulative; diff two reads for a rate.
     #[must_use]
     pub fn rejects(&self) -> ProposalRejects {
