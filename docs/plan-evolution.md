@@ -182,81 +182,47 @@ Remaining: the gate is installed; verify end-to-end on a live cell and record th
 
 **Guarantee: Theorem + Measurement.** Done.
 
-### II.2 — Route weight from measured load
+### II.2 / II.5 — WITHDRAWN: there is no routing or placement choice to weight
 
-Routing is currently pure geometry. The cell measures per-node load and does not use it. A derived law would
-bias the choice among equally-valid geometric paths toward the less loaded, without breaking the diameter-2
-guarantee — the constraint being that any deviation must preserve reachability, so the weight can only reorder
-*equivalent* choices, never exclude one.
+**Both rested on a premise the audit disproved, and saying so is the finding.**
 
-**Guarantee: Theorem** (reachability preserved by construction) **+ Measurement** (tail latency under skew).
+*Route weight.* The plane has diameter 2 and any two points lie on a **unique** line, so `routed_send` has no
+alternatives to rank. Rerouting around a loss is likewise determined — the co-linear survivor is
+`mediator(self, lost)`, one point, not a set.
 
-### II.3 — Epoch pacing from the recovery constant
+*Placement under pressure.* `nearest_occupied` is the successor on the index ring, and it **must** stay a pure
+function of the address: a reader recomputes it to find the data. Biasing placement by load would put a value
+where the reader does not look, which is not a tuning question but a correctness one. This is the property that
+removes the directory and the search, and it is bought precisely by leaving no choice.
 
-The epoch period is a configured constant. The cell knows its own recovery time `τ = 1/κ` (`regeneration`
-already computes reintegration time). An epoch shorter than the cell's recovery time reshuffles a cell that has
-not finished healing from the last reshuffle.
+*Read shard selection.* Also absent: `on_get` fans a `Lookup` to **every** peer at once and the erasure code
+tolerates the silent ones, so the read already takes the fastest `K` rather than picking `K` in advance.
 
-**Guarantee: Theorem** — **DONE** for the bound itself (`regeneration::min_epoch_period`); the wiring that
-*applies* it to a running node remains.
+The geometry has removed the choice everywhere it could have existed. A control law needs a decision to make,
+and inventing a place to apply one would have been the opposite of deriving it.
 
-The derivation turned out to need no `c` at all. An advance injects an excursion `e₀` which decays as
-`e₀·e^(−T/τ)`, so the steady state across epochs is the geometric sum `e₀/(1 − e^(−T/τ))`, and it must stay
-inside the stability radius. Solving for the period:
+### II.2′ — Read fan-out width under pressure (replaces both)
+
+The lever that *is* there, and it acts on a different load: [`admission_bits`] prices what others inflict on the
+cell, and this governs what the cell inflicts **on itself**. A read that asks everyone costs `N` messages to
+recover `K` shards — `N/K` ≈ 2.3× amplification on the Fano cell — spent, under pressure, on exactly the links
+that are struggling.
 
 ```text
-    T > τ · ln( 1 / (1 − e₀/r_stab) )
+    width(s) = K + margin + (N − K − margin)·(1 − s)
 ```
 
-Every term is measured by the cell: `τ = 1/Δ` from its seven line rates (T-226(v)), `r_stab = √(P − 2/N)` from
-its purity, `e₀` from what an advance is observed to cost. Notably the same shape as the admission law's
-`−log(1 − s)`, because both answer one question — how much can be spent before the residual stops fitting in
-the headroom.
+Bounded below by the **code**, not by policy: fewer than `K` shards cannot reconstruct at all, and the practical
+floor is `K + margin` because a silent holder at width exactly `K` turns every read into two rounds — more load
+than the message it saved.
 
-`∞` when a single advance already spends the whole headroom, which is the honest answer: no cadence makes that
-survivable, and a number would be a period that does not work.
+Linear, where the admission price and the epoch floor both go as `−log(1 − s)`. That is not an inconsistency:
+those two price something that must **diverge** as the headroom vanishes, since an unbounded cost is what keeps
+demand out. This one cannot diverge — the code floors it — so the honest shape is the one that spends the
+remaining headroom evenly.
 
-**A unit error was found by checking before wiring, which is the reason to check.** The polar gap `Δ` counts
-corroborated-alive points per Fano line — a healthy cell gives the theorem's maximal `Δ = 2` — so it carries no
-unit, and `τ = 1/Δ` is a relaxation time in *observation windows*, not seconds. Reporting a healthy cell's
-`τ = 0.5` as wall-clock would have called half a step half a second, and the floor is linear in `τ`, so the
-error would have passed through undiminished. The healer now measures its own observation cadence and the
-accessor is `epoch_floor_seconds`. Pinned where the quantity is defined.
-
-**The loop is closed.** The floor reaches the operator as `Notification::EpochFloor`, and the daemon compares
-it against the configured period — below it, a warning that says what is actually wrong (excursions accumulate
-rather than decay), and `None` when no cadence is sustainable at all.
-
-Two choices there were made on the merits rather than by convenience. The route is a **notification, not the
-coherence frame**: a floor is read off the cell's health, so publishing it to the network would leak that
-health, and it is a statement about *this node's configuration* rather than about the cell. And the cadence is
-**once per epoch advance**, which is not a chosen interval: the cost of an advance is a difference across that
-boundary, so an advance is exactly when the figure is re-measured.
-
-*(Superseded — kept for the record: the measurement was wired before the last hop, and the gap was recorded
-rather than left implicit.)* `e₀` cannot be read from one window — it is a
-difference *across* an epoch boundary — so the healer takes it there (the stability radius entering an epoch
-minus the radius on the first window of the next), and `OverlayNode::epoch_floor` exposes the resulting bound.
-Nothing reads it yet. The handle cannot query the engine directly (it reads its own fields; the engine speaks in
-commands and notifications), so the honest route is the coherence frame the engine already emits every
-window — which means a telemetry-format change, and that deserves its own pass rather than a hasty one.
-
-Recorded here rather than left implicit, because "built and unwired" is the exact pattern Phase I existed to
-close, and the adaptive admission gate was held back for the same kind of reason until its return path existed.
-
-### II.4 — Role assignment from measured deficit
-
-The cell assigns roles, but not from a measurement of what it lacks. A cell short of storage should be
-assigning storage.
-
-**Guarantee: Theorem** (an assignment that is a fixed point of the deficit map) **+ Measurement**.
-
-### II.5 — Storage placement under pressure
-
-Placement is derived from the address, which is right for locating and blind to load.
-
-**Guarantee: Theorem** (placement remains a deterministic function of the address, so lookup is unaffected)
-**+ Measurement**.
+**Guarantee: Theorem** (the floor is the code's, and monotonicity and the `≥ K` bound are pinned) **+ the wiring
+to `on_get`, which remains.**
 
 ---
 

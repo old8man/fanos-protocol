@@ -230,6 +230,51 @@ pub fn admission_bits(base_bits: u32, stress: f64) -> u32 {
     }
 }
 
+/// The **read fan-out width** a cell under stress `s` should use — how many peers a single read asks.
+///
+/// The other lever, and it acts on a different load from [`admission_bits`]. That one prices the load others
+/// inflict; this one governs the load the cell inflicts **on itself**. A read that asks every peer costs `N`
+/// messages to recover `K` shards, so every read is amplified `N/K`-fold — 2.3× on the Fano cell — and under
+/// pressure that amplification is spent on the very links that are struggling.
+///
+/// ## Why the floor is `K` and not lower
+///
+/// An erasure-coded value needs `K` shards to reconstruct. Asking fewer than `K` peers cannot complete the
+/// read *at all*, so the width is bounded below by the code, not by policy. The safe minimum in practice is
+/// `K + margin`, because a peer that does not answer costs a retry: at width exactly `K` a single silent
+/// holder turns every read into two rounds, which is more load than the message it saved.
+///
+/// ## The law
+///
+/// Between those ends the width follows the headroom that remains:
+///
+/// ```text
+///     width(s) = K + margin + (N − K − margin)·(1 − s)
+/// ```
+///
+/// At rest (`s = 0`) it is `N` — ask everyone, fastest-K wins, which is the right default for a read. As the
+/// headroom closes it contracts linearly to the code's own floor, and at `s ≥ 1` a cell past its survival
+/// bound spends the least it can and still answer.
+///
+/// Linear rather than the `−log(1 − s)` the other two laws share, and the difference is not an inconsistency:
+/// those two price something that must *diverge* as the headroom vanishes, because an unbounded cost is what
+/// keeps demand out. This one is bounded below by the code and cannot diverge, so the honest shape is the one
+/// that spends the remaining headroom evenly.
+#[must_use]
+pub fn read_fanout(n: usize, k: usize, margin: usize, stress: f64) -> usize {
+    let floor = k.saturating_add(margin).min(n);
+    if stress.is_nan() || stress <= 0.0 {
+        return n;
+    }
+    if stress >= 1.0 {
+        return floor;
+    }
+    let spread = n.saturating_sub(floor);
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let extra = ((spread as f64) * (1.0 - stress)).round() as usize;
+    floor.saturating_add(extra).min(n)
+}
+
 /// The admission controller: the law with the **memory** it needs to work.
 ///
 /// [`admission_bits`] is the correct instantaneous relation and, driven directly from a live measurement, it
@@ -301,6 +346,36 @@ mod tests {
     use super::*;
 
     const N: usize = 7;
+
+    #[test]
+    fn read_fanout_spans_from_everyone_to_the_code_s_own_floor() {
+        // At rest a read asks the whole cell — fastest-`K` wins, the right default. Past the survival bound it
+        // asks the least it can and still answer, which the erasure code fixes at `K + margin` and no policy
+        // may go under: fewer than `K` cannot reconstruct at all.
+        assert_eq!(read_fanout(7, 3, 1, 0.0), 7, "at rest, everyone");
+        assert_eq!(read_fanout(7, 3, 1, 1.0), 4, "past the bound, K + margin");
+        assert_eq!(read_fanout(7, 3, 1, 2.5), 4, "and no lower, however bad it gets");
+        assert_eq!(read_fanout(7, 3, 1, f64::NAN), 7, "an unmeasurable stress must not narrow a read");
+    }
+
+    #[test]
+    fn read_fanout_is_monotone_and_never_breaks_the_code() {
+        // The one hard constraint: a width below `K` cannot reconstruct, so no stress may produce one.
+        let mut previous = usize::MAX;
+        for i in 0..=100 {
+            let w = read_fanout(7, 3, 1, f64::from(i) / 100.0);
+            assert!(w >= 3, "width {w} is below K — that read cannot complete at all");
+            assert!(w <= previous, "width rose as stress rose: {w} after {previous}");
+            assert!(w <= 7, "cannot ask more peers than the cell has");
+            previous = w;
+        }
+    }
+
+    #[test]
+    fn a_margin_wider_than_the_cell_cannot_ask_for_more_than_exists() {
+        assert_eq!(read_fanout(7, 3, 99, 1.0), 7, "the floor is clamped to the cell");
+        assert_eq!(read_fanout(3, 3, 0, 1.0), 3, "a cell exactly the size of K asks all of it");
+    }
 
     #[test]
     fn stress_is_one_exactly_where_the_survival_condition_turns() {
