@@ -1643,6 +1643,47 @@ fn a_validator_short_one_commit_vote_rejoins_the_chain() {
 
 
 #[test]
+fn a_round_nobody_could_accept_ends_on_the_votes_rather_than_the_clock() {
+    // Tendermint's nil vote, and what observing it is for. A validator that accepted nothing used to be
+    // *silent*, so peers could not tell "has not decided" from "accepted nothing", and a failed round could end
+    // only when the wall clock said so — on a timeout that doubles toward 24 s. Measured live: rounds reaching
+    // 13 inside a 240 s ceiling while every validator already knew each one had failed.
+    //
+    // The scenario has to be one where validators genuinely accept nothing, which took two attempts to build.
+    // Dropping PREPARE *votes* does not do it: each validator still prepared its own proposal, and one that has
+    // spoken cannot also say nil without equivocating. So the proposals themselves are withheld — nobody sees
+    // anything to accept, which is exactly the case nil exists for.
+    let mut c = Cluster::new(&genesis());
+    for i in 0..N {
+        c.deaf_propose.insert(i);
+    }
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }, b"votes-not-clock");
+    c.submit_all(&tx);
+    c.tick();
+    assert_eq!(c.engines[0].round(), 0, "no proposal arrived, so nothing has moved yet");
+
+    // One expiry apiece. Every validator says `nil`, the quorum of nils forms immediately, and the round ends
+    // on those votes — in the same step, because the simulator delivers them all at once.
+    c.timeout();
+    assert!(c.engines[0].round() > 0, "the round must end once the votes say it failed");
+
+    // **What this can and cannot show.** The latency gain is a production property: there the clock that would
+    // otherwise end the round doubles toward 24 s while the votes cross in milliseconds, so ending on votes is
+    // the difference between a cell that retries at once and one that spends its budget in backoff. Here the
+    // timeout is *injected by hand*, so there is no wall clock to save and no way to exhibit it. What the
+    // simulator can show is that nil is **safe**, which is the half that could silently be wrong:
+    assert_eq!(c.hashes_at(0).len(), 0, "a quorum of `nil` must decide nothing — it is the absence of a value");
+    for i in 0..N {
+        assert_eq!(c.engines[i].chain().next_height(), 0, "validator {i} finalized on nil");
+        // The one that could silently be wrong. A quorum of nils *is* a quorum, so nothing stops the ordinary
+        // prepare path from locking on it — and a validator locked on the absence of a value would then refuse
+        // every real proposal at that height, needing an "unlock" from something that never existed. Checked
+        // through the probe because height and hashes cannot see it: locking on nil never finalizes either.
+        assert!(!c.engines[i].probe().locked, "validator {i} locked on `nil` — on the absence of a decision");
+    }
+}
+
+#[test]
 fn a_minority_locked_on_a_dead_block_is_released_by_the_majority_s_proof() {
     // Tendermint's **unlocking rule**, which was missing entirely, and the situation that needs it — which is
     // *not* the sub-quorum split above. There, three lock and four do not, and neither side reaches the quorum

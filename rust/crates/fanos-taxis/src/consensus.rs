@@ -42,7 +42,7 @@ use crate::incentive::{SlashEvidence, detect_equivocation};
 use crate::params::CellParams;
 use crate::state::StateMachine;
 use crate::tx::{SealedTx, Transaction, TxCommit};
-use crate::vote::{Certificate, Phase, SignedVote, Vote};
+use crate::vote::{Certificate, NIL, Phase, SignedVote, Vote};
 
 /// A backstop on how many `t`-subsets [`open_from_subset`] tries. The recorded shares of one transaction are
 /// first-writer-wins per committee member, so their count never exceeds a line's size (`q + 1`) and the true
@@ -1574,8 +1574,49 @@ impl<S: StateMachine> ConsensusEngine<S> {
             }
         };
         out.extend(transitions);
+        out.extend(self.round_failed_by_votes());
         out.extend(self.maybe_advance_round());
         out
+    }
+
+    /// End a round the **votes** say has failed, without waiting for the clock.
+    ///
+    /// Tendermint's rule: once `2f+1` validators have PREPAREd in this round and no single value holds a
+    /// quorum, the round cannot produce a decision — every remaining validator could vote and still not reach
+    /// `Q` for any one value. Waiting out the timeout at that point is waiting for information that has already
+    /// arrived.
+    ///
+    /// It is the other half of [`NIL`]: nil makes "I refused" observable, and this is what observing it is
+    /// *for*. Together they turn round failure from a wall-clock event into a message-driven one — and the
+    /// clock in question doubles toward 24 s, which is why a live cell was reaching round 13 inside a 240 s
+    /// budget while every validator already knew each round had failed.
+    ///
+    /// Safe unconditionally: advancing a round decides nothing. The lock and all committed state persist, votes
+    /// are round-tagged so no certificate can be assembled across the boundary, and a validator that advances
+    /// early simply arrives where the timeout would have taken it.
+    fn round_failed_by_votes(&mut self) -> Vec<Output> {
+        let height = self.height();
+        let mut by_value: BTreeMap<[u8; 32], BTreeSet<u8>> = BTreeMap::new();
+        let mut voters: BTreeSet<u8> = BTreeSet::new();
+        for sv in &self.prepares {
+            if sv.vote.height == height && sv.vote.round == self.round {
+                voters.insert(sv.vote.voter);
+                by_value.entry(sv.vote.block_hash).or_default().insert(sv.vote.voter);
+            }
+        }
+        if voters.len() < self.params.quorum {
+            return Vec::new(); // the round has not spoken yet
+        }
+        // A value that already holds a quorum decides the round; one that *could still* reach one keeps it
+        // alive. Only when neither is true has the round provably failed.
+        let undecided = self.params.n.saturating_sub(voters.len());
+        let alive = by_value
+            .iter()
+            .any(|(hash, who)| *hash != NIL && who.len().saturating_add(undecided) >= self.params.quorum);
+        if alive {
+            return Vec::new();
+        }
+        self.advance_round()
     }
 
     /// Jump to the round `f + 1` validators have already reached — **round synchronization**, and it was missing.
@@ -1672,7 +1713,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// If a prepared certificate exists for `block_hash` at `round` and we have not yet committed this round,
     /// lock the block and broadcast a commit vote.
     fn check_prepared(&mut self, block_hash: [u8; 32], round: u32) -> Vec<Output> {
-        if round != self.round || self.sent_commit.contains(&self.round) {
+        // A quorum of `nil` means the round failed, not that the cell agreed on nothing-in-particular. Locking
+        // on it would be locking on the absence of a decision, and every later proposal would then have to
+        // "unlock" from a value that never existed.
+        if block_hash == NIL || round != self.round || self.sent_commit.contains(&self.round) {
             return Vec::new();
         }
         let cert = self.collect_cert(Phase::Prepare, block_hash);
@@ -2154,12 +2198,51 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Locks and committed-block state persist across rounds (safety); votes are round-tagged so stale-round
     /// votes never form a current-round certificate.
     fn on_timeout(&mut self) -> Vec<Output> {
+        // **First expiry in this round: speak, and stay.** A validator that has accepted nothing says so with a
+        // `nil` PREPARE and remains where it is, because the statement is only useful to peers who are still in
+        // the round to hear it. Leaving in the same step — which the first version of this did — broadcasts the
+        // news to a round everyone has already left.
+        //
+        // The round then ends on the *votes* ([`round_failed_by_votes`]), which is the whole point: a failed
+        // round finishes when the cell knows it failed, not when a clock that doubles toward 24 s says so.
+        // Reaching here a second time means those votes never arrived, and the timeout does what it always did.
+        if !self.sent_prepare.contains(&self.round) {
+            return self.prepare_nil();
+        }
+        self.advance_round()
+    }
+
+    /// Leave the current round for the next one.
+    fn advance_round(&mut self) -> Vec<Output> {
         self.round = self.round.saturating_add(1);
         // Proposals already seen this height stay valid bodies (same parent/height); only the round advances.
         // A fresh round may re-elect this validator as leader; `proposed_round` is compared against the new
         // round, so no reset is needed for it to propose again.
         let mut out = self.reprepare_lock();
         out.extend(self.maybe_propose());
+        out
+    }
+
+    /// Broadcast a `nil` PREPARE for the current round, if this validator has not prepared anything in it.
+    ///
+    /// The signal that lets a round end **by votes instead of by clock** — see [`NIL`]. Sent once per
+    /// round (`sent_prepare` is the same gate a real prepare uses), so a validator cannot both prepare a value
+    /// and prepare nil, which would be equivocation.
+    fn prepare_nil(&mut self) -> Vec<Output> {
+        if self.sent_prepare.contains(&self.round) {
+            return Vec::new();
+        }
+        self.sent_prepare.insert(self.round);
+        let vote = Vote {
+            height: self.height(),
+            round: self.round,
+            block_hash: NIL,
+            phase: Phase::Prepare,
+            voter: self.me,
+        };
+        let sv = SignedVote::sign(vote, &self.signer);
+        let mut out = self.accept_vote(sv.clone());
+        out.push(Output::Send(ConsensusMsg::Vote(sv)));
         out
     }
 

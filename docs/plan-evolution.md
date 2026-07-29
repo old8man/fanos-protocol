@@ -129,10 +129,20 @@ covers the sub-quorum split where no conflicting quorum can form at all. The rul
 window: a polka formed, no commit followed. That is real, and it is not currently reachable in the simulator.
 Recorded rather than claimed.
 
-**On nil votes.** A validator that refuses a proposal is silent, so its peers cannot distinguish "has not
-decided" from "refused", and a failed round can end only by timeout — which doubles toward 24 s. That is the
-likeliest cause of the 200-second rounds measured live. Implementing them is a protocol change (a new vote
-form, quorum counting, the locking rule's interaction) and is the next item of this phase.
+**On nil votes — DONE.** `vote::NIL` is a reserved sentinel (forging it would need a preimage of the all-zero
+digest, an assumption already spent everywhere else), a validator whose round timeout expires with nothing
+accepted says `nil` and **stays** in the round, and `round_failed_by_votes` ends the round once `2f+1` have
+spoken and no value can still reach a quorum. Three attempts to build the test each corrected the design: a
+validator that already prepared cannot also say nil without equivocating, so the scenario had to be one where
+proposals never arrive; and the first implementation sent nil *while leaving*, announcing to a round everyone
+had already left.
+
+The safety half — a quorum of nils must never *lock* — is pinned through the probe, because it is invisible to
+height and hashes (locking on nil never finalizes either, so both worlds look identical from outside).
+
+**Stated limitation:** the latency gain is a production property and the simulator cannot exhibit it. There the
+clock that would otherwise end the round doubles toward 24 s while votes cross in milliseconds; here the timeout
+is injected by hand, so there is no wall clock to save.
 
 ### I.5 — Split the two numbers `admission_difficulty` holds
 

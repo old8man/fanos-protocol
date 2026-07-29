@@ -49,6 +49,20 @@ impl Phase {
 /// phase(1) ‖ voter(1)`.
 pub const VOTE_LEN: usize = 8 + 4 + 32 + 1 + 1;
 
+/// The block hash a validator votes when it accepts **nothing** this round — Tendermint's `nil`.
+///
+/// A reserved sentinel rather than a new wire field, and the reason it is sound is one the protocol already
+/// depends on: producing a vote for this "block" would mean exhibiting a preimage of the all-zero digest, and
+/// every hash-addressed structure here already rests on that being infeasible. So the sentinel adds no
+/// assumption; it spends one that is already spent.
+///
+/// **What it buys.** Without it, a validator that refuses a proposal is silent, so its peers cannot tell "has
+/// not decided yet" from "refused" — and a failed round can end only when the wall clock says so, on a timeout
+/// that doubles toward 24 s. With it a round ends when the *votes* say it failed, which is the difference
+/// between a cell that retries in milliseconds and one that spends its whole budget in backoff. Measured live
+/// before this: rounds reaching 13 inside a 240 s ceiling.
+pub const NIL: [u8; 32] = [0u8; 32];
+
 /// The signable content of one vote: which validator votes, in which phase, for which block at which
 /// `(height, round)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
