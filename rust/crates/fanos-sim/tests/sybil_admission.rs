@@ -143,11 +143,18 @@ fn a_joiner_without_a_valid_pow_proof_is_rejected_and_told_sybil_reject() {
         "the receiver sent at least one SYBIL_REJECT — the rejection is genuine, not vacuous"
     );
 
-    // Control: a retried proof-less join is rejected again, not silently admitted the second
-    // time — proving the first attempt truly never entered `members` (an already-admitted
-    // member's *repeat* announce is dropped without a re-flood or a re-reject, per
-    // `announce_validates_coords_and_never_overwrites_a_member` in overlay.rs; seeing a SECOND
-    // reject here rules out that this was instead a silent, harmless duplicate-admit).
+    // And the retry is where this test used to be wrong. It asserted that a second join is rejected *again*,
+    // reasoning that a still-proof-less joiner must be refused twice — and inferring from a single reject that
+    // the first attempt had been silently admitted. Both halves were stale.
+    //
+    // The reject is not a bare refusal: it carries `required_difficulty()`, precisely so a joiner whose proof
+    // is honest work at a price that has since risen learns the new one (`overlay.rs::on_sybil_reject`, with
+    // guards against being talked into paying *less* and against an extortionate demand). So the joiner
+    // **re-mints its proof at the demanded difficulty** and retries with a valid one.
+    //
+    // The retry is therefore admitted, and that is the gate working rather than failing: an adversary who pays
+    // the admission cost is supposed to get in — that is what the cost is for. What must never happen is
+    // admission *without* paying, and the assertions above pin exactly that.
     sim.inject(
         joiner_coord,
         Command::Join {
@@ -155,10 +162,19 @@ fn a_joiner_without_a_valid_pow_proof_is_rejected_and_told_sybil_reject() {
         },
     );
     sim.run_for(Duration::from_millis(500));
-    assert!(
-        sybil_rejected.load(Ordering::Relaxed) >= 2,
-        "a retried proof-less join is rejected again — it was never admitted the first time"
+
+    assert_eq!(
+        joined.load(Ordering::Relaxed),
+        1,
+        "the retry carries a proof re-minted at the price the reject named, so it is admitted — a PAID join"
     );
+    assert_eq!(
+        sybil_rejected.load(Ordering::Relaxed),
+        1,
+        "and exactly one rejection was ever needed: the unpaid attempt. A second reject would mean the joiner \
+         never learned the price, which would make the adaptive gate a permanent unexplained refusal"
+    );
+
 }
 
 #[test]
