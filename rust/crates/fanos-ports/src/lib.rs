@@ -263,6 +263,26 @@ pub enum Notification {
     /// wire bytes (not the struct) are carried so this stays a plain, `Eq` payload — the same bytes a
     /// node gossips or publishes (docs/design-telemetry.md).
     Observed(Vec<u8>),
+    /// The shortest epoch period this cell's own measurements say it can sustain, **in seconds**.
+    ///
+    /// Emitted once per epoch advance, which is not a chosen cadence: the cost of an advance is a difference
+    /// across that boundary, so an advance is exactly when the figure is re-measured.
+    ///
+    /// **Operational, not telemetry.** It goes to this node's own operator rather than into the coherence frame
+    /// the cell publishes, because it is a statement about *this node's configuration* — and a floor is read
+    /// off the cell's health, so broadcasting it would leak that health to anyone listening.
+    ///
+    /// A driver compares it against the configured period. Below the floor the cost is not churn: excursions
+    /// accumulate across epochs, and a cell reshuffled faster than it reintegrates never reaches a steady
+    /// state. `f64::INFINITY` means no cadence is currently sustainable — the cell cannot afford to reshuffle
+    /// at all until it is healthier.
+    EpochFloor {
+        /// The floor in milliseconds, or `None` when **no** cadence is currently sustainable — one advance
+        /// already spends the cell's whole headroom, so it cannot afford to reshuffle at all until it is
+        /// healthier. Spelled as an absent value rather than a sentinel, because a very large number here reads
+        /// as a very slow cadence and means something else entirely.
+        millis: Option<u64>,
+    },
     /// This node's join was **refused by an admission gate**, with the difficulty that would have passed.
     ///
     /// Surfaced rather than swallowed because under an adaptive gate a refusal is not a verdict about the

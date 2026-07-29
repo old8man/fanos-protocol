@@ -65,6 +65,10 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        Notification::EpochFloor { millis } => match millis {
+            Some(ms) => format!("EpochFloor {ms}ms"),
+            None => "EpochFloor (no sustainable cadence)".to_owned(),
+        },
         Notification::AdmissionRefused { required } => match required {
             Some(bits) => format!("AdmissionRefused (needs {bits} bits)"),
             None => "AdmissionRefused (no price given)".to_owned(),

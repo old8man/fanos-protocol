@@ -84,6 +84,11 @@ pub(crate) struct Healer {
     last_epoch: Option<(u64, f64)>,
     /// The most recent `(stability radius, spectral gap)` — the two per-window inputs to the epoch floor.
     latest: Option<(f64, f64)>,
+    /// The epoch whose floor has already been reported, so each advance is reported exactly once.
+    ///
+    /// An epoch rather than a flag: the question is "have I told anyone about *this* advance", and the epoch
+    /// answers it directly while a boolean only records that something happened.
+    reported_epoch: Option<u64>,
     /// How long one observation window lasts, in seconds, measured from consecutive observations.
     ///
     /// The **unit bridge**, and it is load-bearing. The polar gap `Δ` is a count of corroborated-alive points
@@ -178,6 +183,7 @@ impl Healer {
             last_epoch: None,
             latest: None,
             window_seconds: None,
+            reported_epoch: None,
             epoch_cost: None,
             activity: BTreeMap::new(),
             self_activity: 0,
@@ -404,6 +410,19 @@ impl Healer {
     /// unit and `τ = 1/Δ` is a relaxation time in *observation windows*; seconds appear only by multiplying
     /// through by the measured window. A healthy cell has `Δ = 2`, and reporting its `τ = 0.5` as a wall-clock
     /// figure would have called half a step half a second.
+    /// Take the epoch floor **if an advance has just been measured**, clearing the flag.
+    ///
+    /// Reported per advance rather than per window: the figure only changes when an advance is measured, and a
+    /// value repeated every window would be noise an operator learns to ignore.
+    fn take_epoch_floor(&mut self, epoch: Epoch) -> Option<f64> {
+        if self.reported_epoch == Some(epoch.get()) || self.epoch_cost.is_none() {
+            return None;
+        }
+        let floor = self.epoch_floor_seconds()?;
+        self.reported_epoch = Some(epoch.get());
+        Some(floor)
+    }
+
     pub(crate) fn epoch_floor_seconds(&self) -> Option<f64> {
         let cost = self.epoch_cost?;
         let (radius, gap) = self.latest?;
@@ -552,6 +571,15 @@ impl Healer {
                     coherence.n(),
                     polar_gap_from_liveness(degraded),
                 );
+                if let Some(seconds) = self.take_epoch_floor(epoch) {
+                    // A finite floor becomes milliseconds; an infinite one is the absent value, because
+                    // "no sustainable cadence" is not a very large period.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let millis = seconds
+                        .is_finite()
+                        .then(|| (seconds * 1000.0).max(0.0) as u64);
+                    effects.push(Effect::Notify(Notification::EpochFloor { millis }));
+                }
                 match self
                     .homeostat
                     .control(m.purity, coherence.mean_correlation(), coherence.n())

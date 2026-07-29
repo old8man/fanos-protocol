@@ -11,6 +11,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 use std::sync::Arc;
 
 use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
@@ -167,12 +168,12 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     if let Some(s) = flag(args, "--mix-delay-ms") {
         // A relay's mean Poisson mixing delay in ms (spec §L5/V7, audit S1-H1); 0 disables mixing.
         let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --mix-delay-ms '{s}'")))?;
-        config.mix_mean_delay = std::time::Duration::from_millis(ms);
+        config.mix_mean_delay = Duration::from_millis(ms);
     }
     if let Some(s) = flag(args, "--cover-interval-ms") {
         // A relay's mean cover-cell interval in ms (spec §L5/V8, audit S1-H1/E1); 0 disables cover traffic.
         let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --cover-interval-ms '{s}'")))?;
-        config.cover_interval = std::time::Duration::from_millis(ms);
+        config.cover_interval = Duration::from_millis(ms);
     }
     if let Some(path) = flag(args, "--beacon-params") {
         // Provision the threshold-DVRF beacon so this node runs the live epoch clock (§7.6, audit S1-H2):
@@ -187,6 +188,9 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
 async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let config = node_config_from_args(args)?;
+    // Kept before the config moves into `start`: the epoch floor a cell measures is only a verdict next to
+    // the cadence this node was actually configured with.
+    let epoch_period = config.epoch_period;
     let mut node = Node::start_on_plane(config).await?;
     let health = node.health();
     let [x, y, z] = health.address;
@@ -231,7 +235,7 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
                 }
             }
             note = node.next_notification() => match note {
-                Some(n) => log_notification(&n),
+                Some(n) => log_notification_against(&n, Some(epoch_period)),
                 None => break,
             },
         }
@@ -1580,9 +1584,9 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     // the sealed transaction and gossips it to the whole cell's mempool.
     let config = node_config_from_args(args)?;
     let node = Node::start::<F2>(config).await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let bootstrap connections establish
+    tokio::time::sleep(Duration::from_secs(2)).await; // let bootstrap connections establish
     let submitted = node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: tx_to_frame(&sealed) });
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let the frame flush + propagate
+    tokio::time::sleep(Duration::from_secs(2)).await; // let the frame flush + propagate
     node.shutdown();
     if submitted {
         println!(
@@ -1745,6 +1749,36 @@ async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
 }
 
 fn log_notification(note: &Notification) {
+    log_notification_against(note, None);
+}
+
+/// Log a notification, judging the epoch floor against `configured` when the caller knows it.
+///
+/// The comparison is the whole point of the floor. A cell measures the shortest epoch period it can absorb;
+/// on its own that is a number, and next to the configured period it is a verdict — and below the floor the
+/// cost is not churn but accumulation, since a cell reshuffled faster than it reintegrates never reaches a
+/// steady state at all.
+fn log_notification_against(note: &Notification, configured: Option<Duration>) {
+    if let Notification::EpochFloor { millis } = note {
+        match (millis, configured) {
+            (None, _) => {
+                tracing::warn!(
+                    "this cell can sustain no epoch cadence at all — one advance already spends its whole \
+                     stability headroom. It is too unhealthy to reshuffle until it recovers."
+                );
+            }
+            (Some(ms), Some(period)) if Duration::from_millis(*ms) > period => {
+                tracing::warn!(
+                    floor_ms = ms,
+                    configured_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX),
+                    "the configured epoch period is SHORTER than this cell can absorb — excursions accumulate \
+                     across epochs rather than decaying, and the cell never reaches a steady state"
+                );
+            }
+            (Some(ms), _) => info!(floor_ms = ms, "measured the shortest epoch period this cell can sustain"),
+        }
+        return;
+    }
     match note {
         Notification::Delivered { from, payload } => {
             info!(?from, bytes = payload.len(), "payload delivered");

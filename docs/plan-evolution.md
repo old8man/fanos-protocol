@@ -223,7 +223,18 @@ unit, and `τ = 1/Δ` is a relaxation time in *observation windows*, not seconds
 error would have passed through undiminished. The healer now measures its own observation cadence and the
 accessor is `epoch_floor_seconds`. Pinned where the quantity is defined.
 
-**The measurement is wired; the last hop to the operator is not.** `e₀` cannot be read from one window — it is a
+**The loop is closed.** The floor reaches the operator as `Notification::EpochFloor`, and the daemon compares
+it against the configured period — below it, a warning that says what is actually wrong (excursions accumulate
+rather than decay), and `None` when no cadence is sustainable at all.
+
+Two choices there were made on the merits rather than by convenience. The route is a **notification, not the
+coherence frame**: a floor is read off the cell's health, so publishing it to the network would leak that
+health, and it is a statement about *this node's configuration* rather than about the cell. And the cadence is
+**once per epoch advance**, which is not a chosen interval: the cost of an advance is a difference across that
+boundary, so an advance is exactly when the figure is re-measured.
+
+*(Superseded — kept for the record: the measurement was wired before the last hop, and the gap was recorded
+rather than left implicit.)* `e₀` cannot be read from one window — it is a
 difference *across* an epoch boundary — so the healer takes it there (the stability radius entering an epoch
 minus the radius on the first window of the next), and `OverlayNode::epoch_floor` exposes the resulting bound.
 Nothing reads it yet. The handle cannot query the engine directly (it reads its own fields; the engine speaks in
