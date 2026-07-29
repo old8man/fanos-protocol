@@ -37,6 +37,7 @@ pub mod healing;
 pub mod hierarchy;
 pub mod homeostat;
 pub mod loadbalance;
+pub mod minima;
 pub mod monitor;
 pub mod partition;
 pub mod plan;
