@@ -13,7 +13,6 @@
 //!
 //! ```
 //! use fanos_sim::{Sim, spawn_cell};
-//! use fanos_runtime::{Command, Config, Duration};
 //! use fanos_field::F2;
 //!
 //! let mut sim = Sim::new(0xFA);
@@ -60,8 +59,9 @@ pub use sim::{FrameObs, Sim};
 pub use trace::{Trace, fmt_coord};
 
 use fanos_field::Field;
+use fanos_node::composition::{CellComposition, compose_engine};
 use fanos_geometry::Plane;
-use fanos_runtime::{Config, OverlayNode, Triple};
+use fanos_runtime::{Config, Triple};
 
 /// Spawn a full cell `PG(2, q)`: an [`OverlayNode`] at every point. Returns the node
 /// coordinates indexed by point index (so `cell[i]` is the node at point `i`).
@@ -74,11 +74,28 @@ pub fn spawn_cell<F: Field + 'static>(sim: &mut Sim, config: Config) -> Vec<Trip
 /// fractional last cell in a [`Cluster`](crate::Cluster). The absent points read as down to the members
 /// present, exactly as a real under-provisioned cell would sense them.
 pub fn spawn_partial_cell<F: Field + 'static>(sim: &mut Sim, config: Config, size: usize) -> Vec<Triple> {
+    spawn_composed_cell::<F>(sim, &CellComposition::overlay_only(config), size)
+}
+
+/// Spawn `size` points of a cell running **the engine a deployment would run**.
+///
+/// The fidelity seam, and the one the standing rule ("the simulator differs from production only in transport")
+/// requires. Before this, [`spawn_cell`] built a bare `OverlayNode` while `Node::start` layered an admission
+/// gate, a beacon, a mixnet router and a threshold service on top of one — so the instrument meant to find
+/// composition defects was, by construction, blind to the layer they live in. Every defect the 2026-07-28
+/// audit found was in that layer.
+///
+/// Both paths now call `fanos_node::composition::compose_engine`. There is one function, so they cannot drift:
+/// a role added to the composition appears here on the same commit.
+pub fn spawn_composed_cell<F: Field + 'static>(
+    sim: &mut Sim,
+    what: &CellComposition,
+    size: usize,
+) -> Vec<Triple> {
     let size = size.min(Plane::<F>::N as usize);
     let mut coords = Vec::with_capacity(size);
     for point in Plane::<F>::points().take(size) {
-        let node = OverlayNode::<F>::new(point, config);
-        coords.push(sim.add(Box::new(node)));
+        coords.push(sim.add(compose_engine::<F>(point, what)));
     }
     coords
 }
@@ -90,6 +107,38 @@ mod scenarios {
     use super::*;
     use fanos_diakrisis::{Fault, Verdict};
     use fanos_field::F2;
+
+    #[test]
+    fn a_composed_cell_still_diagnoses_like_a_bare_one() {
+        // A smoke test, and named as one after its first version claimed more. It asserts that composing extra
+        // roles onto the overlay does not cost the reflex underneath — a real thing to check, and *not* a check
+        // that the simulator composes like production: a bare overlay localizes this crash identically, so
+        // substituting one for the other leaves this test green. Measured, by doing exactly that.
+        //
+        // The seam itself is a property of the source — both paths calling one function — so it is checked in
+        // the source, by `fanos-cli/tests/composition_seam.rs`.
+        let mut sim = Sim::new(0x5EED_C0DE);
+        let what = CellComposition {
+            admission: Some(4),
+            ..CellComposition::overlay_only(Config::default())
+        };
+        let cell = spawn_composed_cell::<F2>(&mut sim, &what, 7);
+        assert_eq!(cell.len(), 7, "a full Fano cell");
+
+        sim.inject_all(&Command::StartHeartbeat);
+        sim.run_for(Duration::from_millis(2000));
+        sim.crash(cell[5]);
+        sim.run_for(Duration::from_millis(3000));
+        sim.inject_all(&Command::Diagnose);
+        sim.settle();
+
+        // The composed cell still diagnoses: a node that prices admission has not lost its reflex, and it pins
+        // the same culprit by the same 3-bit syndrome.
+        assert!(
+            sim.report().any_verdict(&Verdict::Localized(Fault::Single(5))),
+            "a composed cell must still localize the crash — it is the same overlay underneath"
+        );
+    }
     use fanos_runtime::{Command, Duration};
     use std::collections::BTreeSet;
 

@@ -82,11 +82,20 @@ empty, which is its intended steady state.
 not: it composes engines directly, while production composes them through `Node::start`. The measured gap is
 that **node composition is never simulated** — and that is exactly where the defects are.
 
-**Guarantee: Invariant.** The simulator instantiates the same composition function production does, with the
-transport as the only substituted seam. Checkable by construction: if there is one composition entry point and
-both callers use it, they cannot diverge.
+**Guarantee: Invariant** — **DONE**. `fanos_node::composition::compose_engine` is the one assembly point, and
+both `Node::start` and `fanos_sim::spawn_cell` call it. The compiler confirmed the extraction was complete
+rather than partial: `ThresholdRouter`, `BeaconNode`, `HybridKemSecret` and `OverlayNode` all became unused
+imports in the files they moved out of.
 
-This is the largest single refactor in Phase I and the one that pays for the rest.
+Checked in the **source**, by `fanos-cli/tests/composition_seam.rs`, and that is the lesson of this item. The
+first version asserted it at runtime — stand up a composed cell, crash a node, watch it localize the fault — and
+passed just as well with the simulator put back to a bare overlay, because a bare overlay localizes that crash
+identically. The property is not "a composed cell behaves differently"; it is "there is one assembly function
+and both callers use it", which is a fact about the text.
+
+Two simulator files are declared exempt with the reason: they build **topology fixtures** (gateways wired across
+cells, hierarchical peers pinned per node) rather than nodes, and folding every `OverlayNode` builder into
+`CellComposition` would turn it into a mirror of that type instead of a statement about what a node *is*.
 
 ### I.4 — TAXIS, rule by rule, against its source
 

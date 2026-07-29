@@ -43,6 +43,7 @@ pub mod rendezvous;
 pub mod rendezvous_host;
 pub mod rendezvous_relay;
 pub mod admin;
+pub mod composition;
 pub mod angelos_driver;
 pub mod setup;
 pub mod resolve;

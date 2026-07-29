@@ -10,24 +10,19 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fanos_aphantos::ThresholdRouter;
 use fanos_diaulos::StaticKeypair;
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
 use fanos_onoma::{Address, Epoch, lookup_key};
-use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+use fanos_pqcrypto::SeedRng;
 use fanos_quic::{
     Client, Directory, Fabric, NodeHandle, ProteusConfig, spawn_self_certifying_persistent_over,
 };
-use fanos_keygen::BeaconNode;
 use fanos_keygen::recovery::{RecoveryAction, StallDetector, recovery_decision};
-use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification, OverlayNode};
+use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification};
 use tokio::task::JoinHandle;
 
-use crate::{
-    CellNode, ExitPolicy, OverlayBeaconNode, ServiceNode, ThresholdService, serve_exit,
-    spawn_exit_publisher, spawn_mix_publisher,
-};
+use crate::{ExitPolicy, serve_exit, spawn_exit_publisher, spawn_mix_publisher};
 
 use fanos_core::roles::{Capability, Demand, Role, RoleController, RoleSet as CoreRoleSet};
 use fanos_primitives::NodeId;
@@ -42,7 +37,7 @@ use crate::resolve::{ResolvedService, verify_descriptor};
 /// The mixnet's per-hop cooperation threshold — how many of a Fano line's three members must combine to
 /// peel one onion layer (2-of-3). A relay's [`ThresholdRouter`] gathers this many partials; an anonymous
 /// client's `--threshold` MUST match, since it seals each layer for exactly this many members.
-const MIX_THRESHOLD: usize = 2;
+pub(crate) const MIX_THRESHOLD: usize = 2;
 
 /// 32 fresh bytes of OS entropy — the mix router's per-run key seeds (a relay node only).
 fn os_entropy_32() -> Result<[u8; 32], NodeError> {
@@ -627,54 +622,22 @@ impl Node {
                 // Tell the overlay, so if a deployment turns on self-certified membership the check verifies
                 // level 0 by the proof-of-coordinate HELLO + descriptor signature rather than the hash chain
                 // (which would reject every legitimate VRF announcement, audit C3).
-                let overlay_config = OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() };
-                let overlay = OverlayNode::<F>::new(coord, overlay_config);
-                // PoW Sybil admission (§L3): price every join and re-solve the proof each epoch as the
-                // coordinate reshuffles — closes the free-identity gap self-certifying coords leave open.
-                let overlay = match admission {
-                    Some(difficulty) => overlay.with_admission_pow(difficulty),
-                    None => overlay,
+                let what = crate::composition::CellComposition {
+                    overlay: OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() },
+                    admission,
+                    beacon: beacon.clone(),
+                    relay,
+                    onion_seed,
+                    kem_seed,
+                    mix_mean_delay,
+                    cover_interval,
+                    service: service.clone(),
+                    // A deployed node sits at its cell root and discovers its roster by announcement; both are
+                    // scenario parameters, and their absence here is what a deployment means.
+                    hier_path: None,
+                    cell_members: None,
                 };
-                let base: Box<dyn Engine + Send> = match beacon {
-                    Some(bp) => {
-                        let obn = OverlayBeaconNode::new(
-                            overlay,
-                            BeaconNode::<F>::new(coord, bp.share, bp.commitment, bp.threshold),
-                        );
-                        if relay {
-                            // The mixnet router at this coordinate, with Poisson mixing + constant-rate cover
-                            // ON so the relay defends against a global passive adversary (T2) — the shipping
-                            // node ran both off (audit S1-H1). Zero values leave the respective behaviour off.
-                            let (router_secret, _identity) =
-                                HybridKemSecret::generate(&mut SeedRng::from_seed(&kem_seed));
-                            let router =
-                                ThresholdRouter::<F>::new(coord, &router_secret, MIX_THRESHOLD, onion_seed)
-                                    .with_mixing(mix_mean_delay)
-                                    .with_cover(cover_interval);
-                            Box::new(CellNode::new(obn, router))
-                        } else {
-                            Box::new(obn)
-                        }
-                    }
-                    None => Box::new(overlay),
-                };
-                // The service role composes a threshold-hosting engine OVER whatever cell engine the other
-                // roles produced (overlay, beacon, and/or the mixnet relay), so the one coordinate also
-                // serves its CALYPSO line — an intro reaching it is dispatched to the service, everything
-                // else to the cell engine (see [`ServiceNode`]).
-                match service {
-                    Some((seed, line, threshold)) => {
-                        // Regenerate the member secret in memory from its seed (never serialized, audit
-                        // #124); its public is the one the operator collected into the published line.
-                        let (secret, _public) =
-                            HybridKemSecret::generate(&mut SeedRng::from_seed(&seed));
-                        Box::new(ServiceNode::new(
-                            base,
-                            ThresholdService::new(coord.coords(), secret, line, threshold),
-                        ))
-                    }
-                    None => base,
-                }
+                crate::composition::compose_engine::<F>(coord, &what)
             },
             directory.clone(),
             // PROTEUS (§13.4): when a community secret is configured, every frame is shaped and the shape
