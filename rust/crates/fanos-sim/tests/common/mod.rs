@@ -6,7 +6,8 @@
 use fanos_field::Field;
 use fanos_geometry::Plane;
 use fanos_keygen::BeaconNode;
-use fanos_node::OverlayBeaconNode;
+use fanos_node::composition::{CellComposition, compose_engine};
+use fanos_node::{BeaconParams, OverlayBeaconNode};
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_runtime::{Config, OverlayNode, Triple};
 use fanos_sim::Sim;
@@ -45,6 +46,92 @@ pub fn spawn_beacon_cell<F: Field + 'static>(
         let beacon = BeaconNode::<F>::new(point, share, commitment.clone(), threshold)
             .with_recovery_authority(authority_vk.clone());
         coords.push(sim.add(Box::new(OverlayBeaconNode::new(overlay, beacon))));
+    }
+    coords
+}
+
+/// The same cell, assembled the way **production assembles it** — through
+/// [`fanos_node::composition::compose_engine`] from a [`CellComposition`], rather than by hand.
+///
+/// [`spawn_beacon_cell`] builds `OverlayBeaconNode` directly, which is the drift the composition seam exists
+/// to prevent: it can configure things production cannot, and it did — `with_recovery_authority` had no caller
+/// outside this file, so every shipped beacon ran without a trust root and could never reshare. That is now a
+/// `BeaconParams` field, and this helper is what proves the wire carries it: a reshare succeeds here **only
+/// if** `compose_engine` passed the authority through to the `BeaconNode`.
+///
+/// `with_authority = false` is the falsification, kept as a callable configuration rather than a comment: the
+/// same cell, the same signed trigger, refused.
+pub fn spawn_composed_beacon_cell<F: Field + 'static>(
+    sim: &mut Sim,
+    config: Config,
+    threshold: usize,
+    anchors: usize,
+    with_authority: bool,
+) -> Vec<Triple> {
+    let n = Plane::<F>::N as usize;
+    // The same deterministic sharing as `spawn_beacon_cell`, so a scenario can compare the two assemblies
+    // directly rather than wondering whether the key material differed.
+    let (shares, commitment) = deal(
+        &[0xB5; 32],
+        threshold,
+        n,
+        &mut DeterministicRng::new(b"fanos-sim/recovery/beacon-cell"),
+    )
+    .unwrap();
+    let (_, authority_vk) = recovery_authority();
+    let mut coords = Vec::with_capacity(n);
+    for (i, point) in Plane::<F>::points().enumerate() {
+        let what = CellComposition {
+            beacon: Some(BeaconParams {
+                commitment: commitment.clone(),
+                threshold,
+                share: (i < anchors).then(|| shares[i].clone()),
+                authority: with_authority.then(|| authority_vk.clone()),
+            }),
+            ..CellComposition::overlay_only(config)
+        };
+        coords.push(sim.add(compose_engine::<F>(point, &what)));
+    }
+    coords
+}
+
+/// A composed **relay** cell: beacon + mixnet router, the roles a production `--relay` node runs.
+///
+/// `relay = false` builds the identical cell *without* the router — same beacon, same config, same seeds — so
+/// a scenario can isolate what the router contributes. That control is not decoration: the first version of
+/// the cover test compared this cell against a bare `spawn_cell`, which differs in the **beacon** too, and
+/// stayed green when the relay was switched off. It measured the wrong difference.
+///
+/// The relay branch of `compose_engine` had no scenario at all — `CellComposition { relay: true }` appeared
+/// nowhere in this crate, `mixnet.rs` builds a bare `NyxNode` and `mix_relay.rs` hand-assembles a composite —
+/// so the one thing a shipped relay actually is went unexercised, including the hop threshold it seals onions
+/// at. A beacon is required and not incidental: the onion key rotates against the cell epoch, so
+/// `compose_engine` builds no router without one.
+pub fn spawn_composed_relay_cell<F: Field + 'static>(
+    sim: &mut Sim,
+    config: Config,
+    cover: fanos_runtime::Duration,
+    relay: bool,
+) -> Vec<Triple> {
+    let n = Plane::<F>::N as usize;
+    let (shares, commitment) =
+        deal(&[0xB5; 32], 2, n, &mut DeterministicRng::new(b"fanos-sim/relay/beacon-cell")).unwrap();
+    let mut coords = Vec::with_capacity(n);
+    for (i, point) in Plane::<F>::points().enumerate() {
+        let mut what = CellComposition::overlay_only(config);
+        what.beacon = Some(BeaconParams {
+            commitment: commitment.clone(),
+            threshold: 2,
+            share: Some(shares[i].clone()),
+            authority: None,
+        });
+        what.relay = relay;
+        what.cover_interval = cover;
+        // Distinct per node: a relay's onion and router keys are its own, and seeding them identically would
+        // make every hop of a circuit peelable by the same secret.
+        what.onion_seed = [i as u8; 32];
+        what.kem_seed = [0x80 ^ i as u8; 32];
+        coords.push(sim.add(compose_engine::<F>(point, &what)));
     }
     coords
 }

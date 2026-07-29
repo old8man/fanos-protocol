@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::spawn_beacon_cell;
+use common::{spawn_beacon_cell, spawn_composed_beacon_cell};
 use fanos_field::F2;
 use fanos_keygen::BeaconNode;
 use fanos_runtime::{Command, Config, Duration, Epoch, Notification};
@@ -127,6 +127,68 @@ fn proactive_resharing_survives_the_r_c1_cliff() {
         "the reshared 3-of-4 beacon assembles where the original 4-of-7 would have frozen"
     );
     assert_eq!(sim.tick_epoch(), Some(Epoch::new(4)), "and the epoch clock keeps advancing");
+}
+
+/// The same R-C1 recovery, on a cell assembled **the way production assembles it**.
+///
+/// `proactive_resharing_survives_the_r_c1_cliff` above proves the *mechanism*, but it builds its beacons by
+/// hand, so it proves nothing about whether a shipped node can reach them. It could not: `BeaconParams` had no
+/// authority field and `with_recovery_authority` had no caller outside the test helper, so every real beacon
+/// ran with no trust root and refused every trigger — fail-closed, and permanently frozen. This runs the same
+/// scenario through `compose_engine`, which is what `Node::start` calls.
+#[test]
+fn a_composed_cell_carries_the_recovery_authority_through_to_its_beacon() {
+    let mut sim = Sim::new(0x5EED);
+    let cell = spawn_composed_beacon_cell::<F2>(&mut sim, Config::default(), 4, 7, true);
+    sim.inject_all(&Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(2000));
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(1)), "healthy: the clock starts");
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(2)), "and advances");
+
+    let (authority_sk, _) = common::recovery_authority();
+    let trigger = BeaconNode::<F2>::reshare_trigger(&authority_sk, 1, 3, &[4u8, 5, 6, 7], &[4u8, 5, 6, 7]);
+    sim.inject_frame(cell[6], cell[6], trigger);
+    sim.run_for(Duration::from_millis(3000));
+
+    for &i in &[0usize, 1, 2, 3] {
+        sim.crash(cell[i]);
+    }
+    assert_eq!(
+        sim.tick_epoch(),
+        Some(Epoch::new(3)),
+        "a composed cell survives the 4-anchor loss — so `compose_engine` really did hand the authority to the \
+         BeaconNode; without it the trigger is refused and this freezes"
+    );
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(4)), "and keeps advancing");
+}
+
+/// The falsification, kept as a test rather than a note: the identical cell and the identical signed trigger,
+/// with no authority provisioned, must **not** recover.
+///
+/// This is the behaviour every shipped node had before the field existed. It is worth pinning because the
+/// failure is silent and fail-closed — the clock simply never ticks again — which is exactly the shape a
+/// regression here would take.
+#[test]
+fn a_composed_cell_without_an_authority_refuses_the_trigger_and_stays_frozen() {
+    let mut sim = Sim::new(0x5EED);
+    let cell = spawn_composed_beacon_cell::<F2>(&mut sim, Config::default(), 4, 7, false);
+    sim.inject_all(&Command::StartHeartbeat);
+    sim.run_for(Duration::from_millis(2000));
+    assert_eq!(sim.tick_epoch(), Some(Epoch::new(1)), "healthy: the clock starts");
+
+    let (authority_sk, _) = common::recovery_authority();
+    let trigger = BeaconNode::<F2>::reshare_trigger(&authority_sk, 1, 3, &[4u8, 5, 6, 7], &[4u8, 5, 6, 7]);
+    sim.inject_frame(cell[6], cell[6], trigger);
+    sim.run_for(Duration::from_millis(3000));
+
+    for &i in &[0usize, 1, 2, 3] {
+        sim.crash(cell[i]);
+    }
+    assert_eq!(
+        sim.tick_epoch(),
+        None,
+        "with no trust root the reshare never happened, so the original 4-of-7 beacon freezes at the cliff"
+    );
 }
 
 #[test]
