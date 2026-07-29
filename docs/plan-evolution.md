@@ -258,27 +258,45 @@ non-responder is already much rarer than the first, so a larger margin buys less
 
 ## Phase III — Recursion
 
-**Why last.** It builds on both prior phases, and it is where the elegance meets its real limit.
+**Re-audited, and the phase's premise was wrong.** Written from notes that lagged the code.
 
-### III.1 — Federation as the primary structure
+### III.1 — WITHDRAWN: the capacity bound was already solved
 
-**Evidence.** A cell holds about `q` nodes, not `q²+q+1` — a birthday bound on VRF coordinate draws, measured
-and recorded. So the plane's beauty operates at cell scale, and everything above it is the recursion of cells.
-The hierarchy exists in part; it is not the primary structure.
+The plan said a cell holds about `q` nodes rather than `q²+q+1` — a birthday bound on VRF coordinate draws —
+and concluded that federation is *forced*. That was true and has been fixed: `fanos_vrf::probe_point` gives each
+node a **verifiable probe sequence**, so a node displaced from a contested point advances along its own
+sequence and the cell recovers full occupancy. Measured over the real derivation rather than an urn model: 15 of
+15 on `PG(2,4)`, 200 of 200 on `PG(2,31)`. Only the tiny Fano cell loses one in seven, because a line there
+holds three points and a node fails to seat only when *every* point of its line is taken — probability
+`~load^(q+1)`, negligible at real `q` and not at `q = 2`.
 
-**Guarantee: Theorem.** The capacity bound is already derived. What follows — how many levels for `N` nodes,
-what the cross-cell diameter is, what a federation's own viability means — should be stated with the same
-rigour.
+The design also already carries a sharp adversarial correction: the walk stays on **one line** rather than the
+whole plane, because a whole-plane walk is a *steering* primitive — the sequence is a public function of a
+public VRF output, so an attacker who grinds Sybils onto `p₀…p_{j−1}` lands the victim deterministically on
+`p_j`, on a line the attacker occupies. Confining the walk trades a little capacity for the removal of that.
 
-### III.2 — Cross-cell coherence
+So federation is still wanted at internet scale — `fanos-core::hierarchy` computes the `O(log n)` routing-state
+and rendezvous-depth figures — but it is driven by **total network size**, not by a per-cell ceiling. A cell of
+`PG(2,31)` holds 993 nodes. The hierarchy's addressing, `RouteHier` routing, auto-seed and poisoning defences
+are built; what remains there is cross-cell directory and rendezvous, which is a feature rather than a
+structural correction.
 
-Each cell diagnoses itself. Nothing notices that forty cells are simultaneously degraded — which is the first
-question of any real incident.
+### III.2 — Cross-cell coherence: the one genuinely open item
 
-**Guarantee: Theorem** (a federation-level `Γ` whose measures compose from its cells') **+ the aggregate
-tier**, which also finally gives the published ε-private coherence frames a reader.
+Each cell diagnoses itself, and a fault that a cell cannot heal already escalates to its parent
+(`escalate_to_parent`, bounded by a TTL so the recursion terminates). So **fault** propagation upward exists.
 
----
+What does not exist is **health aggregation**. Nothing notices that forty cells are simultaneously degraded —
+which is the first question of any real incident, and the one an operator asks before any other: *is this my
+cell, or the network?*
+
+The input is already on the wire and has never had a reader. Nodes publish ε-differentially-private coherence
+frames (`telemetry_dir::publish_coherence`), and `read_coherence` has **no caller at all** — noted at the start
+of this session and still true. The privacy shape is already right for this: exact locally, exact within a cell
+that must act on it, noised in aggregate, so an observer sees weather rather than a target.
+
+**Guarantee: Theorem** (a federation-level `Γ` whose measures compose from its cells', so the aggregate means
+the same thing one level up) **+ the reader that finally consumes the published frames.**
 
 ## Cross-cutting
 
