@@ -113,6 +113,8 @@ pub struct ConsensusProbe {
     pub max_seen_height: u64,
     /// Why it has been refusing proposals.
     pub rejects: ProposalRejects,
+    /// Skeleton requests seen, and how many this validator could answer.
+    pub skeleton_asks: (u64, u64),
 }
 
 impl core::fmt::Display for ConsensusProbe {
@@ -127,6 +129,10 @@ impl core::fmt::Display for ConsensusProbe {
         }
         if let Some(h) = self.awaiting_body {
             write!(f, " await:{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3])?;
+        }
+        let (asked, served) = self.skeleton_asks;
+        if asked > 0 {
+            write!(f, " skel={served}/{asked}")?;
         }
         let r = &self.rejects;
         let total = r.proposer + r.link + r.locked + r.structure + r.last_commit + r.seal + r.witness + r.unavailable;
@@ -599,6 +605,11 @@ pub struct ConsensusEngine<S: StateMachine> {
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
     // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
     rejects: ProposalRejects,
+    // Skeleton requests seen, and how many this validator could answer. The instrument that separates two failures a
+    // frozen trace cannot otherwise tell apart: a cell where every validator awaits one body may be one whose requests
+    // are **not arriving**, or one where they arrive and **nobody holds the block**. `await:<hash>` looks identical in
+    // both, and they need opposite investigations.
+    skeleton_asks: (u64, u64),
     // The canonical COMMIT certificate for each finalized height this validator can still produce, keyed by the height
     // it finalizes. Two sources: one learned from **another block's `last_commit`** (see `adopt_certified_parent`,
     // carried into `finalize` because `collect_cert` can only build a certificate from votes this validator actually
@@ -714,6 +725,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sortition: None,
             round0_tickets: BTreeMap::new(),
             rejects: ProposalRejects::default(),
+            skeleton_asks: (0, 0),
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
@@ -914,6 +926,18 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.proposals.get(hash).or_else(|| self.recent_bodies.get(hash)).map(Block::skeleton)
     }
 
+    /// Record that a peer asked this validator for a skeleton, and whether it could be answered.
+    ///
+    /// Separate from [`skeleton_of`](Self::skeleton_of) on purpose. The accessor is a pure read and stays one —
+    /// making it `&mut` to carry a counter would force every caller, including a test that only wants to look,
+    /// to hold a mutable borrow. Counting belongs where the request is *handled*, which is the driver.
+    pub fn note_skeleton_ask(&mut self, served: bool) {
+        self.skeleton_asks.0 = self.skeleton_asks.0.saturating_add(1);
+        if served {
+            self.skeleton_asks.1 = self.skeleton_asks.1.saturating_add(1);
+        }
+    }
+
     /// **Any** data-availability shard of a block this validator holds in full.
     ///
     /// A shard normally has exactly one custodian — the validator whose index it is — so a dispersal that never
@@ -946,6 +970,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             locked: self.locked_block.is_some(),
             holds_locked_body: self.locked_block.is_some_and(|h| self.proposals.contains_key(&h)),
             awaiting_body: self.awaited_body().map(|h| [h[0], h[1], h[2], h[3]]),
+            skeleton_asks: self.skeleton_asks,
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
         }

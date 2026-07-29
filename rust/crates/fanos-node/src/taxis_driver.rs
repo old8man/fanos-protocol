@@ -697,7 +697,9 @@ fn on_shard<S: StateMachine>(
         // A peer is committed to a block it never received. If we hold it, hand back the skeleton — the requester then
         // samples and admits it on the ordinary path, so this recovery needs no path of its own.
         ShardMsg::NeedSkeleton { block } => {
-            if let Some(skeleton) = engine.skeleton_of(&block) {
+            let skeleton = engine.skeleton_of(&block);
+            engine.note_skeleton_ask(skeleton.is_some());
+            if let Some(skeleton) = skeleton {
                 client.command(Command::Emit { to: from, frame: to_frame(&ConsensusMsg::Propose(skeleton)) });
             }
         }
