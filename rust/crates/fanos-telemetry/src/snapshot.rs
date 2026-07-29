@@ -11,6 +11,7 @@
 use alloc::string::String;
 use core::fmt::Write as _;
 
+use fanos_diakrisis::minima::OPTIMAL_INTEGRATION;
 use fanos_diakrisis::stability::stability_radius;
 
 use crate::frame::{AlarmLevel, CellId, CoherenceFrame, Regime};
@@ -88,6 +89,20 @@ pub struct CoherenceSnapshot {
     /// Falls back to the binary syndrome signal only when `P = 0`, which means an unreadable matrix rather
     /// than any state a cell can be in.
     pub alive_nodes: u32,
+    /// How far the cell sits from its **robust operating point**: `Φ − Φ*`, where `Φ* = 5/4`.
+    ///
+    /// Negative means under-coupled — nearer the collapse boundary than it needs to be; positive means nearer
+    /// over-coupling. Zero is the point that maximizes the smaller of the two distances
+    /// (`fanos_diakrisis::minima::OPTIMAL_INTEGRATION`, derived from the metric `r_stab` itself implies).
+    ///
+    /// **Why an operator needs it.** The band is `Φ ∈ (1, 2]` and [`Regime`] reports only *which* band the cell
+    /// is in, so a cell at `Φ = 1.05` reads as a healthy collective subject, the homeostat correctly answers
+    /// `Hold`, and nothing anywhere says its stability radius is a *third* of what the same cell could hold
+    /// (`0.120` against `0.378` on a Fano plane). This is the number that says so.
+    ///
+    /// It reports; it does not steer. Teaching the homeostat to drive toward `Φ*` is a control-law change and
+    /// is gated separately (`docs/open-tasks.md`).
+    pub setpoint_offset: f64,
 }
 
 impl CoherenceSnapshot {
@@ -121,6 +136,7 @@ impl CoherenceSnapshot {
             heal_seq: frame.heal_seq,
             ready: phi >= PHI_THRESHOLD && reflection >= REFLECTION_FLOOR,
             alive_nodes: alive,
+            setpoint_offset: phi - OPTIMAL_INTEGRATION,
         }
     }
 
@@ -165,9 +181,19 @@ impl CoherenceSnapshot {
         // Appended after the pre-existing fields (never inserted earlier): the doc-promised field
         // order of everything before it stays byte-identical for an existing consumer, and a fixed
         // terminal-width renderer (ui.rs) that only has room to show up through "ready" is unaffected.
-        let _ = write!(s, "\"alive_nodes\":{}", self.alive_nodes);
+        let _ = write!(s, "\"alive_nodes\":{},", self.alive_nodes);
+        push_num_last(&mut s, "setpoint_offset", self.setpoint_offset);
         s.push('}');
         s
+    }
+}
+
+/// [`push_num`] without the trailing comma, for the last field of the object.
+fn push_num_last(s: &mut String, key: &str, v: f64) {
+    if v.is_finite() {
+        let _ = write!(s, "\"{key}\":{v}");
+    } else {
+        let _ = write!(s, "\"{key}\":null");
     }
 }
 
@@ -327,6 +353,39 @@ mod tests {
         let faulted = CoherenceSnapshot::from_frame(&faulted_frame);
         assert!(faulted.faulted);
         assert_eq!(faulted.alive_nodes, 7, "the matrix still describes seven nodes");
+    }
+
+    #[test]
+    fn the_setpoint_offset_says_which_way_the_cell_is_off_and_by_how_much() {
+        // The band reports only *which* band, so a cell just above the collapse boundary reads healthy. This
+        // field is what distinguishes "in the band" from "where in the band", which is a 3.16× difference in
+        // stability radius on a Fano plane.
+        //
+        // Φ = 6r² on a 7-cell, so r = √(Φ/6): pick correlations that land the cell below, at, and above Φ*.
+        let below = CoherenceSnapshot::from_frame(&frame((1.05f64 / 6.0).sqrt()));
+        let at = CoherenceSnapshot::from_frame(&frame((1.25f64 / 6.0).sqrt()));
+        let above = CoherenceSnapshot::from_frame(&frame((1.90f64 / 6.0).sqrt()));
+
+        assert!(below.setpoint_offset < -0.1, "under-coupled reads negative: {}", below.setpoint_offset);
+        assert!(at.setpoint_offset.abs() < 0.01, "at Φ* it reads ~zero: {}", at.setpoint_offset);
+        assert!(above.setpoint_offset > 0.5, "toward over-coupling reads positive: {}", above.setpoint_offset);
+
+        // All three are inside the band, so `Regime` cannot tell them apart — which is the whole reason this
+        // field exists. Assert that, or the test would pass on a field nobody needs.
+        assert_eq!(below.regime, at.regime, "the regime is identical across a 3× robustness difference");
+        assert_eq!(at.regime, above.regime);
+    }
+
+    #[test]
+    fn the_json_prefix_stays_byte_identical_when_a_field_is_appended() {
+        // Appending must not renumber: an existing consumer reading up to `alive_nodes` must see exactly the
+        // bytes it saw before, which is the discipline `alive_nodes` itself followed.
+        let json = CoherenceSnapshot::from_frame(&frame(0.5)).to_json();
+        let (prefix, tail) = json.split_once(",\"setpoint_offset\":").expect("appended last, with a comma");
+        assert!(prefix.starts_with('{'), "the prefix is the whole object minus the new field");
+        assert!(prefix.contains("\"alive_nodes\":"), "and it still ends with the previously-last field");
+        assert!(tail.ends_with('}'), "the new field closes the object");
+        assert!(!prefix.contains("setpoint_offset"), "the field appears exactly once, at the end");
     }
 
     #[test]

@@ -255,6 +255,16 @@ fn render_vitals(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnaps
     } else {
         Span::styled("over-coupled — shed correlation", Style::default().fg(CRIT))
     };
+    // The radius alone cannot say whether it is small because the cell is small or because the cell is badly
+    // placed inside its band — `r_stab` varies 3.16× across `Φ ∈ (1, 2]`. The offset from the derived robust
+    // point `Φ* = 5/4` is what distinguishes them, so it annotates the radius rather than standing alone.
+    let setpoint_note = if snap.setpoint_offset < -0.1 {
+        Span::styled("under-coupled — room above", Style::default().fg(WARN))
+    } else if snap.setpoint_offset <= 0.1 {
+        Span::styled("at the robust point Φ*", Style::default().fg(READY))
+    } else {
+        Span::styled("drifting toward over-coupling", Style::default().fg(WARN))
+    };
     let cascade = if snap.cascade_lead >= 0 {
         Span::styled(
             format!("forecast in {} ticks", snap.cascade_lead),
@@ -280,6 +290,12 @@ fn render_vitals(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnaps
         kv(
             "stability r_stab",
             &format!("{:.3}", snap.stability_radius),
+            Color::White,
+            Some(setpoint_note),
+        ),
+        kv(
+            "offset from Φ*",
+            &format!("{:+.3}", snap.setpoint_offset),
             Color::White,
             None,
         ),
