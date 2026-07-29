@@ -197,6 +197,50 @@ mod tests {
         }
     }
 
+    /// **Two corrupt points can never own both ends of a circuit** — the mixnet's end-to-end guarantee, and a
+    /// fact about the plane rather than about any threshold tuning.
+    ///
+    /// A MIX hop is a *line*, peeled by a threshold of its `q+1 = 3` members (`MIX_THRESHOLD = 2`), so a hop
+    /// falls when two of its points are corrupt. Two points lie on exactly one line, so **at most one line is
+    /// ever captured while at most two points are corrupt** — and one line cannot be both the first and the
+    /// last hop. Since only first-and-last correlation deanonymizes (a captured middle hop learns which relays
+    /// flank it, not the client or the destination), end-to-end deanonymization is *impossible* inside the
+    /// Byzantine tolerance `f = ⌊(n−1)/3⌋ = 2`.
+    ///
+    /// Enumerated rather than argued, because the argument was got wrong twice (`docs/audit.md` E7): a Chernoff
+    /// bound over the same quantity gave 3.9 %, by assuming an independence between hops that an incidence
+    /// structure does not have. **And the guarantee does not generalize** — it rests on `f = t = 2`, an accident
+    /// of the smallest plane, which is why the second half of this test pins the boundary rather than the
+    /// property alone.
+    #[test]
+    fn two_corrupt_points_can_never_capture_two_distinct_lines() {
+        /// Lines holding at least `t` corrupt points — a captured hop.
+        fn captured(corrupt: u8, t: u32) -> Vec<usize> {
+            (0..fano::N).filter(|&l| (fano::INCIDENCE[l] & corrupt).count_ones() >= t).collect()
+        }
+
+        for corrupt in 0u8..=0x7F {
+            if corrupt.count_ones() > 2 {
+                continue;
+            }
+            assert!(
+                captured(corrupt, 2).len() <= 1,
+                "corrupt {corrupt:#09b} captured {} lines — two points lie on exactly one line, so at most one \
+                 hop can fall and first-and-last correlation must be impossible",
+                captured(corrupt, 2).len()
+            );
+        }
+
+        // The bound is *tight*, not vacuous: three corrupt points capture three lines when they are not
+        // collinear — which is where end-to-end correlation becomes possible, and exactly where consensus
+        // halts, since `f = 2`. Without this half the test would pass on a plane where nothing is ever
+        // captured at all.
+        assert!(
+            (0u8..=0x7F).filter(|c| c.count_ones() == 3).any(|c| captured(c, 2).len() == 3),
+            "at three corrupt points the guarantee must break, or it proves nothing"
+        );
+    }
+
     /// Every Fano line has three points and every point is on three lines (regularity of
     /// the const tables).
     #[test]

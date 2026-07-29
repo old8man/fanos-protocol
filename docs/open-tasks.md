@@ -14,6 +14,40 @@ No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes 
 
 ## Tier A — headline frontiers
 
+### [A] The homeostat has a derived setpoint and does not steer to it
+`Homeostat::control` (`homeostat.rs`) returns `Hold` for any mean correlation inside `collective_subject_window`, i.e. any
+`Φ ∈ (1, 2]` — a range across which `r_stab = √((Φ−1)/N)` varies **3.16×** (`0.120` at `Φ = 1.1` against `0.378` at
+`Φ = 2` on a Fano cell). A cell can sit a hair above the collapse boundary, be told it is healthy, and absorb a third of
+the disturbance it could.
+
+The setpoint is now **derived** (`fanos_diakrisis::minima::OPTIMAL_INTEGRATION`): the metric is the one `r_stab` already
+implies, `ds = dP/(2√(P − 2/N))`, and integrating it to the upper boundary gives `d_high = 1/√N − r_stab`, so the two
+distances partition `1/√N` and the max-min point is `r_stab* = 1/(2√N)`, i.e. `Φ* = 5/4`, `P* = (9/4)/N`. Notably **not**
+the midpoint `Φ = 3/2`, which is strictly worse — the metric is singular at the lower boundary.
+
+**What remains is the control change, and it should be evidence-gated.** Teaching `control` to nudge toward `Φ*` inside
+the band replaces a dead zone with a proportional term, which can oscillate; it needs a closed-loop experiment showing a
+cell held at `Φ*` survives a flood that one left at `Φ = 1.1` does not, before it goes in.
+
+**Check before working:** `control` should still return `BandControl::Hold` unconditionally for
+`CollectiveState::CollectiveSubject`, and `OPTIMAL_INTEGRATION` should still have no caller outside its own tests.
+
+### [A] Anonymity cannot leave its cell, and that is what forces the robustness trade-off
+`fanos-aphantos` is parameterized by a single field `F` throughout. The threshold onion routes over hop **lines of one
+plane** (`threshold_onion.rs`, `hop_lines: &[Triple]`), NOSTOS picks a dead-drop from the `q+1` lines through a point of
+that same plane (`nostos.rs::select_drop_line`), and `HierAddr` — the hierarchical address that would name a coordinate in
+another cell — appears **nowhere in the crate**. So an anonymous circuit is confined to its cell and the anonymity set is
+the cell, not the federation.
+
+This is not a cosmetic limit. `fanos_diakrisis::minima` derives that a cell's robustness ceiling is `r_stab ≤ 1/√N`, so the
+anonymity floor `1/K` and the robustness ceiling pull in opposite directions and the only current lever is the plane order:
+Fano gives `1/7` anonymity at `r_stab = 0.378`, `PG(2,31)` gives `1/993` at `0.032` — a 12× robustness cost for credible
+anonymity. Federation would resolve it *if* circuits could cross cells; today it buys nothing for anonymity.
+
+**Check before working:** `grep -rn "HierAddr" crates/fanos-aphantos/` should still return nothing, and
+`threshold_onion.rs`'s hop unit should still be a flat `Triple`. Design authority: `docs/design-anonymity-substrate.md`,
+numbers in `docs/deployment-minima.md`.
+
 ### [A] Close the "libraries ahead of wiring" gap — four items, measured and guarded
 The list is now computed, not remembered: `fanos-cli/tests/architecture.rs` takes the closure over the manifests and fails
 if a crate is linked by nothing (or if a listed orphan gets wired). 34 of 43 crates sit in the node's closure, 38 of 43 are
@@ -49,10 +83,17 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
-### [A] A ~1-in-8 test sits in the per-push CI gate, and it should not be hidden
+### [A] A ~1-in-3 test sits in the per-push CI gate, and it should not be hidden
 `a_hash_locked_contract_is_funded_and_claimed_over_live_consensus` is **not** `#[ignore]`d, so it runs in the `gate`
 job on every push, where it fails both under full-workspace loopback saturation and — at a lower rate — in isolation.
-A gate that fails one push in eight blocks merges at random and trains people to re-run rather than read.
+A gate that fails this often blocks merges at random and trains people to re-run rather than read.
+
+**Re-measured 2026-07-29 in isolation** (`cargo test -p fanos-node --test dromos_quic a_hash_locked --features
+validator`, one test alone, host load 6–9): **pass / pass / fail at HEAD**, and fail / pass / fail with an unrelated
+observational change applied — statistically indistinguishable, which is how that change was cleared. The rate is
+therefore around **one in three, not one in eight**; the older figure is stale and was the reason a single passing
+baseline run looked like exoneration. Two conclusions follow: a lone HEAD run proves nothing about this test, and the
+underlying data-availability defect has not been improving.
 
 The repo's own convention would move it: two sibling real-QUIC tests are `#[ignore]`d into the nightly `heavy` job for
 exactly this reason, with the rationale written down. **Deliberately not doing that yet.** Ignoring it would convert a
@@ -65,6 +106,14 @@ Whichever way it goes, it is a decision to make explicitly rather than by attrit
 
 **Process note for the next investigator:** the failure message carries the whole `ConsensusProbe` trace, which is the
 diagnosis. Do not filter test output through `grep -E "FAILED|^---- "` — that drops exactly the line worth reading.
+
+The probe now also carries `skel=served/asked` (`ConsensusEngine::note_skeleton_ask`), which separates two failures the
+trace could not otherwise tell apart: a cell whose skeleton requests never arrive, and one where they arrive and nobody
+holds the block. `await:<hash>` looks identical in both and they need opposite investigations.
+
+**And never let a pipeline decide whether the gate passed.** `cargo test … | grep …` reports *grep's* exit status, so a
+run ending `error: test failed` was reported as exit 0 and nearly shipped. Run the gate bare, `echo $?` on its own, then
+read the detail in a separate call.
 
 ### [A] The adaptive admission gate is built and tested but DELIBERATELY NOT INSTALLED
 `fanos_core::AdaptivePowAdmission` reads its difficulty from a `LiveDifficulty` the coherence controller drives,

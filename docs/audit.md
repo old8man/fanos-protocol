@@ -22,7 +22,7 @@
 > - **Mass-loss recovery** (R-C1 cliff, Audit II/III §4): **CLOSED** — partition-safe below-threshold re-genesis (RGC + `BeaconNode::rebootstrap` + generation fencing) + an auto-trigger (recovery-decision ladder + stall detector) replaces the permanent freeze; durable state-sync + secret-leader election are built and proven over real QUIC.
 > - **The Audit III §3 DoS/overflow cluster:** §3.2 (OBOLOS ternary-randomness reject), §3.3 (storage `decode_response` bound), §3.5 (audit-cadence), §3.4 (market floors + prune), §3.7 (TREASURY access-list), §3.8/§3.9 (CI green): **CLOSED** per Audit IV's re-verification + subsequent commits.
 > - **Γ-viability gate** (Audit II CRITICAL-ARCH): **CLOSED** — built as the `fanos-holarch` crate (`gamma`/`verdict`/`panel`/`Sigma` + the Ω4 ablations); the E∧L verdict is now a CI number.
-> - **Beacon-reshare key-secrecy** (Audit IV §2.1, CRITICAL, **RESOLVED 2026-07-24**): the last live CRITICAL across all four audits is now closed. The `BeaconReshareTrigger` is **authenticated** — it carries a `HybridSignature` by the beacon's recovery `authority`, and `on_reshare_trigger` refuses any unsigned/foreign-signed/tampered trigger before any anchor deals a sub-share; `node.rs::actuate_recovery` escalates a proactive reshare to that authority (as re-genesis already is) rather than a node self-issuing one. The 2-anchor-coalition master-key exfiltration is closed, while legitimate threshold-lowering recovery still works (the authority signs it). The in-flux `recovery.rs` was not touched. Full detail at Audit IV §2.1 below. **With this, no open CRITICAL/HIGH security item remains across the four audits** — the residual is the coherence/MEDIUM-LOW tail noted next.
+> - **Beacon-reshare key-secrecy** (Audit IV §2.1, CRITICAL, **RESOLVED 2026-07-24**): the last live CRITICAL across all four audits is now closed. The `BeaconReshareTrigger` is **authenticated** — it carries a `HybridSignature` by the beacon's recovery `authority`, and `on_reshare_trigger` refuses any unsigned/foreign-signed/tampered trigger before any anchor deals a sub-share; `node.rs::actuate_recovery` escalates a proactive reshare to that authority (as re-genesis already is) rather than a node self-issuing one. The 2-anchor-coalition master-key exfiltration is closed, while legitimate threshold-lowering recovery still works (the authority signs it). The in-flux `recovery.rs` was not touched. Full detail at Audit IV §2.1 below. **One open HIGH as of 2026-07-29 — E7:** `MIX_THRESHOLD` is a constant `2` on every plane, so above Fano the tolerated Byzantine corruption alone captures every MIX hop and the lane provides no anonymity at `q ≥ 7`. The default plane `q = 2` is unaffected (there `f = t = 2` makes end-to-end correlation impossible). The fix is derived and evaluates to the current value at `q = 2`: `t = ⌈2(q+1)/3⌉`. No other CRITICAL/HIGH remains across the four audits. — the residual is the coherence/MEDIUM-LOW tail noted next.
 > - **Remaining:** the coherence/meta-holon tail (E→L / L→O / Ω2 / Ω9 reconciliation) and the per-subsystem MEDIUM/LOW items are preserved in the dated sections below and tracked in ongoing work. Where an archived section says "unbuilt/open," verify against the current tree — it has advanced hundreds of commits since each snapshot.
 >
 > ### Residual sweep — 2026-07-26
@@ -394,6 +394,85 @@ Pinned by `beacon::tests::{any_threshold_subset_yields_the_same_unbiasable_seed,
 **Lower-severity anonymity items:** `fanos-nyx` `sheaf.rs`/`tessera.rs` "transparent" threshold onions carry Shamir shares in cleartext yet cite the §5.2 ZK-below-threshold property — superseded on the live path but still `pub` re-exported (integrator footgun; gate behind a sim feature or rename); the Lindblad anti-DDoS gate is implemented and tested only in `fanos-sim/tests/calypso_ddos.rs`, unintegrated into any shipping service, and `stabilize.rs:34-36` asserts a "quarantine per T-226" backstop that (per the corpus) has no theorem; the threshold layer's `ct_len` is cleartext (a peeling node learns its path position — a documented Sphinx-filler residual that `sealed.rs` avoids by AEAD-encrypting the length); and ONOMA global-name issuance is interface-only with `LocalRegistry::insert` silently overwriting (no first-come settlement).
 
 **Verdict.** The **entire E-series anonymity floor is now resolved** — E1 (constant-rate cover), E2 (secret-keyed mix delays), E3 (SIV-salt descriptor nonce + per-boot onion-nonce freshening), E4 (forward-secure relay onion keys with a grace window), E5 (unpredictable distributed-beacon rendezvous), E6 (constant-rate cover displacement) — all implemented and verified above (#61). The marketing verbs ("verifiable mixing," "forward secrecy," "unpredictable epochs," "no volume fingerprint") now match the shipping Full engine. The only remaining anonymity work is the live-network **deployment transport** of the beacon and the single E4∩E5 epoch driver (→ #54). The lower-severity items below are documented-in-code residuals, none a fabrication.
+
+### E7 — `MIX_THRESHOLD` is a constant and does not scale with the plane *(HIGH)* — **OPEN, found 2026-07-29**
+
+`fanos-node/src/node.rs:42` declares `pub(crate) const MIX_THRESHOLD: usize = 2`, passed unchanged to
+`ThresholdRouter::<F>::new` for **every** field `F` (`composition.rs:149`). A MIX hop is a line of `q+1` points
+(`threshold_router.rs`: "each hop is peeled only by a threshold `t` of that line's `q + 1` members"), so on any
+plane a hop falls to **any two** corrupt members — while the Byzantine tolerance `f = ⌊(n−1)/3⌋` grows with the
+plane.
+
+| `q` | nodes `n` | line `m` | `t/m` | tolerated `f` | **fraction of hops captured** | worst case |
+|---|---|---|---|---|---|---|
+| **2** | 7 | 3 | 0.667 | 2 | **0.143** — exactly 1 line of 7 | 0.143 |
+| 4 | 21 | 5 | 0.400 | 6 | 0.450 | 0.714 |
+| 7 | 57 | 8 | 0.250 | 18 | **0.795** | 1.000 |
+| 31 | 993 | 32 | 0.062 | 330 | **≈1.000** | 1.000 |
+
+The middle column is hypergeometric — the corrupt count is exactly `f`, not a binomial draw — and it reproduces
+the exact enumeration at `q = 2` (`1/7 = 0.1429`), which is the check that the model is the right one. The right
+column is the pigeonhole bound `min(C(f,2), n)/n`: each corrupt *pair* determines one line, so it caps what an
+adversary could reach by placing its nodes deliberately rather than at random.
+
+Two corrupt points lie on exactly one line, so each corrupt *pair* captures one hop. At `q = 2` the tolerance is
+`f = 2 = t`: exactly one pair, exactly one captured line — and one line cannot be both the first and the last
+hop of a circuit, so **end-to-end deanonymization is impossible at the default plane**. That is a coincidence of
+`f = t = 2`, not a property of the construction. Above Fano the pair count outruns the line count and the
+tolerated corruption alone owns every hop: **on `q ≥ 7` the MIX lane provides no anonymity at all under the
+platform's own fault assumption.**
+
+**Raising `q` therefore makes anonymity worse, not better** — the opposite of what the plane-order knob is for,
+and the opposite of what `docs/deployment-minima.md` recommended before this was found.
+
+### The fix is derived and changes nothing at the default
+
+Under the platform's tolerance the corrupt *density* is `f/n = ⌊(n−1)/3⌋/n → 1/3`, so a line of `m` points
+carries about `m/3` corrupt in expectation. The threshold that preserves Fano's margin at any `m` is
+
+```text
+t = ⌈2m/3⌉ = ⌈2(q+1)/3⌉
+```
+
+and at `q = 2` it evaluates to `⌈2⌉ = 2` — exactly the shipped constant. **The value is right; it was simply
+never generalized.** With it, hop capture falls as the plane grows, which is what §4 claims and what the
+constant prevents:
+
+| `q` | `t` now | `t` fixed | P(hop captured) now | P(hop captured) fixed |
+|---|---|---|---|---|
+| 2 | 2 | **2** | 0.143 | 0.143 |
+| 4 | 2 | 4 | 0.450 | 0.0114 |
+| 7 | 2 | 6 | 0.795 | 0.0091 |
+| 31 | 2 | 22 | **≈1.000** | 0.000032 |
+
+**Liveness cost, which must be checked before the change lands:** a higher `t` means more members must be
+reachable to peel a hop. At `t = ⌈2m/3⌉` a hop needs two thirds of a line online — tighter than today's two of
+three at `q = 2` only in absolute terms, identical in ratio. The trade is the same one BFT already makes and
+should be verified against the mixnet's own liveness tests, not assumed.
+
+### How this was found, and the two wrong turns on the way
+
+Worth recording because both errors are reusable ones.
+
+**First wrong turn — a bound quoted as a property.** §4's Chernoff bound `P_break ≤ exp(−(q+1)·D(τ‖f))` is
+asymptotic in `q`; evaluated at `q = 2` it gives `0.425`, which looked like a weakness and was written up as a
+HIGH claim-integrity finding. But a binomial models hops as *independent draws*, and on one finite plane the
+corrupt set is **fixed** and hops are **lines that share points**. Exact enumeration over every corrupt set
+showed the truth: at two corrupt, exactly one line falls, and `P(first ∧ last) = 0` — not the `3.9 %` the
+binomial predicted.
+
+**Second wrong turn — the right answer generalized without checking.** Having found the Fano guarantee exact,
+the natural conclusion was "the design is better than its justification". True at `q = 2`, and false everywhere
+else, because it rested on `f = t` — an accident of the smallest plane.
+
+*Provenance:* the enumeration was run twice, once on a hand-written line set and once on the lines generated by
+the repository's own `fanos-geometry::fano` GF(2) construction (`coords_at` / `incident_gf2`). Different
+labellings — `[(4,5,6),(1,3,4),…]` against `[(0,1,3),(1,2,4),…]` — identical numbers, as they must be since all
+Fano planes are isomorphic.
+
+**The lesson, twice over:** a probabilistic bound over a finite incidence structure must be checked against
+enumeration before it is quoted as a security property — and a result proved at one parameter must be re-derived
+before it is carried to another.
 
 ## 9. Part F — DIAULOS stream reliability
 

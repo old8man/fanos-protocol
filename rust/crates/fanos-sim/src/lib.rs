@@ -14,6 +14,7 @@
 //! ```
 //! use fanos_sim::{Sim, spawn_cell};
 //! use fanos_field::F2;
+//! use fanos_runtime::{Command, Config, Duration};
 //!
 //! let mut sim = Sim::new(0xFA);
 //! let cell = spawn_cell::<F2>(&mut sim, Config::default());

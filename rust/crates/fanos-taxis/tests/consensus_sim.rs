@@ -2010,3 +2010,41 @@ fn a_sub_quorum_lock_split_heals() {
         assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
     }
 }
+
+/// **The consensus knee, swept rather than asserted.**
+///
+/// `CellParams::derive` fixes `f = ⌊(n−1)/3⌋` and quorum `Q = ⌈(n+f+1)/2⌉`, giving `f = 2`, `Q = 5` on a Fano
+/// cell. That is arithmetic on paper. This drives the actual engines with `k` validators reachable, for every
+/// `k` from three to seven, and asks whether anything finalizes.
+///
+/// It complements the storage sweep in `fanos-sim/tests/minima.rs`, which found the read floor at four
+/// survivors. Both floors matter and they are different numbers: a cell that has halted for consensus can
+/// still be serving reads, and `docs/deployment-minima.md` says so on the strength of these two measurements
+/// rather than on the strength of the formulas they check.
+#[test]
+fn finalization_needs_the_quorum_and_no_fewer() {
+    for k in 3..=N {
+        let mut c = Cluster::new(&genesis());
+        let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }, b"quorum-knee");
+        c.submit_all(&tx);
+
+        // Cut everything above `k` away. The survivors are `0..k`, so a majority partition of size `k`.
+        let cut: Vec<usize> = (k..N).collect();
+        if !cut.is_empty() {
+            c.split(&cut);
+        }
+        // Enough rounds that the proposer rotates past any cut-off leader — a sub-quorum group that merely
+        // never got a proposal would look identical to one that cannot reach quorum.
+        for _ in 0..16 {
+            c.tick();
+            c.timeout();
+        }
+
+        let finalized = c.honest_count_at(0);
+        if k >= 5 {
+            assert!(finalized >= 5, "k={k} reaches the quorum of 5, so it must finalize; got {finalized}");
+        } else {
+            assert_eq!(finalized, 0, "k={k} is below the quorum of 5 and must finalize nothing");
+        }
+    }
+}
