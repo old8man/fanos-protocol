@@ -888,7 +888,13 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let mut tally: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         for sv in self.prepares.iter().chain(&self.commits) {
             let hash = sv.vote.block_hash;
-            if sv.vote.height == height
+            // `nil` is a statement that a validator accepted *nothing*, not a block anyone can fetch. Counting it
+            // here made every validator chase a body that does not exist by construction — measured live as a
+            // whole cell reporting `await:00000000`, the all-zero sentinel, the moment nil votes were introduced.
+            // The interaction is the lesson: a sentinel added to one tally silently joins every other tally that
+            // ranges over the same field.
+            if sv.vote.block_hash != NIL
+                && sv.vote.height == height
                 && !self.proposals.contains_key(&hash)
                 && self.recent_bodies.get(&hash).is_none()
             {
