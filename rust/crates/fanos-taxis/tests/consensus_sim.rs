@@ -1643,6 +1643,57 @@ fn a_validator_short_one_commit_vote_rejoins_the_chain() {
 
 
 #[test]
+fn a_minority_locked_on_a_dead_block_is_released_by_the_majority_s_proof() {
+    // Tendermint's **unlocking rule**, which was missing entirely, and the situation that needs it — which is
+    // *not* the sub-quorum split above. There, three lock and four do not, and neither side reaches the quorum
+    // of five, so no certificate for a conflicting value can exist at all and the release has nothing to fire
+    // on; `valid_value` is what heals that one.
+    //
+    // The rule matters when the locked side is **smaller than the quorum's complement**: two validators lock on
+    // a block, the remaining five prepare a different one and form a real certificate for it. The cell is fine —
+    // five is a quorum — and the two are stranded forever, refusing every proposal at that height on a lock
+    // nothing can release. Their peers hold exactly the proof that should free them, and carry it on every
+    // proposal, and before this the acceptor side never looked at it.
+    //
+    // Deliberately asserted on **all seven**, not on the cell: a test that only checks the cell advanced passes
+    // while two validators are permanently deaf, which is precisely how this went unnoticed.
+    let mut c = Cluster::new(&genesis());
+    let stranded = [0usize, 1];
+    let free: Vec<usize> = (0..N).filter(|i| !stranded.contains(i)).collect();
+
+    // Round 0: PREPAREs reach only the two, so they see a polka and lock; the five never do.
+    c.set_drop_to(Some((Phase::Prepare, &free)));
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"strand-two");
+    c.submit_all(&tx);
+    c.tick();
+    c.set_drop_to(None);
+
+    // The mempool changes, so every later proposal differs from the block the two locked on — without a release
+    // they refuse all of them.
+    let second = c.seal(Transfer { from: ALICE, to: BOB, amount: 25, nonce: 1 }, b"the-cell-moves-on");
+    c.submit_all(&second);
+    for _ in 0..10 {
+        c.timeout();
+        c.tick();
+    }
+
+    let head = c.engines[free[0]].chain().next_height();
+    assert!(head >= 1, "the five that were never blinded must finalize — they are a quorum");
+    let root = c.engines[free[0]].chain().state_root();
+    for &i in &stranded {
+        assert_eq!(
+            c.engines[i].chain().next_height(),
+            head,
+            "validator {i} is stranded on a lock the cell has demonstrably moved past"
+        );
+        assert_eq!(c.engines[i].chain().state_root(), root, "validator {i} disagrees on the executed state");
+    }
+    for h in 0..head {
+        assert_eq!(c.hashes_at(h).len(), 1, "releasing a lock must not fork height {h}");
+    }
+}
+
+#[test]
 fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
     // Round synchronization, which this engine did not have. Rounds advanced by exactly one thing — a validator's own
     // timeout firing — so nothing ever moved a validator toward the round its peers were on. Local timers are

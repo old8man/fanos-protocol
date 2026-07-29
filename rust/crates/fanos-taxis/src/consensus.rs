@@ -544,6 +544,28 @@ const COLLECT_WINDOW_TICKS: u32 = 1;
 /// all, so it is generous rather than tight.
 const RECENT_BODY_CAP: usize = 64;
 
+/// The **structural** half of the unlocking test: everything about a proof-of-lock except its signatures.
+///
+/// Separated because this is where a subtle error is possible and would be silent. The signature check is
+/// all-or-nothing and fails loudly; these five comparisons each admit an off-by-one, and one of them —
+/// `pol.round > locked_round` — is the safety boundary of the whole rule.
+///
+/// * **`> locked_round`, strictly.** Releasing on a proof from the round we locked at, or an earlier one, would
+///   break agreement: our lock exists *because* a quorum prepared our value at that round, and a second quorum
+///   at the same round can only exist if `f+1` validators equivocated. Accepting it would make one equivocation
+///   round enough to split the cell, which is precisely what the lock is for.
+/// * **`<= now`.** A certificate from a round we have not reached is not evidence about the past; a peer can
+///   mint one for a future round only by getting a quorum to vote there, in which case we will be told by the
+///   round-synchronization rule and can re-judge it then.
+/// * **phase, height and hash** must all match the proposal, or the proof is about something else.
+fn pol_shape_releases(pol: &Certificate, block_hash: [u8; 32], height: u64, locked_round: u32, now: u32) -> bool {
+    pol.phase == Phase::Prepare
+        && pol.height == height
+        && pol.block_hash == block_hash
+        && pol.round > locked_round
+        && pol.round <= now
+}
+
 /// One validator's sans-I/O consensus engine over a state machine `S`.
 pub struct ConsensusEngine<S: StateMachine> {
     params: CellParams,
@@ -1389,6 +1411,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // Remember the (valid, available) block body so we can finalize it later even if a conflicting
         // proposal arrives afterwards (equivocation) — keyed by hash, never overwritten by a different block.
         let proposer = block.header.proposer;
+        // Decided before the block moves into `proposals`: the unlocking evidence rides on the proposal, so it
+        // has to be read while we still hold it.
+        let releases_our_lock = self.unlocks_us(&block);
         self.proposals.entry(bh).or_insert(block);
         // If we already hold a commit certificate for this height+block but were waiting on the body (an async
         // scheduler delivered the CC first), finalize now instead of staying wedged (audit fix, HIGH 3).
@@ -1402,9 +1427,11 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return self.rank_round0(proposer, ticket, bh, height);
         }
         // Round ≥ 1 (or sortition disabled): the single-leader immediate prepare (the pre-SSLE path, unchanged).
-        // Safety lock: never prepare a block conflicting with the one we are locked on this height.
+        // Safety lock: never prepare a block conflicting with the one we are locked on — **unless the proposal
+        // proves the cell moved on**. See `unlocks_us`.
         if let Some(locked) = self.locked_block
             && locked != bh
+            && !releases_our_lock
         {
             self.rejects.locked += 1;
             return Vec::new();
@@ -1418,6 +1445,39 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let mut out = self.accept_vote(sv.clone());
         out.push(Output::Send(ConsensusMsg::Vote(sv)));
         out
+    }
+
+    /// Whether `block` carries the evidence that releases this validator's lock — Tendermint's **unlocking
+    /// rule**, and it was missing.
+    ///
+    /// A validator locked on `v` at round `r_lock` refuses every conflicting proposal. Taken alone that is not a
+    /// safety property but a deadlock: at the same height it can then accept *nothing else, ever*, no matter
+    /// what the rest of the cell demonstrably agreed. The lock is meant to be released by proof, and the proof
+    /// is a PREPARE quorum for the new value at a round **strictly later** than the one we locked at.
+    ///
+    /// The `pol` field carrying that proof already existed and was already checked — but only for *proposer
+    /// entitlement* (`pol_ok` in [`on_propose`](Self::on_propose)), never for unlocking. So the mechanism that
+    /// decides **who may propose** a re-offered value was built, and the one that decides **who may accept it**
+    /// was not. Measured live before this: a sub-quorum lock split froze a cell for its whole 240 s budget with
+    /// `rejects.locked` and nothing else anywhere.
+    ///
+    /// ## Why releasing is safe
+    ///
+    /// We locked on `v` because we saw `Q = 2f+1` PREPAREs for it at `r_lock`. Releasing requires `Q` PREPAREs
+    /// for `v'` at `r_pol > r_lock`. Two quorums of `2f+1` out of `n = 3f+1` intersect in at least `f+1`
+    /// validators, so at least one **honest** validator prepared both — which an honest validator does only if
+    /// it had itself released its lock on `v`, i.e. only if it had seen this same kind of evidence. The
+    /// induction bottoms out at a *committed* value: once `Q` COMMIT votes exist for `v`, no conflicting
+    /// PREPARE quorum can form at any later round, because that would need `f+1` honest validators to prepare
+    /// against a lock none of them can have released. Agreement is preserved; what is released is the deadlock.
+    ///
+    /// Refusing to release is therefore not the conservative choice it looks like. It trades a liveness
+    /// property the theorem grants for no safety the theorem asks for.
+    fn unlocks_us(&self, block: &Block) -> bool {
+        let Some(held) = &self.locked_cert else { return false };
+        let Some(pol) = &block.pol else { return false };
+        pol_shape_releases(pol, block.hash(), self.height(), held.round, self.round)
+            && pol.verify(self.params.quorum, &self.verifiers)
     }
 
     /// Prepare the **lowest-ticket** round-0 proposal collected so far — the elected secret leader. Called on
@@ -2136,5 +2196,65 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let mut out = self.accept_vote(sv.clone());
         out.push(Output::Send(ConsensusMsg::Vote(sv)));
         out
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A proof-of-lock with the given shape. Signatures are not exercised here — [`pol_shape_releases`] is the
+    /// structural half by construction, and the cryptographic half is checked separately by `Certificate::verify`.
+    fn pol(phase: Phase, height: u64, round: u32, block_hash: [u8; 32]) -> Certificate {
+        Certificate { phase, height, round, block_hash, votes: Vec::new() }
+    }
+
+    const BH: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn a_later_prepare_quorum_for_this_block_releases_the_lock() {
+        // The rule itself: locked at round 2, a proof from round 4, current round 5.
+        assert!(pol_shape_releases(&pol(Phase::Prepare, 9, 4, BH), BH, 9, 2, 5));
+    }
+
+    #[test]
+    fn a_proof_from_our_own_round_or_earlier_never_releases() {
+        // **The safety boundary.** Our lock exists because a quorum prepared our value at round 2; a second
+        // quorum for a different value at round 2 can only exist if `f+1` validators equivocated. Releasing on
+        // it would make one equivocating round enough to split the cell — exactly what the lock prevents.
+        assert!(!pol_shape_releases(&pol(Phase::Prepare, 9, 2, BH), BH, 9, 2, 5), "equal round");
+        assert!(!pol_shape_releases(&pol(Phase::Prepare, 9, 1, BH), BH, 9, 2, 5), "earlier round");
+        assert!(!pol_shape_releases(&pol(Phase::Prepare, 9, 0, BH), BH, 9, 2, 5), "round zero");
+    }
+
+    #[test]
+    fn a_proof_from_a_round_we_have_not_reached_never_releases() {
+        // Not evidence about the past. If a quorum really is voting there, round synchronization brings us to
+        // that round and the proof is judged again on its merits.
+        assert!(!pol_shape_releases(&pol(Phase::Prepare, 9, 6, BH), BH, 9, 2, 5));
+    }
+
+    #[test]
+    fn a_proof_about_something_else_never_releases() {
+        assert!(!pol_shape_releases(&pol(Phase::Commit, 9, 4, BH), BH, 9, 2, 5), "wrong phase");
+        assert!(!pol_shape_releases(&pol(Phase::Prepare, 8, 4, BH), BH, 9, 2, 5), "wrong height");
+        assert!(!pol_shape_releases(&pol(Phase::Prepare, 9, 4, [1u8; 32]), BH, 9, 2, 5), "wrong block");
+    }
+
+    #[test]
+    fn the_release_window_is_exactly_the_open_interval_above_our_lock() {
+        // Every round from 0 to `now`, checked against the rule as stated, so a future edit that widens or
+        // narrows the window by one fails here rather than in a cell.
+        const LOCKED_AT: u32 = 3;
+        const NOW: u32 = 7;
+        for round in 0..=NOW + 2 {
+            let releases = pol_shape_releases(&pol(Phase::Prepare, 1, round, BH), BH, 1, LOCKED_AT, NOW);
+            assert_eq!(
+                releases,
+                round > LOCKED_AT && round <= NOW,
+                "round {round} released={releases}, but the rule is `locked < round <= now`"
+            );
+        }
     }
 }

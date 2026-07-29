@@ -110,6 +110,30 @@ A protocol built from a paper's happy path will have other such gaps.
 TAXIS claims. For each: state its hypothesis, assert it in a test, and record where the implementation
 establishes it. A rule that cannot be pointed at in the code is a rule that is not there.
 
+**First pass done. Two more rules were missing, and one is now implemented:**
+
+| rule | status |
+|---|---|
+| round synchronization (`f+1` from a higher round ⇒ jump) | **was missing**; implemented earlier this session |
+| **unlocking** (release a lock on a strictly-later PREPAREquorum) | **was missing**; implemented — the `pol` field carrying the proof existed and was checked only for *proposer entitlement*, never for *who may accept* |
+| nil votes (prevote/precommit nil) | **absent, and deliberately recorded as a gap** — see below |
+| the lock gate (refuse conflicting proposals) | present |
+| `valid_value` (propose an observed polka) | present |
+| per-phase timeouts | **absent** — TAXIS has one round timeout, not three |
+
+**On the unlocking rule, an honest note about coverage.** It is correct, standard, and the safety boundary
+(`pol.round > locked_round`, strictly) is pinned by five unit tests including a falsification. But **no scenario
+in the current harness requires it**, and two attempts to build one both passed without the rule — because
+`adopt_certified_parent` already frees a validator stranded at a height the cell *finalized*, and `valid_value`
+covers the sub-quorum split where no conflicting quorum can form at all. The rule matters in the remaining
+window: a polka formed, no commit followed. That is real, and it is not currently reachable in the simulator.
+Recorded rather than claimed.
+
+**On nil votes.** A validator that refuses a proposal is silent, so its peers cannot distinguish "has not
+decided" from "refused", and a failed round can end only by timeout — which doubles toward 24 s. That is the
+likeliest cause of the 200-second rounds measured live. Implementing them is a protocol change (a new vote
+form, quorum counting, the locking rule's interaction) and is the next item of this phase.
+
 ### I.5 — Split the two numbers `admission_difficulty` holds
 
 **Evidence.** One field is used both as "the price I demand of joiners" and "the difficulty I solved for
