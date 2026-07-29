@@ -84,6 +84,27 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
 ///
 /// Under-delivering an anonymity request in silence is the worse failure. An operator who is told can raise the order or
 /// accept the limit knowingly; one who is not told believes the profile's name.
+/// The mixnet hop threshold for this invocation: `--threshold` if given, else derived from `--plane-order`.
+///
+/// One helper rather than three copies, because the client and the relay must agree exactly — a client seals
+/// each onion layer for precisely this many members — and three `None => 2` defaults are three chances to
+/// diverge. The derivation is [`fanos_node::node::mix_threshold`]: a hop is a line of `q+1` points, and a
+/// threshold fixed at the Fano value lets any two corrupt members own a hop however wide the line is
+/// (`docs/audit.md` E7).
+fn mix_threshold_arg(args: &[String]) -> Result<u8, NodeError> {
+    if let Some(s) = flag(args, "--threshold") {
+        return s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")));
+    }
+    let plane_order: u32 = match flag(args, "--plane-order") {
+        Some(s) => s
+            .parse()
+            .map_err(|_| NodeError::Config(format!("bad --plane-order '{s}' (expected 2, 4, 7 or 31)")))?,
+        None => 2,
+    };
+    u8::try_from(fanos_node::node::mix_threshold((plane_order + 1) as usize))
+        .map_err(|_| NodeError::Config("plane order too large for a u8 threshold".to_owned()))
+}
+
 fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
     if config.plane_order > 2 {
         return;
@@ -440,10 +461,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         Some(s) => parse_beacon_hex(s)?,
         None => BeaconSeed::GENESIS,
     };
-    let threshold: u8 = match flag(args, "--threshold") {
-        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
-        None => 2,
-    };
+    let threshold = mix_threshold_arg(args)?;
     if threshold == 0 {
         return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
     }
@@ -670,12 +688,7 @@ fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
             None => Ok(default),
         }
     };
-    let threshold: u8 = match flag(args, "--threshold") {
-        Some(s) => s
-            .parse()
-            .map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
-        None => 2,
-    };
+    let threshold = mix_threshold_arg(args)?;
     if threshold == 0 {
         return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
     }
@@ -1347,10 +1360,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
         Some(s) => parse_beacon_hex(s)?,
         None => BeaconSeed::GENESIS,
     };
-    let threshold: u8 = match flag(rest, "--threshold") {
-        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
-        None => 2,
-    };
+    let threshold = mix_threshold_arg(rest)?;
 
     let service = StaticKeypair::generate(&mut SeedRng::from_seed(&host_secret));
     let bundle = bundle_from_kem_public(service.public());

@@ -36,10 +36,45 @@ use crate::error::NodeError;
 use crate::identity;
 use crate::resolve::{ResolvedService, verify_descriptor};
 
-/// The mixnet's per-hop cooperation threshold — how many of a Fano line's three members must combine to
-/// peel one onion layer (2-of-3). A relay's [`ThresholdRouter`] gathers this many partials; an anonymous
-/// client's `--threshold` MUST match, since it seals each layer for exactly this many members.
-pub(crate) const MIX_THRESHOLD: usize = 2;
+/// The mixnet's per-hop cooperation threshold: how many of a hop line's `q+1` members must combine to peel one
+/// onion layer. A relay's [`ThresholdRouter`] gathers this many partials; an anonymous client's `--threshold`
+/// MUST match, since it seals each layer for exactly this many members.
+///
+/// **Derived from the plane, not fixed.** This was `const MIX_THRESHOLD: usize = 2` — correct for a Fano line's
+/// three points and silently wrong everywhere else, because a hop then falls to any *two* corrupt members
+/// however wide the line is, while the Byzantine tolerance `f = ⌊(n−1)/3⌋` grows with the plane. Two points lie
+/// on exactly one line, so each corrupt *pair* captures one hop; at `q = 2` the tolerance is `f = 2 = t`, so
+/// exactly one of seven lines falls and one line cannot be both ends of a circuit — end-to-end deanonymization
+/// is *impossible*. That is an accident of `f = t`. Above Fano the pairs outrun the lines: 45 % of hops
+/// captured at `q = 4`, 80 % at `q = 7`, essentially all at `q = 31` (`docs/audit.md` E7).
+///
+/// The bound: under the platform's own tolerance the corrupt *density* is `f/n = ⌊(n−1)/3⌋/n → 1/3`, so a line
+/// of `m` points carries about `m/3` corrupt in expectation, and the threshold preserving Fano's margin at any
+/// `m` is
+///
+/// ```text
+/// t = ⌈2m/3⌉
+/// ```
+///
+/// At `m = 3` that is exactly `2` — **the previous constant, unchanged at the default plane.** The value was
+/// right; it was never generalized. With it, hop capture *falls* as the plane grows (0.143 → 0.011 → 0.009 →
+/// 0.00003) instead of rising to certainty, which is what makes `--plane-order 4|7|31` the sound advice
+/// [`warn_if_plane_cannot_anonymize`](crate) already gives.
+///
+/// **Liveness is the cost.** A wider hop needs two thirds of its line reachable to peel — the same *ratio*
+/// Fano already runs at, so the trade is the one BFT makes everywhere else, but it is a real one and the mixnet
+/// liveness tests are what should confirm it.
+#[must_use]
+pub const fn mix_threshold(line_size: usize) -> usize {
+    // `⌈2m/3⌉` in integers. A degenerate line still needs someone to peel it, hence the floor of one.
+    let t = (2 * line_size).div_ceil(3);
+    if t == 0 { 1 } else { t }
+}
+
+/// The mix threshold on the default plane, `PG(2,2)`: a 3-point line, `2`-of-`3`.
+///
+/// Kept as a named value for the client CLI's default, which cannot see a plane before it parses one.
+pub const DEFAULT_MIX_THRESHOLD: usize = mix_threshold(3);
 
 /// 32 fresh bytes of OS entropy — the mix router's per-run key seeds (a relay node only).
 fn os_entropy_32() -> Result<[u8; 32], NodeError> {
@@ -850,6 +885,50 @@ impl Node {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The default plane must be **bit-for-bit unchanged** by the generalization.
+    ///
+    /// `MIX_THRESHOLD` was `2`, correct for a Fano line's three points, and `mix_threshold(3)` must still be
+    /// `2` — otherwise every existing `PG(2,2)` deployment silently changes its onion layout and stops
+    /// interoperating. That is the whole reason this fix is safe to land: the constant's *value* was right.
+    #[test]
+    fn the_default_plane_keeps_the_threshold_it_shipped_with() {
+        assert_eq!(mix_threshold(3), 2, "PG(2,2): a 3-point line stays 2-of-3");
+        assert_eq!(DEFAULT_MIX_THRESHOLD, 2);
+    }
+
+    /// The threshold ratio must stay at or above `2/3` on every supported plane.
+    ///
+    /// That is the property, not the arithmetic. Under the platform's tolerance the corrupt *density* tends to
+    /// `1/3`, so a line carries about `m/3` corrupt in expectation; a threshold below `2m/3` leaves no margin,
+    /// and a threshold *fixed* at 2 — which is what shipped — collapses the ratio to `0.062` at `q = 31`,
+    /// where any two corrupt members own a hop of thirty-two (`docs/audit.md` E7).
+    #[test]
+    fn the_threshold_ratio_never_falls_below_two_thirds() {
+        for q in [2u32, 4, 7, 31] {
+            let m = (q + 1) as usize;
+            let t = mix_threshold(m);
+            #[allow(clippy::cast_precision_loss)] // line sizes are tiny; f64 holds them exactly
+            let ratio = t as f64 / m as f64;
+            assert!(
+                ratio >= 2.0 / 3.0 - 1e-12,
+                "q={q}: t/m = {t}/{m} = {ratio} fell below 2/3 — a hop would have less margin than Fano's"
+            );
+            // And it is the *smallest* such threshold: one less would break the ratio, so this is not simply
+            // "large enough" but the cheapest value that is.
+            assert!(
+                ((t - 1) as f64) / (m as f64) < 2.0 / 3.0,
+                "q={q}: t={t} is larger than it needs to be"
+            );
+        }
+    }
+
+    /// A degenerate line still needs someone to peel it.
+    #[test]
+    fn a_degenerate_line_still_needs_one_peeler() {
+        assert_eq!(mix_threshold(0), 1, "never zero — a hop nobody must open is not a hop");
+        assert_eq!(mix_threshold(1), 1);
+    }
     use crate::config::{BeaconParams, ExitParams, NodeConfig, ServiceParams};
     use fanos_field::F2;
 

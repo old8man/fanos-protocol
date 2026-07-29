@@ -22,7 +22,7 @@
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_field::Field;
-use fanos_geometry::{Point, Triple};
+use fanos_geometry::{Plane, Point, Triple};
 use fanos_keygen::BeaconNode;
 use fanos_pqcrypto::kem::HybridKemSecret;
 use fanos_pqcrypto::rng::SeedRng;
@@ -34,8 +34,8 @@ use crate::overlay_beacon::OverlayBeaconNode;
 use crate::service_node::ServiceNode;
 use crate::threshold_service::ThresholdService;
 
-/// The threshold a mixnet relay reconstructs an onion layer at.
-pub(crate) use crate::node::MIX_THRESHOLD;
+/// The threshold a mixnet relay reconstructs an onion layer at — `⌈2(q+1)/3⌉`, derived from the plane.
+pub(crate) use crate::node::mix_threshold;
 
 /// Everything that decides *which engine* a node runs — the roles it serves and the material each needs.
 ///
@@ -143,10 +143,13 @@ pub fn compose_engine<F: Field + 'static>(
             if what.relay {
                 let (router_secret, _identity) =
                     HybridKemSecret::generate(&mut SeedRng::from_seed(&what.kem_seed));
+                // Derived from *this* plane: a hop is a line of `q+1` points, and a threshold fixed at the
+                // Fano value would let any two corrupt members own a hop however wide the line is (E7).
+                let threshold = mix_threshold(Plane::<F>::LINE_SIZE as usize);
                 let router = ThresholdRouter::<F>::new(
                     coord,
                     &router_secret,
-                    MIX_THRESHOLD,
+                    threshold,
                     what.onion_seed,
                 )
                 .with_mixing(what.mix_mean_delay)
