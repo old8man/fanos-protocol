@@ -39,6 +39,7 @@ fanos-session.workspace = true
 fanos-rendezvous.workspace = true
 fanos-pqcrypto.workspace = true
 # BLAKE3 labeled hashing for the threshold-service intro id (audit #99).
+fanos-angelos.workspace = true
 fanos-primitives.workspace = true
 # The SOCKS5 Dialer trait a `.fanos` dialer implements (the proxy stays transport-agnostic; the node
 # is the integration point that provides a Dialer).

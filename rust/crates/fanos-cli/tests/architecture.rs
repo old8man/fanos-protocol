@@ -40,7 +40,6 @@ const EMBEDDING_SURFACE: &[(&str, &str)] = &[
 /// shrink it; for these two it is the wrong one, because the work is real and what is missing is a driver and a
 /// verb, not the capability.
 const ORPHANS: &[(&str, &str)] = &[
-    ("fanos-angelos", "the L11 messenger: sans-I/O and complete; needs a node driver + CLI verb (plan I.1)"),
     ("fanos-ergon", "the effect-algebra execution model: DROMOS executes without it (plan I.1)"),
 ];
 
@@ -161,8 +160,8 @@ fn the_reachability_figures_are_what_the_audit_states() {
     let from_any = closure(&deps, &binaries);
 
     assert_eq!(total, 43, "the workspace crate count changed");
-    assert_eq!(from_node.len(), 34, "reachable from fanos-node (itself included): {from_node:?}");
-    assert_eq!(from_any.len(), 38, "reachable from any shipped binary");
+    assert_eq!(from_node.len(), 35, "reachable from fanos-node (itself included): {from_node:?}");
+    assert_eq!(from_any.len(), 39, "reachable from any shipped binary");
     assert_eq!(total - from_any.len(), unlinked().len(), "the unlinked set must account for the remainder");
 }
 
@@ -172,9 +171,13 @@ fn the_reachability_figures_are_what_the_audit_states() {
 /// nobody can reach: it reads as a shipped feature, it is maintained and compiled and tested, and no user can
 /// touch it. Two is the count at the time this ratchet was set (2026-07-29); the only admissible directions are
 /// wiring one up or deleting it.
+///
+/// It started at two. `fanos-angelos` came off it when `fanos message serve` gave the messenger a door — the
+/// capability had been finished for a long time and only the composition was missing, which is the shape of
+/// every orphan.
 #[test]
 fn the_orphan_list_only_shrinks() {
-    const AT_RATCHET: usize = 2;
+    const AT_RATCHET: usize = 1;
     assert!(
         ORPHANS.len() <= AT_RATCHET,
         "the orphan list grew to {} — a new crate was added that nothing can reach. Wire it, or delete it; \

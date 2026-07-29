@@ -43,6 +43,7 @@ pub mod rendezvous;
 pub mod rendezvous_host;
 pub mod rendezvous_relay;
 pub mod admin;
+pub mod angelos_driver;
 pub mod setup;
 pub mod resolve;
 /// Differentially-private telemetry export over the overlay store (audit C7) — see [`telemetry_dir`].

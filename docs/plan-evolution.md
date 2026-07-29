@@ -54,8 +54,12 @@ when nothing of ours links it) from `ORPHANS` (capability with no door), because
 meanings — and puts a **ratchet** on the orphan count: it may shrink and never grow, and resolving one requires
 lowering the ratchet so the ground cannot be given back.
 
-Wiring `fanos-angelos` needs a node driver over the anonymous transport plus a CLI verb. That is the next
-substantive item in this phase.
+**`fanos-angelos` is wired** — `fanos message serve` hosts the messenger on the anonymous rendezvous, and the
+orphan ratchet is down to one. What was missing was never the capability: `angelos_driver` is a composition, and
+the whole of it is running ANGELOS's handshake over a stream the node already knows how to accept anonymously.
+
+`fanos-ergon` remains. It is the last orphan, and the decision there is genuinely open — DROMOS executes without
+it, so the question is whether the effect algebra replaces that execution path or is deleted.
 
 ### I.2 — Every frame that is sent is handled
 

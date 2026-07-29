@@ -50,6 +50,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
         Some("host") => cmd_host(args.get(2..).unwrap_or(&[])).await,
+        Some("message") => cmd_message(args.get(2..).unwrap_or(&[])).await,
         Some("validator") => cmd_validator(args.get(2..).unwrap_or(&[])).await,
         Some("pay") => cmd_pay(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
@@ -1255,6 +1256,138 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
             }
         );
     }
+    Ok(())
+}
+
+/// Run one accepted ANGELOS conversation to its end, printing what arrives.
+///
+/// A refused handshake and a broken conversation are both logged rather than propagated: this is one caller of
+/// many, and a messenger that stops serving because one peer sent garbage has been denied service by that peer.
+async fn converse(stream: DuplexStream, secret: &fanos_pqcrypto::kem::HybridKemSecret) {
+    let mut talk = match fanos_node::angelos_driver::Conversation::respond(stream, secret).await {
+        Ok(c) => c,
+        Err(e) => {
+            info!(error = %e, "angelos handshake refused");
+            return;
+        }
+    };
+    loop {
+        match talk.recv().await {
+            Ok(Some(message)) => {
+                if let Some(text) = message.as_text() {
+                    println!("[{}] {text}", message.seq);
+                } else {
+                    info!(seq = message.seq, "non-text message");
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                info!(error = %e, "conversation ended");
+                break;
+            }
+        }
+    }
+}
+
+/// `fanos message serve --host-key FILE` — host an ANGELOS messenger on the anonymous rendezvous.
+///
+/// The composition, and it is only a composition: `fanos host` already stands up an anonymous service and hands
+/// each accepted session to a handler. This makes the handler the messenger instead of a TCP forward, so every
+/// anonymity property of the hidden-service path — computed rendezvous, no directory, neither coordinate on the
+/// wire — carries over unchanged, and ANGELOS adds end-to-end secrecy on top of the transport's.
+///
+/// Until this verb existed `fanos-angelos` was a complete messenger no shipped binary could reach: the
+/// capability was finished and the door was missing.
+async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
+    init_tracing();
+    let Some(mode) = args.first().map(String::as_str) else {
+        return Err(NodeError::Config(
+            "usage: fanos message serve --host-key FILE [--config FILE] [--bootstrap …]".to_owned(),
+        ));
+    };
+    if mode != "serve" {
+        return Err(NodeError::Config(format!(
+            "unknown `fanos message {mode}` (expected: serve)"
+        )));
+    }
+    let rest = args.get(1..).unwrap_or(&[]);
+    let host_secret = match flag(rest, "--host-key") {
+        Some(p) => std::fs::read(p)?,
+        None => {
+            return Err(NodeError::Config(
+                "fanos message serve requires --host-key <file> — the messenger's secret seed and stable \
+                 .fanos identity (generate one with `head -c 32 /dev/urandom > msg.key`)"
+                    .to_owned(),
+            ));
+        }
+    };
+    let epoch = match flag(rest, "--epoch") {
+        Some(s) => Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?),
+        None => Epoch::ZERO,
+    };
+    let beacon = match flag(rest, "--beacon") {
+        Some(s) => parse_beacon_hex(s)?,
+        None => BeaconSeed::GENESIS,
+    };
+    let threshold: u8 = match flag(rest, "--threshold") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
+        None => 2,
+    };
+
+    let service = StaticKeypair::generate(&mut SeedRng::from_seed(&host_secret));
+    let bundle = bundle_from_kem_public(service.public());
+    let address = Address::from_bundle(&bundle);
+    // The messenger's own long-term KEM identity, derived from the same seed under its own label so the
+    // transport identity and the end-to-end identity are not the same key doing two jobs.
+    let (kem_secret, kem_public) = fanos_pqcrypto::kem::HybridKemSecret::generate(
+        &mut SeedRng::from_seed(&fanos_primitives::hash_labeled("FANOS-v1/angelos-identity", &host_secret)),
+    );
+
+    let config = node_config_from_args(rest)?;
+    let mut node = Node::start_on_plane(config).await?;
+    if let Err(e) =
+        publish_service(&node.client(), &bundle, [0, 0, 0], epoch, 0, b"profile=anonymous").await
+    {
+        node.shutdown();
+        return Err(e);
+    }
+
+    let secret = Arc::new(kem_secret);
+    let handler = move |stream: DuplexStream| {
+        let secret = Arc::clone(&secret);
+        async move { converse(stream, &secret).await }
+    };
+    let _driver = spawn_rendezvous_host(
+        node.client(),
+        node.address(),
+        HostedService { service, host_secret, threshold, vrf_coordinates: true },
+        (epoch, *beacon.as_bytes()),
+        handler,
+    );
+
+    // `Address` renders its own `.fanos` suffix — appending another produced `…​.fanos.fanos` on the first run
+    // of this verb, which is not cosmetic: an address a correspondent copies has to be the address that resolves.
+    eprintln!("fanos messenger up — {address}");
+    eprintln!("  end-to-end identity (share this with correspondents):");
+    let mut identity_hex = String::new();
+    for byte in kem_public.encode() {
+        use std::fmt::Write as _;
+        let _ = write!(identity_hex, "{byte:02x}");
+    }
+    eprintln!("  {identity_hex}");
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut ctrl_c => break,
+            note = node.next_notification() => match note {
+                Some(n) => log_notification(&n),
+                None => break,
+            },
+        }
+    }
+    node.shutdown();
     Ok(())
 }
 
