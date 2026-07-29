@@ -19,6 +19,7 @@ use fanos_field::F2;
 use fanos_onoma::Address;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
+use fanos_pqcrypto::sig::HybridSigSecret;
 use fanos_node::{
     AnonRouteParams, BeaconParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
     NodeConfig,
@@ -1047,7 +1048,7 @@ fn deal_own_beacon(path: &Path) -> Result<(), NodeError> {
     let (shares, commitment) = deal(&secret, 1, 1, &mut DeterministicRng::new(&rng_seed))
         .ok_or_else(|| NodeError::Config("could not deal a 1-of-1 beacon".to_owned()))?;
     let share = shares.first().cloned();
-    let params = BeaconParams { commitment, threshold: 1, share };
+    let params = BeaconParams { commitment, threshold: 1, share, authority: None };
     // Secret: it carries this cell's beacon share.
     write_file(path, &params.to_config_string(), true)
 }
@@ -1453,17 +1454,37 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     let (shares, commitment) = deal(&secret, t, n, &mut DeterministicRng::new(&rng_seed))
         .ok_or_else(|| NodeError::Config(format!("cannot deal {t}-of-{n}: need 1 <= t <= n <= 255")))?;
 
+    // The **recovery authority**, without which the dealt beacon can never be reshaped. A beacon with no
+    // configured trust root refuses every reshare trigger and every re-genesis, so losing `n − t + 1` anchors
+    // freezes its epoch clock permanently — the R-C1 cliff. Every provisioning file therefore carries the
+    // authority's VERIFIER, and its secret is written once, separately, for the operator to keep offline: a
+    // node holds no authority key and cannot self-issue a threshold change.
+    let mut authority_seed = [0u8; 32];
+    getrandom::fill(&mut authority_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let (_authority_secret, authority) = HybridSigSecret::generate(&mut SeedRng::from_seed(&authority_seed));
+
     for (i, share) in shares.iter().enumerate() {
-        let params =
-            BeaconParams { commitment: commitment.clone(), threshold: t, share: Some(share.clone()) };
+        let params = BeaconParams {
+            commitment: commitment.clone(),
+            threshold: t,
+            share: Some(share.clone()),
+            authority: Some(authority.clone()),
+        };
         let path = format!("{out}/anchor-{}.beacon", i + 1);
         std::fs::write(&path, params.to_config_string())?;
         println!("wrote {path}");
     }
-    let consumer = BeaconParams { commitment, threshold: t, share: None };
+    let consumer =
+        BeaconParams { commitment, threshold: t, share: None, authority: Some(authority) };
     let cpath = format!("{out}/consumer.beacon");
     std::fs::write(&cpath, consumer.to_config_string())?;
     println!("wrote {cpath}");
+    let apath = format!("{out}/recovery-authority.key");
+    // The SEED, not the derived secret: `HybridSigSecret::generate` is deterministic in it, so the operator
+    // regenerates the same authority whenever one is needed — the convention the rest of the tree uses for
+    // secret material (a service member's KEM key is carried the same way).
+    std::fs::write(&apath, fanos_node::config::hex_encode(&authority_seed))?;
+    println!("wrote {apath}  (SECRET SEED — keep offline; it is what authorizes a reshare or re-genesis)");
     println!("dealt a {t}-of-{n} beacon; run each anchor with `fanos node --beacon-params anchor-<i>.beacon`");
     Ok(())
 }

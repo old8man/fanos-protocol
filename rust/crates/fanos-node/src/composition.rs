@@ -136,10 +136,16 @@ pub fn compose_engine<F: Field + 'static>(
     };
     let base: Box<dyn Engine + Send> = match &what.beacon {
         Some(bp) => {
-            let obn = OverlayBeaconNode::new(
-                overlay,
-                BeaconNode::<F>::new(coord, bp.share.clone(), bp.commitment.clone(), bp.threshold),
-            );
+            // The recovery authority is part of *provisioning*, not of the beacon's steady-state operation —
+            // but omitting it here is what left every shipped beacon unable to reshare or re-genesis, so the
+            // freeze the resharing machinery exists to escape was permanent in production while both halves
+            // sat built and tested (`BeaconParams::authority`).
+            let mut beacon =
+                BeaconNode::<F>::new(coord, bp.share.clone(), bp.commitment.clone(), bp.threshold);
+            if let Some(authority) = &bp.authority {
+                beacon = beacon.with_recovery_authority(authority.clone());
+            }
+            let obn = OverlayBeaconNode::new(overlay, beacon);
             if what.relay {
                 let (router_secret, _identity) =
                     HybridKemSecret::generate(&mut SeedRng::from_seed(&what.kem_seed));

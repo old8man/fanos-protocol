@@ -488,7 +488,12 @@ impl NodeFleet {
                 .collect();
             let node = fanos_node::Node::start_over::<F>(
                 fanos_node::NodeConfig {
-                    beacon: Some(fanos_node::BeaconParams { commitment: commitment.clone(), threshold: 2, share: None }),
+                    beacon: Some(fanos_node::BeaconParams {
+                        commitment: commitment.clone(),
+                        threshold: 2,
+                        share: None,
+                        authority: None,
+                    }),
                     roles,
                     bootstrap,
                     ..fanos_node::NodeConfig::default()
@@ -770,7 +775,7 @@ mod tests {
         let offered = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let node = Node::start_over::<F2>(
             NodeConfig {
-                beacon: Some(fanos_node::BeaconParams { commitment, threshold: 2, share: None }),
+                beacon: Some(fanos_node::BeaconParams { commitment, threshold: 2, share: None, authority: None }),
                 roles: offered,
                 ..NodeConfig::default()
             },

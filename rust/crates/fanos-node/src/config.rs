@@ -8,6 +8,7 @@ use std::time::Duration;
 use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
 use fanos_geometry::Triple;
 use fanos_quic::{Environment, Morph};
+use fanos_pqcrypto::sig::HybridVerifier;
 use fanos_vrf::vss::{VssCommitment, VssShare};
 
 use crate::error::NodeError;
@@ -107,7 +108,7 @@ pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 /// additionally makes it an **anchor** that contributes partials; `None` is a pure **consumer**. With
 /// `beacon = None` the node runs a bare [`OverlayNode`](fanos_runtime::OverlayNode), pinned at genesis
 /// (the pre-beacon behaviour), so this is fully backward-compatible.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BeaconParams {
     /// The beacon group's public commitment — a genesis parameter shared across the network.
     pub commitment: VssCommitment,
@@ -115,6 +116,33 @@ pub struct BeaconParams {
     pub threshold: usize,
     /// This node's beacon share if it is an anchor; `None` for a pure consumer.
     pub share: Option<VssShare>,
+    /// The **recovery authority's verifier** — the trust root that may order a threshold change.
+    ///
+    /// Without it a beacon refuses every reshare trigger and every re-genesis
+    /// (`BeaconNode::on_reshare_trigger` and `rebootstrap` both return early on `authority: None`), which is
+    /// safe — it fails closed — and leaves the cell with **no way out of a beacon freeze**. Lose `n − t + 1`
+    /// anchors and the epoch clock stops forever, which is the R-C1 cliff the resharing machinery was built to
+    /// close. That machinery, and the node-side detector that escalates into it, were both finished in July
+    /// 2026 with no wire between them: there was no field here, no config key, and `with_recovery_authority`
+    /// had no caller outside the simulator.
+    ///
+    /// It is deliberately the *verifier*, never the secret. A node holds no authority key and cannot
+    /// self-issue a trigger; it detects the stall, elects a coordinator and escalates, and an operator or
+    /// parent cell signs. This is the public half every member needs to check that signature.
+    pub authority: Option<HybridVerifier>,
+}
+
+impl fmt::Debug for BeaconParams {
+    /// Hand-written because [`HybridVerifier`] is not `Debug` — and deriving it on the key would be the wrong
+    /// fix, since the *share* below is a secret and a derived `Debug` on this struct is exactly how one leaks
+    /// into a log line. Only presence is reported, never material.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaconParams")
+            .field("threshold", &self.threshold)
+            .field("anchor", &self.share.is_some())
+            .field("authority", &self.authority.is_some())
+            .finish()
+    }
 }
 
 impl BeaconParams {
@@ -123,7 +151,9 @@ impl BeaconParams {
     /// of pinning at genesis. Keys:
     /// - `threshold = <t>` — the DVRF reconstruction threshold;
     /// - `commitment = <hex>` — the group's public [`VssCommitment`] (network-wide genesis material);
-    /// - `share = <hex>` — THIS node's anchor [`VssShare`]; omit for a pure consumer (verifies + adopts only).
+    /// - `share = <hex>` — THIS node's anchor [`VssShare`]; omit for a pure consumer (verifies + adopts only);
+    /// - `authority = <hex>` — the recovery authority's [`HybridVerifier`]; omit and the cell can never
+    ///   reshape its beacon, so a freeze is permanent (see [`BeaconParams::authority`]).
     ///
     /// The share is this node's secret — protect the file. The commitment/threshold are public and identical
     /// network-wide. Generate a set with `fanos beacon-deal` (or an external DKG).
@@ -131,6 +161,7 @@ impl BeaconParams {
         let mut threshold: Option<usize> = None;
         let mut commitment: Option<VssCommitment> = None;
         let mut share: Option<VssShare> = None;
+        let mut authority: Option<HybridVerifier> = None;
         for (n, raw) in text.lines().enumerate() {
             let l = raw.split('#').next().unwrap_or("").trim();
             if l.is_empty() {
@@ -156,6 +187,11 @@ impl BeaconParams {
                         NodeError::Config("bad beacon share (not a valid VssShare)".to_owned())
                     })?);
                 }
+                "authority" => {
+                    authority = Some(HybridVerifier::decode(&hex_decode(value)?).ok_or_else(|| {
+                        NodeError::Config("bad beacon authority (not a valid HybridVerifier)".to_owned())
+                    })?);
+                }
                 other => return Err(NodeError::Config(format!("unknown beacon config key '{other}'"))),
             }
         }
@@ -165,6 +201,7 @@ impl BeaconParams {
             threshold: threshold
                 .ok_or_else(|| NodeError::Config("beacon config missing `threshold`".to_owned()))?,
             share,
+            authority,
         })
     }
 
@@ -179,6 +216,9 @@ impl BeaconParams {
         let _ = writeln!(s, "commitment = {}", hex_encode(&self.commitment.to_bytes()));
         if let Some(share) = &self.share {
             let _ = writeln!(s, "share = {}", hex_encode(&share.to_bytes()));
+        }
+        if let Some(authority) = &self.authority {
+            let _ = writeln!(s, "authority = {}", hex_encode(&authority.encode()));
         }
         s
     }
@@ -356,7 +396,9 @@ fn parse_coord(s: &str) -> Result<Triple, NodeError> {
 
 /// Decode exactly 64 hex characters into a 32-byte seed.
 /// Hex-encode bytes (lower-case) — the inverse of [`hex_decode`], for writing beacon provisioning files.
-fn hex_encode(bytes: &[u8]) -> String {
+/// Lowercase hex. Public so the CLI's beacon dealer can write the recovery-authority seed in the same
+/// encoding the provisioning files use — one format for everything an operator handles by hand.
+pub fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
@@ -875,20 +917,57 @@ mod tests {
         let s2 = shares.get(2).unwrap();
 
         // An ANCHOR's file carries the threshold, the public commitment, and its own share.
-        let anchor = BeaconParams { commitment: commitment.clone(), threshold: 4, share: Some(s2.clone()) };
+        let anchor =
+            BeaconParams { commitment: commitment.clone(), threshold: 4, share: Some(s2.clone()), authority: None };
         let parsed = BeaconParams::from_config_str(&anchor.to_config_string()).unwrap();
         assert_eq!(parsed.threshold, 4);
         assert_eq!(parsed.commitment.to_bytes(), commitment.to_bytes(), "the group commitment round-trips");
         assert_eq!(parsed.share.unwrap().to_bytes(), s2.to_bytes(), "the anchor's share round-trips");
 
         // A pure CONSUMER's file omits the share (it verifies + adopts, never contributes).
-        let consumer = BeaconParams { commitment, threshold: 4, share: None };
+        let consumer = BeaconParams { commitment, threshold: 4, share: None, authority: None };
         let parsed = BeaconParams::from_config_str(&consumer.to_config_string()).unwrap();
         assert!(parsed.share.is_none(), "a consumer has no share");
 
         // Missing required fields, and a bad hex body, are rejected — not silently defaulted.
         assert!(BeaconParams::from_config_str("threshold = 4\n").is_err(), "a missing commitment is rejected");
         assert!(BeaconParams::from_config_str("threshold = 4\ncommitment = zz\n").is_err(), "bad hex is rejected");
+    }
+
+    #[test]
+    fn the_recovery_authority_survives_the_provisioning_file() {
+        // The field that closes the recovery loop, and the one whose absence made a beacon freeze permanent:
+        // a beacon with no configured trust root refuses every reshare trigger and every re-genesis. It must
+        // therefore reach a node the same way its share does — through the file an operator is handed.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+        let (_secret, verifier) =
+            fanos_pqcrypto::sig::HybridSigSecret::generate(&mut fanos_pqcrypto::rng::SeedRng::from_seed(
+                b"fanos-node/config/authority-round-trip",
+            ));
+        let (_shares, commitment) =
+            deal(&[0x2C; 32], 4, 7, &mut DeterministicRng::new(b"cfg-authority")).unwrap();
+        let params = BeaconParams {
+            commitment: commitment.clone(),
+            threshold: 4,
+            share: None,
+            authority: Some(verifier.clone()),
+        };
+        let back = BeaconParams::from_config_str(&params.to_config_string()).expect("round trip");
+        let recovered = back.authority.expect("the authority must survive the file");
+        assert_eq!(
+            recovered.encode(),
+            verifier.encode(),
+            "the verifier must come back byte-identical — a different key rejects the operator's own trigger"
+        );
+
+        // And a file without one still parses: an operator may deliberately provision a cell that cannot be
+        // reshaped, and that must be a choice rather than a parse error.
+        let without = BeaconParams::from_config_str(
+            &BeaconParams { commitment: commitment.clone(), threshold: 4, share: None, authority: None }
+                .to_config_string(),
+        )
+        .expect("a file without an authority is still valid");
+        assert!(without.authority.is_none());
     }
 
     #[test]

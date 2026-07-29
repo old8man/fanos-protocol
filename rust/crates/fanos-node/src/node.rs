@@ -1021,6 +1021,7 @@ mod tests {
                 commitment,
                 threshold: 2,
                 share: None,
+                authority: None,
             }),
             ..NodeConfig::default()
         })
@@ -1174,7 +1175,7 @@ mod tests {
         let offered = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            beacon: Some(BeaconParams { commitment, threshold: 2, share: None }),
+            beacon: Some(BeaconParams { commitment, threshold: 2, share: None, authority: None }),
             roles: offered,
             ..NodeConfig::default()
         })
@@ -1221,6 +1222,7 @@ mod tests {
                 commitment,
                 threshold: 2,
                 share: None,
+                authority: None,
             }),
             roles: RoleSet {
                 relay: true,

@@ -33,6 +33,7 @@ async fn the_live_epoch_clock_advances_the_beacon_across_epochs() {
             commitment,
             threshold: 1,
             share: Some(share),
+            authority: None,
         }),
         // A short period so the wall clock ticks several times within the test.
         epoch_period: Duration::from_millis(120),
