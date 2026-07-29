@@ -82,6 +82,13 @@ pub enum Request {
     Health,
     /// The roles the **cell** has assigned this node, which is not always what its config offered.
     Roles,
+    /// A **census** of the cells this node can see — the answer to "is this my cell, or the network?".
+    ///
+    /// Reads every cell coordinate's published ε-private coherence frame for the current epoch and reports the
+    /// distribution: healthy, alarmed, silent, unreachable. Slower than the other verbs by design — it goes to
+    /// the overlay store rather than to local state — and issued serially, since a monitor that fans out over a
+    /// federation at once is a load spike on a network it may be asking about because it is under load.
+    Census,
     /// Ask the node to shut down cleanly.
     Shutdown,
 }
@@ -94,6 +101,7 @@ impl Request {
             "ping" => Some(Self::Ping),
             "health" => Some(Self::Health),
             "roles" => Some(Self::Roles),
+            "census" => Some(Self::Census),
             "shutdown" => Some(Self::Shutdown),
             _ => None,
         }
@@ -102,7 +110,7 @@ impl Request {
     /// Every verb, for the error message a wrong one gets.
     #[must_use]
     pub const fn all() -> &'static str {
-        "ping | health | roles | shutdown"
+        "ping | health | roles | census | shutdown"
     }
 }
 
@@ -249,7 +257,7 @@ mod tests {
 
     #[test]
     fn every_documented_verb_parses_and_nothing_else_does() {
-        for word in ["ping", "health", "roles", "shutdown"] {
+        for word in ["ping", "health", "roles", "census", "shutdown"] {
             assert!(Request::parse(word).is_some(), "`{word}` is documented but does not parse");
             assert!(Request::all().contains(word), "`{word}` parses but is not in the help string");
         }

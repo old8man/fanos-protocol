@@ -287,6 +287,31 @@ pub struct Census {
     pub unreachable: usize,
 }
 
+impl core::fmt::Display for Census {
+    /// One line per count, plus the verdict — the shape `fanos status` and a person with `socat` both read.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "asked: {}", self.asked())?;
+        writeln!(f, "healthy: {}", self.healthy)?;
+        writeln!(f, "integration_alarm: {}", self.integration)?;
+        writeln!(f, "structure_alarm: {}", self.structure)?;
+        writeln!(f, "silent: {}", self.silent)?;
+        writeln!(f, "unreachable: {}", self.unreachable)?;
+        // Stated rather than left to arithmetic: the verdict is over the cells that *answered*, and saying so
+        // is what stops a reader treating the silent ones as a vote either way.
+        writeln!(
+            f,
+            "verdict: {}",
+            if self.answered() == 0 {
+                "no reading — no cell answered"
+            } else if self.network_wide() {
+                "NETWORK — most answering cells are alarmed"
+            } else {
+                "not network-wide — most answering cells are healthy"
+            }
+        )
+    }
+}
+
 impl Census {
     /// How many cells answered at all.
     #[must_use]

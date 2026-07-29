@@ -281,7 +281,7 @@ and rendezvous-depth figures — but it is driven by **total network size**, not
 are built; what remains there is cross-cell directory and rendezvous, which is a feature rather than a
 structural correction.
 
-### III.2 — Cross-cell coherence: the one genuinely open item
+### III.2 — Cross-cell coherence — DONE
 
 Each cell diagnoses itself, and a fault that a cell cannot heal already escalates to its parent
 (`escalate_to_parent`, bounded by a TTL so the recursion terminates). So **fault** propagation upward exists.
@@ -314,8 +314,14 @@ exists to prevent and which one `unwrap_or_default` would undo. The network verd
 *answered*: counting silence as health hides a partition, counting it as sickness lets one unreachable cell
 speak for the network, and neither is a reading.
 
-`take_census` finally gives the published ε-private frames the reader they have never had. What remains is the
-operator verb that calls it.
+`take_census` finally gives the published ε-private frames the reader they have never had, and `census` on the
+control socket is the verb. Served **off** the node's loop: a census reads every cell coordinate out of the
+overlay store, and serving it inline would stop the node driving its own engine for the duration — an operator's
+question is not worth pausing the node it is about.
+
+Exercised live on a fresh single-node cell with no ε configured: seven coordinates asked, seven silent, verdict
+*"no reading — no cell answered"*. That is the property, demonstrated rather than asserted — the same setup
+folded into a "healthy" count would have reported a perfectly well network.
 
 ## Cross-cutting
 

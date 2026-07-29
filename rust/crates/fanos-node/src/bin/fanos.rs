@@ -227,6 +227,20 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
                     Request::Health => fanos_node::admin::render_health(&node.health()),
                     Request::Roles => format!("{:?}\n", node.assigned_roles()),
                     Request::Shutdown => "shutting down\n".to_owned(),
+                    Request::Census => {
+                        // Answered off the loop. A census reads every cell coordinate out of the overlay store,
+                        // so serving it inline would stop this node driving its own engine for the duration —
+                        // an operator's question is not worth pausing the node it is about.
+                        let client = node.client();
+                        let epoch = node.live_beacon().map_or(Epoch::ZERO, |(e, _)| e);
+                        tokio::spawn(async move {
+                            let coords = fanos_node::telemetry_dir::cell_telemetry_coords::<F2>();
+                            let census =
+                                fanos_node::telemetry_dir::take_census(&client, &coords, epoch).await;
+                            let _ = reply.send(census.to_string());
+                        });
+                        continue;
+                    }
                 };
                 let _ = reply.send(body);
                 if stop {
