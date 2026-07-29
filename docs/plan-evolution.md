@@ -216,6 +216,16 @@ the headroom.
 `∞` when a single advance already spends the whole headroom, which is the honest answer: no cadence makes that
 survivable, and a number would be a period that does not work.
 
+**The measurement is wired; the last hop to the operator is not.** `e₀` cannot be read from one window — it is a
+difference *across* an epoch boundary — so the healer takes it there (the stability radius entering an epoch
+minus the radius on the first window of the next), and `OverlayNode::epoch_floor` exposes the resulting bound.
+Nothing reads it yet. The handle cannot query the engine directly (it reads its own fields; the engine speaks in
+commands and notifications), so the honest route is the coherence frame the engine already emits every
+window — which means a telemetry-format change, and that deserves its own pass rather than a hasty one.
+
+Recorded here rather than left implicit, because "built and unwired" is the exact pattern Phase I existed to
+close, and the adaptive admission gate was held back for the same kind of reason until its return path existed.
+
 ### II.4 — Role assignment from measured deficit
 
 The cell assigns roles, but not from a measurement of what it lacks. A cell short of storage should be

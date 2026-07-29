@@ -23,6 +23,7 @@ use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
 use fanos_core::LiveDifficulty;
+use fanos_diakrisis::regeneration;
 use fanos_diakrisis::stability::{self, AdmissionController, inferred_disturbance};
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
 use fanos_field::Field;
@@ -78,6 +79,15 @@ pub(crate) struct Healer {
     live_difficulty: Option<LiveDifficulty>,
     /// The operator's configured floor, which the controller may raise above but never go under.
     admission_floor: u32,
+    /// The epoch this cell was last observed in, and the stability radius it held entering it — the two
+    /// readings the cost of an epoch advance is measured from. See [`epoch_floor`](Self::epoch_floor).
+    last_epoch: Option<(u64, f64)>,
+    /// The most recent `(stability radius, spectral gap)` — the two per-window inputs to the epoch floor.
+    latest: Option<(f64, f64)>,
+    /// The headroom the most recent epoch advance was measured to consume, and the shortest period that cost
+    /// makes sustainable. `None` until a first advance has been observed — a floor derived from no measurement
+    /// would be a guess wearing a derivation.
+    epoch_cost: Option<f64>,
     /// Per-peer **data-relay** activity (`Route` frames) accumulated since the last behavioural sample —
     /// the raw counts the coherence self-model is built from. Control chatter (pings, gossip) is excluded,
     /// so this reflects *load*, not liveness.
@@ -157,6 +167,9 @@ impl Healer {
             last_purity: None,
             live_difficulty: None,
             admission_floor: 0,
+            last_epoch: None,
+            latest: None,
+            epoch_cost: None,
             activity: BTreeMap::new(),
             self_activity: 0,
             decoupling: 0.0,
@@ -336,6 +349,45 @@ impl Healer {
         self.live_difficulty = Some(live);
     }
 
+    /// Measure what an epoch advance costs this cell, and keep it.
+    ///
+    /// The one input to the epoch-cadence bound (`regeneration::min_epoch_period`) that cannot be read from a
+    /// single window: `τ` comes from the line rates and `r_stab` from the purity, but `e₀` — the headroom an
+    /// advance consumes — only exists as a *difference across the boundary*. So it is taken there: the
+    /// stability radius entering an epoch, minus the radius on the first window of the next one.
+    ///
+    /// A negative difference is recorded as zero, not as a negative cost: a cell that came out of a reshuffle
+    /// healthier than it went in was recovering from something else, and crediting the advance for it would let
+    /// the floor drift below what the cell can actually sustain.
+    fn measure_epoch_cost(&mut self, epoch: Epoch, purity: f64, n: usize, gap: f64) {
+        let radius = stability::stability_radius(purity, n);
+        self.latest = Some((radius, gap));
+        match self.last_epoch {
+            Some((seen, before)) if seen != epoch.get() => {
+                self.epoch_cost = Some((before - radius).max(0.0));
+                self.last_epoch = Some((epoch.get(), radius));
+            }
+            None => self.last_epoch = Some((epoch.get(), radius)),
+            // Same epoch: keep the radius we entered it with, not this window's — the cost is measured against
+            // the state the advance acted on.
+            Some(_) => {}
+        }
+    }
+
+    /// The shortest epoch period this cell can sustain, from its own measurements.
+    ///
+    /// `None` until an advance has been observed, because two of the three inputs are cheap and the third is
+    /// not: a floor computed with a guessed `e₀` would read as derived and be invented.
+    ///
+    /// The unit is the caller's — the bound is `τ · ln(…)` and `τ` is a relaxation time in whatever unit the
+    /// spectral gap is expressed in. The driver converts.
+    pub(crate) fn epoch_floor(&self) -> Option<f64> {
+        let cost = self.epoch_cost?;
+        let (radius, gap) = self.latest?;
+        let tau = if gap > 0.0 { 1.0 / gap } else { f64::INFINITY };
+        Some(regeneration::min_epoch_period(tau, cost, radius))
+    }
+
     /// Move this node's admission price to what its own measured stress justifies.
     ///
     /// The **actuator** of DDoS homeostasis. T-104 says a cell survives sustained noise iff `‖h‖ < κ·r_stab`,
@@ -469,6 +521,12 @@ impl Healer {
             if let Some(coherence) = measured {
                 let m = coherence.measures();
                 self.price_admission(now, m.purity, coherence.n(), polar_gap_from_liveness(degraded));
+                self.measure_epoch_cost(
+                    epoch,
+                    m.purity,
+                    coherence.n(),
+                    polar_gap_from_liveness(degraded),
+                );
                 match self
                     .homeostat
                     .control(m.purity, coherence.mean_correlation(), coherence.n())

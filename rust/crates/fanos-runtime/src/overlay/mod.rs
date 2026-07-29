@@ -1070,6 +1070,18 @@ impl<F: Field> OverlayNode<F> {
             .unwrap_or_default()
     }
 
+    /// The shortest epoch period this cell's own measurements say it can sustain.
+    ///
+    /// `None` until an epoch advance has been observed — the cost of one is a difference *across* that
+    /// boundary and cannot be read from a single window. Comparing it against the configured period compares a
+    /// cadence against what the cell measures it can absorb; below the floor the cost is not churn but
+    /// accumulation, since a cell reshuffled faster than it reintegrates never reaches a steady state. See
+    /// `fanos_diakrisis::regeneration::min_epoch_period`.
+    #[must_use]
+    pub fn epoch_floor(&self) -> Option<f64> {
+        self.healer.epoch_floor()
+    }
+
     /// The current self-healing reroute table (down node → co-linear survivor), for observation.
     pub fn reroutes(&self) -> impl Iterator<Item = (Triple, Triple)> + '_ {
         self.healer.reroutes()
