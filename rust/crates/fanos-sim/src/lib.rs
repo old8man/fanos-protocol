@@ -115,8 +115,8 @@ mod scenarios {
         // that the simulator composes like production: a bare overlay localizes this crash identically, so
         // substituting one for the other leaves this test green. Measured, by doing exactly that.
         //
-        // The seam itself is a property of the source — both paths calling one function — so it is checked in
-        // the source, by `fanos-cli/tests/composition_seam.rs`.
+        // The seam itself is a property of the source — both paths calling one function — so it is checked
+        // there, by `fanos-cli/tests/composition_seam.rs`.
         let mut sim = Sim::new(0x5EED_C0DE);
         let what = CellComposition {
             admission: Some(4),
