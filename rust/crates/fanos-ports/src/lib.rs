@@ -263,6 +263,25 @@ pub enum Notification {
     /// wire bytes (not the struct) are carried so this stays a plain, `Eq` payload — the same bytes a
     /// node gossips or publishes (docs/design-telemetry.md).
     Observed(Vec<u8>),
+    /// What this node is **actually carrying**, per role, since the last observation.
+    ///
+    /// The input the self-organizing role assignment was missing. Its controller has always taken the cell's
+    /// *demand* — how many nodes each role needs — and until now that demand was one unit per role a node
+    /// *offered*, which measures supply and calls it need. So the assignment tracked who volunteered rather
+    /// than what the cell lacked.
+    ///
+    /// Counts are per role in `Role::ALL` order, in whatever unit that role's work is naturally counted:
+    /// relays carried, shards held. A driver converts a load into a demand in nodes by dividing through the
+    /// capacity one node absorbs — `⌈load / capacity⌉` — which is the arithmetic the setpoint denominator has
+    /// always described and never had a numerator for.
+    ///
+    /// Roles with no sensor yet report their offer, unchanged and deliberately not disguised: reporting a
+    /// measured relay count beside a fabricated service count in one vector would make the second look like
+    /// the first.
+    LoadReport {
+        /// Per-role counts in `Role::ALL` order.
+        per_role: [u16; 5],
+    },
     /// The shortest epoch period this cell's own measurements say it can sustain, **in seconds**.
     ///
     /// Emitted once per epoch advance, which is not a chosen cadence: the cost of an advance is a difference

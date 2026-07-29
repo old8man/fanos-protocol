@@ -423,6 +423,24 @@ impl Healer {
         self.last_stress = stress;
     }
 
+    /// What this node is carrying, per role, in `Role::ALL` order.
+    ///
+    /// Two roles have a real sensor and three do not, and the difference is kept visible rather than smoothed
+    /// over. **Relay** is the count of relays this node carried since the last behavioural sample — a rate, and
+    /// exactly the quantity the role exists to perform. **Storage** is the number of keys this node holds
+    /// shards for. The rest report `1` where the role is offered, which is what the whole vector used to be:
+    /// a measure of supply standing in for demand.
+    ///
+    /// Mixing a measured count with an offered one in a single vector is safe because the controller steps each
+    /// role toward *its own* setpoint independently — no cross-role comparison is made — but it would be unsafe
+    /// to present them as the same kind of number, which is why this says which is which.
+    fn load_report(&self, held_shards: usize) -> [u16; 5] {
+        let relays = u16::try_from(self.self_activity).unwrap_or(u16::MAX);
+        let stored = u16::try_from(held_shards).unwrap_or(u16::MAX);
+        // Role::ALL order: relay, storage, service, exit, rendezvous.
+        [relays, stored, 0, 0, 0]
+    }
+
     /// The stress this cell last measured, for a law that must decide outside the observation loop.
     pub(crate) fn stress(&self) -> f64 {
         self.last_stress
@@ -447,6 +465,43 @@ impl Healer {
         let window = self.window_seconds?;
         let tau_windows = if gap > 0.0 { 1.0 / gap } else { f64::INFINITY };
         Some(regeneration::min_epoch_period(tau_windows, cost, radius) * window)
+    }
+
+    /// What this node is carrying, as an effect — emitted every observation, coherence or not.
+    pub(crate) fn load_effect(&self, held_shards: usize) -> Effect {
+        Effect::Notify(Notification::LoadReport { per_role: self.load_report(held_shards) })
+    }
+
+    /// Run the per-observation control laws that need the cell's **coherence matrix**.
+    ///
+    /// Separate from the load report, which does not: a node knows how many keys it holds and how many relays
+    /// it carried whether or not `Γ_net` has enough samples to exist yet. Folding the two together made the
+    /// role controller's only real input wait on a quantity it never needed — caught by a test that asked a
+    /// fresh node what it was carrying and got nothing.
+    ///
+    /// Grouped because they share one shape — each reads the cell's own state this window and either acts on it
+    /// or tells someone who can. Kept out of `diagnose`, which is the *diagnosis*: sensing a fault and healing
+    /// it is a different job from governing a price, a cadence, or a role.
+    fn control_laws(
+        &mut self,
+        now: Instant,
+        epoch: Epoch,
+        purity: f64,
+        n: usize,
+        degraded: u8,
+    ) -> Vec<Effect> {
+        let gap = polar_gap_from_liveness(degraded);
+        self.price_admission(now, purity, n, gap);
+        self.measure_epoch_cost(now, epoch, purity, n, gap);
+        let mut out = Vec::new();
+        if let Some(seconds) = self.take_epoch_floor(epoch) {
+            // A finite floor becomes milliseconds; an infinite one is the absent value, because "no
+            // sustainable cadence" is not a very large period.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let millis = seconds.is_finite().then(|| (seconds * 1000.0).max(0.0) as u64);
+            out.push(Effect::Notify(Notification::EpochFloor { millis }));
+        }
+        out
     }
 
     /// Move this node's admission price to what its own measured stress justifies.
@@ -582,23 +637,7 @@ impl Healer {
             // **escalation** on a coherence *collapse* (`P ≤ 2/N`). Over-coupling is the verdict path's.
             if let Some(coherence) = measured {
                 let m = coherence.measures();
-                self.price_admission(now, m.purity, coherence.n(), polar_gap_from_liveness(degraded));
-                self.measure_epoch_cost(
-                    now,
-                    epoch,
-                    m.purity,
-                    coherence.n(),
-                    polar_gap_from_liveness(degraded),
-                );
-                if let Some(seconds) = self.take_epoch_floor(epoch) {
-                    // A finite floor becomes milliseconds; an infinite one is the absent value, because
-                    // "no sustainable cadence" is not a very large period.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let millis = seconds
-                        .is_finite()
-                        .then(|| (seconds * 1000.0).max(0.0) as u64);
-                    effects.push(Effect::Notify(Notification::EpochFloor { millis }));
-                }
+                effects.extend(self.control_laws(now, epoch, m.purity, coherence.n(), degraded));
                 match self
                     .homeostat
                     .control(m.purity, coherence.mean_correlation(), coherence.n())

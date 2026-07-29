@@ -65,6 +65,7 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        Notification::LoadReport { per_role } => format!("LoadReport {per_role:?}"),
         Notification::EpochFloor { millis } => match millis {
             Some(ms) => format!("EpochFloor {ms}ms"),
             None => "EpochFloor (no sustainable cadence)".to_owned(),

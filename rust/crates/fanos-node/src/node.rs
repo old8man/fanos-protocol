@@ -7,6 +7,7 @@
 //! wires identity, bootstrap, and the engine together and exposes control.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use fanos_quic::{
 };
 use fanos_keygen::recovery::{RecoveryAction, StallDetector, recovery_decision};
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::{ExitPolicy, serve_exit, spawn_exit_publisher, spawn_mix_publisher};
@@ -95,8 +97,8 @@ fn spawn_beacon_tracker(client: Client, enabled: bool) -> (Option<JoinHandle<()>
                         }
                     }
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -246,8 +248,8 @@ fn spawn_move_announcer(client: Client, info: Vec<u8>) -> JoinHandle<()> {
                 Ok(Notification::Reseated { .. }) => {
                     client.command(Command::Join { info: info.clone() });
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })
@@ -285,8 +287,8 @@ fn spawn_recovery_trigger(
             tokio::select! {
                 ev = events.recv() => match ev {
                     Ok(note) => watcher.on_note(&note),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = ticker.tick() => watcher.on_tick(me, &anchors),
             }
@@ -439,6 +441,25 @@ fn spawn_roles<F: Field + 'static>(
 ) -> SelfOrganization {
     let offered = roles.offered();
     let peers = directory.clone();
+    // The engine measures per-role load once per observation and reports it; this is where the role loop reads
+    // it. Shared atomics rather than a channel because the two run on different clocks — the engine samples per
+    // observation window, the load publisher asks whenever it is due — and only the most recent value matters.
+    let load: Arc<[AtomicU16; 5]> = Arc::new(core::array::from_fn(|_| AtomicU16::new(0)));
+    let sink = Arc::clone(&load);
+    let mut reports = handle.client().subscribe();
+    tokio::spawn(async move {
+        loop {
+            match reports.recv().await {
+                Ok(Notification::LoadReport { per_role }) => {
+                    for (slot, value) in sink.iter().zip(per_role) {
+                        slot.store(value, Ordering::Relaxed);
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     spawn_self_organization::<F>(
         handle.client(),
         SelfOrgConfig {
@@ -455,10 +476,26 @@ fn spawn_roles<F: Field + 'static>(
             // else's (`crate::bound`). `None` only in a pinned cell, where the proof cannot exist.
             prover: handle.coordinate_prover(),
         },
-        // Until a telemetry-driven load sensor lands, a node reports the load it is itself serving: one unit per role
-        // it offers. That is honest — it is the load this node accounts for — and makes the cell setpoint the count
-        // of offering nodes, so the assignment tracks the real offer rather than a fabricated number.
-        move || Demand::per_role(|r| u16::from(offered.has(r))),
+        // The measured load this node is carrying, converted to a demand in **nodes** by the setpoint
+        // denominator the constant has always described: `⌈load / capacity⌉`. Roles with a real sensor
+        // (relay: relays carried; storage: keys held) report what they are doing; the rest fall back to the
+        // offer, which is what the whole vector used to be — supply standing in for demand.
+        {
+            let carried = Arc::clone(&load);
+            move || {
+                Demand::per_role(|r| {
+                    let measured = carried
+                        .get(r.index())
+                        .map_or(0, |slot: &AtomicU16| slot.load(Ordering::Relaxed));
+                    if measured == 0 {
+                        // No sensor for this role (or genuinely idle): fall back to the offer rather than
+                        // reporting a demand of zero, which would retire a role the moment it went quiet.
+                        return u16::from(offered.has(r));
+                    }
+                    measured.div_ceil(ROLE_CAPACITY_PER_NODE.max(1))
+                })
+            }
+        },
         // The transport's own peer table, as a lower bound on live membership that owes nothing to the overlay store.
         // The role loop uses it to tell "I am alone" from "I have found no one yet" — see `ROSTER_REFRESH`.
         move || peers.len(),

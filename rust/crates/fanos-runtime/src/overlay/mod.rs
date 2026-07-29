@@ -968,6 +968,9 @@ impl<F: Field> OverlayNode<F> {
             &self.config,
             self.epoch,
         );
+        // The load this node is carrying, reported every observation — it needs no coherence matrix, only the
+        // counts the node already keeps, and the role controller's setpoint is its one real input.
+        effects.push(self.healer.load_effect(self.store.entries.len()));
         // R-C2: the Healer raises the `Escalated` NOTIFICATION but has no router — the facade (which owns the
         // hierarchical address) transports the residue up to the parent cell's sibling members, where it folds
         // into their `ParentCell` reflex. Origination lives here so a driver on any transport gets it.
@@ -1175,7 +1178,7 @@ pub(crate) type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<
 
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     // Codec helpers the tests build frames with; scoped here so the library build does not carry them.
     use crate::frames::{announce_body, encode_publish, encode_value};
@@ -1315,6 +1318,48 @@ mod tests {
         assert!(
             admitter.members().any(|(c, _)| c == joiner_coord),
             "one peer's refusal must not travel — the joiner paid this peer's price and belongs in its view"
+        );
+    }
+
+    #[test]
+    fn a_node_reports_the_load_it_carries_rather_than_the_roles_it_offers() {
+        // The gap this closes. The role controller has always taken the cell's *demand* — how many nodes each
+        // role needs — and the number handed to it was one unit per role a node *offered*, which measures
+        // supply and calls it need. So the assignment tracked who volunteered, not what the cell lacked.
+        //
+        // Two roles now have a real sensor, and the assertion is that they move with the work: a node holding
+        // more keys reports more storage load, where the offer-based figure was constant at one whatever the
+        // node was doing.
+        let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        let mut node =
+            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+
+        let load_of = |node: &mut OverlayNode<F2>, at: u64| -> [u16; 5] {
+            node.step(Instant(at), Input::Command(Command::Diagnose))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::LoadReport { per_role }) => Some(*per_role),
+                    _ => None,
+                })
+                .expect("an observation reports the load it measured")
+        };
+
+        let idle = load_of(&mut node, 0);
+        assert_eq!(idle[1], 0, "an empty node stores nothing — the offer-based figure said 1 regardless");
+
+        // Give it shards to hold, and the storage figure must follow.
+        for i in 0..4u8 {
+            node.step(
+                Instant(1),
+                Input::Command(Command::Put { key: alloc::vec![i], value: alloc::vec![7u8; 64] }),
+            );
+        }
+        let busy = load_of(&mut node, 2);
+        assert!(
+            busy[1] > idle[1],
+            "storage load must track the keys held: idle {} vs busy {}",
+            idle[1],
+            busy[1]
         );
     }
 

@@ -182,6 +182,30 @@ Remaining: the gate is installed; verify end-to-end on a live cell and record th
 
 **Guarantee: Theorem + Measurement.** Done.
 
+### II.4 — Role assignment from measured deficit — DONE
+
+**The mechanism was already excellent and one input was fiction.** Self-organizing assignment exists and is
+provable: a node advertises only *capability*, and the cell assigns the epoch's roles as a deterministic
+function of signed capabilities, the beacon, and the cell's **demand** — every node computes the same
+assignment for every node with no coordination, no role can be forged without capability, and none can be aimed
+at. A proportional controller (`Demand::rebalance`) already tracked a setpoint.
+
+The demand handed to it was `one unit per role the node offered`. That measures **supply** and calls it need,
+so the assignment tracked who volunteered rather than what the cell lacked. The code said so itself — "until a
+telemetry-driven load sensor lands" — and `ROLE_CAPACITY_PER_NODE` was already documented as the denominator of
+`⌈load / capacity⌉`, a formula whose numerator did not exist.
+
+Now measured where a sensor exists: **relay** is relays carried since the last behavioural sample, **storage**
+is keys held. The remaining three fall back to the offer, unchanged and **not disguised** — reporting a measured
+relay count beside a fabricated service count in one vector would make the second look like the first. Safe to
+mix because the controller steps each role toward its own setpoint independently; unsafe to present as one kind
+of number, which is why the code says which is which. A measured zero also falls back to the offer, since a
+demand of zero would retire a role the moment it went quiet.
+
+**A design fault caught by the test:** the report was first emitted inside the branch that needs the coherence
+matrix, so a fresh node reported nothing — the role controller's only real input made to wait on a quantity it
+never needed. A node knows what it holds and what it carried whether or not `Γ_net` has samples yet.
+
 ### II.2 / II.5 — WITHDRAWN: there is no routing or placement choice to weight
 
 **Both rested on a premise the audit disproved, and saying so is the finding.**
