@@ -623,6 +623,25 @@ The cryptographic cores, accounting math, invariant formulas, controllers, and h
 - **the enablement** — cover traffic + mixing, beacon provisioning, self-organization actuation, differential-privacy export, holonomy verification;
 - **the recovery wiring** — beacon resharing, parent escalation transport, cross-cell erasure.
 
+**The pattern now has a detector, added 2026-07-30 after it produced two more HIGHs.** Every instance above was
+found by *reading*, months after landing, usually while looking for something else — `MIX_THRESHOLD` while
+measuring anonymity for an unrelated question, `with_recovery_authority` while asking why no scenario composes a
+relay. `fanos-cli/tests/architecture.rs::no_new_public_capability_arrives_unwired` scans every `pub fn` in a
+crate's shipping source for a production call site anywhere, and ratchets a per-crate budget of the ones with
+none. It fails on the commit that *introduces* a new unreachable capability, which is the only cheap moment to
+notice one.
+
+The standing debt is 297 functions and most of it is legitimate (accessors a test asserts on, analysis functions
+that exist to be checked rather than called, simulator helpers). Some is not, and the sweep names it: the
+reading half of `crosscell_dir` has no caller, so a cell publishes its checkpoint and no parent ever anchors a
+child's finality — the module's own doc calls that "the remaining live-node piece".
+
+The scan's own correctness is a test rather than a claim, because the first version was blind: it matched call
+sites as `NAME(`, and nearly every call in this tree is generic, so `probe_point::<F>(…)` never matched and it
+reported hundreds of *wired* functions as unwired. A companion test asserts five known call sites are visible —
+**before trusting a source sweep, run it against something known to be wired and check it comes back
+positive.**
+
 Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not sloppiness; it is the gap between an excellent skeleton and a live, adversary-facing, self-healing platform — the same "excellent foundations, incomplete productionization" shape the prior audit named, now extended into the crown-jewel subsystems (OBOLOS, DROMOS, THESAUROS, ANGELOS, live TAXIS) that were built *after* that audit and had never been reviewed.
 
 ### Severity tally
