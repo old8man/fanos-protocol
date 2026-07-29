@@ -185,6 +185,58 @@ pub fn recovery_decision(live_anchors: &[u8], threshold: usize) -> RecoveryActio
     RecoveryAction::None
 }
 
+/// The **stall detector** (audit §4): the driver state that turns a frozen beacon clock into a
+/// [`recovery_decision`]. The recovery watcher folds one observation of the current live-beacon epoch per
+/// periodic tick; [`observe`](Self::observe) confirms a *stall* — the clock frozen, not merely quiet between
+/// rounds — once the epoch has failed to advance for `patience` consecutive observations, returning `true`
+/// exactly on that confirmation and then re-arming, so a persistent freeze re-fires every `patience` ticks
+/// (periodic recovery attempts, not a one-shot). Any epoch advance clears the count.
+#[derive(Clone, Debug)]
+pub struct StallDetector {
+    patience: usize,
+    last: Option<Epoch>,
+    stalled_for: usize,
+}
+
+impl StallDetector {
+    /// A detector that confirms a stall after `patience` consecutive non-advancing observations. A
+    /// `patience` of `0` is treated as `1` (a stall is never confirmed on the first, baseline observation).
+    #[must_use]
+    pub fn new(patience: usize) -> Self {
+        Self { patience: patience.max(1), last: None, stalled_for: 0 }
+    }
+
+    /// Fold one periodic observation of the current live `epoch`. Returns `true` iff this observation
+    /// confirms a stall (the epoch has not advanced for `patience` consecutive ticks); an advance resets the
+    /// counter and returns `false`, and the first observation only establishes the baseline.
+    pub fn observe(&mut self, epoch: Epoch) -> bool {
+        match self.last {
+            // Baseline: the first observation establishes the tracked epoch, never an immediate stall.
+            None => {
+                self.last = Some(epoch);
+                self.stalled_for = 0;
+                false
+            }
+            // Progress: the clock advanced, so the anchors are live — clear the count.
+            Some(prev) if epoch > prev => {
+                self.last = Some(epoch);
+                self.stalled_for = 0;
+                false
+            }
+            // No advance this tick: confirm a stall once the count reaches `patience`, then re-arm.
+            Some(_) => {
+                self.stalled_for += 1;
+                if self.stalled_for >= self.patience {
+                    self.stalled_for = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -269,5 +321,24 @@ mod tests {
         // t' > |survivors| is impossible to satisfy — refused.
         let rgc = RecoveryAuthorization::issue(&sk, 1, Epoch::new(9), &[6, 7], 3, [0; 32]);
         assert!(!rgc.verify(&vk), "threshold above the survivor count is not well-formed");
+    }
+
+    #[test]
+    fn the_stall_detector_confirms_a_freeze_after_patience_and_rearms() {
+        let mut d = StallDetector::new(3);
+        // The first observation is only a baseline — never an immediate stall.
+        assert!(!d.observe(Epoch::new(5)));
+        // Three consecutive non-advancing observations confirm the stall on the third.
+        assert!(!d.observe(Epoch::new(5)));
+        assert!(!d.observe(Epoch::new(5)));
+        assert!(d.observe(Epoch::new(5)), "a freeze is confirmed after `patience` non-advancing ticks");
+        // It re-arms: another `patience` frozen ticks re-fire (periodic recovery attempts, not one-shot).
+        assert!(!d.observe(Epoch::new(5)));
+        assert!(!d.observe(Epoch::new(5)));
+        assert!(d.observe(Epoch::new(5)), "a persistent freeze re-fires every `patience` ticks");
+        // An epoch advance clears the count — no stall while the clock is moving.
+        assert!(!d.observe(Epoch::new(6)));
+        assert!(!d.observe(Epoch::new(6)));
+        assert!(!d.observe(Epoch::new(7)));
     }
 }
