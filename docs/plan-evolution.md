@@ -197,8 +197,24 @@ The epoch period is a configured constant. The cell knows its own recovery time 
 already computes reintegration time). An epoch shorter than the cell's recovery time reshuffles a cell that has
 not finished healing from the last reshuffle.
 
-**Guarantee: Theorem.** The bound `epoch_period ≥ c·τ` follows from the reintegration-time result; `c` is
-derived from how much of a heal must complete before the next disturbance.
+**Guarantee: Theorem** — **DONE** for the bound itself (`regeneration::min_epoch_period`); the wiring that
+*applies* it to a running node remains.
+
+The derivation turned out to need no `c` at all. An advance injects an excursion `e₀` which decays as
+`e₀·e^(−T/τ)`, so the steady state across epochs is the geometric sum `e₀/(1 − e^(−T/τ))`, and it must stay
+inside the stability radius. Solving for the period:
+
+```text
+    T > τ · ln( 1 / (1 − e₀/r_stab) )
+```
+
+Every term is measured by the cell: `τ = 1/Δ` from its seven line rates (T-226(v)), `r_stab = √(P − 2/N)` from
+its purity, `e₀` from what an advance is observed to cost. Notably the same shape as the admission law's
+`−log(1 − s)`, because both answer one question — how much can be spent before the residual stops fitting in
+the headroom.
+
+`∞` when a single advance already spends the whole headroom, which is the honest answer: no cadence makes that
+survivable, and a number would be a period that does not work.
 
 ### II.4 — Role assignment from measured deficit
 

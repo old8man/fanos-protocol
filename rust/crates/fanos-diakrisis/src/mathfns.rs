@@ -43,6 +43,27 @@ pub(crate) fn log2(x: f64) -> f64 {
     }
 }
 
+/// Natural logarithm, dispatched like [`sqrt`].
+///
+/// Needed by the epoch-cadence bound, whose derivation is a geometric sum: solving "the residual disturbance
+/// must fit in the headroom" for the period gives a `ln`.
+#[inline]
+#[must_use]
+pub(crate) fn ln(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.ln()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::log(x)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-diakrisis on no_std requires the `libm` feature for ln")
+    }
+}
+
 /// `base^exp` for a non-negative integer exponent, by square-and-multiply. Pure
 /// multiplication, so it needs no math backend (works identically on `std` and `no_std`).
 #[inline]

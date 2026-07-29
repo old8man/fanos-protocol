@@ -19,6 +19,7 @@
 
 use fanos_geometry::fano;
 
+use crate::mathfns::ln;
 use crate::healing::KAPPA_BOOTSTRAP;
 
 /// Total line flux `G = Σ_p γ_p`: the sum of the cell's seven Fano-line rates (T-226).
@@ -68,6 +69,56 @@ pub fn recovery_time(line_rates: &[f64; fano::N]) -> f64 {
     } else {
         1.0 / delta
     }
+}
+
+/// The **shortest epoch period a cell can sustain**, in the same time unit as its recovery time.
+///
+/// An epoch advance is not a neutral tick: it reshuffles every VRF coordinate, so every peer relationship is
+/// re-formed and liveness must be re-established. That is a *disturbance*, and the cell relaxes from it over
+/// its reintegration time `τ = 1/Δ` ([`recovery_time`], T-226(v)).
+///
+/// ## The derivation
+///
+/// Each advance injects an excursion `e₀`. Over a period `T` it decays as `e₀·e^(−T/τ)`, and the next advance
+/// adds another. The steady state is the geometric sum
+///
+/// ```text
+///     e_ss = e₀ / (1 − e^(−T/τ))
+/// ```
+///
+/// The cell survives while that stays inside its stability radius (`e_ss < r_stab`, the T-104 survival
+/// condition). Solving for `T`:
+///
+/// ```text
+///     T > τ · ln( 1 / (1 − e₀/r_stab) )
+/// ```
+///
+/// Nothing in it is chosen. `τ` is read from the cell's own seven line rates, `r_stab = √(P − 2/N)` from its
+/// purity, and `e₀` is the excursion an advance is measured to cost. The shape is the same one the admission
+/// law arrives at — `−log(1 − s)`, a price that diverges exactly where the headroom runs out — because both
+/// answer the same question: how much can be spent before the residual no longer fits.
+///
+/// ## The two ends
+///
+/// * `e₀ ≥ r_stab` — one advance already exceeds the headroom, so **no** period is sustainable and this
+///   returns `∞`. The honest answer: the cell cannot afford to reshuffle at all until it is healthier, and a
+///   number here would be a period that does not work.
+/// * `e₀ ≤ 0` — an advance costs nothing measurable, so any cadence is sustainable and this returns `0`.
+///
+/// A configured period below this floor does not merely churn: the excursion accumulates across epochs, and a
+/// cell that is reshuffled faster than it reintegrates never reaches a steady state at all.
+#[must_use]
+pub fn min_epoch_period(recovery_time: f64, excursion_per_epoch: f64, stability_radius: f64) -> f64 {
+    // NaN falls through here by construction: an unmeasurable cost must not manufacture a bound.
+    if excursion_per_epoch.is_nan() || excursion_per_epoch <= 0.0 || !recovery_time.is_finite() || recovery_time <= 0.0
+    {
+        // No measurable cost, or no finite relaxation time to reason from: nothing to bound.
+        return if recovery_time.is_finite() { 0.0 } else { f64::INFINITY };
+    }
+    if stability_radius <= 0.0 || excursion_per_epoch >= stability_radius {
+        return f64::INFINITY; // one advance already spends the whole headroom
+    }
+    recovery_time * ln(1.0 / (1.0 - excursion_per_epoch / stability_radius))
 }
 
 /// The regeneration rate `κ(Γ) = κ_bootstrap + κ₀·Coh_E` (corpus `axiom-septicity.md`), given the
@@ -146,4 +197,59 @@ mod tests {
         // If every line rate is zero the gap closes and reintegration cannot complete.
         assert_eq!(recovery_time(&[0.0; fano::N]), f64::INFINITY);
     }
+
+    #[test]
+    fn the_epoch_floor_reproduces_its_own_derivation() {
+        // `T > τ·ln(1/(1 − e₀/r))`, checked against the closed form it is solved from: at that period the
+        // steady-state excursion `e₀/(1 − e^{−T/τ})` sits exactly on the stability radius.
+        let (tau, e0, r) = (4.0, 0.25, 1.0);
+        let t = min_epoch_period(tau, e0, r);
+        let steady = e0 / (1.0 - (-t / tau).exp());
+        assert!((steady - r).abs() < 1e-9, "at the floor the steady state must touch the radius, got {steady}");
+    }
+
+    #[test]
+    fn a_longer_period_leaves_the_cell_inside_its_radius_and_a_shorter_one_does_not() {
+        // The property the bound exists for: below it the excursion accumulates across epochs.
+        let (tau, e0, r) = (10.0, 0.2, 1.0);
+        let floor = min_epoch_period(tau, e0, r);
+        let steady = |t: f64| e0 / (1.0 - (-t / tau).exp());
+        assert!(steady(floor * 1.5) < r, "a longer period must stay inside the radius");
+        assert!(steady(floor * 0.5) > r, "a shorter one must not — that is what the floor means");
+    }
+
+    #[test]
+    fn the_floor_scales_with_the_cell_s_own_relaxation_time() {
+        // `τ` is read from the cell's seven line rates, so a slower cell demands a longer epoch — proportionally,
+        // since `τ` multiplies the whole expression.
+        let (e0, r) = (0.3, 1.0);
+        let slow = min_epoch_period(20.0, e0, r);
+        let fast = min_epoch_period(5.0, e0, r);
+        assert!((slow / fast - 4.0).abs() < 1e-9, "the floor is linear in τ: {slow} vs {fast}");
+    }
+
+    #[test]
+    fn a_cell_that_cannot_afford_one_advance_has_no_sustainable_period() {
+        // `∞` is the honest answer, not a large number: if a single reshuffle already spends the whole headroom,
+        // no cadence makes it survivable and any figure here would be a period that does not work.
+        assert!(min_epoch_period(5.0, 1.0, 1.0).is_infinite(), "cost equal to the radius");
+        assert!(min_epoch_period(5.0, 2.0, 1.0).is_infinite(), "cost beyond it");
+        assert!(min_epoch_period(5.0, 0.5, 0.0).is_infinite(), "no headroom at all");
+    }
+
+    #[test]
+    fn an_advance_that_costs_nothing_bounds_nothing() {
+        assert_eq!(min_epoch_period(5.0, 0.0, 1.0), 0.0);
+        assert_eq!(min_epoch_period(5.0, -1.0, 1.0), 0.0, "a negative cost is not a reason to slow down");
+    }
+
+    #[test]
+    fn a_cell_whose_gap_has_closed_can_sustain_no_cadence() {
+        // `recovery_time` is `∞` when the spectral gap has closed — the slowest mode never relaxes. A cell in
+        // that state has no period at which reshuffling is safe, and saying so beats inventing one.
+        let closed = recovery_time(&[0.0; fano::N]);
+        assert!(closed.is_infinite(), "the fixture must have a closed gap");
+        assert!(min_epoch_period(closed, 0.1, 1.0).is_infinite());
+    }
+
 }
