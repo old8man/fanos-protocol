@@ -27,6 +27,13 @@ use super::{
 };
 
 
+/// How many peers beyond the erasure threshold `K` a read asks even at full stress.
+///
+/// One. At width exactly `K` a single silent holder turns the read into a second round, which costs more than
+/// the message the narrower fan-out saved — so the margin is not caution, it is the cheaper arithmetic. Larger
+/// margins buy less: the second non-responder is already much rarer than the first.
+const READ_FANOUT_MARGIN: usize = 1;
+
 impl<F: Field> OverlayNode<F> {
     /// Account a permanent data loss (audit R-C3) for `digest` at a read's `Retrieved(None)` conclusion: if
     /// this node PROVABLY held a shard of it (so the value was stored) **and** the down shard-homes form a
@@ -213,9 +220,22 @@ impl<F: Field> OverlayNode<F> {
                 value: None,
             })];
         }
-        // Fan a `Lookup` out to every cell peer at once — each is a potential shard home. Sent directly
-        // (not rerouted): a down peer simply does not reply, and the erasure redundancy tolerates it.
-        let peers: Vec<Triple> = self.peers.keys().copied().collect();
+        // Fan a `Lookup` out across cell peers — each is a potential shard home. Sent directly (not rerouted):
+        // a down peer simply does not reply, and the erasure redundancy tolerates it.
+        //
+        // **How wide is a control decision.** Asking everyone spends `N` messages to recover `K` shards, and
+        // under pressure that amplification lands on the very links that are struggling — so the width follows
+        // the cell's measured headroom (`stability::read_fanout`). At rest it is every peer, which is the right
+        // default for a read: fastest-`K` wins. The floor is the erasure code's own, never policy's — below `K`
+        // a read cannot complete at all.
+        let mut peers: Vec<Triple> = self.peers.keys().copied().collect();
+        let width = fanos_diakrisis::stability::read_fanout(
+            peers.len(),
+            erasure::K,
+            READ_FANOUT_MARGIN,
+            self.healer.stress(),
+        );
+        peers.truncate(width);
         if peers.is_empty() {
             // No peer to gather from and the local shards did not reconstruct — the value is unreachable.
             return alloc::vec![Effect::Notify(Notification::Retrieved {

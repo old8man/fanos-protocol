@@ -84,6 +84,12 @@ pub(crate) struct Healer {
     last_epoch: Option<(u64, f64)>,
     /// The most recent `(stability radius, spectral gap)` — the two per-window inputs to the epoch floor.
     latest: Option<(f64, f64)>,
+    /// The stress this cell last measured — the input every control law here shares.
+    ///
+    /// Kept because two laws now read it at different moments: the admission price is set inside the
+    /// observation that computes it, while a read's fan-out is decided whenever a `Get` arrives, which is not
+    /// synchronised to anything.
+    last_stress: f64,
     /// The epoch whose floor has already been reported, so each advance is reported exactly once.
     ///
     /// An epoch rather than a flag: the question is "have I told anyone about *this* advance", and the epoch
@@ -183,6 +189,7 @@ impl Healer {
             last_epoch: None,
             latest: None,
             window_seconds: None,
+            last_stress: 0.0,
             reported_epoch: None,
             epoch_cost: None,
             activity: BTreeMap::new(),
@@ -410,6 +417,17 @@ impl Healer {
     /// unit and `τ = 1/Δ` is a relaxation time in *observation windows*; seconds appear only by multiplying
     /// through by the measured window. A healthy cell has `Δ = 2`, and reporting its `τ = 0.5` as a wall-clock
     /// figure would have called half a step half a second.
+    /// Force the measured stress — tests only.
+    #[cfg(test)]
+    pub(crate) fn set_stress_for_test(&mut self, stress: f64) {
+        self.last_stress = stress;
+    }
+
+    /// The stress this cell last measured, for a law that must decide outside the observation loop.
+    pub(crate) fn stress(&self) -> f64 {
+        self.last_stress
+    }
+
     /// Take the epoch floor **if an advance has just been measured**, clearing the flag.
     ///
     /// Reported per advance rather than per window: the figure only changes when an advance is measured, and a
@@ -462,6 +480,7 @@ impl Healer {
         let disturbance =
             inferred_disturbance(purity, rate, lambda, kappa, stability::p_opt(n), n);
         let stress = stability::stress(stability::stability_radius(purity, n), kappa, disturbance);
+        self.last_stress = stress;
         // The window is the retention unit: the excursion decays as `(1 − κ·Δt)` over it, and releasing the
         // price faster than the cell recovers is precisely what makes the controller oscillate.
         let retention = 1.0 - (kappa * seconds).clamp(0.0, 1.0);

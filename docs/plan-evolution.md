@@ -221,8 +221,14 @@ those two price something that must **diverge** as the headroom vanishes, since 
 demand out. This one cannot diverge — the code floors it — so the honest shape is the one that spends the
 remaining headroom evenly.
 
-**Guarantee: Theorem** (the floor is the code's, and monotonicity and the `≥ K` bound are pinned) **+ the wiring
-to `on_get`, which remains.**
+**Guarantee: Theorem + Invariant — DONE.** The floor is the code's; monotonicity and the hard `≥ K` bound are
+pinned, and the law is wired into `on_get`. At rest a read asks every peer it knows; at full stress it narrows
+and never below what the erasure code needs — a narrowing that went too far would not slow a read down, it
+would make it impossible. Falsified by removing the truncation.
+
+The margin above `K` is one, and derived rather than cautious: at width exactly `K` a single silent holder
+turns the read into a second round, which costs more than the message the narrower fan-out saved. The second
+non-responder is already much rarer than the first, so a larger margin buys less than it spends.
 
 ---
 

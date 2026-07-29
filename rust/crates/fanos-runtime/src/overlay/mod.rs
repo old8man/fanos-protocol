@@ -645,6 +645,12 @@ impl<F: Field> OverlayNode<F> {
             .solve(&admission_challenge(&self.membership.identity, coord, self.epoch));
     }
 
+    /// Force the measured stress, so a test can exercise a law that normally waits on an observation.
+    #[cfg(test)]
+    pub(crate) fn stress_for_test(&mut self, stress: f64) {
+        self.healer.set_stress_for_test(stress);
+    }
+
     /// This node's current admission proof — for tests that assert it was (or was not) re-minted.
     #[cfg(test)]
     pub(crate) fn admission_proof_for_test(&self) -> &[u8] {
@@ -1309,6 +1315,40 @@ mod tests {
         assert!(
             admitter.members().any(|(c, _)| c == joiner_coord),
             "one peer's refusal must not travel — the joiner paid this peer's price and belongs in its view"
+        );
+    }
+
+    #[test]
+    fn a_read_narrows_under_stress_and_never_below_what_the_code_needs() {
+        // The law wired into the read path. At rest a `Get` asks every peer — fastest-`K` wins, the right
+        // default. Under stress the width follows the headroom, because asking everyone spends `N` messages to
+        // recover `K` shards and that amplification lands on the links already struggling.
+        //
+        // The floor is the erasure code's, not policy's: below `K` a read cannot complete at all, so no stress
+        // may produce one. That is the assertion worth having — a narrowing that goes too far does not slow a
+        // read down, it makes it impossible.
+        let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        let mut node =
+            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+        let lookups = |effects: &[Effect]| {
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Send { frame, .. } if decode_frame(frame)
+                    .is_ok_and(|(f, _)| f.frame_type() == Some(FrameType::Lookup))))
+                .count()
+        };
+
+        let calm = node.step(Instant(0), Input::Command(Command::Get { key: b"k1".to_vec() }));
+        assert_eq!(lookups(&calm), 6, "at rest a read asks every peer it knows");
+
+        node.stress_for_test(1.0);
+        let strained = node.step(Instant(1), Input::Command(Command::Get { key: b"k2".to_vec() }));
+        let asked = lookups(&strained);
+        assert!(asked < 6, "under full stress a read must narrow, asked {asked}");
+        assert!(
+            asked >= erasure::K,
+            "asked {asked} peers for a value needing {} shards — that read cannot complete at all",
+            erasure::K
         );
     }
 
