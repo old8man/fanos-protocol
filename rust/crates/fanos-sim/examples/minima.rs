@@ -189,10 +189,11 @@ fn main() {
     println!("  fewest survivors that SOMETIMES serve a read     : {ever_reads:?}");
     println!("  coherence floor (the window is non-empty)        : {MIN_VIABLE_CELL}");
     println!(
-        "\n  Robustness ceiling is monotone *down*: 1/√3 = {:.3} > 1/√7 = {:.3}.",
+        "\n  The absolute robustness ceiling falls with the cell: 1/√3 = {:.3} > 1/√7 = {:.3}.",
         max_stability_radius(3),
         max_stability_radius(7)
     );
-    println!("  So the smallest cell that works is also the sturdiest — *while held inside the band*.");
-    println!("  At a fixed absolute purity the order reverses; see fanos_diakrisis::minima for both regimes.");
+    println!("  That is NOT 'smaller is sturdier'. Each fault costs less in a bigger cell at the same rate,");
+    println!("  so the tolerated FRACTION is 1 − 1/√2 ≈ 29.3% at every size and the absorbed COUNT grows:");
+    println!("  2 faults at N=7, 291 at N=993. See fanos_diakrisis::minima result 6.");
 }

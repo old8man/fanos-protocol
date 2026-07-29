@@ -28,7 +28,7 @@ collapse every question about cell size onto one variable. Four consequences fol
 `(1/√(N−1), √(2/(N−1))]` — but in integration they are the constants `Φ ∈ (1, 2]`, equivalently
 `P ∈ (2/N, 3/N]`. A cell grows by *diluting* correlation at exactly the rate that holds `Φ` still.
 
-**3. Robustness has a ceiling that falls as the cell grows.** Since `r_stab = √(P − 2/N) = √((Φ − 1)/N)` and
+**3. The stability radius falls as the cell grows — and fault tolerance does not.** Since `r_stab = √(P − 2/N) = √((Φ − 1)/N)` and
 `Φ ≤ 2`:
 
 ```
@@ -38,12 +38,14 @@ r_stab ≤ 1/√N
 attained only at the top of the window. T-104 survives sustained noise `h` iff `h < κ·r_stab`, so the
 disturbance an `N`-node cell can absorb is at most `κ/√N` — and with `κ_bootstrap = ω₀/N`, at most `ω₀·N^(−3/2)`.
 
-**This inverts the usual intuition — and it is conditional.** A larger *compliant* cell is not a sturdier one:
-the viable band in purity is `(2/N, 3/N]`, of width `1/N`, so it narrows as the cell grows and leaves less room
-between health and the boundary, not more. Seven nodes is not a floor to grow out of — among admissible cells
-it is the **maximum** of `1/√N`.
+**The tempting reading of that is wrong, and this document carried it for most of a day.** "A larger cell has a
+smaller radius, so it is less robust" compares an absolute distance without asking what it is measured against
+— and the disturbance scales too. One decorrelated node consumes **34.5 %** of a Fano cell's radius and
+**0.2 %** of a `PG(2,31)` cell's. Both the capacity and the per-fault cost fall as `N^(−3/2)`, and they cancel.
+What survives the cancellation is the fault count in the table further down, and that is what a deployment
+feels.
 
-The condition is `Φ ≤ 2`, i.e. `P ≤ 3/N` — purity that *scales down* with the cell. Hold purity at an absolute
+One qualification before it. The condition is `Φ ≤ 2`, i.e. `P ≤ 3/N` — purity that *scales down* with the cell. Hold purity at an absolute
 level instead and `r_stab = √(P − 2/N)` runs the **other way**, because the subtrahend `2/N` shrinks: at
 `P = 0.75` the radius climbs from `0.699` at `N = 7` to `0.865` at `N = 993`, and integrating the reduced
 dynamics there measures a critical attack that *grows* with the cell (`0.725` at `N = 7`, `3.875` at `N = 21`).
@@ -53,12 +55,25 @@ self-model floor `R ≥ 1/3` **is** `P ≤ 3/N`. A cell at absolute purity `0.75
 over-coupled, no longer self-observing, and what the homeostat answers with `Decouple`. Both statements are
 pinned in `fanos_diakrisis::minima`.
 
-| cell, held in-band | `r_stab ≤ 1/√N` | absorbed disturbance `∝ N^(−3/2)` |
-|---|---|---|
-| 7 (Fano) | **0.378** | 1.00× |
-| 21 | 0.218 | 0.19× |
-| 57 | 0.132 | 0.043× |
-| 993 | 0.032 | 0.00021× |
+| cell, held in-band | `r_stab ≤ 1/√N` | **node failures absorbed** | as a fraction |
+|---|---|---|---|
+| 7 (Fano) | 0.378 | **2** | 28.6 % |
+| 21 | 0.218 | **6** | 28.6 % |
+| 57 | 0.132 | **17** | 29.8 % |
+| 993 | 0.032 | **291** | 29.3 % |
+
+**The fraction is a constant, and it is derived.** Let `k` nodes decorrelate and `m = N − k` stay intact; only
+intact pairs carry off-diagonal mass, so `P(k) = 1/N + m(m−1)r²/N²`, and at the top of the band the viability
+condition `P > 2/N` reduces to `2m(m−1) > N(N−1)`:
+
+```
+k/N  →  1 − 1/√2  ≈  0.2929
+```
+
+independent of `N`. Compare the Byzantine tolerance `f/N → 1/3`: the coherence bound sits just inside it, and
+two derivations from unrelated parts of the theory agreeing within four points is the best evidence either one
+carries. **Cell size costs nothing in fault tolerance** — a `PG(2,31)` cell absorbs 291 simultaneous failures
+where a Fano cell absorbs two.
 
 **4. There is an absolute floor at `N = 3`.** The window in `r` is `(1/√(N−1), √(2/(N−1))]`, whose lower edge
 reaches `1` at `N = 2` — and a correlation cannot exceed one, so the window is empty. Two nodes cannot form a
@@ -146,13 +161,24 @@ default — `t = ⌈2(q+1)/3⌉` evaluates to `2` at `q = 2` — and with it hop
 instead of rising to certainty. Recorded as `docs/audit.md` E7 (HIGH, open); full working in
 `docs/design-anonymity-substrate.md` §4a.
 
-| cell | anonymity floor `1/K` | deanonymization at tolerated `f` | robustness `1/√N` |
+| cell | anonymity floor `1/K` | deanonymization at tolerated `f` | faults absorbed |
 |---|---|---|---|
-| 7 (Fano), `t = 2` | 1/7 — testbed only | **0** | **0.378** |
-| 993 (`q = 31`), `t = 2` **as shipped** | 1/993 | **≈1.0 — no anonymity** | 0.032 |
-| 993, with `t = ⌈2(q+1)/3⌉ = 22` | 1/993 — credible | ~0 | 0.032 |
+| 7 (Fano), `t = 2` | 1/7 — testbed only | **0** | 2 |
+| 993 (`q = 31`), `t = 2` — the old constant | 1/993 | **≈1.0 — no anonymity** | 291 |
+| 993, with `t = ⌈2(q+1)/3⌉ = 22` | 1/993 — credible | ~0 | 291 |
 
-Only the third row is a usable anonymity deployment, and it does not exist yet.
+**Raising the plane order is free in fault tolerance** (result 3 above: the tolerated fraction is `1 − 1/√2` at
+every size), so with the threshold fixed there is no reason not to. Its real prices are elsewhere and worth
+naming:
+
+* **Coordination.** A quorum of 662 of 993 rather than 5 of 7, and PBFT is quadratic in messages — a round on
+  `PG(2,31)` costs roughly `(993/7)² ≈ 20 000×` a Fano round. This is the dominant cost of a large cell.
+* **Hop liveness.** `t = 22` of a 32-point line: two thirds must be reachable to peel a layer. The same
+  *ratio* Fano runs at, stricter in absolute terms.
+* **Finding 993 operators**, which is not a technical cost but is a real one.
+
+So the architecture separates anonymity from fragility and leaves an honest trade of *anonymity against
+coordination* — the right one to be left with, since coordination can be engineered down and fragility cannot.
 
 ### So, in practice
 

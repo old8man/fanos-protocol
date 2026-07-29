@@ -39,10 +39,16 @@ that same plane (`nostos.rs::select_drop_line`), and `HierAddr` — the hierarch
 another cell — appears **nowhere in the crate**. So an anonymous circuit is confined to its cell and the anonymity set is
 the cell, not the federation.
 
-This is not a cosmetic limit. `fanos_diakrisis::minima` derives that a cell's robustness ceiling is `r_stab ≤ 1/√N`, so the
-anonymity floor `1/K` and the robustness ceiling pull in opposite directions and the only current lever is the plane order:
-Fano gives `1/7` anonymity at `r_stab = 0.378`, `PG(2,31)` gives `1/993` at `0.032` — a 12× robustness cost for credible
-anonymity. Federation would resolve it *if* circuits could cross cells; today it buys nothing for anonymity.
+**The cost of not having it is smaller than this item once claimed.** An earlier version priced raising the plane order at
+"a 12× robustness cost", from `r_stab = 0.378` at `N = 7` down to `0.032` at `N = 993`. That compared absolute radii
+without normalizing by the disturbance, which scales the same way: `fanos_diakrisis::minima` result 6 derives that the
+tolerated fault fraction is `1 − 1/√2 ≈ 29.3 %` **at every cell size**, so a `PG(2,31)` cell absorbs 291 simultaneous
+failures where Fano absorbs 2. Raising `q` for anonymity is free in fault tolerance; its real price is coordination
+(a quorum of 662 of 993, quadratic in messages).
+
+So federation is not needed to escape a robustness penalty — there isn't one. What it would buy is an anonymity set at the
+union rather than per cell, and graceful degradation past the fault threshold (`f = 3/7`: one cell 11.4 %, three federated
+cells 1.6 %). Worth having, not urgent.
 
 **Check before working:** `grep -rn "HierAddr" crates/fanos-aphantos/` should still return nothing, and
 `threshold_onion.rs`'s hop unit should still be a flat `Triple`. Design authority: `docs/design-anonymity-substrate.md`,

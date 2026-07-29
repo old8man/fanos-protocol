@@ -1,4 +1,4 @@
-//! **How small a cell may be — and why smaller is stronger.**
+//! **How small a cell may be, and what size costs.**
 //!
 //! "How many nodes does FANOS need?" was answered here for a long time by reading constants off the
 //! implementation: the geometry admits `q ≥ 2` so a cell has seven points, consensus tolerates `f = ⌊(N−1)/3⌋`,
@@ -24,7 +24,7 @@
 //! `(1/√(N−1), √(2/(N−1))]` — but in integration they are the constants `Φ ∈ (1, 2]`, equivalently
 //! `P ∈ (2/N, 3/N]`. A cell grows by *diluting* correlation at exactly the rate that holds `Φ` still.
 //!
-//! **3. Robustness has a ceiling that falls as the cell grows.** The stability radius is
+//! **3. The stability radius falls as the cell grows — and fault tolerance does not.** The radius is
 //! `r_stab = √(P − 2/N) = √((Φ − 1)/N)`, and `Φ ≤ 2` caps it at
 //!
 //! ```text
@@ -35,10 +35,11 @@
 //! disturbance such a cell can absorb is at most `κ/√N` — and with `κ_bootstrap = ω₀/N` it falls as
 //! `ω₀·N^(−3/2)`.
 //!
-//! **This inverts the intuition — and it is conditional, which the first version of this module failed to
-//! say.** A larger *compliant* cell is not a sturdier one: the viable band in purity is `(2/N, 3/N]`, of width
-//! `1/N`, so it narrows as the cell grows and there is less room between health and the boundary, not more.
-//! Seven nodes is not a floor to grow out of; among admissible cells it is the **maximum** of `1/√N`.
+//! **The tempting reading of that is wrong, and it was published here for most of a day.** "A larger cell has
+//! a smaller radius, so it is less robust" compares an *absolute* distance without asking what it is compared
+//! against — and the disturbance scales too. Decorrelating one node consumes `34.5 %` of a Fano cell's radius
+//! and `0.2 %` of a `PG(2,31)` cell's; both the capacity and the per-fault cost fall as `N^(−3/2)`, and they
+//! cancel. See result 6, which is what actually follows.
 //!
 //! The condition is `Φ ≤ 2`, i.e. `P ≤ 3/N` — purity that *scales down* with the cell. Hold purity at an
 //! absolute level instead and `r_stab = √(P − 2/N)` runs the **other way**, because the subtrahend `2/N`
@@ -80,6 +81,35 @@
 //! Exposed, not enforced: teaching `control` to steer toward `Φ*` inside the band is a control-law change and
 //! is gated on evidence, not on this derivation alone (`docs/open-tasks.md`).
 //!
+//! ## 6. Fault tolerance is scale-free — cell size costs nothing
+//!
+//! Let `k` of `N` nodes decorrelate (the coherence shadow of a node failing) and `m = N − k` stay intact. The
+//! diagonal is untouched, so `diag = 1/N`, and only intact pairs contribute off-diagonal mass:
+//!
+//! ```text
+//! P(k) = 1/N + m(m−1)·r²/N²
+//! ```
+//!
+//! At the top of the band, `r² = 2/(N−1)`, the cell dies when `P ≤ 2/N`, which reduces to
+//!
+//! ```text
+//! 2m(m−1) ≤ N(N−1)        ⟺        k/N → 1 − 1/√2 ≈ 0.2929
+//! ```
+//!
+//! **A constant. The tolerated fraction of failed nodes does not depend on `N` at all** — measured 28.6 %,
+//! 28.6 %, 29.8 %, 29.3 % for `N = 7, 21, 57, 993`, against a Byzantine tolerance `f/N → 1/3` the coherence
+//! bound sits just inside. Two derivations from unrelated places agreeing to within four points is the best
+//! evidence either of them is right.
+//!
+//! So the `1/√N` ceiling is not a tax on growth. It is an absolute distance in a coordinate whose disturbances
+//! shrink at the same rate, and what survives the normalization is a **linear** growth in tolerated faults:
+//! `2, 6, 17, 291` nodes for those four cells. A `PG(2,31)` cell absorbs 291 simultaneous failures where a
+//! Fano cell absorbs two.
+//!
+//! The practical consequence, and the reason this matters: **raising the plane order for anonymity costs
+//! nothing in fault tolerance.** An earlier version of this module priced it at "12×", which was the ratio of
+//! absolute radii and meant nothing.
+//!
 //! ## What this module is not
 //!
 //! It is not the deployment minimum. Coherence is one of four independent constraints — consensus wants
@@ -87,11 +117,11 @@
 //! form a hyperoval), and anonymity wants `N` *large*, since the flow-matching floor is `1/K` in the anonymity
 //! set. Anonymity is the one that pulls the other way, and it pulls hard.
 //!
-//! Federation would resolve it — many small cells, the anonymity set taken at the union — **but the
-//! implementation does not support that**: `fanos-aphantos` is parameterized by a single field throughout, so
-//! an anonymous circuit cannot leave its cell. Raising `q` is currently the only lever, and it costs
-//! robustness as `1/√N`. That argument belongs in `docs/deployment-minima.md`; what belongs here is the half
-//! of it that is a theorem.
+//! Anonymity is answered by raising the plane order, and by result 6 that costs **nothing** in fault
+//! tolerance — the tolerated fraction is `1 − 1/√2` at every size. Federation would be the alternative, and
+//! the implementation does not support it anyway: `fanos-aphantos` is parameterized by a single field
+//! throughout, so an anonymous circuit cannot leave its cell. The deployment argument belongs in
+//! `docs/deployment-minima.md`; what belongs here is the half of it that is a theorem.
 
 use crate::coherence::{p_crit, purity_equicorrelated};
 use crate::mathfns::sqrt;
@@ -236,6 +266,40 @@ pub fn over_coupling_distance(purity: f64, n: usize) -> f64 {
     (max_stability_radius(n) - crate::stability::stability_radius(purity, n)).max(0.0)
 }
 
+/// The fraction of a cell's nodes whose failure exhausts its stability radius: `1 − 1/√2`.
+///
+/// Derived, and **independent of `N`** — which is the result that removes the apparent penalty for a large
+/// cell. Let `k` nodes decorrelate and `m = N − k` stay intact. The diagonal is untouched, so `diag = 1/N`,
+/// and only intact pairs carry off-diagonal mass: `P(k) = 1/N + m(m−1)r²/N²`. At the top of the band
+/// (`r² = 2/(N−1)`) the viability condition `P > 2/N` becomes `2m(m−1) > N(N−1)`, so the cell dies at
+/// `m ≈ N/√2`, i.e. after losing `1 − 1/√2 ≈ 29.3 %` of its nodes.
+///
+/// Compare the Byzantine tolerance `f/N = ⌊(N−1)/3⌋/N → 1/3`. The coherence bound sits just inside it, and two
+/// derivations from unrelated parts of the theory landing within four points of each other is the strongest
+/// evidence either carries.
+///
+/// **What this repeals.** `r_stab ≤ 1/√N` says the absolute distance to collapse shrinks with the cell, and it
+/// is easy — this module did it — to read that as "bigger is weaker". It is not: the disturbance shrinks at
+/// the same rate, one failed node costing `34.5 %` of a Fano radius and `0.2 %` of a `PG(2,31)` one. What is
+/// left after the cancellation is a *linear* growth in absorbed faults: `2, 6, 17, 291` for `N = 7, 21, 57,
+/// 993`. Raising the plane order for anonymity is free in fault tolerance.
+pub const TOLERATED_FAULT_FRACTION: f64 = 1.0 - core::f64::consts::FRAC_1_SQRT_2;
+
+/// The purity of a top-of-band cell after `k` of its `n` nodes decorrelate: `1/N + m(m−1)r²/N²`.
+///
+/// The closed form behind [`TOLERATED_FAULT_FRACTION`], exposed so a caller can ask the question directly
+/// rather than rebuild an `N×N` matrix — which for `PG(2,31)` is a million entries per query.
+#[must_use]
+pub fn purity_after_failures(n: usize, k: usize) -> f64 {
+    if n < 2 {
+        return 0.0;
+    }
+    let m = n.saturating_sub(k);
+    let (n_f, m_f) = (n as f64, m as f64);
+    let r2 = 2.0 / (n_f - 1.0);
+    1.0 / n_f + m_f * (m_f - 1.0) * r2 / (n_f * n_f)
+}
+
 /// The mean correlation an `N`-node cell must hold to reach integration `phi`: `r = √(Φ/(N−1))`.
 ///
 /// The inverse of `Φ = (N−1)r²`, and the operational form: a cell is steered by its coupling, not by its
@@ -339,10 +403,15 @@ mod tests {
     }
 
     #[test]
-    fn a_larger_cell_is_strictly_less_robust() {
-        // The inversion of intuition, stated as an order. The viable band in purity is `(2/N, 3/N]`, of width
-        // `1/N` — it narrows as the cell grows, so there is *less* room between health and the boundary in a
-        // big plane than a small one. This is the argument for federating rather than enlarging.
+    fn a_larger_cells_absolute_radius_is_smaller_which_is_not_the_same_as_weaker() {
+        // The order is real: the viable band in purity is `(2/N, 3/N]`, of width `1/N`, so it narrows as the
+        // cell grows and the absolute distance to the boundary falls as `1/√N`.
+        //
+        // The NAME of this test used to say "is strictly less robust", and that reading is wrong — see
+        // `the_tolerated_fault_fraction_is_the_same_at_every_cell_size`. Each fault also costs less in a
+        // bigger cell, at exactly the same rate, so what a deployment feels is a *constant* tolerated fraction
+        // and a *growing* fault count. Keeping the assertion and correcting the claim is the point: a true
+        // measurement with a false gloss is worse than no measurement, because it travels.
         for pair in CELLS.windows(2) {
             let (small, large) = (pair[0], pair[1]);
             assert!(
@@ -354,7 +423,7 @@ mod tests {
         for n in MIN_VIABLE_CELL..7 {
             assert!(
                 max_stability_radius(n) >= max_stability_radius(7),
-                "N={n} would out-rank the Fano cell — the geometry, not coherence, is what forbids it"
+                "N={n} would out-rank the Fano cell's radius — the geometry, not coherence, forbids it"
             );
         }
     }
@@ -639,6 +708,55 @@ mod tests {
             let (lo, hi) = collective_subject_window(n);
             assert!(r > lo && r <= hi, "N={n}: r*={r} must lie in ({lo}, {hi}]");
         }
+    }
+
+    #[test]
+    fn the_tolerated_fault_fraction_is_the_same_at_every_cell_size() {
+        // Result 6, and the one that repeals this module's own earlier claim that a big cell is weaker. Count
+        // failures until the radius is gone, at every supported size, and the FRACTION must not move.
+        for n in CELLS {
+            let killed = (1..=n).find(|&k| stability_radius(purity_after_failures(n, k), n) <= 0.0);
+            let k = killed.unwrap_or(n);
+            #[allow(clippy::cast_precision_loss)] // cell sizes are small; f64 holds them exactly
+            let fraction = k as f64 / n as f64;
+            assert!(
+                (fraction - TOLERATED_FAULT_FRACTION).abs() < 0.03,
+                "N={n}: {k} of {n} failures ({fraction:.3}) should be within a few points of \
+                 1 − 1/√2 = {TOLERATED_FAULT_FRACTION:.4} — a size-dependent fraction would mean cell size \
+                 really does cost fault tolerance"
+            );
+            // And the count itself grows with the cell: two faults for Fano, hundreds for PG(2,31). The
+            // absolute radius shrinks as 1/√N and buys MORE failures, not fewer, because each costs less.
+            assert!(k >= 2, "N={n}: even the smallest cell absorbs a fault");
+        }
+        // Strictly increasing in `N` — the statement "bigger is weaker" is not merely unproven, it is backwards.
+        let absorbed: Vec<usize> = CELLS
+            .iter()
+            .map(|&n| (1..=n).find(|&k| stability_radius(purity_after_failures(n, k), n) <= 0.0).unwrap_or(n))
+            .collect();
+        for pair in absorbed.windows(2) {
+            assert!(pair[1] > pair[0], "a larger cell must absorb strictly more failures: {absorbed:?}");
+        }
+    }
+
+    #[test]
+    fn one_failure_costs_less_in_a_larger_cell_at_exactly_the_rate_the_radius_shrinks() {
+        // Why the fraction is constant: capacity and per-fault cost both fall as N^(-3/2) and cancel. Measured
+        // as the share of the radius one decorrelated node consumes — 34.5 % on Fano, 0.2 % on PG(2,31).
+        let mut previous = 1.0;
+        for n in CELLS {
+            let full = stability_radius(purity_after_failures(n, 0), n);
+            let after = stability_radius(purity_after_failures(n, 1), n);
+            let consumed = (full - after) / full;
+            assert!(consumed < previous, "N={n}: one failure must cost a smaller share than in a smaller cell");
+            previous = consumed;
+        }
+        // The Fano figure, pinned: a third of the radius for a single node is why a seven-cell tolerates two.
+        let fano = {
+            let full = stability_radius(purity_after_failures(7, 0), 7);
+            (full - stability_radius(purity_after_failures(7, 1), 7)) / full
+        };
+        assert!((0.30..0.40).contains(&fano), "one Fano node should cost about a third of the radius: {fano}");
     }
 
     #[test]
