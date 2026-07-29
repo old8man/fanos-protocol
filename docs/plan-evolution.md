@@ -216,6 +216,13 @@ the headroom.
 `∞` when a single advance already spends the whole headroom, which is the honest answer: no cadence makes that
 survivable, and a number would be a period that does not work.
 
+**A unit error was found by checking before wiring, which is the reason to check.** The polar gap `Δ` counts
+corroborated-alive points per Fano line — a healthy cell gives the theorem's maximal `Δ = 2` — so it carries no
+unit, and `τ = 1/Δ` is a relaxation time in *observation windows*, not seconds. Reporting a healthy cell's
+`τ = 0.5` as wall-clock would have called half a step half a second, and the floor is linear in `τ`, so the
+error would have passed through undiminished. The healer now measures its own observation cadence and the
+accessor is `epoch_floor_seconds`. Pinned where the quantity is defined.
+
 **The measurement is wired; the last hop to the operator is not.** `e₀` cannot be read from one window — it is a
 difference *across* an epoch boundary — so the healer takes it there (the stability radius entering an epoch
 minus the radius on the first window of the next), and `OverlayNode::epoch_floor` exposes the resulting bound.

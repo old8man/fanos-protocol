@@ -252,4 +252,27 @@ mod tests {
         assert!(min_epoch_period(closed, 0.1, 1.0).is_infinite());
     }
 
+
+    #[test]
+    fn a_healthy_cell_s_relaxation_time_is_half_a_step_not_half_a_second() {
+        // The unit trap, pinned where the quantity is defined. `Δ` counts corroborated-alive points per Fano
+        // line — a healthy cell has uniform rates `γ̄ = 3` and the theorem's maximal `Δ = 2` — so it carries no
+        // unit at all, and `τ = 1/Δ` is a relaxation time in *master-equation steps*. A caller that reported it
+        // as wall-clock would call half a step half a second, and the epoch floor built on it would be wrong by
+        // whatever the observation cadence happens to be.
+        let healthy = [3.0f64; fano::N];
+        let delta = spectral_gap(&healthy);
+        assert!((delta - 2.0).abs() < 1e-12, "a healthy cell's gap is the theorem's maximal 2, got {delta}");
+        let tau = recovery_time(&healthy);
+        assert!((tau - 0.5).abs() < 1e-12, "τ = 1/Δ = 0.5 — in steps, and the caller owes the conversion");
+
+        // …and the floor inherits that unit, linearly. Whatever converts one converts the other.
+        let floor = min_epoch_period(tau, 0.2, 1.0);
+        let floor_twice_as_slow = min_epoch_period(tau * 2.0, 0.2, 1.0);
+        assert!(
+            (floor_twice_as_slow / floor - 2.0).abs() < 1e-9,
+            "the floor is linear in τ, so a unit error in τ is a unit error in the floor"
+        );
+    }
+
 }

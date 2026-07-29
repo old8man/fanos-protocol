@@ -84,6 +84,14 @@ pub(crate) struct Healer {
     last_epoch: Option<(u64, f64)>,
     /// The most recent `(stability radius, spectral gap)` — the two per-window inputs to the epoch floor.
     latest: Option<(f64, f64)>,
+    /// How long one observation window lasts, in seconds, measured from consecutive observations.
+    ///
+    /// The **unit bridge**, and it is load-bearing. The polar gap `Δ` is a count of corroborated-alive points
+    /// per Fano line (a healthy cell gives `Δ = 2`), so it is *dimensionless* and `τ = 1/Δ` is a relaxation
+    /// time in master-equation steps, not in seconds. One step is one observation window, so seconds only
+    /// appear by multiplying through by this. Reporting `1/Δ` as a wall-clock time would have called half a
+    /// step half a second.
+    window_seconds: Option<f64>,
     /// The headroom the most recent epoch advance was measured to consume, and the shortest period that cost
     /// makes sustainable. `None` until a first advance has been observed — a floor derived from no measurement
     /// would be a guess wearing a derivation.
@@ -169,6 +177,7 @@ impl Healer {
             admission_floor: 0,
             last_epoch: None,
             latest: None,
+            window_seconds: None,
             epoch_cost: None,
             activity: BTreeMap::new(),
             self_activity: 0,
@@ -359,9 +368,19 @@ impl Healer {
     /// A negative difference is recorded as zero, not as a negative cost: a cell that came out of a reshuffle
     /// healthier than it went in was recovering from something else, and crediting the advance for it would let
     /// the floor drift below what the cell can actually sustain.
-    fn measure_epoch_cost(&mut self, epoch: Epoch, purity: f64, n: usize, gap: f64) {
+    fn measure_epoch_cost(&mut self, now: Instant, epoch: Epoch, purity: f64, n: usize, gap: f64) {
         let radius = stability::stability_radius(purity, n);
         self.latest = Some((radius, gap));
+        // The observation cadence, measured rather than assumed: it is what converts a relaxation time in
+        // master-equation steps into one in seconds.
+        if let Some((_, then)) = self.last_purity {
+            let elapsed = now.as_nanos().saturating_sub(then);
+            if elapsed > 0 {
+                #[allow(clippy::cast_precision_loss)] // a window is milliseconds; f64 holds it exactly
+                let seconds = elapsed as f64 / 1e9;
+                self.window_seconds = Some(seconds);
+            }
+        }
         match self.last_epoch {
             Some((seen, before)) if seen != epoch.get() => {
                 self.epoch_cost = Some((before - radius).max(0.0));
@@ -374,18 +393,23 @@ impl Healer {
         }
     }
 
-    /// The shortest epoch period this cell can sustain, from its own measurements.
+    /// The shortest epoch period this cell can sustain, **in seconds**, from its own measurements.
     ///
-    /// `None` until an advance has been observed, because two of the three inputs are cheap and the third is
-    /// not: a floor computed with a guessed `e₀` would read as derived and be invented.
+    /// `None` until an advance has been observed *and* the observation cadence has been measured. Two of the
+    /// three inputs to the bound come free from any window; the third — what an advance costs — is a difference
+    /// across the epoch boundary, and a floor computed with a guessed one would read as derived and be
+    /// invented.
     ///
-    /// The unit is the caller's — the bound is `τ · ln(…)` and `τ` is a relaxation time in whatever unit the
-    /// spectral gap is expressed in. The driver converts.
-    pub(crate) fn epoch_floor(&self) -> Option<f64> {
+    /// The conversion is not incidental. `Δ` counts corroborated-alive points per Fano line, so it carries no
+    /// unit and `τ = 1/Δ` is a relaxation time in *observation windows*; seconds appear only by multiplying
+    /// through by the measured window. A healthy cell has `Δ = 2`, and reporting its `τ = 0.5` as a wall-clock
+    /// figure would have called half a step half a second.
+    pub(crate) fn epoch_floor_seconds(&self) -> Option<f64> {
         let cost = self.epoch_cost?;
         let (radius, gap) = self.latest?;
-        let tau = if gap > 0.0 { 1.0 / gap } else { f64::INFINITY };
-        Some(regeneration::min_epoch_period(tau, cost, radius))
+        let window = self.window_seconds?;
+        let tau_windows = if gap > 0.0 { 1.0 / gap } else { f64::INFINITY };
+        Some(regeneration::min_epoch_period(tau_windows, cost, radius) * window)
     }
 
     /// Move this node's admission price to what its own measured stress justifies.
@@ -522,6 +546,7 @@ impl Healer {
                 let m = coherence.measures();
                 self.price_admission(now, m.purity, coherence.n(), polar_gap_from_liveness(degraded));
                 self.measure_epoch_cost(
+                    now,
                     epoch,
                     m.purity,
                     coherence.n(),
