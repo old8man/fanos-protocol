@@ -247,3 +247,171 @@ mod tests {
         assert!(differed > 0, "no export differed from its exact frame — the DP mechanism is not being applied");
     }
 }
+
+/// A **census** of a set of cells' published health — the answer to an operator's first question.
+///
+/// Plan III.2. Every incident starts with *is this my cell, or the network?*, and nothing could answer it: each
+/// cell diagnoses itself, a fault it cannot heal escalates to its parent (`ParentCell::observe`), and no view
+/// existed that spanned cells at all. The input has been on the wire the whole time — nodes publish
+/// ε-differentially-private coherence frames — and [`read_coherence`] had no caller.
+///
+/// ## Why a census and not a composed `Φ`
+///
+/// A federation-level coherence *matrix* would need the cross-cell entries, and no node measures one: a cell's
+/// `Γ_net` is over its own points. Synthesising a network-wide `Φ` from cells' `Φ`s would be inventing a
+/// quantity, and it would read exactly like a measured one.
+///
+/// The recursion that *does* compose is already built and is a different mechanism: a child cell is a **point**
+/// of its parent, so an unhealable child becomes a degraded point and the parent's own reflex runs unchanged.
+/// That is the control path. This is the observability path, and the honest thing for it to report is a
+/// distribution: how many cells are healthy, how many are alarmed, how many could not be read.
+///
+/// ## Silence is not health
+///
+/// Unreadable cells are counted separately and never folded into "healthy". A monitor that treats a quiet cell
+/// as a well one reports its best news exactly when a partition is at its worst — which is the failure mode
+/// [`read_coherence`]'s three-valued result exists to prevent, and it would be undone here by a single
+/// `unwrap_or_default`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Census {
+    /// Cells reporting `Φ ≥ 1` and `P ≥ 2/N` — integrated and above the viability floor.
+    pub healthy: usize,
+    /// Cells reporting the **integration** alarm: `Φ < 1` but still viable. The earliest warning (V17).
+    pub integration: usize,
+    /// Cells reporting the **structure** alarm: `Φ < 1` and `P < 2/N` — below viability, where the
+    /// V-preservation gate has closed and self-recovery is no longer possible without help.
+    pub structure: usize,
+    /// Cells that published nothing for this epoch. A definite negative: the slot is empty.
+    pub silent: usize,
+    /// Cells whose read did not conclude. **Not** a negative and not evidence of anything — a timeout.
+    pub unreachable: usize,
+}
+
+impl Census {
+    /// How many cells answered at all.
+    #[must_use]
+    pub fn answered(&self) -> usize {
+        self.healthy + self.integration + self.structure
+    }
+
+    /// How many cells were asked.
+    #[must_use]
+    pub fn asked(&self) -> usize {
+        self.answered() + self.silent + self.unreachable
+    }
+
+    /// Whether the *network* is the story rather than any one cell: a majority of the cells that answered are
+    /// alarmed.
+    ///
+    /// Deliberately over the cells that **answered**, not over those asked. Counting silence as health would
+    /// hide a partition; counting it as sickness would let one unreachable cell speak for the network. Neither
+    /// is a reading, so the fraction is taken over the population that actually reported and the rest is
+    /// carried alongside for the operator to weigh.
+    #[must_use]
+    pub fn network_wide(&self) -> bool {
+        let answered = self.answered();
+        answered > 0 && (self.integration + self.structure) * 2 > answered
+    }
+
+    /// Fold one cell's read into the census.
+    fn observe(&mut self, read: &Read<CoherenceFrame>) {
+        match read {
+            Read::Found(frame) => match frame.alarm() {
+                fanos_telemetry::AlarmLevel::Healthy => self.healthy += 1,
+                fanos_telemetry::AlarmLevel::Integration => self.integration += 1,
+                fanos_telemetry::AlarmLevel::Structure => self.structure += 1,
+            },
+            Read::Absent => self.silent += 1,
+            Read::Unknown => self.unreachable += 1,
+        }
+    }
+}
+
+/// Read every coordinate's published coherence for `epoch` and compose a [`Census`].
+///
+/// Reads are issued one at a time rather than concurrently: this is an operator's occasional question, not a
+/// data path, and a monitor that fans out over a whole federation at once is itself a load spike on a network
+/// it may be asking about *because* it is under load.
+pub async fn take_census(client: &Client, coords: &[Coord], epoch: Epoch) -> Census {
+    let mut census = Census::default();
+    for &coord in coords {
+        census.observe(&read_coherence(client, coord, epoch).await);
+    }
+    census
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod census_tests {
+    use super::*;
+    use fanos_telemetry::{CellId, CoherenceFrame};
+
+    /// A frame carrying the given alarm level.
+    ///
+    /// The alarm is a **published byte**, not something the reader derives from `Φ` and `P` — the publisher
+    /// computes it and the reader trusts it. A first version of this fixture set the measures and left the
+    /// verdict at zero, so every cell read as healthy and the network test could not fail. Worth knowing about
+    /// the frame: a consumer that recomputes the alarm from the measures would be second-guessing the cell
+    /// that made it.
+    fn frame(alarm: u8) -> CoherenceFrame {
+        CoherenceFrame {
+            cell_id: CellId([0u8; 16]),
+            epoch: 1,
+            syndrome: 0,
+            verdict: alarm << 2, // ALARM_SHIFT
+            phi: 1.0,
+            purity: 0.5,
+            reflection: 0.5,
+            mean_r: 0.5,
+            gap: 1.0,
+            forecast: -1,
+            heal_seq: 0,
+        }
+    }
+
+    #[test]
+    fn a_silent_cell_is_never_counted_as_a_healthy_one() {
+        // The property this type exists to protect. A monitor that folds silence into health reports its best
+        // news exactly when a partition is at its worst — the failure mode `read_coherence`'s three-valued
+        // result exists to prevent, and one `unwrap_or_default` here would undo it.
+        let mut c = Census::default();
+        c.observe(&Read::Found(frame(0)));
+        c.observe(&Read::Absent);
+        c.observe(&Read::Unknown);
+        assert_eq!(c.healthy, 1, "only the cell that said so is healthy");
+        assert_eq!(c.silent, 1, "an empty slot is a definite negative, kept apart");
+        assert_eq!(c.unreachable, 1, "a timeout is not evidence of anything, kept apart again");
+        assert_eq!(c.answered(), 1, "one cell reported");
+        assert_eq!(c.asked(), 3, "three were asked");
+    }
+
+    #[test]
+    fn the_network_verdict_is_taken_over_the_cells_that_answered() {
+        // Counting silence as health would hide a partition; counting it as sickness would let one unreachable
+        // cell speak for the network. Neither is a reading, so the fraction is over those that reported.
+        let mut c = Census::default();
+        for _ in 0..3 {
+            c.observe(&Read::Found(frame(2))); // the structure alarm — below viability
+        }
+        c.observe(&Read::Found(frame(0)));
+        assert!(c.network_wide(), "three of four answering cells alarmed is the network, not a cell");
+
+        let mut quiet = Census::default();
+        quiet.observe(&Read::Found(frame(0)));
+        for _ in 0..20 {
+            quiet.observe(&Read::Unknown);
+        }
+        assert!(
+            !quiet.network_wide(),
+            "twenty unreachable cells must not vote — one healthy answer is the only reading there is"
+        );
+    }
+
+    #[test]
+    fn an_empty_census_makes_no_claim() {
+        // Zero answers is not a healthy network and not a sick one.
+        assert!(!Census::default().network_wide());
+        assert_eq!(Census::default().asked(), 0);
+    }
+}
+

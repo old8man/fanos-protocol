@@ -295,8 +295,27 @@ frames (`telemetry_dir::publish_coherence`), and `read_coherence` has **no calle
 of this session and still true. The privacy shape is already right for this: exact locally, exact within a cell
 that must act on it, noised in aggregate, so an observer sees weather rather than a target.
 
-**Guarantee: Theorem** (a federation-level `Γ` whose measures compose from its cells', so the aggregate means
-the same thing one level up) **+ the reader that finally consumes the published frames.**
+**Guarantee: Theorem + Invariant — the reader is DONE; the operator verb remains.**
+
+And the theorem came out differently from the plan's guess, which is the finding. There is **no** federation-level
+`Γ` to compose: a cell's coherence matrix is over its own points, and the cross-cell entries exist in nobody's
+measurement. Synthesising a network-wide `Φ` from cells' `Φ`s would invent a quantity that then reads exactly
+like a measured one.
+
+The composition that *does* exist is already built and is a different mechanism entirely: a child cell is a
+**point** of its parent, so an unhealable child becomes a degraded point and the parent's own reflex runs
+unchanged (`ParentCell::observe` / `contains_escalation`). That is the **control** path, and it composes
+properly because the parent is measuring its own points.
+
+So the observability path reports a **census** — how many cells healthy, alarmed, silent, unreachable — with
+silence kept strictly apart from health. A monitor that folds a quiet cell into the healthy count reports its
+best news exactly when a partition is at its worst, which is the failure `read_coherence`'s three-valued result
+exists to prevent and which one `unwrap_or_default` would undo. The network verdict is taken over the cells that
+*answered*: counting silence as health hides a partition, counting it as sickness lets one unreachable cell
+speak for the network, and neither is a reading.
+
+`take_census` finally gives the published ε-private frames the reader they have never had. What remains is the
+operator verb that calls it.
 
 ## Cross-cutting
 
