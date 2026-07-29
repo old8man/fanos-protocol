@@ -18,6 +18,12 @@ use crate::frame::{AlarmLevel, CellId, CoherenceFrame, Regime};
 /// The Fano cell size `N = 7` (the DIAKRISIS observation unit, spec §6).
 pub const CELL_N: usize = 7;
 
+/// The largest supported plane, `PG(2,31)` — the ceiling on a recovered node count.
+///
+/// Present because the previous estimate clamped to [`CELL_N`], which silently capped every reading from a
+/// cell larger than Fano at seven.
+pub const MAX_CELL_N: usize = 993;
+
 /// Integration threshold: a cell is one bound subject iff `Φ ≥ 1` (spec §6, V11).
 pub const PHI_THRESHOLD: f64 = 1.0;
 /// Purity floor `P_crit = 2/N` — the viability boundary (T-104).
@@ -67,18 +73,20 @@ pub struct CoherenceSnapshot {
     pub heal_seq: u32,
     /// Readiness: `Φ ≥ 1 ∧ R ≥ 1/3` — bound *and* self-observing. The theorem-grounded liveness gate.
     pub ready: bool,
-    /// The cell's alive-node count, recovered from the equicorrelated identity `Φ = (N−1)·r²` (spec
-    /// §2.7) by inverting for `N`. **Exact** for the mandatory liveness-only fold
-    /// ([`observer::SelfObserver::observe_liveness`](crate::observer::SelfObserver::observe_liveness),
-    /// the production self-observation every node runs every window: it literally builds an
-    /// `N`-sized equicorrelated matrix from the live count, so the inversion recovers that exact `N`
-    /// for any `r ≠ 0`). Only **approximate** when the frame instead came from measured per-node
-    /// signals (`observe_cell`), whose empirical correlation need not be exactly equicorrelated. The
-    /// compact 3-bit syndrome deliberately carries no count (Minimal Self-Observation Overhead
-    /// theorem) — this is the best operator estimate recoverable without widening the wire frame. A
-    /// degenerate `r ≈ 0` (fully decorrelated — the resilient/diversified regime, not a fault) cannot
-    /// be inverted and falls back to the binary syndrome signal (`CELL_N` healthy, `CELL_N − 1`
-    /// faulted).
+    /// The cell's alive-node count, recovered **exactly** as `N = 1/(R·P)`.
+    ///
+    /// Since `P = Tr(Γ²) = frob/n²` and `R = 1/(N·P) = n/frob`, their product is `1/n` on *any* coherence
+    /// matrix. The compact 3-bit syndrome deliberately carries no count (Minimal Self-Observation Overhead
+    /// theorem), and this recovers it from the measures already on the wire — no stratum assumption and no
+    /// widening of the frame.
+    ///
+    /// It replaces an inversion of the equicorrelated identity `Φ = (N−1)·r²`, which was exact only for the
+    /// liveness-only fold, approximate for frames built from measured per-node signals, undefined at `r ≈ 0`
+    /// (a fully decorrelated cell — the *diversified* regime, not a fault), and clamped to [`CELL_N`], so a
+    /// `PG(2,31)` cell reported at most seven alive nodes out of 993.
+    ///
+    /// Falls back to the binary syndrome signal only when `P = 0`, which means an unreadable matrix rather
+    /// than any state a cell can be in.
     pub alive_nodes: u32,
 }
 
@@ -92,6 +100,10 @@ impl CoherenceSnapshot {
         let reflection = f64::from(frame.reflection);
         let mean_correlation = f64::from(frame.mean_r);
         let faulted = frame.is_faulted();
+        // Recovered exactly from the frame's own measures, and used for *both* the node count and the
+        // stability radius — `r_stab = √(P − 2/N)` was previously computed against a hard-coded seven, which
+        // made the operator's headroom reading wrong on every cell that is not `PG(2,2)`.
+        let alive = recover_cell_size(purity, reflection, faulted);
         Self {
             cell_id: frame.cell_id,
             epoch: frame.epoch,
@@ -100,7 +112,7 @@ impl CoherenceSnapshot {
             reflection,
             mean_correlation,
             spectral_gap: f64::from(frame.gap),
-            stability_radius: stability_radius(purity, CELL_N),
+            stability_radius: stability_radius(purity, alive.max(1) as usize),
             regime: frame.regime(),
             alarm: frame.alarm(),
             faulted,
@@ -108,7 +120,7 @@ impl CoherenceSnapshot {
             cascade_lead: frame.forecast,
             heal_seq: frame.heal_seq,
             ready: phi >= PHI_THRESHOLD && reflection >= REFLECTION_FLOOR,
-            alive_nodes: estimate_alive_nodes(phi, mean_correlation, faulted),
+            alive_nodes: alive,
         }
     }
 
@@ -168,19 +180,34 @@ fn push_num(s: &mut String, key: &str, v: f64) {
     }
 }
 
-/// Invert the equicorrelated identity `Φ = (N−1)·r²` (spec §2.7) for `N` — see
-/// [`CoherenceSnapshot::alive_nodes`] for when this is exact vs. approximate, and the fallback.
-fn estimate_alive_nodes(phi: f64, mean_correlation: f64, faulted: bool) -> u32 {
-    let r2 = mean_correlation * mean_correlation;
-    let inverted = phi / r2 + 1.0;
-    // A meaningfully nonzero r is required to divide; otherwise fall back to the binary syndrome
-    // signal rather than propagate a division blow-up.
-    if r2 > 1e-9 && inverted.is_finite() {
-        // No `f64::round()` in core-only no_std (it needs libm, and this crate's own `libm` feature
-        // only wires the backend through to fanos-diakrisis, not to bare f64 methods here). Clamp to
-        // non-negative first, then the classic round-to-nearest-via-truncation trick: adding 0.5
-        // before the truncating cast rounds correctly for any non-negative input.
-        let clamped = inverted.clamp(0.0, CELL_N as f64);
+/// Recover the cell's node count from the frame **exactly**: `N = 1/(R·P)`.
+///
+/// The measures are `P = Tr(Γ²) = frob/n²` and `R = 1/(N·P) = n/frob`, so their product is `1/n` on *any*
+/// coherence matrix. No stratum assumption, no degeneracy, no division by a quantity that legitimately
+/// approaches zero.
+///
+/// This replaces an inversion of the equicorrelated identity `Φ = (N−1)·r²`, which had three defects the exact
+/// form does not:
+///
+/// * it held only on the equicorrelated stratum, and was documented as "approximate" elsewhere;
+/// * it divided by `r²`, so a fully decorrelated cell — the *diversified* regime, not a fault — could not be
+///   inverted at all and fell back to a binary syndrome guess;
+/// * it clamped the result to `CELL_N`, so on `PG(2,31)` it reported at most 7 alive nodes out of 993.
+///
+/// `faulted` is retained only for the genuinely degenerate case `P = 0`, which means an empty or unreadable
+/// matrix rather than any cell state.
+fn recover_cell_size(purity: f64, reflection: f64, faulted: bool) -> u32 {
+    let product = reflection * purity;
+    let inverted = 1.0 / product;
+    if product > 1e-12 && inverted.is_finite() {
+        // No `f64::round()` in core-only no_std (it needs libm, and this crate's own `libm` feature only wires
+        // the backend through to fanos-diakrisis, not to bare f64 methods here). Clamp to non-negative first,
+        // then the classic round-to-nearest-via-truncation trick: adding 0.5 before the truncating cast rounds
+        // correctly for any non-negative input.
+        //
+        // The upper clamp is the largest supported plane, not `CELL_N` — a `PG(2,31)` cell has 993 points and
+        // clamping it to seven was the defect this replaced.
+        let clamped = inverted.clamp(0.0, MAX_CELL_N as f64);
         (clamped + 0.5) as u32
     } else if faulted {
         (CELL_N - 1) as u32
@@ -285,17 +312,42 @@ mod tests {
     }
 
     #[test]
-    fn alive_nodes_falls_back_to_the_syndrome_when_r_is_degenerate() {
-        // r ≈ 0 (fully decorrelated — the diversified/resilient regime, not itself a fault) makes
-        // Φ/r² un-invertible; the fallback reads the binary syndrome signal instead of blowing up.
+    fn a_fully_decorrelated_cell_is_still_counted_exactly() {
+        // `r = 0` is the diversified/resilient regime, not a fault — and it is precisely where the old
+        // inversion of `Φ = (N−1)r²` divided by zero and had to guess from the binary syndrome. `N = 1/(R·P)`
+        // has no such hole: a decorrelated cell has `Γ = I/n`, so `P = 1/n`, `R = 1`, and the product is `1/n`
+        // exactly as for any other correlation.
         let healthy = CoherenceSnapshot::from_frame(&frame(0.0));
-        assert_eq!(healthy.alive_nodes, CELL_N as u32, "no fault ⇒ CELL_N");
+        assert_eq!(healthy.alive_nodes, 7, "a decorrelated 7-cell is seven nodes, not a syndrome guess");
 
+        // And a localized fault does not change the count, because the count is measured rather than inferred
+        // from the fault bit. The old code returned `CELL_N − 1` here purely because it could not divide.
         let matrix = CoherenceMatrix::equicorrelated(7, 0.0);
         let faulted_frame = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0);
         let faulted = CoherenceSnapshot::from_frame(&faulted_frame);
         assert!(faulted.faulted);
-        assert_eq!(faulted.alive_nodes, CELL_N as u32 - 1, "one localized fault ⇒ CELL_N − 1");
+        assert_eq!(faulted.alive_nodes, 7, "the matrix still describes seven nodes");
+    }
+
+    #[test]
+    fn the_count_is_exact_for_every_supported_plane() {
+        // The defect this replaced clamped to `CELL_N`, so a `PG(2,31)` cell reported seven alive nodes out of
+        // 993 — and the stability radius `√(P − 2/N)` was computed against the wrong `N` with it.
+        for n in [7usize, 21, 57, 993] {
+            for r in [0.0, 0.05, 0.3] {
+                let matrix = CoherenceMatrix::equicorrelated(n, r);
+                let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0);
+                let snap = CoherenceSnapshot::from_frame(&f);
+                assert_eq!(snap.alive_nodes as usize, n, "N={n} r={r}: the count must be exact");
+                // …and the radius must follow the recovered N, not a constant.
+                let expected = stability_radius(snap.purity, n);
+                assert!(
+                    (snap.stability_radius - expected).abs() < 1e-9,
+                    "N={n} r={r}: r_stab must use the recovered N (got {}, want {expected})",
+                    snap.stability_radius
+                );
+            }
+        }
     }
 
     #[test]
@@ -307,7 +359,7 @@ mod tests {
             let matrix = CoherenceMatrix::equicorrelated(7, r);
             let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0);
             let snap = CoherenceSnapshot::from_frame(&f);
-            assert!(snap.alive_nodes <= CELL_N as u32, "r={r}");
+            assert!(snap.alive_nodes <= MAX_CELL_N as u32, "r={r}");
         }
     }
 }
