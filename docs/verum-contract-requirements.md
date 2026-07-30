@@ -295,7 +295,27 @@ single most useful reply is a working example file we can copy.
 whose success path is empty, a `--strict` flag that exits non-zero when nothing was verified would stop this from reading
 as a pass in CI — the same "a gate that only ever accepts" failure named throughout this document.
 
-### G11 — `verum verify` proves any return refinement that mentions a parameter *(soundness; one-line repro)*
+### G11 — ~~`verum verify` proves any return refinement that mentions a parameter~~ — **FIXED at source (`f63c544e9`), independently re-verified here 2026-07-30**
+
+**Verified on this side rather than taken on report**, because a fix report is a claim like any other, and both directions
+matter: the one-line repro now gives `0 proved, 1 failed` with **exit 105**, and the real derivation written as a return
+refinement — `fn tolerated(n: Plane) -> Int{== (n - 1) / 3} { (n - 1) / 3 }` — gives `✓ Proved` with **exit 0**. A gate
+that only rejects would have been the other failure mode. So the `ensures` workaround below is no longer needed and the
+more natural syntax is available.
+
+**The root cause is worth reading even though the bug is closed**, because it is the shape this whole document is about: the
+refined-return section of `VerifyCommand` was a **comment asserting that the postcondition-translation layer already
+synthesized an implicit `ensures`** — and no such synthesis existed. A function with only a return refinement therefore had
+no `requires` step and no `ensures` step to run, and fell through to `Proved` unconditionally. Constant predicates were
+caught by the typechecker's static path, which is exactly why the leak was confined to the parameter-dependent case that
+only SMT can decide. A documented mechanism that does not exist, found because the negative case was tried.
+
+The fix reportedly surfaced **24 previously vacuously-proved obligations** in Verum's own `core/math/{elementary,hyperbolic,
+integers,special}`, and reseeded the ratchet at 1524 proved / 104 failed. That is the same "a gate that only ever accepts"
+failure this document names in G1 and G10, found in the library rather than the tooling — and a truthful baseline is worth
+more than a green one.
+
+**Original finding, kept for the repro and the narrowing:**
 
 Measured 2026-07-30, `verum` 0.1.0. Minimal reproduction:
 
