@@ -27,6 +27,9 @@ use fanos_hermes::{Htlc, HtlcState, HtlcTerms, Resolution};
 use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, verify};
 
 use crate::bridge::{POOL_SINK, ShieldTx};
+use fanos_ergon::Limits;
+
+use crate::ergon_host::{LedgerHost, LedgerState, SPACE_BALANCE, SignedTerm};
 use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
 use crate::naming::{NameError, NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
@@ -59,6 +62,14 @@ pub const TAG_HTLC: u8 = 0x05;
 pub const TAG_STAKE: u8 = 0x06;
 /// Transaction-type tag: a validator slashing proof (equivocation evidence).
 pub const TAG_SLASH: u8 = 0x07;
+
+/// Transaction-type tag: an **ERGON term** — a composition over the primitive effects, submitted as a transaction.
+///
+/// The tag that makes user programmability reachable from the wire rather than from a test. Everything the term does is
+/// checked by the chain independently of whoever produced it: the envelope's signature authenticates the caller, the
+/// canonical codec refuses a non-canonical encoding, `well_typed` refuses an ill-typed term, `Term::footprint` derives the
+/// access list, and the evaluator confines execution to it.
+pub const TAG_ERGON: u8 = 0x08;
 
 /// Domain-separation label for the hybrid state root.
 const HYBRID_ROOT_LABEL: &str = "FANOS-dromos-v1/hybrid-root";
@@ -578,6 +589,7 @@ impl HybridLedger {
                 }
                 None => ExecOutcome::Malformed,
             },
+            Some((&TAG_ERGON, body)) => self.apply_term(body, verdict),
             Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
                 Some((shielded_tx, proof)) => {
                     let ok =
@@ -688,6 +700,53 @@ impl HybridLedger {
         out
     }
 
+    /// Execute an [`ERGON term`](crate::ergon_host) transaction.
+    ///
+    /// Every check the chain relies on happens here and none of them is taken on trust from the submitter: the signature
+    /// authenticates the caller and binds the exact term bytes, the nonce is checked exactly as a transfer's is,
+    /// `SignedTerm::checked` decodes canonically *and* type-checks in one step, and the evaluator confines execution to
+    /// the footprint it derives itself.
+    ///
+    /// A term reaching a value space this ledger does not map is **rejected**, not partially applied. The alternative —
+    /// executing what it can — would let a term's footprint describe less than it touched, which is the one thing the
+    /// scheduler cannot survive.
+    fn apply_term(&mut self, body: &[u8], verdict: Option<bool>) -> ExecOutcome {
+        let Some(envelope) = SignedTerm::from_bytes(body) else {
+            return ExecOutcome::Malformed;
+        };
+        if !verdict.unwrap_or_else(|| envelope.verify()) {
+            return ExecOutcome::Rejected;
+        }
+        let caller = envelope.caller();
+        let expected = self.tokens.nonce(&caller);
+        if envelope.nonce > expected {
+            // Premature, not invalid — the same reading a transfer gets under blind anti-MEV ordering.
+            return ExecOutcome::Deferred;
+        }
+        if envelope.nonce != expected {
+            return ExecOutcome::Rejected;
+        }
+        let Some(checked) = envelope.checked(&Limits::unbounded()) else {
+            return ExecOutcome::Malformed;
+        };
+        let fp = checked.term().footprint();
+        if fp.reads().iter().chain(fp.writes()).any(|k| k.space != SPACE_BALANCE) {
+            return ExecOutcome::Rejected;
+        }
+        let mut host = LedgerHost::new(caller);
+        let mut state = LedgerState::new(self);
+        match fanos_ergon::eval(&checked, &[], &mut host, &mut state) {
+            Ok(_) => {
+                self.tokens.bump_nonce(caller);
+                ExecOutcome::Applied
+            }
+            // The evaluator is atomic, so a fault has already rolled back everything the term wrote. The nonce is NOT
+            // bumped: a term that did nothing must not consume the caller's counter, or a rejected submission would
+            // invalidate the caller's next one.
+            Err(_) => ExecOutcome::Rejected,
+        }
+    }
+
     /// The state keys one transaction touches — a conservative superset (so the scheduler never lets two
     /// genuinely-dependent transactions share a wave). A transaction that does not decode touches nothing (its
     /// execution is a no-op). `pending` supplies deals opened earlier in the same block.
@@ -701,6 +760,20 @@ impl HybridLedger {
         match tx.payload.split_first() {
             Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
                 Some(st) => AccessList::new([], [st.transfer.from, st.transfer.to]),
+                None => AccessList::default(),
+            },
+            // The ERGON access list is **derived from the term**, not declared beside it — which is the property
+            // `docs/design-ergon.md` §1 refuses a VM to keep. A term whose footprint reaches a value space this ledger does
+            // not map is rejected at execution, so mapping only `SPACE_BALANCE` here is exact rather than optimistic: a
+            // rejected transaction writes nothing, and any access list is safe for one that writes nothing.
+            Some((&TAG_ERGON, body)) => match SignedTerm::from_bytes(body).and_then(|st| st.checked(&Limits::unbounded())) {
+                Some(checked) => {
+                    let fp = checked.term().footprint();
+                    AccessList::new(
+                        fp.reads().iter().filter(|k| k.space == SPACE_BALANCE).map(|k| k.slot),
+                        fp.writes().iter().filter(|k| k.space == SPACE_BALANCE).map(|k| k.slot),
+                    )
+                }
                 None => AccessList::default(),
             },
             Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
@@ -1071,6 +1144,104 @@ mod tests {
         let (signer, verifier) = HybridSigSecret::generate(&mut rng);
         let id = account_id(&verifier);
         (signer, verifier, id)
+    }
+
+    /// An ERGON term submitted as a transaction, signed by `tag`'s account.
+    fn ergon_tx(term: &fanos_ergon::Term, nonce: u64, signer: &HybridSigSecret, key: &HybridVerifier) -> Transaction {
+        let envelope = SignedTerm::sign(term.encode(), nonce, signer, key.clone());
+        let mut payload = vec![TAG_ERGON];
+        payload.extend_from_slice(&envelope.to_bytes());
+        Transaction::new(payload)
+    }
+
+    #[test]
+    fn a_signed_term_executes_as_a_transaction_and_is_replay_protected() {
+        // The wiring that makes ERGON reachable from the wire rather than from a test — and the point of the whole
+        // exercise: a composition the eight tags cannot express, submitted by a user, executed by the chain.
+        let (signer, key, alice) = account(1);
+        let (_, _, bob) = account(2);
+        let (_, _, carol) = account(3);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Atomic pay-two-parties, which no single tag expresses.
+        let term = fanos_ergon::Term::Seq(vec![
+            crate::ergon_host::transfer_term(alice, bob, 300),
+            crate::ergon_host::transfer_term(alice, carol, 200),
+        ]);
+        let tx = ergon_tx(&term, 0, &signer, &key);
+        assert_eq!(ledger.apply(&tx), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&alice), 500);
+        assert_eq!(ledger.tokens().balance(&bob), 300);
+        assert_eq!(ledger.tokens().balance(&carol), 200);
+
+        // Replayed verbatim: the nonce has moved on, so it is refused.
+        assert_eq!(ledger.apply(&tx), ExecOutcome::Rejected, "a replay is refused");
+        assert_eq!(ledger.tokens().balance(&bob), 300, "and nothing moved twice");
+    }
+
+    #[test]
+    fn a_tampered_term_is_refused_because_the_signature_covers_its_bytes() {
+        // The envelope binds the exact bytes. Substituting a term the caller never signed — the obvious attack on a
+        // "submit a program" tag — must fail on the signature, not on the term's own rules.
+        let (signer, key, alice) = account(1);
+        let (_, _, bob) = account(2);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        let honest = crate::ergon_host::transfer_term(alice, bob, 1);
+        let greedy = crate::ergon_host::transfer_term(alice, bob, 1000);
+        let envelope = SignedTerm::sign(honest.encode(), 0, &signer, key.clone());
+        let forged = SignedTerm::from_bytes(&{
+            let mut b = envelope.to_bytes();
+            b.truncate(b.len() - honest.encode().len());
+            b.extend_from_slice(&greedy.encode());
+            b
+        })
+        .expect("the forged envelope still decodes");
+        assert!(!forged.verify(), "the signature does not cover the substituted term");
+
+        let mut payload = vec![TAG_ERGON];
+        payload.extend_from_slice(&forged.to_bytes());
+        assert_eq!(ledger.apply(&Transaction::new(payload)), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&bob), 0, "nothing moved");
+    }
+
+    #[test]
+    fn the_ergon_access_list_is_the_terms_own_derived_footprint() {
+        // What DROMOS schedules on. Derived from the term by the chain, never read from a declaration — so a term cannot
+        // understate what it touches, which is the property the scheduler cannot survive losing.
+        let (signer, key, alice) = account(1);
+        let (_, _, bob) = account(2);
+        let term = crate::ergon_host::transfer_term(alice, bob, 5);
+        let tx = ergon_tx(&term, 0, &signer, &key);
+        let empty = BTreeMap::new();
+        let access = HybridLedger::new(TokenLedger::new()).access_of(&tx, &empty, &empty);
+        assert_eq!(access.writes, [alice, bob].into_iter().collect(), "exactly the two balances");
+        assert!(access.reads.is_empty());
+    }
+
+    #[test]
+    fn a_term_reaching_an_unmapped_value_space_is_rejected_rather_than_partly_applied() {
+        // Where the ledger cannot be precise it is conservative and loud. `AccessList` keys are 32 bytes with no space, so
+        // a term touching a space this ledger does not map could have a footprint that describes less than it touches —
+        // and executing what it can would be exactly the mis-schedule the footprint exists to prevent.
+        let (signer, key, alice) = account(1);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        let unmapped = fanos_ergon::Key::at(crate::ergon_host::LEDGER_POINT, 9, alice);
+        let term = fanos_ergon::Term::Do(
+            fanos_ergon::Effect::internal(
+                crate::ergon_host::EFFECT_TRANSFER,
+                fanos_ergon::Footprint::new(vec![], vec![unmapped]),
+            ),
+        );
+        let tx = ergon_tx(&term, 0, &signer, &key);
+        assert_eq!(ledger.apply(&tx), ExecOutcome::Rejected);
+        assert_eq!(ledger.tokens().balance(&alice), 1000, "untouched");
     }
 
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {

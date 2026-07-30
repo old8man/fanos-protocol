@@ -30,6 +30,9 @@
 //! native `apply_with_verdict` agree on **balances**, and the nonce is not the effect's business. See the tests.
 
 use fanos_ergon::value::{Fault, Value};
+use fanos_ergon::{Checked, Limits};
+use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
+use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_ergon::{Effect, Expr, Footprint, Host, Key, PointId, Reader, State, Term};
 
 use crate::hybrid::TAG_TRANSPARENT;
@@ -71,6 +74,108 @@ pub fn transfer_term(from: [u8; 32], to: [u8; 32], amount: u64) -> Term {
         Expr::bytes32(to),
         Expr::int(u128::from(amount)),
     ]))
+}
+
+/// The domain label the envelope's signature covers.
+const TERM_LABEL: &str = "FANOS/ergon/term/v1";
+
+/// A **term submitted as a transaction** — the envelope that makes everything above reachable from the wire.
+///
+/// This is where the platform's two halves meet, and the division is the one `docs/design-ergon.md` §11 step 4's
+/// correction insists on: the envelope authenticates, the term describes, and the effect's own rule authorizes. The
+/// signature covers the term bytes **and** the nonce, so a term is bound to one submission by one account — signing the
+/// term alone would leave it replayable by anyone who saw it, and signing the nonce alone would let the bytes be swapped.
+#[derive(Clone)]
+pub struct SignedTerm {
+    /// The canonically encoded term (`Term::encode`).
+    pub term: Vec<u8>,
+    /// The caller's replay counter, checked against the ledger exactly as a transfer's is.
+    pub nonce: u64,
+    /// The caller's public key; its `account_id` is the identity effects are authorized against.
+    pub caller_key: HybridVerifier,
+    /// The signature over `TERM_LABEL ‖ nonce ‖ term`.
+    sig: Vec<u8>,
+}
+
+impl core::fmt::Debug for SignedTerm {
+    /// Hand-written because [`HybridVerifier`] is not `Debug`, and reporting the caller's *account* is more useful than
+    /// its key bytes anyway — an account id is what every other diagnostic in the ledger speaks in.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Non-exhaustive on purpose: the caller's *account* is what every other diagnostic in the ledger speaks in, and
+        // the key bytes and the signature say nothing a reader can act on.
+        f.debug_struct("SignedTerm")
+            .field("caller", &hex4(&self.caller()))
+            .field("nonce", &self.nonce)
+            .field("term_bytes", &self.term.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The first four bytes of an identifier, for diagnostics — the form the consensus probes already use.
+fn hex4(id: &[u8; 32]) -> String {
+    use core::fmt::Write as _;
+    id.iter().take(4).fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+impl SignedTerm {
+    fn signable(nonce: u64, term: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TERM_LABEL.len() + 8 + term.len());
+        out.extend_from_slice(TERM_LABEL.as_bytes());
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out.extend_from_slice(term);
+        out
+    }
+
+    /// Sign an encoded term for submission.
+    #[must_use]
+    pub fn sign(term: Vec<u8>, nonce: u64, signer: &HybridSigSecret, caller_key: HybridVerifier) -> Self {
+        let sig = signer.sign(&Self::signable(nonce, &term)).to_bytes();
+        Self { term, nonce, caller_key, sig }
+    }
+
+    /// The account the term acts for.
+    #[must_use]
+    pub fn caller(&self) -> [u8; 32] { crate::token::account_id(&self.caller_key) }
+
+    /// Whether the signature verifies over the nonce and the exact term bytes.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        let Some(sig) = HybridSignature::from_bytes(&self.sig) else {
+            return false;
+        };
+        self.caller_key.verify(&Self::signable(self.nonce, &self.term), &sig)
+    }
+
+    /// Canonical bytes: `nonce(8) ‖ key ‖ sig ‖ term`, the term last so it runs to the end and needs no length prefix.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + HYBRID_VK_LEN + HYBRID_SIG_LEN + self.term.len());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.caller_key.encode());
+        out.extend_from_slice(&self.sig);
+        out.extend_from_slice(&self.term);
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes).
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let nonce = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+        let caller_key = HybridVerifier::decode(bytes.get(8..8 + HYBRID_VK_LEN)?)?;
+        let sig = bytes.get(8 + HYBRID_VK_LEN..8 + HYBRID_VK_LEN + HYBRID_SIG_LEN)?.to_vec();
+        let term = bytes.get(8 + HYBRID_VK_LEN + HYBRID_SIG_LEN..)?.to_vec();
+        Some(Self { term, nonce, caller_key, sig })
+    }
+
+    /// The term this envelope carries, decoded **and** type-checked, or `None` if it is neither.
+    ///
+    /// One function, so that decoding cannot be followed by "and then someone type-checks it" — the same reason
+    /// `fanos_ergon::Checked::decode` exists.
+    #[must_use]
+    pub fn checked(&self, limits: &Limits) -> Option<Checked> { Checked::decode(&self.term, limits).ok() }
 }
 
 /// A [`State`] view of the **whole** hybrid ledger, routed by [`Key::space`].

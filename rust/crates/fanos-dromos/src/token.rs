@@ -281,6 +281,13 @@ impl TokenLedger {
         Ok(())
     }
 
+    /// Advance `account`'s replay counter — for the ERGON envelope, which does its own nonce check.
+    ///
+    /// Crate-private for the same reason as `set_balance`.
+    pub(crate) fn bump_nonce(&mut self, account: [u8; 32]) {
+        *self.nonces.entry(account).or_insert(0) += 1;
+    }
+
     /// Set `account`'s balance outright — for the ERGON state adapter only (`crate::ergon_host`).
     ///
     /// Crate-private, deliberately. The public surface is `apply`/`credit`, which preserve the ledger's invariants; a
