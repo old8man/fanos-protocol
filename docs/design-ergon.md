@@ -534,6 +534,25 @@ node's dependency graph and reproducibility intact, and it is the same shape as 
    removes the question instead of documenting it.
 2. The eight existing rules re-expressed as primitive effects, behind the same wire tags so no capability is lost.
 3. `HybridLedger::apply` replaced by the term interpreter; the declared `AccessList` deleted and `fp` wired into DROMOS.
+
+   **Partly done, and one part deliberately NOT done — 2026-07-30.** `TAG_ERGON` executes terms on the live path and its
+   access list is `Term::footprint`, derived rather than declared. `AccessList` is **not** widened to carry `Key::space`,
+   and the deferral is a decision rather than a backlog item:
+
+   - Widening buys nothing today. Every existing arm would sit at space 0, ERGON's balances are space 0, so the conflict
+     behaviour would be byte-identical to what it is now.
+   - Widening *costs* a soundness hazard. The invariant that keeps two execution paths from forking the state is that
+     **every path touching one entity names it with the same key**. The moment one arm is qualified (`SPACE_NAME` for the
+     name registry, say) and the other path is not, two transactions writing the same name read as disjoint, share a wave,
+     and both apply. Today the invariant holds trivially because nothing is qualified; a half-finished widening is how it
+     stops holding.
+   - So the invariant is pinned by a test instead —
+     `the_native_and_term_paths_name_the_same_state_with_the_same_keys` compares the access lists a transfer produces
+     through `TAG_TRANSPARENT` and through a `TAG_ERGON` term, and asserts they conflict. Falsified by making the ERGON
+     arm hash its slots: the test fails where a fork would otherwise appear under load.
+
+   The widening happens **with** the second value space, in one change that qualifies both paths together — not before,
+   and not one arm at a time.
 4. `Gate`/`Alt` predicates over ledger state. ~~HERMES's HTLC migrated to `Gate` and `TAG_HTLC` retired.~~
    **CORRECTED 2026-07-30 by attempting it — a `Gate` cannot carry authorization.**
 

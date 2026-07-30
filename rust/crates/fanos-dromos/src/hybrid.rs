@@ -1250,6 +1250,44 @@ mod tests {
         assert_eq!(ledger.tokens().balance(&alice), 1000, "untouched");
     }
 
+    #[test]
+    fn the_native_and_term_paths_name_the_same_state_with_the_same_keys() {
+        // The invariant that keeps two execution paths from forking the state, pinned before it can be broken rather than
+        // after. A transfer can now arrive two ways — as `TAG_TRANSPARENT` or inside a `TAG_ERGON` term — and the
+        // scheduler decides they conflict by comparing access lists. If the two paths named the same accounts differently
+        // they would read as disjoint, run in the same wave, and both debit the same balance.
+        //
+        // It holds trivially today because `AccessList` keys are bare 32-byte ids and both paths use account ids. It stops
+        // holding the moment either path qualifies its keys and the other does not, which is exactly what widening
+        // `AccessList` to carry `Key::space` would invite — see the note in `docs/design-ergon.md` §11 step 3. This test is
+        // what fails then, instead of a fork appearing under load.
+        let (signer, key, alice) = account(1);
+        let (_, _, bob) = account(2);
+        let empty = BTreeMap::new();
+        let ledger = HybridLedger::new(TokenLedger::new());
+
+        let native = SignedTransfer::sign(
+            Transfer { from: alice, to: bob, amount: 7, nonce: 0 },
+            &signer,
+            key.clone(),
+        );
+        let native_access =
+            ledger.access_of(&Transaction::new(HybridLedger::transparent_payload(&native)), &empty, &empty);
+
+        let term_access = ledger.access_of(
+            &ergon_tx(&crate::ergon_host::transfer_term(alice, bob, 7), 0, &signer, &key),
+            &empty,
+            &empty,
+        );
+
+        assert_eq!(
+            native_access.writes, term_access.writes,
+            "both paths name the same two balances, so the scheduler sees the conflict"
+        );
+        assert_eq!(native_access.reads, term_access.reads);
+        assert!(native_access.conflicts_with(&term_access), "and they are therefore never scheduled together");
+    }
+
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
         Note::new(value, derive_owner_pk(nsk), auth_of(nsk), Randomness::from_seed(tag), [tag.len() as u8; 32])
     }
