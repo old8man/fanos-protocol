@@ -520,9 +520,10 @@ evicts in **insertion order**. Under SSLE all-propose a height costs one skeleto
 seven-validator cell overruns the map in nine rounds — and the first entry discarded is the earliest, which is round 0's
 min-ticket winner: the block the cell converged on. Later proposals that will never be chosen evict the one that was.
 
-The consequence is a loop, not a delay: once evicted the block leaves `outstanding()`, so no shard is ever requested for
-it again; the driver sees the validator still waiting and re-fetches the skeleton; the next round's proposals evict it
-again. Measured live as seven of seven validators at round 13 reporting `await` for a body none of them held.
+The consequence is a loop, not a delay: once evicted the block leaves the sampler's request schedule (`Sampler::due`,
+then named `outstanding`), so no shard is ever requested for it again; the driver sees the validator still waiting and
+re-fetches the skeleton; the next round's proposals evict it again. Measured live as seven of seven validators at round
+13 reporting `await` for a body none of them held.
 
 Fixed by an invariant rather than a bigger number: `Sampler::pin` protects exactly the one skeleton the engine has
 already committed to needing (`awaited_body`), and the driver pins it every tick. The flood defence the cap exists for is
