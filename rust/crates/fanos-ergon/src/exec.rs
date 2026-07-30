@@ -48,8 +48,8 @@ pub trait Host {
     /// Apply effect `kind` with evaluated `args`, through a state view confined to the effect's footprint.
     fn effect(&mut self, kind: u16, args: &[Value], state: &mut dyn State) -> Result<(), Fault>;
 
-    /// Answer host-interpreted predicate `kind` over `reads`.
-    fn predicate(&self, kind: u16, reads: &[Key], state: &dyn Reader) -> Result<bool, Fault>;
+    /// Answer host-interpreted predicate `kind` over `reads`, with `args` already evaluated.
+    fn predicate(&self, kind: u16, reads: &[Key], args: &[Value], state: &dyn Reader) -> Result<bool, Fault>;
 
     /// Verify a claim's proof. `Prove` is inert until PQ-ZK recursion lands (`docs/design-ergon.md` §5c), so the honest
     /// default is to refuse rather than to accept.
@@ -285,7 +285,13 @@ fn eval_predicate<S: State + ?Sized, H: Host>(
 ) -> Result<bool, Fault> {
     receipt.predicates += 1;
     match pred {
-        Predicate::Host { kind, reads } => host.predicate(*kind, reads, state),
+        Predicate::Host { kind, reads, args: exprs } => {
+            let mut evaluated = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                evaluated.push(e.eval(state, args)?);
+            }
+            host.predicate(*kind, reads, &evaluated, state)
+        }
         Predicate::Compare { op, lhs, rhs } => {
             let (a, b) = (lhs.eval(state, args)?, rhs.eval(state, args)?);
             op.apply(a, b)
@@ -359,8 +365,14 @@ mod tests {
             }
         }
 
-        fn predicate(&self, kind: u16, _reads: &[Key], _state: &dyn Reader) -> Result<bool, Fault> {
-            Ok(kind == 1)
+        /// Kind 1: unconditionally true. Kind 8: true iff the first argument is 42 — the argument-relative question a
+        /// host predicate could not ask before, and the shape an HTLC's "does this preimage match" takes.
+        fn predicate(&self, kind: u16, _reads: &[Key], args: &[Value], _state: &dyn Reader) -> Result<bool, Fault> {
+            match kind {
+                1 => Ok(true),
+                8 => Ok(args.first() == Some(&Value::Int(42))),
+                _ => Ok(false),
+            }
         }
     }
 
@@ -495,6 +507,38 @@ mod tests {
 
         let mem = Mem::default();
         assert!(matches!(deep.eval(&mem, &[]), Err(Fault::ExprTooDeep { .. })), "the expression bound holds on its own");
+    }
+
+    #[test]
+    fn a_host_predicate_sees_its_arguments_and_not_only_state() {
+        // `Predicate::Host` took no arguments until the first real predicate was written against it. An HTLC claim asks
+        // "does *this revealed preimage* hash to the stored hashlock" — a question about a value the caller supplied — and
+        // without arguments a host predicate can only ask about state, which is half the useful questions.
+        let gate = |arg: u128| {
+            Term::Gate(
+                Predicate::host_with(8, vec![], vec![Expr::int(arg)]),
+                alloc::boxed::Box::new(write_to(k(10), Expr::int(1))),
+            )
+        };
+        let mut yes = Mem::default();
+        eval(&ck(gate(42)), &[], &mut rules(), &mut yes).expect("evaluates");
+        assert_eq!(yes.get(&k(10)), Some(Value::Int(1)), "the argument reached the predicate and it admitted");
+
+        let mut no = Mem::default();
+        let r = eval(&ck(gate(41)), &[], &mut rules(), &mut no).expect("evaluates");
+        assert_eq!(r.effects, 0, "a different argument refuses — so the predicate is reading it, not ignoring it");
+        assert_eq!(no.get(&k(10)), None);
+    }
+
+    #[test]
+    fn a_predicates_argument_reads_join_the_footprint() {
+        // Same derivation as an effect's: a predicate whose argument loads a key makes that key part of the term's read
+        // set, so DROMOS sees it without anyone declaring it.
+        let t = Term::Gate(
+            Predicate::host_with(8, vec![], vec![Expr::Load(k(5))]),
+            alloc::boxed::Box::new(write_to(k(10), Expr::int(1))),
+        );
+        assert!(t.footprint().reads().contains(&k(5)), "the predicate's argument load is a read: {:?}", t.footprint());
     }
 
     #[test]

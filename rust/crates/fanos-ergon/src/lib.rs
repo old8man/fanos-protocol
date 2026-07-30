@@ -350,6 +350,13 @@ pub enum Predicate {
         kind: u16,
         /// The keys the predicate reads. A predicate never writes — that is what makes it a gate.
         reads: Vec<Key>,
+        /// The arguments, as total key-static expressions — symmetric with [`Effect::args`].
+        ///
+        /// Added when the first real host predicate was written and could not be expressed without them. An HTLC claim
+        /// asks "does *this revealed preimage* hash to the stored hashlock", and a signature check asks "is *this
+        /// signature* valid for *this message*" — both are questions about a value the caller supplied, not only about
+        /// state. A predicate that cannot take an argument can ask half the questions worth gating on.
+        args: Vec<Expr>,
     },
     /// A comparison between two total expressions — what makes a `Gate` a real condition rather than an opaque tag.
     Compare {
@@ -375,7 +382,15 @@ impl Predicate {
     pub fn host(kind: u16, mut reads: Vec<Key>) -> Self {
         reads.sort_unstable();
         reads.dedup();
-        Self::Host { kind, reads }
+        Self::Host { kind, reads, args: Vec::new() }
+    }
+
+    /// A host-interpreted predicate over a read set **and** arguments.
+    #[must_use]
+    pub fn host_with(kind: u16, mut reads: Vec<Key>, args: Vec<Expr>) -> Self {
+        reads.sort_unstable();
+        reads.dedup();
+        Self::Host { kind, reads, args }
     }
 
     /// This predicate's footprint: everything it reads, and no writes.
@@ -391,7 +406,12 @@ impl Predicate {
 
     fn collect_reads(&self, out: &mut Vec<Key>) {
         match self {
-            Self::Host { reads, .. } => out.extend_from_slice(reads),
+            Self::Host { reads, args, .. } => {
+                out.extend_from_slice(reads);
+                for a in args {
+                    a.collect_reads(out);
+                }
+            }
             Self::Compare { lhs, rhs, .. } => {
                 lhs.collect_reads(out);
                 rhs.collect_reads(out);
@@ -410,7 +430,7 @@ impl Predicate {
     #[must_use]
     pub fn expr_depth(&self) -> u32 {
         match self {
-            Self::Host { .. } => 0,
+            Self::Host { args, .. } => args.iter().map(Expr::depth).max().unwrap_or(0),
             Self::Compare { lhs, rhs, .. } => lhs.depth().max(rhs.depth()),
             Self::And(parts) | Self::Or(parts) => parts.iter().map(Self::expr_depth).max().unwrap_or(0),
             Self::Not(inner) => inner.expr_depth(),

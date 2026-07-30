@@ -140,7 +140,7 @@ impl Host for LedgerHost {
         }
     }
 
-    fn predicate(&self, kind: u16, _reads: &[Key], _state: &dyn Reader) -> Result<bool, Fault> {
+    fn predicate(&self, kind: u16, _reads: &[Key], _args: &[Value], _state: &dyn Reader) -> Result<bool, Fault> {
         // No host predicates yet: everything the transfer needs to ask is expressible as a `Predicate::Compare` over the
         // balance keys, which is the point of the expression layer. A signature check is the first real host predicate,
         // and it belongs to the envelope rather than a `Gate` — see the module note on authorization.

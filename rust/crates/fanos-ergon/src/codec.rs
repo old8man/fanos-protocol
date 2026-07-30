@@ -259,10 +259,11 @@ fn expr(r: &mut Reader<'_>, depth: u32) -> Option<Expr> {
 
 fn put_predicate(out: &mut Vec<u8>, p: &Predicate) {
     match p {
-        Predicate::Host { kind, reads } => {
+        Predicate::Host { kind, reads, args } => {
             out.push(0);
             put_u16(out, *kind);
             put_seq(out, reads, put_key);
+            put_seq(out, args, put_expr);
         }
         Predicate::Compare { op, lhs, rhs } => {
             out.push(1);
@@ -298,7 +299,8 @@ fn predicate(r: &mut Reader<'_>, depth: u32) -> Option<Predicate> {
             if !is_sorted_unique(&reads) {
                 return None; // `Predicate::host` sorts; see `footprint`
             }
-            Predicate::Host { kind, reads }
+            let args = r.seq(|r| expr(r, 1))?;
+            Predicate::Host { kind, reads, args }
         }
         1 => {
             let op = cmp(r)?;
