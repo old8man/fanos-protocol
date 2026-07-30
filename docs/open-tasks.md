@@ -365,13 +365,27 @@ directory) and reports what the node itself sees: coordinate, peers, verified cl
 addressable from the network at all, which is the property that matters for a process whose job is accepting
 traffic from strangers.
 
+**But the read half closes for `fanos node` only, and not for `fanos validator`** (found 2026-07-30 while looking for
+somewhere to surface the consensus probe). `admin::serve` is called exactly once, in `cmd_node`; `cmd_validator` builds
+its own `tokio::select!` over ctrl-c, taxis events and node notifications and never binds a socket or drains an
+`admin_rx`. So on the one process that actually runs consensus there is **no control channel at all** — not `ping`,
+`health`, `roles`, `census` or `shutdown` either — and `fanos status` against a validator always takes the
+"fall back to the config" branch the startup message describes as the failure case.
+
 Remaining, in order:
-1. **`OverlayCoherenceSource`** — the observatory still watches a *simulated* cell. `read_coherence` has no caller,
+1. **The validator's control socket** — bind and drain it in `cmd_validator` exactly as `cmd_node` does, including
+   the non-fatal stance (a node that cannot open a control channel is still a working node) and the unlink on exit.
+2. **A `consensus` verb** — `TaxisHandle::probe()` has two callers and both are in `dromos_quic.rs`, so every field of
+   `ConsensusProbe` is reachable only from a test binary. Each of those fields exists *because* a live cell was stuck
+   and its state could not be read, which makes the operator of a stuck validator precisely the person who cannot get
+   them. `probe()` is async ⇒ answer off the loop like `census` does; render with the existing `Display` rather than
+   inventing a second format.
+3. **`OverlayCoherenceSource`** — the observatory still watches a *simulated* cell. `read_coherence` has no caller,
    so nodes publish ε-private coherence frames that nothing consumes. The same `SnapshotSource` trait the live
    source implements is the seam; this is the last thing between the panel and a real deployment.
-2. **`fanos node --metrics-listen`** — `render_openmetrics` exists and nothing serves it, so a deployment cannot be
-   scraped. The control socket could carry it as a fifth verb, which needs no new listener.
-3. **Coherence in `status`** — Φ/P/R belongs beside the peer count, and needs (1).
+4. **`fanos node --metrics-listen`** — `render_openmetrics` exists and nothing serves it, so a deployment cannot be
+   scraped. The control socket could carry it as a further verb, which needs no new listener.
+5. **Coherence in `status`** — Φ/P/R belongs beside the peer count, and needs (3).
 
 ### [A] ROOT CAUSE: TAXIS had no round synchronization — FIXED
 The defect the whole live-stall investigation was circling. `self.round` advanced by exactly one thing — this
