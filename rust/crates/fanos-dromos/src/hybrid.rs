@@ -202,6 +202,14 @@ impl HybridLedger {
         true
     }
 
+    /// Mutable access to the transparent sub-ledger, for the ERGON state adapter (`crate::ergon_host`).
+    ///
+    /// Crate-private for the same reason `TokenLedger::set_balance` is: the public surface is the one that preserves
+    /// invariants. The adapter may hold this because ERGON confines every write to a footprint the term derives, so the
+    /// invariant is split rather than dropped — the host rule checks the ledger's conditions, the evaluator checks the key
+    /// was permitted.
+    pub(crate) fn tokens_mut(&mut self) -> &mut TokenLedger { &mut self.tokens }
+
     /// The authenticated transparent token ledger (read-only).
     #[must_use]
     pub fn tokens(&self) -> &TokenLedger {

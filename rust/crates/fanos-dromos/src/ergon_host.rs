@@ -73,7 +73,45 @@ pub fn transfer_term(from: [u8; 32], to: [u8; 32], amount: u64) -> Term {
     ]))
 }
 
-/// A [`State`] view of a token ledger: account balances, addressed by key.
+/// A [`State`] view of the **whole** hybrid ledger, routed by [`Key::space`].
+///
+/// The reason this exists alongside [`TokenState`] is the property a chain actually needs: consensus is on `state_root`,
+/// which folds all six sub-ledgers. Showing that an ERGON-executed transfer produces the same *balances* as the native
+/// rule is necessary and not sufficient — it is the identical **root** that would let `HybridLedger::apply` be replaced by
+/// the term interpreter (`docs/design-ergon.md` §11 step 3) without a consensus change. So the equivalence is asserted
+/// where consensus reads it.
+pub struct LedgerState<'a> {
+    ledger: &'a mut crate::hybrid::HybridLedger,
+}
+
+impl<'a> LedgerState<'a> {
+    /// View `ledger` as ERGON state.
+    pub fn new(ledger: &'a mut crate::hybrid::HybridLedger) -> Self { Self { ledger } }
+}
+
+impl Reader for LedgerState<'_> {
+    fn get(&self, key: &Key) -> Option<Value> {
+        match key.space {
+            SPACE_BALANCE => Some(Value::Int(u128::from(self.ledger.tokens().balance(&key.slot)))),
+            // Every further space is a sub-ledger yet to be mapped, and `None` is the honest answer: `Expr::Load` on it
+            // becomes `Fault::Missing`, which refuses the term rather than inventing a value for state this adapter
+            // cannot see. Adding a space is adding an arm here.
+            _ => None,
+        }
+    }
+}
+
+impl State for LedgerState<'_> {
+    fn set(&mut self, key: Key, value: Value) {
+        if key.space == SPACE_BALANCE
+            && let Ok(n) = value.as_u64()
+        {
+            self.ledger.tokens_mut().set_balance(key.slot, n);
+        }
+    }
+}
+
+/// A [`State`] view of a token ledger alone: account balances, addressed by key.
 pub struct TokenState<'a> {
     ledger: &'a mut TokenLedger,
 }
@@ -201,6 +239,50 @@ mod tests {
         native.credit(BOB, 250);
         assert_eq!(viaergon.balance(&ALICE), native.balance(&ALICE), "same debit");
         assert_eq!(viaergon.balance(&BOB), native.balance(&BOB), "same credit");
+    }
+
+    #[test]
+    fn an_ergon_transfer_and_the_native_rule_reach_the_identical_state_root() {
+        // The property that would let step 3 happen — replacing `HybridLedger::apply` with the term interpreter — without
+        // a consensus change. Consensus is on `state_root`, which folds all six sub-ledgers, so equal balances are
+        // necessary and not sufficient: a term path that touched the shielded pool or the name registry as a side effect
+        // would pass a balance comparison and fork the root.
+        use fanos_taxis::state::StateMachine;
+
+        let mut viaergon = crate::hybrid::HybridLedger::new(funded());
+        {
+            let checked = Checked::new(transfer_term(ALICE, BOB, 250), &Limits::unbounded()).expect("well typed");
+            let mut host = LedgerHost::new(ALICE);
+            let mut state = LedgerState::new(&mut viaergon);
+            eval(&checked, &[], &mut host, &mut state).expect("the transfer applies");
+        }
+
+        let mut native_tokens = funded();
+        native_tokens.set_balance(ALICE, 750);
+        native_tokens.credit(BOB, 250);
+        let native = crate::hybrid::HybridLedger::new(native_tokens);
+
+        assert_eq!(
+            viaergon.state_root(),
+            native.state_root(),
+            "the term path and the native path agree where consensus reads them"
+        );
+    }
+
+    #[test]
+    fn a_space_this_adapter_does_not_map_reads_as_missing_rather_than_zero() {
+        // The honest answer for an unmapped sub-ledger. Returning zero would let a term compute over state the adapter
+        // cannot see and reach a confident wrong answer; `Fault::Missing` refuses the term instead.
+        let mut ledger = crate::hybrid::HybridLedger::new(funded());
+        let unmapped = Key::at(LEDGER_POINT, 7, ALICE);
+        let term = Term::Do(
+            Effect::internal(EFFECT_TRANSFER, Footprint::new(vec![unmapped], vec![]))
+                .with_args(vec![Expr::Load(unmapped)]),
+        );
+        let checked = Checked::new(term, &Limits::unbounded()).expect("well typed");
+        let mut host = LedgerHost::new(ALICE);
+        let mut state = LedgerState::new(&mut ledger);
+        assert_eq!(eval(&checked, &[], &mut host, &mut state).expect_err("unmapped space"), Fault::Missing(unmapped));
     }
 
     #[test]
