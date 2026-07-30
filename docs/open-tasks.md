@@ -148,6 +148,36 @@ Two consequences, and the second is why the title changed:
    taking four minutes is bad regardless of any test, and 35 s → 300 s is an **8× spread** with no adversary, no
    partition and no crash. That spread is the defect; the red test is a messenger.
 
+**The 8× is the round-timeout ladder, quantitatively — 2026-07-30.** `ROUND_TIMEOUT_BASE` is 1.5 s doubling to a
+`ROUND_TIMEOUT_MAX` of 24 s, so the cumulative wait for `r` rounds at one height is 1.5, 4.5, 10.5, 22.5, 46.5, then
++24 s each. The observed durations land on that ladder:
+
+| observed | verdict | nearest cumulative | off by |
+|---|---|---|---|
+| 89.5 s | pass | r7 = 94.5 s | 6 % |
+| 168.6 s | pass | r10 = 166.5 s | **1 %** |
+| 228.2 s | pass | r13 = 238.5 s | 4 % |
+| 245.4 s · 247.2 s | fail | r13 = 238.5 s | 3–4 % |
+| 263.0 s | fail | r14 = 262.5 s | **0 %** |
+
+The two 35 s runs sit below r5 and are better read as a couple of rounds spread over the scenario's two heights. Every
+slow run matches within a few percent, and the failing traces' round numbers agree independently — `h1r13`, `h2r12`,
+`h1r8`, `h3r9`.
+
+So the time is spent **waiting on a clock, not on the network**: each failed round past the fourth costs 24 s of pure
+idling while the transport is loopback with sub-millisecond latency. The cap is tuned for a WAN. The 8× spread is
+therefore 1–2 rounds against 12–14, at 24 s apiece.
+
+That splits the item into two questions, and the second is the one that was hiding:
+
+1. **Why does a height sometimes need twelve rounds?** The traces are the instrument for it, and this is what task #27
+   captures.
+2. **Should one failed round cost 24 s on a sub-millisecond transport?** Tendermint-style backoff exists to adapt to real
+   latency, and here it adapts to none: the ladder is a fixed schedule that ignores the observed round-trip time entirely.
+   A cap derived from measured latency rather than assumed WAN conditions would turn a four-minute recovery into a
+   sub-second one **without touching consensus logic** — and would leave the r12 question exactly as visible, since the
+   round count is what the probe reports.
+
 So the question to work is *why the two-round scenario's convergence varies 8×*, not *why a test is flaky*. The
 `ccrej[h/v/park]` and `PARKED@` counters are in place for it, and the next capture must keep the trace — the batch above
 grepped only `test result` and threw away the instrument's output, which is the second time that mistake has cost a run.
