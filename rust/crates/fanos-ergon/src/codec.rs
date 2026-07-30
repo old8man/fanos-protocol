@@ -112,12 +112,14 @@ fn put_seq<T>(out: &mut Vec<u8>, items: &[T], mut f: impl FnMut(&mut Vec<u8>, &T
 
 fn put_key(out: &mut Vec<u8>, k: &Key) {
     put_u32(out, k.point);
+    put_u16(out, k.space);
     out.extend_from_slice(&k.slot);
 }
 
 fn key(r: &mut Reader<'_>) -> Option<Key> {
     let point: PointId = r.u32()?;
-    Some(Key::at(point, r.array32()?))
+    let space = r.u16()?;
+    Some(Key::at(point, space, r.array32()?))
 }
 
 fn put_value(out: &mut Vec<u8>, v: &Value) {
@@ -436,7 +438,7 @@ mod tests {
     use crate::exec::compare;
     use alloc::vec;
 
-    fn k(n: u64) -> Key { Key::small(0 as PointId, n) }
+    fn k(n: u64) -> Key { Key::small(0 as PointId, 0, n) }
 
     /// A term using every constructor, so a round-trip test covers the whole grammar rather than the easy half.
     fn every_shape() -> Term {

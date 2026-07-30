@@ -341,7 +341,7 @@ mod tests {
         fn set(&mut self, key: Key, value: Value) { self.0.insert(key, value); }
     }
 
-    fn k(n: u64) -> Key { Key::small(0 as PointId, n) }
+    fn k(n: u64) -> Key { Key::small(0 as PointId, 0, n) }
 
     /// Kind 1: write `args[0]` to `target`. Kind 2: the same, but to `stray` — a rule that reaches outside its
     /// footprint, which is the thing confinement must catch. Kind 3: always refuse.

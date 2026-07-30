@@ -46,9 +46,17 @@ pub const EFFECT_TRANSFER: u16 = TAG_TRANSPARENT as u16;
 /// line's quorum, or the whole cell (`design-ergon.md` §8). Until state is sharded, every key sits here.
 pub const LEDGER_POINT: PointId = 0;
 
-/// The key holding `account`'s balance — the account id itself, which is what `access_of` already uses.
+/// The value space of transparent account balances.
+///
+/// Named rather than left as `0` because the space is what makes a footprint identify what it touches: an account and a
+/// name entry may share an identifier, and without the space they would be one key — a conflict the scheduler sees that is
+/// not real, and worse, a footprint that no longer says unambiguously what a term reaches. See [`Key::space`].
+pub const SPACE_BALANCE: u16 = 0;
+
+/// The key holding `account`'s balance — the account id itself, which is what `access_of` already uses, now qualified by
+/// its space.
 #[must_use]
-pub const fn balance_key(account: [u8; 32]) -> Key { Key::at(LEDGER_POINT, account) }
+pub const fn balance_key(account: [u8; 32]) -> Key { Key::at(LEDGER_POINT, SPACE_BALANCE, account) }
 
 /// A transparent transfer as an ERGON term.
 ///
@@ -77,16 +85,23 @@ impl<'a> TokenState<'a> {
 
 impl Reader for TokenState<'_> {
     fn get(&self, key: &Key) -> Option<Value> {
-        // Every slot in this space is an account, and an account with no entry has balance **zero** — a fact about the
-        // ledger rather than an absence. So this never answers `None`, which would make `Expr::Load` on a fresh recipient
-        // a `Fault::Missing` and refuse the first payment anyone ever receives.
+        // Routed by the key's space, which is the whole reason `Key` carries one: this adapter answers for balances and
+        // must not answer for a name entry that happens to share an identifier.
+        if key.space != SPACE_BALANCE {
+            return None;
+        }
+        // An account with no entry has balance **zero** — a fact about the ledger rather than an absence. So a balance
+        // query never answers `None`, which would make `Expr::Load` on a fresh recipient a `Fault::Missing` and refuse the
+        // first payment anyone ever receives.
         Some(Value::Int(u128::from(self.ledger.balance(&key.slot))))
     }
 }
 
 impl State for TokenState<'_> {
     fn set(&mut self, key: Key, value: Value) {
-        if let Ok(n) = value.as_u64() {
+        if key.space == SPACE_BALANCE
+            && let Ok(n) = value.as_u64()
+        {
             self.ledger.set_balance(key.slot, n);
         }
     }
@@ -217,6 +232,18 @@ mod tests {
         assert_eq!(fault, Fault::OutsideFootprint(balance_key(BOB)));
         assert_eq!(ledger.balance(&ALICE), 1000, "and the debit was rolled back");
         assert_eq!(ledger.balance(&BOB), 0, "the credit never landed");
+    }
+
+    #[test]
+    fn the_balance_adapter_refuses_a_key_from_another_value_space() {
+        // The adapter answers for balances and must not answer for a name entry, a hashlock or a stake record that
+        // happens to share an identifier. Without the space in the key those are the same key, and the adapter would hand
+        // out a balance for something that is not one.
+        let mut ledger = funded();
+        let state = TokenState::new(&mut ledger);
+        assert_eq!(state.get(&balance_key(ALICE)), Some(Value::Int(1000)), "its own space answers");
+        let foreign = Key::at(LEDGER_POINT, SPACE_BALANCE + 1, ALICE);
+        assert_eq!(state.get(&foreign), None, "another space does not");
     }
 
     #[test]

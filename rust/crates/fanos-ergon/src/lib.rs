@@ -108,14 +108,35 @@ pub type LineId = u32;
 pub struct Key {
     /// The projective point this state lives at.
     pub point: PointId,
-    /// The slot at that point — a host state key, full width.
+    /// Which **value space** the slot names — an account balance, a name entry, an HTLC hashlock, a stake record.
+    ///
+    /// Derived, not decorative. A host is not one flat map: `fanos_dromos::HybridLedger` is heterogeneous sub-ledgers, and
+    /// a 32-byte identifier alone cannot say which of them it belongs to. Two consequences follow, and the second is the
+    /// one that forces this field:
+    ///
+    /// 1. Two entities in different sub-ledgers that happen to share an identifier would collapse to one key. That is
+    ///    *safe* — the scheduler would see a conflict that is not real — but it is a silent throughput loss.
+    /// 2. A footprint would no longer **identify** what a term touches. The alternative was a slot→space table the host
+    ///    builds from the term it is about to run; each evaluation would be self-consistent, but the key itself would be
+    ///    ambiguous, and `Par`'s proof of disjointness would then be a proof over a namespace nobody pinned. A footprint
+    ///    exists precisely to say unambiguously what is touched, so ambiguity there is not an inconvenience, it is the
+    ///    property gone.
+    ///
+    /// Widening the key rather than stealing bits from the slot, because truncation is the one thing a footprint must
+    /// never do (see the note on `slot` below) — and because the identifiers are already exactly 32 bytes, so there are
+    /// no spare bits to take. Two bytes per key in the encoding is the whole cost.
+    ///
+    /// Orthogonal to `point`: a space is *what* the state is, a point is *where* it lives, and [`Locality`] reads only the
+    /// latter. Overloading `point` as a namespace was the other rejected option, for exactly that reason.
+    pub space: u16,
+    /// The slot within that space — a host state key, full width.
     pub slot: [u8; 32],
 }
 
 impl Key {
-    /// A key at `point` with the given 32-byte slot.
+    /// A key at `point` in `space` with the given 32-byte slot.
     #[must_use]
-    pub const fn at(point: PointId, slot: [u8; 32]) -> Self { Self { point, slot } }
+    pub const fn at(point: PointId, space: u16, slot: [u8; 32]) -> Self { Self { point, space, slot } }
 
     /// A key at `point` whose slot is a small integer — for tests and for hosts whose state is enumerable rather than
     /// hashed. Big-endian in the low eight bytes, so ordering matches the integer's.
@@ -123,7 +144,7 @@ impl Key {
     // Both indices are bounded by the loop and by `to_be_bytes`'s fixed width, so the panic clippy warns about is
     // unreachable; `slice::get` is not const-stable, and this must stay `const` to be usable in constant contexts.
     #[allow(clippy::indexing_slicing)]
-    pub const fn small(point: PointId, n: u64) -> Self {
+    pub const fn small(point: PointId, space: u16, n: u64) -> Self {
         let mut slot = [0u8; 32];
         let be = n.to_be_bytes();
         let mut i = 0;
@@ -131,7 +152,7 @@ impl Key {
             slot[24 + i] = be[i];
             i += 1;
         }
-        Self { point, slot }
+        Self { point, space, slot }
     }
 }
 
@@ -818,7 +839,7 @@ mod tests {
     use super::*;
 
     /// A key at point `n`, slot 0 — the tests care about identity and placement, not slots.
-    fn k(n: PointId) -> Key { Key::small(n, 0) }
+    fn k(n: PointId) -> Key { Key::small(n, 0, 0) }
 
     /// Keys at the given points.
     fn ks(ns: &[PointId]) -> Vec<Key> { ns.iter().copied().map(k).collect() }
@@ -871,15 +892,26 @@ mod tests {
         let mut b = [0u8; 32];
         a[0] = 1; // differs only in the HIGH bytes, exactly where a u64 truncation would have lost it
         b[1] = 1;
-        let ka = Key::at(3, a);
-        let kb = Key::at(3, b);
+        let ka = Key::at(3, 0, a);
+        let kb = Key::at(3, 0, b);
         assert_ne!(ka, kb, "keys differing outside the low 8 bytes stay distinct");
         assert!(!Footprint::new(vec![], vec![ka]).conflicts(&Footprint::new(vec![], vec![kb])));
 
         // And the small-integer helper is order-preserving, so a host with enumerable state gets sane ordering.
-        assert!(Key::small(0, 1) < Key::small(0, 2));
-        assert!(Key::small(0, 255) < Key::small(0, 256));
-        assert_eq!(Key::small(0, 0).slot, [0u8; 32]);
+        // Two entities sharing an identifier in different value spaces are DIFFERENT keys, which is the whole reason
+        // `space` exists: an account and a name entry with equal hashes must not collapse into one, or a footprint stops
+        // saying unambiguously what a term touches and `Par`'s disjointness proof is over an unpinned namespace.
+        let account = Key::at(0, 0, [7u8; 32]);
+        let name = Key::at(0, 1, [7u8; 32]);
+        assert_ne!(account, name, "same slot, different space, different key");
+        let fp_a = Footprint::new(alloc::vec![], alloc::vec![account]);
+        let fp_n = Footprint::new(alloc::vec![], alloc::vec![name]);
+        assert!(fp_a.parallel_safe(&fp_n), "so writing each is schedulable in parallel");
+        assert!(fp_a.conflicts(&Footprint::new(alloc::vec![], alloc::vec![account])), "and the same key still conflicts");
+
+        assert!(Key::small(0, 0, 1) < Key::small(0, 0, 2));
+        assert!(Key::small(0, 0, 255) < Key::small(0, 0, 256));
+        assert_eq!(Key::small(0, 0, 0).slot, [0u8; 32]);
     }
 
     #[test]
