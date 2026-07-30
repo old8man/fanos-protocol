@@ -433,12 +433,43 @@ storage, peers only (our own votes are echoed back through the same path and wou
 `voters_above` it separates "never arrived" from "arrived and lost before the buffer" — three readings of this path
 deduced the answer and all three were wrong.
 
-**Next, in order.** (1) One live capture with `votes=` — decisive by construction, and running. (2) If the third bucket
-is 0, the question is the driver's: note that `resample_pending` re-requests **every** missing shard of **every**
-pending block on **every** 150 ms tick, with no backoff and no give-up, and the same trace shows `shard=7130/7130
-took=5366` at a single height — a validator serving thousands of requests for two blocks it will never complete. That is
-established as waste; that it delays votes past a 24 s round timeout on loopback is **not** established and must not be
-assumed.
+**CORRECTED by the very counter that was built to test it.** The capture came back and the delivery reading is wrong:
+
+```
+v0 r10  votes=31<27=0> oh=0  rej[prop=71]  skel=   3/1749
+v1 r10  votes=32<31=0> oh=6  rej[prop=31]  skel=1061/2388
+v2 r9   votes=31<33=0> oh=6  rej[prop=48]  skel=1191/2391
+v3 r9   votes=30<37=0> oh=5  rej[prop= 6]  skel=2561/2561
+v4 r8   votes=30<18=0> oh=6  rej[prop=28]  skel= 282/1340
+v5 r9   votes=31<26=4> oh=6  rej[prop=24]  skel= 977/2117
+v6 r8   votes=21<18=0> oh=9  rej[prop= 5]  skel= 362/ 909
+```
+
+Votes arrive in the tens in both the below- and equal-round buckets, so nothing is dropping them. `above = 0` means the
+cell advances rounds in near-lockstep — every vote lands at a peer that has already left that round — not that anyone is
+unreachable. A one-sided reading of a single field cost a wrong headline; the second field is what corrected it.
+
+**The real defect is upstream of rounds.** No validator prints `lock` in this trace: no value ever held a PREPARE quorum
+at height 1, and the seven were chasing **four different bodies**. The correlation names the cause — `rejects.proposer`
+against skeletons this validator could serve: 71 → 3 of 1749 (0.2 %), and 6 → 2561 of 2561 (100 %).
+
+Entitlement is judged against the **receiver's** round, because the header carries none by design. Round
+synchronization pulls a validator *forward* to its peers' round; nothing pulls one that has run *ahead* back. So the
+validator furthest ahead refuses the most proposals — and it threw away their **bodies** too, which is a second decision
+the first was never entitled to make. It then broadcast `NeedSkeleton` for the body it had just discarded, every tick,
+to peers in the same state. Fixed by splitting the gate: validity gates admission, entitlement gates only the vote, and
+`pending_finalize` resolves before either (a COMMIT quorum outranks the right to propose). Growth is bounded with no
+chosen constant — an unentitled proposal is stored only if that proposer has no body at this height yet, so at most one
+entry per validator per height. Pinned by `a_validator_that_ran_ahead_still_keeps_the_body_it_refuses_to_prepare` and
+falsified by restoring the fused gate, whose failure prints the defect in one line: `await:1c350fe0 … rej[prop=1]`.
+
+**Still open, and not to be assumed fixed.** `resample_pending` re-requests **every** missing shard of **every** pending
+block on **every** 150 ms tick, with no backoff and no give-up; a `Sampler` entry leaves `pending` only by successful
+reconstruction, `prune_below`, or cap eviction, so a block that cannot be completed at a stalled height is retried for
+the whole stall. `shard=7130/7130 took=5366` at a single height is that. The admission fix should shrink it at the
+source — most of those requests are for bodies that will now simply be held — but the retry policy is unbounded on its
+own terms and that is a separate defect. The confirming experiment for the admission fix is **not** "the test passes":
+it is that the round spread collapses and `rej[prop]` falls to near zero.
 
 ### [A] CORRECTION: the eviction fix is a latent-defect fix, not the demonstrated live cause
 Checked my own arithmetic after committing, and it does not support the attribution. `Sampler::reconstruct` **removes**
