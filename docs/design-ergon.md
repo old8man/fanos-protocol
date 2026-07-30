@@ -534,7 +534,27 @@ node's dependency graph and reproducibility intact, and it is the same shape as 
    removes the question instead of documenting it.
 2. The eight existing rules re-expressed as primitive effects, behind the same wire tags so no capability is lost.
 3. `HybridLedger::apply` replaced by the term interpreter; the declared `AccessList` deleted and `fp` wired into DROMOS.
-4. `Gate`/`Alt` predicates over ledger state; HERMES's HTLC migrated to `Gate` and `TAG_HTLC` retired.
+4. `Gate`/`Alt` predicates over ledger state. ~~HERMES's HTLC migrated to `Gate` and `TAG_HTLC` retired.~~
+   **CORRECTED 2026-07-30 by attempting it — a `Gate` cannot carry authorization.**
+
+   A term is submitted by a user, who chooses its structure. So `Gate(P, E)` runs `E` iff `P` holds *in the term the user
+   wrote* — and the user may simply omit the gate and submit `E` alone. Any condition that must hold for `E` to be safe is
+   therefore a condition `E` itself has to check. Migrating the HTLC to `Gate(preimage_matches, release_escrow)` would put
+   the release behind a guard the claimant is free to delete.
+
+   What a `Gate` does give, and it is worth having: the **author's own** conditional logic (*"pay only if the recipient's
+   name is registered"* — a policy the author imposes on themselves), atomicity with its siblings, and a footprint widened
+   by the predicate's reads so DROMOS sees them. What it does not give is a protocol obligation. The distinction is
+   *whose* condition it is: an author's, not the protocol's.
+
+   Pinned by `a_gate_cannot_carry_authorization_because_the_author_writes_the_term`, which checks both directions — the
+   ungated term is refused by the effect's own rule, **and** a gated term whose guard passes is still refused for an
+   unauthorized caller, so the gate is demonstrably not what refused. Falsified by moving the check out of the effect: both
+   cases then succeed, which is the theft.
+
+   So `TAG_HTLC` is not retired by re-expressing it. The claim's preimage check stays inside its rule, exactly where it is
+   today, and the composition win is elsewhere: `Seq[claim(id, preimage), transfer(...)]` is an atomic claim-and-forward
+   that no single tag expresses. That is the capability §5(a) promises, and it needs no authorization to live in a gate.
 5. `Prove` behind the OBOLOS verifier, inert until recursion lands.
 6. **The Verum front end** (§10c): a `verum` target emitting the canonical term encoding, the contract dialect's gate
    (`@verify(thorough)` + capability-typed state handles), `decreases`-bounded loop unrolling, and a conformance suite that

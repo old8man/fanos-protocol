@@ -339,6 +339,48 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_cannot_carry_authorization_because_the_author_writes_the_term() {
+        // The finding that corrects `docs/design-ergon.md` §11 step 4, pinned rather than argued.
+        //
+        // Step 4 proposes migrating the HTLC to `Gate(preimage_matches, release_escrow)` and retiring `TAG_HTLC`. But a
+        // term is submitted by a user who chooses its structure, so the user can simply OMIT the gate and submit the
+        // release alone. A `Gate` therefore gives the author's own conditional logic, atomicity with siblings, and a
+        // footprint widened by the predicate's reads — and never authorization.
+        //
+        // Demonstrated on the rule that does hold its own check: the transfer verifies `from == caller`, so wrapping it in
+        // a gate adds a condition and removing the gate does not remove the check. If authorization lived in the gate
+        // instead, the ungated term below would succeed.
+        let ungated = transfer_term(ALICE, BOB, 100);
+        let gated = Term::Gate(
+            fanos_ergon::exec::compare(fanos_ergon::Cmp::Ge, Expr::Load(balance_key(ALICE)), Expr::int(100)),
+            Box::new(transfer_term(ALICE, BOB, 100)),
+        );
+
+        // The gate admits, and the transfer applies, when the caller is authorized.
+        let mut allowed = funded();
+        run(&gated, ALICE, &mut allowed).expect("evaluates");
+        assert_eq!(allowed.balance(&BOB), 100);
+
+        // Strip the gate and the effect's OWN check still refuses an unauthorized caller — which is what makes the rule
+        // safe against a term that omits its guard.
+        let mut stripped = funded();
+        assert_eq!(
+            run(&ungated, BOB, &mut stripped).expect_err("BOB is not ALICE"),
+            Fault::Rejected { kind: EFFECT_TRANSFER }
+        );
+        assert_eq!(stripped.balance(&ALICE), 1000, "nothing moved");
+
+        // And the converse, which is the load-bearing half: the gate is NOT what refused. Give the same unauthorized
+        // caller the gated term with a guard that passes, and the effect still refuses.
+        let mut gated_but_unauthorized = funded();
+        assert_eq!(
+            run(&gated, BOB, &mut gated_but_unauthorized).expect_err("the guard passes; the rule does not"),
+            Fault::Rejected { kind: EFFECT_TRANSFER }
+        );
+        assert_eq!(gated_but_unauthorized.balance(&BOB), 0);
+    }
+
+    #[test]
     fn an_overdraft_is_refused_and_leaves_the_state_untouched() {
         let mut ledger = funded();
         let fault = run(&transfer_term(ALICE, BOB, 1001), ALICE, &mut ledger).expect_err("insufficient funds");
