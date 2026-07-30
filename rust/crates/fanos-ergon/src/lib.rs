@@ -58,6 +58,7 @@
 
 extern crate alloc;
 
+pub mod codec;
 pub mod exec;
 pub mod value;
 
@@ -631,6 +632,51 @@ impl Limits {
     /// Permissive limits for tests and for hosts that impose their own bounds elsewhere.
     #[must_use]
     pub const fn unbounded() -> Self { Self { proof_bytes: u32::MAX, footprint_width: usize::MAX } }
+}
+
+/// A term that has passed [`well_typed`] — the check carried **in the type** rather than left to a caller's memory.
+///
+/// `well_typed` as a free function asks every call site the same question: *did you remember?* Every defect this codebase
+/// has found in its own recovery paths has that shape — a mechanism that was correct and reachable from nothing, or a
+/// check that existed and was skipped on one path. So the guarantee is made unforgeable instead: [`exec::eval`] accepts
+/// only a `Checked`, and the only ways to obtain one are [`Checked::new`] (which runs the check) and
+/// [`Checked::decode`] (which runs it after parsing). There is no path that executes an unchecked term, so there is
+/// nothing to forget.
+///
+/// This is Verum's refinement type `Term { well_typed(self) }` expressed in Rust's terms — a witness newtype. It is worth
+/// spelling out because the two systems will meet here: the emitter produces a `Term`, and only a `Checked` can run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checked(Term);
+
+impl Checked {
+    /// Check `term` against `limits` and carry the result in the type.
+    pub fn new(term: Term, limits: &Limits) -> Result<Self, TypeError> {
+        well_typed(&term, limits)?;
+        Ok(Self(term))
+    }
+
+    /// Decode a canonical encoding **and** check it — the wire path, in one step.
+    ///
+    /// One function rather than two so that decoding cannot be followed by "and then someone type-checks it". Returns
+    /// `Err(None)` for bytes that are not a canonical encoding and `Err(Some(e))` for a term that decodes but is
+    /// ill-typed, because those are different faults: the first is a malformed artefact, the second a well-formed
+    /// artefact the chain refuses.
+    pub fn decode(bytes: &[u8], limits: &Limits) -> Result<Self, Option<TypeError>> {
+        let term = Term::decode(bytes).ok_or(None)?;
+        Self::new(term, limits).map_err(Some)
+    }
+
+    /// The term itself, for matching on.
+    #[must_use]
+    pub const fn term(&self) -> &Term { &self.0 }
+
+    /// Consume the witness, returning the term.
+    #[must_use]
+    pub fn into_inner(self) -> Term { self.0 }
+
+    /// The canonical encoding — always of a checked term, so an artefact's hash names something executable.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> { self.0.encode() }
 }
 
 /// The deepest expression nesting anywhere in a term — effect arguments and predicates alike.

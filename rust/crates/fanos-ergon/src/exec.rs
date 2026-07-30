@@ -25,7 +25,7 @@
 use alloc::vec::Vec;
 
 use crate::value::{Cmp, Expr, Fault, Value};
-use crate::{Claim, Footprint, Key, Predicate, Term};
+use crate::{Checked, Claim, Footprint, Key, Predicate, Term};
 
 /// Read access to ledger state, keyed by [`Key`].
 pub trait Reader {
@@ -168,19 +168,20 @@ pub struct Receipt {
 ///
 /// `args` are the instantiation arguments [`Expr::Arg`](crate::value::Expr::Arg) indexes.
 ///
-/// Takes no `Limits`, deliberately. Every admission bound — proof size, footprint width, nesting — is checked once by
+/// Takes a [`Checked`] rather than a `Term`, so "was this type-checked?" is not a question this function can be asked
+/// wrongly. Takes no `Limits`, deliberately. Every admission bound — proof size, footprint width, nesting — is checked once by
 /// [`well_typed`](crate::well_typed) *before* a fee is charged, and threading them here as well would mean two places
 /// deciding the same question. A caller that skips the type check gets a correct evaluation of a term the chain would have
-/// refused: their bug, not a safety hole, because expression depth is enforced by the evaluator itself so nothing
-/// unbounded can run.
+/// refused — which is now impossible to reach, since obtaining a `Checked` *is* passing the check.
 ///
 /// Atomic: on any fault, every write this call made is rolled back before the fault is returned.
 pub fn eval<S: State + ?Sized, H: Host>(
-    term: &Term,
+    term: &Checked,
     args: &[Value],
     host: &mut H,
     state: &mut S,
 ) -> Result<Receipt, Fault> {
+    let term = term.term();
     let mut journal = Journal::new(state);
     let mut receipt = Receipt::default();
     match run(term, args, host, &mut journal, &mut receipt) {
@@ -300,6 +301,7 @@ pub fn compare(op: Cmp, lhs: Expr, rhs: Expr) -> Predicate { Predicate::Compare 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::Limits;
     use crate::value::BinOp;
     use crate::{Effect, PointId};
     use alloc::collections::BTreeMap;
@@ -347,6 +349,9 @@ mod tests {
 
     fn rules() -> Rules { Rules { target: k(10), stray: k(99) } }
 
+    /// A term with its check carried in the type, which is the only way `eval` accepts one.
+    fn ck(t: Term) -> Checked { Checked::new(t, &Limits::unbounded()).expect("well typed") }
+
     fn write_to(target: Key, arg: Expr) -> Term {
         Term::Do(
             Effect::internal(1, Footprint::new(vec![], vec![target])).with_args(vec![arg]),
@@ -360,7 +365,7 @@ mod tests {
         let mut mem = Mem::default();
         mem.set(k(1), Value::Int(1000));
         let term = write_to(k(10), Expr::bin(BinOp::Div, Expr::Load(k(1)), Expr::int(2)));
-        let receipt = eval(&term, &[], &mut rules(), &mut mem).expect("evaluates");
+        let receipt = eval(&ck(term.clone()), &[], &mut rules(), &mut mem).expect("evaluates");
         assert_eq!(receipt.effects, 1);
         assert_eq!(mem.get(&k(10)), Some(Value::Int(500)), "the computed amount was written");
     }
@@ -387,7 +392,7 @@ mod tests {
         let term = Term::Do(
             Effect::internal(2, Footprint::new(vec![], vec![k(10)])).with_args(vec![Expr::int(7)]),
         );
-        let fault = eval(&term, &[], &mut rules(), &mut mem).expect_err("must fault");
+        let fault = eval(&ck(term.clone()), &[], &mut rules(), &mut mem).expect_err("must fault");
         assert_eq!(fault, Fault::OutsideFootprint(k(99)));
         assert_eq!(mem.get(&k(99)), None, "the out-of-footprint write did not take effect");
     }
@@ -402,7 +407,7 @@ mod tests {
             write_to(k(10), Expr::int(42)),
             Term::Do(Effect::internal(3, Footprint::empty())), // kind 3 always refuses
         ]);
-        let fault = eval(&term, &[], &mut rules(), &mut mem).expect_err("must fault");
+        let fault = eval(&ck(term.clone()), &[], &mut rules(), &mut mem).expect_err("must fault");
         assert_eq!(fault, Fault::Rejected { kind: 3 });
         assert_eq!(mem.get(&k(10)), Some(Value::Int(1)), "the first write was rolled back");
     }
@@ -414,17 +419,17 @@ mod tests {
         let mut mem = Mem::default();
         let over = write_to(k(10), Expr::bin(BinOp::Add, Expr::int(u128::MAX), Expr::int(1)));
         assert_eq!(
-            eval(&over, &[], &mut rules(), &mut mem).expect_err("overflow"),
+            eval(&ck(over.clone()), &[], &mut rules(), &mut mem).expect_err("overflow"),
             Fault::Overflow
         );
         let div0 = write_to(k(10), Expr::bin(BinOp::Div, Expr::int(1), Expr::int(0)));
         assert_eq!(
-            eval(&div0, &[], &mut rules(), &mut mem).expect_err("div by zero"),
+            eval(&ck(div0.clone()), &[], &mut rules(), &mut mem).expect_err("div by zero"),
             Fault::DivByZero
         );
         let under = write_to(k(10), Expr::bin(BinOp::Sub, Expr::int(1), Expr::int(2)));
         assert_eq!(
-            eval(&under, &[], &mut rules(), &mut mem).expect_err("unsigned underflow"),
+            eval(&ck(under.clone()), &[], &mut rules(), &mut mem).expect_err("unsigned underflow"),
             Fault::Overflow
         );
         assert_eq!(mem.get(&k(10)), None, "no fault left a partial write behind");
@@ -441,32 +446,38 @@ mod tests {
                 alloc::boxed::Box::new(write_to(k(10), Expr::int(1))),
             )
         };
-        eval(&gate(50), &[], &mut rules(), &mut mem).expect("admits");
+        eval(&ck(gate(50)), &[], &mut rules(), &mut mem).expect("admits");
         assert_eq!(mem.get(&k(10)), Some(Value::Int(1)), "the guard held, so the body ran");
 
         let mut mem2 = Mem::default();
         mem2.set(k(1), Value::Int(10));
-        let r = eval(&gate(50), &[], &mut rules(), &mut mem2).expect("refuses cleanly");
+        let r = eval(&ck(gate(50)), &[], &mut rules(), &mut mem2).expect("refuses cleanly");
         assert_eq!(r.effects, 0, "the guard failed, so the body did not run");
         assert_eq!(mem2.get(&k(10)), None);
     }
 
     #[test]
-    fn an_over_deep_expression_is_refused_at_admission_and_at_evaluation() {
-        // Both, deliberately. Admission refuses before a fee is charged; evaluation refuses because a term that reached
-        // it by another route must not be able to recurse a validator's stack away.
+    fn an_over_deep_expression_cannot_be_admitted_and_cannot_be_evaluated_either() {
+        // Two layers, and the second is no longer reachable from the first — which is the point of `Checked`.
+        //
+        // Admission refuses the term, so there is no way to hand `eval` one: `Checked::new` is the only door and it runs
+        // `well_typed`. That closes the "a term that arrived by another route" case *by construction* rather than by
+        // defending against it, which is why this test no longer calls `eval` at all. `Expr::eval`'s own bound is still
+        // load-bearing and still tested, through the public expression API a host rule could reach directly.
         let mut deep = Expr::int(1);
         for _ in 0..=crate::value::EXPR_DEPTH_MAX {
             deep = Expr::bin(BinOp::Add, deep, Expr::int(1));
         }
-        let term = write_to(k(10), deep);
-        let err = crate::well_typed(&term, &crate::Limits::unbounded()).expect_err("admission refuses");
+        let term = write_to(k(10), deep.clone());
+        let err = crate::well_typed(&term, &Limits::unbounded()).expect_err("admission refuses");
         assert!(matches!(err, crate::TypeError::ExprTooDeep { .. }), "{err:?}");
-        let mut mem = Mem::default();
-        assert!(matches!(
-            eval(&term, &[], &mut rules(), &mut mem),
-            Err(Fault::ExprTooDeep { .. })
-        ));
+        assert!(
+            Checked::new(term, &Limits::unbounded()).is_err(),
+            "and therefore no witness exists, so `eval` cannot be called with it"
+        );
+
+        let mem = Mem::default();
+        assert!(matches!(deep.eval(&mem, &[]), Err(Fault::ExprTooDeep { .. })), "the expression bound holds on its own");
     }
 
     #[test]
@@ -475,10 +486,10 @@ mod tests {
         // named fault rather than a silent zero.
         let mut mem = Mem::default();
         let term = write_to(k(10), Expr::bin(BinOp::Mul, Expr::Arg(0), Expr::int(3)));
-        eval(&term, &[Value::Int(5)], &mut rules(), &mut mem).expect("evaluates");
+        eval(&ck(term.clone()), &[Value::Int(5)], &mut rules(), &mut mem).expect("evaluates");
         assert_eq!(mem.get(&k(10)), Some(Value::Int(15)));
         assert_eq!(
-            eval(&term, &[], &mut rules(), &mut mem).expect_err("no argument supplied"),
+            eval(&ck(term.clone()), &[], &mut rules(), &mut mem).expect_err("no argument supplied"),
             Fault::ArgOutOfRange { index: 0, supplied: 0 }
         );
     }
