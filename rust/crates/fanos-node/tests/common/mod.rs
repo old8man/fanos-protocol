@@ -118,6 +118,12 @@ where
         let (reached, trace) = observe().await;
         let took = sampled_at.elapsed();
         if reached {
+            // **Report the converged state, not just the fact of converging.** A run that only says "reached" makes the
+            // outcome the sole observable, and the outcome is the one thing a fix must not be judged by: a scenario can
+            // go green because the defect was fixed or because that run was lucky. Twice in the round-split
+            // investigation the question was "what does a *passing* cell look like here", and the answer had to be
+            // guessed. Visible under `--nocapture`, where it costs a line and settles it.
+            println!("{what}: reached in {:?}. Converged to: {trace}", started.elapsed());
             return;
         }
         if trace != last {
