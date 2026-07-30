@@ -136,6 +136,24 @@ than tested-for.
 the Rust constants against the Verum artefact. The Rust stays as the implementation; the Verum becomes the specification
 that can *fail*. That is strictly better than a doc, and cheaper than a rewrite.
 
+**MEASURED, AND BLOCKED — for a reason that makes the proposal more valuable, not less.** Tested the same hour with a
+deliberately drifted derivation, `fn tolerated(n: Int{> 3}) -> Int{== (n - 1) / 3} { 2 }` — E7 in one line:
+
+- `verum check` **refuses** it, correctly.
+- `verum verify` reports **"✓ tolerated: Proved in 0.00s — 1 proved, 0 failed"**.
+
+Narrowed to a one-line repro (`fn wrong(n: Int) -> Int{== n + 1000} { 0 }`, also "Proved") and bounded: a
+*constant-only* return refinement is caught, a call-site argument is caught, and only a return refinement **referencing a
+parameter** is unsoundly proved. Filed as G11.
+
+That is exactly our case — a derivation references its inputs, always — so building §3 today would install a gate that
+cannot fail, which is the defect it exists to prevent. It also inverts the trust ordering worth knowing about: the sound
+tool here is `check`, not `verify`.
+
+The right reading is not "this idea is weaker". It is that §3's value is confirmed and its dependency named: one
+soundness fix in `verify` turns the whole class of constant-drift defects — the class that already cost us a HIGH — into
+compile errors. Until then, do not port a single constant, because a passing `verify` would mean nothing.
+
 ---
 
 ## 4. Two structural alignments worth knowing, not yet worth building

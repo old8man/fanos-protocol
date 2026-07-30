@@ -295,6 +295,61 @@ single most useful reply is a working example file we can copy.
 whose success path is empty, a `--strict` flag that exits non-zero when nothing was verified would stop this from reading
 as a pass in CI — the same "a gate that only ever accepts" failure named throughout this document.
 
+### G11 — `verum verify` proves any return refinement that mentions a parameter *(soundness; one-line repro)*
+
+Measured 2026-07-30, `verum` 0.1.0. Minimal reproduction:
+
+```verum
+fn wrong(n: Int) -> Int{== n + 1000} { 0 }
+```
+
+```
+$ verum verify dep_absurd.vr
+  ✓ wrong: Proved in 0.00s
+  Summary: 1 proved, 0 failed, 0 timeout, 0 skipped
+
+$ verum check dep_absurd.vr
+error: Return value in function 'wrong' does not satisfy refinement constraint
+```
+
+`verify` proves `0 == n + 1000` for all `n`. In 0.00 s, which suggests the obligation is discharged trivially rather than
+sent to a solver.
+
+**The failure is specific, and I narrowed it before filing** — obligations are generated in general:
+
+| case | `verify` |
+|---|---|
+| `fn always_big(n: Int) -> Int{> 100} { 1 }` — constant-only return refinement | **error**, correctly |
+| `needs_big(1)` where `needs_big(x: Int{> 100})` — call-site argument | **error**, correctly |
+| `fn wrong(n: Int) -> Int{== n + 1000} { 0 }` — return refinement **referencing a parameter** | **"Proved"** |
+| `fn tolerated(n: Int{> 3}) -> Int{== (n - 1) / 3} { 2 }` — the same shape, realistic | **"Proved"** |
+
+So it is the **dependent** return refinement that is unsound; the parameter binding looks lost or mis-scoped, leaving a
+predicate that is trivially satisfiable.
+
+Two further observations that matter more than the bug itself:
+
+- **The two tools disagree, and the sound one is `check`.** That inverts the expected trust ordering — `verify` is the
+  formal path and the one a user reaches for when they want certainty. A user who runs `verify` and sees "1 proved, 0
+  failed" has been told the opposite of the truth.
+- **A related false *rejection*.** `fn f(x: P) -> Int{> 0} { x }` with `type P is Int{> 0}` is refused by `check`
+  ("Return value does not satisfy refinement constraint") although `x` has that refinement by its type. So the parameter's
+  refinement fails to propagate to the return position in `check` too — incompleteness there, unsoundness in `verify`,
+  same neighbourhood of the code.
+
+**Why FANOS cares, and why this is the highest-severity item in this document.** `docs/design-verum-frontier.md` §3
+proposes tying our derived constants to their derivations so that drift becomes a build failure — the class of defect that
+produced audit E7 (`MIX_THRESHOLD` written as `const = 2`, correct at `q = 2`, silently wrong at every larger plane, found
+by accident months later). A derivation **by definition** references its inputs: `f = (n−1)/3`, `Q = (n+f+1)/2`,
+`t = ⌈2(q+1)/3⌉`. Every one of them is the dependent case. Today `verify` would report all of them proved whether or not
+they hold, so the proposal would install a gate that cannot fail — precisely the failure mode named in G1 and G10, in the
+tool whose entire purpose is to prevent it.
+
+**Acceptance.** The one-line repro fails under `verify`, with a regression test; and the `check`/`verify` verdicts are
+asserted to agree on a corpus that includes at least one dependent refinement in each direction (true and false). The
+agreement test is the load-bearing one — a disagreement between two checkers is a bug in at least one of them, and only
+a test that compares them will notice next time.
+
 ---
 
 ## 5. Open questions I could not answer from the outside
