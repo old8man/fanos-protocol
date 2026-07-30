@@ -89,12 +89,19 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
-### [A] A ~1-in-3 test sits in the per-push CI gate, and it should not be hidden
+### [A] A ~1-in-4 test sits in the per-push CI gate, and it should not be hidden
 `a_hash_locked_contract_is_funded_and_claimed_over_live_consensus` is **not** `#[ignore]`d, so it runs in the `gate`
 job on every push, where it fails both under full-workspace loopback saturation and — at a lower rate — in isolation.
 A gate that fails this often blocks merges at random and trains people to re-run rather than read.
 
-**Re-measured 2026-07-29 in isolation** (`cargo test -p fanos-node --test dromos_quic a_hash_locked --features
+**Re-measured across 15 isolated runs, 2026-07-29 and 07-30:** 4 failures, so roughly **1 in 4**. The two
+batches disagree — 3 of 6 on 07-29 at host load 6–9, then 1 of 9 on 07-30 at load 4.7–9.6 — and Fisher's exact
+gives `p ≈ 0.11`, so **neither "the rate fell" nor "load drives it" is established**. The single 07-30 failure
+did land at the highest load observed (9.56), which makes load-sensitivity plausible and not more than that.
+The earlier "1 in 8" and the intermediate "1 in 3" were both over-precise for their samples; quote the run count
+with the rate or do not quote it.
+
+**Original 07-29 measurement** (`cargo test -p fanos-node --test dromos_quic a_hash_locked --features
 validator`, one test alone, host load 6–9): **pass / pass / fail at HEAD**, and fail / pass / fail with an unrelated
 observational change applied — statistically indistinguishable, which is how that change was cleared. The rate is
 therefore around **one in three, not one in eight**; the older figure is stale and was the reason a single passing
