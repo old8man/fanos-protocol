@@ -56,15 +56,16 @@ numbers in `docs/deployment-minima.md`.
 
 ### [A] Close the "libraries ahead of wiring" gap — four items, measured and guarded
 The list is now computed, not remembered: `fanos-cli/tests/architecture.rs` takes the closure over the manifests and fails
-if a crate is linked by nothing (or if a listed orphan gets wired). 34 of 43 crates sit in the node's closure, 38 of 43 are
-reachable from some shipped binary. The earlier prose version of this item was wrong in two thirds of its list — see
+if a crate is linked by nothing (or if a listed orphan gets wired). **36 of 43** crates sit in the node's closure and
+**40 of 43** are reachable from some shipped binary (2026-07-30; the test holds these numbers and is the authority — the
+figures written here had already drifted to 34/38). The earlier prose version of this item was wrong in two thirds of its list — see
 `docs/audit-2026-07-27-architecture.md` §2.1 — because it grepped for crate names where the crate is reached through an
 intermediary. What genuinely remains:
 
 | crate | claim it carries | gap |
 |---|---|---|
 | `fanos-angelos` | L11 messenger, a headline product | **orphan** — linked by nothing at all |
-| `fanos-ergon` | the effect-algebra "no gas, derived footprints" model | **orphan** — DROMOS executes without it |
+| ~~`fanos-ergon`~~ | the effect-algebra "no gas, derived footprints" model | **WIRED 2026-07-30** — `fanos_dromos::ergon_host` + `TAG_ERGON`; the orphan list is now empty |
 | `fanos-vpn` | the full-tunnel datapath | CI now compiles `--features vpn`; **the datapath itself is still exercised by nothing** |
 
 Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding

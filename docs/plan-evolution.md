@@ -58,8 +58,16 @@ lowering the ratchet so the ground cannot be given back.
 orphan ratchet is down to one. What was missing was never the capability: `angelos_driver` is a composition, and
 the whole of it is running ANGELOS's handshake over a stream the node already knows how to accept anonymously.
 
-`fanos-ergon` remains. It is the last orphan, and the decision there is genuinely open — DROMOS executes without
-it, so the question is whether the effect algebra replaces that execution path or is deleted.
+**`fanos-ergon` is wired too, and the open question was answered by building it** — 2026-07-30. The choice was
+posed as "replace the execution path or delete the algebra", and the answer is neither: the algebra became an
+execution model (`Value`, a total expression layer, a `Host`/`State` interface, an evaluator that confines itself to
+the footprint it derives), the ledger became its first host, and `TAG_ERGON` makes a term a transaction. The eight
+existing tags keep executing as they did; a term composes over them. **The orphan list is now empty** and
+`AT_RATCHET` is 0.
+
+What made the question answerable was finding what the crate was actually missing. It had no evaluator, no way to
+represent a quantity, and no host interface — so "replace the execution path" was not a decision anyone could take,
+because there was nothing to replace it *with*. `docs/design-ergon.md` §10a records that audit.
 
 ### I.2 — Every frame that is sent is handled
 
