@@ -132,6 +132,8 @@ pub struct ConsensusProbe {
     pub cert_taken: u64,
     /// Why an offered commit certificate did not: `(wrong height/phase, failed verification, parked for want of the body)`.
     pub cc_rejects: (u64, u64, u64),
+    /// Round-synchronization jumps and the total rounds they skipped.
+    pub round_jumps: (u64, u64),
     /// Body-recovery requests emitted for a parked decision.
     pub body_asks: u64,
     /// How this validator answered peers' body requests: `(served, not held, refused as unwanted/invalid)`.
@@ -177,6 +179,10 @@ impl core::fmt::Display for ConsensusProbe {
         let (bs, bn, br) = self.body_answers;
         if self.body_asks + bs + bn + br + self.body_taken > 0 {
             write!(f, " body={}a/{}got ans={bs}/{bn}/{br}", self.body_asks, self.body_taken)?;
+        }
+        let (jumps, skipped) = self.round_jumps;
+        if jumps > 0 {
+            write!(f, " jumped={jumps}/{skipped}")?;
         }
         let (cch, ccv, ccp) = self.cc_rejects;
         if cch + ccv + ccp > 0 {
@@ -734,6 +740,13 @@ pub struct ConsensusEngine<S: StateMachine> {
     // (`Certificate::verify` depends on nothing but the fixed committee), which is exactly why the answer has to be
     // measured instead of derived.
     cc_rejects: (u64, u64, u64),
+    /// Round-synchronization accounting: `(jumps, rounds skipped)`.
+    ///
+    /// `maybe_advance_round` exists to pull a drifted validator to the round `f + 1` peers have reached, and a trace with
+    /// seven validators spread over four rounds says it is not doing so — but a snapshot cannot distinguish "the rule never
+    /// fires" from "it fires and they drift apart again between jumps". Those need opposite fixes, so the count is the only
+    /// way to tell, exactly as the skeleton and shard counters were.
+    round_jumps: (u64, u64),
     /// Body-recovery accounting: requests emitted, `(served, not held, refused)` as a responder, bodies applied.
     body_asks: u64,
     body_answers: (u64, u64, u64),
@@ -862,6 +875,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_taken: 0,
             cert_taken: 0,
             cc_rejects: (0, 0, 0),
+            round_jumps: (0, 0),
             body_asks: 0,
             body_answers: (0, 0, 0),
             body_taken: 0,
@@ -1136,6 +1150,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_taken: self.sync_taken,
             cert_taken: self.cert_taken,
             cc_rejects: self.cc_rejects,
+            round_jumps: self.round_jumps,
             body_asks: self.body_asks,
             body_answers: self.body_answers,
             body_taken: self.body_taken,
@@ -1987,6 +2002,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if target <= self.round {
             return Vec::new();
         }
+        self.round_jumps.0 = self.round_jumps.0.saturating_add(1);
+        self.round_jumps.1 = self.round_jumps.1.saturating_add(u64::from(target - self.round));
         self.round = target;
         // Exactly what a timeout does on arrival at a new round — re-offer the lock, propose if now entitled. Round-0
         // sortition state is not reset: a jump is always *forward*, and round 0 is behind us by construction.

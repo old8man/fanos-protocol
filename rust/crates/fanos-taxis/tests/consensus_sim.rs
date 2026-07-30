@@ -1970,6 +1970,12 @@ fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
          was at {ahead}, and every proposal it hears is judged against its own stale round",
         c.engines[straggler].round()
     );
+
+    // **Which branch of that disjunction fired**, which the assertion above cannot say. Either outcome satisfies it, so
+    // it would stay green on a cell that finalized past the height without the synchronization rule ever running — and
+    // this test exists to check the rule. `round_jumps` counts `maybe_advance_round` actually firing.
+    let p = c.engines[straggler].probe();
+    assert!(p.round_jumps.0 > 0, "the straggler jumped rather than merely finalizing around the problem: {p}");
 }
 
 #[test]
