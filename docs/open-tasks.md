@@ -178,6 +178,46 @@ That splits the item into two questions, and the second is the one that was hidi
    sub-second one **without touching consensus logic** — and would leave the r12 question exactly as visible, since the
    round count is what the probe reports.
 
+**The twelve-round mechanism, from a fresh trace — 2026-07-30.** Captured post-`270aef8`, so the old
+`PARKED@1 ccrej[park=1963]` wedge is closed and this is the current cause. All seven validators at height 1, in **four
+different rounds** (r9, r9, r10, r11, r12, r12, r12), each awaiting a **different** body (`7736f246` ×3, `49d97a60`,
+`e2a409d3`, `60410e05`, `892121ac`). Nobody locked, no `PARKED@`, no `sync=` (nobody thinks itself behind), DA healthy
+(shard serve 96–100 %, `took` in the thousands). One reject kind only: `rej[prop=36…155]` per validator, and zero
+`link`/`structure`/`lock`/`last_commit`.
+
+`ConsensusProbe::awaiting_body`'s own documentation reads that for us: *"A cell in which every validator awaits the same
+block is one whose body never reached anyone — a dispersal failure. A cell in which each awaits a different one is not
+stuck on a body at all; it is failing to converge."* Four distinct hashes ⇒ convergence, not availability.
+
+**And the gate explains it.** `on_propose`'s check is
+
+```rust
+let proposer_ok = pol_ok
+    || if sortition_round0 { is_line_member(seed, height, 0, proposer) }
+       else { leader(seed, height, self.round) == block.header.proposer };
+```
+
+`sortition_round0` is true only while `self.round == 0`. So: under SSLE every line member proposes at round 0; ranking
+picks a min-ticket winner but its **body must be recovered** through DA, which takes seconds; if round 0's quorum has not
+formed in `ROUND_TIMEOUT_BASE` = 1.5 s everyone advances; and a round-0 body arriving at a validator now in r5 is checked
+against *r5's* leader, which it is not. Refused, `rejects.proposer`. A `pol` cannot rescue it either — a POL is attached
+when a proposer **re-offers a locked block**, and the trace shows nobody locked.
+
+So round-0 proposals become permanently inadmissible the moment round 0 ends, and the cell must wait for a round whose
+leader both proposes *and* gets its body distributed inside that round's window. At 24 s per round past the fourth, that is
+the r9–r13 tail and the minutes.
+
+**This is the theory withdrawn earlier — and it was withdrawn for the wrong reason.** The withdrawal was right that
+skeletons route to `on_skeleton` and never reach `on_propose`. It was wrong to conclude the gate is never consulted:
+**recovered bodies** reach `on_propose` through `admit`, and that is where it bites. The trace's 36–155 proposer rejects
+with no other kind is the evidence that was missing then.
+
+**Candidate fix, stated as a hypothesis because a plausible one here already passed 132 tests and was still wrong:** the
+round-0 winner is chosen by *ticket ranking*, not by the leader rota, so asking `leader(seed, h, self.round)` about it is
+the wrong question. Keeping the ranked round-0 winner admissible at later rounds is the targeted change. The experiment
+that would confirm it is not "the test passes": it is that the **round spread collapses** and `rej[prop]` falls to near
+zero in the probe. Anything less could be the ladder's own variance.
+
 So the question to work is *why the two-round scenario's convergence varies 8×*, not *why a test is flaky*. The
 `ccrej[h/v/park]` and `PARKED@` counters are in place for it, and the next capture must keep the trace — the batch above
 grepped only `test result` and threw away the instrument's output, which is the second time that mistake has cost a run.
