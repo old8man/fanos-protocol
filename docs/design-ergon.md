@@ -438,10 +438,93 @@ Recorded here rather than discovered later.
 
 ---
 
+## 10a. Audit, 2026-07-30 — what step 1 actually left behind
+
+Read against the code rather than against this document. `fanos-ergon` is 931 lines and **nothing in the workspace depends
+on it**: 0 dependents, which the crate-level ratchet in `fanos-cli/tests/architecture.rs` exists to catch. That is not
+neglect, it is a consequence — the crate cannot *be* depended on for execution, because it has none.
+
+**The public surface is entirely static.** `Footprint::{new,union,conflicts,parallel_safe,points,locality}`,
+`Term::{footprint,locality,depth,size,is_external,effect_kinds}`, `well_typed`, `cost`. There is no `eval`, no `apply`, no
+state trait. §3's "a bounded total term a validator re-executes" describes an intent; no code re-executes anything. So
+steps 2–5 below are not merely unstarted, they are **blocked on three types that do not exist**:
+
+1. **No value model.** Nothing in the crate can represent a quantity. `Effect { kind: u16, footprint, external }` carries
+   no arguments, so `Transfer` cannot say *how much*; `Predicate { kind: u16, reads }` likewise. The algebra expresses
+   sequencing, gating and proven disjointness — **structure** — and cannot express **content**. Step 2 ("the eight rules
+   re-expressed as primitive effects") is impossible as written: `TAG_TRANSFER` needs an amount and a recipient.
+2. **No host interface.** No `State` trait (`get(&Key) -> Value`, `set(Key, Value)`), so there is nowhere for
+   `HybridLedger` to attach, and no `Host` to map a `kind` to a rule or a `Claim` to a verifier.
+3. **No evaluator, hence no footprint *enforcement*.** The footprint is derived from the term, which makes it honest about
+   the term — but the moment effects have behaviour, a derived footprint is only sound if execution is **confined** to it.
+   An effect that touches a key outside its declared footprint must be a fault, not a surprise, or `Par`'s proof of
+   disjointness becomes a promise again and the scheduler's determinism rests on the compiler's good manners.
+
+**And the expressiveness story does not reach user programmability.** §5's three sources are: (a) composing the existing
+eight effects, (b) adding new primitive effects, (c) `Prove`. A contract author gets exactly (a) — new *compositions* of
+what the protocol already implements. (b) is a protocol release per new behaviour, which is the opposite of user
+programmability. (c) is gated on ZK recursion by §5's own admission. So today an author cannot introduce **any new
+computation**, only a new arrangement of existing computations. That is a real ceiling and §5 does not name it.
+
+## 10b. The missing layer: bounded total expressions
+
+The ceiling lifts with one addition, and it is forced rather than chosen. For an author to write logic, effect and
+predicate arguments must be **computed**, not just constant — `transfer(to, balance(from) / 2)` is the smallest useful
+example. So the algebra needs an expression layer with exactly two properties:
+
+- **Total and bounded** — no recursion, no unbounded iteration, depth-limited by `Limits`. This is the same discipline
+  `Term` already has, one level down, and it keeps §7's closure theorem's shape.
+- **Reads declared, never discovered** — an expression may read only keys already in its enclosing effect's footprint.
+  Then the footprint stays a compile-time artefact and DROMOS's precondition survives, which is the whole reason §1
+  refuses a VM. An expression that reads outside the footprint is a *type error*, checked by `well_typed`, not a runtime
+  surprise.
+
+That is the difference between a scheduling calculus and an execution model, and it is a smaller addition than a VM
+precisely because it buys expressiveness *without* buying dynamic key computation.
+
+## 10c. Verum as the source language
+
+The user's own verified systems language (`/Users/taaliman/projects/oldman/verum-lang`, installed as `verum` 0.1.0, 26
+crates) is designed for this, and its features line up with ERGON's preconditions one-to-one rather than approximately:
+
+| ERGON requires | Verum already has |
+|---|---|
+| bounded total terms (§3, no loops) | `loop_annotation = 'invariant' expr \| 'decreases' expr`, and `@verify(thorough)` = "formal + **mandatory** invariant / frame / **termination** obligations" |
+| a footprint known before execution (§1) | `capability_type = path_type 'with' capability_list` — `Read`/`Write`/`ReadWrite`/`Admin`/`Transaction` and custom, with attenuating subtyping (`T with [A,B,C] <: T with [A,B]`) |
+| effects distinguished from pure computation | the `pure` modifier ("compiler-verified no side effects") and `@effect(<kind>)` |
+| `Prove` claims (§5c) | `@verify(certified)` with proof terms exportable to Coq / Lean / Dedukti / Metamath |
+| a declared context per contract | `context_clause = 'using' context_spec`, dependency injection as a language feature |
+
+So the compilation gate is derivable, not a matter of taste: **a contract dialect is Verum restricted to functions whose
+state access goes through capability-typed handles and which compile at `@verify(thorough)` or above.** Termination is
+then discharged by the compiler, so `decreases` bounds let loops be unrolled into `Seq` when the bound is a compile-time
+constant and rejected when it is not; capability types give the read/write key sets; `pure` functions collapse to
+`Footprint::empty`. Verum's grammar even carries a `contract#` tagged literal already.
+
+**The trust boundary is what makes this safe, and it is the part to state loudest: the chain never trusts the compiler.**
+It decodes the term, runs `well_typed`, derives the footprint itself with `Term::footprint`, and confines execution to it.
+Verum's verification buys the *author* correctness and the *proof* of termination; every guarantee the chain relies on is
+one the chain re-establishes. A compromised or buggy compiler can produce a term the chain rejects — it cannot produce one
+the chain mis-schedules. This is why the front end may be as sophisticated as it likes without enlarging the TCB.
+
+**Coupling.** The chain consumes an *artefact* (a canonically-encoded term plus, where used, a proof), never a compiler.
+So FANOS does not depend on the Verum crates; `verum` emits the artefact and `fanos-ergon` decodes it. That keeps the
+node's dependency graph and reproducibility intact, and it is the same shape as OBOLOS: prover outside, verifier inside.
+
+---
+
 ## 11. Implementation order
 
+**Revised 2026-07-30 after §10a.** The original list is kept below because its steps are still the right steps, but
+2–5 were blocked on types that do not exist, and step 0 is the unblocking. The order now is:
+
+0. **Values, host interface, expression layer, evaluator** (§10a, §10b). `Value`; `Expr` — total, depth-bounded, reading
+   only keys inside the enclosing footprint, which `well_typed` checks; `Effect`/`Predicate` gain computed arguments;
+   `trait State`/`trait Host`; `eval` that **confines** execution to the derived footprint and faults otherwise. This is
+   what turns the crate from a typing calculus into an execution model, and it is what makes steps 2–5 expressible.
 1. `fanos-ergon`: the sans-I/O term algebra — `Term`, `Effect`, `Footprint`, `fp`, `depth`, well-typedness, with the
-   closure theorem's induction as the test suite. No ledger dependency; `no_std`. **Done.**
+   closure theorem's induction as the test suite. No ledger dependency; `no_std`. **Done** — and audited in §10a: complete
+   as a static calculus, with no execution semantics.
    
    One thing attempting step 2 surfaced, worth recording as a design fact rather than a fix: a `Key`'s slot is **32 bytes,
    not a `u64`**, because that is what a host state key actually is (`fanos-dromos`'s keys are 32-byte account, name and
@@ -453,5 +536,10 @@ Recorded here rather than discovered later.
 3. `HybridLedger::apply` replaced by the term interpreter; the declared `AccessList` deleted and `fp` wired into DROMOS.
 4. `Gate`/`Alt` predicates over ledger state; HERMES's HTLC migrated to `Gate` and `TAG_HTLC` retired.
 5. `Prove` behind the OBOLOS verifier, inert until recursion lands.
+6. **The Verum front end** (§10c): a `verum` target emitting the canonical term encoding, the contract dialect's gate
+   (`@verify(thorough)` + capability-typed state handles), `decreases`-bounded loop unrolling, and a conformance suite that
+   compiles a contract, decodes it in `fanos-ergon`, and checks the chain's own `well_typed` + `Term::footprint` agree with
+   what the compiler intended. That last check is the one that keeps the trust boundary honest — it must fail loudly if the
+   compiler and the chain ever disagree.
 
 Step 1 is pure and provable and is where this begins.
