@@ -40,7 +40,12 @@ const EMBEDDING_SURFACE: &[(&str, &str)] = &[
 /// shrink it; for these two it is the wrong one, because the work is real and what is missing is a driver and a
 /// verb, not the capability.
 const ORPHANS: &[(&str, &str)] = &[
-    ("fanos-ergon", "the effect-algebra execution model: DROMOS executes without it (plan I.1)"),
+    // **Empty as of 2026-07-30**, and worth stating rather than leaving as an absence: every crate in the workspace is
+    // now reachable from a shipped binary or is a declared embedding surface. `fanos-ergon` was the last entry — an
+    // execution model DROMOS executed without — and `fanos_dromos::ergon_host` plus `TAG_ERGON` closed it.
+    //
+    // An empty list is the goal, not a reason to delete the check: the assertion below is what fails when the next
+    // capability lands without a door.
 ];
 
 /// Every crate that is allowed to be unlinked, for either reason.
@@ -160,8 +165,10 @@ fn the_reachability_figures_are_what_the_audit_states() {
     let from_any = closure(&deps, &binaries);
 
     assert_eq!(total, 43, "the workspace crate count changed");
-    assert_eq!(from_node.len(), 35, "reachable from fanos-node (itself included): {from_node:?}");
-    assert_eq!(from_any.len(), 39, "reachable from any shipped binary");
+    // 35 → 36: `fanos-ergon` joined the node's closure when `fanos-dromos` took a dependency on it (`ergon_host`).
+    assert_eq!(from_node.len(), 36, "reachable from fanos-node (itself included): {from_node:?}");
+    // 39 → 40, same cause. And the remainder is now the embedding surface alone, since `ORPHANS` is empty.
+    assert_eq!(from_any.len(), 40, "reachable from any shipped binary");
     assert_eq!(total - from_any.len(), unlinked().len(), "the unlinked set must account for the remainder");
 }
 
@@ -177,17 +184,19 @@ fn the_reachability_figures_are_what_the_audit_states() {
 /// every orphan.
 #[test]
 fn the_orphan_list_only_shrinks() {
-    const AT_RATCHET: usize = 1;
-    assert!(
-        ORPHANS.len() <= AT_RATCHET,
-        "the orphan list grew to {} — a new crate was added that nothing can reach. Wire it, or delete it; \
-         adding a row is not one of the options.",
-        ORPHANS.len()
-    );
-    // …and when it shrinks, lower the ratchet, so the gain is locked in rather than left as slack.
-    assert!(
-        ORPHANS.len() == AT_RATCHET,
-        "an orphan was resolved — lower AT_RATCHET to {} so the ground gained cannot be given back.",
+    // Lowered 1 → 0 on 2026-07-30: `fanos-ergon` was the last orphan and is now reachable, so the ground is locked in.
+    //
+    // At zero the two checks this test used to make — "the list grew" and "it shrank and the ratchet was not lowered" —
+    // are the same assertion, which is what a fully-closed ratchet means and why they are now one. Zero is not a finished
+    // state: it is the state in which the next capability landing without a door fails this test on the commit that adds
+    // it, which was always the point.
+    const AT_RATCHET: usize = 0;
+    assert_eq!(
+        ORPHANS.len(),
+        AT_RATCHET,
+        "the orphan list is {} rather than {AT_RATCHET}. If it GREW, a crate was added that nothing can reach — wire it \
+         or delete it; adding a row is not one of the options. If it SHRANK, lower AT_RATCHET so the ground gained \
+         cannot be given back.",
         ORPHANS.len()
     );
 }
@@ -241,7 +250,13 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-diakrisis", 40),
     ("fanos-diaulos", 6),
     ("fanos-dromos", 18),
-    ("fanos-ergon", 3),
+    // 3 → 4, and the bump has a reason as the rule requires: `Expr::bin`, `exec::compare` and `Predicate::host_with`
+    // are the expression layer's constructors. Nothing in production builds a computed argument or a compared gate yet
+    // — `transfer_term` is the only term builder — and the callers are the Verum emitter and contract authors
+    // (`docs/design-ergon.md` §11 step 6). This is the ratchet working as intended: the debt is named and bounded, not
+    // hidden. `Journal::written` was the fifth and was deleted instead of budgeted — an accessor I added speculatively
+    // with no caller anywhere, which is dead code rather than pending work.
+    ("fanos-ergon", 4),
     ("fanos-field", 1),
     ("fanos-geometry", 2),
     ("fanos-holarch", 1),

@@ -142,9 +142,6 @@ impl<'a, S: State + ?Sized> Journal<'a, S> {
         }
     }
 
-    /// How many distinct keys have been written.
-    #[must_use]
-    pub fn written(&self) -> usize { self.undo.len() }
 }
 
 impl<S: State + ?Sized> Reader for Journal<'_, S> {
