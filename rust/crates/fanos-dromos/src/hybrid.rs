@@ -735,7 +735,13 @@ impl HybridLedger {
         }
         let mut host = LedgerHost::new(caller);
         let mut state = LedgerState::new(self);
-        match fanos_ergon::eval(&checked, &[], &mut host, &mut state) {
+        let outcome = fanos_ergon::eval(&checked, &[], &mut host, &mut state);
+        // Defence in depth behind the space check above: if the adapter could not route anything, the term is refused even
+        // if the evaluator was satisfied. A dropped write must never reach a committed state.
+        if state.unmapped().is_some() {
+            return ExecOutcome::Rejected;
+        }
+        match outcome {
             Ok(_) => {
                 self.tokens.bump_nonce(caller);
                 ExecOutcome::Applied

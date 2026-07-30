@@ -187,31 +187,49 @@ impl SignedTerm {
 /// where consensus reads it.
 pub struct LedgerState<'a> {
     ledger: &'a mut crate::hybrid::HybridLedger,
+    /// The first write this adapter could not route, if any.
+    ///
+    /// Recorded rather than returned, for the reason [`fanos_ergon::Confined`] records its violations: a `Result` a host
+    /// rule can discard with `let _ =` is not a guarantee, and a **silently dropped write** is the worst failure available
+    /// here — the rule believes it moved value, the state says otherwise, and nothing anywhere says so. `apply_term`
+    /// rejects the transaction if this is set, which is defence in depth behind its own space check: that check is what
+    /// stops such a term today, and this is what stops the next caller who forgets to make one.
+    unmapped: core::cell::Cell<Option<Key>>,
 }
 
 impl<'a> LedgerState<'a> {
     /// View `ledger` as ERGON state.
-    pub fn new(ledger: &'a mut crate::hybrid::HybridLedger) -> Self { Self { ledger } }
+    pub fn new(ledger: &'a mut crate::hybrid::HybridLedger) -> Self {
+        Self { ledger, unmapped: core::cell::Cell::new(None) }
+    }
+
+    /// The first key this adapter could not route, read or written.
+    #[must_use]
+    pub fn unmapped(&self) -> Option<Key> { self.unmapped.get() }
 }
 
 impl Reader for LedgerState<'_> {
     fn get(&self, key: &Key) -> Option<Value> {
-        match key.space {
-            SPACE_BALANCE => Some(Value::Int(u128::from(self.ledger.tokens().balance(&key.slot)))),
-            // Every further space is a sub-ledger yet to be mapped, and `None` is the honest answer: `Expr::Load` on it
-            // becomes `Fault::Missing`, which refuses the term rather than inventing a value for state this adapter
-            // cannot see. Adding a space is adding an arm here.
-            _ => None,
+        if key.space == SPACE_BALANCE {
+            return Some(Value::Int(u128::from(self.ledger.tokens().balance(&key.slot))));
         }
+        // Every further space is a sub-ledger yet to be mapped, and `None` is the honest answer: `Expr::Load` on it becomes
+        // `Fault::Missing`, which refuses the term rather than inventing a value for state this adapter cannot see. Adding
+        // a space is adding a branch here. Recorded as well as refused, so a caller that ignores the fault still cannot
+        // proceed as though the read succeeded.
+        self.unmapped.set(self.unmapped.get().or(Some(*key)));
+        None
     }
 }
 
 impl State for LedgerState<'_> {
     fn set(&mut self, key: Key, value: Value) {
-        if key.space == SPACE_BALANCE
-            && let Ok(n) = value.as_u64()
-        {
-            self.ledger.tokens_mut().set_balance(key.slot, n);
+        match (key.space, value.as_u64()) {
+            (SPACE_BALANCE, Ok(n)) => self.ledger.tokens_mut().set_balance(key.slot, n),
+            // A write this adapter cannot route must never vanish quietly. It is dropped — a value written to a space the
+            // adapter does not understand would be a guess — and recorded, so the transaction is rejected rather than
+            // committed with a rule believing it did something it did not.
+            _ => self.unmapped.set(self.unmapped.get().or(Some(key))),
         }
     }
 }
@@ -372,6 +390,28 @@ mod tests {
             native.state_root(),
             "the term path and the native path agree where consensus reads them"
         );
+    }
+
+    #[test]
+    fn an_unroutable_write_is_recorded_rather_than_dropped() {
+        // Defence in depth, tested directly because the primary check in `apply_term` shields it in the live path — and
+        // code a shield keeps unreachable is code nobody has run. A write to a space this adapter cannot route must not
+        // vanish quietly: dropped it is (writing a guess would be worse), but recorded, so the transaction is rejected
+        // instead of committing with a rule believing it moved value.
+        let mut ledger = crate::hybrid::HybridLedger::new(funded());
+        let stray = Key::at(LEDGER_POINT, SPACE_BALANCE + 5, ALICE);
+        let mut state = LedgerState::new(&mut ledger);
+        assert_eq!(state.unmapped(), None, "nothing recorded yet");
+        state.set(stray, Value::Int(999));
+        assert_eq!(state.unmapped(), Some(stray), "the write was recorded");
+        assert_eq!(state.get(&balance_key(ALICE)), Some(Value::Int(1000)), "and it did not land anywhere");
+
+        // A read of an unroutable key is recorded too — the footprint DROMOS scheduled on would otherwise be a footprint
+        // the rule did not use, which is the same defect from the read side.
+        let mut fresh = crate::hybrid::HybridLedger::new(funded());
+        let reader = LedgerState::new(&mut fresh);
+        assert_eq!(reader.get(&stray), None);
+        assert_eq!(reader.unmapped(), Some(stray));
     }
 
     #[test]
