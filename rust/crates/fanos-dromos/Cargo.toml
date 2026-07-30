@@ -11,6 +11,9 @@ keywords = ["blockchain", "execution", "state-machine", "privacy", "fanos"]
 categories = ["cryptography"]
 
 [dependencies]
+# ERGON — the effect-term algebra the ledger acts as a host for (`ergon_host`), so a well-typed term over the
+# primitive effects is a new transaction kind without a protocol release. `docs/design-ergon.md` §11 step 2.
+fanos-ergon.workspace = true
 # The consensus StateMachine trait + Transaction/ExecOutcome DROMOS executes for, and the transparent
 # `Accounts` ledger the hybrid state machine composes with the shielded pool.
 fanos-taxis.workspace = true

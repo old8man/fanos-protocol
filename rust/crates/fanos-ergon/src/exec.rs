@@ -66,26 +66,39 @@ pub trait Host {
 pub struct Confined<'a, S: State + ?Sized> {
     inner: &'a mut S,
     footprint: &'a Footprint,
-    violation: Option<Key>,
+    violation: core::cell::Cell<Option<Key>>,
 }
 
 impl<'a, S: State + ?Sized> Confined<'a, S> {
     /// Restrict `inner` to `footprint`.
     pub fn new(inner: &'a mut S, footprint: &'a Footprint) -> Self {
-        Self { inner, footprint, violation: None }
+        Self { inner, footprint, violation: core::cell::Cell::new(None) }
     }
 
-    /// The first out-of-footprint key touched, if any.
+    /// The first out-of-footprint key touched, if any — read **or** written.
     #[must_use]
-    pub const fn violation(&self) -> Option<Key> { self.violation }
+    pub fn violation(&self) -> Option<Key> { self.violation.get() }
+
+    fn record(&self, key: Key) {
+        if self.violation.get().is_none() {
+            self.violation.set(Some(key));
+        }
+    }
 }
 
 impl<S: State + ?Sized> Reader for Confined<'_, S> {
     fn get(&self, key: &Key) -> Option<Value> {
         // A read of a key the effect may *write* is in bounds: a rule that updates a balance must read it first, and
         // requiring the key in both sets would make every read-modify-write footprint say the same thing twice.
+        //
+        // An out-of-footprint read is **recorded**, not merely refused. The first version only returned `None`, and a real
+        // host immediately showed why that is wrong: it read a key outside its footprint, got `None`, and reported its own
+        // "rejected" — so a *confinement* failure surfaced as an ordinary rule refusal and the derived footprint being
+        // wrong was invisible. Reads matter to the scheduler exactly as much as writes: a rule reading a key the term did
+        // not name means the footprint DROMOS scheduled on is not the footprint the rule used.
         if self.footprint.reads().binary_search(key).is_err() && self.footprint.writes().binary_search(key).is_err() {
-            return None; // refused, and recorded on the write path or by `violation` after a `get_recording`
+            self.record(*key);
+            return None;
         }
         self.inner.get(key)
     }
@@ -94,9 +107,7 @@ impl<S: State + ?Sized> Reader for Confined<'_, S> {
 impl<S: State + ?Sized> State for Confined<'_, S> {
     fn set(&mut self, key: Key, value: Value) {
         if self.footprint.writes().binary_search(&key).is_err() {
-            if self.violation.is_none() {
-                self.violation = Some(key);
-            }
+            self.record(key);
             return; // the write is dropped as well as recorded — a violation must not take effect even transiently
         }
         self.inner.set(key, value);
@@ -208,10 +219,15 @@ fn run<S: State + ?Sized, H: Host>(
                 evaluated.push(a.eval(state, args)?);
             }
             let mut confined = Confined::new(state, &footprint);
-            host.effect(effect.kind, &evaluated, &mut confined)?;
+            let outcome = host.effect(effect.kind, &evaluated, &mut confined);
+            // The violation is checked BEFORE the host's own result, and the order is load-bearing: a host that reads
+            // outside its footprint sees `None` and will usually report a rule refusal of its own, which would mask the
+            // confinement failure entirely. The more fundamental fault must win — otherwise the one signal that says "the
+            // derived footprint is wrong" is the one the caller never sees.
             if let Some(key) = confined.violation() {
                 return Err(Fault::OutsideFootprint(key));
             }
+            outcome?;
             receipt.effects += 1;
             Ok(())
         }
@@ -249,10 +265,11 @@ fn run<S: State + ?Sized, H: Host>(
             // The claim's writes are the host's to apply — it verified them. Confined to the claim's footprint for the
             // same reason an effect is: a proof of *what* follows is not a licence to touch anything else.
             let mut confined = Confined::new(state, &claim.footprint);
-            host.effect(claim.kind, &[], &mut confined)?;
+            let outcome = host.effect(claim.kind, &[], &mut confined);
             if let Some(key) = confined.violation() {
                 return Err(Fault::OutsideFootprint(key));
             }
+            outcome?;
             receipt.claims += 1;
             Ok(())
         }

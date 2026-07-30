@@ -281,6 +281,16 @@ impl TokenLedger {
         Ok(())
     }
 
+    /// Set `account`'s balance outright — for the ERGON state adapter only (`crate::ergon_host`).
+    ///
+    /// Crate-private, deliberately. The public surface is `apply`/`credit`, which preserve the ledger's invariants; a
+    /// setter that does not is exactly the thing a caller outside this crate should not have. The adapter may hold it
+    /// because ERGON confines every write to a footprint the term derives, so the invariant moves rather than
+    /// disappearing: the *rule* checks sufficiency and overflow, and the *evaluator* checks the key was permitted.
+    pub(crate) fn set_balance(&mut self, account: [u8; 32], amount: u64) {
+        self.balances.insert(account, amount);
+    }
+
     /// Whether `st`'s nonce is **ahead** of its sender's — the transfer is not applicable yet, and becomes so
     /// once the sender's earlier transfers execute.
     ///
