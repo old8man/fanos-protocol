@@ -150,9 +150,24 @@ That is exactly our case — a derivation references its inputs, always — so b
 cannot fail, which is the defect it exists to prevent. It also inverts the trust ordering worth knowing about: the sound
 tool here is `check`, not `verify`.
 
-The right reading is not "this idea is weaker". It is that §3's value is confirmed and its dependency named: one
-soundness fix in `verify` turns the whole class of constant-drift defects — the class that already cost us a HIGH — into
-compile errors. Until then, do not port a single constant, because a passing `verify` would mean nothing.
+**Then bounded, and the bound unblocks it.** The theorem path and the `ensures` postcondition path are both sound —
+`theorem obviously_false(n) ensures n == n + 1000` fails with a counterexample and a hint, and
+`fn f(n) -> Int ensures result == n + 1000 { 0 }` fails as a postcondition violation. Only a refinement in *return
+position* referencing a parameter is mis-proved. So the same obligation, written as a postcondition, works — verified in
+both directions:
+
+```verum
+fn tolerated_faults(n: Int) -> Int
+    requires n >= 4
+    ensures result == (n - 1) / 3
+{ (n - 1) / 3 }          // ✓ Proved
+{ 2 }                    // ✗ postcondition violation   ← E7 in one line, refused
+```
+
+**§3 is therefore buildable today**, with one rule: express derivations as `ensures`, never as return-type refinements.
+That is the whole adaptation. The bug stays filed as G11 because the two forms mean the same thing to an author and the
+more natural-reading one is the one that lies — but it is not a blocker, and stopping at "blocked" would have been the
+wrong answer by one experiment.
 
 ---
 
@@ -183,6 +198,11 @@ invention. Low cost, modest payoff — do it when the emitter lands, not before.
 2. **§3's first slice** — the derivation as a failing specification. Small, and it retires a class of defect that has
    already cost a HIGH.
 3. **§2's first slice** — one engine under both runtimes. Larger, and the payoff is the project's most persistent cost.
+
+   And a note on method, since it changed two verdicts in one hour: **bound a defect before accepting it as a blocker.**
+   §1 looked gated on kernel size and is really gated on SMT proof reconstruction. §3 looked blocked by an unsound
+   verifier and is buildable today in a different syntax. Both corrections came from one more experiment after the first
+   discouraging result.
 4. **§4** — take `RestartIntensity` into the recovery ladder now; leave the rest.
 
 And the discipline that applies to all four, learned the hard way this session: **a mechanism that cannot fail in a test

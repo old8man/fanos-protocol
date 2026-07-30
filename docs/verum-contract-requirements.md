@@ -327,6 +327,29 @@ sent to a solver.
 So it is the **dependent** return refinement that is unsound; the parameter binding looks lost or mis-scoped, leaving a
 predicate that is trivially satisfiable.
 
+**Bounded further, and this is the useful part: the rest of the verification path is sound.** The same false obligation is
+caught correctly everywhere else it can be written:
+
+| the same claim, written differently | `verify` |
+|---|---|
+| `theorem obviously_false(n: Int) ensures n == n + 1000` | **✗ Failed**, with a counterexample *and* a hint ("try `omega` — both sides are linear arithmetic") |
+| `fn f(n: Int) -> Int ensures result == n + 1000 { 0 }` | **✗ Failed** — "postcondition violation" |
+| `fn wrong(n: Int) -> Int{== n + 1000} { 0 }` | **"Proved"** |
+
+So the theorem path and the `ensures` postcondition path both work; the defect is confined to a refinement **in return
+position that references a parameter**. That makes this a narrow bug rather than a broken verifier, and it hands us a
+workaround good enough to build on today — see below.
+
+**The workaround, verified in both directions**, which is the only way a workaround is worth anything:
+
+```verum
+fn tolerated_faults(n: Int) -> Int
+    requires n >= 4
+    ensures result == (n - 1) / 3
+{ (n - 1) / 3 }          // ✓ Proved
+{ 2 }                    // ✗ postcondition violation  ← E7 in one line, correctly refused
+```
+
 Two further observations that matter more than the bug itself:
 
 - **The two tools disagree, and the sound one is `check`.** That inverts the expected trust ordering — `verify` is the
@@ -337,13 +360,15 @@ Two further observations that matter more than the bug itself:
   refinement fails to propagate to the return position in `check` too — incompleteness there, unsoundness in `verify`,
   same neighbourhood of the code.
 
-**Why FANOS cares, and why this is the highest-severity item in this document.** `docs/design-verum-frontier.md` §3
-proposes tying our derived constants to their derivations so that drift becomes a build failure — the class of defect that
-produced audit E7 (`MIX_THRESHOLD` written as `const = 2`, correct at `q = 2`, silently wrong at every larger plane, found
-by accident months later). A derivation **by definition** references its inputs: `f = (n−1)/3`, `Q = (n+f+1)/2`,
-`t = ⌈2(q+1)/3⌉`. Every one of them is the dependent case. Today `verify` would report all of them proved whether or not
-they hold, so the proposal would install a gate that cannot fail — precisely the failure mode named in G1 and G10, in the
-tool whose entire purpose is to prevent it.
+**Why FANOS cares.** `docs/design-verum-frontier.md` §3 proposes tying our derived constants to their derivations so drift
+becomes a build failure — the class that produced audit E7 (`MIX_THRESHOLD` written as `const = 2`, correct at `q = 2`,
+silently wrong at every larger plane, found by accident months later). A derivation **by definition** references its
+inputs: `f = (n−1)/3`, `Q = (n+f+1)/2`, `t = ⌈2(q+1)/3⌉` — every one is the dependent case.
+
+Because the `ensures` form is sound, that proposal is **not blocked**: we will write the derivations as postconditions and
+avoid return-position refinements entirely. So this is filed as a serious bug rather than an obstacle — it does not stop
+us, and the reason to fix it is that the two forms mean the same thing to an author, and the one that reads more naturally
+is the one that lies.
 
 **Acceptance.** The one-line repro fails under `verify`, with a regression test; and the `check`/`verify` verdicts are
 asserted to agree on a corpus that includes at least one dependent refinement in each direction (true and false). The
