@@ -572,6 +572,7 @@ fn drive<S: StateMachine>(
                             if let Some(shard) = shards.get(p) {
                                 let deliver = ShardMsg::Deliver { block: hash, index: idx, data: shard.clone() };
                                 client.command(Command::Emit { to, frame: shard_to_frame(&deliver) });
+                                engine.note_shard_sent();
                             }
                         }
                     }
@@ -681,6 +682,7 @@ fn on_shard<S: StateMachine>(
 ) {
     match msg {
         ShardMsg::Deliver { block, index, data } => {
+            engine.note_shard_taken();
             if let Some(full) = da.accept(block, index, data) {
                 admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, full);
             }
@@ -689,7 +691,11 @@ fn on_shard<S: StateMachine>(
             // Our own shard if we hold it, else re-derive the requested one from the whole block if we have it.
             // Without the fallback a shard has exactly one custodian, so a dispersal that never arrived is
             // unobtainable however many peers hold the block — including the proposer, which built it.
-            if let Some(shard) = da.serve(&block, index).or_else(|| engine.shard_of(&block, index)) {
+            let shard = da.serve(&block, index).or_else(|| engine.shard_of(&block, index));
+            // Counted at the handling site rather than inside the engine: the answer comes from `da` first, which the
+            // engine cannot see, so only here is `served` the truth about what went back on the wire.
+            engine.note_shard_ask(shard.is_some());
+            if let Some(shard) = shard {
                 let deliver = ShardMsg::Deliver { block, index, data: shard.clone() };
                 client.command(Command::Emit { to: from, frame: shard_to_frame(&deliver) });
             }

@@ -115,6 +115,12 @@ pub struct ConsensusProbe {
     pub rejects: ProposalRejects,
     /// Skeleton requests seen, and how many this validator could answer.
     pub skeleton_asks: (u64, u64),
+    /// Shard requests seen, and how many this validator could answer.
+    pub shard_asks: (u64, u64),
+    /// Delivered shards this validator accepted.
+    pub shards_taken: u64,
+    /// Shards this validator dispersed as a proposer.
+    pub shards_sent: u64,
 }
 
 impl core::fmt::Display for ConsensusProbe {
@@ -133,6 +139,13 @@ impl core::fmt::Display for ConsensusProbe {
         let (asked, served) = self.skeleton_asks;
         if asked > 0 {
             write!(f, " skel={served}/{asked}")?;
+        }
+        let (sh_asked, sh_served) = self.shard_asks;
+        if sh_asked > 0 || self.shards_taken > 0 {
+            write!(f, " shard={sh_served}/{sh_asked} took={}", self.shards_taken)?;
+        }
+        if self.shards_sent > 0 {
+            write!(f, " sent={}", self.shards_sent)?;
         }
         let r = &self.rejects;
         let total = r.proposer + r.link + r.locked + r.structure + r.last_commit + r.seal + r.witness + r.unavailable;
@@ -610,6 +623,19 @@ pub struct ConsensusEngine<S: StateMachine> {
     // are **not arriving**, or one where they arrive and **nobody holds the block**. `await:<hash>` looks identical in
     // both, and they need opposite investigations.
     skeleton_asks: (u64, u64),
+    // The same instrument one layer down, for SHARDS — added 2026-07-30 after the skeleton counter answered its own
+    // question and pointed past itself. It showed requests arriving in thousands and being served (one validator
+    // answered 3461 of 3461), with the requesters *sampling* — so they hold skeletons and lack shards, which is the
+    // half `skeleton_asks` cannot see.
+    //
+    // Both directions, because the skeleton case proved serving alone is not enough to localize a stall: `(asked,
+    // served)` is what this validator was asked for and could answer; `taken` is how many delivered shards it
+    // accepted. A stall with `asked = 0` is a request-side failure, `served = 0` a holder-side one, and
+    // `asked > 0, served > 0, taken = 0` means the replies are produced and lost or refused — three different
+    // investigations, and a single counter would conflate them exactly as the first one nearly did.
+    shard_asks: (u64, u64),
+    shards_taken: u64,
+    shards_sent: u64,
     // The canonical COMMIT certificate for each finalized height this validator can still produce, keyed by the height
     // it finalizes. Two sources: one learned from **another block's `last_commit`** (see `adopt_certified_parent`,
     // carried into `finalize` because `collect_cert` can only build a certificate from votes this validator actually
@@ -726,6 +752,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             round0_tickets: BTreeMap::new(),
             rejects: ProposalRejects::default(),
             skeleton_asks: (0, 0),
+            shard_asks: (0, 0),
+            shards_taken: 0,
+            shards_sent: 0,
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
@@ -938,6 +967,24 @@ impl<S: StateMachine> ConsensusEngine<S> {
         }
     }
 
+    /// Record that a peer asked this validator for a shard, and whether it could be answered.
+    pub fn note_shard_ask(&mut self, served: bool) {
+        self.shard_asks.0 = self.shard_asks.0.saturating_add(1);
+        if served {
+            self.shard_asks.1 = self.shard_asks.1.saturating_add(1);
+        }
+    }
+
+    /// Record that a delivered shard was accepted by the sampler.
+    pub fn note_shard_taken(&mut self) {
+        self.shards_taken = self.shards_taken.saturating_add(1);
+    }
+
+    /// Record that this validator dispersed a shard as a proposer.
+    pub fn note_shard_sent(&mut self) {
+        self.shards_sent = self.shards_sent.saturating_add(1);
+    }
+
     /// **Any** data-availability shard of a block this validator holds in full.
     ///
     /// A shard normally has exactly one custodian — the validator whose index it is — so a dispersal that never
@@ -971,6 +1018,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             holds_locked_body: self.locked_block.is_some_and(|h| self.proposals.contains_key(&h)),
             awaiting_body: self.awaited_body().map(|h| [h[0], h[1], h[2], h[3]]),
             skeleton_asks: self.skeleton_asks,
+            shard_asks: self.shard_asks,
+            shards_taken: self.shards_taken,
+            shards_sent: self.shards_sent,
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
         }

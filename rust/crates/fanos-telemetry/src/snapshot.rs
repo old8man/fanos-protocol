@@ -243,7 +243,7 @@ fn recover_cell_size(purity: f64, reflection: f64, faulted: bool) -> u32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::float_cmp)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::*;
     use fanos_diakrisis::coherence::CoherenceMatrix;

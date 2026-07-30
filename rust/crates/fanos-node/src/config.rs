@@ -141,7 +141,10 @@ impl fmt::Debug for BeaconParams {
             .field("threshold", &self.threshold)
             .field("anchor", &self.share.is_some())
             .field("authority", &self.authority.is_some())
-            .finish()
+            // Non-exhaustive on purpose, and the lint that asks for every field is the reason to say so out loud:
+            // `commitment` is bulky group material and `share` is a secret, so this impl reports presence and never
+            // content. Listing them to satisfy a lint is how the secret gets into a log line.
+            .finish_non_exhaustive()
     }
 }
 
@@ -897,7 +900,7 @@ impl NodeConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

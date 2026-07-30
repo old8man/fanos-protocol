@@ -204,6 +204,29 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
             "the parallel scheduler executed this block (waves > 0), rather than the serial default"
         );
     }
+    // The data-availability layer actually RAN on this path, asserted for the same reason as `waves_last_block`
+    // above: no outcome distinguishes DA from its absence, because the block commits either way. The shape has bitten
+    // twice already (the mix threshold, the beacon recovery authority) — machinery finished, tested, and reachable
+    // from nothing.
+    //
+    // Each clause is what its own falsification showed it to be, which is not what the first draft claimed:
+    //
+    //   * `shards_sent` is the PROPOSER side, and only proposers disperse — so it is asserted cell-wide, not per
+    //     validator. Falsified by dropping the dispersal `Emit`.
+    //   * `shard_asks` is the sampling loop: a peer asked for a shard and this validator answered. Falsified by
+    //     no-oping `request_shards` — every validator then reports `shard=0/0`.
+    //   * `shards_taken` counts every accepted delivery, dispersed OR sampled. Dropping dispersal does NOT make it
+    //     zero (measured — the test stays green), so it does not pin dispersal and is not claimed to: it pins that
+    //     shards flow and the sampler takes them.
+    let mut dispersed = 0u64;
+    for (i, h) in handles.iter().enumerate() {
+        let p = h.probe().await.expect("validator is up").consensus;
+        let (asked, served) = p.shard_asks;
+        dispersed += p.shards_sent;
+        assert!(p.shards_taken > 0, "v{i} accepted a shard the sampler took: {p}");
+        assert!(asked > 0 && served > 0, "v{i} answered a peer's shard request (the sampling loop ran): {p}");
+    }
+    assert!(dispersed > 0, "some proposer dispersed erasure shards rather than shipping whole blocks");
 }
 
 /// The same private transfer, but submitted the way a **real external client** does: sealed and sent as a

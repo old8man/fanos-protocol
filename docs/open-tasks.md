@@ -124,6 +124,33 @@ The probe now also carries `skel=served/asked` (`ConsensusEngine::note_skeleton_
 trace could not otherwise tell apart: a cell whose skeleton requests never arrive, and one where they arrive and nobody
 holds the block. `await:<hash>` looks identical in both and they need opposite investigations.
 
+**And `shard=served/asked took=N sent=M` one layer down (2026-07-30),** because the skeleton counter answered its own
+question and pointed past itself: requests arrive in thousands and are served (one validator answered 3461 of 3461), so
+what is missing is the *shards*, which `skel=` cannot see. Three counters rather than one, because a single number
+conflates three different investigations — `asked = 0` is a request-side failure, `served = 0` a holder-side one, and
+`asked > 0, served > 0, took = 0` means replies are produced and then lost or refused.
+
+Two things the instrument settled immediately, before any failing run:
+
+- **`sampling=x/64` is not a sample fraction.** It is `Sampler::in_flight()` against `PENDING_CAP` — blocks being
+  reassembled, not shards gathered. `sampling=1/64` is *healthy*, and a healthy passing run shows three of seven
+  validators ending on `await:<hash>` with `sampling=1/64`. Neither `await` nor a low `sampling` is a failure signature;
+  earlier readings that treated them as one were reading a capacity as a shortfall.
+- **The healthy shape**, from a passing `a_private_transfer` run: `shard=402/402 took=1052`, every validator nonzero,
+  serve rates 97–100 %. That is what the counters read when nothing is wrong, which is the only way a failing trace means
+  anything.
+
+Validated before use, per the rule this test taught: each clause of the new assertion in
+`a_private_transfer_executes_over_live_consensus_end_to_end` was falsified by disabling the mechanism it claims.
+`shard_asks` dies when `request_shards` is a no-op; `shards_sent` dies when the dispersal `Emit` is removed. But
+`shards_taken` does **not** die when dispersal is removed — the test stays green — so it counts *any* accepted delivery,
+dispersed or sampled, and the assertion no longer claims otherwise. The first draft's comment did claim it, which is the
+whole reason to falsify clause by clause rather than run the suite once and believe it.
+
+A side measurement worth keeping: with dispersal removed the cell still commits, once in 9.4 s and once failing at
+94.9 s. So proposer dispersal is not load-bearing for correctness at q = 2 — sampling recovers what it did not send — and
+its absence shows up as *flakiness*, exactly the shape being chased. Nothing tested dispersal at all before this.
+
 **And never let a pipeline decide whether the gate passed.** `cargo test … | grep …` reports *grep's* exit status, so a
 run ending `error: test failed` was reported as exit 0 and nearly shipped. Run the gate bare, `echo $?` on its own, then
 read the detail in a separate call.
@@ -255,16 +282,50 @@ v6     : 0/Some(Locked)  h1r13 behind(2) await   ← one stuck at height 1
 Six of seven complete the whole scenario. The failure is a **single straggler**, and it is not confused: `behind(2)`
 means its own `max_seen_height` exceeds its height, so it knows the cell moved on, and `await` means it is waiting on a
 body. So the question is no longer "why does consensus not progress" — it does — but **why catch-up does not run for a
-validator that has already detected it is behind**. Candidates, in order:
-- **its `max_seen_height` is 2 while the cell is at 8** — and this is almost certainly the answer. `note_height` fires
-  from proposals, votes, skeletons and exec-votes alike, so a validator receiving *any* current cell traffic would
-  record 8. Recording 2 means it heard nothing above height 2 for the remaining ~200 s. It is not failing to ask; it
-  cannot hear the answer. That points at the overlay/transport — a node that stops receiving — not at consensus, and
-  not at the catch-up protocol, which asked exactly as designed. Ruled out along the way: the `SyncResp` snapshot
-  exceeding a frame (`MAX_FRAME` is 1 MiB, the test ledger is orders of magnitude smaller).
-- `certified[1]` is pruned on every peer once a checkpoint forms above it (`prune_sync_retention`), so the
-  `CommitCert` answer is unavailable and only `SyncResp` can serve it;
-- `awaited_body` may be occupying the validator ahead of the sync path.
+validator that has already detected it is behind**.
+
+**The leading candidate — "it cannot hear the answer" — is REFUTED, 2026-07-30.** The shard counters caught the same
+failure with the traffic visible:
+
+```
+v0,v1,v2,v4 : 1000/None       h4r2                shard=8463/8779 … took=3390  sent=60
+v5,v6       : 1000/None       h4r2 await:3de7398e shard=4112/4284 … took=7909  sent=48
+v3          : 0/Some(Locked)  h2r12 behind(3) lock await:3a4474d5
+              skel=0/564   shard=2012/2354  took=4773  sent=42  sampling=4/64
+```
+
+The straggler answered 2012 of 2354 shard requests, was asked for 564 skeletons, **accepted 4773 delivered shards** and
+dispersed 42 of its own. It is in dense two-way traffic, so "a node that stops receiving" is not what this is. Note also
+that six of seven finish while two of the six sit on `await:<hash>` — waiting on a body is normal and not a failure
+signature, the same correction the `sampling=x/64` reading needed.
+
+**What the code says, read against that trace.** The wedge is `finalize`: it requires the block *body*
+(`self.proposals.get(&block_hash)`), and without it records the decision in `pending_finalize` and returns. Its comment
+claims this "never wedge[s] permanently at this height (audit fix, HIGH 3)" **on the assumption that `on_propose`
+eventually delivers the body** — which for a straggler two heights back is exactly what may never happen. So:
+
+- the `CommitCert` answer hands the straggler the *decision* and not the body, and cannot free it on its own;
+- `prune_sync_retention` drops `certified[h]` below the checkpoint height, so even that answer expires;
+- `SyncResp` is the only mechanism that skips the body — it transfers executed state — and it is gated on an
+  `ExecCertificate`, i.e. on a quorum of execution votes. Those are emitted on **every** executed block, and
+  `capture_sync_snapshot` retains `(root, head)` per height, so at `h4` a peer should hold a checkpoint at `h3` and be
+  able to answer a `have_height = 2` request.
+- Everything is wired on the live path: `step_msg` maps `SyncReq`/`SyncResp`/`CommitCert`/`ExecVote`
+  (`taxis_driver.rs:500–505`), the generic `TaxisApp::Consensus(msg)` arm routes them, `Output::SendTo` is emitted to the
+  one peer, and `Input::Tick` calls `maybe_request_sync`. So this is not the unwired-capability pattern.
+
+One asymmetry found while reading, which may or may not matter: `on_skeleton` returns before `note_height` whenever
+`self.round != 0`, so a straggler that has timed out into a high round stops learning the cell's height *from
+skeletons*. In this trace it learned `3` and never `4` while receiving thousands of DA frames — DA messages are a
+separate app type and never touch `note_height`.
+
+**Next, and do not guess past it:** a `sync=` counter — requests sent, requests answered, and *which branch* answered
+(snapshot, commit-cert, or the two silent `return Vec::new()` paths in `on_sync_req`, which fall through to nothing at
+all once a checkpoint exists but its retained state does not). Two wrong diagnoses this session came from reasoning one
+step past the last measurement.
+
+Ruled out along the way and still ruled out: the `SyncResp` snapshot exceeding a frame (`MAX_FRAME` is 1 MiB, the test
+ledger is orders of magnitude smaller).
 
 ### [A] Superseded: the residual stall is *not* the lock split — both healing changes measured neutral or worse
 The lock-split mechanism is now fully addressed and **neither half moved the live rate**, which is the finding:
