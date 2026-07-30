@@ -365,12 +365,29 @@ directory) and reports what the node itself sees: coordinate, peers, verified cl
 addressable from the network at all, which is the property that matters for a process whose job is accepting
 traffic from strangers.
 
-**But the read half closes for `fanos node` only, and not for `fanos validator`** (found 2026-07-30 while looking for
-somewhere to surface the consensus probe). `admin::serve` is called exactly once, in `cmd_node`; `cmd_validator` builds
-its own `tokio::select!` over ctrl-c, taxis events and node notifications and never binds a socket or drains an
-`admin_rx`. So on the one process that actually runs consensus there is **no control channel at all** — not `ping`,
-`health`, `roles`, `census` or `shutdown` either — and `fanos status` against a validator always takes the
-"fall back to the config" branch the startup message describes as the failure case.
+**But the socket belongs to one subcommand, not to the node** (found 2026-07-30 while looking for somewhere to surface
+the consensus probe; the first reading of it was "the validator lacks a verb", the second "the validator lacks a
+socket", and both were too small). Counted across every command in `bin/fanos.rs` that runs until ctrl-c:
+
+```
+cmd_node       long-running   admin::serve = 1
+cmd_proxy      long-running   admin::serve = 0
+cmd_host       long-running   admin::serve = 0
+cmd_vpn        long-running   admin::serve = 0
+cmd_validator  long-running   admin::serve = 0
+```
+
+Four of the five roles anyone actually deploys — the anonymous proxy, the hidden-service host, the VPN datapath and the
+consensus validator — expose **no control channel at all**: no `ping`, `health`, `roles`, `census`, and no clean
+`shutdown` except a signal. `fanos status` against any of them always takes the "fall back to the config" branch its own
+startup message describes as the failure case. The one command that *does* have the socket is the one that runs no
+chain, hosts nothing and carries no datapath.
+
+The fix is not to paste the socket into four more `select!` blocks. Each command rolls its own run-until-shutdown loop,
+which is *why* the socket sits in only one of them; copying it would put the duplication in five places and guarantee
+the next role forgets. Extract the loop — bind, drain `admin_rx`, notifications, ctrl-c, unlink on exit — with a
+per-role answer callback. Same seam as "collapse seven `spawn*` entry points into one builder" below; decide whether
+that work absorbs this rather than landing twice.
 
 Remaining, in order:
 1. **The validator's control socket** — bind and drain it in `cmd_validator` exactly as `cmd_node` does, including
