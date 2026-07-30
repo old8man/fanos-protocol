@@ -1920,13 +1920,19 @@ fn a_stuck_validator_that_never_sees_a_newer_block_still_rejoins_from_the_commit
         c.timeout();
     }
 
-    // They rejoined — and only the certificate could have carried them, since no newer block ever arrived.
+    // They rejoined — and the certificate is what carried them, now asserted directly rather than argued by
+    // exclusion. `cert_taken` counts only adoptions that actually moved the height, so it cannot be satisfied by a
+    // certificate that was received and refused; the old "no newer block ever arrived" reasoning was sound but it
+    // could not distinguish *which* mechanism fired, and a live trace has since shown certificates being answered
+    // ~4250 times while advancing nobody.
     let head = c.engines[0].chain().next_height();
     let root = c.engines[0].chain().state_root();
     assert!(head >= 1, "the cell finalized the contested height");
     for &i in &short {
+        let p = c.engines[i].probe();
         assert_eq!(c.engines[i].chain().next_height(), head, "validator {i} rejoined at the cell's height");
         assert_eq!(c.engines[i].chain().state_root(), root, "validator {i} agrees on the executed state — no fork");
+        assert!(p.cert_taken > 0, "validator {i} was carried by a COMMIT certificate, not by something else: {p}");
     }
     assert_eq!(c.hashes_at(0).len(), 1, "one block at the contested height — rejoining must not fork it");
 }

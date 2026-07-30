@@ -127,8 +127,11 @@ pub struct ConsensusProbe {
     pub sync_answers: (u64, u64, u64),
     /// Certified-state snapshots adopted.
     pub sync_taken: u64,
-    /// Commit certificates that finalized a height.
+    /// Commit certificates **offered by a peer** (`ConsensusMsg::CommitCert`) that finalized a height — the
+    /// catch-up path only, never `adopt_certified_parent`'s read of a newer block's `last_commit`.
     pub cert_taken: u64,
+    /// Why an offered commit certificate did not: `(wrong height/phase, failed verification, parked for want of the body)`.
+    pub cc_rejects: (u64, u64, u64),
     /// A height whose COMMIT decision is held but **unappliable for want of the block body**.
     ///
     /// The wedge, named. `finalize` parks a certified decision here when the body is absent and applies it "the
@@ -164,6 +167,10 @@ impl core::fmt::Display for ConsensusProbe {
         let (snap, cert, none) = self.sync_answers;
         if self.sync_asks > 0 || snap + cert + none > 0 {
             write!(f, " sync={}a/{}s/{}c ans={snap}/{cert}/{none}", self.sync_asks, self.sync_taken, self.cert_taken)?;
+        }
+        let (cch, ccv, ccp) = self.cc_rejects;
+        if cch + ccv + ccp > 0 {
+            write!(f, " ccrej[h={cch} v={ccv} park={ccp}]")?;
         }
         if let Some(h) = self.parked {
             write!(f, " PARKED@{h}")?;
@@ -670,6 +677,13 @@ pub struct ConsensusEngine<S: StateMachine> {
     sync_answers: (u64, u64, u64),
     sync_taken: u64,
     cert_taken: u64,
+    // Why an offered commit certificate did NOT advance us: `(wrong height or phase, failed verification, parked for
+    // want of the body)`. The trace that forced this: two validators answered ~4250 catch-up requests each with a
+    // certificate, five laggards each adopted exactly ONE, and `parked` was empty on all of them — so the certificates
+    // were refused somewhere, and reading the guards could not say which. Every one of them is self-contained
+    // (`Certificate::verify` depends on nothing but the fixed committee), which is exactly why the answer has to be
+    // measured instead of derived.
+    cc_rejects: (u64, u64, u64),
     // The canonical COMMIT certificate for each finalized height this validator can still produce, keyed by the height
     // it finalizes. Two sources: one learned from **another block's `last_commit`** (see `adopt_certified_parent`,
     // carried into `finalize` because `collect_cert` can only build a certificate from votes this validator actually
@@ -793,6 +807,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_answers: (0, 0, 0),
             sync_taken: 0,
             cert_taken: 0,
+            cc_rejects: (0, 0, 0),
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
@@ -1063,6 +1078,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_answers: self.sync_answers,
             sync_taken: self.sync_taken,
             cert_taken: self.cert_taken,
+            cc_rejects: self.cc_rejects,
             parked: self.pending_finalize.keys().min().copied(),
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
@@ -1181,7 +1197,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Verified exactly as one read out of a block's `last_commit`, through the same
     /// [`adopt_commit_cert`](Self::adopt_commit_cert): the sender is not trusted, the quorum of signatures is.
     fn on_commit_cert(&mut self, cert: Certificate) -> Vec<Output> {
-        self.adopt_commit_cert(cert)
+        let before = self.height();
+        let out = self.adopt_commit_cert(cert);
+        // Counted HERE and not inside `adopt_commit_cert`, which `adopt_certified_parent` also calls: a single counter
+        // over both sources would say "a certificate advanced us" while the actual carrier was a newer block's
+        // `last_commit`, and the live question is specifically whether the *offered* certificates work. Conflating two
+        // mechanisms in one number is the error this instrument exists to avoid.
+        if self.height() > before {
+            self.cert_taken = self.cert_taken.saturating_add(1);
+        }
+        out
     }
 
     /// Adopt a catch-up response — the load-bearing state-sync step. Every guard is mandatory:
@@ -1399,10 +1424,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// signatures. Nothing about the sender is trusted.
     fn adopt_commit_cert(&mut self, cert: Certificate) -> Vec<Output> {
         let height = self.height();
-        if cert.height != height
-            || cert.phase != Phase::Commit
-            || !cert.verify(self.params.quorum, &self.verifiers)
-        {
+        if cert.height != height || cert.phase != Phase::Commit {
+            self.cc_rejects.0 = self.cc_rejects.0.saturating_add(1);
+            return Vec::new();
+        }
+        if !cert.verify(self.params.quorum, &self.verifiers) {
+            self.cc_rejects.1 = self.cc_rejects.1.saturating_add(1);
             return Vec::new();
         }
         let bh = cert.block_hash;
@@ -1412,8 +1439,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let out = self.finalize(bh);
         // Counted only when the height actually moved: `finalize` parks the decision and returns nothing when the body
         // is missing, which is precisely the case a `cert_taken` that counted attempts would hide.
-        if self.height() > height {
-            self.cert_taken = self.cert_taken.saturating_add(1);
+        if self.height() <= height {
+            self.cc_rejects.2 = self.cc_rejects.2.saturating_add(1);
         }
         out
     }
