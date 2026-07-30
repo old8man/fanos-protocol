@@ -121,8 +121,14 @@ jobs:
         run: cargo miri test -p fanos-ffi --lib
 
   # Every assertion whose cost rules it out of the per-push gate: the real-parameter zero-knowledge proofs, the
-  # multi-node real-QUIC end-to-end paths (unreliable when a full-workspace run saturates the loopback, hence
-  # `#[ignore]`d there), and the randomized no-fork searches. Nightly, and on demand.
+  # randomized no-fork searches, and the three multi-node real-QUIC paths listed in
+  # `fanos-cli/tests/ignored_tests.rs::COST_GATED` (the C ABI pair and the fabric seam — unreliable when a
+  # full-workspace run saturates the loopback). Nightly, and on demand.
+  #
+  # NOT the whole real-QUIC suite: `dromos_quic`, `taxis_quic`, `anonymous_quic`, `exit_quic`, `mix_directory_quic`
+  # and `diaulos_quic` carry no `#[ignore]` and run in the per-push gate above. An earlier wording of this comment
+  # read as though the class were ignored wholesale, which is worth correcting because the difference is exactly
+  # where a flaky e2e test blocks a merge.
   heavy:
     name: cost-gated assertions
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

@@ -129,6 +129,26 @@ batches disagree — 3 of 6 on 07-29 at host load 6–9, then 1 of 9 on 07-30 at
 gives `p ≈ 0.11`, so **neither "the rate fell" nor "load drives it" is established**. The single 07-30 failure
 did land at the highest load observed (9.56), which makes load-sensitivity plausible and not more than that.
 
+**`#[ignore]` is the WRONG instrument here, and that is a decision — 2026-07-30.** The obvious remedy is to mark it
+`#[ignore]` so the nightly `heavy` job takes it, and three multi-node real-QUIC tests already live there. But
+`fanos-cli/tests/ignored_tests.rs` defines the class precisely and holds the workspace to it: `#[ignore]` means either a
+**measurement** (prefixed `measure_`/`probe_`/`sweep_`, never gates) or a **cost-gated assertion** listed in `COST_GATED`,
+whose stated criterion is *"reliable in isolation, unreliable when a full-workspace run saturates the loopback"*.
+
+This test fails **3 of 7 single-test runs**. It is not reliable in isolation, so it does not meet the criterion — the class
+is defined by *cost*, not by flakiness. Moving it there would make a nightly gate fail a quarter of its nights and would
+corrupt a check that currently proves something exact. A well-defined policy is worth more than the convenience of
+reusing its attribute.
+
+So the options are the two real ones: **fix it**, or **add a quarantine class** — distinct from cost-gating, with its own
+list and its own meta-test, for a test that must run and whose failure must not block. The second is a policy change and
+should not be smuggled in as an `#[ignore]`.
+
+**Also corrected:** `.github/workflows/ci.yml`'s comment read as though every multi-node real-QUIC path is `#[ignore]`d.
+Three are; the whole `fanos-node` e2e suite (`dromos_quic`, `taxis_quic`, `anonymous_quic`, `exit_quic`,
+`mix_directory_quic`, `diaulos_quic`) is not, and runs per push. Verified by counting the attributes rather than reading
+the comment.
+
 **That figure measures a tree that no longer exists**, and the distinction matters more than the number: every run
 above predates `270aef8` (the body-recovery rung — a validator holding a certified decision now asks a certificate
 voter for the block, where before it parked the decision forever) and `1fa8edc`. A rate is a property of a
