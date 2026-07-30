@@ -258,6 +258,43 @@ cannot drift back, and anything not strictly required for checking terms moved o
 intent). If some of the 44 000 is already untrusted support code that merely lives in the same crate, then the fix is
 mostly to **say which lines are the TCB** — a manifest we can point an auditor at is worth nearly as much as the reduction.
 
+### G10 — `elaborate-proof` has an empty success path *(the real gate on proof-carrying contracts)*
+
+Measured 2026-07-30 with the installed `verum` 0.1.0. `verum elaborate-proof` emits only
+`elaborated/verification-surface.json` — **zero `.vproof` certificates** — for every input tried:
+
+| input | result |
+|---|---|
+| four arithmetic theorems in the shape a contract carries (value conservation, no-underflow, the Fano quorum, quorum intersection), `proof by auto` | `skipped — unsupported tactic form: Auto` ×4 |
+| `proof by rfl` | `skipped — unsupported tactic form: Named` |
+| `proof by reflexivity`, goal `k == k` | `skipped — Reflexivity in empty context — needs a DefinitionalEquality witness` |
+| **your own kernel-bootstrap lemma**, `core/verify/kernel_v0/lemmas/beta.vr` | `skipped — apply target mathlib4.lambda.ChurchRosser is neither a local binder nor a registered axiom` |
+
+`crates/verum_kernel/src/tactic_elaborator.rs:583-653` says why, and the split is clean: `Apply`, `Reflexivity`, `Exact`,
+`Intro`, `Seq` are handled — explicit proof terms — and every automation form is an explicit `UnsupportedTactic`: `Auto`,
+`Smt`, `Omega`, `Ring`, `Field`, `Simp`, `Rewrite`, `Blast`, `Split`, `Trivial`, `Assumption`. `Reflexivity`'s own comment
+calls it a stand-in, which is why it fails on `k == k`.
+
+**Why this is the most valuable item in this document for FANOS.** `docs/design-verum-frontier.md` §1 works out that a
+kernel-checked certificate would give the platform unbounded verified expressiveness *today*, without waiting for
+recursive ZK — because ZK's 145 MiB is the price of secrecy, and a public contract needs correctness, not secrecy. That
+whole opportunity rests on one thing: an arithmetic obligation becoming a certificate. Arithmetic is what `Smt`/`Auto`
+discharge, and `Smt`/`Auto` are exactly what does not elaborate. So the gap is **SMT proof reconstruction** — the
+SMTCoq / veriT-proof-output problem — and it is upstream of everything else we might build here.
+
+It also reorders G9. I filed the kernel's size first because I reasoned about the architecture instead of running it;
+shrinking the kernel would not produce a single certificate, whereas making one tactic elaborate produces the first.
+
+**Acceptance, deliberately minimal.** *One* obligation, end to end: a theorem whose `elaborate-proof` emits a `.vproof`
+that `check-proof` accepts. Not a tactic suite — one. With it we can measure certificate size and check time and answer
+whether proof-carrying contracts are viable at all; without it there is nothing to measure and we will not design around
+the pipeline. If explicit `apply`/`exact` proofs are meant to work already and my four attempts were malformed, the
+single most useful reply is a working example file we can copy.
+
+**Related, and cheap:** the commands report `0 verified, N skipped (unsupported)` and exit successfully. For a pipeline
+whose success path is empty, a `--strict` flag that exits non-zero when nothing was verified would stop this from reading
+as a pass in CI — the same "a gate that only ever accepts" failure named throughout this document.
+
 ---
 
 ## 5. Open questions I could not answer from the outside

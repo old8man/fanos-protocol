@@ -51,11 +51,39 @@ so. This is not a reason to abandon the idea — it is the idea's **gating condi
 ("the kernel should be small") into a concrete deliverable with a customer. Filed as G9 in
 `docs/verum-contract-requirements.md`.
 
-**First slice (ours, no Verum change needed):** define `Claim` kind `PROOF_TERM`, and a `Host::verify` implementation
-behind a feature flag that shells out to a checker. Measure: proof-term size and check time for three contracts of
-increasing weight. If a proof term for a realistic contract is megabytes, this dies on gossip cost like ZK did and we
-learn it in a day rather than after building for it. **Measure before believing** — the 145 MiB number is exactly what
-that discipline bought last time.
+**MEASURED THE SAME DAY, AND IT MOVES THE GATING CONDITION.** The first slice was to measure a certificate's size and
+check time. There is nothing to measure: **no certificate can be produced today.**
+
+`verum elaborate-proof` runs and emits only `verification-surface.json` — zero `.vproof` files — for every input tried:
+
+| input | result |
+|---|---|
+| four FANOS-shaped theorems (value conservation, no-debt, the Fano quorum, quorum intersection), `proof by auto` | `skipped — unsupported tactic form: Auto` ×4 |
+| `proof by rfl` | `skipped — unsupported tactic form: Named` |
+| `proof by reflexivity` | `skipped — Reflexivity in empty context — needs a DefinitionalEquality witness` |
+| **Verum's own kernel-bootstrap lemma** `core/verify/kernel_v0/lemmas/beta.vr` | `skipped — apply target mathlib4.lambda.ChurchRosser is neither a local binder nor a registered axiom` |
+
+The reason is exact and sits at `crates/verum_kernel/src/tactic_elaborator.rs:583-653`. The elaborator handles `Apply`,
+`Reflexivity`, `Exact`, `Intro`, `Seq` — explicit proof terms — and rejects **all** of the automation: `Auto`, `Smt`,
+`Omega`, `Ring`, `Field`, `Simp`, `Rewrite`, `Blast`, `Split`, `Trivial`, `Assumption`. And `Reflexivity` is a "stand-in"
+by its own comment, which is why it fails even on `k == k`.
+
+So the real gating condition is **SMT proof reconstruction**, not the kernel's size. A contract's obligations are
+arithmetic — conservation, no-underflow, a bound — and arithmetic is exactly what `Smt`/`Auto` discharge and exactly what
+does not become a certificate. Bridging "the solver says true" to "the kernel has a term" is the well-known hard problem
+(SMTCoq, veriT proof output), and it is a piece of work in Verum, not a configuration we were missing.
+
+**This corrects the paragraph above, one turn after writing it.** The kernel's 9×-over-budget size (G9) is a real finding
+and still the price of the trade — but it is the *second* obstacle, and I ranked it first because I reasoned about the
+architecture instead of running it. The order of the two matters: shrinking the kernel would not produce a single
+certificate, while making one tactic elaborate would produce the first.
+
+**Revised first slice**, and it is now Verum's rather than ours: make **one** arithmetic obligation elaborate end to end —
+`verum elaborate-proof` emitting a `.vproof` that `verum check-proof` accepts. Then the measurement I wanted (size, check
+time) becomes possible, and §1 either lives or dies on data. Filed as G10.
+
+Kept as the standing discipline, because it worked here within the hour: **measure before believing.** The 145 MiB number
+is what that bought last time; this is what it bought today.
 
 ---
 
@@ -130,8 +158,10 @@ invention. Low cost, modest payoff — do it when the emitter lands, not before.
 
 ## 5. What I would do in what order
 
-1. **§1's first slice** — measure a proof term's size and check time. One day, and it either unblocks the platform's
-   biggest [P] item or kills the idea cheaply. Do this first because it is the only one whose *result* changes the others.
+1. ~~**§1's first slice** — measure a proof term's size and check time.~~ **Done, and it returned "not yet possible"**
+   (§1). The measurement is now blocked on G10, which is Verum's work: one arithmetic obligation elaborating to a
+   certificate the kernel accepts. Nothing on our side to do until then, which is exactly the value of having measured it
+   first — we would otherwise have designed `Claim` kinds around a pipeline with an empty success path.
 2. **§3's first slice** — the derivation as a failing specification. Small, and it retires a class of defect that has
    already cost a HIGH.
 3. **§2's first slice** — one engine under both runtimes. Larger, and the payoff is the project's most persistent cost.
