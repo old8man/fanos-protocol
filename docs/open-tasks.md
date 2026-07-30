@@ -463,13 +463,41 @@ chosen constant — an unentitled proposal is stored only if that proposer has n
 entry per validator per height. Pinned by `a_validator_that_ran_ahead_still_keeps_the_body_it_refuses_to_prepare` and
 falsified by restoring the fused gate, whose failure prints the defect in one line: `await:1c350fe0 … rej[prop=1]`.
 
-**Still open, and not to be assumed fixed.** `resample_pending` re-requests **every** missing shard of **every** pending
-block on **every** 150 ms tick, with no backoff and no give-up; a `Sampler` entry leaves `pending` only by successful
-reconstruction, `prune_below`, or cap eviction, so a block that cannot be completed at a stalled height is retried for
-the whole stall. `shard=7130/7130 took=5366` at a single height is that. The admission fix should shrink it at the
-source — most of those requests are for bodies that will now simply be held — but the retry policy is unbounded on its
-own terms and that is a separate defect. The confirming experiment for the admission fix is **not** "the test passes":
-it is that the round spread collapses and `rej[prop]` falls to near zero.
+The confirming experiment for the admission fix was stated as **not** "the test passes" but "the round spread collapses
+and `rej[prop]` falls to near zero", and that is what happened: `h1 r8–r10, rej[prop] 5…71` became `h3 r0–r2,
+rej[prop] 6…11`, with above-round votes going from 0 on six of seven to 4…10 on all seven and the round-sync rule
+visibly firing (`jumped=2/2 above=0`). 8/8 green against 4 failures in the previous 9 — P ≈ 0.5 % under the old rate.
+
+### [A] The DA resample is a schedule, not a list — FIXED
+`resample_pending` re-requested **every** missing shard of **every** pending block on **every** 150 ms tick, with no
+backoff and no give-up; a `Sampler` entry leaves `pending` only by reconstruction, `prune_below`, or cap eviction, so a
+block that cannot be completed at a stalled height was retried for the whole stall — `shard=7130/7130 took=5366` at one
+height. The admission fix above shrank it at the source, but the retry policy was unbounded on its own terms.
+
+Derived rather than tuned. A repeat is worth sending only if the answer could have changed, and exactly two things
+change it: the proposer's dispersal finally reaching the peer we asked (the race retry exists for — bounded by one
+dispersal sweep, so it resolves in the first attempts), or that peer obtaining the block another way (unbounded in time,
+its probability decaying with every attempt already failed). Early dense, late sparse, which is **doubling**, with no
+parameter to pick: `O(log t)` requests instead of `t` for a block that completes, completion delayed by under 2×, and
+1600 sweeps turned into 17 for a block that never does.
+
+That bound is why there is deliberately **no give-up rule** — at logarithmic cost an abandoned entry is not worth an
+invented horizon, and `prune_below` plus `PENDING_CAP` already bound the map. The *gap* is capped instead, because
+obtainability is not monotone: a peer that could answer nothing can answer **any** index the moment it reconstructs the
+block itself. The cap is the cell's own progress unit — one round timeout in ticks — and the relation is asserted in
+`fanos-node`, the only crate that can see both constants, because a derived constant with no link back to its
+derivation is a magic number with a nice comment. Progress resets the schedule and only *real* progress does: a fresh
+shard resets, a duplicate must not, or the interval sticks at 1 and the storm returns.
+
+Live, five consecutive runs, against the scenario that was failing at the 240 s ceiling three commits earlier — the
+columns are before the entitlement split, after it, and after this:
+
+```
+shard asks     1340…10435  →  626…2444  →  139…529
+shards taken   1644…5855   →  667…1326  →  125…353
+skeleton asks   909…2561   →    2…30    →  0 in most runs
+convergence    240 s FAIL  →     44 s   →  7.1–8.9 s   (5/5)
+```
 
 ### [A] CORRECTION: the eviction fix is a latent-defect fix, not the demonstrated live cause
 Checked my own arithmetic after committing, and it does not support the attribution. `Sampler::reconstruct` **removes**
