@@ -24,8 +24,10 @@ ipstack = { version = "1.0.1", optional = true }
 
 [features]
 # Compile the real TUN device adapter (`device`) and the full-tunnel stack (`fulltunnel`) for a runnable
-# `fanos vpn` (TCP + UDP). The device syscalls + stack are runtime-verified only (need root / a TUN); the
-# lightweight UDP datapath is verified without this feature.
+# `fanos vpn` (TCP + UDP). The device **syscalls** need root and a real TUN, so they stay runtime-verified — but the
+# **stack** does not, and `tests/datapath.rs` exercises it: `run_fulltunnel` is generic over both edges, so a
+# `tokio::io::duplex` stands in for the TUN and a recording dialer for the exit. The earlier wording lumped the two
+# together and left the full-tunnel claim resting on untested code.
 device = ["dep:tun", "dep:ipstack"]
 
 [dev-dependencies]

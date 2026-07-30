@@ -68,13 +68,19 @@ intermediary. What genuinely remains:
 said "linked by nothing at all" while the crate sat in the node's manifest, which is the second time this table has
 outlived its subject.
 
-| crate | claim it carries | gap |
-|---|---|---|
-| `fanos-vpn` | the full-tunnel datapath | **linked** (`fanos vpn` in `fanos-node/src/bin/fanos.rs`) and CI compiles `--features vpn`, but `fulltunnel.rs` and `device.rs` carry **zero tests** — the datapath itself is exercised by nothing |
+**And the coverage half is closed too — 2026-07-30.** `fanos-vpn/tests/datapath.rs` exercises `run_fulltunnel` end to
+end with no TUN and no root: it is generic over both edges, so a `tokio::io::duplex` stands in for the device and a
+recording dialer for the exit, and a real IPv4/UDP datagram written to the device arrives at the exit **addressed to its
+own destination** — the property that distinguishes a tunnel from a proxy. Falsified two ways: dialing a fixed address
+instead of the flow's, and dropping UDP flows at the accept loop.
 
-So what remains is not a linkage gap but a **coverage** gap, and the distinction matters because the architecture test
-cannot see it: linkage is computable from manifests, and "is this code ever run" is not. `fanos-bench`/`fanos-ffi`/
-`fanos-wasm` are embedding surfaces and exempt by construction.
+What is left is `device.rs` alone — the TUN **syscalls**, which genuinely need root and a device. The crate's feature
+comment used to lump the syscalls and the stack together as "runtime-verified only", which is how the full-tunnel claim
+came to rest on untested code; it now says which half is which.
+
+The distinction this item turned on is worth keeping: a **linkage** gap is computable from the manifests and the
+architecture test catches it, while a **coverage** gap — "is this code ever run" — is not visible to it at all.
+`fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding surfaces and exempt by construction.
 
 ### [A] Decide whether `InsufficientFunds` is premature — the one case left, and it is a trade-off
 The sweep is otherwise done. `ExecOutcome::Deferred` now covers every order-dependent case in
