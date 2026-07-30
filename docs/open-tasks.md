@@ -397,6 +397,49 @@ so no certificate can be assembled from a round we skipped. Both randomized no-f
 
 Pinned by `a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached`, verified load-bearing.
 
+### [A] …and the rule works. The residual round split is a DELIVERY failure — 2026-07-30
+The fix above is real, and the next trace showed the cell split across rounds anyway:
+
+```
+v0 h1r9 lock await:ec97cba9   v1 h1r8 lock await:fe9dbb89   v2 h1r9 lock await:fe9dbb89
+v3 h1r8 lock await:fe9dbb89 jumped=1/1 above=0              v4 h1r8 lock await:ec97cba9
+v5 h1r8 lock await:fe9dbb89   v6 h1r9 lock await:fe9dbb89
+```
+
+Four at r8, three at r9, every validator locked and **holding** its body, `rej[prop]` in single or low double digits
+(3–18, against 19–257 in the pre-fix traces), no `rej[lock]`, no `rej[unavail]`, and 240 s with nothing finalized.
+Neither group can finalize alone: `collect_cert` reads the votes of **one** round, so 4 < 5 and 3 < 5.
+
+The decisive number is `above=0` on every validator. Reproduced deterministically
+(`a_cell_whose_rounds_split_four_three_still_finalizes`): nothing dropped, crashed or partitioned — the only deviation
+from a healthy cell is one extra timer firing on three of seven, which is not a fault. `timeout_some` is what makes it
+expressible; cell-wide `timeout` held every validator in one round by construction, the one arrangement in which drift
+cannot occur.
+
+**The offset does not survive the drain.** The three that advanced re-prepare their lock at the new round, those
+PREPAREs reach the four that stayed, `f + 1 = 3` peers are visible above, and `maybe_advance_round` closes the gap
+inside the same delivery. Falsifying it — disabling the rule — freezes the sim into the live shape exactly, with the one
+difference that is the finding:
+
+```
+sim, rule disabled:   v3 h0r0 lock votes=0<6=3> above=3    ← the evidence is present, the rule is not acting
+live, 240 s stall:    v3 h1r8 lock              above=0    ← the evidence never arrived
+```
+
+A genuine 4/3 split **must** show `above=3` on the laggards. The live cell shows 0, so the votes that close the gap are
+not being delivered, and the engine is not the defect. That is a transport claim and only a counter can make it, so the
+vote path now has one: `votes=<below>‹<equal>=<above>› oh=<other height>`, counted after authentication and before
+storage, peers only (our own votes are echoed back through the same path and would guarantee a non-zero). Paired with
+`voters_above` it separates "never arrived" from "arrived and lost before the buffer" — three readings of this path
+deduced the answer and all three were wrong.
+
+**Next, in order.** (1) One live capture with `votes=` — decisive by construction, and running. (2) If the third bucket
+is 0, the question is the driver's: note that `resample_pending` re-requests **every** missing shard of **every**
+pending block on **every** 150 ms tick, with no backoff and no give-up, and the same trace shows `shard=7130/7130
+took=5366` at a single height — a validator serving thousands of requests for two blocks it will never complete. That is
+established as waste; that it delays votes past a 24 s round timeout on loopback is **not** established and must not be
+assumed.
+
 ### [A] CORRECTION: the eviction fix is a latent-defect fix, not the demonstrated live cause
 Checked my own arithmetic after committing, and it does not support the attribution. `Sampler::reconstruct` **removes**
 the entry, so `pending` holds only skeletons that never reconstructed — not every skeleton ever seen. And under SSLE
