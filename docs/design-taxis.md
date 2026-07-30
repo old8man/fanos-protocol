@@ -214,6 +214,36 @@ Safety is unchanged and needs no new argument: a `pol` can only re-offer a block
 it never introduces a value the cell had not already been willing to prepare, and §2.1 still forbids two `PC`s at
 one height.
 
+### 4.2 Entitlement gates the vote, not the body {#admission}
+
+Round synchronization (a validator seeing `f+1` peers above its round jumps to theirs) closes drift in one
+direction only. **Nothing pulls back a validator that has run *ahead*** — and since entitlement is judged against
+the *receiver's* round, the validator furthest ahead refuses the most proposals. That much is correct: a proposal
+whose proposer holds no rota slot at my round must not get my PREPARE.
+
+What was wrong is that the same early return also discarded the **body**. The check was derived for one decision
+and silently made two. The runaway then had nothing to prepare, nothing to serve, and asked the cell every tick
+for the very block it had thrown away — from peers in the same state. Measured on a cell frozen at height 1 for
+240 s, and the correlation is the argument:
+
+| `rejects.proposer` | skeleton requests this validator could answer |
+| --- | --- |
+| 71 (round 10) | 3 of 1749 — 0.2 % |
+| 6 (round 9) | 2561 of 2561 — 100 % |
+
+Nobody was locked, so no value ever held a `PC`, and each validator chased a different body.
+
+So the gate is **split, not weakened**: validity (link, structure, `last_commit`, seal, and the cryptographic DA
+check of §6) gates admission to `proposals`; entitlement gates only the PREPARE; and a parked COMMIT decision
+resolves before either, since a commit quorum is strictly stronger evidence than the right to propose. Retention
+stays bounded with no chosen constant — an *unentitled* proposal is stored only if that proposer has no body at
+this height yet, so at most one entry per validator per height. A second distinct block from one proposer is at
+best its own later-round proposal, which arrives entitled, and at worst equivocation, which is slashable and
+needs no help from this buffer.
+
+Safety is untouched: the lock rule, the quorum rule, and §2.1 all act on votes, and no new vote is cast. Holding a
+block the cell may yet converge on is what a replica is *for*.
+
 ---
 
 ## 5. Anti-MEV — the threshold-encrypted mempool
@@ -288,13 +318,39 @@ withheld block with certainty**, and `k` independent samples bound the false-ava
 A block that fails sampling gets no PREPARE from honest validators ⇒ cannot reach a `PC` ⇒ cannot finalize.
 Availability is thus a *precondition of finality*, proven at the cell, not an afterthought.
 
-**Audit note (assurance gap).** In the reference engine the availability bit-mask is supplied by the *driver*
-(`on_propose(block, present)`); the engine gates on it but does not itself sample, and the reference wire ships
-the whole payload inside the proposal, so real withholding is not yet modelled end-to-end. The header↔payload
-binding via the DA commitment is sound (a proposer cannot swap payloads), but the *gating* currently reduces to
-"the driver sampled honestly." Making the engine perform/verify sampling itself (or verify a signed
-DA-attestation quorum) and shipping headers + sampled shards rather than the whole payload is required to make
-withholding a real, in-engine-defeated threat.
+**That assurance gap is closed** (the note here used to describe it as open, and had gone stale). The engine no
+longer takes an availability bit from the driver: `on_propose` calls `block.reconstruct_payload(shards)` and
+refuses to PREPARE when it returns `None`, which is a cryptographic check rather than a report — a withholding
+proposer leaves an unrecoverable erasure pattern, and a tampering one fails the `da_commit` match. The wire
+matches: `Output::Send(Propose)` broadcasts the payload-less **skeleton** and disperses one shard per validator
+(`taxis_driver`), so availability is established by real peer sampling and never by the proposer's own say-so.
+The sampling decision procedure is a sans-I/O component (`fanos_taxis::da::Sampler`) precisely so the driver and
+the simulator exercise the same code rather than two lookalikes.
+
+### 6.1 Re-sampling is a schedule, not a sweep {#resample}
+
+A replica requests a missing shard the moment a skeleton arrives, but the proposer disperses peer by peer, so the
+request routinely reaches a peer *before* that peer has been given its own shard. Without a retry the requester
+waits forever for a shard its peer has held all along — one proposal in flight loses that race sometimes, and
+`N` racing proposals under SSLE lose it reliably.
+
+Retrying every sweep is the obvious fix and is wrong in the other direction. A sampling entry leaves the map only
+by reconstruction, pruning, or eviction, so a block that *cannot* be completed at a stalled height is re-requested
+for the entire stall: measured at one height as `shard=7130/7130 took=5366` per validator, thousands of frames for
+two blocks nobody could serve.
+
+The schedule is derived rather than tuned. A repeat is worth sending only if the answer could have changed, and
+exactly two things change it: the dispersal finally reaching the peer we asked — the race above, bounded by one
+dispersal sweep, so it resolves in the first few attempts — or that peer obtaining the block another way, which is
+unbounded in time with probability decaying in every attempt already failed. Early dense and late sparse **is**
+geometric doubling, with no parameter to choose: `O(log t)` requests instead of `t` for a block that completes,
+delaying it by under 2×, and 1600 sweeps reduced to 17 for one that never does.
+
+That bound is also why there is deliberately **no give-up rule** — at logarithmic cost an abandoned entry is not
+worth an invented horizon. The *gap* is capped instead, because obtainability is not monotone: a peer that could
+answer nothing can answer any index the moment it reconstructs the block itself. The cap is one round timeout
+expressed in sweeps, so a sampler can never be the reason a round is lost. Progress resets the schedule, and only
+real progress does — a shard never seen before resets it, a re-delivered duplicate must not.
 
 ---
 
