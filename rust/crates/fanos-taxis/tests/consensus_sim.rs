@@ -135,6 +135,19 @@ struct Cluster {
     proposed: Vec<Block>,
     /// Equivocation proofs the engines surfaced (the operational slashing signal).
     slashes: Vec<SlashEvidence>,
+    /// Skeletons this cell began sampling, cell-wide — the denominator [`da_requests`](Self::da_requests) needs.
+    ///
+    /// A count of requests is a count of absolute messages, and the claim under test is a *rate*: requests per block
+    /// being sampled. Reading the total alone made a 40-sweep run look 2x worse than an unbounded policy, when what had
+    /// actually happened was that the cell was sampling many more blocks.
+    da_begins: u64,
+    /// Shard **requests** this cell has made, cell-wide — the sim's first message-*cost* counter.
+    ///
+    /// The sim modelled delivery and never cost, so a defect whose whole harm is traffic volume was invisible to it: a
+    /// re-fetch is free and instantaneous here, while in production it is thousands of frames and a round timeout. Both
+    /// TAXIS liveness defects fixed on 2026-07-30 were of exactly that shape, and neither could be reproduced here in
+    /// any timer pattern — measured, not assumed. A counter is what makes the class expressible.
+    da_requests: u64,
 }
 
 impl Cluster {
@@ -179,6 +192,8 @@ impl Cluster {
             deaf_propose: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
+            da_begins: 0,
+            da_requests: 0,
         }
     }
 
@@ -283,8 +298,8 @@ impl Cluster {
             // carries rather than the body.
             let outs = self.engines[i].step(Input::Skeleton { block: skeleton.clone() });
             self.collect(i, outs);
-            if let Some(s) = self.samplers.get_mut(i) {
-                s.begin(skeleton.clone());
+            if self.samplers.get_mut(i).is_some_and(|s| s.begin(skeleton.clone())) {
+                self.da_begins += 1;
             }
             if present & (1 << i) != 0
                 && let Some(shard) = all.get(i)
@@ -316,8 +331,8 @@ impl Cluster {
             let Some(skeleton) = skeleton else { continue };
             let outs = self.engines[i].step(Input::Skeleton { block: skeleton.clone() });
             self.collect(i, outs);
-            if let Some(s) = self.samplers.get_mut(i) {
-                s.begin(skeleton);
+            if self.samplers.get_mut(i).is_some_and(|s| s.begin(skeleton)) {
+                self.da_begins += 1;
             }
         }
         // Mirrors the driver's per-tick sweep: drop sampling for heights already decided.
@@ -341,6 +356,9 @@ impl Cluster {
             let wanted = self.samplers.get_mut(i).map(Sampler::due).unwrap_or_default();
             for (hash, missing) in wanted {
                 for index in missing {
+                    // Counted before the partition/crash checks: a request a peer never receives still cost the sender
+                    // a frame, which is precisely the cost a storm is made of.
+                    self.da_requests += 1;
                     let peer = usize::from(index);
                     // A partition drops the request or its answer; a crashed peer answers nothing.
                     if self.crashed[peer] || self.partition[i] != self.partition[peer] {
@@ -1989,6 +2007,127 @@ fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
     // After a successful jump nothing is left above us — the pair `(jumped, above)` is what makes a live trace readable:
     // `above >= f + 1` with `jumped = 0` would mean the evidence is present and the rule is not acting on it.
     assert_eq!(p.voters_above, 0, "having jumped, no peer remains at a higher round: {p}");
+}
+
+#[test]
+fn a_block_that_can_never_be_reconstructed_costs_sub_linearly_in_time() {
+    // **The storm class, made expressible.** A withheld block is missing a hyperoval's worth of shards — the minimal
+    // unrecoverable erasure pattern — so no peer can ever answer for it and its sampling entry never completes. Before
+    // `Sampler::due` became a schedule, that entry was re-requested on every sweep for as long as it stayed pending:
+    // measured live at one height as `shard=7130/7130 took=5366` per validator, thousands of frames for two blocks
+    // nobody could serve.
+    //
+    // The sim could not have caught it, and that is why `Cluster::da_requests` exists: it modelled message *delivery*
+    // and never message *cost*, so a re-fetch here is free and instantaneous while in production it is frames on a wire
+    // and a round-timeout ladder. Re-fusing either TAXIS liveness defect leaves every other scenario in this file
+    // byte-identical — measured, not assumed.
+    //
+    // Two conditions had to be right before the counter said anything, and both were found by measuring:
+    //   * the height must **stall**, or `prune_below` retires each entry as soon as its height is decided and no block
+    //     stays unobtainable long enough for a retry policy to matter (with heights advancing: 10 % apart);
+    //   * the cost must be read **per block sampled**, not in total — the cell samples hundreds of skeletons, and the
+    //     absolute figure made a 40-sweep run look worse than an unbounded policy purely because it sampled more.
+    //
+    // What is asserted is the property itself rather than a threshold: run the same scenario for `s` and `2s` sweeps,
+    // and the per-block cost must **not** keep pace with time. An unbounded policy asks on every sweep of a block's
+    // life, so doubling the run doubles it; doubling backoff asks on `O(log)` of them, so it must fall behind. No
+    // constant is chosen anywhere, and the comparison normalises itself.
+    const SHORT: usize = 30;
+    let cost = |sweeps: usize| -> f64 {
+        let mut c = Cluster::new(&genesis());
+        c.with_da_delay(4);
+        c.withholding.insert(leader(&SEED, 0, 0) as u8);
+        // The height must not advance: the live storm was a *stalled* height holding the same entries for 1600 sweeps.
+        c.set_drop_phase(Some(Phase::Commit));
+        let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"withheld");
+        c.submit_all(&tx);
+        // No timeouts: rounds do not advance, so no *new* proposal is ever made and the entries opened at round 0 stay
+        // pending for the whole run. That is the live condition — two blocks held for 1600 sweeps — and without it the
+        // sim's blocks live about seven sweeps, where doubling saves 7 asks against 3 and no policy is distinguishable.
+        for _ in 0..sweeps {
+            c.tick();
+        }
+        assert!(c.da_begins > 0, "the scenario must actually sample something at {sweeps} sweeps");
+        #[allow(clippy::cast_precision_loss)]
+        let per_block = c.da_requests as f64 / c.da_begins as f64;
+        per_block
+    };
+
+    let short = cost(SHORT);
+    let long = cost(SHORT * 2);
+
+    // The threshold is read off the two models rather than fitted between two measurements. Doubling the run multiplies
+    // a `log s` cost by `log(2s)/log(s) = 1 + 1/log2(s)` and a linear cost by 2. At `s = 30` that is 1.25 against 2.00,
+    // and the assertion sits at twice the logarithmic growth — enough headroom that scheduling noise cannot trip it,
+    // and nowhere near the linear figure. Measured, in both directions: 43.4 → 46.9 with the schedule (a ratio of
+    // 1.08), and 215.1 → 420.9 with every pending block asked on every sweep (1.96).
+    #[allow(clippy::cast_precision_loss)]
+    let allowed = 1.0 + 2.0 / (SHORT.ilog2() as f64);
+    assert!(
+        long < short * allowed,
+        "an unobtainable block must cost O(log t) requests, not O(t): {short:.1} per block over {SHORT} sweeps and \
+         {long:.1} over {} — a ratio of {:.2} against a derived ceiling of {allowed:.2}, and 2.00 is what asking on \
+         every sweep looks like",
+        SHORT * 2,
+        long / short
+    );
+}
+
+#[test]
+fn a_cell_whose_timers_never_agree_still_finalizes_a_run_of_heights() {
+    // **Local timers are independent, and this suite pretended otherwise.** Every other scenario here fires them
+    // cell-wide, which holds every validator in one round *by construction* — the one arrangement in which round drift,
+    // and everything downstream of it, cannot occur. Two production liveness defects survived 139 green tests for
+    // exactly that reason, and both needed a live QUIC trace to find: a validator that ran ahead discarded the bodies
+    // of proposals it was right to refuse a vote for, and the DA sampler re-requested them forever.
+    //
+    // So here no timer agrees with any other: validator `i` fires on the steps where `(step + i) % 3 == 0`, a fixed
+    // phase per validator, which keeps the offsets moving instead of settling. Nothing is dropped, crashed or
+    // partitioned — an offset is not a fault, and a consensus that needs the cell's clocks to agree has no liveness
+    // argument on a real network. Deterministic in `(step, i)`, so a failure reproduces exactly.
+    let mut c = Cluster::new(&genesis());
+    // Dispersal latency is what makes a round a real interval. Without it one `tick` drains the bus to quiescence and
+    // completes a whole height — propose, prepare, commit, finalize — so every validator sits at round 0 forever and no
+    // timer pattern can produce drift. Measured while building this test: 30 heights in 30 steps, `widest = 0`,
+    // `jumps = 0`. That is the fidelity gap behind both defects, stated as a number.
+    c.with_da_delay(4);
+    let mut submitted = 0u64;
+    let mut widest = 0u32;
+    for step in 0..30usize {
+        // One transaction per height keeps the nonces consecutive, so a rejected transfer can never be what a stalled
+        // height is blamed on.
+        if c.engines[0].chain().next_height() >= submitted {
+            let tag = [b's', u8::try_from(submitted).unwrap_or(0)];
+            let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 1, nonce: submitted }, &tag);
+            c.submit_all(&tx);
+            submitted += 1;
+        }
+        c.tick();
+        let firing: Vec<usize> = (0..N).filter(|i| (step + i) % 3 == 0).collect();
+        c.timeout_some(&firing);
+        let rounds: Vec<u32> = (0..N).map(|i| c.engines[i].round()).collect();
+        let spread = rounds.iter().max().copied().unwrap_or(0) - rounds.iter().min().copied().unwrap_or(0);
+        widest = widest.max(spread);
+    }
+
+    // The test must have exercised what it claims to. A run in which the cell never drifted would satisfy every
+    // assertion below while testing nothing, which is how the synchronous clock model hid two defects in the first
+    // place — so the drift itself is asserted, not assumed.
+    let jumps: u64 = (0..N).map(|i| c.engines[i].probe().round_jumps.0).sum();
+    assert!(widest >= 1, "the timers never actually disagreed, so this run exercised no drift at all");
+    assert!(jumps > 0, "the cell drifted by {widest} rounds and never once used the rule that closes it");
+
+    let reached = c.engines[0].chain().next_height();
+    let probes: Vec<String> = (0..N).map(|i| format!("v{i}:{}", c.engines[i].probe())).collect();
+    let report = probes.join(" | ");
+    assert!(reached >= 3, "a cell whose clocks never agree must still make progress — reached {reached}. {report}");
+    for h in 0..reached {
+        assert_eq!(c.hashes_at(h).len(), 1, "drifting timers must not fork height {h}: {report}");
+    }
+    assert!(
+        c.honest_count_at(reached - 1) >= CellParams::FANO.quorum,
+        "and a quorum must be carried along, not left behind: {report}"
+    );
 }
 
 #[test]
