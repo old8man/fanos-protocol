@@ -110,6 +110,13 @@ A gate that fails this often blocks merges at random and trains people to re-run
 batches disagree — 3 of 6 on 07-29 at host load 6–9, then 1 of 9 on 07-30 at load 4.7–9.6 — and Fisher's exact
 gives `p ≈ 0.11`, so **neither "the rate fell" nor "load drives it" is established**. The single 07-30 failure
 did land at the highest load observed (9.56), which makes load-sensitivity plausible and not more than that.
+
+**That figure measures a tree that no longer exists**, and the distinction matters more than the number: every run
+above predates `270aef8` (the body-recovery rung — a validator holding a certified decision now asks a certificate
+voter for the block, where before it parked the decision forever) and `1fa8edc`. A rate is a property of a
+particular tree, so quoting it against the current one would be quoting a measurement of something else. The
+post-fix sample so far is **6 passes and 1 failure in 7 runs** — too small to distinguish from either 1-in-4 or
+from fixed, which is exactly why it is written as a count and not as a rate.
 The earlier "1 in 8" and the intermediate "1 in 3" were both over-precise for their samples; quote the run count
 with the rate or do not quote it.
 
