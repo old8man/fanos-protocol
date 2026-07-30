@@ -134,6 +134,13 @@ pub struct ConsensusProbe {
     pub cc_rejects: (u64, u64, u64),
     /// Round-synchronization jumps and the total rounds they skipped.
     pub round_jumps: (u64, u64),
+    /// Distinct peers this validator can **see** at a round above its own, right now.
+    ///
+    /// A state rather than a counter, and that is the point: `round_jumps` says whether the rule ever fired, and this says
+    /// whether it *could*. A validator four rounds behind with `above ≥ f + 1` means the evidence is in the buffer and the
+    /// rule is not acting on it; with `above = 0` it means the votes are not there at all, and the question moves to the
+    /// transport or to `store_vote`. One snapshot separates them, where a count of firings cannot.
+    pub voters_above: usize,
     /// Body-recovery requests emitted for a parked decision.
     pub body_asks: u64,
     /// How this validator answered peers' body requests: `(served, not held, refused as unwanted/invalid)`.
@@ -181,8 +188,8 @@ impl core::fmt::Display for ConsensusProbe {
             write!(f, " body={}a/{}got ans={bs}/{bn}/{br}", self.body_asks, self.body_taken)?;
         }
         let (jumps, skipped) = self.round_jumps;
-        if jumps > 0 {
-            write!(f, " jumped={jumps}/{skipped}")?;
+        if jumps > 0 || self.voters_above > 0 {
+            write!(f, " jumped={jumps}/{skipped} above={}", self.voters_above)?;
         }
         let (cch, ccv, ccp) = self.cc_rejects;
         if cch + ccv + ccp > 0 {
@@ -1151,6 +1158,16 @@ impl<S: StateMachine> ConsensusEngine<S> {
             cert_taken: self.cert_taken,
             cc_rejects: self.cc_rejects,
             round_jumps: self.round_jumps,
+            voters_above: {
+                let h = self.height();
+                let mut seen = BTreeSet::new();
+                for sv in self.prepares.iter().chain(&self.commits) {
+                    if sv.vote.height == h && sv.vote.round > self.round && sv.vote.voter != self.me {
+                        seen.insert(sv.vote.voter);
+                    }
+                }
+                seen.len()
+            },
             body_asks: self.body_asks,
             body_answers: self.body_answers,
             body_taken: self.body_taken,

@@ -1976,6 +1976,9 @@ fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
     // this test exists to check the rule. `round_jumps` counts `maybe_advance_round` actually firing.
     let p = c.engines[straggler].probe();
     assert!(p.round_jumps.0 > 0, "the straggler jumped rather than merely finalizing around the problem: {p}");
+    // After a successful jump nothing is left above us — the pair `(jumped, above)` is what makes a live trace readable:
+    // `above >= f + 1` with `jumped = 0` would mean the evidence is present and the rule is not acting on it.
+    assert_eq!(p.voters_above, 0, "having jumped, no peer remains at a higher round: {p}");
 }
 
 #[test]
