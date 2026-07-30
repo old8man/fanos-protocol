@@ -232,6 +232,32 @@ The repo has `repro/` and a `Makefile`, so this may already hold; I did not test
 non-determinism (hash-map iteration order, timestamps, absolute paths, parallel-codegen ordering) named and removed rather
 than tolerated.
 
+### G9 — the kernel is nine times its own audit budget *(gating a much bigger opportunity)*
+
+`crates/verum_kernel/src/lib.rs` states the property that makes an LCF kernel trustworthy:
+
+> Target size: **under 5000 lines of Rust, audit-able by a single reviewer in one session**.
+
+Measured 2026-07-30: **79 files, 70 614 lines, ≈44 405 excluding comments and blank lines.** The largest are
+`arch_anti_pattern.rs` (3 712), `soundness/expr_translate.rs` (2 977), `soundness/proof_body_translate.rs` (2 787),
+`proof_checker.rs` (2 669), `support.rs` (2 248).
+
+**Why FANOS cares, and it is not a style complaint.** A blockchain can put a proof *checker* in its trusted computing base
+and gain something large: unbounded verified expressiveness at the cost of one check, without waiting for recursive ZK.
+`docs/design-verum-frontier.md` §1 works this through — our own design doc conflates privacy with correctness, and a
+kernel-checked proof term serves the correctness half today. ZK's 145 MiB is the price of *secrecy*, which a public
+contract does not need.
+
+That trade is proportionate at 5 000 lines and not obviously so at 44 000, because "auditable by one reviewer in one
+session" is the entire property being bought. So the kernel's stated target is, for us, the gating condition on the largest
+opportunity in the integration — which turns "the kernel should stay small" from an aspiration into a deliverable with a
+named customer.
+
+**Acceptance.** The non-comment line count of everything the kernel *trusts* is under 5 000, with a CI assertion so it
+cannot drift back, and anything not strictly required for checking terms moved out (the crate doc already says that is the
+intent). If some of the 44 000 is already untrusted support code that merely lives in the same crate, then the fix is
+mostly to **say which lines are the TCB** — a manifest we can point an auditor at is worth nearly as much as the reduction.
+
 ---
 
 ## 5. Open questions I could not answer from the outside
