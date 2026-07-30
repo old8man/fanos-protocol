@@ -856,6 +856,20 @@ anonymity for latency/bandwidth. The snapshot below is retained for the record.
 
 - **[HIGH, borderline CRITICAL] T-H1 — reveal-driven execution-state divergence (nondeterminism).** `consensus.rs:835-888` (`try_execute`): the reveal window drops an undecryptable tx based on `self.reveals` = shares **this validator locally collected** (per-validator, async). The window boundary is deterministic, but the *share set at that boundary is not agreed*. **Scenario:** on a Fano keyper line (3 members, `t=2`, `f=2`), 2 Byzantine members reveal valid signed shares only to validators {0,1,2} → {0,1,2} execute tx X, {3,4,5,6} drop it after the window → **honest validators hold permanently different state roots** (a late share never re-executes; the block already left `exec_queue`). Also reachable with honest keypers under a slow/partitioned link delaying a share past 4 heights. The comment at `:862` claiming "the drop is identical on every validator" is **false**. The `ExecCertificate` *detects* it (no `Q`-quorum root forms) so it is not a silent cross-cell theft, but honest nodes fork intra-cell state and checkpoint liveness is lost. **Uncovered by tests** (the sim broadcasts every reveal; Byzantine nodes only equivocate on prepare votes; no test asserts state-root equality across validators). **Fix:** gate execution on *agreed* data — the on-chain decryption-key commitment (Shutter/Ferveo, already in `design-taxis.md §5.1`) or a `Q`-quorum "undecryptable" certificate.
 - **[HIGH, LIKELY] T-H2 — the round lock has no unlock / re-propose rule → partial-lock liveness wedge.** `consensus.rs:547-551` refuses any block ≠ `locked_block`; `:494-510` always assembles a *fresh* block, never re-proposing the locked value; `:945` only bumps the round on timeout. The code implements the *refuse-conflicting* half of Tendermint but not the *unlock-on-newer-PC / re-propose-locked-value* half. A partial lock (3 validators lock B, `<Q` commits) + fresh proposals forever → the height wedges permanently (safety preserved, liveness not). **Fix:** implement `lockedValue`/`validRound` — the proposer re-proposes its locked value with a PC justification; validators unlock when shown a PC for a round ≥ their lockedRound.
+
+  **Resolved.** Both halves are in the engine and both were needed: `unlocks_us` releases a lock on a PREPARE
+  certificate from a round strictly between our lock's and our current one (the open interval is the safety boundary,
+  and it is pinned by five unit tests), `reprepare_lock` re-offers the locked value on entering a round, and
+  `valid_value` lets an *unlocked* proposer re-offer a polka it merely observed. The justification rides on
+  `Block::pol` outside the hashed header, so a re-proposal is byte-identical and a locked validator can accept it —
+  `on_propose` admits any proposer carrying a valid one, which is strictly stronger evidence than a rota slot.
+  `a_sub_quorum_lock_split_heals` covers the exact 3-of-7 partial lock this entry describes. Design write-up in
+  `design-taxis.md` §4.1, including the measured asymmetry: relaxing only the receiver moved the failure rate not at
+  all, because the rota reaches a locked validator in 3 rounds of 7 while the timeout doubles toward 24 s.
+
+  Two liveness defects **downstream** of this one were found later (2026-07-30) and are also closed — entitlement
+  discarding bodies it was only entitled to refuse a vote for, and an unbounded DA resample. See `design-taxis.md`
+  §4.2 and §6.1; neither is a regression of T-H2, and neither was reachable while the lock wedge was open.
 - **[HIGH, disclosed] T-H3 — a within-`f` keyper majority can transiently censor a targeted tx** (`consensus.rs:835-888` + `incentive.rs:247-266`): 2-of-3 keyper line, 2 Byzantine withhold reveals → tx dropped after the reveal window; only *permanent* censorship is proven impossible; per-epoch, per-tx censorship is operational and unpriced, with no force-inclusion/inclusion-list. Compounds with T-H1.
 - **[HIGH, disclosed [P]] T-H4 — DA dispersal is not wired.** `taxis_driver.rs:228` derives the DA shards from the proposer's own block, so `reconstruct_payload` always sees the full set → the whole payload rides in the proposal, real withholding is never modeled, and erasure-coded dispersal gives no scalability. **Fix:** ship headers + sampled shards and verify a signed DA-attestation quorum in-engine.
 - **[HIGH, found and RESOLVED 2026-07-30 (`1fa8edc`)] T-H6 — `SyncResp`'s `head` was unauthenticated: one Byzantine peer could isolate a syncing validator.**
@@ -950,7 +964,8 @@ anonymity for latency/bandwidth. The snapshot below is retained for the record.
 6. **R-C1 beacon resharing + safe-stall; R-C2 live parent escalation; R-C3 hierarchical erasure** (the three recovery cliffs). 
 7. **R-H1 identity-first epoch-stamped membership; R-H2 wire + churn-harden self-organization; R-M1 identity-keyed quarantine.**
 8. **S1-H1 cover+mixing on in the shipping node; S1-H2 CLI beacon provisioning** (turns forward secrecy + rotation on).
-9. **TAXIS T-H2 (round-lock liveness), T-H5 (apply slashing/rewards); O-H1/O-H2, AT-H1/H2/H3.**
+9. **TAXIS T-H5 (apply slashing/rewards); O-H1/O-H2, AT-H1/H2/H3.** (T-H2 round-lock liveness is closed — see its
+   resolution note.)
 
 **Tier 2 — coherence / architecture**
 10. **Build the HOLARCH Γ-calculator gate (S5-C1)**; wire E→L tx submission (S5-H1); implement the stake `AdmissionPolicy` (S5-H2); add the seven-aspect budget tables (S5-H4) + CALM classes (S5-M1) + `SUBJECT_DEPTH_MAX` (S5-M2); reconcile the staking contradiction (S5-M3).
@@ -1153,7 +1168,16 @@ Only **S1-H2 (beacon reachable)** is fully correct (executed green: a provisione
 
 ## §7. Still-open from the prior audit (unchanged — confirmed)
 
-OBOLOS O-M1/M2/M3/M4; ANGELOS AT-M1 (no zeroize), AT-M2 (group out-of-order drop), AT-M3 (per-chunk PoR < λ), AT-M5 (caller-seeded ratchet randomness), AT-H3 (media replay window); TAXIS T-H2 (round-lock liveness wedge), T-H3 (keyper censorship), T-H4 (DA dispersal — engine gained in-engine verification but the driver still feeds the proposer's own full shard set), T-H5 (slashing/rewards emitted but never applied to state), T-M1-M4 (cross-cell); C7 (telemetry-DP built-but-unwired — zero `.privatize` callers), holonomy verification (absent from the threshold/rendezvous peel path). None regressed; each remains as characterized.
+OBOLOS O-M1/M2/M3/M4; ANGELOS AT-M1 (no zeroize), AT-M2 (group out-of-order drop), AT-M3 (per-chunk PoR < λ), AT-M5 (caller-seeded ratchet randomness), AT-H3 (media replay window); TAXIS T-H3 (keyper censorship), T-H5 (slashing/rewards emitted but never applied to state), T-M1-M4 (cross-cell); C7 (telemetry-DP built-but-unwired — zero `.privatize` callers), holonomy verification (absent from the threshold/rendezvous peel path). None regressed; each remains as characterized — **except two now closed**, and both had gone stale in this list.
+**T-H2** (round-lock liveness wedge): `unlocks_us` + `reprepare_lock` + `valid_value` + `Block::pol` are all in the
+engine, pinned by `a_sub_quorum_lock_split_heals` and five unit tests on the release interval; see its resolution note
+above and `design-taxis.md` §4.1. **T-H4** (DA dispersal): the driver no longer feeds the proposer's own full shard set
+— `Output::Send(Propose)` broadcasts the payload-less skeleton and disperses **one** shard to each validator
+(`taxis_driver.rs:584`, keeping its own via `da.hold`), and the engine's gate is a cryptographic
+`reconstruct_payload` against `da_commit` rather than a reported availability bit. What §6 still describes and the
+engine does not do is the `k`-lines *sampling* protocol specifically; the shipped gate is full reconstruction, which is
+strictly stronger per block but is not the same procedure, so §6's text and the code should be reconciled rather than
+either being assumed correct.
 
 ---
 
