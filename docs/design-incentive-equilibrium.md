@@ -50,8 +50,10 @@ This is the crux, and it is what a generic blockchain lacks:
   conflicting commit certificates for one height *impossible*: any two `Q`-quorums share an honest validator
   who signs at most one block. So an equivocator cannot cause a double-spend or a fork — the outcome it could
   buy with equivocation does not exist.
-- **Withhold-data gains 0 (and loses the reward).** PREPARE is gated on DA sampling; an unavailable payload
-  gets no honest prepares, so the block never finalizes and the proposer earns `0` instead of its share.
+- **Withhold-data gains 0 (and loses the reward).** PREPARE is gated on availability — the engine reconstructs
+  the payload from the shards it gathered and matches it against `da_commit` — so an unavailable payload gets no
+  honest prepares, the block never finalizes, and the proposer earns `0` instead of its share. (The *sampling*
+  procedure with the `(1/7)^k` bound governs the L4 store, not this gate; see `design-taxis.md` §6.)
 
 So for the three "attacking" deviations the *benefit* term is `0`, while equivocation and data-withholding
 additionally carry a *cost* (slashing / lost reward).

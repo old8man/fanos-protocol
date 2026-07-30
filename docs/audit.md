@@ -1665,15 +1665,26 @@ to the spec-coherence "staking contradiction" (§7.5):** the platform simultaneo
 has nothing to bite. **Fix:** add a bonded-stake sub-ledger + apply Slash/Reward into executed state (and reconcile the
 spec).
 
-**[MED] DA not independently sampled (T-H4).** `taxis_driver.rs:266`: the driver feeds the engine the **proposer's own
-full shard set** (`b.da_shards().map(Some)`), so `reconstruct_payload` checks proposer-supplied data, not network
-samples. A proposer that gossips a full block to its target validator defeats DA sampling (acknowledged in-code at
-`:20-22`). The §6.3/§L4.3 DA guarantee is not live on the consensus path. **Fix:** sample shards from peers, not from the
-proposer's attachment.
+**[MED] DA not independently sampled (T-H4).** ~~`taxis_driver.rs:266`: the driver feeds the engine the **proposer's
+own full shard set** (`b.da_shards().map(Some)`), so `reconstruct_payload` checks proposer-supplied data, not network
+samples.~~ **Resolved, and re-verified against the current tree rather than assumed.** An inbound
+`ConsensusMsg::Propose` from a peer is routed to `on_skeleton`, which samples the shards from *peers* and admits the
+block to the engine only once it reconstructs (`taxis_driver.rs`, the `Notification::App` arm). The
+`b.da_shards().map(Some)` construction survives in exactly one place — `step_msg`'s `Propose` arm — which is reached
+only by the proposer's own loopback delivery, where holding your own payload is not a DA question. On the send side,
+`Output::Send(Propose)` broadcasts the payload-less skeleton and disperses **one** shard per validator. So the guarantee
+is live on the consensus path.
 
-**[LOW] T-H2 no explicit unlock rule** (`consensus.rs:1028,1423`): `locked_block` clears only on finalize/sync, no
+  One correction to the entry's framing, worth keeping: what the consensus path does is *reconstruction*, not the
+  `k`-lines *sampling* procedure. The shards come from the network, which is what this finding demanded, but the
+  `(1/7)^k` bound belongs to the L4 store — see `design-taxis.md` §6.
+
+**[LOW] T-H2 no explicit unlock rule** ~~(`consensus.rs:1028,1423`): `locked_block` clears only on finalize/sync, no
 unlock-on-higher-prepared-cert; advances via re-lock on each new prepared cert, so not currently wedge-able (partition MC
-passes) — theoretical residual. **T-H3 keyper censorship: bounded/OK** (`incentive::can_permanently_censor` false within
+passes) — theoretical residual.~~ **Resolved.** `unlocks_us` implements the unlock-on-higher-prepared-cert rule
+explicitly, releasing on a PREPARE certificate from a round in the *open* interval above our lock and below our current
+round — the open interval being the safety boundary, since a second certificate at our own lock's round could only exist
+if `f+1` validators equivocated. Five unit tests pin exactly that window. **T-H3 keyper censorship: bounded/OK** (`incentive::can_permanently_censor` false within
 `f`; machine-checked).
 
 **SSLE secret-leader election — SAFE & live, does NOT break BFT (CONFIRMED, corroborating the auditor's preliminary

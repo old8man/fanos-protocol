@@ -25,7 +25,9 @@ The spec pins five structural identities and leaves the protocol to the implemen
 
 The open questions the implementation must answer rigorously: *what is the finality quorum and how many
 Byzantine validators does a cell tolerate?* *How exactly does "committees = lines" become a safe+live BFT?*
-*How does the encrypted mempool prevent MEV without breaking liveness?* *How does DA sampling gate finality?*
+*How does the encrypted mempool prevent MEV without breaking liveness?* *How does data availability gate finality?*
+(The spec's identity 3 above fixes *sampling along lines* as the availability primitive; §6 records where that is
+actually used and why the consensus gate ended up stronger.)
 
 ---
 
@@ -307,16 +309,32 @@ remaining honest limits:
 
 ---
 
-## 6. Data availability — sampling gates finality
+## 6. Data availability — availability gates finality
 
-A proposer must not be able to finalize a block whose data it withholds (else state is unrecoverable). The
-block payload is erasure-coded with the **projective LRC** (`[7,3,4]` on the Fano cell) across the cell's
-nodes, and **PREPARE is gated on DA sampling** (`fanos-code::da`): before preparing, a validator samples `k`
-lines chosen unpredictably from `H(block_hash ‖ SEED(epoch))` and checks each is fully present. By the DA
-theorem (`da.rs`): an unavailable value has **≤ 1 external line**, so **two distinct samples detect any
-withheld block with certainty**, and `k` independent samples bound the false-available probability by `(1/7)^k`.
-A block that fails sampling gets no PREPARE from honest validators ⇒ cannot reach a `PC` ⇒ cannot finalize.
-Availability is thus a *precondition of finality*, proven at the cell, not an afterthought.
+A proposer must not be able to finalize a block whose data it withholds (else state is unrecoverable). The block
+payload is erasure-coded with the **projective LRC** (`[7,3,4]` on the Fano cell) across the cell's nodes, and
+**PREPARE is gated on availability**: a block that fails the gate gets no PREPARE from honest validators ⇒ cannot
+reach a `PC` ⇒ cannot finalize. Availability is thus a *precondition of finality*, proven at the cell, not an
+afterthought.
+
+**Two different procedures decide availability in this codebase, and this section used to describe the wrong one.**
+Both are live; the difference is deliberate and follows from what each layer already holds.
+
+* **Consensus reconstructs.** `on_propose` calls `Block::reconstruct_payload(shards)` and refuses to PREPARE when it
+  returns `None` — the payload is rebuilt from the shards this validator gathered and matched against the header's
+  `da_commit`. A withholding proposer leaves an unrecoverable erasure pattern and a tampering one fails the
+  commitment, so both are refused by a cryptographic check rather than a report. Consensus can afford the stronger
+  test because it must hold the body to *execute* it anyway: reconstruction is not an extra cost here, it is the
+  work the validator was going to do regardless.
+* **The L4 erasure store samples.** `fanos_code::da::{sample_lines, samples_pass}` picks `DA_SAMPLES = 3` distinct
+  Fano lines from an unpredictable seed and checks each is fully present
+  (`fanos-runtime/src/overlay/storage.rs`). By the DA theorem (`da.rs`): an unavailable value has **≤ 1 external
+  line**, so **two distinct samples detect any withheld value with certainty**, and `k` independent samples bound
+  the false-available probability by `(1/7)^k`. The store cannot reconstruct, because it is asked about objects it
+  has no reason to materialise — which is exactly the situation sampling exists for.
+
+So the `(1/7)^k` bound governs the **store**, not the consensus gate, and `k` has no counterpart on the consensus
+path. Attaching it to PREPARE, as this section did, overstated one layer's guarantee by borrowing another's.
 
 **That assurance gap is closed** (the note here used to describe it as open, and had gone stale). The engine no
 longer takes an availability bit from the driver: `on_propose` calls `block.reconstruct_payload(shards)` and

@@ -121,8 +121,9 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
       for light clients; per-epoch committee rotation (the driver runs a fixed epoch — beacon sub is wired).
 **C · TAXIS residuals — ✅ DONE (2026-07-22).**
 - [x] Wire fee/reward distribution (`564c789`) — `Output::Reward`, `distribute` among commit-cert signers.
-- [x] In-engine DA sampling (`c9e5c63`) — `Input::Propose` carries sampled `DaShards`; `on_propose` verifies
-      availability by `reconstruct_payload` vs `da_commit` instead of trusting a driver bit.
+- [x] In-engine DA verification (`c9e5c63`) — `Input::Propose` carries sampled `DaShards`; `on_propose` verifies
+      availability by `reconstruct_payload` vs `da_commit` instead of trusting a driver bit. (Not *sampling*: the
+      k-lines procedure is the L4 store's, `design-taxis.md` §6.)
 - [x] On-chain decryption-key commitment (`3757192`) — `keyper::{KeyperKeyCert, KeyperRegistry,
       seal_to_keyper_line}`: self-certified KEM keys, `commit()` (agreed genesis constant), engine
       `accepts_keyper_registry`; the Shutter/Ferveo on-chain key, PQ-native (authority, not pre-open verifiability).
@@ -138,8 +139,8 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
   the FANOS-native BFT blockchain. Projective-cell PBFT consensus (proved a masking-quorum system: `n=q²+q+1`,
   `f=⌊(n−1)/3⌋`, `Q=⌈(n+f+1)/2⌉`; tight `n=3f+1` for `q≢1 mod 3`, incl. the Fano cell 7/2/5), beacon leader
   election (cartel-proof by the `(q+1)/n` centrality cap), **anti-MEV** threshold-encrypted mempool (reuses
-  `ThresholdSealed`; proposer orders blind, keyper line reveals post-commit), **DA-sampled** blocks (projective
-  LRC + line sampling gates finality), sans-I/O engine, App-overlay wire. Verified by a 7-node BFT sim
+  `ThresholdSealed`; proposer orders blind, keyper line reveals post-commit), **DA-gated** blocks (projective
+  LRC + in-engine reconstruction gates finality), sans-I/O engine, App-overlay wire. Verified by a 7-node BFT sim
   (finality+execution, `f=2` crash-liveness, DA-withholding rejection, Byzantine safety). `docs/design-taxis.md`.
 - **L7 incentive equilibrium** — ✅ **DONE** (`a60ab73`): `fanos-taxis::incentive` + `docs/design-incentive-
   equilibrium.md` close the §16 open problem — a machine-checked proof that honest validation is a Nash
