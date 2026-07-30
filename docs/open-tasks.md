@@ -319,10 +319,32 @@ One asymmetry found while reading, which may or may not matter: `on_skeleton` re
 skeletons*. In this trace it learned `3` and never `4` while receiving thousands of DA frames — DA messages are a
 separate app type and never touch `note_height`.
 
-**Next, and do not guess past it:** a `sync=` counter — requests sent, requests answered, and *which branch* answered
-(snapshot, commit-cert, or the two silent `return Vec::new()` paths in `on_sync_req`, which fall through to nothing at
-all once a checkpoint exists but its retained state does not). Two wrong diagnoses this session came from reasoning one
-step past the last measurement.
+**That counter was built, and it found a wedge — `322bbaf`.** `sync=<asks>a/<snapshots>s/<certs>c
+ans=<snap>/<cert>/<none>`, plus `PARKED@<height>` for a COMMIT decision held but unappliable for want of the body.
+
+`on_sync_resp` cleared `sync_heads`/`sync_states` and *then* installed the certificate it had just adopted — discarding,
+at the one moment it certainly held all three, exactly the three things a `SyncResp` is made of: the certified state, its
+root, and the head it sits on. So a validator whose checkpoint sits above a peer's height took the snapshot branch of
+`on_sync_req`, found nothing retained, and returned an **empty vector**; and it could not fall back to a commit
+certificate either, because it *jumped over* the requester's height and never finalized it. Empty is indistinguishable
+from a lost packet, so the requester re-asks every tick and is met with silence again.
+
+A node that has just been rescued is the peer most likely to be asked next — it was behind for the same reason its
+neighbours are, and it holds precisely the state they need. It answered every one of them with nothing. Measured:
+`h9r1 sync=1a/1s/0c ans=0/0/2`. Fixed by retaining the adopted snapshot, pinned by
+`a_freshly_synced_validator_still_answers_a_laggard_instead_of_going_silent`, and the two silent `return Vec::new()`
+paths now fall through to the certificate — holding a checkpoint is not the same as being able to serve it, and the two
+were conflated.
+
+**The first draft of that test asserted something false**, and the counter is what showed it: keyed on
+`latest_checkpoint().is_some()`, it fired while the laggard was still at genesis, because a validator forms a checkpoint
+from a **quorum of peers' exec votes** at a height it never executed itself. A validator that far behind genuinely has
+nothing to offer anyone, and answering nothing is correct there — the defect is answering nothing while *ahead*. Keyed on
+the height having moved instead.
+
+Whether this moves the live `a_hash_locked` rate is a separate question and is being measured; the straggler's own wedge
+is `finalize` requiring the body, which `PARKED@h` now shows instead of leaving to inference. Two wrong diagnoses this
+session came from reasoning one step past the last measurement.
 
 Ruled out along the way and still ruled out: the `SyncResp` snapshot exceeding a frame (`MAX_FRAME` is 1 MiB, the test
 ledger is orders of magnitude smaller).
