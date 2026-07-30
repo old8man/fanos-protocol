@@ -58,6 +58,12 @@
 
 extern crate alloc;
 
+pub mod exec;
+pub mod value;
+
+pub use exec::{Confined, Host, Journal, Reader, Receipt, State, eval};
+pub use value::{BinOp, Cmp, EXPR_DEPTH_MAX, Expr, Fault, Value};
+
 use alloc::vec::Vec;
 
 /// The maximum nesting depth of a well-typed term — **three**, and not a configuration knob.
@@ -277,22 +283,55 @@ pub struct Effect {
     /// The host-interpreted effect kind.
     pub kind: u16,
     /// The keys this effect reads and writes — part of its type.
+    ///
+    /// Not the whole footprint: [`Effect::footprint`] unions this with the keys the argument expressions load, so the
+    /// derived footprint covers the whole effect. See the note there.
     pub footprint: Footprint,
+    /// The arguments, as total key-static expressions — what lets an effect say *how much* rather than only *what kind*.
+    ///
+    /// `docs/design-ergon.md` §10a records why this was the ceiling on programmability: without arguments a contract
+    /// author could only rearrange transitions the protocol already implemented.
+    pub args: Vec<Expr>,
     /// Whether the effect's consequence escapes the ledger (see the type note above).
     pub external: bool,
 }
 
 impl Effect {
-    /// A ledger-internal effect of the given kind over the given footprint.
+    /// A ledger-internal effect of the given kind over the given footprint, with no arguments.
     #[must_use]
     pub const fn internal(kind: u16, footprint: Footprint) -> Self {
-        Self { kind, footprint, external: false }
+        Self { kind, footprint, args: Vec::new(), external: false }
     }
 
     /// An effect whose consequence escapes the ledger; the algebra guards its ledger half only.
     #[must_use]
     pub const fn external(kind: u16, footprint: Footprint) -> Self {
-        Self { kind, footprint, external: true }
+        Self { kind, footprint, args: Vec::new(), external: true }
+    }
+
+    /// This effect with the given arguments.
+    #[must_use]
+    pub fn with_args(mut self, args: Vec<Expr>) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// The effect's **derived** footprint: its declared keys unioned with everything its arguments load.
+    ///
+    /// Unioned rather than checked, and that is the design rather than a shortcut. A check ("an argument may not read
+    /// outside the footprint") creates an *outside* — a second place the truth lives, which a later refactor can stop
+    /// consulting. Deriving leaves nothing to forget: the footprint is a function of the whole effect, so an argument that
+    /// reads a key simply *is* part of the effect's read set, and DROMOS sees it without anyone having declared it.
+    #[must_use]
+    pub fn footprint(&self) -> Footprint {
+        if self.args.is_empty() {
+            return self.footprint.clone();
+        }
+        let mut reads = self.footprint.reads().to_vec();
+        for a in &self.args {
+            a.collect_reads(&mut reads);
+        }
+        Footprint::new(reads, self.footprint.writes().to_vec())
     }
 }
 
@@ -302,25 +341,80 @@ impl Effect {
 /// only admits or refuses the child based on what it reads. That one-way flow is why there is no reentrancy to reason
 /// about — a child cannot re-enter its parent, because influence has no upward path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Predicate {
-    /// The host-interpreted predicate kind.
-    pub kind: u16,
-    /// The keys the predicate reads. A predicate never writes — that is what makes it a gate.
-    pub reads: Vec<Key>,
+pub enum Predicate {
+    /// A host-interpreted question over a declared read set — for what an expression cannot say: a valid signature, a
+    /// fresh nullifier, a Merkle membership.
+    Host {
+        /// The host-interpreted predicate kind.
+        kind: u16,
+        /// The keys the predicate reads. A predicate never writes — that is what makes it a gate.
+        reads: Vec<Key>,
+    },
+    /// A comparison between two total expressions — what makes a `Gate` a real condition rather than an opaque tag.
+    Compare {
+        /// The comparison.
+        op: Cmp,
+        /// Left operand.
+        lhs: Expr,
+        /// Right operand.
+        rhs: Expr,
+    },
+    /// Every part holds. Short-circuits, which is unobservable: a predicate cannot write, so evaluating fewer of them
+    /// cannot change the state a later one reads.
+    And(Vec<Predicate>),
+    /// Some part holds.
+    Or(Vec<Predicate>),
+    /// The part does not hold.
+    Not(alloc::boxed::Box<Predicate>),
 }
 
 impl Predicate {
-    /// A predicate of the given kind over the given read set.
+    /// A host-interpreted predicate of the given kind over the given read set.
     #[must_use]
-    pub fn new(kind: u16, mut reads: Vec<Key>) -> Self {
+    pub fn host(kind: u16, mut reads: Vec<Key>) -> Self {
         reads.sort_unstable();
         reads.dedup();
-        Self { kind, reads }
+        Self::Host { kind, reads }
     }
 
-    /// This predicate's footprint: its reads, and no writes.
+    /// This predicate's footprint: everything it reads, and no writes.
+    ///
+    /// Derived through the expression tree for the structural forms, exactly as [`Effect::footprint`] is, so a `Gate`'s
+    /// reads reach DROMOS without being declared anywhere.
     #[must_use]
-    pub fn footprint(&self) -> Footprint { Footprint::new(self.reads.clone(), Vec::new()) }
+    pub fn footprint(&self) -> Footprint {
+        let mut reads = Vec::new();
+        self.collect_reads(&mut reads);
+        Footprint::new(reads, Vec::new())
+    }
+
+    fn collect_reads(&self, out: &mut Vec<Key>) {
+        match self {
+            Self::Host { reads, .. } => out.extend_from_slice(reads),
+            Self::Compare { lhs, rhs, .. } => {
+                lhs.collect_reads(out);
+                rhs.collect_reads(out);
+            }
+            Self::And(parts) | Self::Or(parts) => {
+                for p in parts {
+                    p.collect_reads(out);
+                }
+            }
+            Self::Not(inner) => inner.collect_reads(out),
+        }
+    }
+
+    /// The deepest expression nesting anywhere in this predicate — checked by [`well_typed`] so a term that would fault
+    /// on depth at run time is refused at admission instead.
+    #[must_use]
+    pub fn expr_depth(&self) -> u32 {
+        match self {
+            Self::Host { .. } => 0,
+            Self::Compare { lhs, rhs, .. } => lhs.depth().max(rhs.depth()),
+            Self::And(parts) | Self::Or(parts) => parts.iter().map(Self::expr_depth).max().unwrap_or(0),
+            Self::Not(inner) => inner.expr_depth(),
+        }
+    }
 }
 
 /// A claim about an off-chain computation, to be **verified** rather than re-executed: given `footprint.reads`, the
@@ -500,6 +594,17 @@ pub enum TypeError {
         /// The admission cap it exceeded.
         cap: u32,
     },
+    /// An expression nests deeper than [`EXPR_DEPTH_MAX`].
+    ///
+    /// Checked at admission as well as during evaluation. The evaluator has to check it regardless — a term reaching it
+    /// by another route must not blow a validator's stack — but a term that would fault on depth should be refused
+    /// *before* a fee is charged for it, not after.
+    ExprTooDeep {
+        /// The offending expression's depth.
+        depth: u32,
+        /// The cap it exceeded.
+        cap: u32,
+    },
     /// The footprint is wider than the per-transaction cap.
     FootprintTooWide {
         /// Distinct keys the term touches.
@@ -528,8 +633,20 @@ impl Limits {
     pub const fn unbounded() -> Self { Self { proof_bytes: u32::MAX, footprint_width: usize::MAX } }
 }
 
-/// Check well-typedness: depth within [`D_MAX`], `Par` branches disjoint, no empty combinator, claims and footprint
-/// within `limits`.
+/// The deepest expression nesting anywhere in a term — effect arguments and predicates alike.
+#[must_use]
+fn expr_depth_of(term: &Term) -> u32 {
+    match term {
+        Term::Do(e) => e.args.iter().map(Expr::depth).max().unwrap_or(0),
+        Term::Seq(cs) | Term::Par(cs) => cs.iter().map(expr_depth_of).max().unwrap_or(0),
+        Term::Gate(p, b) => p.expr_depth().max(expr_depth_of(b)),
+        Term::Alt(bs) => bs.iter().map(|(p, b)| p.expr_depth().max(expr_depth_of(b))).max().unwrap_or(0),
+        Term::Prove(_) => 0,
+    }
+}
+
+/// Check well-typedness: depth within [`D_MAX`], expressions within [`EXPR_DEPTH_MAX`], `Par` branches disjoint, no empty
+/// combinator, claims and footprint within `limits`.
 ///
 /// Checked **before** execution and in cheapest-first order, so a malformed term is refused at its first violation rather
 /// than after work has been done on it.
@@ -537,6 +654,10 @@ pub fn well_typed(term: &Term, limits: &Limits) -> Result<(), TypeError> {
     let depth = term.depth();
     if depth > u32::from(D_MAX) {
         return Err(TypeError::TooDeep { depth });
+    }
+    let expr_depth = expr_depth_of(term);
+    if expr_depth > EXPR_DEPTH_MAX {
+        return Err(TypeError::ExprTooDeep { depth: expr_depth, cap: EXPR_DEPTH_MAX });
     }
     let width = term.footprint().width();
     if width > limits.footprint_width {
@@ -641,7 +762,7 @@ mod tests {
         Term::Do(Effect::internal(kind, Footprint::new(ks(r), ks(w))))
     }
 
-    fn pred(kind: u16, r: &[PointId]) -> Predicate { Predicate::new(kind, ks(r)) }
+    fn pred(kind: u16, r: &[PointId]) -> Predicate { Predicate::host(kind, ks(r)) }
 
     /// The Fano plane's seven lines, as the incidence oracle the locality analysis takes.
     ///
