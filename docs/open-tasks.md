@@ -368,15 +368,26 @@ never collected — votes are not retransmitted) stay exactly *one* ahead foreve
 unavailable **precisely in the configuration that needs it**, and the only remaining path is the commit certificate,
 which requires the body.
 
-**The serving guard and the adopting guard disagree by one.** `on_sync_resp` rejects on `cert.height < self.height()` —
-so it *accepts* `C == L` — while `on_sync_req` falls through to the certificate on `cert.height <= have_height`, so it
-never sends that case. Adopting `C == L` is exactly what a laggard needs and is sound: a `Q`-quorum of execution votes
-attests the state *after* height `L`, `chain.restore` sets `base_height = L + 1`, and the laggard resumes at `L + 1`
-without ever finalizing `L` locally. Nothing about it can fork — the root is quorum-certified.
+**The serving guard and the adopting guard do disagree by one**, and it is worth recording that it is *not* the cause.
+`on_sync_resp` rejects on `cert.height < self.height()`, so it accepts `C == L`; `on_sync_req` falls through to the
+certificate on `cert.height <= have_height`, so it never sends that case. Adopting `C == L` would be sound and is what a
+laggard needs — a `Q`-quorum attests the state *after* `L`, `chain.restore` sets `base_height = L + 1`, and a
+quorum-certified root cannot fork.
 
-So the fix is one comparison: serve when `C >= have_height`. Being measured rather than assumed, with `ccrej[h/v/park]`
-in flight to say *why* ~8500 offered certificates advanced nobody — that answer may be a second, independent defect and
-the guard change must not be allowed to mask it.
+**But serving `C >= have_height` would not have rescued this cell, and the arithmetic says why.** A checkpoint at height
+`h` needs a `Q`-quorum of *execution* votes for `h`, and a validator votes only after executing it. The five laggards
+never finalized height 1, so they never executed it and never voted: height 1 has 2 exec votes against `Q = 5` and **no
+checkpoint at height 1 exists anywhere**. The two ahead validators are therefore checkpointed at height **0** — *below*
+the laggards' height — so `C >= L` reads `0 >= 1` and fails too.
+
+That closes the question without a guard bug: **the execution checkpoint cannot advance past a stuck majority, by
+construction**, because the stuck majority is what a quorum of execution votes requires. The snapshot rescue is not
+merely unavailable here, it is structurally impossible, and the whole burden falls on the commit certificate — which is
+offered ~8500 times and advances nobody.
+
+So the live question is unchanged and one measurement away: `ccrej[h/v/park]` will name the guard that refuses those
+certificates. Everything above is arithmetic on the trace; the refusal is not, and three attempts at deriving it have
+already been wrong.
 
 Ruled out along the way and still ruled out: the `SyncResp` snapshot exceeding a frame (`MAX_FRAME` is 1 MiB, the test
 ledger is orders of magnitude smaller).
