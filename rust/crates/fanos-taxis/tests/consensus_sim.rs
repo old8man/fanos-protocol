@@ -210,6 +210,12 @@ impl Cluster {
                     if to < N && !self.crashed[to] && self.partition[idx] == self.partition[to] {
                         let input = self.msg_to_input(idx, &msg);
                         let outs = self.engines[to].step(input);
+                        // Mirrors the driver: a body obtained whole ends its sampling.
+                        if let ConsensusMsg::Body(b) = &msg
+                            && let Some(s) = self.samplers.get_mut(to)
+                        {
+                            s.forget(&b.hash());
+                        }
                         self.collect(to, outs);
                     }
                 }
@@ -230,6 +236,10 @@ impl Cluster {
                 Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
             }
             ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
+            ConsensusMsg::NeedBody { block } => Input::NeedBody { from: from as u8, block: *block },
+            // NOT `Input::Propose` like `Propose` above: a body answers a decision the receiver already holds, and is
+            // checked against that decision rather than judged as a proposal.
+            ConsensusMsg::Body(b) => Input::Body(b.clone()),
         }
     }
 
@@ -308,6 +318,14 @@ impl Cluster {
             self.collect(i, outs);
             if let Some(s) = self.samplers.get_mut(i) {
                 s.begin(skeleton);
+            }
+        }
+        // Mirrors the driver's per-tick sweep: drop sampling for heights already decided.
+        for i in 0..N {
+            let h = self.engines[i].height();
+            if let Some(s) = self.samplers.get_mut(i) {
+                s.pin(self.engines[i].awaited_body());
+                s.prune_below(h);
             }
         }
         self.run();
@@ -623,9 +641,16 @@ fn every_validator_recovers_a_dispersed_block_not_merely_a_quorum() {
 
     assert_eq!(c.honest_count_at(0), N, "EVERY validator finalizes height 0, not just a quorum");
     assert_eq!(c.hashes_at(0).len(), 1, "and on one block");
-    for (i, s) in c.samplers.iter().enumerate() {
-        assert_eq!(s.in_flight(), 0, "validator {i} recovered every body it was sampling");
-    }
+    // The sampler assertion that used to stand here — `in_flight() == 0` for every validator — is **deleted, not
+    // relaxed**, and the distinction matters. It read as "every validator recovered the payload", but what it actually
+    // said was "no sampling is in progress at the final tick": incidental to one message schedule, and it stopped
+    // holding once body recovery changed the timing, with a validator at height 4 legitimately sampling a height-4
+    // proposal. The payload claim it stood in for is proven below and far more directly — a validator cannot *execute*
+    // a transfer whose payload it never recovered, so the BOB balance is the evidence.
+    //
+    // A "nothing stale is left to prune" assertion replaced it briefly and was dropped too: falsifying it by removing
+    // the per-tick sweep left the test green, so this scenario never produces an abandoned entry and the assertion was
+    // vacuous. `Sampler::prune_below` is pinned where a stale entry can actually be constructed — in `da.rs`.
     let root = c.engines[0].chain().state_root();
     for (i, e) in c.engines.iter().enumerate() {
         assert_eq!(e.chain().state().balance(&BOB), 100, "validator {i} executed the transfer");
@@ -775,6 +800,113 @@ fn a_lagging_validator_state_syncs_to_the_certified_state_and_rejoins() {
     assert_eq!(c.engines[LAG].chain().state_root(), root, "the synced validator's state root matches the cell");
     // No fork: every height carries a single block hash across all validators.
     for h in 0..c.engines[0].chain().next_height() {
+        assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
+    }
+}
+
+/// **A validator holding a decision it cannot apply asks a certificate voter for the body — and applies it.**
+///
+/// The measured wedge, in deterministic form. A live cell produced `ccrej[h=0 v=0 park=1963] PARKED@1`: 1963 commit
+/// certificates accepted — every one passing height, phase and signature — and every one parked, because `finalize`
+/// needs the block body and nothing in the protocol carried it. `NeedSkeleton` answers with a payload-less skeleton, and
+/// re-gathering the payload from erasure shards asks custodians that may never have been dispersed one, while the block
+/// sits whole on every validator that voted COMMIT on it.
+#[test]
+fn a_validator_holding_a_decision_it_cannot_apply_asks_a_voter_for_the_body() {
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"need-body");
+    c.submit_all(&tx);
+
+    // Drop the PROPOSAL to one validator while everyone else prepares and commits it: it collects the commit quorum
+    // from their votes and so holds the decision, having never held the block.
+    let victim = 0usize;
+    c.deaf_propose.insert(victim);
+    c.tick();
+    c.deaf_propose.remove(&victim);
+
+    let p = c.engines[victim].probe();
+    let Some(parked) = p.parked else {
+        panic!("setup did not park a decision — asserting the recovery below would be vacuous: {p}");
+    };
+    assert_eq!(parked, 0, "the parked decision is the height it cannot finalize: {p}");
+    assert_eq!(c.engines[victim].chain().next_height(), 0, "and it has not finalized it");
+
+    // Exactly ONE tick, which is what makes this a test of the body path rather than of whatever rescues first. At
+    // this instant the snapshot path is provably unavailable: the cell has executed height 0, so the newest checkpoint
+    // anywhere is at 0, and `on_sync_req` serves a snapshot only STRICTLY above the requester's height. Give the cell
+    // six ticks instead and it is a state-sync that carries the victim — measured, on the first draft of this test.
+    c.tick();
+
+    let p = c.engines[victim].probe();
+    assert!(p.body_asks > 0, "it asked a certificate voter for the body: {p}");
+    assert!(p.body_taken > 0, "and applied one: {p}");
+    assert!(p.parked.is_none(), "so nothing is parked any more: {p}");
+    assert_eq!(
+        c.engines[victim].chain().next_height(),
+        c.engines[1].chain().next_height(),
+        "it finalized the decision it had been holding and is level with the cell: {p}"
+    );
+    assert_eq!(c.hashes_at(0).len(), 1, "one block at that height — recovery must not fork it");
+}
+
+/// **A cell where the MAJORITY failed to collect the commit quorum still recovers.**
+///
+/// Every recovery test in this file strands one validator (`LAG = 6`) or three (`short = [4, 5, 6]`). The live
+/// `dromos_quic` failure strands **five of seven**, and that is not the same problem scaled: with five short, the
+/// execution checkpoint can never advance past them, because a checkpoint needs a `Q`-quorum of *execution* votes and a
+/// validator votes only after executing the height it is stuck on. Measured on the live cell: height 1 carried 2 exec
+/// votes against `Q = 5`, so the two ahead validators were checkpointed at height **0** — below the laggards' height —
+/// and `on_sync_req` served a commit certificate ~4250 times each and a snapshot **never**.
+///
+/// So this configuration takes the state-sync path off the table entirely and rests the whole recovery on
+/// `ConsensusMsg::CommitCert`. Live, that path advanced nobody: five validators asked ~850 times each and adopted
+/// exactly one certificate apiece. This is the deterministic form of that cell.
+#[test]
+fn a_cell_whose_commit_quorum_reached_only_a_minority_still_recovers() {
+    let mut c = Cluster::new(&genesis());
+    // Five of seven never receive the COMMIT votes, so only two collect the quorum and finalize. They still SEND
+    // theirs, which is why the quorum forms at all — the same partial-connectivity fault as the three-short test,
+    // past the point where a quorum of *executors* remains.
+    let short = [2usize, 3, 4, 5, 6];
+    c.set_drop_to(Some((Phase::Commit, &short)));
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"majority-short");
+    c.submit_all(&tx);
+    c.tick();
+
+    let ahead = c.engines[0].chain().next_height();
+    assert!(ahead >= 1, "the two well-connected validators finalized the height: {}", c.engines[0].probe());
+    for &i in &short {
+        assert_eq!(c.engines[i].chain().next_height(), 0, "validator {i} is short a signature, not a body");
+    }
+    // The premise of this scenario, asserted rather than assumed: no checkpoint can exist at the finalized height,
+    // because only two validators executed it.
+    for i in 0..N {
+        let ck = c.engines[i].latest_checkpoint().map(|c| c.height);
+        assert!(ck.is_none() || ck < Some(ahead), "validator {i} cannot be checkpointed at a height 5 of 7 never executed");
+    }
+
+    // What carries them is the **newer-block** path, not the certificate, and that is a measurement rather than an
+    // assumption: stubbing `offer_commit_cert` to return nothing leaves this test green, so `adopt_certified_parent`
+    // reads the evidence out of the two ahead validators' later proposals. Deliberately NOT also closing that door with
+    // `deaf_propose` — the draft that did fails, and not because the certificate is missing: the short validators reach
+    // the height with `sync_asks == 0`, having never asked for catch-up at all. Asserting `cert_taken > 0` here would be
+    // asserting a mechanism this scenario does not use, which is exactly the vacuous-test class the falsification pass
+    // exists to catch.
+    c.set_drop_to(None);
+    for _ in 0..12 {
+        c.tick();
+        c.timeout();
+    }
+
+    let head = c.engines[0].chain().next_height();
+    let root = c.engines[0].chain().state_root();
+    for i in 0..N {
+        let p = c.engines[i].probe();
+        assert_eq!(c.engines[i].chain().next_height(), head, "validator {i} rejoined the cell's height: {p}");
+        assert_eq!(c.engines[i].chain().state_root(), root, "validator {i} agrees on the executed state — no fork");
+    }
+
+    for h in 0..head {
         assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
     }
 }
@@ -1162,7 +1294,9 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
                         // and skipping it cannot cause a fork (an un-synced node simply does not advance).
                         ConsensusMsg::SyncReq { .. }
                         | ConsensusMsg::SyncResp { .. }
-                        | ConsensusMsg::CommitCert(_) => continue,
+                        | ConsensusMsg::CommitCert(_)
+                        | ConsensusMsg::NeedBody { .. }
+                        | ConsensusMsg::Body(_) => continue,
                     };
                     for o in engines[i].step(input) {
                         match o {

@@ -187,6 +187,42 @@ impl Sampler {
         Some(full)
     }
 
+    /// Stop sampling `block` — it was obtained another way.
+    ///
+    /// Reconstruction is not the only route to a body: a parked decision can be discharged by a peer handing over the
+    /// whole block (`ConsensusMsg::Body`), and a lagging validator can jump the height entirely by adopting a certified
+    /// snapshot. Without this the pending entry outlives its purpose, and `pending` is capped — so entries nobody is
+    /// waiting for compete for the space with the one block a validator actually is stuck on, which is exactly the
+    /// eviction that [`pin`](Self::pin) exists to prevent.
+    pub fn forget(&mut self, block: &[u8; 32]) {
+        self.pending.remove(block);
+        if self.pinned.as_ref() == Some(block) {
+            self.pinned = None;
+        }
+    }
+
+    /// Drop every pending skeleton for a height **below** `height` — work that can never be needed again.
+    ///
+    /// A skeleton carries its own `header.height`, so this needs nothing from the engine but the current one. Without it
+    /// a validator accumulates the sampling it abandoned on the way: measured as a validator at height 4 still holding a
+    /// block from an earlier height, missing five of seven shards, which no future request would ever complete. `pending`
+    /// is capped, and eviction is by insertion order — so abandoned entries compete for the space with the one block a
+    /// validator is actually stuck on, the very eviction [`pin`](Self::pin) exists to prevent.
+    pub fn prune_below(&mut self, height: u64) {
+        let stale: Vec<[u8; 32]> = self
+            .pending
+            .iter()
+            .filter(|(hash, p)| {
+                // Never the entry this validator is blocked on, whatever its height — that is `pin`'s whole purpose.
+                p.skeleton.header.height < height && self.pinned.as_ref() != Some(*hash)
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &stale {
+            self.pending.remove(hash);
+        }
+    }
+
     /// Whether `block` is already being sampled — so a recovery request is not re-sent while one is in flight.
     #[must_use]
     pub fn is_sampling(&self, block: &[u8; 32]) -> bool {
@@ -209,6 +245,35 @@ mod tests {
     /// A block with a payload big enough to erasure-code across the cell.
     fn block_with_payload() -> Block {
         Block::assemble([0u8; 32], 0, fanos_primitives::Epoch::ZERO, 0, Vec::new())
+    }
+
+    /// A block at `height`, so a stale-vs-current distinction can be constructed.
+    fn block_at(height: u64) -> Block {
+        Block::assemble([0u8; 32], height, fanos_primitives::Epoch::ZERO, 0, Vec::new())
+    }
+
+    #[test]
+    fn abandoned_sampling_is_dropped_and_the_pinned_entry_never_is() {
+        // Sampling a validator walked away from is not harmless: `pending` is capped and evicts by insertion order, so
+        // entries for heights already decided compete for the space with the one block a stuck validator depends on.
+        // Measured while chasing the live wedge: a validator at height 4 still holding a block from an earlier height,
+        // missing five of seven shards, which no future request could ever complete.
+        let (old, new) = (block_at(1), block_at(4));
+        let (old_hash, new_hash) = (old.hash(), new.hash());
+        let mut s = Sampler::new(0);
+        assert!(s.begin(old.skeleton()));
+        assert!(s.begin(new.skeleton()));
+        assert_eq!(s.in_flight(), 2);
+
+        s.prune_below(4);
+        assert!(!s.is_sampling(&old_hash), "the height-1 skeleton is finished work at height 4");
+        assert!(s.is_sampling(&new_hash), "the height-4 skeleton is still live");
+
+        // And the pin outranks the height, because the whole point of `pin` is the entry a validator is blocked on.
+        assert!(s.begin(old.skeleton()));
+        s.pin(Some(old_hash));
+        s.prune_below(9);
+        assert!(s.is_sampling(&old_hash), "a pinned entry survives pruning whatever its height");
     }
 
     #[test]

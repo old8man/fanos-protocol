@@ -132,6 +132,12 @@ pub struct ConsensusProbe {
     pub cert_taken: u64,
     /// Why an offered commit certificate did not: `(wrong height/phase, failed verification, parked for want of the body)`.
     pub cc_rejects: (u64, u64, u64),
+    /// Body-recovery requests emitted for a parked decision.
+    pub body_asks: u64,
+    /// How this validator answered peers' body requests: `(served, not held, refused as unwanted/invalid)`.
+    pub body_answers: (u64, u64, u64),
+    /// Bodies applied to a decision this validator was holding.
+    pub body_taken: u64,
     /// A height whose COMMIT decision is held but **unappliable for want of the block body**.
     ///
     /// The wedge, named. `finalize` parks a certified decision here when the body is absent and applies it "the
@@ -167,6 +173,10 @@ impl core::fmt::Display for ConsensusProbe {
         let (snap, cert, none) = self.sync_answers;
         if self.sync_asks > 0 || snap + cert + none > 0 {
             write!(f, " sync={}a/{}s/{}c ans={snap}/{cert}/{none}", self.sync_asks, self.sync_taken, self.cert_taken)?;
+        }
+        let (bs, bn, br) = self.body_answers;
+        if self.body_asks + bs + bn + br + self.body_taken > 0 {
+            write!(f, " body={}a/{}got ans={bs}/{bn}/{br}", self.body_asks, self.body_taken)?;
         }
         let (cch, ccv, ccp) = self.cc_rejects;
         if cch + ccv + ccp > 0 {
@@ -390,6 +400,23 @@ pub enum ConsensusMsg {
     /// requester's *current* height. Serves the case [`SyncResp`](Self::SyncResp) structurally cannot — see
     /// [`on_commit_cert`](ConsensusEngine::on_commit_cert).
     CommitCert(Certificate),
+    /// **"I hold a quorum decision I cannot apply — send me the block itself."**
+    ///
+    /// The last gap in the catch-up ladder, measured on a live cell: a validator received 1963 commit certificates,
+    /// every one passing height, phase and signature checks, and parked every one of them for want of the block body
+    /// (`ccrej[h=0 v=0 park=1963] PARKED@1`). Certificates carry the *decision*; nothing carried the *payload*.
+    ///
+    /// `NeedSkeleton` cannot serve this: a skeleton is payload-less by construction, and re-gathering the payload from
+    /// erasure shards asks custodians that may never have been dispersed one. Meanwhile the block sits whole on every
+    /// validator that voted COMMIT on it — which the certificate *names*. So the evidence that creates the obligation
+    /// also identifies who can discharge it, and this asks exactly one of them.
+    NeedBody {
+        /// The block hash a quorum certificate decided and this validator cannot apply.
+        block: [u8; 32],
+    },
+    /// The whole block, answering [`NeedBody`](Self::NeedBody). Self-verifying — the requester checks the hash against
+    /// the decision it parked, so nothing about the sender is trusted.
+    Body(Block),
 }
 
 impl ConsensusMsg {
@@ -430,6 +457,14 @@ impl ConsensusMsg {
                 out.push(6);
                 out.extend_from_slice(&cert.to_bytes());
             }
+            Self::NeedBody { block } => {
+                out.push(7);
+                out.extend_from_slice(block);
+            }
+            Self::Body(b) => {
+                out.push(8);
+                out.extend_from_slice(&b.to_bytes());
+            }
         }
         out
     }
@@ -457,6 +492,13 @@ impl ConsensusMsg {
                 Some(Self::SyncResp { cert, head, snapshot })
             }
             6 => Some(Self::CommitCert(Certificate::from_bytes(body)?)),
+            7 => {
+                let mut r = codec::Reader::new(body);
+                let block = r.array::<32>()?;
+                r.finish()?;
+                Some(Self::NeedBody { block })
+            }
+            8 => Some(Self::Body(Block::from_bytes(body)?)),
             _ => None,
         }
     }
@@ -512,6 +554,15 @@ pub enum Input {
     },
     /// A commit certificate received off the wire, finalizing the height we are stuck on (verified before use).
     CommitCert(Certificate),
+    /// A peer asks for a block body it holds a quorum decision for; `from` directs the reply.
+    NeedBody {
+        /// The asking validator's index (from the authenticated transport source, not a spoofable field).
+        from: u8,
+        /// The block hash wanted.
+        block: [u8; 32],
+    },
+    /// A peer's answer to [`NeedBody`](Self::NeedBody) — the whole block, checked against the parked decision.
+    Body(Block),
     /// A catch-up response received off the wire (verified + adopted only if it beats our height).
     SyncResp {
         /// The offered certificate.
@@ -684,6 +735,10 @@ pub struct ConsensusEngine<S: StateMachine> {
     // (`Certificate::verify` depends on nothing but the fixed committee), which is exactly why the answer has to be
     // measured instead of derived.
     cc_rejects: (u64, u64, u64),
+    /// Body-recovery accounting: requests emitted, `(served, not held, refused)` as a responder, bodies applied.
+    body_asks: u64,
+    body_answers: (u64, u64, u64),
+    body_taken: u64,
     // The canonical COMMIT certificate for each finalized height this validator can still produce, keyed by the height
     // it finalizes. Two sources: one learned from **another block's `last_commit`** (see `adopt_certified_parent`,
     // carried into `finalize` because `collect_cert` can only build a certificate from votes this validator actually
@@ -808,6 +863,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_taken: 0,
             cert_taken: 0,
             cc_rejects: (0, 0, 0),
+            body_asks: 0,
+            body_answers: (0, 0, 0),
+            body_taken: 0,
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
@@ -1079,6 +1137,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_taken: self.sync_taken,
             cert_taken: self.cert_taken,
             cc_rejects: self.cc_rejects,
+            body_asks: self.body_asks,
+            body_answers: self.body_answers,
+            body_taken: self.body_taken,
             parked: self.pending_finalize.keys().min().copied(),
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
@@ -1092,6 +1153,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 let mut out = self.maybe_propose();
                 out.extend(self.tick_round0_window());
                 out.extend(self.maybe_request_sync());
+                out.extend(self.maybe_request_body());
                 out
             }
             Input::Propose { block, shards } => self.on_propose(block, &shards),
@@ -1101,6 +1163,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Input::ExecVote(v) => self.on_exec_vote(v),
             Input::Timeout => self.on_timeout(),
             Input::SyncReq { from, have_height } => self.on_sync_req(from, have_height),
+            Input::NeedBody { from, block } => self.on_need_body(from, &block),
+            Input::Body(block) => self.on_body(block),
             Input::CommitCert(cert) => self.on_commit_cert(cert),
             Input::SyncResp { cert, head, snapshot } => self.on_sync_resp(cert, head, &snapshot),
         }
@@ -1123,6 +1187,78 @@ impl<S: StateMachine> ConsensusEngine<S> {
         } else {
             Vec::new()
         }
+    }
+
+    /// Ask one COMMIT-certificate voter for the body of a decision we hold and cannot apply.
+    ///
+    /// The last rung of the catch-up ladder. `finalize` parks a certified decision when the body is absent, on the
+    /// assumption that `on_propose` eventually delivers it — true for a scheduler reordering two messages, false for a
+    /// validator the cell has moved past. Measured live: 1963 certificates accepted and parked, `PARKED@1`, forever.
+    ///
+    /// **Addressed, not broadcast, and provably to a holder.** Every voter in the certificate held the block in order to
+    /// sign a COMMIT for it, so the certificate that creates the obligation also names `Q` peers who can discharge it.
+    /// One request per tick to one voter, rotating by attempt so a departed voter costs one tick rather than the
+    /// recovery. Broadcasting instead would send `n−1` copies of a multi-kilobyte body per tick, and this session's
+    /// measurements are unambiguous that added recovery traffic makes the stall worse, not better.
+    fn maybe_request_body(&mut self) -> Vec<Output> {
+        let height = self.height();
+        let Some(&block) = self.pending_finalize.get(&height) else {
+            return Vec::new();
+        };
+        let Some(cert) = self.certified.get(&height) else {
+            return Vec::new(); // no certificate to name a holder — `NeedSkeleton`/sampling is all we have
+        };
+        let voters: Vec<u8> = cert.votes.iter().map(|sv| sv.vote.voter).filter(|&v| v != self.me).collect();
+        if voters.is_empty() {
+            return Vec::new();
+        }
+        let turn = usize::try_from(self.body_asks).unwrap_or(0) % voters.len();
+        let Some(&pick) = voters.get(turn) else {
+            return Vec::new();
+        };
+        self.body_asks = self.body_asks.saturating_add(1);
+        alloc::vec![Output::SendTo { to: pick, msg: ConsensusMsg::NeedBody { block } }]
+    }
+
+    /// Answer a peer's [`ConsensusMsg::NeedBody`] with the whole block, if we hold it.
+    ///
+    /// No entitlement check is needed or possible: the block is one a quorum already decided, its hash is public in
+    /// every vote, and the answer is self-verifying at the receiver. Withholding it from a peer that asks would only
+    /// stall the cell the responder belongs to.
+    fn on_need_body(&mut self, from: u8, block: &[u8; 32]) -> Vec<Output> {
+        let Some(full) = self.proposals.get(block).or_else(|| self.recent_bodies.get(block)) else {
+            self.body_answers.1 = self.body_answers.1.saturating_add(1);
+            return Vec::new();
+        };
+        let msg = ConsensusMsg::Body(full.clone());
+        self.body_answers.0 = self.body_answers.0.saturating_add(1);
+        alloc::vec![Output::SendTo { to: from, msg }]
+    }
+
+    /// Apply a block body handed over for a decision we already hold.
+    ///
+    /// Deliberately **not** routed through `on_propose`: this is not a proposal and must not be judged as one. A
+    /// proposal is checked for proposer right and round entitlement because accepting it means *voting*; here the cell
+    /// has already voted, the quorum certificate is in hand, and the only question is whether these bytes are the block
+    /// that quorum named. The hash answers that completely — it binds the whole header, and `verify_structure` binds the
+    /// payload to `tx_root`/`da_commit` — so a Byzantine sender can substitute nothing.
+    ///
+    /// Accepting only a hash we have **parked or locked on** is what keeps it from becoming a back door into
+    /// `proposals`: an unsolicited body for any other hash is dropped.
+    fn on_body(&mut self, block: Block) -> Vec<Output> {
+        let bh = block.hash();
+        let height = self.height();
+        let wanted = self.pending_finalize.get(&height) == Some(&bh) || self.locked_block == Some(bh);
+        if !wanted || block.header.height != height || !block.verify_structure() {
+            self.body_answers.2 = self.body_answers.2.saturating_add(1);
+            return Vec::new();
+        }
+        self.body_taken = self.body_taken.saturating_add(1);
+        self.proposals.insert(bh, block);
+        if self.pending_finalize.get(&height) == Some(&bh) {
+            return self.finalize(bh);
+        }
+        Vec::new()
     }
 
     /// Serve a catch-up request: if we hold a checkpoint STRICTLY newer than the requester's height and the
@@ -1990,6 +2126,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // We hold a commit certificate but not the block body yet (an async scheduler delivered the CC
             // before the proposal). Remember the decision and finalize the instant on_propose delivers the
             // body — never wedge permanently at this height (audit fix, HIGH 3).
+            // Record the evidence while it still exists. `collect_cert` filters votes by the current height and
+            // round, so the commit quorum that brought us here — the quorum that is the *reason* we are finalizing — is
+            // unrecoverable the moment this height moves on. Parking without it lost two things at once: this validator
+            // could not offer the certificate to a peer in the same position, and it could not name a peer to ask for
+            // the body, since the certificate's voters are exactly the holders (`maybe_request_body`).
+            if !self.certified.contains_key(&height) {
+                let cert = self.collect_cert(Phase::Commit, block_hash);
+                self.certified.insert(height, cert);
+            }
             self.pending_finalize.insert(height, block_hash);
             return Vec::new();
         };

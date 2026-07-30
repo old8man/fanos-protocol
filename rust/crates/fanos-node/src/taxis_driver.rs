@@ -386,6 +386,9 @@ where
                     // touches it: under SSLE all-propose the cell produces one skeleton per validator per round, and
                     // the block being awaited is by definition an old one. See `Sampler::pin`.
                     da.pin(engine.awaited_body());
+                    // Abandoned sampling is finished work: a skeleton for a height already decided can never be
+                    // completed or needed, and it competes for a capped map with the block we are stuck on.
+                    da.prune_below(engine.height());
                     if let Some(want) = engine.awaited_body()
                         && !da.is_sampling(&want)
                     {
@@ -443,6 +446,11 @@ where
                                 coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok())
                             {
                                 let outs = step_msg(&mut engine, &msg, src);
+                                // A handed-over body ends the sampling for that block: it was obtained whole, so the
+                                // pending entry is finished work competing for a capped map.
+                                if let ConsensusMsg::Body(b) = &msg {
+                                    da.forget(&b.hash());
+                                }
                                 drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
                             }
                         }
@@ -501,6 +509,10 @@ fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg
         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
         ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from, have_height: *have_height },
         ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
+        // The body-recovery pair. `Body` deliberately does NOT go to `on_skeleton` like `Propose` does: it is a whole
+        // block answering a decision this validator already holds, and the engine checks it against that decision.
+        ConsensusMsg::NeedBody { block } => Input::NeedBody { from, block: *block },
+        ConsensusMsg::Body(b) => Input::Body(b.clone()),
         ConsensusMsg::SyncResp { cert, head, snapshot } => {
             Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
         }

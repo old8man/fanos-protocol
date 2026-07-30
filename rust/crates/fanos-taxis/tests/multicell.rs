@@ -177,10 +177,13 @@ impl<S: StateMachine + Clone> Cell<S> {
                     ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
                     ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
                     ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
-                    // This fully-connected cross-cell harness never lags, so catch-up messages are inapplicable.
+                    // This fully-connected cross-cell harness never lags, so catch-up messages — including the
+                    // body-recovery pair, which fires only on a parked decision — are inapplicable.
                     ConsensusMsg::SyncReq { .. }
                     | ConsensusMsg::SyncResp { .. }
-                    | ConsensusMsg::CommitCert(_) => continue,
+                    | ConsensusMsg::CommitCert(_)
+                    | ConsensusMsg::NeedBody { .. }
+                    | ConsensusMsg::Body(_) => continue,
                 };
                 let outs = self.engines[i].step(input);
                 self.absorb(outs);
