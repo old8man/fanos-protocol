@@ -222,15 +222,7 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
         health.local_addr, health.known_peers
     );
 
-    // The control socket, so an operator can ask this process anything while it runs. Its absence is not fatal:
-    // a node that cannot bind its admin socket is still a working node, and refusing to run over a control
-    // channel would be the tool getting in the way of the thing it exists to serve.
-    let (admin_tx, mut admin_rx) = tokio::sync::mpsc::channel::<fanos_node::admin::Envelope>(16);
-    let admin_socket = fanos_node::admin::socket_path(&data_dir_for(args));
-    match fanos_node::admin::serve(&admin_socket, admin_tx) {
-        Ok(_task) => eprintln!("control socket: {}", admin_socket.display()),
-        Err(e) => eprintln!("control socket unavailable ({e}) — `fanos status` will fall back to the config"),
-    }
+    let (admin_socket, mut admin_rx) = control_socket(args);
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -242,31 +234,9 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
                 break;
             }
             Some((req, reply)) = admin_rx.recv() => {
-                use fanos_node::admin::Request;
-                let stop = matches!(req, Request::Shutdown);
-                let body = match req {
-                    Request::Ping => "pong\n".to_owned(),
-                    Request::Health => fanos_node::admin::render_health(&node.health()),
-                    Request::Roles => format!("{:?}\n", node.assigned_roles()),
-                    Request::Shutdown => "shutting down\n".to_owned(),
-                    Request::Census => {
-                        // Answered off the loop. A census reads every cell coordinate out of the overlay store,
-                        // so serving it inline would stop this node driving its own engine for the duration —
-                        // an operator's question is not worth pausing the node it is about.
-                        let client = node.client();
-                        let epoch = node.live_beacon().map_or(Epoch::ZERO, |(e, _)| e);
-                        tokio::spawn(async move {
-                            let coords = fanos_node::telemetry_dir::cell_telemetry_coords::<F2>();
-                            let census =
-                                fanos_node::telemetry_dir::take_census(&client, &coords, epoch).await;
-                            let _ = reply.send(census.to_string());
-                        });
-                        continue;
-                    }
-                };
-                let _ = reply.send(body);
-                if stop {
-                    info!("shutdown requested over the control socket");
+                // `fanos node` runs no chain, so `consensus` is answered by saying so rather than by inventing a
+                // reading — the honest answer to "what is your height" from a process that has no ledger.
+                if answer_control(&req, reply, &node, NO_CHAIN) == Control::Stop {
                     break;
                 }
             }
@@ -284,6 +254,166 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos node down");
     Ok(())
+}
+
+/// Whether the control loop should keep running after a request.
+#[derive(PartialEq, Eq)]
+enum Control {
+    /// Answered; carry on.
+    Go,
+    /// The operator asked this node to stop.
+    Stop,
+}
+
+/// What a role with no ledger answers `consensus` with.
+///
+/// A named constant rather than a literal at four call sites, because the point is that these roles answer
+/// *honestly* — "I run no chain" is a real answer, and a role inventing a height it does not have would be worse
+/// than the missing verb this replaces.
+const NO_CHAIN: &str = "this role runs no chain — start `fanos validator` to run consensus\n";
+
+/// How long the `consensus` verb waits for the driver before answering that it did not.
+///
+/// Short on purpose: the probe is a local channel round trip, so anything approaching this bound *is* the finding.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bind this invocation's control socket, so an operator can ask a **running** role anything.
+///
+/// One function because the socket was one *command's*, not the node's: of the five commands that run until
+/// Ctrl-C, only `fanos node` bound it, so the anonymous proxy, the hidden-service host, the VPN datapath and the
+/// consensus validator — every role anyone actually deploys — had no control channel at all, not even
+/// `shutdown`. Each command rolling its own run-until-shutdown loop is *why*, so the fix is a shared seam rather
+/// than a fifth copy.
+///
+/// Failing to bind is deliberately not fatal: a node that cannot open a control channel is still a working node,
+/// and refusing to run over one would be the tool getting in the way of the thing it exists to serve.
+fn control_socket(args: &[String]) -> (PathBuf, tokio::sync::mpsc::Receiver<fanos_node::admin::Envelope>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<fanos_node::admin::Envelope>(16);
+    let path = fanos_node::admin::socket_path(&data_dir_for(args));
+    match fanos_node::admin::serve(&path, tx) {
+        Ok(_task) => eprintln!("control socket: {}", path.display()),
+        Err(e) => eprintln!("control socket unavailable ({e}) — `fanos status` will fall back to the config"),
+    }
+    (path, rx)
+}
+
+/// What the control socket needs from whatever kind of node a role happens to be running.
+///
+/// Two kinds exist. Most roles hold a `fanos_node::Node`, which knows its health and the roles the cell assigned
+/// it; `fanos validator` holds the lower-level `fanos_quic::NodeHandle`, which knows its coordinate and its peers
+/// and nothing about role assignment. The trait exists so there is **one** answerer rather than one per node kind,
+/// and so a role that cannot answer a verb says so instead of the verb silently disappearing from that role.
+trait Controllable {
+    /// This node's health, as the socket renders it.
+    fn health_line(&self) -> String;
+    /// The roles the cell assigned, or why this node cannot say.
+    fn roles_line(&self) -> String;
+    /// A client and epoch to take a census with.
+    fn census_source(&self) -> (fanos_quic::Client, Epoch);
+    /// The next overlay notification, so [`serve_control`] can drain it alongside the socket.
+    async fn next_note(&mut self) -> Option<Notification>;
+}
+
+impl Controllable for Node {
+    fn health_line(&self) -> String {
+        fanos_node::admin::render_health(&self.health())
+    }
+    fn roles_line(&self) -> String {
+        format!("{:?}\n", self.assigned_roles())
+    }
+    fn census_source(&self) -> (fanos_quic::Client, Epoch) {
+        (self.client(), self.live_beacon().map_or(Epoch::ZERO, |(e, _)| e))
+    }
+    async fn next_note(&mut self) -> Option<Notification> {
+        self.next_notification().await
+    }
+}
+
+impl Controllable for fanos_quic::NodeHandle {
+    /// Coordinate, listener and verified peer claims — what this layer genuinely knows. Deliberately not the same
+    /// shape as `Node`'s: reporting a health record this node cannot actually compute would be worse than a
+    /// shorter honest one.
+    fn health_line(&self) -> String {
+        let [x, y, z] = self.address();
+        let claims = self.verified_claims().map_or_else(|| "n/a (directory trust)".to_owned(), |n| n.to_string());
+        format!("coordinate: {x}:{y}:{z}\nlisten: {}\nverified claims: {claims}\n", self.local_addr())
+    }
+    fn roles_line(&self) -> String {
+        "roles: not tracked by this role — it runs a fixed function, not a cell-assigned one\n".to_owned()
+    }
+    fn census_source(&self) -> (fanos_quic::Client, Epoch) {
+        // No beacon of its own: a validator takes its epoch from the config it was dealt, and the census only
+        // needs *an* epoch to address frames with. `ZERO` reads every cell's genesis frame, which is the honest
+        // answer for a node that is not tracking the live beacon rather than a silently wrong one.
+        (self.client(), Epoch::ZERO)
+    }
+    async fn next_note(&mut self) -> Option<Notification> {
+        self.next_notification().await
+    }
+}
+
+/// Serve a role's control socket and drain its notifications until the socket says stop or the stream ends.
+///
+/// One function because it was three identical copies the moment the socket reached more than one command —
+/// which is the same duplication that left four roles without a socket at all, arriving a second time. A role
+/// whose own work future differs (the validator, which also drains consensus events and answers `consensus` from
+/// a live probe) drives its loop directly instead; that difference is real, and hiding it behind a callback would
+/// buy nothing.
+async fn serve_control<N: Controllable>(
+    node: &mut N,
+    admin_rx: &mut tokio::sync::mpsc::Receiver<fanos_node::admin::Envelope>,
+    consensus: &str,
+) {
+    loop {
+        tokio::select! {
+            Some((req, reply)) = admin_rx.recv() => {
+                if answer_control(&req, reply, node, consensus) == Control::Stop {
+                    break;
+                }
+            }
+            note = node.next_note() => match note {
+                Some(n) => log_notification(&n),
+                None => break,
+            },
+        }
+    }
+}
+
+/// Answer one control request. `consensus` is the only verb a role answers differently, so it arrives already
+/// rendered — a role with a ledger passes its probe, a role without passes [`NO_CHAIN`].
+fn answer_control<N: Controllable>(
+    req: &fanos_node::admin::Request,
+    reply: tokio::sync::oneshot::Sender<String>,
+    node: &N,
+    consensus: &str,
+) -> Control {
+    use fanos_node::admin::Request;
+    let stop = matches!(req, Request::Shutdown);
+    let body = match *req {
+        Request::Ping => "pong\n".to_owned(),
+        Request::Health => node.health_line(),
+        Request::Roles => node.roles_line(),
+        Request::Consensus => consensus.to_owned(),
+        Request::Shutdown => "shutting down\n".to_owned(),
+        Request::Census => {
+            // Answered off the loop. A census reads every cell coordinate out of the overlay store, so serving it
+            // inline would stop this node driving its own engine for the duration — an operator's question is not
+            // worth pausing the node it is about.
+            let (client, epoch) = node.census_source();
+            tokio::spawn(async move {
+                let coords = fanos_node::telemetry_dir::cell_telemetry_coords::<F2>();
+                let census = fanos_node::telemetry_dir::take_census(&client, &coords, epoch).await;
+                let _ = reply.send(census.to_string());
+            });
+            return Control::Go;
+        }
+    };
+    let _ = reply.send(body);
+    if stop {
+        info!("shutdown requested over the control socket");
+        return Control::Stop;
+    }
+    Control::Go
 }
 
 /// Where this invocation's state lives — the directory the control socket goes in.
@@ -420,11 +550,13 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutdown signal received");
     };
+    let (admin_socket, mut admin_rx) = control_socket(args);
     tokio::select! {
         () = serve_proxy(socks, http, dialer, shutdown) => {}
-        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+        () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
     node.shutdown();
+    let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos proxy down");
     Ok(())
 }
@@ -523,11 +655,13 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutdown signal received");
     };
+    let (admin_socket, mut admin_rx) = control_socket(args);
     tokio::select! {
         () = shutdown => {}
-        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+        () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
     node.shutdown();
+    let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos host down");
     Ok(())
 }
@@ -593,12 +727,14 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutdown signal received");
     };
+    let (admin_socket, mut admin_rx) = control_socket(args);
     tokio::select! {
         () = fanos_vpn::run_fulltunnel(device, dialer) => {}
         () = shutdown => {}
-        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+        () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
     node.shutdown();
+    let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos vpn down");
     Ok(())
 }
@@ -1718,17 +1854,50 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     );
     info!(validator = me, coord = ?node.address(), %listen, "fanos validator up");
 
-    // Serve until Ctrl-C, logging consensus progress and draining the node's notifications.
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("shutdown signal received");
-    };
-    tokio::select! {
-        () = shutdown => {}
-        () = async { while let Ok(ev) = events.recv().await { info!(?ev, "taxis event"); } } => {}
-        () = async { while let Some(n) = node.next_notification().await { log_notification(&n); } } => {}
+    // Serve until Ctrl-C, logging consensus progress, draining the node's notifications, and — the point of the
+    // `consensus` verb — answering an operator who wants to know why this validator sits where it does.
+    let (admin_socket, mut admin_rx) = control_socket(args);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut ctrl_c => {
+                info!("shutdown signal received");
+                break;
+            }
+            Some((req, reply)) = admin_rx.recv() => {
+                if matches!(req, fanos_node::admin::Request::Consensus) {
+                    // **Bounded, not spawned.** A probe is one round trip to the driver task, so `census`'s
+                    // spawn-and-continue would be overkill — but awaiting it unbounded would hang this loop on
+                    // precisely the wedged driver an operator is asking about, taking `shutdown` down with it.
+                    // A timeout turns "the engine is not answering" into an answer, which is the one this verb
+                    // exists to give.
+                    let body = match tokio::time::timeout(PROBE_TIMEOUT, handle.probe()).await {
+                        Ok(Some(p)) => format!("{}\n", p.consensus),
+                        Ok(None) => "consensus: the driver task has ended\n".to_owned(),
+                        Err(_) => format!("consensus: the driver did not answer within {PROBE_TIMEOUT:?}\n"),
+                    };
+                    let _ = reply.send(body);
+                    continue;
+                }
+                if answer_control(&req, reply, &node, NO_CHAIN) == Control::Stop {
+                    break;
+                }
+            }
+            ev = events.recv() => match ev {
+                Ok(e) => info!(?e, "taxis event"),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => info!(missed = n, "taxis events lagged"),
+            },
+            note = node.next_notification() => match note {
+                Some(n) => log_notification(&n),
+                None => break,
+            },
+        }
     }
     node.shutdown();
+    let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos validator {me} down");
     Ok(())
 }

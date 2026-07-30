@@ -89,6 +89,17 @@ pub enum Request {
     /// the overlay store rather than to local state — and issued serially, since a monitor that fans out over a
     /// federation at once is a load spike on a network it may be asking about because it is under load.
     Census,
+    /// **Why this validator sits where it does** — the consensus engine's own position and the counters behind it.
+    ///
+    /// Everything `ConsensusProbe` carries: height and round, whether it is locked and on what, the body it is
+    /// waiting for, proposals refused *by cause*, the skeleton/shard/body/sync exchange counts, the vote arrivals
+    /// bucketed against our own round, and any parked decision. Rendered by the probe's own `Display`, which is the
+    /// dense one-validator-per-line form these are read in.
+    ///
+    /// It exists because every one of those counters was added while a live cell was stuck and its state could not
+    /// be read — from a test harness. The operator of a stuck validator is exactly who needs them, and was exactly
+    /// who could not get them. A role that runs no chain answers so rather than inventing a reading.
+    Consensus,
     /// Ask the node to shut down cleanly.
     Shutdown,
 }
@@ -102,6 +113,7 @@ impl Request {
             "health" => Some(Self::Health),
             "roles" => Some(Self::Roles),
             "census" => Some(Self::Census),
+            "consensus" => Some(Self::Consensus),
             "shutdown" => Some(Self::Shutdown),
             _ => None,
         }
@@ -110,7 +122,7 @@ impl Request {
     /// Every verb, for the error message a wrong one gets.
     #[must_use]
     pub const fn all() -> &'static str {
-        "ping | health | roles | census | shutdown"
+        "ping | health | roles | census | consensus | shutdown"
     }
 }
 
@@ -329,6 +341,24 @@ mod tests {
         let unknown = ask(&path, "reconfigure").await.unwrap().unwrap_or_default();
         assert!(unknown.starts_with("error: unknown request"), "got {unknown:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn every_verb_the_error_message_advertises_is_a_verb_the_parser_accepts() {
+        // The two drifted apart the moment a verb was added: `all()` is what an operator is told to type after a
+        // mistake, so a verb listed there and unparsed is a lie told at exactly the wrong moment, and a verb
+        // parsed but unlisted is a capability nobody can discover. Checked against each other rather than against
+        // a hand-written list, so adding a verb cannot satisfy this test without wiring both sides.
+        for verb in Request::all().split('|').map(str::trim) {
+            assert!(Request::parse(verb).is_some(), "`{verb}` is advertised by all() and the parser refuses it");
+        }
+        // …and the reverse direction, for the verbs this build knows about.
+        for verb in ["ping", "health", "roles", "census", "consensus", "shutdown"] {
+            assert!(Request::parse(verb).is_some(), "`{verb}` must parse");
+            assert!(Request::all().contains(verb), "`{verb}` parses but is not advertised, so nobody can find it");
+        }
+        // Case-insensitively, as the parser promises.
+        assert!(Request::parse("  CONSENSUS \n").is_some(), "verbs are parsed case-insensitively and trimmed");
     }
 
     #[tokio::test]
