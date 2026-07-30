@@ -22,7 +22,7 @@
 > - **Mass-loss recovery** (R-C1 cliff, Audit II/III §4): **CLOSED** — partition-safe below-threshold re-genesis (RGC + `BeaconNode::rebootstrap` + generation fencing) + an auto-trigger (recovery-decision ladder + stall detector) replaces the permanent freeze; durable state-sync + secret-leader election are built and proven over real QUIC.
 > - **The Audit III §3 DoS/overflow cluster:** §3.2 (OBOLOS ternary-randomness reject), §3.3 (storage `decode_response` bound), §3.5 (audit-cadence), §3.4 (market floors + prune), §3.7 (TREASURY access-list), §3.8/§3.9 (CI green): **CLOSED** per Audit IV's re-verification + subsequent commits.
 > - **Γ-viability gate** (Audit II CRITICAL-ARCH): **CLOSED** — built as the `fanos-holarch` crate (`gamma`/`verdict`/`panel`/`Sigma` + the Ω4 ablations); the E∧L verdict is now a CI number.
-> - **Beacon-reshare key-secrecy** (Audit IV §2.1, CRITICAL, **RESOLVED 2026-07-24**): the last live CRITICAL across all four audits is now closed. The `BeaconReshareTrigger` is **authenticated** — it carries a `HybridSignature` by the beacon's recovery `authority`, and `on_reshare_trigger` refuses any unsigned/foreign-signed/tampered trigger before any anchor deals a sub-share; `node.rs::actuate_recovery` escalates a proactive reshare to that authority (as re-genesis already is) rather than a node self-issuing one. The 2-anchor-coalition master-key exfiltration is closed, while legitimate threshold-lowering recovery still works (the authority signs it). The in-flux `recovery.rs` was not touched. Full detail at Audit IV §2.1 below. **One open HIGH as of 2026-07-29 — E7:** `MIX_THRESHOLD` is a constant `2` on every plane, so above Fano the tolerated Byzantine corruption alone captures every MIX hop and the lane provides no anonymity at `q ≥ 7`. The default plane `q = 2` is unaffected (there `f = t = 2` makes end-to-end correlation impossible). The fix is derived and evaluates to the current value at `q = 2`: `t = ⌈2(q+1)/3⌉`. No other CRITICAL/HIGH remains across the four audits. — the residual is the coherence/MEDIUM-LOW tail noted next.
+> - **Beacon-reshare key-secrecy** (Audit IV §2.1, CRITICAL, **RESOLVED 2026-07-24**): the last live CRITICAL across all four audits is now closed. The `BeaconReshareTrigger` is **authenticated** — it carries a `HybridSignature` by the beacon's recovery `authority`, and `on_reshare_trigger` refuses any unsigned/foreign-signed/tampered trigger before any anchor deals a sub-share; `node.rs::actuate_recovery` escalates a proactive reshare to that authority (as re-genesis already is) rather than a node self-issuing one. The 2-anchor-coalition master-key exfiltration is closed, while legitimate threshold-lowering recovery still works (the authority signs it). The in-flux `recovery.rs` was not touched. Full detail at Audit IV §2.1 below. **E7 (`MIX_THRESHOLD` a constant `2` on every plane) is CLOSED 2026-07-29** — generalized to `t = ⌈2(q+1)/3⌉`, which evaluates to the shipped `2` at `q = 2`, so the default plane is unchanged and `q ≥ 7` regains anonymity; pinned by a test that also fails at `t−1`. **One open HIGH as of 2026-07-30 — T-H6:** `ConsensusMsg::SyncResp` carries an **unauthenticated `head`**. `ExecVote` signs `height ‖ state_root ‖ voter` only, so a Byzantine cell member can pair a genuine execution certificate with an arbitrary block hash and `on_sync_resp` installs it as the victim's chain head — isolating an honest validator (`link` rejects in both directions) and, in a Fano cell, taking effective participation to `4 < Q = 5` alongside the two tolerated faults. Safety is unaffected (the victim can never reach quorum, so no fork); liveness is not. Fix derived: bind the head into the attestation and delete the wire field. — the residual is the coherence/MEDIUM-LOW tail noted next.
 > - **Remaining:** the coherence/meta-holon tail (E→L / L→O / Ω2 / Ω9 reconciliation) and the per-subsystem MEDIUM/LOW items are preserved in the dated sections below and tracked in ongoing work. Where an archived section says "unbuilt/open," verify against the current tree — it has advanced hundreds of commits since each snapshot.
 >
 > ### Residual sweep — 2026-07-26
@@ -395,9 +395,19 @@ Pinned by `beacon::tests::{any_threshold_subset_yields_the_same_unbiasable_seed,
 
 **Verdict.** The **entire E-series anonymity floor is now resolved** — E1 (constant-rate cover), E2 (secret-keyed mix delays), E3 (SIV-salt descriptor nonce + per-boot onion-nonce freshening), E4 (forward-secure relay onion keys with a grace window), E5 (unpredictable distributed-beacon rendezvous), E6 (constant-rate cover displacement) — all implemented and verified above (#61). The marketing verbs ("verifiable mixing," "forward secrecy," "unpredictable epochs," "no volume fingerprint") now match the shipping Full engine. The only remaining anonymity work is the live-network **deployment transport** of the beacon and the single E4∩E5 epoch driver (→ #54). The lower-severity items below are documented-in-code residuals, none a fabrication.
 
-### E7 — `MIX_THRESHOLD` is a constant and does not scale with the plane *(HIGH)* — **OPEN, found 2026-07-29**
+### E7 — `MIX_THRESHOLD` is a constant and does not scale with the plane *(HIGH)* — **RESOLVED 2026-07-29, found the same day**
 
-`fanos-node/src/node.rs:42` declares `pub(crate) const MIX_THRESHOLD: usize = 2`, passed unchanged to
+**Closed as derived below.** `fanos-node/src/node.rs` now carries `pub const fn mix_threshold(line_size: usize) ->
+usize` computing `⌈2m/3⌉`, with `DEFAULT_MIX_THRESHOLD = mix_threshold(3) = 2` so the default plane is byte-identical,
+and `composition.rs` passes `mix_threshold(Plane::<F>::LINE_SIZE)` for the field actually in use. Three tests pin it: the
+default plane unchanged, the ratio never below `2/3` **and `t−1` breaking it** (so the bound is tight, not merely
+satisfied), and a degenerate line still needing one peeler. The CLI's three `None => 2` fallbacks became one
+`mix_threshold_arg` helper, because three copies of a constant is how the constant survived generalization in the first
+place.
+
+The finding as written, kept for the derivation and the two wrong turns:
+
+`fanos-node/src/node.rs:42` declared `pub(crate) const MIX_THRESHOLD: usize = 2`, passed unchanged to
 `ThresholdRouter::<F>::new` for **every** field `F` (`composition.rs:149`). A MIX hop is a line of `q+1` points
 (`threshold_router.rs`: "each hop is peeled only by a threshold `t` of that line's `q + 1` members"), so on any
 plane a hop falls to **any two** corrupt members — while the Byzantine tolerance `f = ⌊(n−1)/3⌋` grows with the
@@ -848,6 +858,26 @@ anonymity for latency/bandwidth. The snapshot below is retained for the record.
 - **[HIGH, LIKELY] T-H2 — the round lock has no unlock / re-propose rule → partial-lock liveness wedge.** `consensus.rs:547-551` refuses any block ≠ `locked_block`; `:494-510` always assembles a *fresh* block, never re-proposing the locked value; `:945` only bumps the round on timeout. The code implements the *refuse-conflicting* half of Tendermint but not the *unlock-on-newer-PC / re-propose-locked-value* half. A partial lock (3 validators lock B, `<Q` commits) + fresh proposals forever → the height wedges permanently (safety preserved, liveness not). **Fix:** implement `lockedValue`/`validRound` — the proposer re-proposes its locked value with a PC justification; validators unlock when shown a PC for a round ≥ their lockedRound.
 - **[HIGH, disclosed] T-H3 — a within-`f` keyper majority can transiently censor a targeted tx** (`consensus.rs:835-888` + `incentive.rs:247-266`): 2-of-3 keyper line, 2 Byzantine withhold reveals → tx dropped after the reveal window; only *permanent* censorship is proven impossible; per-epoch, per-tx censorship is operational and unpriced, with no force-inclusion/inclusion-list. Compounds with T-H1.
 - **[HIGH, disclosed [P]] T-H4 — DA dispersal is not wired.** `taxis_driver.rs:228` derives the DA shards from the proposer's own block, so `reconstruct_payload` always sees the full set → the whole payload rides in the proposal, real withholding is never modeled, and erasure-coded dispersal gives no scalability. **Fix:** ship headers + sampled shards and verify a signed DA-attestation quorum in-engine.
+- **[HIGH, found 2026-07-30] T-H6 — `SyncResp`'s `head` is unauthenticated: one Byzantine peer can isolate a syncing validator.**
+  `ExecVote::signable` (`checkpoint.rs:39`) is `height ‖ state_root ‖ voter` — the **block hash is not covered** — and
+  `ExecCertificate::verify` checks only that every vote agrees on `(height, state_root)`. `on_sync_resp` then calls
+  `self.chain.restore(height, head, state)` with `head` taken straight off the wire, and `Chain::restore` clears the
+  headers and installs it with no linkage check. So a Byzantine cell member (the driver accepts a `SyncResp` from any
+  known validator coordinate) can pair a **genuine** certificate — they are served and broadcast freely — with an
+  **arbitrary** block hash. The victim adopts a chain tip nobody has: its own proposals carry a `parent` no peer
+  recognizes, and every proposal it receives fails `header.parent != chain.head()`. It is isolated at that height, and
+  the attacker can race every recovery attempt.
+  **Safety is unaffected** — the victim can never assemble a quorum, so there is no fork — but liveness is: in a Fano
+  cell (`n = 7`, `Q = 5`, `f = 2`), two Byzantine validators plus one honest node wedged this way leaves `4 < Q`. The
+  attack costs one message and needs no forged signature.
+  Worth noting alongside: `HybridLedger::state_root` covers the six sub-ledger roots only, **not** `height` or
+  `audit_beacon`, so the certified root does not pin the height either — only the contents.
+  **Fix (derived):** bind the head into the attestation rather than validating it afterwards. `ExecVote` gains `head`,
+  `signable` becomes `height ‖ state_root ‖ head ‖ voter`, `ExecCertificate` gains `head` and requires every vote to
+  agree on it; `on_sync_resp` then reads `cert.head` and the field is **deleted** from `ConsensusMsg::SyncResp`.
+  Removing the unauthenticated field beats checking it — nothing later can reintroduce the mistake — and the attestation
+  then states what a syncing node actually needs to believe: *executing the chain ending at `head` through height `h`
+  yields `state_root`*.
 - **[HIGH, disclosed] T-H5 — slashing is detected but never applied; rewards are non-canonical and never minted.** `taxis_driver.rs:268-273` maps `Output::Slash`/`Reward` to events that **never touch ledger state**; `consensus.rs:717-730` computes the reward split from the *local* commit view (non-canonical, would fork the root if folded). The Nash equilibrium's `S>0`/`R` conditions are provable-but-not-live. **Fix:** apply slashing/rewards to a real balance canonically.
 - **MEDIUM:** T-M1 cross-cell is one-way emission-proof, not two-phase atomic, and not wired into any shipped `StateMachine` (replay-dedup by `(source,nonce)` is delegated and implemented nowhere → a naive wiring double-applies); T-M2 live parent attestation never calls `conflict()` → silently anchors the first-seen child fork; T-M3 `pending_finalize` body admission is gated by the current-round leader → a CC-without-body can re-wedge after a timeout; T-M4 cross-cell verifier trust-root is assumed, not established for peer cells.
 - **LOW:** duplicate tx not rejected structurally; `open_from_subset` combinatorial cap at 4096; well-sealed-but-undecryptable tx wastes a block slot.
