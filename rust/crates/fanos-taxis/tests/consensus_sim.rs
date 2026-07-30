@@ -338,7 +338,7 @@ impl Cluster {
             if self.crashed[i] {
                 continue;
             }
-            let wanted = self.samplers.get(i).map(Sampler::outstanding).unwrap_or_default();
+            let wanted = self.samplers.get_mut(i).map(Sampler::due).unwrap_or_default();
             for (hash, missing) in wanted {
                 for index in missing {
                     let peer = usize::from(index);

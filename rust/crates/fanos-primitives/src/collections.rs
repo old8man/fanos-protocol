@@ -40,6 +40,16 @@ impl<K: Ord + Copy, V> BoundedMap<K, V> {
         self.map.iter()
     }
 
+    /// Iterate the live entries in key order, with mutable values.
+    ///
+    /// Values only, never keys: a key change would have to be mirrored in `order` to keep the eviction bound honest,
+    /// and `BTreeMap` rightly forbids it. Mutating a value in place is not a re-insertion, so — exactly as with
+    /// [`get_mut`](Self::get_mut) — the size and eviction order are untouched. It exists for the sweep that both
+    /// *reads* every entry and *advances* per-entry state in the same pass, such as a retry schedule.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.map.iter_mut()
+    }
+
     /// Insert `(key, value)`. A **new** key takes a fresh slot, evicting the oldest entry if the map was at
     /// capacity; a **known** key just updates its value, leaving the size and eviction order untouched.
     /// Returns the evicted `(key, value)`, if a new key pushed the map over capacity.

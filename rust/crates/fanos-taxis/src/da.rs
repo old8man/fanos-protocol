@@ -41,10 +41,27 @@ const HELD_CAP: usize = 512;
 /// Cap on skeletons awaiting reconstruction — same remote-key reasoning, against a proposal flood.
 pub const PENDING_CAP: usize = 64;
 
+/// Longest gap, in resample sweeps, that [`Sampler::due`] will leave between two requests for one block.
+///
+/// The cap exists because a block's obtainability is not monotone in *our* knowledge: a peer that could answer nothing
+/// becomes able to answer **any** index the moment it reconstructs the block itself (the driver falls back to
+/// `ConsensusEngine::shard_of`, which regenerates any shard from a held body). Unbounded doubling would let us sleep
+/// through that transition. Bounding the gap bounds the loss to one interval.
+///
+/// The value is the cell's own progress unit rather than a chosen number: one round timeout, expressed in sweeps —
+/// `ROUND_TIMEOUT_MAX / TICK_PERIOD` = 24 s / 150 ms. That is the interval after which the cell re-offers and re-votes
+/// everything anyway, so a sampler that wakes at least that often can never be the reason a round is lost. The relation
+/// is machine-checked in `fanos-node`, which is the crate that owns both constants.
+pub const RESAMPLE_MAX_INTERVAL: u32 = 160;
+
 /// A skeleton awaiting reconstruction: the shards gathered so far, this node's own plus those sampled from peers.
 struct Pending {
     skeleton: Block,
     shards: Box<DaShards>,
+    /// Sweeps still to wait before this block's missing shards are requested again.
+    wait: u32,
+    /// The gap to apply after the next request — doubles while nothing is learned, resets on progress.
+    interval: u32,
 }
 
 /// One validator's data-availability sampling state.
@@ -88,7 +105,7 @@ impl Sampler {
         {
             *slot = Some(mine.clone());
         }
-        if let Some((evicted, victim)) = self.pending.insert(hash, Pending { skeleton, shards })
+        if let Some((evicted, victim)) = self.pending.insert(hash, Pending { skeleton, shards, wait: 0, interval: 1 })
             && self.pinned == Some(evicted)
         {
             // Evicting the one block this validator is stuck on would strand it: it leaves `outstanding`, so no shard
@@ -129,15 +146,43 @@ impl Sampler {
             .collect()
     }
 
-    /// Every block still being sampled, paired with the shard indices it is missing — one sweep for a retry tick.
+    /// The blocks whose missing shards are **due** to be requested on this sweep, paired with those indices.
     ///
     /// Retrying matters more than it looks: a replica requests a shard the moment a skeleton arrives, but the proposer
     /// disperses peer by peer, so the request routinely reaches a peer *before* that peer has been given its own shard.
     /// The peer holds nothing, answers nothing, and without a retry the requester waits forever for a shard its peer
     /// has held all along. One proposal in flight loses that race sometimes; N racing proposals lose it reliably.
-    #[must_use]
-    pub fn outstanding(&self) -> Vec<([u8; 32], Vec<u8>)> {
-        self.pending.iter().map(|(&h, _)| (h, self.missing(&h))).filter(|(_, m)| !m.is_empty()).collect()
+    ///
+    /// ## Why this is a schedule and not a list
+    ///
+    /// It returned *everything* outstanding, on every 150 ms tick, forever — and a pending entry leaves the map only by
+    /// reconstruction, [`prune_below`](Self::prune_below), or cap eviction. So a block that cannot be completed at a
+    /// stalled height was re-requested for the whole stall: measured at one height, `shard=7130/7130 took=5366` per
+    /// validator, thousands of requests for two blocks nobody could answer.
+    ///
+    /// A repeat is worth sending only if the answer could have changed, and exactly two things change it. **(a)** The
+    /// proposer's dispersal finally reaches the peer we asked — the race above, bounded by one dispersal sweep, so it
+    /// resolves within the first few attempts. **(b)** That peer obtains the block some other way — unbounded in time,
+    /// with probability decaying in every attempt that has already failed. Early requests must therefore be dense and
+    /// late ones sparse, which is exactly what doubling gives, with no tuned parameter: for a block that completes after
+    /// `t` sweeps it costs `O(log t)` requests instead of `t` and delays completion by at most one interval — under 2× —
+    /// and for a block that never completes it turns 1600 sweeps into 11.
+    ///
+    /// That bound is also why there is **no give-up rule**: at logarithmic cost an abandoned entry is not worth an
+    /// invented horizon, and `prune_below` plus [`PENDING_CAP`] already bound the map. The gap is capped instead
+    /// ([`RESAMPLE_MAX_INTERVAL`]), because obtainability is not monotone.
+    pub fn due(&mut self) -> Vec<([u8; 32], Vec<u8>)> {
+        let mut out = Vec::new();
+        for (&hash, p) in self.pending.iter_mut() {
+            if p.wait > 0 {
+                p.wait -= 1;
+                continue;
+            }
+            p.wait = p.interval;
+            p.interval = p.interval.saturating_mul(2).min(RESAMPLE_MAX_INTERVAL);
+            out.push(hash);
+        }
+        out.into_iter().map(|h| (h, self.missing(&h))).filter(|(_, m)| !m.is_empty()).collect()
     }
 
     /// The validator that **proposed** a block still being sampled — the one peer guaranteed to hold its whole payload.
@@ -168,7 +213,18 @@ impl Sampler {
         if let Some(p) = self.pending.get_mut(&block)
             && let Some(slot) = p.shards.get_mut(usize::from(index))
         {
+            let fresh = slot.is_none();
             *slot = Some(shard);
+            // **Progress resets the schedule.** The backoff in [`due`](Self::due) measures "nothing has been learned
+            // about this block"; a shard we did not have is precisely something learned, and it says the peers holding
+            // this block are answering. Without the reset a block that gathers its shards slowly would be punished for
+            // the very sweeps in which it was gathering them — the doubling would outrun the delivery it is waiting on.
+            // Gated on the slot being empty, so a re-delivered duplicate (which teaches nothing) cannot hold the
+            // interval at 1 and reinstate the storm this schedule exists to end.
+            if fresh {
+                p.wait = 0;
+                p.interval = 1;
+            }
         }
         self.reconstruct(&block)
     }
@@ -250,6 +306,69 @@ mod tests {
     /// A block at `height`, so a stale-vs-current distinction can be constructed.
     fn block_at(height: u64) -> Block {
         Block::assemble([0u8; 32], height, fanos_primitives::Epoch::ZERO, 0, Vec::new())
+    }
+
+    #[test]
+    fn a_block_nobody_can_answer_costs_logarithmically_many_sweeps_not_linearly() {
+        // The measured failure: `outstanding()` returned everything on every 150 ms tick forever, and a pending entry
+        // leaves the map only by reconstruction, `prune_below`, or eviction — so a block that cannot be completed at a
+        // stalled height was re-requested for the whole stall. One height, per validator: `shard=7130/7130 took=5366`.
+        let mut s = Sampler::new(0);
+        assert!(s.begin(block_with_payload().skeleton()));
+        // 1600 sweeps is the 240 s stall at a 150 ms tick — the exact conditions of that trace.
+        let sweeps = 1600u32;
+        let asked = u32::try_from((0..sweeps).filter(|_| !s.due().is_empty()).count()).unwrap();
+        // The bound is the schedule's own, not a number picked to fit: doubling reaches the cap in `log2(cap)` steps,
+        // and every sweep after that costs one request per cap-length. Written this way it stays true if the cap moves.
+        let bound = RESAMPLE_MAX_INTERVAL.ilog2() + 2 + sweeps / RESAMPLE_MAX_INTERVAL;
+        assert!(
+            asked <= bound,
+            "a block nobody answers must cost O(log t) requests, not O(t): {asked} sweeps of {sweeps} asked, \
+             against a derived bound of {bound}"
+        );
+        // …and the gap never grows past the cell's own progress unit, because obtainability is not monotone: a peer
+        // that could answer nothing becomes able to answer any index the moment it reconstructs the block itself.
+        let mut gaps = 0u32;
+        for _ in 0..RESAMPLE_MAX_INTERVAL * 3 {
+            if !s.due().is_empty() {
+                gaps += 1;
+            }
+        }
+        assert!(gaps >= 3, "the interval must cap, so a long-lived entry keeps waking: only {gaps} in 3 cap-lengths");
+    }
+
+    #[test]
+    fn a_shard_that_teaches_something_resets_the_schedule_and_a_duplicate_does_not() {
+        // The backoff measures "nothing learned about this block". A shard we did not have is something learned, so it
+        // must reset — otherwise a block gathering its shards slowly is punished for the very sweeps in which it is
+        // gathering them, and the doubling outruns the delivery it waits on. A *re-delivered* shard teaches nothing,
+        // and letting it reset would hold the interval at 1 and reinstate the storm this schedule exists to end.
+        let block = block_with_payload();
+        let (hash, shards) = (block.hash(), block.da_shards());
+        let mut s = Sampler::new(0);
+        assert!(s.begin(block.skeleton()));
+        let shard = shards.get(1).expect("the cell has a shard at index 1").clone();
+        // Sweep until the schedule asks, which leaves it at the top of a wait as long as the current interval. Driving
+        // to a *fire* rather than counting sweeps is what makes this test read the reset instead of the arithmetic: the
+        // first draft asserted emptiness on a sweep that was legitimately due, and blamed the duplicate for it.
+        let fire = |s: &mut Sampler| (0..RESAMPLE_MAX_INTERVAL * 2).any(|_| !s.due().is_empty());
+        for i in 0..3 {
+            assert!(fire(&mut s), "the schedule must keep asking about an unanswered block (fire {i})");
+        }
+
+        assert!(s.due().is_empty(), "just after a request the schedule waits");
+        assert!(s.accept(hash, 1, shard.clone()).is_none(), "one shard cannot reconstruct the payload");
+        assert!(!s.due().is_empty(), "a shard never seen before resets the schedule to the very next sweep");
+
+        for i in 0..3 {
+            assert!(fire(&mut s), "and the backoff resumes from there (fire {i})");
+        }
+        assert!(s.accept(hash, 1, shard).is_none(), "the same shard again");
+        assert!(
+            (0..3).all(|_| s.due().is_empty()),
+            "a duplicate teaches nothing, so it must not reset the schedule — three consecutive quiet sweeps can only \
+             hold if the wait survived it"
+        );
     }
 
     #[test]
@@ -351,7 +470,8 @@ mod tests {
     #[test]
     fn a_request_answered_before_its_peer_was_dispersed_is_recovered_by_the_retry() {
         // The race that deadlocked a live cell. Validator 0 asks first, while nobody else has been dispersed a shard
-        // yet, so every answer is empty; `outstanding` must still report the block so the next tick asks again.
+        // yet, so every answer is empty; the block must still come back due so a later sweep asks again. This is the
+        // property the backoff schedule must not cost: it may make the second attempt *later*, never absent.
         let block = block_with_payload();
         let hash = block.hash();
         let shards = block.da_shards();
@@ -365,13 +485,16 @@ mod tests {
             let peer = rest.get(usize::from(index) - 1).expect("a peer per index above our own");
             assert!(peer.serve(&hash, index).is_none(), "peer {index} holds nothing yet");
         }
-        assert_eq!(first.outstanding().len(), 1, "the block is still outstanding, so the retry will ask again");
+        assert_eq!(first.due().len(), 1, "the block is still outstanding, so the retry will ask again");
 
-        // Dispersal lands late, and the retry now succeeds where the first attempt found nothing.
+        // Dispersal lands late, and the retry now succeeds where the first attempt found nothing. The sweep after a
+        // request is a wait, by construction — so drive sweeps until the schedule offers the block again, which is
+        // exactly what the driver's tick loop does, and assert it does come back rather than assuming it.
         for (i, peer) in rest.iter_mut().enumerate() {
             peer.hold(hash, shards.get(i + 1).cloned().unwrap());
         }
-        for (h, indices) in first.outstanding() {
+        let retry = (0..RESAMPLE_MAX_INTERVAL).find_map(|_| Some(first.due()).filter(|d| !d.is_empty()));
+        for (h, indices) in retry.expect("the schedule must offer an un-answered block again") {
             for index in indices {
                 let Some(peer) = rest.get(usize::from(index) - 1) else { continue };
                 let Some(shard) = peer.serve(&h, index) else { continue };
@@ -407,7 +530,7 @@ mod tests {
 
         assert!(s.is_sampling(&hash), "the awaited skeleton was evicted by proposals nobody is waiting for");
         assert!(
-            s.outstanding().iter().any(|(h, _)| *h == hash),
+            s.due().iter().any(|(h, _)| *h == hash),
             "the awaited block must stay outstanding, or no shard is ever requested for it again"
         );
         assert_eq!(s.proposer_of(&hash), Some(awaited.header.proposer), "and its proposer stays addressable");

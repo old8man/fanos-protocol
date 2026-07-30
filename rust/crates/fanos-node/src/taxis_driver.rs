@@ -376,7 +376,7 @@ where
                     // sometimes (measured: a 7-node cell executing on 6 of 7 validators, the seventh stranded at genesis
                     // permanently, and the same suite executing on 0 of 7 in the next run). Under SSLE all-propose there
                     // are N proposals racing at once and it loses reliably: no block ever finalized.
-                    resample_pending(&client, &coords, me, &da);
+                    resample_pending(&client, &coords, me, &mut da);
                     // Ask for a body this validator is committed to but has never seen. Votes carry only a hash, so it
                     // can be locked on — or hold a commit certificate for — a block it never received, and then it will
                     // neither prepare it (it cannot execute what it does not have) nor accept any conflicting proposal.
@@ -732,8 +732,8 @@ fn on_shard<S: StateMachine>(
 ///
 /// After [`RESAMPLE_ESCALATE`] fruitless rounds the request stops addressing each shard's custodian and goes to the
 /// whole cell, because a custodian is only the right address while dispersal worked.
-fn resample_pending(client: &Client, coords: &[Triple], me: u8, da: &Sampler) {
-    for (block, missing) in da.outstanding() {
+fn resample_pending(client: &Client, coords: &[Triple], me: u8, da: &mut Sampler) {
+    for (block, missing) in da.due() {
         request_shards(client, coords, block, &missing);
         // …and the block's **proposer**, which is the one peer that cannot be empty. See `Sampler::proposer_of`.
         let Some(proposer) = da.proposer_of(&block).filter(|&p| p != me) else { continue };
@@ -814,6 +814,23 @@ pub fn spawn_checkpoint_publisher<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_resample_cap_is_one_round_timeout_in_ticks() {
+        // `Sampler::due` backs off geometrically and caps the gap at `RESAMPLE_MAX_INTERVAL`, whose whole justification
+        // is that it equals the cell's own progress unit: a sampler that wakes at least once per round timeout can
+        // never be the reason a round is lost. That claim spans two crates — the constant lives in `fanos-taxis`, which
+        // cannot see this driver's clock — so it is asserted here, in the one crate that owns both.
+        //
+        // A derived constant with no link back to its derivation is a magic number with a nice comment: change
+        // `TICK_PERIOD` or `ROUND_TIMEOUT_MAX` and nothing would have complained.
+        let ticks_per_round_timeout = ROUND_TIMEOUT_MAX.as_millis() / TICK_PERIOD.as_millis();
+        assert_eq!(
+            u128::from(fanos_taxis::da::RESAMPLE_MAX_INTERVAL),
+            ticks_per_round_timeout,
+            "the resample cap must stay one round timeout ({ROUND_TIMEOUT_MAX:?}) at one tick per {TICK_PERIOD:?}"
+        );
+    }
 
     #[test]
     fn the_round_timeout_backs_off_exponentially_caps_and_resets_on_progress() {
