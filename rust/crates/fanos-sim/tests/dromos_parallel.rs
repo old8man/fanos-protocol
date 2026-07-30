@@ -10,10 +10,10 @@
 use fanos_dromos::scheduler::{AccessList, schedule, width};
 
 /// A 32-byte account key from an index.
-fn acct(i: u64) -> [u8; 32] {
+fn acct(i: u64) -> fanos_ergon::Key {
     let mut k = [0u8; 32];
     k[..8].copy_from_slice(&i.to_le_bytes());
-    k
+    fanos_dromos::ergon_host::balance_key(k)
 }
 
 /// A deterministic, seeded PRNG (splitmix64) — reproducible, no wall-clock entropy.

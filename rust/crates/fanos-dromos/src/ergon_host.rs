@@ -56,6 +56,34 @@ pub const LEDGER_POINT: PointId = 0;
 /// not real, and worse, a footprint that no longer says unambiguously what a term reaches. See [`Key::space`].
 pub const SPACE_BALANCE: u16 = 0;
 
+/// The value space of the shielded pool's aggregate state — a pool-wide marker, not an account.
+pub const SPACE_SHIELDED: u16 = 1;
+/// The value space of name-registry entries, keyed by the name's hash.
+pub const SPACE_NAME: u16 = 2;
+/// The value space of storage deals, keyed by deal id.
+pub const SPACE_STORAGE: u16 = 3;
+/// The value space of hash time-locked contracts, keyed by contract id.
+pub const SPACE_HTLC: u16 = 4;
+
+/// The key naming the shielded pool's aggregate state.
+#[must_use]
+pub const fn shielded_key(marker: [u8; 32]) -> Key { Key::at(LEDGER_POINT, SPACE_SHIELDED, marker) }
+
+/// The key holding the name-registry entry for a name hash.
+#[must_use]
+pub const fn name_key(name_hash: [u8; 32]) -> Key { Key::at(LEDGER_POINT, SPACE_NAME, name_hash) }
+
+/// The key holding a storage deal.
+#[must_use]
+pub const fn storage_key(deal: [u8; 32]) -> Key { Key::at(LEDGER_POINT, SPACE_STORAGE, deal) }
+
+/// The key holding a hash time-locked contract.
+///
+/// Readable from a term (its hashlock), never writable by one: ERGON has no HTLC effect, so a term may **branch on** a
+/// contract without being able to resolve it. That asymmetry is deliberate — see `LedgerState`.
+#[must_use]
+pub const fn htlc_key(contract: [u8; 32]) -> Key { Key::at(LEDGER_POINT, SPACE_HTLC, contract) }
+
 /// The key holding `account`'s balance — the account id itself, which is what `access_of` already uses, now qualified by
 /// its space.
 #[must_use]
@@ -212,6 +240,14 @@ impl Reader for LedgerState<'_> {
     fn get(&self, key: &Key) -> Option<Value> {
         if key.space == SPACE_BALANCE {
             return Some(Value::Int(u128::from(self.ledger.tokens().balance(&key.slot))));
+        }
+        // The HTLC space is **readable and not writable**, and the asymmetry is the point: a term may branch on a
+        // contract's hashlock without being able to resolve the contract, because ERGON has no HTLC effect and a `Gate`
+        // cannot carry authorization (§11 step 4's correction). So `Gate(Load(htlc_key(id)) == expected, transfer)` is a
+        // user-level condition over protocol state — a new capability — while the escrow stays where its own rule guards
+        // it. A write here is refused and recorded by `set` below.
+        if key.space == SPACE_HTLC {
+            return self.ledger.htlcs().htlcs.get(&key.slot).map(|h| Value::Bytes32(h.terms().hashlock));
         }
         // Every further space is a sub-ledger yet to be mapped, and `None` is the honest answer: `Expr::Load` on it becomes
         // `Fault::Missing`, which refuses the term rather than inventing a value for state this adapter cannot see. Adding
@@ -412,6 +448,25 @@ mod tests {
         let reader = LedgerState::new(&mut fresh);
         assert_eq!(reader.get(&stray), None);
         assert_eq!(reader.unmapped(), Some(stray));
+    }
+
+    #[test]
+    fn the_htlc_space_is_readable_and_not_writable() {
+        // The asymmetry the second value space rests on, asserted where it is actually reachable. A term-level test was
+        // written first and was theatre: it built a transfer effect whose footprint named an HTLC slot, and the effect was
+        // refused for having no arguments at all — falsifying the write refusal left it green. No effect in this host
+        // *tries* to write an HTLC slot, so the property lives in the adapter and is tested there.
+        //
+        // Read yes: a term may branch on a contract. Write no: ERGON has no HTLC effect and a `Gate` cannot carry
+        // authorization, so reading protocol state must not become a way to change it.
+        let mut ledger = crate::hybrid::HybridLedger::new(funded());
+        let lock = htlc_key([3u8; 32]);
+        let mut state = LedgerState::new(&mut ledger);
+        assert_eq!(state.get(&lock), None, "an absent contract reads as absent, not as a value");
+        assert_eq!(state.unmapped(), None, "and that is a routed answer, not an unroutable key");
+
+        state.set(lock, Value::Bytes32([9u8; 32]));
+        assert_eq!(state.unmapped(), Some(lock), "the write is refused and recorded");
     }
 
     #[test]

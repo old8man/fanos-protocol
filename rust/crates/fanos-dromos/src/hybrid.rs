@@ -29,7 +29,9 @@ use fanos_thesauros::{Deal, DealParams, DealState, Settlement, decode_response, 
 use crate::bridge::{POOL_SINK, ShieldTx};
 use fanos_ergon::Limits;
 
-use crate::ergon_host::{LedgerHost, LedgerState, SPACE_BALANCE, SignedTerm};
+use crate::ergon_host::{
+    LedgerHost, LedgerState, SignedTerm, balance_key, htlc_key, name_key, shielded_key, storage_key,
+};
 use crate::hermes::{HTLC_ESCROW, HtlcBook, HtlcTx, htlc_id};
 use crate::naming::{NameError, NameRegistry, NameTx, TREASURY};
 use crate::scheduler::{AccessList, schedule};
@@ -729,10 +731,9 @@ impl HybridLedger {
         let Some(checked) = envelope.checked(&Limits::unbounded()) else {
             return ExecOutcome::Malformed;
         };
-        let fp = checked.term().footprint();
-        if fp.reads().iter().chain(fp.writes()).any(|k| k.space != SPACE_BALANCE) {
-            return ExecOutcome::Rejected;
-        }
+        // No pre-check on value spaces any more: `LedgerState` records every key it cannot route, read or written, and the
+        // check below refuses the transaction if anything was. One decision in one place — a duplicate would be a second
+        // thing to keep in step with the adapter, and the adapter is the only code that knows what it can route.
         let mut host = LedgerHost::new(caller);
         let mut state = LedgerState::new(self);
         let outcome = fanos_ergon::eval(&checked, &[], &mut host, &mut state);
@@ -765,7 +766,7 @@ impl HybridLedger {
     ) -> AccessList {
         match tx.payload.split_first() {
             Some((&TAG_TRANSPARENT, body)) => match SignedTransfer::from_bytes(body) {
-                Some(st) => AccessList::new([], [st.transfer.from, st.transfer.to]),
+                Some(st) => AccessList::new([], [balance_key(st.transfer.from), balance_key(st.transfer.to)]),
                 None => AccessList::default(),
             },
             // The ERGON access list is **derived from the term**, not declared beside it — which is the property
@@ -776,24 +777,24 @@ impl HybridLedger {
                 Some(checked) => {
                     let fp = checked.term().footprint();
                     AccessList::new(
-                        fp.reads().iter().filter(|k| k.space == SPACE_BALANCE).map(|k| k.slot),
-                        fp.writes().iter().filter(|k| k.space == SPACE_BALANCE).map(|k| k.slot),
+                        fp.reads().iter().copied(),
+                        fp.writes().iter().copied(),
                     )
                 }
                 None => AccessList::default(),
             },
             Some((&TAG_SHIELDED, body)) => match decode_submission(body) {
                 Some((stx, _)) => {
-                    let mut writes = vec![SHIELDED_MARKER, POOL_SINK];
+                    let mut writes = vec![shielded_key(SHIELDED_MARKER), balance_key(POOL_SINK)];
                     if stx.public_value > 0 {
-                        writes.push(stx.public_recipient);
+                        writes.push(balance_key(stx.public_recipient));
                     }
                     if stx.fee > 0 {
                         // The fee moves POOL_SINK → TREASURY at runtime (`apply_shielded`, audit O-H1), so
                         // TREASURY is a real write — declare it (audit §3.7). Without this a shielded-fee tx and a
                         // name tx (which also writes TREASURY) read as non-conflicting yet both write it, so once
                         // the parallel scheduler is live and TREASURY gains a read/debit they could fork the state.
-                        writes.push(TREASURY);
+                        writes.push(balance_key(TREASURY));
                     }
                     AccessList::new([], writes)
                 }
@@ -802,30 +803,30 @@ impl HybridLedger {
             Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
                 Some(nt) => AccessList::new(
                     [],
-                    [nt.payment.transfer.from, TREASURY, hash_labeled(NAME_KEY_LABEL, nt.op.name())],
+                    [balance_key(nt.payment.transfer.from), balance_key(TREASURY), name_key(hash_labeled(NAME_KEY_LABEL, nt.op.name()))],
                 ),
                 None => AccessList::default(),
             },
             Some((&TAG_SHIELD, body)) => match ShieldTx::from_bytes(body) {
-                Some(sx) => AccessList::new([], [sx.payment.transfer.from, POOL_SINK, SHIELDED_MARKER]),
+                Some(sx) => AccessList::new([], [balance_key(sx.payment.transfer.from), balance_key(POOL_SINK), shielded_key(SHIELDED_MARKER)]),
                 None => AccessList::default(),
             },
             Some((&TAG_STORAGE, body)) => match StorageTx::from_bytes(body) {
                 Some(StorageTx::Open { params, payment }) => AccessList::new(
                     [],
-                    [params.consumer, STORAGE_ESCROW, deal_id(&params, payment.transfer.nonce)],
+                    [balance_key(params.consumer), balance_key(STORAGE_ESCROW), storage_key(deal_id(&params, payment.transfer.nonce))],
                 ),
                 Some(StorageTx::Prove { deal_id: id, .. }) => {
-                    let mut writes = vec![STORAGE_ESCROW, id];
+                    let mut writes = vec![balance_key(STORAGE_ESCROW), storage_key(id)];
                     if let Some(provider) = self.deal_party(&id, pending).map(|(p, _)| p) {
-                        writes.push(provider);
+                        writes.push(balance_key(provider));
                     }
                     AccessList::new([], writes)
                 }
                 Some(StorageTx::Close { deal_id: id, .. }) => {
-                    let mut writes = vec![STORAGE_ESCROW, id];
+                    let mut writes = vec![balance_key(STORAGE_ESCROW), storage_key(id)];
                     if let Some(consumer) = self.deal_party(&id, pending).map(|(_, c)| c) {
-                        writes.push(consumer);
+                        writes.push(balance_key(consumer));
                     }
                     AccessList::new([], writes)
                 }
@@ -833,19 +834,19 @@ impl HybridLedger {
             },
             Some((&TAG_HTLC, body)) => match HtlcTx::from_bytes(body) {
                 Some(HtlcTx::Lock { terms, payment }) => {
-                    AccessList::new([], [terms.sender, HTLC_ESCROW, htlc_id(&terms, payment.transfer.nonce)])
+                    AccessList::new([], [balance_key(terms.sender), balance_key(HTLC_ESCROW), htlc_key(htlc_id(&terms, payment.transfer.nonce))])
                 }
                 Some(HtlcTx::Claim { htlc_id: id, .. }) => {
-                    let mut writes = vec![HTLC_ESCROW, id];
+                    let mut writes = vec![balance_key(HTLC_ESCROW), htlc_key(id)];
                     if let Some(recipient) = self.htlc_party(&id, pending_htlc).map(|(_, r)| r) {
-                        writes.push(recipient);
+                        writes.push(balance_key(recipient));
                     }
                     AccessList::new([], writes)
                 }
                 Some(HtlcTx::Refund { htlc_id: id }) => {
-                    let mut writes = vec![HTLC_ESCROW, id];
+                    let mut writes = vec![balance_key(HTLC_ESCROW), htlc_key(id)];
                     if let Some(sender) = self.htlc_party(&id, pending_htlc).map(|(s, _)| s) {
-                        writes.push(sender);
+                        writes.push(balance_key(sender));
                     }
                     AccessList::new([], writes)
                 }
@@ -855,14 +856,17 @@ impl HybridLedger {
                 // Bond debits `from` → STAKE_SINK; unbond releases STAKE_SINK → `from`. Both touch exactly these
                 // two accounts, so declaring them serializes a stake op against any conflicting transfer (e.g. a
                 // same-sender transfer that shares the nonce sequence).
-                Some(stake_tx) => AccessList::new([], [stake_tx.transfer().transfer.from, STAKE_SINK]),
+                Some(stake_tx) => AccessList::new([], [balance_key(stake_tx.transfer().transfer.from), balance_key(STAKE_SINK)]),
                 None => AccessList::default(),
             },
             Some((&TAG_SLASH, body)) => match SlashTx::from_bytes(body) {
                 // Slashing moves the equivocator's bonded stake STAKE_SINK → TREASURY: it writes the equivocator's
                 // account (its bonded balance), the sink, and the treasury. Declaring TREASURY also serializes it
                 // against name and shielded-fee txs, which write TREASURY too.
-                Some(slash_tx) => AccessList::new([], [account_id(&slash_tx.verifier), STAKE_SINK, TREASURY]),
+                Some(slash_tx) => AccessList::new(
+                    [],
+                    [balance_key(account_id(&slash_tx.verifier)), balance_key(STAKE_SINK), balance_key(TREASURY)],
+                ),
                 None => AccessList::default(),
             },
             _ => AccessList::default(),
@@ -1143,6 +1147,8 @@ mod tests {
     fn auth_of(nsk: &[u8; 32]) -> [u8; 32] {
         spend_auth_commit(&derive_spend_auth(&spend_seed_of(nsk)).1)
     }
+    use crate::ergon_host::transfer_term;
+    use crate::hermes::{HtlcTerms, hashlock};
     use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 
     fn account(tag: u8) -> (HybridSigSecret, HybridVerifier, [u8; 32]) {
@@ -1173,8 +1179,8 @@ mod tests {
 
         // Atomic pay-two-parties, which no single tag expresses.
         let term = fanos_ergon::Term::Seq(vec![
-            crate::ergon_host::transfer_term(alice, bob, 300),
-            crate::ergon_host::transfer_term(alice, carol, 200),
+            transfer_term(alice, bob, 300),
+            transfer_term(alice, carol, 200),
         ]);
         let tx = ergon_tx(&term, 0, &signer, &key);
         assert_eq!(ledger.apply(&tx), ExecOutcome::Applied);
@@ -1197,8 +1203,8 @@ mod tests {
         tokens.credit(alice, 1000);
         let mut ledger = HybridLedger::new(tokens);
 
-        let honest = crate::ergon_host::transfer_term(alice, bob, 1);
-        let greedy = crate::ergon_host::transfer_term(alice, bob, 1000);
+        let honest = transfer_term(alice, bob, 1);
+        let greedy = transfer_term(alice, bob, 1000);
         let envelope = SignedTerm::sign(honest.encode(), 0, &signer, key.clone());
         let forged = SignedTerm::from_bytes(&{
             let mut b = envelope.to_bytes();
@@ -1221,11 +1227,15 @@ mod tests {
         // understate what it touches, which is the property the scheduler cannot survive losing.
         let (signer, key, alice) = account(1);
         let (_, _, bob) = account(2);
-        let term = crate::ergon_host::transfer_term(alice, bob, 5);
+        let term = transfer_term(alice, bob, 5);
         let tx = ergon_tx(&term, 0, &signer, &key);
         let empty = BTreeMap::new();
         let access = HybridLedger::new(TokenLedger::new()).access_of(&tx, &empty, &empty);
-        assert_eq!(access.writes, [alice, bob].into_iter().collect(), "exactly the two balances");
+        assert_eq!(
+            access.writes,
+            [balance_key(alice), balance_key(bob)].into_iter().collect(),
+            "exactly the two balances"
+        );
         assert!(access.reads.is_empty());
     }
 
@@ -1275,7 +1285,7 @@ mod tests {
             ledger.access_of(&Transaction::new(HybridLedger::transparent_payload(&native)), &empty, &empty);
 
         let term_access = ledger.access_of(
-            &ergon_tx(&crate::ergon_host::transfer_term(alice, bob, 7), 0, &signer, &key),
+            &ergon_tx(&transfer_term(alice, bob, 7), 0, &signer, &key),
             &empty,
             &empty,
         );
@@ -1286,6 +1296,64 @@ mod tests {
         );
         assert_eq!(native_access.reads, term_access.reads);
         assert!(native_access.conflicts_with(&term_access), "and they are therefore never scheduled together");
+    }
+
+    #[test]
+    fn a_term_can_branch_on_a_live_htlc_without_being_able_to_resolve_it() {
+        // The capability the second value space buys, and the shape §11 step 4's correction leaves available: a user term
+        // reads protocol state and imposes its OWN condition, while the escrow stays behind the rule that guards it.
+        //
+        // Both halves are asserted, because the read alone would prove nothing: the term pays when the hashlock is the one
+        // it expected and does not when it is not — so it is genuinely reading the contract rather than the guard being
+        // vacuous.
+        let (signer, key, alice) = account(1);
+        let (_, _, bob) = account(2);
+        let preimage = [0x5Au8; 32];
+        let terms = HtlcTerms {
+            sender: alice,
+            recipient: bob,
+            amount: 10,
+            hashlock: hashlock(&preimage),
+            timeout: 100,
+        };
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        let lock = SignedTransfer::sign(
+            Transfer { from: alice, to: HTLC_ESCROW, amount: 10, nonce: 0 },
+            &signer,
+            key.clone(),
+        );
+        let id = htlc_id(&terms, 0);
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::htlc_payload(&HtlcTx::Lock {
+                terms,
+                payment: Box::new(lock),
+            }))),
+            ExecOutcome::Applied,
+            "the contract is live"
+        );
+
+        let gated = |expected: [u8; 32]| {
+            fanos_ergon::Term::Gate(
+                fanos_ergon::exec::compare(
+                    fanos_ergon::Cmp::Eq,
+                    fanos_ergon::Expr::Load(htlc_key(id)),
+                    fanos_ergon::Expr::bytes32(expected),
+                ),
+                Box::new(transfer_term(alice, bob, 1)),
+            )
+        };
+
+        // The wrong expectation: the guard refuses, nothing moves, and the transaction still commits (a declined `Gate` is
+        // the identity, not a fault).
+        let before = ledger.tokens().balance(&bob);
+        assert_eq!(ledger.apply(&ergon_tx(&gated([0xFFu8; 32]), 1, &signer, &key)), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), before, "the guard declined");
+
+        // The right one: the term reads the live contract's hashlock and pays.
+        assert_eq!(ledger.apply(&ergon_tx(&gated(hashlock(&preimage)), 2, &signer, &key)), ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), before + 1, "the guard admitted");
     }
 
     fn note(value: u64, nsk: &[u8; 32], tag: &[u8]) -> Note {
@@ -1397,7 +1465,10 @@ mod tests {
 
         let empty: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])> = BTreeMap::new();
         let shielded_access = ledger.access_of(&shielded_tx, &empty, &empty);
-        assert!(shielded_access.writes.contains(&TREASURY), "a shielded-fee tx declares the TREASURY write");
+        assert!(
+            shielded_access.writes.contains(&balance_key(TREASURY)),
+            "a shielded-fee tx declares the TREASURY write"
+        );
 
         // A name tx also writes TREASURY, so the scheduler must treat the two as conflicting (never parallel).
         let name_tx = NameTx {
@@ -1996,7 +2067,7 @@ mod tests {
                 for ((key, b), a) in watched.iter().zip(before.iter()).zip(after.iter()) {
                     if b != a {
                         assert!(
-                            access.writes.contains(key),
+                            access.writes.contains(&balance_key(*key)),
                             "seed {seed}: apply changed a balance access_of did not declare — this is the shape of \
                              the audit §3.7 fork: the scheduler would place this transaction in a wave with another \
                              that also writes it"

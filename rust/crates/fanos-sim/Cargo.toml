@@ -11,6 +11,9 @@ keywords = ["simulation", "discrete-event", "p2p", "deterministic", "fanos"]
 categories = ["simulation", "network-programming"]
 
 [dependencies]
+# ERGON keys — `fanos_dromos::scheduler::AccessList` is keyed by them (docs/design-ergon.md §11 step 3), so a test
+# building access lists needs the key type.
+fanos-ergon.workspace = true
 fanos-field.workspace = true
 fanos-geometry.workspace = true
 fanos-diakrisis.workspace = true

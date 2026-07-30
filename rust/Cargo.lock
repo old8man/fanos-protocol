@@ -1303,6 +1303,7 @@ dependencies = [
  "fanos-diakrisis",
  "fanos-diaulos",
  "fanos-dromos",
+ "fanos-ergon",
  "fanos-field",
  "fanos-geometry",
  "fanos-incentives",

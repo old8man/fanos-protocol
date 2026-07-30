@@ -6,6 +6,12 @@
 //! their declared access lists, with no clocks, threads, or map iteration order leaking in.
 //!
 //! **The model.** Each transaction declares an [`AccessList`]: the state keys it reads and the keys it writes.
+//!
+//! A key is a [`fanos_ergon::Key`] — a projective point, a **value space**, and a 32-byte slot — rather than a bare
+//! 32-byte id. The space is what stops two different entities that happen to share an identifier from reading as one
+//! (`Key::space` argues the derivation), and using ERGON's own key type here rather than a local pair is what makes
+//! `Term::footprint` a projection into this type instead of a translation between two of them: a translation is a place
+//! where the two can disagree, and a disagreement about a key IS a missed conflict.
 //! Two transactions *conflict* iff one writes a key the other reads or writes (read–read never conflicts).
 //! Given the fixed order, [`schedule`] assigns each transaction to a **wave**: `1 + max(wave of any earlier
 //! transaction it conflicts with)`, or wave 0 if it conflicts with none. This is a level assignment on the
@@ -19,6 +25,8 @@
 //!   (its dependencies) sit in strictly lower waves, so it observes exactly the state it would under the serial
 //!   order; independent transactions cannot affect it. The parallel result is the serial result.
 
+use fanos_ergon::Key;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -28,15 +36,15 @@ use std::collections::BTreeSet;
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct AccessList {
     /// The keys the transaction reads.
-    pub reads: BTreeSet<[u8; 32]>,
+    pub reads: BTreeSet<Key>,
     /// The keys the transaction writes.
-    pub writes: BTreeSet<[u8; 32]>,
+    pub writes: BTreeSet<Key>,
 }
 
 impl AccessList {
     /// An access list from read and write key iterators.
     #[must_use]
-    pub fn new(reads: impl IntoIterator<Item = [u8; 32]>, writes: impl IntoIterator<Item = [u8; 32]>) -> Self {
+    pub fn new(reads: impl IntoIterator<Item = Key>, writes: impl IntoIterator<Item = Key>) -> Self {
         Self { reads: reads.into_iter().collect(), writes: writes.into_iter().collect() }
     }
 
@@ -52,7 +60,7 @@ impl AccessList {
 
 /// Whether two sorted key sets share any element (a linear merge over the `BTreeSet`s).
 #[must_use]
-fn intersects(a: &BTreeSet<[u8; 32]>, b: &BTreeSet<[u8; 32]>) -> bool {
+fn intersects(a: &BTreeSet<Key>, b: &BTreeSet<Key>) -> bool {
     // Iterate the smaller against membership in the larger.
     let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     small.iter().any(|k| large.contains(k))
@@ -66,8 +74,8 @@ fn intersects(a: &BTreeSet<[u8; 32]>, b: &BTreeSet<[u8; 32]>) -> bool {
 pub fn schedule(access: &[AccessList]) -> Vec<Vec<usize>> {
     // `last_write[k]` / `last_read[k]` = the highest wave of a transaction that has written / read key `k` so
     // far. A transaction's wave is one past the highest wave it depends on; the maps make this O(accesses).
-    let mut last_write: BTreeMap<[u8; 32], usize> = BTreeMap::new();
-    let mut last_read: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+    let mut last_write: BTreeMap<Key, usize> = BTreeMap::new();
+    let mut last_read: BTreeMap<Key, usize> = BTreeMap::new();
     let mut wave_of: Vec<usize> = Vec::with_capacity(access.len());
 
     for a in access {
@@ -121,8 +129,8 @@ pub fn width(waves: &[Vec<usize>]) -> usize {
 mod tests {
     use super::*;
 
-    fn key(n: u8) -> [u8; 32] {
-        [n; 32]
+    fn key(n: u8) -> Key {
+        Key::at(0, 0, [n; 32])
     }
 
     /// A transaction over integer accounts, for the equivalence oracle: it reads its `reads`, writes each of its
