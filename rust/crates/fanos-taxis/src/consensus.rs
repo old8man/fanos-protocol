@@ -389,10 +389,13 @@ pub enum ConsensusMsg {
     /// and the full serialized state at that height. All untrusted transport — the receiver verifies the
     /// certificate against the committee keys and the restored `state_root()` against the certified root.
     SyncResp {
-        /// The certificate proving `(height, state_root)` under a `Q`-quorum of the fixed committee.
+        /// The certificate proving `(height, state_root, head)` under a `Q`-quorum of the fixed committee.
+        ///
+        /// The chain tip rides **inside** the certificate. It used to be a sibling field on this message and was
+        /// therefore unauthenticated: a Byzantine member could pair a genuine certificate with any hash and the receiver
+        /// installed it (T-H6). Deleting the field is the fix — a comparison against `cert.head` would have worked too,
+        /// and would have been one refactor away from being dropped again.
         cert: ExecCertificate,
-        /// The block hash at `cert.height` (so the receiver's next proposal links to the right parent).
-        head: [u8; 32],
         /// The full state at `cert.height`, per [`StateMachine::snapshot`](crate::state::StateMachine::snapshot).
         snapshot: Vec<u8>,
     },
@@ -446,11 +449,10 @@ impl ConsensusMsg {
                 out.push(4);
                 codec::put_u64(&mut out, *have_height);
             }
-            Self::SyncResp { cert, head, snapshot } => {
+            Self::SyncResp { cert, snapshot } => {
                 out.push(5);
-                // Length-prefix the variable-width certificate; `head` is fixed 32; the snapshot runs to the end.
+                // Length-prefix the variable-width certificate; the snapshot runs to the end.
                 codec::put_var_bytes(&mut out, &cert.to_bytes());
-                out.extend_from_slice(head);
                 out.extend_from_slice(snapshot);
             }
             Self::CommitCert(cert) => {
@@ -487,9 +489,8 @@ impl ConsensusMsg {
             5 => {
                 let mut r = codec::Reader::new(body);
                 let cert = ExecCertificate::from_bytes(r.var_bytes()?)?;
-                let head = r.array::<32>()?;
                 let snapshot = r.rest().to_vec();
-                Some(Self::SyncResp { cert, head, snapshot })
+                Some(Self::SyncResp { cert, snapshot })
             }
             6 => Some(Self::CommitCert(Certificate::from_bytes(body)?)),
             7 => {
@@ -565,10 +566,8 @@ pub enum Input {
     Body(Block),
     /// A catch-up response received off the wire (verified + adopted only if it beats our height).
     SyncResp {
-        /// The offered certificate.
+        /// The offered certificate — which carries the attested chain tip, so there is no separate head to trust.
         cert: ExecCertificate,
-        /// The block head hash at `cert.height`.
-        head: [u8; 32],
         /// The serialized state at `cert.height`.
         snapshot: Vec<u8>,
     },
@@ -1166,7 +1165,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Input::NeedBody { from, block } => self.on_need_body(from, &block),
             Input::Body(block) => self.on_body(block),
             Input::CommitCert(cert) => self.on_commit_cert(cert),
-            Input::SyncResp { cert, head, snapshot } => self.on_sync_resp(cert, head, &snapshot),
+            Input::SyncResp { cert, snapshot } => self.on_sync_resp(cert, &snapshot),
         }
     }
 
@@ -1293,7 +1292,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
         };
         let (snapshot, cert) = (snapshot.clone(), cert.clone());
         self.sync_answers.0 = self.sync_answers.0.saturating_add(1);
-        alloc::vec![Output::SendTo { to: from, msg: ConsensusMsg::SyncResp { cert, head, snapshot } }]
+        debug_assert_eq!(cert.head, head, "the retained head must be the one the quorum attested");
+        alloc::vec![Output::SendTo { to: from, msg: ConsensusMsg::SyncResp { cert, snapshot } }]
     }
 
     /// [`offer_commit_cert`](Self::offer_commit_cert), counting whether a certificate actually went back.
@@ -1354,7 +1354,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     ///
     /// Only then install it atomically and reset all per-height working state so we resume at `height + 1`
     /// without re-voting decided heights (which would read as equivocation).
-    fn on_sync_resp(&mut self, cert: ExecCertificate, head: [u8; 32], snapshot: &[u8]) -> Vec<Output> {
+    fn on_sync_resp(&mut self, cert: ExecCertificate, snapshot: &[u8]) -> Vec<Output> {
         if cert.height < self.height() {
             return Vec::new(); // (1) not ahead of us
         }
@@ -1369,7 +1369,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         }
         // Atomic adoption: install the certified state at `cert.height` on `head`, reset the round machinery,
         // and drop everything tied to the abandoned heights (the transferred state is already executed).
-        let height = cert.height;
+        let (height, head) = (cert.height, cert.head);
         self.sync_taken = self.sync_taken.saturating_add(1);
         self.chain.restore(height, head, state);
         self.reset_round_state();
@@ -2443,7 +2443,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 }
             }
             // Attest the executed state at this height — the checkpoint that makes divergence detectable.
-            out.push(self.emit_exec_vote(block.header.height));
+            out.push(self.emit_exec_vote(block.header.height, block.header.hash()));
             // Retain a servable snapshot of the just-executed state so a lagging peer can state-sync to it
             // (audit §3.9 / §4). Deduped by state root (empty blocks share a root → serialized once) and
             // indexed by height with the block hash a syncing node adopts as its `head`.
@@ -2465,8 +2465,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
 
     /// Sign and locally record this validator's execution attestation for `height` (the current state root),
     /// returning the broadcast action. Recording our own vote lets a checkpoint form from our view too.
-    fn emit_exec_vote(&mut self, height: u64) -> Output {
-        let vote = ExecVote::sign(height, self.chain.state_root(), self.me, &self.signer);
+    fn emit_exec_vote(&mut self, height: u64, head: [u8; 32]) -> Output {
+        let vote = ExecVote::sign(height, self.chain.state_root(), head, self.me, &self.signer);
         self.record_exec_vote(vote.clone());
         Output::Send(ConsensusMsg::ExecVote(vote))
     }
@@ -2504,15 +2504,17 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let Some(by_voter) = self.exec_votes.get(&height) else {
             return;
         };
-        // Group votes by attested root; the first root reaching the quorum is canonical (two cannot, since a
-        // Q-quorum shares an honest validator that attests one root).
-        let mut by_root: BTreeMap<[u8; 32], Vec<ExecVote>> = BTreeMap::new();
+        // Group by the attested `(root, head)` PAIR, not the root alone: a vote now binds both, so a certificate may
+        // only be assembled from votes that agree on both. Honest validators at one height agree on the head by
+        // construction — they finalized the same block — so this rejects nothing legitimate and prevents a certificate
+        // from being stitched together across two different tips (T-H6).
+        let mut by_state: BTreeMap<([u8; 32], [u8; 32]), Vec<ExecVote>> = BTreeMap::new();
         for v in by_voter.values() {
-            by_root.entry(v.state_root).or_default().push(v.clone());
+            by_state.entry((v.state_root, v.head)).or_default().push(v.clone());
         }
-        for (root, votes) in by_root {
+        for ((root, head), votes) in by_state {
             if votes.len() >= self.params.quorum {
-                self.checkpoint = Some(ExecCertificate { height, state_root: root, votes });
+                self.checkpoint = Some(ExecCertificate { height, state_root: root, head, votes });
                 self.prune_sync_retention(height);
                 return;
             }

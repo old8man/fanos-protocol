@@ -513,8 +513,8 @@ fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg
         // block answering a decision this validator already holds, and the engine checks it against that decision.
         ConsensusMsg::NeedBody { block } => Input::NeedBody { from, block: *block },
         ConsensusMsg::Body(b) => Input::Body(b.clone()),
-        ConsensusMsg::SyncResp { cert, head, snapshot } => {
-            Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
+        ConsensusMsg::SyncResp { cert, snapshot } => {
+            Input::SyncResp { cert: cert.clone(), snapshot: snapshot.clone() }
         }
     };
     engine.step(input)

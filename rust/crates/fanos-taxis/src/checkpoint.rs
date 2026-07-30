@@ -20,13 +20,27 @@ use alloc::vec::Vec;
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 
-/// A validator's signed attestation that executing the ledger through `height` yields `state_root`.
+/// A validator's signed attestation that executing **the chain ending at `head`** through `height` yields
+/// `state_root`.
+///
+/// `head` is signed, and that is load-bearing rather than incidental (finding T-H6, 2026-07-30). A state-sync response
+/// carries the certified state *and* the block hash the receiver installs as its chain tip; while the attestation covered
+/// only `(height, state_root)`, that tip was unauthenticated, so a Byzantine cell member could pair a **genuine**
+/// certificate with an arbitrary hash. The victim would adopt a tip nobody holds: its own proposals carry a `parent` no
+/// peer recognizes and every proposal it receives fails the linkage check, isolating an honest validator for the cost of
+/// one message and no forged signature. In a Fano cell that takes effective participation to `4 < Q = 5` alongside the
+/// two tolerated faults.
+///
+/// Binding the tip into the signature — rather than validating a wire field at the receiver — is what makes the
+/// message's `head` field unnecessary and lets it be deleted. A check can be forgotten; a signed field cannot.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExecVote {
     /// The executed height this attests to.
     pub height: u64,
     /// The state root after executing every finalized block up to and including `height`.
     pub state_root: [u8; 32],
+    /// The hash of the block finalized at `height` — the chain tip this state belongs to.
+    pub head: [u8; 32],
     /// The attesting validator's index.
     pub voter: u8,
     /// The hybrid-PQ signature over [`signable`](ExecVote::signable).
@@ -34,21 +48,22 @@ pub struct ExecVote {
 }
 
 impl ExecVote {
-    /// The signed content: `height(8) ‖ state_root(32) ‖ voter(1)`.
+    /// The signed content: `height(8) ‖ state_root(32) ‖ head(32) ‖ voter(1)`.
     #[must_use]
-    fn signable(height: u64, state_root: &[u8; 32], voter: u8) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 32 + 1);
+    fn signable(height: u64, state_root: &[u8; 32], head: &[u8; 32], voter: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 32 + 32 + 1);
         out.extend_from_slice(&height.to_be_bytes());
         out.extend_from_slice(state_root);
+        out.extend_from_slice(head);
         out.push(voter);
         out
     }
 
     /// Sign an execution attestation with the validator's hybrid signing key.
     #[must_use]
-    pub fn sign(height: u64, state_root: [u8; 32], voter: u8, signer: &HybridSigSecret) -> Self {
-        let sig = signer.sign(&Self::signable(height, &state_root, voter)).to_bytes();
-        Self { height, state_root, voter, sig }
+    pub fn sign(height: u64, state_root: [u8; 32], head: [u8; 32], voter: u8, signer: &HybridSigSecret) -> Self {
+        let sig = signer.sign(&Self::signable(height, &state_root, &head, voter)).to_bytes();
+        Self { height, state_root, head, voter, sig }
     }
 
     /// Whether the signature verifies under `verifier` (which must be `voter`'s key).
@@ -57,18 +72,19 @@ impl ExecVote {
         let Some(sig) = HybridSignature::from_bytes(&self.sig) else {
             return false;
         };
-        verifier.verify(&Self::signable(self.height, &self.state_root, self.voter), &sig)
+        verifier.verify(&Self::signable(self.height, &self.state_root, &self.head, self.voter), &sig)
     }
 
     /// The fixed byte length of an execution attestation's [`to_bytes`](Self::to_bytes).
-    pub const LEN: usize = 8 + 32 + 1 + HYBRID_SIG_LEN;
+    pub const LEN: usize = 8 + 32 + 32 + 1 + HYBRID_SIG_LEN;
 
-    /// Canonical bytes: `height(8) ‖ state_root(32) ‖ voter(1) ‖ signature`.
+    /// Canonical bytes: `height(8) ‖ state_root(32) ‖ head(32) ‖ voter(1) ‖ signature`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 32 + 1 + HYBRID_SIG_LEN);
+        let mut out = Vec::with_capacity(Self::LEN);
         out.extend_from_slice(&self.height.to_be_bytes());
         out.extend_from_slice(&self.state_root);
+        out.extend_from_slice(&self.head);
         out.push(self.voter);
         out.extend_from_slice(&self.sig);
         out
@@ -77,41 +93,48 @@ impl ExecVote {
     /// Decode from [`to_bytes`](Self::to_bytes), or `None` if the wrong length.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 8 + 32 + 1 + HYBRID_SIG_LEN {
+        if bytes.len() != Self::LEN {
             return None;
         }
         let height = u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
         let state_root = bytes.get(8..40)?.try_into().ok()?;
-        let voter = *bytes.get(40)?;
-        let sig = bytes.get(41..)?.to_vec();
-        Some(Self { height, state_root, voter, sig })
+        let head = bytes.get(40..72)?.try_into().ok()?;
+        let voter = *bytes.get(72)?;
+        let sig = bytes.get(73..)?.to_vec();
+        Some(Self { height, state_root, head, voter, sig })
     }
 }
 
-/// A `Q`-quorum of validators attesting the **same** `(height, state_root)` — a portable proof of a cell's
-/// canonical executed state, verifiable by anyone holding the cell's validator keys.
+/// A `Q`-quorum of validators attesting the **same** `(height, state_root, head)` — a portable proof of a cell's
+/// canonical executed state *and the chain tip it belongs to*, verifiable by anyone holding the cell's validator keys.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExecCertificate {
     /// The executed height.
     pub height: u64,
     /// The canonical state root the quorum agrees on.
     pub state_root: [u8; 32],
+    /// The block hash finalized at `height` — quorum-attested, so a state-sync receiver installs a tip the cell agreed
+    /// on rather than one its peer chose (T-H6).
+    pub head: [u8; 32],
     /// The `Q` (or more) distinct attesting votes.
     pub votes: Vec<ExecVote>,
 }
 
 impl ExecCertificate {
-    /// Whether this is a valid execution certificate: every vote agrees on this `(height, state_root)`, the
+    /// Whether this is a valid execution certificate: every vote agrees on this `(height, state_root, head)`, the
     /// voters are **distinct** and each in range, every signature verifies, and there are at least `quorum`.
     /// Because two `Q`-quorums share an honest validator and an honest validator attests one root per height,
     /// two certificates for the same height can never carry different roots — so a verified certificate names
     /// the *unique* canonical executed state.
+    ///
+    /// `head` is checked here and signed in every vote, so tampering with it invalidates the certificate rather than
+    /// merely being caught by a downstream comparison someone could omit.
     #[must_use]
     pub fn verify(&self, quorum: usize, verifiers: &[HybridVerifier]) -> bool {
         let mut seen = alloc::vec![false; verifiers.len()];
         let mut count = 0usize;
         for v in &self.votes {
-            if v.height != self.height || v.state_root != self.state_root {
+            if v.height != self.height || v.state_root != self.state_root || v.head != self.head {
                 return false;
             }
             let Some(slot) = seen.get_mut(usize::from(v.voter)) else {
@@ -145,14 +168,15 @@ impl ExecCertificate {
         vote.verify(verifier).then_some(vote.voter)
     }
 
-    /// Canonical bytes: `height(8) ‖ state_root(32) ‖ vote_count(2) ‖ votes*` (each vote fixed-width
+    /// Canonical bytes: `height(8) ‖ state_root(32) ‖ head(32) ‖ vote_count(2) ‖ votes*` (each vote fixed-width
     /// [`ExecVote::LEN`]) — the portable form a cell publishes so a parent (or a cross-cell peer) can verify its
     /// finality over the overlay.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 32 + 2 + self.votes.len() * ExecVote::LEN);
+        let mut out = Vec::with_capacity(8 + 32 + 32 + 2 + self.votes.len() * ExecVote::LEN);
         out.extend_from_slice(&self.height.to_be_bytes());
         out.extend_from_slice(&self.state_root);
+        out.extend_from_slice(&self.head);
         out.extend_from_slice(&(self.votes.len() as u16).to_be_bytes());
         for v in &self.votes {
             out.extend_from_slice(&v.to_bytes());
@@ -166,8 +190,9 @@ impl ExecCertificate {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let height = u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
         let state_root = bytes.get(8..40)?.try_into().ok()?;
-        let count = usize::from(u16::from_be_bytes(bytes.get(40..42)?.try_into().ok()?));
-        let body = bytes.get(42..)?;
+        let head = bytes.get(40..72)?.try_into().ok()?;
+        let count = usize::from(u16::from_be_bytes(bytes.get(72..74)?.try_into().ok()?));
+        let body = bytes.get(74..)?;
         if body.len() != count * ExecVote::LEN {
             return None;
         }
@@ -176,7 +201,7 @@ impl ExecCertificate {
             let start = i * ExecVote::LEN;
             votes.push(ExecVote::from_bytes(body.get(start..start + ExecVote::LEN)?)?);
         }
-        Some(Self { height, state_root, votes })
+        Some(Self { height, state_root, head, votes })
     }
 }
 
@@ -185,6 +210,9 @@ impl ExecCertificate {
 mod tests {
     use super::*;
     use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+
+    /// The chain tip every fixture attests, so a tampered one is visibly different.
+    const HEAD: [u8; 32] = [0xEE; 32];
 
     fn keys(n: usize) -> Vec<(HybridSigSecret, HybridVerifier)> {
         (0..n)
@@ -200,12 +228,52 @@ mod tests {
         let ks = keys(7);
         let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
         let root = [0x11; 32];
-        let votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(9, root, i as u8, &ks[i].0)).collect();
-        let cert = ExecCertificate { height: 9, state_root: root, votes };
+        let votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(9, root, HEAD, i as u8, &ks[i].0)).collect();
+        let cert = ExecCertificate { height: 9, state_root: root, head: HEAD, votes };
         assert!(cert.verify(5, &verifiers), "5 matching signed attestations certify height 9's root");
         // Fewer than the quorum does not certify.
-        let short = ExecCertificate { height: 9, state_root: root, votes: cert.votes[..4].to_vec() };
+        let short = ExecCertificate { height: 9, state_root: root, head: HEAD, votes: cert.votes[..4].to_vec() };
         assert!(!short.verify(5, &verifiers));
+    }
+
+    #[test]
+    fn a_certificate_whose_head_was_swapped_after_signing_is_rejected() {
+        // Finding T-H6. The chain tip used to travel beside the certificate in `ConsensusMsg::SyncResp`, unsigned, and
+        // `on_sync_resp` installed it as the receiver's head with no linkage check. A Byzantine cell member could
+        // therefore take a GENUINE certificate — they are served and broadcast freely — pair it with any hash, and leave
+        // an honest validator on a tip nobody holds: its proposals name a `parent` no peer recognizes and every proposal
+        // it receives fails the linkage check. No forged signature, one message, and in a Fano cell it takes effective
+        // participation to 4 < Q = 5 alongside the two tolerated faults.
+        //
+        // The head is now signed by every vote, so this is what "swapping it" costs. Note the vote signatures are left
+        // untouched: only the certificate's own field moves, which is exactly the attack the old shape permitted.
+        let ks = keys(7);
+        let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
+        let root = [0x33; 32];
+        let votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(4, root, HEAD, i as u8, &ks[i].0)).collect();
+        let honest = ExecCertificate { head: HEAD, height: 4, state_root: root, votes: votes.clone() };
+        assert!(honest.verify(5, &verifiers), "the untampered certificate is valid");
+
+        let swapped = ExecCertificate { head: [0xAB; 32], height: 4, state_root: root, votes };
+        assert!(!swapped.verify(5, &verifiers), "a head the quorum never attested invalidates the certificate");
+    }
+
+    #[test]
+    fn two_validators_disagreeing_on_the_tip_cannot_be_pooled_into_one_quorum() {
+        // The other half of binding the head: a certificate must not be assembled ACROSS tips. Five signatures exist
+        // here and all verify, but they attest two different heads — so no group of them reaches the quorum, and
+        // `try_form_checkpoint` groups by the `(root, head)` pair for the same reason.
+        let ks = keys(7);
+        let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
+        let root = [0x44; 32];
+        let other = [0x99; 32];
+        let mut votes: Vec<ExecVote> = (0..3).map(|i| ExecVote::sign(6, root, HEAD, i as u8, &ks[i].0)).collect();
+        votes.extend((3..5).map(|i| ExecVote::sign(6, root, other, i as u8, &ks[i].0)));
+        for (i, v) in votes.iter().enumerate() {
+            assert!(v.verify(&verifiers[i]), "vote {i} is genuinely signed — the mix is honest disagreement");
+        }
+        let pooled = ExecCertificate { head: HEAD, height: 6, state_root: root, votes };
+        assert!(!pooled.verify(5, &verifiers), "votes attesting different tips cannot be pooled into one quorum");
     }
 
     #[test]
@@ -214,12 +282,12 @@ mod tests {
         let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
         let root = [0x22; 32];
         // One voter attests a different root — the certificate (which claims a single root) is not uniform.
-        let mut votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(3, root, i as u8, &ks[i].0)).collect();
-        votes[4] = ExecVote::sign(3, [0xFF; 32], 4, &ks[4].0);
-        let cert = ExecCertificate { height: 3, state_root: root, votes };
+        let mut votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(3, root, HEAD, i as u8, &ks[i].0)).collect();
+        votes[4] = ExecVote::sign(3, [0xFF; 32], HEAD, 4, &ks[4].0);
+        let cert = ExecCertificate { height: 3, state_root: root, head: HEAD, votes };
         assert!(!cert.verify(5, &verifiers), "a non-uniform-root set is not a certificate");
         // A vote signed by the wrong key is rejected.
-        let forged = ExecVote::sign(3, root, 0, &ks[6].0); // voter 0 signed by key 6
+        let forged = ExecVote::sign(3, root, HEAD, 0, &ks[6].0); // voter 0 signed by key 6
         assert!(!forged.verify(&verifiers[0]));
     }
 
@@ -229,25 +297,26 @@ mod tests {
         let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
         let canonical = [0x33; 32];
         let cert = ExecCertificate {
+            head: HEAD,
             height: 12,
             state_root: canonical,
-            votes: (0..5).map(|i| ExecVote::sign(12, canonical, i as u8, &ks[i].0)).collect(),
+            votes: (0..5).map(|i| ExecVote::sign(12, canonical, HEAD, i as u8, &ks[i].0)).collect(),
         };
         assert!(cert.verify(5, &verifiers));
         // Validator 6 executed to a different root at the same height → detected + attributable (slashable).
-        let bad = ExecVote::sign(12, [0xAB; 32], 6, &ks[6].0);
+        let bad = ExecVote::sign(12, [0xAB; 32], HEAD, 6, &ks[6].0);
         assert_eq!(cert.conflicting(&bad, &verifiers), Some(6));
         // An agreeing vote, a wrong-height vote, and an unsigned/forged vote are not flagged.
-        let good = ExecVote::sign(12, canonical, 6, &ks[6].0);
+        let good = ExecVote::sign(12, canonical, HEAD, 6, &ks[6].0);
         assert_eq!(cert.conflicting(&good, &verifiers), None);
-        let other_height = ExecVote::sign(11, [0xAB; 32], 6, &ks[6].0);
+        let other_height = ExecVote::sign(11, [0xAB; 32], HEAD, 6, &ks[6].0);
         assert_eq!(cert.conflicting(&other_height, &verifiers), None);
     }
 
     #[test]
     fn an_exec_vote_round_trips_through_bytes() {
         let ks = keys(1);
-        let v = ExecVote::sign(42, [0x7E; 32], 0, &ks[0].0);
+        let v = ExecVote::sign(42, [0x7E; 32], HEAD, 0, &ks[0].0);
         assert_eq!(ExecVote::from_bytes(&v.to_bytes()), Some(v.clone()));
         assert!(v.verify(&ks[0].1));
     }
@@ -257,8 +326,8 @@ mod tests {
         let ks = keys(7);
         let verifiers: Vec<HybridVerifier> = ks.iter().map(|(_, v)| v.clone()).collect();
         let root = [0x9A; 32];
-        let votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(4, root, i as u8, &ks[i].0)).collect();
-        let cert = ExecCertificate { height: 4, state_root: root, votes };
+        let votes: Vec<ExecVote> = (0..5).map(|i| ExecVote::sign(4, root, HEAD, i as u8, &ks[i].0)).collect();
+        let cert = ExecCertificate { height: 4, state_root: root, head: HEAD, votes };
         let rt = ExecCertificate::from_bytes(&cert.to_bytes()).unwrap();
         assert_eq!(rt, cert, "the certificate round-trips through bytes");
         assert!(rt.verify(5, &verifiers), "a decoded certificate still verifies");

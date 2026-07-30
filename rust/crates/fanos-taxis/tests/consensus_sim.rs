@@ -232,8 +232,8 @@ impl Cluster {
             ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
             ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
             ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from: from as u8, have_height: *have_height },
-            ConsensusMsg::SyncResp { cert, head, snapshot } => {
-                Input::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() }
+            ConsensusMsg::SyncResp { cert, snapshot } => {
+                Input::SyncResp { cert: cert.clone(), snapshot: snapshot.clone() }
             }
             ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
             ConsensusMsg::NeedBody { block } => Input::NeedBody { from: from as u8, block: *block },
@@ -976,8 +976,18 @@ fn a_forged_or_mismatched_catch_up_response_is_refused() {
         c.timeout();
     }
     let cert = c.engines[0].latest_checkpoint().expect("the cell certified a state").clone();
-    let head = c.engines[0].chain().head();
     assert!(cert.height >= 1, "a checkpoint formed past genesis");
+    // The tip is INSIDE the certificate now (T-H6) and it is the cell's real one — it used to be a sibling field on the
+    // message, which is what let a Byzantine peer pair a genuine certificate with a tip nobody holds. Checked only when
+    // the checkpoint is at the chain's own last finalized height, which is the case this scenario produces; asserting it
+    // unconditionally would be asserting something the chain does not retain.
+    if cert.height + 1 == c.engines[0].chain().next_height() {
+        assert_eq!(
+            cert.head,
+            c.engines[0].chain().head(),
+            "the certificate attests the block actually finalized at its height"
+        );
+    }
     // The certified state, reconstructed deterministically: genesis with the one transfer applied.
     let mut expected = genesis();
     expected.apply(&Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx());
@@ -987,21 +997,21 @@ fn a_forged_or_mismatched_catch_up_response_is_refused() {
     // (1) A FORGED certificate (votes truncated below the quorum) is refused — no adoption.
     let mut weak = cert.clone();
     weak.votes.truncate(1);
-    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: weak, head, snapshot: good.clone() }), Vec::new());
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: weak, snapshot: good.clone() }), Vec::new());
     assert_eq!(c.engines[LAG].chain().next_height(), 0, "an under-quorum certificate is not adopted");
 
     // (2) A MISMATCHED snapshot (the empty state, whose root ≠ the certified root) is refused.
     let wrong = Accounts::new().snapshot();
-    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), head, snapshot: wrong }), Vec::new());
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), snapshot: wrong }), Vec::new());
     assert_eq!(c.engines[LAG].chain().next_height(), 0, "a snapshot that does not match the certified root is refused");
 
     // (3) The GENUINE response IS adopted — the positive control: verified certificate + matching snapshot.
-    let outs = c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), head, snapshot: good });
+    let outs = c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), snapshot: good });
     assert!(matches!(outs.as_slice(), [Output::Committed { .. }]), "a valid response adopts (emits Committed)");
     assert_eq!(c.engines[LAG].chain().next_height(), cert.height + 1, "the laggard adopts the certified height");
     assert_eq!(c.engines[LAG].chain().state_root(), cert.state_root, "and reaches the certified state root");
     // (4) A stale re-offer of the SAME certificate is now a no-op (monotone — never rolls back).
-    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert, head, snapshot: expected.snapshot() }), Vec::new());
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert, snapshot: expected.snapshot() }), Vec::new());
 }
 
 #[test]
@@ -1507,7 +1517,7 @@ fn honest_validators_certify_the_executed_state() {
         assert_eq!(cp.state_root, root, "checkpoint certifies the agreed executed state root");
         assert!(cp.verify(CellParams::FANO.quorum, &verifiers), "it is a valid Q-quorum certificate");
         // A divergent validator (a wrong root at the same height) would be detectable + attributable.
-        let bad = fanos_taxis::ExecVote::sign(0, [0xEE; 32], 6, &gen_keys()[6].sig);
+        let bad = fanos_taxis::ExecVote::sign(0, [0xEE; 32], [0xAA; 32], 6, &gen_keys()[6].sig);
         assert_eq!(cp.conflicting(&bad, &verifiers), Some(6), "a wrong-root execution is flagged, not silent");
     }
 }

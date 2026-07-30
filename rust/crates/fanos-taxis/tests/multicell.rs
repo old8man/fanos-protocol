@@ -258,8 +258,8 @@ fn a_cross_cell_transfer_is_trust_minimized_end_to_end() {
         // Cell B's own checkpoint after minting (its committee attests the post-mint state root).
         let keys_b = gen_keys(0xB0);
         let root_b = b_state.state_root();
-        let votes: Vec<ExecVote> = (0..CellParams::FANO.quorum).map(|i| ExecVote::sign(0, root_b, i as u8, &keys_b[i].sig)).collect();
-        ExecCertificate { height: 0, state_root: root_b, votes }
+        let votes: Vec<ExecVote> = (0..CellParams::FANO.quorum).map(|i| ExecVote::sign(0, root_b, [0xEE; 32], i as u8, &keys_b[i].sig)).collect();
+        ExecCertificate { height: 0, state_root: root_b, head: [0xEE; 32], votes }
     };
     let mut parent = ChildRegistry::new();
     parent.register(cell_a.committee(1));

@@ -136,8 +136,8 @@ mod tests {
     }
 
     fn cert(height: u64, root: [u8; 32], secrets: &[HybridSigSecret], q: usize) -> ExecCertificate {
-        let votes = (0..q).map(|i| ExecVote::sign(height, root, i as u8, &secrets[i])).collect();
-        ExecCertificate { height, state_root: root, votes }
+        let votes = (0..q).map(|i| ExecVote::sign(height, root, [0xEE; 32], i as u8, &secrets[i])).collect();
+        ExecCertificate { height, state_root: root, head: [0xEE; 32], votes }
     }
 
     #[test]

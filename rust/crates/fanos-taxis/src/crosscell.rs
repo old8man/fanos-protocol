@@ -318,8 +318,8 @@ mod tests {
             outbox.push(m.clone());
         }
         let state_root = compose_state_root(&accounts_root, &outbox.root());
-        let votes: Vec<ExecVote> = (0..q).map(|i| ExecVote::sign(5, state_root, i as u8, &ks[i].0)).collect();
-        let cert = ExecCertificate { height: 5, state_root, votes };
+        let votes: Vec<ExecVote> = (0..q).map(|i| ExecVote::sign(5, state_root, [0xEE; 32], i as u8, &ks[i].0)).collect();
+        let cert = ExecCertificate { height: 5, state_root, head: [0xEE; 32], votes };
         let receipt = outbox.receipt(index, accounts_root, cert).unwrap();
         (verifiers, receipt)
     }
