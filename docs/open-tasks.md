@@ -62,14 +62,19 @@ figures written here had already drifted to 34/38). The earlier prose version of
 `docs/audit-2026-07-27-architecture.md` §2.1 — because it grepped for crate names where the crate is reached through an
 intermediary. What genuinely remains:
 
+**The orphan half of this item is closed.** `ORPHANS` in that test is now **empty** and its ratchet is at 0:
+`fanos-angelos` is a dependency of `fanos-node` (`fanos message serve`) and `fanos-ergon` became reachable through
+`fanos_dromos::ergon_host` + `TAG_ERGON` on 2026-07-30. Both rows that used to stand here were stale — the angelos one
+said "linked by nothing at all" while the crate sat in the node's manifest, which is the second time this table has
+outlived its subject.
+
 | crate | claim it carries | gap |
 |---|---|---|
-| `fanos-angelos` | L11 messenger, a headline product | **orphan** — linked by nothing at all |
-| ~~`fanos-ergon`~~ | the effect-algebra "no gas, derived footprints" model | **WIRED 2026-07-30** — `fanos_dromos::ergon_host` + `TAG_ERGON`; the orphan list is now empty |
-| `fanos-vpn` | the full-tunnel datapath | CI now compiles `--features vpn`; **the datapath itself is still exercised by nothing** |
+| `fanos-vpn` | the full-tunnel datapath | **linked** (`fanos vpn` in `fanos-node/src/bin/fanos.rs`) and CI compiles `--features vpn`, but `fulltunnel.rs` and `device.rs` carry **zero tests** — the datapath itself is exercised by nothing |
 
-Each needs one live test or an honest downgrade of the claim. `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding
-surfaces and are exempt by construction.
+So what remains is not a linkage gap but a **coverage** gap, and the distinction matters because the architecture test
+cannot see it: linkage is computable from manifests, and "is this code ever run" is not. `fanos-bench`/`fanos-ffi`/
+`fanos-wasm` are embedding surfaces and exempt by construction.
 
 ### [A] Decide whether `InsufficientFunds` is premature — the one case left, and it is a trade-off
 The sweep is otherwise done. `ExecOutcome::Deferred` now covers every order-dependent case in
