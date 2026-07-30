@@ -119,7 +119,43 @@ Two rules the sweep established, both worth keeping:
   dropped anyway. The first version had it backwards and the existing storage suite caught it; the ordering is now pinned
   by `a_transaction_that_is_both_malformed_and_premature_is_rejected_not_deferred`.
 
-### [A] A ~1-in-4 test sits in the per-push CI gate, and it should not be hidden
+### [A] Convergence for the two-round HTLC scenario spans 35 s to >300 s — the "flaky test" is that tail cut by a 240 s ceiling
+
+**Re-titled 2026-07-30, and the reframing is the finding.** Twelve single-test runs were measured with their durations,
+and the durations settle what a year of rate-counting could not:
+
+| | seconds |
+|---|---|
+| passes | 35.3 · 35.5 · 89.5 · 168.6 · 228.2 |
+| failures | 245.4 · 247.2 · 263.0 · 300.8 |
+
+**There is no gap.** The pass distribution runs continuously to 228 s and the failures begin at 245 s — which is the
+harness's own 240 s ceiling. So the failures are the right tail of one continuous distribution, cut by the clock, not a
+distinct wedge. The harness has been saying so in its own verdict string all along: *"INCONCLUSIVE — still changing at the
+240 s ceiling, so this is latency rather than a wedge."*
+
+**And load does not drive it**, which had been the standing hypothesis: pass loads mean 10.30, failure loads mean 11.45,
+the **lowest-load run of the batch failed** (6.87) and the highest-load pass was at 15.23. Failures and passes interleave
+across the whole range.
+
+Two consequences, and the second is why the title changed:
+
+1. **Every previous "root cause" was real and none of them was the cause of the *rate*.** Round synchronization, the
+   unlocking rule, nil votes, custodian targeting, the proof-of-lock, the body-recovery rung — each shaved latency off a
+   long tail rather than removing a wedge, which is exactly what a tail predicts and what the measurements showed (a rate
+   that never clearly moved).
+2. **Raising the ceiling would make the test pass and hide the real problem.** An HTLC claim on a seven-node loopback cell
+   taking four minutes is bad regardless of any test, and 35 s → 300 s is an **8× spread** with no adversary, no
+   partition and no crash. That spread is the defect; the red test is a messenger.
+
+So the question to work is *why the two-round scenario's convergence varies 8×*, not *why a test is flaky*. The
+`ccrej[h/v/park]` and `PARKED@` counters are in place for it, and the next capture must keep the trace — the batch above
+grepped only `test result` and threw away the instrument's output, which is the second time that mistake has cost a run.
+
+**Process note kept from the old title:** the gate question is separate and already decided below — `#[ignore]` is the
+wrong instrument, because that class is defined by cost and this is not a cost problem.
+
+### [A] ~~A ~1-in-4 test sits in the per-push CI gate~~ — the gate half
 `a_hash_locked_contract_is_funded_and_claimed_over_live_consensus` is **not** `#[ignore]`d, so it runs in the `gate`
 job on every push, where it fails both under full-workspace loopback saturation and — at a lower rate — in isolation.
 A gate that fails this often blocks merges at random and trains people to re-run rather than read.
