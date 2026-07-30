@@ -502,7 +502,17 @@ impl Cluster {
     }
 
     fn timeout(&mut self) {
-        for i in 0..N {
+        self.timeout_some(&(0..N).collect::<Vec<_>>());
+    }
+
+    /// Fire the round timer of **some** validators only.
+    ///
+    /// Timers are local and independent, so this is the ordinary case and cell-wide [`timeout`](Self::timeout) is the
+    /// special one. The distinction is not cosmetic: a cell-wide timeout keeps every validator in the same round by
+    /// construction, which is the one arrangement in which round drift cannot be expressed — and drift is what a live
+    /// cell exhibits (measured: four validators at round 8 while three were at round 9, quorum 5, nothing finalizing).
+    fn timeout_some(&mut self, who: &[usize]) {
+        for &i in who {
             if self.crashed[i] {
                 continue;
             }
@@ -1979,6 +1989,62 @@ fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
     // After a successful jump nothing is left above us — the pair `(jumped, above)` is what makes a live trace readable:
     // `above >= f + 1` with `jumped = 0` would mean the evidence is present and the rule is not acting on it.
     assert_eq!(p.voters_above, 0, "having jumped, no peer remains at a higher round: {p}");
+}
+
+#[test]
+fn a_cell_whose_rounds_split_four_three_still_finalizes() {
+    // The live pathology, reduced to its arithmetic. A certificate is collected from the votes of **one** round
+    // (`collect_cert` reads `self.round`), so a cell partitioned across two rounds cannot finalize from either side:
+    // 4 < 5 and 3 < 5. No amount of waiting helps, because uniform timers advance both groups together and preserve
+    // the offset exactly. Measured over real QUIC: `v1 v3 v4 v5` at round 8, `v0 v2 v6` at round 9, every validator
+    // locked and holding its body, no proposal rejected for any reason but entitlement, nothing finalizing for 240 s.
+    //
+    // Nothing here is dropped, crashed, or partitioned: the *only* deviation from a healthy cell is one extra timer
+    // firing on three validators. That is deliberate — an offset is not a fault, and a consensus that needs the whole
+    // cell's clocks to agree has no liveness argument on a real network.
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }, b"round-split");
+    c.submit_all(&tx);
+    // Lock the whole cell on one block without letting it finalize: a PREPARE quorum forms (so every validator locks
+    // and holds the body) while the COMMIT quorum never does. This reproduces the observed `lock` on all seven.
+    c.set_drop_phase(Some(Phase::Commit));
+    c.tick();
+    c.set_drop_phase(None);
+    for i in 0..N {
+        let p = c.engines[i].probe();
+        assert!(p.locked && p.holds_locked_body, "validator {i} must be locked on a body it holds: {p}");
+    }
+    // The offset: three validators' timers fire once more than the other four. Nothing else changes.
+    c.timeout_some(&[0, 1, 2]);
+    let probes: Vec<String> = (0..N).map(|i| format!("v{i}:{}", c.engines[i].probe())).collect();
+    let report = probes.join(" | ");
+
+    // **The offset does not survive the drain**, and that is the result. The three that advanced re-prepare their lock
+    // at the new round (`reprepare_lock`), those PREPAREs reach the four that stayed, `f + 1 = 3` peers are visible
+    // above, and `maybe_advance_round` closes the gap inside the same delivery — after which one round holds all seven
+    // votes and the height finalizes. So a 4/3 round split is *not* a state a healthy cell can be found in.
+    //
+    // Which makes this test the sharp half of a live diagnosis rather than a regression guard. Over QUIC the split
+    // persisted for 240 s with `above = 0` on every validator — no peer visible above anyone's round — while here the
+    // same arithmetic heals immediately. The engine is therefore not the defect: the votes that close the gap are not
+    // being *delivered*. `votes_seen`'s third bucket is what tells the two apart, and it is asserted below.
+    assert!(
+        c.engines[3].probe().round_jumps.0 > 0,
+        "a validator that stayed must have jumped to its peers' round, not waited for a clock: {report}"
+    );
+    assert!(
+        c.engines[3].probe().votes_seen.2 > 0,
+        "and it must have *received* the above-round votes that justify the jump — the live cell's `above = 0` says it \
+         did not, which is a transport claim and only this counter can make it: {report}"
+    );
+    let rounds: BTreeSet<u32> = (0..N).map(|i| c.engines[i].round()).collect();
+    assert_eq!(rounds.len(), 1, "the cell must be back in one round: {rounds:?} — {report}");
+    assert!(
+        c.honest_count_at(0) >= CellParams::FANO.quorum,
+        "a one-round offset must not cost the cell its liveness — {} of {N} finalized. {report}",
+        c.honest_count_at(0)
+    );
+    assert_eq!(c.hashes_at(0).len(), 1, "and the round split must not fork the height: {report}");
 }
 
 #[test]

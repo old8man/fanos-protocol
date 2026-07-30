@@ -134,6 +134,16 @@ pub struct ConsensusProbe {
     pub cc_rejects: (u64, u64, u64),
     /// Round-synchronization jumps and the total rounds they skipped.
     pub round_jumps: (u64, u64),
+    /// Peers' votes ingested at this height, bucketed by the round they carried **relative to ours at the moment of
+    /// receipt**: `(below, equal, above)`.
+    ///
+    /// The vote path had no counter at all, which is why every question about it had to be answered by reading code and
+    /// deducing — three times wrongly. Paired with [`voters_above`](Self::voters_above) it closes the loop: `above = 0`
+    /// here means no such vote was ever *delivered*, so the question is the transport's; `above > 0` here with
+    /// `voters_above = 0` means they arrive and are lost between here and the buffer.
+    pub votes_seen: (u64, u64, u64),
+    /// Votes discarded for belonging to another height (stale or ahead of us).
+    pub votes_off_height: u64,
     /// Distinct peers this validator can **see** at a round above its own, right now.
     ///
     /// A state rather than a counter, and that is the point: `round_jumps` says whether the rule ever fired, and this says
@@ -186,6 +196,10 @@ impl core::fmt::Display for ConsensusProbe {
         let (bs, bn, br) = self.body_answers;
         if self.body_asks + bs + bn + br + self.body_taken > 0 {
             write!(f, " body={}a/{}got ans={bs}/{bn}/{br}", self.body_asks, self.body_taken)?;
+        }
+        let (vb, ve, va) = self.votes_seen;
+        if vb + ve + va + self.votes_off_height > 0 {
+            write!(f, " votes={vb}<{ve}={va}> oh={}", self.votes_off_height)?;
         }
         let (jumps, skipped) = self.round_jumps;
         if jumps > 0 || self.voters_above > 0 {
@@ -709,6 +723,11 @@ pub struct ConsensusEngine<S: StateMachine> {
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
     // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
     rejects: ProposalRejects,
+    // Peers' votes ingested, bucketed by the round they carried relative to ours *when they arrived*, plus the ones
+    // that belonged to another height. Cumulative. See `ConsensusProbe::votes_seen` for why the vote path needs a
+    // counter of its own rather than being reasoned about.
+    votes_seen: (u64, u64, u64),
+    votes_off_height: u64,
     // Skeleton requests seen, and how many this validator could answer. The instrument that separates two failures a
     // frozen trace cannot otherwise tell apart: a cell where every validator awaits one body may be one whose requests
     // are **not arriving**, or one where they arrive and **nobody holds the block**. `await:<hash>` looks identical in
@@ -873,6 +892,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sortition: None,
             round0_tickets: BTreeMap::new(),
             rejects: ProposalRejects::default(),
+            votes_seen: (0, 0, 0),
+            votes_off_height: 0,
             skeleton_asks: (0, 0),
             shard_asks: (0, 0),
             shards_taken: 0,
@@ -1157,6 +1178,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_taken: self.sync_taken,
             cert_taken: self.cert_taken,
             cc_rejects: self.cc_rejects,
+            votes_seen: self.votes_seen,
+            votes_off_height: self.votes_off_height,
             round_jumps: self.round_jumps,
             voters_above: {
                 let h = self.height();
@@ -1907,6 +1930,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             if v.height > height {
                 self.note_height(v.height); // a peer is voting a height we have not reached — we are behind
             }
+            if v.voter != self.me {
+                self.votes_off_height = self.votes_off_height.saturating_add(1);
+            }
             return Vec::new(); // stale or future height
         }
         let Some(verifier) = self.verifiers.get(usize::from(v.voter)) else {
@@ -1914,6 +1940,18 @@ impl<S: StateMachine> ConsensusEngine<S> {
         };
         if !sv.verify(verifier) {
             return Vec::new(); // bad / forged signature
+        }
+        // Counted after authentication and before storage, so the number is "votes a real validator cast that reached
+        // this engine" — neither inflated by forgeries nor conditioned on what the buffer later does with them. Our own
+        // votes are excluded: they are echoed back through this path by the driver, and counting them would put a
+        // guaranteed non-zero in the `equal` bucket that hides whether any *peer* was heard at all.
+        if v.voter != self.me {
+            let bucket = match v.round.cmp(&self.round) {
+                core::cmp::Ordering::Less => &mut self.votes_seen.0,
+                core::cmp::Ordering::Equal => &mut self.votes_seen.1,
+                core::cmp::Ordering::Greater => &mut self.votes_seen.2,
+            };
+            *bucket = bucket.saturating_add(1);
         }
         // Equivocation slashing (incentive layer, now operational): if this voter already cast a conflicting
         // vote at the same slot, surface the self-contained proof so the driver applies the slash `S > 0` the
