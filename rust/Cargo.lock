@@ -1005,6 +1005,7 @@ dependencies = [
 name = "fanos-dromos"
 version = "0.1.0"
 dependencies = [
+ "fanos-ergon",
  "fanos-hermes",
  "fanos-obolos",
  "fanos-pqcrypto",
