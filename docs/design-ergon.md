@@ -213,13 +213,42 @@ same admission predicate that checks viability (§6), which is where every such 
 
 Three sources, in increasing power, and the third is the one that makes the model unbounded.
 
+**Measured cost of (a), 2026-07-30 — composition trades schedulability for atomicity, and §5(a) below overstates the
+case.** A composite is **one scheduling unit** whose access list is exactly the union of its parts, so it conflicts with
+everything any part conflicts with. `fanos-sim/tests/ergon_composition_cost.rs` measures it at fixed work (240 transfers,
+64 accounts — a contended pool):
+
+| transfers per term | parallelism (units/waves) | transfers per wave |
+|---|---|---|
+| 1 | **8.28×** | 8.28 |
+| 2 | 2.86× | 5.71 |
+| 4 | 1.36× | 5.45 |
+| 8 | **1.03×** | 8.28 |
+
+At eight per term the schedule is **serial**. With accounts plentiful (100 000) the cost vanishes entirely — every
+composite still runs concurrently — so it is a property of *contention*, not of composition, which is what makes it a
+trade-off an author can reason about.
+
+**And the transfers-per-wave column is why this needed measuring rather than reasoning.** It is 8.28 at both ends of the
+ladder, so read alone it says grouping is free. The wave count can never exceed the unit count, so at eight-per-term there
+are 30 units and at most 30 waves; a fully serialized schedule then reports the same transfers-per-wave as the ungrouped
+run because each of its waves happens to carry eight transfers. The first version of the experiment used that metric,
+produced a U-shaped curve, and contradicted the hypothesis it was written to test — the same
+ratio-of-absolute-quantities error that once produced a "12× robustness cost" that did not exist.
+
+So what `Par` genuinely buys is **not** a tighter footprint: it is that disjointness is *proven at admission* rather than
+discovered, so the scheduler never over-approximates inside a term. Worth stating separately, because §5(a)'s wording
+conflates the two.
+
 **(a) Composition of existing primitives — available immediately.** The eight tags become eight *effects*, and any
 well-typed term over them is a new transaction kind requiring no protocol release. Atomic multi-step transitions that are
 currently impossible become expressible: *"pay a storage provider **and** register a name **and** shield the change, all
 or nothing"* is `Seq [Storage, Name, Shield]`; *"transfer, but only if the recipient's name is registered"* is
 `Gate (NameExists r) Transparent`. This is combinatorially larger than eight kinds while remaining exactly as
-statically analysable — the footprint is *derived*, so DROMOS is not merely preserved but strengthened (a composite's
-footprint is tighter than the union of separately-submitted transactions, because `Par` proves disjointness).
+statically analysable — the footprint is *derived*, so nothing about DROMOS's analysis is weakened. It is **not**
+strengthened, which an earlier version of this paragraph claimed: a composite's footprint is exactly the union of its
+parts, and the measurement above shows what that costs under contention. What `Par` adds is a *proof* of disjointness at
+admission rather than a discovery of it.
 
 **(b) Horizontal breadth — the growth axis §2.1 licenses.** New primitive effects are added at level 0, not by deepening
 nesting. Each carries its own footprint type, and §7's closure theorem means adding one cannot invalidate any existing
