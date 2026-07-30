@@ -342,9 +342,41 @@ from a **quorum of peers' exec votes** at a height it never executed itself. A v
 nothing to offer anyone, and answering nothing is correct there — the defect is answering nothing while *ahead*. Keyed on
 the height having moved instead.
 
-Whether this moves the live `a_hash_locked` rate is a separate question and is being measured; the straggler's own wedge
-is `finalize` requiring the body, which `PARKED@h` now shows instead of leaving to inference. Two wrong diagnoses this
+Whether this moves the live `a_hash_locked` rate is a separate question and is **not** established: 1 pass and 1 failure
+in the two runs completed before the batch was stopped to chase what those runs revealed. Two wrong diagnoses this
 session came from reasoning one step past the last measurement.
+
+### [A] The snapshot rescue needs a peer TWO heights ahead — and the stall guarantees none exists
+
+The second trace, with the catch-up counters, is a different failure from the first and it closes out by arithmetic:
+
+```
+v0: 0/Locked h2r5             skel=0/2231   sync=0a/0s/1c   ans=0/4248/0
+v1: 0/Locked h1r13 behind(2)  skel=602/1532 sync=908a/0s/1c ans=0/0/3775
+… v2–v5 the same shape, 817–876 asks each, 0 snapshots adopted, 1 certificate
+v6: 0/Locked h2r6             skel=19/2255  sync=0a/0s/0c   ans=0/4266/0
+```
+
+**Nobody ever serves a snapshot** — `ans=0/…` on every validator in both traces — and that is structural, not luck. A
+validator at height `P` has executed at most `P−1`, so its checkpoint is `C ≤ P−1`; `on_sync_req` serves the snapshot
+branch only when `C > have_height`. A peer must therefore be **at least two heights ahead** of the requester to serve
+one. Here `P = 2` against `L = 1`, so it cannot.
+
+And the cell can never open that gap: five of seven are stuck at height 1, `Q = 5`, so height 2 can never assemble a
+quorum. The two validators that did finalize height 1 (with the laggards' COMMIT votes, which the laggards themselves
+never collected — votes are not retransmitted) stay exactly *one* ahead forever. The snapshot rescue is therefore
+unavailable **precisely in the configuration that needs it**, and the only remaining path is the commit certificate,
+which requires the body.
+
+**The serving guard and the adopting guard disagree by one.** `on_sync_resp` rejects on `cert.height < self.height()` —
+so it *accepts* `C == L` — while `on_sync_req` falls through to the certificate on `cert.height <= have_height`, so it
+never sends that case. Adopting `C == L` is exactly what a laggard needs and is sound: a `Q`-quorum of execution votes
+attests the state *after* height `L`, `chain.restore` sets `base_height = L + 1`, and the laggard resumes at `L + 1`
+without ever finalizing `L` locally. Nothing about it can fork — the root is quorum-certified.
+
+So the fix is one comparison: serve when `C >= have_height`. Being measured rather than assumed, with `ccrej[h/v/park]`
+in flight to say *why* ~8500 offered certificates advanced nobody — that answer may be a second, independent defect and
+the guard change must not be allowed to mask it.
 
 Ruled out along the way and still ruled out: the `SyncResp` snapshot exceeding a frame (`MAX_FRAME` is 1 MiB, the test
 ledger is orders of magnitude smaller).
