@@ -1740,12 +1740,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let links = block.header.height == height
             && block.header.parent == self.chain.head()
             && block.header.epoch == self.epoch;
-        if !proposer_ok || !links || !block.verify_structure() || !self.valid_last_commit(&block) {
-            // Counted separately, because "the proposer had no right to propose" and "the block does not link to my
-            // head" are different failures with different fixes, and a fused condition cannot say which fired.
-            if !proposer_ok {
-                self.rejects.proposer += 1;
-            } else if !links {
+        if !links || !block.verify_structure() || !self.valid_last_commit(&block) {
+            // Counted separately, because "the block does not link to my head" and "its roots do not match its own
+            // contents" are different failures with different fixes, and a fused condition cannot say which fired.
+            if !links {
                 self.rejects.link += 1;
             } else if !block.verify_structure() {
                 self.rejects.structure += 1;
@@ -1796,11 +1794,42 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // Decided before the block moves into `proposals`: the unlocking evidence rides on the proposal, so it
         // has to be read while we still hold it.
         let releases_our_lock = self.unlocks_us(&block);
+        // **Holding a body is not voting for it**, and the entitlement gate used to decide both.
+        //
+        // Entitlement is judged against the *receiver's* round, because the header deliberately carries none (a header
+        // that committed to the round would make a re-proposal differ byte for byte, and a locked validator could never
+        // accept one). So a proposer legitimate at its own round is an impostor to a peer one round ahead — and until
+        // now that peer also threw the **body** away. Round synchronization only pulls a validator *forward* to where
+        // its peers are; nothing pulls one that has run ahead back, so the validator furthest ahead rejects the most
+        // proposals, ends up holding the fewest bodies, and can prepare nothing. Measured on a live cell frozen at
+        // height 1 for 240 s, and the correlation is the whole argument:
+        //
+        //     v0 round 10, rejects.proposer = 71 → served    3 of 1749 skeleton requests (0.2 %)
+        //     v3 round  9, rejects.proposer =  6 → served 2561 of 2561 (100 %)
+        //
+        // Nobody was locked, so no value ever held a PREPARE quorum, and every validator was chasing a different body
+        // from peers that did not have it either. Storing it costs one map entry for a block that already passed
+        // link, structure, `last_commit`, seal and the cryptographic DA gate — and buys the ability to prepare or
+        // finalize it the instant the cell agrees, instead of asking the cell for a skeleton nobody can serve.
+        //
+        // Growth stays bounded without a chosen constant: an *unentitled* proposal is stored only if this proposer has
+        // no body here yet, so it adds at most one entry per validator per height. A second distinct block from the
+        // same proposer is at best its own later-round proposal (which arrives entitled, and is stored as always) and
+        // at worst equivocation, which is slashable and needs no help from this buffer.
+        if !proposer_ok && self.proposals.values().any(|b| b.header.proposer == proposer) {
+            self.rejects.proposer += 1;
+            return Vec::new();
+        }
         self.proposals.entry(bh).or_insert(block);
         // If we already hold a commit certificate for this height+block but were waiting on the body (an async
-        // scheduler delivered the CC first), finalize now instead of staying wedged (audit fix, HIGH 3).
+        // scheduler delivered the CC first), finalize now instead of staying wedged (audit fix, HIGH 3). Decided
+        // before entitlement on purpose: a COMMIT quorum is strictly stronger evidence than the right to propose.
         if self.pending_finalize.get(&height) == Some(&bh) {
             return self.finalize(bh);
+        }
+        if !proposer_ok {
+            self.rejects.proposer += 1;
+            return Vec::new(); // held, not voted for
         }
         if let Some(ticket) = ticket {
             // Round-0 lottery: rank this ticket (never prepare on first sight — that would split honest PREPAREs

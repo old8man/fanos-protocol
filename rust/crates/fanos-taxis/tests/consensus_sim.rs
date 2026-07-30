@@ -1992,6 +1992,49 @@ fn a_validator_left_behind_in_the_round_rejoins_the_round_its_peers_reached() {
 }
 
 #[test]
+fn a_validator_that_ran_ahead_still_keeps_the_body_it_refuses_to_prepare() {
+    // Round synchronization pulls a validator **forward** to the round its peers reached. Nothing pulls one that has
+    // run ahead back — and entitlement is judged against the receiver's round, so the validator furthest ahead refuses
+    // the most proposals. Until this fix it also discarded their bodies, and the two are not the same decision:
+    // refusing to *vote* for an off-round proposal is the safety rule, throwing away a block that passed link,
+    // structure, `last_commit`, seal and the cryptographic DA gate is just losing information it will need.
+    //
+    // Measured on a live cell frozen at height 1 for 240 s: the validator with 71 `rejects.proposer` could answer 3 of
+    // 1749 skeleton requests, the one with 6 could answer 2561 of 2561. Nobody was locked, so no value ever held a
+    // PREPARE quorum, and each validator was chasing a different body from peers that did not hold it either.
+    let mut c = Cluster::new(&genesis());
+    let ahead = 3usize;
+    assert_ne!(
+        leader(&SEED, 0, 0),
+        leader(&SEED, 0, 1),
+        "the construction needs the two rounds to elect different leaders, or nothing is off-rota to begin with"
+    );
+    // Two expiries: the first is the nil PREPARE that makes "I accepted nothing" observable, the second leaves the
+    // round. One validator's timer runs fast — an offset, not a fault.
+    c.timeout_some(&[ahead]);
+    c.timeout_some(&[ahead]);
+    assert_eq!(c.engines[ahead].round(), 1, "the validator must be exactly one round ahead of its peers");
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }, b"ran-ahead");
+    c.submit_all(&tx);
+    c.tick();
+
+    let ldr = leader(&SEED, 0, 0) as u8;
+    let proposed = c
+        .proposed
+        .iter()
+        .find(|b| b.header.proposer == ldr && b.header.height == 0)
+        .map(Block::hash)
+        .expect("round 0's leader proposed");
+    let p = c.engines[ahead].probe();
+    assert!(p.rejects.proposer > 0, "the off-rota proposal must still be refused a vote: {p}");
+    assert!(
+        c.engines[ahead].skeleton_of(&proposed).is_some(),
+        "…and its body kept, so this validator can serve it and prepare it the instant the cell agrees: {p}"
+    );
+}
+
+#[test]
 fn a_cell_whose_rounds_split_four_three_still_finalizes() {
     // The live pathology, reduced to its arithmetic. A certificate is collected from the votes of **one** round
     // (`collect_cert` reads `self.round`), so a cell partitioned across two rounds cannot finalize from either side:
