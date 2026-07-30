@@ -82,16 +82,34 @@ The distinction this item turned on is worth keeping: a **linkage** gap is compu
 architecture test catches it, while a **coverage** gap — "is this code ever run" — is not visible to it at all.
 `fanos-bench`/`fanos-ffi`/`fanos-wasm` are embedding surfaces and exempt by construction.
 
-### [A] Decide whether `InsufficientFunds` is premature — the one case left, and it is a trade-off
+### [A] ~~Decide whether `InsufficientFunds` is premature~~ — DECIDED: it is not
 The sweep is otherwise done. `ExecOutcome::Deferred` now covers every order-dependent case in
 `HybridLedger::apply_with_verdict` that has an **identifiable pending prerequisite**: a transparent nonce ahead of its
 account, an HTLC claim/refund ahead of its lock, a storage prove/close ahead of its open, and the funding transfer of a
 shield, a name operation, an HTLC lock and a storage open (`TokenLedger::is_premature`). The shielded path needs nothing —
 its rolling anchor window accepts any recent root and no wallet can prove membership against a root that does not exist.
 
-What is left is deliberately undone: a transaction that fails on **balance** has no identifiable prerequisite, so
-deferring it re-consumes block space for `REVEAL_WINDOW` blocks and multiplies a spam flood by that factor, with no fee to
-price it (ERGON is gasless). Deciding it needs the spam-cost model, not more of this pattern.
+**DECIDED 2026-07-30: do not defer on balance.** The item said this needed the spam-cost model; it does not, because the
+decision turns on **agency** rather than on the cost's magnitude, and that is settled by one fact in the code.
+
+`TokenLedger::apply_with_verdict` returns `InsufficientFunds` *before* the nonce bump, so a rejected transaction **does
+not consume its sender's nonce**. The identical bytes can therefore be resubmitted the moment funds arrive. Compare the
+nonce-ahead case, where deferral is load-bearing: that transaction is waiting on the sender's **own earlier**
+transaction, already in flight, and resubmitting cannot help because the prerequisite is temporal rather than the
+sender's to supply.
+
+So the two cases differ in exactly the respect that matters. Deferring a balance failure buys convenience the sender can
+supply themselves; it costs re-consumed block space for up to `REVEAL_WINDOW = 4` blocks — a 5× amplification of a spam
+flood — with no fee to price it, since ERGON is gasless.
+
+**And this sharpens the project's own rule.** "Premature iff re-executing unchanged against a later state could succeed"
+is *necessary* and not sufficient: a balance failure satisfies it too. The criterion that separates them is
+
+> **Defer iff the prerequisite is one the sender cannot supply by resubmitting.**
+
+which keeps every case the sweep already deferred (a nonce ahead of its account, a claim ahead of its lock, a prove ahead
+of its open, a funding transfer) and excludes this one. Worth having as the rule, because the weaker version would have
+argued for deferring here.
 
 Two rules the sweep established, both worth keeping:
 - A rejection is premature **iff re-executing the transaction unchanged against a later state could succeed.** Replay,
