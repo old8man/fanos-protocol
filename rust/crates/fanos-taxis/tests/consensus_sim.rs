@@ -780,6 +780,55 @@ fn a_lagging_validator_state_syncs_to_the_certified_state_and_rejoins() {
 }
 
 #[test]
+fn a_freshly_synced_validator_still_answers_a_laggard_instead_of_going_silent() {
+    // The hole this closes is created by the sync path itself, which is what makes it reachable rather than
+    // contrived: `on_sync_resp` clears `sync_heads`/`sync_states` and *then* installs the certificate it adopted. So
+    // the instant a validator finishes state-syncing it holds a checkpoint above every laggard's height and retains
+    // no snapshot for it — and `on_sync_req` used to return an empty vector in exactly that case.
+    //
+    // Empty is the worst possible answer. The requester cannot distinguish it from a lost packet, so it re-asks on
+    // every tick and is met with silence; and the checkpoint's mere existence pre-empted the commit-certificate
+    // answer that a validator *without* a checkpoint would have given. A node that just caught up became a silent
+    // hole for the peers it was best placed to help.
+    const LAG: usize = 6;
+    let mut c = Cluster::new(&genesis());
+    c.crashed[LAG] = true;
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 250, nonce: 0 }, b"resync-hole");
+    c.submit_all(&tx);
+    for _ in 0..6 {
+        c.tick();
+        c.timeout();
+    }
+    assert!(c.engines[LAG].latest_checkpoint().is_none(), "the crashed validator has no checkpoint of its own");
+
+    // Drive until the laggard has **jumped forward**, and ask it at that first moment — the only instant at which it
+    // is both ahead of the requester and guaranteed to retain nothing. Asking later would pass vacuously, because the
+    // next executed block refills `sync_heads` and hides the hole.
+    //
+    // Keyed on the height rather than on `latest_checkpoint()`, which was the first draft of this test and asserted
+    // something false: a validator forms a checkpoint from a *quorum of peers' exec votes* at a height it never
+    // executed itself, so the laggard holds one while still at genesis — and a validator that far behind genuinely has
+    // nothing to offer anyone. Answering nothing is correct there; the defect is answering nothing while ahead.
+    c.crashed[LAG] = false;
+    let mut asked = false;
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+        if c.engines[LAG].chain().next_height() > 0 {
+            let answer = c.engines[LAG].step(Input::SyncReq { from: 0, have_height: 0 });
+            assert!(
+                !answer.is_empty(),
+                "a validator holding a checkpoint above height 0 answered a catch-up request with nothing: {}",
+                c.engines[LAG].probe()
+            );
+            asked = true;
+            break;
+        }
+    }
+    assert!(asked, "the laggard did jump forward, so the case under test actually arose");
+}
+
+#[test]
 fn a_forged_or_mismatched_catch_up_response_is_refused() {
     // The load-bearing state-sync guards (audit §3.9): a lagging node adopts ONLY a Q-quorum-certified state
     // whose OWN recomputed root matches the certificate. A forged certificate (under-quorum) or a snapshot that

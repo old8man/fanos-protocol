@@ -121,6 +121,20 @@ pub struct ConsensusProbe {
     pub shards_taken: u64,
     /// Shards this validator dispersed as a proposer.
     pub shards_sent: u64,
+    /// Catch-up requests this validator emitted.
+    pub sync_asks: u64,
+    /// How it answered peers' catch-up requests: `(snapshot, commit-certificate, nothing)`.
+    pub sync_answers: (u64, u64, u64),
+    /// Certified-state snapshots adopted.
+    pub sync_taken: u64,
+    /// Commit certificates that finalized a height.
+    pub cert_taken: u64,
+    /// A height whose COMMIT decision is held but **unappliable for want of the block body**.
+    ///
+    /// The wedge, named. `finalize` parks a certified decision here when the body is absent and applies it "the
+    /// instant `on_propose` delivers the body" — an assumption that holds for a scheduler reordering two messages and
+    /// not for a straggler whose block the cell has already stopped retaining.
+    pub parked: Option<u64>,
 }
 
 impl core::fmt::Display for ConsensusProbe {
@@ -146,6 +160,13 @@ impl core::fmt::Display for ConsensusProbe {
         }
         if self.shards_sent > 0 {
             write!(f, " sent={}", self.shards_sent)?;
+        }
+        let (snap, cert, none) = self.sync_answers;
+        if self.sync_asks > 0 || snap + cert + none > 0 {
+            write!(f, " sync={}a/{}s/{}c ans={snap}/{cert}/{none}", self.sync_asks, self.sync_taken, self.cert_taken)?;
+        }
+        if let Some(h) = self.parked {
+            write!(f, " PARKED@{h}")?;
         }
         let r = &self.rejects;
         let total = r.proposer + r.link + r.locked + r.structure + r.last_commit + r.seal + r.witness + r.unavailable;
@@ -636,6 +657,19 @@ pub struct ConsensusEngine<S: StateMachine> {
     shard_asks: (u64, u64),
     shards_taken: u64,
     shards_sent: u64,
+
+    // Catch-up accounting (2026-07-30). The shard counters showed a straggler in dense two-way traffic that still
+    // never rejoined, which rules out "it cannot hear" and leaves the catch-up protocol itself. These name which
+    // link of it fails, because `behind(n)` says only that the validator knows.
+    //
+    // `sync_asks` is what we emitted. `sync_answers` is how we answered *peers* — snapshot, commit-certificate, or
+    // **nothing**, and the third is the one worth a counter of its own: `on_sync_req` has two paths that send no
+    // reply at all once a checkpoint exists but its retained state does not, and a requester cannot tell that from
+    // a lost packet. `sync_taken` / `cert_taken` are answers we adopted.
+    sync_asks: u64,
+    sync_answers: (u64, u64, u64),
+    sync_taken: u64,
+    cert_taken: u64,
     // The canonical COMMIT certificate for each finalized height this validator can still produce, keyed by the height
     // it finalizes. Two sources: one learned from **another block's `last_commit`** (see `adopt_certified_parent`,
     // carried into `finalize` because `collect_cert` can only build a certificate from votes this validator actually
@@ -755,6 +789,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
             shard_asks: (0, 0),
             shards_taken: 0,
             shards_sent: 0,
+            sync_asks: 0,
+            sync_answers: (0, 0, 0),
+            sync_taken: 0,
+            cert_taken: 0,
             certified: BTreeMap::new(),
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
@@ -1021,6 +1059,11 @@ impl<S: StateMachine> ConsensusEngine<S> {
             shard_asks: self.shard_asks,
             shards_taken: self.shards_taken,
             shards_sent: self.shards_sent,
+            sync_asks: self.sync_asks,
+            sync_answers: self.sync_answers,
+            sync_taken: self.sync_taken,
+            cert_taken: self.cert_taken,
+            parked: self.pending_finalize.keys().min().copied(),
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
         }
@@ -1059,6 +1102,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// certificate-verified, so a spurious request (we were only transiently behind) is harmless.
     fn maybe_request_sync(&mut self) -> Vec<Output> {
         if self.max_seen_height > self.height() {
+            self.sync_asks = self.sync_asks.saturating_add(1);
             alloc::vec![Output::Send(ConsensusMsg::SyncReq { have_height: self.height() })]
         } else {
             Vec::new()
@@ -1071,21 +1115,41 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// gains nothing it could not verify; the snapshot + certificate are self-authenticating.
     fn on_sync_req(&mut self, from: u8, have_height: u64) -> Vec<Output> {
         let Some(cert) = &self.checkpoint else {
-            return self.offer_commit_cert(from, have_height);
+            return self.answer_with_cert(from, have_height);
         };
         if cert.height <= have_height {
-            return self.offer_commit_cert(from, have_height);
+            return self.answer_with_cert(from, have_height);
         }
+        // Holding a checkpoint is not the same as being able to *serve* it, and the two were conflated: reaching this
+        // point with no retained state used to answer **nothing at all**, which from the requester's side is
+        // indistinguishable from a dropped packet — so it re-asks, and is answered with silence again.
+        //
+        // The state a fresh checkpoint refers to is routinely absent, and not as an edge case: `on_sync_resp` clears
+        // `sync_heads`/`sync_states` and *then* installs the certificate it just adopted. A validator that has itself
+        // just state-synced therefore holds a checkpoint above every laggard's height and retains no snapshot for it,
+        // and until it executes its next block it is a silent hole for exactly the peers it is best placed to help.
+        //
+        // So fall through to the certificate instead. It is strictly more than nothing — a quorum over
+        // `(height, block_hash)` that finalizes the requester's height the moment it holds the body — and the
+        // checkpoint path must not pre-empt it merely by existing.
         let Some((root, head)) = self.sync_heads.get(&cert.height) else {
-            return Vec::new(); // we do not retain the certified height's head/state (pruned or mid-flight)
+            return self.answer_with_cert(from, have_height);
         };
-        let Some(snapshot) = self.sync_states.get(root) else {
-            return Vec::new();
+        let (root, head) = (*root, *head);
+        let Some(snapshot) = self.sync_states.get(&root) else {
+            return self.answer_with_cert(from, have_height);
         };
-        alloc::vec![Output::SendTo {
-            to: from,
-            msg: ConsensusMsg::SyncResp { cert: cert.clone(), head: *head, snapshot: snapshot.clone() },
-        }]
+        let (snapshot, cert) = (snapshot.clone(), cert.clone());
+        self.sync_answers.0 = self.sync_answers.0.saturating_add(1);
+        alloc::vec![Output::SendTo { to: from, msg: ConsensusMsg::SyncResp { cert, head, snapshot } }]
+    }
+
+    /// [`offer_commit_cert`](Self::offer_commit_cert), counting whether a certificate actually went back.
+    fn answer_with_cert(&mut self, from: u8, have_height: u64) -> Vec<Output> {
+        let out = self.offer_commit_cert(from, have_height);
+        let slot = if out.is_empty() { &mut self.sync_answers.2 } else { &mut self.sync_answers.1 };
+        *slot = slot.saturating_add(1);
+        out
     }
 
     /// Answer a `SyncReq` with the COMMIT certificate that finalized the requester's current height, when the
@@ -1145,6 +1209,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // Atomic adoption: install the certified state at `cert.height` on `head`, reset the round machinery,
         // and drop everything tied to the abandoned heights (the transferred state is already executed).
         let height = cert.height;
+        self.sync_taken = self.sync_taken.saturating_add(1);
         self.chain.restore(height, head, state);
         self.reset_round_state();
         self.pending_finalize.clear();
@@ -1155,6 +1220,18 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.mempool.clear();
         self.sync_states.clear();
         self.sync_heads.clear();
+        // Keep the snapshot we just adopted as the one we can serve. Clearing the retention and installing the
+        // certificate — which is what this did — throws away the only three things a `SyncResp` is made of, at the one
+        // moment we are certain to hold all of them: the certified state, its root, and the head it sits on.
+        //
+        // The consequence was not a missed optimization but a silent hole. A validator whose checkpoint is above a
+        // peer's height takes the snapshot branch of `on_sync_req`, finds no retained state, and answers nothing; and
+        // it cannot fall back to a commit certificate either, because it *jumped over* the requester's height and so
+        // never finalized it. A node that has just been rescued is the peer most likely to be asked next — it was
+        // behind for the same reason its neighbours are — and it answered every one of them with silence.
+        // Pinned by `a_freshly_synced_validator_still_answers_a_laggard_instead_of_going_silent`.
+        self.sync_states.insert(cert.state_root, snapshot.to_vec());
+        self.sync_heads.insert(height, (cert.state_root, head));
         self.checkpoint = Some(cert);
         self.max_seen_height = self.max_seen_height.max(self.height());
         // Signal the jump so the driver surfaces the new tip exactly like a finalized height.
@@ -1332,7 +1409,13 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // Carry the certificate into `finalize`: the next block this validator proposes records it as `last_commit`, and
         // one rebuilt from votes we never received would not verify at any peer.
         self.certified.insert(height, cert);
-        self.finalize(bh)
+        let out = self.finalize(bh);
+        // Counted only when the height actually moved: `finalize` parks the decision and returns nothing when the body
+        // is missing, which is precisely the case a `cert_taken` that counted attempts would hide.
+        if self.height() > height {
+            self.cert_taken = self.cert_taken.saturating_add(1);
+        }
+        out
     }
 
     /// Rank a round-0 proposal **skeleton** into the min-ticket lottery, without its payload.
