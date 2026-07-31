@@ -60,6 +60,18 @@ pub enum Value {
     Int(u128),
     /// A 32-byte identifier or digest.
     Bytes32([u8; 32]),
+    /// An opaque byte string the chain does not interpret, bounded by the codec's sequence limit.
+    ///
+    /// Distinct from `Bytes32`, which is an *identifier* the chain keys and compares on. This is a payload — a name's
+    /// target descriptor, a deal's parameters — that the ledger stores and hands back without reading. The distinction
+    /// is worth a variant rather than a convention: comparing two identifiers is meaningful, comparing two payloads is
+    /// a byte comparison of things nobody promised are comparable, so [`Cmp`] treats them differently.
+    ///
+    /// **This is not the "opaque blob" that was rejected as the answer to records, and the difference is structural.**
+    /// Rejected was making a whole *record* an opaque string, which would hide `expiry` from `Compare` and `Gate` and
+    /// disable the expression layer exactly where contracts need it. As a *leaf inside* a record the structure stays
+    /// visible and only the genuinely uninterpreted field is opaque — which is what it already is on the ledger.
+    Bytes(Vec<u8>),
     /// A product of tagged fields, **sorted by tag and duplicate-free** — see the type note.
     Record(Vec<(u16, Value)>),
 }
@@ -69,7 +81,7 @@ impl Value {
     pub const fn as_int(&self) -> Result<u128, Fault> {
         match self {
             Self::Int(n) => Ok(*n),
-            Self::Bytes32(_) | Self::Record(_) => Err(Fault::TypeMismatch),
+            Self::Bytes32(_) | Self::Bytes(_) | Self::Record(_) => Err(Fault::TypeMismatch),
         }
     }
 
@@ -80,7 +92,7 @@ impl Value {
         match self {
             Self::Int(n) if *n <= u64::MAX as u128 => Ok(*n as u64),
             Self::Int(_) => Err(Fault::Overflow),
-            Self::Bytes32(_) | Self::Record(_) => Err(Fault::TypeMismatch),
+            Self::Bytes32(_) | Self::Bytes(_) | Self::Record(_) => Err(Fault::TypeMismatch),
         }
     }
 
@@ -88,7 +100,7 @@ impl Value {
     pub const fn as_bytes32(&self) -> Result<[u8; 32], Fault> {
         match self {
             Self::Bytes32(b) => Ok(*b),
-            Self::Int(_) | Self::Record(_) => Err(Fault::TypeMismatch),
+            Self::Int(_) | Self::Bytes(_) | Self::Record(_) => Err(Fault::TypeMismatch),
         }
     }
 
@@ -104,7 +116,15 @@ impl Value {
                 .ok()
                 .and_then(|i| fields.get(i).map(|(_, v)| v))
                 .ok_or(Fault::TypeMismatch),
-            Self::Int(_) | Self::Bytes32(_) => Err(Fault::TypeMismatch),
+            Self::Int(_) | Self::Bytes32(_) | Self::Bytes(_) => Err(Fault::TypeMismatch),
+        }
+    }
+
+    /// This value as an uninterpreted payload, or [`Fault::TypeMismatch`] if it is anything else.
+    pub fn as_bytes(&self) -> Result<&[u8], Fault> {
+        match self {
+            Self::Bytes(b) => Ok(b),
+            Self::Int(_) | Self::Bytes32(_) | Self::Record(_) => Err(Fault::TypeMismatch),
         }
     }
 
@@ -125,7 +145,7 @@ impl Value {
     #[must_use]
     pub fn depth(&self) -> u32 {
         match self {
-            Self::Int(_) | Self::Bytes32(_) => 1,
+            Self::Int(_) | Self::Bytes32(_) | Self::Bytes(_) => 1,
             Self::Record(fields) => 1 + fields.iter().map(|(_, v)| v.depth()).max().unwrap_or(0),
         }
     }
@@ -350,12 +370,14 @@ impl Cmp {
                 (Value::Int(p), Value::Int(q)) => p == q,
                 (Value::Bytes32(p), Value::Bytes32(q)) => eq32(p, q),
                 (Value::Record(_), Value::Record(_)) => x == y,
+                (Value::Bytes(p), Value::Bytes(q)) => p == q,
                 _ => return Err(Fault::TypeMismatch),
             }),
             (Self::Ne, x, y) => Ok(match (x, y) {
                 (Value::Int(p), Value::Int(q)) => p != q,
                 (Value::Bytes32(p), Value::Bytes32(q)) => !eq32(p, q),
                 (Value::Record(_), Value::Record(_)) => x != y,
+                (Value::Bytes(p), Value::Bytes(q)) => p != q,
                 _ => return Err(Fault::TypeMismatch),
             }),
             (Self::Lt, Value::Int(p), Value::Int(q)) => Ok(p < q),

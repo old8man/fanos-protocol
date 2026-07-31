@@ -122,6 +122,30 @@ fn key(r: &mut Reader<'_>) -> Option<Key> {
     Some(Key::at(point, space, r.array32()?))
 }
 
+/// Encode a [`Value`] canonically — the same encoding a term's literals use.
+///
+/// Public because values outlive the terms that write them: a host stores a record in state, and whatever computes a
+/// state root over that state needs the *same* canonical bytes the term codec produces. Two encodings of one record
+/// would be two identities, and it would not help for terms to agree if storage did not.
+#[must_use]
+pub fn encode_value(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_value(&mut out, v);
+    out
+}
+
+/// Decode a [`Value`], refusing non-canonical input and anything with trailing bytes.
+///
+/// Trailing bytes are refused for the same reason the term decoder refuses them: an encoding with slack is a second
+/// encoding of the same value.
+#[must_use]
+pub fn decode_value(bytes: &[u8]) -> Option<Value> {
+    let mut r = Reader::new(bytes);
+    let v = value(&mut r)?;
+    r.finish()?;
+    Some(v)
+}
+
 fn put_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Int(n) => {
@@ -131,6 +155,10 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
         Value::Bytes32(b) => {
             out.push(1);
             out.extend_from_slice(b);
+        }
+        Value::Bytes(b) => {
+            out.push(3);
+            put_seq(out, b, |o, byte| o.push(*byte));
         }
         Value::Record(fields) => {
             out.push(2);
@@ -158,6 +186,9 @@ fn value_at(r: &mut Reader<'_>, depth: u32) -> Option<Value> {
     match r.u8()? {
         0 => Some(Value::Int(r.u128()?)),
         1 => Some(Value::Bytes32(r.array32()?)),
+        // Bounded by the codec's own sequence limit rather than a second constant: "how long before this is a flood"
+        // is one question, and two answers to it would be two places to get it wrong.
+        3 => Some(Value::Bytes(r.seq(Reader::u8)?)),
         2 => {
             let mut last: Option<u16> = None;
             let fields = r.seq(|r| {

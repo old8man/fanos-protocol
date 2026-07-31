@@ -29,6 +29,7 @@
 //! One consequence, stated because it is what an equivalence test can and cannot claim: an ERGON-executed transfer and a
 //! native `apply_with_verdict` agree on **balances**, and the nonce is not the effect's business. See the tests.
 
+use crate::naming::NameRecord;
 use fanos_ergon::value::{Fault, Value};
 use fanos_ergon::{Checked, Limits};
 use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
@@ -360,11 +361,70 @@ impl Host for LedgerHost {
     }
 }
 
+/// Field tags for a [`crate::naming::NameRecord`] as an ERGON value.
+///
+/// Numbered rather than positional because the encoding is canonical by tag order: adding a field later must not
+/// renumber the existing ones, or every previously-stored record would decode as something else.
+pub mod name_fields {
+    /// The owning account id.
+    pub const OWNER: u16 = 0;
+    /// The descriptor the name resolves to — opaque to the chain.
+    pub const TARGET: u16 = 1;
+    /// The height after which the name expires.
+    pub const EXPIRY: u16 = 2;
+}
+
+/// A name record as an ERGON value, and back.
+///
+/// This pair is the proof that the value language represents the ledger's own state rather than an approximation of
+/// it: if a record cannot survive the round trip byte-identically, an ERGON term writing it would silently store
+/// something else, and the footprint would name a key whose contents no longer mean what the ledger thinks.
+#[must_use]
+pub fn name_record_value(rec: &NameRecord) -> Value {
+    // `record` cannot fail here — the tags are distinct constants — but the fallible constructor is the only one, so
+    // that a non-canonical record cannot be built anywhere, including here.
+    Value::record(vec![
+        (name_fields::OWNER, Value::Bytes32(rec.owner)),
+        (name_fields::TARGET, Value::Bytes(rec.target.clone())),
+        (name_fields::EXPIRY, Value::Int(u128::from(rec.expiry))),
+    ])
+    .unwrap_or(Value::Int(0))
+}
+
+/// Read a name record back out of an ERGON value, or `None` if it is not one.
+#[must_use]
+pub fn name_record_from(v: &Value) -> Option<NameRecord> {
+    Some(NameRecord {
+        owner: v.field(name_fields::OWNER).ok()?.as_bytes32().ok()?,
+        target: v.field(name_fields::TARGET).ok()?.as_bytes().ok()?.to_vec(),
+        expiry: u64::try_from(v.field(name_fields::EXPIRY).ok()?.as_int().ok()?).ok()?,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use fanos_ergon::{Checked, Limits, eval};
+
+    /// The verification #38 set for itself: a REAL ledger record, not one shaped like it, surviving the value
+    /// language byte-identically. Anything less and an ERGON term writing this record would silently store something
+    /// else, while its footprint went on naming a key whose contents no longer mean what the ledger thinks.
+    #[test]
+    fn a_real_name_record_round_trips_through_the_value_language() {
+        for target in [vec![], vec![0u8], vec![9u8; 300]] {
+            let rec = NameRecord { owner: [3u8; 32], target: target.clone(), expiry: 12_345 };
+            let value = name_record_value(&rec);
+            assert_eq!(name_record_from(&value).as_ref(), Some(&rec), "target of {} bytes", target.len());
+
+            // …and through the CODEC too, which is where canonicity is enforced: a record that decodes to itself but
+            // re-encodes differently would give one ledger record two contract identities.
+            let bytes = fanos_ergon::codec::encode_value(&value);
+            let decoded = fanos_ergon::codec::decode_value(&bytes).expect("a canonical record decodes");
+            assert_eq!(decoded, value, "the encoding must round-trip");
+            assert_eq!(fanos_ergon::codec::encode_value(&decoded), bytes, "and re-encode to the same bytes");
+        }
+    }
 
     const ALICE: [u8; 32] = [1u8; 32];
     const BOB: [u8; 32] = [2u8; 32];
