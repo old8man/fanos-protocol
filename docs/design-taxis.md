@@ -248,6 +248,51 @@ block the cell may yet converge on is what a replica is *for*.
 
 ---
 
+### 4.3 The round timeout is measured, not chosen {#round-timeout}
+
+A round timeout that is too short livelocks a height — each premature advance reshuffles the leader before the
+in-flight round can commit — and one that is too long turns a hiccup into a stall. The implementation had two
+typed constants: a `1.5 s` base whose own documentation justified it only as "comfortably longer than a tick",
+and a `24 s` ceiling with no justification at all. Together they cost a **240 s** stall, which is nine doublings,
+on a cell whose healthy heights finalize in well under a second.
+
+**The question is not new, so neither is the answer.** A round timeout and a retransmission timeout ask the same
+thing — *how long before I conclude the other side is not going to answer?* — and RFC 6298 answers it from
+measurement rather than from a guess:
+
+```text
+SRTT   ← (7·SRTT + R) / 8
+RTTVAR ← (3·RTTVAR + |SRTT − R|) / 4
+RTO     = SRTT + 4·RTTVAR          clamped to [TICK_PERIOD, ROUND_TIMEOUT_MAX]
+```
+
+The `4·RTTVAR` term is the substance and not a safety margin: `k` deviations leave at most `1/k²` of the mass
+beyond them (Chebyshev), so premature timeouts stay rare **without assuming a latency distribution** — which is
+exactly the situation, since round latency under load has none anyone has characterised. The arithmetic is
+integer because RFC 6298 picks `1/8` and `1/4` *for being shifts*; floats would keep the constants and discard
+the reason they are those constants, and this value feeds a timer computed from itself, where rounding drift is a
+slow bias with no derived bound.
+
+**Which samples count is Karn's algorithm, and it is load-bearing.** The driver can time a *height*, not a round:
+the engine resets `round` on finalization before the driver looks, so a height that needed three rounds is
+indistinguishable from one that needed one. Folding those in would raise the estimate precisely when the cell is
+struggling — the opposite of its purpose. TCP has the identical ambiguity for retransmitted segments and resolves
+it by not sampling them, leaving backoff to cover them. So a height whose round timeout ever fired contributes
+backoff and never measurement.
+
+**The ceiling stays a constant** even though the operating point is now adaptive, because two things derive from
+it and both want the *longest legitimate quiet period* rather than the typical one: the integration harness's
+frozen threshold (`2 × ROUND_TIMEOUT_MAX`) and the DA sampler's `RESAMPLE_MAX_INTERVAL` (§6.1). Before the first
+admissible sample the estimate *is* the base, so genesis behaviour is unchanged.
+
+Measured on a seven-validator cell over real QUIC: the estimate settles at **497–779 ms** across the seven and
+stays at 521–598 ms a hundred and thirty heights later, with the whole cell at round 0 and no spread. Two things
+there are worth more than the average. The shorter timeout costs no rounds — the spread stays zero. And the seven
+values *differ*, because each measures its own host, which is the property no single constant can express whatever
+number is typed into it.
+
+---
+
 ## 5. Anti-MEV — the threshold-encrypted mempool
 
 MEV (front-running, sandwiching, censorship-for-profit) is possible only if the party choosing *order* can see
