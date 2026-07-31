@@ -921,6 +921,16 @@ impl HybridLedger {
         Self::tagged(TAG_NAME, &name_tx.to_bytes())
     }
 
+    /// Wrap a signed ERGON term as a DROMOS transaction payload.
+    ///
+    /// The counterpart of the tag wrappers above, and it exists for the same reason they do: a term must be
+    /// submittable exactly the way every other operation is, or an equivalence between the two can only be asserted
+    /// by comparing different submission paths — which measures the layers between them rather than the operation.
+    #[must_use]
+    pub fn term_payload(term: &SignedTerm) -> Vec<u8> {
+        Self::tagged(TAG_ERGON, &term.to_bytes())
+    }
+
     /// Wrap a validator staking operation (bond/unbond) as a DROMOS transaction payload.
     #[must_use]
     pub fn stake_payload(tx: &StakeTx) -> Vec<u8> {

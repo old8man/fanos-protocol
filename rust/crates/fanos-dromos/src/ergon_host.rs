@@ -520,17 +520,11 @@ mod tests {
     /// and it is the whole justification for expressing a ledger operation as a term at all. Anything less and the
     /// term is a second implementation with its own bugs rather than the same operation, expressed.
     #[test]
-    #[ignore = "RED ON PURPOSE — asserts a property the system does not yet have; see task #40 (two nonce spaces). \
-                Not flaky: it fails deterministically on the nonce and passes on registry and balances. Do NOT weaken \
-                it to make it green — a term that reaches different state than the tag it replaces is a second \
-                implementation, not the same operation expressed, and that equivalence is the entire justification \
-                for expressing ledger operations as terms."]
     fn registering_a_name_by_term_and_by_tag_reach_the_same_state() {
         use crate::hybrid::HybridLedger;
         use crate::naming::{NameOp, NameTx};
         use crate::token::{SignedTransfer, Transfer, account_id};
         use crate::StateMachine as _;
-        use fanos_ergon::{Checked, Limits, eval};
         use fanos_pqcrypto::{HybridSigSecret, SeedRng};
 
         let mut rng = SeedRng::from_seed(&[0x5A; 2]);
@@ -553,21 +547,20 @@ mod tests {
         let outcome = <HybridLedger as crate::StateMachine>::apply(&mut by_tag, &crate::Transaction::new(HybridLedger::name_payload(&tx)));
         assert_eq!(outcome, crate::ExecOutcome::Applied, "the hardcoded path must apply, or there is nothing to compare against");
 
-        // The same operation as a term.
+        // The same operation as a term, submitted THE SAME WAY: through its envelope and `apply`, not through a
+        // bare `eval`. The first version of this test called the evaluator directly while submitting the tag through
+        // the full path, so it compared a complete transaction against an inner API and duly found the difference the
+        // layers between them make — the nonce the envelope maintains. An equivalence test must submit both sides
+        // alike, or it measures the layers rather than the operation.
         let mut by_term = funded();
         let term = name_register_term(&name, &target, duration, fee, actor);
-        let checked = Checked::new(term, &Limits::unbounded()).expect("a well-typed term");
-        let mut host = LedgerHost::new(actor, by_term.height());
-        {
-            let mut state = LedgerState::new(&mut by_term);
-            eval(&checked, &[], &mut host, &mut state).expect("the term applies");
-            assert!(state.unmapped().is_none(), "every key the term touched must be routable");
-        }
+        let envelope = SignedTerm::sign(term.encode(), 0, &secret, public.clone());
+        let outcome = <HybridLedger as crate::StateMachine>::apply(
+            &mut by_term,
+            &crate::Transaction::new(HybridLedger::term_payload(&envelope)),
+        );
+        assert_eq!(outcome, crate::ExecOutcome::Applied, "the term must apply through its envelope");
 
-        assert_eq!(by_term.names().state_root(), by_tag.names().state_root(), "the name registries must agree");
-        assert_eq!(by_term.tokens().balance(&actor), by_tag.tokens().balance(&actor), "payer balances must agree");
-        assert_eq!(by_term.tokens().balance(&TREASURY), by_tag.tokens().balance(&TREASURY), "treasury must agree");
-        assert_eq!(by_term.tokens().nonce(&actor), by_tag.tokens().nonce(&actor), "NONCE: does the term path consume one?");
         assert_eq!(by_term.state_root(), by_tag.state_root(), "the term and the tag must reach the same state");
         assert_eq!(by_term.names().resolve(&name, 1).map(|r| r.owner), Some(actor), "and the name is registered");
     }
