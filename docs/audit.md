@@ -1687,6 +1687,27 @@ round — the open interval being the safety boundary, since a second certificat
 if `f+1` validators equivocated. Five unit tests pin exactly that window. **T-H3 keyper censorship: bounded/OK** (`incentive::can_permanently_censor` false within
 `f`; machine-checked).
 
+**[MEDIUM] T-M5 — the lag signal was a claim, not evidence (FIXED 2026-07-31, `5f1c343`).** `accept_vote` called
+`note_height(v.height)` seven lines *before* verifying the signature, and the block paths read the header's height from
+inside the validity-**failure** branch — so they fired precisely when the block had not checked out. `max_seen_height`
+is monotone with no reset, and `maybe_propose` gates `can_reoffer` on it, so a single forged frame set every
+validator's lag signal to `u64::MAX` permanently (`behind(18446744073709551615)` in the probe) and left every
+validator broadcasting `SyncReq` every tick forever (`sync=9a/0s/0c ans=0/0/63`).
+
+Fixed by the same principle as T-H6 — **bind, don't trust**. `on_exec_vote` already verified before noting, so the
+right order was in the file and the other three were the deviation. Votes authenticate first; blocks believe only what
+`last_commit` proves, and the quorum verification runs only when the claim is material.
+
+**Filed as HIGH and corrected downward by falsification, which is the part worth keeping.** The obvious reading —
+"this permanently disables lock-split recovery" — is wrong: reverting the fix still lets the cell reach height 15 and
+heal, because `reprepare_lock` and `valid_value` also close a split and neither reads the poisoned signal. Only
+`can_reoffer` is suppressed. Ordering the liveness assertion *first* in the regression test is what surfaced the
+over-claim; with the counter assertion leading it tripped first and the liveness half never ran.
+
+Also closed with it: the `on_skeleton` asymmetry this file recorded as "may or may not matter" (the round-0 lottery
+guard returned before `note_height`, so a validator that had timed out even once stopped learning the cell's height
+from skeletons — the message peers actually broadcast under DA dispersal). It mattered.
+
 **SSLE secret-leader election — SAFE & live, does NOT break BFT (CONFIRMED, corroborating the auditor's preliminary
 read).** No two leaders can both drive a commit at one height/view: the min-ticket only changes **which** block an honest
 validator PREPAREs; each still sends **≤1 PREPARE per `(height,round)`** (`sent_prepare` idempotence,
