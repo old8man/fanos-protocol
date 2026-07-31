@@ -134,6 +134,13 @@ pub struct ConsensusProbe {
     pub cc_rejects: (u64, u64, u64),
     /// Round-synchronization jumps and the total rounds they skipped.
     pub round_jumps: (u64, u64),
+    /// `(mempool depth, live deferral clocks)` — the backlog pressure an operator otherwise cannot see.
+    ///
+    /// The pair, not either alone, because it is their **relationship** that is diagnostic. A mempool that grows
+    /// while the deferral count sits pinned at its cap is the signature of premature transactions whose give-up
+    /// horizon is not being reached — the failure mode [`Self::deferred_since`]'s eviction rule exists to prevent
+    /// — whereas a mempool growing with the deferral count near zero is ordinary submission load.
+    pub backlog: (usize, usize),
     /// Peers' votes ingested at this height, bucketed by the round they carried **relative to ours at the moment of
     /// receipt**: `(below, equal, above)`.
     ///
@@ -200,6 +207,12 @@ impl core::fmt::Display for ConsensusProbe {
         let (vb, ve, va) = self.votes_seen;
         if vb + ve + va + self.votes_off_height > 0 {
             write!(f, " votes={vb}<{ve}={va}> oh={}", self.votes_off_height)?;
+        }
+        let (pool, clocks) = self.backlog;
+        if pool + clocks > 0 {
+            // Always both, never whichever is non-zero: `pool` alone cannot distinguish submission load from a
+            // deferral backlog that is not aging out, and that distinction is the reason the pair is reported.
+            write!(f, " backlog={pool}tx/{clocks}def")?;
         }
         let (jumps, skipped) = self.round_jumps;
         if jumps > 0 || self.voters_above > 0 {
@@ -668,6 +681,22 @@ const COLLECT_WINDOW_TICKS: u32 = 1;
 /// all, so it is generous rather than tight.
 const RECENT_BODY_CAP: usize = 64;
 
+/// How many premature-transaction give-up clocks a validator tracks at once (see `deferred_since`).
+///
+/// **What happens AT the bound is the whole design, and it is fail-closed.** A clock is what lets a deferred
+/// transaction be retried without becoming immortal, so a transaction with no clock cannot be retried — refusing the
+/// clock and refusing the retry are one decision, not two. At capacity a newly deferred transaction is therefore
+/// dropped exactly as if its horizon had passed. Its sender may re-submit; nothing is lost that a client cannot redo.
+///
+/// The consequence is that `BoundedMap`'s own eviction is **unreachable** for this map — `insert` runs only below
+/// capacity — which is the point. There is no victim to choose wrongly.
+///
+/// The number is a policy on how much *retry convenience* to offer under contention, not a correctness bound: memory
+/// stays bounded and no clock is ever restarted for any value of it. It is not derived, and honestly cannot be yet —
+/// the natural derivation is "as many transactions as can be pending at once", and that quantity is currently
+/// unbounded because the mempool has no cap of its own.
+const DEFERRAL_CAP: usize = 64;
+
 /// The **structural** half of the unlocking test: everything about a proof-of-lock except its signatures.
 ///
 /// Separated because this is where a subtle error is possible and would be silent. The signature check is
@@ -812,6 +841,23 @@ pub struct ConsensusEngine<S: StateMachine> {
     valid_value: Option<([u8; 32], Certificate)>,
     /// The height at which each still-premature transaction was **first** deferred, so retention is bounded by
     /// [`REVEAL_WINDOW`] rather than being unbounded: a far-future nonce cannot be re-queued forever.
+    ///
+    /// **A missing record does not fail closed on its own**, and that is what makes the capacity policy load-bearing:
+    /// the natural reading of "no record" is "first deferred now", which does not drop the transaction, it *restarts
+    /// its give-up clock*. Any rule that lets a record disappear while the transaction lives therefore hands an
+    /// attacker an immortal transaction — measured, before [`DEFERRAL_CAP`]'s fail-closed rule, at a victim occupying
+    /// every height of a 26-height run instead of expiring after 5.
+    ///
+    /// FIFO eviction was that rule. `BoundedMap` fixes a key's position at its first insert and never refreshes it on
+    /// re-insertion, so insertion order here is *exactly* deferral order, and the oldest entry — the one FIFO takes —
+    /// is by construction the transaction closest to its horizon: the single entry whose value still decides anything.
+    /// `TxCommit` is derived from submitted transactions, so a steady arrival of newly deferred ones is
+    /// remote-reachable, and every arrival pushed a predecessor's deadline forward.
+    ///
+    /// Note there was nothing better to evict, either: a newcomer's `first` IS the current height and every recorded
+    /// clock is at or before it, so the newcomer is always the youngest and "evict the least-aged" degenerates to
+    /// "evict the newcomer". Refusing it outright — and refusing its retry with it — is that same decision without the
+    /// map write, and it is the only form in which no clock is ever restarted.
     deferred_since: BoundedMap<TxCommit, u64>,
     // Ticks elapsed since the round-0 collection window opened (the first proposal was buffered), or `None`
     // while it has not opened. The window closes — and the min-ticket is prepared — at `COLLECT_WINDOW_TICKS`
@@ -911,7 +957,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             recent_bodies: BoundedMap::new(RECENT_BODY_CAP),
             locked_cert: None,
             valid_value: None,
-            deferred_since: BoundedMap::new(RECENT_BODY_CAP),
+            deferred_since: BoundedMap::new(DEFERRAL_CAP),
             round0_window: None,
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
@@ -1181,6 +1227,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             votes_seen: self.votes_seen,
             votes_off_height: self.votes_off_height,
             round_jumps: self.round_jumps,
+            backlog: (self.mempool.len(), self.deferred_since.len()),
             voters_above: {
                 let h = self.height();
                 let mut seen = BTreeSet::new();
@@ -2591,19 +2638,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // Bounded by the engine's existing give-up horizon rather than a new constant: a transaction still
             // premature `REVEAL_WINDOW` blocks after its first deferral is dropped, the same horizon that
             // already decides when an undecryptable transaction stops being waited for.
-            for (sealed, outcome) in opened_from.iter().zip(&outcomes) {
-                if *outcome != ExecOutcome::Deferred {
-                    self.deferred_since.remove(&sealed.commit());
-                    continue;
-                }
-                let first = *self.deferred_since.get(&sealed.commit()).unwrap_or(&block.header.height);
-                if block.header.height.saturating_sub(first) <= REVEAL_WINDOW {
-                    self.deferred_since.insert(sealed.commit(), first);
-                    self.submit(sealed.clone());
-                } else {
-                    self.deferred_since.remove(&sealed.commit());
-                }
-            }
+            self.note_deferrals(&opened_from, &outcomes, block.header.height);
             // Attest the executed state at this height — the checkpoint that makes divergence detectable.
             out.push(self.emit_exec_vote(block.header.height, block.header.hash()));
             // Retain a servable snapshot of the just-executed state so a lagging peer can state-sync to it
@@ -2680,6 +2715,40 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 self.prune_recovery_retention();
                 return;
             }
+        }
+    }
+
+    /// Return still-premature transactions to the mempool, and age each one against its **own** first deferral.
+    ///
+    /// Blind ordering means a proposer cannot order a sender's transactions by a nonce it cannot see, so a block
+    /// routinely carries nonce 2 ahead of nonce 1; without re-submission the later one is dropped at finalize (keyed
+    /// on inclusion, not outcome) and is never executed and never retryable — measured as four transfers from one
+    /// account executing exactly one. Bounded by the engine's existing give-up horizon rather than a new constant: a
+    /// transaction still premature [`REVEAL_WINDOW`] blocks after its first deferral is dropped, the same horizon
+    /// that already decides when an undecryptable transaction stops being waited for.
+    ///
+    /// A **known** transaction is aged against its stored clock and never re-inserted — re-insertion would be a no-op
+    /// on `BoundedMap` anyway, and writing it would suggest the clock could move. A **new** one is admitted only if
+    /// there is room for its clock ([`DEFERRAL_CAP`]), because a transaction that cannot be aged must not be retried.
+    fn note_deferrals(&mut self, opened_from: &[SealedTx], outcomes: &[ExecOutcome], height: u64) {
+        for (sealed, outcome) in opened_from.iter().zip(outcomes) {
+            let commit = sealed.commit();
+            if *outcome != ExecOutcome::Deferred {
+                self.deferred_since.remove(&commit);
+                continue;
+            }
+            let Some(&first) = self.deferred_since.get(&commit) else {
+                if self.deferred_since.len() < DEFERRAL_CAP {
+                    self.deferred_since.insert(commit, height);
+                    self.submit(sealed.clone());
+                }
+                continue;
+            };
+            if height.saturating_sub(first) > REVEAL_WINDOW {
+                self.deferred_since.remove(&commit);
+                continue;
+            }
+            self.submit(sealed.clone());
         }
     }
 

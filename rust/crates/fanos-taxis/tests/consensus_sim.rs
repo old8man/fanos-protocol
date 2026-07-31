@@ -16,13 +16,14 @@ use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::committee::{epoch_seal_line, leader, leader_line, leader_ticket, line_members};
 use fanos_vrf::pqvrf::MerkleVrfSecret;
-use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
+use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, REVEAL_WINDOW, RevealMsg};
 use fanos_taxis::da::Sampler;
 use fanos_taxis::vote::{SignedVote, Vote};
 use fanos_taxis::Phase;
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
 use fanos_taxis::state::StateMachine;
+use fanos_taxis::tx::TxCommit;
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
 
 /// A Shamir share serialized as the reveal wire carries it: `x(1) ‖ y`.
@@ -895,6 +896,104 @@ fn body_retention_is_bounded_by_the_checkpoint_horizon_and_covers_exactly_what_b
     }
     assert!(served > 0, "the retained window is non-empty");
     assert!(dropped > 0, "and the horizon actually released something — otherwise this proves nothing");
+}
+
+#[test]
+fn a_sustained_deferral_flood_cannot_restart_an_older_transactions_give_up_clock() {
+    // #43. A premature transaction (a nonce ahead of its sender's, the common case under blind ordering) is
+    // returned to the mempool and aged against `deferred_since[commit]` — the height it was FIRST deferred — until
+    // `REVEAL_WINDOW` heights have passed. A MISSING record does not drop the transaction; `note_deferrals` falls
+    // back to "first deferred now", so losing the record does not evict the transaction, it **restarts its clock**.
+    //
+    // That makes the map's eviction order the give-up policy. `BoundedMap` fixes a key's position at its first
+    // insert and never refreshes it on re-insertion, so insertion order here IS deferral order exactly — and plain
+    // FIFO therefore takes, every single time, the entry closest to its horizon: the one whose value is the only
+    // thing still load-bearing. `TxCommit` is derived from submitted transactions, so a steady arrival of newly
+    // deferred ones is remote-reachable, and it pushes every predecessor's deadline forward indefinitely.
+    //
+    // THE PROPERTY, and it is the whole claim: a premature transaction occupies blocks for at most `REVEAL_WINDOW`
+    // heights past its first deferral **no matter what arrives after it**.
+    const CAP: usize = 64; // `deferred_since`'s capacity
+    const PER_HEIGHT: usize = 4; // fresh clocks per height, enough to keep displacing the map's oldest entry
+    // The horizon is `REVEAL_WINDOW` heights of PATIENCE, and the give-up decision is made at execution — i.e.
+    // AFTER inclusion — so the height that finally drops the transaction is also the last height carrying it.
+    // The span of occupied heights is therefore `REVEAL_WINDOW + 1`, not `REVEAL_WINDOW`; measured 0..=5 here.
+    const SPAN: u64 = REVEAL_WINDOW + 1;
+    let mut c = Cluster::new(&genesis());
+
+    // The victim goes in alone and first, so it is unambiguously the oldest clock in the map.
+    let victim = c.seal(Transfer { from: ALICE, to: BOB, amount: 1, nonce: 9 }, b"victim");
+    let vc = victim.commit();
+    c.submit_all(&victim);
+    c.tick();
+    c.timeout();
+
+    // Then a sustained flood: every height, fresh senders with far-future nonces, each deferring forever.
+    let mut minted = 0u32;
+    for round in 0..12u32 {
+        let batch = if round == 0 { CAP + 1 } else { PER_HEIGHT };
+        for _ in 0..batch {
+            let mut from = [0u8; 32];
+            from[0] = 0xF1;
+            from[1..5].copy_from_slice(&minted.to_le_bytes());
+            minted += 1;
+            let flood = c.seal(Transfer { from, to: BOB, amount: 1, nonce: 9 }, b"flood");
+            c.submit_all(&flood);
+        }
+        c.tick();
+        c.timeout();
+    }
+
+    // Which heights actually carried a transaction, read off the FINALIZED chain (not the proposal set, which
+    // can hold blocks no quorum ever agreed).
+    let span_of = |c: &Cluster, want: TxCommit| -> Option<(u64, u64)> {
+        let mut carried: Vec<u64> = Vec::new();
+        for h in 0..c.engines[0].chain().next_height() {
+            let Some(hash) = c.hashes_at(h).into_iter().next() else { continue };
+            let Some(b) = c.proposed.iter().find(|b| b.hash() == hash) else { continue };
+            if b.sealed_txs.iter().any(|t| t.commit() == want) {
+                carried.push(h);
+            }
+        }
+        Some((*carried.first()?, *carried.last()?))
+    };
+
+    let (first, last) = span_of(&c, vc).expect("the victim was included at least once");
+    assert!(
+        last - first <= SPAN,
+        "the victim occupied heights {first}..={last} ({} past its horizon of {SPAN}) — a flood of newer \
+         deferrals restarted its give-up clock",
+        last - first
+    );
+
+    // And the same rule at the other end, quantified over EVERY transaction rather than a chosen one — because
+    // which transaction gets refused a clock is not predictable from this side: the proposer orders the mempool
+    // blindly by commitment, so block order is not submission order. A first attempt here nominated one "late"
+    // transaction and asserted about it; that probe could not discriminate, since by the round it was minted the
+    // first batch's clocks had expired and the map had room again.
+    //
+    // The universal form needs no guess and is strictly stronger: refusing a clock and refusing the retry are ONE
+    // decision, so an engine that re-queues a transaction it declined to age has merely moved immortality from the
+    // oldest entry to the newest — and *some* transaction then outlives the span, whichever one it is.
+    let mut worst: Option<(TxCommit, u64, u64)> = None;
+    for tx in c.proposed.iter().flat_map(|b| b.sealed_txs.iter()).map(SealedTx::commit).collect::<BTreeSet<_>>() {
+        let Some((f, l)) = span_of(&c, tx) else { continue };
+        if worst.is_none_or(|(_, wf, wl)| l - f > wl - wf) {
+            worst = Some((tx, f, l));
+        }
+    }
+    let (_, wf, wl) = worst.expect("the run finalized transactions");
+    assert!(
+        wl - wf <= SPAN,
+        "some transaction occupied heights {wf}..={wl}, past the horizon of {SPAN} — every transaction is either \
+         aged against a clock or refused outright, and this implementation retried one it could not age"
+    );
+
+    // THE MECHANISM, second: the clock map is still bounded, so keeping the older clock did not trade a horizon
+    // for a leak. Read through the operator-visible observable rather than a test-only accessor — an operator
+    // watching a deferral attack sees exactly this pair.
+    let (pool, clocks) = c.engines[0].probe().backlog;
+    assert!(clocks <= CAP, "the deferral map stayed bounded ({clocks} clocks, cap {CAP}) — pool {pool}");
 }
 
 /// **A validator holding a decision it cannot apply asks a certificate voter for the body — and applies it.**
