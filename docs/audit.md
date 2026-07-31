@@ -2165,3 +2165,91 @@ entitlement/link/structure/last_commit gate split apart so the counter says *whi
 unprepared one are indistinguishable from outside (the round times out, the height stalls) and have nothing in common as
 fixes; two iterations were spent on the wrong subsystem before a measurement showed data availability was clear
 (`pending=0, backlog=0` on all seven validators). Counters rather than logs, because the engine is `no_std` and sans-I/O.
+
+# Bounded-capacity re-audit — 2026-07-31
+
+**Trigger.** Two consecutive tasks (#41, #42) removed the same shape from different subsystems — a *capacity* standing
+where a *relevance rule* belonged. A shape found twice is a class, so the whole class was enumerated rather than
+grepped: all 11 `BoundedMap::new(...)` sites in the workspace, classified one by one.
+
+## The audit question of 2026-07-28 was too narrow, and it cleared three real defects
+
+That sweep asked, per site, **"does anything *block* on a key it holds?"** and cleared everything else — in its own
+words: "`recent_bodies`/`certified` are per-height (bounded by heights, fine)", "`seen_txs` and `deferred_since` lose
+only bookkeeping", "`claims.rs` is 1024 and unreachable in a cell". All three verdicts were wrong.
+
+They slipped because **none of the three failures blocks**. In each case the reader fails *open* — a fallback default,
+a `?` that yields `None`, a body simply not served — so a predicate about waiting cannot see them.
+
+**The question that works: what does a reader do when the key is absent?** Ranked by danger:
+
+1. **Substitutes a default derived from *now*** — the worst: it resets a clock or a deadline, and the system looks
+   healthy while a horizon silently stops existing.
+2. **Returns `None` into a `?`** — a capability disappears, indistinguishable from "not known yet".
+3. **Two structures holding one fact, evicted independently** — they can disagree, and no single site looks wrong.
+4. Fails loudly, or is genuinely bookkeeping — fine.
+
+A second rule earned the same way: **check a constant's stated justification against the map it is actually on.** A
+shared constant is a shared *argument*, and here one number carried a proof about points onto a map keyed by identities.
+
+## Findings
+
+**§1. `recent_bodies` — capacity where a horizon existed (FIXED, `6190453`).** `RECENT_BODY_CAP`'s own doc conceded the
+gap ("generous rather than tight"). The horizon was already in the engine and already pruning `certified` beside it: the
+execution checkpoint. The derivation is an exhaustive partition — below the checkpoint a peer is carried by `SyncResp`,
+at or above it `SyncResp` gains nothing and bodies are the only path, and every body such a peer can ask for sits at a
+height ≥ the checkpoint. Falsified both ways; notably, moving the floor **one height up** does not shrink a cache, it
+breaks the laggard's rescue outright, so `>=` is exact rather than conservative.
+
+**§2. `deferred_since` — "loses only bookkeeping" was the exact error (FIXED, verified).** The record is a *give-up
+clock*; a missing one does not drop the transaction, `note_deferrals` reads it as "first deferred now" and **restarts**
+it. Insertion order here is exactly deferral order (`BoundedMap` fixes a key's position at first insert and never
+refreshes it), so FIFO took the entry closest to its horizon every time. `TxCommit` derives from submitted
+transactions, so this is remote-reachable. Measured: under a sustained flood the victim occupied heights **0..=25 and
+never expired**, against 0..=5 once fixed.
+
+The fix is an *admission* policy, not an eviction policy, and the first attempt got that wrong in an instructive way: a
+newcomer's clock is by construction the youngest — its timestamp is the current height and every stored one is at or
+before it — so "evict the youngest" was dead code and the transaction fell through to being re-queued with **no clock at
+all**. Immortality had merely moved from the oldest entry to the newest. Refusing the clock and refusing the retry are
+one decision; `BoundedMap`'s eviction is now unreachable for this map, so there is no victim to choose wrongly.
+
+**§3. `ClaimBook` — a foreign key across two independently-evicted maps (FIXED, verified).** `Best::holder` is a key
+into `peers`; its doc states the assumption and nothing enforced it. On divergence `contender()` still reports a point
+contested while `witness_for()` returns `None`, so a node is told it is displaced and cannot prove it — able neither to
+hold the point nor advance past it, for a whole epoch. Falsification: **24 of 57 points** named a forgotten holder.
+
+The constant's justification was also false: "the largest plane this code represents holds 993 points" is `F31`, but
+`fanos_field` defines `F127` (16257 points) and `F256` (65793) — and 993 counts *points*, i.e. bounds `best`, while
+being applied to `peers`. The shipped binary runs `F2` (7 points), so the arithmetic never bit; it was a proof of the
+wrong proposition sitting above true code. **A first draft of the fix made that 993 load-bearing** and was discarded on
+verifying it — a documented bound is not a proof, and a fix resting on one inherits its errors. The shipped rule holds
+by construction for any plane: prefer an unreferenced victim, and if every retained peer is referenced, drop one and
+purge the `best` entries naming it, so the two can never disagree.
+
+## Two findings this enumeration surfaced that are NOT eviction defects
+
+**§4. HIGH, open — a hidden service's combiner binding is unauthenticated.**
+`service_tag = H(RDV_HOST, service_pubkey ‖ epoch)` where the public key IS the service's dial address, so anyone can
+compute the tag; `HostRegister` carries no signature; `register_host` validates only non-emptiness; and
+`BoundedMap::insert` on a known key **overwrites**. One unsigned message per epoch therefore seizes a hidden service's
+forward route — every client request peeled at that combiner goes to the attacker's dead-drop, and the attacker also
+receives each `Request`'s `reply_circuit`, whose last hop is one of the *client's own* lines, narrowing the client to
+that line's `q+1` members. Not impersonation: DIAULOS authenticates the service by static-key encapsulation. The path
+ships (`spawn_rendezvous_host` is called from two CLI sites).
+
+The fix is forced rather than chosen, two alternatives having been eliminated: a signature alone proves nothing because
+the tag commits to a KEM key that verifies nothing; and carrying the bundle while keeping the tag KEM-derived fails
+because a bundle is plain concatenated bytes, so an attacker forges `(own signing prefix ‖ victim KEM key)` and the
+anonymous combiner has nothing to check it against. Hence **the tag must commit to the key that authenticates the
+registration** — it hashes the whole canonical identity bundle — and client plumbing is part of the fix, not a way
+around it. Consequence to be stated in the design doc: a KEM-only identity (zero signing prefix) cannot authenticate a
+registration at all, so **hosting requires a signing identity** and such a registration must be refused.
+
+**§5. Open — the mempool and the block are both unbounded.** `ConsensusEngine::mempool` is a plain `Vec<SealedTx>`, the
+only remote-fed structure in the workspace without a bound, and the proposer clones the whole of it into a block with no
+per-block limit and no size check in `verify_structure`. So a submitter sets both a validator's peak memory and the
+block size — and therefore the DA shard size every validator erasure-codes, disperses and samples, converting local
+pressure into cell-wide bandwidth. Inverse of §1–§3: a bound absent where every sibling has one. The block limit is the
+half that must be a protocol constant in `CellParams` and checked in validation, since validators that disagree on it
+disagree on which blocks are well-formed.
