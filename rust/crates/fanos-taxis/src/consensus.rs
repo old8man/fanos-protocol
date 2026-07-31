@@ -2323,13 +2323,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // and after `chain.finalize` below no validator can rebuild it from votes again.
         //
         // Bounded to the same window as `recent_bodies`, and that is not an arbitrary pairing: a certificate is only
-        // useful to a stuck peer alongside the body it finalizes, so retaining one past the other buys nothing. Without
-        // this the map grows one entry per height forever whenever execution checkpoints stop forming —
-        // `prune_sync_retention` is the only other thing that trims it, and it runs only when one does.
+        // useful to a stuck peer alongside the body it finalizes, so retaining one past the other buys nothing —
+        // which is why `prune_recovery_retention` trims both, to the one horizon, in one place.
         self.certified.insert(height, finalizer.clone());
-        if let Some(floor) = height.checked_sub(RECENT_BODY_CAP as u64) {
-            self.certified.retain(|&h, _| h >= floor);
-        }
+        self.prune_recovery_retention();
         self.last_finalized_cert = Some(finalizer);
         self.chain.finalize(block.header.clone());
 
@@ -2680,21 +2677,47 @@ impl<S: StateMachine> ConsensusEngine<S> {
         for ((root, head), votes) in by_state {
             if votes.len() >= self.params.quorum {
                 self.checkpoint = Some(ExecCertificate { height, state_root: root, head, votes });
-                self.prune_sync_retention(height);
+                self.prune_recovery_retention();
                 return;
             }
         }
     }
 
-    /// Prune the state-sync retention to the window at/above the newly-certified `checkpoint_height`: a synced
-    /// node only ever serves the checkpoint height (or a still-uncertified higher one), so older per-height
-    /// heads are dead, and a state whose root no longer backs any retained head is dropped. Bounds the memory to
-    /// the (small) execution-to-certification lag.
-    fn prune_sync_retention(&mut self, checkpoint_height: u64) {
-        self.sync_heads.retain(|&h, _| h >= checkpoint_height);
-        self.certified.retain(|&h, _| h >= checkpoint_height);
+    /// Prune **every** recovery retention to the window at/above the latest certified checkpoint.
+    ///
+    /// One rule, one place, because there is only one horizon. A node holds four things purely so a lagging peer can
+    /// be rescued — per-height sync heads, the executed states behind them, the finalizing certificates, and the block
+    /// bodies — and all four stop being useful at exactly the same height, so keeping four retention policies would be
+    /// four chances to disagree. Below `checkpoint.height` nothing here can help anyone: a validator that far behind is
+    /// rescued by `SyncResp` — certified executed state — not by replaying blocks it can no longer verify a path to.
+    ///
+    /// **The bodies used to be bounded by a count instead**, and `RECENT_BODY_CAP`'s own doc said what that meant:
+    /// "this only has to cover the window between finalization and a recovery request … so it is generous rather than
+    /// tight". That names a window and then declines to derive it — the same capacity-instead-of-relevance shape the DA
+    /// sampler carried until [`Sampler::retain_relevant`](crate::da::Sampler::retain_relevant) replaced it. The horizon
+    /// was already here, already agreed by a quorum, and already pruning the certificates alongside them.
+    ///
+    /// `RECENT_BODY_CAP` keeps its meaning as the flood bound on a **remote**-keyed map, which is the only claim a
+    /// constant can support; with no checkpoint yet there is no horizon and it is the sole bound, which is correct —
+    /// before the first checkpoint every body is still within the window by definition.
+    ///
+    /// **The floor is inclusive and it is tight, by measurement rather than by argument.** `body_retention_is_bounded_
+    /// by_the_checkpoint_horizon_and_covers_exactly_what_bodies_serve` falsifies it from both sides: dropping the prune
+    /// leaves heights below the horizon servable (the leak the count-bound allowed), and moving the floor a single
+    /// height up — `c.height + 1` — does not merely shrink a cache, it **breaks the laggard's rescue outright**, the
+    /// synced node never reaching the live head. So the checkpoint height itself is load-bearing for catch-up, and
+    /// `>=` here is the exact boundary in both directions, not a safe over-estimate of one.
+    fn prune_recovery_retention(&mut self) {
+        let Some(floor) = self.checkpoint.as_ref().map(|c| c.height) else { return };
+        self.sync_heads.retain(|&h, _| h >= floor);
+        self.certified.retain(|&h, _| h >= floor);
         let live: BTreeSet<[u8; 32]> = self.sync_heads.values().map(|(r, _)| *r).collect();
         self.sync_states.retain(|r, _| live.contains(r));
+        let stale: Vec<[u8; 32]> =
+            self.recent_bodies.iter().filter(|(_, b)| b.header.height < floor).map(|(h, _)| *h).collect();
+        for hash in &stale {
+            self.recent_bodies.remove(hash);
+        }
     }
 
     /// Advance the round (proposer timeout): re-elect a leader and clear this round's proposal/prepare state.

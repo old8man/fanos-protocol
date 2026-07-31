@@ -833,6 +833,70 @@ fn a_lagging_validator_state_syncs_to_the_certified_state_and_rejoins() {
     }
 }
 
+#[test]
+fn body_retention_is_bounded_by_the_checkpoint_horizon_and_covers_exactly_what_bodies_serve() {
+    // #42. `recent_bodies` was bounded by a count — `RECENT_BODY_CAP`, whose own doc said it was "generous rather
+    // than tight" — which is a capacity where a relevance rule belongs. The horizon it should have used was already
+    // in the engine, already agreed by a quorum, and already pruning the finalizing certificates beside it: the
+    // **execution checkpoint**.
+    //
+    // The derivation is a partition, and the point of this test is that the partition is EXHAUSTIVE — the retained
+    // half is exactly the half bodies serve, so tightening the bound costs nothing:
+    //
+    //   * a peer at height `h < checkpoint` is carried to the checkpoint by `SyncResp` (certified executed state);
+    //     replaying bodies it would have to re-verify is strictly more work for the same destination, so bodies
+    //     below the checkpoint serve nobody — and this test's FIRST assertion is that such a peer still rejoins.
+    //   * a peer at `h >= checkpoint` gains nothing from `SyncResp` (it is already there), so bodies are its only
+    //     path — and every body it can ask for is at a height `>= checkpoint`, which is precisely what is retained.
+    //
+    // Both halves are asserted, and the second matters as much as the first: a retention rule that keeps everything
+    // is a memory leak wearing a correctness argument.
+    const LAG: usize = 6;
+    let mut c = Cluster::new(&genesis());
+    c.crashed[LAG] = true;
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 250, nonce: 0 }, b"horizon");
+    c.submit_all(&tx);
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+    let cp = c.engines[0].latest_checkpoint().expect("the live cell formed an execution checkpoint").height;
+    let head = c.engines[0].chain().next_height();
+    assert!(head > cp, "the head is ahead of the checkpoint, so there is a retained window to test at all");
+
+    // ---- THE PROPERTY, first: pruning below the horizon costs no liveness. ----
+    // The laggard is at genesis — far below the checkpoint, so every body it might have replayed is now gone. It
+    // must still rejoin, because the horizon is exactly where the OTHER rescue path takes over.
+    c.crashed[LAG] = false;
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+    assert!(c.engines[LAG].chain().next_height() >= head, "a peer below the horizon is still rescued (by SyncResp)");
+    assert_eq!(c.engines[LAG].chain().state_root(), c.engines[0].chain().state_root(), "and lands on the same chain");
+
+    // ---- THE MECHANISM, second: the window is the horizon, on both sides. ----
+    // Re-read the checkpoint: it advanced while the laggard synced, so the floor under test is the current one.
+    let cp = c.engines[0].latest_checkpoint().expect("checkpoint").height;
+    let head = c.engines[0].chain().next_height();
+    let (mut served, mut dropped) = (0u64, 0u64);
+    for h in 0..head {
+        let Some(hash) = c.hashes_at(h).into_iter().next() else { continue };
+        // `shard_of` is the serving path a lagging peer reaches (`NeedBody` answers from the same two maps), so it
+        // is the honest observable for "could this node still help someone at height h".
+        let servable = c.engines[0].shard_of(&hash, 0).is_some();
+        if h >= cp {
+            assert!(servable, "height {h} is at/above the checkpoint {cp} — the ONLY path for a peer there");
+            served += 1;
+        } else {
+            assert!(!servable, "height {h} is below the checkpoint {cp} — retaining it serves nobody");
+            dropped += 1;
+        }
+    }
+    assert!(served > 0, "the retained window is non-empty");
+    assert!(dropped > 0, "and the horizon actually released something — otherwise this proves nothing");
+}
+
 /// **A validator holding a decision it cannot apply asks a certificate voter for the body — and applies it.**
 ///
 /// The measured wedge, in deterministic form. A live cell produced `ccrej[h=0 v=0 park=1963] PARKED@1`: 1963 commit
