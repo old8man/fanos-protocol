@@ -44,6 +44,7 @@ use fanos_wire::{FrameType, decode_frame};
 
 use crate::overlay_beacon::OverlayBeaconNode;
 use crate::rendezvous_relay::RendezvousRelay;
+use fanos_rendezvous::{CONTROL_MIX_DIRECTORY, MixDirectory};
 use fanos_aphantos::ThresholdRouter;
 
 /// The overlay heartbeat's timer token as seen *outside* the composite. Chosen so the router (whose
@@ -172,6 +173,15 @@ impl<F: Field> Engine for CellNode<F> {
             }
             // Every other timer token is the router's (gather deadline, mix release, or cover tick).
             Input::Timer(_) => self.relay.step(now, input),
+            // The epoch's mix directory, handed in by the async sibling that resolved it. A `Control` command is
+            // local by construction — it enters through the node handle, never off the wire — which is why key
+            // material may be installed from one; the relay would be wrong to take a directory from a frame.
+            Input::Command(Command::Control { tag, ref body }) if tag == CONTROL_MIX_DIRECTORY => {
+                if let Some(dir) = MixDirectory::decode(body) {
+                    self.relay.set_directory(dir);
+                }
+                Vec::new()
+            }
             // StartHeartbeat drives the overlay+beacon composite AND starts the relay router's cover schedule
             // (audit S1-H1): otherwise cover only begins lazily on the router's first real forward, so the
             // silence→cover transition coincides with — and thereby reveals — the relay's first real traffic,

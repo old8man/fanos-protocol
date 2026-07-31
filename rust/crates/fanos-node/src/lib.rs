@@ -75,7 +75,7 @@ pub use rendezvous_host::{
 };
 pub use mixdir::{
     build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,
-    resolve_mix_key, spawn_mix_publisher,
+    resolve_mix_key, spawn_mix_directory_feeder, spawn_mix_publisher,
 };
 pub use ingress_node::IngressNode;
 pub use node::{Health, Node};

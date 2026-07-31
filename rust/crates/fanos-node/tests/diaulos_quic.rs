@@ -258,7 +258,7 @@ async fn fanos_dialer_reaches_a_service_by_name() {
         <[u8]>::to_ascii_uppercase,
     );
 
-    let resolver = StaticResolver::new().with("svc.fanos", a_addr, service_public);
+    let resolver = StaticResolver::new().with("svc.fanos", a_addr, fanos_diaulos::bundle_from_kem_public(&service_public));
     let dialer = FanosDialer::new(b.client(), resolver);
 
     let mut stream = dialer

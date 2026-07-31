@@ -504,6 +504,7 @@ impl<F: Field> Engine for NyxNode<F> {
             // A NYX node ignores the overlay's diagnose/observe/storage/membership commands.
             Input::Command(
                 Command::Diagnose
+                | Command::Control { .. }
                 | Command::Observe
                 | Command::Put { .. }
                 | Command::Get { .. }

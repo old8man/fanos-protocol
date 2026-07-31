@@ -33,7 +33,7 @@ use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_primitives::BoundedMap;
 use fanos_primitives::hash::{hash_labeled, label};
-use fanos_rendezvous::{HostRegister, Request, SessionId, parse_host_register};
+use fanos_rendezvous::{HostRegister, MixDirectory, Request, SessionId, parse_host_register};
 use fanos_runtime::{Effect, Engine, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
@@ -57,6 +57,15 @@ pub struct RendezvousRelay<F: Field> {
     /// onion to the service's registered dead-drop line — reachable without any node learning its coordinate.
     /// A [`BoundedMap`], bounded like `registrations` at [`MAX_HOSTS`] against a registration flood.
     hosts: BoundedMap<[u8; 32], HostRegister>,
+    /// The mix directory the forward seal reads its hop keys from, refreshed each epoch by the composite that
+    /// owns this relay (the same place that drives the router's rotation).
+    ///
+    /// **The registration used to carry these keys itself** — `q + 1` per hop — on the argument that a combiner is
+    /// any node the beacon happened to place there and holds no global directory. Measured, that argument bought a
+    /// payload growing linearly with the plane: ~3.7 KB at `q = 2` and ~39 KB at `q = 31`, against a fixed 7041-byte
+    /// onion body. The registration therefore did not fit on any plane past Fano, *before* authentication added a
+    /// bundle and a signature. A combiner is a cell node and can be handed a directory; that is what this is.
+    directory: MixDirectory,
     /// Per-node seed for the fresh onion/e2e seeds each host-forward draws; deterministic (derived from this
     /// relay's coordinate) so a sim reproduces exactly, distinct per node so two combiners never collide.
     forward_seed: [u8; 32],
@@ -86,6 +95,7 @@ impl<F: Field> RendezvousRelay<F> {
             router,
             registrations: BoundedMap::new(MAX_REGISTRATIONS),
             hosts: BoundedMap::new(MAX_HOSTS),
+            directory: MixDirectory::new(),
             forward_seed,
             forward_counter: 0,
         }
@@ -104,7 +114,22 @@ impl<F: Field> RendezvousRelay<F> {
     /// Returns the effect announcing the binding, or nothing when the registration was refused — so a caller
     /// that must know the route exists has an observable instead of a duration to guess.
     fn register_host(&mut self, reg: HostRegister) -> Vec<Effect> {
-        if reg.forward_circuit.is_empty() || reg.forward_keys.is_empty() {
+        if reg.forward_circuit.is_empty() {
+            return Vec::new();
+        }
+        // **The binding is checked, not believed.** `service_tag` is a one-way image of the service's published
+        // identity and its epoch, so anyone holding the (public) address can compute it — and `BoundedMap::insert`
+        // on a known key overwrites. Without this line one unsigned message per epoch seized a hidden service's
+        // route: every client request peeled here would go to the sender's dead-drop instead of the service's, and
+        // the sender would additionally read each request's `reply_circuit`, whose last hop is one of the CLIENT's
+        // own lines. `HostRegister::verify` recomputes the tag from the carried identity, refuses a KEM-only
+        // identity that could authenticate nothing, and checks the signature over the whole registration.
+        //
+        // The epoch comes from the router rather than a field of this type, because the router's is the same
+        // beacon-led clock (`CellNode` documents the invariant: the beacon leads, the router follows). A
+        // registration minted for another epoch carries another tag and would be filed under a key no client of
+        // *this* epoch looks up, so refusing it costs nothing that was ever reachable.
+        if !reg.verify(self.router.onion_epoch()) {
             return Vec::new();
         }
         let service_tag = reg.service_tag;
@@ -146,6 +171,16 @@ impl<F: Field> RendezvousRelay<F> {
     #[must_use]
     pub fn router(&self) -> &ThresholdRouter<F> {
         &self.router
+    }
+
+    /// Install the epoch's mix directory — the hop keys [`HostRegister::seal_forward_to_host`] seals with.
+    ///
+    /// Mirrors `RendezvousService::set_directory` on the host side, and is driven from the same place: a combiner
+    /// cannot look anything up itself (it is a sans-I/O `Engine`), so the composite that already rebuilds the cell
+    /// directory each epoch hands it over. A relay with no directory simply cannot forward — registrations still
+    /// bind, and the next epoch's install makes them usable.
+    pub fn set_directory(&mut self, directory: MixDirectory) {
+        self.directory = directory;
     }
 
     /// A mutable reference to the wrapped router (for a composite engine to drive its epoch rotation).
@@ -198,7 +233,7 @@ impl<F: Field> RendezvousRelay<F> {
             && let Some(reg) = self.hosts.get(&req.service_tag).cloned()
         {
             let (e2e, onion) = self.next_forward_seeds();
-            return match reg.seal_forward_to_host::<F>(&payload, &e2e, &onion) {
+            return match reg.seal_forward_to_host::<F>(&self.directory, &payload, &e2e, &onion) {
                 Some(fwd) => vec![Effect::Send { to: fwd.combiner, frame: fwd.frame }],
                 // A registered host whose route we cannot seal to: drop, don't surface locally (this node
                 // is not the service — a local delivery would be answered by the wrong party).
@@ -540,13 +575,32 @@ mod tests {
             launch_frame(l, &onion)
         };
 
-        // The service's meeting tag and its dead-drop line L_O (a different line). It registers by onion.
-        let tag = service_tag(b"a-hidden-service-key", Epoch::new(0));
+        // The service's identity and its dead-drop line L_O (a different line). It registers by onion.
+        let epoch = relay.router().onion_epoch();
+        let mut srng = SeedRng::from_seed(b"a-hidden-service-key");
+        let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
+        let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
+        let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
+        let tag = service_tag(&bundle, epoch);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc_keys, svc_reply_pub) =
             fanos_aphantos::nostos::ReplyKeys::generate(b"svc-deaddrop");
-        let reg = HostRegister::onion::<F2>(tag, svc_reply_pub.encode(), vec![drop_line], &dir, 1)
+        relay.set_directory(dir.clone());
+        let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], 1)
             .expect("the dead-drop line's members are in the directory");
+
+        // **A route seizure is refused before the genuine registration is even made.** The tag is a public
+        // function of the address, so anyone can compute it; what an attacker cannot do is present an identity
+        // that hashes to it. Asserted FIRST, so the count below cannot be satisfied by the attacker's entry.
+        let (a_signer, a_verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
+        let a_bundle = fanos_diaulos::bundle_from_identity(&a_verifier, &kem_pub);
+        let mut seizure = HostRegister { identity: a_bundle, sig: Vec::new(), ..reg.clone() };
+        seizure.sig = a_signer.sign(&seizure.encode()).to_bytes();
+        let mut bad_body = HOST_REGISTER_TAG.to_vec();
+        bad_body.extend_from_slice(&seizure.encode());
+        relay.step(Instant(0), Input::Message { from: [6, 6, 6], frame: seal_to_relay(&bad_body, b"bad") });
+        assert_eq!(relay.hosts(), 0, "a registration claiming a tag its identity does not hash to is refused");
+
         let mut reg_body = HOST_REGISTER_TAG.to_vec();
         reg_body.extend_from_slice(&reg.encode());
         relay.step(Instant(0), Input::Message { from: [9, 9, 9], frame: seal_to_relay(&reg_body, b"reg") });

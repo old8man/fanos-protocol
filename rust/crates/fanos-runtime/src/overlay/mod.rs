@@ -1131,7 +1131,10 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
             Input::Timer(HEARTBEAT) if self.heartbeating => self.on_heartbeat(now),
-            Input::Timer(_) => Vec::new(),
+            // An unarmed timer, and a sub-engine control message — inert here for the same reason: neither names
+            // anything this engine owns. The overlay composes no sub-engine that takes a `Control`, and the
+            // composite that does (`CellNode`, for the combiner's mix directory) intercepts it before this point.
+            Input::Timer(_) | Input::Command(Command::Control { .. }) => Vec::new(),
             Input::Message { from, frame } => self.on_message(now, from, &frame),
         }
     }

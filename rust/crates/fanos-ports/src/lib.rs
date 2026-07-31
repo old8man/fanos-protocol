@@ -76,6 +76,23 @@ pub struct TimerToken(pub u64);
 pub enum Command {
     /// Begin periodic liveness heartbeats.
     StartHeartbeat,
+    /// Hand a composite engine's sub-engine a value only an async task could have produced.
+    ///
+    /// **Local by construction, and that is the security property.** Commands enter through the node handle, in
+    /// process; nothing on the wire can produce one. That is what separates this from [`Self::Emit`], whose body a
+    /// peer chooses — so a control message may be trusted where a frame may not, and a sub-engine that installs
+    /// key material from one is not thereby accepting key material from the network.
+    ///
+    /// It exists because a sans-I/O engine cannot look anything up, while some of what it needs is the result of a
+    /// lookup: the rendezvous combiner must seal a forward onion to a mix directory it has no way to build. An
+    /// async sibling builds it and hands it over here. `tag` names the sub-engine's message kind and `body` is its
+    /// own encoding — the runtime deliberately knows neither, so a new one needs no change at this layer.
+    Control {
+        /// The sub-engine's message kind (its own namespace; the runtime does not interpret it).
+        tag: u16,
+        /// The encoded message, in whatever form that sub-engine defined.
+        body: Vec<u8>,
+    },
     /// Send an application payload to the peer at coordinate `to` (spec §L1 rendezvous).
     Send {
         /// Destination coordinate.

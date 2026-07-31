@@ -8,6 +8,7 @@
 //! the multi-client service accept loop. This is the **Direct** profile — the anonymous rendezvous is
 //! a different transport under the identical stream.
 
+use fanos_diaulos::service_public_from_bundle;
 use fanos_diaulos::{ClientSession, Coord, StaticKeypair};
 use fanos_field::F2;
 use fanos_onoma::Epoch;
@@ -267,18 +268,25 @@ where
     (in_tx, task)
 }
 
-/// Resolves a `.fanos` host to the service's overlay coordinate and static KEM public key — the two
-/// facts [`FanosDialer`] needs to dial it. A production impl reads the ONOMA descriptor (bundle +
-/// coordinate) from the overlay; [`StaticResolver`] is a fixed map for simple deployments and tests.
+/// Resolves a `.fanos` host to the service's overlay coordinate and its **canonical identity bundle** — the two
+/// facts [`FanosDialer`] needs to dial it. A production impl reads the ONOMA descriptor (bundle + coordinate)
+/// from the overlay; [`StaticResolver`] is a fixed map for simple deployments and tests.
+///
+/// **The bundle, not the KEM key it contains**, and the distinction is load-bearing: a dial needs *two*
+/// derivations from the service's identity, and they read different parts of it. The KEM key LOCATES the service
+/// — it derives the meeting line and the handshake encapsulates to it — while the whole bundle AUTHORISES its
+/// route binding, since `service_tag` is a one-way image of it and the combiner recomputes that tag from the
+/// registration's carried identity. Reducing to the KEM key here threw the second derivation's input away, so a
+/// client computed a tag no host could ever register under.
 pub trait ServiceResolver: Send + Sync {
-    /// Resolve `host` (the full `.fanos` name), or `None` if it is unknown.
-    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send;
+    /// Resolve `host` (the full `.fanos` name) to `(coordinate, identity bundle)`, or `None` if it is unknown.
+    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, Vec<u8>)>> + Send;
 }
 
 /// A fixed `host → (coordinate, key)` map.
 #[derive(Default)]
 pub struct StaticResolver {
-    map: BTreeMap<String, (Coord, HybridKemPublic)>,
+    map: BTreeMap<String, (Coord, Vec<u8>)>,
 }
 
 impl StaticResolver {
@@ -290,14 +298,14 @@ impl StaticResolver {
 
     /// Register a service (builder style).
     #[must_use]
-    pub fn with(mut self, host: impl Into<String>, coord: Coord, public: HybridKemPublic) -> Self {
-        self.map.insert(host.into(), (coord, public));
+    pub fn with(mut self, host: impl Into<String>, coord: Coord, identity: Vec<u8>) -> Self {
+        self.map.insert(host.into(), (coord, identity));
         self
     }
 }
 
 impl ServiceResolver for StaticResolver {
-    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send {
+    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, Vec<u8>)>> + Send {
         std::future::ready(self.map.get(host).cloned())
     }
 }
@@ -316,7 +324,7 @@ pub struct FanosDialer<R: ServiceResolver> {
     resolver: R,
     profile: Profile,
     /// The exit node (coordinate + service key) clearnet targets are routed through, if any.
-    exit: Option<(Coord, HybridKemPublic)>,
+    exit: Option<(Coord, Vec<u8>)>,
 }
 
 /// Parameters to draw a **fresh unlinkable** rendezvous route *per dial* — the general anonymous proxy
@@ -366,8 +374,8 @@ impl<R: ServiceResolver> FanosDialer<R> {
     /// key `public` — the dialer opens a [`dial_exit`] session and hands it the destination. Without this,
     /// clearnet targets are `Unsupported`.
     #[must_use]
-    pub fn with_exit(mut self, coord: Coord, public: HybridKemPublic) -> Self {
-        self.exit = Some((coord, public));
+    pub fn with_exit(mut self, coord: Coord, identity: Vec<u8>) -> Self {
+        self.exit = Some((coord, identity));
         self
     }
 
@@ -410,20 +418,25 @@ impl<R: ServiceResolver> FanosDialer<R> {
     fn establish(
         &self,
         coord: Coord,
-        service_public: &HybridKemPublic,
+        identity: &[u8],
         rng: &mut SeedRng,
     ) -> Result<DuplexStream, DialError> {
         Ok(match &self.profile {
-            Profile::Direct => dial_service(self.client.clone(), coord, service_public, rng),
+            Profile::Direct => {
+                let public = service_public_from_bundle(identity).ok_or(DialError::Unreachable)?;
+                dial_service(self.client.clone(), coord, &public, rng)
+            }
             Profile::Fixed(route) => {
                 // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
                 let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), service_public, route, &secret, rng)
+                crate::rendezvous::anonymous_dial(self.client.clone(), identity, route, &secret, rng)
+                    .ok_or(DialError::Unreachable)?
             }
             Profile::Fresh(params) => {
                 // Derive the service's per-target meeting line, DRAW A FRESH route (new random forward/reply
                 // hops so this connection is unlinkable to the client's others), then ride the session over it.
-                let meeting = meeting_line::<F2>(&service_public.encode(), params.epoch, &params.beacon).coords();
+                let public = service_public_from_bundle(identity).ok_or(DialError::Unreachable)?;
+                let meeting = meeting_line::<F2>(&public.encode(), params.epoch, &params.beacon).coords();
                 let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
                     params.directory.clone(),
                     params.threshold,
@@ -434,7 +447,8 @@ impl<R: ServiceResolver> FanosDialer<R> {
                     rng,
                 );
                 let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), service_public, &route, &secret, rng)
+                crate::rendezvous::anonymous_dial(self.client.clone(), identity, &route, &secret, rng)
+                    .ok_or(DialError::Unreachable)?
             }
         })
     }
@@ -457,11 +471,10 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
         // clearnet target rides the configured EXIT — but through the **same anonymity profile** as a `.fanos`
         // service (the exit is just a service, reached by its service key), so an anonymous profile never sends
         // clearnet by-coordinate Direct, which would leak the client's coordinate to the exit (audit S1-C1).
-        let (coord, service_public, exit_target): (Coord, HybridKemPublic, Option<String>) = if target.is_fanos()
-        {
+        let (coord, identity, exit_target): (Coord, Vec<u8>, Option<String>) = if target.is_fanos() {
             let host = target.host();
-            let (coord, service_public) = self.resolver.resolve(&host).await.ok_or(DialError::Unreachable)?;
-            (coord, service_public, None)
+            let (coord, identity) = self.resolver.resolve(&host).await.ok_or(DialError::Unreachable)?;
+            (coord, identity, None)
         } else {
             let Some((exit_coord, exit_public)) = &self.exit else {
                 return Err(DialError::Unsupported(
@@ -475,7 +488,7 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
         let mut rng = SeedRng::from_seed(&os_entropy_32()?);
 
         // Establish the session per the anonymity profile (the exit is just a service, reached by its key).
-        let stream = self.establish(coord, &service_public, &mut rng)?;
+        let stream = self.establish(coord, &identity, &mut rng)?;
 
         // For a clearnet target, hand the exit its destination over the (Direct or anonymous) session it now
         // rides — the exit still learns only the target, never the client's coordinate.

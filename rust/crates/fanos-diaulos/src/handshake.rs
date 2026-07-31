@@ -26,6 +26,7 @@
 use fanos_pqcrypto::kem::{
     CIPHERTEXT_LEN, HybridCiphertext, HybridKemPublic, HybridKemSecret, PUBLIC_LEN, SessionKey,
 };
+use fanos_pqcrypto::HybridVerifier;
 use fanos_primitives::hash::{hash_labeled, hash_xof, label};
 use fanos_primitives::keys::{ED25519_PK_LEN, MLDSA65_PK_LEN};
 use rand_core::CryptoRng;
@@ -60,6 +61,27 @@ pub fn service_public_from_bundle(bundle: &[u8]) -> Option<HybridKemPublic> {
 pub fn bundle_from_kem_public(public: &HybridKemPublic) -> Vec<u8> {
     let mut bundle = vec![0u8; KEM_OFFSET_IN_BUNDLE];
     bundle.extend_from_slice(&public.encode());
+    bundle
+}
+
+/// Build a **full** identity bundle from both halves: the signing keys a hosted service is authenticated by and
+/// the KEM key a client dials.
+///
+/// The counterpart to [`bundle_from_kem_public`], and the one a hidden service must publish. That function zeroes
+/// the signing prefix, which is fine for a Direct descriptor — the client only ever reads the KEM half back out —
+/// but it cannot support hosting: a combiner authenticates a route registration by recomputing the service tag
+/// from the presented bundle and verifying a signature under its signing prefix, and a zero prefix is
+/// reconstructible by anyone holding the (public) KEM key. So a KEM-only service can be *dialled* but cannot
+/// *bind a route*, and this is how it acquires the half that lets it.
+///
+/// Note what changing the bundle changes: the `.fanos` name is derived from it, so a service that gains a signing
+/// identity gains a new address. That is the point rather than a cost — the address now commits to the key that
+/// authorises its routing.
+#[must_use]
+pub fn bundle_from_identity(signing: &HybridVerifier, kem: &HybridKemPublic) -> Vec<u8> {
+    let mut bundle = signing.encode();
+    debug_assert_eq!(bundle.len(), KEM_OFFSET_IN_BUNDLE, "the signing prefix is the bundle's KEM offset");
+    bundle.extend_from_slice(&kem.encode());
     bundle
 }
 

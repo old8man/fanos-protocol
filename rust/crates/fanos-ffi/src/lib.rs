@@ -316,7 +316,10 @@ pub unsafe extern "C" fn fanos_service_connect(
     // `dial_service` spawns the session's transport bridge, so it must run inside the runtime context.
     let stream = {
         let _guard = handle.rt.enter();
-        dial_service(handle.node.client(), coord, &public, &mut rng)
+        let Some(kem) = fanos_diaulos::service_public_from_bundle(&public) else {
+            return ptr::null_mut();
+        };
+        dial_service(handle.node.client(), coord, &kem, &mut rng)
     };
     Box::into_raw(Box::new(FanosStream { handle: handle.rt.handle().clone(), stream, _session: None }))
 }

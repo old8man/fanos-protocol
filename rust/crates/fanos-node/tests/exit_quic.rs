@@ -283,7 +283,7 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
     );
 
     // A `.fanos`-resolving dialer (empty resolver — we only test clearnet) that routes clearnet via the exit.
-    let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, e_public);
+    let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, fanos_diaulos::bundle_from_kem_public(&e_public));
     let mut stream = dialer
         .dial(&Target::Ip(echo))
         .await
@@ -322,7 +322,7 @@ async fn the_proxy_dialer_relays_udp_through_the_exit() {
     );
     let udp_echo = spawn_udp_echo().await;
 
-    let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, e_public);
+    let dialer = FanosDialer::new(c.client(), StaticResolver::new()).with_exit(e_addr, fanos_diaulos::bundle_from_kem_public(&e_public));
     let mut tunnel = tokio::time::timeout(common::HANG_CEILING, dialer.dial_udp(&Target::Ip(udp_echo)))
         .await
         .expect("open the UDP tunnel in time")

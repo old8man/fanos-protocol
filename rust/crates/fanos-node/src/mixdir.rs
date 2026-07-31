@@ -24,7 +24,7 @@ use fanos_geometry::{Plane, Point};
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{Epoch, MixDirectory};
-use fanos_runtime::Notification;
+use fanos_runtime::{Command, Notification};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -241,6 +241,51 @@ pub fn spawn_mix_publisher(
                 }
                 // Other notifications are irrelevant to key rotation; a lagged stream only means we may
                 // have missed an epoch, and the next BeaconReady's catch-up advance covers it.
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Keep this node's **combiner** side supplied with the epoch's mix directory.
+///
+/// A cell node is a potential meeting combiner for any hidden service whose key lands on its line, and a combiner
+/// must seal the forward onion to a registered host's dead-drop — which needs that line's member keys. It cannot
+/// resolve them itself: [`RendezvousRelay`](crate::rendezvous_relay::RendezvousRelay) is a sans-I/O engine and
+/// [`build_cell_mix_directory`] is a store lookup. So an async sibling resolves and hands it over through
+/// [`Command::Control`], which is local by construction — key material may be installed from a command precisely
+/// because, unlike a frame, no peer can produce one.
+///
+/// **The registration used to carry those keys instead.** Measured, that cost `q + 1` keys per hop — ~3.7 KB at
+/// `q = 2` and ~39 KB at `q = 31` — against a fixed 7041-byte onion body, so a registration did not fit on any
+/// plane past Fano even before authentication added an identity bundle and a signature.
+///
+/// A rebuild immediately after a beacon advance may see peers that have not yet republished, so the directory can
+/// start an epoch incomplete; it is replaced whole on the next advance, and a combiner that cannot seal simply
+/// does not forward. That is the correct failure: a partial directory never produces a *wrong* route.
+pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: bool) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut events = client.subscribe();
+        let install = async |client: &Client, epoch: Epoch, beacon: BeaconSeed| {
+            let dir = build_cell_mix_directory::<F>(client, epoch, vrf_coordinates.then_some(beacon)).await;
+            if !dir.is_empty() {
+                client.command(Command::Control {
+                    tag: fanos_rendezvous::CONTROL_MIX_DIRECTORY,
+                    body: dir.encode(),
+                });
+            }
+        };
+        // Genesis first, and for the same reason `spawn_mix_publisher` publishes at genesis before its loop: a
+        // cell whose beacon has not advanced yet still has hosts registering and clients dialing, and a combiner
+        // with no directory cannot forward. Waiting for the first `BeaconReady` would leave the whole genesis
+        // epoch unserved — which is not a corner case, it is how every fixed-epoch deployment runs.
+        install(&client, Epoch::ZERO, BeaconSeed::GENESIS).await;
+        loop {
+            match events.recv().await {
+                Ok(Notification::BeaconReady { epoch, seed }) => {
+                    install(&client, epoch, BeaconSeed::new(seed)).await;
+                }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             }

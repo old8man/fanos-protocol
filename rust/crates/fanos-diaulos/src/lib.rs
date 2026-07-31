@@ -40,7 +40,7 @@ pub use conn::Connection;
 pub use endpoint::StreamEndpoint;
 pub use frame::Frame;
 pub use handshake::{
-    ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, bundle_from_kem_public,
+    ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, bundle_from_identity, bundle_from_kem_public,
     service_public_from_bundle,
 };
 pub use overlay::{ClientSession, Coord, ServerSession};

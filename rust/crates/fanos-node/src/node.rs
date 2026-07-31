@@ -24,7 +24,7 @@ use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::{ExitPolicy, serve_exit, spawn_exit_publisher, spawn_mix_publisher};
+use crate::{ExitPolicy, serve_exit, spawn_exit_publisher, spawn_mix_directory_feeder, spawn_mix_publisher};
 
 use fanos_core::roles::{Capability, Demand, Role, RoleController, RoleSet as CoreRoleSet};
 use fanos_primitives::NodeId;
@@ -465,7 +465,15 @@ fn spawn_mix_export(handle: &NodeHandle, relay: bool, onion_seed: [u8; 32]) -> O
         return None;
     }
     let prover = handle.coordinate_prover()?;
-    Some(spawn_mix_publisher(handle.client(), onion_seed, Some(prover)))
+    // Two halves of one role, spawned together because a relay is both: it PUBLISHES its own onion key so others
+    // can seal to it, and it CONSUMES the cell's directory so it can seal a forward onion as a meeting combiner.
+    // The second used to be unnecessary only because a host registration carried the hop keys itself, which does
+    // not fit the fixed-width packet past the Fano plane.
+    let feeder = spawn_mix_directory_feeder::<fanos_field::F2>(handle.client(), true);
+    let publisher = spawn_mix_publisher(handle.client(), onion_seed, Some(prover));
+    Some(tokio::spawn(async move {
+        let _ = tokio::join!(publisher, feeder);
+    }))
 }
 
 fn spawn_roles<F: Field + 'static>(

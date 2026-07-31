@@ -12,7 +12,6 @@ use std::time::Duration;
 use fanos_calypso::descriptor::{Descriptor, SealedDescriptor, open, seal};
 use fanos_diaulos::{Coord, service_public_from_bundle};
 use fanos_onoma::{Address, Epoch, lookup_key};
-use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 
 use crate::diaulos::ServiceResolver;
@@ -147,7 +146,7 @@ impl NodeResolver {
 }
 
 impl ServiceResolver for NodeResolver {
-    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, HybridKemPublic)>> + Send {
+    fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, Vec<u8>)>> + Send {
         let client = self.client.clone();
         let epoch = self.epoch;
         let min_pow = self.min_pow;
@@ -162,8 +161,12 @@ impl ServiceResolver for NodeResolver {
                 .ok()??;
             let resolved = verify_descriptor(&address, epoch, &blob, min_pow).ok()?;
             let coord = decode_coord(&resolved.metadata)?;
-            let public = service_public_from_bundle(&resolved.bundle)?;
-            Some((coord, public))
+            // Check the bundle carries a usable KEM key, then hand the WHOLE bundle up rather than that key: a
+            // dial needs two derivations from the identity and they read different parts of it — the KEM key
+            // locates the service, the whole bundle authorises its route binding (`service_tag`). Reducing here
+            // is what made a client compute a tag no host could register under.
+            service_public_from_bundle(&resolved.bundle)?;
+            Some((coord, resolved.bundle))
         }
     }
 }

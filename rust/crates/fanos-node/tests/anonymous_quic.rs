@@ -17,22 +17,24 @@ mod common;
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
-use fanos_diaulos::StaticKeypair;
+use fanos_diaulos::{StaticKeypair, bundle_from_identity};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
+use fanos_node::spawn_mix_directory_feeder;
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, HostedService, OverlayBeaconNode, RendezvousRoute, StaticResolver,
     build_cell_mix_directory, serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
 };
-use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
+use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, HybridSigSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_runtime::{Config as OverlayConfig, OverlayNode};
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
+use fanos_rendezvous::CONTROL_MIX_DIRECTORY;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, HostRegister, MixDirectory, RendezvousService, combiner_for, meeting_line,
-    seal_forward, seal_host_register, service_tag,
+    seal_forward, seal_host_register,
 };
 
 /// The epoch's public randomness beacon, shared by the service (which listens on the derived meeting
@@ -100,6 +102,19 @@ async fn await_anonymous(node: &mut NodeHandle, want: &[u8]) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// The signing half a hosted service needs, plus the full bundle it publishes.
+///
+/// Mirrors `hidden_service_identity` in the CLI: the combiner authenticates a route registration by recomputing
+/// `service_tag` from the presented bundle and verifying a signature under its signing prefix, so a hosted service
+/// must publish a bundle with a real one. A KEM-only bundle is reconstructible by anyone holding the public KEM
+/// key and would authenticate nothing.
+fn signing_half(kem: &HybridKemPublic, seed: &[u8]) -> (HybridSigSecret, Vec<u8>) {
+    let mut rng = SeedRng::from_seed(seed);
+    let (signer, verifier) = HybridSigSecret::generate(&mut rng);
+    let bundle = bundle_from_identity(&verifier, kem);
+    (signer, bundle)
 }
 
 #[tokio::test]
@@ -171,6 +186,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let mut skp = SeedRng::from_seed(b"anon-quic-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public().clone();
+    let (_signer, bundle) = signing_half(&service_public, b"anon-quic-service");
     let epoch = fanos_rendezvous::Epoch::new(5);
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
@@ -217,7 +233,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     // Dial through the production seam: a FanosDialer on the anonymous profile resolves the name to the
     // service key and rides the DIAULOS session over the mixnet (the coordinate is unused anonymously —
     // the meeting line comes from the key).
-    let resolver = StaticResolver::new().with("anon.fanos", meeting, service_public);
+    let resolver = StaticResolver::new().with("anon.fanos", meeting, bundle.clone());
     let dialer = FanosDialer::anonymous(client_node.client(), resolver, route);
     let mut stream = dialer
         .dial(&Target::Name("anon.fanos".to_owned(), 80))
@@ -295,6 +311,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     let mut skp = SeedRng::from_seed(b"anon-cell-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public().clone();
+    let (_signer, bundle) = signing_half(&service_public, b"anon-quic-service");
     let epoch = fanos_rendezvous::Epoch::ZERO;
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
@@ -329,7 +346,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         beacon: TEST_BEACON,
         depths: (1, 1),
     };
-    let resolver = StaticResolver::new().with("cell.fanos", meeting, service_public);
+    let resolver = StaticResolver::new().with("cell.fanos", meeting, bundle.clone());
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
     let mut stream = dialer
         .dial(&Target::Name("cell.fanos".to_owned(), 80))
@@ -370,6 +387,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     let mut skp = SeedRng::from_seed(b"off-combiner-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public().clone();
+    let (signer, bundle) = signing_half(&service_public, b"anon-quic-service");
     let epoch = fanos_rendezvous::Epoch::ZERO;
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let m_combiner = combiner_for::<F2>(meeting).unwrap();
@@ -382,10 +400,18 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     let drop_line =
         select_drop_line(host_point, b"off-combiner-host", epoch.get(), TEST_BEACON.as_bytes()).coords();
     let (host_reply_keys, host_reply_pub) = ReplyKeys::generate(b"off-combiner-host");
-    let tag = service_tag(&service_public.encode(), epoch);
-    // The primary, coordinate-hiding registration: a 1-hop forward route to the dead-drop line.
-    let reg = HostRegister::onion::<F2>(tag, host_reply_pub.encode(), vec![drop_line], &mix, t as u8)
+    // The primary, coordinate-hiding registration: a 1-hop forward route to the dead-drop line, signed under the
+    // service's published identity so the combiner can check the binding rather than believe it.
+    let reg = HostRegister::onion(&bundle, &signer, epoch, host_reply_pub.encode(), vec![drop_line], t as u8)
         .expect("the dead-drop line's members are in the mix directory");
+
+    // The combiner is handed the epoch's mix directory — the hop keys it seals the forward onion with. It cannot
+    // resolve them itself (a sans-I/O engine cannot do a store lookup), and the registration no longer carries
+    // them: carrying `q + 1` keys per hop made it grow with the plane and overflow the fixed-width onion packet.
+    // A `Control` command is local by construction, so this is key material from in-process, never off the wire.
+    for n in nodes.iter().flatten() {
+        n.client().command(Command::Control { tag: CONTROL_MIX_DIRECTORY, body: mix.encode() });
+    }
 
     let host_node = nodes[host_index].take().unwrap();
     // The operator registers anonymously: seal the registration to the meeting line and emit it (it peels at
@@ -411,7 +437,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     // Wait for the binding itself, not for a duration: the combiner silently drops a request whose tag it has not
     // bound yet, and the client then waits forever for a reply that was never forwarded.
     let bound = common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held")).await;
-    assert_eq!(bound, tag, "the combiner bound this service's forward route");
+    assert_eq!(bound, reg.service_tag, "the combiner bound this service's forward route");
 
     // A third node dials by name — it neither is the combiner nor knows where the service is.
     let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
@@ -423,7 +449,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         beacon: TEST_BEACON,
         depths: (1, 1),
     };
-    let resolver = StaticResolver::new().with("off.fanos", meeting, service_public);
+    let resolver = StaticResolver::new().with("off.fanos", meeting, bundle.clone());
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
     let mut stream = dialer
         .dial(&Target::Name("off.fanos".to_owned(), 80))
@@ -470,6 +496,10 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         // one: `None` on both ends. The host driver below is told the same, and that symmetry is the whole design — the
         // binding exists exactly where VRF coordinates do (S1-M3, `mixdir::parse_bound_record`).
         publishers.push(spawn_mix_publisher(n.client(), onion_seed, n.coordinate_prover()));
+        // The combiner half of the same role: a cell node PUBLISHES its onion key so others can seal to it, and
+        // CONSUMES the cell's directory so it can seal a forward onion for a host registered off its combiner.
+        // `Node::start` spawns the pair together for exactly this reason (`spawn_mix_export`).
+        publishers.push(spawn_mix_directory_feeder::<F2>(n.client(), n.coordinate_prover().is_some()));
     }
     // Wait for the mix keys to be readable, not for a duration: the host driver below builds its directory from this
     // store, and an empty read makes it register a route through nothing.
@@ -482,6 +512,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     let mut skp = SeedRng::from_seed(b"driver-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public().clone();
+    let (signer, bundle) = signing_half(&service_public, b"anon-quic-service");
     let epoch = fanos_rendezvous::Epoch::ZERO;
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let m_index = Point::<F2>::new(combiner_for::<F2>(meeting).unwrap()).unwrap().index();
@@ -495,6 +526,8 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         // Pinned coordinates: no mix-key record in this cell can prove its slot, and none is asked to.
         HostedService {
             service,
+            identity: bundle.clone(),
+            signer,
             host_secret: b"driver-host-secret".to_vec(),
             threshold: t as u8,
             vrf_coordinates: false,
@@ -518,7 +551,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         beacon: TEST_BEACON,
         depths: (1, 1),
     };
-    let resolver = StaticResolver::new().with("driver.fanos", meeting, service_public);
+    let resolver = StaticResolver::new().with("driver.fanos", meeting, bundle.clone());
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
     let mut stream = dialer
         .dial(&Target::Name("driver.fanos".to_owned(), 80))

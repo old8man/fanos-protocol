@@ -28,6 +28,8 @@ pub use fanos_calypso::{BeaconSeed, Epoch};
 use fanos_field::Field;
 use fanos_geometry::{Line, Triple};
 use fanos_pqcrypto::kem::HybridKemPublic;
+use fanos_pqcrypto::sig::HYBRID_VK_LEN;
+use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_wire::Wire;
 
 mod transport;
@@ -49,6 +51,15 @@ pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &Beac
     fanos_calypso::rendezvous::rendezvous_line::<F>(service_pubkey, epoch, beacon)
 }
 
+/// The [`Command::Control`](fanos_ports::Command::Control) tag under which a combiner is handed the epoch's mix
+/// directory ([`MixDirectory::encode`]).
+///
+/// A combiner needs those hop keys to seal a forward onion to a registered host's dead-drop, and it cannot get
+/// them itself: it is a sans-I/O engine and building the directory is a store lookup. The registration used to
+/// carry them instead, which made it grow as `q + 1` per hop — measured at ~39 KB on a `q = 31` plane against a
+/// 7041-byte onion body, so it did not fit past Fano even before authentication added a bundle and a signature.
+pub const CONTROL_MIX_DIRECTORY: u16 = 1;
+
 /// A directory of mixnet members' hybrid KEM public keys, keyed by overlay coordinate. Sealing an
 /// onion seals each hop to the coordinates of that line's members named here.
 #[derive(Clone, Default)]
@@ -57,6 +68,34 @@ pub struct MixDirectory {
 }
 
 impl MixDirectory {
+    /// Encode as a flat `Vec<MixEntry>` — the form a combiner is handed one in ([`Command::Control`]).
+    ///
+    /// Deterministic (the map iterates in coordinate order), so two nodes that resolved the same cell produce
+    /// byte-identical directories, which keeps a mismatch a real disagreement rather than an encoding artefact.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let entries: Vec<MixEntry> =
+            self.entries().map(|(coord, key)| MixEntry { coord: *coord, key: key.encode() }).collect();
+        entries.to_wire()
+    }
+
+    /// Decode what [`Self::encode`] produced. `None` if the bytes are malformed or an entry's key is not a
+    /// well-formed hybrid KEM public — a directory is key material, so a partial parse is refused whole.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cur = bytes;
+        let entries = <Vec<MixEntry> as Wire>::wire_decode(&mut cur).ok()?;
+        if !cur.is_empty() {
+            return None;
+        }
+        let mut dir = Self::new();
+        for entry in entries {
+            dir.insert(entry.coord, HybridKemPublic::decode(&entry.key)?);
+        }
+        Some(dir)
+    }
+
+
     /// An empty directory.
     #[must_use]
     pub fn new() -> Self {
@@ -212,11 +251,37 @@ pub fn seal_nostos_reply<F: Field>(
 /// save by luck, **not** the node at that combiner. The operator instead registers an anonymous forward
 /// route there (`design-anonymity-substrate.md` §3b); this tag lets the combiner route each client
 /// request to the right registered host when several services share one combiner (Fano has only four).
-/// It rotates per epoch and is a one-way image of the public key, so it discloses no coordinate.
+/// It rotates per epoch and is a one-way image of the public identity, so it discloses no coordinate.
+///
+/// **It hashes the service's whole canonical identity bundle, not the KEM half a client dials.** That is what makes
+/// a host registration authenticable at all, and the alternatives were eliminated rather than passed over:
+///
+/// * A signature alone proves nothing if the tag commits only to the KEM key — a KEM key verifies nothing, so the
+///   signature would be by some *other* key with no stated relation to the tag.
+/// * Carrying the bundle while keeping the tag KEM-derived fails too, and this is the subtle one: a bundle is plain
+///   concatenated bytes (`Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768`), so an attacker who knows the victim's KEM
+///   public key — which every client must — simply presents `(own signing prefix ‖ victim KEM key)`, signs with the
+///   key it holds, and passes. Nothing binds a bundle's halves together except its publication, and an anonymous
+///   combiner has nothing to check that against.
+/// * Proving KEM-secret possession is not available non-interactively: encapsulating proves nothing (anyone can),
+///   only decapsulating does, and a one-shot registration has no round trip.
+///
+/// So the tag must commit to **the key that authenticates the registration**. Note the resulting split, which is
+/// coherent rather than accidental: [`meeting_line`] stays KEM-derived because it *locates* the service, while this
+/// tag is identity-derived because it *authorises* a route binding. One addresses, the other authenticates.
 #[must_use]
-pub fn service_tag(service_pubkey: &[u8], epoch: Epoch) -> [u8; 32] {
-    let mut data = Vec::with_capacity(service_pubkey.len() + 4);
-    data.extend_from_slice(service_pubkey);
+pub fn service_tag(service_identity: &[u8], epoch: Epoch) -> [u8; 32] {
+    // Only the bundle's **signing prefix** goes in, and that is the invariant rather than an optimisation: the tag
+    // must commit to the key that authenticates the registration, which is the signing half. The KEM half's job is
+    // to LOCATE the service — the client derives the meeting line from it and already holds it — so carrying it
+    // into a registration would cost 1216 bytes of a fixed-width onion packet and buy nothing.
+    //
+    // A bundle too short to have a prefix is hashed whole. That is safe rather than a fallback worth avoiding: it
+    // yields a tag no well-formed identity can reproduce, and `HostRegister::verify` refuses such an identity
+    // outright before ever comparing tags.
+    let signing = service_identity.get(..HYBRID_VK_LEN).unwrap_or(service_identity);
+    let mut data = Vec::with_capacity(signing.len() + 4);
+    data.extend_from_slice(signing);
     data.extend_from_slice(&epoch.low32_be_bytes());
     fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::RDV_HOST, &data)
 }
@@ -250,7 +315,9 @@ pub const HOST_REGISTER_TAG: &[u8; 4] = b"RHR1";
 /// leaks the coordinate to the one combiner node (Tor's posture, no worse). The primary, coordinate-hiding
 /// path carries a real `forward_circuit` + `reply_pub`.
 /// `#[derive(Wire)]` emits `service_tag(32) ‖ reply_pub(varint-prefixed) ‖ forward_circuit(varint count ‖
-/// Triple×12) ‖ coordinate(12)`.
+/// Triple×12) ‖ coordinate(12) ‖ identity(varint-prefixed) ‖ sig(varint-prefixed)`. The two authentication
+/// fields are appended rather than placed with the tag they bind, so [`Self::signing_preimage`] — the same
+/// encoding with `sig` emptied — stays a prefix-stable function of the rest.
 #[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct HostRegister {
     /// The [`service_tag`] the combiner routes matching client requests by.
@@ -262,14 +329,22 @@ pub struct HostRegister {
     /// Hop lines to the service's own **dead-drop line** (the last hop), through which the combiner
     /// forwards client requests as NOSTOS onions. Empty on the bare-host fallback.
     pub forward_circuit: Vec<Triple>,
-    /// The self-provisioned member keys for `forward_circuit`'s lines ([`MixEntry`]), so the combiner —
-    /// which holds no global directory — can seal the forward onion. Empty on the bare-host fallback.
-    pub forward_keys: Vec<MixEntry>,
     /// The threshold `t` the forward onion's hops seal to (`t`-of-`(q+1)`), as the service chose it.
     pub threshold: u8,
     /// The bare-host fallback coordinate — used **only** when `forward_circuit` is empty (the combiner
     /// forwards by a direct `Send`, learning this coordinate). All-zeros on the primary onion path.
     pub coordinate: Triple,
+    /// The service's canonical published identity bundle — the preimage of [`service_tag`].
+    ///
+    /// Carried so the combiner can *recompute* the tag rather than believe it. A registration whose bundle does not
+    /// hash to its own `service_tag` is a registration for a service the sender cannot name.
+    pub identity: Vec<u8>,
+    /// A [`HybridSignature`] over this registration with `sig` empty, by the signing half of `identity`.
+    ///
+    /// Covers every field at once — the epoch-bound tag, `reply_pub`, `forward_circuit`, `threshold` and
+    /// `coordinate` — because each of them redirects traffic. Signing only the tag would let a genuine
+    /// registration be replayed with a swapped circuit, which is the same seizure by a longer route.
+    pub sig: Vec<u8>,
 }
 
 impl HostRegister {
@@ -278,57 +353,80 @@ impl HostRegister {
     /// `reply_pub`. `directory` supplies the member keys for `forward_circuit`'s lines — extracted into the
     /// registration so the combiner (which holds no directory) can seal. `None` if a member key is missing.
     #[must_use]
-    pub fn onion<F: Field>(
-        service_tag: [u8; 32],
+    pub fn onion(
+        identity: &[u8],
+        signer: &HybridSigSecret,
+        epoch: Epoch,
         reply_pub: Vec<u8>,
         forward_circuit: Vec<Triple>,
-        directory: &MixDirectory,
         threshold: u8,
     ) -> Option<Self> {
-        let mut forward_keys = Vec::new();
-        for &line in &forward_circuit {
-            for coord in line_member_coords::<F>(line) {
-                let key = directory.get(&coord)?.encode();
-                if !forward_keys.iter().any(|e: &MixEntry| e.coord == coord) {
-                    forward_keys.push(MixEntry { coord, key });
-                }
-            }
+        if forward_circuit.is_empty() {
+            return None;
         }
-        Some(Self {
-            service_tag,
+        let mut reg = Self {
+            service_tag: service_tag(identity, epoch),
             reply_pub,
             forward_circuit,
-            forward_keys,
             threshold,
             coordinate: [0, 0, 0], // the primary onion path hides the coordinate; all-zeros = none
-        })
+            identity: identity.to_vec(),
+            sig: Vec::new(),
+        };
+        reg.sig = signer.sign(&reg.signing_preimage()).to_bytes();
+        Some(reg)
+    }
+
+    /// The exact bytes [`Self::sig`] covers: this registration's own canonical encoding with the signature field
+    /// empty. Deriving the preimage from the encoding rather than listing fields by hand means a field added later
+    /// is signed by construction — the failure mode where a new redirecting field silently escapes the signature is
+    /// the one that would reopen this hole quietly.
+    #[must_use]
+    fn signing_preimage(&self) -> Vec<u8> {
+        let mut bare = self.clone();
+        bare.sig = Vec::new();
+        bare.encode()
+    }
+
+    /// Whether this registration is one the named service actually issued, for `epoch`.
+    ///
+    /// Three checks, and each rejects a distinct forgery:
+    /// 1. the tag is **recomputed** from `identity`, so a sender cannot claim a service it cannot name;
+    /// 2. the signing prefix must not be all-zero — `bundle_from_kem_public` builds exactly that for a KEM-only
+    ///    service, and such a bundle is reconstructible by anyone holding the (public) KEM key, so accepting one
+    ///    would authenticate nothing while looking like it did. Hosting requires a signing identity;
+    /// 3. the signature must verify over [`Self::signing_preimage`] under that prefix.
+    #[must_use]
+    pub fn verify(&self, epoch: Epoch) -> bool {
+        if self.service_tag != service_tag(&self.identity, epoch) {
+            return false;
+        }
+        let Some(prefix) = self.identity.get(..HYBRID_VK_LEN) else { return false };
+        if prefix.iter().all(|b| *b == 0) {
+            return false;
+        }
+        let (Some(verifier), Some(sig)) = (HybridVerifier::decode(prefix), HybridSignature::from_bytes(&self.sig)) else {
+            return false;
+        };
+        verifier.verify(&self.signing_preimage(), &sig)
     }
 
     /// Build the **bare-host fallback** registration (an operator that cannot peel a dead-drop): the combiner
     /// forwards each request by a direct `Send` to `coordinate`, learning it. Weaker than [`Self::onion`] —
     /// the primary path hides the coordinate; this leaks it to the one combiner node (Tor's posture).
     #[must_use]
-    pub fn bare(service_tag: [u8; 32], coordinate: Triple) -> Self {
-        Self {
-            service_tag,
+    pub fn bare(identity: &[u8], signer: &HybridSigSecret, epoch: Epoch, coordinate: Triple) -> Self {
+        let mut reg = Self {
+            service_tag: service_tag(identity, epoch),
             reply_pub: Vec::new(),
             forward_circuit: Vec::new(),
-            forward_keys: Vec::new(),
             threshold: 0,
             coordinate,
-        }
-    }
-
-    /// The self-provisioned forward directory rebuilt as a [`MixDirectory`] (for the combiner's seal).
-    #[must_use]
-    pub fn forward_directory(&self) -> MixDirectory {
-        let mut dir = MixDirectory::new();
-        for entry in &self.forward_keys {
-            if let Some(public) = HybridKemPublic::decode(&entry.key) {
-                dir.insert(entry.coord, public);
-            }
-        }
-        dir
+            identity: identity.to_vec(),
+            sig: Vec::new(),
+        };
+        reg.sig = signer.sign(&reg.signing_preimage()).to_bytes();
+        reg
     }
 
     /// Seal a client `request` into a NOSTOS onion bound for this service's dead-drop line — what a meeting
@@ -339,6 +437,7 @@ impl HostRegister {
     #[must_use]
     pub fn seal_forward_to_host<F: Field>(
         &self,
+        directory: &MixDirectory,
         request: &[u8],
         e2e_seed: &[u8],
         onion_seed: &[u8],
@@ -349,7 +448,7 @@ impl HostRegister {
         seal_nostos_reply::<F>(
             &self.reply_pub,
             &self.forward_circuit,
-            &self.forward_directory(),
+            directory,
             self.threshold,
             request,
             e2e_seed,
@@ -403,6 +502,20 @@ pub fn parse_host_register(delivery: &[u8]) -> Option<HostRegister> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A deterministic signing identity plus the canonical bundle it publishes.
+    ///
+    /// The bundle's layout is `Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768`; only the signing prefix is read back by
+    /// [`HostRegister::verify`], so the KEM half is filler here — what matters is that `service_tag` hashes the
+    /// WHOLE thing, which is what stops a forged `(own signing prefix ‖ victim KEM key)` bundle from reproducing
+    /// someone else's tag.
+    fn identity(seed: &[u8]) -> (Vec<u8>, HybridSigSecret) {
+        let mut rng = fanos_pqcrypto::SeedRng::from_seed(seed);
+        let (secret, verifier) = HybridSigSecret::generate(&mut rng);
+        let mut bundle = verifier.encode();
+        bundle.extend_from_slice(&[0x42; 32]);
+        (bundle, secret)
+    }
 
     #[test]
     fn request_wrapper_round_trips() {
@@ -470,15 +583,20 @@ mod tests {
     #[test]
     fn host_register_round_trips_and_parses_by_tag() {
         // The primary onion path: a real dead-drop forward circuit + NOSTOS reply key, all-zero coordinate.
+        let (bundle, signer) = identity(b"round-trip-service");
+        let epoch = Epoch::new(9);
         let reg = HostRegister {
-            service_tag: [0x5B; 32],
+            service_tag: service_tag(&bundle, epoch),
             reply_pub: b"service-nostos-reply-key".to_vec(),
             forward_circuit: vec![[1, 2, 3], [4, 5, 6]],
-            forward_keys: vec![MixEntry { coord: [1, 1, 1], key: b"member-key".to_vec() }],
             threshold: 2,
             coordinate: [0, 0, 0],
+            identity: bundle,
+            sig: Vec::new(),
         };
+        let reg = HostRegister { sig: signer.sign(&reg.signing_preimage()).to_bytes(), ..reg };
         assert_eq!(HostRegister::decode(&reg.encode()), Some(reg.clone()));
+        assert!(reg.verify(epoch), "a genuine registration survives the wire round trip and verifies");
 
         // A tagged onion body parses back through the combiner's classifier; a bare `Request` does not.
         let mut body = Vec::new();
@@ -498,13 +616,57 @@ mod tests {
         );
 
         // The bare-host fallback: empty forward circuit/keys, a real coordinate.
-        let fallback = HostRegister::bare([0x11; 32], [7, 8, 9]);
-        assert!(fallback.forward_circuit.is_empty() && fallback.forward_keys.is_empty());
+        let (fb_bundle, fb_signer) = identity(b"bare-fallback-service");
+        let fallback = HostRegister::bare(&fb_bundle, &fb_signer, Epoch::new(9), [7, 8, 9]);
+        assert!(fallback.forward_circuit.is_empty(), "the bare fallback names no forward route");
         assert_eq!(HostRegister::decode(&fallback.encode()), Some(fallback));
     }
 
     #[test]
-    fn onion_registration_self_provisions_its_forward_keys_and_seals() {
+    fn a_registration_cannot_be_forged_for_a_service_the_sender_cannot_name() {
+        // THE PROPERTY this whole binding exists for: knowing a hidden service's public address must not let you
+        // take over its route. Before the identity-derived tag, one unsigned message per epoch did exactly that —
+        // `register_host` accepted any well-formed registration and `BoundedMap::insert` overwrites a known key.
+        //
+        // Four forgeries, each closing a distinct hole. They are asserted in order of subtlety, because the third
+        // is the one that defeats the fix that *looks* sufficient.
+        let epoch = Epoch::new(5);
+        let (victim, victim_signer) = identity(b"the-victim-service");
+        let (attacker, attacker_signer) = identity(b"the-attacker");
+        let genuine = HostRegister::bare(&victim, &victim_signer, epoch, [1, 2, 3]);
+        assert!(genuine.verify(epoch), "the service's own registration verifies");
+
+        // 1. Claim the victim's tag while signing with your own key. The tag is PUBLIC — anyone can compute
+        //    `service_tag(victim_bundle, epoch)` — so this is the cheap attack, and it dies on recomputation.
+        let seizure = HostRegister { identity: attacker.clone(), ..genuine.clone() };
+        let seizure = HostRegister { sig: attacker_signer.sign(&seizure.signing_preimage()).to_bytes(), ..seizure };
+        assert!(!seizure.verify(epoch), "a tag that does not hash from the presented identity is refused");
+
+        // 2. Replay the genuine registration into another epoch. The tag rotates, so the signature no longer
+        //    matches the tag it must bind — a stale route cannot be resurrected.
+        assert!(!genuine.verify(Epoch::new(6)), "a registration does not carry across epochs");
+
+        // 3. Keep the genuine identity and signature, swap only where traffic goes. This is the forgery that
+        //    survives signing the TAG alone, which is why the signature covers the whole encoding.
+        let redirected = HostRegister { coordinate: [9, 9, 9], ..genuine.clone() };
+        assert!(!redirected.verify(epoch), "the signature covers the forwarding fields, not just the tag");
+
+        // 4. A KEM-only bundle — `bundle_from_kem_public`'s zero signing prefix. Anyone holding the (public) KEM
+        //    key rebuilds that bundle byte for byte, so accepting one would authenticate nothing while looking
+        //    like it did. Hosting requires a signing identity; this is refused rather than trusted.
+        let mut kem_only = vec![0u8; HYBRID_VK_LEN];
+        kem_only.extend_from_slice(&[0x42; 32]);
+        let unsigned = HostRegister {
+            service_tag: service_tag(&kem_only, epoch),
+            identity: kem_only,
+            sig: Vec::new(),
+            ..genuine.clone()
+        };
+        assert!(!unsigned.verify(epoch), "a KEM-only identity cannot authenticate a registration, so it is refused");
+    }
+
+    #[test]
+    fn an_onion_registration_names_its_forward_route_and_the_combiner_seals_to_it() {
         use fanos_field::F2;
         use fanos_geometry::Line;
         use fanos_pqcrypto::{HybridKemSecret, SeedRng};
@@ -520,34 +682,33 @@ mod tests {
         let (reply_keys, reply_pub) =
             fanos_aphantos::nostos::ReplyKeys::generate(b"svc-forward-reply");
 
-        let reg = HostRegister::onion::<F2>(
-            [0x5B; 32],
-            reply_pub.encode(),
-            vec![drop_line],
-            &dir,
-            2,
-        )
+        let (bundle, signer) = identity(b"onion-service");
+        let reg = HostRegister::onion(&bundle, &signer, Epoch::new(3), reply_pub.encode(), vec![drop_line], 2)
         .expect("all forward-line members are in the directory");
-        // It carried exactly the 3 members of the dead-drop line, and the directory rebuilds to them.
-        assert_eq!(reg.forward_keys.len(), 3);
-        assert_eq!(reg.forward_directory().len(), 3);
+        // It names the dead-drop line and the threshold, and carries NO member keys: those are the combiner's
+        // to resolve. Carrying them made the registration grow as `q + 1` per hop, so it did not fit the
+        // fixed-width onion packet on any plane past Fano — a limit measured, not assumed (~39 KB at q = 31
+        // against a 7041-byte body).
+        assert_eq!(reg.forward_circuit, vec![drop_line]);
         assert_eq!(reg.threshold, 2);
 
         // The combiner seals a client request to the service's dead-drop; it launches at the drop line's
         // combiner, and only the service (with reply_keys) opens the end-to-end body once peeled.
         let fwd = reg
-            .seal_forward_to_host::<F2>(b"the-wrapped-client-request", b"e2e-seed", b"onion-seed")
+            .seal_forward_to_host::<F2>(&dir, b"the-wrapped-client-request", b"e2e-seed", b"onion-seed")
             .expect("a primary registration seals a forward onion");
         assert_eq!(fwd.combiner, combiner_for::<F2>(drop_line).unwrap());
         // The bare-host fallback has no forward circuit, so it seals nothing (the combiner Sends direct).
         assert!(
-            HostRegister::bare([9; 32], [1, 1, 1])
-                .seal_forward_to_host::<F2>(b"x", b"e", b"o")
+            HostRegister::bare(&bundle, &signer, Epoch::new(3), [1, 1, 1])
+                .seal_forward_to_host::<F2>(&dir, b"x", b"e", b"o")
                 .is_none()
         );
         // A drop route whose line members are absent from the directory can't self-provision.
         let empty = MixDirectory::new();
-        assert!(HostRegister::onion::<F2>([1; 32], vec![], vec![drop_line], &empty, 2).is_none());
+        // An empty forward circuit is the bare-host shape, which `onion` refuses by construction.
+        assert!(HostRegister::onion(&bundle, &signer, Epoch::new(3), vec![], vec![], 2).is_none());
+        let _ = &empty;
         let _ = &reply_keys; // reply_keys' secret half stays with the service; only the public traveled
     }
 

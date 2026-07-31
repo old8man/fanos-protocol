@@ -31,12 +31,13 @@ use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_geometry::{Point, Triple};
+use fanos_pqcrypto::HybridSigSecret;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_quic::Client;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, Epoch, HostRegister, MixDirectory, RendezvousService, SessionId,
-    meeting_line, seal_host_register, service_tag,
+    meeting_line, seal_host_register,
 };
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced};
@@ -279,6 +280,22 @@ where
 pub struct HostedService {
     /// The service's static keypair — its anonymous identity, and what a client addresses it by.
     pub service: StaticKeypair,
+    /// The service's **canonical published identity bundle** (`Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768`) — what
+    /// a `.fanos` resolution yields, and the preimage of [`service_tag`].
+    ///
+    /// **Its KEM half must be `service`'s public key**, and [`spawn_rendezvous_host`] refuses to run otherwise.
+    /// The two are used for different things by the client — the KEM key LOCATES the service (it derives the
+    /// meeting line) while the bundle AUTHORISES its route binding (it derives the tag) — so a bundle that named
+    /// a different key would send clients to compute a tag for a service that lives somewhere else, and every
+    /// dial would silently miss.
+    pub identity: Vec<u8>,
+    /// The signing secret whose public half is `identity`'s signing prefix: it signs each epoch's registration.
+    ///
+    /// Hosting **requires** a signing identity, and that is forced rather than chosen. The combiner authenticates
+    /// a registration by recomputing the tag from the presented bundle and verifying a signature under it; a
+    /// KEM-only bundle (`bundle_from_kem_public`, zero signing prefix) is reconstructible by anyone holding the
+    /// public KEM key, so accepting one would authenticate nothing while appearing to.
+    pub signer: HybridSigSecret,
     /// Seeds the dead-drop line selection and each epoch's reply key. Deterministic, so a restart re-derives both.
     pub host_secret: Vec<u8>,
     /// The rendezvous registration threshold: how many of the meeting line's points must hold a share.
@@ -321,8 +338,19 @@ where
     H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let HostedService { service, host_secret, threshold, vrf_coordinates } = hosted;
+    let HostedService { service, identity, signer, host_secret, threshold, vrf_coordinates } = hosted;
     let service_public = service.public().clone();
+    // **The bundle must name this very service.** A client makes two derivations from a service's identity and
+    // they read different parts of it: the KEM half locates the service (the meeting line, and the handshake
+    // encapsulates to it) while the whole bundle authorises its route binding. A bundle carrying someone else's
+    // KEM key would send every client to compute a tag for a service that lives at another meeting line, and
+    // every dial would miss — silently, since a tag that matches no registration simply falls through to local
+    // delivery. Refusing to start says so once, loudly, instead.
+    if fanos_diaulos::service_public_from_bundle(&identity).map(|k| k.encode()) != Some(service_public.encode()) {
+        return tokio::spawn(async move {
+            tracing::error!("hidden service refused to start: the identity bundle's KEM key is not this service's");
+        });
+    }
     let (epoch_tx, epoch_rx) = unbounded_channel::<HostEpoch>();
     // The accept loop opens forwarded dead-drops (its key ring fed per epoch) and hands each session to the
     // handler; it starts with an empty ring + directory, filled by the first rotation below.
@@ -336,22 +364,17 @@ where
         Some(epoch_rx),
         handler,
     );
+    let ctx = HostContext { service_public, host_secret, threshold, vrf_coordinates, identity, signer };
     tokio::spawn(async move {
         let mut events = client.subscribe();
         let (mut epoch, mut seed) = initial;
-        rotate_host(
-            &client, coord, &service_public, &host_secret, threshold, vrf_coordinates, epoch, seed, &epoch_tx,
-        )
-        .await;
+        rotate_host(&client, coord, &ctx, epoch, seed, &epoch_tx).await;
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch: reached, seed: s }) if reached > epoch => {
                     epoch = reached;
                     seed = s;
-                    rotate_host(
-                        &client, coord, &service_public, &host_secret, threshold, vrf_coordinates, epoch, seed, &epoch_tx,
-                    )
-                    .await;
+                    rotate_host(&client, coord, &ctx, epoch, seed, &epoch_tx).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -379,23 +402,36 @@ where
     })
 }
 
+/// Everything about the hosted service that every epoch's rotation needs, gathered once.
+///
+/// It exists because threading these individually had already reached nine parameters with a
+/// `too_many_arguments` suppression, and the registration binding adds two more. A suppressed lint is a place a
+/// reviewer stops reading, which is the wrong thing to have on the function that decides where a hidden service's
+/// traffic goes.
+struct HostContext {
+    service_public: HybridKemPublic,
+    host_secret: Vec<u8>,
+    threshold: u8,
+    /// See [`HostedService::vrf_coordinates`] — whether a mix-key record must prove the slot it sits at.
+    vrf_coordinates: bool,
+    identity: Vec<u8>,
+    signer: HybridSigSecret,
+}
+
 /// One epoch's host rotation: rebuild the directory, register the anonymous forward route at the current
 /// meeting combiner, and push the fresh `(reply key, directory)` to the accept loop. A silent no-op if the
 /// directory is not yet resolvable or a member key is missing — the next epoch (or the client's retransmits)
 /// retries.
-#[allow(clippy::too_many_arguments)]
 async fn rotate_host(
     client: &Client,
     coord: Triple,
-    service_public: &HybridKemPublic,
-    host_secret: &[u8],
-    threshold: u8,
-    // See `HostedService::vrf_coordinates` — whether a mix-key record must prove the slot it sits at.
-    vrf_coordinates: bool,
+    ctx: &HostContext,
     epoch: Epoch,
     seed: [u8; 32],
     epoch_tx: &UnboundedSender<HostEpoch>,
 ) {
+    let HostContext { service_public, host_secret, threshold, vrf_coordinates, identity, signer } = ctx;
+    let (threshold, vrf_coordinates) = (*threshold, *vrf_coordinates);
     // The same beacon this host derives its dead-drop line from, one line down.
     let beacon = BeaconSeed::new(seed);
     // The mix directory's binding mode is the cell's, so it is read from the client rather than configured here: a record
@@ -411,9 +447,8 @@ async fn rotate_host(
     // A fresh per-epoch dead-drop reply keypair (deterministic in secret+epoch), advertised in the
     // registration and handed to the accept loop to open forwarded requests.
     let (reply_keys, reply_pub) = ReplyKeys::generate(&epoch_seed(host_secret, epoch, b"reply"));
-    let tag = service_tag(&service_public.encode(), epoch);
     let Some(reg) =
-        HostRegister::onion::<F2>(tag, reply_pub.encode(), vec![drop_line], &dir, threshold)
+        HostRegister::onion(identity, signer, epoch, reply_pub.encode(), vec![drop_line], threshold)
     else {
         return;
     };

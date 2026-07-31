@@ -13,11 +13,11 @@
 //! wires it to a real [`Client`].
 
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
+use fanos_diaulos::service_public_from_bundle;
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
 use fanos_geometry::{Line, Plane, Point};
 use fanos_onoma::Epoch;
-use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_line,
@@ -258,11 +258,16 @@ fn draw_line<F: Field, R: Rng>(rng: &mut R, ok: impl Fn(Coord) -> bool) -> Optio
 #[must_use]
 pub fn anonymous_dial<R: CryptoRng>(
     client: Client,
-    service_public: &HybridKemPublic,
+    identity: &[u8],
     route: &RendezvousRoute,
     secret: &[u8],
     rng: &mut R,
-) -> DuplexStream {
+) -> Option<DuplexStream> {
+    // Both derivations come from the one identity, so they cannot disagree: the KEM half LOCATES the service
+    // (the meeting line, and the handshake encapsulates to it) while the whole bundle AUTHORISES its route
+    // binding (`service_tag`, which the combiner recomputes from the registration's carried identity).
+    // `None` is the single place a malformed bundle is rejected, so no caller re-derives and none can disagree.
+    let service_public = &service_public_from_bundle(identity)?;
     let meeting = meeting_line::<F2>(&service_public.encode(), route.epoch, &route.beacon).coords();
     let mut forward_circuit = route.forward_hops.clone();
     forward_circuit.push(meeting);
@@ -285,7 +290,7 @@ pub fn anonymous_dial<R: CryptoRng>(
     // The service host-registration tag: if the service is hosted off its meeting combiner (the general
     // case), the node at the combiner routes this request to the host registered under this tag
     // (§3b). A service that is its own combiner ignores it (the delivery surfaces locally there).
-    let tag = service_tag(&service_public.encode(), route.epoch);
+    let tag = service_tag(identity, route.epoch);
     let rclient = RendezvousClient::<F2>::new(
         forward_circuit,
         reply_circuit,
@@ -296,7 +301,7 @@ pub fn anonymous_dial<R: CryptoRng>(
         tag,
     );
     let session = ClientSession::dial(meeting, service_public, rng);
-    dial_anonymous(client, session, rclient, reply_keys)
+    Some(dial_anonymous(client, session, rclient, reply_keys))
 }
 
 #[cfg(test)]
@@ -464,7 +469,7 @@ mod tests {
             .unwrap();
         let (_other, other_pub) = session_reply_keypair(b"a-different-session");
         let foreign = seal_to_receiver(
-            &HybridKemPublic::decode(&other_pub).unwrap(),
+            &fanos_pqcrypto::kem::HybridKemPublic::decode(&other_pub).unwrap(),
             b"not for this session",
             b"foreign-seed",
         )
@@ -477,7 +482,7 @@ mod tests {
             .unwrap();
         // The real reply: a dead-drop body end-to-end-sealed to this session's advertised reply key.
         let body = seal_to_receiver(
-            &HybridKemPublic::decode(&reply_pub).unwrap(),
+            &fanos_pqcrypto::kem::HybridKemPublic::decode(&reply_pub).unwrap(),
             b"reply",
             b"reply-seed",
         )

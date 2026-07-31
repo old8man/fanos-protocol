@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 use std::sync::Arc;
 
-use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
+use fanos_diaulos::{StaticKeypair, bundle_from_identity, bundle_from_kem_public};
 use fanos_field::F2;
 use fanos_onoma::Address;
 use fanos_pqcrypto::kem::HybridKemPublic;
@@ -568,6 +568,24 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
 /// combiner — learns this node's coordinate. `--host-key <file>` is the service's secret seed, its **stable
 /// `.fanos` identity** (keep it secret; generate one with `head -c 32 /dev/urandom > svc.key`). The dial
 /// side is `fanos proxy --profile anonymous` with a matching `--epoch`/`--beacon`/`--threshold`.
+/// Derive a hidden service's full published identity from its secret seed.
+///
+/// Both halves come from the one seed so a restart re-derives the same `.fanos` address, and they are
+/// domain-separated so the KEM and signing keys are independent draws rather than two views of one.
+///
+/// Hosting **needs** the signing half, which is why this exists beside `bundle_from_kem_public` rather than
+/// replacing a call to it: a combiner authenticates a route registration by recomputing the service tag from the
+/// presented bundle and verifying a signature under its signing prefix, and a KEM-only bundle's prefix is zero —
+/// reconstructible by anyone holding the (public) KEM key, so it would authenticate nothing while appearing to.
+fn hidden_service_identity(host_secret: &[u8]) -> (StaticKeypair, HybridSigSecret, Vec<u8>) {
+    let service = StaticKeypair::generate(&mut SeedRng::from_seed(host_secret));
+    let mut sign_seed = host_secret.to_vec();
+    sign_seed.extend_from_slice(b"/fanos-host-sign");
+    let (signer, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(&sign_seed));
+    let bundle = bundle_from_identity(&verifier, service.public());
+    (service, signer, bundle)
+}
+
 async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let forward: SocketAddr = flag(args, "--forward")
@@ -604,8 +622,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     };
 
     // Derive the service identity + its `.fanos` address from the secret seed.
-    let service = StaticKeypair::generate(&mut SeedRng::from_seed(&host_secret));
-    let bundle = bundle_from_kem_public(service.public());
+    let (service, signer, bundle) = hidden_service_identity(&host_secret);
     let address = Address::from_bundle(&bundle);
 
     let config = node_config_from_args(args)?;
@@ -636,7 +653,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         node.client(),
         node.address(),
         // A `Node` always runs VRF coordinates, so each mix-key record must prove the slot it sits at (S1-M3).
-        HostedService { service, host_secret, threshold, vrf_coordinates: true },
+        HostedService { service, identity: bundle.clone(), signer, host_secret, threshold, vrf_coordinates: true },
         (epoch, *beacon.as_bytes()),
         handler,
     );
@@ -799,7 +816,13 @@ async fn build_proxy_dialer(
     };
     // With an exit configured, clearnet (non-`.fanos`) targets ride it; without one they are refused.
     Ok(match exit {
-        Some((coord, public)) => base.with_exit(coord, public),
+        // The exit directory publishes a KEM key, not a full identity bundle, so it is wrapped as a KEM-only one.
+        // That is correct **for an exit** and would not be for a hidden service: an exit is located by coordinate
+        // and answers at its own meeting combiner, so no `HostRegister` binds it and the tag a dial computes
+        // matches nothing — the delivery then surfaces locally at the combiner, which is exactly the
+        // service-is-its-own-combiner path. An exit hosted OFF its combiner would need a real bundle, and giving
+        // the exit directory one is the follow-up rather than a silent gap.
+        Some((coord, public)) => base.with_exit(coord, bundle_from_kem_public(&public)),
         None => base,
     })
 }
@@ -1499,8 +1522,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
     };
     let threshold = mix_threshold_arg(rest)?;
 
-    let service = StaticKeypair::generate(&mut SeedRng::from_seed(&host_secret));
-    let bundle = bundle_from_kem_public(service.public());
+    let (service, signer, bundle) = hidden_service_identity(&host_secret);
     let address = Address::from_bundle(&bundle);
     // The messenger's own long-term KEM identity, derived from the same seed under its own label so the
     // transport identity and the end-to-end identity are not the same key doing two jobs.
@@ -1525,7 +1547,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
     let _driver = spawn_rendezvous_host(
         node.client(),
         node.address(),
-        HostedService { service, host_secret, threshold, vrf_coordinates: true },
+        HostedService { service, identity: bundle.clone(), signer, host_secret, threshold, vrf_coordinates: true },
         (epoch, *beacon.as_bytes()),
         handler,
     );

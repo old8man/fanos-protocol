@@ -43,6 +43,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Send { .. } => "Send",
         Command::Emit { .. } => "Emit",
         Command::Diagnose => "Diagnose",
+        Command::Control { .. } => "Control",
         Command::Observe => "Observe",
         Command::Put { .. } => "Put",
         Command::Get { .. } => "Get",
