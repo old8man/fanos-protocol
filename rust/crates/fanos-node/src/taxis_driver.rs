@@ -103,6 +103,64 @@ fn next_round_timeout(current: Duration, progressed: bool) -> Duration {
     }
 }
 
+/// The round timeout this host's **measured** round latency justifies, or [`ROUND_TIMEOUT_BASE`] before the first
+/// sample.
+///
+/// `ROUND_TIMEOUT_BASE` was a chosen number whose own documentation justified it only as "comfortably longer than
+/// a tick", and `ROUND_TIMEOUT_MAX` was bare. Together they cost a *240 s* stall: nine doublings before an
+/// integration harness gave up, on a cell whose healthy heights finalize in well under a second.
+///
+/// So it is derived instead, and by the standard estimator rather than a new heuristic — a round timeout and a
+/// retransmission timeout answer the identical question, "how long before I conclude the other side is not going
+/// to answer?", and RFC 6298 answers it from measurement:
+///
+/// ```text
+/// SRTT   <- (7*SRTT + R) / 8
+/// RTTVAR <- (3*RTTVAR + |SRTT - R|) / 4
+/// RTO     = SRTT + 4*RTTVAR
+/// ```
+///
+/// The `4*RTTVAR` term is the whole point and is not a safety fudge: `k` deviations leave at most `1/k²` of the
+/// mass beyond them (Chebyshev), so premature timeouts stay rare **without assuming a latency distribution** —
+/// which matters here precisely because round latency under load has no distribution anyone has characterised.
+///
+/// Integer arithmetic, deliberately. RFC 6298 picks `1/8` and `1/4` *because they are shifts*; writing this in
+/// floats would keep the constants and discard the reason they are those constants. It also matters beyond
+/// taste — the output feeds a timer whose next value is computed from itself, and rounding drift in a
+/// self-referential EWMA is a slow bias with no bound anyone has derived.
+///
+/// The **ceiling stays a constant** even though the operating point is now adaptive, because two other things
+/// derive from it and both want the *longest legitimate quiet period*, not the typical one: `FROZEN_SPAN` in the
+/// integration harness (`2 × ROUND_TIMEOUT_MAX`) and [`fanos_taxis::da::RESAMPLE_MAX_INTERVAL`]
+/// (`ROUND_TIMEOUT_MAX / TICK_PERIOD`, machine-checked by `the_resample_cap_is_one_round_timeout_in_ticks`).
+#[must_use]
+fn estimated_round_timeout(rtt: Option<(Duration, Duration)>) -> Duration {
+    match rtt {
+        None => ROUND_TIMEOUT_BASE,
+        Some((srtt, var)) => (srtt + var * 4).clamp(TICK_PERIOD, ROUND_TIMEOUT_MAX),
+    }
+}
+
+/// Fold one **admissible** round-latency sample into the smoothed estimate — see [`estimated_round_timeout`].
+///
+/// Which samples are admissible is **Karn's algorithm**, and it is load-bearing rather than a refinement. The
+/// driver can time a *height*, not a round: it holds the finalize edge, but the engine resets `round` on
+/// finalization before the driver looks, so a height that needed three rounds is indistinguishable from one that
+/// needed one. Folding those in would inflate the estimate exactly when the cell is struggling — the opposite of
+/// what it is for. TCP has the identical ambiguity for retransmitted segments and resolves it the same way: do
+/// not sample them, and let backoff cover them. The caller therefore passes only heights during which the round
+/// timeout never fired.
+#[must_use]
+fn fold_round_latency(rtt: Option<(Duration, Duration)>, r: Duration) -> (Duration, Duration) {
+    match rtt {
+        // RFC 6298 §2.2, the first measurement.
+        None => (r, r / 2),
+        Some((srtt, var)) => {
+            ((srtt * 7 + r) / 8, (var * 3 + srtt.abs_diff(r)) / 4)
+        }
+    }
+}
+
 /// A callback that turns a detected equivocation into a submittable **sealed slash transaction** — injected by
 /// the node, which knows the concrete DROMOS state machine and holds the public keyper registry needed to seal.
 /// The generic engine driver stays state-machine-agnostic; this closure carries the one DROMOS-specific step, so
@@ -353,6 +411,12 @@ where
         let mut round_timeout = ROUND_TIMEOUT_BASE;
         let mut timeout_deadline = start + round_timeout;
         let mut last_height = engine.chain().next_height();
+        // The adaptive estimate and the two things Karn's rule needs to decide whether a height is samplable:
+        // when it began, and whether its round timeout ever fired. `None` until the first admissible sample, so
+        // behaviour before one is byte-identical to the fixed base.
+        let mut rtt: Option<(Duration, Duration)> = None;
+        let mut height_started = start;
+        let mut timed_out_this_height = false;
         // The height of the last execution checkpoint we surfaced, so each is emitted exactly once.
         let mut last_ckpt: Option<u64> = None;
         // Tx-gossip dedup: a bounded set of transaction commitments this node has already ingested + gossiped,
@@ -411,6 +475,12 @@ where
                     // against 2 of 3 for this line as it stands. A round retried at base cadence preempts a round
                     // that would have completed, which is the livelock the backoff prevents, and no amount of "but
                     // the proposal differs" reasoning avoids it.
+                    //
+                    // It also makes this height inadmissible as a latency sample (Karn — see
+                    // `fold_round_latency`): a height that needed more than one round says nothing about how long
+                    // a *successful* round takes, and folding it in would raise the estimate precisely when the
+                    // cell is already struggling.
+                    timed_out_this_height = true;
                     round_timeout = next_round_timeout(round_timeout, false);
                     timeout_deadline = Instant::now() + round_timeout;
                 }
@@ -488,8 +558,14 @@ where
             let height = engine.chain().next_height();
             if height != last_height {
                 last_height = height;
-                round_timeout = ROUND_TIMEOUT_BASE;
-                timeout_deadline = Instant::now() + round_timeout;
+                let now = Instant::now();
+                if !timed_out_this_height {
+                    rtt = Some(fold_round_latency(rtt, now - height_started));
+                }
+                timed_out_this_height = false;
+                height_started = now;
+                round_timeout = estimated_round_timeout(rtt);
+                timeout_deadline = now + round_timeout;
             }
         }
     });
@@ -814,6 +890,77 @@ pub fn spawn_checkpoint_publisher<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_estimator_follows_the_measured_latency_instead_of_the_chosen_base() {
+        // The whole point: on a host whose rounds take 200 ms the timeout must land near 200 ms, not at the 1.5 s
+        // someone once typed. Before any sample it *is* the base — genesis behaviour is unchanged.
+        assert_eq!(estimated_round_timeout(None), ROUND_TIMEOUT_BASE, "no measurement yet ⇒ the documented base");
+
+        let fast = Duration::from_millis(200);
+        let mut rtt = None;
+        for _ in 0..40 {
+            rtt = Some(fold_round_latency(rtt, fast));
+        }
+        let settled = estimated_round_timeout(rtt);
+        assert!(
+            settled < ROUND_TIMEOUT_BASE,
+            "a cell finalizing in {fast:?} must not keep waiting {ROUND_TIMEOUT_BASE:?} — settled at {settled:?}"
+        );
+        assert!(settled >= fast, "…and never below the latency it measured: {settled:?} < {fast:?}");
+
+        // It tracks a step change rather than staying where it started.
+        let slow = Duration::from_secs(3);
+        for _ in 0..40 {
+            rtt = Some(fold_round_latency(rtt, slow));
+        }
+        assert!(
+            estimated_round_timeout(rtt) > settled * 4,
+            "the estimate must follow latency upward, not stay at {settled:?}"
+        );
+    }
+
+    #[test]
+    fn the_deviation_term_is_what_absorbs_jitter() {
+        // `SRTT + 4*RTTVAR`, not `SRTT`. Two hosts with the SAME mean and different jitter must get different
+        // timeouts, or the estimator is just an average and a jittery host times out on half its good rounds.
+        // Falsifying the `4*RTTVAR` term collapses these two to equal, which is exactly what this asserts against.
+        let mean = Duration::from_millis(400);
+        let (mut steady, mut jittery) = (None, None);
+        for i in 0..40 {
+            steady = Some(fold_round_latency(steady, mean));
+            // Same mean, alternating ±300 ms. `saturating_sub` rather than `-`: the swing is smaller than the
+            // mean by construction, and a checked form would put an unwrap in a test that is about arithmetic.
+            let jitter = Duration::from_millis(300);
+            let swing = if i % 2 == 0 { mean + jitter } else { mean.saturating_sub(jitter) };
+            jittery = Some(fold_round_latency(jittery, swing));
+        }
+        assert!(
+            estimated_round_timeout(jittery) > estimated_round_timeout(steady),
+            "a jittery host must be given more headroom than a steady one at the same mean: {:?} vs {:?}",
+            estimated_round_timeout(jittery),
+            estimated_round_timeout(steady)
+        );
+    }
+
+    #[test]
+    fn the_estimate_stays_inside_the_bounds_the_rest_of_the_system_derives_from() {
+        // Below a tick the driver would time out rounds it has not even ticked; above the ceiling it would break
+        // two constants derived FROM that ceiling (`FROZEN_SPAN`, `RESAMPLE_MAX_INTERVAL`).
+        let tiny = Duration::from_micros(1);
+        let mut rtt = None;
+        for _ in 0..40 {
+            rtt = Some(fold_round_latency(rtt, tiny));
+        }
+        assert_eq!(estimated_round_timeout(rtt), TICK_PERIOD, "clamped up to one tick");
+
+        let huge = ROUND_TIMEOUT_MAX * 10;
+        let mut rtt = None;
+        for _ in 0..40 {
+            rtt = Some(fold_round_latency(rtt, huge));
+        }
+        assert_eq!(estimated_round_timeout(rtt), ROUND_TIMEOUT_MAX, "clamped down to the ceiling");
+    }
 
     #[test]
     fn the_resample_cap_is_one_round_timeout_in_ticks() {
