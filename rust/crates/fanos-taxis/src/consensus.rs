@@ -1272,6 +1272,35 @@ impl<S: StateMachine> ConsensusEngine<S> {
         }
     }
 
+    /// Every block whose body can still be decided at this height — the sampler's *relevance* criterion.
+    ///
+    /// This replaces sizing a cap, and the distinction matters. `da::PENDING_CAP` bounds a map keyed by a
+    /// remote-chosen hash, so it is a flood defence and cannot also be a capacity plan: one height legitimately
+    /// produces `n` skeletons per round times however many rounds it takes, and rounds are bounded by nothing —
+    /// least of all now that the round timeout is measured rather than typed. There is no correct number.
+    ///
+    /// Relevance *is* bounded. At this height only these can still be decided:
+    /// * the body we are blocked on ([`awaited_body`](Self::awaited_body)) — a parked decision, or our own lock;
+    /// * the block we are locked on, which we may re-offer;
+    /// * a polka we merely observed (`valid_value`), which an unlocked proposer may re-offer.
+    ///
+    /// A proposal from a round the cell has passed matters only if someone is locked on it, and that is the first
+    /// case; anything below this height is already dropped by `Sampler::prune_below`. So this is `O(1)` regardless
+    /// of round count — a derived bound where a chosen one stood.
+    #[must_use]
+    pub fn relevant_bodies(&self) -> Vec<[u8; 32]> {
+        let mut out = Vec::with_capacity(3);
+        for h in [self.awaited_body(), self.locked_block, self.valid_value.as_ref().map(|(h, _)| *h)]
+            .into_iter()
+            .flatten()
+        {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
     /// Ask one COMMIT-certificate voter for the body of a decision we hold and cannot apply.
     ///
     /// The last rung of the catch-up ladder. `finalize` parks a certified decision when the body is absent, on the

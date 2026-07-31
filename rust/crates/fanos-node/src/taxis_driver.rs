@@ -460,7 +460,7 @@ where
                     // Protect the awaited skeleton from the sampler's insertion-order eviction before anything else
                     // touches it: under SSLE all-propose the cell produces one skeleton per validator per round, and
                     // the block being awaited is by definition an old one. See `Sampler::pin`.
-                    da.pin(engine.awaited_body());
+                    da.retain_relevant(engine.relevant_bodies());
                     // Abandoned sampling is finished work: a skeleton for a height already decided can never be
                     // completed or needed, and it competes for a capped map with the block we are stuck on.
                     da.prune_below(engine.height());

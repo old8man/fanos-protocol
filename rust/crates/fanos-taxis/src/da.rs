@@ -72,15 +72,15 @@ pub struct Sampler {
     held: BoundedMap<[u8; 32], Vec<u8>>,
     /// Skeletons whose payload is still being sampled, keyed by block hash.
     pending: BoundedMap<[u8; 32], Pending>,
-    /// The one skeleton eviction must not take — see [`pin`](Sampler::pin).
-    pinned: Option<[u8; 32]>,
+    /// What eviction must not take — see [`retain_relevant`](Sampler::retain_relevant).
+    relevant: Vec<[u8; 32]>,
 }
 
 impl Sampler {
     /// A sampler for the validator at index `me`.
     #[must_use]
     pub fn new(me: u8) -> Self {
-        Self { me, held: BoundedMap::new(HELD_CAP), pending: BoundedMap::new(PENDING_CAP), pinned: None }
+        Self { me, held: BoundedMap::new(HELD_CAP), pending: BoundedMap::new(PENDING_CAP), relevant: Vec::new() }
     }
 
     /// Retain the shard dispersed to this validator for `block`, so peers can sample it from here.
@@ -105,34 +105,38 @@ impl Sampler {
         {
             *slot = Some(mine.clone());
         }
-        if let Some((evicted, victim)) = self.pending.insert(hash, Pending { skeleton, shards, wait: 0, interval: 1 })
-            && self.pinned == Some(evicted)
-        {
-            // Evicting the one block this validator is stuck on would strand it: it leaves `outstanding`, so no shard
-            // is ever requested for it again. Put it back — the re-insert takes the next-oldest instead, which is by
-            // construction a skeleton nobody is waiting for. See [`pin`](Self::pin).
-            self.pending.insert(evicted, victim);
+        // Make room BEFORE inserting, by taking the oldest entry that can no longer be decided — never by inserting
+        // and repairing afterwards. That older shape works for exactly one protected entry and fails silently for a
+        // set (see `BoundedMap::remove_oldest_where`), which is why the single pin it replaces was a workaround
+        // rather than a rule.
+        if self.pending.len() >= PENDING_CAP {
+            // Everything present is still relevant: refuse the skeleton rather than displace something that can
+            // still be decided. The honest outcome — the map is at its flood bound with nothing disposable, and the
+            // caller re-offers on the next sweep.
+            if self.pending.remove_oldest_where(|h| !self.relevant.contains(h)).is_none() {
+                return false;
+            }
         }
+        self.pending.insert(hash, Pending { skeleton, shards, wait: 0, interval: 1 });
         true
     }
 
-    /// Protect one skeleton from eviction: the block this validator is **stuck waiting for**, or `None`.
+    /// What eviction must not take: every block whose body can still be decided at this height.
     ///
-    /// [`PENDING_CAP`] bounds this map because its key is a remote-chosen block hash, and eviction is by insertion
-    /// order — which is exactly wrong for the block that matters. Under SSLE every line member proposes, so a height
-    /// costs one skeleton per validator per round; a seven-validator cell overruns a 64-entry map in nine rounds, and
-    /// the **first** entry discarded is the earliest — typically round 0's min-ticket winner, the block the cell
-    /// actually converged on. Later proposals that will never be chosen push out the one that was.
+    /// **A relevance rule, not a one-entry exemption**, and the difference is the whole finding. This began as `pin`,
+    /// a single protected hash, added because [`PENDING_CAP`] evicts in insertion order and the first entry discarded
+    /// is the earliest — typically round 0's min-ticket winner, the block the cell converged on. Measured live as
+    /// every validator reporting `await` at round 13 for a body none of them held.
     ///
-    /// The effect is not a slow recovery but a loop: once evicted the block leaves [`outstanding`](Self::outstanding),
-    /// so no shard is requested for it; the driver notices the validator is still waiting and re-fetches the skeleton;
-    /// the next round's proposals evict it again. Measured live as every validator in a cell reporting `await` at round
-    /// 13 for a body none of them held.
+    /// That the pin *worked* was the tell: if the one block the engine has already committed to needing must be
+    /// exempted from the cap, the cap cannot be trusted to keep what matters. A larger cap is no answer either —
+    /// one height produces `n` skeletons per round times however many rounds it takes, and rounds are bounded by
+    /// nothing. There is no correct number, which is why the old one read as arbitrary.
     ///
-    /// Pinning is sound because the pinned entry is the one the engine has *already committed to needing*
-    /// (`ConsensusEngine::awaited_body`), and it is a single entry: the flood defence the cap exists for is untouched.
-    pub fn pin(&mut self, block: Option<[u8; 32]>) {
-        self.pinned = block;
+    /// So the cap goes back to being purely the flood defence its own doc claims (its key is remote-chosen), and
+    /// `ConsensusEngine::relevant_bodies` decides what may be displaced. Capacity stops pretending to be a plan.
+    pub fn retain_relevant(&mut self, blocks: Vec<[u8; 32]>) {
+        self.relevant = blocks;
     }
 
     /// The shard indices still missing for `block`, i.e. what to request. Empty if nothing is pending for it.
@@ -252,9 +256,7 @@ impl Sampler {
     /// eviction that [`pin`](Self::pin) exists to prevent.
     pub fn forget(&mut self, block: &[u8; 32]) {
         self.pending.remove(block);
-        if self.pinned.as_ref() == Some(block) {
-            self.pinned = None;
-        }
+        self.relevant.retain(|h| h != block);
     }
 
     /// Drop every pending skeleton for a height **below** `height` — work that can never be needed again.
@@ -270,7 +272,7 @@ impl Sampler {
             .iter()
             .filter(|(hash, p)| {
                 // Never the entry this validator is blocked on, whatever its height — that is `pin`'s whole purpose.
-                p.skeleton.header.height < height && self.pinned.as_ref() != Some(*hash)
+                p.skeleton.header.height < height && !self.relevant.contains(*hash)
             })
             .map(|(hash, _)| *hash)
             .collect();
@@ -372,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_sampling_is_dropped_and_the_pinned_entry_never_is() {
+    fn abandoned_sampling_is_dropped_and_a_relevant_entry_never_is() {
         // Sampling a validator walked away from is not harmless: `pending` is capped and evicts by insertion order, so
         // entries for heights already decided compete for the space with the one block a stuck validator depends on.
         // Measured while chasing the live wedge: a validator at height 4 still holding a block from an earlier height,
@@ -390,9 +392,9 @@ mod tests {
 
         // And the pin outranks the height, because the whole point of `pin` is the entry a validator is blocked on.
         assert!(s.begin(old.skeleton()));
-        s.pin(Some(old_hash));
+        s.retain_relevant(vec![old_hash]);
         s.prune_below(9);
-        assert!(s.is_sampling(&old_hash), "a pinned entry survives pruning whatever its height");
+        assert!(s.is_sampling(&old_hash), "a relevant entry survives pruning whatever its height");
     }
 
     #[test]
@@ -518,7 +520,7 @@ mod tests {
         let hash = awaited.hash();
         let mut s = Sampler::new(0);
         assert!(s.begin(awaited.skeleton()));
-        s.pin(Some(hash));
+        s.retain_relevant(vec![hash]);
 
         // Two full caps' worth of later proposals — far past the point where insertion order would have discarded it.
         for n in 0..(PENDING_CAP * 2) {
@@ -536,14 +538,45 @@ mod tests {
         assert_eq!(s.proposer_of(&hash), Some(awaited.header.proposer), "and its proposer stays addressable");
     }
 
+    /// The test that failed the first attempt at this, and the reason the fix is a rule rather than a bigger
+    /// exemption: **several** blocks can matter at one height — the body awaited, the block locked on, a polka
+    /// observed — and a flood must displace none of them. The single-entry `pin` this replaces could protect exactly
+    /// one; with three, its insert-then-repair form evicted another that should have been kept, silently.
     #[test]
-    fn pinning_protects_exactly_one_entry_and_not_the_cap() {
+    fn a_flood_displaces_none_of_the_several_blocks_that_can_still_be_decided() {
+        let keep: Vec<Block> = (0..3)
+            .map(|i| {
+                let mut parent = [0xEE; 32];
+                parent[0] = i;
+                Block::assemble(parent, 1, fanos_primitives::Epoch::ZERO, 0, Vec::new())
+            })
+            .collect();
+        let mut s = Sampler::new(0);
+        for b in &keep {
+            assert!(s.begin(b.skeleton()));
+        }
+        s.retain_relevant(keep.iter().map(Block::hash).collect());
+
+        for n in 0..(PENDING_CAP * 2) {
+            let mut parent = [7u8; 32];
+            parent[0] = u8::try_from(n % 251).unwrap_or(0);
+            parent[1] = u8::try_from(n / 251).unwrap_or(0);
+            s.begin(Block::assemble(parent, 1, fanos_primitives::Epoch::ZERO, 0, Vec::new()).skeleton());
+        }
+        for (i, b) in keep.iter().enumerate() {
+            assert!(s.is_sampling(&b.hash()), "relevant block {i} was displaced by proposals nobody is waiting for");
+        }
+        assert!(s.in_flight() <= PENDING_CAP, "and the flood bound still holds");
+    }
+
+    #[test]
+    fn relevance_protects_what_can_still_be_decided_and_not_the_cap() {
         // The pin must not become an unbounded exemption: the cap exists against a remote-chosen key, and one protected
         // entry is the whole concession. Everything else still evicts normally.
         let mut s = Sampler::new(0);
-        let pinned = Block::assemble([9u8; 32], 1, fanos_primitives::Epoch::ZERO, 0, Vec::new());
-        assert!(s.begin(pinned.skeleton()));
-        s.pin(Some(pinned.hash()));
+        let kept = Block::assemble([9u8; 32], 1, fanos_primitives::Epoch::ZERO, 0, Vec::new());
+        assert!(s.begin(kept.skeleton()));
+        s.retain_relevant(vec![kept.hash()]);
         let mut early = Vec::new();
         for n in 0..(PENDING_CAP * 2) {
             let mut parent = [9u8; 32];
@@ -555,8 +588,8 @@ mod tests {
                 early.push(b.hash());
             }
         }
-        assert!(s.is_sampling(&pinned.hash()), "the pinned entry survives");
-        assert!(early.iter().all(|h| !s.is_sampling(h)), "unpinned entries still evict — the cap still bounds memory");
-        assert!(s.in_flight() <= PENDING_CAP + 1, "the map never exceeds its cap by more than the pinned entry");
+        assert!(s.is_sampling(&kept.hash()), "the relevant entry survives");
+        assert!(early.iter().all(|h| !s.is_sampling(h)), "disposable entries still evict — the cap still bounds memory");
+        assert!(s.in_flight() <= PENDING_CAP, "the map never exceeds its cap at all now that room is made first");
     }
 }

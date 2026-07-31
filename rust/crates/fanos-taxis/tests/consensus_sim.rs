@@ -340,7 +340,7 @@ impl Cluster {
         for i in 0..N {
             let h = self.engines[i].height();
             if let Some(s) = self.samplers.get_mut(i) {
-                s.pin(self.engines[i].awaited_body());
+                s.retain_relevant(self.engines[i].relevant_bodies());
                 s.prune_below(h);
             }
         }
