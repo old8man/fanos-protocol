@@ -78,6 +78,24 @@ impl<K: Ord + Copy, V> BoundedMap<K, V> {
         self.map.get_mut(key)
     }
 
+    /// Remove the **oldest** entry whose key `disposable` accepts, returning it — or `None` if every entry is kept.
+    ///
+    /// The primitive a caller needs to make room by relevance rather than by age alone, and it lives here because
+    /// insertion order lives here: `order` is this type's private FIFO queue, and a caller choosing a victim from
+    /// `iter()` would be choosing in *key* order, which is arbitrary with respect to age.
+    ///
+    /// It exists because the alternative shape does not generalise. Protecting entries by inserting first and
+    /// repairing after — put the victim back if it should have been kept — works for exactly one protected entry,
+    /// since the re-insert then evicts the next-oldest, which is by construction not the protected one. With two it
+    /// can evict another entry that should have been kept, silently. Choosing the victim *before* displacing anything
+    /// is the only form that holds for a set.
+    pub fn remove_oldest_where(&mut self, mut disposable: impl FnMut(&K) -> bool) -> Option<(K, V)> {
+        let at = self.order.iter().position(&mut disposable)?;
+        let key = *self.order.get(at)?;
+        self.order.remove(at);
+        self.map.remove(&key).map(|v| (key, v))
+    }
+
     /// Remove `key`, returning its value if present. Its slot in the eviction order is dropped too, so `order`
     /// keeps tracking exactly the live key set (an eviction never surfaces a stale key that would skip a real
     /// one and break the bound). Removing an absent key is a no-op.
@@ -112,6 +130,44 @@ impl<K: Ord + Copy, V> BoundedMap<K, V> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selective_removal_takes_the_oldest_disposable_and_keeps_the_rest() {
+        // Age order among the disposable, and the kept set untouched however old it is — the two properties a caller
+        // needs to make room by relevance without abandoning the FIFO bound.
+        let mut m: BoundedMap<u32, u32> = BoundedMap::new(8);
+        for i in 0..6 {
+            m.insert(i, i * 10);
+        }
+        // Keep the two OLDEST; they must survive while younger entries are taken.
+        let keep = [0u32, 1];
+        for expected in [2u32, 3, 4] {
+            let (k, v) = m.remove_oldest_where(|k| !keep.contains(k)).expect("a disposable entry exists");
+            assert_eq!((k, v), (expected, expected * 10), "removal must take the oldest DISPOSABLE, not the oldest");
+        }
+        assert!(keep.iter().all(|k| m.contains_key(k)), "kept entries survive regardless of age");
+
+        // With only kept entries left it reports none rather than taking one anyway — the caller must learn that
+        // making room would cost something it said it needed.
+        m.remove_oldest_where(|k| !keep.contains(k)).expect("one disposable entry remains");
+        assert!(m.remove_oldest_where(|k| !keep.contains(k)).is_none(), "nothing disposable left");
+        assert_eq!(m.len(), keep.len(), "and the kept set is exactly what remains");
+    }
+
+    #[test]
+    fn selective_removal_keeps_the_eviction_order_honest() {
+        // The queue must lose the same key the map did: a stale key left in `order` would later be dequeued instead
+        // of a live one, skipping a real eviction and breaking the bound this type exists to enforce.
+        let mut m: BoundedMap<u32, u32> = BoundedMap::new(3);
+        for i in 0..3 {
+            m.insert(i, i);
+        }
+        m.remove_oldest_where(|k| *k == 0).expect("key 0 is disposable");
+        // Two live entries and room for one more, so this insert must evict NOTHING.
+        assert!(m.insert(9, 9).is_none(), "a removal freed a slot, so the next insert evicts nothing");
+        // The next one is at capacity again and must evict the true oldest survivor, which is 1.
+        assert_eq!(m.insert(10, 10).map(|(k, _)| k), Some(1), "FIFO resumes from the real oldest, not a stale key");
+    }
 
     #[test]
     fn a_flood_of_distinct_keys_stays_capped_evicting_oldest_first() {
