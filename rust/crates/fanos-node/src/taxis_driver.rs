@@ -262,6 +262,13 @@ pub struct DriverProbe {
     /// stalled with this near the cap may be losing skeletons to eviction, and one stalled with it in single digits
     /// provably is not. That distinction was argued rather than measured once already.
     pub sampling: usize,
+    /// The round timeout this driver is currently waiting out — the **measured** estimate, not the constant.
+    ///
+    /// Driver state, not engine state, which is why it is here: the engine has no clock. It is also the only way
+    /// to check that [`estimated_round_timeout`] is *wired* rather than merely correct — unit tests prove the
+    /// estimator follows its input, and only this says the driver is feeding it any. An estimate sitting exactly
+    /// at `ROUND_TIMEOUT_BASE` on a cell that has been finalizing for minutes means no sample was ever admitted.
+    pub round_timeout: Duration,
 }
 
 impl core::fmt::Display for DriverProbe {
@@ -273,6 +280,10 @@ impl core::fmt::Display for DriverProbe {
         if self.sampling > 0 {
             write!(f, " sampling={}/{}", self.sampling, fanos_taxis::da::PENDING_CAP)?;
         }
+        // Always, unlike the two above: zero is not its uninteresting value. Reading `rto=1.5s` on a cell that has
+        // been finalizing for minutes is the finding — it says the estimator was never fed — and a field that
+        // hides at its default cannot report that.
+        write!(f, " rto={:?}", self.round_timeout)?;
         Ok(())
     }
 }
@@ -497,6 +508,7 @@ where
                         consensus: engine.probe(),
                         lagged: lagged.load(Ordering::Relaxed),
                         sampling: da.in_flight(),
+                        round_timeout,
                     });
                 }
                 note = note_rx.recv() => match note {
