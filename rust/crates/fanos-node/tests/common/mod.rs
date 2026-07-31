@@ -249,24 +249,67 @@ where
 /// moved" on a completely idle host.
 static DELIVERED: AtomicU64 = AtomicU64::new(0);
 
+/// Wakeups of a task that does nothing but wake — the discriminator `DELIVERED` cannot supply.
+///
+/// "No bytes moved" has two readings that demand opposite responses: this session is wedged, or the runtime was
+/// never scheduled to work on it. [`DELIVERED`] separates them by asking whether any *other flow* ever moved a
+/// byte, and its own doc names the limit that leaves — a host that starves only after some traffic has flowed
+/// reads as a wedge. That limit was hit twice in one workspace run, on tests that pass alone in under two seconds.
+///
+/// This asks a question with no such gap: **was this runtime running at all while the window drained?** The task
+/// sleeps one [`POLL`] and increments, so its count rises only when the executor actually polls it. Timers alone
+/// are not enough — they keep firing on a contended host precisely when the workers cannot run, which is why
+/// charging by timer ticks under-stretched the window (measured: 48 s to 79 s at 4× oversubscription).
+///
+/// No threshold is chosen because the expectation is arithmetic: a window of `w` contains `w / POLL` wakeups if
+/// the executor was polling us. The ratio is reported either way, so a reader can second-guess the verdict.
+static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+
+/// Start the heartbeat once per test binary, and return its current count. Idempotent.
+fn heartbeat() -> u64 {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(POLL).await;
+                HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    });
+    HEARTBEAT.load(Ordering::Relaxed)
+}
+
 /// One read bounded by [`FROZEN_SPAN`] of granted time. Returns the byte count (0 at end of stream).
 async fn read_within_span<S>(stream: &mut S, into: &mut [u8], so_far: usize) -> usize
 where
     S: AsyncRead + Unpin,
 {
+    let beats_before = heartbeat();
+    let opened = Instant::now();
     let read = within_span(stream.read(into))
         .await
         .unwrap_or_else(|| {
             let moved = DELIVERED.load(Ordering::Relaxed);
+            let beats = HEARTBEAT.load(Ordering::Relaxed).saturating_sub(beats_before);
+            let elapsed = opened.elapsed();
+            let expected = (elapsed.as_secs_f64() / POLL.as_secs_f64()).max(1.0);
+            #[allow(clippy::cast_precision_loss)]
+            let ran = beats as f64 / expected;
+            let evidence = format!(
+                "the runtime was polled {beats} times in {elapsed:?} against {expected:.0} expected ({:.0}% of what \
+                 it should have been), and this process has delivered {moved} bytes on other flows",
+                ran * 100.0
+            );
             assert!(
-                moved > 0,
-                "INCONCLUSIVE — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes, and no flow in \
-                 this process has ever moved one: the host may simply not have scheduled the work, so this run says \
-                 nothing about the system. Re-run it alone; if it passes, the host was the variable."
+                moved > 0 && ran > 0.5,
+                "INCONCLUSIVE — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes. {evidence}. \
+                 Either nothing in this process ever moved a byte, or this runtime was not scheduled enough to \
+                 judge — so the run says nothing about the system. Re-run it alone; if it passes, the host was the \
+                 variable."
             );
             panic!(
-                "REFUTED — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes, though this process \
-                 has delivered {moved} bytes on other flows: the host can move data, so this session is wedged."
+                "REFUTED — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes. {evidence} — so \
+                 the runtime WAS running and this session still moved nothing: it is wedged."
             )
         })
         .expect("the stream is readable");
