@@ -19,6 +19,7 @@
 //! therefore *clears* the book when the epoch moves. Carrying claims across an epoch would let a peer's retired placement
 //! justify a displacement in the current one, which is the pre-settling attack the beacon exists to prevent.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -35,8 +36,20 @@ use fanos_vrf::{DisplacementWitness, VrfOutput, VrfProof, VrfPublic, claim_beats
 /// A claim is only useful for a point on *this* node's line, of which there are `q + 1`, but a witness may be any peer
 /// whose walk reaches a contested point earlier — so the useful set is not bounded by the line. This is bounded because
 /// the book grows from the network: every accepted `HELLO` adds an entry, and an unbounded map fed by connection attempts
-/// is a memory-exhaustion path even when every entry is authentic. The largest plane this code represents holds 993
-/// points, so this is comfortably past a full cell while staying a fixed cost.
+/// is a memory-exhaustion path even when every entry is authentic.
+///
+/// **This number carries no correctness argument, deliberately.** It used to: the doc said "the largest plane this code
+/// represents holds 993 points, so this is comfortably past a full cell". That was wrong twice over. 993 is
+/// `31² + 31 + 1`, the point count of `F31` — but `fanos_field` also defines `F127` (16257 points) and `F256`
+/// (`Gf2m<8>`, 65793 points), so it was not the largest plane; and it was a statement about *points*, i.e. about `best`,
+/// applied to `peers`, which is keyed by an identity hash over a 2^256 space and is bounded by nothing geometric — as
+/// the paragraph above says two sentences earlier. The shipped binary runs `F2` (7 points), so the arithmetic never
+/// bit; it was a proof of the wrong proposition that happened to sit above true code.
+///
+/// The invariant `peers` actually needs — that it retains every holder `best` names, since `Best::holder` is a foreign
+/// key into it — is now maintained **by construction** in [`ClaimBook::record`], for any plane and any capacity, rather
+/// than by an inequality between a capacity and a point count. So this is free to be what it always was: a flood bound,
+/// comfortably past a full cell, at a fixed cost.
 pub(crate) const CAPACITY: usize = 1024;
 
 /// One peer's verified coordinate claim material — everything a witness needs, and nothing more.
@@ -59,6 +72,12 @@ struct Best {
     index: u16,
     output: VrfOutput,
     /// Key into `peers`, so recovering the witness material is a lookup rather than a scan.
+    ///
+    /// A foreign key across two independently-bounded maps, sound only because [`ClaimBook::record`] keeps `peers` and
+    /// `best` consistent on every eviction. Without that the reference dangles, and the failure is silent and
+    /// self-contradicting: [`ClaimBook::contender`] reads `best` alone and still reports the point contested, while
+    /// [`ClaimBook::witness_for`] cannot resolve the holder and returns `None` — so the node is told it is displaced
+    /// and simultaneously cannot prove it, able neither to hold the point nor to advance past it, for a whole epoch.
     holder: [u8; 32],
 }
 
@@ -81,6 +100,35 @@ struct Book {
     epoch: Epoch,
     peers: BoundedMap<[u8; 32], PeerClaim>,
     best: BoundedMap<Triple, Best>,
+}
+
+impl Book {
+    /// Free one slot in `peers` **without ever leaving a [`Best::holder`] dangling**.
+    ///
+    /// Two rules, in order, and the second is what makes this total:
+    ///
+    /// 1. **Prefer irrelevance to age.** A peer no `best` entry names can never be returned as a witness —
+    ///    [`ClaimBook::witness_for`] reaches `peers` only through `holder` — so it is the only kind of entry that is
+    ///    free to drop. `BoundedMap`'s FIFO default would instead drop by age, which is uncorrelated with whether the
+    ///    entry is live and so takes a referenced holder whenever an unreferenced one exists.
+    /// 2. **If every peer is a live witness, drop one and drop its references with it.** `best` is keyed by a point,
+    ///    so it holds at most one entry per point of the plane — 7 on `F2`, but 65793 on `F256` — and once that
+    ///    exceeds `CAPACITY` every retained peer can be referenced at once. Rather than let the capacity silently
+    ///    decide correctness (the shape that made the old doc's inequality load-bearing), forgetting the peer also
+    ///    forgets what named it. Losing a point's best claim is the conservative direction: `contender` then reports
+    ///    the point uncontested, and a claim made on that basis is checked again at the far end by
+    ///    `verify_coordinate_claim`, so the cost is a retry rather than an unprovable displacement.
+    fn evict_one_peer(&mut self) {
+        let referenced: BTreeSet<[u8; 32]> = self.best.iter().map(|(_, b)| b.holder).collect();
+        if self.peers.remove_oldest_where(|k| !referenced.contains(k)).is_some() {
+            return;
+        }
+        let Some((victim, _)) = self.peers.remove_oldest_where(|_| true) else { return };
+        let stale: Vec<Triple> = self.best.iter().filter(|(_, b)| b.holder == victim).map(|(p, _)| *p).collect();
+        for point in &stale {
+            self.best.remove(point);
+        }
+    }
 }
 
 impl Default for ClaimBook {
@@ -126,6 +174,9 @@ impl ClaimBook {
     pub(crate) fn record<F: Field>(&self, id: &[u8], public: VrfPublic, proof: VrfProof, output: &VrfOutput) {
         let key = hash_labeled("FANOS-v1/claim-book-peer", id);
         let mut book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if !book.peers.contains_key(&key) && book.peers.len() >= CAPACITY {
+            book.evict_one_peer();
+        }
         book.peers.insert(key, PeerClaim { id: id.to_vec(), public, proof });
         // Index the peer's entire walk once. This is the whole reason the book exists rather than a scan per query.
         for index in 0..probe_bound::<F>() {
@@ -254,6 +305,43 @@ mod tests {
         let id = format!("peer-{seed}").into_bytes();
         let (_, proof, output) = prove_coordinate_ranked::<F7>(&sk, &id, epoch, beacon);
         (id, sk.public(), proof, output)
+    }
+
+    #[test]
+    fn a_peer_flood_never_leaves_a_best_claim_naming_a_forgotten_holder() {
+        // `Best::holder` is a foreign key into `peers`, and the two are independently-bounded maps. `witness_for`
+        // resolves that key with `?`, so a holder evicted out from under a live `best` entry does not fail loudly —
+        // it makes the book **self-contradicting**: `contender` reads `best` alone and still reports the point
+        // contested, while `witness_for` returns None, and a node in that state can neither hold the point nor prove
+        // the displacement that would let it advance past it, for the rest of the epoch.
+        //
+        // Nothing in the types enforces the reference; `record` does, by choosing the eviction victim from the
+        // *unreferenced* peers rather than by age. This asserts the invariant that makes `witness_for` total.
+        let epoch = Epoch::new(4);
+        let beacon = BeaconSeed::GENESIS;
+        let book = ClaimBook::new();
+        book.adopt(epoch);
+
+        // Twice the capacity, so `peers` must evict about half of everything it ever saw.
+        for s in 0..(CAPACITY as u16 * 2) {
+            let (id, public, proof, output) = peer16(s, epoch, &beacon);
+            book.record::<F7>(&id, public, proof, &output);
+        }
+
+        let guard = book.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        // THE PROPERTY: every point's best claim can still be turned into a witness.
+        let dangling: Vec<Triple> =
+            guard.best.iter().filter(|(_, b)| guard.peers.get(&b.holder).is_none()).map(|(p, _)| *p).collect();
+        assert!(
+            dangling.is_empty(),
+            "{} of {} points name a holder the book has forgotten — `contender` still calls them contested and \
+             `witness_for` cannot answer",
+            dangling.len(),
+            guard.best.len()
+        );
+        // And it was a real flood, not a run that fit: without eviction the invariant is trivial.
+        assert_eq!(guard.peers.len(), CAPACITY, "the book filled and evicted, so the invariant was under load");
+        assert!(guard.best.len() > 1, "several points carry a best claim, so there is something to dangle");
     }
 
     #[test]
