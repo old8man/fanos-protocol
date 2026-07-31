@@ -28,18 +28,40 @@ use crate::Key;
 
 /// A state value.
 ///
-/// Fixed-width on purpose. `Int` is 128-bit against the ledger's 64-bit quantities
-/// (`fanos_dromos::token::TokenLedger::balance -> u64`), so intermediate arithmetic has headroom and narrowing happens
-/// once, explicitly, at the host boundary — rather than each operation carrying its own overflow question. `Bytes32` is
-/// the width of everything else the ledger keys on: account, name and deal hashes, commitments, digests. Anything wider
-/// is addressed *by* its digest, which is what the ledger already does, so a variable-length value would add a size
-/// question to every operation and buy nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// `Int` is 128-bit against the ledger's 64-bit quantities (`fanos_dromos::token::TokenLedger::balance -> u64`), so
+/// intermediate arithmetic has headroom and narrowing happens once, explicitly, at the host boundary — rather than each
+/// operation carrying its own overflow question. `Bytes32` is the width of everything the ledger *keys* on: account,
+/// name and deal hashes, commitments, digests.
+///
+/// **`Record` exists because the two scalars could not represent the ledger's own state, and the argument that said they
+/// could was wrong on one side.** The earlier rationale here read: "anything wider is addressed *by* its digest, which
+/// is what the ledger already does". That is true of **keys** — [`Key::slot`] is a digest, rightly — and false of
+/// **values**: the ledger keys by digest and *stores* a struct (`NameRecord { owner, target, expiry }`, a storage deal,
+/// an HTLC). The two sides of the map were conflated, so every ledger operation but `transfer` had nothing to write
+/// with.
+///
+/// The alternative — keep the scalars and store a *hash* of the record, holding the record elsewhere — was rejected on
+/// the property the whole design rests on: a term's footprint would then name a hash key while the real mutation landed
+/// outside it, which is exactly the declared-access-list trust assumption ERGON exists to delete.
+///
+/// A product of tagged fields rather than an opaque byte string, because an opaque one buys the vocabulary by spending
+/// what the vocabulary is for: `Compare` and `Gate` could not see `expiry` inside a record, and the expression layer
+/// would stop working precisely where contracts need it. Fields stay addressable, and a field selector reads *within* a
+/// value already fetched — it computes no key, so footprints stay derivable by structural induction.
+///
+/// **Canonical by construction:** fields are sorted by tag and duplicate-free, and the codec refuses anything else. The
+/// sort *is* the canonical form, the same discipline footprints already use, and it matters for the same reason — the
+/// artefact hash is the contract's identity.
+///
+/// No longer `Copy`, which is the price. Representing the state is not negotiable; a convenience is.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Value {
     /// An unsigned integer quantity.
     Int(u128),
     /// A 32-byte identifier or digest.
     Bytes32([u8; 32]),
+    /// A product of tagged fields, **sorted by tag and duplicate-free** — see the type note.
+    Record(Vec<(u16, Value)>),
 }
 
 impl Value {
@@ -47,7 +69,7 @@ impl Value {
     pub const fn as_int(&self) -> Result<u128, Fault> {
         match self {
             Self::Int(n) => Ok(*n),
-            Self::Bytes32(_) => Err(Fault::TypeMismatch),
+            Self::Bytes32(_) | Self::Record(_) => Err(Fault::TypeMismatch),
         }
     }
 
@@ -58,7 +80,7 @@ impl Value {
         match self {
             Self::Int(n) if *n <= u64::MAX as u128 => Ok(*n as u64),
             Self::Int(_) => Err(Fault::Overflow),
-            Self::Bytes32(_) => Err(Fault::TypeMismatch),
+            Self::Bytes32(_) | Self::Record(_) => Err(Fault::TypeMismatch),
         }
     }
 
@@ -66,7 +88,45 @@ impl Value {
     pub const fn as_bytes32(&self) -> Result<[u8; 32], Fault> {
         match self {
             Self::Bytes32(b) => Ok(*b),
-            Self::Int(_) => Err(Fault::TypeMismatch),
+            Self::Int(_) | Self::Record(_) => Err(Fault::TypeMismatch),
+        }
+    }
+
+    /// The field tagged `tag`, or [`Fault::TypeMismatch`] if this is not a record or has no such field.
+    ///
+    /// A *selector*, never a computation: it reads within a value the state already yielded, so it addresses no key and
+    /// leaves footprint derivation by structural induction untouched. Absence is a type error rather than a default,
+    /// for the same reason [`Fault::Missing`] is not zero — a rule that invents state is a rule nobody wrote.
+    pub fn field(&self, tag: u16) -> Result<&Self, Fault> {
+        match self {
+            Self::Record(fields) => fields
+                .binary_search_by_key(&tag, |(t, _)| *t)
+                .ok()
+                .and_then(|i| fields.get(i).map(|(_, v)| v))
+                .ok_or(Fault::TypeMismatch),
+            Self::Int(_) | Self::Bytes32(_) => Err(Fault::TypeMismatch),
+        }
+    }
+
+    /// Build a record from `fields`, putting them in canonical order, or `None` if a tag repeats.
+    ///
+    /// The only constructor, so a non-canonical record cannot be built in the first place — the codec's refusal to
+    /// *decode* one is then a second line of defence rather than the only one.
+    #[must_use]
+    pub fn record(mut fields: Vec<(u16, Self)>) -> Option<Self> {
+        fields.sort_by_key(|(t, _)| *t);
+        if fields.windows(2).any(|w| w.first().map(|(a, _)| *a) == w.get(1).map(|(b, _)| *b)) {
+            return None;
+        }
+        Some(Self::Record(fields))
+    }
+
+    /// This value's nesting depth: `1` for a scalar, `1 + max(children)` for a record.
+    #[must_use]
+    pub fn depth(&self) -> u32 {
+        match self {
+            Self::Int(_) | Self::Bytes32(_) => 1,
+            Self::Record(fields) => 1 + fields.iter().map(|(_, v)| v.depth()).max().unwrap_or(0),
         }
     }
 }
@@ -215,11 +275,11 @@ impl Expr {
 
     fn eval_unchecked(&self, state: &dyn crate::exec::Reader, args: &[Value]) -> Result<Value, Fault> {
         match self {
-            Self::Lit(v) => Ok(*v),
+            Self::Lit(v) => Ok(v.clone()),
             Self::Load(k) => state.get(k).ok_or(Fault::Missing(*k)),
             Self::Arg(i) => args
                 .get(usize::from(*i))
-                .copied()
+                .cloned()
                 .ok_or(Fault::ArgOutOfRange { index: *i, supplied: args.len() }),
             Self::Bin(op, l, r) => {
                 let (a, b) = (l.eval_unchecked(state, args)?.as_int()?, r.eval_unchecked(state, args)?.as_int()?);
@@ -281,16 +341,21 @@ impl Cmp {
     ///
     /// Ordering is defined on integers only; ordering two digests would be an ordering of hashes, which means nothing a
     /// contract should branch on, so it is a [`Fault::TypeMismatch`] rather than a silent byte comparison.
-    pub const fn apply(self, a: Value, b: Value) -> Result<bool, Fault> {
+    pub fn apply(self, a: &Value, b: &Value) -> Result<bool, Fault> {
         match (self, a, b) {
+            // Records compare structurally: two records are equal iff their tagged fields are, which is well-defined
+            // because canonical order makes the encoding unique. Ordering them is still refused below, for the same
+            // reason ordering digests is.
             (Self::Eq, x, y) => Ok(match (x, y) {
                 (Value::Int(p), Value::Int(q)) => p == q,
-                (Value::Bytes32(p), Value::Bytes32(q)) => eq32(&p, &q),
+                (Value::Bytes32(p), Value::Bytes32(q)) => eq32(p, q),
+                (Value::Record(_), Value::Record(_)) => x == y,
                 _ => return Err(Fault::TypeMismatch),
             }),
             (Self::Ne, x, y) => Ok(match (x, y) {
                 (Value::Int(p), Value::Int(q)) => p != q,
-                (Value::Bytes32(p), Value::Bytes32(q)) => !eq32(&p, &q),
+                (Value::Bytes32(p), Value::Bytes32(q)) => !eq32(p, q),
+                (Value::Record(_), Value::Record(_)) => x != y,
                 _ => return Err(Fault::TypeMismatch),
             }),
             (Self::Lt, Value::Int(p), Value::Int(q)) => Ok(p < q),

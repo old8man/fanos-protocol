@@ -132,15 +132,52 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
             out.push(1);
             out.extend_from_slice(b);
         }
+        Value::Record(fields) => {
+            out.push(2);
+            put_seq(out, fields, |o, (tag, val)| {
+                o.extend_from_slice(&tag.to_be_bytes());
+                put_value(o, val);
+            });
+        }
+    }
+}
+
+/// Decode a value, **bounding depth during the parse**.
+///
+/// Before the bound, not after: a nesting bomb is a few bytes that expand into an arbitrarily deep tree, so a check
+/// applied to the finished value has already paid for it. The term codec bounds depth the same way and for the same
+/// reason; this is that discipline extended to the value language now that values nest.
+///
+/// The bound is [`EXPR_DEPTH_MAX`], and the coupling is derived even though the number is policy: a field-selector
+/// chain in an expression is exactly what walks a record's depth, so a record deeper than can be *expressed* is
+/// unaddressable and therefore useless.
+fn value_at(r: &mut Reader<'_>, depth: u32) -> Option<Value> {
+    if depth > EXPR_DEPTH_MAX {
+        return None;
+    }
+    match r.u8()? {
+        0 => Some(Value::Int(r.u128()?)),
+        1 => Some(Value::Bytes32(r.array32()?)),
+        2 => {
+            let mut last: Option<u16> = None;
+            let fields = r.seq(|r| {
+                let tag = r.u16()?;
+                // Canonical order, refused rather than repaired: the artefact hash is the contract's identity, so two
+                // encodings of one record would be two identities. Strictly increasing rejects duplicates too.
+                if last.is_some_and(|prev| prev >= tag) {
+                    return None;
+                }
+                last = Some(tag);
+                Some((tag, value_at(r, depth + 1)?))
+            })?;
+            Some(Value::Record(fields))
+        }
+        _ => None,
     }
 }
 
 fn value(r: &mut Reader<'_>) -> Option<Value> {
-    match r.u8()? {
-        0 => Some(Value::Int(r.u128()?)),
-        1 => Some(Value::Bytes32(r.array32()?)),
-        _ => None,
-    }
+    value_at(r, 1)
 }
 
 /// A footprint, and the canonicity check that makes an artefact hash meaningful.
@@ -434,6 +471,83 @@ impl Term {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+
+    /// Every record type the ledger actually stores must survive the value language byte-identically, or the language
+    /// does not represent the state it addresses — which was the whole finding that motivated `Record`.
+    #[test]
+    fn a_ledger_record_round_trips_byte_identically() {
+        // Shaped like `NameRecord { owner, target, expiry }`: a digest, a variable-length blob, and a quantity. The
+        // blob is the field the two scalars could not hold and the reason a hash-and-store-elsewhere workaround was
+        // refused — a footprint naming a hash key while the mutation lands outside it is the trust assumption ERGON
+        // deletes.
+        let record = Value::record(vec![
+            (0u16, Value::Bytes32([7u8; 32])),
+            (2u16, Value::Int(4242)),
+            (1u16, Value::Record(vec![(0u16, Value::Int(1)), (1u16, Value::Int(2))])),
+        ])
+        .expect("distinct tags");
+        let mut bytes = Vec::new();
+        put_value(&mut bytes, &record);
+        let mut r = Reader::new(&bytes);
+        assert_eq!(value(&mut r), Some(record.clone()), "a record must decode to itself");
+        let mut again = Vec::new();
+        put_value(&mut again, &record);
+        assert_eq!(bytes, again, "and re-encode to the same bytes — the artefact hash is the contract's identity");
+    }
+
+    #[test]
+    fn a_non_canonical_record_is_refused_rather_than_repaired() {
+        // Two encodings of one record would be two identities, so the decoder must refuse rather than sort. Both
+        // non-canonical shapes are rejected: out of order, and a repeated tag.
+        for fields in [vec![(5u16, 1u128), (1u16, 2u128)], vec![(3u16, 1u128), (3u16, 2u128)]] {
+            let mut bytes = vec![2u8];
+            put_u16(&mut bytes, u16::try_from(fields.len()).unwrap());
+            for (tag, n) in &fields {
+                bytes.extend_from_slice(&tag.to_be_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&n.to_be_bytes());
+            }
+            let mut r = Reader::new(&bytes);
+            assert_eq!(value(&mut r), None, "non-canonical field order or a duplicate tag must not decode: {fields:?}");
+        }
+    }
+
+    #[test]
+    fn the_constructor_cannot_build_a_non_canonical_record() {
+        // The decoder's refusal is the second line of defence, not the only one: a record that cannot be *built*
+        // wrongly cannot be encoded wrongly either.
+        assert!(Value::record(vec![(1u16, Value::Int(0)), (1u16, Value::Int(1))]).is_none(), "duplicate tag");
+        let sorted = Value::record(vec![(9u16, Value::Int(0)), (2u16, Value::Int(1))]).expect("distinct tags");
+        let Value::Record(fields) = &sorted else { panic!("a record") };
+        assert_eq!(fields.first().map(|(t, _)| *t), Some(2), "the constructor puts fields in canonical order");
+    }
+
+    #[test]
+    fn a_nesting_bomb_is_refused_during_the_parse_not_after_it() {
+        // A few bytes that expand into an arbitrarily deep tree. Bounded DURING the parse, because a check applied to
+        // the finished value has already paid for it — the same discipline the term codec uses.
+        let mut bytes = Vec::new();
+        for _ in 0..(EXPR_DEPTH_MAX + 4) {
+            bytes.push(2);
+            put_u16(&mut bytes, 1);
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+        }
+        bytes.push(0);
+        bytes.extend_from_slice(&0u128.to_be_bytes());
+        let mut r = Reader::new(&bytes);
+        assert_eq!(value(&mut r), None, "a record nested past the addressable depth must be refused");
+    }
+
+    #[test]
+    fn a_field_selector_reads_within_a_value_and_addresses_no_key() {
+        // The property that keeps footprints derivable: selecting a field touches nothing the term did not already
+        // name. Absence is a type error rather than a default, for the same reason `Missing` is not zero.
+        let record = Value::record(vec![(1u16, Value::Int(7)), (4u16, Value::Bytes32([1u8; 32]))]).unwrap();
+        assert_eq!(record.field(1).and_then(Value::as_int), Ok(7));
+        assert_eq!(record.field(9).err(), Some(crate::value::Fault::TypeMismatch), "an absent field is a type error, not a default");
+        assert_eq!(Value::Int(1).field(0).err(), Some(crate::value::Fault::TypeMismatch), "a scalar has no fields");
+    }
+
     use super::*;
     use crate::exec::compare;
     use alloc::vec;

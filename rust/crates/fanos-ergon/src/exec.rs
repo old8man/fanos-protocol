@@ -291,7 +291,7 @@ fn eval_predicate<S: State + ?Sized, H: Host>(
         }
         Predicate::Compare { op, lhs, rhs } => {
             let (a, b) = (lhs.eval(state, args)?, rhs.eval(state, args)?);
-            op.apply(a, b)
+            op.apply(&a, &b)
         }
         Predicate::And(parts) => {
             for p in parts {
@@ -332,7 +332,7 @@ mod tests {
     struct Mem(BTreeMap<Key, Value>);
 
     impl Reader for Mem {
-        fn get(&self, key: &Key) -> Option<Value> { self.0.get(key).copied() }
+        fn get(&self, key: &Key) -> Option<Value> { self.0.get(key).cloned() }
     }
     impl State for Mem {
         fn set(&mut self, key: Key, value: Value) { self.0.insert(key, value); }
@@ -351,11 +351,11 @@ mod tests {
         fn effect(&mut self, kind: u16, args: &[Value], state: &mut dyn State) -> Result<(), Fault> {
             match kind {
                 1 => {
-                    state.set(self.target, args[0]);
+                    state.set(self.target, args[0].clone());
                     Ok(())
                 }
                 2 => {
-                    state.set(self.stray, args[0]);
+                    state.set(self.stray, args[0].clone());
                     Ok(())
                 }
                 _ => Err(Fault::Rejected { kind }),
