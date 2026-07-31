@@ -7,10 +7,16 @@
 //! finalize a header describing a payload it withheld or altered.
 //!
 //! The payload — the ordered [`SealedTx`] ciphertexts — is erasure-coded with the **projective LRC**
-//! (`[7,3,4]` on the Fano cell, [`fanos_code::erasure`]) across the cell's seven nodes. Availability is then
-//! checked by **DA sampling along lines** ([`fanos_code::da`]): by the DA theorem an unavailable payload has
-//! `≤ 1` external line, so two distinct line-samples detect any withheld block with certainty. That check
-//! gates PREPARE (see [`crate::consensus`]).
+//! (`[7,3,4]` on the Fano cell, [`fanos_code::erasure`]) across the cell's seven nodes. Availability then gates
+//! PREPARE (see [`crate::consensus`]) by **reconstruction**: a validator rebuilds the payload from the shards it
+//! sampled off its peers and matches it against `da_commit`, so a withholding proposer leaves an unrecoverable
+//! erasure pattern and a tampering one fails the commitment.
+//!
+//! Not the `k`-lines *sampling* procedure of [`fanos_code::da`], which this note used to cite — that one, with
+//! its `(1/7)^k` bound from the ≤ 1-external-line theorem, is the **L4 erasure store's**
+//! (`fanos_runtime::overlay::storage`). The split is deliberate rather than accidental: consensus must hold the
+//! body to execute it anyway, so the stronger check costs it nothing, while the store is asked about objects it
+//! has no reason to materialise — which is the situation sampling exists for. See `docs/design-taxis.md` §6.
 
 use alloc::vec::Vec;
 
@@ -89,7 +95,7 @@ pub struct BlockHeader {
     pub proposer: u8,
     /// A binding commitment to the **ordered** list of transaction commitments (`H(commit₀ ‖ commit₁ ‖ …)`).
     pub tx_root: [u8; 32],
-    /// A binding commitment to the erasure-coded payload shards — what DA sampling verifies against.
+    /// A binding commitment to the erasure-coded payload shards — what a reconstructed payload is checked against.
     pub da_commit: [u8; 32],
     /// A binding commitment to the block's `last_commit` — the parent block's commit certificate (`H(cert)`,
     /// or all-zero at genesis / height 1). Recording it in the hashed header fixes the reward beneficiaries (the
