@@ -32,6 +32,17 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Domain-separation label for the registry state root.
 const ROOT_LABEL: &str = "FANOS-dromos-v1/name-root";
 
+/// The label under which a name is digested to its registry key.
+///
+/// Lives here rather than in `hybrid`, because the registry itself is keyed by this digest now: the access list, the
+/// ERGON footprint and the storage must name the same thing, and one of the three owning the definition is how they
+/// stay that way.
+pub const NAME_KEY_LABEL: &str = "FANOS-dromos-v1/name-key";
+
+/// A name's registry key: the digest the access list, the ERGON footprint and the storage all agree on.
+#[must_use]
+pub fn name_digest(name: &[u8]) -> [u8; 32] { hash_labeled(NAME_KEY_LABEL, name) }
+
 /// The **price** of registering or renewing `name` for `duration` periods — length-tiered so short, premium
 /// names cost more (anti-squatting). A deterministic function of the name and duration; the exact constants are
 /// a monetary-policy knob.
@@ -127,6 +138,12 @@ impl Descriptor {
 /// A registered name's on-chain record.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NameRecord {
+    /// The name itself — the preimage of the key this record is stored under.
+    ///
+    /// Carried in the value because the registry is keyed by digest and a digest has no preimage: a read addressed the
+    /// way the scheduler addresses it must still be able to say *which* name it found. Exactly one place holds it, so
+    /// there is no second source to disagree with.
+    pub name: Vec<u8>,
     /// The owning account id (a [`crate::token::account_id`]).
     pub owner: [u8; 32],
     /// The target descriptor the name resolves to (a payment address, service, or messaging id — opaque here).
@@ -215,7 +232,7 @@ pub enum NameError {
 /// The on-chain name registry.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct NameRegistry {
-    records: BTreeMap<Vec<u8>, NameRecord>,
+    records: BTreeMap<[u8; 32], NameRecord>,
 }
 
 impl NameRegistry {
@@ -228,7 +245,7 @@ impl NameRegistry {
     /// Resolve `name` as of `now` — its record if registered and unexpired, else `None`.
     #[must_use]
     pub fn resolve(&self, name: &[u8], now: u64) -> Option<&NameRecord> {
-        self.records.get(name).filter(|r| now <= r.expiry)
+        self.records.get(&name_digest(name)).filter(|r| now <= r.expiry)
     }
 
     /// Resolve `name` to its typed [`Descriptor`] as of `now` — the endpoint (payment address, service,
@@ -282,7 +299,7 @@ impl NameRegistry {
                 if fee < price(name, *duration) {
                     return Err(NameError::InsufficientFee);
                 }
-                Ok(Mutation::Set(name.to_vec(), NameRecord { owner: actor, target: target.clone(), expiry: now.saturating_add(*duration) }))
+                Ok(Mutation::Set(name.to_vec(), NameRecord { name: name.to_vec(), owner: actor, target: target.clone(), expiry: now.saturating_add(*duration) }))
             }
             NameOp::Renew { duration, .. } => {
                 let rec = self.owned(name, actor, now)?;
@@ -312,13 +329,19 @@ impl NameRegistry {
         Ok(rec)
     }
 
-    /// A binding commitment to the registry — sorted `(name, owner, expiry, target)`, hashed.
+    /// A binding commitment to the registry — `(key, name, owner, expiry, target)` in **digest order**, hashed.
+    ///
+    /// Digest order rather than name order, because the map is keyed by digest so the other four sub-ledgers can be
+    /// addressed the same way (see `name_digest`). Equally canonical — a `BTreeMap` over `[u8; 32]` has exactly one
+    /// order — but **not the same root** as the name-ordered fold it replaces. Deliberate and stated: preserving a
+    /// root computed over the wrong addressing would be preserving the defect.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {
         let mut buf = Vec::new();
-        for (name, rec) in &self.records {
-            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name);
+        for (key, rec) in &self.records {
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&(rec.name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&rec.name);
             buf.extend_from_slice(&rec.owner);
             buf.extend_from_slice(&rec.expiry.to_le_bytes());
             buf.extend_from_slice(&(rec.target.len() as u32).to_le_bytes());
@@ -333,8 +356,9 @@ impl NameRegistry {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        put_map(&mut out, &self.records, |o, name, rec| {
-            put_var_bytes(o, name);
+        put_map(&mut out, &self.records, |o, key, rec| {
+            o.extend_from_slice(key);
+            put_var_bytes(o, &rec.name);
             o.extend_from_slice(&rec.owner);
             put_u64(o, rec.expiry);
             put_var_bytes(o, &rec.target);
@@ -346,13 +370,16 @@ impl NameRegistry {
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        // Smallest record: empty name (4) ‖ owner (32) ‖ expiry (8) ‖ empty target (4) = 48 bytes.
-        let records = read_map(&mut r, 48, |r| {
+        // Smallest record: key (32) ‖ empty name (4) ‖ owner (32) ‖ expiry (8) ‖ empty target (4) = 80 bytes.
+        let records = read_map(&mut r, 80, |r| {
+            let key = r.array::<32>()?;
             let name = r.var_bytes()?.to_vec();
             let owner = r.array::<32>()?;
             let expiry = r.u64()?;
             let target = r.var_bytes()?.to_vec();
-            Some((name, NameRecord { owner, target, expiry }))
+            // The key must be the name's digest, or a snapshot could place a record under an address that does not
+            // resolve to it — a restore that silently disagrees with the chain it restored from.
+            (key == name_digest(&name)).then_some((key, NameRecord { name, owner, target, expiry }))
         })?;
         r.finish()?;
         Some(Self { records })
@@ -457,10 +484,10 @@ enum Mutation {
 }
 
 impl Mutation {
-    fn commit(self, records: &mut BTreeMap<Vec<u8>, NameRecord>) {
+    fn commit(self, records: &mut BTreeMap<[u8; 32], NameRecord>) {
         match self {
             Mutation::Set(name, rec) => {
-                records.insert(name, rec);
+                records.insert(name_digest(&name), rec);
             }
         }
     }
@@ -469,6 +496,59 @@ impl Mutation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    /// The registry is keyed by the digest the access list and the ERGON footprint already use — so all three name the
+    /// same thing. This asserts the identity rather than trusting it: a lookup by name must find what a lookup by that
+    /// name's digest stored.
+    #[test]
+    fn a_name_and_its_digest_address_the_same_record() {
+        let key = name_digest(b"alice");
+        let mut reg = NameRegistry::default();
+        reg.records.insert(key, NameRecord { name: b"alice".to_vec(), owner: [1u8; 32], target: vec![7], expiry: 100 });
+        assert!(reg.resolve(b"alice", 50).is_some(), "resolving by name must find the digest-keyed record");
+        assert_eq!(reg.resolve(b"alice", 50).map(|r| r.name.clone()), Some(b"alice".to_vec()), "and know its own name");
+        assert!(reg.resolve(b"bob", 50).is_none(), "a different name must not collide");
+    }
+
+    /// A snapshot that placed a record under an address the record does not resolve to would restore a registry that
+    /// silently disagrees with the chain it came from — every later lookup by name would miss it. Refused on decode.
+    #[test]
+    fn a_snapshot_cannot_store_a_record_under_the_wrong_address() {
+        let mut reg = NameRegistry::default();
+        reg.records.insert(
+            name_digest(b"alice"),
+            NameRecord { name: b"alice".to_vec(), owner: [1u8; 32], target: vec![7], expiry: 100 },
+        );
+        let good = reg.to_bytes();
+        assert_eq!(NameRegistry::from_bytes(&good).as_ref(), Some(&reg), "a well-formed snapshot restores");
+
+        // The same records under a key belonging to a different name.
+        let mut wrong = NameRegistry::default();
+        wrong.records.insert(
+            name_digest(b"mallory"),
+            NameRecord { name: b"alice".to_vec(), owner: [1u8; 32], target: vec![7], expiry: 100 },
+        );
+        assert!(NameRegistry::from_bytes(&wrong.to_bytes()).is_none(), "a mis-addressed record must not decode");
+    }
+
+    /// Digest order is a different order from name order, so the root necessarily changed — the point is that it is
+    /// still *an* order, one and only one, which is what makes a root a commitment at all.
+    #[test]
+    fn the_root_is_canonical_under_the_new_key() {
+        let make = |names: &[&[u8]]| {
+            let mut reg = NameRegistry::default();
+            for n in names {
+                reg.records.insert(
+                    name_digest(n),
+                    NameRecord { name: (*n).to_vec(), owner: [2u8; 32], target: vec![], expiry: 9 },
+                );
+            }
+            reg
+        };
+        let forward: &[&[u8]] = &[b"a", b"b", b"c"];
+        let reverse: &[&[u8]] = &[b"c", b"b", b"a"];
+        assert_eq!(make(forward).state_root(), make(reverse).state_root(), "insertion order must not reach the root");
+    }
     use super::*;
     use crate::token::{Transfer, account_id};
     use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};

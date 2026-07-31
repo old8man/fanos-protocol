@@ -45,8 +45,6 @@ use crate::token::{TokenError, ProverAuth, SignedTransfer, TokenLedger, account_
 /// The shared state key every shielded operation touches — so shielded spends serialize against each other
 /// (they mutate the one nullifier set / commitment tree) while parallelizing against disjoint transparent work.
 const SHIELDED_MARKER: [u8; 32] = *b"FANOS-dromos-shielded-pool-mark!";
-/// Domain label deriving a name's scheduler key from its bytes.
-const NAME_KEY_LABEL: &str = "FANOS-dromos-v1/name-key";
 
 /// Transaction-type tag: an authenticated transparent transfer.
 pub const TAG_TRANSPARENT: u8 = 0x00;
@@ -803,7 +801,7 @@ impl HybridLedger {
             Some((&TAG_NAME, body)) => match NameTx::from_bytes(body) {
                 Some(nt) => AccessList::new(
                     [],
-                    [balance_key(nt.payment.transfer.from), balance_key(TREASURY), name_key(hash_labeled(NAME_KEY_LABEL, nt.op.name()))],
+                    [balance_key(nt.payment.transfer.from), balance_key(TREASURY), name_key(crate::naming::name_digest(nt.op.name()))],
                 ),
                 None => AccessList::default(),
             },

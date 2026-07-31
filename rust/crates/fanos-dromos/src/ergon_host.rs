@@ -366,6 +366,8 @@ impl Host for LedgerHost {
 /// Numbered rather than positional because the encoding is canonical by tag order: adding a field later must not
 /// renumber the existing ones, or every previously-stored record would decode as something else.
 pub mod name_fields {
+    /// The name itself — the preimage of the key the record is stored under.
+    pub const NAME: u16 = 3;
     /// The owning account id.
     pub const OWNER: u16 = 0;
     /// The descriptor the name resolves to — opaque to the chain.
@@ -384,6 +386,7 @@ pub fn name_record_value(rec: &NameRecord) -> Value {
     // `record` cannot fail here — the tags are distinct constants — but the fallible constructor is the only one, so
     // that a non-canonical record cannot be built anywhere, including here.
     Value::record(vec![
+        (name_fields::NAME, Value::Bytes(rec.name.clone())),
         (name_fields::OWNER, Value::Bytes32(rec.owner)),
         (name_fields::TARGET, Value::Bytes(rec.target.clone())),
         (name_fields::EXPIRY, Value::Int(u128::from(rec.expiry))),
@@ -395,6 +398,7 @@ pub fn name_record_value(rec: &NameRecord) -> Value {
 #[must_use]
 pub fn name_record_from(v: &Value) -> Option<NameRecord> {
     Some(NameRecord {
+        name: v.field(name_fields::NAME).ok()?.as_bytes().ok()?.to_vec(),
         owner: v.field(name_fields::OWNER).ok()?.as_bytes32().ok()?,
         target: v.field(name_fields::TARGET).ok()?.as_bytes().ok()?.to_vec(),
         expiry: u64::try_from(v.field(name_fields::EXPIRY).ok()?.as_int().ok()?).ok()?,
@@ -413,7 +417,7 @@ mod tests {
     #[test]
     fn a_real_name_record_round_trips_through_the_value_language() {
         for target in [vec![], vec![0u8], vec![9u8; 300]] {
-            let rec = NameRecord { owner: [3u8; 32], target: target.clone(), expiry: 12_345 };
+            let rec = NameRecord { name: b"alice".to_vec(), owner: [3u8; 32], target: target.clone(), expiry: 12_345 };
             let value = name_record_value(&rec);
             assert_eq!(name_record_from(&value).as_ref(), Some(&rec), "target of {} bytes", target.len());
 
