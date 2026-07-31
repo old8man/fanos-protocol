@@ -735,7 +735,8 @@ impl HybridLedger {
         // No pre-check on value spaces any more: `LedgerState` records every key it cannot route, read or written, and the
         // check below refuses the transaction if anything was. One decision in one place — a duplicate would be a second
         // thing to keep in step with the adapter, and the adapter is the only code that knows what it can route.
-        let mut host = LedgerHost::new(caller);
+        // The height is the runtime's, never the term's — see `LedgerHost::height`.
+        let mut host = LedgerHost::new(caller, self.height);
         let mut state = LedgerState::new(self);
         let outcome = fanos_ergon::eval(&checked, &[], &mut host, &mut state);
         // Defence in depth behind the space check above: if the adapter could not route anything, the term is refused even

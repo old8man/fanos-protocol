@@ -29,19 +29,29 @@
 //! One consequence, stated because it is what an equivalence test can and cannot claim: an ERGON-executed transfer and a
 //! native `apply_with_verdict` agree on **balances**, and the nonce is not the effect's business. See the tests.
 
-use crate::naming::{NameRecord, name_digest};
+use crate::naming::{MAX_NAME_LEN, MIN_NAME_LEN, NameRecord, TREASURY, name_digest, price};
 use fanos_ergon::value::{Fault, Value};
 use fanos_ergon::{Checked, Limits};
 use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
 use fanos_ergon::{Effect, Expr, Footprint, Host, Key, PointId, Reader, State, Term};
 
-use crate::hybrid::TAG_TRANSPARENT;
+use crate::hybrid::{TAG_NAME, TAG_TRANSPARENT};
 use crate::token::TokenLedger;
 
 /// The transparent-transfer effect. Numbered by its wire tag so the correspondence to the existing transaction kind is
 /// mechanical rather than a mapping table someone has to maintain.
 pub const EFFECT_TRANSFER: u16 = TAG_TRANSPARENT as u16;
+
+/// Register a free name, paying the registry's price to the treasury.
+///
+/// **One effect, not `Seq[transfer, record]`** — and the reason generalises. The registry requires
+/// `fee >= price(name, duration)`, so the payment is a *precondition of the record*, not a separable step. Split in
+/// two, the record half would take the fee as an argument, and the author writes the arguments: a term could transfer
+/// one coin and claim a thousand. Composition is for composing operations; the halves of one operation are not
+/// separable when a condition binds them. (Where a payment is genuinely independent — a flat fee with no threshold —
+/// the split is right.)
+pub const EFFECT_NAME_REGISTER: u16 = TAG_NAME as u16;
 
 /// The projective point ledger state currently lives at.
 ///
@@ -102,6 +112,22 @@ pub fn transfer_term(from: [u8; 32], to: [u8; 32], amount: u64) -> Term {
         Expr::bytes32(from),
         Expr::bytes32(to),
         Expr::int(u128::from(amount)),
+    ]))
+}
+
+/// A term that registers `name` — the composable form of what `TAG_NAME` does.
+///
+/// The footprint is written out because it is the term's *declaration* of what it touches, and `Confined` refuses any
+/// access outside it: the payer's balance, the treasury's, and the name's own key. It must equal the hand-written
+/// access list for this operation, which is asserted by the equivalence test.
+#[must_use]
+pub fn name_register_term(name: &[u8], target: &[u8], duration: u64, fee: u64, payer: [u8; 32]) -> Term {
+    let footprint = Footprint::new(vec![], vec![balance_key(payer), balance_key(TREASURY), name_key(name_digest(name))]);
+    Term::Do(Effect::internal(EFFECT_NAME_REGISTER, footprint).with_args(vec![
+        Expr::Lit(Value::Bytes(name.to_vec())),
+        Expr::Lit(Value::Bytes(target.to_vec())),
+        Expr::int(u128::from(duration)),
+        Expr::int(u128::from(fee)),
     ]))
 }
 
@@ -328,12 +354,18 @@ impl State for TokenState<'_> {
 pub struct LedgerHost {
     /// The authenticated caller, bound into [`Expr::Arg`] `0` by the runtime.
     caller: [u8; 32],
+    /// The height this term executes at.
+    ///
+    /// Supplied by the runtime and never by the term, for the same reason `caller` is: an effect whose conditions
+    /// depend on time must not let the author choose the time. A term that could name its own height would register
+    /// an expired name as free, or renew one it no longer owns.
+    height: u64,
 }
 
 impl LedgerHost {
     /// A host acting for `caller` — the identity the envelope authenticated.
     #[must_use]
-    pub const fn new(caller: [u8; 32]) -> Self { Self { caller } }
+    pub const fn new(caller: [u8; 32], height: u64) -> Self { Self { caller, height } }
 
     /// The transfer rule, over evaluated arguments and a confined state view.
     ///
@@ -360,10 +392,67 @@ impl LedgerHost {
     }
 }
 
+impl LedgerHost {
+    /// The name-registration rule, over evaluated arguments and a confined state view.
+    ///
+    /// Every condition `NameRegistry::apply` enforces lives **inside** the effect, because the author writes the term
+    /// and may omit a `Gate`: a protocol condition offered as a gate is a condition nobody must obey. So the length
+    /// bound, the treasury payee, freeness at this height and the price floor are all checked here, and the fee is
+    /// moved here too — it is a precondition of the record, so it cannot be a sibling step.
+    ///
+    /// One thing the algebra supplies that the hand-written path pays for: `NameRegistry::apply` deliberately
+    /// validates before settling payment "so a rejected op never touches the token ledger". Under ERGON the `Journal`
+    /// undoes a failed term, so ordering here is not load-bearing — the same guarantee without the discipline.
+    fn apply_name_register(&self, args: &[Value], state: &mut dyn State) -> Result<(), Fault> {
+        let kind = EFFECT_NAME_REGISTER;
+        let [name, target, duration, fee] = args else { return Err(Fault::Rejected { kind }) };
+        let (name, target) = (name.as_bytes()?, target.as_bytes()?);
+        let (duration, fee) = (duration.as_u64()?, fee.as_u64()?);
+
+        if !(MIN_NAME_LEN..=MAX_NAME_LEN).contains(&name.len()) {
+            return Err(Fault::Rejected { kind });
+        }
+        let key = name_key(name_digest(name));
+        // Free *at this height* — an expired record is not an obstacle, which is why the read does not filter expiry
+        // and the comparison happens here, where the height is the runtime's rather than the term's.
+        if let Some(existing) = state.get(&key)
+            && name_record_from(&existing).is_some_and(|rec| self.height <= rec.expiry)
+        {
+            return Err(Fault::Rejected { kind });
+        }
+        if fee < price(name, duration) {
+            return Err(Fault::Rejected { kind });
+        }
+
+        // The fee, paid by the authenticated caller to the treasury. Not a sibling `Do(transfer)`: the price check
+        // above is only meaningful if this effect is the one that moves the money.
+        let payer = balance_key(self.caller);
+        let payee = balance_key(TREASURY);
+        let from = state.get(&payer).ok_or(Fault::Rejected { kind })?.as_u64()?;
+        let to = state.get(&payee).ok_or(Fault::Rejected { kind })?.as_u64()?;
+        let debited = from.checked_sub(fee).ok_or(Fault::Rejected { kind })?;
+        let credited = to.checked_add(fee).ok_or(Fault::Overflow)?;
+        state.set(payer, Value::Int(u128::from(debited)));
+        state.set(payee, Value::Int(u128::from(credited)));
+
+        state.set(
+            key,
+            name_record_value(&NameRecord {
+                name: name.to_vec(),
+                owner: self.caller,
+                target: target.to_vec(),
+                expiry: self.height.saturating_add(duration),
+            }),
+        );
+        Ok(())
+    }
+}
+
 impl Host for LedgerHost {
     fn effect(&mut self, kind: u16, args: &[Value], state: &mut dyn State) -> Result<(), Fault> {
         match kind {
             EFFECT_TRANSFER => self.apply_transfer(args, state),
+            EFFECT_NAME_REGISTER => self.apply_name_register(args, state),
             _ => Err(Fault::Rejected { kind }),
         }
     }
@@ -425,6 +514,63 @@ pub fn name_record_from(v: &Value) -> Option<NameRecord> {
 mod tests {
     use super::*;
     use fanos_ergon::{Checked, Limits, eval};
+
+    /// **The claim, checked rather than asserted:** an ERGON term and the hardcoded `TAG_NAME` path produce the
+    /// IDENTICAL state root from the same input. Both paths exist side by side, so the equivalence is mechanical —
+    /// and it is the whole justification for expressing a ledger operation as a term at all. Anything less and the
+    /// term is a second implementation with its own bugs rather than the same operation, expressed.
+    #[test]
+    #[ignore = "RED ON PURPOSE — asserts a property the system does not yet have; see task #40 (two nonce spaces). \
+                Not flaky: it fails deterministically on the nonce and passes on registry and balances. Do NOT weaken \
+                it to make it green — a term that reaches different state than the tag it replaces is a second \
+                implementation, not the same operation expressed, and that equivalence is the entire justification \
+                for expressing ledger operations as terms."]
+    fn registering_a_name_by_term_and_by_tag_reach_the_same_state() {
+        use crate::hybrid::HybridLedger;
+        use crate::naming::{NameOp, NameTx};
+        use crate::token::{SignedTransfer, Transfer, account_id};
+        use crate::StateMachine as _;
+        use fanos_ergon::{Checked, Limits, eval};
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+
+        let mut rng = SeedRng::from_seed(&[0x5A; 2]);
+        let (secret, public) = HybridSigSecret::generate(&mut rng);
+        let actor = account_id(&public);
+        let (name, target, duration) = (b"alice".to_vec(), vec![9u8, 9], 10u64);
+        let fee = price(&name, duration);
+
+        let funded = || {
+            let mut t = TokenLedger::new();
+            t.credit(actor, 1_000_000);
+            t.credit(TREASURY, 0);
+            HybridLedger::new(t)
+        };
+
+        // The hardcoded path.
+        let mut by_tag = funded();
+        let transfer = Transfer { from: actor, to: TREASURY, amount: fee, nonce: 0 };
+        let tx = NameTx { op: NameOp::Register { name: name.clone(), target: target.clone(), duration }, payment: SignedTransfer::sign(transfer, &secret, public.clone()) };
+        let outcome = <HybridLedger as crate::StateMachine>::apply(&mut by_tag, &crate::Transaction::new(HybridLedger::name_payload(&tx)));
+        assert_eq!(outcome, crate::ExecOutcome::Applied, "the hardcoded path must apply, or there is nothing to compare against");
+
+        // The same operation as a term.
+        let mut by_term = funded();
+        let term = name_register_term(&name, &target, duration, fee, actor);
+        let checked = Checked::new(term, &Limits::unbounded()).expect("a well-typed term");
+        let mut host = LedgerHost::new(actor, by_term.height());
+        {
+            let mut state = LedgerState::new(&mut by_term);
+            eval(&checked, &[], &mut host, &mut state).expect("the term applies");
+            assert!(state.unmapped().is_none(), "every key the term touched must be routable");
+        }
+
+        assert_eq!(by_term.names().state_root(), by_tag.names().state_root(), "the name registries must agree");
+        assert_eq!(by_term.tokens().balance(&actor), by_tag.tokens().balance(&actor), "payer balances must agree");
+        assert_eq!(by_term.tokens().balance(&TREASURY), by_tag.tokens().balance(&TREASURY), "treasury must agree");
+        assert_eq!(by_term.tokens().nonce(&actor), by_tag.tokens().nonce(&actor), "NONCE: does the term path consume one?");
+        assert_eq!(by_term.state_root(), by_tag.state_root(), "the term and the tag must reach the same state");
+        assert_eq!(by_term.names().resolve(&name, 1).map(|r| r.owner), Some(actor), "and the name is registered");
+    }
 
     /// What the whole #38 -> #39 -> #37 chain was for: a term SEES and CHANGES the real registry, addressed by the
     /// same digest the access list and the scheduler use. Before this, `SPACE_NAME` was unmapped — reads answered
@@ -497,7 +643,7 @@ mod tests {
 
     fn run(term: &Term, caller: [u8; 32], ledger: &mut TokenLedger) -> Result<(), Fault> {
         let checked = Checked::new(term.clone(), &Limits::unbounded()).expect("well typed");
-        let mut host = LedgerHost::new(caller);
+        let mut host = LedgerHost::new(caller, 0);
         let mut state = TokenState::new(ledger);
         eval(&checked, &[], &mut host, &mut state).map(|_| ())
     }
@@ -530,7 +676,7 @@ mod tests {
         let mut viaergon = crate::hybrid::HybridLedger::new(funded());
         {
             let checked = Checked::new(transfer_term(ALICE, BOB, 250), &Limits::unbounded()).expect("well typed");
-            let mut host = LedgerHost::new(ALICE);
+            let mut host = LedgerHost::new(ALICE, 0);
             let mut state = LedgerState::new(&mut viaergon);
             eval(&checked, &[], &mut host, &mut state).expect("the transfer applies");
         }
@@ -599,7 +745,7 @@ mod tests {
                 .with_args(vec![Expr::Load(unmapped)]),
         );
         let checked = Checked::new(term, &Limits::unbounded()).expect("well typed");
-        let mut host = LedgerHost::new(ALICE);
+        let mut host = LedgerHost::new(ALICE, 0);
         let mut state = LedgerState::new(&mut ledger);
         assert_eq!(eval(&checked, &[], &mut host, &mut state).expect_err("unmapped space"), Fault::Missing(unmapped));
     }
