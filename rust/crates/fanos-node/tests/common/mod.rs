@@ -45,6 +45,7 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -294,15 +295,60 @@ where
 async fn within_span<F: Future>(work: F) -> Option<F::Output> {
     tokio::pin!(work);
     let mut granted = Duration::ZERO;
+    let charge = POLL.mul_f64(cpu_share());
     loop {
         tokio::select! {
             done = &mut work => return Some(done),
-            () = tokio::time::sleep(POLL) => granted += POLL,
+            () = tokio::time::sleep(POLL) => granted += charge,
         }
         if granted >= FROZEN_SPAN {
             return None;
         }
     }
+}
+
+/// The share of one CPU a runnable task can expect right now, in `(0, 1]`.
+///
+/// Charging the budget a full [`POLL`] per timer tick assumed a tick *is* the opportunity to make progress. It is
+/// not, and this module's own [`converge`] doc already records the measurement: charging by timer ticks "stretched
+/// a 48 s window to only 79 s at 4× oversubscription, because timers are exactly what keeps running when the
+/// worker threads cannot". `converge` was given a better denominator; the layer below it was left as it was, and
+/// that is the layer `read_within_span` uses — which is how two sub-two-second tests came to be reported
+/// `REFUTED — this session is wedged` during a contended workspace run (they pass alone in 1.47 s and 0.87 s).
+///
+/// The factor is derived rather than chosen, from processor sharing: with `L` runnable tasks contending for `C`
+/// cores each receives `C/L` of a core once `L > C`, and all of one below that. So the window stretches by exactly
+/// the contention factor, and on an unloaded host the factor is exactly `1` — which is the property that matters
+/// most, because it means **this cannot make a genuine wedge harder to see on a quiet machine: there it changes
+/// nothing at all.**
+///
+/// Load average rather than this process's CPU time, deliberately: process CPU cannot separate "starved" from
+/// "idle because wedged" — a wedged session consumes nothing either way, so a budget charged by it would stall on
+/// the very case it exists to report. Load measures the *host's* contention, which is what actually differs.
+///
+/// Read once per span rather than per tick, and through the OS's own tool rather than FFI (`unsafe_code` is
+/// denied workspace-wide, and a test harness is not the place to make an exception). Contention does not change
+/// meaningfully inside one window, so one read is enough; a failed read falls back to `1.0`, which is exactly the
+/// old behaviour and therefore cannot widen a window by accident.
+fn cpu_share() -> f64 {
+    let cores = f64::from(u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1));
+    share_at(read_load_average().unwrap_or(0.0), cores)
+}
+
+/// The derivation itself, separated from the host it reads — so the tests exercise **this** function rather than a
+/// copy of it that can drift, and so they do not depend on the load the machine happens to be under.
+fn share_at(load: f64, cores: f64) -> f64 {
+    if load <= cores { 1.0 } else { cores / load }
+}
+
+/// The 1-minute load average, or `None` if this host does not offer one the way we know how to ask.
+fn read_load_average() -> Option<f64> {
+    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+        return text.split_whitespace().next()?.parse().ok();
+    }
+    let out = std::process::Command::new("sysctl").args(["-n", "vm.loadavg"]).output().ok()?;
+    // `{ 1.23 4.56 7.89 }`
+    String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Wait until `node`'s rendezvous relay binds a §3b host registration, and return the tag it bound.
@@ -352,4 +398,43 @@ static CELL_FIXTURE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// Acquire the whole-cell fixture lock, yielding until it is free.
 pub async fn serial_cell() -> MutexGuard<'static, ()> {
     CELL_FIXTURE.lock().await
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn an_unloaded_host_charges_exactly_what_it_always_did() {
+        // The property that makes this change safe to make at all: on a quiet machine the factor is exactly 1, so
+        // a genuine wedge is reported in the same window as before. A "fix" for false positives that also widens
+        // the quiet-machine window would have bought load-tolerance with blindness, which is the worse trade.
+        let cores = f64::from(u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1));
+        // Exactly 1.0, not approximately: the whole safety argument is that a quiet machine behaves as before.
+        assert!((share_at(0.0, cores) - 1.0).abs() < f64::EPSILON, "an idle host must charge the full poll");
+        assert!((share_at(cores, cores) - 1.0).abs() < f64::EPSILON, "and so must one loaded to exactly its cores");
+    }
+
+    #[test]
+    fn oversubscription_stretches_the_window_by_exactly_the_contention_factor() {
+        // Processor sharing, asserted as the identity it is rather than as a range: at `k`x oversubscription a
+        // runnable task gets `1/k` of a core, so the window must last `k`x longer. No tuning factor anywhere.
+        let cores = 16.0;
+        for k in [2.0, 3.0, 4.0, 10.0] {
+            let share = share_at(cores * k, cores);
+            assert!(
+                (share - 1.0 / k).abs() < 1e-9,
+                "at {k}x oversubscription a task expects 1/{k} of a core, got {share}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_charge_is_never_zero_so_a_wedge_is_always_eventually_reported() {
+        // The failure mode of any contention-aware budget: at extreme load the charge could round to nothing and
+        // the window would never close, converting every wedge into a hang. Bounded below by construction.
+        let share = share_at(1e9, 16.0);
+        assert!(share > 0.0, "the charge must stay positive at any load, got {share}");
+        assert!(POLL.mul_f64(share) > Duration::ZERO, "…and must survive the conversion back to a Duration");
+    }
 }

@@ -1114,6 +1114,7 @@ dependencies = [
  "fanos-vrf",
  "fanos-wire",
  "getrandom 0.4.3",
+ "libc",
  "rand_core 0.10.1",
  "tokio",
  "tracing",
