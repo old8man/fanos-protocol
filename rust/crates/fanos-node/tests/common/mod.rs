@@ -370,9 +370,18 @@ async fn within_span<F: Future>(work: F) -> Option<F::Output> {
 /// the very case it exists to report. Load measures the *host's* contention, which is what actually differs.
 ///
 /// Read once per span rather than per tick, and through the OS's own tool rather than FFI (`unsafe_code` is
-/// denied workspace-wide, and a test harness is not the place to make an exception). Contention does not change
-/// meaningfully inside one window, so one read is enough; a failed read falls back to `1.0`, which is exactly the
-/// old behaviour and therefore cannot widen a window by accident.
+/// denied workspace-wide, and a test harness is not the place to make an exception). A failed read falls back to
+/// `1.0`, which is exactly the old behaviour and therefore cannot widen a window by accident.
+///
+/// **Known limit, measured the hard way: the one-minute load average LAGS.** It describes the minute just past,
+/// not the moment, so on a machine whose contention is decaying this over-stretches the window and on one ramping
+/// up it under-stretches. The cost of getting this wrong is asymmetric and in the safe direction — over-stretching
+/// delays a verdict, under-stretching is the false REFUTED this replaced — but it is a real bound on the
+/// correction. It also makes load average a poor *experimental* control: an attempt to measure the dilation curve
+/// at three load levels produced 258 s at "load 12" and 3 s at "load 16", because the first ran while the machine
+/// was still draining a previous experiment the one-minute average had not caught up with. The independent
+/// variable was never actually controlled. A shorter-horizon measure (run-queue depth sampled directly) would fix
+/// both, and is the obvious next step if this correction ever needs to be tighter.
 fn cpu_share() -> f64 {
     let cores = f64::from(u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1));
     share_at(read_load_average().unwrap_or(0.0), cores)
