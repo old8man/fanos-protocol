@@ -1874,7 +1874,12 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
                     // A timeout turns "the engine is not answering" into an answer, which is the one this verb
                     // exists to give.
                     let body = match tokio::time::timeout(PROBE_TIMEOUT, handle.probe()).await {
-                        Ok(Some(p)) => format!("{}\n", p.consensus),
+                        // The WHOLE `DriverProbe`, not just its `consensus` field: `LAGGED` and `sampling` are
+                        // what make an operator's reading falsifiable. Stalled with `lagged > 0` is a transport
+                        // question; stalled with `lagged == 0` received everything the cell sent and is a
+                        // consensus one. Dropping them — as the first draft of this verb did — leaves exactly the
+                        // unfalsifiable explanation the type's own doc warns against.
+                        Ok(Some(p)) => format!("{p}\n"),
                         Ok(None) => "consensus: the driver task has ended\n".to_owned(),
                         Err(_) => format!("consensus: the driver did not answer within {PROBE_TIMEOUT:?}\n"),
                     };
