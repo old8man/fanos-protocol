@@ -571,12 +571,21 @@ where
             if height != last_height {
                 last_height = height;
                 let now = Instant::now();
+                // **Karn's second clause, and the first version of this dropped it.** The rule is not only "do not
+                // sample a height that timed out" — it is also "keep the backed-off timeout until a clean sample
+                // proves a shorter one". Recomputing from the estimate here regardless produced an oscillation
+                // that never converges: estimate 500 ms, height needs 700, timeout fires at 500, the round is
+                // advanced prematurely, backoff doubles to 1 s, the height completes — dirty, so no sample — and
+                // the reset put it straight back to 500 ms for the next one. The cell then pays a premature
+                // advance on every height under load and never learns, which is exactly the livelock the fixed
+                // timeout's own documentation warned about. Half of Karn is worse than none, because it looks
+                // like the whole of it in a diff.
                 if !timed_out_this_height {
                     rtt = Some(fold_round_latency(rtt, now - height_started));
+                    round_timeout = estimated_round_timeout(rtt);
                 }
                 timed_out_this_height = false;
                 height_started = now;
-                round_timeout = estimated_round_timeout(rtt);
                 timeout_deadline = now + round_timeout;
             }
         }
@@ -953,6 +962,46 @@ mod tests {
             estimated_round_timeout(jittery),
             estimated_round_timeout(steady)
         );
+    }
+
+    #[test]
+    fn a_height_that_timed_out_keeps_the_backed_off_timeout_rather_than_the_stale_estimate() {
+        // Karn's algorithm is two clauses and the first draft of this shipped one. Not sampling a dirty height is
+        // half; the other half is KEEPING the backed-off timeout until a clean sample earns a shorter one.
+        //
+        // Without it the driver oscillates and never converges: an estimate the last height already disproved is
+        // reinstated the moment that height finishes, so the next one times out at the same too-low value, backs
+        // off, completes dirty, and resets again — a premature round advance on every height under load, which is
+        // the livelock the fixed timeout's own doc warned about. This test is written against the *sequence*,
+        // because the bug is invisible in any single value.
+        let settled = {
+            let mut rtt = None;
+            for _ in 0..40 {
+                rtt = Some(fold_round_latency(rtt, Duration::from_millis(300)));
+            }
+            estimated_round_timeout(rtt)
+        };
+        // A height that timed out has driven the timeout above the estimate via `next_round_timeout`.
+        let backed_off = next_round_timeout(next_round_timeout(settled, false), false);
+        assert!(backed_off > settled, "the backoff must exceed the estimate for this test to mean anything");
+
+        // The rule the driver must follow at the progress edge: recompute ONLY on a clean height.
+        let after = |timed_out: bool, current: Duration, rtt| {
+            if timed_out { current } else { estimated_round_timeout(rtt) }
+        };
+        let rtt = {
+            let mut r = None;
+            for _ in 0..40 {
+                r = Some(fold_round_latency(r, Duration::from_millis(300)));
+            }
+            r
+        };
+        assert_eq!(
+            after(true, backed_off, rtt),
+            backed_off,
+            "a height that timed out must keep what the backoff bought, not the estimate it already disproved"
+        );
+        assert_eq!(after(false, backed_off, rtt), settled, "…and a clean one earns the estimate back");
     }
 
     #[test]

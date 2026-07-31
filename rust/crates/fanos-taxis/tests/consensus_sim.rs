@@ -18,6 +18,7 @@ use fanos_taxis::committee::{epoch_seal_line, leader, leader_line, leader_ticket
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, DaShards, Input, Output, RevealMsg};
 use fanos_taxis::da::Sampler;
+use fanos_taxis::vote::{SignedVote, Vote};
 use fanos_taxis::Phase;
 use fanos_taxis::incentive::SlashEvidence;
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
@@ -2464,6 +2465,62 @@ fn a_sub_quorum_lock_split_heals() {
     }
     for h in 0..height {
         assert!(c.hashes_at(h).len() <= 1, "no fork at height {h}");
+    }
+}
+
+#[test]
+fn one_forged_frame_cannot_disable_the_cell_s_lock_split_recovery() {
+    // The lag signal `max_seen_height` is **monotone with no reset**, and `accept_vote` used to raise it seven
+    // lines BEFORE checking the signature — so one forged frame set it to `u64::MAX` on every validator,
+    // permanently. `maybe_propose` gates `can_reoffer` on that signal, which is the mechanism documented as
+    // existing "to break a lock split at the contested height".
+    //
+    // **The severity that suggests is not what falsification showed, and the weaker claim is the honest one.**
+    // Reverting the fix does NOT break healing: the cell still reaches height 15 and heals the split, because
+    // `reprepare_lock` and `valid_value` also close it and neither reads the poisoned signal. Only `can_reoffer`
+    // is suppressed. What the revert *does* produce is the counter assertion below plus a visible sync storm
+    // (`sync=9a/0s/0c ans=0/0/63` — every validator asking forever and every answer empty).
+    //
+    // So the liveness assertion here is a regression guard, not the discriminating one, and saying so matters:
+    // ordering it first was what caught the over-claim. A test whose falsification trips only its *last*
+    // assertion has an untested prefix, and this one's prefix stays because a future change that made healing
+    // depend on `can_reoffer` alone should fail here loudly.
+    let mut c = Cluster::new(&genesis());
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"poison");
+    c.submit_all(&tx);
+
+    // One frame claiming a height the cell will never reach, attributed to validator 1 and signed by validator 2's
+    // key — a forgery an attacker with its OWN key can mint, which is the realistic capability. (`SignedVote.sig`
+    // is private, so an unsigned one cannot even be constructed from here; the wire decoder can, and this is the
+    // stronger test anyway: it survives a fix that only rejected empty signatures.)
+    let keys = gen_keys();
+    let vote = Vote { height: u64::MAX, round: 0, block_hash: [9u8; 32], phase: Phase::Prepare, voter: 1 };
+    c.inject(ConsensusMsg::Vote(SignedVote::sign(vote, &keys[2].sig)));
+
+    // **The property first, the mechanism second.** Ordered this way deliberately: with the counter assertion
+    // leading, falsifying the fix trips it and the liveness half never runs, so nothing would have shown that
+    // half to be load-bearing rather than decoration. The cell must still heal the split the poisoned signal
+    // disables. Same construction as
+    // `a_sub_quorum_lock_split_heals`: hide PREPAREs from four of seven for one round, so three lock and four
+    // never see the polka; quorum is 5, so only re-offering can break it.
+    c.set_drop_to(Some((Phase::Prepare, &[3, 4, 5, 6])));
+    c.tick();
+    c.set_drop_to(None);
+    for _ in 0..8 {
+        c.tick();
+        c.timeout();
+    }
+    let height = c.engines[0].chain().next_height();
+    let probes: Vec<String> = (0..N).map(|i| format!("v{i}:{}", c.engines[i].probe())).collect();
+    assert!(height >= 1, "a forged frame must not cost the cell its lock-split recovery: {}", probes.join(" | "));
+    for h in 0..height {
+        assert_eq!(c.hashes_at(h).len(), 1, "and it must not fork height {h}: {}", probes.join(" | "));
+    }
+
+    // The mechanism, checked after the property it protects: no validator believed the claim in the first place.
+    for (i, e) in c.engines.iter().enumerate() {
+        let p = e.probe();
+        assert_eq!(p.max_seen_height, 0, "validator {i} believed a forged claim: {p}");
     }
 }
 

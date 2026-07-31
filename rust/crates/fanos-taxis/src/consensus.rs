@@ -1230,6 +1230,35 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.max_seen_height = self.max_seen_height.max(height);
     }
 
+    /// Raise the lag signal from a block, but only as far as the block can **prove**.
+    ///
+    /// A header's `height` is an unsigned claim: blocks are not signed, and the two call sites that used to trust it
+    /// sat in the validity-*failure* branch, so they fired precisely when the block had not checked out. The
+    /// certificate is the evidence — a COMMIT quorum for `cert.height` proves the cell finalized that height, so its
+    /// next height is at least `cert.height + 1`. Nothing else about the block is believed.
+    ///
+    /// This matters far more than a counter, because [`max_seen_height`](Self::note_height) is **monotone with no
+    /// reset** and `maybe_propose` gates `can_reoffer` on it. One frame claiming `u64::MAX` therefore used to
+    /// disable, permanently and cell-wide, the one mechanism documented as existing "to break a lock split at the
+    /// contested height" — a liveness wedge for the price of a single message from one validator inside `f`.
+    ///
+    /// The quorum verification is gated on the claim being *material* (above both our height and what we already
+    /// believe), so a repeated or stale claim costs nothing and an attacker pays one frame per verification rather
+    /// than driving an unbounded loop.
+    fn note_certified_height(&mut self, block: &Block) {
+        let claimed = block.header.height;
+        if claimed <= self.height() || claimed <= self.max_seen_height {
+            return;
+        }
+        if let Some(cert) = block.last_commit.as_ref()
+            && cert.phase == Phase::Commit
+            && cert.height == claimed.saturating_sub(1)
+            && cert.verify(self.params.quorum, &self.verifiers)
+        {
+            self.note_height(cert.height.saturating_add(1));
+        }
+    }
+
     /// If the cell has clearly moved ahead of us (a peer finalized a height we have not), broadcast a
     /// catch-up request. Emitted at most once per `Tick`, so it is naturally rate-limited; a settled peer
     /// answers with a certified snapshot ([`on_sync_req`](Self::on_sync_req)). Adopting is monotone and
@@ -1653,6 +1682,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if !adopted.is_empty() {
             return adopted;
         }
+        // **Learning you are behind is not a round-0 lottery decision**, and the guard below used to decide both.
+        // A validator that has timed out even once sits at round ≥ 1 and returned there — so it stopped learning the
+        // cell's height from skeletons, which under DA dispersal is the message peers actually broadcast (a proposal
+        // goes out as a payload-less skeleton plus one shard each). The abundant signal was the silenced one.
+        // Recorded in `docs/audit.md` as an asymmetry that "may or may not matter"; it does.
+        self.note_certified_height(block);
         if self.sortition.is_none() || self.round != 0 || self.sent_prepare.contains(&0) {
             return Vec::new();
         }
@@ -1664,10 +1699,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             || !block.last_commit_matches()
             || !self.valid_last_commit(block)
         {
-            if block.header.height > height {
-                self.note_height(block.header.height); // a skeleton for a height ahead of us — we are behind
-            }
-            return Vec::new();
+            return Vec::new(); // the lag signal was already taken above, from evidence rather than the header
         }
         let Some(ticket) = self.verify_witness(block) else {
             return Vec::new();
@@ -1751,7 +1783,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 self.rejects.last_commit += 1;
             }
             if block.header.height > height {
-                self.note_height(block.header.height); // a proposal for a height ahead of us — we are behind
+                self.note_certified_height(&block); // only as far as its `last_commit` proves
                 // Before discarding it: a block from a higher height carries the certificate that finalized ours.
                 let adopted = self.adopt_certified_parent(&block);
                 if !adopted.is_empty() {
@@ -1955,6 +1987,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
     fn accept_vote(&mut self, sv: SignedVote) -> Vec<Output> {
         let height = self.height();
         let v = sv.vote;
+        // **Authenticate first.** Everything below acts on claims this vote makes, and the off-height branch used to
+        // run before this check — so an unsigned frame's `height` field raised the monotone, never-reset lag signal
+        // that gates `can_reoffer`. `on_exec_vote` already had the right order; this is the deviation, not the rule.
+        let Some(verifier) = self.verifiers.get(usize::from(v.voter)) else {
+            return Vec::new();
+        };
+        if !sv.verify(verifier) {
+            return Vec::new(); // bad / forged signature
+        }
         if v.height != height {
             if v.height > height {
                 self.note_height(v.height); // a peer is voting a height we have not reached — we are behind
@@ -1963,12 +2004,6 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 self.votes_off_height = self.votes_off_height.saturating_add(1);
             }
             return Vec::new(); // stale or future height
-        }
-        let Some(verifier) = self.verifiers.get(usize::from(v.voter)) else {
-            return Vec::new();
-        };
-        if !sv.verify(verifier) {
-            return Vec::new(); // bad / forged signature
         }
         // Counted after authentication and before storage, so the number is "votes a real validator cast that reached
         // this engine" — neither inflated by forgeries nor conditioned on what the buffer later does with them. Our own
