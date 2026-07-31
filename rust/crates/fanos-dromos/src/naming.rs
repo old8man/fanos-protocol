@@ -329,12 +329,28 @@ impl NameRegistry {
         Ok(rec)
     }
 
+    #[must_use]
+    /// The record stored under `key`, whatever its expiry — the digest-addressed read the ERGON state adapter needs.
+    ///
+    /// Unlike [`resolve`](Self::resolve) this does **not** filter expired records, because the two answer different
+    /// questions: resolution asks "what does this name point at now", and a term reading state asks "what is stored
+    /// here". Folding expiry into the read would make a term's view of state depend on the clock rather than on the
+    /// state, and a footprint would then name a key whose contents change without a write.
+    pub fn record_at(&self, key: &[u8; 32]) -> Option<&NameRecord> { self.records.get(key) }
+
+    /// Store `rec` under its own name's digest, replacing any record there.
+    ///
+    /// The key is derived from the record rather than supplied, so a caller cannot place a record at an address that
+    /// does not resolve to it — the same invariant the snapshot decoder enforces, kept in the one other place a
+    /// record can enter the map.
+    pub fn put(&mut self, rec: NameRecord) { self.records.insert(name_digest(&rec.name), rec); }
+
     /// A binding commitment to the registry — `(key, name, owner, expiry, target)` in **digest order**, hashed.
     ///
-    /// Digest order rather than name order, because the map is keyed by digest so the other four sub-ledgers can be
-    /// addressed the same way (see `name_digest`). Equally canonical — a `BTreeMap` over `[u8; 32]` has exactly one
-    /// order — but **not the same root** as the name-ordered fold it replaces. Deliberate and stated: preserving a
-    /// root computed over the wrong addressing would be preserving the defect.
+    /// Digest order rather than name order, because the map is keyed by digest so all five sub-ledgers are addressed
+    /// the same way (see [`name_digest`]). Equally canonical — a `BTreeMap` over `[u8; 32]` has exactly one order —
+    /// but **not the same root** as the name-ordered fold it replaces. Deliberate and stated: preserving a root
+    /// computed over the wrong addressing would be preserving the defect.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {
         let mut buf = Vec::new();

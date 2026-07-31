@@ -221,6 +221,9 @@ impl HybridLedger {
     /// was permitted.
     pub(crate) fn tokens_mut(&mut self) -> &mut TokenLedger { &mut self.tokens }
 
+    /// The name registry, mutably — for the ERGON state adapter, which routes `SPACE_NAME` writes here.
+    pub(crate) fn names_mut(&mut self) -> &mut NameRegistry { &mut self.names }
+
     /// The authenticated transparent token ledger (read-only).
     #[must_use]
     pub fn tokens(&self) -> &TokenLedger {

@@ -29,7 +29,7 @@
 //! One consequence, stated because it is what an equivalence test can and cannot claim: an ERGON-executed transfer and a
 //! native `apply_with_verdict` agree on **balances**, and the nonce is not the effect's business. See the tests.
 
-use crate::naming::NameRecord;
+use crate::naming::{NameRecord, name_digest};
 use fanos_ergon::value::{Fault, Value};
 use fanos_ergon::{Checked, Limits};
 use fanos_pqcrypto::sig::{HYBRID_SIG_LEN, HYBRID_VK_LEN};
@@ -250,6 +250,14 @@ impl Reader for LedgerState<'_> {
         if key.space == SPACE_HTLC {
             return self.ledger.htlcs().htlcs.get(&key.slot).map(|h| Value::Bytes32(h.terms().hashlock));
         }
+        // The name space, readable and writable both, which the other mapped spaces are not: a name record is ordinary
+        // state with no rule guarding it beyond the registry's own, and now that the registry is keyed by the same
+        // digest the footprint uses (`naming::name_digest`), the key alone is enough to find it. `None` for an absent
+        // name is the honest answer and not a default — `Expr::Load` turns it into `Fault::Missing`, which refuses a
+        // term that assumed a name exists rather than inventing an empty record for it.
+        if key.space == SPACE_NAME {
+            return self.ledger.names().record_at(&key.slot).map(name_record_value);
+        }
         // Every further space is a sub-ledger yet to be mapped, and `None` is the honest answer: `Expr::Load` on it becomes
         // `Fault::Missing`, which refuses the term rather than inventing a value for state this adapter cannot see. Adding
         // a space is adding a branch here. Recorded as well as refused, so a caller that ignores the fault still cannot
@@ -263,6 +271,13 @@ impl State for LedgerState<'_> {
     fn set(&mut self, key: Key, value: Value) {
         match (key.space, value.as_u64()) {
             (SPACE_BALANCE, Ok(n)) => self.ledger.tokens_mut().set_balance(key.slot, n),
+            // A name write must land under the digest of the name INSIDE the record, not under whatever key the term
+            // named — `put` derives the address, so a term cannot store a record at an address that does not resolve
+            // to it. A key/record mismatch is therefore not a silent relocation but an unmapped write, recorded below.
+            (SPACE_NAME, _) => match name_record_from(&value) {
+                Some(rec) if name_digest(&rec.name) == key.slot => self.ledger.names_mut().put(rec),
+                _ => self.unmapped.set(self.unmapped.get().or(Some(key))),
+            },
             // A write this adapter cannot route must never vanish quietly. It is dropped — a value written to a space the
             // adapter does not understand would be a guess — and recorded, so the transaction is rejected rather than
             // committed with a rule believing it did something it did not.
@@ -410,6 +425,46 @@ pub fn name_record_from(v: &Value) -> Option<NameRecord> {
 mod tests {
     use super::*;
     use fanos_ergon::{Checked, Limits, eval};
+
+    /// What the whole #38 -> #39 -> #37 chain was for: a term SEES and CHANGES the real registry, addressed by the
+    /// same digest the access list and the scheduler use. Before this, `SPACE_NAME` was unmapped — reads answered
+    /// `None` and writes were dropped and recorded, honestly refusing rather than pretending.
+    #[test]
+    fn a_term_reads_and_writes_a_real_name_record_through_the_state_adapter() {
+        use crate::hybrid::HybridLedger;
+
+        let mut ledger = HybridLedger::new(TokenLedger::new());
+        let rec = NameRecord { name: b"alice".to_vec(), owner: [4u8; 32], target: vec![1, 2, 3], expiry: 500 };
+        ledger.names_mut().put(rec.clone());
+
+        let key = name_key(name_digest(b"alice"));
+        {
+            let state = LedgerState::new(&mut ledger);
+            let seen = state.get(&key).expect("a stored name is readable at its digest");
+            assert_eq!(name_record_from(&seen).as_ref(), Some(&rec), "and reads back as the record it is");
+            assert!(state.unmapped().is_none(), "a mapped space must not be recorded as unmapped");
+            let absent = name_key(name_digest(b"nobody"));
+            assert_eq!(state.get(&absent), None, "an absent name is `None`, not an invented empty record");
+        }
+
+        // A write lands in the registry, and lands under the digest of the name INSIDE the record.
+        let renamed = NameRecord { expiry: 900, ..rec.clone() };
+        {
+            let mut state = LedgerState::new(&mut ledger);
+            state.set(key, name_record_value(&renamed));
+            assert!(state.unmapped().is_none(), "a well-addressed name write is routed, not dropped");
+        }
+        assert_eq!(ledger.names().resolve(b"alice", 800).map(|r| r.expiry), Some(900), "the registry changed");
+
+        // A record whose own name does not hash to the key it was written at is REFUSED, not relocated: a term that
+        // could store a record at an address it does not resolve to would make the footprint a fiction.
+        {
+            let mut state = LedgerState::new(&mut ledger);
+            state.set(name_key(name_digest(b"mallory")), name_record_value(&rec));
+            assert!(state.unmapped().is_some(), "a mis-addressed name write must be refused and recorded");
+        }
+        assert!(ledger.names().resolve(b"mallory", 100).is_none(), "and must not have landed anywhere");
+    }
 
     /// The verification #38 set for itself: a REAL ledger record, not one shaped like it, surviving the value
     /// language byte-identically. Anything less and an ERGON term writing this record would silently store something
