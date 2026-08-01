@@ -16,7 +16,7 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target, UdpDialer, UdpTunnel};
 use fanos_quic::Client;
-use fanos_rendezvous::{BeaconSeed, MixDirectory, meeting_line};
+use fanos_rendezvous::{BeaconSeed, MixDirectory, meeting_lines};
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, OverlayTransport, dial_over_transport, serve_over_channels};
 use rand_core::CryptoRng;
@@ -429,14 +429,32 @@ impl<R: ServiceResolver> FanosDialer<R> {
             Profile::Fixed(route) => {
                 // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
                 let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), identity, route, &secret, rng)
+                // Pick one of the service's `f + 1` meeting points at random — random rather than derived from
+                // the client, since a derived pick makes two of one client's dials share a point, which is a
+                // linkable observation.
+                let public = service_public_from_bundle(identity).ok_or(DialError::Unreachable)?;
+                let meetings = meeting_lines::<F2>(&public.encode(), route.epoch, &route.beacon);
+                let mut pick = [0u8; 4];
+                rng.fill(&mut pick);
+                let meeting = *meetings
+                    .get(u32::from_be_bytes(pick) as usize % meetings.len().max(1))
+                    .ok_or(DialError::Unreachable)?;
+                crate::rendezvous::anonymous_dial(self.client.clone(), identity, route, meeting, &secret, rng)
                     .ok_or(DialError::Unreachable)?
             }
             Profile::Fresh(params) => {
                 // Derive the service's per-target meeting line, DRAW A FRESH route (new random forward/reply
                 // hops so this connection is unlinkable to the client's others), then ride the session over it.
                 let public = service_public_from_bundle(identity).ok_or(DialError::Unreachable)?;
-                let meeting = meeting_line::<F2>(&public.encode(), params.epoch, &params.beacon).coords();
+                // ONE pick, used for BOTH the route draw and the dial. They must agree: `draw` lays hops that
+                // avoid the destination, so a route drawn toward one meeting point and sealed to another is a
+                // circuit built for somewhere it is not going — measured as 0 of 8 dials arriving.
+                let meetings = meeting_lines::<F2>(&public.encode(), params.epoch, &params.beacon);
+                let mut pick = [0u8; 4];
+                rng.fill(&mut pick);
+                let meeting = *meetings
+                    .get(u32::from_be_bytes(pick) as usize % meetings.len().max(1))
+                    .ok_or(DialError::Unreachable)?;
                 let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
                     params.directory.clone(),
                     params.threshold,
@@ -447,7 +465,7 @@ impl<R: ServiceResolver> FanosDialer<R> {
                     rng,
                 );
                 let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), identity, &route, &secret, rng)
+                crate::rendezvous::anonymous_dial(self.client.clone(), identity, &route, meeting, &secret, rng)
                     .ok_or(DialError::Unreachable)?
             }
         })

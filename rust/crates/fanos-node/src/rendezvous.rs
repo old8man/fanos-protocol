@@ -16,11 +16,11 @@ use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::service_public_from_bundle;
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
-use fanos_geometry::{Line, Plane, Point};
+use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_onoma::Epoch;
 use fanos_quic::Client;
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_lines,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for,
     service_tag, session_reply_keypair,
 };
 use fanos_runtime::{Command, Notification};
@@ -260,6 +260,7 @@ pub fn anonymous_dial<R: CryptoRng>(
     client: Client,
     identity: &[u8],
     route: &RendezvousRoute,
+    meeting: Triple,
     secret: &[u8],
     rng: &mut R,
 ) -> Option<DuplexStream> {
@@ -268,14 +269,11 @@ pub fn anonymous_dial<R: CryptoRng>(
     // binding (`service_tag`, which the combiner recomputes from the registration's carried identity).
     // `None` is the single place a malformed bundle is rejected, so no caller re-derives and none can disagree.
     let service_public = &service_public_from_bundle(identity)?;
-    // Pick ONE of the service's `f + 1` meeting points at random. Always taking point 0 left a whole epoch of a
-    // service's inbound traffic behind one combiner that could silently drop it; spread, a censoring combiner
-    // costs a `1/m` fraction of dials. Random rather than derived from the client, deliberately: a derived pick
-    // would make two of one client's dials share a meeting point, which is a linkable observation.
-    let meetings = meeting_lines::<F2>(&service_public.encode(), route.epoch, &route.beacon);
-    let mut pick = [0u8; 4];
-    rng.fill_bytes(&mut pick);
-    let meeting = *meetings.get(u32::from_be_bytes(pick) as usize % meetings.len().max(1))?;
+    // The meeting point is CHOSEN BY THE CALLER, not here, and that is a correctness constraint rather than
+    // style: a route is drawn to avoid its own destination, so whoever draws the route must be the one who knows
+    // which of the service's `f + 1` points it ends at. Picking here instead left the Fresh profile drawing
+    // toward point 0 while this appended a different point — measured as 0 of 8 dials arriving once point 0's
+    // combiner was silenced, i.e. the censorship spread not working at all.
     let mut forward_circuit = route.forward_hops.clone();
     forward_circuit.push(meeting);
     // NOSTOS reply home: the terminus of the reply circuit is one of the client's OWN lines — a line
