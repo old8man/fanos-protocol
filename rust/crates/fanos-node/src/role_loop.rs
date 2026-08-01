@@ -4,8 +4,19 @@
 //! Each epoch the loop reads the cell's authenticated capability directory ([`crate::capdir`]), steps the
 //! controller (the UHM-grounded Lyapunov-descent demand rebalance + role assignment), extracts *this* node's
 //! assigned roles, and publishes them on a `watch` channel the node acts on. The setpoint — how much of each
-//! role the cell wants — is supplied on another `watch` channel a load sensor drives (task A3); until that is
-//! wired the node holds a fixed target.
+//! role the cell wants — is a **cell aggregate over measured load**: [`spawn_self_organization`] runs a load
+//! publisher beside the capability publisher, each node advertises its own observed per-role load at its
+//! coordinate slot ([`crate::loaddir`]), and every node sums the roster so all derive the *same* setpoint,
+//! which is what keeps the assignment deterministic.
+//!
+//! **This comment used to say "until that is wired the node holds a fixed target". It is wired** — and the
+//! stale sentence was read by a later reader as evidence the loop was open, and copied into a design document
+//! before anyone checked the code. The residual is narrower and worth stating exactly, so the next reader does
+//! not have to re-derive it: `HealerNode::load_report` measures **2 of the 5 roles** (relay from forwarding
+//! activity, storage from shards held) and returns `0` for service, exit and rendezvous. `Node::start` then
+//! falls back to *this node's own offer* for a role reporting zero — deliberately, since a demand of zero
+//! would retire a role the moment it went quiet — so for those three, supply stands in for demand. Feeding
+//! them is `docs/design-observability.md` §7.
 //!
 //! Composition with [`crate::capdir`]: a node runs *two* tasks — [`crate::capdir::spawn_capability_publisher`]
 //! keeps its own advertisement live, and [`spawn_role_loop`] reads the whole roster and computes its

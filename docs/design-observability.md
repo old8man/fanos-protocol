@@ -57,11 +57,26 @@ Three subsystems are open-loop today, and the same missing piece closes all thre
 directory and steps a `RoleController` — a UHM-grounded **Lyapunov-descent** demand rebalance plus role
 assignment — then publishes this node's assigned roles on a `watch` channel. The controller is real.
 
-Its own documentation states the gap: *"The setpoint — how much of each role the cell wants — is supplied on
-another watch channel a load sensor drives; until that is wired the node holds a fixed target."*
+**CORRECTION (2026-08-01): an earlier revision of this section said the setpoint was a fixed target and the
+load sensor "does not exist". That was wrong**, and it was wrong because it quoted a *stale doc comment* in
+`role_loop.rs` instead of reading the code — the same "validate what a claim counts before building on it"
+failure this document exists to make unnecessary. The comment has been corrected too.
 
-A controller with no feedback is not a control system. **The load sensor needs data-path measurement, which does
-not exist** — so "self-organizing" is presently a property of the code rather than of the running network.
+What is actually there: the loop **is** closed end-to-end. `spawn_self_organization` wires a load publisher
+alongside the capability publisher; `HealerNode` emits `Notification::LoadReport`; `node.rs` folds it into
+per-role atomics; `loaddir` publishes each node's report to its coordinate slot and `build_cell_setpoint` sums
+the roster so every node derives the *same* setpoint (determinism the assignment requires).
+
+**The real gap is narrower and sharper: the sensor covers 2 of 5 roles.** `HealerNode::load_report` returns
+`[relays, stored, 0, 0, 0]` over `Role::ALL = [relay, storage, service, exit, rendezvous]` — relay measured
+from forwarding activity, storage from shards held. The other three report zero, and `node.rs` then falls back
+to *the node's own offer* rather than reporting a demand of zero (which would retire a role the moment it went
+quiet). For those three, **supply is standing in for demand**: the controller is steering by what nodes say
+they can do, not by what the cell needs.
+
+That is exactly what this plane supplies, and it makes the value concrete rather than architectural: a service
+role's demand is sessions served, an exit's is flows carried, a rendezvous's is gathers armed and registrations
+bound — every one of them a station rate. Closing §7 means feeding those three, not building the loop.
 
 ### 2.2 Self-healing treats what it can see
 
