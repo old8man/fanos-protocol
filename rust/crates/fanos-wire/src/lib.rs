@@ -12,6 +12,9 @@
 //! * [`tessera`] — the fixed-size Tessera packet layout (§7.7).
 //! * [`error`] — decode errors and the protocol error taxonomy (§7.5).
 //! * [`capability`] — protocol-version and capability-bitfield negotiation (§7.4).
+//! * [`activation`] — **epoch-aligned activation for derivation changes**: the class of change a frame
+//!   registry cannot type, because it alters how a value is *computed* rather than how it is encoded
+//!   (`docs/design-upgrade.md`).
 //!
 //! The `#[cfg]` gates keep it `#![no_std]` (with `alloc`).
 
@@ -20,6 +23,7 @@
 
 extern crate alloc;
 
+pub mod activation;
 pub mod capability;
 pub mod element;
 pub mod error;
@@ -28,6 +32,7 @@ pub mod tessera;
 pub mod varint;
 pub mod wire;
 
+pub use activation::Derivation;
 pub use capability::{Capabilities, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION, negotiate_version};
 pub use error::{ProtocolError, WireError};
 pub use frame::{Frame, FrameType, SessionFrameType, decode_frame, encode_frame};

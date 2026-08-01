@@ -96,6 +96,35 @@ Consequences, each of which is the reason to do it this way rather than a nice p
   activation height is the same idea applied to derivations, and belongs in the same authority (`fanos-wire`)
   rather than in a second, parallel scheme that could disagree with the first.
 
+### 3.0 Where it lives, and the dependency fact that decides the type
+
+§3 argues the activation registry "belongs in the same authority (`fanos-wire`) rather than in a second,
+parallel scheme that could disagree with the first". Checked against the crate graph, that placement holds —
+but it fixes the *type*, and not the way one would first reach for:
+
+**`fanos-wire` cannot use `Epoch`.** `Epoch` lives in `fanos-primitives`, and `fanos-primitives` already
+carries an optional dependency **on `fanos-wire`**. A `fanos-wire → fanos-primitives` edge would close a
+cycle. So the registry takes a bare **epoch ordinal (`u64`)**, or a newtype `fanos-wire` defines itself.
+
+That is the better shape anyway, and worth stating as a rule rather than a workaround: the frame-numbering
+authority is *below* the geometry and identity vocabulary in the graph, and should stay there. An activation
+height is a number two nodes must agree on — it needs no plane, no coordinate, and no key material to mean
+what it means. Reaching for `Epoch` would have coupled the wire's version authority to the whole geometry
+stack to gain nothing but a nicer signature.
+
+The shape, then:
+
+```text
+  ActivationHeight(u64)                    // the epoch ordinal a feature becomes active at
+  Derivation                               // the enumeration of derivation-versioned behaviours
+  fn active_at(d: Derivation, epoch: u64) -> bool     // e >= activation_height(d)
+```
+
+with each call site selecting between its two implementations on `active_at`, and the epoch supplied by the
+caller that already holds one (the node driver) rather than read from a clock inside the registry — the same
+sans-I/O discipline every other engine follows. **First consumer: `combiner_of` vs `combiner_of_salted`**,
+the change that motivated this document.
+
 ### 3.1 Both derivations must be linked into the binary
 
 A node that has not yet reached the activation height must still speak the *old* derivation, and after it, the
@@ -103,6 +132,16 @@ A node that has not yet reached the activation height must still speak the *old*
 worth naming: **derivation changes accumulate as code that cannot be deleted until every supported epoch is
 past.** A retirement policy ("derivations older than `N` epochs are dropped in release `X`") must exist from the
 start, or the codebase silently becomes an archive of every wire it ever spoke.
+
+**Status: the registry exists (`fanos_wire::activation`), the dual implementations do not.** `Derivation`,
+`activation_height`, and `Activation::is_active(derivation, epoch)` are built and tested, so the *schedule*
+now has a single authority and a place for the next change to go. What is deliberately **not** built is the
+second half — no call site yet selects between two implementations on `is_active`, because there is currently
+nothing to select *between*: `combiner_of_salted` shipped before the registry existed, so it is registered at
+height `0` (honestly "active for every epoch this build has seen") rather than back-dated to a switch that
+never happened. Registering it at all is what gives the mechanism a worked example and the next derivation
+change a home. **The first real exercise of this design will be the first derivation changed after it** —
+and that change, not this commit, is what will prove the dual-implementation and retirement discipline.
 
 ---
 
