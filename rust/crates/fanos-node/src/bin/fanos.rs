@@ -275,6 +275,11 @@ const NO_CHAIN: &str = "this role runs no chain — start `fanos validator` to r
 /// How long the `consensus` verb waits for the driver before answering that it did not.
 ///
 /// Short on purpose: the probe is a local channel round trip, so anything approaching this bound *is* the finding.
+///
+/// Gated like its only use (`cmd_validator`): without the feature there is no driver to probe, and an ungated
+/// constant is dead code the moment this crate is linted ALONE — `cargo clippy --workspace` unifies the feature
+/// on from another member and never sees it, which is exactly why per-crate verification is the stricter gate.
+#[cfg(feature = "validator")]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bind this invocation's control socket, so an operator can ask a **running** role anything.
