@@ -299,10 +299,30 @@ needs the service to land by luck on one of only four Fano combiners, and its co
 substrate exists to hide. Option (b) hands the adversary the failure signal, which is the wrong direction on
 principle. The registration cost is real and bounded, and §5's replica set already needs a host driver.
 
-Whatever the path, the proof required is the same and is not yet written: a scenario where the combiner at meeting
-point 0 silently drops everything and the client still reaches the service through another, falsified by collapsing
-`m` to 1 and confirming the dial fails. Without it a green suite shows only that dialing works, not that
-censorship is survived.
+### 6.3 The bound is claimed by construction and NOT yet demonstrated
+
+The mechanism is in place — hosts register at all `m`, clients pick among them — and the eight anonymous e2e tests
+pass. **That is not the same as surviving censorship, and the difference has been measured rather than assumed.**
+
+With meeting point 0's combiner stopped and points 1 and 2 alive, dials fail far more often than the pick
+distribution can account for: 0 of 8 arrived in one run, while a run differing only in an instrumentation probe
+passed. Three candidate causes were each ruled out by their own experiment — a route/meeting mismatch in the Fresh
+profile (a real defect, since fixed, but not this), impatience (per-attempt deadline raised fourfold, no change),
+and missing bindings (probed directly: all three meeting points bind the same service tag). What remains is
+unexplained and nondeterministic.
+
+Two properties of the setting were established on the way, and both belong here rather than in a test comment:
+
+* **A silenced combiner does not refuse, it swallows.** A dial still *succeeds* — it only seals and emits — and
+  the exchange then wedges indefinitely. So the only failure signal available to a client is a clock, which is
+  the one signal an adversary controls. This is the concrete form of the objection §6.2 raised against letting
+  the client walk the points as the primary mechanism.
+* **The property to prove is "remains reachable", not "every dial completes".** Since a dial does not retry, a
+  fraction of picks landing on a censored point *should* fail; a test asserting otherwise cannot pass and would
+  be measuring a mechanism that does not exist yet.
+
+Until a scenario demonstrates reachability under a silenced meeting point — falsified by collapsing `m` to 1 —
+§6's bound stands as a derivation whose implementation is unverified.
 
 ---
 
