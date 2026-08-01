@@ -34,6 +34,7 @@ use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
 use fanos_rendezvous::CONTROL_MIX_DIRECTORY;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, HostRegister, MixDirectory, RendezvousService, combiner_for, meeting_line,
+    meeting_lines,
     seal_forward, seal_host_register,
 };
 
@@ -186,7 +187,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let mut skp = SeedRng::from_seed(b"anon-quic-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public().clone();
-    let (_signer, bundle) = signing_half(&service_public, b"anon-quic-service");
+    let (signer, bundle) = signing_half(&service_public, b"anon-quic-service");
     let epoch = fanos_rendezvous::Epoch::new(5);
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
@@ -204,6 +205,26 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let hop_to_rp = *lines.iter().find(|&&l| l != rp && l != meeting).unwrap();
 
     let service_node = nodes[l_index].take().unwrap();
+    // The service registers a forward route at EVERY meeting point, even though it happens to sit at one
+    // combiner: a client now picks among the `f + 1` points, and a registration is what makes any of them able to
+    // reach it. Being at a combiner stops being load-bearing — it becomes an accident of placement.
+    let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-quic-svc-secret", epoch.get(), TEST_BEACON.as_bytes())
+        .coords();
+    let (svc_reply_keys, svc_reply_pub) = ReplyKeys::generate(b"anon-quic-svc-secret");
+    let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], t as u8)
+        .expect("the dead-drop line is nameable");
+    for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
+        let seed = [b"anon-quic-svc-secret".as_slice(), &(i as u32).to_be_bytes()].concat();
+        if let Some(fwd) = seal_host_register::<F2>(&[point], &mix, t as u8, &reg, &seed) {
+            service_node.client().command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
+        }
+    }
+    // Any node may be the combiner the client picks, and a combiner cannot seal a forward without the epoch's
+    // mix directory — it is a sans-I/O engine and cannot resolve one itself.
+    for n in nodes.iter().flatten() {
+        n.client().command(Command::Control { tag: CONTROL_MIX_DIRECTORY, body: mix.encode() });
+    }
+    service_node.client().command(Command::Control { tag: CONTROL_MIX_DIRECTORY, body: mix.encode() });
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"anon-quic-svc-secret");
     // The PRODUCTION src host driver — the same accept loop, no test fixture (§3b). It ingests each
     // anonymous request, drives the DIAULOS server, and seals the reply back through the client's route.
@@ -212,7 +233,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         service,
         SeedRng::from_seed(b"anon-quic-svc-accept"),
         rservice,
-        vec![], // service is its own combiner here — no forwarded dead-drops to open
+        vec![svc_reply_keys], // opens the dead-drops its own registration points at
         None,   // no epoch-rotation driver: a fixed single-epoch test
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
@@ -311,13 +332,33 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     let mut skp = SeedRng::from_seed(b"anon-cell-svc");
     let service = StaticKeypair::generate(&mut skp);
     let service_public = service.public().clone();
-    let (_signer, bundle) = signing_half(&service_public, b"anon-quic-service");
+    let (signer, bundle) = signing_half(&service_public, b"anon-quic-service");
     let epoch = fanos_rendezvous::Epoch::ZERO;
     let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &TEST_BEACON).coords();
     let l_combiner = combiner_for::<F2>(meeting).unwrap();
     let l_index = Point::<F2>::new(l_combiner).unwrap().index();
 
     let service_node = nodes[l_index].take().unwrap();
+    // The service registers a forward route at EVERY meeting point, even though it happens to sit at one
+    // combiner: a client now picks among the `f + 1` points, and a registration is what makes any of them able to
+    // reach it. Being at a combiner stops being load-bearing — it becomes an accident of placement.
+    let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-cell-svc-secret", epoch.get(), TEST_BEACON.as_bytes())
+        .coords();
+    let (svc_reply_keys, svc_reply_pub) = ReplyKeys::generate(b"anon-cell-svc-secret");
+    let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], t as u8)
+        .expect("the dead-drop line is nameable");
+    for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
+        let seed = [b"anon-cell-svc-secret".as_slice(), &(i as u32).to_be_bytes()].concat();
+        if let Some(fwd) = seal_host_register::<F2>(&[point], &mix, t as u8, &reg, &seed) {
+            service_node.client().command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
+        }
+    }
+    // Every node may be the combiner the client picks, and a combiner cannot seal a forward without the epoch's
+    // mix directory — it is a sans-I/O engine and cannot resolve one itself.
+    for n in nodes.iter().flatten() {
+        n.client().command(Command::Control { tag: CONTROL_MIX_DIRECTORY, body: mix.encode() });
+    }
+    service_node.client().command(Command::Control { tag: CONTROL_MIX_DIRECTORY, body: mix.encode() });
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"anon-cell-svc-secret");
     // The production src host driver (§3b), on the full deployed cell-of-composites shape.
     serve_anonymous_rpc(
@@ -325,7 +366,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         service,
         SeedRng::from_seed(b"anon-cell-svc-accept"),
         rservice,
-        vec![], // service is its own combiner here — no forwarded dead-drops to open
+        vec![svc_reply_keys], // opens the dead-drops its own registration points at
         None,   // no epoch-rotation driver: a fixed single-epoch test
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
@@ -416,8 +457,13 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     let host_node = nodes[host_index].take().unwrap();
     // The operator registers anonymously: seal the registration to the meeting line and emit it (it peels at
     // the combiner, which binds the tag → forward route, learning only the dead-drop LINE, not this node).
-    let reg_fwd = seal_host_register::<F2>(&[meeting], &mix, t as u8, &reg, b"off-combiner-reg").unwrap();
-    host_node.client().command(Command::Emit { to: reg_fwd.combiner, frame: reg_fwd.frame });
+    // At every meeting point, because the client picks among them — registering at one leaves the other m−1
+    // unable to reach this host, which is the very spread the f+1 points exist to provide.
+    for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
+        let seed = [b"off-combiner-reg".as_slice(), &(i as u32).to_be_bytes()].concat();
+        let reg_fwd = seal_host_register::<F2>(&[point], &mix, t as u8, &reg, &seed).unwrap();
+        host_node.client().command(Command::Emit { to: reg_fwd.combiner, frame: reg_fwd.frame });
+    }
 
     // The operator serves anonymously, opening each forwarded dead-drop with its reply key.
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"off-combiner-svc-secret");

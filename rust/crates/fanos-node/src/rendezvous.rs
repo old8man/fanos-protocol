@@ -20,7 +20,7 @@ use fanos_geometry::{Line, Plane, Point};
 use fanos_onoma::Epoch;
 use fanos_quic::Client;
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_line,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for, meeting_lines,
     service_tag, session_reply_keypair,
 };
 use fanos_runtime::{Command, Notification};
@@ -268,7 +268,14 @@ pub fn anonymous_dial<R: CryptoRng>(
     // binding (`service_tag`, which the combiner recomputes from the registration's carried identity).
     // `None` is the single place a malformed bundle is rejected, so no caller re-derives and none can disagree.
     let service_public = &service_public_from_bundle(identity)?;
-    let meeting = meeting_line::<F2>(&service_public.encode(), route.epoch, &route.beacon).coords();
+    // Pick ONE of the service's `f + 1` meeting points at random. Always taking point 0 left a whole epoch of a
+    // service's inbound traffic behind one combiner that could silently drop it; spread, a censoring combiner
+    // costs a `1/m` fraction of dials. Random rather than derived from the client, deliberately: a derived pick
+    // would make two of one client's dials share a meeting point, which is a linkable observation.
+    let meetings = meeting_lines::<F2>(&service_public.encode(), route.epoch, &route.beacon);
+    let mut pick = [0u8; 4];
+    rng.fill_bytes(&mut pick);
+    let meeting = *meetings.get(u32::from_be_bytes(pick) as usize % meetings.len().max(1))?;
     let mut forward_circuit = route.forward_hops.clone();
     forward_circuit.push(meeting);
     // NOSTOS reply home: the terminus of the reply circuit is one of the client's OWN lines — a line
