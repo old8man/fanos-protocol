@@ -348,9 +348,39 @@ impl<F: Field> ThresholdRouter<F> {
         Self::line_members(line).iter().position(|&m| m == me)
     }
 
-    /// The canonical combiner of a line — its first `points_on` member.
+    /// The canonical combiner of a line — the member its own coordinates select.
+    ///
+    /// **Not member zero, and the difference is a censorship bound.** Taking the first member made the combiner
+    /// map concentrate: enumerating every line of the plane, only **4 of 7** points on `PG(2,2)` and **14 of 57**
+    /// on `PG(2,7)` were ever a combiner — a fraction that *shrinks* as `q` grows. On `PG(2,7)` that let an
+    /// adversary holding 14 specific points, **fewer than the `f = 18` the fault model already tolerates**,
+    /// control every combiner in the plane and censor every hidden service in the cell. The points are a public
+    /// function of the geometry, so choosing them needed no secret.
+    ///
+    /// Selecting by a digest of the line's own coordinates spreads the image to **5 of 7** and **40 of 57**
+    /// respectively. The property that must hold is `|image| ≥ f + 1` — 5 ≥ 3 and 40 ≥ 19 — because that is what
+    /// lets a service hold `f + 1` distinct meeting combiners and leaves at least one outside any admissible
+    /// adversary set. `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults` asserts exactly
+    /// that, on both planes.
+    ///
+    /// Full coverage is neither achieved nor required: ~70 % on `PG(2,7)` is what a uniform per-line choice gives
+    /// (coupon-collector, `1 − 1/e`). The image is also **fixed rather than rotating**, so the same points are
+    /// combiners every epoch — sufficient for the bound above, and stated because it is a real residual: a
+    /// rotating choice would need `(epoch, beacon)` threaded through all 55 call sites, which no identified attack
+    /// currently justifies.
+    ///
+    /// Still a pure public function of the line, so every party derives the same combiner without coordinating.
     fn combiner_of(line: Triple) -> Option<Triple> {
-        Self::line_members(line).into_iter().next()
+        let members = Self::line_members(line);
+        let [a, b, c] = line;
+        let mut data = [0u8; 12];
+        let (x, y) = data.split_at_mut(4);
+        let (y, z) = y.split_at_mut(4);
+        x.copy_from_slice(&a.to_be_bytes());
+        y.copy_from_slice(&b.to_be_bytes());
+        z.copy_from_slice(&c.to_be_bytes());
+        let digest = fanos_primitives::hash_labeled("FANOS-v1/threshold-combiner", &data);
+        members.get(usize::from(digest[0]) % members.len().max(1)).copied()
     }
 
     /// Handle an onion addressed to us as the combiner of `line`: seed a pending peel with our own
@@ -746,6 +776,38 @@ mod tests {
     use super::*;
     use crate::threshold_onion::{HopLine, member_partial, seal_onion};
     use fanos_field::F2;
+
+    /// **The censorship bound, asserted on two planes because it must follow from the geometry.**
+    ///
+    /// A hidden service is reachable only if some meeting combiner of its is honest, so it needs `f + 1` DISTINCT
+    /// combiners — and that is impossible unless the combiner map's image is itself at least that large. Taking a
+    /// line's first member (what this replaced) gave an image of 4 on `PG(2,2)` and **14 on `PG(2,7)`, below the
+    /// `f = 18` the fault model already tolerates**: an adversary inside its budget held every combiner in the
+    /// plane and could censor every hidden service in the cell.
+    ///
+    /// A Fano-only test would have stayed green — 4 ≥ 3 — which is exactly why this enumerates a second plane.
+    #[test]
+    fn the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults() {
+        use fanos_field::F7;
+        use fanos_geometry::Plane;
+
+        fn image<F: Field>() -> usize {
+            Plane::<F>::lines()
+                .filter_map(|l| ThresholdRouter::<F>::combiner_of(l.coords()))
+                .collect::<alloc::collections::BTreeSet<_>>()
+                .len()
+        }
+        for (q, image) in [(2usize, image::<F2>()), (7, image::<F7>())] {
+            let n = q * q + q + 1;
+            let f = (n - 1) / 3;
+            assert!(
+                image > f,
+                "PG(2,{q}): only {image} of {n} points are ever a combiner, and the cell tolerates f = {f} faults \
+                 — so an adversary within its budget can hold every combiner and censor the whole cell"
+            );
+        }
+    }
+
     use fanos_pqcrypto::SeedRng;
 
     fn has_delivery(effects: &[Effect], payload: &[u8]) -> bool {
