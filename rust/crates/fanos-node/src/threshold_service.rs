@@ -35,6 +35,7 @@ use fanos_calypso::hosting::{SealedIntro, SealedShare, Share, open_service_share
 use fanos_geometry::Triple;
 use fanos_pqcrypto::HybridKemSecret;
 use fanos_primitives::hash_labeled;
+use fanos_runtime::ports::GatherClock;
 use fanos_runtime::{Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -53,9 +54,6 @@ const ANONYMOUS: Triple = [0, 0, 0];
 /// (spec §12.5 DoS). Beyond it, new intros are dropped until a slot frees (completed or timed out).
 const DEFAULT_MAX_PENDING: usize = 256;
 
-/// Default deadline for a combiner to gather `threshold` PartialDecs before abandoning an intro.
-const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
-
 /// How many recently-served intro ids to remember, to suppress a replayed intro re-serving (bounded).
 const SERVED_MEMORY: usize = 256;
 
@@ -65,6 +63,9 @@ struct PendingIntro {
     intro: SealedIntro,
     shares: BTreeMap<u8, Share>,
     timer: TimerToken,
+    /// When the share requests went out — a completed gather yields `now − armed_at` as one latency
+    /// sample for the measured deadline ([`GatherClock`]).
+    armed_at: Instant,
 }
 
 /// One member of a threshold-hosted CALYPSO service-line (see the module docs). Constructed with this
@@ -80,7 +81,12 @@ pub struct ThresholdService {
     served: VecDeque<IntroId>,
     seq: u64,
     max_pending: usize,
-    gather_timeout: Duration,
+    /// The measured gather deadline (RFC 6298 over completed gathers — [`GatherClock`]); `pending` is
+    /// bounded by `max_pending` COUNT, which is what leaves the deadline free to be measured.
+    gather: GatherClock,
+    /// An explicit pin for scenarios that must assert a specific expiry; `None` — the default — uses the
+    /// measured value.
+    gather_override: Option<Duration>,
 }
 
 impl ThresholdService {
@@ -100,15 +106,25 @@ impl ThresholdService {
             served: VecDeque::new(),
             seq: 0,
             max_pending: DEFAULT_MAX_PENDING,
-            gather_timeout: DEFAULT_GATHER_TIMEOUT,
+            gather: GatherClock::new(),
+            gather_override: None,
         }
     }
 
-    /// Override the combiner's gather deadline (default 2 s).
+    /// **Pin** the combiner's gather deadline, disabling the measured one ([`GatherClock`]).
+    ///
+    /// For scenarios that must assert a specific expiry. Production leaves it unset: the pinned constant
+    /// this used to set is the defect the measured deadline removed — the right value moved 45× between
+    /// build profiles alone (`fanos-aphantos/tests/gather_cost.rs`).
     #[must_use]
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
-        self.gather_timeout = timeout;
+        self.gather_override = Some(timeout);
         self
+    }
+
+    /// The deadline the next intro-gather is armed with — the pin if one is set, else the measured value.
+    fn gather_deadline(&self) -> Duration {
+        self.gather_override.unwrap_or_else(|| self.gather.deadline())
     }
 
     /// The number of intros currently gathering (combiner state) — for tests and observability.
@@ -176,9 +192,9 @@ impl ThresholdService {
         self.seq = self.seq.wrapping_add(1);
         effects.push(Effect::ArmTimer {
             token: timer,
-            after: self.gather_timeout,
+            after: self.gather_deadline(),
         });
-        self.pending.insert(id, PendingIntro { intro, shares, timer });
+        self.pending.insert(id, PendingIntro { intro, shares, timer, armed_at: now });
         effects.extend(self.try_serve(now, id));
         effects
     }
@@ -210,7 +226,7 @@ impl ThresholdService {
     /// If the gather for `id` has reached `threshold` distinct shares, open the intro and surface the
     /// recovered request; else leave it pending. A failed open (below threshold / tamper) leaves the
     /// gather in place to await more shares.
-    fn try_serve(&mut self, _now: Instant, id: IntroId) -> Vec<Effect> {
+    fn try_serve(&mut self, now: Instant, id: IntroId) -> Vec<Effect> {
         let Some(pending) = self.pending.get(&id) else {
             return Vec::new();
         };
@@ -221,18 +237,24 @@ impl ThresholdService {
         let Ok(request) = pending.intro.open(&shares) else {
             return Vec::new();
         };
+        let armed_at = pending.armed_at;
         // Served: drop the gather and remember the id, then surface the request. The gather's deadline
         // timer may still fire later; `on_timer` finds no matching pending intro and harmlessly no-ops
         // (there is no CancelTimer effect — a stale tick is inert).
         self.pending.remove(&id);
         self.remember_served(id);
+        // One completed gather is one latency sample — `RTT + C_partial + Q` together, under the load
+        // the next gather will meet. This is what replaces the former 2 s constant.
+        self.gather.observe(now.since(armed_at));
         vec![Effect::Notify(Notification::Delivered {
             from: ANONYMOUS,
             payload: request,
         })]
     }
 
-    /// A gather deadline fired: drop the (still-incomplete) intro it bounds, freeing its slot.
+    /// A gather deadline fired: drop the (still-incomplete) intro it bounds, freeing its slot — and back
+    /// off ([`GatherClock::expired`]): the deadline was demonstrably too short for the load this node is
+    /// under, and an expiry yields no sample, so nothing else would ever widen it (RFC 6298 §5.5 + Karn).
     fn on_timer(&mut self, token: TimerToken) -> Vec<Effect> {
         if let Some(&id) = self
             .pending
@@ -241,6 +263,7 @@ impl ThresholdService {
             .map(|(id, _)| id)
         {
             self.pending.remove(&id);
+            self.gather.expired();
         }
         Vec::new()
     }
@@ -301,4 +324,132 @@ fn decode_partial(body: &[u8]) -> Option<(IntroId, Share)> {
     let id: IntroId = body.get(..32)?.try_into().ok()?;
     let (&x, y) = body.get(32..)?.split_first()?;
     Some((id, Share::new(x, y.to_vec())))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use fanos_geometry::Point;
+    use fanos_pqcrypto::{HybridKemPublic, SeedRng};
+
+    use super::*;
+    use fanos_field::F2;
+
+    /// A `t`-of-3 service line at Fano points 0..3, returning the coordinates, the members' secrets and
+    /// their publics in seal order.
+    fn line_of_three() -> (Vec<Triple>, Vec<HybridKemSecret>, Vec<HybridKemPublic>) {
+        let mut coords = Vec::new();
+        let mut secrets = Vec::new();
+        let mut publics = Vec::new();
+        for i in 0..3usize {
+            let (secret, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xC1, i as u8]));
+            coords.push(Point::<F2>::at(i).coords());
+            secrets.push(secret);
+            publics.push(public);
+        }
+        (coords, secrets, publics)
+    }
+
+    /// The gather-deadline this engine armed, if any (it arms exactly one timer per opened gather).
+    fn armed_deadline(effects: &[Effect]) -> Option<Duration> {
+        effects.iter().find_map(|e| match e {
+            Effect::ArmTimer { after, .. } => Some(*after),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_intro_gather_deadline_is_measured_not_a_constant() {
+        // This engine held its own copy of the 2000 ms constant that #55 measured the cost of — a value
+        // whose right setting moves 45x between build profiles alone
+        // (`fanos-aphantos/tests/gather_cost.rs`). It now shares `fanos_ports::GatherClock`, and what
+        // this test owes is the WIRING, since the estimator itself is proven in fanos-ports: a completed
+        // gather must feed a sample (so the next deadline tracks observation) and an expiry must feed the
+        // backoff (so a too-tight estimate can recover). Delete either call and one half fails.
+        let (line, secrets, publics) = line_of_three();
+        let t = 2usize;
+        let refs: Vec<&HybridKemPublic> = publics.iter().collect();
+        // A KEM secret is deliberately not `Clone` (secret hygiene), so take the two this test drives —
+        // the combiner's and member 1's — by ownership, in seal order.
+        let mut secrets = secrets.into_iter();
+        let combiner_secret = secrets.next().unwrap();
+        let member_1_secret = secrets.next().unwrap();
+        let mut svc = ThresholdService::new(line[0], combiner_secret, line.clone(), t);
+
+        // Cold: nothing measured yet, so the bootstrap deadline stands.
+        let intro = SealedIntro::seal(b"first", t as u8, &refs, b"seed-0").unwrap();
+        let effects = svc.step(Instant(0), Input::Message { from: line[2], frame: intro_frame(&intro) });
+        assert_eq!(
+            armed_deadline(&effects),
+            Some(fanos_runtime::ports::gather::INITIAL_GATHER_DEADLINE),
+            "a cold combiner arms the bootstrap deadline, not a measurement it does not have"
+        );
+        // Complete that gather in 3 ms — member 1's partial brings it to t = 2.
+        let id = ThresholdService::intro_id(&intro);
+        let share = intro.member_partial(1, &member_1_secret).unwrap();
+        let served = svc.step(
+            Instant(Duration::from_millis(3).as_nanos()),
+            Input::Message { from: line[1], frame: encode(FrameType::SvcPartial, &encode_partial(&id, &share)) },
+        );
+        assert!(
+            served.iter().any(|e| matches!(e, Effect::Notify(Notification::Delivered { .. }))),
+            "the gather completed at threshold"
+        );
+
+        // A run of fast gathers: the armed deadline must collapse toward the observation, which the old
+        // constant could never do.
+        let mut now = Duration::from_millis(3).as_nanos();
+        for i in 1..12u8 {
+            let intro = SealedIntro::seal(b"payload", t as u8, &refs, &[0xA0, i]).unwrap();
+            svc.step(Instant(now), Input::Message { from: line[2], frame: intro_frame(&intro) });
+            let id = ThresholdService::intro_id(&intro);
+            let share = intro.member_partial(1, &member_1_secret).unwrap();
+            now += Duration::from_millis(3).as_nanos();
+            svc.step(
+                Instant(now),
+                Input::Message { from: line[1], frame: encode(FrameType::SvcPartial, &encode_partial(&id, &share)) },
+            );
+        }
+        let probe = SealedIntro::seal(b"probe", t as u8, &refs, b"seed-probe").unwrap();
+        let armed = svc.step(Instant(now), Input::Message { from: line[2], frame: intro_frame(&probe) });
+        let measured = armed_deadline(&armed).unwrap();
+        assert!(
+            measured < Duration::from_millis(60),
+            "after a dozen 3 ms completions the armed deadline tracks the measurement, got {measured:?}"
+        );
+
+        // Now let that gather EXPIRE. Its deadline fired without reaching t, so the next one must be
+        // strictly wider — the half of RFC 6298 a pure smoother never supplies (an expiry yields no
+        // sample, so nothing else would ever widen a too-tight estimate).
+        let timer = armed
+            .iter()
+            .find_map(|e| match e {
+                Effect::ArmTimer { token, .. } => Some(*token),
+                _ => None,
+            })
+            .unwrap();
+        svc.step(Instant(now), Input::Timer(timer));
+        let next = SealedIntro::seal(b"after-expiry", t as u8, &refs, b"seed-after").unwrap();
+        let rearmed = svc.step(Instant(now), Input::Message { from: line[2], frame: intro_frame(&next) });
+        let widened = armed_deadline(&rearmed).unwrap();
+        assert!(
+            widened > measured,
+            "an expiry must widen the next armed deadline: {widened:?} vs {measured:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_deadline_overrides_the_measurement() {
+        // `with_gather_timeout` remains, but as an explicit PIN for a scenario that must assert a
+        // specific expiry — not as the operating default it used to be.
+        let (line, secrets, publics) = line_of_three();
+        let refs: Vec<&HybridKemPublic> = publics.iter().collect();
+        let pinned = Duration::from_millis(250);
+        let combiner_secret = secrets.into_iter().next().unwrap();
+        let mut svc = ThresholdService::new(line[0], combiner_secret, line.clone(), 2)
+            .with_gather_timeout(pinned);
+        let intro = SealedIntro::seal(b"pinned", 2, &refs, b"seed-pin").unwrap();
+        let effects = svc.step(Instant(0), Input::Message { from: line[2], frame: intro_frame(&intro) });
+        assert_eq!(armed_deadline(&effects), Some(pinned), "the pin wins over the measured value");
+    }
 }

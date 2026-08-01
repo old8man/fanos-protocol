@@ -27,7 +27,9 @@ use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet};
 use fanos_primitives::Epoch;
 use fanos_primitives::shamir::Share;
-use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_ports::{
+    Command, Duration, Effect, Engine, GatherClock, Input, Instant, Notification, TimerToken,
+};
 
 use crate::threshold_onion::{self as threshold, ThresholdPeel};
 
@@ -47,26 +49,6 @@ const TAG_DROP: u8 = 0xE3;
 
 /// The anonymous-source sentinel in a delivery notification (the endpoint learns no originator).
 pub const ANONYMOUS: Triple = [0, 0, 0];
-
-/// The deadline used **before the first gather completes**, when there is nothing measured to derive one
-/// from — the bootstrap slot RFC 6298 fills with its 1 s initial RTO, for the same reason.
-///
-/// It is generous on purpose and it is *not* the operating value: one completed gather replaces it with a
-/// measurement ([`GatherClock`]). Being wrong here costs at most the first hop of a cold node, which the
-/// reliability layer retransmits; being wrong *permanently* is what the former 2000 ms constant did.
-const INITIAL_GATHER_DEADLINE: Duration = Duration::from_millis(2000);
-
-/// Floor on the derived deadline. Not a tuning knob: it stops a run of unusually fast gathers (an idle node
-/// on a loopback) from collapsing the estimate so far that the first genuinely loaded gather is abandoned
-/// before its partials can physically arrive. One millisecond is below any real `RTT + C_partial` — the
-/// measured `C_partial` alone is 1.05 ms in release — so it can never bind in operation, only in pathology.
-const MIN_GATHER_DEADLINE: Duration = Duration::from_millis(1);
-
-/// Ceiling on the derived deadline, and the one place memory enters the timing. In-flight gathers are capped
-/// by count ([`MAX_PENDING`]), so this does not bound memory; it bounds how long a *dead* hop is believed in,
-/// which is what an adversary would stretch by answering slowly to pin gather slots. Ten seconds is far above
-/// any honest `RTT + C_partial + Q` this cell has measured and far below a stall an operator would not notice.
-const MAX_GATHER_DEADLINE: Duration = Duration::from_millis(10_000);
 
 /// Cap on concurrently-pending gathers, so **memory is bounded by count rather than by the deadline**.
 ///
@@ -108,108 +90,6 @@ struct Pending {
     /// When the share requests went out. A gather that completes yields `now − armed_at` as one latency
     /// sample, which is what makes the deadline measured rather than chosen ([`GatherClock`]).
     armed_at: Instant,
-}
-
-/// The adaptive gather deadline: an EWMA of observed gather latency plus a margin from its variation,
-/// in the shape RFC 6298 gives TCP's RTO (`SRTT`, `RTTVAR`, `RTO = SRTT + 4·RTTVAR`).
-///
-/// **Why measured and not chosen.** A gather's wall-clock is `RTT + C_partial + Q` — network, the ML-KEM
-/// decap a member pays per share request, and the queue of requests already accepted. `tests/gather_cost.rs`
-/// measures `C_partial` at **47 ms under `dev` and 1.05 ms under `release` on one machine**: a 45× spread
-/// from a build flag alone, before any hardware or load variation. The former 2000 ms constant therefore
-/// absorbed ~42 queued share requests per member in the profile the end-to-end tests run in and ~1900 in the
-/// shipped one, and #55 measured what that costs — gathers expiring at 1 of `t = 2` in the hundreds, turning
-/// a censorship-survival property into a run-to-run coin flip. No constant is right across that range.
-///
-/// **Why a completed gather is the right sample.** Its elapsed time contains all three terms *together*,
-/// measured under the same load the next gather will meet — so `Q`, the term that actually dominates and the
-/// one no formula can predict, needs no model. The engine stays sans-I/O: samples come from the `now` its
-/// driver already passes to [`Engine::step`], never from a wall clock.
-///
-/// The `1/8` and `1/4` gains and the `4·var` margin are RFC 6298's, unchanged: they are the standard
-/// smoothing for exactly this problem (a deadline over a latency whose variance is the signal), and inventing
-/// different ones here would be a chosen constant wearing a derivation's clothes.
-#[derive(Clone, Copy)]
-struct GatherClock {
-    /// Smoothed latency estimate; `None` until the first gather completes.
-    srtt: Option<Duration>,
-    /// Smoothed mean deviation of that estimate.
-    var: Duration,
-    /// Consecutive expiries since the last completed gather — the exponent of RFC 6298's backoff.
-    ///
-    /// **Smoothing without backoff is not RFC 6298, and the difference is a real defect that a test caught
-    /// in this very engine.** An estimator fed only by *completions* converges to the mean of a quiet
-    /// period and then holds no margin for a loud one: when load arrives, gathers expire, and — because an
-    /// expiry produces no sample — the estimate never learns that it is now too tight. It expires at the
-    /// same short deadline forever. Measured: `fanos-sim`'s role-convergence test passed 2/2 at baseline
-    /// and failed 2/4 with a backoff-less adaptive deadline, because failing hops starved the capability
-    /// directory the role controller reads.
-    ///
-    /// RFC 6298 §5.5 is exactly this repair — `RTO ← RTO × 2` on every timeout, reset on success. It is
-    /// what makes the scheme *safe when the estimate is wrong*, which a pure smoother never is.
-    backoff: u32,
-}
-
-/// Cap on the consecutive-expiry exponent. **It is sized so that it never binds before
-/// [`MAX_GATHER_DEADLINE`] does**, which is a correctness requirement rather than a safety margin: the widest
-/// span the backoff must be able to cross is `MIN → MAX`, a factor of `10⁴`, and `2¹⁶ = 65536 > 10⁴`. A
-/// smaller exponent cap would silently strand the fastest cells — one whose gathers settle at 1 ms could
-/// widen only to `2^k` ms and would keep expiring under a load spike no matter how many times it backed off,
-/// which is precisely the failure this whole mechanism exists to end. So the CEILING is the bound that binds,
-/// and this constant only keeps the shift total.
-const MAX_GATHER_BACKOFF: u32 = 16;
-
-impl GatherClock {
-    const fn new() -> Self {
-        Self { srtt: None, var: Duration(0), backoff: 0 }
-    }
-
-    /// A gather's deadline fired without reaching `t`: back off, per RFC 6298 §5.5.
-    ///
-    /// No latency *sample* is taken here — that is Karn's algorithm, and it matters: an expiry tells us the
-    /// deadline was too short, not how long the gather would have taken, so folding a fabricated duration
-    /// into `srtt` would corrupt the estimator with a number nobody measured.
-    fn expired(&mut self) {
-        self.backoff = (self.backoff + 1).min(MAX_GATHER_BACKOFF);
-    }
-
-    /// Fold in one completed gather's elapsed time, and clear the backoff — the estimate is trusted again.
-    fn observe(&mut self, sample: Duration) {
-        self.backoff = 0;
-        match self.srtt {
-            // RFC 6298 (2.2): the first measurement seeds both terms.
-            None => {
-                self.srtt = Some(sample);
-                self.var = Duration(sample.as_nanos() / 2);
-            }
-            // RFC 6298 (2.3): var ← ¾·var + ¼·|srtt − sample|; srtt ← ⅞·srtt + ⅛·sample.
-            Some(srtt) => {
-                let (s, m) = (srtt.as_nanos(), sample.as_nanos());
-                let delta = s.abs_diff(m);
-                self.var = Duration((self.var.as_nanos() / 4).saturating_mul(3) + delta / 4);
-                self.srtt = Some(Duration((s / 8).saturating_mul(7) + m / 8));
-            }
-        }
-    }
-
-    /// The deadline to arm the next gather with: `(SRTT + 4·RTTVAR) << backoff`, clamped.
-    fn deadline(self) -> Duration {
-        let Some(srtt) = self.srtt else {
-            // Even the bootstrap backs off: a node whose very first gathers all expire must widen, or a
-            // cold start into a loaded cell never completes a gather and so never gets a sample at all.
-            return Duration(
-                INITIAL_GATHER_DEADLINE
-                    .as_nanos()
-                    .saturating_mul(1u64 << self.backoff)
-                    .min(MAX_GATHER_DEADLINE.as_nanos()),
-            );
-        };
-        let raw = srtt
-            .as_nanos()
-            .saturating_add(self.var.as_nanos().saturating_mul(4))
-            .saturating_mul(1u64 << self.backoff);
-        Duration(raw.clamp(MIN_GATHER_DEADLINE.as_nanos(), MAX_GATHER_DEADLINE.as_nanos()))
-    }
 }
 
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
@@ -690,8 +570,7 @@ impl<F: Field> ThresholdRouter<F> {
         self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
         // One completed gather is one latency sample, and it contains `RTT + C_partial + Q` together —
         // measured under exactly the load the next gather will meet. This is what replaces the constant.
-        self.gather
-            .observe(Duration(now.0.saturating_sub(armed_at.0)));
+        self.gather.observe(now.since(armed_at));
         Some(match peel {
             ThresholdPeel::Deliver { payload, holonomy } => {
                 // If we own this circuit's endpoint, verify the path-authenticator and drop a delivery
@@ -1628,124 +1507,86 @@ mod tests {
     }
 
     #[test]
-    fn the_gather_deadline_tracks_measured_latency_instead_of_a_constant() {
-        // The #14 property: the deadline is a function of what the node OBSERVES, so the same code adapts to
-        // a machine where a share answer costs 1 ms and to one where it costs 47 ms — a 45x spread measured
-        // between build profiles alone (`tests/gather_cost.rs`), which is why no constant can be correct.
-        let mut clock = GatherClock::new();
+    fn the_router_arms_gathers_with_the_measured_deadline_not_a_constant() {
+        // The WIRING of `fanos_ports::GatherClock` into this engine — the pure estimator is proven in
+        // fanos-ports; what this engine owes is that (1) a completed peel feeds the clock a sample and
+        // the next gather is armed with the measured deadline, and (2) an expiry feeds the backoff and
+        // the next gather is armed wider. Disable either call and the matching assertion fails.
+        let line = Line::<F2>::at(0).coords();
+        let members = ThresholdRouter::<F2>::line_members(line);
+        let t = 2usize;
+        let onion_seed = |i: u8| {
+            let mut s = [0x71u8; 32];
+            s[31] = i;
+            s
+        };
+        let ratchets: Vec<OnionKeyRatchet> =
+            (0..3).map(|i| OnionKeyRatchet::new(onion_seed(i), Epoch::ZERO)).collect();
+        let pubs = [ratchets[0].public(), ratchets[1].public(), ratchets[2].public()];
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"measured-arm"));
+        let me_idx = 0usize;
+        let mut router = ThresholdRouter::<F2>::new(
+            Point::<F2>::new(members[me_idx]).unwrap(),
+            &identity,
+            t,
+            onion_seed(me_idx as u8),
+        );
+        let deadline_of = |effects: &[Effect]| {
+            effects.iter().find_map(|e| match e {
+                Effect::ArmTimer { token, after } if token.0 & (MIX_FLAG | COVER_TOKEN) == 0 => {
+                    Some(*after)
+                }
+                _ => None,
+            })
+        };
 
-        // Before any sample there is nothing to derive from, so the bootstrap stands.
+        // Cold: the first gather is armed with the bootstrap deadline.
+        let seal = |i: u8| {
+            seal_onion(&[HopLine { line, members: &pubs }], t as u8, b"wired-clock", &[0x5A, i])
+                .unwrap()
+        };
+        let effects =
+            router.step(Instant(0), Input::Message { from: [9, 9, 9], frame: launch_frame(line, &seal(0)) });
         assert_eq!(
-            clock.deadline(),
-            INITIAL_GATHER_DEADLINE,
-            "a cold node uses the bootstrap deadline, not a measurement it does not have"
+            deadline_of(&effects),
+            Some(fanos_ports::gather::INITIAL_GATHER_DEADLINE),
+            "a cold router arms the bootstrap deadline"
         );
 
-        // A fast cell: gathers complete in ~2 ms. The deadline must settle FAR below the old 2 s constant —
-        // that constant's real cost was believing a dead hop for a thousand round trips.
-        for _ in 0..40 {
-            clock.observe(Duration::from_millis(2));
-        }
-        let fast = clock.deadline();
-        assert!(
-            fast < Duration::from_millis(50),
-            "after 40 samples of 2 ms the deadline settles near the observation, not at 2000 ms: {fast:?}"
-        );
-
-        // The same code on a loaded/slow cell: gathers take ~800 ms. The deadline must rise ABOVE the old
-        // constant's usable margin rather than abandoning honest hops — the failure #55 measured.
-        let mut slow = GatherClock::new();
-        for _ in 0..40 {
-            slow.observe(Duration::from_millis(800));
-        }
-        let slow_deadline = slow.deadline();
-        assert!(
-            slow_deadline > Duration::from_millis(700),
-            "a cell whose gathers take 800 ms must wait for them: {slow_deadline:?}"
-        );
-        assert!(
-            slow_deadline > fast,
-            "the deadline is a function of observed latency — slow cell {slow_deadline:?} must exceed fast              cell {fast:?}, which a constant could never do"
-        );
-
-        // Variance widens the margin: the same MEAN with jitter must yield a strictly larger deadline than
-        // without, or a deadline would abandon the slow half of a bimodal cell.
-        let mut steady = GatherClock::new();
-        let mut jittery = GatherClock::new();
-        for i in 0..40 {
-            steady.observe(Duration::from_millis(100));
-            jittery.observe(Duration::from_millis(if i % 2 == 0 { 20 } else { 180 }));
-        }
-        assert!(
-            jittery.deadline() > steady.deadline(),
-            "jitter must widen the margin: jittery {:?} vs steady {:?}",
-            jittery.deadline(),
-            steady.deadline()
-        );
-
-        // And it is bounded at both ends, so neither a pathological run of instant gathers nor an adversary
-        // answering ever more slowly can drive it to zero or to forever.
-        let mut instant = GatherClock::new();
-        for _ in 0..40 {
-            instant.observe(Duration(0));
-        }
-        assert_eq!(instant.deadline(), MIN_GATHER_DEADLINE, "floored");
-        let mut forever = GatherClock::new();
-        for _ in 0..40 {
-            forever.observe(Duration::from_millis(600_000));
-        }
-        assert_eq!(forever.deadline(), MAX_GATHER_DEADLINE, "capped");
-    }
-
-    #[test]
-    fn an_expiring_gather_backs_off_so_a_too_tight_estimate_can_recover() {
-        // **The half of RFC 6298 that smoothing alone does not give**, and the one a real test caught
-        // missing: an estimator fed only by COMPLETIONS converges to a quiet period's mean and then holds
-        // no margin. When load arrives its gathers expire — and an expiry yields no sample, so nothing
-        // ever tells it that it is now too tight. It expires at the same short deadline forever.
-        //
-        // Measured before this existed: fanos-sim's role-convergence test passed 2/2 at baseline and
-        // failed 2/4 with a backoff-less adaptive deadline, because starved hops starved the capability
-        // directory the role controller reads. That is the failure mode this asserts against.
-        let mut clock = GatherClock::new();
-        for _ in 0..40 {
-            clock.observe(Duration::from_millis(2));
-        }
-        let settled = clock.deadline();
-
-        // Each expiry must WIDEN the deadline — strictly, and monotonically.
-        let mut prev = settled;
-        for _ in 0..4 {
-            clock.expired();
-            let widened = clock.deadline();
-            assert!(
-                widened > prev,
-                "every expiry must widen the deadline: {widened:?} did not exceed {prev:?}"
+        // Complete a run of 2 ms gathers: each peel feeds `now - armed_at` into the clock. If the
+        // observe call were dropped, the deadline would stay at the 2 s bootstrap forever.
+        let two_ms = Duration::from_millis(2).as_nanos();
+        let mut now = 0u64;
+        for i in 0..12u8 {
+            let onion = seal(i);
+            router.step(Instant(now), Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion) });
+            let req_id = router.seq - 1;
+            let other = 1 - me_idx; // any other line member's honest partial completes t = 2
+            let honest = member_partial(&onion, other, ratchets[other].secret()).unwrap();
+            now += two_ms;
+            router.step(
+                Instant(now),
+                Input::Message { from: members[other], frame: encode_rep(req_id, &honest) },
             );
-            prev = widened;
         }
+        let armed = router
+            .step(Instant(now), Input::Message { from: [9, 9, 9], frame: launch_frame(line, &seal(200)) });
+        let measured = deadline_of(&armed).unwrap();
         assert!(
-            prev.as_nanos() >= settled.as_nanos().saturating_mul(8),
-            "four doublings must reach at least 8x the settled estimate: {prev:?} vs {settled:?}"
+            measured < Duration::from_millis(50),
+            "after a dozen 2 ms completions the armed deadline tracks the measurement, got {measured:?}"
         );
 
-        // A completed gather clears the backoff — the estimate is trusted again, so the deadline returns
-        // to tracking observation rather than staying permanently inflated by one bad patch of load.
-        clock.observe(Duration::from_millis(2));
+        // Let that pending gather EXPIRE: the next arm must be strictly wider (the backoff wiring).
+        let expired_id = router.seq - 1;
+        router.step(Instant(now), Input::Timer(TimerToken(expired_id)));
+        let rearmed = router
+            .step(Instant(now), Input::Message { from: [9, 9, 9], frame: launch_frame(line, &seal(201)) });
+        let widened = deadline_of(&rearmed).unwrap();
         assert!(
-            clock.deadline() < prev,
-            "a completed gather must clear the backoff, not leave the deadline inflated forever"
+            widened > measured,
+            "an expiry must widen the next armed deadline: {widened:?} vs {measured:?}"
         );
-
-        // And the backoff is bounded, so a node under sustained failure cannot inflate without limit.
-        let mut runaway = GatherClock::new();
-        for _ in 0..40 {
-            runaway.observe(Duration::from_millis(50));
-        }
-        for _ in 0..64 {
-            runaway.expired();
-        }
-        assert_eq!(runaway.deadline(), MAX_GATHER_DEADLINE, "backoff is capped by the ceiling");
     }
 
     #[test]

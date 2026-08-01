@@ -58,6 +58,7 @@ use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
+use fanos_runtime::ports::GatherClock;
 use fanos_runtime::{Duration, Effect, Engine, Input, Instant, TimerToken};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -394,9 +395,8 @@ impl IngressResponse {
 
 // --- The threshold-hosted ingress engine ---
 
-/// Default deadline for a POROS combiner to gather a threshold of descriptor shares.
-const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Default cap on concurrently-gathering requests — a bound on combiner state against a request flood.
+/// Bounding `pending` by COUNT is what leaves the gather deadline free to be measured ([`GatherClock`]).
 const DEFAULT_MAX_PENDING: usize = 256;
 
 /// A combiner's in-flight gather for one requester: the request, the descriptor shares collected so far
@@ -405,6 +405,9 @@ struct PendingServe {
     req: IngressRequest,
     shares: BTreeMap<u8, Share>,
     timer: TimerToken,
+    /// When the share requests went out — a completed gather yields `now − armed_at` as one latency
+    /// sample for the measured deadline ([`GatherClock`]).
+    armed_at: Instant,
 }
 
 /// One member of a **threshold-hosted POROS ingress line**, as a sans-I/O engine. It holds only *one*
@@ -432,7 +435,10 @@ pub struct PorosHost {
     pending: BTreeMap<Triple, PendingServe>,
     seq: u64,
     max_pending: usize,
-    gather_timeout: Duration,
+    /// The measured gather deadline (RFC 6298 over completed gathers — [`GatherClock`]).
+    gather: GatherClock,
+    /// An explicit pin for scenarios that must assert a specific expiry; `None` uses the measured value.
+    gather_override: Option<Duration>,
     // The Sybil **cap** layer (design authority §6): an optional allowlist of admitted requester coordinates,
     // supplied by the coherence/credential layer — canonically the fast-mixing trust graph ([`crate::sybil`]),
     // whose conductance bound caps admitted Sybils at `O(attack edges)` regardless of their count. `None` ⇒ the
@@ -495,7 +501,8 @@ impl PorosHost {
             pending: BTreeMap::new(),
             seq: 0,
             max_pending: DEFAULT_MAX_PENDING,
-            gather_timeout: DEFAULT_GATHER_TIMEOUT,
+            gather: GatherClock::new(),
+            gather_override: None,
             admitted: None,
             kem_secret: None,
             rotation: None,
@@ -522,11 +529,20 @@ impl PorosHost {
         self
     }
 
-    /// Override the combiner's gather deadline (default 2 s).
+    /// **Pin** the combiner's gather deadline, disabling the measured one ([`GatherClock`]).
+    ///
+    /// For scenarios that must assert a specific expiry. Production leaves it unset: the pinned constant
+    /// this used to set is the defect the measured deadline removed — the right value moved 45× between
+    /// build profiles alone (`fanos-aphantos/tests/gather_cost.rs`).
     #[must_use]
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
-        self.gather_timeout = timeout;
+        self.gather_override = Some(timeout);
         self
+    }
+
+    /// The deadline the next gather is armed with — the pin if one is set, else the measured value.
+    fn gather_deadline(&self) -> Duration {
+        self.gather_override.unwrap_or_else(|| self.gather.deadline())
     }
 
     /// Impose the **Sybil cap**: only requesters whose coordinate is in `admitted` are served (after they also
@@ -714,9 +730,9 @@ impl PorosHost {
             .collect();
         let timer = TimerToken(self.seq);
         self.seq = self.seq.wrapping_add(1);
-        effects.push(Effect::ArmTimer { token: timer, after: self.gather_timeout });
+        effects.push(Effect::ArmTimer { token: timer, after: self.gather_deadline() });
         let requester = req.requester;
-        self.pending.insert(requester, PendingServe { req, shares, timer });
+        self.pending.insert(requester, PendingServe { req, shares, timer, armed_at: now });
         effects.extend(self.try_serve(now, requester));
         effects
     }
@@ -741,7 +757,7 @@ impl PorosHost {
 
     /// If the gather for `requester` holds a threshold of shares, reconstruct the descriptor, bucket it,
     /// and send the response; else leave it pending. A failed reconstruction awaits more shares.
-    fn try_serve(&mut self, _now: Instant, requester: Triple) -> Vec<Effect> {
+    fn try_serve(&mut self, now: Instant, requester: Triple) -> Vec<Effect> {
         let Some(pending) = self.pending.get(&requester) else {
             return Vec::new();
         };
@@ -761,14 +777,20 @@ impl PorosHost {
             return Vec::new();
         }
         let response = IngressResponse { peers: descriptor.bucket(&pending.req) };
+        let armed_at = pending.armed_at;
         self.pending.remove(&requester);
+        // One completed gather is one latency sample — `RTT + C_share + Q` together, under the load the
+        // next gather will meet. This is what replaces the former 2 s constant.
+        self.gather.observe(now.since(armed_at));
         vec![Effect::Send {
             to: requester,
             frame: encode(FrameType::PorosResponse, &response.to_bytes()),
         }]
     }
 
-    /// A gather deadline fired: drop the still-incomplete request it bounds, freeing its slot.
+    /// A gather deadline fired: drop the still-incomplete request it bounds, freeing its slot — and back
+    /// off ([`GatherClock::expired`]): the deadline was demonstrably too short for the load this node is
+    /// under, and an expiry yields no sample, so nothing else would ever widen it (RFC 6298 §5.5 + Karn).
     fn on_timer(&mut self, token: TimerToken) -> Vec<Effect> {
         if let Some(&requester) = self
             .pending
@@ -777,6 +799,7 @@ impl PorosHost {
             .map(|(r, _)| r)
         {
             self.pending.remove(&requester);
+            self.gather.expired();
         }
         Vec::new()
     }
@@ -1166,6 +1189,97 @@ mod tests {
         let e_bad = combiner.step(Instant(1), Input::Message { from: sybil_coord, frame: request_frame(&bad) });
         assert!(e_bad.is_empty(), "the Sybil cap drops it despite valid PoW — no gather opened");
         assert_eq!(combiner.pending(), 1, "still only the admitted requester is gathering");
+    }
+
+    #[test]
+    fn the_ingress_gather_deadline_is_measured_not_a_constant() {
+        // POROS held its own copy of the same 2000 ms constant, and the same argument retires it: the
+        // right value moves 45x between build profiles alone (`fanos-aphantos/tests/gather_cost.rs`).
+        // The estimator is proven in `fanos_ports::gather`; what this engine owes is the WIRING — a
+        // completed serve feeds a latency sample, an expiry feeds the backoff. Delete either call and
+        // one half of this fails.
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let community = b"clockwork".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 4);
+        let beacon = BeaconSeed::new([0x2C; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x3Du8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let mut combiner = PorosHost::new(
+            line[0],
+            shares[0].clone(),
+            line.clone(),
+            threshold,
+            community.clone(),
+            epoch,
+            beacon,
+            difficulty,
+        );
+        let armed_deadline = |effects: &[Effect]| {
+            effects.iter().find_map(|e| match e {
+                Effect::ArmTimer { after, .. } => Some(*after),
+                _ => None,
+            })
+        };
+        // A distinct requester per attempt: `pending` is keyed by requester, so reusing one would
+        // collide with its own in-flight gather rather than open a new one.
+        let requester = |i: u32| -> Triple { [i + 100, 0, 1] };
+        let ask = |c: &mut PorosHost, now: u64, r: Triple| {
+            let req = solve_ingress_request(r, &community, epoch, &beacon, difficulty);
+            c.step(Instant(now), Input::Message { from: r, frame: request_frame(&req) })
+        };
+
+        // Cold: nothing measured, so the bootstrap deadline stands.
+        let first = ask(&mut combiner, 0, requester(0));
+        assert_eq!(
+            armed_deadline(&first),
+            Some(fanos_runtime::ports::gather::INITIAL_GATHER_DEADLINE),
+            "a cold combiner arms the bootstrap deadline"
+        );
+
+        // A run of fast gathers: member 1's share completes each at t = 2, 4 ms after it was asked.
+        let four_ms = Duration::from_millis(4).as_nanos();
+        let mut now = 0u64;
+        for i in 0..12u32 {
+            let r = requester(i);
+            if i > 0 {
+                ask(&mut combiner, now, r);
+            }
+            now += four_ms;
+            let served = combiner.step(
+                Instant(now),
+                Input::Message {
+                    from: line[1],
+                    frame: encode(FrameType::PorosShare, &encode_share_reply(r, &shares[1])),
+                },
+            );
+            assert!(!served.is_empty(), "the gather completed and served at threshold");
+        }
+        let probe = ask(&mut combiner, now, requester(50));
+        let measured = armed_deadline(&probe).unwrap();
+        assert!(
+            measured < Duration::from_millis(80),
+            "after a dozen 4 ms completions the armed deadline tracks the measurement, got {measured:?}"
+        );
+
+        // Let that gather EXPIRE: the next arm must be strictly wider. Without the backoff an estimator
+        // fed only by completions can never learn it has become too tight, because an expiry yields no
+        // sample — the failure mode RFC 6298 §5.5 exists to prevent.
+        let timer = probe
+            .iter()
+            .find_map(|e| match e {
+                Effect::ArmTimer { token, .. } => Some(*token),
+                _ => None,
+            })
+            .unwrap();
+        combiner.step(Instant(now), Input::Timer(timer));
+        let rearmed = ask(&mut combiner, now, requester(51));
+        let widened = armed_deadline(&rearmed).unwrap();
+        assert!(
+            widened > measured,
+            "an expiry must widen the next armed deadline: {widened:?} vs {measured:?}"
+        );
     }
 
     #[test]

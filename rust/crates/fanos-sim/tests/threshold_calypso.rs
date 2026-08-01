@@ -17,10 +17,16 @@
 //! This test builds its own minimal `ServiceMember`/`Client` engines — a combiner-gather protocol
 //! mirroring `fanos_aphantos::threshold_router::ThresholdRouter`, simplified for this demonstration
 //! (a single in-flight intro per member; no req-id multiplexing, no mixing/cover traffic — those are
-//! NYX transport concerns, orthogonal to CALYPSO's own threshold-hosting crypto) — rather than wiring
-//! into `fanos_rendezvous::RendezvousService`, which (per the integration TODO on
-//! `fanos_calypso::hosting`) still needs that live-wiring pass; `ServiceMember` here is the worked
-//! template for it.
+//! NYX transport concerns, orthogonal to CALYPSO's own threshold-hosting crypto).
+//!
+//! **That live-wiring pass is DONE, and this file is deliberately kept anyway.** `ServiceMember` was
+//! the worked template for it; the production engines are now `fanos_node::ThresholdService` (the
+//! multiplexed, DoS-bounded gather) composed with `fanos_rendezvous::RendezvousService` (the
+//! cookie→reply-route binding) as `fanos_node::ThresholdRendezvous`, and they are driven over the sim
+//! overlay by `threshold_service_live.rs`. What this file still earns its place by is being the
+//! *independent* implementation: it exercises CALYPSO's threshold-hosting crypto through a second,
+//! separately-written gather, so a defect in the production engine cannot make both sides agree on
+//! the same wrong answer.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 

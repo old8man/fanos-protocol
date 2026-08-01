@@ -91,7 +91,8 @@ impl<F: Field> ThresholdRendezvous<F> {
         Self { gather, service, identity_share, _f: PhantomData }
     }
 
-    /// Override the combiner's intro-gather deadline (default 2 s) — see [`ThresholdService::with_gather_timeout`].
+    /// **Pin** the combiner's intro-gather deadline, disabling the measured one — see
+    /// [`ThresholdService::with_gather_timeout`]. Production leaves it unset.
     #[must_use]
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
         self.gather = self.gather.with_gather_timeout(timeout);
