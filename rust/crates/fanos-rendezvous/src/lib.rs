@@ -89,9 +89,16 @@ pub fn meeting_lines<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &Bea
     let m = (n - 1) / 3 + 1; // f + 1
     let (mut lines, mut combiners) = (Vec::with_capacity(m), Vec::with_capacity(m));
     for i in 0..n as u32 {
+        // Index 0 hashes the key ALONE, so `meeting_lines(..)[0] == meeting_line(..)` exactly. That identity is
+        // what makes adopting several meeting points additive rather than a flag day: a party still using the
+        // single-point derivation is using meeting point 0, which every host registers at, so old and new coexist
+        // and the extra points are pure gain. Mixing the index in at `i = 0` too would have made the two
+        // derivations disagree and forced client and host to switch in the same instant or lose each other.
         let mut data = Vec::with_capacity(service_pubkey.len() + 4);
         data.extend_from_slice(service_pubkey);
-        data.extend_from_slice(&i.to_be_bytes());
+        if i > 0 {
+            data.extend_from_slice(&i.to_be_bytes());
+        }
         let line = meeting_line::<F>(&data, epoch, beacon).coords();
         let Some(combiner) = combiner_for::<F>(line) else { continue };
         if combiners.contains(&combiner) {
@@ -693,6 +700,15 @@ mod tests {
             assert_eq!(combiners.len(), want, "every meeting point must sit at a DIFFERENT combiner — two at one \
                  combiner puts two of them in a single adversary's hands");
         }
+
+        // **Point 0 IS the single-point derivation**, which is what lets several meeting points be adopted
+        // additively: anyone still computing `meeting_line` is computing meeting point 0, and every host
+        // registers there, so the two derivations coexist instead of forcing a flag day.
+        assert_eq!(
+            meeting_lines::<F2>(b"svc", Epoch::new(4), &BeaconSeed::GENESIS).first().copied(),
+            Some(meeting_line::<F2>(b"svc", Epoch::new(4), &BeaconSeed::GENESIS).coords()),
+            "meeting point 0 must equal the single-point derivation"
+        );
 
         // A pure function of (key, epoch, beacon): a client and a host derive the same set with no coordination,
         // and the set rotates so an adversary cannot camp the next epoch's meeting points in advance.

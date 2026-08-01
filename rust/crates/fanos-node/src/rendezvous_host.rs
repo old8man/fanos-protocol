@@ -37,7 +37,7 @@ use fanos_pqcrypto::rng::SeedRng;
 use fanos_quic::Client;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, Epoch, HostRegister, MixDirectory, RendezvousService, SessionId,
-    meeting_line, seal_host_register,
+    meeting_lines, seal_host_register,
 };
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced};
@@ -440,7 +440,6 @@ async fn rotate_host(
     if dir.is_empty() {
         return;
     }
-    let meeting = meeting_line::<F2>(&service_public.encode(), epoch, &beacon).coords();
     let Some(point) = Point::<F2>::new(coord) else { return };
     // The dead-drop line: beacon-blinded, through this node's own point — forwarded requests come home here.
     let drop_line = select_drop_line(point, host_secret, epoch.get(), &seed).coords();
@@ -453,8 +452,21 @@ async fn rotate_host(
         return;
     };
     // Register anonymously: seal the registration to the meeting line and raw-emit it at the combiner.
-    if let Some(fwd) = seal_host_register::<F2>(&[meeting], &dir, threshold, &reg, &epoch_seed(host_secret, epoch, b"reg")) {
-        client.command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
+    // Register at EVERY meeting point, not one. A single meeting line put a whole epoch of this service's inbound
+    // traffic behind one combiner, which cannot read it but can drop it — censorship by one node, and the beacon
+    // is public so the placement is predictable an epoch ahead. `meeting_lines` yields `f + 1` points with
+    // distinct combiners, so an adversary inside the tolerated fault budget cannot hold them all.
+    //
+    // Additive by construction: meeting point 0 IS the single-point derivation, so a client still computing
+    // `meeting_line` keeps finding this service there while the extra points are pure gain.
+    //
+    // Each registration is sealed under its own seed. They carry the same identity and route but different tags,
+    // so a combiner that peels one cannot replay it to another meeting point.
+    for (i, meeting) in meeting_lines::<F2>(&service_public.encode(), epoch, &beacon).into_iter().enumerate() {
+        let seed = epoch_seed(host_secret, epoch, &[b"reg".as_slice(), &(i as u32).to_be_bytes()].concat());
+        if let Some(fwd) = seal_host_register::<F2>(&[meeting], &dir, threshold, &reg, &seed) {
+            client.command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
+        }
     }
     let _ = epoch_tx.send(HostEpoch { reply_keys, directory: dir });
 }
