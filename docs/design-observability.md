@@ -243,12 +243,19 @@ level ("keys held"). Both work because the controller steps each role toward *it
 compares across roles, but a new sensor must pick one deliberately and say which it is. Gathers are naturally a
 rate; sessions are naturally a level; mixing them inside one role's own history is what would break.
 
-*Do not report zero for idle.* `Node::start` substitutes the offer when a role reports `0` precisely because a
-demand of zero retires the role, and a retired role then carries nothing, which reports zero again — a
-self-latching failure. A real sensor must therefore distinguish **"measured zero"** from **"no sensor"**, which
-the current `[u16; 5]` cannot express. That is the one type change this work genuinely needs: an
-`Option<u16>` per role, or a parallel "measured" mask, so the fallback fires on *absence* rather than on
-*emptiness*.
+*A measured zero is not the same as no sensor, and today the code cannot tell them apart.* `Node::start`
+substitutes the node's own offer whenever a role reports `0`. That substitution is right for a role with no
+sensor — and it is also what stops a self-latching failure, since a demand of zero would retire the role,
+after which it carries nothing and reports zero again.
+
+But it fires on *emptiness*, not on *absence*, and the two are different. **A role that HAS a sensor and
+legitimately reads zero has its true reading discarded and replaced by the offer** — so the controller can
+never learn that demand fell to zero, precisely when it should be shrinking the role. This is not a
+hypothetical about future sensors: it binds **relay and storage today**, the two roles that are already
+measured. A cell cannot currently conclude "nobody here needs relays".
+
+So the one type change this work genuinely needs is to make absence expressible: an `Option<u16>` per role, or
+a parallel "measured" mask, so the fallback fires on *no sensor* and a measured zero is believed.
 
 **Acceptance, falsifiable:** a sim scenario where demand for one role rises and the cell's assignment shifts
 toward it — and where disabling the new sensor leaves the assignment flat. Anything less is testing that the
