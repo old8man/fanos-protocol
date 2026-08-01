@@ -2300,9 +2300,18 @@ property is `|image| > f` — 5 > 2 and 40 > 18 — because that is what lets a 
 combiners. Still a pure public function of the line, so no call site changed.
 
 **It was found by a test that asserted a count on TWO planes.** A Fano-only test stays green at 4 combiners and the
-concentration would have shipped. The residual is stated rather than hidden: the image is fixed, not rotating, so
-the same ~40 points are combiners every epoch — sufficient for the bound, and removing even that would mean
-threading `(epoch, beacon)` through all 55 call sites, which no identified attack justifies.
+concentration would have shipped.
+
+**The residual noted here — "the image is fixed, not rotating" — turned out to be the smaller half of the problem,
+and both halves are now CLOSED (2026-08-01, #55).** The larger half: the canonical combiner was addressed on *every
+hop of every circuit*, not just meeting lines, so each dial carried five single points of failure and one dead node
+could censor a hosted service at full spread `m`. Since nothing in a threshold gather is combiner-specific — any
+member can seed its share, collect `t`, peel, multicast — launches now draw a **per-onion** member
+(`combiner_for_salted(line, onion_bytes)`), and a hop line dies only when `q + 2 − t` of its members do, the same
+quorum the peel already needs. That also disposes of the rotation residual without threading `(epoch, beacon)`
+anywhere: the per-onion draw gives the uniform member coverage an epoch rotation would have. Combiner-local state
+(a §3b route binding) is correspondingly spread to every member of the line. Derivation:
+`docs/design-hidden-service-hardening.md` §6.1b.
 
 ## §3. One meeting point per service (derivation `32a4248`, decision `769c878`, wiring open)
 
@@ -2316,6 +2325,20 @@ options are recorded with costs; (a) — hosting becomes mandatory — is chosen
 cannot survive a real plane (it needs the service to land by luck on one of four Fano combiners, and its coordinate
 is then exactly what the substrate exists to hide), and the alternative of letting the client walk the points hands
 the adversary the failure signal, since a censoring combiner black-holes rather than refuses.
+
+**Wiring is now closed and the bound DEMONSTRATED (2026-08-01).** Proving it is what exposed §2's larger defect
+above: with meeting point 0 stopped the scenario reached 0 of 8 dials where the model predicted 2/3, and eleven
+candidate causes were eliminated by measurement before the real one — every hop having a canonical-combiner SPOF —
+was found. After the repair the same scenario reaches 2, 8 and 3 of 8 across runs; the property asserted is
+`reached > 0` ("remains reachable"), falsified by collapsing `m` to 1 with a genuinely stopped node. The remaining
+run-to-run variance was a *separate* defect, filed and then CLOSED the same day: `DEFAULT_GATHER_TIMEOUT = 2000 ms`
+was a chosen constant — under CPU contention share-gathers expired at 1 of `t = 2` behind the retransmit flood, and
+`fanos-aphantos/tests/gather_cost.rs` measured why no constant can be right (`C_partial` moves **45×** between
+build profiles alone). The deadline is now *measured*: an RFC 6298-shaped estimator over completed gathers
+(`GatherClock` — SRTT + 4·RTTVAR, exponential backoff on expiry per §5.5, Karn's rule on samples), with the
+in-flight map bounded by **count** (`MAX_PENDING`) so memory no longer rides on the timing value. The backoff half
+is not decoration: without it the sim's role-convergence test failed 2/4, because an estimator fed only by
+completions converges to a quiet period's mean and an expiry yields no sample to widen it.
 
 ## §4. Open, with the work specified
 

@@ -37,7 +37,7 @@ use fanos_pqcrypto::rng::SeedRng;
 use fanos_quic::Client;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, Epoch, HostRegister, MixDirectory, RendezvousService, SessionId,
-    meeting_lines, seal_host_register,
+    line_member_coords, meeting_lines, seal_host_register,
 };
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced};
@@ -462,10 +462,19 @@ async fn rotate_host(
     //
     // Each registration is sealed under its own seed. They carry the same identity and route but different tags,
     // so a combiner that peels one cannot replay it to another meeting point.
+    //
+    // And each is emitted to EVERY member of its meeting line, not to one combiner (#55): a route binding is
+    // state at whichever node peels the request, and client launches draw a per-onion member
+    // (`combiner_for_salted`), so a member without the binding is a member that answers a client with silence.
+    // The same sealed frame serves all `q + 1` — each member runs its own gather over the identical onion and
+    // binds. This is what makes silencing a meeting point cost the adversary a `q + 2 − t` quorum of its line
+    // rather than one node.
     for (i, meeting) in meeting_lines::<F2>(&service_public.encode(), epoch, &beacon).into_iter().enumerate() {
         let seed = epoch_seed(host_secret, epoch, &[b"reg".as_slice(), &(i as u32).to_be_bytes()].concat());
         if let Some(fwd) = seal_host_register::<F2>(&[meeting], &dir, threshold, &reg, &seed) {
-            client.command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
+            for member in line_member_coords::<F2>(meeting) {
+                client.command(Command::Emit { to: member, frame: fwd.frame.clone() });
+            }
         }
     }
     let _ = epoch_tx.send(HostEpoch { reply_keys, directory: dir });

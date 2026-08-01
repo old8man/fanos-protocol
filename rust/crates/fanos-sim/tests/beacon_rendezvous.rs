@@ -19,7 +19,7 @@ use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, Epoch, MixDirectory, combiner_for, meeting_line, seal_forward,
+    ANONYMOUS, BeaconSeed, Epoch, MixDirectory, line_member_coords, meeting_line, seal_forward,
 };
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
@@ -103,12 +103,15 @@ fn a_beacon_derived_meeting_line_delivers_over_the_mixnet() {
     sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
     sim.run_for(Duration::from_millis(4000));
 
-    let l_comb = combiner_for::<F2>(meeting).unwrap();
+    // The launch and final gather are per-onion salted picks (#55), so the delivery surfaces at
+    // whichever MEMBER of the meeting line gathered it — membership, not the canonical combiner,
+    // is the invariant.
+    let members = line_member_coords::<F2>(meeting);
     assert!(
         sim.report()
             .deliveries()
-            .any(|(recv, from, bytes)| recv == l_comb && from == ANONYMOUS && bytes == payload),
-        "an onion sealed to the beacon-derived meeting line delivered anonymously"
+            .any(|(recv, from, bytes)| members.contains(&recv) && from == ANONYMOUS && bytes == payload),
+        "an onion sealed to the beacon-derived meeting line delivered anonymously at a line member"
     );
 }
 

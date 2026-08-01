@@ -324,7 +324,11 @@ mod tests {
         // The combiner bound the reply route and seals a reply back through it.
         assert!(members[0].knows(&cookie), "the decrypting combiner bound the reply route");
         let reply = members[0].seal_reply(&cookie, b"the response").expect("a reply seals through the bound circuit");
-        assert_eq!(reply.combiner, fanos_rendezvous::combiner_for::<F2>(req.reply_circuit[0]).unwrap());
+        // The launch target is a per-onion salted member of the first reply hop (#55).
+        assert!(
+            fanos_rendezvous::line_member_coords::<F2>(req.reply_circuit[0]).contains(&reply.combiner),
+            "the reply launches at a member of its first hop line"
+        );
 
         // A non-combiner member never bound the route (it only sent a PartialDec) — it cannot reply.
         assert!(!members[1].knows(&cookie), "a member that only served a PartialDec did not learn the route");

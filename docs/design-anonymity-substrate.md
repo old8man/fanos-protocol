@@ -256,20 +256,24 @@ relay to it, and that relay must not learn where "it" is.
 **The construction — both endpoints are dead-drop receivers; the combiner is a pure rendezvous.** The service
 operator `O` is treated exactly as a NOSTOS receiver:
 
-1. **Anonymous host-registration** (`O → m`, the `RdvHostRegister` frame, wire `0x5B`). Each epoch, `O` computes
-   `m = combiner_for(L_rdv(svc_pub, epoch, beacon))`, draws a fresh dead-drop line `L_O = select_drop_line(c_O, …)`
-   through its own point, and rides a **forward onion to `m`** carrying `{ service_tag, reply_pub_O, forward_route_O }`
-   — where `service_tag = H("FANOS-v1/rdv-host" ‖ svc_pub ‖ epoch)` disambiguates services co-located at one
-   combiner (Fano has only 4), `reply_pub_O` is a fresh NOSTOS reply key, and `forward_route_O` is a threshold
-   circuit ending at `L_O`. The registration is itself an onion, so `m` learns only `O`'s **line** `L_O` (`O` hidden
-   `1`-of-`(q+1)`), never `c_O`. `O` **re-registers each epoch**, because `m` and `L_O` both rotate with the beacon.
-2. **Combiner-side forwarding** (`m → O`). When a client request peels out at `m` as an anonymous delivery, `m`
-   looks up the request's `service_tag`; if a host is registered, it **re-seals the entire client `Request` as a
-   NOSTOS onion to `forward_route_O`** (`seal_nostos_reply` — the same primitive that seals a client reply, §3) and
-   emits it. `O`, a member of `L_O`, receives the dead-drop, opens it with `reply_pub_O`'s secret, and now holds the
-   client's `Request` verbatim: cookie, the client's own reply circuit, and the DIAULOS `ClientHello` sealed to
-   `svc_pub`. A request whose tag matches no registered host falls through to a **local** delivery (unchanged), so a
-   node that genuinely *is* its own combiner still serves directly — the rule is additive.
+1. **Anonymous host-registration** (`O → L_rdv`, the `RdvHostRegister` frame, wire `0x5B`). Each epoch, `O`
+   draws a fresh dead-drop line `L_O = select_drop_line(c_O, …)` through its own point, and rides a **forward
+   onion to `L_rdv`** carrying `{ service_tag, reply_pub_O, forward_route_O }` — where
+   `service_tag = H("FANOS-v1/rdv-host" ‖ svc_pub ‖ epoch)` disambiguates services co-located at one gathering
+   node, `reply_pub_O` is a fresh NOSTOS reply key, and `forward_route_O` is a threshold circuit ending at `L_O`.
+   The same sealed registration is emitted to **every member of `L_rdv`** (hardening §6.1b): a route binding is
+   state at whichever member gathers a request, client launches draw a per-onion member
+   (`combiner_for_salted`), and a member without the binding would answer a client with silence. The registration
+   is itself an onion, so no member learns more than `O`'s **line** `L_O` (`O` hidden `1`-of-`(q+1)`), never
+   `c_O`. `O` **re-registers each epoch**, because `L_rdv` and `L_O` both rotate with the beacon.
+2. **Member-side forwarding** (`L_rdv → O`). When a client request peels out at a gathering member of `L_rdv` as
+   an anonymous delivery, that member looks up the request's `service_tag`; if a host is registered, it
+   **re-seals the entire client `Request` as a NOSTOS onion to `forward_route_O`** (`seal_nostos_reply` — the
+   same primitive that seals a client reply, §3) and emits it. `O`, a member of `L_O`, receives the dead-drop,
+   opens it with `reply_pub_O`'s secret, and now holds the client's `Request` verbatim: cookie, the client's own
+   reply circuit, and the DIAULOS `ClientHello` sealed to `svc_pub`. A request whose tag matches no registered
+   host falls through to a **local** delivery (unchanged), so a node that genuinely is a member of its own
+   meeting line still serves directly — the rule is additive.
 3. **Reply** (`O → client`). `O` ingests the request into a `RendezvousService`, drives the DIAULOS `ServerSession`
    (only `O` holds the service secret, so only `O` completes the handshake — `m` cannot), and seals each response
    back through the **client's** dead-drop line via ordinary NOSTOS (`RendezvousService::seal_reply`). The reply

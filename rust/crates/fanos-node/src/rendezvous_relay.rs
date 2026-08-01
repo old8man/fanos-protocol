@@ -1,13 +1,18 @@
 //! `RendezvousRelay` — a designated rendezvous point that relays clients' replies (audit #54, item 3).
 //!
-//! A client's reply circuit ends at a rendezvous **line**, whose *combiner* peels the reply onion and
-//! delivers it. But only a strict subset of a plane's points are combiners (Fano: 4 of 7) *and* a node's
-//! coordinate reshuffles every epoch, so a client cannot reliably be its own reply rendezvous — and an
-//! external `.fanos` client (running only an overlay node, never a router) can never peel an onion at all.
-//! It instead **engages a relay**: it registers its session cookie with a node sitting at a combiner (an
+//! A client's reply circuit ends at a rendezvous **line**, one of whose members peels the reply onion and
+//! delivers it. An external `.fanos` client (running only an overlay node, never a router) can never peel an
+//! onion at all, so it cannot be its own reply rendezvous.
+//! It instead **engages a relay**: it registers its session cookie with a node on that line (an
 //! [`RdvRegister`](fanos_wire::FrameType::RdvRegister) frame carrying the 16-byte cookie), names that
 //! relay's line as its reply circuit's last hop, and the relay forwards each anonymous reply it peels —
 //! tagged by that cookie — to the client's real coordinate as an [`RdvReply`](fanos_wire::FrameType::RdvReply).
+//!
+//! **A bare-proxy client registers with every member of its reply line, not one node** ([`register_targets`],
+//! #55): a reply's final gather happens at a per-onion salted member, so the member that peels it is not
+//! predictable from the line alone, and only a member holding the cookie can forward. That is the same spread
+//! a §3b host registration makes, for the same reason — and it is the cost of this fallback, which NOSTOS
+//! avoids entirely by making the client a line member that needs no forwarding at all.
 //! This is Tor's rendezvous-point model, and it is the **bare-proxy fallback**: the relay learns the
 //! client's coordinate (which the client chose) but never the service. The stronger, primary path — where
 //! the client's coordinate never leaves its node at all — is **NOSTOS** ([`fanos_aphantos::nostos`]): a
@@ -38,8 +43,10 @@ use fanos_runtime::{Effect, Engine, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
 /// A rendezvous relay: a [`ThresholdRouter`] plus a table of the clients whose anonymous replies it
-/// forwards, keyed by each client's session cookie. Construct it at a **combiner** coordinate (the relay's
-/// line's combiner).
+/// forwards, keyed by each client's session cookie. Construct one at **every member** of a line that serves as
+/// a rendezvous — any member may be the one a given reply's salted pick sends the final gather to (#55), and
+/// only a member holding the cookie can forward. `MixRelay` composes this at every cell node, which satisfies
+/// that by construction.
 pub struct RendezvousRelay<F: Field> {
     router: ThresholdRouter<F>,
     /// `cookie → client coordinate`: a peeled reply prefixed with `cookie` is forwarded straight to the
@@ -297,9 +304,35 @@ impl<F: Field> Engine for RendezvousRelay<F> {
 /// ([`RdvRegister`](fanos_wire::FrameType::RdvRegister)): a 16-byte `cookie` binds the session so the relay
 /// forwards its replies to the sender's coordinate — the **bare-proxy fallback**, for a client that cannot
 /// be a line member. A full cell-node client uses NOSTOS and never registers here.
+///
+/// **Send it to every member of the reply line — use [`register_targets`], not this alone.** The frame is the
+/// primitive; the *set of nodes it must reach* is the thing that is easy to get wrong.
 #[must_use]
 pub fn register_frame(cookie: SessionId) -> Vec<u8> {
     framed(FrameType::RdvRegister, &cookie)
+}
+
+/// Every `(coordinate, frame)` a bare-proxy client must send to register `cookie` for replies arriving on
+/// `reply_line` — one per member of that line.
+///
+/// **The whole line, not its canonical combiner, and that is correctness rather than redundancy** (#55). A
+/// reply's final gather happens at a per-onion salted member ([`fanos_rendezvous::combiner_for_salted`]), so
+/// which member peels a given reply is not predictable from the line; a member without the cookie finds no
+/// registration, and `classify_anonymous` then passes the reply through as a local delivery — silently losing
+/// it at a node that is not the client. Registering with one node made the fallback work only for the
+/// `1/(q+1)` of replies that happened to land there.
+///
+/// This costs the fallback `q + 1` small frames per session and tells every member of one line that *some*
+/// client is at the sender's coordinate — which is the posture this fallback already has (it exists precisely
+/// for a client that cannot hide as a line member), now spread over the line instead of concentrated in one
+/// node. A client that can run a router should use NOSTOS instead and register nothing.
+#[must_use]
+pub fn register_targets<F: Field>(cookie: SessionId, reply_line: Triple) -> Vec<(Triple, Vec<u8>)> {
+    let frame = register_frame(cookie);
+    fanos_rendezvous::line_member_coords::<F>(reply_line)
+        .into_iter()
+        .map(|member| (member, frame.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -432,6 +465,43 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_proxy_registration_must_reach_every_member_of_its_reply_line() {
+        // #55: which member peels a given reply is the per-onion salted pick, so a cookie registered at ONE
+        // node serves only the `1/(q+1)` of replies that happen to land there — the rest fall through as
+        // local deliveries at a node that is not the client, and are silently lost. `register_targets`
+        // exists so a caller cannot express the broken form by accident.
+        let line = Line::<F2>::at(0).coords();
+        let members = line_member_coords::<F2>(line);
+        let cookie: SessionId = *b"bare-proxy-cook0";
+        let targets = register_targets::<F2>(cookie, line);
+
+        // Every member is a target, exactly once, and each carries the same registration frame.
+        let mut coords: Vec<Triple> = targets.iter().map(|(c, _)| *c).collect();
+        let mut expected = members.clone();
+        coords.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(coords, expected, "the whole line is addressed, not one canonical combiner");
+        assert!(
+            targets.iter().all(|(_, f)| *f == register_frame(cookie)),
+            "each member receives the same RdvRegister frame"
+        );
+
+        // And the requirement is real, not cosmetic: a relay that never saw the registration does NOT
+        // forward — it passes the reply through as a local anonymous delivery, which is the silent loss.
+        let unregistered = Point::<F2>::new(members[1]).unwrap();
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"unregistered-member"));
+        let mut relay =
+            RendezvousRelay::new(ThresholdRouter::<F2>::new(unregistered, &identity, 1, [0x4Cu8; 32]));
+        let mut tagged = cookie.to_vec();
+        tagged.extend_from_slice(b"a reply this member cannot route");
+        let effects = relay.classify_anonymous(tagged);
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "a member without the cookie forwards nothing — hence every member must be registered"
+        );
+    }
+
+    #[test]
     fn one_shared_relay_demultiplexes_two_clients_by_cookie() {
         // The property a shared cell relay needs: two clients register distinct cookies at the SAME
         // combiner; each service reply, tagged by cookie, is forwarded to the correct client — no
@@ -549,7 +619,7 @@ mod tests {
     #[test]
     fn a_relay_forwards_a_request_to_an_anonymously_registered_host() {
         use fanos_pqcrypto::HybridKemSecret;
-        use fanos_rendezvous::{HOST_REGISTER_TAG, MixDirectory, combiner_for, service_tag};
+        use fanos_rendezvous::{HOST_REGISTER_TAG, MixDirectory, line_member_coords, service_tag};
 
         // A KEM key at every Fano point, so any line's members can be sealed to (the host's forward route).
         let mut dir = MixDirectory::new();
@@ -617,10 +687,14 @@ mod tests {
         .encode();
         let effects =
             relay.step(Instant(1), Input::Message { from: [8, 8, 8], frame: seal_to_relay(&request, b"req") });
-        let drop_combiner = combiner_for::<F2>(drop_line).unwrap();
+        // A member of the drop line, not its canonical combiner: the forward's launch target is the
+        // per-onion salted pick (#55).
+        let drop_members = line_member_coords::<F2>(drop_line);
         assert!(
-            effects.iter().any(|e| matches!(e, Effect::Send { to, .. } if *to == drop_combiner)),
-            "the request is re-sealed and forwarded to the service's dead-drop line combiner",
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send { to, .. } if drop_members.contains(to))),
+            "the request is re-sealed and forwarded to a member of the service's dead-drop line",
         );
         assert!(
             !effects.iter().any(|e| matches!(

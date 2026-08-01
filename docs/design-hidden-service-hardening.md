@@ -1,10 +1,13 @@
 # Hidden-service hardening — accountable anonymity, attack resistance, load distribution
 
-**Status: partly implemented — §6 is real, §2–§5 are design.** Written 2026-07-31, updated 2026-08-01. What has
-landed: the registration binding is authenticated (`9e34d4c`), the combiner map covers the plane instead of
-concentrating below the fault bound (`a7c7699`), `m = f + 1` is derived and proven (`32a4248`), and a host
-registers at all `m` (`edcf845`). What has NOT: **the client still always takes meeting point 0**, so the
-censorship bound of §6 does not bind yet — the registrations cost traffic and buy nothing until clients spread.
+**Status: §6 is implemented and its bound is demonstrated; §2–§5 are design.** Written 2026-07-31, updated
+2026-08-01. What has landed: the registration binding is authenticated (`9e34d4c`), the combiner map covers the
+plane instead of concentrating below the fault bound (`a7c7699`), `m = f + 1` is derived and proven (`32a4248`), a
+host registers at all `m` (`edcf845`), the client spreads over them (`bb13b14`), and — the piece that made the
+spread actually bind — **every hop draws a per-onion member instead of one canonical combiner** (§6.1b), with the
+share-gather deadline derived from measurement rather than chosen. A scenario now survives a genuinely stopped
+meeting point, falsified by collapsing `m` to 1 (§6.3).
+
 Everything in §2–§5 (the client tag, the admission ladder, the filtering surface, replica load-spreading) is
 design only, and §8's frontier — whether the lattice ZK stack can carry the §2 proof at a per-request cost — is
 unmeasured.
@@ -28,11 +31,12 @@ Today a service registers a forward route at one combiner and answers whatever a
 1. **No accountability at all.** Every client is perfectly unlinkable, so the service cannot distinguish one
    attacker sending a million requests from a million clients sending one. Nothing can be rate-limited, and the
    backend behind `fanos host --forward` sees every request as coming from the same place.
-2. **One meeting point per epoch.** `meeting_line(service_pubkey, epoch, beacon)` yields a single line, so a single
-   node holds the whole of a service's inbound traffic for an epoch. It cannot read requests, but it can drop them.
-   **This is a censorship single point of failure and is filed separately as a defect, not a design gap** — Tor has
-   had multiple introduction points since v2, and the fix here is smaller than Tor's because the plane supplies the
-   spread for free (§6).
+2. **One meeting point per epoch — CLOSED (§6), and it was two defects, not one.** `meeting_line` yielded a single
+   line, so one node held a service's whole inbound traffic for an epoch: it could not read requests but could drop
+   them. Tor has had multiple introduction points since v2, and the plane supplies the spread for free, so `m = f+1`
+   points closed the stated gap. Demonstrating it then exposed the *unstated* one: the spread was defeated a layer
+   below, because every hop of every circuit — not just meeting lines — was addressed to one canonical combiner
+   (§6.1b). Both are fixed and the bound is now measured rather than argued.
 3. **One route per tag.** `hosts: BoundedMap<[u8;32], HostRegister>` maps a service to exactly one forward route,
    so a service is one process on one machine. There is no way to run a second replica (§5).
 
@@ -239,6 +243,10 @@ A replica registers at the meeting **line**, which has `q + 1` points. Registeri
 means no single node sees the whole request stream — an availability gain *and* an anonymity gain, since traffic
 analysis at one combiner sees a `1/(q+1)` sample.
 
+The `1/(q+1)` sampling is no longer hypothetical: the per-onion salted launch pick (§6.1b) spreads *every* hop's
+gathers uniformly over its line's members, so the single-combiner vantage this subsection worried about does not
+exist on the wire any more — for meeting lines or any other hop.
+
 ---
 
 ## §6. Censorship resistance — `m` meeting points, not one
@@ -276,6 +284,52 @@ Implemented as `fanos_rendezvous::meeting_lines`, with a two-plane test. That te
 underneath: the combiner map used to cover only 14 of 57 points on `PG(2,7)` against `f = 18`, which made `f + 1`
 distinct combiners *unobtainable* — and a Fano-only test would have stayed green at 4 combiners and shipped it.
 
+### 6.1b The model above was itself incomplete: every hop had a combiner, and every combiner was a SPOF
+
+Demonstrating §6.3 falsified the *model*, not just the implementation. The derivation above treats "a meeting
+point" as the unit of censorship and its **canonical combiner** as the thing an adversary captures. But a dial
+traverses more than meeting points: a forward intermediate hop, the host's dead-drop line (`§3b`), a reply
+intermediate hop, and the client's own dead-drop line — **every one a line, every line addressed at one canonical
+combiner**. Measured with one node silenced on Fano, a dial survived with `p ≈ 0.3` where the meeting-point model
+predicted `2/3`: the other four single-combiner hazards, never covered by the `m = f + 1` derivation, multiplied
+in. The host's dead-drop line was the worst of them — a single fixed line per epoch, so one dead node could censor
+a service at full spread `m`.
+
+The repair is not more spread constants; it is noticing that **the canonical combiner was a convention, not a
+mechanism**. Nothing in the threshold gather is combiner-specific — any member of a line can seed its own share,
+collect `t`, peel, and multicast (`ThresholdRouter::on_onion`; asserted by
+`an_onion_addressed_at_a_non_canonical_member_peels_there`). Pinning every launch to one canonical member per line
+threw away the line's own `t`-of-`(q+1)` threshold at every hop. So:
+
+* **Launches draw a per-onion member** — `combiner_for_salted(line, onion_bytes)`: the canonical digest of the
+  line, extended by the sealed onion's bytes. Deterministic (the simulator reproduces every pick; a given onion
+  has one target), public (it links nothing the ciphertext does not already link), and uniform over the `q + 1`
+  members. Every DIAULOS retransmit reseals a fresh onion, so a session re-draws its per-hop gatherers until it
+  threads live ones — self-healing through machinery that already existed. Cover traffic draws the same way, so
+  the address pattern cannot tell cover from cargo.
+
+  **The reduction width is a security parameter, not an implementation detail.** Reducing `k` digest bits mod
+  `m = q + 1` favours the low residues by `(2^k mod m)/2^k`, and a member the reduction favours is the member an
+  adversary should silence — which would give back, statistically, exactly what this section removes structurally.
+  The first implementation reduced one byte (`k = 8`): 1.2 % skew on Fano but **12.9 % at `q = 32`**, worsening as
+  the plane grows. It reduces 64 bits, so the bias is `≈ m·2⁻⁶⁴`. The test asserting this is *exact* rather than
+  statistical — it exhibits two salts agreeing on digest byte 0 that pick different members, impossible under a
+  one-byte reduction — because the sampled version of that test passed against the defect it was written to catch:
+  Fano's 1.2 % skew is smaller than both a ±5 % band and the sampling noise at 6000 draws.
+* **Combiner-local state is spread to the whole line.** A §3b route binding lives at whichever node peels the
+  request, so the host emits the *same sealed registration* to every member of each meeting line (`q + 1` gathers
+  over one onion, once per epoch). A member without the binding is a member that answers a client with silence.
+
+The bound this buys is the one the peel already has: **a hop line dies only when `q + 2 − t` of its members die**
+— the same quorum that makes the layer unpeelable — instead of when one canonical node does. On Fano (`t = 2`):
+two dead nodes break the quorum of exactly *one* line, the line through both; every other line of the plane keeps
+`≥ t` live members and every hop over it remains available under retransmission. An `f = 2` adversary therefore
+cannot censor even one *service* (its `m = 3` meeting lines cannot all lose quorum), let alone the plane. For
+general `q` the per-line statement is exact, and full-service censorship requires a quorum break on **every** one
+of the `m = f + 1` meeting lines — pairwise intersections make those kills mostly disjoint, so the cost is
+`Θ(m · (q + 2 − t))` targeted nodes against a budget of `f`; the Fano case is proven by the scenario test, the
+general-`q` inequality is stated, not yet mechanised.
+
 ### 6.2 The consequence: the at-combiner mode cannot survive `m > 1`
 
 Wiring `m` surfaced a structural incompatibility rather than a bug. **A service that is its own combiner sits at
@@ -299,30 +353,56 @@ needs the service to land by luck on one of only four Fano combiners, and its co
 substrate exists to hide. Option (b) hands the adversary the failure signal, which is the wrong direction on
 principle. The registration cost is real and bounded, and §5's replica set already needs a host driver.
 
-### 6.3 The bound is claimed by construction and NOT yet demonstrated
+Under the salted launch pick (§6.1b) the at-combiner mode degrades further, which only reinforces (a): requests
+peel at a per-onion member of the meeting line, so an unregistered service co-located with the canonical combiner
+sees only `1/(q+1)` of first attempts and completes sessions on retransmit re-draws — functional, geometrically
+slower, and still a coordinate leak. Hosting-by-registration is the mode with the bound.
 
-The mechanism is in place — hosts register at all `m`, clients pick among them — and the eight anonymous e2e tests
-pass. **That is not the same as surviving censorship, and the difference has been measured rather than assumed.**
+### 6.3 The bound is now demonstrated — and demonstrating it is what found §6.1b
 
-With meeting point 0's combiner stopped and points 1 and 2 alive, dials fail far more often than the pick
-distribution can account for: 0 of 8 arrived in one run, while a run differing only in an instrumentation probe
-passed. Three candidate causes were each ruled out by their own experiment — a route/meeting mismatch in the Fresh
-profile (a real defect, since fixed, but not this), impatience (per-attempt deadline raised fourfold, no change),
-and missing bindings (probed directly: all three meeting points bind the same service tag). What remains is
-unexplained and nondeterministic.
+`a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding` establishes the service, then **stops meeting
+point 0's node** (`shutdown()`, not `drop` — dropping the handle leaves the node running, and the first version of
+this scenario passed its own falsification with `m` collapsed to 1, because the point it claimed to have silenced
+was still answering) and dials eight times. The assertion is `reached > 0`.
+
+**Before §6.1b's repair, that assertion failed outright** — 0 of 8 and 0 of 8 on two of six runs, 1–2 of 8 on the
+rest, against the `2/3` the meeting-point model predicts. Eleven candidate causes were eliminated by their own
+experiments, including several that looked certain: a route/meeting mismatch in the Fresh profile (a real defect,
+fixed separately), impatience (per-attempt deadline raised fourfold — no change), missing bindings, the service
+failing to seal, and the reply circuit not terminating at one of the client's own lines (instrumented directly:
+`member = true` on every dial of every run). The cause was none of them. It was that **the meeting point was not
+the only single point of failure in the path** — §6.1b.
+
+With the salted launch pick and the whole-line registration spread, the same scenario reaches 2, 8, and 3 of 8
+across three runs. The property holds; the count varies, and the residual variance is **not** censorship but a
+second chosen constant, which chasing it exposed and which is now also removed.
+
+Under CPU contention the share-gather round trip inflates behind the retransmit flood on the same connections and
+gathers expire at `1` of `t = 2` by the hundreds. `DEFAULT_GATHER_TIMEOUT` was 2000 ms, and
+`fanos-aphantos/tests/gather_cost.rs` measures what that was racing: answering one share request costs **47 ms
+under `dev` and 1.05 ms under `release`** on one machine — a 45× spread from a build flag alone. So the same
+constant absorbed ~42 queued share requests per member in the profile these end-to-end tests run in and ~1900 in
+the shipped one. No number is right across a 45× range, let alone across the hardware a real cell spans.
+
+The replacement is measured rather than chosen: a gather's wall-clock is `RTT + C_partial + Q`, and a *completed
+gather* is one sample containing all three terms together, taken under the load the next gather will meet — so
+`Q`, the dominant term and the one no formula can predict, needs no model. The samples are smoothed in RFC 6298's
+shape (`SRTT`, `RTTVAR`, deadline `= SRTT + 4·RTTVAR`) with that RFC's gains unchanged, since inventing different
+ones would be a chosen constant wearing a derivation's clothes. This was only safe once the in-flight gather map
+was bounded by **count** instead: the deadline had been that map's only bound, which quietly made a timing value a
+memory-safety parameter, so lengthening it to fix liveness would have traded one defect for another.
 
 Two properties of the setting were established on the way, and both belong here rather than in a test comment:
 
-* **A silenced combiner does not refuse, it swallows.** A dial still *succeeds* — it only seals and emits — and
-  the exchange then wedges indefinitely. So the only failure signal available to a client is a clock, which is
-  the one signal an adversary controls. This is the concrete form of the objection §6.2 raised against letting
-  the client walk the points as the primary mechanism.
-* **The property to prove is "remains reachable", not "every dial completes".** Since a dial does not retry, a
-  fraction of picks landing on a censored point *should* fail; a test asserting otherwise cannot pass and would
-  be measuring a mechanism that does not exist yet.
-
-Until a scenario demonstrates reachability under a silenced meeting point — falsified by collapsing `m` to 1 —
-§6's bound stands as a derivation whose implementation is unverified.
+* **A silenced node does not refuse, it swallows.** A dial still *succeeds* — it only seals and emits — and the
+  exchange then wedges indefinitely. So the only failure signal available to a client is a clock, which is the one
+  signal an adversary controls. This is the concrete form of the objection §6.2 raised against letting the client
+  walk the points as the primary mechanism, and it is why the repair had to be structural (draw a different member
+  every reseal) rather than reactive (notice the failure and retry elsewhere).
+* **The property to prove is "remains reachable", not "every dial completes".** A whole dial does not retry, so an
+  attempt whose deadline expires is lost; what self-heals is *within* a dial, where each DIAULOS retransmit reseals
+  a fresh onion and re-draws its per-hop gatherers. A test asserting that every dial completes would be measuring
+  a mechanism that does not exist.
 
 ---
 
@@ -358,12 +438,16 @@ a defect.
 
 **Derived.** The tier ordering in §3 (from the gradients of Φ). The replica selection in §5 (consistent hashing on
 an identifier that must exist anyway). The spread in §5.2 (`q + 1` line members). The requirement that `m` in §6
-follow from the plane's fault tolerance.
+follow from the plane's fault tolerance. The per-hop availability bound in §6.1b — a hop line survives while `t` of
+its `q + 1` members do, which is the peel's own quorum rather than a second constant. The share-gather deadline in
+§6.3, now a smoothed measurement of completed gathers rather than a number (and its in-flight map bounded by count,
+so no timing value doubles as a memory bound).
 
 **Chosen, and each needs a derivation before it ships.** `K` (per-epoch quota) — should follow from the honest
 client's actual request profile, measured, not guessed. `u*` and `λ` in the controller. The rotation period `N` in
 §7.3 — derivable from a target compromise probability, and that derivation should be done rather than a number
-picked.
+picked. Three sibling gather deadlines still hold the chosen 2 s that `ThresholdRouter` shed — `ThresholdService`,
+the threshold-rendezvous intro gather, and POROS admission — and the §6.3 argument applies to each verbatim.
 
 **Unproven, and the honest frontier.** The §2 construction assumes the lattice ZK stack can carry a membership
 proof plus a PRF evaluation plus a range check at a per-request cost a client can pay. OBOLOS's whole-transaction

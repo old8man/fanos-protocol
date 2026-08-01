@@ -15,7 +15,8 @@
 //!   service's meeting line;
 //! * **service → client** — [`RendezvousService::ingest`] records the cookie→reply-circuit binding and
 //!   surfaces the inner bytes; [`RendezvousService::seal_reply`] seals the response back through that
-//!   client's reply circuit, which ends at the combiner the client listens on.
+//!   client's reply circuit, which ends at the client's own dead-drop LINE — the client receives it as
+//!   one of that line's `q + 1` members, not at any single combiner coordinate (#55).
 
 use core::marker::PhantomData;
 
@@ -25,7 +26,7 @@ use fanos_geometry::Triple;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_primitives::BoundedMap;
 
-use crate::{Forward, MixDirectory, Request, combiner_for, seal_forward, seal_nostos_reply};
+use crate::{Forward, MixDirectory, Request, seal_forward, seal_nostos_reply};
 
 /// A per-session cookie the service demultiplexes concurrent clients by, without learning who they are.
 pub type SessionId = [u8; 16];
@@ -51,9 +52,14 @@ pub fn session_reply_keypair(secret: &[u8]) -> (ReplyKeys, Vec<u8>) {
 /// The client half of an anonymous session.
 ///
 /// It seals outbound DIAULOS payloads into onions routed to the service's meeting line, naming its own
-/// reply rendezvous inside each [`Request`], and knows the combiner coordinate ([`Self::reply_combiner`])
-/// where the service's replies land. Sans-I/O: a driver launches each returned [`Forward`] and delivers
-/// whatever arrives at the reply combiner back into the DIAULOS session.
+/// reply rendezvous inside each [`Request`]. Sans-I/O: a driver launches each returned [`Forward`] and
+/// feeds back the deliveries that land on the client's own reply line.
+///
+/// It deliberately exposes no "the coordinate my replies arrive at" accessor. There is no such coordinate:
+/// a reply is a dead-drop multicast to every member of the reply line, and the driver recognises its own
+/// by opening it with the session's [`ReplyKeys`] — the reply key IS the demultiplexer. An accessor
+/// returning the line's canonical combiner existed here and was removed with #55, having become both
+/// unused and untrue.
 ///
 /// A fresh seed is drawn from an internal CSPRNG for every onion, so no two onions share per-hop key
 /// material — the constructor's `secret` is the only entropy input (OS entropy in production, a fixed
@@ -116,18 +122,12 @@ impl<F: Field> RendezvousClient<F> {
         }
     }
 
-    /// This session's cookie — the service tags its replies with it, so the driver can route deliveries
-    /// arriving at [`Self::reply_combiner`] back to the correct session.
+    /// This session's cookie. On the **legacy** (no-reply-key) path the service tags each reply with it so a
+    /// rendezvous relay can route the delivery back to the registering client; on the NOSTOS path nothing is
+    /// tagged — the reply key demultiplexes — and this serves as the session's identifier to the service.
     #[must_use]
     pub fn cookie(&self) -> SessionId {
         self.cookie
-    }
-
-    /// The combiner coordinate this client listens on for the service's replies (the reply circuit's
-    /// destination). `None` only if the reply circuit is empty.
-    #[must_use]
-    pub fn reply_combiner(&self) -> Option<Triple> {
-        combiner_for::<F>(*self.reply_circuit.last()?)
     }
 
     /// Seal `payload` (a DIAULOS `ClientHello` or cell) into an onion bound for the service's meeting
@@ -293,7 +293,7 @@ mod tests {
     use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
 
     use super::*;
-    use crate::meeting_line;
+    use crate::{line_member_coords, meeting_line};
 
     /// A directory with a hybrid KEM key at every Fano point — enough to seal onions through any line.
     fn fano_directory() -> MixDirectory {
@@ -366,30 +366,55 @@ mod tests {
         );
         let a = c.seal_send(b"hello").unwrap();
         let b = c.seal_send(b"hello").unwrap();
-        assert_eq!(
-            a.combiner, b.combiner,
-            "same first hop → same launch combiner"
-        );
         assert_ne!(
             a.frame, b.frame,
             "a fresh per-onion seed must change the sealed frame — no key-material reuse"
         );
+        // Both launch at a MEMBER of the first hop line — but not necessarily the same one, and that
+        // difference is the point (#55). This assertion used to read `a.combiner == b.combiner` ("same
+        // first hop → same launch combiner"), which pinned every onion to one canonical node and made it
+        // a per-hop censorship single point of failure. The pick is salted by the sealed bytes, so two
+        // resealings of the same payload draw independently — which is exactly what lets a session
+        // self-heal past a dead member on retransmission.
+        let members = line_member_coords::<F2>(hop);
+        assert!(
+            members.contains(&a.combiner) && members.contains(&b.combiner),
+            "every launch targets a member of its first hop line"
+        );
     }
 
     #[test]
-    fn reply_combiner_is_the_reply_circuit_destination() {
+    fn resealing_the_same_payload_reaches_every_member_of_the_first_hop() {
+        // The availability property #55 rests on, stated as a test rather than left to the salt's
+        // definition: a client that keeps resealing (as DIAULOS retransmission does) must eventually
+        // launch at EVERY member of its first hop line, or a dead member would still be a dead hop.
         let dir = fano_directory();
-        let rp = line(4);
-        let c = RendezvousClient::<F2>::new(
-            vec![line(0)],
-            vec![line(1), rp],
+        let hop = line(0);
+        let members = line_member_coords::<F2>(hop);
+        let mut c = RendezvousClient::<F2>::new(
+            vec![hop, line(1)],
+            vec![line(3)],
             dir,
             2,
-            b"s",
+            b"reseal-secret",
             vec![],
             [0; 32],
         );
-        assert_eq!(c.reply_combiner(), combiner_for::<F2>(rp));
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            let f = c.seal_send(b"hello").unwrap();
+            if !seen.contains(&f.combiner) {
+                seen.push(f.combiner);
+            }
+        }
+        seen.sort_unstable();
+        let mut expected = members;
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "64 resealings reach every member of the first hop line — one dead member costs \
+             attempts, not the hop"
+        );
     }
 
     #[test]
@@ -420,8 +445,12 @@ mod tests {
         assert!(svc.knows(&cookie));
         assert_eq!(svc.sessions(), 1);
         // Now a reply seals through the recorded circuit (legacy cookie-tagged path — no reply key).
+        // The launch target is a per-onion salted member of the first hop line (#55).
         let reply = svc.seal_reply(&cookie, b"resp").unwrap();
-        assert_eq!(reply.combiner, combiner_for::<F2>(hop).unwrap());
+        assert!(
+            line_member_coords::<F2>(hop).contains(&reply.combiner),
+            "the reply launches at a member of its first hop line"
+        );
     }
 
     #[test]
@@ -594,10 +623,14 @@ mod tests {
             .encode(),
         )
         .unwrap();
-        // The NOSTOS reply seals (end-to-end + dead-drop) and launches at the reply line's combiner; the
-        // line's members route it and the client, a member, decrypts. Fresh seeds keep replies unlinkable.
+        // The NOSTOS reply seals (end-to-end + dead-drop) and launches at a salted member of the reply
+        // line (#55); the line's members route it and the client, a member, decrypts. Fresh seeds keep
+        // replies unlinkable.
         let a = svc.seal_reply(&cookie, b"resp").unwrap();
-        assert_eq!(a.combiner, combiner_for::<F2>(l).unwrap());
+        assert!(
+            line_member_coords::<F2>(l).contains(&a.combiner),
+            "the NOSTOS reply launches at a member of the reply line"
+        );
         let b = svc.seal_reply(&cookie, b"resp").unwrap();
         assert_ne!(
             a.frame, b.frame,

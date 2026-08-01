@@ -91,10 +91,11 @@ fn a_deeper_multi_hop_circuit_still_delivers() {
     sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
     sim.run_for(Duration::from_millis(4000));
 
-    let l_comb = combiner_for::<F2>(meeting).unwrap();
+    // Salted picks (#55): the delivery surfaces at whichever member of the meeting line gathered it.
+    let members = line_member_coords::<F2>(meeting);
     assert!(
-        delivered_anonymously(&sim, l_comb, payload),
-        "a 3-hop onion still delivers anonymously to the meeting line"
+        members.iter().any(|&m| delivered_anonymously(&sim, m, payload)),
+        "a 3-hop onion still delivers anonymously to a member of the meeting line"
     );
 }
 
@@ -115,9 +116,10 @@ fn threshold_extremes_still_deliver() {
         sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
         sim.run_for(Duration::from_millis(4000));
 
-        let l_comb = combiner_for::<F2>(meeting).unwrap();
+        // Salted picks (#55): the delivery surfaces at whichever member gathered it.
+        let members = line_member_coords::<F2>(meeting);
         assert!(
-            delivered_anonymously(&sim, l_comb, payload),
+            members.iter().any(|&m| delivered_anonymously(&sim, m, payload)),
             "threshold t={t} of q+1=3 delivers"
         );
     }
@@ -129,21 +131,22 @@ fn a_hop_starved_below_threshold_does_not_deliver() {
     let t = 2usize;
     let meeting =
         meeting_line::<F2>(b"starve-svc", fanos_rendezvous::Epoch::new(1), &BEACON).coords();
-    // Keep the combiner (the onion's entry point) live but silence the other members, so the final hop
-    // has only 1 < t=2 live members and can never be reconstructed.
+    // Keep one member (the onion's entry point) live but silence the other members, so the final hop
+    // has only 1 < t=2 live members and can never be reconstructed. The frame is injected AT the live
+    // member explicitly — the salted launch pick (#55) could otherwise land on a silenced member and the
+    // test would starve at the wrong stage (no gather at all instead of a below-threshold gather).
     let members = line_member_coords::<F2>(meeting);
     let skip = &members[1..];
     let dir = spawn_plane::<F2>(&mut sim, t, skip);
 
     let payload = b"starved-hello";
     let fwd = seal_forward::<F2>(&[meeting], &dir, t as u8, payload, b"starve-seed").unwrap();
-    sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
+    sim.inject_frame(Point::<F2>::at(6).coords(), members[0], fwd.frame);
     sim.run_for(Duration::from_millis(4000));
 
-    let l_comb = combiner_for::<F2>(meeting).unwrap();
     assert!(
-        !delivered_anonymously(&sim, l_comb, payload),
-        "a hop with fewer than t live members yields no anonymous delivery — and no panic"
+        members.iter().all(|&m| !delivered_anonymously(&sim, m, payload)),
+        "a hop with fewer than t live members yields no anonymous delivery at any member — and no panic"
     );
 }
 
@@ -164,9 +167,10 @@ fn rendezvous_generalises_to_a_larger_plane_pg_2_3() {
     sim.inject_frame(Point::<F3>::at(12).coords(), fwd.combiner, fwd.frame);
     sim.run_for(Duration::from_millis(5000));
 
-    let l_comb = combiner_for::<F3>(meeting).unwrap();
+    // Salted picks (#55): the delivery surfaces at whichever of the line's q+1 = 4 members gathered it.
+    let members = line_member_coords::<F3>(meeting);
     assert!(
-        delivered_anonymously(&sim, l_comb, payload),
+        members.iter().any(|&m| delivered_anonymously(&sim, m, payload)),
         "the anonymous rendezvous works unchanged on PG(2,3) — nothing is hard-wired to Fano"
     );
 }
@@ -197,25 +201,78 @@ fn the_meeting_line_rotates_across_epochs() {
     sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
     sim.run_for(Duration::from_millis(4000));
 
-    let c5 = combiner_for::<F2>(l5).unwrap();
+    // Salted picks (#55): the delivery surfaces at some member of epoch 5's line.
+    let m5 = line_member_coords::<F2>(l5);
     assert!(
-        delivered_anonymously(&sim, c5, payload),
+        m5.iter().any(|&m| delivered_anonymously(&sim, m, payload)),
         "delivered at the epoch-5 rendezvous"
     );
-    // Find some other epoch whose combiner differs from epoch 5's, and confirm this payload never
-    // landed there — an epoch-5 onion does not reach a foreign epoch's listening point.
-    if let Some(other_c) = (0..20u32)
-        .map(|e| {
-            combiner_for::<F2>(
-                meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into()), &BEACON).coords(),
-            )
-            .unwrap()
-        })
-        .find(|&c| c != c5)
+    // Find some other epoch's meeting LINE and confirm the payload never landed at a listening point of
+    // that line — an epoch-5 onion does not reach a foreign epoch's rendezvous.
+    //
+    // Excluding the shared point is geometry, not a fudge: two distinct lines of PG(2, q) meet in exactly
+    // one point, so a node on the foreign line may also be on `l5` and legitimately receive this delivery
+    // as one of epoch 5's own members. Comparing whole lines rather than one canonical combiner each is
+    // also what keeps this assertion meaningful after #55 — a foreign epoch's canonical combiner can be
+    // an `l5` member, which under salted picks would have made the old form fail for the wrong reason.
+    if let Some(foreign) = (0..20u32)
+        .map(|e| meeting_line::<F2>(key, fanos_rendezvous::Epoch::new(e.into()), &BEACON).coords())
+        .find(|&l| l != l5)
     {
         assert!(
-            !delivered_anonymously(&sim, other_c, payload),
-            "an epoch-5 onion does not reach a different epoch's rendezvous point"
+            line_member_coords::<F2>(foreign)
+                .iter()
+                .filter(|m| !m5.contains(m))
+                .all(|&m| !delivered_anonymously(&sim, m, payload)),
+            "an epoch-5 onion does not reach a different epoch's rendezvous line"
         );
     }
+}
+
+#[test]
+fn one_silenced_member_costs_attempts_not_the_hop() {
+    // **The #55 property, deterministically.** The QUIC scenario
+    // (`fanos-node/tests/anonymous_quic.rs::a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding`)
+    // proves this end-to-end but over a real network, where its count varies with load. Here the same
+    // property is pinned in the deterministic simulator, where the only variable is the geometry.
+    //
+    // The claim: a hop line whose canonical combiner is DEAD still delivers, because a launch draws a
+    // per-onion member (`combiner_for_salted`) and a resealing sender therefore reaches the live ones.
+    // Before the salted pick, killing that one node killed the hop outright, and it is a public function
+    // of the line — so an adversary needed no secret to pick the node to silence.
+    let mut sim = Sim::new(0x5501);
+    let t = 2usize;
+    let meeting = meeting_line::<F2>(b"censored-svc", fanos_rendezvous::Epoch::new(1), &BEACON).coords();
+    // Silence exactly the canonical combiner — the single node the old addressing sent every onion to.
+    let dead = combiner_for::<F2>(meeting).unwrap();
+    let dir = spawn_plane::<F2>(&mut sim, t, &[dead]);
+    let members = line_member_coords::<F2>(meeting);
+    assert!(members.contains(&dead), "the canonical combiner is a member of its own line");
+
+    // A resealing sender: distinct seeds stand in for DIAULOS retransmits, each drawing its own member.
+    let payload = b"reaches-past-the-silenced-node";
+    let mut launched_at_dead = 0usize;
+    for i in 0..16u8 {
+        let seed = [b"censor-seed".as_slice(), &[i]].concat();
+        let fwd = seal_forward::<F2>(&[meeting], &dir, t as u8, payload, &seed).unwrap();
+        if fwd.combiner == dead {
+            launched_at_dead += 1;
+        }
+        sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
+    }
+    sim.run_for(Duration::from_millis(4000));
+
+    // The property: the line still delivers, at some LIVE member.
+    assert!(
+        members.iter().any(|&m| m != dead && delivered_anonymously(&sim, m, payload)),
+        "with the canonical combiner silenced the hop still delivers at a live member — the line's \
+         own t-of-(q+1) quorum is the availability bound, not one node"
+    );
+    // And the cost is bounded to the attempts that drew the dead member — roughly 1/(q+1) of them, not
+    // all of them. Asserting `< 16` rather than a rate keeps this a statement about the mechanism (the
+    // pick VARIES) rather than a hostage to the hash's exact distribution on one line.
+    assert!(
+        launched_at_dead < 16,
+        "not every attempt draws the dead member — a constant pick is the failure mode this closes"
+    );
 }

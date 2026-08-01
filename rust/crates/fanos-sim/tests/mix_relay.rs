@@ -14,7 +14,7 @@ use fanos_keygen::BeaconNode;
 use fanos_node::MixRelay;
 use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, Epoch, MixDirectory, combiner_for, meeting_line, seal_forward,
+    ANONYMOUS, BeaconSeed, Epoch, MixDirectory, line_member_coords, meeting_line, seal_forward,
 };
 use fanos_runtime::{Command, Duration, Notification};
 use fanos_sim::Sim;
@@ -105,11 +105,13 @@ fn a_mixrelay_cell_beacons_rotates_and_rendezvouses() {
     sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
     sim.run_for(Duration::from_millis(4000));
 
-    let l_comb = combiner_for::<F2>(meeting).unwrap();
+    // MEMBERSHIP, not the canonical combiner: the final hop's gatherer is the per-onion salted pick
+    // (#55), so the delivery surfaces at whichever member of the meeting line gathered it.
+    let members = line_member_coords::<F2>(meeting);
     assert!(
         sim.report()
             .deliveries()
-            .any(|(recv, from, bytes)| recv == l_comb && from == ANONYMOUS && bytes == payload),
+            .any(|(recv, from, bytes)| members.contains(&recv) && from == ANONYMOUS && bytes == payload),
         "an onion sealed to the epoch-1 beacon line delivered through the rotated MixRelay cell"
     );
 }

@@ -22,7 +22,7 @@ use fanos_geometry::{Line, Point, Triple};
 use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, RendezvousService, Request, SessionId,
-    combiner_for, meeting_line, seal_forward,
+    line_member_coords, meeting_line, seal_forward,
 };
 use fanos_runtime::Duration;
 use fanos_sim::Sim;
@@ -117,17 +117,15 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
     let epoch = fanos_rendezvous::Epoch::new(9);
     let meeting = meeting_line::<F2>(&service.public().encode(), epoch, &BEACON).coords();
-    let l_combiner = combiner_for::<F2>(meeting).unwrap();
+    // MEMBERSHIP, not one coordinate: a hop's gatherer is the per-onion salted pick (#55), so the
+    // service reads its requests wherever on its meeting line they surfaced.
+    let meeting_members = line_member_coords::<F2>(meeting);
 
     let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
-    // The client's reply rendezvous line, listed in its reply circuit: distinct from the meeting line
-    // *and* with a distinct combiner, so the service (listening at its own combiner) does not also
-    // receive the client's reply traffic — two lines can share a combiner point, so avoid the collision.
-    let rp_c = lines
-        .iter()
-        .copied()
-        .find(|&l| l != meeting && combiner_for::<F2>(l) != Some(l_combiner))
-        .unwrap();
+    // The client's reply rendezvous line, listed in its reply circuit: a distinct LINE from the meeting
+    // line, so the service does not also receive the client's reply traffic as a delivery on its own
+    // line. (Comparing canonical combiners was the pre-#55 proxy for this; lines are the real unit.)
+    let rp_c = lines.iter().copied().find(|&l| l != meeting).unwrap();
     let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
     let hop_to_rp = *lines.iter().find(|&&l| l != rp_c && l != meeting).unwrap();
 
@@ -154,8 +152,8 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
         let (_, _, bytes) = sim
             .report()
             .deliveries()
-            .find(|(recv, from, _)| *recv == l_combiner && *from == ANONYMOUS)
-            .expect("request delivered anonymously to the meeting line");
+            .find(|(recv, from, _)| meeting_members.contains(recv) && *from == ANONYMOUS)
+            .expect("request delivered anonymously to a member of the meeting line");
         Request::decode(bytes).expect("valid request")
     };
     assert_eq!(
@@ -167,19 +165,27 @@ fn a_full_diaulos_handshake_completes_over_the_anonymous_bidirectional_path() {
         fanos_diaulos::accept(&service, &req.payload, &mut arng).expect("service accepts");
 
     // ← seal the ServerHello back along the reply circuit to the client's rendezvous.
+    //
+    // Count the deliveries already made BEFORE injecting the reply, and skip them below. Two distinct
+    // lines of PG(2, q) always meet in exactly one point, so the client's reply line necessarily shares a
+    // member with the service's meeting line — and the client's own earlier REQUEST delivery landed
+    // there. Selecting by coordinate alone would pick up the request and fail to establish; the cut is
+    // temporal, which is what actually distinguishes them.
+    let before_reply = sim.report().deliveries().count();
     let back =
         seal_forward::<F2>(&req.reply_circuit, &dir, t, &server_hello, b"seed-back").unwrap();
-    sim.inject_frame(l_combiner, back.combiner, back.frame);
+    sim.inject_frame(meeting_members[0], back.combiner, back.frame);
     sim.run_for(Duration::from_millis(3000));
 
-    // Client (at RP_c's combiner) receives the ServerHello anonymously and completes the handshake.
-    let rp_combiner = combiner_for::<F2>(rp_c).unwrap();
+    // The client, a member of RP_c, receives the ServerHello anonymously and completes the handshake.
+    let reply_members = line_member_coords::<F2>(rp_c);
     let dialed = {
         let (_, _, bytes) = sim
             .report()
             .deliveries()
-            .find(|(recv, from, _)| *recv == rp_combiner && *from == ANONYMOUS)
-            .expect("server hello delivered anonymously to the client rendezvous");
+            .skip(before_reply)
+            .find(|(recv, from, _)| reply_members.contains(recv) && *from == ANONYMOUS)
+            .expect("server hello delivered anonymously to a member of the client rendezvous line");
         pending
             .establish(bytes)
             .expect("the 1-RTT handshake completed over the anonymous path")
@@ -200,19 +206,14 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
     let epoch = fanos_rendezvous::Epoch::new(3);
     let meeting = meeting_line::<F2>(&service.public().encode(), epoch, &BEACON).coords();
-    let l_combiner = combiner_for::<F2>(meeting).unwrap();
+    // MEMBERSHIP, not one coordinate (#55): each hop's gatherer is the per-onion salted pick.
+    let meeting_members = line_member_coords::<F2>(meeting);
 
     let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
-    // The client's reply rendezvous must have a combiner *distinct* from the service's meeting line —
-    // otherwise the service, listening at its combiner, would also receive the client's reply traffic
-    // (two lines can share their combiner point). The client derives its reply line and picks one that
-    // avoids the collision.
-    let rp_c = lines
-        .iter()
-        .copied()
-        .find(|&l| l != meeting && combiner_for::<F2>(l) != Some(l_combiner))
-        .unwrap();
-    let rp_combiner = combiner_for::<F2>(rp_c).unwrap();
+    // The client's reply rendezvous must be a distinct LINE from the service's meeting line, or the
+    // service would also receive the client's reply traffic as a delivery on its own line.
+    let rp_c = lines.iter().copied().find(|&l| l != meeting).unwrap();
+    let reply_members = line_member_coords::<F2>(rp_c);
 
     let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
     let hop_to_rp = *lines.iter().find(|&&l| l != rp_c).unwrap();
@@ -256,8 +257,8 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
         drain(
             &sim,
             &mut seen,
-            l_combiner,
-            rp_combiner,
+            &meeting_members,
+            &reply_members,
             &service,
             &mut server,
             &mut srng,
@@ -280,14 +281,14 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
         // service → client: seal each DIAULOS reply back through the client's circuit, keyed by cookie.
         for payload in server.poll_payloads() {
             let fwd = rservice.seal_reply(&rclient.cookie(), &payload).unwrap();
-            sim.inject_frame(l_combiner, fwd.combiner, fwd.frame);
+            sim.inject_frame(meeting_members[0], fwd.combiner, fwd.frame);
         }
         sim.run_for(Duration::from_millis(2000));
         drain(
             &sim,
             &mut seen,
-            l_combiner,
-            rp_combiner,
+            &meeting_members,
+            &reply_members,
             &service,
             &mut server,
             &mut srng,
@@ -318,8 +319,8 @@ fn a_full_diaulos_session_request_response_over_the_anonymous_path() {
 fn drain(
     sim: &Sim,
     seen: &mut usize,
-    l_combiner: Triple,
-    rp_combiner: Triple,
+    meeting_members: &[Triple],
+    reply_members: &[Triple],
     keypair: &fanos_diaulos::StaticKeypair,
     server: &mut fanos_diaulos::ServerSession,
     srng: &mut SeedRng,
@@ -335,13 +336,15 @@ fn drain(
         .collect();
     *seen = sim.report().deliveries().count();
     for (recv, bytes) in new {
-        if recv == l_combiner {
+        // MEMBERSHIP, not a single coordinate: the final hop's gatherer is the per-onion salted pick
+        // (#55, `combiner_for_salted`), so a delivery surfaces at whichever member gathered it.
+        if meeting_members.contains(&recv) {
             // A client request arriving at the service's meeting line: the transport ingests it (binding
             // the cookie to its reply circuit) and surfaces the inner DIAULOS bytes for the server.
             if let Some((_cookie, payload)) = rservice.ingest(&bytes) {
                 server.handle_payload(keypair, &payload, srng);
             }
-        } else if recv == rp_combiner && let Some(cell) = bytes.get(16..) {
+        } else if reply_members.contains(&recv) && let Some(cell) = bytes.get(16..) {
             // A service reply arriving at the client's rendezvous: strip the 16-byte session-cookie prefix
             // the service tags every reply with (a shared relay uses it to demultiplex clients), then feed
             // the client's DIAULOS session the cell.
@@ -366,27 +369,19 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
     let service = fanos_diaulos::StaticKeypair::generate(&mut skp);
     let epoch = fanos_rendezvous::Epoch::new(11);
     let meeting = meeting_line::<F2>(&service.public().encode(), epoch, &BEACON).coords();
-    let l_combiner = combiner_for::<F2>(meeting).unwrap();
+    // MEMBERSHIP, not one coordinate (#55): each hop's gatherer is the per-onion salted pick.
+    let meeting_members = line_member_coords::<F2>(meeting);
 
     let lines: Vec<Triple> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
-    let combiner = |l: Triple| combiner_for::<F2>(l).unwrap();
-    // Two reply rendezvous lines whose combiners are distinct from L's and from each other, so the two
-    // clients' return traffic never crosses (or lands on the service's own listening point).
-    let rp_a = lines
-        .iter()
-        .copied()
-        .find(|&l| combiner(l) != l_combiner)
-        .unwrap();
-    let rp_b = lines
-        .iter()
-        .copied()
-        .find(|&l| combiner(l) != l_combiner && combiner(l) != combiner(rp_a))
-        .unwrap();
-    let (rp_a_comb, rp_b_comb) = (combiner(rp_a), combiner(rp_b));
-    assert_ne!(
-        rp_a_comb, rp_b_comb,
-        "the two clients listen at distinct points"
-    );
+    // Two reply rendezvous LINES, each distinct from L and from each other.
+    //
+    // They are NOT required to be point-disjoint, and demanding that would be asking the geometry for
+    // something it cannot give: two distinct lines of PG(2, q) meet in exactly one point, always. So the
+    // clients are told apart the way the protocol itself tells them apart and the way this test is named
+    // — **by cookie** — rather than by which coordinate a reply happened to surface at. Under the salted
+    // pick a reply may land on any member of its line, including the one the two lines share.
+    let rp_a = lines.iter().copied().find(|&l| l != meeting).unwrap();
+    let rp_b = lines.iter().copied().find(|&l| l != meeting && l != rp_a).unwrap();
 
     let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
     let hop_a = *lines.iter().find(|&&l| l != rp_a).unwrap();
@@ -465,18 +460,23 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
                 .collect();
             seen = sim.report().deliveries().count();
             for (recv, bytes) in new {
-                if recv == l_combiner {
+                if meeting_members.contains(&recv) {
                     if let Some((cookie, payload)) = rsvc.ingest(&bytes) {
                         servers
                             .entry(cookie)
                             .or_default()
                             .handle_payload(&service, &payload, &mut srng);
                     }
-                } else if recv == rp_a_comb && let Some(cell) = bytes.get(16..) {
-                    // Strip the 16-byte session-cookie prefix the service tags replies with, then feed A.
-                    client_a.handle_payload(cell);
-                } else if recv == rp_b_comb && let Some(cell) = bytes.get(16..) {
-                    client_b.handle_payload(cell);
+                } else if let (Some(tag), Some(cell)) = (bytes.get(..16), bytes.get(16..)) {
+                    // Route by the 16-byte session-cookie prefix the service tags every reply with —
+                    // which is exactly what a shared rendezvous relay does, and what this test's name
+                    // claims. Coordinate-based routing would be ambiguous at the single point the two
+                    // reply lines share.
+                    if tag == cookie_a {
+                        client_a.handle_payload(cell);
+                    } else if tag == cookie_b {
+                        client_b.handle_payload(cell);
+                    }
                 }
             }
 
@@ -495,7 +495,7 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
                 }
                 for payload in server.poll_payloads() {
                     if let Some(fwd) = rsvc.seal_reply(cookie, &payload) {
-                        sim.inject_frame(l_combiner, fwd.combiner, fwd.frame);
+                        sim.inject_frame(meeting_members[0], fwd.combiner, fwd.frame);
                     }
                 }
             }

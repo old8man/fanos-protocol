@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use fanos_aphantos::threshold::{HopLine, seal_onion};
-use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
+use fanos_aphantos::threshold_router::launch_frame;
 pub use fanos_calypso::{BeaconSeed, Epoch};
 use fanos_field::Field;
 use fanos_geometry::{Line, Triple};
@@ -37,9 +37,16 @@ pub use transport::{RendezvousClient, RendezvousService, SessionId, session_repl
 
 /// The anonymous-source sentinel a threshold delivery carries (`from` in `Notification::Delivered`).
 pub use fanos_aphantos::threshold_router::ANONYMOUS;
-/// The combiner coordinate where an onion bound for `line` is finally delivered — the point a party
-/// listens at to receive its rendezvous traffic.
+/// The **canonical** combiner of a line — a pure function of the line alone, used by derivations
+/// (the `meeting_lines` distinct-combiner walk) rather than by launches, which draw a per-onion
+/// member via [`combiner_for_salted`] (#55).
 pub use fanos_aphantos::threshold_router::combiner_for;
+/// The line member a particular onion is launched at — the per-onion salted pick that makes a hop's
+/// availability the line's own `t`-of-`q+1` quorum instead of one canonical node (#55).
+pub use fanos_aphantos::threshold_router::combiner_for_salted;
+/// A line's member coordinates in canonical seal order — what a host walks to spread combiner-local
+/// state (a §3b route binding) to **every** member, since a salted launch may peel at any of them.
+pub use fanos_aphantos::threshold_router::line_member_coords;
 
 /// The rendezvous **meeting line** for a service: the client and the service each derive the *same*
 /// line from the service's public key, the `epoch`, and the epoch's randomness `beacon`, with no lookup
@@ -271,7 +278,12 @@ pub fn seal_forward<F: Field>(
         .collect();
     let onion = seal_onion(&hops, threshold, payload, seed).ok()?;
     Some(Forward {
-        combiner: combiner_for::<F>(first)?,
+        // The launch target is drawn PER ONION (salted by the sealed bytes, #55): any member of the
+        // first hop line can gather, and pinning launches to the one canonical combiner made that
+        // node a per-hop censorship single point of failure. Every reseal — and every DIAULOS
+        // retransmit reseals — draws an independent member, so a dead member costs 1/(q+1) of
+        // attempts, not the hop.
+        combiner: combiner_for_salted::<F>(first, &onion)?,
         frame: launch_frame(first, &onion),
     })
 }
@@ -793,7 +805,11 @@ mod tests {
         let fwd = reg
             .seal_forward_to_host::<F2>(&dir, b"the-wrapped-client-request", b"e2e-seed", b"onion-seed")
             .expect("a primary registration seals a forward onion");
-        assert_eq!(fwd.combiner, combiner_for::<F2>(drop_line).unwrap());
+        // The launch target is a per-onion salted member of the drop line (#55).
+        assert!(
+            line_member_coords::<F2>(drop_line).contains(&fwd.combiner),
+            "the forward launches at a member of the drop line"
+        );
         // The bare-host fallback has no forward circuit, so it seals nothing (the combiner Sends direct).
         assert!(
             HostRegister::bare(&bundle, &signer, Epoch::new(3), [1, 1, 1])

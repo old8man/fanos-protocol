@@ -16,6 +16,8 @@ mod common;
 
 
 use fanos_aphantos::ThresholdRouter;
+use std::time::Duration;
+
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::{StaticKeypair, bundle_from_identity};
 use fanos_field::F2;
@@ -33,9 +35,8 @@ use fanos_runtime::{Config as OverlayConfig, OverlayNode};
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
 use fanos_rendezvous::CONTROL_MIX_DIRECTORY;
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, HostRegister, MixDirectory, RendezvousService, combiner_for, meeting_line,
-    meeting_lines,
-    seal_forward, seal_host_register,
+    ANONYMOUS, BeaconSeed, HostRegister, MixDirectory, RendezvousService, combiner_for,
+    line_member_coords, meeting_line, meeting_lines, seal_forward, seal_host_register,
 };
 
 /// The epoch's public randomness beacon, shared by the service (which listens on the derived meeting
@@ -83,23 +84,62 @@ async fn router(i: usize, dir: &Directory, t: usize) -> (NodeHandle, HybridKemPu
     (handle, onion_public)
 }
 
-/// Await an anonymous delivery of `want` on `node`, bounded by the shared hang ceiling.
+/// Await an anonymous delivery of `want` at **any member of `line`**, within the shared hang ceiling.
 ///
-/// The ceiling used to be a per-call `secs` argument, which is the same conflation `common::HANG_CEILING` removes: a
-/// caller passing `20` was not claiming the delivery takes 20 s, it was guessing how long to wait before giving up.
-async fn await_anonymous(node: &mut NodeHandle, want: &[u8]) -> bool {
-    tokio::time::timeout(common::HANG_CEILING, async {
-        loop {
-            match node.next_notification().await {
-                Some(Notification::Delivered { from, payload })
-                    if from == ANONYMOUS && payload == want =>
-                {
-                    return true;
+/// This replaced a single-node `await_anonymous(&mut nodes[l_index], …)`: which member gathers a given onion is
+/// now the per-onion salted pick (#55), so there is no one node to await. The members are polled CONCURRENTLY,
+/// and that is a correctness requirement rather than a nicety — a serial loop would spend the whole ceiling on
+/// the first member and time out before ever reaching the one that received it. Racing them makes "some member
+/// of the line got it" a single bounded wait, on the same total budget the one-node form used.
+///
+/// The ceiling is `common::HANG_CEILING` rather than a per-call `secs` argument, which removes the old
+/// conflation: a caller passing `20` was not claiming the delivery takes 20 s, it was guessing how long to wait
+/// before giving up.
+async fn await_anonymous_on_line(nodes: &mut [NodeHandle], line: Triple, want: &[u8]) -> bool {
+    let members = line_member_coords::<F2>(line);
+    let mut waits: Vec<Option<_>> = nodes
+        .iter_mut()
+        .enumerate()
+        .filter(|(i, _)| {
+            members.iter().any(|&m| Point::<F2>::new(m).is_some_and(|p| p.index() == *i))
+        })
+        .map(|(_, node)| {
+            Some(Box::pin(async move {
+                loop {
+                    match node.next_notification().await {
+                        Some(Notification::Delivered { from, payload })
+                            if from == ANONYMOUS && payload == want =>
+                        {
+                            return true;
+                        }
+                        Some(_) => {}
+                        None => return false,
+                    }
                 }
-                Some(_) => {}
-                None => return false,
+            }))
+        })
+        .collect();
+    tokio::time::timeout(common::HANG_CEILING, async {
+        // Poll every member's wait until one reports the delivery. `select_all` needs the `futures` crate,
+        // which this crate does not carry for tests; a hand-rolled poll over the pinned futures keeps the
+        // dependency surface unchanged and is exactly as concurrent. A finished wait is TAKEN OUT rather
+        // than polled again — polling a completed future is undefined, and a member whose node has shut
+        // down completes immediately with `false`.
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for slot in &mut waits {
+                let Some(wait) = slot.as_mut() else { continue };
+                match wait.as_mut().poll(cx) {
+                    std::task::Poll::Ready(true) => return std::task::Poll::Ready(true),
+                    std::task::Poll::Ready(false) => *slot = None,
+                    std::task::Poll::Pending => pending = true,
+                }
             }
-        }
+            // Every member's stream ended without the delivery: report it now rather than idling to the
+            // ceiling — an exhausted race is an answer, not a hang.
+            if pending { std::task::Poll::Pending } else { std::task::Poll::Ready(false) }
+        })
+        .await
     })
     .await
     .unwrap_or(false)
@@ -141,9 +181,6 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
         .map(|i| Line::<F2>::at(i).coords())
         .find(|&l| l != meeting)
         .unwrap();
-    let l_combiner = combiner_for::<F2>(meeting).unwrap();
-    let l_index = Point::<F2>::new(l_combiner).unwrap().index();
-
     // A client injector node (a non-mixnet coordinate) that puts the launch frame on the wire.
     let injector = spawn(
         Box::new(RawInjector {
@@ -162,11 +199,15 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
         payload: fwd.frame,
     });
 
-    // The node sitting at the meeting line's combiner receives the payload anonymously — the mixnet
-    // peeled both hops over the real socket, and no node (nor the endpoint) learned the source.
+    // A node ON the meeting line receives the payload anonymously — the mixnet peeled both hops over the
+    // real socket, and no node (nor the endpoint) learned the source.
+    //
+    // *Which* member is decided by the per-onion salted pick (#55), so the assertion is over the line's
+    // membership rather than its canonical combiner. Awaiting one predetermined node is what this test did
+    // before, and it is precisely the assumption whose removal made a silenced node survivable.
     assert!(
-        await_anonymous(&mut nodes[l_index], &payload).await,
-        "the onion was delivered anonymously to the meeting line over QUIC"
+        await_anonymous_on_line(&mut nodes, meeting, &payload).await,
+        "the onion was delivered anonymously to a member of the meeting line over QUIC"
     );
 }
 
@@ -381,7 +422,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     let client_node = nodes[client_index].take().unwrap();
 
     let params = AnonRouteParams {
-        directory: mix,
+        directory: mix.clone(),
         threshold: t as u8,
         epoch,
         beacon: TEST_BEACON,
@@ -402,6 +443,63 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     );
     drop(nodes);
     drop(client_node);
+}
+
+/// Register `reg` anonymously at **every member of every** meeting line of `service_public` this epoch.
+///
+/// At every meeting point, because the client picks among them — registering at one leaves the other `m − 1`
+/// unable to reach this host, which is the very spread the `f + 1` points exist to provide. And at every MEMBER
+/// of each point (#55), because a client launch draws a per-onion member (`combiner_for_salted`): a member
+/// without the binding is a member that answers a client with silence. One sealed frame serves all `q + 1` —
+/// each member runs its own gather over the identical onion and binds. Each point's registration is sealed under
+/// its own seed, so a member that peels one cannot replay it to another point.
+fn register_at_every_meeting_member(
+    host: &NodeHandle,
+    service_public: &HybridKemPublic,
+    epoch: fanos_rendezvous::Epoch,
+    mix: &MixDirectory,
+    threshold: u8,
+    reg: &HostRegister,
+) {
+    for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
+        let seed = [b"off-combiner-reg".as_slice(), &(i as u32).to_be_bytes()].concat();
+        let fwd = seal_host_register::<F2>(&[point], mix, threshold, reg, &seed).unwrap();
+        for member in line_member_coords::<F2>(point) {
+            host.client().command(Command::Emit { to: member, frame: fwd.frame.clone() });
+        }
+    }
+}
+
+/// Block until **every member of every** meeting line has bound `expect`'s forward route.
+///
+/// Waiting on the binding rather than on a duration is the difference between a test and a coin flip: a member
+/// silently drops a request whose tag it has not bound yet, and the client then waits forever for a reply that
+/// was never forwarded. Every member, not just the canonical combiner, because a client's launch draws a
+/// per-onion member (#55) and may peel anywhere on the line — dialing before the spread completed measured as
+/// 0 of 8 arrivals, which reads exactly like "the spread does not work" and is in fact "the spread had not
+/// finished". A node lying on two meeting lines binds once per line, and is therefore awaited twice.
+async fn await_every_meeting_member_binds(
+    nodes: &mut [Option<NodeHandle>],
+    host: &mut NodeHandle,
+    host_index: usize,
+    points: &[Triple],
+    expect: [u8; 32],
+) {
+    for &point in points {
+        for member in line_member_coords::<F2>(point) {
+            let mi = Point::<F2>::new(member).unwrap().index();
+            let node = if mi == host_index {
+                &mut *host
+            } else {
+                nodes[mi].as_mut().unwrap_or_else(|| panic!("meeting-line member node {mi} is held"))
+            };
+            assert_eq!(
+                common::host_registered(node).await,
+                expect,
+                "meeting-line member {member:?} must bind this service's forward route"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -454,16 +552,8 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         n.client().command(Command::Control { tag: CONTROL_MIX_DIRECTORY, body: mix.encode() });
     }
 
-    let host_node = nodes[host_index].take().unwrap();
-    // The operator registers anonymously: seal the registration to the meeting line and emit it (it peels at
-    // the combiner, which binds the tag → forward route, learning only the dead-drop LINE, not this node).
-    // At every meeting point, because the client picks among them — registering at one leaves the other m−1
-    // unable to reach this host, which is the very spread the f+1 points exist to provide.
-    for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
-        let seed = [b"off-combiner-reg".as_slice(), &(i as u32).to_be_bytes()].concat();
-        let reg_fwd = seal_host_register::<F2>(&[point], &mix, t as u8, &reg, &seed).unwrap();
-        host_node.client().command(Command::Emit { to: reg_fwd.combiner, frame: reg_fwd.frame });
-    }
+    let mut host_node = nodes[host_index].take().unwrap();
+    register_at_every_meeting_member(&host_node, &service_public, epoch, &mix, t as u8, &reg);
 
     // The operator serves anonymously, opening each forwarded dead-drop with its reply key.
     let rservice = RendezvousService::<F2>::new(mix.clone(), t as u8, b"off-combiner-svc-secret");
@@ -480,16 +570,20 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
             resp
         },
     );
-    // Wait for the binding itself, not for a duration: the combiner silently drops a request whose tag it has not
-    // bound yet, and the client then waits forever for a reply that was never forwarded.
-    let bound = common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held")).await;
-    assert_eq!(bound, reg.service_tag, "the combiner bound this service's forward route");
+    await_every_meeting_member_binds(
+        &mut nodes,
+        &mut host_node,
+        host_index,
+        &meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON),
+        reg.service_tag,
+    )
+    .await;
 
     // A third node dials by name — it neither is the combiner nor knows where the service is.
     let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
     let client_node = nodes[client_index].take().unwrap();
     let params = AnonRouteParams {
-        directory: mix,
+        directory: mix.clone(),
         threshold: t as u8,
         epoch,
         beacon: TEST_BEACON,
@@ -507,6 +601,46 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     assert_eq!(
         response, b"anon-quic-200:GET /off",
         "a service hosted off its meeting combiner was reached end-to-end via combiner forwarding",
+    );
+
+    // === CENSORSHIP: meeting point 0's combiner goes silent, and the service stays reachable. ===
+    //
+    // This is what `f + 1` meeting points exist for: with one, a single node held a whole epoch of this service's
+    // inbound traffic and could drop it; with `f + 1`, an adversary inside the tolerated fault budget cannot hold
+    // them all. Two things this test had to learn the hard way, both worth keeping:
+    //
+    // * **`shutdown()`, not `drop`.** Dropping the handle leaves the node running, and the first version of this
+    //   test PASSED its own falsification with m collapsed to 1 — the combiner it claimed to have silenced was
+    //   still answering. A test that disables nothing proves nothing.
+    // * **A silenced combiner does not refuse, it swallows.** `dial` still succeeds (it only seals and emits) and
+    //   the exchange then wedges forever, so each attempt needs its own deadline. That is the censorship property
+    //   showing through rather than test hygiene: the only failure signal is a clock, which is exactly the signal
+    //   the adversary controls — and why docs §6.2 rejected client-walks-the-points as the PRIMARY mechanism.
+    //
+    // SOME ATTEMPTS MAY STILL MISS THEIR DEADLINE UNDER LOAD, and that is the expected shape, not a flake:
+    // `anonymous_dial` does not retry a whole dial, but every DIAULOS retransmit reseals a fresh onion whose
+    // launch and per-hop gatherers are drawn anew (`combiner_for_salted`, #55) — so a dial that touches the
+    // silenced node simply loses that attempt's round trip and self-heals on the next reseal, bounded by the
+    // per-attempt deadline. The property is "remains reachable", not "every dial completes in time". Do not
+    // "fix" a marginal count by looping until green.
+    nodes[m_index].take().expect("the combiner node is still held").shutdown();
+    let dialer = FanosDialer::anonymous_fresh(
+        client_node.client(),
+        StaticResolver::new().with("off.fanos", meeting, bundle.clone()),
+        AnonRouteParams { directory: mix.clone(), threshold: t as u8, epoch, beacon: TEST_BEACON, depths: (1, 1) },
+    );
+    let mut reached = 0;
+    for _ in 0..8 {
+        let Ok(mut s) = dialer.dial(&Target::Name("off.fanos".to_owned(), 80)).await else { continue };
+        let attempt = tokio::time::timeout(Duration::from_secs(12), common::exchange(&mut s, b"GET /off")).await;
+        if attempt.as_deref() == Ok(b"anon-quic-200:GET /off".as_slice()) {
+            reached += 1;
+        }
+    }
+    assert!(
+        reached > 0,
+        "with meeting point 0's combiner silent the service must still be reachable through another of its \
+         f + 1 points — 0 of 8 dials arrived, which is what a SINGLE meeting point would give",
     );
     drop(nodes);
     drop((host_node, client_node));

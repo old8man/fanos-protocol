@@ -20,8 +20,7 @@ use fanos_geometry::{Line, Plane, Point, Triple};
 use fanos_onoma::Epoch;
 use fanos_quic::Client;
 use fanos_rendezvous::{
-    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, combiner_for,
-    service_tag, session_reply_keypair,
+    ANONYMOUS, BeaconSeed, MixDirectory, RendezvousClient, service_tag, session_reply_keypair,
 };
 use fanos_runtime::{Command, Notification};
 
@@ -184,15 +183,16 @@ impl RendezvousRoute {
         depths: (usize, usize),
         rng: &mut R,
     ) -> Self {
-        let meeting_combiner = combiner_for::<F>(service_meeting);
-        // The client's reply rendezvous: a random line distinct from the meeting line AND whose combiner is
-        // a distinct, *live* relay present in the directory — that relay peels the reply and forwards it to
-        // this client (audit #54, item 3), so it must be reachable to serve as the rendezvous point. Falls
-        // back to the meeting line only on a degenerate plane that offers no such line.
+        // The client's reply rendezvous: a random line distinct from the meeting line — the service must not
+        // receive the client's reply traffic as a delivery on its own line — and **sealable**: every member's
+        // key present in the directory, because a reply onion seals to the whole line and its launch draws a
+        // per-onion member (#55, `combiner_for_salted`), so no single member's liveness is the gate any more.
+        // Falls back to the meeting line only on a degenerate plane that offers no such line.
         let reply_rendezvous = draw_line::<F, R>(rng, |l| {
             l != service_meeting
-                && combiner_for::<F>(l)
-                    .is_some_and(|c| Some(c) != meeting_combiner && directory.get(&c).is_some())
+                && fanos_rendezvous::line_member_coords::<F>(l)
+                    .iter()
+                    .all(|m| directory.get(m).is_some())
         })
         .unwrap_or(service_meeting);
         let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting], rng);
@@ -319,7 +319,7 @@ mod tests {
     use fanos_field::F2;
     use fanos_geometry::{Line, Point};
     use fanos_pqcrypto::{HybridKemSecret, SeedRng};
-    use fanos_rendezvous::{MixDirectory, combiner_for, meeting_line};
+    use fanos_rendezvous::{MixDirectory, meeting_line};
 
     fn fano_directory() -> MixDirectory {
         let mut dir = MixDirectory::new();
@@ -393,9 +393,15 @@ mod tests {
         );
         let reply_rdv = *r.reply_circuit.last().unwrap();
         assert_ne!(
-            combiner_for::<F2>(reply_rdv),
-            combiner_for::<F2>(meeting),
-            "the reply rendezvous does not collide with the meeting combiner"
+            reply_rdv, meeting,
+            "the reply rendezvous is not the meeting line — the service must not receive the \
+             client's reply traffic as a delivery on its own line"
+        );
+        assert!(
+            fanos_rendezvous::line_member_coords::<F2>(reply_rdv)
+                .iter()
+                .all(|m| fano_directory().get(m).is_some()),
+            "the reply rendezvous is sealable: every member's key is in the directory"
         );
 
         // Fresh per dial: a different RNG state yields a different path (overwhelmingly likely).
@@ -431,7 +437,9 @@ mod tests {
             reply_pub.clone(),
             [0; 32],
         );
-        let expected_first_combiner = combiner_for::<F2>(hop).unwrap();
+        // The launch target is a per-onion salted pick (#55), so the invariant is line MEMBERSHIP of
+        // the first hop, not equality with the canonical combiner.
+        let first_hop_members = fanos_rendezvous::line_member_coords::<F2>(hop);
 
         let (out_tx, out_rx) = channel(ChannelTransport::CAP);
         let (in_tx, mut in_rx) = channel(ChannelTransport::CAP);
@@ -449,13 +457,13 @@ mod tests {
             reply_keys,
         ));
 
-        // Outbound: a framed DIAULOS payload is wrapped + sealed and launched at the first hop's
-        // combiner — never forwarded in the clear.
+        // Outbound: a framed DIAULOS payload is wrapped + sealed and launched at a member of the first
+        // hop line (the per-onion salted pick, #55) — never forwarded in the clear.
         out_tx.send(b"diaulos-hello".to_vec()).await.unwrap();
         let (to, frame) = sent_rx.recv().await.unwrap();
-        assert_eq!(
-            to, expected_first_combiner,
-            "the onion launches at the first hop's combiner"
+        assert!(
+            first_hop_members.contains(&to),
+            "the onion launches at a member of its first hop line"
         );
         assert_ne!(
             frame, b"diaulos-hello",

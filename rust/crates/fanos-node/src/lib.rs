@@ -91,7 +91,7 @@ pub use taxis_config::{ChainInfo, ValidatorConfig, build_genesis, deal_validator
 pub use overlay_beacon::OverlayBeaconNode;
 pub use proxy::serve_proxy;
 pub use rendezvous::{RendezvousRoute, anonymous_dial, dial_anonymous};
-pub use rendezvous_relay::{RendezvousRelay, register_frame};
+pub use rendezvous_relay::{RendezvousRelay, register_frame, register_targets};
 pub use service_node::ServiceNode;
 pub use threshold_rendezvous::{
     ThresholdRendezvous, seal_request_intro, seal_request_to_line, split_delivery,

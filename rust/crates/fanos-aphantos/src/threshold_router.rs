@@ -48,8 +48,36 @@ const TAG_DROP: u8 = 0xE3;
 /// The anonymous-source sentinel in a delivery notification (the endpoint learns no originator).
 pub const ANONYMOUS: Triple = [0, 0, 0];
 
-/// Default deadline for a combiner to gather `t` partials before abandoning a hop.
-const DEFAULT_GATHER_TIMEOUT: Duration = Duration::from_millis(2000);
+/// The deadline used **before the first gather completes**, when there is nothing measured to derive one
+/// from — the bootstrap slot RFC 6298 fills with its 1 s initial RTO, for the same reason.
+///
+/// It is generous on purpose and it is *not* the operating value: one completed gather replaces it with a
+/// measurement ([`GatherClock`]). Being wrong here costs at most the first hop of a cold node, which the
+/// reliability layer retransmits; being wrong *permanently* is what the former 2000 ms constant did.
+const INITIAL_GATHER_DEADLINE: Duration = Duration::from_millis(2000);
+
+/// Floor on the derived deadline. Not a tuning knob: it stops a run of unusually fast gathers (an idle node
+/// on a loopback) from collapsing the estimate so far that the first genuinely loaded gather is abandoned
+/// before its partials can physically arrive. One millisecond is below any real `RTT + C_partial` — the
+/// measured `C_partial` alone is 1.05 ms in release — so it can never bind in operation, only in pathology.
+const MIN_GATHER_DEADLINE: Duration = Duration::from_millis(1);
+
+/// Ceiling on the derived deadline, and the one place memory enters the timing. In-flight gathers are capped
+/// by count ([`MAX_PENDING`]), so this does not bound memory; it bounds how long a *dead* hop is believed in,
+/// which is what an adversary would stretch by answering slowly to pin gather slots. Ten seconds is far above
+/// any honest `RTT + C_partial + Q` this cell has measured and far below a stall an operator would not notice.
+const MAX_GATHER_DEADLINE: Duration = Duration::from_millis(10_000);
+
+/// Cap on concurrently-pending gathers, so **memory is bounded by count rather than by the deadline**.
+///
+/// This is what makes the deadline free to be measured. Previously the only bound on `pending` was the
+/// timeout — every gather sat in a `BTreeMap` until its deadline fired — which quietly made the timing
+/// constant a *memory-safety* parameter, so lengthening it to fix liveness would have traded one defect for
+/// another. Derived from a budget rather than picked: each entry holds one `THRESHOLD_ONION_LEN` onion plus
+/// its shares, so `64 MiB / 20480 B ≈ 3276`. At the cap the oldest incomplete gather is dropped — correct
+/// here, unlike the eviction hazard a keyed cache has, because the oldest gather is precisely the one most
+/// likely already dead, and its client retransmits.
+const MAX_PENDING: usize = (64 * 1024 * 1024) / fanos_threshold::THRESHOLD_ONION_LEN;
 
 /// High bit marking a *mixing* timer token, distinguishing it from a gather-deadline token (which
 /// carries a small request id). No real request id reaches `2^63`.
@@ -77,6 +105,111 @@ struct Pending {
     member_count: usize,
     /// The hop line this combiner is peeling for — the members to multicast a dead-drop delivery to.
     line: Triple,
+    /// When the share requests went out. A gather that completes yields `now − armed_at` as one latency
+    /// sample, which is what makes the deadline measured rather than chosen ([`GatherClock`]).
+    armed_at: Instant,
+}
+
+/// The adaptive gather deadline: an EWMA of observed gather latency plus a margin from its variation,
+/// in the shape RFC 6298 gives TCP's RTO (`SRTT`, `RTTVAR`, `RTO = SRTT + 4·RTTVAR`).
+///
+/// **Why measured and not chosen.** A gather's wall-clock is `RTT + C_partial + Q` — network, the ML-KEM
+/// decap a member pays per share request, and the queue of requests already accepted. `tests/gather_cost.rs`
+/// measures `C_partial` at **47 ms under `dev` and 1.05 ms under `release` on one machine**: a 45× spread
+/// from a build flag alone, before any hardware or load variation. The former 2000 ms constant therefore
+/// absorbed ~42 queued share requests per member in the profile the end-to-end tests run in and ~1900 in the
+/// shipped one, and #55 measured what that costs — gathers expiring at 1 of `t = 2` in the hundreds, turning
+/// a censorship-survival property into a run-to-run coin flip. No constant is right across that range.
+///
+/// **Why a completed gather is the right sample.** Its elapsed time contains all three terms *together*,
+/// measured under the same load the next gather will meet — so `Q`, the term that actually dominates and the
+/// one no formula can predict, needs no model. The engine stays sans-I/O: samples come from the `now` its
+/// driver already passes to [`Engine::step`], never from a wall clock.
+///
+/// The `1/8` and `1/4` gains and the `4·var` margin are RFC 6298's, unchanged: they are the standard
+/// smoothing for exactly this problem (a deadline over a latency whose variance is the signal), and inventing
+/// different ones here would be a chosen constant wearing a derivation's clothes.
+#[derive(Clone, Copy)]
+struct GatherClock {
+    /// Smoothed latency estimate; `None` until the first gather completes.
+    srtt: Option<Duration>,
+    /// Smoothed mean deviation of that estimate.
+    var: Duration,
+    /// Consecutive expiries since the last completed gather — the exponent of RFC 6298's backoff.
+    ///
+    /// **Smoothing without backoff is not RFC 6298, and the difference is a real defect that a test caught
+    /// in this very engine.** An estimator fed only by *completions* converges to the mean of a quiet
+    /// period and then holds no margin for a loud one: when load arrives, gathers expire, and — because an
+    /// expiry produces no sample — the estimate never learns that it is now too tight. It expires at the
+    /// same short deadline forever. Measured: `fanos-sim`'s role-convergence test passed 2/2 at baseline
+    /// and failed 2/4 with a backoff-less adaptive deadline, because failing hops starved the capability
+    /// directory the role controller reads.
+    ///
+    /// RFC 6298 §5.5 is exactly this repair — `RTO ← RTO × 2` on every timeout, reset on success. It is
+    /// what makes the scheme *safe when the estimate is wrong*, which a pure smoother never is.
+    backoff: u32,
+}
+
+/// Cap on the consecutive-expiry exponent. **It is sized so that it never binds before
+/// [`MAX_GATHER_DEADLINE`] does**, which is a correctness requirement rather than a safety margin: the widest
+/// span the backoff must be able to cross is `MIN → MAX`, a factor of `10⁴`, and `2¹⁶ = 65536 > 10⁴`. A
+/// smaller exponent cap would silently strand the fastest cells — one whose gathers settle at 1 ms could
+/// widen only to `2^k` ms and would keep expiring under a load spike no matter how many times it backed off,
+/// which is precisely the failure this whole mechanism exists to end. So the CEILING is the bound that binds,
+/// and this constant only keeps the shift total.
+const MAX_GATHER_BACKOFF: u32 = 16;
+
+impl GatherClock {
+    const fn new() -> Self {
+        Self { srtt: None, var: Duration(0), backoff: 0 }
+    }
+
+    /// A gather's deadline fired without reaching `t`: back off, per RFC 6298 §5.5.
+    ///
+    /// No latency *sample* is taken here — that is Karn's algorithm, and it matters: an expiry tells us the
+    /// deadline was too short, not how long the gather would have taken, so folding a fabricated duration
+    /// into `srtt` would corrupt the estimator with a number nobody measured.
+    fn expired(&mut self) {
+        self.backoff = (self.backoff + 1).min(MAX_GATHER_BACKOFF);
+    }
+
+    /// Fold in one completed gather's elapsed time, and clear the backoff — the estimate is trusted again.
+    fn observe(&mut self, sample: Duration) {
+        self.backoff = 0;
+        match self.srtt {
+            // RFC 6298 (2.2): the first measurement seeds both terms.
+            None => {
+                self.srtt = Some(sample);
+                self.var = Duration(sample.as_nanos() / 2);
+            }
+            // RFC 6298 (2.3): var ← ¾·var + ¼·|srtt − sample|; srtt ← ⅞·srtt + ⅛·sample.
+            Some(srtt) => {
+                let (s, m) = (srtt.as_nanos(), sample.as_nanos());
+                let delta = s.abs_diff(m);
+                self.var = Duration((self.var.as_nanos() / 4).saturating_mul(3) + delta / 4);
+                self.srtt = Some(Duration((s / 8).saturating_mul(7) + m / 8));
+            }
+        }
+    }
+
+    /// The deadline to arm the next gather with: `(SRTT + 4·RTTVAR) << backoff`, clamped.
+    fn deadline(self) -> Duration {
+        let Some(srtt) = self.srtt else {
+            // Even the bootstrap backs off: a node whose very first gathers all expire must widen, or a
+            // cold start into a loaded cell never completes a gather and so never gets a sample at all.
+            return Duration(
+                INITIAL_GATHER_DEADLINE
+                    .as_nanos()
+                    .saturating_mul(1u64 << self.backoff)
+                    .min(MAX_GATHER_DEADLINE.as_nanos()),
+            );
+        };
+        let raw = srtt
+            .as_nanos()
+            .saturating_add(self.var.as_nanos().saturating_mul(4))
+            .saturating_mul(1u64 << self.backoff);
+        Duration(raw.clamp(MIN_GATHER_DEADLINE.as_nanos(), MAX_GATHER_DEADLINE.as_nanos()))
+    }
 }
 
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
@@ -90,7 +223,12 @@ pub struct ThresholdRouter<F: Field> {
     /// the window past its epoch. Distinct from the long-term identity key.
     onion: OnionKeyRatchet,
     threshold: usize,
-    gather_timeout: Duration,
+    /// The measured gather deadline (see [`GatherClock`]) — replaces a chosen constant with the engine's own
+    /// observation of `RTT + C_partial + Q`.
+    gather: GatherClock,
+    /// An explicit override, for a driver that must pin the deadline (a deterministic scenario asserting a
+    /// specific expiry). `None` — the default — uses the measured value.
+    gather_override: Option<Duration>,
     pending: BTreeMap<u64, Pending>,
     seq: u64,
     /// Mean Poisson mixing delay before forwarding a peeled hop (0 ⇒ forward immediately). Holding
@@ -156,7 +294,8 @@ impl<F: Field> ThresholdRouter<F> {
             coord,
             onion: OnionKeyRatchet::new(onion_seed, Epoch::ZERO),
             threshold,
-            gather_timeout: DEFAULT_GATHER_TIMEOUT,
+            gather: GatherClock::new(),
+            gather_override: None,
             pending: BTreeMap::new(),
             seq: 0,
             mean_delay: Duration(0),
@@ -185,11 +324,20 @@ impl<F: Field> ThresholdRouter<F> {
         self.onion.epoch()
     }
 
-    /// Override the combiner's partial-gathering deadline (default 2 s).
+    /// **Pin** the combiner's partial-gathering deadline, disabling the measured one ([`GatherClock`]).
+    ///
+    /// For a scenario that must assert a specific expiry — a starvation test proving a hop below `t` live
+    /// members is abandoned rather than hanging. Production leaves it unset: a pinned deadline is the defect
+    /// this type exists to remove, since the right value moved 45× between build profiles on one machine.
     #[must_use]
     pub fn with_gather_timeout(mut self, timeout: Duration) -> Self {
-        self.gather_timeout = timeout;
+        self.gather_override = Some(timeout);
         self
+    }
+
+    /// The deadline the next gather will be armed with — the pin if one is set, else the measured value.
+    fn gather_deadline(&self) -> Duration {
+        self.gather_override.unwrap_or_else(|| self.gather.deadline())
     }
 
     /// Bind this router to the endpoint of a circuit it owns (a rendezvous loopback or a reply circuit
@@ -270,7 +418,9 @@ impl<F: Field> ThresholdRouter<F> {
             material.extend_from_slice(&self.cover_seq.to_be_bytes());
             let mut cell = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
             fanos_primitives::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
-            if let Some(combiner) = Self::combiner_of(line) {
+            // Salted like a real launch (#55): cover traffic must draw its gatherer the same way real
+            // onions do, or the address pattern alone would tell cover and cargo apart.
+            if let Some(combiner) = Self::combiner_of_salted(line, &cell) {
                 effects.push(Effect::Send {
                     to: combiner,
                     frame: encode_onion(line, &cell),
@@ -348,7 +498,9 @@ impl<F: Field> ThresholdRouter<F> {
         Self::line_members(line).iter().position(|&m| m == me)
     }
 
-    /// The canonical combiner of a line — the member its own coordinates select.
+    /// The **canonical** combiner of a line — [`Self::combiner_of_salted`] with an empty salt. Use it where a
+    /// pure function of the line alone is required: the `meeting_lines` distinct-combiner walk, a bare-proxy
+    /// client's registration target, tests of the canonical map.
     ///
     /// **Not member zero, and the difference is a censorship bound.** Taking the first member made the combiner
     /// map concentrate: enumerating every line of the plane, only **4 of 7** points on `PG(2,2)` and **14 of 57**
@@ -364,28 +516,61 @@ impl<F: Field> ThresholdRouter<F> {
     /// that, on both planes.
     ///
     /// Full coverage is neither achieved nor required: ~70 % on `PG(2,7)` is what a uniform per-line choice gives
-    /// (coupon-collector, `1 − 1/e`). The image is also **fixed rather than rotating**, so the same points are
-    /// combiners every epoch — sufficient for the bound above, and stated because it is a real residual: a
-    /// rotating choice would need `(epoch, beacon)` threaded through all 55 call sites, which no identified attack
-    /// currently justifies.
-    ///
-    /// Still a pure public function of the line, so every party derives the same combiner without coordinating.
+    /// (coupon-collector, `1 − 1/e`), and `|image| ≥ f + 1` is the whole requirement. This map is deliberately
+    /// **fixed across epochs**, which used to be a stated residual — it no longer is, because nothing routes by
+    /// it: launches draw a per-onion member ([`Self::combiner_of_salted`]), so the uniform member coverage a
+    /// rotating map would have bought is supplied per packet instead of per epoch.
     fn combiner_of(line: Triple) -> Option<Triple> {
+        Self::combiner_of_salted(line, &[])
+    }
+
+    /// The line member that gathers **this particular onion** — the canonical digest of the line, extended by
+    /// a per-onion `salt`. Every member of a line can combine (nothing in [`Self::on_onion`] is
+    /// combiner-specific), so *which* member an onion is addressed to is a free choice of the sender — and
+    /// pinning it to one canonical member per line re-created, at every hop, the single point of failure the
+    /// `f + 1` meeting-point spread exists to remove (#55): one silenced node killed a hop line outright even
+    /// though `t` of its `q + 1` members were alive and its peel quorum was intact.
+    ///
+    /// Salting the pick with the onion bytes restores the line's own threshold as the hop's availability
+    /// bound. Each sealed onion — and every DIAULOS retransmit is a **fresh** onion — draws an independent
+    /// uniform member, so a hop with `d` dead members loses only `d/(q+1)` of attempts and a retransmitting
+    /// session self-heals; silencing the hop **permanently** now requires killing `q + 2 − t` of its members,
+    /// the same quorum the peel itself needs. The salt is a public function of the (public) onion ciphertext:
+    /// deterministic — the simulator reproduces every pick, and a given onion has one target, so duplicates
+    /// collapse — and it links nothing that the onion itself does not already link.
+    ///
+    /// The map stays fixed across epochs (empty-salt case above): rotation is supplied per onion by the salt,
+    /// so the `(epoch, beacon)` threading the canonical map's doc once contemplated is no longer the missing
+    /// piece — the per-onion draw already yields the uniform member coverage an epoch rotation would have.
+    fn combiner_of_salted(line: Triple, salt: &[u8]) -> Option<Triple> {
         let members = Self::line_members(line);
         let [a, b, c] = line;
-        let mut data = [0u8; 12];
-        let (x, y) = data.split_at_mut(4);
-        let (y, z) = y.split_at_mut(4);
-        x.copy_from_slice(&a.to_be_bytes());
-        y.copy_from_slice(&b.to_be_bytes());
-        z.copy_from_slice(&c.to_be_bytes());
+        let mut data = Vec::with_capacity(12 + salt.len());
+        data.extend_from_slice(&a.to_be_bytes());
+        data.extend_from_slice(&b.to_be_bytes());
+        data.extend_from_slice(&c.to_be_bytes());
+        data.extend_from_slice(salt);
         let digest = fanos_primitives::hash_labeled("FANOS-v1/threshold-combiner", &data);
-        members.get(usize::from(digest[0]) % members.len().max(1)).copied()
+        // **Eight digest bytes, not one, and the width is the uniformity claim.** Reducing a single byte
+        // mod `q + 1` is only uniform when `q + 1` divides 256: the residues `0..(256 mod (q+1))` each get
+        // one extra preimage, a bias of `(256 mod (q+1)) / 256` — 1.2 % on Fano, but **12.9 % at `q = 32`**,
+        // and it grows with the plane. That matters here precisely because the availability bound in the
+        // doc above is a uniformity statement: a member favoured by the reduction is a member an adversary
+        // prefers to silence. Over `u64` the same bias is `≈ (q+1)·2⁻⁶⁴`, which is nothing on any plane.
+        // Same shape as `nostos::select_drop_line`, which reduces a `q + 1` modulus the same way.
+        let raw = u64::from_be_bytes(
+            digest
+                .get(..8)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0u8; 8]),
+        );
+        let idx = (raw % members.len().max(1) as u64) as usize;
+        members.get(idx).copied()
     }
 
     /// Handle an onion addressed to us as the combiner of `line`: seed a pending peel with our own
     /// partial and fan out share-requests to the rest of the line.
-    fn on_onion(&mut self, line: Triple, onion: Vec<u8>) -> Vec<Effect> {
+    fn on_onion(&mut self, now: Instant, line: Triple, onion: Vec<u8>) -> Vec<Effect> {
         let req_id = self.seq;
         self.seq += 1;
 
@@ -411,6 +596,14 @@ impl<F: Field> ThresholdRouter<F> {
                 });
             }
         }
+        // Bounded by COUNT, not by the deadline (see `MAX_PENDING`): memory must not depend on a timing
+        // value that is now measured and free to grow. The oldest incomplete gather goes — it is the one
+        // most likely already dead, and its client retransmits.
+        if self.pending.len() >= MAX_PENDING
+            && let Some(&oldest) = self.pending.keys().next()
+        {
+            self.pending.remove(&oldest);
+        }
         self.pending.insert(
             req_id,
             Pending {
@@ -418,15 +611,16 @@ impl<F: Field> ThresholdRouter<F> {
                 shares,
                 member_count,
                 line,
+                armed_at: now,
             },
         );
         // If we already have a threshold (e.g. t = 1), peel now; else await replies until deadline.
-        if let Some(done) = self.try_peel(req_id) {
+        if let Some(done) = self.try_peel(now, req_id) {
             effects.extend(done);
         } else {
             effects.push(Effect::ArmTimer {
                 token: TimerToken(req_id),
-                after: self.gather_timeout,
+                after: self.gather_deadline(),
             });
         }
         effects
@@ -452,7 +646,7 @@ impl<F: Field> ThresholdRouter<F> {
 
     /// Handle a partial-decryption reply: fold it in (if it is a plausible member share) and try to
     /// peel. A reply is only a *candidate* — it is not trusted until a subset of shares actually peels.
-    fn on_reply(&mut self, req_id: u64, share: Share) -> Vec<Effect> {
+    fn on_reply(&mut self, now: Instant, req_id: u64, share: Share) -> Vec<Effect> {
         let Some(pending) = self.pending.get_mut(&req_id) else {
             return Vec::new(); // unknown / already-peeled request
         };
@@ -477,7 +671,7 @@ impl<F: Field> ThresholdRouter<F> {
             return Vec::new(); // flood cap — a real line never needs this many candidates
         }
         pending.shares.push(share);
-        self.try_peel(req_id).unwrap_or_default()
+        self.try_peel(now, req_id).unwrap_or_default()
     }
 
     /// If a pending peel can be satisfied, peel it and act on the outcome. The pending state is removed
@@ -485,14 +679,19 @@ impl<F: Field> ThresholdRouter<F> {
     /// poisoned share can therefore neither reconstruct a wrong key that discards the peel nor destroy
     /// the in-flight state, so honest replies still complete the hop (liveness under up to `t − 1`
     /// malicious members).
-    fn try_peel(&mut self, req_id: u64) -> Option<Vec<Effect>> {
+    fn try_peel(&mut self, now: Instant, req_id: u64) -> Option<Vec<Effect>> {
         let pending = self.pending.get(&req_id)?;
         if pending.shares.len() < self.threshold {
             return None;
         }
         let line = pending.line;
+        let armed_at = pending.armed_at;
         let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
         self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
+        // One completed gather is one latency sample, and it contains `RTT + C_partial + Q` together —
+        // measured under exactly the load the next gather will meet. This is what replaces the constant.
+        self.gather
+            .observe(Duration(now.0.saturating_sub(armed_at.0)));
         Some(match peel {
             ThresholdPeel::Deliver { payload, holonomy } => {
                 // If we own this circuit's endpoint, verify the path-authenticator and drop a delivery
@@ -516,15 +715,17 @@ impl<F: Field> ThresholdRouter<F> {
                     })],
                 }
             }
-            ThresholdPeel::Forward { next, onion } => match Self::combiner_of(next) {
-                Some(c) => {
-                    // Re-pad the inner onion to the constant bucket so the forwarded packet is the
-                    // same size as the one we received — no cross-hop size correlation.
-                    let padded = threshold::pad(&onion).unwrap_or(onion);
-                    self.forward_send(c, encode_onion(next, &padded))
+            ThresholdPeel::Forward { next, onion } => {
+                // Re-pad the inner onion to the constant bucket so the forwarded packet is the
+                // same size as the one we received — no cross-hop size correlation. The next hop's
+                // gatherer is then picked per onion (salted by the padded bytes, #55): any member
+                // can combine, and varying the pick keeps one dead member from killing the hop.
+                let padded = threshold::pad(&onion).unwrap_or(onion);
+                match Self::combiner_of_salted(next, &padded) {
+                    Some(c) => self.forward_send(c, encode_onion(next, &padded)),
+                    None => Vec::new(),
                 }
-                None => Vec::new(),
-            },
+            }
         })
     }
 
@@ -622,11 +823,11 @@ fn peel_search(
 }
 
 impl<F: Field> Engine for ThresholdRouter<F> {
-    fn step(&mut self, _now: Instant, input: Input) -> Vec<Effect> {
+    fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         match input {
             Input::Message { frame, .. } => match frame.split_first() {
                 Some((&TAG_ONION, body)) => match decode_onion(body) {
-                    Some((line, onion)) => self.on_onion(line, onion),
+                    Some((line, onion)) => self.on_onion(now, line, onion),
                     None => Vec::new(),
                 },
                 Some((&TAG_REQ, body)) => match decode_req(body) {
@@ -636,7 +837,7 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                     None => Vec::new(),
                 },
                 Some((&TAG_REP, body)) => match decode_rep(body) {
-                    Some((req_id, share)) => self.on_reply(req_id, share),
+                    Some((req_id, share)) => self.on_reply(now, req_id, share),
                     None => Vec::new(),
                 },
                 Some((&TAG_DROP, body)) => match decode_drop(body) {
@@ -656,8 +857,12 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                         None => Vec::new(),
                     }
                 } else {
-                    // The gather deadline fired: drop an incomplete pending peel.
-                    self.pending.remove(&token);
+                    // The gather deadline fired: drop an incomplete pending peel, and BACK OFF — the
+                    // deadline was demonstrably too short for the load this node is under, and an expiry
+                    // yields no sample, so nothing else would ever widen it (RFC 6298 §5.5 + Karn).
+                    if self.pending.remove(&token).is_some() {
+                        self.gather.expired();
+                    }
                     Vec::new()
                 }
             }
@@ -694,10 +899,22 @@ pub fn launch_frame(line: Triple, onion: &[u8]) -> Vec<u8> {
     encode_onion(line, onion)
 }
 
-/// The combiner coordinate a client routes the first (or any) hop's onion to, for a given field `F`.
+/// The **canonical** combiner of a line, for a given field `F` — the empty-salt case of
+/// [`combiner_for_salted`]. Derivations that need a pure function of the line alone (the
+/// `meeting_lines` distinct-combiner walk, a bare-proxy registration target) use this; an actual
+/// onion launch uses the salted pick.
 #[must_use]
 pub fn combiner_for<F: Field>(line: Triple) -> Option<Triple> {
     ThresholdRouter::<F>::combiner_of(line)
+}
+
+/// The line member a **particular onion** is launched at (`salt` = the sealed onion bytes), for a given
+/// field `F`. Any member of a line can gather, so the sender's pick is free — and drawing it per onion is
+/// what turns the hop's availability from "one canonical node" into "the line's own `t`-of-`q+1` quorum"
+/// (#55). See `ThresholdRouter::combiner_of_salted` for the full derivation.
+#[must_use]
+pub fn combiner_for_salted<F: Field>(line: Triple, salt: &[u8]) -> Option<Triple> {
+    ThresholdRouter::<F>::combiner_of_salted(line, salt)
 }
 
 /// The canonical member coordinates of `line` in seal order, for a client assembling a hop's keys.
@@ -1375,5 +1592,311 @@ mod tests {
                 .is_empty(),
             "a node not on the line ignores a dead-drop cell addressed to that line",
         );
+    }
+
+    #[test]
+    fn the_salted_combiner_pick_spreads_over_the_lines_members_and_only_them() {
+        // #55: the per-onion salted pick is what turns a hop's availability into the line's own
+        // t-of-(q+1) quorum. Three properties carry that: every pick is a member of the line, the
+        // picks are not constant across salts (a constant pick is the canonical-combiner SPOF again),
+        // and the empty salt IS the canonical combiner (one derivation, not two).
+        for idx in 0..Plane::<F2>::N as usize {
+            let line = Line::<F2>::at(idx).coords();
+            let members = ThresholdRouter::<F2>::line_members(line);
+            let mut seen = Vec::new();
+            for s in 0..64u8 {
+                let pick = combiner_for_salted::<F2>(line, &[s, 0xA5]).unwrap();
+                assert!(
+                    members.contains(&pick),
+                    "a salted pick is always a member of its line"
+                );
+                if !seen.contains(&pick) {
+                    seen.push(pick);
+                }
+            }
+            assert!(
+                seen.len() >= 2,
+                "64 salts must reach at least two distinct members of line {line:?} — a constant \
+                 pick would re-create the per-hop single point of failure"
+            );
+            assert_eq!(
+                combiner_for_salted::<F2>(line, &[]),
+                combiner_for::<F2>(line),
+                "the empty salt is exactly the canonical combiner — one derivation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gather_deadline_tracks_measured_latency_instead_of_a_constant() {
+        // The #14 property: the deadline is a function of what the node OBSERVES, so the same code adapts to
+        // a machine where a share answer costs 1 ms and to one where it costs 47 ms — a 45x spread measured
+        // between build profiles alone (`tests/gather_cost.rs`), which is why no constant can be correct.
+        let mut clock = GatherClock::new();
+
+        // Before any sample there is nothing to derive from, so the bootstrap stands.
+        assert_eq!(
+            clock.deadline(),
+            INITIAL_GATHER_DEADLINE,
+            "a cold node uses the bootstrap deadline, not a measurement it does not have"
+        );
+
+        // A fast cell: gathers complete in ~2 ms. The deadline must settle FAR below the old 2 s constant —
+        // that constant's real cost was believing a dead hop for a thousand round trips.
+        for _ in 0..40 {
+            clock.observe(Duration::from_millis(2));
+        }
+        let fast = clock.deadline();
+        assert!(
+            fast < Duration::from_millis(50),
+            "after 40 samples of 2 ms the deadline settles near the observation, not at 2000 ms: {fast:?}"
+        );
+
+        // The same code on a loaded/slow cell: gathers take ~800 ms. The deadline must rise ABOVE the old
+        // constant's usable margin rather than abandoning honest hops — the failure #55 measured.
+        let mut slow = GatherClock::new();
+        for _ in 0..40 {
+            slow.observe(Duration::from_millis(800));
+        }
+        let slow_deadline = slow.deadline();
+        assert!(
+            slow_deadline > Duration::from_millis(700),
+            "a cell whose gathers take 800 ms must wait for them: {slow_deadline:?}"
+        );
+        assert!(
+            slow_deadline > fast,
+            "the deadline is a function of observed latency — slow cell {slow_deadline:?} must exceed fast              cell {fast:?}, which a constant could never do"
+        );
+
+        // Variance widens the margin: the same MEAN with jitter must yield a strictly larger deadline than
+        // without, or a deadline would abandon the slow half of a bimodal cell.
+        let mut steady = GatherClock::new();
+        let mut jittery = GatherClock::new();
+        for i in 0..40 {
+            steady.observe(Duration::from_millis(100));
+            jittery.observe(Duration::from_millis(if i % 2 == 0 { 20 } else { 180 }));
+        }
+        assert!(
+            jittery.deadline() > steady.deadline(),
+            "jitter must widen the margin: jittery {:?} vs steady {:?}",
+            jittery.deadline(),
+            steady.deadline()
+        );
+
+        // And it is bounded at both ends, so neither a pathological run of instant gathers nor an adversary
+        // answering ever more slowly can drive it to zero or to forever.
+        let mut instant = GatherClock::new();
+        for _ in 0..40 {
+            instant.observe(Duration(0));
+        }
+        assert_eq!(instant.deadline(), MIN_GATHER_DEADLINE, "floored");
+        let mut forever = GatherClock::new();
+        for _ in 0..40 {
+            forever.observe(Duration::from_millis(600_000));
+        }
+        assert_eq!(forever.deadline(), MAX_GATHER_DEADLINE, "capped");
+    }
+
+    #[test]
+    fn an_expiring_gather_backs_off_so_a_too_tight_estimate_can_recover() {
+        // **The half of RFC 6298 that smoothing alone does not give**, and the one a real test caught
+        // missing: an estimator fed only by COMPLETIONS converges to a quiet period's mean and then holds
+        // no margin. When load arrives its gathers expire — and an expiry yields no sample, so nothing
+        // ever tells it that it is now too tight. It expires at the same short deadline forever.
+        //
+        // Measured before this existed: fanos-sim's role-convergence test passed 2/2 at baseline and
+        // failed 2/4 with a backoff-less adaptive deadline, because starved hops starved the capability
+        // directory the role controller reads. That is the failure mode this asserts against.
+        let mut clock = GatherClock::new();
+        for _ in 0..40 {
+            clock.observe(Duration::from_millis(2));
+        }
+        let settled = clock.deadline();
+
+        // Each expiry must WIDEN the deadline — strictly, and monotonically.
+        let mut prev = settled;
+        for _ in 0..4 {
+            clock.expired();
+            let widened = clock.deadline();
+            assert!(
+                widened > prev,
+                "every expiry must widen the deadline: {widened:?} did not exceed {prev:?}"
+            );
+            prev = widened;
+        }
+        assert!(
+            prev.as_nanos() >= settled.as_nanos().saturating_mul(8),
+            "four doublings must reach at least 8x the settled estimate: {prev:?} vs {settled:?}"
+        );
+
+        // A completed gather clears the backoff — the estimate is trusted again, so the deadline returns
+        // to tracking observation rather than staying permanently inflated by one bad patch of load.
+        clock.observe(Duration::from_millis(2));
+        assert!(
+            clock.deadline() < prev,
+            "a completed gather must clear the backoff, not leave the deadline inflated forever"
+        );
+
+        // And the backoff is bounded, so a node under sustained failure cannot inflate without limit.
+        let mut runaway = GatherClock::new();
+        for _ in 0..40 {
+            runaway.observe(Duration::from_millis(50));
+        }
+        for _ in 0..64 {
+            runaway.expired();
+        }
+        assert_eq!(runaway.deadline(), MAX_GATHER_DEADLINE, "backoff is capped by the ceiling");
+    }
+
+    #[test]
+    fn pending_gathers_are_bounded_by_count_so_memory_never_rides_on_the_deadline() {
+        // Making the deadline measured (and therefore free to grow) is only safe because `pending` stopped
+        // depending on it. Previously the timeout was the ONLY bound on the map — which quietly made a
+        // timing value a memory-safety parameter, so fixing liveness by lengthening it would have traded one
+        // defect for another.
+        let line = Line::<F2>::at(0).coords();
+        let members = ThresholdRouter::<F2>::line_members(line);
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"bounded-pending"));
+        let mut router =
+            ThresholdRouter::<F2>::new(Point::<F2>::new(members[0]).unwrap(), &identity, 2, [0x3B; 32]);
+
+        // Flood distinct onions with NO timer ever firing — the deadline cannot be what saves us here.
+        for i in 0..(MAX_PENDING + 128) {
+            let mut onion = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+            onion[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            router.step(
+                Instant(i as u64),
+                Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion) },
+            );
+        }
+        assert!(
+            router.pending.len() <= MAX_PENDING,
+            "in-flight gathers are capped at {MAX_PENDING}, got {} — with no timer fired",
+            router.pending.len()
+        );
+    }
+
+    #[test]
+    fn the_salted_pick_reduces_wide_entropy_so_its_modulo_bias_is_negligible() {
+        // The availability bound in `combiner_of_salted`'s doc is a UNIFORMITY statement, and uniformity
+        // here is decided by ONE parameter: how many digest bits the modulus reduces. Reducing `k` bits by
+        // `m = q + 1` biases the low residues by `(2^k mod m) / 2^k`. At `k = 8` that is 1.2 % on Fano and
+        // **12.9 % at `q = 32`**, growing with the plane; at `k = 64` it is `≈ m·2⁻⁶⁴`. A member favoured by
+        // the reduction is a member an adversary prefers to silence, so the width is a security parameter.
+        //
+        // **The test is exact rather than statistical, and that is the point.** The first version of this
+        // test sampled 6000 draws and asserted a ±5 % band — and it PASSED against the single-byte
+        // reduction it was written to catch, because Fano's 1.2 % bias is smaller than both the band and
+        // the sampling noise (σ/µ ≈ 1.8 %). Detecting a 1.2 % bias by sampling needs ~10⁵ draws to clear
+        // noise and is still marginal. So assert the cause, not the symptom: exhibit two salts whose
+        // digests agree on byte 0 yet pick DIFFERENT members. Under `digest[0] % m` that is impossible by
+        // construction; under a wide reduction it is ordinary. One counterexample settles it, with no
+        // threshold to tune and nothing to go flaky.
+        let line = Line::<F2>::at(0).coords();
+        let salt_digest = |s: u64| {
+            let [a, b, c] = line;
+            let mut data = Vec::new();
+            data.extend_from_slice(&a.to_be_bytes());
+            data.extend_from_slice(&b.to_be_bytes());
+            data.extend_from_slice(&c.to_be_bytes());
+            data.extend_from_slice(&s.to_be_bytes());
+            fanos_primitives::hash_labeled("FANOS-v1/threshold-combiner", &data)
+        };
+        let mut by_first_byte: BTreeMap<u8, (u64, Triple)> = BTreeMap::new();
+        let mut witness = None;
+        for s in 0..4_000u64 {
+            let first = salt_digest(s)[0];
+            let pick = combiner_for_salted::<F2>(line, &s.to_be_bytes()).unwrap();
+            match by_first_byte.get(&first) {
+                Some(&(prev_s, prev_pick)) if prev_pick != pick => {
+                    witness = Some((prev_s, s, first));
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    by_first_byte.insert(first, (s, pick));
+                }
+            }
+        }
+        assert!(
+            witness.is_some(),
+            "no two salts sharing digest byte 0 picked different members — the reduction consumes only \
+             that byte, so its modulo bias is 2^8-wide (1.2 % on Fano, 12.9 % at q = 32) rather than \
+             2^64-wide, and some member is systematically the one to silence"
+        );
+
+        // With the width established, a coarse spread check catches a gross skew the width test cannot
+        // (e.g. a reduction that is wide but constant-folded): no member takes more than half the draws.
+        let members = ThresholdRouter::<F2>::line_members(line);
+        let mut counts = alloc::vec![0usize; members.len()];
+        for s in 0..3_000u64 {
+            let pick = combiner_for_salted::<F2>(line, &s.to_be_bytes()).unwrap();
+            counts[members.iter().position(|&m| m == pick).unwrap()] += 1;
+        }
+        assert!(
+            counts.iter().all(|&c| c * 2 < 3_000),
+            "no member may take half the draws of a {}-member line: {counts:?}",
+            members.len()
+        );
+    }
+
+    #[test]
+    fn an_onion_addressed_at_a_non_canonical_member_peels_there() {
+        // #55: nothing in the gather is combiner-specific, so ANY member a salted launch lands on
+        // must run it to completion. Drive a NON-canonical member of the delivery line through the
+        // whole peel: it seeds its own share, folds one honest partial, and multicasts the dead-drop
+        // — exactly what the canonical combiner would have done.
+        use crate::nostos::{ReplyKeys, seal_reply};
+        let l = Line::<F2>::at(1).coords();
+        let members = ThresholdRouter::<F2>::line_members(l);
+        let t = 2usize;
+        let canonical = ThresholdRouter::<F2>::combiner_of(l).unwrap();
+        let (alt_idx, alt) = members
+            .iter()
+            .enumerate()
+            .find(|(_, m)| **m != canonical)
+            .expect("a 3-member line has a non-canonical member");
+
+        let onion_seed = |i: u8| {
+            let mut s = [0x61u8; 32];
+            s[31] = i;
+            s
+        };
+        let ratchets: Vec<OnionKeyRatchet> =
+            (0..3).map(|i| OnionKeyRatchet::new(onion_seed(i), Epoch::ZERO)).collect();
+        let pubs = [ratchets[0].public(), ratchets[1].public(), ratchets[2].public()];
+
+        let (reply_keys, reply_pub) = ReplyKeys::generate(b"nostos-alt-member");
+        let payload = b"homecoming via any member";
+        let onion =
+            seal_reply(&reply_pub, &[HopLine { line: l, members: &pubs }], t as u8, payload, b"alt-seed")
+                .unwrap();
+
+        // The salted launch lands at `alt`, which gathers: its own share plus one honest partial.
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"alt-id"));
+        let mut router = ThresholdRouter::<F2>::new(
+            Point::<F2>::new(*alt).unwrap(),
+            &identity,
+            t,
+            onion_seed(alt_idx as u8),
+        );
+        router.step(Instant(0), Input::Message { from: [9, 9, 9], frame: launch_frame(l, &onion) });
+        let other_idx = (0..3).find(|&i| i != alt_idx).unwrap();
+        let honest = member_partial(&onion, other_idx, ratchets[other_idx].secret()).unwrap();
+        let effects = router.step(
+            Instant(1),
+            Input::Message { from: members[other_idx], frame: encode_rep(0, &honest) },
+        );
+
+        let delivered = effects.iter().any(|e| {
+            matches!(e, Effect::Notify(Notification::Delivered { payload: p, .. })
+                if reply_keys.open(p).as_deref() == Some(&payload[..]))
+        });
+        let multicast = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Send { frame, .. } if frame.first() == Some(&TAG_DROP)))
+            .count();
+        assert!(delivered, "the non-canonical member completes the peel and surfaces the body");
+        assert_eq!(multicast, 2, "and multicasts the dead-drop to the other q members");
     }
 }
