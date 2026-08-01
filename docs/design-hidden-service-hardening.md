@@ -1,7 +1,15 @@
 # Hidden-service hardening — accountable anonymity, attack resistance, load distribution
 
-**Status: design.** Nothing here is implemented yet except the registration binding (#45, in progress). Written
-2026-07-31 in answer to a direct requirement: hidden-service anonymity and security at the highest level reachable,
+**Status: partly implemented — §6 is real, §2–§5 are design.** Written 2026-07-31, updated 2026-08-01. What has
+landed: the registration binding is authenticated (`9e34d4c`), the combiner map covers the plane instead of
+concentrating below the fault bound (`a7c7699`), `m = f + 1` is derived and proven (`32a4248`), and a host
+registers at all `m` (`edcf845`). What has NOT: **the client still always takes meeting point 0**, so the
+censorship bound of §6 does not bind yet — the registrations cost traffic and buy nothing until clients spread.
+Everything in §2–§5 (the client tag, the admission ladder, the filtering surface, replica load-spreading) is
+design only, and §8's frontier — whether the lattice ZK stack can carry the §2 proof at a per-request cost — is
+unmeasured.
+
+Written in answer to a direct requirement: hidden-service anonymity and security at the highest level reachable,
 protocol-level resistance to DDoS and related attacks, **client identifiers a conventional backend (nginx, haproxy)
 can filter on** while the chain of hops is unchanged, and load distribution.
 
