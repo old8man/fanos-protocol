@@ -218,6 +218,28 @@ impl<F: Field> ThresholdRouter<F> {
         Vec::new()
     }
 
+    /// **The gather path's measured health** — the smoothed latency and its deviation, or `None` before the
+    /// first gather completes.
+    ///
+    /// `docs/design-observability.md` §4.1 names this as the first thing the plane should export, for a
+    /// reason worth keeping: it is *already computed*. [`GatherClock`] maintains it to derive the deadline
+    /// ([`RFC 6298`](https://www.rfc-editor.org/rfc/rfc6298)'s `SRTT`/`RTTVAR`), so surfacing it costs one
+    /// method and no new state — and it is precisely the load signal the role controller's setpoint wants
+    /// for the rendezvous role, since a lengthening gather is what "this line is oversubscribed" looks like
+    /// before any hop actually fails.
+    ///
+    /// A *rate*-free reading, unlike the [`stations`](Self::stations) counters: it is a level, and it is the
+    /// engine's own estimate rather than a count of events. A caller mixing the two into one demand figure
+    /// must say which is which — see the design's note on rate-versus-level.
+    ///
+    /// **Local-only**, exactly like the station counters (`stations` R4): a per-node latency estimate is
+    /// node-identifying metadata, and nothing here crosses a boundary until the DP sensitivity for it is
+    /// derived the way `Δr = 1/21` was for the coherence frame.
+    #[must_use]
+    pub const fn gather_health(&self) -> (Option<Duration>, Duration) {
+        (self.gather.srtt(), self.gather.var())
+    }
+
     /// This router's data-path counters for the current window — **local-only** (`stations` R4: nothing
     /// crosses a node boundary until per-family DP sensitivities are derived the way `Δr = 1/21` was).
     #[must_use]
@@ -1649,6 +1671,63 @@ mod tests {
         assert!(
             widened > measured,
             "an expiry must widen the next armed deadline: {widened:?} vs {measured:?}"
+        );
+    }
+
+    #[test]
+    fn the_gather_path_health_is_none_until_measured_then_tracks_the_observation() {
+        // §4.1's "export what is already computed": the deadline estimator's own SRTT is the gather path's
+        // health, and a lengthening gather is what "this line is oversubscribed" looks like BEFORE any hop
+        // fails. The property that makes it usable as a load signal is that it reports honestly when it
+        // has nothing — a cold router must not present a fabricated latency as a measurement.
+        let line = Line::<F2>::at(0).coords();
+        let members = ThresholdRouter::<F2>::line_members(line);
+        let t = 2usize;
+        let onion_seed = |i: u8| {
+            let mut sd = [0x9Cu8; 32];
+            sd[31] = i;
+            sd
+        };
+        let ratchets: Vec<OnionKeyRatchet> =
+            (0..3).map(|i| OnionKeyRatchet::new(onion_seed(i), Epoch::ZERO)).collect();
+        let pubs = [ratchets[0].public(), ratchets[1].public(), ratchets[2].public()];
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"gather-health"));
+        let mut router = ThresholdRouter::<F2>::new(
+            Point::<F2>::new(members[0]).unwrap(),
+            &identity,
+            t,
+            onion_seed(0),
+        );
+
+        assert_eq!(
+            router.gather_health().0,
+            None,
+            "a router that has completed no gather reports NO measurement, not a plausible-looking zero"
+        );
+
+        // Complete gathers at a known latency; the estimate must land on it rather than merely be non-None.
+        let step_ns = Duration::from_millis(5).as_nanos();
+        let mut now = 0u64;
+        for i in 0..12u8 {
+            let onion =
+                seal_onion(&[HopLine { line, members: &pubs }], t as u8, b"health", &[0x7C, i]).unwrap();
+            router.step(
+                Instant(now),
+                Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion) },
+            );
+            let req_id = router.seq - 1;
+            let honest = member_partial(&onion, 1, ratchets[1].secret()).unwrap();
+            now += step_ns;
+            router.step(
+                Instant(now),
+                Input::Message { from: members[1], frame: encode_rep(req_id, &honest) },
+            );
+        }
+        let (srtt, _var) = router.gather_health();
+        let srtt = srtt.expect("after twelve completed gathers there IS a measurement");
+        assert!(
+            srtt > Duration::from_millis(1) && srtt < Duration::from_millis(20),
+            "the estimate tracks the observed 5 ms rather than drifting: {srtt:?}"
         );
     }
 
