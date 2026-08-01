@@ -428,10 +428,27 @@ pub fn pack_to_budget(sealed: Vec<SealedTx>, budget: usize) -> Vec<SealedTx> {
 pub fn budget_for(parent: [u8; 32], height: u64, epoch: Epoch, proposer: u8, last_commit: Option<&Certificate>) -> usize {
     let mut skeleton = Block::assemble(parent, height, epoch, proposer, Vec::new());
     if let Some(cert) = last_commit {
-        skeleton = skeleton.with_last_commit(cert.clone());
+        // Attached as the proof-of-lock TOO, which is not a trick but the worst case measured honestly:
+        // `to_bytes` emits `last_commit`, `witness` and `pol`, and a `pol` is a `Certificate` — the same
+        // shape and size as `last_commit`. Budgeting for only one of them is a **liveness break in the
+        // safety-critical path**: a locked block is re-proposed with a `pol` attached
+        // (`maybe_propose`'s locked branch), which *grows* it, so a payload packed against a
+        // pol-less budget would then fail its own `fits_frame` and be rejected by the very cell that
+        // produced it. Reserving the space up front costs one block's worth of capacity and cannot
+        // fail that way.
+        skeleton = skeleton.with_last_commit(cert.clone()).with_pol(cert.clone());
     }
-    skeleton.payload_budget()
+    skeleton.payload_budget().saturating_sub(WITNESS_ALLOWANCE)
 }
+
+/// Bytes reserved for the SSLE sortition witness, which `maybe_propose` attaches *after* assembly.
+///
+/// A [`LeaderWitness`] is `output(32) ‖ Merkle siblings`, so its size is `32 + 32·h` for a registration
+/// tree of height `h`. Reserving for `h = 32` — far above any registration tree this cell will hold — costs
+/// about a kilobyte of block capacity and removes the whole class of "grew after budgeting" failure. The
+/// asymmetry is the same one the overhead constants above lean on: a few bytes of lost capacity against a
+/// block that cannot be delivered or cannot be verified.
+const WITNESS_ALLOWANCE: usize = 32 + 32 * 32;
 
 /// The ordered transaction commitments of a sealed-tx list.
 fn commits_of(sealed: &[SealedTx]) -> Vec<TxCommit> {
@@ -544,6 +561,19 @@ mod tests {
         let one = pack_to_budget(sorted.clone(), sorted[0].to_bytes().len() + 16);
         assert!(one.len() <= 1, "a budget for one transaction takes at most one, got {}", one.len());
         assert!(pack_to_budget(sorted, 0).is_empty(), "a zero budget takes nothing");
+
+        // **A block must still fit AFTER everything is attached to it.** `to_bytes` emits `last_commit`,
+        // `witness` and `pol`, and all three arrive *after* assembly — so a budget measured on a bare
+        // skeleton is not the budget the finished block is judged by. Getting this wrong is a liveness
+        // break in the safety-critical path: `maybe_propose`'s locked branch re-proposes an
+        // already-validated block with a `pol` attached, which GROWS it, and a payload packed against a
+        // pol-less budget would then fail its own `fits_frame` — rejected by the cell that produced it.
+        // So the packed set is re-checked here with the certificate attached in BOTH slots.
+        let grown = Block::assemble(GENESIS_PARENT, 1, Epoch::new(3), 4, packed.clone());
+        assert!(
+            grown.fits_frame(),
+            "a block packed to budget must still fit once last_commit, witness and pol are attached"
+        );
 
         // The gate and the packer must agree, which is the property that actually matters: anything the
         // proposer is willing to BUILD must be something a verifier is willing to ACCEPT. If they
