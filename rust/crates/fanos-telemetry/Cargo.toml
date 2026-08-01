@@ -15,6 +15,9 @@ categories = ["network-programming"]
 fanos-diakrisis = { workspace = true }
 # The Fano/Hamming 3-bit syndrome — the load-bearing minimal fault localizer.
 fanos-code = { workspace = true }
+# `Triple` — the data-path plane keys its counters by STRUCTURE (a hop line), never by flow, so it
+# speaks the geometry's own coordinate type rather than a stringly-typed label (`stations`, R2).
+fanos-geometry = { workspace = true }
 # Canonical wire codec: the CoherenceFrame's byte layout is a derived Wire (audit A1).
 fanos-wire = { workspace = true, features = ["alloc"] }
 fanos-wire-derive = { workspace = true }
@@ -43,8 +46,8 @@ default = ["std"]
 # `alloc` is the no_std substrate (the CoherenceFrame codec + history use Vec); `std` builds on it and
 # adds the file-I/O persistence + the platform system-metric probes (both `#[cfg(feature="std")]`-gated).
 # A no_std embedded monitor selects `alloc` + `libm` (the float backend).
-std = ["alloc", "fanos-diakrisis/std", "fanos-code/std", "fanos-wire/std"]
-alloc = ["fanos-diakrisis/alloc", "fanos-code/alloc", "fanos-wire/alloc"]
+std = ["alloc", "fanos-diakrisis/std", "fanos-code/std", "fanos-wire/std", "fanos-geometry/std"]
+alloc = ["fanos-diakrisis/alloc", "fanos-code/alloc", "fanos-wire/alloc", "fanos-geometry/alloc"]
 libm = ["dep:libm", "fanos-diakrisis/libm"]
 # The cross-platform system-metric backend (implies std).
 sysinfo = ["std", "dep:sysinfo"]

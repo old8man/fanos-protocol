@@ -7,6 +7,16 @@
 //! by theorems, not tuned: read *coherence*, not CPU. Readiness is `Φ ≥ 1 ∧ R ≥ 1/3` — a cell that is
 //! one bound subject *and* still self-observing — which is the honest liveness gate a Kubernetes probe
 //! or an SLO should read, in place of a hand-picked latency.
+//!
+//! ## What must NOT be added here
+//!
+//! This is an **export** surface — its JSON leaves the node. The data-path plane's counters
+//! ([`crate::stations`]) are therefore deliberately absent, and adding them would be a defect rather than
+//! an improvement: their per-family DP sensitivities are not yet derived (the way `Δr = 1/21` was for the
+//! coherence frame), and a rate keyed by line is a signal a global passive adversary can correlate against
+//! observed traffic. Station counts stay node-local until that analysis exists — see
+//! `docs/design-observability.md` §8. If they ever do cross a boundary, they cross through
+//! [`crate::dp`](crate::dp), never through a second unprivatized door beside it.
 
 use alloc::string::String;
 use core::fmt::Write as _;

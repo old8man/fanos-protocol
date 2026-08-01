@@ -52,13 +52,14 @@ use fanos_calypso::hosting::{
     shard_service_key,
 };
 use fanos_calypso::pow;
-use fanos_field::Field;
+use fanos_field::{F2, Field};
 use fanos_geometry::{Line, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
 use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
 use fanos_runtime::ports::GatherClock;
+use fanos_telemetry::stations::{Observation, Station, Stations};
 use fanos_runtime::{Duration, Effect, Engine, Input, Instant, TimerToken};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -504,6 +505,10 @@ pub struct PorosHost {
     gather: GatherClock,
     /// An explicit pin for scenarios that must assert a specific expiry; `None` uses the measured value.
     gather_override: Option<Duration>,
+    /// The data-path plane's counters ([`Stations`]). POROS's admission gates all returned the same
+    /// silent `Vec::new()`, so an operator could not tell "we are under a Sybil flood" from "our
+    /// difficulty is set wrong" — four different worlds, one empty vector.
+    stations: Stations,
     // The Sybil **cap** layer (design authority §6): an optional allowlist of admitted requester coordinates,
     // supplied by the coherence/credential layer — canonically the fast-mixing trust graph ([`crate::sybil`]),
     // whose conductance bound caps admitted Sybils at `O(attack edges)` regardless of their count. `None` ⇒ the
@@ -568,6 +573,7 @@ impl PorosHost {
             max_pending: DEFAULT_MAX_PENDING,
             gather: GatherClock::new(),
             gather_override: None,
+            stations: Stations::new(),
             admitted: None,
             kem_secret: None,
             rotation: None,
@@ -631,6 +637,32 @@ impl PorosHost {
     #[must_use]
     fn sybil_admits(&self, requester: &Triple) -> bool {
         self.admitted.as_ref().is_none_or(|set| set.contains(requester))
+    }
+
+    /// This host's ingress line as a coordinate triple — the STRUCTURE key the data-path counters use
+    /// (`stations` R2). Derived from the roster this host was dealt into, so it needs no lookup.
+    fn line_coords(&self) -> Triple {
+        // The line's OWN coordinates, derived from the same `(community, epoch, beacon)` that placed this
+        // host on it — not a stand-in such as "the roster's first member". A member coordinate would
+        // aggregate correctly by accident (every member shares the roster order) while reading as a line
+        // triple that it is not, and a plane built to end a diagnosis-by-thin-evidence defect must not
+        // put an approximation where the exact value was one call away.
+        // `F2` concretely, because `PorosHost` is: the base cell is the Fano plane and every other
+        // engine in this crate (`rendezvous_host`, `cell_node`) is F2-concrete for the same reason.
+        // Making this generic while every caller passes `F2` would be indirection, not flexibility.
+        ingress_line::<F2>(&self.community, self.epoch, &self.beacon).coords()
+    }
+
+    /// This host's data-path counters for the current window — **local-only** (`stations` R4: nothing
+    /// crosses a node boundary until per-family DP sensitivities are derived).
+    #[must_use]
+    pub const fn stations(&self) -> &Stations {
+        &self.stations
+    }
+
+    /// Take and clear this window's data-path observations.
+    pub fn take_stations(&mut self) -> Vec<Observation> {
+        self.stations.take()
     }
 
     /// The number of requests currently gathering (combiner state), for tests/observability.
@@ -769,19 +801,23 @@ impl PorosHost {
         // the §6 derivation rests on (the binding the `verify_ingress_request` doc names as the caller's duty,
         // now enforced in-engine — parallel to the reshare `from`-authentication).
         if from != req.requester {
+            self.stations.record(Station::AdmissionIdentityUnbound, None);
             return Vec::new();
         }
         // Gate 1 — the PoW **rate-limiter** (bounds identity-creation rate, keeps the insider count small).
         if !verify_ingress_request(&req, &self.community, self.epoch, &self.beacon, self.difficulty) {
+            self.stations.record(Station::AdmissionPowFailed, None);
             return Vec::new();
         }
         // Gate 2 — the Sybil **cap** (the trust-graph conductance bound): a valid PoW is necessary but not
         // sufficient. A requester the coherence layer has not admitted is dropped no matter how much work it did,
         // so a flood of freshly-minted identities behind a sparse trust cut cannot buy ingress.
         if !self.sybil_admits(&req.requester) {
+            self.stations.record(Station::AdmissionSybilCapped, None);
             return Vec::new();
         }
         if self.pending.contains_key(&req.requester) || self.pending.len() >= self.max_pending {
+            self.stations.record(Station::AdmissionNoCapacity, None);
             return Vec::new();
         }
         let mut shares = BTreeMap::new();
@@ -847,6 +883,8 @@ impl PorosHost {
         // One completed gather is one latency sample — `RTT + C_share + Q` together, under the load the
         // next gather will meet. This is what replaces the former 2 s constant.
         self.gather.observe(now.since(armed_at));
+        let line = self.line_coords();
+        self.stations.record(Station::GatherCompleted, Some(line));
         vec![Effect::Send {
             to: requester,
             frame: encode(FrameType::PorosResponse, &response.to_bytes()),
@@ -865,6 +903,8 @@ impl PorosHost {
         {
             self.pending.remove(&requester);
             self.gather.expired();
+            let line = self.line_coords();
+            self.stations.record(Station::GatherExpired, Some(line));
         }
         Vec::new()
     }
@@ -985,6 +1025,64 @@ mod tests {
         // A different community rendezvouses differently (the community-secret enumeration-resistance input).
         let other: BTreeSet<_> = (1..=8).map(|e| at(b"other-community", e)).collect();
         assert_ne!(lines, other, "distinct communities have distinct ingress rotations");
+    }
+
+    #[test]
+    fn the_four_admission_gates_are_distinguishable_instead_of_one_silent_vec() {
+        // `docs/design-observability.md` §4 calls POROS the sharpest case: its four admission gates —
+        // identity binding, PoW, the Sybil cap, and pending-full — all returned the same silent
+        // `Vec::new()`, so an operator could not tell "we are under a Sybil flood" from "our difficulty
+        // is set wrong". Four different worlds, one empty vector. Each must now name itself.
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let community = b"gates".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 8);
+        let beacon = BeaconSeed::new([0x5c; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x2Bu8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let admitted = coord(4);
+        let mut host = PorosHost::new(
+            line[0],
+            shares[0].clone(),
+            line.clone(),
+            threshold,
+            community.clone(),
+            epoch,
+            beacon,
+            difficulty,
+        )
+        .with_admission([admitted].into_iter().collect());
+
+        // Gate 0 — a valid proof arriving from the WRONG coordinate (relayed/replayed).
+        let good = solve_ingress_request(admitted, &community, epoch, &beacon, difficulty);
+        assert!(host.step(Instant(0), Input::Message { from: coord(5), frame: request_frame(&good) }).is_empty());
+        // Gate 1 — an unsolved proof, from its own coordinate.
+        let bad = IngressRequest { requester: admitted, nonce: 0 };
+        assert!(host.step(Instant(1), Input::Message { from: admitted, frame: request_frame(&bad) }).is_empty());
+        // Gate 2 — a VALID proof from an identity the coherence layer has not admitted.
+        let outsider = coord(6);
+        let outsider_req = solve_ingress_request(outsider, &community, epoch, &beacon, difficulty);
+        assert!(
+            host.step(Instant(2), Input::Message { from: outsider, frame: request_frame(&outsider_req) }).is_empty()
+        );
+
+        // Every refusal above produced the same empty effect vector — which is precisely why the wire
+        // could never distinguish them, and precisely what the plane must.
+        let s = host.stations();
+        assert_eq!(s.total(Station::AdmissionIdentityUnbound), 1, "a relayed proof names itself");
+        assert_eq!(s.total(Station::AdmissionPowFailed), 1, "an unsolved proof names itself");
+        assert_eq!(s.total(Station::AdmissionSybilCapped), 1, "a capped identity names itself");
+        assert_eq!(
+            s.total(Station::AdmissionNoCapacity),
+            0,
+            "and a gate that did NOT fire stays silent — otherwise every refusal would look like all four"
+        );
+
+        // A window is read and cleared in one step, so a count can be neither double-read nor lost.
+        let window = host.take_stations();
+        assert_eq!(window.len(), 3, "three distinct stations fired");
+        assert_eq!(host.stations().total(Station::AdmissionPowFailed), 0, "the window restarted");
     }
 
     #[test]

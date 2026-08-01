@@ -23,6 +23,12 @@
 //!   the sensory input whose [`pressure`](sysmetrics::SystemSample::pressure) becomes each node's
 //!   scalar in the cell correlation. Pure, tested parsers plus a cached-handle Linux `/proc` probe.
 //!
+//! * [`stations`] — the **data-path plane**: where work stops, counted by structure. The coherence
+//!   plane above answers *"is the organism healthy?"*; this one answers *"is the work getting done, and
+//!   where does it stop?"* — the question defect #55 could only be answered by hand-inserted probes
+//!   (`docs/design-observability.md`). Its keys are `(station, line)` and nothing else, because a
+//!   cross-hop correlatable token would be a tagging attack (R1).
+//!
 //! Subsequent modules (the local time-series history, the mandatory per-node observer loop,
 //! distributed collection, and the monitor WebSocket) build on these.
 
@@ -41,6 +47,7 @@ pub mod observer;
 #[cfg(feature = "std")]
 pub mod persist;
 pub mod snapshot;
+pub mod stations;
 pub mod sysmetrics;
 
 #[cfg(all(feature = "alloc", any(feature = "std", feature = "libm")))]

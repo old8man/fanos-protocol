@@ -30,6 +30,7 @@ use fanos_primitives::shamir::Share;
 use fanos_ports::{
     Command, Duration, Effect, Engine, GatherClock, Input, Instant, Notification, TimerToken,
 };
+use fanos_telemetry::stations::{Observation, Station, Stations};
 
 use crate::threshold_onion::{self as threshold, ThresholdPeel};
 
@@ -106,6 +107,11 @@ pub struct ThresholdRouter<F: Field> {
     /// The measured gather deadline (see [`GatherClock`]) — replaces a chosen constant with the engine's own
     /// observation of `RTT + C_partial + Q`.
     gather: GatherClock,
+    /// The data-path plane's counters ([`Stations`], `docs/design-observability.md`). A threshold gather
+    /// is where work most often stops, and #55 measured what that costs when it is invisible: gathers
+    /// expiring at `1` of `t = 2` **by the hundreds per run** were found only by hand-inserted probes,
+    /// after eleven other hypotheses had been eliminated one at a time. Local-only, keyed by structure.
+    stations: Stations,
     /// An explicit override, for a driver that must pin the deadline (a deterministic scenario asserting a
     /// specific expiry). `None` — the default — uses the measured value.
     gather_override: Option<Duration>,
@@ -176,6 +182,7 @@ impl<F: Field> ThresholdRouter<F> {
             threshold,
             gather: GatherClock::new(),
             gather_override: None,
+            stations: Stations::new(),
             pending: BTreeMap::new(),
             seq: 0,
             mean_delay: Duration(0),
@@ -202,6 +209,26 @@ impl<F: Field> ThresholdRouter<F> {
     #[must_use]
     pub fn onion_epoch(&self) -> Epoch {
         self.onion.epoch()
+    }
+
+    /// Record an unparseable frame and discard it — the one place a decode failure is counted, so the
+    /// skew signal cannot be half-instrumented by a later arm being added without one.
+    fn undecodable(&mut self) -> Vec<Effect> {
+        self.stations.record(Station::FrameDecodeFailed, None);
+        Vec::new()
+    }
+
+    /// This router's data-path counters for the current window — **local-only** (`stations` R4: nothing
+    /// crosses a node boundary until per-family DP sensitivities are derived the way `Δr = 1/21` was).
+    #[must_use]
+    pub const fn stations(&self) -> &Stations {
+        &self.stations
+    }
+
+    /// Take and clear this window's data-path observations — read-and-clear in one step, so a count is
+    /// neither double-read nor lost between a read and a clear.
+    pub fn take_stations(&mut self) -> Vec<Observation> {
+        self.stations.take()
     }
 
     /// **Pin** the combiner's partial-gathering deadline, disabling the measured one ([`GatherClock`]).
@@ -482,7 +509,9 @@ impl<F: Field> ThresholdRouter<F> {
         if self.pending.len() >= MAX_PENDING
             && let Some(&oldest) = self.pending.keys().next()
         {
-            self.pending.remove(&oldest);
+            let evicted = self.pending.remove(&oldest);
+            // Capacity pressure, NOT a slow line — a different world, so a different station.
+            self.stations.record(Station::GatherEvicted, evicted.map(|p| p.line));
         }
         self.pending.insert(
             req_id,
@@ -507,8 +536,11 @@ impl<F: Field> ThresholdRouter<F> {
     }
 
     /// Handle a share-request from a combiner: compute our partial for `line` and reply.
-    fn on_request(&self, req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<Effect> {
+    fn on_request(&mut self, req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<Effect> {
         let Some(i) = self.my_index(line) else {
+            // A share request for a line this node is not on — the answer to "why does that gather
+            // never reach quorum": its combiner is asking members that cannot serve it.
+            self.stations.record(Station::ShareRequestNotAMember, Some(line));
             return Vec::new();
         };
         let Some(share) = self
@@ -516,6 +548,10 @@ impl<F: Field> ThresholdRouter<F> {
             .secrets()
             .find_map(|sk| threshold::member_partial(onion, i, sk))
         else {
+            // A member of the line that cannot compute its own share: the layer was sealed to a key
+            // this node no longer holds — **epoch/key skew between members**, otherwise invisible, and
+            // exactly the per-line signal an upgrade needs (docs/design-upgrade.md §4).
+            self.stations.record(Station::SharePartialFailed, Some(line));
             return Vec::new();
         };
         alloc::vec![Effect::Send {
@@ -528,13 +564,20 @@ impl<F: Field> ThresholdRouter<F> {
     /// peel. A reply is only a *candidate* — it is not trusted until a subset of shares actually peels.
     fn on_reply(&mut self, now: Instant, req_id: u64, share: Share) -> Vec<Effect> {
         let Some(pending) = self.pending.get_mut(&req_id) else {
-            return Vec::new(); // unknown / already-peeled request
+            // Already peeled, foreign, or **past its deadline** — the last of which says the deadline
+            // was too tight rather than the line too slow, and only a count can tell them apart.
+            self.stations.record(Station::ShareForUnknownRequest, None);
+            return Vec::new();
         };
         // Reject any share whose index is not a real member of this line (valid Shamir x is
         // `1..=member_count`). This caps distinct pollution to the true membership and drops
         // garbage-index forgeries outright, so an attacker cannot balloon the candidate set with
         // arbitrary `x` values.
         if share.x() == 0 || usize::from(share.x()) > pending.member_count {
+            // A **forged** share: no honest member could produce this index. Distinguishable from
+            // noise by construction, so this station is an attack indicator rather than an error rate.
+            let line = pending.line;
+            self.stations.record(Station::ShareIndexOutOfRange, Some(line));
             return Vec::new();
         }
         // De-duplicate only *exact* (x, y) repeats. Crucially we do NOT drop a differing `y` at an
@@ -548,7 +591,11 @@ impl<F: Field> ThresholdRouter<F> {
             return Vec::new();
         }
         if pending.shares.len() >= MAX_CANDIDATES {
-            return Vec::new(); // flood cap — a real line never needs this many candidates
+            // Flood cap — a real line never needs this many candidates, so reaching it is an attack on
+            // the gather's memory rather than a busy epoch.
+            let line = pending.line;
+            self.stations.record(Station::ShareFloodCapped, Some(line));
+            return Vec::new();
         }
         pending.shares.push(share);
         self.try_peel(now, req_id).unwrap_or_default()
@@ -571,6 +618,7 @@ impl<F: Field> ThresholdRouter<F> {
         // One completed gather is one latency sample, and it contains `RTT + C_partial + Q` together —
         // measured under exactly the load the next gather will meet. This is what replaces the constant.
         self.gather.observe(now.since(armed_at));
+        self.stations.record(Station::GatherCompleted, Some(line));
         Some(match peel {
             ThresholdPeel::Deliver { payload, holonomy } => {
                 // If we own this circuit's endpoint, verify the path-authenticator and drop a delivery
@@ -579,6 +627,10 @@ impl<F: Field> ThresholdRouter<F> {
                 if let Some((lines, seed)) = &self.delivery_check
                     && threshold::verify_delivery(lines, seed, holonomy).is_err()
                 {
+                    // S1-M1 firing: a delivery that traversed a different circuit than agreed. Silent
+                    // by design on the wire (an attacker learns nothing), which is exactly why it must
+                    // not also be silent to the operator.
+                    self.stations.record(Station::HolonomyRejected, Some(line));
                     return Some(Vec::new());
                 }
                 // NOSTOS geometric dead-drop: a delivery whose payload is dead-drop-enveloped is not
@@ -704,26 +756,34 @@ fn peel_search(
 impl<F: Field> Engine for ThresholdRouter<F> {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         match input {
+            // Every `None` arm below is a frame this node could not parse. Counted, they are the
+            // **derivation-skew detector** `docs/design-upgrade.md` §4 requires: a member running a
+            // different wire or derivation version does not error loudly — it emits a well-formed frame
+            // to a valid coordinate that simply never peels — so an upgrade is not a controlled
+            // operation until this signal exists. An unparseable frame has no readable line, so these
+            // are unattributed by construction (`None`), which the station type keeps distinct from a
+            // line's own count.
             Input::Message { frame, .. } => match frame.split_first() {
                 Some((&TAG_ONION, body)) => match decode_onion(body) {
                     Some((line, onion)) => self.on_onion(now, line, onion),
-                    None => Vec::new(),
+                    None => self.undecodable(),
                 },
                 Some((&TAG_REQ, body)) => match decode_req(body) {
                     Some((req_id, combiner, line, onion)) => {
                         self.on_request(req_id, combiner, line, onion)
                     }
-                    None => Vec::new(),
+                    None => self.undecodable(),
                 },
                 Some((&TAG_REP, body)) => match decode_rep(body) {
                     Some((req_id, share)) => self.on_reply(now, req_id, share),
-                    None => Vec::new(),
+                    None => self.undecodable(),
                 },
                 Some((&TAG_DROP, body)) => match decode_drop(body) {
                     Some((line, e2e)) => self.on_drop(line, e2e),
-                    None => Vec::new(),
+                    None => self.undecodable(),
                 },
-                _ => Vec::new(),
+                // An unknown or absent tag: also skew, and also unattributable.
+                _ => self.undecodable(),
             },
             Input::Timer(TimerToken(token)) => {
                 if token == COVER_TOKEN {
@@ -739,8 +799,11 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                     // The gather deadline fired: drop an incomplete pending peel, and BACK OFF — the
                     // deadline was demonstrably too short for the load this node is under, and an expiry
                     // yields no sample, so nothing else would ever widen it (RFC 6298 §5.5 + Karn).
-                    if self.pending.remove(&token).is_some() {
+                    if let Some(dead) = self.pending.remove(&token) {
                         self.gather.expired();
+                        // THE station: the hop is discarded entire, and how many shares it had reached
+                        // is the difference between "the line is slow" and "the line is dead".
+                        self.stations.record(Station::GatherExpired, Some(dead.line));
                     }
                     Vec::new()
                 }
@@ -1586,6 +1649,72 @@ mod tests {
         assert!(
             widened > measured,
             "an expiry must widen the next armed deadline: {widened:?} vs {measured:?}"
+        );
+    }
+
+    #[test]
+    fn a_starved_hop_records_which_line_expired_instead_of_vanishing() {
+        // **The question #55 could not answer.** With a node silenced, the coherence plane could say
+        // "point 3 is faulted" — which the operator already knew, having stopped it — but not the two
+        // facts that actually solved it. This is the second: gathers expiring below threshold, per line,
+        // in the hundreds. It was found by hand-inserting probes and grepping; now the engine records it.
+        let line = Line::<F2>::at(0).coords();
+        let members = ThresholdRouter::<F2>::line_members(line);
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"starved-station"));
+        let mut router =
+            ThresholdRouter::<F2>::new(Point::<F2>::new(members[0]).unwrap(), &identity, 2, [0x7E; 32]);
+
+        // Nothing is recorded before anything stops — a plane that reports activity it did not observe
+        // is worse than none.
+        assert!(router.stations().is_empty(), "a fresh router has observed nothing");
+
+        // Launch a hop, then fire its deadline with no partial ever arriving: t = 2 was never reached.
+        let mut onion = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        onion[..8].copy_from_slice(&7u64.to_be_bytes());
+        let armed = router.step(
+            Instant(0),
+            Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion) },
+        );
+        let token = armed
+            .iter()
+            .find_map(|e| match e {
+                Effect::ArmTimer { token, .. } if token.0 & (MIX_FLAG | COVER_TOKEN) == 0 => Some(*token),
+                _ => None,
+            })
+            .expect("the gather armed a deadline");
+        router.step(Instant(1), Input::Timer(token));
+
+        // The station names the LINE, which is the whole diagnostic value: "some gathers expired" is a
+        // number, "this line's gathers expired" is a cause.
+        assert_eq!(
+            router.stations().get(Station::GatherExpired, Some(line)),
+            1,
+            "an expired gather is attributed to the line it was peeling for"
+        );
+        assert_eq!(
+            router.stations().total(Station::GatherCompleted),
+            0,
+            "and a hop that never completed is not counted as one — a one-sided counter points at the \
+             wrong half, so the denominator has to be honest too"
+        );
+
+        // A forged share index is an ATTACK indicator, not an error rate, so it gets its own station.
+        let mut onion2 = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        onion2[..8].copy_from_slice(&8u64.to_be_bytes());
+        router.step(
+            Instant(2),
+            Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion2) },
+        );
+        let req_id = router.seq - 1;
+        let forged = Share::new(200, alloc::vec![0u8; 32]); // no honest member has index 200
+        router.step(
+            Instant(3),
+            Input::Message { from: members[1], frame: encode_rep(req_id, &forged) },
+        );
+        assert_eq!(
+            router.stations().get(Station::ShareIndexOutOfRange, Some(line)),
+            1,
+            "a share index outside the line's real membership is distinguishable from noise"
         );
     }
 

@@ -1,9 +1,22 @@
 # Observability: the data-path plane, and why it is the afferent nerve rather than a debugging tool
 
-**Status: design, 2026-08-01.** The coherence plane (`fanos-telemetry`, `fanos-observatory`) is built, live and
-mathematically grounded. The **data-path plane described here does not exist** — there are zero station counters
-anywhere in the codebase. This document derives what it must be, from three things that are currently open-loop
-because of its absence.
+**Status: §3–§5 implemented, §6–§7 open. Updated 2026-08-01.** The coherence plane (`fanos-telemetry`,
+`fanos-observatory`) is built, live and mathematically grounded. The data-path plane derived here **now
+exists in substrate form**: `fanos_telemetry::stations` supplies the derived `Station` enumeration and the
+node-local, structure-keyed `Stations` counters (§3's R1–R4 and §5's geometric cardinality bound are
+properties of the types), and the discard sites of two engines are instrumented:
+
+* **`ThresholdRouter`** — gather expiry below threshold *and* completion (the denominator, without which the
+  first is a bare number rather than a rate), cap-eviction, share-request-not-a-member, own-share-failed
+  (key/epoch skew), share-for-unknown-request, forged share index, candidate flood cap, holonomy reject, and
+  every frame-decode failure through a single `undecodable()` site;
+* **`PorosHost`** — the four admission gates §4 names as the sharpest case, which previously returned the
+  same silent `Vec::new()`, plus its own gather expiry and completion.
+
+**What is NOT done**, and each is tracked: the remaining discard sites (`RendezvousRelay`,
+`rendezvous_host`, per-tag frame-decode counts); §4.1's export of already-computed signals (`GatherClock`
+now exposes `srtt`/`var`, but nothing reads them yet); §7's load sensor, which is this plane's acceptance
+criterion; and §8's derivations, until which **counters stay local-only** — nothing here exports itself.
 
 ---
 
@@ -160,6 +173,14 @@ does not error — it produces a partial that does not reconstruct, or addresses
 hop simply never peels. #55 is the empirical proof of how that presents: a wholly dead data path indistinguishable
 from eleven other causes, with a clock as the only signal. An upgrade architecture needs skew observable **per
 line** before it can be survivable.
+
+*Implemented in part:* `ThresholdRouter` now routes **every** decode-failure arm — and the unknown-tag arm —
+through one `undecodable()` site recording `FrameDecodeFailed`, so the count cannot be half-instrumented by a
+later arm being added without one. It is deliberately **unattributed** (`line: None`): a frame that failed to
+parse has no readable line, and inventing one would put fabricated evidence against a line into the very plane
+built to end diagnosis-by-thin-evidence. Per-*tag* counts and the other engines' decode sites remain open, and
+`SharePartialFailed` — a member that cannot compute its own share, i.e. **key/epoch skew inside a line that is
+otherwise agreeing** — is the sharper of the two skew signals and is instrumented.
 
 **The founding operator's monitoring position becomes principled.** Running the founding nodes gives full local
 visibility (§3 R4) with no privileged key and no anonymity cost — and that visibility **dilutes as others join**,

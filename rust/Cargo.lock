@@ -908,6 +908,7 @@ dependencies = [
  "fanos-ports",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-telemetry",
  "fanos-threshold",
  "fanos-wire",
  "proptest",
@@ -1354,6 +1355,7 @@ version = "0.1.0"
 dependencies = [
  "fanos-code",
  "fanos-diakrisis",
+ "fanos-geometry",
  "fanos-wire",
  "fanos-wire-derive",
  "libm",
