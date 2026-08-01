@@ -21,6 +21,21 @@
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
+use fanos_wire::MAX_FRAME;
+
+/// Bytes a `ShardMsg::Deliver` adds around one DA shard, plus the outer frame envelope.
+///
+/// **Read off the encoding, not fitted to a measurement**: `wire.rs` writes `tag(1) ‖ block(32) ‖
+/// index(1) ‖ len(4)` ahead of the shard — 38 bytes — and the outer `encode_frame` prepends a type varint
+/// and a length varint, at most 8 bytes each for a body of this size. 54 is that sum, and it is rounded
+/// **up** deliberately: over-estimating the overhead costs a few bytes of block capacity, while
+/// under-estimating it puts the shard back over the ceiling, where it is dropped in silence. The two
+/// errors are not symmetric, so the constant leans the safe way.
+const SHARD_FRAME_OVERHEAD: usize = 38 + 8 + 8;
+
+/// Bytes a `ConsensusMsg::Body` adds around a whole block, plus the outer frame envelope — a variant tag
+/// and the same envelope as above. Rounded up for the same asymmetry.
+const CONSENSUS_MSG_OVERHEAD: usize = 8 + 8 + 8;
 use fanos_primitives::{Epoch, hash_labeled};
 use fanos_vrf::pqvrf::{MerkleProof, VrfOutput};
 use fanos_wire::Wire;
@@ -283,6 +298,41 @@ impl Block {
         encode_payload(&self.sealed_txs)
     }
 
+    /// The **payload budget** this block may carry, derived from the transport's frame ceiling.
+    ///
+    /// A block leaves the proposer by two paths and must survive **both**, so the budget is the smaller:
+    ///
+    /// * **whole-block** — a `NeedBody` catch-up answer ships the entire block in one frame, so
+    ///   `payload + everything_else <= MAX_FRAME`;
+    /// * **DA shards** — a proposal ships `K`-of-`N` erasure shards, each in its own frame, and
+    ///   [`erasure::encode`] makes each shard `ceil(payload / K)` bytes, so
+    ///   `ceil(payload / K) + shard_overhead <= MAX_FRAME`.
+    ///
+    /// **The block's own overhead is MEASURED, not assumed**, and that matters more than it looks: it is
+    /// dominated by the `last_commit` certificate, which carries one signature per quorum member — so it
+    /// grows with the cell. A constant fitted on a Fano cell would silently over-budget a larger plane and
+    /// put the block back over the ceiling, which is the very defect this closes. Measuring costs one
+    /// encode of a block that is being encoded anyway.
+    ///
+    /// Returns `0` if the fixed overhead alone already exceeds a frame — a cell whose certificate cannot
+    /// fit has a problem this bound cannot fix, and reporting a budget of zero states that honestly rather
+    /// than underflowing into a huge one.
+    #[must_use]
+    pub fn payload_budget(&self) -> usize {
+        let overhead = self.to_bytes().len().saturating_sub(self.payload_bytes().len());
+        let whole_block = MAX_FRAME.saturating_sub(overhead + CONSENSUS_MSG_OVERHEAD);
+        let via_shards = MAX_FRAME.saturating_sub(SHARD_FRAME_OVERHEAD).saturating_mul(erasure::K);
+        whole_block.min(via_shards)
+    }
+
+    /// Whether this block's payload fits [`payload_budget`](Self::payload_budget) — the check
+    /// [`verify_structure`](Self::verify_structure) folds in, so an oversized block is **rejected on
+    /// arrival** rather than accepted and then silently dropped by the transport.
+    #[must_use]
+    pub fn fits_frame(&self) -> bool {
+        self.payload_bytes().len() <= self.payload_budget()
+    }
+
     /// The `N = 7` projective-LRC shards of the payload (one per cell node) — the DA-coded block data.
     #[must_use]
     pub fn da_shards(&self) -> [Vec<u8>; erasure::N] {
@@ -295,7 +345,11 @@ impl Block {
     pub fn verify_structure(&self) -> bool {
         let tx_root_ok = self.header.tx_root == tx_root(&self.tx_commits());
         let da_ok = self.header.da_commit == commit_shards(&self.da_shards());
-        tx_root_ok && da_ok && self.last_commit_matches()
+        // A block larger than the transport can carry is not a valid block, however well its commitments
+        // check out: nothing downstream will complain about it, because an over-ceiling frame is dropped
+        // *silently* by the receiver (see `fanos_wire::MAX_FRAME`). Verified structure has to mean
+        // deliverable structure, or the mempool cannot drain — the block carrying it never arrives (#46).
+        tx_root_ok && da_ok && self.fits_frame() && self.last_commit_matches()
     }
 
     /// The recorded `last_commit` matches the header's commitment to it.
@@ -328,6 +382,55 @@ impl Block {
         }
         decode_payload(&payload)
     }
+}
+
+/// Take the longest prefix of `sealed` whose encoded payload fits `budget` bytes.
+///
+/// **The proposer's half of the frame bound.** [`Block::fits_frame`] rejects an oversized block on
+/// arrival; this stops one being built, which is where the defect actually bites — an over-ceiling block is
+/// dropped *silently* by the receiver, so a proposer that keeps producing them stalls the chain without a
+/// single error anywhere (#46). Rejection alone would turn a silent stall into a loud one; packing keeps
+/// the chain moving and drains the mempool across successive blocks instead.
+///
+/// A **prefix**, not a best-fit subset, because the caller has already sorted by commitment for anti-MEV:
+/// the order is the fairness property, and reordering to squeeze in one more transaction would trade it
+/// away for a few bytes. Transactions that do not fit stay in the mempool for the next block.
+///
+/// The size accounting bounds each element's framing rather than re-encoding the prefix at every step
+/// (which would be quadratic): `Vec<Vec<u8>>::to_wire` writes a sequence prefix and one length prefix per
+/// element, each a varint of at most 8 bytes. That over-estimates slightly, so the packer may leave a few
+/// bytes unused — the safe direction, for the same reason the overhead constants round up.
+#[must_use]
+pub fn pack_to_budget(sealed: Vec<SealedTx>, budget: usize) -> Vec<SealedTx> {
+    /// Upper bound on a varint length prefix at these sizes.
+    const PREFIX_MAX: usize = 8;
+    let mut used = PREFIX_MAX; // the sequence's own prefix
+    let mut out = Vec::with_capacity(sealed.len());
+    for tx in sealed {
+        let cost = tx.to_bytes().len().saturating_add(PREFIX_MAX);
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used += cost;
+        out.push(tx);
+    }
+    out
+}
+
+/// The payload budget for a block that is **not yet assembled** — the same derivation as
+/// [`Block::payload_budget`], measured on a skeleton carrying `last_commit`.
+///
+/// The proposer needs the budget *before* it packs, but the certificate that dominates the overhead is
+/// attached *after* assembly, so the budget cannot be read off the finished block without risking having
+/// already overshot. Building an empty block with the same certificate gives the same overhead for one
+/// cheap encode.
+#[must_use]
+pub fn budget_for(parent: [u8; 32], height: u64, epoch: Epoch, proposer: u8, last_commit: Option<&Certificate>) -> usize {
+    let mut skeleton = Block::assemble(parent, height, epoch, proposer, Vec::new());
+    if let Some(cert) = last_commit {
+        skeleton = skeleton.with_last_commit(cert.clone());
+    }
+    skeleton.payload_budget()
 }
 
 /// The ordered transaction commitments of a sealed-tx list.
@@ -397,6 +500,66 @@ mod tests {
         }).collect();
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
         SealedTx::seal(&Transaction::new(tag.to_vec()), epoch, 0, &pubs, 2, tag).unwrap()
+    }
+
+    #[test]
+    fn a_block_is_bounded_by_what_the_transport_can_actually_carry() {
+        // #46: the mempool was uncapped, the proposer cloned all of it into a block, `verify_structure`
+        // checked no size — and the transport drops an over-ceiling frame in SILENCE. Measured on this
+        // codebase: the whole-block path fails past ~1.03 MB, the DA-shard path past ~3.15 MB, and the
+        // failure is a receiver-side `continue` with the sender still reporting success. So nothing
+        // downstream ever complains: a proposer that keeps building oversized blocks stalls the chain
+        // with no error anywhere, and the pool never drains because the block carrying it never arrives.
+        let b = sample_block();
+
+        // The budget is POSITIVE and strictly under a frame — a bound that permitted a whole frame of
+        // payload would ignore the block's own header and certificate, which is how it got here.
+        let budget = b.payload_budget();
+        assert!(budget > 0, "a block with a normal certificate has room for transactions");
+        assert!(
+            budget < MAX_FRAME.saturating_mul(erasure::K),
+            "the budget leaves room for per-shard framing: {budget}"
+        );
+        assert!(b.fits_frame(), "an ordinary block fits");
+        assert!(b.verify_structure(), "and verifies");
+
+        // The packer never exceeds the budget, and never reorders — the sort is the anti-MEV property.
+        let txs: Vec<SealedTx> = (0..8u8).map(|i| sealed_tx(&[b'p', i], Epoch::new(3))).collect();
+        let mut sorted = txs.clone();
+        sorted.sort_by_key(SealedTx::commit);
+        let packed = pack_to_budget(sorted.clone(), budget);
+        assert_eq!(
+            packed,
+            sorted[..packed.len()],
+            "the packer takes a PREFIX — reordering to fit one more would trade away the anti-MEV order"
+        );
+        assert!(
+            encode_payload(&packed).len() <= budget,
+            "packed payload {} exceeds budget {budget}",
+            encode_payload(&packed).len()
+        );
+
+        // A tight budget takes fewer, and a zero budget takes none — the degenerate case must not panic
+        // or wrap, because it is reachable when a certificate alone fills a frame.
+        let one = pack_to_budget(sorted.clone(), sorted[0].to_bytes().len() + 16);
+        assert!(one.len() <= 1, "a budget for one transaction takes at most one, got {}", one.len());
+        assert!(pack_to_budget(sorted, 0).is_empty(), "a zero budget takes nothing");
+
+        // The gate and the packer must agree, which is the property that actually matters: anything the
+        // proposer is willing to BUILD must be something a verifier is willing to ACCEPT. If they
+        // disagreed, a proposer would keep producing blocks its own cell rejects — a stall with a
+        // different signature but the same effect as the silent one this closes.
+        let assembled = Block::assemble(GENESIS_PARENT, 1, Epoch::new(3), 4, packed);
+        assert!(assembled.fits_frame(), "what the packer produced, the gate accepts");
+        assert!(assembled.verify_structure(), "and it verifies end to end");
+
+        // And `fits_frame` is exactly the budget comparison — not a weaker proxy that could drift from
+        // it. Asserted as an identity so a future change to either side has to change both.
+        assert_eq!(
+            assembled.fits_frame(),
+            assembled.payload_bytes().len() <= assembled.payload_budget(),
+            "the gate IS the budget comparison"
+        );
     }
 
     fn sample_block() -> Block {

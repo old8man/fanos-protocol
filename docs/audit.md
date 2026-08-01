@@ -2355,8 +2355,9 @@ completions converges to a quiet period's mean and an expiry yields no sample to
   so sticky sessions need no shared state. **First step is a benchmark, not code** — the construction assumes the
   lattice ZK stack can carry membership + PRF + range at a per-request cost, and OBOLOS's whole-transaction proof
   is not that circuit.
-* **Unbounded mempool and block** against a transport that silently caps frames at 1 MiB — a candidate liveness
-  kill that must be measured (which path binds first) before it is claimed.
+* ~~**Unbounded mempool and block** against a transport that silently caps frames at 1 MiB~~ — **MEASURED
+  AND CLOSED 2026-08-01**, see §4c below. It was a real liveness kill, and the path that binds is not the
+  one the entry assumed.
 * **The C ABI facade**: 13 functions, and no error channel at all — every failure is `NULL` or `-1`, so a caller
   cannot tell "no such name" from "not joined" from "out of memory".
 
@@ -2422,6 +2423,38 @@ place, because a dial that never completes its handshake opens no stream and so 
 most common ghost of all (dialling a service that is not there) was invisible to the fix aimed at ghosts.
 Falsification: with the give-up rule removed the session is still retransmitting past 60 s; with it, it ends in
 seconds, and a live-but-lossy peer completes untouched.
+
+## §4c. The mempool could not drain, because the block carrying it was undeliverable (#46, FIXED 2026-08-01)
+
+The entry above asked for a measurement before the claim. Here it is, taken against the real encoders and a
+live QUIC driver rather than by reading:
+
+| path | fails at | how it fails |
+|---|---|---|
+| proposal **skeleton** | never — constant **17 310 B** at any payload | n/a (17 144 B of it is the `last_commit` certificate) |
+| `ConsensusMsg::Body` | payload **~1.03 MB** | receiver `read_to_end(MAX_FRAME)` → `TooLong` → bare `continue` |
+| **DA shard** (`Deliver`) | payload **~3.15 MB** | same silent drop |
+
+Live over real QUIC: **1 048 576 B delivers; 1 048 577 B vanishes** — the sender's emit returns success, no
+error is logged, the connection survives, and a 2 KB probe afterwards still arrives. `verify_structure`
+accepted a 2.08 MB block; **no size gate existed anywhere.**
+
+**The binding path is not the first one to fail.** `Body` breaks earliest (~1.03 MB) but only kills `NeedBody`
+catch-up. Proposals travel as skeleton + shards, so the liveness kill is the **shard** ceiling: a mempool past
+~3.15 MB makes every shard undeliverable → no validator reconstructs → no `PREPARE` → nothing commits → the
+pool never drains → the next proposal is just as oversized. Self-perpetuating, and it reports nothing.
+
+**Why the bound could not have been written before.** `MAX_FRAME` was a *private* const in `fanos-quic` and a
+second `pub const` in `fanos-node`'s ANGELOS driver — two copies, equal by coincidence, and **invisible to
+`fanos-taxis`**. The block producer could not have derived a limit even in principle. It now lives once, in
+`fanos-wire`, beside the frame registry it belongs to.
+
+The limit is `min(whole_block, K · shard)` and the block's own overhead is **measured, not fitted**: it is
+dominated by the `last_commit` certificate, which carries a signature per quorum member and therefore grows
+with the cell — a constant tuned on Fano would silently over-budget a larger plane and reintroduce exactly
+this defect. Enforced on both sides: `pack_to_budget` stops the proposer building one (a *prefix*, so the
+anti-MEV commitment sort is preserved), and `fits_frame` in `verify_structure` rejects one on arrival, because
+verified structure has to mean *deliverable* structure. Falsified by making the packer ignore its budget.
 
 ## §5. On method, because two of this cycle's hours went to it
 

@@ -39,7 +39,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Read *before* the body, so it is the one number an unauthenticated peer can make this side act on: without a
 /// bound, a four-byte header allocates four gigabytes. Sized for a media chunk with room over — ANGELOS
 /// attachments are chunked by the crate that produces them, so a legitimate frame never approaches it.
-pub const MAX_FRAME: usize = 1 << 20;
+///
+/// **Re-exported from [`fanos_wire`], not defined here.** It was a second, independent copy of the same
+/// number; the two were equal only by coincidence and nothing would have caught them diverging.
+pub use fanos_wire::MAX_FRAME;
 
 /// A messaging session bound to one byte stream.
 pub struct Conversation<S> {

@@ -233,8 +233,13 @@ fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
 
 /// Bytes of a HELLO: three little-endian `u32`s (a projective coordinate).
 const HELLO_LEN: usize = TRIPLE_WIRE_LEN;
-/// Per-frame receive cap. Onion/Tessera frames are far smaller; this only bounds abuse.
-const MAX_FRAME: usize = 1 << 20;
+/// Per-frame receive cap — **re-exported from the wire authority, not defined here**.
+///
+/// This driver enforces the bound, but it does not own it: every producer of a frame anywhere in the
+/// workspace is bound by the same number, and a copy per enforcer is a copy free to drift. It used to be a
+/// private `const` here with a second `pub const` in `fanos-node`'s ANGELOS driver — see
+/// [`fanos_wire::MAX_FRAME`] for what that cost.
+use fanos_wire::MAX_FRAME;
 /// Cap on **concurrent inbound connection-handler tasks** (audit C3): each accepted connection spawns a
 /// task (HELLO exchange, then frame reads), so without a bound a peer opening connections in a loop grows
 /// the task/handshake count without limit. The accept loop takes a permit per connection and holds it for

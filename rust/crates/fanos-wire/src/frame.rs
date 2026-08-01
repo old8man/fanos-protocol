@@ -9,6 +9,25 @@ use alloc::vec::Vec;
 use crate::error::WireError;
 use crate::varint;
 
+/// **The transport's frame ceiling — one authority for the whole workspace.**
+///
+/// A receiver reads at most this many bytes per stream; anything larger is discarded. That makes it a
+/// *protocol* bound rather than a transport detail: every producer of a frame — a consensus message, a
+/// data-availability shard, an ANGELOS envelope — is bounded by it, so it belongs to the wire authority
+/// that already numbers frame types, not to whichever driver happens to enforce it.
+///
+/// **It used to live in two places, and the consequence was measured rather than theorised.** It was a
+/// private `const` in `fanos-quic`'s driver and a second `pub const` in `fanos-node`'s ANGELOS driver —
+/// two copies free to drift, and invisible to everyone else. `fanos-taxis` in particular could not see it
+/// at all, so the block producer had *no* size bound: a block whose payload exceeded the ceiling was
+/// assembled, accepted by `verify_structure`, and then **silently dropped by the receiver** — the mempool
+/// could not drain, because the block carrying it was undeliverable (defect #46).
+///
+/// Measured against a live QUIC driver: a 1 048 576-byte frame is delivered; 1 048 577 vanishes, the
+/// sender's send call still reports success, no error is logged, and the connection survives. That
+/// silence is why the bound has to be enforced by the *producer* — nothing downstream will complain.
+pub const MAX_FRAME: usize = 1 << 20;
+
 /// The message-type registry (spec §7.2). Discriminants encode the group in the high nibble.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u64)]

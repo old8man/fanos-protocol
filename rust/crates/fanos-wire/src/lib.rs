@@ -35,7 +35,7 @@ pub mod wire;
 pub use activation::Derivation;
 pub use capability::{Capabilities, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION, negotiate_version};
 pub use error::{ProtocolError, WireError};
-pub use frame::{Frame, FrameType, SessionFrameType, decode_frame, encode_frame};
+pub use frame::{Frame, FrameType, MAX_FRAME, SessionFrameType, decode_frame, encode_frame};
 pub use wire::Wire;
 
 /// Re-exports the `#[derive(Wire)]` macro expansion refers to, so generated code resolves the same

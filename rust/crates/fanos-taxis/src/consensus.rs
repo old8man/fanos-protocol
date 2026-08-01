@@ -1637,6 +1637,19 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // Order the mempool blindly by commitment (the proposer never sees contents — anti-MEV).
             let mut sealed = self.mempool.clone();
             sealed.sort_by_key(SealedTx::commit);
+            // Then take only what the transport can actually carry (#46). Without this the proposer packs
+            // the whole pool, the block's DA shards exceed the frame ceiling, every shard is dropped in
+            // SILENCE, no validator can reconstruct, nothing commits — and the pool never drains, so the
+            // next block is just as oversized. The stall is self-perpetuating and reports nothing.
+            // Measured: the shard path fails at ~3.15 MB of payload, the whole-block path at ~1.03 MB.
+            let budget = crate::block::budget_for(
+                self.chain.head(),
+                height,
+                self.epoch,
+                self.me,
+                self.last_finalized_cert.as_ref(),
+            );
+            let sealed = crate::block::pack_to_budget(sealed, budget);
             Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed)
         };
         // Record the certificate that finalized the parent as this block's `last_commit`, so its execution
