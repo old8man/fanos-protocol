@@ -2259,6 +2259,13 @@ disagree on which blocks are well-formed.
 Grew out of the bounded-capacity enumeration above: two of the eleven `BoundedMap` sites turned out not to be
 eviction defects at all, and pulling on them opened the anonymity path.
 
+**And then kept growing, which is why §4a–§4b are not about hidden services at all.** Proving §6's censorship
+bound exposed a chosen-constant gather deadline; instrumenting *that* exposed a session layer with no give-up
+rule anywhere (§4b); and verifying the crate that observation landed in exposed a `no_std` claim that had
+never once compiled, behind a CI job that could not fail (§4a). Each was found by taking the previous finding
+seriously enough to check the thing next to it — the pattern worth keeping from this cycle, and the reason
+these sit under a heading that no longer describes them.
+
 ## §1. The route binding was unauthenticated (HIGH, FIXED `9e34d4c`)
 
 `service_tag = H(RDV_HOST, service_pubkey ‖ epoch)` and the service public key *is* the dial address, so anyone
@@ -2352,6 +2359,32 @@ completions converges to a quiet period's mean and an expiry yields no sample to
   kill that must be measured (which path binds first) before it is claimed.
 * **The C ABI facade**: 13 functions, and no error channel at all — every failure is `NULL` or `-1`, so a caller
   cannot tell "no such name" from "not joined" from "out of memory".
+
+## §4a. The no_std claim was not true, and the gate that should have caught it looked away (2026-08-01, FIXED)
+
+`fanos-diakrisis` documents a `libm` feature — *the* no_std float backend — and carries a `mathfns` shim
+written precisely so the crate "calls `sqrt` rather than the inherent method so the two builds share code".
+Three call sites in `stability.rs` did not: they used `f64::ceil` and `f64::round` directly, which exist only
+under `std`. **The crate's advertised no_std configuration had never compiled**, and every crate above it
+inherited the falsehood — including `fanos-telemetry` and `fanos-ports`, both of which advertise embedded use.
+
+**Why CI was green anyway, which is the more useful half of the finding.** The portability job cross-builds
+for `wasm32-unknown-unknown`, and **wasm has native `f64.ceil`/`f64.nearest` instructions** — so the inherent
+methods resolve there. A target chosen as a proxy for "no_std" silently supplied the exact facility whose
+absence the `libm` feature exists to cover, and the proxy therefore could not fail. The defect was invisible
+for as long as wasm was the only target checked, and would have surfaced first on a real float-less
+deployment target (Cortex-M, RISC-V) — that is, in the field rather than in CI.
+
+Fixed by extending `mathfns` with `ceil`/`round` in the shape the module already established (dispatch to the
+intrinsic under `std`, `libm` under `no_std`, `compile_error!` when neither), and routing the three sites
+through it. Verified: `fanos-diakrisis`, `fanos-telemetry` and `fanos-ports` now build `--no-default-features
+--features "alloc libm"` on the **host** toolchain, and the crate's 157 tests pass unchanged.
+
+**The gate is repaired, not just the code.** The portability job now runs the same feature combinations as a
+host-target `cargo check` *before* the wasm cross-build, where the `std`-only methods genuinely do not exist.
+It is strictly stricter and costs one cheap check job. The general lesson is worth stating plainly: **a
+cross-target build is only a portability gate for the facilities that target actually lacks** — choosing
+wasm32, whose float support is unusually complete, made this one a gate against nothing.
 
 ## §4b. Nothing ever gave up — the ghost session (found 2026-08-01, FIXED)
 

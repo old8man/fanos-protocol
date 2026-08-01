@@ -326,9 +326,66 @@ two dead nodes break the quorum of exactly *one* line, the line through both; ev
 `≥ t` live members and every hop over it remains available under retransmission. An `f = 2` adversary therefore
 cannot censor even one *service* (its `m = 3` meeting lines cannot all lose quorum), let alone the plane. For
 general `q` the per-line statement is exact, and full-service censorship requires a quorum break on **every** one
-of the `m = f + 1` meeting lines — pairwise intersections make those kills mostly disjoint, so the cost is
-`Θ(m · (q + 2 − t))` targeted nodes against a budget of `f`; the Fano case is proven by the scenario test, the
-general-`q` inequality is stated, not yet mechanised.
+of the `m = f + 1` meeting lines. That inequality is derived below.
+
+#### 6.1c The general-`q` bound, derived — and the intersection structure runs the *other* way
+
+The earlier sketch here said "pairwise intersections make those kills mostly disjoint, so the cost is
+`Θ(m·(q+2−t))`". **That reasoning was backwards**, and the correction matters because it moves the bound in
+the adversary's favour rather than ours — so the honest statement is tighter than the one it replaces.
+
+Write the requirement as *slots*. A line dies when `q + 2 − t` of its `q + 1` members are dead, so censoring a
+service means filling `m·(q + 2 − t)` line-kill slots. A single killed node fills one slot **per meeting line
+it lies on** — so intersections make kills *shared*, not disjoint, and every shared point is a discount the
+adversary collects.
+
+Two configurations bracket the cost, and it is worth being precise about which is worse:
+
+* **Concurrent** (all `m` lines through one point `P`). Killing `P` fills `m` slots at once — but in
+  `PG(2,q)` two lines meet in exactly one point, so if all `m` pass through `P`, no *other* point lies on more
+  than one of them. Every remaining slot costs its own node: `1 + m·(q + 1 − t)`.
+* **General position** (no three of the `m` concurrent). Each point lies on at most **2** of them, and each
+  line carries `m − 1` intersections. When `q + 2 − t ≤ m − 1` the adversary can spend *only* on intersections,
+  every kill worth 2: `⌈m·(q + 2 − t)/2⌉`.
+
+General position is the **cheaper** attack, i.e. the worst case for us — the opposite of what the sketch
+assumed. Fano makes it concrete: `m = 3`, `q = 2`, `t = 2`, so `q + 2 − t = 2`. Concurrent costs
+`1 + 3·1 = 4`; general position costs `⌈3·2/2⌉ = 3`, and 3 is achievable — kill the three pairwise
+intersection points and every line loses exactly its two.
+
+**The security claim survives, for every `q`.** With `m = f + 1`, censorship must cost strictly more than the
+`f` nodes the adversary has:
+
+```text
+  ⌈m·(q + 2 − t)/2⌉ > f = m − 1
+    ⟸  m·(q + 2 − t) > 2m − 2
+    ⟸  m·(q + 2 − t − 2) > −2        which holds whenever  q + 2 − t ≥ 2,  i.e.  t ≤ q
+```
+
+and `t = ⌈2(q+1)/3⌉ ≤ q` for every `q ≥ 2` (Fano `t = 2 ≤ 2`; `PG(2,7)` `t = 6 ≤ 7`; `PG(2,31)` `t = 22 ≤ 31`).
+So the threshold formula the mixnet already uses is exactly what makes this hold — the two are not
+independent choices.
+
+**The margin is thinnest at Fano and widens with `q`**: on the base plane the adversary needs 3 targeted kills
+against a budget of 2, a margin of one node. That is worth stating plainly rather than burying — the shipped
+default is the tightest case the family admits, and any future change to `t` must be re-checked against
+`t ≤ q` before it ships.
+
+**Checked by exhaustive search, not only by algebra.** Over *every* choice of `m = 3` meeting lines, the
+minimum kill-set was computed by brute force:
+
+| plane | `t` | dead needed per line | predicted (concurrent / general) | **measured minimum** | budget `f` | margin |
+|---|---|---|---|---|---|---|
+| `PG(2,2)` | 2 | 2 | 4 / **3** | **3** | 2 | 1 |
+| `PG(2,3)` | 3 | 2 | 4 / **3** | **3** | 2 | 1 |
+
+The measurement matches the general-position branch on both planes, which is the point of running it: it
+confirms the *cheaper* branch is the one that binds, and so confirms the correction above rather than the
+sketch it replaced.
+
+Status: the Fano case is proven end-to-end by the scenario test; the algebra is derived and exhaustively
+checked at `q = 2, 3`; carrying the search into the reference suite as a Rust test (and extending it to
+`PG(2,7)`, where the search space needs a smarter minimum-cover than brute force) remains open.
 
 ### 6.2 The consequence: the at-combiner mode cannot survive `m > 1`
 
