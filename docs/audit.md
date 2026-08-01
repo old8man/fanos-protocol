@@ -2253,3 +2253,91 @@ block size — and therefore the DA shard size every validator erasure-codes, di
 pressure into cell-wide bandwidth. Inverse of §1–§3: a bound absent where every sibling has one. The block limit is the
 half that must be a protocol constant in `CellParams` and checked in validation, since validators that disagree on it
 disagree on which blocks are well-formed.
+
+# Hidden-service audit — 2026-07-31 / 08-01
+
+Grew out of the bounded-capacity enumeration above: two of the eleven `BoundedMap` sites turned out not to be
+eviction defects at all, and pulling on them opened the anonymity path.
+
+## §1. The route binding was unauthenticated (HIGH, FIXED `9e34d4c`)
+
+`service_tag = H(RDV_HOST, service_pubkey ‖ epoch)` and the service public key *is* the dial address, so anyone
+could compute the tag; `HostRegister` carried no signature; `register_host` checked only that the forwarding fields
+were non-empty; and `BoundedMap::insert` on a known key overwrites. **One unsigned message per epoch seized a
+hidden service's route.** Every client request peeled at that combiner went to the sender's dead-drop, and the
+sender additionally read each request's `reply_circuit`, whose last hop is one of the *client's own* lines —
+narrowing that client to `q+1` members. Not impersonation: DIAULOS authenticates the service by static-key
+encapsulation, so confidentiality and authenticity held; availability and client anonymity did not.
+
+**Two plausible fixes are wrong, and both look right.** "Add a signature" proves nothing while the tag commits to a
+KEM key, which verifies nothing. "Carry the bundle, keep the tag KEM-derived, verify under the bundle's signing
+prefix" fails too: a bundle is plain concatenated bytes, so an attacker presents `(own signing prefix ‖ victim KEM
+key)`, signs with the key it holds, and passes — nothing binds a bundle's halves except its publication, which an
+anonymous combiner cannot check. The forced invariant is therefore **the tag must commit to the key that
+authenticates the registration**, so it hashes the identity bundle's signing prefix and client plumbing is part of
+the fix rather than a way around it.
+
+Two consequences worth keeping. **Hosting now requires a signing identity** — a KEM-only bundle's zero prefix is
+reconstructible by anyone holding the public KEM key, so accepting one would authenticate nothing while appearing
+to. And the authenticated registration **stopped fitting the fixed-width onion packet**: measured at 10.3 KB
+(bundle 3200 B + signature 3373 B + self-provisioned forward keys ~3684 B) against a 7041-byte body. That exposed a
+*pre-existing* defect — `forward_keys` carried `q+1` keys per hop, so a registration already exceeded the packet on
+any plane past Fano (~39 KB at q = 31). The keys left the registration and the combiner is handed a directory
+instead, which needed `Command::Control { tag, body }`: a control channel that is **local by construction**, since
+commands enter through the node handle and nothing on the wire can produce one. That is precisely why key material
+may be installed from a command and must not be from a frame.
+
+## §2. The combiner map concentrated below the fault bound (HIGH, FIXED `a7c7699`)
+
+`combiner_of(line)` took the line's *first* member. Enumerating every line: **4 combiners of 7 points on `PG(2,2)`,
+14 of 57 on `PG(2,7)`** — a fraction that *shrinks* as `q` grows. On `PG(2,7)` an adversary holding 14 specific
+points, **fewer than the `f = 18` the fault model already tolerates**, held every combiner in the plane and could
+censor every hidden service in the cell. The points are a public function of the geometry, so choosing them needed
+no secret: a whole-cell censorship capability strictly inside the tolerated fault budget.
+
+Selecting the member by a digest of the line's own coordinates spreads the image to 5 of 7 and 40 of 57. The
+property is `|image| > f` — 5 > 2 and 40 > 18 — because that is what lets a service hold `f+1` distinct meeting
+combiners. Still a pure public function of the line, so no call site changed.
+
+**It was found by a test that asserted a count on TWO planes.** A Fano-only test stays green at 4 combiners and the
+concentration would have shipped. The residual is stated rather than hidden: the image is fixed, not rotating, so
+the same ~40 points are combiners every epoch — sufficient for the bound, and removing even that would mean
+threading `(epoch, beacon)` through all 55 call sites, which no identified attack justifies.
+
+## §3. One meeting point per service (derivation `32a4248`, decision `769c878`, wiring open)
+
+A service had exactly one meeting line per epoch, so one combiner held a whole epoch of its inbound traffic and
+could drop it. `m = f+1` is **derived**: below it an adversary inside the tolerated budget covers every meeting
+combiner and censors deterministically; at it, pigeonhole leaves one honest.
+
+Wiring it surfaced a structural incompatibility rather than a bug: **a service that is its own combiner sits at one
+point, so `m > 1` and the at-combiner mode cannot both hold**, and one node cannot occupy `m` combiners. Three
+options are recorded with costs; (a) — hosting becomes mandatory — is chosen, because the at-combiner mode already
+cannot survive a real plane (it needs the service to land by luck on one of four Fano combiners, and its coordinate
+is then exactly what the substrate exists to hide), and the alternative of letting the client walk the points hands
+the adversary the failure signal, since a censoring combiner black-holes rather than refuses.
+
+## §4. Open, with the work specified
+
+* **Accountable anonymity** (`docs/design-hidden-service-hardening.md`): a post-quantum rate-limiting nullifier
+  over the SIS stack OBOLOS already carries, giving the filterable per-epoch client tag an nginx can rate-limit on,
+  an admission ladder driven by a controller rather than three knobs, and the same tag as the consistent-hash key
+  so sticky sessions need no shared state. **First step is a benchmark, not code** — the construction assumes the
+  lattice ZK stack can carry membership + PRF + range at a per-request cost, and OBOLOS's whole-transaction proof
+  is not that circuit.
+* **Unbounded mempool and block** against a transport that silently caps frames at 1 MiB — a candidate liveness
+  kill that must be measured (which path binds first) before it is claimed.
+* **The C ABI facade**: 13 functions, and no error channel at all — every failure is `NULL` or `-1`, so a caller
+  cannot tell "no such name" from "not joined" from "out of memory".
+
+## §5. On method, because two of this cycle's hours went to it
+
+A test binary sat at 0.0 % CPU and the story — "the combiner change broke a peel" — fitted perfectly. It survived
+three rounds of evidence. `ps` matches by *name*, so after a killed run it matches a corpse; a refuted observation
+refutes the observation, not the phenomenon; and the baseline (one `git checkout`, one run) exonerated the change
+in ninety seconds after three rounds of reasoning had not. Only `sample` answered it: `Main Thread → _dyld_start`,
+blocked in the loader before `main`, so no test ever ran. Underneath it all, two `cargo` processes had been alive
+for 3 h 45 m and 6 h 02 m holding the build lock — after killing them a suite that took minutes finished in 0.08 s.
+
+**The lesson is not the rules, all of which were already written down. It is that a plausible causal story survives
+round after round when none of the evidence is aimed at the mechanism itself.**
