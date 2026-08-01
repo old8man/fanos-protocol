@@ -60,6 +60,52 @@ pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &Beac
 /// 7041-byte onion body, so it did not fit past Fano even before authentication added a bundle and a signature.
 pub const CONTROL_MIX_DIRECTORY: u16 = 1;
 
+/// **All** of a service's meeting lines for `epoch` — the `f + 1` points a client may reach it at.
+///
+/// A single meeting point is a censorship single point of failure, and the count is forced rather than chosen.
+/// Model the censor as the fault model already does: an adversary holds a set `A` of points with `|A| = f`, where
+/// `f = ⌊(n − 1)/3⌋` and `n = q² + q + 1` is the plane's point count — the same tolerance every other bound here
+/// assumes. A service is censored exactly when every one of its meeting **combiners** lies in `A`. With `m ≤ f`
+/// distinct combiners the adversary picks `A` to cover them and censorship is deterministic, *within the tolerance
+/// the platform already grants it*; with `m = f + 1`, pigeonhole leaves at least one combiner outside `A` for
+/// every admissible `A`. So `m = f + 1` — on the Fano plane, 3, which is the number Tor picked by convention and
+/// here follows from the geometry.
+///
+/// **Distinct COMBINERS, not distinct lines**, and that is part of the derivation rather than a detail: two lines
+/// can share a combiner, and `f + 1` lines with `f` distinct combiners is the censored case again. The index walks
+/// until `f + 1` distinct combiner points are held, bounded by `n` because after `n` distinct combiners the whole
+/// plane is covered — a derived bound, not a retry constant. It can only terminate because the combiner map itself
+/// covers more than `f` points, which it did NOT before `ThresholdRouter::combiner_of` was spread: 14 of 57 on
+/// `PG(2,7)` against `f = 18` made `f + 1` distinct combiners literally unobtainable.
+///
+/// Both sides run this identical loop over a pure function of `(key, epoch, beacon)`, so a client and a host agree
+/// on the set with no coordination. Unlike Tor's service-*chosen* introduction points, these are a public function
+/// of the key and the beacon, so a client can verify it is dialing a legitimate meeting point without trusting the
+/// service to tell it.
+#[must_use]
+pub fn meeting_lines<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &BeaconSeed) -> Vec<Triple> {
+    let q = F::Q as usize;
+    let n = q * q + q + 1;
+    let m = (n - 1) / 3 + 1; // f + 1
+    let (mut lines, mut combiners) = (Vec::with_capacity(m), Vec::with_capacity(m));
+    for i in 0..n as u32 {
+        let mut data = Vec::with_capacity(service_pubkey.len() + 4);
+        data.extend_from_slice(service_pubkey);
+        data.extend_from_slice(&i.to_be_bytes());
+        let line = meeting_line::<F>(&data, epoch, beacon).coords();
+        let Some(combiner) = combiner_for::<F>(line) else { continue };
+        if combiners.contains(&combiner) {
+            continue;
+        }
+        combiners.push(combiner);
+        lines.push(line);
+        if lines.len() == m {
+            break;
+        }
+    }
+    lines
+}
+
 /// A directory of mixnet members' hybrid KEM public keys, keyed by overlay coordinate. Sealing an
 /// onion seals each hop to the coordinates of that line's members named here.
 #[derive(Clone, Default)]
@@ -620,6 +666,40 @@ mod tests {
         let fallback = HostRegister::bare(&fb_bundle, &fb_signer, Epoch::new(9), [7, 8, 9]);
         assert!(fallback.forward_circuit.is_empty(), "the bare fallback names no forward route");
         assert_eq!(HostRegister::decode(&fallback.encode()), Some(fallback));
+    }
+
+    #[test]
+    fn a_service_has_f_plus_one_meeting_points_with_distinct_combiners() {
+        use fanos_field::{F2, F7};
+        // THE PROPERTY: no adversary within the fault model can hold every meeting point of a service. `f` is the
+        // tolerance the platform already grants — `⌊(n − 1)/3⌋` — so `f + 1` distinct combiners leaves one honest
+        // by pigeonhole. Asserted on TWO planes, because the count must FOLLOW from the geometry rather than be a
+        // constant that happens to suit Fano — and that is not a hypothetical: enumerating a second plane is what
+        // exposed the combiner map covering only 14 of 57 points, which made `f + 1 = 19` unobtainable.
+        for q in [2usize, 7] {
+            let n = q * q + q + 1;
+            let want = (n - 1) / 3 + 1;
+            let lines = if q == 2 {
+                meeting_lines::<F2>(b"a-service-key", Epoch::new(4), &BeaconSeed::GENESIS)
+            } else {
+                meeting_lines::<F7>(b"a-service-key", Epoch::new(4), &BeaconSeed::GENESIS)
+            };
+            assert_eq!(lines.len(), want, "PG(2,{q}) tolerates f = {} faults, so a service needs {want} meeting \
+                 points", want - 1);
+            let combiners: std::collections::BTreeSet<Triple> = lines
+                .iter()
+                .filter_map(|&l| if q == 2 { combiner_for::<F2>(l) } else { combiner_for::<F7>(l) })
+                .collect();
+            assert_eq!(combiners.len(), want, "every meeting point must sit at a DIFFERENT combiner — two at one \
+                 combiner puts two of them in a single adversary's hands");
+        }
+
+        // A pure function of (key, epoch, beacon): a client and a host derive the same set with no coordination,
+        // and the set rotates so an adversary cannot camp the next epoch's meeting points in advance.
+        let a = meeting_lines::<F2>(b"svc", Epoch::new(4), &BeaconSeed::GENESIS);
+        assert_eq!(a, meeting_lines::<F2>(b"svc", Epoch::new(4), &BeaconSeed::GENESIS), "deterministic");
+        assert_ne!(a, meeting_lines::<F2>(b"svc", Epoch::new(5), &BeaconSeed::GENESIS), "rotates per epoch");
+        assert_ne!(a, meeting_lines::<F2>(b"other", Epoch::new(4), &BeaconSeed::GENESIS), "service-specific");
     }
 
     #[test]
