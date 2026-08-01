@@ -214,6 +214,46 @@ Until that interface exists, every claim about self-organization is a claim abou
 about a network organizing itself. **That is the acceptance criterion for this whole plane**, and it is stronger
 than "the counters exist".
 
+### 7.1 The wiring, worked out — it is one parameter, not a new subsystem
+
+The loop is already closed for two roles (§2.1), so what remains is narrow, and the codebase already shows the
+shape to use. `HealerNode::load_report` cannot see how many keys this node stores either — so it *takes them*:
+`OverlayNode` calls `self.healer.load_effect(self.store.entries.len())`. **The caller supplies what the healer
+cannot see.** The three missing roles are the same problem one layer out: they are carried by *sibling* engines
+in a composite (`CellNode` = overlay+beacon + `RendezvousRelay`; `MixRelay` = beacon + relay), which the healer
+has no view of and should not gain one.
+
+So: widen that parameter from a bare `held_shards: usize` to a small role-indexed reading, and let the composite
+fill it from the `Stations` its engines now own. No new channel, no new plumbing, and the layering holds —
+`fanos-runtime` never learns about `ThresholdRouter`, because the composite in `fanos-node` is the only place
+that can see both.
+
+The three sensors, each already recorded:
+
+| role | demand is | station |
+|---|---|---|
+| **rendezvous** | gathers this node armed for its lines, plus registrations bound | `GatherCompleted` + `GatherExpired` (armed = their sum) |
+| **service** | client sessions served | the session-accept counter `rendezvous_host` keeps |
+| **exit** | flows carried | the exit relay's per-window flow count |
+
+**Two traps to avoid, both of which this plane makes easy to fall into.**
+
+*Rate, not level.* `Relay` is already "relays carried since the last sample" — a rate — while `Storage` is a
+level ("keys held"). Both work because the controller steps each role toward *its own* setpoint and never
+compares across roles, but a new sensor must pick one deliberately and say which it is. Gathers are naturally a
+rate; sessions are naturally a level; mixing them inside one role's own history is what would break.
+
+*Do not report zero for idle.* `Node::start` substitutes the offer when a role reports `0` precisely because a
+demand of zero retires the role, and a retired role then carries nothing, which reports zero again — a
+self-latching failure. A real sensor must therefore distinguish **"measured zero"** from **"no sensor"**, which
+the current `[u16; 5]` cannot express. That is the one type change this work genuinely needs: an
+`Option<u16>` per role, or a parallel "measured" mask, so the fallback fires on *absence* rather than on
+*emptiness*.
+
+**Acceptance, falsifiable:** a sim scenario where demand for one role rises and the cell's assignment shifts
+toward it — and where disabling the new sensor leaves the assignment flat. Anything less is testing that the
+counter increments, which §7 already says is not the criterion.
+
 ---
 
 ## §8. What is derived, what is chosen, and what is unproven

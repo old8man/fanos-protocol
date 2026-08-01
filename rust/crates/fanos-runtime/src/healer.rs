@@ -428,8 +428,18 @@ impl Healer {
     /// Two roles have a real sensor and three do not, and the difference is kept visible rather than smoothed
     /// over. **Relay** is the count of relays this node carried since the last behavioural sample — a rate, and
     /// exactly the quantity the role exists to perform. **Storage** is the number of keys this node holds
-    /// shards for. The rest report `1` where the role is offered, which is what the whole vector used to be:
-    /// a measure of supply standing in for demand.
+    /// shards for. The rest report **`0`** — this function has no sensor for them — and `Node::start` turns a
+    /// zero into the node's own *offer*, because reporting a demand of zero would retire a role the moment it
+    /// went quiet. So for service, exit and rendezvous the setpoint is fed by supply standing in for demand.
+    ///
+    /// (This paragraph used to say "the rest report `1` where the role is offered", which described the
+    /// *combined* behaviour while appearing to describe this function. The substitution happens one layer up,
+    /// and saying so here is the difference between a reader finding the fallback and assuming it away.)
+    ///
+    /// Feeding the missing three is `docs/design-observability.md` §7: each is a station rate the data-path
+    /// plane now records — service = sessions served, exit = flows carried, rendezvous = gathers armed and
+    /// registrations bound — and they reach this function the same way `held_shards` does, from the caller
+    /// that can see them.
     ///
     /// Mixing a measured count with an offered one in a single vector is safe because the controller steps each
     /// role toward *its own* setpoint independently — no cross-role comparison is made — but it would be unsafe
