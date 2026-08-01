@@ -36,8 +36,18 @@ use tokio::time::Instant;
 /// cap, the least-recently-active session is evicted (its handler aborted) to admit a new one.
 pub(crate) const MAX_SESSIONS: usize = 1024;
 
-/// A session with no traffic for this long is evicted — its inbound channel closed and its handler task
-/// aborted — reclaiming a wedged or abandoned handler that never signals completion (audit A4).
+/// A session that has **accepted** no datagram for this long is evicted — its inbound channel closed and
+/// its handler task aborted — reclaiming a wedged or abandoned handler that never signals completion
+/// (audit A4).
+///
+/// "Accepted", not "seen": a session whose handler has stopped draining its bounded queue rejects every
+/// further datagram, so it ages out even while its peer keeps sending. Sweeping on arrival instead made
+/// this timer un-trippable by exactly the wedged sessions it exists to reclaim (see [`Session::last_active`]).
+///
+/// This is the **backstop**, not the primary bound. A peer that stops answering is now abandoned by the
+/// session driver itself (`fanos_session`'s RFC 1122 give-up rule), which ends the task and lets the
+/// ordinary reap path free the slot; this sweep covers what that cannot see — a handler wedged against a
+/// peer still sending.
 pub(crate) const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the accept loop sweeps for idle sessions to evict.
@@ -50,7 +60,33 @@ pub(crate) const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) struct Session {
     pub(crate) in_tx: Sender<Vec<u8>>,
     pub(crate) task: JoinHandle<()>,
+    /// When this session last **accepted** a datagram — not when one last arrived for it.
+    ///
+    /// The distinction is the whole point: it is refreshed only by [`Session::accept`], on a successful
+    /// `in_tx.try_send`, so a session whose handler has stopped draining its queue ages out even while
+    /// its peer keeps sending. Refreshing on arrival made the field measure *traffic*, which meant the
+    /// sweep could never fire on precisely the wedged sessions it exists to reclaim, and `evict_lru`
+    /// would sacrifice healthy sessions to keep them.
     pub(crate) last_active: Instant,
+}
+
+impl Session {
+    /// Offer `payload` to this session, returning whether it was taken.
+    ///
+    /// `try_send`, so a **full** queue drops the datagram (audit A4b — DIAULOS retransmits it) and a
+    /// **closed** one reports failure for the caller's reap checks. The idle timer is refreshed **only on
+    /// success**, which is what makes [`SESSION_IDLE_TIMEOUT`] a liveness bound rather than a traffic one.
+    ///
+    /// Both accept loops — Direct ([`serve`]) and anonymous
+    /// ([`crate::rendezvous_host::serve_anonymous`]) — go through here, so the invariant has one
+    /// definition instead of two copies free to drift apart.
+    pub(crate) fn accept(&mut self, payload: Vec<u8>) -> bool {
+        let taken = self.in_tx.try_send(payload).is_ok();
+        if taken {
+            self.last_active = Instant::now();
+        }
+        taken
+    }
 }
 
 /// Evict the least-recently-active session (called when a session map is at [`MAX_SESSIONS`]), aborting its
@@ -167,11 +203,7 @@ where
                             peers.insert(from, Session { in_tx, task, last_active: Instant::now() });
                         }
                         if let Some(session) = peers.get_mut(&from) {
-                            session.last_active = Instant::now();
-                            // try_send: drop this datagram if the session's bounded inbound queue
-                            // is full (audit A4b) — DIAULOS retransmits — or if it is closed (the
-                            // session is reaped by the is_closed() checks above).
-                            let _ = session.in_tx.try_send(payload);
+                            session.accept(payload);
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -591,6 +623,41 @@ mod tests {
             task,
             last_active: Instant::now() - age,
         }
+    }
+
+    #[tokio::test]
+    async fn a_wedged_session_ages_out_even_while_its_peer_keeps_sending() {
+        // The ghost-session sweep half. `last_active` must measure whether this session is still
+        // CONSUMING, not whether datagrams keep arriving for it: a handler that has stopped draining
+        // its bounded queue rejects everything further, and a timer refreshed by mere arrival could
+        // never trip on precisely the wedged sessions it exists to reclaim — worse, since `evict_lru`
+        // picks by the same field, the wedged one would look freshest and healthy sessions would be
+        // shed to keep it.
+        let (in_tx, in_rx) = channel::<Vec<u8>>(1); // capacity 1: one accepted, then wedged
+        let mut wedged = Session {
+            in_tx,
+            task: tokio::spawn(std::future::pending::<()>()),
+            last_active: Instant::now() - Duration::from_secs(3600),
+        };
+        // Nobody is draining `in_rx` — the wedged handler. The first datagram fits the queue and so is
+        // genuinely accepted, which must refresh the timer.
+        assert!(wedged.accept(b"first".to_vec()), "the empty queue takes one");
+        let refreshed = wedged.last_active;
+        assert!(
+            Instant::now().duration_since(refreshed) < SESSION_IDLE_TIMEOUT,
+            "an ACCEPTED datagram refreshes the idle timer"
+        );
+        // Now the queue is full. Every further datagram — a peer retransmitting forever, or an attacker
+        // deliberately holding the slot — is dropped, and must NOT refresh the timer.
+        for _ in 0..64 {
+            assert!(!wedged.accept(b"more".to_vec()), "a full queue takes nothing");
+        }
+        assert_eq!(
+            wedged.last_active, refreshed,
+            "a peer that only keeps SENDING cannot hold a wedged session's slot open — the timer moved \
+             only for the datagram that was actually taken"
+        );
+        drop(in_rx);
     }
 
     /// The cap-eviction victim is always the *least-recently-active* session — so a stalled/idle session

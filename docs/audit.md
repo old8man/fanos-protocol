@@ -2353,6 +2353,43 @@ completions converges to a quiet period's mean and an expiry yields no sample to
 * **The C ABI facade**: 13 functions, and no error channel at all — every failure is `NULL` or `-1`, so a caller
   cannot tell "no such name" from "not joined" from "out of memory".
 
+## §4b. Nothing ever gave up — the ghost session (found 2026-08-01, FIXED)
+
+Chasing #55's gather deadline surfaced a second, independent liveness defect in the same neighbourhood, and it
+had been there since the session layer was written: **no code path in the platform ever abandoned a peer.**
+`fanos_session::drive` returned only on `is_done()` or a closed transport, and a peer that has simply stopped
+answering satisfies neither — so a dropped client stream left *both* ends retransmitting at the tick cadence
+indefinitely, each holding a task, and on a service a session slot and a handler with it. `grep` for a give-up
+condition across `fanos-stream` and `fanos-diaulos` returned nothing at all.
+
+The host's idle sweep could not reclaim them, because it measured **traffic** rather than progress: it refreshed
+`last_active` on every inbound datagram, and a retransmit is an inbound datagram. The timer meant to trip on a
+dead session was being reset by that session's own death rattle — and since `evict_lru` picks by the same field,
+a wedged session looked *most recently active* and healthy ones were evicted in its place.
+
+**Both halves are now closed, and the bounds are derived rather than picked.**
+
+* **Established sessions** abandon a peer after `R2 = 15` unacknowledged retransmissions — RFC 1122 §4.2.3.5, and
+  exactly Linux's `tcp_retries2`. The statistic already existed: `StreamSender`'s per-sequence attempt map, kept
+  for retransmit jitter, is the R2 counter, so this reads state rather than adding it. Attempts and not
+  wall-clock, because the RTO backs off toward a ceiling expressed *relative* to the measured base RTO — so a
+  count of attempts already scales with the transport, while a duration constant would be the very defect the
+  measured gather deadline had just removed.
+* **Handshakes** are a *different* bound, and assuming otherwise would have caused a regression: a `ClientHello`
+  is resent every tick with no backoff, so 15 attempts is 3.75 s at the anonymous cadence — while the censorship
+  scenario deliberately grants each dial 12 s, because a dial that draws a silenced member legitimately loses
+  that round trip and self-heals on reseal. Reusing the count would have abandoned dials the system was in the
+  middle of recovering. The handshake bound is therefore RFC 1122's *other* figure — 3 minutes for a
+  connection-opening segment — scaled by the driver's own tick, 60× the granted per-dial patience.
+* **The sweep now refreshes on an accepted datagram, not an arriving one**, which reclaims the remaining case
+  (a wedged handler whose queue is full) with no new plumbing.
+
+**A test written against the first fix is what found the second.** The ghost test failed with the R2 rule in
+place, because a dial that never completes its handshake opens no stream and so accumulates no R2 at all — the
+most common ghost of all (dialling a service that is not there) was invisible to the fix aimed at ghosts.
+Falsification: with the give-up rule removed the session is still retransmitting past 60 s; with it, it ends in
+seconds, and a live-but-lossy peer completes untouched.
+
 ## §5. On method, because two of this cycle's hours went to it
 
 A test binary sat at 0.0 % CPU and the story — "the combiner change broke a peel" — fitted perfectly. It survived

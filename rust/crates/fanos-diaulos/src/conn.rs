@@ -131,6 +131,22 @@ impl Connection {
             .is_some_and(|s| s.sender.is_complete())
     }
 
+    /// The **worst `R2` count across every stream** on this connection — how many times the
+    /// most-retransmitted unacknowledged segment anywhere has been resent
+    /// ([`StreamSender::stalled_attempts`](fanos_stream::StreamSender::stalled_attempts)).
+    ///
+    /// The maximum, not the sum or the mean, because a connection is only as alive as its most-stuck
+    /// stream: one stream making progress does not make another's peer reachable, and a driver deciding
+    /// whether to abandon the connection must see the worst case rather than have it averaged away.
+    #[must_use]
+    pub fn stalled_attempts(&self) -> u32 {
+        self.streams
+            .values()
+            .map(|s| s.sender.stalled_attempts())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Whether `stream_id`'s receive side has the whole peer stream (FIN and all prior segments).
     #[must_use]
     pub fn receiver_finished(&self, stream_id: u32) -> bool {

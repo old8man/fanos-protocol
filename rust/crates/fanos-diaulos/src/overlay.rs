@@ -242,6 +242,17 @@ impl ClientSession {
             _ => false,
         }
     }
+
+    /// The connection's worst `R2` retransmit count ([`Connection::stalled_attempts`]) — how a driver
+    /// tells "the service is gone" from "the service is slow". Zero while still handshaking, where a
+    /// `ClientHello` is resent on its own schedule and no stream reliability state exists yet.
+    #[must_use]
+    pub fn stalled_attempts(&self) -> u32 {
+        match &self.state {
+            ClientState::Live { dialed } => dialed.conn.stalled_attempts(),
+            _ => 0,
+        }
+    }
 }
 
 /// The service half of one client's session: accept a dial and carry the session over the overlay
@@ -432,6 +443,13 @@ impl ServerSession {
         self.conn
             .as_ref()
             .is_some_and(|c| c.is_stream_done(stream_id))
+    }
+
+    /// The connection's worst `R2` retransmit count ([`Connection::stalled_attempts`]) — how a driver
+    /// tells "the client is gone" from "the client is slow". Zero before a client has been accepted.
+    #[must_use]
+    pub fn stalled_attempts(&self) -> u32 {
+        self.conn.as_ref().map_or(0, Connection::stalled_attempts)
     }
 }
 

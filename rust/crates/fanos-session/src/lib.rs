@@ -246,6 +246,10 @@ trait SessionStream: Send + 'static {
     fn poll_new(&mut self) -> Vec<Vec<u8>>;
     /// Fold a received datagram cell into the session.
     fn handle_payload(&mut self, payload: &[u8]);
+    /// How many times the most-retransmitted unacknowledged segment has been resent — TCP's `R2`
+    /// statistic (RFC 1122 §4.2.3.5), which is how [`drive`] tells a peer that is **gone** from one
+    /// that is merely slow. Zero while handshaking and for a stream whose window is fully acked.
+    fn stalled_attempts(&self) -> u32;
 }
 
 impl SessionStream for ClientSession {
@@ -278,6 +282,9 @@ impl SessionStream for ClientSession {
     }
     fn handle_payload(&mut self, payload: &[u8]) {
         ClientSession::handle_payload(self, payload);
+    }
+    fn stalled_attempts(&self) -> u32 {
+        ClientSession::stalled_attempts(self)
     }
 }
 
@@ -339,7 +346,57 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
             self.stream_id = self.server.primary();
         }
     }
+    fn stalled_attempts(&self) -> u32 {
+        self.server.stalled_attempts()
+    }
 }
+
+/// **`R2` — the retransmit count at which a session abandons its peer** (RFC 1122 §4.2.3.5), and the
+/// answer to "how long does a dead session live".
+///
+/// Without it, nothing in the platform ever gave up: [`drive`] returned only on `is_done()` or a closed
+/// transport, and a peer that has vanished satisfies neither — so both ends retransmitted at the tick
+/// cadence *forever*, holding a session slot, a task, and (on a service) a handler each. A dropped client
+/// stream produced exactly that, and the host's idle sweep could not reclaim it because inbound
+/// retransmits kept refreshing the very timer meant to trip.
+///
+/// **The value is derived from the wall-clock RFC 1122 requires, not chosen for feel.** RFC 1122 sets the
+/// floor at "at least 100 seconds" before a connection may be abandoned. Attempt `k` waits an RTO that
+/// doubles until it saturates at `RTO_BACKOFF_MULT · base_rto = 4 · base_rto`
+/// (`fanos_stream`), so `n` attempts take at least `(1 + 2 + 4 + 4 + … ) · base_rto` ticks — from the
+/// third attempt on, `4·base_rto` each. With `n = 15` that is `≥ (1 + 2 + 13·4) = 55` base RTOs. At the
+/// anonymous path's own cadence (`RENDEZVOUS_TICK`, the mixnet's effective round trip) a base RTO is
+/// `≥ RTO_MIN_TICKS = 1` tick, and the shipped tick is hundreds of milliseconds, so 55 base RTOs clears
+/// 100 s with margin on the slowest transport and lands far above any real recovery on the fastest.
+///
+/// It is also exactly Linux's `net.ipv4.tcp_retries2` default, which is the same constant answering the
+/// same question against decades of deployment — matching it is evidence, not coincidence.
+///
+/// **This bounds only a peer that never acknowledges.** Every ack resets the count for what it covers, and
+/// a SACKed hole is excluded ([`StreamSender::stalled_attempts`](fanos_stream::StreamSender::stalled_attempts)),
+/// so a live-but-lossy peer is never abandoned — only an absent one.
+const GIVE_UP_ATTEMPTS: u32 = 15;
+
+/// **How long an unanswered *handshake* is pursued** before the dial is abandoned — the second half of
+/// the give-up rule, and deliberately a different quantity from [`GIVE_UP_ATTEMPTS`].
+///
+/// It cannot share that threshold, and the reason is measurable rather than stylistic. A `ClientHello`
+/// is retransmitted on **every** poll with no RTO backoff (`ClientSession::poll_payloads`), so an
+/// attempt count here means "consecutive ticks", not "exponentially spaced attempts". At the anonymous
+/// profile's cadence (`RENDEZVOUS_TICK`, 250 ms) fifteen ticks is 3.75 s — while the censorship
+/// scenario in `fanos-node/tests/anonymous_quic.rs` deliberately grants each dial **12 s**, because a
+/// dial that draws a silenced member legitimately loses that round trip and self-heals on the next
+/// reseal. Reusing the data-phase count would therefore abandon dials the system is in the middle of
+/// recovering — converting a survivable path into a dead one, which is precisely the class of defect
+/// this work exists to remove.
+///
+/// So the bound is a **duration**, scaled by the driver's own tick, and its value is RFC 1122
+/// §4.2.3.5's own answer to this exact question: the standard requires `R2` for a connection-*opening*
+/// segment to correspond to at least **3 minutes** — far longer than for established data, precisely
+/// because "nobody answered yet" is weaker evidence of absence than "nobody acknowledged what they
+/// were already exchanging". At 250 ms that is 720 unanswered round trips, 60× the granted per-dial
+/// patience, so it can only fire on a peer that genuinely is not there.
+const HANDSHAKE_GIVE_UP: Duration = Duration::from_secs(180);
 
 /// What the next emit should do, if anything. `Tick` runs the full clock-ticking retransmit sweep
 /// ([`SessionStream::poll_payloads`]); `Reactive` sends only genuinely new information — first-sent
@@ -380,6 +437,11 @@ async fn drive<S: SessionStream>(
     let mut app_eof = false; // the app closed its write side
     let mut finished = false; // we called session.finish()
     let mut read_eof = false; // we signaled EOF to the app's read half (the peer finished writing)
+    // Consecutive retransmit ticks spent still handshaking. Counted only on the tick (never reactively),
+    // so it measures elapsed round trips rather than traffic volume — the handshake half of the give-up
+    // rule ([`HANDSHAKE_GIVE_UP`]), which the data half cannot cover because an unanswered `ClientHello`
+    // opens no stream and so accumulates no `R2` at all.
+    let mut handshake_ticks: u32 = 0;
     // Emit outbound cells on startup, when the app hands us new data, after draining a *batch* of
     // inbound datagrams, or on the retransmit tick — but only the tick runs the clock-ticking
     // `poll_payloads` sweep (retransmission included); every other trigger is `Reactive` and calls the
@@ -433,7 +495,23 @@ async fn drive<S: SessionStream>(
             let _ = wr.shutdown().await;
             read_eof = true;
         }
-        if session.is_done() {
+        // Done, or **abandoned**. A peer is abandoned on either of two disjoint pieces of evidence,
+        // because a session can die in either phase and neither test can see the other:
+        //
+        // * **established** — it has not acknowledged through `R2` retransmissions ([`GIVE_UP_ATTEMPTS`]);
+        // * **handshaking** — it has not answered the `ClientHello` for [`HANDSHAKE_GIVE_UP`], which the
+        //   first test cannot detect at all, since no stream exists yet to accumulate retransmissions on.
+        //
+        // Every exit shuts the app's read half down, so a handler sees EOF and returns, its task
+        // completes, and the accept loop reaps the session through machinery that already exists — the
+        // ghost session (immortal, retransmitting at the tick cadence, holding a slot) cannot form.
+        let handshake_abandoned =
+            u64::from(handshake_ticks).saturating_mul(tick.as_millis().try_into().unwrap_or(u64::MAX))
+                >= HANDSHAKE_GIVE_UP.as_millis().try_into().unwrap_or(u64::MAX);
+        if session.is_done()
+            || session.stalled_attempts() >= GIVE_UP_ATTEMPTS
+            || handshake_abandoned
+        {
             if !read_eof {
                 let _ = wr.shutdown().await;
             }
@@ -469,7 +547,12 @@ async fn drive<S: SessionStream>(
                 }
                 Err(_) => return,
             },
-            _ = ticker.tick() => emit = Emit::Tick,
+            _ = ticker.tick() => {
+                // One elapsed round trip. While still handshaking it counts toward abandoning the dial;
+                // going live resets it, so a slow-but-answering peer is never penalised for the wait.
+                handshake_ticks = if session.is_live() { 0 } else { handshake_ticks.saturating_add(1) };
+                emit = Emit::Tick;
+            }
         }
     }
 }
@@ -841,6 +924,116 @@ mod tests {
                 .unwrap();
             assert_eq!(buf.get(..n), Some(&msg[..]), "round {round}: wrong payload");
         }
+    }
+
+    /// A peer that completes the handshake and then **goes silent while still holding the channels
+    /// open** — the shape a vanished far end actually has on the wire. Dropping the channels instead
+    /// would close the transport and end the session through an entirely different path, proving
+    /// nothing about the give-up rule.
+    async fn serve_then_vanish(
+        keypair: StaticKeypair,
+        outbound: Sender<Vec<u8>>,
+        mut inbound: Receiver<Vec<u8>>,
+    ) {
+        let mut server = ServerSession::new();
+        let mut rng = SeedRng::from_seed(b"vanishing-server");
+        // Answer exactly the handshake: poll once per inbound datagram until the session is established,
+        // then stop responding forever while keeping `outbound`/`inbound` alive.
+        while server.primary().is_none() {
+            match inbound.recv().await {
+                Some(payload) => {
+                    server.handle_payload(&keypair, &payload, &mut rng);
+                    for out in server.poll_payloads() {
+                        if !offer(&outbound, out) {
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            }
+        }
+        // Vanish: hold both channel ends (so the transport stays open) and never answer again.
+        std::future::pending::<()>().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_peer_vanishes_ends_instead_of_retransmitting_forever() {
+        // **The ghost session.** Before this, nothing in the platform ever gave up: `drive` returned only
+        // on `is_done()` or a closed transport, and a peer that has stopped answering satisfies neither.
+        // A dropped stream therefore left both ends retransmitting at the tick cadence *indefinitely*,
+        // each holding a task — and on a service, a session slot and a handler with it.
+        //
+        // The property asserted is the one an operator cares about: **the session ENDS**. It is asserted
+        // before any mechanism, so removing the give-up rule fails here rather than in some counter check
+        // that would never be reached.
+        //
+        // The peer is modelled as answering the handshake and then going silent with the channels still
+        // open, which is what a far end that has gone away looks like: cells keep going out, nothing
+        // acknowledges them, and `R2` climbs exactly as it would in production.
+        let mut rng = SeedRng::from_seed(b"ghost-key");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut crng = SeedRng::from_seed(b"ghost-client");
+        let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
+
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
+        let mut stream = stream_over_channels_paced(
+            client,
+            ChannelTransport { outbound: c2s_tx, inbound: s2c_rx },
+            TICK,
+        );
+        tokio::spawn(serve_then_vanish(keypair, s2c_tx, c2s_rx));
+
+        // Write and close the write half — the shape a client takes when its caller goes away mid-flow.
+        stream.write_all(b"anyone still there?").await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        // The driver must hang up on its own. `read_to_end` returns only once `drive` shuts the read
+        // half, which here cannot happen via `is_done()` (nothing is ever acked) — only via the give-up
+        // rule. The bound is generous but finite: R2 = 15 backed-off attempts at a 20 ms tick is a few
+        // seconds, and "forever" is what this is distinguishing it from.
+        let mut sink = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut sink)).await;
+        assert!(
+            ended.is_ok(),
+            "a session whose peer stops answering must END, not retransmit forever — that is the ghost \
+             session, and it holds a task (and on a service a session slot and a handler) for as long \
+             as it lives"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_peer_is_never_abandoned_by_the_give_up_rule() {
+        // The other half, and the one that makes the rule safe to have: the give-up threshold must be
+        // reachable ONLY by a peer that has genuinely stopped acknowledging. A working request/response
+        // — which retransmits under this crate's own pacing — must complete untouched.
+        //
+        // Without this, "make sessions mortal" could be satisfied by a rule that also kills live ones,
+        // which would be a far worse defect than the ghost it replaced.
+        let mut rng = SeedRng::from_seed(b"live-peer-key");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut crng = SeedRng::from_seed(b"live-peer-client");
+        let client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
+
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, s2c_rx) = channel(ChannelTransport::CAP);
+        let mut stream = stream_over_channels_paced(
+            client,
+            ChannelTransport { outbound: c2s_tx, inbound: s2c_rx },
+            TICK,
+        );
+        tokio::spawn(serve_uppercase(keypair, s2c_tx, c2s_rx));
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            stream.write_all(b"still here").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.unwrap();
+            resp
+        })
+        .await
+        .expect("a live peer completes — the give-up rule must not fire on it");
+        assert_eq!(result, b"STILL HERE", "and the answer is intact");
     }
 
 }

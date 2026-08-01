@@ -573,6 +573,34 @@ impl StreamSender {
     pub fn is_complete(&self) -> bool {
         self.finished && self.acked >= self.total()
     }
+
+    /// **How many times the most-retransmitted unacknowledged segment has been resent** — TCP's `R2`
+    /// statistic (RFC 1122 §4.2.3.5), the input to deciding that a peer is gone rather than slow.
+    ///
+    /// This reads bookkeeping the sender already keeps for retransmit jitter ([`jitter_ticks`]); it adds
+    /// no state. It is a *statistic*, not a policy: what counts as "too many" belongs to the layer that
+    /// owns the connection, and lives in `fanos_session`.
+    ///
+    /// **Why attempts and not elapsed time.** The RTO backs off ×2 toward a ceiling expressed *relative*
+    /// to the measured base RTO ([`RTO_BACKOFF_MULT`]), so `n` attempts already denote a duration scaled
+    /// to this transport's own measured RTT. Counting attempts therefore adapts wherever the estimator
+    /// adapts, while a wall-clock give-up constant would be right on one transport and wrong on the next
+    /// — the same defect the measured gather deadline removed elsewhere in the platform.
+    ///
+    /// Zero while nothing is in flight, and zero for a segment that has only ever been sent once — so a
+    /// quiet, fully-acked stream never trips a caller's threshold.
+    #[must_use]
+    pub fn stalled_attempts(&self) -> u32 {
+        // Only sequences still unacknowledged count: `retransmitted` is pruned to `>= acked` on every
+        // ack, but a SACKed hole inside the window is acknowledged without being reclaimed, and holding
+        // *its* attempt count against the peer would abandon a connection that is demonstrably alive.
+        self.retransmitted
+            .iter()
+            .filter(|(seq, _)| **seq >= self.acked && !self.sacked.contains(seq))
+            .map(|(_, &attempts)| attempts)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// The receiver half: buffers in-window out-of-order segments, releases the in-order prefix on
@@ -728,6 +756,50 @@ mod tests {
     use super::*;
 
     // ---- RTT/RTO estimator + retransmit scheduling (audit F4-RTO) ----
+
+    #[test]
+    fn a_peer_that_never_acks_accumulates_r2_while_a_lossy_one_does_not() {
+        // `stalled_attempts` is the input to the give-up rule that stops a session retransmitting at
+        // the tick cadence forever (`fanos_session::GIVE_UP_ATTEMPTS`, RFC 1122 §4.2.3.5's R2). It has
+        // to separate the two cases that look alike on the wire: a peer that is GONE, and one that is
+        // merely LOSSY. Only the first may ever be abandoned.
+        let payload: Vec<u8> = (0..4 * MAX_SEGMENT as u32).map(|i| i as u8).collect();
+
+        // Nothing sent yet, and a freshly-sent window: no retransmissions, so nothing is stalled.
+        let mut silent = StreamSender::new(0, &payload).with_window(8);
+        assert_eq!(silent.stalled_attempts(), 0, "an unsent stream is not stalled");
+        let sent: BTreeSet<u32> = silent.outbound().iter().map(|s| s.seq).collect();
+        assert!(!sent.is_empty(), "the first sweep sends the window");
+        assert_eq!(silent.stalled_attempts(), 0, "a first send is not a retransmission");
+
+        // A peer that never acks: sweep the clock and the count climbs without bound, which is exactly
+        // the "gone" signal — and the only reason a session may ever abandon its peer.
+        for _ in 0..RTO_MAX_TICKS {
+            let _ = silent.outbound();
+        }
+        assert!(
+            silent.stalled_attempts() >= 3,
+            "a peer that never acks accumulates retransmissions: {}",
+            silent.stalled_attempts()
+        );
+
+        // A peer that IS answering, just imperfectly: it acks everything sent so far. The count must
+        // fall back to zero — abandoning this peer would be abandoning a live connection, the failure
+        // this statistic exists to avoid.
+        let mut lossy = StreamSender::new(0, &payload).with_window(8);
+        let first: Vec<u32> = lossy.outbound().iter().map(|s| s.seq).collect();
+        for _ in 0..RTO_MAX_TICKS {
+            let _ = lossy.outbound();
+        }
+        assert!(lossy.stalled_attempts() > 0, "it did retransmit while unacked");
+        let top = first.iter().copied().max().unwrap_or(0);
+        lossy.on_ack(Ack { cumulative: top + 1, sack: 0, rwnd: SACK_WIDTH });
+        assert_eq!(
+            lossy.stalled_attempts(),
+            0,
+            "an ack clears the stall — a lossy but LIVE peer must never be abandoned"
+        );
+    }
 
     #[test]
     fn an_in_flight_segment_is_not_resent_before_its_rto() {

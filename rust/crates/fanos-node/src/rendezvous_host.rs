@@ -196,11 +196,7 @@ pub fn serve_anonymous<R, H, Fut>(
                             sessions.insert(cookie, Session { in_tx, task, last_active: Instant::now() });
                         }
                         if let Some(session) = sessions.get_mut(&cookie) {
-                            session.last_active = Instant::now();
-                            // try_send: drop this datagram if the session's bounded inbound queue is
-                            // full (audit A4b) — DIAULOS retransmits — or if it is closed (reaped by
-                            // the is_closed() checks above).
-                            let _ = session.in_tx.try_send(inner);
+                            session.accept(inner);
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
