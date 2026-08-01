@@ -252,9 +252,49 @@ them requires controlling a growing fraction of the plane rather than a fixed fe
 with 3 introduction points chosen by the service; FANOS gets a *verifiable* spread instead of a chosen one, because
 the lines are a public function of the key and the beacon.
 
-`m` is not a free constant: it should be derived from the plane's fault tolerance so that surviving `f` adversarial
-nodes requires the same margin the rest of the platform assumes. That derivation is part of the task, not assumed
-here.
+### 6.1 `m = f + 1`, derived and proven
+
+`m` is not a free constant and it is now settled. Model the censor as the fault model already does: an adversary
+holds a set `A` of points with `|A| = f`, where `f = ⌊(n − 1)/3⌋` — the same tolerance every other bound here
+assumes. A service is censored exactly when every one of its meeting **combiners** lies in `A`. With `m ≤ f`
+distinct combiners the adversary picks `A` to cover them and censorship is deterministic *within the budget the
+platform already grants it*; with `m = f + 1`, pigeonhole leaves one combiner outside `A` for every admissible `A`.
+
+So **`m = f + 1`** — on the Fano plane, 3, which is the number Tor picked by convention and here follows from the
+geometry. Distinct *combiners*, not distinct lines: two lines can share one, and `f + 1` lines with `f` distinct
+combiners is the censored case again.
+
+Implemented as `fanos_rendezvous::meeting_lines`, with a two-plane test. That test is also what found the defect
+underneath: the combiner map used to cover only 14 of 57 points on `PG(2,7)` against `f = 18`, which made `f + 1`
+distinct combiners *unobtainable* — and a Fano-only test would have stayed green at 4 combiners and shipped it.
+
+### 6.2 The consequence: the at-combiner mode cannot survive `m > 1`
+
+Wiring `m` surfaced a structural incompatibility rather than a bug. **A service that is its own combiner sits at
+`combiner_for(meeting)` — one point.** With `m` meeting points a client may pick any of them, and one node cannot
+occupy `m` combiners. So `m = f + 1` and the at-combiner mode cannot both hold, and no amount of test rewriting
+changes that.
+
+Three ways out, and the costs are what decide it:
+
+* **(a) Hosting becomes mandatory.** Every service registers a forward route at all `m` (the §3b path, authenticated
+  by the identity binding). The at-combiner shortcut is deleted. Costs registration traffic ×`(f + 1)` — 3 on Fano,
+  19 on `PG(2,7)` — and every service runs the host driver.
+* **(b) The client walks the points**, trying one and moving on. But a censoring combiner black-holes rather than
+  refuses, so "failure" is a timeout — the one signal the adversary controls — and a dial under censorship costs
+  `m` round trips.
+* **(c) `m` applies only to hosted services**, leaving at-combiner services with their single point of censorship —
+  which puts the weakest mode in the path an operator reaches for first.
+
+**(a) is chosen.** The at-combiner mode is a test-and-demo convenience that already cannot survive a real plane: it
+needs the service to land by luck on one of only four Fano combiners, and its coordinate is then the very thing the
+substrate exists to hide. Option (b) hands the adversary the failure signal, which is the wrong direction on
+principle. The registration cost is real and bounded, and §5's replica set already needs a host driver.
+
+Whatever the path, the proof required is the same and is not yet written: a scenario where the combiner at meeting
+point 0 silently drops everything and the client still reaches the service through another, falsified by collapsing
+`m` to 1 and confirming the dial fails. Without it a green suite shows only that dialing works, not that
+censorship is survived.
 
 ---
 
