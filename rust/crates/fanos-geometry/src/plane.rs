@@ -308,6 +308,96 @@ mod tests {
 
     use super::*;
 
+    /// Every `k`-subset of `items`, as index vectors — a tiny combinations helper for the exhaustive
+    /// searches below (no `itertools` in this `no_std` leaf).
+    fn subsets(n: usize, k: usize) -> Vec<Vec<usize>> {
+        // Recursive rather than the usual index-bumping loop: this crate denies panicking indexing even in
+        // tests, and the loop form is written entirely in `idx[i]`. Recursion expresses the same
+        // enumeration with no indexing at all, which is the honest way to satisfy the lint rather than
+        // silencing it — a combinations helper that can panic is a test that can lie about why it failed.
+        fn go(start: usize, n: usize, k: usize, acc: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+            if k == 0 {
+                out.push(acc.clone());
+                return;
+            }
+            // Stop once too few elements remain to complete a k-subset.
+            for i in start..=n.saturating_sub(k) {
+                acc.push(i);
+                go(i + 1, n, k - 1, acc, out);
+                acc.pop();
+            }
+        }
+        let mut out = Vec::new();
+        go(0, n, k, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// **The censorship bound of `docs/design-hidden-service-hardening.md` §6.1c, mechanised.**
+    ///
+    /// A hosted service is reachable through `m` meeting *lines*, and a line stops serving when
+    /// `need = q + 2 − t` of its `q + 1` members are dead (the threshold peel needs `t`). So censoring the
+    /// service means killing `need` members on **every** one of the `m` lines at once — and the security
+    /// claim is that this costs strictly more than the `f` nodes an adversary is allowed, with `m = f + 1`.
+    ///
+    /// Asserted as **"no set of size ≤ f suffices"** rather than by computing the exact minimum, because
+    /// that is precisely the security statement and it is far cheaper to check: the search is over every
+    /// choice of `m` lines × every subset of at most `f` points.
+    ///
+    /// **This replaces an argument that ran backwards.** The design doc originally reasoned that pairwise
+    /// intersections make the kills "mostly disjoint"; they make them **shared** — a node lying on two
+    /// meeting lines fills a kill-slot on both, which is a discount for the *adversary*. The corrected
+    /// derivation brackets the cost between the concurrent case (`1 + m(q+1−t)`) and general position
+    /// (`⌈m(q+2−t)/2⌉`), and general position is the cheaper attack. The bound survives for every `q` with
+    /// `t ≤ q`, which the shipped `t = ⌈2(q+1)/3⌉` guarantees — but the margin is **one node** on Fano,
+    /// which the original asymptotic had hidden.
+    fn no_kill_set_within_budget_censors_a_service<F: Field>(t: u32, f: usize) {
+        let q = F::Q;
+        assert!(t <= q, "the threshold formula must satisfy t <= q, or the bound does not hold at all");
+        let need = (q + 2 - t) as usize;
+        let m = f + 1;
+
+        let points: Vec<Triple> = Plane::<F>::points().map(|p| p.coords()).collect();
+        let lines: Vec<Vec<Triple>> = Plane::<F>::lines()
+            .map(|l| Plane::<F>::points_on(l).map(|p| p.coords()).collect())
+            .collect();
+
+        // Every choice of `m` meeting lines the service could derive.
+        for meeting in subsets(lines.len(), m) {
+            // Every kill-set the adversary can afford, including the degenerate empty one.
+            for size in 0..=f {
+                for kill in subsets(points.len(), size) {
+                    let dead: Vec<Triple> = kill.iter().filter_map(|&i| points.get(i).copied()).collect();
+                    let censored = meeting.iter().all(|&li| {
+                        lines.get(li).is_some_and(|line| {
+                            line.iter().filter(|p| dead.contains(p)).count() >= need
+                        })
+                    });
+                    assert!(
+                        !censored,
+                        "q={q}: {size} nodes censored a service on {m} meeting lines — the f+1 spread \
+                         does not hold, and a budget-{f} adversary can silence a hidden service"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_budget_f_adversary_cannot_censor_a_service_on_fano() {
+        // The shipped plane, and the TIGHTEST case the family admits: q=2, t=2, need=2, m=3. Exhaustive
+        // search (Python, `scratchpad/censor.py`) puts the true minimum kill-set at 3 against a budget of
+        // 2 — a margin of exactly one node. That thinness is why this is worth mechanising rather than
+        // arguing: any future change to `t` moves it, and `t <= q` is the assertion that catches it.
+        no_kill_set_within_budget_censors_a_service::<F2>(2, 2);
+    }
+
+    #[test]
+    fn a_budget_f_adversary_cannot_censor_a_service_on_pg_2_4() {
+        // A second, larger plane, because a Fano-only check is exactly how the combiner-concentration
+        // defect (`a7c7699`) shipped: q=4 gives t = ceil(2*5/3) = 4, need = 2, and the same m = 3.
+        no_kill_set_within_budget_censors_a_service::<F4>(4, 2);
+    }
+
     /// Brute-force reference: the points on a line are those `p` with `p · L = 0`, found by
     /// scanning the whole plane. The fast `points_on` must reproduce this set exactly.
     fn brute_force_points_on<F: Field>(line: Line<F>) -> Vec<Triple> {

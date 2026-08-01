@@ -383,9 +383,20 @@ The measurement matches the general-position branch on both planes, which is the
 confirms the *cheaper* branch is the one that binds, and so confirms the correction above rather than the
 sketch it replaced.
 
-Status: the Fano case is proven end-to-end by the scenario test; the algebra is derived and exhaustively
-checked at `q = 2, 3`; carrying the search into the reference suite as a Rust test (and extending it to
-`PG(2,7)`, where the search space needs a smarter minimum-cover than brute force) remains open.
+**Now mechanised in the reference suite.** `fanos-geometry`'s `plane.rs` carries the search as two tests —
+Fano and `PG(2,4)` — asserting the security statement directly rather than the exact minimum: **no kill-set of
+size ≤ f censors a service**, over *every* choice of `m` meeting lines and *every* affordable kill-set. That
+formulation is both the claim and the cheap one to check, since it needs no minimisation. It also asserts
+`t ≤ q` up front, which is the condition the whole bound rests on.
+
+Falsified by raising `t` to `q + 1` on Fano, so one dead node kills a line: the test fails, a budget-2
+adversary censors. `PG(2,4)` is included because a Fano-only check is exactly how the combiner-concentration
+defect (`a7c7699`) shipped.
+
+Status: the Fano case is also proven end-to-end by the scenario test over real QUIC; the algebra is derived
+and exhaustively checked at `q = 2, 3, 4`. Extending the *exact-minimum* search to `PG(2,7)` needs a smarter
+minimum-cover than brute force and remains open — but the security property, which is what matters, is
+mechanised on two planes.
 
 ### 6.2 The consequence: the at-combiner mode cannot survive `m > 1`
 
