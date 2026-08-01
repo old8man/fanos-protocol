@@ -96,8 +96,15 @@ pub fn ingress_line<F: Field>(community: &[u8], epoch: Epoch, beacon: &BeaconSee
     meeting_line::<F>(community, epoch, beacon)
 }
 
-/// The **combiner** of the [`ingress_line`] — the canonical member a new node contacts, and where the
-/// threshold hosts gather to serve. `None` only on a degenerate plane offering no combiner.
+/// The **canonical** combiner of the [`ingress_line`] — a pure function of the line alone. `None` only on
+/// a degenerate plane offering no combiner.
+///
+/// **This is the canonical case, not the address a requester should dial**: use [`ingress_walk`]. Every
+/// member of an ingress line can serve a request (see [`PorosHost::on_request`], which has no
+/// is-canonical check), so sending every requester here would make one node the single point of failure
+/// for a whole community's admission — the same defect #55 removed from every mixnet hop. It is kept for
+/// derivations that need the line's canonical point, mirroring `combiner_for` against
+/// `combiner_for_salted`.
 #[must_use]
 pub fn ingress_combiner<F: Field>(
     community: &[u8],
@@ -105,6 +112,64 @@ pub fn ingress_combiner<F: Field>(
     beacon: &BeaconSeed,
 ) -> Option<Triple> {
     combiner_for::<F>(ingress_line::<F>(community, epoch, beacon).coords())
+}
+
+/// The ingress line's members in the order **this requester** should try them — a per-requester
+/// permutation, deterministic and public.
+///
+/// **Why a walk here, where the mixnet gets a single salted pick.** Both fix the same defect (one
+/// canonical addressee where only a canonical *set* was required), but the two settings differ in what
+/// the requester can observe. A mixnet hop's failure is invisible — a censoring combiner black-holes
+/// rather than refuses, so the sender cannot tell a dead pick from a slow one and must not be asked to
+/// walk; it re-draws per onion instead, and retransmission does the spreading. POROS admission is a
+/// **direct dial**: a refusal or a timeout is observable by the requester, so it can try the next member
+/// itself. Walking is therefore strictly better here — one timeout costs a dead first choice rather than
+/// the whole admission, and a requester is denied only when the *entire line* refuses it, which is the
+/// property the Sybil gate is entitled to assume.
+///
+/// **Why keyed by the requester.** There is no onion to salt with, but the requester's coordinate is
+/// already present and already non-transferable — [`admission_challenge`] binds the PoW to it — so
+/// keying the permutation with it costs nothing and spreads distinct requesters over distinct first
+/// choices. Folding `(community, epoch, beacon)` in too means the order rotates with the line itself, so
+/// no member is durably "the front door" for anyone.
+///
+/// Deterministic and public: every party derives the same order without coordinating, the simulator
+/// reproduces it, and it discloses nothing the requester's own coordinate does not already disclose.
+#[must_use]
+pub fn ingress_walk<F: Field>(
+    community: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    requester: Triple,
+) -> Vec<Triple> {
+    let mut members =
+        fanos_rendezvous::line_member_coords::<F>(ingress_line::<F>(community, epoch, beacon).coords());
+    // Fisher–Yates over a domain-separated XOF keyed by (community, epoch, beacon, requester). Eight
+    // bytes per swap, reduced over `u64`: the same width argument as the mixnet's salted pick — reducing
+    // a single byte mod `i + 1` biases the low indices by `(256 mod (i+1))/256`, which is 12.9 % at
+    // `q = 32` and grows with the plane, and a systematically-favoured first choice is exactly the node
+    // an adversary would silence. Over `u64` the bias is `≈ (i+1)·2⁻⁶⁴`.
+    let mut key = Vec::with_capacity(community.len() + 8 + 32 + TRIPLE_WIRE_LEN);
+    key.extend_from_slice(community);
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key.extend_from_slice(beacon.as_bytes());
+    key.extend_from_slice(&encode_triple(requester));
+    let mut stream = alloc_zeroed_swaps(members.len());
+    fanos_primitives::hash::hash_xof(INGRESS_WALK_LABEL, &key, &mut stream);
+    for i in (1..members.len()).rev() {
+        let chunk = stream.get(i * 8..i * 8 + 8).and_then(|b| b.try_into().ok()).unwrap_or([0u8; 8]);
+        let j = (u64::from_be_bytes(chunk) % (i as u64 + 1)) as usize;
+        members.swap(i, j);
+    }
+    members
+}
+
+/// Domain separator for the [`ingress_walk`] permutation.
+const INGRESS_WALK_LABEL: &str = "FANOS-v1/poros-ingress-walk";
+
+/// A zeroed byte buffer sized for one 8-byte draw per Fisher–Yates swap.
+fn alloc_zeroed_swaps(members: usize) -> Vec<u8> {
+    vec![0u8; members.saturating_mul(8)]
 }
 
 /// The admission proof-of-work challenge — bound to `(community, epoch, beacon, requester)`. Folding
@@ -920,6 +985,55 @@ mod tests {
         // A different community rendezvouses differently (the community-secret enumeration-resistance input).
         let other: BTreeSet<_> = (1..=8).map(|e| at(b"other-community", e)).collect();
         assert_ne!(lines, other, "distinct communities have distinct ingress rotations");
+    }
+
+    #[test]
+    fn the_ingress_walk_spreads_requesters_over_the_whole_line() {
+        // The admission SPOF. Every member of an ingress line can serve a request — `on_request` has no
+        // is-canonical check — so addressing every requester at `ingress_combiner` would have made one
+        // node the single point of failure for a whole community's admission, which is exactly the
+        // defect #55 removed from every mixnet hop.
+        use std::collections::BTreeSet;
+        let beacon = BeaconSeed::new([0x9e; 32]);
+        let (community, epoch) = (b"walkers".as_slice(), Epoch::new(5));
+        let line = ingress_line::<F2>(community, epoch, &beacon).coords();
+        let members: BTreeSet<Triple> =
+            fanos_rendezvous::line_member_coords::<F2>(line).into_iter().collect();
+        let requester = |i: u32| -> Triple { [i + 1, 0, 1] };
+
+        let mut first_choices = BTreeSet::new();
+        for i in 0..64u32 {
+            let walk = ingress_walk::<F2>(community, epoch, &beacon, requester(i));
+            // **Completeness is the availability property**: a requester is denied only when the WHOLE
+            // line refuses, so the walk must reach every member — and exactly once, or a dead member
+            // would be retried while a live one went untried.
+            assert_eq!(
+                walk.iter().copied().collect::<BTreeSet<_>>(),
+                members,
+                "a walk is a permutation of the line's members — every member reachable, none twice"
+            );
+            assert_eq!(walk.len(), members.len(), "no duplicates");
+            first_choices.insert(walk[0]);
+        }
+        // The spread itself: distinct requesters must not share one front door.
+        assert!(
+            first_choices.len() >= 2,
+            "64 requesters must not all start at the same member — a constant first choice IS the \
+             single point of failure this replaces: {first_choices:?}"
+        );
+
+        // Deterministic (both sides derive it without coordinating), and keyed by the requester.
+        assert_eq!(
+            ingress_walk::<F2>(community, epoch, &beacon, requester(7)),
+            ingress_walk::<F2>(community, epoch, &beacon, requester(7)),
+            "same inputs, same order — the host and the requester agree without a round trip"
+        );
+        // And it rotates with the line: the same requester gets a different order next epoch, so no
+        // member is durably anyone's front door.
+        let rotated: BTreeSet<Vec<Triple>> = (1..12u64)
+            .map(|e| ingress_walk::<F2>(community, Epoch::new(e), &beacon, requester(7)))
+            .collect();
+        assert!(rotated.len() > 1, "the walk order rotates across epochs");
     }
 
     #[test]
