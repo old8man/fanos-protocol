@@ -79,6 +79,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # **wasm32 alone is not a sufficient no_std gate, and this job used to be exactly that.** wasm has
+      # native `f64.ceil`/`f64.nearest` instructions, so a `no_std` crate calling the inherent `f64::ceil`
+      # compiles for wasm32 while failing on every float-less target (Cortex-M, RISC-V) that a `libm`
+      # feature exists to serve. `fanos-diakrisis` shipped exactly that defect: three inherent-method calls
+      # that its own `mathfns` shim was written to prevent, invisible here for as long as wasm was the
+      # only target checked. So the same crates are ALSO checked with `cargo check` on the host toolchain,
+      # where those methods genuinely do not exist without `std` — a strictly stricter gate, and cheap.
+      - name: Check the no_std core on the host target (no wasm float intrinsics to hide behind)
+        run: |
+          cargo check -p fanos-diakrisis --no-default-features --features libm
+          cargo check -p fanos-diakrisis --no-default-features --features "alloc libm"
+          cargo check -p fanos-telemetry --no-default-features --features "alloc libm"
+          cargo check -p fanos-ports     --no-default-features --features "alloc libm"
+          cargo check -p fanos-nyx       --no-default-features --features "alloc libm"
+          cargo check -p fanos-runtime   --no-default-features --features "alloc libm"
       # Every line below is verified to build for wasm32 with exactly these features. `fanos-runtime` needs
       # `alloc` as well as `libm`: its overlay engine is heapful (the erasure/DA modules it imports from
       # fanos-code are `alloc`-gated), which is the embedded build its own manifest documents.

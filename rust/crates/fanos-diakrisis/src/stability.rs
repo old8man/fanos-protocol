@@ -226,7 +226,7 @@ pub fn admission_bits(base_bits: u32, stress: f64) -> u32 {
         MAX_ADMISSION_BITS
     } else {
         // Round up: a fractional bit of demanded work is a bit the attacker does not have to do.
-        raised.ceil() as u32
+        crate::mathfns::ceil(raised) as u32
     }
 }
 
@@ -271,7 +271,7 @@ pub fn read_fanout(n: usize, k: usize, margin: usize, stress: f64) -> usize {
     }
     let spread = n.saturating_sub(floor);
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let extra = ((spread as f64) * (1.0 - stress)).round() as usize;
+    let extra = crate::mathfns::round((spread as f64) * (1.0 - stress)) as usize;
     floor.saturating_add(extra).min(n)
 }
 
@@ -329,7 +329,7 @@ impl AdmissionController {
         if raised >= f64::from(MAX_ADMISSION_BITS) {
             MAX_ADMISSION_BITS
         } else {
-            raised.ceil() as u32
+            crate::mathfns::ceil(raised) as u32
         }
     }
 

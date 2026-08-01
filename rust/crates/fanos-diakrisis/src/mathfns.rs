@@ -64,6 +64,46 @@ pub(crate) fn ln(x: f64) -> f64 {
     }
 }
 
+/// Round toward `+∞`, dispatched like [`sqrt`].
+///
+/// Needed wherever a real-valued bound becomes a whole number of *things* — rounds, epochs, hops — and the
+/// direction is the safety argument: a bound that says "at least `x`" must become `⌈x⌉`, since `⌊x⌋` would
+/// silently under-provision the very margin the derivation computed.
+#[inline]
+#[must_use]
+pub(crate) fn ceil(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.ceil()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::ceil(x)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-diakrisis on no_std requires the `libm` feature for ceil")
+    }
+}
+
+/// Round to the nearest integer (halfway away from zero), dispatched like [`sqrt`].
+#[inline]
+#[must_use]
+pub(crate) fn round(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.round()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::round(x)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-diakrisis on no_std requires the `libm` feature for round")
+    }
+}
+
 /// `base^exp` for a non-negative integer exponent, by square-and-multiply. Pure
 /// multiplication, so it needs no math backend (works identically on `std` and `no_std`).
 #[inline]
