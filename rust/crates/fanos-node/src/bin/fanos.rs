@@ -276,10 +276,13 @@ const NO_CHAIN: &str = "this role runs no chain — start `fanos validator` to r
 ///
 /// Short on purpose: the probe is a local channel round trip, so anything approaching this bound *is* the finding.
 ///
-/// Gated like its only use (`cmd_validator`): without the feature there is no driver to probe, and an ungated
-/// constant is dead code the moment this crate is linted ALONE — `cargo clippy --workspace` unifies the feature
-/// on from another member and never sees it, which is exactly why per-crate verification is the stricter gate.
-#[cfg(feature = "validator")]
+/// It used to be gated to `validator`, its only use, with the note that an ungated constant is dead code the
+/// moment this crate is linted ALONE. `stations` is a second use and is not feature-gated — every role has a
+/// control socket — so the gate came off with the reason for it.
+///
+/// One bound for both because they are the same shape of question: a round trip to something that may be the
+/// very thing that is stuck. Awaiting either unbounded would hang the control loop on the wedge the operator is
+/// asking about, taking `shutdown` down with it. The timeout is what turns "not answering" into an answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bind this invocation's control socket, so an operator can ask a **running** role anything.
@@ -384,6 +387,34 @@ async fn serve_control<N: Controllable>(
     }
 }
 
+/// Await the data-path plane's answer to an `Observe` this caller just issued, or say why there is none.
+///
+/// Drains until a [`Notification::DataPath`] arrives, because `Observe` also raises the coherence observation
+/// and the two share the stream. `Lagged` is retried rather than treated as failure: the drop is of *other*
+/// notifications, and the one being waited for may still be ahead.
+async fn read_data_path(notes: &mut tokio::sync::broadcast::Receiver<Notification>) -> String {
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, notes.recv()).await {
+            Ok(Ok(Notification::DataPath { stations, gather })) => {
+                return fanos_node::admin::render_data_path(&stations, gather);
+            }
+            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return "the node is shutting down\n".to_owned();
+            }
+            Err(_) => {
+                // Two different worlds, and the operator needs to tell them apart: an engine that never stepped
+                // the command, and a node composed with no data-path engine at all (no relay, no POROS host),
+                // which has no counters to report and is not faulty for it.
+                return "no answer within the probe timeout: either this node runs no data-path engine \
+                        (no relay, no POROS host) or its engine is not stepping\n"
+                    .to_owned();
+            }
+        }
+    }
+}
+
 /// Answer one control request. `consensus` is the only verb a role answers differently, so it arrives already
 /// rendered — a role with a ledger passes its probe, a role without passes [`NO_CHAIN`].
 fn answer_control<N: Controllable>(
@@ -400,6 +431,29 @@ fn answer_control<N: Controllable>(
         Request::Roles => node.roles_line(),
         Request::Consensus => consensus.to_owned(),
         Request::Shutdown => "shutting down\n".to_owned(),
+        Request::Stations => {
+            // Answered off the loop, for the same reason as `census` and by the same shape: it round-trips a
+            // command through the engine, and serving it inline would stop this node driving that engine while
+            // it waits for its own answer.
+            //
+            // The wait is **bounded**, like the consensus probe. A node whose engine is not stepping is exactly
+            // the node an operator asks this of, and an unbounded await would hang on it — turning the verb
+            // that should report the wedge into another casualty of it. The timeout makes "the engine is not
+            // answering" an answer.
+            let (client, _) = node.census_source();
+            tokio::spawn(async move {
+                let mut notes = client.subscribe();
+                // Subscribe *before* issuing, or the answer can land in the gap between the two.
+                let asked = client.command(fanos_node::Command::Observe);
+                let body = if asked {
+                    read_data_path(&mut notes).await
+                } else {
+                    "the engine is not accepting commands\n".to_owned()
+                };
+                let _ = reply.send(body);
+            });
+            return Control::Go;
+        }
         Request::Census => {
             // Answered off the loop. A census reads every cell coordinate out of the overlay store, so serving it
             // inline would stop this node driving its own engine for the duration — an operator's question is not
@@ -1389,7 +1443,12 @@ fn manager_reload(manager: fanos_node::setup::ServiceManager) -> Vec<String> {
     }
 }
 
-/// `fanos status [--config FILE]`: report what this host is set up to be, and whether it is running.
+/// `fanos status [VERB] [--config FILE] [--data DIR]`: report what this host is set up to be, and whether it is
+/// running.
+///
+/// `VERB` is any control-socket verb (`Request::all()`), defaulting to `health`. It is what makes the rest of
+/// that surface reachable: the socket has served `census`, `consensus` and `stations` with no way to ask them
+/// short of `socat`.
 ///
 /// Deliberately answerable **without** contacting the node: the first question an operator has is "did my setup
 /// take", and a status command that can only answer by connecting cannot distinguish "not configured" from
@@ -1397,6 +1456,19 @@ fn manager_reload(manager: fanos_node::setup::ServiceManager) -> Vec<String> {
 async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     let paths = fanos_node::setup::Paths::detect();
     let config_path = flag(args, "--config").map_or(paths.config.clone(), PathBuf::from);
+
+    // Which question to ask the running node. `health` by default — the one an operator asks first — but the
+    // control socket serves six verbs and the shipped CLI could reach exactly one of them, so `census`,
+    // `consensus` and `stations` were features that required `socat` to invoke. A verb that ships behind a tool
+    // nobody has is a verb that does not ship.
+    //
+    // Validated here rather than round-tripped, so a typo gets the whole list back instead of an unhelpful
+    // answer from a node that is working fine.
+    let verb = positional(args).unwrap_or("health");
+    if fanos_node::admin::Request::parse(verb).is_none() {
+        println!("unknown verb `{verb}` — try one of: {}", fanos_node::admin::Request::all());
+        return Ok(());
+    }
 
     if !config_path.exists() {
         println!("not set up — no configuration at {}", config_path.display());
@@ -1435,11 +1507,17 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     // sees — how many peers it has, whose claims it verified, which point it actually sits on. Falling back to
     // the port is deliberate rather than lazy: a node built before this socket existed, or one that could not
     // bind it, must still report as running rather than as missing.
-    let socket = fanos_node::admin::socket_path(&paths.data);
-    let live = fanos_node::admin::ask(&socket, "health").await.unwrap_or(None);
+    // `data_dir_for`, not `paths.data`: the helper honours `--data` and its own doc says it exists "so
+    // `fanos status` finds the socket of a node started by the service unit" — and `fanos status` was the one
+    // caller that did not use it. So `fanos node --data X` bound its socket under X while `fanos status
+    // --data X` looked under the platform default, and the answer was "running, but not answering its control
+    // socket (an older build)" — a sentence that blames the node for the asker's arithmetic. Found by running
+    // one against a node whose state was somewhere else.
+    let socket = fanos_node::admin::socket_path(&data_dir_for(args));
+    let live = fanos_node::admin::ask(&socket, verb).await.unwrap_or(None);
     if let Some(body) = live {
         println!("daemon        : running");
-        println!("\n--- as the node itself reports ---");
+        println!("\n--- as the node itself reports ({verb}) ---");
         print!("{body}");
     } else {
         let bindable = std::net::UdpSocket::bind(config.listen).is_ok();
@@ -2146,6 +2224,22 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// The first **positional** argument: one that neither starts with `-` nor is a flag's value.
+///
+/// The second half is what a bare `!a.starts_with('-')` scan misses, and it does not fail loudly — [`flag`]
+/// takes the *next* argument as its value, so `status --config /etc/fanos.conf` offers that path as a
+/// positional and a command reading one gets a file path where it expected a verb. Written the naive way and
+/// caught by running it.
+fn positional(args: &[String]) -> Option<&str> {
+    args.iter()
+        .enumerate()
+        .find(|&(i, a)| {
+            !a.starts_with('-')
+                && !i.checked_sub(1).and_then(|p| args.get(p)).is_some_and(|p| p.starts_with('-'))
+        })
+        .map(|(_, a)| a.as_str())
+}
+
 /// The values following every occurrence of `name` (repeatable flags).
 fn flag_all<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
@@ -2174,7 +2268,9 @@ fn print_help() {
                        [--bootstrap x:y:z@host:port,…] [--telemetry EPSILON]\n\
                        (detect this OS, pick a free port, generate an identity, write the config,\n\
                         install a service and start it — `--yes` takes every default, for provisioning)\n\
-           fanos status                     — what this host is set up as, and whether it is running\n\
+           fanos status [VERB]              — what this host is set up as, and whether it is running\n\
+           \x20                                 VERB asks a running node directly: health (default), roles,\n\
+           \x20                                 stations (where work is stopping), census, consensus\n\
            fanos start | stop | restart     — drive the installed service\n\
            fanos uninstall [--purge] [--yes]\n\
                        (remove the service; --purge also deletes config, identity and state — the\n\

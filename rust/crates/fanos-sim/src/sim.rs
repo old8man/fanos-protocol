@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
+use fanos_runtime::ports::stations::GatherHealth;
 use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification, TimerToken, Triple};
 use fanos_wire::decode_frame;
 
@@ -77,12 +78,15 @@ fn note_desc(note: &Notification) -> String {
                     None => format!("{}={}", o.station.name(), o.count),
                 })
                 .collect();
-            let clock = gather.map_or_else(
-                || "gather=unmeasured".to_owned(),
-                |(srtt, var)| {
-                    format!("gather srtt={}ms var={}ms", srtt.as_nanos() / 1_000_000, var.as_nanos() / 1_000_000)
-                },
-            );
+            let clock = match gather {
+                GatherHealth::Measured { srtt, var } => format!(
+                    "gather srtt={}ms var={}ms",
+                    srtt.as_nanos() / 1_000_000,
+                    var.as_nanos() / 1_000_000
+                ),
+                GatherHealth::Unmeasured => "gather=unmeasured".to_owned(),
+                GatherHealth::NoGatherPath => "gather=n/a".to_owned(),
+            };
             format!("DataPath [{}] {clock}", hit.join(" "))
         }
         // Rendered as `-` for a role with no sensor and the number for one with a reading, because `Some(0)`

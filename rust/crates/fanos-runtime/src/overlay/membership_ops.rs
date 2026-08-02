@@ -9,6 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::ports::stations::Station;
 use fanos_core::PowAdmission;
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple};
@@ -72,6 +73,10 @@ impl<F: Field> OverlayNode<F> {
         // coordinates (spec §7.8 membership). The hierarchical address was already validated by
         // `parse_announce` (canonical points, bounded depth), so a forged one is dropped before here.
         let Some(coord) = Point::<F>::new(coord).map(|p| p.coords()) else {
+            // Unattributed by construction: the coordinate is not a point of this plane, so there is no line to
+            // charge it to, and inventing one would put fabricated evidence against a line into the plane built
+            // to end diagnosis on thin evidence.
+            self.stations.record(Station::FrameDecodeFailed, None);
             return Vec::new();
         };
         // Sybil admission (opt-in, spec §L3, §7.8 JOIN step 2): the FIRST gate, ahead of
@@ -94,6 +99,7 @@ impl<F: Field> OverlayNode<F> {
                 // number is, for that peer, an unexplained permanent refusal. Telling them costs nothing they
                 // could not learn by trying again, which is the same argument that makes the adaptive price safe
                 // to expose at all.
+                self.stations.record(Station::AdmissionPowFailed, Some(coord));
                 let required = self.membership.required_difficulty();
                 return alloc::vec![Effect::Send {
                     to: coord,
@@ -121,6 +127,10 @@ impl<F: Field> OverlayNode<F> {
             && (!fanos_primitives::address_matches_identity_from::<F>(&id, &hier, min_level)
                 || !descriptor_signature_ok::<F>(coord, &hier, &id, &sig))
         {
+            // The sharpest of the three and the one that was silent: an address that is not the identity's own
+            // descent chain is a routing-table poisoning attempt, and a descriptor that does not sign this
+            // transport coordinate is a transport hijack. Both simply vanished.
+            self.stations.record(Station::AdmissionIdentityUnbound, Some(coord));
             return Vec::new();
         }
         // First sight only. A repeat must NOT overwrite the stored key bundle — otherwise any peer

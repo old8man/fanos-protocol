@@ -26,7 +26,7 @@ pub mod stations;
 pub use fanos_geometry::Triple;
 pub use fanos_primitives::Epoch;
 pub use gather::GatherClock;
-pub use stations::{Observation, Station, Stations};
+pub use stations::{GatherHealth, Observation, Station, Stations};
 
 /// A monotonic instant in nanoseconds since the run's origin. Virtual — never the wall clock.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]
@@ -313,10 +313,9 @@ pub enum Notification {
     DataPath {
         /// Station counts keyed by `(station, line)` — bounded by the geometry, not by attacker-chosen labels.
         stations: Vec<Observation>,
-        /// The measured gather deadline's `(srtt, var)`; `None` until a gather has completed. An engine still
-        /// reporting `None` after minutes of traffic is running on the initial estimate, which is the
-        /// difference between "the deadline is wrong" and "the deadline was never measured".
-        gather: Option<(Duration, Duration)>,
+        /// The gather path's health — including whether this engine **has** one, which an `Option` could not
+        /// say without meaning two things at once. See [`stations::GatherHealth`].
+        gather: GatherHealth,
     },
     /// **`None` means "this role has no sensor", which is not the same as a measured zero** — and the type
     /// says so, because the prose alone did not. This doc used to promise that an unmeasured role was

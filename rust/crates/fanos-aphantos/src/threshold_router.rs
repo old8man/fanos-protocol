@@ -30,7 +30,7 @@ use fanos_primitives::shamir::Share;
 use fanos_ports::{
     Command, Duration, Effect, Engine, GatherClock, Input, Instant, Notification, TimerToken,
 };
-use fanos_ports::stations::{Observation, Station, Stations};
+use fanos_ports::stations::{GatherHealth, Observation, Station, Stations};
 
 use crate::threshold_onion::{self as threshold, ThresholdPeel};
 
@@ -851,7 +851,7 @@ impl<F: Field> Engine for ThresholdRouter<F> {
             // composite that routes `Observe` here exports them without knowing what they are.
             Input::Command(Command::Observe) => alloc::vec![Effect::Notify(Notification::DataPath {
                 stations: self.stations.observations(),
-                gather: self.gather_health().0.map(|srtt| (srtt, self.gather_health().1)),
+                gather: GatherHealth::of(&self.gather),
             })],
             Input::Command(_) => Vec::new(),
         }

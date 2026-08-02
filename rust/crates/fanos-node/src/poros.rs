@@ -59,7 +59,7 @@ use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
 use fanos_runtime::ports::GatherClock;
-use fanos_runtime::ports::stations::{Observation, Station, Stations};
+use fanos_runtime::ports::stations::{GatherHealth, Observation, Station, Stations};
 use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
@@ -938,7 +938,7 @@ impl Engine for PorosHost {
             // them directly rather than a driver reaching into an engine (`docs/design-observability.md` §4.1).
             Input::Command(Command::Observe) => vec![Effect::Notify(Notification::DataPath {
                 stations: self.stations.observations(),
-                gather: self.gather.srtt().map(|srtt| (srtt, self.gather.var())),
+                gather: GatherHealth::of(&self.gather),
             })],
             Input::Command(_) => Vec::new(),
         }

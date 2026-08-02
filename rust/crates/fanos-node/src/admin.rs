@@ -24,11 +24,14 @@
 //! as often a person with `socat` as it is this binary, and a format a human can read without a tool is a format
 //! that gets used when something is wrong.
 
+use core::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
+
+use fanos_runtime::ports::stations::{GatherHealth, Observation};
 
 use crate::node::Health;
 
@@ -100,6 +103,22 @@ pub enum Request {
     /// be read — from a test harness. The operator of a stuck validator is exactly who needs them, and was exactly
     /// who could not get them. A role that runs no chain answers so rather than inventing a reading.
     Consensus,
+    /// **The data-path plane** — where work is stopping, and how healthy the gather path is.
+    ///
+    /// The station counters and the measured gather deadline (`docs/design-observability.md` §4.1). Every one
+    /// of these was computed and thrown away: #55 was localized by hand-inserting eight `eprintln!` probes and
+    /// eliminating eleven candidate causes one at a time, while the two facts that actually solved it — every
+    /// circuit through a point dead, gathers expiring at `1` of `t = 2` by the hundreds — were sitting in the
+    /// process's own control flow and nothing recorded them. This is the verb that reads them from a running
+    /// node, which is exactly the position that could not.
+    ///
+    /// It is also the **first production caller of `Command::Observe`**. The sense-only read had existed with
+    /// only the simulator issuing it, so the whole passive-observation path — the coherence frame included —
+    /// was exercised nowhere a deployed node runs.
+    ///
+    /// Answered off the loop, like `census`: it round-trips a command through the engine, and an operator's
+    /// question is not worth pausing the node it is about.
+    Stations,
     /// Ask the node to shut down cleanly.
     Shutdown,
 }
@@ -114,6 +133,7 @@ impl Request {
             "roles" => Some(Self::Roles),
             "census" => Some(Self::Census),
             "consensus" => Some(Self::Consensus),
+            "stations" => Some(Self::Stations),
             "shutdown" => Some(Self::Shutdown),
             _ => None,
         }
@@ -122,7 +142,7 @@ impl Request {
     /// Every verb, for the error message a wrong one gets.
     #[must_use]
     pub const fn all() -> &'static str {
-        "ping | health | roles | census | consensus | shutdown"
+        "ping | health | roles | census | consensus | stations | shutdown"
     }
 }
 
@@ -160,6 +180,59 @@ pub fn render_health(health: &Health) -> String {
     }
     let _ = writeln!(s, "roles_offered: {:?}", health.roles);
     s
+}
+
+/// Render the data-path plane as the socket's response body.
+///
+/// One station per line, **only where the count is non-zero**: a node reports `stations × lines` counters and
+/// printing them all at zero buries the two that moved, which is the diagnosis-by-thin-evidence this plane
+/// exists to end rather than reproduce. A wholly quiet plane says so in words, because an empty response and a
+/// broken verb look identical.
+///
+/// Lines are named by coordinate where the site knew one. An unattributed count is printed as such rather than
+/// folded into a bucket: a frame that failed to parse has no readable line, and inventing one would put
+/// fabricated evidence against a line into the plane built to end exactly that.
+#[must_use]
+pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> String {
+    let mut out = String::new();
+    let mut moved = 0usize;
+    for o in stations.iter().filter(|o| o.count > 0) {
+        moved += 1;
+        match o.line {
+            Some([x, y, z]) => {
+                let _ = writeln!(out, "{:<24} line {x}:{y}:{z}  {}", o.station.name(), o.count);
+            }
+            None => {
+                let _ = writeln!(out, "{:<24} unattributed   {}", o.station.name(), o.count);
+            }
+        }
+    }
+    if moved == 0 {
+        out.push_str("no station has fired: nothing has been discarded, expired or refused\n");
+    }
+    match gather {
+        // Milliseconds: the deadline lives in the 1 ms .. 10 s band its bounds define, and nanoseconds there
+        // are six digits of noise in front of the one an operator reads.
+        GatherHealth::Measured { srtt, var } => {
+            let _ = writeln!(
+                out,
+                "gather_deadline          srtt {} ms  var {} ms",
+                srtt.as_nanos() / 1_000_000,
+                var.as_nanos() / 1_000_000
+            );
+        }
+        // A finding, not a shrug: there is a gather path and nothing has completed on it, so the engine is
+        // running on its initial estimate rather than on anything it observed.
+        GatherHealth::Unmeasured => {
+            out.push_str("gather_deadline          unmeasured — no gather has completed\n");
+        }
+        // Not a finding at all, and printed differently for that reason: this engine has no threshold gather,
+        // so there is no deadline to be right or wrong about.
+        GatherHealth::NoGatherPath => {
+            out.push_str("gather_deadline          n/a — this node runs no threshold gather\n");
+        }
+    }
+    out
 }
 
 /// Serve one connection: read a verb, forward it, write the answer.
@@ -266,17 +339,102 @@ pub async fn ask(path: &Path, request: &str) -> std::io::Result<Option<String>> 
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use fanos_runtime::ports::Duration;
+    use fanos_runtime::ports::stations::Station;
 
     #[test]
     fn every_documented_verb_parses_and_nothing_else_does() {
-        for word in ["ping", "health", "roles", "census", "shutdown"] {
-            assert!(Request::parse(word).is_some(), "`{word}` is documented but does not parse");
-            assert!(Request::all().contains(word), "`{word}` parses but is not in the help string");
+        // Derived from the help string rather than a hand-written list. The literal it used to iterate had
+        // already drifted — `consensus` was documented, parsed, and silently unchecked — because a list that
+        // must be edited alongside two other places gets edited in two.
+        for word in Request::all().split('|').map(str::trim) {
+            assert!(Request::parse(word).is_some(), "`{word}` is offered in help but does not parse");
         }
         assert!(Request::parse("PING").is_some(), "verbs are case-insensitive");
         assert!(Request::parse(" health \n").is_some(), "a line from a socket carries its newline");
         assert!(Request::parse("reconfigure").is_none(), "an unknown verb must not be silently accepted");
         assert!(Request::parse("").is_none());
+    }
+
+    #[test]
+    fn every_variant_is_reachable_over_the_socket() {
+        // The direction the help string cannot give: a verb the enum has and the parser does not is a feature
+        // nobody can invoke. The `match` is exhaustive, so a new variant does not compile until someone states
+        // its word here — which is the only check that survives someone forgetting this file exists.
+        let every = [
+            Request::Ping,
+            Request::Health,
+            Request::Roles,
+            Request::Census,
+            Request::Consensus,
+            Request::Stations,
+            Request::Shutdown,
+        ];
+        for request in &every {
+            let word = match request {
+                Request::Ping => "ping",
+                Request::Health => "health",
+                Request::Roles => "roles",
+                Request::Census => "census",
+                Request::Consensus => "consensus",
+                Request::Stations => "stations",
+                Request::Shutdown => "shutdown",
+            };
+            assert!(Request::all().contains(word), "`{word}` is a variant but is not offered in help");
+            let parsed = Request::parse(word).expect("a variant's own word must parse");
+            assert_eq!(
+                core::mem::discriminant(&parsed),
+                core::mem::discriminant(request),
+                "`{word}` parses to a different verb than the one it names"
+            );
+        }
+        assert_eq!(
+            Request::all().split('|').count(),
+            every.len(),
+            "the help string and the variant list disagree on how many verbs there are"
+        );
+    }
+
+    #[test]
+    fn the_data_path_render_shows_what_moved_and_says_when_nothing_did() {
+        // A node reports `stations × lines` counters. Printing them all buries the two that moved, which is the
+        // diagnosis-by-thin-evidence the plane exists to end rather than reproduce — so only non-zero counts
+        // appear, and a quiet plane says so in words, because an empty body and a broken verb look identical.
+        let quiet = render_data_path(&[], GatherHealth::Unmeasured);
+        assert!(quiet.contains("no station has fired"), "silence must be stated, not implied: {quiet}");
+        assert!(
+            quiet.contains("unmeasured"),
+            "an unmeasured deadline is not a fast one — the engine is on its initial estimate: {quiet}"
+        );
+
+        // And the third state, which an `Option` could not carry: a node with no gather at all must not be told
+        // its deadline is unmeasured, or every overlay-only node reports a finding it cannot act on.
+        let no_gather = render_data_path(&[], GatherHealth::NoGatherPath);
+        assert!(no_gather.contains("n/a"), "no gather path is not an unmeasured one: {no_gather}");
+        assert!(
+            !no_gather.contains("unmeasured"),
+            "an engine with no gather must not report an unmeasured deadline: {no_gather}"
+        );
+
+        let obs = [
+            Observation { station: Station::GatherExpired, line: Some([1, 0, 1]), count: 412 },
+            Observation { station: Station::GatherCompleted, line: Some([1, 0, 1]), count: 0 },
+            Observation { station: Station::FrameDecodeFailed, line: None, count: 7 },
+        ];
+        let body = render_data_path(
+            &obs,
+            GatherHealth::Measured { srtt: Duration::from_millis(180), var: Duration::from_millis(40) },
+        );
+        assert!(body.contains("412") && body.contains("line 1:0:1"), "a hot station names its line: {body}");
+        assert!(body.contains("unattributed"), "an unattributable count says so, not a fabricated line: {body}");
+        // Via `name()`, not a literal. Written as `"gather_completed"` this assertion could never fail — the
+        // names are dotted — so the filter it exists to pin was unguarded, and the falsification pass that
+        // removed the filter passed clean.
+        assert!(
+            !body.contains(Station::GatherCompleted.name()),
+            "a station that never fired is not printed: {body}"
+        );
+        assert!(body.contains("srtt 180 ms") && body.contains("var 40 ms"), "the measured deadline: {body}");
     }
 
     #[test]

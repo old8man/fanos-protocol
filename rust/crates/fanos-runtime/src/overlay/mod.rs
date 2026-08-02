@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
+use crate::ports::stations::{GatherHealth, Stations};
 use fanos_core::roles::{self, Role, RoleReading};
 use fanos_core::{AdaptivePowAdmission, AdmissionPolicy, LiveDifficulty, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
@@ -324,6 +325,13 @@ pub struct OverlayNode<F: Field> {
     /// The current epoch, driven by the flooded beacon (adopt-max, spec §L3). Epoch-derived
     /// rendezvous/shapes rotate as it advances.
     epoch: Epoch,
+    /// The **data-path plane's** counters for this engine (`docs/design-observability.md`): where an
+    /// announcement stopped, counted by structure.
+    ///
+    /// The threshold engines had these and an ordinary overlay node had none, so `fanos status stations` could
+    /// only ever time out on the most common deployment there is — and two of the three refusals below returned
+    /// a bare `Vec::new()`, which is the invisible discard this plane exists to end.
+    stations: Stations,
     /// Per-role load readings pushed in from **outside this engine** — the sensors for roles the overlay itself
     /// cannot see (docs/design-observability.md §7).
     ///
@@ -439,6 +447,7 @@ impl<F: Field> OverlayNode<F> {
             grey_reported: None,
             store: Store::default(),
             epoch: Epoch::ZERO,
+            stations: Stations::new(),
             load_sensors: RoleReading::blind(),
         }
     }
@@ -905,16 +914,26 @@ impl<F: Field> OverlayNode<F> {
     /// running the verdict or any healing — the passive monitor read (docs/design-telemetry.md §4). The
     /// facade senses the cell's liveness; the [`Healer`] folds it into the observation frame.
     fn on_observe(&mut self, now: Instant) -> Vec<Effect> {
-        match self.cell_liveness(now) {
-            Some((_, degraded, alive_count)) => alloc::vec![self.healer.emit_observation(
+        // The data-path plane goes out **unconditionally**, unlike the coherence observation, which needs a
+        // liveness view it may not have yet. A node too young or too alone to compute `Γ_net` is exactly the one
+        // an operator asks where the work is stopping, and answering nothing there would make the verb useless
+        // in the case it exists for.
+        let mut out = alloc::vec![Effect::Notify(Notification::DataPath {
+            stations: self.stations.observations(),
+            // Stated, not implied: the overlay runs no threshold gather, which is different from having one
+            // that has never completed, and only a variant can carry that.
+            gather: GatherHealth::NoGatherPath,
+        })];
+        if let Some((_, degraded, alive_count)) = self.cell_liveness(now) {
+            out.push(self.healer.emit_observation(
                 now,
                 self.epoch,
                 alive_count,
                 degraded,
                 self.config.healthy_correlation,
-            )],
-            None => Vec::new(),
+            ));
         }
+        out
     }
 
     /// This node's OWN direct-observation liveness fresh-mask (bit `k` ⇔ it has heard Fano point `k` within

@@ -54,6 +54,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::Duration;
 use fanos_geometry::Triple;
 
 /// A place where the data path **decided not to continue** — the code's own discard sites, named by what
@@ -166,6 +167,71 @@ impl Station {
             Self::AdmissionNoCapacity => "admission.no_capacity",
         }
     }
+}
+
+/// The health of an engine's threshold-gather path, with **"there is no gather here"** kept distinct from
+/// **"no gather has ever completed"**.
+///
+/// Written as an `Option<(srtt, var)>` these collapse, and they are not the same fact. An overlay node runs no
+/// threshold gather, so reporting it as unmeasured tells its operator about a deadline the engine does not have.
+/// A relay reporting unmeasured after minutes of traffic is a finding: it is running on the initial estimate
+/// rather than on anything it observed, which is the difference between "the deadline is wrong" and "the
+/// deadline was never measured". This is the same conflation `Notification::LoadReport` carried between a
+/// measured zero and an absent sensor, and it is worth a variant for the same reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GatherHealth {
+    /// This engine has no threshold gather — nothing to report, and not a fault.
+    #[default]
+    NoGatherPath,
+    /// There is a gather path and no gather has completed, so the deadline is still the initial estimate.
+    Unmeasured,
+    /// The measured deadline: RFC 6298's smoothed estimate and its variation.
+    Measured {
+        /// Smoothed round-trip estimate over completed gathers.
+        srtt: Duration,
+        /// Mean deviation of that estimate.
+        var: Duration,
+    },
+}
+
+impl GatherHealth {
+    /// The more informative of two readings: a real gather path outranks
+    /// [`NoGatherPath`](Self::NoGatherPath), which says only that *this* engine has none.
+    ///
+    /// Used where a composite folds several engines' answers into the one plane a node reports. Taking the
+    /// first would let an overlay's `NoGatherPath` mask the relay's measured deadline sitting beside it.
+    #[must_use]
+    pub const fn or(self, other: Self) -> Self {
+        match self {
+            Self::NoGatherPath => other,
+            _ => self,
+        }
+    }
+
+    /// The health a clock reports: [`Measured`](Self::Measured) once a gather has completed, else
+    /// [`Unmeasured`](Self::Unmeasured). For an engine that has no gather at all, use
+    /// [`NoGatherPath`](Self::NoGatherPath) directly — a clock cannot say that about itself.
+    #[must_use]
+    pub const fn of(clock: &crate::GatherClock) -> Self {
+        match clock.srtt() {
+            Some(srtt) => Self::Measured { srtt, var: clock.var() },
+            None => Self::Unmeasured,
+        }
+    }
+}
+
+/// Combine two engines' observation lists, summing counts that share a `(station, line)` key.
+///
+/// A composite node runs several data-path engines and must answer with **one** plane, not one per engine: a
+/// reader that takes the first notification it sees would silently drop the rest, and which one arrives first
+/// is an artifact of how the composite happens to order its delegation.
+#[must_use]
+pub fn merge_observations(parts: impl IntoIterator<Item = Observation>) -> Vec<Observation> {
+    let mut totals: BTreeMap<(Station, Option<Triple>), u64> = BTreeMap::new();
+    for o in parts {
+        *totals.entry((o.station, o.line)).or_insert(0) += o.count;
+    }
+    totals.into_iter().map(|((station, line), count)| Observation { station, line, count }).collect()
 }
 
 /// One `(station, line) → count` observation.

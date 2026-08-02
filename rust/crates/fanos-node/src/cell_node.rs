@@ -35,6 +35,7 @@
 //! back to `0`), every other token → the router.
 
 use fanos_core::roles::Role;
+use fanos_runtime::ports::stations::{GatherHealth, merge_observations};
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_pqcrypto::kem::HybridKemPublic;
@@ -156,6 +157,45 @@ impl<F: Field> CellNode<F> {
     }
 }
 
+/// Fold every `DataPath` notification in `effects` into a single one, in place of the first.
+///
+/// **One node, one data-path plane.** Both halves of this composite own counters, so a bare concatenation emits
+/// two notifications and any reader that takes the first — the admin socket does — silently drops the other,
+/// with which one wins decided by the order this file happens to delegate in. Reported together, the counts sum
+/// and the gather health is the more informative of the two, so the overlay's "no gather here" cannot mask the
+/// router's measured deadline sitting beside it.
+fn fold_data_path(effects: Vec<Effect>) -> Vec<Effect> {
+    let planes = effects
+        .iter()
+        .filter(|e| matches!(e, Effect::Notify(Notification::DataPath { .. })))
+        .count();
+    if planes < 2 {
+        return effects;
+    }
+    let mut stations = Vec::new();
+    let mut gather = GatherHealth::NoGatherPath;
+    for effect in &effects {
+        if let Effect::Notify(Notification::DataPath { stations: s, gather: g }) = effect {
+            stations.extend(s.iter().copied());
+            gather = gather.or(*g);
+        }
+    }
+    let merged =
+        Effect::Notify(Notification::DataPath { stations: merge_observations(stations), gather });
+    let mut seen = false;
+    effects
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Notify(Notification::DataPath { .. }) if seen => None,
+            Effect::Notify(Notification::DataPath { .. }) => {
+                seen = true;
+                Some(merged.clone())
+            }
+            other => Some(other),
+        })
+        .collect()
+}
+
 impl<F: Field> Engine for CellNode<F> {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         match input {
@@ -216,7 +256,7 @@ impl<F: Field> Engine for CellNode<F> {
             Input::Command(Command::Observe) => {
                 let mut out = self.step_obn(now, Input::Command(Command::Observe));
                 out.extend(self.relay.router_mut().step(now, Input::Command(Command::Observe)));
-                out
+                fold_data_path(out)
             }
             // Every other command drives the overlay+beacon composite: the epoch tick advances the beacon
             // (which `step_obn` then locks the router's onion key to) and arms the remapped overlay heartbeat;
@@ -349,6 +389,15 @@ mod tests {
                 .expect("a sense-only read exports the data-path plane")
         };
 
+        // Exactly one plane per node. Both halves of this composite own counters, and a reader takes the first
+        // notification it sees, so two would mean one silently dropped — chosen by delegation order.
+        let planes = node
+            .step(Instant(0), Input::Command(Command::Observe))
+            .iter()
+            .filter(|e| matches!(e, Effect::Notify(Notification::DataPath { .. })))
+            .count();
+        assert_eq!(planes, 1, "a node reports one data-path plane, not one per engine");
+
         let quiet = data_path(&mut node, 0);
         let decode_failures = |obs: &[Observation]| -> u64 {
             obs.iter().filter(|o| o.station == Station::FrameDecodeFailed).map(|o| o.count).sum()
@@ -367,6 +416,22 @@ mod tests {
             decode_failures(&data_path(&mut node, 2)),
             3,
             "the exported map is the one the discard sites write to"
+        );
+
+        // And the merged plane carries the ROUTER's gather health, not the overlay's "no gather here" — the
+        // fold must not let one engine's absence mask the other's real clock.
+        let health = node
+            .step(Instant(3), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { gather, .. }) => Some(*gather),
+                _ => None,
+            })
+            .expect("a sense-only read exports the data-path plane");
+        assert_eq!(
+            health,
+            GatherHealth::Unmeasured,
+            "the relay has a gather path that has not completed; the overlay's NoGatherPath must not win"
         );
     }
 
