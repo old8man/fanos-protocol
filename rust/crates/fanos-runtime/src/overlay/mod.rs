@@ -941,6 +941,13 @@ impl<F: Field> OverlayNode<F> {
             gather: GatherHealth::NoGatherPath,
         })];
         if let Some((_, degraded, alive_count)) = self.cell_liveness(now) {
+            // The full footprint, beside the frame that carries only its syndrome. Computed here already and
+            // discarded until now — an operator's node map cannot be reconstructed from a 3-bit code that
+            // localizes one fault when there may be three.
+            out.push(Effect::Notify(Notification::Liveness {
+                degraded,
+                alive: u16::try_from(alive_count).unwrap_or(u16::MAX),
+            }));
             out.push(self.healer.emit_observation(
                 now,
                 self.epoch,

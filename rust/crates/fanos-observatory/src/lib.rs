@@ -16,10 +16,12 @@ pub mod cluster_dashboard;
 #[cfg(feature = "sim")]
 pub mod live;
 pub mod metrics;
+pub mod remote;
 pub mod source;
 pub mod ui;
 
 pub use app::App;
+pub use remote::RemoteNodeSource;
 #[cfg(feature = "sim")]
 pub use cluster_dashboard::{ClusterDashboard, render_cluster};
 #[cfg(feature = "sim")]

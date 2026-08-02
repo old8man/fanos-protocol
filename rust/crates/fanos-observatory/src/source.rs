@@ -45,6 +45,24 @@ pub trait SnapshotSource {
     /// [`snapshot`](Self::snapshot) carries only the 3-bit Hamming *syndrome*; this exposes the full
     /// footprint for the operator's node map. A live source reads it from the same liveness view.
     fn degraded(&self) -> u8;
+
+    /// Whether [`snapshot`](Self::snapshot) is a **reading** rather than a placeholder, and why not if not.
+    ///
+    /// The generated sources always have one — they *are* the cell — so this defaults to `Ok`. A remote source
+    /// does not: before it reaches its node it has no frame, and the trait returns a snapshot rather than an
+    /// option, so it must return *something*.
+    ///
+    /// That something is all-zeros, and measured on a real run the fold turns all-zeros into
+    /// `"alarm":"healthy","faulted":false`. **A monitor that cannot reach its node reported the cell as
+    /// healthy** — silence read as health, in the one direction that hides a failure instead of raising a
+    /// false one. This is the seam that lets a caller refuse to print that.
+    ///
+    /// # Errors
+    /// A short human reason there is no reading — "node not running (no socket)", a socket error, a frame this
+    /// build cannot decode.
+    fn reading(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A self-contained demo source: a real `PurityDynamics` cell driven by an operator-controlled attack.

@@ -1155,6 +1155,7 @@ dependencies = [
  "fanos-field",
  "fanos-geometry",
  "fanos-holarch",
+ "fanos-node",
  "fanos-runtime",
  "fanos-sim",
  "fanos-telemetry",

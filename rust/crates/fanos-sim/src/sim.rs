@@ -67,6 +67,17 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        // The footprint as points, not as a number: `degraded=20` makes a reader do binary in their head,
+        // and the whole reason this rides beside the syndrome is that a reader needs the SET.
+        Notification::Liveness { degraded, alive } => {
+            let down: Vec<String> =
+                (0..8).filter(|i| degraded & (1u8 << i) != 0).map(|i| i.to_string()).collect();
+            if down.is_empty() {
+                format!("Liveness alive={alive} all points fresh")
+            } else {
+                format!("Liveness alive={alive} down=[{}]", down.join(" "))
+            }
+        }
         // The data-path plane: only the stations that actually fired, since a line printing every station at
         // zero buries the two that moved — which is the failure mode the plane exists to end, not repeat.
         Notification::DataPath { stations, gather } => {

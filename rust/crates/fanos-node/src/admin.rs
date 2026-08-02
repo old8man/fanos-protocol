@@ -167,6 +167,44 @@ impl Request {
 /// A request paired with the channel its answer goes back on.
 pub type Envelope = (Request, oneshot::Sender<String>);
 
+/// [`ask`], without a runtime — write a verb, read the answer, on the calling thread.
+///
+/// The async form is right for the CLI, which is already inside tokio. It is wrong for a caller that is not:
+/// `fanos-monitor` is a terminal UI whose `SnapshotSource::tick` is synchronous, and making it carry a runtime
+/// to send nine bytes down a Unix socket would be a dependency chosen by an accident of the client's colour.
+///
+/// The two share the protocol by being read together — write the verb, a newline, then read to EOF — and share
+/// [`socket_path`], which is the part that must not drift: its `SUN_LEN` fallback is derived, and a second
+/// implementation of *that* is how a monitor ends up looking in a different place from the node it monitors.
+///
+/// `Ok(None)` means "not running", the same distinction [`ask`] draws: no socket, or a stale one nobody is
+/// accepting on. Collapsing that into an error would make a monitor unable to tell a stopped node from a
+/// broken one, which is the first thing its operator needs to know.
+///
+/// # Errors
+/// Any I/O failure other than a missing or refused socket.
+pub fn ask_blocking(path: &Path, request: &str) -> std::io::Result<Option<String>> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(s) => s,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body)?;
+    Ok(Some(body))
+}
+
 /// Render a [`Health`] as the socket's response body.
 ///
 /// `key: value` lines, aligned, one fact per line — parseable with `cut` and readable without anything. The
@@ -311,8 +349,25 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> Strin
 /// The **verdict and syndrome are printed as their numbers as well as their meanings**, because an operator
 /// comparing two nodes needs a value that compares, and a reader diagnosing one needs a word that explains.
 #[must_use]
-pub fn render_coherence(frame: &CoherenceFrame) -> String {
+pub fn render_coherence(frame: &CoherenceFrame, degraded: u8, alive: u16) -> String {
     let mut out = String::new();
+    // `wire` first and on one line: the canonical `Wire` bytes of the frame, hex. A monitor decodes this and
+    // gets exactly what the node holds; everything below it is the same data rendered for a person. Serving
+    // both is what lets the human form stay readable — it does not have to double as a parsing target, which
+    // is how a rendering ends up frozen by a scraper that depends on its column widths.
+    let _ = writeln!(out, "wire           : {}", frame.encode().iter().fold(String::new(), |mut a, b| {
+        let _ = write!(a, "{b:02x}");
+        a
+    }));
+    let down: Vec<String> = (0..8).filter(|i| degraded & (1u8 << i) != 0).map(|i| i.to_string()).collect();
+    let _ = writeln!(out, "alive          : {alive}");
+    // As the SET of points, not the mask value: the frame's syndrome localizes one fault, and this exists
+    // precisely because there may be several — a number the reader has to convert to binary hides that.
+    let _ = writeln!(
+        out,
+        "degraded       : {}",
+        if down.is_empty() { "none — every point fresh".to_owned() } else { format!("points {}", down.join(", ")) }
+    );
     let _ = writeln!(out, "epoch          : {}", frame.epoch);
     let _ = writeln!(out, "phi            : {:.3}", frame.phi);
     let _ = writeln!(out, "purity         : {:.3}", frame.purity);
@@ -514,14 +569,19 @@ mod tests {
             forecast: -3,
             heal_seq: 7,
         };
-        let body = render_coherence(&healthy);
+        let body = render_coherence(&healthy, 0, 7);
         assert!(body.contains("no localized fault"), "a zero syndrome is not point zero: {body}");
         assert!(body.contains("phi            : 0.875"), "measures print to three decimals: {body}");
         assert!(body.contains("epoch          : 12"), "and the epoch they were taken at: {body}");
 
         let faulted = CoherenceFrame { syndrome: 4, ..healthy };
-        let body = render_coherence(&faulted);
+        let body = render_coherence(&faulted, 0b0000_1000, 6);
         assert!(body.contains("point 3"), "syndrome 4 names point 3, not point 4: {body}");
+        assert!(body.contains("points 3"), "and the footprint lists the point as a member of a SET: {body}");
+        assert!(
+            body.contains("wire           : "),
+            "a monitor needs the canonical bytes, not the human render, to reconstruct the frame: {body}"
+        );
         assert!(body.contains("syndrome       : 4"), "and the raw value is still there to compare: {body}");
     }
 

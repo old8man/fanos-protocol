@@ -340,6 +340,25 @@ pub enum Notification {
     /// capacity one node absorbs — `⌈load / capacity⌉` — which is the arithmetic the setpoint denominator has
     /// always described and never had a numerator for.
     ///
+    /// **Which points this node currently sees as down**, in answer to [`Command::Observe`] — the cell's
+    /// liveness footprint, as a bitmask over the plane's points (bit `i` ⇔ point `i` is degraded).
+    ///
+    /// The coherence frame carries only the 3-bit Hamming **syndrome**, which localizes *one* fault. That is
+    /// the right thing to publish — it is compact and it is what the DIAKRISIS fold consumes — but it is
+    /// strictly less than what the node knows: `cell_liveness` computes the full mask every observation and
+    /// then throws all but the syndrome away. An operator's node map, and any monitor drawing one, needs the
+    /// footprint; deriving it back from the syndrome would silently report a single fault where there are
+    /// three.
+    ///
+    /// Raised beside the frame rather than folded into it, because the frame's byte layout is a canonical
+    /// `Wire` shape that peers exchange and this is a **local** reading — the same boundary the station
+    /// counters keep.
+    Liveness {
+        /// Bit `i` ⇔ point `i` is degraded (has not been heard from within the liveness timeout).
+        degraded: u8,
+        /// How many members are live, including this node.
+        alive: u16,
+    },
     /// The **data-path plane's** readings, in answer to [`Command::Observe`] — where work stopped, and how
     /// healthy the gather path is (`docs/design-observability.md` §4.1).
     ///

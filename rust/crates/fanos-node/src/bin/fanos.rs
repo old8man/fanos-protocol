@@ -423,12 +423,18 @@ async fn read_data_path(notes: &mut tokio::sync::broadcast::Receiver<Notificatio
 /// merely a guard: "this node cannot yet see its cell" is what an operator needs to be told.
 async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notification>) -> String {
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    // The footprint arrives in its own notification, immediately before the frame. Held rather than awaited
+    // separately: one `Observe` raises both, so a second round trip would double the cost of the verb and
+    // could straddle two observation windows — reporting a mask from one and a frame from the next.
+    let mut seen: Option<(u8, u16)> = None;
     loop {
         match tokio::time::timeout_at(deadline, notes.recv()).await {
+            Ok(Ok(Notification::Liveness { degraded, alive })) => seen = Some((degraded, alive)),
             Ok(Ok(Notification::Observed(bytes))) => {
+                let (degraded, alive) = seen.unwrap_or((0, 0));
                 return fanos_telemetry::CoherenceFrame::decode(&bytes).map_or_else(
                     || "the node emitted a frame this build cannot decode\n".to_owned(),
-                    |f| fanos_node::admin::render_coherence(&f),
+                    |f| fanos_node::admin::render_coherence(&f, degraded, alive),
                 );
             }
             Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
