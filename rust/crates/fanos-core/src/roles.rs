@@ -878,6 +878,71 @@ mod tests {
     const E: Epoch = Epoch::new(3);
 
     #[test]
+    fn a_gain_below_one_makes_the_assignment_depend_on_when_a_node_joined() {
+        // **κ = 1 is load-bearing for cell agreement, not merely a tracking choice**, and the constant's own
+        // doc does not know it: it says a telemetry-driven sensor "should lower it so the Lyapunov descent
+        // smooths real load jitter". Lowering it buys smoothing by making the demand a function of the node's
+        // whole history — and `demand` is per-node state, while the assignment is derived from it. Two members
+        // that have stepped a different number of epochs then assign different roles from the *same* agreed
+        // setpoint, which is precisely the determinism the design rests on.
+        //
+        // At κ = 1 the step is `D' = D + (s − D) = s`: one step erases the history, so a node that joined this
+        // epoch and one that has run for fifty agree immediately. That is what makes it safe today.
+        let setpoint = Demand::per_role(|r| if r == Role::Relay { 6 } else { 0 });
+        let floor = Demand::default();
+        let incumbent_start = Demand::per_role(|r| if r == Role::Relay { 6 } else { 0 });
+        let joiner_start = Demand::default();
+
+        // κ = 1: histories differ, one step, agreement.
+        let incumbent = incumbent_start.rebalance(setpoint, floor, 7);
+        let joiner = joiner_start.rebalance(setpoint, floor, 7);
+        assert_eq!(
+            incumbent, joiner,
+            "at κ = 1 one step erases the history, so a late joiner agrees with an incumbent immediately"
+        );
+
+        // κ = 1/7: the same two histories disagree, and the disagreement is *transient* — which is exactly why
+        // it is easy to miss. It lasts while the joiner climbs to the setpoint, and the cell is split for
+        // every epoch of that climb.
+        let members: Vec<(NodeId, Capability)> =
+            (0..6).map(|i| (node(i), Capability::new(RoleSet::of(&[Role::Relay]), 4))).collect();
+        let beacon = BeaconSeed::new([0x5A; 32]);
+        let epoch = Epoch::new(9);
+        let assigned_by = |demand: Demand| assign_report(&members, epoch, &beacon, demand).roles;
+
+        let mut incumbent = incumbent_start;
+        let mut joiner = joiner_start;
+        let mut split_epochs = 0;
+        for _ in 0..40 {
+            incumbent = incumbent.rebalance(setpoint, floor, 1);
+            joiner = joiner.rebalance(setpoint, floor, 1);
+            if assigned_by(incumbent) != assigned_by(joiner) {
+                split_epochs += 1;
+            }
+        }
+        assert!(
+            split_epochs > 0,
+            "the premise: below κ = 1 the demand is a function of history, so two members that have stepped a \
+             different number of times assign differently from the SAME agreed setpoint"
+        );
+        // Stated as a number because the number is the cost: at κ = 1/7 a joiner needs this many epochs before
+        // the cell agrees with it about who serves what, and an epoch is `DEFAULT_EPOCH_PERIOD`.
+        assert!(
+            split_epochs >= 5,
+            "the split is not a single-epoch artifact — it lasted {split_epochs} epochs"
+        );
+
+        // And it does heal: the divergence is transient, not permanent, which is what makes it survivable at
+        // all and also what makes it easy to miss in a test that only looks at the end state. This assertion
+        // exists because the first draft of this test compared the two AFTER convergence and proved nothing.
+        assert_eq!(
+            assigned_by(incumbent),
+            assigned_by(joiner),
+            "the histories converge eventually — the cost is the transient, not a permanent fork"
+        );
+    }
+
+    #[test]
     fn assignment_is_deterministic_and_verifiable() {
         let members = cell(7, &[Role::Relay, Role::Storage], 4);
         let d = Demand::from_counts([3, 4, 0, 0, 0]);

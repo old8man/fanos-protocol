@@ -432,9 +432,26 @@ fn exit_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<u16>)>, Node
 /// capacity class (bandwidth/uptime tier) belongs with the telemetry that would substantiate it.
 const ROLE_CAPACITY_WEIGHT: u16 = 4;
 
-/// The assignment controller's loop gain `κ = ROLE_GAIN_SEVENTH/7`. `7` is `κ = 1`: track the setpoint in one step,
-/// since with the placeholder load sensor above the setpoint is not noisy enough to need damping. A telemetry-driven
-/// sensor should lower it so the Lyapunov descent smooths real load jitter.
+/// The assignment controller's loop gain `κ = ROLE_GAIN_SEVENTH/7`. `7` is `κ = 1`: track the setpoint in one step.
+///
+/// **This must stay 1, and the reason is cell agreement rather than tracking speed.** The step is
+/// `D' = D + κ(setpoint − D)`, so at `κ = 1` it collapses to `D' = setpoint`: one step erases the history, and a
+/// node that joined this epoch derives the same demand as one that has run for fifty. Below 1 the demand is a
+/// function of how many times *this* node has stepped, and the assignment is derived from the demand — so two
+/// members holding the same agreed setpoint assign different roles, which is exactly the determinism the whole
+/// self-organizing design rests on (`role_loop`: "every node steps an identical controller over the same agreed
+/// inputs"). Measured in `fanos_core::roles`: at `κ = 1/7` a joining node and an incumbent disagree about who
+/// serves what for well over five epochs, each of them a `DEFAULT_EPOCH_PERIOD`.
+///
+/// This doc used to say the opposite — "a telemetry-driven sensor should lower it so the Lyapunov descent
+/// smooths real load jitter" — written when the sensor was a placeholder and the setpoint could not move.
+/// With all five role sensors live (`role_loop::LoadSensor`) the jitter is real, so the advice would now be
+/// taken, and taking it would fork the cell's assignment on every join.
+///
+/// Damping therefore belongs on the **setpoint**, not on the demand: the setpoint is a cell aggregate every
+/// member reads identically out of the load directory, so smoothing it over a bounded window of *published
+/// epochs* rejects noise while staying history-free — any node can fetch the same window and get the same
+/// number. Deriving that window is the open work; the wrong fix is the one this constant used to recommend.
 const ROLE_GAIN_SEVENTH: u8 = 7;
 
 
