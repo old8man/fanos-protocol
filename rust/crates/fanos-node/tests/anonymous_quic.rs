@@ -539,6 +539,7 @@ async fn await_every_meeting_member_binds(
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "two properties in one fixture; see the split note inside")]
 async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
@@ -642,6 +643,18 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
 
     // === CENSORSHIP: meeting point 0's combiner goes silent, and the service stays reachable. ===
     //
+    // ⚠️ **Two properties share this test's name, and they fail independently.** Everything above is plain
+    // reachability (no node silenced); everything below is reachability *under censorship*. Measured, some
+    // failing runs never reach this line — they refute the assertion above — while others reach it and count
+    // 0 of 8. Debugging them as one failure is why this resisted three rounds of hypotheses, each refuted:
+    // a mix-directory race (a 750 ms pre-dial delay does not fix it), unlucky per-attempt draws (arithmetic:
+    // 0-of-8 has probability ≈ 2.3e-8 against an observed ~1 in 3), and a stale first session held open
+    // across the loop (retiring it changes nothing).
+    //
+    // Splitting them into two `#[tokio::test]`s needs the fixture — seven nodes, a beacon, a host, a mix
+    // directory — extracted into a shared builder first. That is the next step and it is a real one: until
+    // then neither half has its own name or its own rate.
+    //
     // This is what `f + 1` meeting points exist for: with one, a single node held a whole epoch of this service's
     // inbound traffic and could drop it; with `f + 1`, an adversary inside the tolerated fault budget cannot hold
     // them all. Two things this test had to learn the hard way, both worth keeping:
@@ -678,8 +691,17 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         StaticResolver::new().with("off.fanos", meeting, bundle.clone()),
         AnonRouteParams { directory: mix.clone(), threshold: t as u8, epoch, beacon: TEST_BEACON, depths: (1, 1) },
     );
+    // **Stop at the first arrival.** The property is "the service remains reachable through another of its
+    // f + 1 points" — one arrival proves it; the remaining attempts prove nothing further and each can cost a
+    // full `FROZEN_SPAN`. Running all eight regardless made the worst case 8 × 48 s ≈ 6.4 minutes of pure
+    // timeout, which is how this test came to look like a hang rather than a failure (measured: a 399 s run).
+    //
+    // Attempts remain bounded at 8 so a genuinely unreachable service still terminates and still refutes.
     let mut reached = 0;
     for _ in 0..8 {
+        if reached > 0 {
+            break;
+        }
         let Ok(mut s) = dialer.dial(&Target::Name("off.fanos".to_owned(), 80)).await else { continue };
         // Bounded by the harness's own **derived** span, not a hand-picked number. `exchange` already runs
         // under `within_span`, whose budget is `FROZEN_SPAN` (= `ROUND_TIMEOUT_MAX × 2`, 48 s). Wrapping it in
