@@ -10,10 +10,25 @@
 //! mixnet's effective round trip (a hop is a multi-round threshold gather), rather than the Direct
 //! profile's base tick — otherwise the onion flood saturates the per-hop gathers.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::await_holding_lock)]
 
 mod common;
 
+
+use std::sync::{LazyLock, Mutex, PoisonError};
+
+// Real-QUIC integration tests each bring up several loopback nodes; running them at once overloads the
+// transport and stalls handshakes. Serialize them behind one blocking lock — the same guard `exit_quic.rs`,
+// `diaulos_quic.rs` and `hole_punch.rs` already use, and the one file that had it missing.
+//
+// This was not a latent tidiness issue. CI ran eight of these concurrently on a two-core runner and four
+// failed together, every one of them reporting that its runtime "was polled 0 times ... against 521 expected
+// (0%)" — a starved host, not a broken system. The workflow has never once been green.
+static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 use fanos_aphantos::ThresholdRouter;
 use std::time::Duration;
@@ -160,6 +175,7 @@ fn signing_half(kem: &HybridKemPublic, seed: &[u8]) -> (HybridSigSecret, Vec<u8>
 
 #[tokio::test]
 async fn an_onion_reaches_the_meeting_line_over_real_quic() {
+    let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let dir = Directory::new();
     let t = 2usize; // 2-of-3 per Fano line
@@ -213,6 +229,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
 
 #[tokio::test]
 async fn a_full_anonymous_session_completes_over_real_quic() {
+    let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let dir = Directory::new();
     let t = 2usize;
@@ -343,6 +360,7 @@ async fn spawn_composite(
 
 #[tokio::test]
 async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
+    let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The full deployed shape: a Fano cell of `CellNode`s (each overlay + beacon + mix router), an
     // anonymous service on one, and a DIFFERENT cell node dialing it with a FRESH per-dial route via
@@ -504,6 +522,7 @@ async fn await_every_meeting_member_binds(
 
 #[tokio::test]
 async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
+    let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The §3b general case — no cheat: the service operator is NOT the node at its meeting combiner (it
     // cannot choose its VRF coordinate). It registers an anonymous forward route (its own dead-drop line)
@@ -648,6 +667,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
 
 #[tokio::test]
 async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
+    let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The full operator driver (§3b): `spawn_rendezvous_host` builds the cell directory, registers an
     // anonymous forward route each epoch, and runs the accept loop — no manual registration. Proves the
