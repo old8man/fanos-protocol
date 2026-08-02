@@ -76,8 +76,41 @@ enum Phase {
     Done,
 }
 
+/// Why the DKG refused a frame — the counters that made audit B1–B3 observable.
+///
+/// Those three were CRITICAL: unauthenticated complaint/commit/justify frames (one node could evict any
+/// honest dealer), a discarded `ingest_share` result (the joint key could include a dealer whose Feldman
+/// check had failed), and a justification verified against the frame's own commitment rather than the
+/// qualified one. All are fixed. **None left a trace.**
+///
+/// A DKG that refuses forged complaints and a DKG nobody is talking to are the same silence, and this
+/// ceremony produces the beacon key every epoch-aligned mechanism depends on — so a ceremony that fails to
+/// terminate has to be able to say why.
+///
+/// Counters, not logs: `no_std`, sans-I/O, nowhere to write.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DkgRejects {
+    /// A complaint that did not come from the complainer it names — **B1**. A Byzantine node forging
+    /// complaints in another's name can evict every honest dealer, and this is the only trace it leaves.
+    pub complaint_impersonated: u64,
+    /// A commitment that did not come from the dealer it names — B1's sibling on the commit path.
+    pub commit_impersonated: u64,
+    /// A justification that did not verify against the **qualified** commitment — **B3**. The frame's own
+    /// commitment is deliberately ignored, so a dealer cannot justify itself with a commitment it just made
+    /// up; this counts the attempts.
+    pub justify_mismatch: u64,
+    /// A dealt share that failed its Feldman check — **B2**. Discarding the result silently is what let a
+    /// rejected dealer into the joint key.
+    pub deal_rejected: u64,
+    /// A frame this build could not parse or does not handle.
+    pub frame_unusable: u64,
+}
+
+
 /// A node participating in a `t`-of-`n` distributed key generation across its cell.
 pub struct DkgNode<F: Field> {
+    /// Why this ceremony refused frames — see [`DkgRejects`].
+    rejects: DkgRejects,
     coord: Point<F>,
     index: u8,
     n: usize,
@@ -114,6 +147,16 @@ pub struct DkgNode<F: Field> {
 }
 
 impl<F: Field> DkgNode<F> {
+    /// Why this ceremony has refused frames — the operator's read on whether a DKG that has not terminated
+    /// is starved of peers or under attack.
+    ///
+    /// Those look identical without it: audit B1 was a Byzantine node forging complaints in other members'
+    /// names to evict every honest dealer, and its only symptom is a ceremony that does not finish.
+    #[must_use]
+    pub const fn rejects(&self) -> DkgRejects {
+        self.rejects
+    }
+
     /// A DKG participant at `coord` contributing `secret`, targeting threshold `threshold`.
     ///
     /// `session_nonce` is **fresh per-DKG-instance** entropy folded into the sharing polynomial (audit
@@ -150,6 +193,7 @@ impl<F: Field> DkgNode<F> {
             share_deadline: DEFAULT_SHARE_DEADLINE,
             complaint_deadline: DEFAULT_COMPLAINT_DEADLINE,
             done: false,
+            rejects: DkgRejects::default(),
             aggregate: None,
         }
     }
@@ -264,6 +308,7 @@ impl<F: Field> DkgNode<F> {
             return Vec::new();
         };
         if share.index() != self.index {
+            self.rejects.frame_unusable = self.rejects.frame_unusable.saturating_add(1);
             return Vec::new(); // not our share
         }
         self.my_shares.entry(dealer).or_insert(share);
@@ -288,6 +333,7 @@ impl<F: Field> DkgNode<F> {
             return Vec::new();
         };
         if self.dealer_of(from) != Some(d) {
+            self.rejects.commit_impersonated = self.rejects.commit_impersonated.saturating_add(1);
             return Vec::new(); // a commitment may only come from its own dealer
         }
         self.note_commitment(d, commitment);
@@ -309,6 +355,9 @@ impl<F: Field> DkgNode<F> {
             return Vec::new();
         };
         if self.dealer_of(from) != Some(c) {
+            // **B1, counted.** Forging complaints in another member's name evicts every honest dealer, and a
+            // ceremony that never terminates is its only other symptom.
+            self.rejects.complaint_impersonated = self.rejects.complaint_impersonated.saturating_add(1);
             return Vec::new(); // a complaint may only come from its own complainer
         }
         let mut effects = Vec::new();
@@ -345,6 +394,7 @@ impl<F: Field> DkgNode<F> {
         };
         // B3: verify against the qualified commitment, ignoring any commitment carried in the frame.
         let Some(commitment) = self.commitments.get(&d).cloned() else {
+            self.rejects.justify_mismatch = self.rejects.justify_mismatch.saturating_add(1);
             return Vec::new(); // we have no qualified commitment for d yet — cannot verify the reveal
         };
         if !vss::verify_share(&share, &commitment) {
@@ -648,6 +698,17 @@ mod tests {
             completed(&fin),
             "an honest dealer survives a forged complaint and the DKG completes"
         );
+
+        // **Surviving the attack is half of it.** B1's whole effect was a ceremony that would not terminate,
+        // and a ceremony starved of peers does not terminate either — so without this counter the two are the
+        // same observation and an operator has nothing to act on. Node 3 forged a complaint naming node 2 as
+        // complainer; that is the only trace it leaves.
+        assert_eq!(
+            o.rejects().complaint_impersonated,
+            1,
+            "the forged complaint is refused AND recorded, or an attack on the ceremony is indistinguishable \
+             from the ceremony being quiet"
+        );
     }
 
     #[test]
@@ -681,6 +742,10 @@ mod tests {
             o.commitments.contains_key(&2),
             "the real dealer's own commitment is accepted"
         );
+        // The commit path's half of B1, counted for the same reason as the complaint path: pre-registering a
+        // bogus commitment for a silent dealer is first-writer-wins poisoning, and its only other symptom is
+        // a dealer that mysteriously fails to qualify.
+        assert_eq!(o.rejects().commit_impersonated, 1, "the impostor's commitment is refused AND recorded");
     }
 
     #[test]
