@@ -538,11 +538,26 @@ async fn await_every_meeting_member_binds(
     }
 }
 
-#[tokio::test]
-#[expect(clippy::too_many_lines, reason = "two properties in one fixture; see the split note inside")]
-async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
-    let _serial = serial();
-    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
+/// The §3b off-combiner fixture: a seven-node cell, a service hosted on a node that is **not** its meeting
+/// combiner, and a third node holding an anonymous dialer for it.
+///
+/// Extracted because two independent properties were sharing one test — plain reachability, and reachability
+/// once a meeting point is censored — and they fail independently. Measured over many runs, some failures
+/// never reached the censorship half at all, so a single pass/fail rate was the sum of two different things
+/// and four successive hypotheses died against it. Each half now has its own name and its own rate.
+struct OffCombiner {
+    nodes: Vec<Option<NodeHandle>>,
+    /// Held so the host keeps serving for the fixture's lifetime.
+    _host_node: NodeHandle,
+    /// Held so the client keeps its transport for the fixture's lifetime; the dialer borrows from it.
+    _client_node: NodeHandle,
+    dialer: FanosDialer<StaticResolver>,
+    /// The canonical combiner of meeting point 0 — the node a censorship scenario silences.
+    m_index: usize,
+}
+
+impl OffCombiner {
+    async fn build() -> Self {
     // The §3b general case — no cheat: the service operator is NOT the node at its meeting combiner (it
     // cannot choose its VRF coordinate). It registers an anonymous forward route (its own dead-drop line)
     // with the combiner by onion; the combiner re-seals each client request to that dead-drop; the operator
@@ -628,93 +643,63 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         depths: (1, 1),
     };
     let resolver = StaticResolver::new().with("off.fanos", meeting, bundle.clone());
+    // The dialer, not a dial: each test opens its own fresh session through `OffCombiner::exchange`, so a
+    // session opened during construction cannot leak state into a later one. That mattered — a first stream
+    // left alive across the censorship loop was one of the hypotheses this split exists to separate.
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
-    let mut stream = dialer
-        .dial(&Target::Name("off.fanos".to_owned(), 80))
-        .await
-        .expect("anonymous dial to an off-combiner service");
 
-    let response = common::exchange(&mut stream, b"GET /off").await;
+        Self { nodes, _host_node: host_node, _client_node: client_node, dialer, m_index }
+    }
 
+    /// One request/response over a fresh anonymous session. `None` if the dial or the exchange did not
+    /// complete within the harness's derived span.
+    async fn exchange(&self) -> Option<Vec<u8>> {
+        let mut s = self.dialer.dial(&Target::Name("off.fanos".to_owned(), 80)).await.ok()?;
+        tokio::time::timeout(common::FROZEN_SPAN, common::exchange(&mut s, b"GET /off")).await.ok()
+    }
+}
+
+#[tokio::test]
+async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
+    let _serial = serial();
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
+    // Plain reachability, nothing silenced: the operator is NOT the node at its meeting combiner, so every
+    // request travels combiner -> re-seal -> the host's dead-drop line, and neither the combiner nor anyone
+    // else learns the operator's coordinate.
+    let cell = OffCombiner::build().await;
     assert_eq!(
-        response, b"anon-quic-200:GET /off",
+        cell.exchange().await.as_deref(),
+        Some(b"anon-quic-200:GET /off".as_slice()),
         "a service hosted off its meeting combiner was reached end-to-end via combiner forwarding",
     );
+}
 
-    // === CENSORSHIP: meeting point 0's combiner goes silent, and the service stays reachable. ===
+#[tokio::test]
+async fn the_service_survives_one_meeting_point_going_silent() {
+    let _serial = serial();
+    let _serial = common::serial_cell().await; // one whole-cell fixture at a time
+    // What `f + 1` meeting points exist for: with one, a single node held a whole epoch of this service's
+    // reachability and could drop it. An adversary inside the tolerated fault budget must not be able to.
     //
-    // ⚠️ **Two properties share this test's name, and they fail independently.** Everything above is plain
-    // reachability (no node silenced); everything below is reachability *under censorship*. Measured, some
-    // failing runs never reach this line — they refute the assertion above — while others reach it and count
-    // 0 of 8. Debugging them as one failure is why this resisted three rounds of hypotheses, each refuted:
-    // a mix-directory race (a 750 ms pre-dial delay does not fix it), unlucky per-attempt draws (arithmetic:
-    // 0-of-8 has probability ≈ 2.3e-8 against an observed ~1 in 3), and a stale first session held open
-    // across the loop (retiring it changes nothing).
+    // **Split from the plain-reachability test above so the two rates are separable.** Measured, some
+    // failures never reached this half at all, so one number covered two different failures — which is why
+    // four hypotheses died against it: a mix-directory race (a 750 ms pre-dial delay does not fix it), the
+    // reply path (the client opens replies on failing runs), unlucky per-attempt draws (0-of-8 has
+    // probability ~2.3e-8 against an observed ~1 in 3), and a stale session held open across the loop
+    // (retiring it changes nothing).
     //
-    // Splitting them into two `#[tokio::test]`s needs the fixture — seven nodes, a beacon, a host, a mix
-    // directory — extracted into a shared builder first. That is the next step and it is a real one: until
-    // then neither half has its own name or its own rate.
-    //
-    // This is what `f + 1` meeting points exist for: with one, a single node held a whole epoch of this service's
-    // inbound traffic and could drop it; with `f + 1`, an adversary inside the tolerated fault budget cannot hold
-    // them all. Two things this test had to learn the hard way, both worth keeping:
-    //
-    // * **`shutdown()`, not `drop`.** Dropping the handle leaves the node running, and the first version of this
-    //   test PASSED its own falsification with m collapsed to 1 — the combiner it claimed to have silenced was
-    //   still answering. A test that disables nothing proves nothing.
-    // * **A silenced combiner does not refuse, it swallows.** `dial` still succeeds (it only seals and emits) and
-    //   the exchange then wedges forever, so each attempt needs its own deadline. That is the censorship property
-    //   showing through rather than test hygiene: the only failure signal is a clock, which is exactly the signal
-    //   the adversary controls — and why docs §6.2 rejected client-walks-the-points as the PRIMARY mechanism.
-    //
-    // ⚠️ **The paragraph below is contradicted by arithmetic and is kept only as the record of a refuted
-    // explanation.** On the Fano plane the silenced node is one of three members of one of three meeting
-    // points, so a single attempt avoids it with probability 1 − (1/3)(1/3) ≈ 0.889, making 0 of 8 arrivals
-    // ≈ 2.3e-8 — one run in forty million. It was observed roughly **one run in three**. Whatever makes a
-    // failing run fail is therefore shared across all eight attempts, not drawn per attempt.
-    //
-    // Two further measured facts: on failing runs the whole forward path is provably healthy (four distinct
-    // combiners receive the request, each reports the host known, the host ingests it, the reply is sealed,
-    // and the client opens it — 314 sealed / 44 opened in one such run); and some failing runs never reach
-    // this loop at all, panicking at the *earlier* end-to-end assertion. This test name covers at least two
-    // distinct failures.
-    //
-    // SOME ATTEMPTS MAY STILL MISS THEIR DEADLINE UNDER LOAD, and that is the expected shape, not a flake:
-    // `anonymous_dial` does not retry a whole dial, but every DIAULOS retransmit reseals a fresh onion whose
-    // launch and per-hop gatherers are drawn anew (`combiner_for_salted`, #55) — so a dial that touches the
-    // silenced node simply loses that attempt's round trip and self-heals on the next reseal, bounded by the
-    // per-attempt deadline. The property is "remains reachable", not "every dial completes in time". Do not
-    // "fix" a marginal count by looping until green.
-    nodes[m_index].take().expect("the combiner node is still held").shutdown();
-    let dialer = FanosDialer::anonymous_fresh(
-        client_node.client(),
-        StaticResolver::new().with("off.fanos", meeting, bundle.clone()),
-        AnonRouteParams { directory: mix.clone(), threshold: t as u8, epoch, beacon: TEST_BEACON, depths: (1, 1) },
-    );
-    // **Stop at the first arrival.** The property is "the service remains reachable through another of its
-    // f + 1 points" — one arrival proves it; the remaining attempts prove nothing further and each can cost a
-    // full `FROZEN_SPAN`. Running all eight regardless made the worst case 8 × 48 s ≈ 6.4 minutes of pure
-    // timeout, which is how this test came to look like a hang rather than a failure (measured: a 399 s run).
-    //
-    // Attempts remain bounded at 8 so a genuinely unreachable service still terminates and still refutes.
+    // A silenced combiner does not refuse, it swallows: `dial` still succeeds (it only seals and emits), so
+    // the only failure signal is a clock. Attempts are bounded at 8 and stop at the first arrival — the
+    // property is "remains reachable", and one arrival settles it. Do not "fix" a marginal count by looping
+    // until green.
+    let mut cell = OffCombiner::build().await;
+    cell.nodes[cell.m_index].take().expect("the combiner node is still held").shutdown();
+
     let mut reached = 0;
     for _ in 0..8 {
-        if reached > 0 {
-            break;
-        }
-        let Ok(mut s) = dialer.dial(&Target::Name("off.fanos".to_owned(), 80)).await else { continue };
-        // Bounded by the harness's own **derived** span, not a hand-picked number. `exchange` already runs
-        // under `within_span`, whose budget is `FROZEN_SPAN` (= `ROUND_TIMEOUT_MAX × 2`, 48 s). Wrapping it in
-        // a shorter 12 s killed every attempt before the thing that judges it could reach a verdict — so the
-        // loop counted 0 of 8 arrivals while the round trip was demonstrably completing underneath: measured,
-        // 314 replies sealed by the host and 44 opened by the client during a single failing run.
-        //
-        // The outer bound is kept (a dial that truly hangs must not consume the whole loop) but set to the
-        // same derived quantity, so it can only ever fire *after* the inner harness has spoken.
-        let attempt =
-            tokio::time::timeout(common::FROZEN_SPAN, common::exchange(&mut s, b"GET /off")).await;
-        if attempt.as_deref() == Ok(b"anon-quic-200:GET /off".as_slice()) {
+        if cell.exchange().await.as_deref() == Some(b"anon-quic-200:GET /off".as_slice()) {
             reached += 1;
+            break;
         }
     }
     assert!(
@@ -722,8 +707,6 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         "with meeting point 0's combiner silent the service must still be reachable through another of its \
          f + 1 points — 0 of 8 dials arrived, which is what a SINGLE meeting point would give",
     );
-    drop(nodes);
-    drop((host_node, client_node));
 }
 
 #[tokio::test]
