@@ -338,9 +338,17 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth, epoch: u
         // The scope is on this line because it is what an operator needs before planning a rollout: it says
         // which canary units are admissible at all, and getting that wrong is not a slower rollout but a dead
         // line (§2 ∧ §3).
+        // The scope is printed as its **consequence**, not its label. "line-scoped" is a fact about the
+        // derivation; "canary by cell only" is what the operator has to do about it, and getting that wrong
+        // is not a slower rollout but a dead line (§2 ∧ §3).
+        let canary = if d.scope().allows_node_canary() {
+            "canary per node ok"
+        } else {
+            "canary by cell only"
+        };
         let _ = write!(
             out,
-            "  {:<22} {} at {} ({}-scoped)",
+            "  {:<22} {} at {} ({}-scoped, {canary})",
             d.name(),
             status.name(),
             d.activation_height(),
@@ -676,6 +684,13 @@ mod tests {
         assert!(
             plane.contains("permanent") || plane.contains("withdrawn at"),
             "every entry states whether it is provisional: {plane}"
+        );
+        // And what an operator may actually do with it. The shipped entry is line-scoped, so the answer is
+        // "by cell only" — the constraint §2 ∧ §3 impose, stated where a rollout is planned rather than left
+        // for someone to re-derive from the scope's name.
+        assert!(
+            plane.contains("canary by cell only"),
+            "a line-scoped derivation must say that a per-node canary is inadmissible: {plane}"
         );
     }
 

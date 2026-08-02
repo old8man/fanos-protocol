@@ -835,7 +835,8 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
     // never resolves `.fanos` names, so an empty resolver suffices. Shared behind an `Arc` — the full-tunnel
     // stack spawns a per-flow bridge task, each needing `&D`.
     let dialer = Arc::new(
-        FanosDialer::new(node.client(), StaticResolver::new()).with_exit(exit_coord, exit_public),
+        FanosDialer::new(node.client(), StaticResolver::new())
+            .with_exit(exit_coord, bundle_from_kem_public(&exit_public)),
     );
 
     let device = fanos_vpn::device::open_tun(&tun_name).map_err(|e| {
