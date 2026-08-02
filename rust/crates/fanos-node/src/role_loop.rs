@@ -47,10 +47,18 @@ use tokio::task::JoinHandle;
 use crate::capdir::{build_capability_directory, spawn_capability_publisher};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
-/// The load one node is taken to absorb per role — the setpoint denominator (`⌈load / capacity⌉`). `1` makes the
-/// cell's setpoint equal the number of nodes offering the role, i.e. "everyone who offers it, serves it", which is
-/// the right default before telemetry can say otherwise.
+/// The load one node is taken to absorb per role — the setpoint denominator, applied **once**, cell-wide, in
+/// `cell_setpoint`. `1` is the right default before telemetry can substantiate a real capacity class, and it is
+/// deliberately *not* what makes "everyone who offers it, serves it" hold: an unsensed offered role publishes
+/// `capacity` as its load, so that identity survives any value here.
 pub(crate) const ROLE_CAPACITY_PER_NODE: u16 = 1;
+
+/// The per-role capacity vector, built once so the load publisher and the setpoint aggregation cannot disagree
+/// about the denominator — the divergence that would reintroduce a double division without any type noticing.
+#[must_use]
+pub(crate) fn role_capacity() -> Demand {
+    Demand::per_role(|_| ROLE_CAPACITY_PER_NODE)
+}
 
 /// The latest per-role load this node **measured**, shared between the engine's notification stream and the role
 /// loop's setpoint closure.
@@ -94,16 +102,16 @@ impl LoadSensor {
         })
     }
 
-    /// The **setpoint** this reading implies, in nodes: `⌈load / capacity⌉` for a role with a sensor, and this
-    /// node's own *offer* for one without.
+    /// This node's **published load contribution**, in work units — the value the cell sums and divides by
+    /// capacity exactly once, in `cell_setpoint`.
     ///
-    /// The fallback is stated once, here, and it fires on **absence** — not on a zero. That distinction is the
-    /// whole point of the change that introduced it: substituting the offer for every zero threw away the true
-    /// reading of a role that legitimately went idle, at exactly the moment the controller should have shrunk it,
-    /// and it bound the two roles that *are* measured. Standing supply in for demand is right for a role nobody
-    /// can see and wrong for one that reported nothing to do.
-    pub(crate) fn setpoint(&self, offered: RoleSet) -> Demand {
-        self.reading().to_demand(ROLE_CAPACITY_PER_NODE, |r| u16::from(offered.has(r)))
+    /// The fallback for a role with no sensor is stated once, in `RoleReading::to_load`, and it fires on
+    /// **absence** — not on a zero. That distinction is the whole point: substituting the offer for every zero
+    /// threw away the true reading of a role that legitimately went idle, at exactly the moment the controller
+    /// should have shrunk it. Standing supply in for demand is right for a role nobody can see and wrong for one
+    /// that reported nothing to do.
+    pub(crate) fn load(&self, offered: RoleSet, capacity: Demand) -> Demand {
+        self.reading().to_load(capacity, offered)
     }
 }
 
@@ -500,6 +508,10 @@ async fn assign_epoch<F: Field>(
         build_capability_directory::<F>(client, epoch, vrf.then_some(*beacon)),
         build_cell_setpoint::<F>(client, epoch, capacity)
     );
+    // The viability floor is applied **here**, after the join, because this is the only place that sees both the
+    // cell-wide setpoint and the eligible supply it must be conditioned on. Determinism is preserved: `members`
+    // is the same authenticated capability directory on every node, so every node floors identically.
+    let setpoint = setpoint.with_viability_floor(Demand::supply(&members));
     let roles = live.step(&members, epoch, beacon, setpoint);
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
@@ -567,7 +579,7 @@ pub fn spawn_self_organization<F: Field>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanos_core::roles::{Capability, Role, RoleSet};
+    use fanos_core::roles::{Capability, Role, RoleSet, cell_setpoint};
 
     fn node(i: u8) -> NodeId {
         NodeId([i; 32])
@@ -582,38 +594,101 @@ mod tests {
         // zero, precisely when it should be shrinking the role. It bound the two roles that *are* measured,
         // relay and storage: a cell could not conclude "nobody here needs relays".
         let offered = RoleSet::of(&[Role::Relay, Role::Storage, Role::Service]);
+        let cap = role_capacity();
         let sensor = LoadSensor::new();
 
         // Nothing reported yet is genuinely absent — the array's initial state must not read as `Some(0)`.
         assert_eq!(sensor.reading(), RoleReading::blind(), "an unreported sensor holds no reading");
-        let cold = sensor.setpoint(offered);
-        for role in Role::ALL {
-            assert_eq!(cold.of(role), u16::from(offered.has(role)), "{role:?} falls back before any report");
-        }
 
         // Now a report: relay measured **zero**, storage measured work, service has no sensor at all.
         sensor.record(
             RoleReading::blind().measuring(Role::Relay, 0).measuring(Role::Storage, 5).into_array(),
         );
+        let published = sensor.load(offered, cap);
+        assert_eq!(published.of(Role::Relay), 0, "a measured idle relay publishes zero work");
+        assert_eq!(published.of(Role::Storage), 5, "a measured load publishes as work units");
+        assert_eq!(
+            published.of(Role::Service),
+            cap.of(Role::Service),
+            "an unsensed offered role presumes itself at capacity — supply standing in for demand"
+        );
+        assert_eq!(published.of(Role::Exit), 0, "an unoffered, unsensed role publishes nothing");
 
-        let want = sensor.setpoint(offered);
+        // What the cell concludes from seven such nodes. This is the assertion that could not be made before:
+        // the setpoint reaches zero, so the controller can actually shrink the role.
+        let want = cell_setpoint(&[published; 7], cap);
         assert_eq!(
             want.of(Role::Relay),
             0,
-            "a measured idle relay must reach the controller as zero demand; the offer-for-any-zero rule \
-             reported 1 here and the role could never shrink"
+            "a cell where every node measured no relay demand must want no relays; the offer-for-any-zero rule \
+             reported 7 here and the role could never shrink"
         );
-        assert_eq!(
-            want.of(Role::Storage),
-            5u16.div_ceil(ROLE_CAPACITY_PER_NODE),
-            "a measured load converts by the setpoint denominator"
-        );
+        assert_eq!(want.of(Role::Storage), 35, "measured storage work aggregates");
+        assert_eq!(want.of(Role::Service), 7, "everyone who offers an unsensed role serves it");
+    }
+
+    #[test]
+    fn the_setpoint_divides_by_capacity_exactly_once() {
+        // At the shipped capacity of 1 a single division and a double one are both the identity, which is the
+        // only reason the double one survived: the driver published `⌈load / capacity⌉` and `cell_setpoint`
+        // divided the sum by capacity again. At capacity 4 they diverge, and the cell under-provisions.
+        let cap = Demand::per_role(|_| 4);
+        let offered = RoleSet::of(&[Role::Relay, Role::Service]);
+        let sensor = LoadSensor::new();
+        sensor.record(RoleReading::blind().measuring(Role::Relay, 8).into_array());
+
+        let published = sensor.load(offered, cap);
+        assert_eq!(published.of(Role::Relay), 8, "a node publishes work units, not nodes");
+
+        let want = cell_setpoint(&[published, published], cap);
+        // 16 units of relay work at 4 units per node. Dividing twice gave ⌈⌈8/4⌉ + ⌈8/4⌉ / 4⌉ = 1 — a quarter
+        // of the relays the cell needs.
+        assert_eq!(want.of(Role::Relay), 4, "16 units of work at 4 per node needs 4 relays");
         assert_eq!(
             want.of(Role::Service),
-            1,
-            "service has no sensor, so supply stands in for demand — the one remaining fallback"
+            2,
+            "the unsensed fallback stays exact away from capacity 1: both nodes offer it, so both serve it"
         );
-        assert_eq!(want.of(Role::Exit), 0, "an unoffered, unsensed role is wanted by nobody");
+    }
+
+    #[test]
+    fn a_self_gated_role_keeps_one_server_and_a_role_nobody_offers_gets_no_phantom_floor() {
+        // Zero demand is absorbing for a role whose load only assigned nodes produce: nobody serving means no
+        // registrations, no flows and no gathers, so the load reads zero forever and the role never returns.
+        // The floor is the minimum that keeps the signal observable — and it must be conditioned on supply,
+        // since a setpoint above supply is surfaced as a deficit the cell escalates to its parent.
+        let measured_nothing = Demand::default();
+        let everyone_offers = Demand::per_role(|_| 3);
+
+        // Named per role rather than compared against `load_is_self_gated()`. Asserting agreement between the
+        // floor and the classification is a tautology — flipping the classification moves both sides together
+        // and the test still passes, which is exactly what happened when this was first written. What must be
+        // pinned is *which roles are which*, and that only a literal can say.
+        let floored = measured_nothing.with_viability_floor(everyone_offers);
+        assert_eq!(floored.of(Role::Service), 1, "nobody serving means no service to measure");
+        assert_eq!(floored.of(Role::Exit), 1, "nobody exiting means no flows to measure");
+        assert_eq!(floored.of(Role::Rendezvous), 1, "nobody gathering means no gathers to measure");
+        assert_eq!(
+            floored.of(Role::Relay),
+            0,
+            "relay load is originated traffic, which a node produces unassigned — no floor needed"
+        );
+        assert_eq!(
+            floored.of(Role::Storage),
+            0,
+            "the store is structural, so held keys stay observable with nobody assigned — no floor needed"
+        );
+
+        // Nobody can serve any role: no floor anywhere, or the cell escalates a want no member can meet.
+        assert_eq!(
+            measured_nothing.with_viability_floor(Demand::default()),
+            Demand::default(),
+            "a role nobody offers must not be floored into a permanent phantom deficit"
+        );
+
+        // The floor never overrides a real measurement.
+        let busy = Demand::per_role(|_| 9);
+        assert_eq!(busy.with_viability_floor(everyone_offers), busy, "a floor raises, it does not clamp");
     }
 
     #[test]

@@ -74,6 +74,34 @@ impl Role {
     /// The number of roles — the width of a per-role array ([`Demand`]).
     pub const COUNT: usize = Role::ALL.len();
 
+    /// Whether this role's **measured load is produced only by nodes assigned to it** — the property that
+    /// decides whether zero demand is a stable state or an absorbing one.
+    ///
+    /// The setpoint loop is closed: assignment → work performed → load measured → assignment. For a role where
+    /// that last arrow depends on the first, retiring the role destroys the very signal that would justify
+    /// reinstating it, and zero becomes a trap the cell cannot climb out of. So the classification is not
+    /// taxonomy — it is read off the loop topology, one role at a time, by asking *what produces this sensor's
+    /// signal*:
+    ///
+    /// - [`Relay`](Self::Relay) — **no**. Its sensor counts frames this node *originated*. A node originates
+    ///   traffic whether or not the cell assigned it the relay role, so the signal outlives the assignment.
+    /// - [`Storage`](Self::Storage) — **no**. The DHT store is structural: a value lands on its responsible
+    ///   content point by geometry, with nobody assigned, so held keys stay observable.
+    /// - [`Service`](Self::Service), [`Exit`](Self::Exit), [`Rendezvous`](Self::Rendezvous) — **yes**. A node
+    ///   only serves, exits, or gathers when the assignment says so. Nobody assigned means no registrations, no
+    ///   flows and no gathers, so the load reads zero forever and the role never returns.
+    ///
+    /// A self-gated role therefore needs a viability floor on its setpoint — see
+    /// [`Demand::with_viability_floor`]. A new role must answer this question, which is why it lives on the enum
+    /// rather than in the driver that happens to need it today.
+    #[must_use]
+    pub const fn load_is_self_gated(self) -> bool {
+        match self {
+            Role::Relay | Role::Storage => false,
+            Role::Service | Role::Exit | Role::Rendezvous => true,
+        }
+    }
+
     /// This role's index into a per-role array, in [`Role::ALL`] order.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -376,6 +404,31 @@ impl Demand {
         };
         Demand::per_role(|role| step(self.of(role), setpoint.of(role), floor.of(role)))
     }
+
+    /// This setpoint raised to the **viability floor**: at least one node for every self-gated role somebody can
+    /// serve.
+    ///
+    /// The floor is `1`, and it is derived rather than chosen. A role whose observed load is produced only by
+    /// nodes assigned to it ([`Role::load_is_self_gated`]) loses observability the instant the cell retires it —
+    /// no assignment means no work means no load means no assignment, an absorbing state. One retained server is
+    /// the minimum that keeps the role's load observable, i.e. the persistent excitation the closed loop needs to
+    /// notice demand returning. Not a tunable: below it the loop is blind, above it the measurement already
+    /// speaks for itself.
+    ///
+    /// `supply` is the per-role **eligible supply** ([`Demand::supply`]) and conditions the floor, because
+    /// flooring a role *nobody offers* would manufacture a want no member can meet — and a setpoint above supply
+    /// is deliberately not capped but surfaced as a deficit the cell escalates to its parent, so a phantom floor
+    /// would escalate forever.
+    ///
+    /// Applied where the **cell total** is known, never per node: if every member floored its own contribution
+    /// the cell would provision one server per member instead of one per cell.
+    #[must_use]
+    pub fn with_viability_floor(self, supply: Demand) -> Demand {
+        Demand::per_role(|role| {
+            let needs_floor = role.load_is_self_gated() && supply.of(role) > 0;
+            self.of(role).max(u16::from(needs_floor))
+        })
+    }
 }
 
 /// Per-role **measured load**, where a role with no sensor is `None` — the raw observation a driver turns into
@@ -450,16 +503,24 @@ impl RoleReading {
         Self { readings }
     }
 
-    /// The [`Demand`] this reading implies, in **nodes**: `⌈load / capacity⌉` for a measured role, and
-    /// `fallback(role)` for one with no sensor.
+    /// This node's **published load contribution**, in work units — what [`cell_setpoint`] sums and then divides
+    /// by capacity, once.
     ///
-    /// The conversion lives here, once, so the fallback policy is stated in a single place rather than inferred
-    /// from a magic zero at each call site. `capacity` is the per-node service capacity, floored at 1 so a
-    /// misconfigured zero cannot divide.
+    /// **In work units, not nodes, and that is the fix.** The driver used to divide here as well
+    /// (`⌈load / capacity⌉`) and publish the quotient, which `cell_setpoint` then divided by capacity again.
+    /// Capacity came out twice. It was invisible only because the shipped per-node capacity is `1`, where both
+    /// divisions are the identity — so the error was waiting for the first role to be given a real capacity
+    /// class, which is exactly what the capacity-weight constant anticipates.
+    ///
+    /// The fallback for a role with **no sensor** is stated in the same units, and stating it that way makes it
+    /// exact rather than approximately right: an offered-but-unsensed role publishes `capacity`, i.e. the node
+    /// presumes itself *at capacity*. The cell total is then `N_offering × capacity` and the setpoint comes back
+    /// as precisely `N_offering` — "everyone who offers it, serves it" — at **any** capacity. Publishing a bare
+    /// `1` reproduced that only at capacity 1 and silently under-provisioned above it.
     #[must_use]
-    pub fn to_demand(self, capacity: u16, mut fallback: impl FnMut(Role) -> u16) -> Demand {
+    pub fn to_load(self, capacity: Demand, offered: RoleSet) -> Demand {
         Demand::per_role(|role| {
-            self.of(role).map_or_else(|| fallback(role), |load| load.div_ceil(capacity.max(1)))
+            self.of(role).unwrap_or(if offered.has(role) { capacity.of(role) } else { 0 })
         })
     }
 }

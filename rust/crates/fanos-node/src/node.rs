@@ -31,7 +31,7 @@ use fanos_quic::NodeCredentials;
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::role_loop::{
-    Assignment, ROLE_CAPACITY_PER_NODE, SelfOrgConfig, SelfOrganization, spawn_load_sensor,
+    Assignment, SelfOrgConfig, SelfOrganization, role_capacity, spawn_load_sensor,
     spawn_self_organization,
 };
 use crate::error::NodeError;
@@ -494,7 +494,7 @@ fn spawn_roles<F: Field + 'static>(
             node_id: NodeId(credentials.vrf_secret().public().to_bytes()),
             vrf_secret: credentials.vrf_secret(),
             capability: Capability::new(offered, ROLE_CAPACITY_WEIGHT),
-            capacity: Demand::per_role(|_| ROLE_CAPACITY_PER_NODE),
+            capacity: role_capacity(),
             controller: RoleController::new(Demand::default(), Demand::default(), ROLE_GAIN_SEVENTH),
             // A `Node` runs VRF coordinates, so it publishes a coordinate-bound advertisement and verifies everyone
             // else's (`crate::bound`). `None` only in a pinned cell, where the proof cannot exist.
@@ -503,7 +503,7 @@ fn spawn_roles<F: Field + 'static>(
         // The measured load this node is carrying, as the controller's setpoint. Both the `⌈load / capacity⌉`
         // conversion and the substitution for a role with **no** sensor live in `LoadSensor::setpoint`, so the
         // fallback is stated once instead of inferred from a magic zero here.
-        move || load.setpoint(offered),
+        move || load.load(offered, role_capacity()),
         // The transport's own peer table, as a lower bound on live membership that owes nothing to the overlay store.
         // The role loop uses it to tell "I am alone" from "I have found no one yet" — see `ROSTER_REFRESH`.
         move || peers.len(),
