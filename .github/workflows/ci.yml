@@ -107,9 +107,13 @@ jobs:
       - name: Build twice from different paths
         run: |
           set -euo pipefail
+          # The workflow's `defaults.run.working-directory` is already `rust`, so this copies `.` — not
+          # `rust`. The first version of this job wrote `-C rust` and died with "tar: rust: Cannot open",
+          # which is what shipping a CI job whose *shell* was never run looks like: the reproducibility
+          # method was validated locally, the six lines around it were not.
           mkdir -p /tmp/build-a /tmp/build-b
-          tar -C rust --exclude=target -cf - . | tar -C /tmp/build-a -xf -
-          tar -C rust --exclude=target -cf - . | tar -C /tmp/build-b -xf -
+          tar --exclude=./target -cf - . | tar -C /tmp/build-a -xf -
+          tar --exclude=./target -cf - . | tar -C /tmp/build-b -xf -
           ( cd /tmp/build-a && CARGO_TARGET_DIR=/tmp/target-a cargo build --release -p fanos-cli -p fanos-node )
           ( cd /tmp/build-b && CARGO_TARGET_DIR=/tmp/target-b cargo build --release -p fanos-cli -p fanos-node )
       - name: Compare the artefacts
