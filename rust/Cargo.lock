@@ -908,7 +908,6 @@ dependencies = [
  "fanos-ports",
  "fanos-pqcrypto",
  "fanos-primitives",
- "fanos-telemetry",
  "fanos-threshold",
  "fanos-wire",
  "proptest",
