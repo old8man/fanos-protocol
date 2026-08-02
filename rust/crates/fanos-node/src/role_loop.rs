@@ -568,6 +568,28 @@ const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> 
     !complete || (stable >= STABLE_BEFORE_BACKOFF && roster >= peers)
 }
 
+/// The setpoint to step toward this epoch: the freshly-read one when the scan concluded, else the demand
+/// already held.
+///
+/// **A partial read may hold the demand; it may never move it.** `Read::Unknown` is documented as "not a
+/// negative, and not evidence of anything", and `build_cell_setpoint`'s own doc says a member whose report did
+/// not resolve "contributes zero exactly as a genuine absence does, so the setpoint is *understated* by a
+/// partial read". Both were true and the caller stepped the controller on that understated value anyway — so a
+/// timed-out read looked exactly like a member reporting no demand, the role shrank, and the next epoch's
+/// successful read grew it back. Pure measurement noise driving role churn, which is churn in the anonymity
+/// set, and with κ = 1 the assignment tracks it in a single step.
+///
+/// Safe on a small or bootstrapping cell precisely because the read is three-valued: an empty coordinate is a
+/// definite `Absent` and does not count as unknown, so a solitary node's six empty slots still read *complete*
+/// and the demand is free to move. Holding would otherwise freeze a young cell at zero for ever — which is what
+/// makes the two-valued version of this rule a bug and the three-valued one a fix.
+///
+/// The viability floor rides with the fresh branch, where the supply it must be conditioned on was just read;
+/// a held demand already carries the floor applied when it was last set.
+fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand) -> Demand {
+    if complete { read.with_viability_floor(supply) } else { held }
+}
+
 /// Recompute and publish the assignment for `epoch`, reporting whether the directory reads it rests on were **complete**.
 ///
 /// The second value is the one that was missing. A read that timed out was indistinguishable from a member that published
@@ -591,10 +613,7 @@ async fn assign_epoch<F: Field>(
         build_capability_directory::<F>(client, epoch, vrf.then_some(*beacon)),
         build_cell_setpoint::<F>(client, epoch, capacity)
     );
-    // The viability floor is applied **here**, after the join, because this is the only place that sees both the
-    // cell-wide setpoint and the eligible supply it must be conditioned on. Determinism is preserved: `members`
-    // is the same authenticated capability directory on every node, so every node floors identically.
-    let setpoint = setpoint.with_viability_floor(Demand::supply(&members));
+    let setpoint = setpoint_to_track(setpoint, load_complete, live.demand(), Demand::supply(&members));
     let roles = live.step(&members, epoch, beacon, setpoint);
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
@@ -666,6 +685,42 @@ mod tests {
 
     fn node(i: u8) -> NodeId {
         NodeId([i; 32])
+    }
+
+    #[test]
+    fn a_read_that_did_not_conclude_holds_the_demand_instead_of_shrinking_it() {
+        // The noise source that made the assignment flap. A member whose load slot timed out contributes zero
+        // exactly as a genuine absence does, so the aggregate is understated — and the controller stepped on
+        // it. With κ = 1 that is a one-step retirement of a role nobody stopped needing, undone the next epoch
+        // by a read that happened to succeed. Churn in the anonymity set, driven by the measurement.
+        let supply = Demand::per_role(|_| 3);
+        let held = Demand::per_role(|r| if r == Role::Relay { 5 } else { 0 });
+        let understated = Demand::default();
+
+        assert_eq!(
+            setpoint_to_track(understated, false, held, supply),
+            held,
+            "a read that did not conclude is not evidence that demand fell — hold"
+        );
+
+        // A read that DID conclude moves the demand, including downward. That direction has to keep working:
+        // believing a measured zero is the whole point of the sensor work, and a rule that never shrank a role
+        // would trade one defect for its mirror image.
+        let measured_zero = Demand::default();
+        let moved = setpoint_to_track(measured_zero, true, held, supply);
+        assert_eq!(moved.of(Role::Relay), 0, "a COMPLETE read of zero relay demand must shrink the role");
+
+        // …and the floor rides with the fresh branch, so a self-gated role stays observable.
+        assert_eq!(moved.of(Role::Rendezvous), 1, "the viability floor applies to the freshly-read setpoint");
+
+        // A young cell must not freeze. Its empty coordinates are definite absences, not unknowns, so the scan
+        // reads complete and the demand is free to move from zero — which is what makes holding safe at all.
+        let fresh = Demand::per_role(|r| if r == Role::Storage { 4 } else { 0 });
+        assert_eq!(
+            setpoint_to_track(fresh, true, Demand::default(), supply).of(Role::Storage),
+            4,
+            "a bootstrapping cell whose reads conclude tracks its first real setpoint"
+        );
     }
 
     #[test]
