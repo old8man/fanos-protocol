@@ -64,9 +64,35 @@ use crate::capdir::{build_capability_directory, spawn_capability_publisher};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
 /// The load one node is taken to absorb per role — the setpoint denominator, applied **once**, cell-wide, in
-/// `cell_setpoint`. `1` is the right default before telemetry can substantiate a real capacity class, and it is
-/// deliberately *not* what makes "everyone who offers it, serves it" hold: an unsensed offered role publishes
-/// `capacity` as its load, so that identity survives any value here.
+/// `cell_setpoint`. An unsensed offered role publishes `capacity` as its load, so "everyone who offers it,
+/// serves it" holds for those whatever this value is.
+///
+/// # This value is wrong now, and `1` is why
+///
+/// `1` was right while every role was unsensed: each offering node published one node's worth, the setpoint
+/// came back equal to the eligible supply, and the identity above was the whole behaviour. Making the sensors
+/// live (`5fa70ea`) changed what a *sensed* role publishes — its **measured load**, counted in keys held and
+/// frames originated — while leaving the denominator at 1. So the setpoint is now
+///
+/// ```text
+///   ⌈Σ (keys held + frames originated) / 1⌉   nodes
+/// ```
+///
+/// which reads an event count as a node count. A cell holding a hundred keys asks for a hundred storage
+/// nodes. On any active cell the demand therefore exceeds the eligible supply permanently, `assign_report`
+/// fills `min(demand, eligible)` so **every offering node receives every role it offered**, and the
+/// controller can no longer express anything: the assignment it produces is the one a node would reach with
+/// no controller at all. Measured on a fleet: `transitions = 0` across a whole observation window, which is
+/// what made role-assignment churn undetectable (`c77120a`).
+///
+/// The permanent deficit that saturation implies is harmless **only because nothing reads it** —
+/// `AssignReport::deficit` has no production caller, so the escalation to the parent cell that
+/// `docs/design-roles.md` describes is not wired. If it were, it would be escalating a fabricated shortfall
+/// on every epoch.
+///
+/// Correcting it is a **measurement**, not a new constant: capacity must be in the load's own units — how
+/// many keys, or frames, one node absorbs per observation window — which is a throughput figure
+/// `fanos-bench` can produce. Setting it by taste would replace one wrong number with another.
 pub(crate) const ROLE_CAPACITY_PER_NODE: u16 = 1;
 
 /// The per-role capacity vector, built once so the load publisher and the setpoint aggregation cannot disagree
