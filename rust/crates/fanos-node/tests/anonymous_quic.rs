@@ -554,6 +554,11 @@ struct OffCombiner {
     dialer: FanosDialer<StaticResolver>,
     /// The canonical combiner of meeting point 0 — the node a censorship scenario silences.
     m_index: usize,
+    /// The host's dead-drop line members — every session's replies come home here, whatever meeting
+    /// point the dial chose, so a silenced node ON this line breaks dials it is not otherwise near.
+    drop_line_members: Vec<Triple>,
+    /// The coordinate of the node `m_index` names, so a scenario can check what it is about to remove.
+    silenced_coord: Triple,
 }
 
 impl OffCombiner {
@@ -648,7 +653,15 @@ impl OffCombiner {
     // left alive across the censorship loop was one of the hypotheses this split exists to separate.
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
 
-        Self { nodes, _host_node: host_node, _client_node: client_node, dialer, m_index }
+        Self {
+            nodes,
+            _host_node: host_node,
+            _client_node: client_node,
+            dialer,
+            m_index,
+            drop_line_members: line_member_coords::<F2>(drop_line),
+            silenced_coord: m_combiner,
+        }
     }
 
     /// One request/response over a fresh anonymous session. `None` if the dial or the exchange did not
@@ -693,6 +706,23 @@ async fn the_service_survives_one_meeting_point_going_silent() {
     // property is "remains reachable", and one arrival settles it. Do not "fix" a marginal count by looping
     // until green.
     let mut cell = OffCombiner::build().await;
+    // **The silenced node must remove exactly ONE thing.** Measured: index 0 is `[1,0,0]`, which is both the
+    // canonical combiner of meeting point 0 *and* a member of the host's dead-drop line
+    // `[[0,0,1],[1,0,0],[1,0,1]]` — so shutting it down removed a meeting point AND a reply-line member at
+    // once. Dials to the two *live* meeting points then failed as well, because the reply line is shared by
+    // every session whatever meeting point it chose, and ~1 in 3 replies drew the dead member as its gatherer
+    // and was lost. That is what the 237-multicasts-to-59-opens ratio was: retransmission past a loss the test
+    // had introduced itself, not the censorship it names.
+    //
+    // Asserted rather than assumed, because the overlap depends on the VRF draw and a future plane or seed
+    // would move it silently — turning this back into a two-variable experiment with no warning.
+    assert!(
+        !cell.drop_line_members.contains(&cell.silenced_coord),
+        "the node this test silences ({:?}) is also on the host's reply line ({:?}) — silencing it removes \
+         two independent things and the result cannot be attributed to either",
+        cell.silenced_coord,
+        cell.drop_line_members,
+    );
     cell.nodes[cell.m_index].take().expect("the combiner node is still held").shutdown();
 
     let mut reached = 0;
