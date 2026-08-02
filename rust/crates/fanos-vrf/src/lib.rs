@@ -760,6 +760,73 @@ mod tests {
     use super::*;
     use fanos_field::{F7, F31};
 
+    /// Seating is not free, and the cost falls as the plane grows.
+    ///
+    /// A coordinate is a uniform draw; collisions are resolved by the probe walk, which is confined to the
+    /// node's own line and so has only `q + 1` chances. Some nodes therefore never seat. That fraction is a
+    /// **capacity fact about the plane**, independent of any adversary, and it belongs beside the sizing
+    /// advice in `docs/deployment-minima.md` — which quotes these numbers.
+    ///
+    /// Pinned here rather than left in a document because it is the kind of figure that is quoted long after
+    /// the code it describes has changed. Two neighbouring numbers it is easy to confuse it with, and neither
+    /// is this one: `≈ √P` is the *birthday* bound — when collisions begin, not how many nodes seat — and
+    /// `1 − 1/e ≈ 63 %` is what unresolved uniform draws would give, i.e. the plane **without** the walk.
+    #[test]
+    fn a_larger_plane_seats_a_larger_fraction_of_its_nodes() {
+        // Simulated over the real walk shape: each node draws a line and takes the first free point on it.
+        fn occupancy(points: usize, line: usize, seed: u64) -> (usize, usize) {
+            let (mut state, mut taken, mut unseated) = (seed | 1, alloc::vec![false; points], 0usize);
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for _ in 0..points {
+                // A line's `q + 1` points, drawn as the walk would visit them.
+                let start = (next() as usize) % points;
+                let stride = 1 + (next() as usize) % points.max(2);
+                // `get_mut`, not indexing: this crate denies panicking indexing even in tests, and the
+                // modulus already proves `p < points` — so the checked form costs nothing and the deny stays
+                // meaningful everywhere else.
+                let mut seated = false;
+                for k in 0..line {
+                    let p = (start + k * stride) % points;
+                    if let Some(slot) = taken.get_mut(p)
+                        && !*slot
+                    {
+                        *slot = true;
+                        seated = true;
+                        break;
+                    }
+                }
+                if !seated {
+                    unseated += 1;
+                }
+            }
+            (taken.iter().filter(|t| **t).count(), unseated)
+        }
+
+        // `q = 2` against `q = 7`: the same experiment at two plane orders.
+        let (occ_small, _) = occupancy(7, 3, 0xA1);
+        let (occ_large, _) = occupancy(57, 8, 0xA1);
+        let frac = |occ: usize, p: usize| occ as f64 / p as f64;
+        assert!(
+            frac(occ_large, 57) > frac(occ_small, 7),
+            "a larger plane must seat a larger FRACTION of its nodes — the walk has more chances on a longer \
+             line; measured {:.0}% at q=2 against {:.0}% at q=7",
+            frac(occ_small, 7) * 100.0,
+            frac(occ_large, 57) * 100.0
+        );
+        // And the walk is what buys it: without any retry, occupancy is the `1 − 1/e` of a blind draw.
+        assert!(
+            frac(occ_small, 7) > 0.63,
+            "even the smallest plane must beat the no-walk baseline of 1 − 1/e ≈ 63%, else the probe walk is \
+             not earning its complexity: got {:.0}%",
+            frac(occ_small, 7) * 100.0
+        );
+    }
+
     #[test]
     fn probe_zero_is_exactly_the_existing_coordinate() {
         // The compatibility hinge: a node meeting no collision derives what it always did, so adding resolution changes

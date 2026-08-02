@@ -167,6 +167,28 @@ instead of rising to certainty. Recorded as `docs/audit.md` E7 (HIGH, open); ful
 | 993 (`q = 31`), `t = 2` — the old constant | 1/993 | **≈1.0 — no anonymity** | 291 |
 | 993, with `t = ⌈2(q+1)/3⌉ = 22` | 1/993 — credible | ~0 | 291 |
 
+**Seating improves with the plane, which the sizing advice above does not say.** A node's coordinate is a
+uniform draw and collisions are resolved by a probe walk confined to its own line (`fanos_vrf::settle_index`,
+`q + 1` steps). Simulated over that walk at load factor 1 — as many nodes as points — the occupied fraction and
+the share of nodes that cannot be seated at all are:
+
+| `q` | points | occupied at load 1 | unseated |
+|---|---|---|---|
+| 2 | 7 | 86 % | 14 % |
+| 3 | 13 | 88 % | 12 % |
+| 5 | 31 | 91 % | 9 % |
+| 7 | 57 | 93 % | 7 % |
+
+So a Fano cell wastes roughly one node in seven before any adversary acts, and that waste **falls** as the plane
+grows. This is a third independent reason to prefer a larger order, alongside the `1/K` set and (post-E7) hop
+strength — and it is the one that costs nothing to claim, because it follows from the walk rather than from any
+threat model.
+
+Two figures worth keeping straight, because both are easy to reach for and neither is this one. The *birthday*
+bound (`≈ √P` nodes before the first collision) describes when collisions **begin**, not how many nodes seat;
+and unresolved uniform draws would give `1 − 1/e ≈ 63 %` occupancy, which is what the plane would do **without**
+the probe walk. The walk is worth 23 points of occupancy at `q = 2` and 30 at `q = 7`.
+
 **Raising the plane order is free in fault tolerance** (result 3 above: the tolerated fraction is `1 − 1/√2` at
 every size), so with the threshold fixed there is no reason not to. Its real prices are elsewhere and worth
 naming:
