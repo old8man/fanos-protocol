@@ -563,6 +563,10 @@ struct OffCombiner {
 
 impl OffCombiner {
     async fn build() -> Self {
+        Self::build_with_host(None).await
+    }
+
+    async fn build_with_host(force_host: Option<usize>) -> Self {
     // The §3b general case — no cheat: the service operator is NOT the node at its meeting combiner (it
     // cannot choose its VRF coordinate). It registers an anonymous forward route (its own dead-drop line)
     // with the combiner by onion; the combiner re-seals each client request to that dead-drop; the operator
@@ -591,7 +595,7 @@ impl OffCombiner {
     let m_index = Point::<F2>::new(m_combiner).unwrap().index();
 
     // The operator hosts on a node that is NOT the meeting combiner — the realistic case.
-    let host_index = (0..7).find(|&i| i != m_index).unwrap();
+    let host_index = force_host.unwrap_or_else(|| (0..7).find(|&i| i != m_index).unwrap());
     let host_point = Point::<F2>::at(host_index);
     // Its dead-drop line (beacon-blinded, through its own point): where forwarded requests come home.
     let drop_line =
@@ -684,6 +688,49 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         cell.exchange().await.as_deref(),
         Some(b"anon-quic-200:GET /off".as_slice()),
         "a service hosted off its meeting combiner was reached end-to-end via combiner forwarding",
+    );
+}
+
+#[tokio::test]
+#[ignore = "diagnostic sweep: ~7 fixtures, minutes — run explicitly with --ignored"]
+async fn every_legitimate_host_placement_is_reachable() {
+    let _serial = serial();
+    let _serial = common::serial_cell().await;
+    // **Does plain reachability depend on where the operator happens to sit?** It must not: an operator
+    // cannot choose its VRF coordinate, so a placement that cannot be reached is a placement the network
+    // hands out and then cannot serve.
+    //
+    // Written as a sweep because the single fixed choice hid it. `(0..7).find(|i| i != m_index)` always
+    // picks the same point, so the suite has only ever exercised one placement — and forcing a different one
+    // while investigating the censorship scenario made plain reachability fail outright.
+    // Each placement is built under its own bound, so a placement that cannot even *register* is reported
+    // as that rather than killing the sweep inside the harness with no index attached. Measured: hosts 0-4
+    // build and host 5 stalls waiting for a meeting-line member to bind — and which placement stalls moves
+    // between runs, so a single fixed choice could never have found this.
+    let mut reachable = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut unbuildable = Vec::new();
+    for host in 0..7 {
+        // Built on its own task, because the fixture's waits **panic** when they give up
+        // (`REFUTED — no notification ... while waiting for a host registration to bind`) and a panic walks
+        // straight through `tokio::time::timeout`. A `JoinHandle` reports it as an `Err` instead, which is
+        // what lets this sweep name *which* placements fail rather than dying on the first with no index.
+        let Ok(cell) = tokio::spawn(OffCombiner::build_with_host(Some(host))).await else {
+            unbuildable.push(host);
+            continue;
+        };
+        if host == cell.m_index {
+            continue; // the meeting combiner itself is the case the §3b scenario excludes by construction
+        }
+        let ok = cell.exchange().await.as_deref() == Some(b"anon-quic-200:GET /off".as_slice());
+        if ok { reachable.push(host) } else { unreachable.push(host) }
+        drop(cell);
+    }
+    assert!(
+        unreachable.is_empty() && unbuildable.is_empty(),
+        "host placement decides whether a service works at all: reachable {reachable:?}, UNREACHABLE \
+         {unreachable:?}, could not even register {unbuildable:?} — an operator cannot choose its VRF \
+         coordinate, so every placement the network hands out has to be servable",
     );
 }
 
