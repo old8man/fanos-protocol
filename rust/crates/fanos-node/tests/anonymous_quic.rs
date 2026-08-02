@@ -31,7 +31,6 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use fanos_aphantos::ThresholdRouter;
-use std::time::Duration;
 
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
 use fanos_diaulos::{StaticKeypair, bundle_from_identity};
@@ -655,6 +654,18 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     //   showing through rather than test hygiene: the only failure signal is a clock, which is exactly the signal
     //   the adversary controls — and why docs §6.2 rejected client-walks-the-points as the PRIMARY mechanism.
     //
+    // ⚠️ **The paragraph below is contradicted by arithmetic and is kept only as the record of a refuted
+    // explanation.** On the Fano plane the silenced node is one of three members of one of three meeting
+    // points, so a single attempt avoids it with probability 1 − (1/3)(1/3) ≈ 0.889, making 0 of 8 arrivals
+    // ≈ 2.3e-8 — one run in forty million. It was observed roughly **one run in three**. Whatever makes a
+    // failing run fail is therefore shared across all eight attempts, not drawn per attempt.
+    //
+    // Two further measured facts: on failing runs the whole forward path is provably healthy (four distinct
+    // combiners receive the request, each reports the host known, the host ingests it, the reply is sealed,
+    // and the client opens it — 314 sealed / 44 opened in one such run); and some failing runs never reach
+    // this loop at all, panicking at the *earlier* end-to-end assertion. This test name covers at least two
+    // distinct failures.
+    //
     // SOME ATTEMPTS MAY STILL MISS THEIR DEADLINE UNDER LOAD, and that is the expected shape, not a flake:
     // `anonymous_dial` does not retry a whole dial, but every DIAULOS retransmit reseals a fresh onion whose
     // launch and per-hop gatherers are drawn anew (`combiner_for_salted`, #55) — so a dial that touches the
@@ -670,7 +681,16 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     let mut reached = 0;
     for _ in 0..8 {
         let Ok(mut s) = dialer.dial(&Target::Name("off.fanos".to_owned(), 80)).await else { continue };
-        let attempt = tokio::time::timeout(Duration::from_secs(12), common::exchange(&mut s, b"GET /off")).await;
+        // Bounded by the harness's own **derived** span, not a hand-picked number. `exchange` already runs
+        // under `within_span`, whose budget is `FROZEN_SPAN` (= `ROUND_TIMEOUT_MAX × 2`, 48 s). Wrapping it in
+        // a shorter 12 s killed every attempt before the thing that judges it could reach a verdict — so the
+        // loop counted 0 of 8 arrivals while the round trip was demonstrably completing underneath: measured,
+        // 314 replies sealed by the host and 44 opened by the client during a single failing run.
+        //
+        // The outer bound is kept (a dial that truly hangs must not consume the whole loop) but set to the
+        // same derived quantity, so it can only ever fire *after* the inner harness has spoken.
+        let attempt =
+            tokio::time::timeout(common::FROZEN_SPAN, common::exchange(&mut s, b"GET /off")).await;
         if attempt.as_deref() == Ok(b"anon-quic-200:GET /off".as_slice()) {
             reached += 1;
         }
