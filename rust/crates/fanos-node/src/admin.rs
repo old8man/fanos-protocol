@@ -32,6 +32,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 use fanos_runtime::ports::stations::{GatherHealth, Observation};
+use fanos_telemetry::CoherenceFrame;
 use fanos_wire::activation::Derivation;
 
 use crate::node::Health;
@@ -120,6 +121,21 @@ pub enum Request {
     /// Answered off the loop, like `census`: it round-trips a command through the engine, and an operator's
     /// question is not worth pausing the node it is about.
     Stations,
+    /// **This node's own coherence frame** — Φ, purity, reflection, the Fano syndrome, the forecast.
+    ///
+    /// The coherence plane, where `stations` is the data-path plane: "is the organism healthy?" beside "is the
+    /// work getting done, and where does it stop?". `docs/design-observability.md` §1 is about needing both,
+    /// and the socket served only the second.
+    ///
+    /// It also closes the gap `fanos-observatory` names in its own module doc — "a **remote** source,
+    /// subscribing to a running node's telemetry stream, implements the same `SnapshotSource` and drops in
+    /// behind this one". The monitor could render a scripted scenario or a simulated cell and never a deployed
+    /// node, because a deployed node had no way to say what it saw. This is that way.
+    ///
+    /// Distinct from `census`, which reads every *peer's* published ε-private frame out of the overlay store:
+    /// this is the node's own reading, unprivatized, local, and immediate — the operator asking their own node,
+    /// which §3's R4 is explicit costs no anonymity.
+    Coherence,
     /// Ask the node to shut down cleanly.
     Shutdown,
 }
@@ -135,6 +151,7 @@ impl Request {
             "census" => Some(Self::Census),
             "consensus" => Some(Self::Consensus),
             "stations" => Some(Self::Stations),
+            "coherence" => Some(Self::Coherence),
             "shutdown" => Some(Self::Shutdown),
             _ => None,
         }
@@ -143,7 +160,7 @@ impl Request {
     /// Every verb, for the error message a wrong one gets.
     #[must_use]
     pub const fn all() -> &'static str {
-        "ping | health | roles | census | consensus | stations | shutdown"
+        "ping | health | roles | census | consensus | stations | coherence | shutdown"
     }
 }
 
@@ -285,6 +302,37 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> Strin
     out
 }
 
+/// Render a [`CoherenceFrame`] as the socket's response body.
+///
+/// `key: value` lines like [`render_health`], so the two read alike and both parse with `cut`. The measures are
+/// printed to three decimals: they are `f32` ratios in `[0, 1]`, and more digits would suggest a precision the
+/// estimator does not have.
+///
+/// The **verdict and syndrome are printed as their numbers as well as their meanings**, because an operator
+/// comparing two nodes needs a value that compares, and a reader diagnosing one needs a word that explains.
+#[must_use]
+pub fn render_coherence(frame: &CoherenceFrame) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "epoch          : {}", frame.epoch);
+    let _ = writeln!(out, "phi            : {:.3}", frame.phi);
+    let _ = writeln!(out, "purity         : {:.3}", frame.purity);
+    let _ = writeln!(out, "reflection     : {:.3}", frame.reflection);
+    let _ = writeln!(out, "mean_r         : {:.3}", frame.mean_r);
+    let _ = writeln!(out, "spectral_gap   : {:.3}", frame.gap);
+    // The syndrome is a 3-bit Hamming code over the seven Fano points: 0 means no localized fault, and any
+    // other value NAMES the point. Printing only the number would make the operator do the decode.
+    let _ = writeln!(
+        out,
+        "syndrome       : {} ({})",
+        frame.syndrome,
+        if frame.syndrome == 0 { "no localized fault".to_owned() } else { format!("point {}", frame.syndrome - 1) }
+    );
+    let _ = writeln!(out, "verdict        : {}", frame.verdict);
+    let _ = writeln!(out, "forecast       : {}", frame.forecast);
+    let _ = writeln!(out, "heal_seq       : {}", frame.heal_seq);
+    out
+}
+
 /// Serve one connection: read a verb, forward it, write the answer.
 async fn serve_one(stream: UnixStream, tx: &mpsc::Sender<Envelope>) {
     let mut reader = BufReader::new(stream);
@@ -418,6 +466,7 @@ mod tests {
             Request::Census,
             Request::Consensus,
             Request::Stations,
+            Request::Coherence,
             Request::Shutdown,
         ];
         for request in &every {
@@ -428,6 +477,7 @@ mod tests {
                 Request::Census => "census",
                 Request::Consensus => "consensus",
                 Request::Stations => "stations",
+                Request::Coherence => "coherence",
                 Request::Shutdown => "shutdown",
             };
             assert!(Request::all().contains(word), "`{word}` is a variant but is not offered in help");
@@ -443,6 +493,36 @@ mod tests {
             every.len(),
             "the help string and the variant list disagree on how many verbs there are"
         );
+    }
+
+    #[test]
+    fn the_coherence_render_decodes_the_syndrome_instead_of_leaving_the_arithmetic_to_the_reader() {
+        // The syndrome is a 3-bit Hamming code over the seven Fano points, so `4` does not mean "four of
+        // something" — it names a point, and the off-by-one is the kind of decode an operator should never be
+        // asked to do at 3am. Both the number and its meaning are printed: the number compares between nodes,
+        // the word explains one.
+        let healthy = CoherenceFrame {
+            cell_id: fanos_telemetry::CellId([0; 16]),
+            epoch: 12,
+            syndrome: 0,
+            verdict: 0,
+            phi: 0.875,
+            purity: 0.5,
+            reflection: 0.25,
+            mean_r: 0.5,
+            gap: 0.125,
+            forecast: -3,
+            heal_seq: 7,
+        };
+        let body = render_coherence(&healthy);
+        assert!(body.contains("no localized fault"), "a zero syndrome is not point zero: {body}");
+        assert!(body.contains("phi            : 0.875"), "measures print to three decimals: {body}");
+        assert!(body.contains("epoch          : 12"), "and the epoch they were taken at: {body}");
+
+        let faulted = CoherenceFrame { syndrome: 4, ..healthy };
+        let body = render_coherence(&faulted);
+        assert!(body.contains("point 3"), "syndrome 4 names point 3, not point 4: {body}");
+        assert!(body.contains("syndrome       : 4"), "and the raw value is still there to compare: {body}");
     }
 
     #[test]

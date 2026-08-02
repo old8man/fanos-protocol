@@ -415,6 +415,35 @@ async fn read_data_path(notes: &mut tokio::sync::broadcast::Receiver<Notificatio
     }
 }
 
+/// Await this node's own coherence frame after an `Observe`, or say why there is none.
+///
+/// Drains until a `Notification::Observed` arrives, because `Observe` raises the data-path plane on the same
+/// stream. A node too young or too alone to have a liveness view raises no observation at all — the overlay
+/// emits the coherence half only when `cell_liveness` resolves — so the timeout is a real answer here and not
+/// merely a guard: "this node cannot yet see its cell" is what an operator needs to be told.
+async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notification>) -> String {
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, notes.recv()).await {
+            Ok(Ok(Notification::Observed(bytes))) => {
+                return fanos_telemetry::CoherenceFrame::decode(&bytes).map_or_else(
+                    || "the node emitted a frame this build cannot decode\n".to_owned(),
+                    |f| fanos_node::admin::render_coherence(&f),
+                );
+            }
+            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return "the node is shutting down\n".to_owned();
+            }
+            Err(_) => {
+                return "no coherence observation within the probe timeout: this node cannot yet see its \
+                        cell (too few peers, or no heartbeats have completed a window)\n"
+                    .to_owned();
+            }
+        }
+    }
+}
+
 /// Answer one control request. `consensus` is the only verb a role answers differently, so it arrives already
 /// rendered — a role with a ledger passes its probe, a role without passes [`NO_CHAIN`].
 fn answer_control<N: Controllable>(
@@ -431,6 +460,22 @@ fn answer_control<N: Controllable>(
         Request::Roles => node.roles_line(),
         Request::Consensus => consensus.to_owned(),
         Request::Shutdown => "shutting down\n".to_owned(),
+        Request::Coherence => {
+            // Answered off the loop and bounded, for the same reasons as `stations` — it is the same
+            // `Observe` round trip, and the node an operator asks this of may be the one that is stuck.
+            let (client, _) = node.census_source();
+            tokio::spawn(async move {
+                let mut notes = client.subscribe();
+                let asked = client.command(fanos_node::Command::Observe);
+                let body = if asked {
+                    read_coherence(&mut notes).await
+                } else {
+                    "the engine is not accepting commands\n".to_owned()
+                };
+                let _ = reply.send(body);
+            });
+            return Control::Go;
+        }
         Request::Stations => {
             // Answered off the loop, for the same reason as `census` and by the same shape: it round-trips a
             // command through the engine, and serving it inline would stop this node driving that engine while
@@ -2270,7 +2315,8 @@ fn print_help() {
                         install a service and start it — `--yes` takes every default, for provisioning)\n\
            fanos status [VERB]              — what this host is set up as, and whether it is running\n\
            \x20                                 VERB asks a running node directly: health (default), roles,\n\
-           \x20                                 stations (where work is stopping), census, consensus\n\
+           \x20                                 coherence (is the cell healthy), stations (where work is\n\
+           \x20                                 stopping), census, consensus\n\
            fanos start | stop | restart     — drive the installed service\n\
            fanos uninstall [--purge] [--yes]\n\
                        (remove the service; --purge also deletes config, identity and state — the\n\
