@@ -356,9 +356,17 @@ Recorded here rather than left implicit:
 - **An established session WEDGES when one cell member is down** — and that is stronger than the "2 dials in
   12 look flaky" it first appeared as. Giving each dial **4× the window** (192 s of *granted* time) recovers
   nothing: the failures land on the harness's `REFUTED` branch, which fires only when the poll ratio shows the
-  runtime *was* being scheduled and the session still moved zero bytes. Not slowness, not contention. The dial
-  and handshake succeed — hedging works — and the traffic afterwards stops forever, so some state bound *once
-  per session* points at the dead node and never redraws. Data path, not rendezvous path (task #38).
+  runtime *was* being scheduled and the session still moved zero bytes. The dial and handshake succeed —
+  hedging works — and the traffic afterwards stops. Data path, not rendezvous path (task #38).
+
+  **The cause is still open, and two hypotheses are now dead.** Two counters were added to kill them and
+  read zero on every node in every run: `GatherUnpeelable` (an expiry is *never* "`t` shares arrived and no
+  subset peeled" — always too few shares) and `GatherSelfShareMissing` (a gatherer never silently starts one
+  share short). A third reading — that expiries concentrate on lines through the dead point — looked
+  convincing on one run and **did not reproduce**: a later run put 680 expiries on a line the dead point is
+  not even on, at exactly that line's three members. What the large-expiry runs *do* share is large SRTTs
+  (4–6 s against 25–80 ms quiet), so machine load is a live confounder and the single-run conclusion was
+  probably reading it. The next step is the autopsy on an idle host, not another theory.
 - **The measurement that hid it.** The experiment wrapped the harness's own budgeted exchange in an outer 48 s
   timeout, which usually fired *first* and turned a loud wedge into a silent non-arrival. The earlier "control
   12/12, silenced 10/12" reading was therefore two **masked wedges**, not two slow dials — a reminder that an

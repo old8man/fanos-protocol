@@ -75,6 +75,26 @@ pub enum Station {
     /// rather than a rate. (Recording only failures is the one-sided-counter defect: it points at the
     /// wrong half.)
     GatherCompleted,
+    /// A gather's deadline fired with **`t` or more shares in hand** that no subset would peel — so the line
+    /// answered and its answers were wrong.
+    ///
+    /// Split from [`Station::GatherExpired`] because that counter's own doc names the distinction it was not
+    /// making: "how many shares it had reached is the difference between *the line is slow* and *the line is
+    /// dead*". Recorded together, the two are indistinguishable, and they call for opposite responses — one is
+    /// a liveness problem answered by avoiding the line, the other is corruption or attack answered by
+    /// refusing its shares. This is also the only counter that can tell whether a line with `q + 1 − t = 1`
+    /// spare member is failing because a member is absent or because a peel had exactly one candidate subset
+    /// and it did not work.
+    GatherUnpeelable,
+    /// The gatherer could **not compute its own share** of a line it is a member of, so the gather started
+    /// one short of where it should.
+    ///
+    /// A silent path until now, and a consequential one: a line's spare capacity is `q + 1 − t`, which is
+    /// exactly **1** at `q = 2`, so a gather that fails to seed itself has none left and needs every other
+    /// member to answer. That converts a routine loss into an expiry, and nothing said why. It happens when
+    /// the onion's layer was sealed to an epoch key this relay has already ratcheted past — the responder's
+    /// side of the same failure is [`Station::SharePartialFailed`], and the gatherer's had no counter at all.
+    GatherSelfShareMissing,
     /// A pending gather evicted at the in-flight cap, not by its deadline — capacity pressure, which is a
     /// different world from a slow line and must not be summed with it.
     GatherEvicted,
@@ -156,6 +176,8 @@ impl Station {
     pub const ALL: &'static [Self] = &[
         Self::GatherExpired,
         Self::GatherCompleted,
+        Self::GatherUnpeelable,
+        Self::GatherSelfShareMissing,
         Self::GatherEvicted,
         Self::ShareRequestNotAMember,
         Self::SharePartialFailed,
@@ -179,6 +201,8 @@ impl Station {
         match self {
             Self::GatherExpired => "gather.expired",
             Self::GatherCompleted => "gather.completed",
+            Self::GatherUnpeelable => "gather.unpeelable",
+            Self::GatherSelfShareMissing => "gather.self_share_missing",
             Self::GatherEvicted => "gather.evicted",
             Self::GatherOpenFailed => "gather.open_failed",
             Self::ShareRequestNotAMember => "share.not_a_member",
@@ -516,6 +540,8 @@ mod tests {
             match *station {
                 Station::GatherExpired => listed(Station::GatherExpired),
                 Station::GatherCompleted => listed(Station::GatherCompleted),
+                Station::GatherUnpeelable => listed(Station::GatherUnpeelable),
+                Station::GatherSelfShareMissing => listed(Station::GatherSelfShareMissing),
                 Station::GatherEvicted => listed(Station::GatherEvicted),
                 Station::GatherOpenFailed => listed(Station::GatherOpenFailed),
                 Station::ShareRequestNotAMember => listed(Station::ShareRequestNotAMember),

@@ -507,13 +507,15 @@ impl<F: Field> ThresholdRouter<F> {
         let members = Self::line_members(line);
         let member_count = members.len();
         let mut shares = Vec::new();
-        if let Some(i) = self.my_index(line)
-            && let Some(share) = self
-                .onion
-                .secrets()
-                .find_map(|sk| threshold::member_partial(&onion, i, sk))
-        {
-            shares.push(share);
+        // Seed our own partial. Failing to is NOT nothing: a line's spare capacity is `q + 1 − t`, exactly 1
+        // at `q = 2`, so a gather that starts one short has none left and needs every remaining member to
+        // answer — a routine loss then becomes an expiry, and until this counter existed nothing said why.
+        match self.my_index(line) {
+            None => {} // not a member of this line: there is no own share to seed, and that is not a fault
+            Some(i) => match self.onion.secrets().find_map(|sk| threshold::member_partial(&onion, i, sk)) {
+                Some(share) => shares.push(share),
+                None => self.stations.record(Station::GatherSelfShareMissing, Some(line)),
+            },
         }
 
         let mut effects = Vec::new();
@@ -824,9 +826,21 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                     // yields no sample, so nothing else would ever widen it (RFC 6298 §5.5 + Karn).
                     if let Some(dead) = self.pending.remove(&token) {
                         self.gather.expired();
-                        // THE station: the hop is discarded entire, and how many shares it had reached
-                        // is the difference between "the line is slow" and "the line is dead".
-                        self.stations.record(Station::GatherExpired, Some(dead.line));
+                        // THE station: the hop is discarded entire, and how many shares it had reached is
+                        // the difference between "the line is slow" and "the line is dead". So record which
+                        // — the previous single counter named that distinction in its own doc comment and
+                        // then did not make it, leaving an absent member and a wrong answer summed together
+                        // when they call for opposite responses.
+                        //
+                        // Below threshold: the line did not answer. At or above: it answered and no subset
+                        // of its answers peeled, which on a line with one spare member (`q + 1 − t = 1` at
+                        // `q = 2`) means the single candidate subset failed.
+                        let station = if dead.shares.len() < self.threshold {
+                            Station::GatherExpired
+                        } else {
+                            Station::GatherUnpeelable
+                        };
+                        self.stations.record(station, Some(dead.line));
                     }
                     Vec::new()
                 }
