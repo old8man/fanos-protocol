@@ -431,6 +431,35 @@ impl Demand {
     }
 }
 
+/// The [`Command::Control`] tag carrying a **load reading** to the sub-engine that assembles the load report.
+///
+/// A composite reaches that engine's `observe_load` seam directly when it holds it as a concrete type. When the
+/// inner engine is behind a `dyn Engine` the type system cannot reach it, and this is the route: the same seam,
+/// addressed by message. `Control` is the right carrier and not merely a convenient one — it is local by
+/// construction, entering only through the node handle, so a peer cannot inject a load reading and talk a cell
+/// into provisioning for work nobody asked for.
+///
+/// (The tag space is documented as per-sub-engine but is matched flatly by the composites that route it, so a
+/// value must be distinct across all of them, not just within one.)
+pub const CONTROL_LOAD_READING: u16 = 2;
+
+/// Encode a load reading for [`CONTROL_LOAD_READING`]: the role index, then the load, big-endian.
+#[must_use]
+pub fn encode_load_reading(role: Role, load: u16) -> [u8; 3] {
+    let [hi, lo] = load.to_be_bytes();
+    // `Role::index()` is `< Role::COUNT`, which the const assertion above pins well inside a byte.
+    [role.index() as u8, hi, lo]
+}
+
+/// Decode a [`CONTROL_LOAD_READING`] body, or `None` if it is not one — a malformed body is dropped, never
+/// guessed at, since a wrong role index would credit the reading to the wrong role.
+#[must_use]
+pub fn decode_load_reading(body: &[u8]) -> Option<(Role, u16)> {
+    let [index, hi, lo] = *body.first_chunk::<3>()?;
+    let role = *Role::ALL.get(usize::from(index))?;
+    Some((role, u16::from_be_bytes([hi, lo])))
+}
+
 /// Per-role **measured load**, where a role with no sensor is `None` — the raw observation a driver turns into
 /// a [`Demand`] setpoint.
 ///

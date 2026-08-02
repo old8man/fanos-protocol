@@ -34,6 +34,7 @@
 //! tokens pass through untouched. Firing is then unambiguous: `OVERLAY_HEARTBEAT` → the overlay (unmapped
 //! back to `0`), every other token → the router.
 
+use fanos_core::roles::Role;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_pqcrypto::kem::HybridKemPublic;
@@ -193,9 +194,23 @@ impl<F: Field> Engine for CellNode<F> {
                 out.extend(self.relay.router_mut().step(now, Input::Command(Command::StartHeartbeat)));
                 out
             }
+            // An observation is where the composite reports the one role only *it* can see. The overlay counts
+            // relay and storage first-hand and reports the rest absent, so without this the rendezvous role
+            // would fall back to this node's own offer forever — supply standing in for demand on a combiner
+            // that knows exactly how much it is carrying (`docs/design-observability.md` §7).
+            //
+            // A **level**, not a rate: registered client sessions plus hosted services are what this combiner
+            // is carrying right now, which is the quantity the per-node capacity is defined against. It also
+            // needs no observation window, so it cannot drift out of step with whatever window the overlay's
+            // own counters use.
+            Input::Command(Command::Diagnose) => {
+                let carried = self.relay.registrations().saturating_add(self.relay.hosts());
+                self.obn.observe_load(Role::Rendezvous, u16::try_from(carried).unwrap_or(u16::MAX));
+                self.step_obn(now, input)
+            }
             // Every other command drives the overlay+beacon composite: the epoch tick advances the beacon
             // (which `step_obn` then locks the router's onion key to) and arms the remapped overlay heartbeat;
-            // Send/Put/Get/Join/Diagnose/Observe are the overlay's directly.
+            // Send/Put/Get/Join/Observe are the overlay's directly.
             Input::Command(_) => self.step_obn(now, input),
         }
     }
@@ -216,6 +231,7 @@ mod tests {
     use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
     use fanos_keygen::BeaconNode;
     use fanos_rendezvous::SessionId;
+    use fanos_core::roles::RoleReading;
     use fanos_runtime::{Config as OverlayConfig, OverlayNode};
     use fanos_vrf::vss::{DeterministicRng, VssCommitment, VssShare, deal};
 
@@ -299,6 +315,26 @@ mod tests {
             )),
             "the heartbeat re-arms — the composite delivered the tick to the overlay"
         );
+    }
+
+    #[test]
+    fn a_cell_node_reports_the_rendezvous_load_the_overlay_cannot_see() {
+        // Same seam as the service composite, reached the other way: `obn` is a concrete type here, so the
+        // reading is a direct call rather than a `Control` message. Asserted through the report the controller
+        // consumes, so a broken hand-off shows up as an unsensed role rather than as nothing at all.
+        let (shares, commitment) = beacon_key();
+        let mut node = cell_node(0, &shares, &commitment);
+        let reading = node
+            .step(Instant(0), Input::Command(Command::Diagnose))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::LoadReport { per_role }) => {
+                    Some(RoleReading::from_array(*per_role).of(Role::Rendezvous))
+                }
+                _ => None,
+            })
+            .expect("an observation reports the load it measured");
+        assert_eq!(reading, Some(0), "a combiner carrying nothing measured zero, not nothing");
     }
 
     #[test]

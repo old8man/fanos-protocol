@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
-use fanos_core::roles::{Role, RoleReading};
+use fanos_core::roles::{self, Role, RoleReading};
 use fanos_core::{AdaptivePowAdmission, AdmissionPolicy, LiveDifficulty, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
@@ -1164,6 +1164,16 @@ impl<F: Field> Engine for OverlayNode<F> {
             // An unarmed timer, and a sub-engine control message — inert here for the same reason: neither names
             // anything this engine owns. The overlay composes no sub-engine that takes a `Control`, and the
             // composite that does (`CellNode`, for the combiner's mix directory) intercepts it before this point.
+            // A load reading from a sibling engine the composite could only reach by message (`dyn Engine`
+            // erases the type that would let it call `observe_load` directly). Same seam, addressed by tag.
+            Input::Command(Command::Control { tag, ref body })
+                if tag == roles::CONTROL_LOAD_READING =>
+            {
+                if let Some((role, load)) = roles::decode_load_reading(body) {
+                    self.observe_load(role, load);
+                }
+                Vec::new()
+            }
             Input::Timer(_) | Input::Command(Command::Control { .. }) => Vec::new(),
             Input::Message { from, frame } => self.on_message(now, from, &frame),
         }

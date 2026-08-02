@@ -32,6 +32,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::role_loop::LoadGauge;
 use crate::diaulos::{dial_service, serve};
 use crate::resolve::STORE_TIMEOUT;
 
@@ -94,15 +95,28 @@ impl ExitPolicy {
 /// Run a clearnet exit service on `client`'s node under the DIAULOS service identity `keypair`. Each client
 /// that dials gets its own stream (see [`serve`]); the exit reads the requested target, checks `policy`,
 /// dials TCP, and splices until either side closes. Returns immediately (spawns the demultiplexer).
-pub fn serve_exit<R>(client: Client, keypair: StaticKeypair, rng: R, policy: ExitPolicy)
-where
+/// `gauge` meters the role: each session counts as one unit of exit work in flight for as long as it is
+/// spliced, which is what closes the role controller's loop for a role no engine can see. `None` runs unmetered
+/// — the role then reports no sensor and the cell falls back to what nodes *offer*, which is the right
+/// behaviour for a bare exit spawned outside a self-organizing node (the integration tests, an embedder).
+pub fn serve_exit<R>(
+    client: Client,
+    keypair: StaticKeypair,
+    rng: R,
+    policy: ExitPolicy,
+    gauge: Option<LoadGauge>,
+) where
     R: CryptoRng + Send + 'static,
 {
     let policy = Arc::new(policy);
     serve(client, keypair, rng, move |stream| {
         let policy = Arc::clone(&policy);
+        // Taken before the session runs and dropped with the future, so every way a session can end — a clean
+        // close, a rejected port, an unreachable host, a cancelled task — decrements it.
+        let carried = gauge.as_ref().map(LoadGauge::in_flight);
         async move {
             relay_one(stream, &policy).await;
+            drop(carried);
         }
     });
 }

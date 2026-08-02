@@ -36,6 +36,8 @@
 //! — none of which set bits 62 and 61 together with bit 63 clear. A fired token is dispatched by that tag:
 //! `(token >> 61) == 0b011` → the service (unmapped back), everything else → the inner engine.
 
+use fanos_core::roles::{CONTROL_LOAD_READING, Role, encode_load_reading};
+use fanos_runtime::Command;
 use fanos_geometry::Triple;
 use fanos_runtime::{Effect, Engine, Input, Instant, TimerToken};
 use fanos_wire::{FrameType, decode_frame};
@@ -92,6 +94,23 @@ impl ServiceNode {
 impl Engine for ServiceNode {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         match input {
+            // An observation is where this composite reports the one role only *it* can see: the intros this
+            // member is currently gathering for. Without it the service role falls back to this node's own
+            // offer — supply standing in for demand on a host that knows what it is carrying.
+            //
+            // Routed as a `Control` command because `inner` is a `dyn Engine`: the type that would let this
+            // call `observe_load` directly is erased by the composition, so the reading is addressed by tag
+            // instead. `Control` never arrives off the wire, so no peer can forge a load reading.
+            Input::Command(Command::Diagnose) => {
+                let carried = u16::try_from(self.service.pending()).unwrap_or(u16::MAX);
+                let reading = encode_load_reading(Role::Service, carried).to_vec();
+                let mut out = self.inner.step(
+                    now,
+                    Input::Command(Command::Control { tag: CONTROL_LOAD_READING, body: reading }),
+                );
+                out.extend(self.inner.step(now, input));
+                out
+            }
             // A threshold-hosting frame is the service's; every other frame is the inner engine's.
             Input::Message { .. } => {
                 let to_service =
@@ -126,6 +145,7 @@ mod tests {
     use fanos_field::F2;
     use fanos_geometry::Point;
     use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
+    use fanos_core::roles::RoleReading;
     use fanos_runtime::{Command, Config as OverlayConfig, Notification, OverlayNode};
 
     use crate::intro_frame;
@@ -139,6 +159,31 @@ mod tests {
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
         let service = ThresholdService::new(coord, secret, vec![coord], 1);
         (ServiceNode::new(Box::new(overlay), service), public)
+    }
+
+    #[test]
+    fn a_service_node_reports_the_service_load_the_overlay_cannot_see() {
+        // The overlay counts relay and storage first-hand and reports every other role absent, so without this
+        // composite pushing its reading in, the service role falls back to whatever the node *offered* —
+        // supply standing in for demand on a host that knows exactly what it is carrying.
+        //
+        // Asserted through the report the role controller actually consumes, not by calling the seam directly:
+        // the reading has to survive `Control` encode/decode, the `dyn Engine` hop, and the overlay's command
+        // dispatch, and any of those silently dropping it would leave the role looking wired and reading
+        // unsensed forever.
+        let (mut node, _public) = solo_service_node(7);
+        let load_of = |node: &mut ServiceNode, at: u64| -> Option<u16> {
+            node.step(Instant(at), Input::Command(Command::Diagnose))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::LoadReport { per_role }) => {
+                        Some(RoleReading::from_array(*per_role).of(Role::Service))
+                    }
+                    _ => None,
+                })
+                .expect("an observation reports the load it measured")
+        };
+        assert_eq!(load_of(&mut node, 0), Some(0), "a host gathering nothing measured zero, not nothing");
     }
 
     #[test]

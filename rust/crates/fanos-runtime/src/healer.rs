@@ -451,10 +451,10 @@ impl Healer {
     /// widening the contract — which also pins the `5` in `Notification::LoadReport`, a crate that cannot see
     /// [`Role`] and so cannot state the relationship itself.
     ///
-    /// Feeding the missing three is `docs/design-observability.md` §7: each is a station rate the data-path
-    /// plane now records — service = sessions served, exit = flows carried, rendezvous = gathers armed and
-    /// registrations bound — and they reach this function the same way `held_shards` does, from the caller
-    /// that can see them, via [`load_effect`](Self::load_effect)'s reading argument.
+    /// The other three are **fed by the caller**, through [`load_effect`](Self::load_effect)'s reading argument:
+    /// a composite engine reports the rendezvous registrations and the service intros it is carrying, and a
+    /// driver gauge reports exit flows in flight. This function stays deliberately ignorant of all three — it
+    /// knows what it counts and passes the rest through, so a new sensor needs no change here.
     fn load_report(&self, sensed: RoleReading) -> [Option<u16>; Role::COUNT] {
         // The caller supplies every reading it can see; the healer fills in the one only it counts.
         sensed.measuring(Role::Relay, u16::try_from(self.self_activity).unwrap_or(u16::MAX)).into_array()

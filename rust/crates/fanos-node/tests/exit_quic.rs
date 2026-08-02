@@ -147,6 +147,7 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
         keypair,
         SeedRng::from_seed(b"exit-quic-svc"),
         ExitPolicy::default(),
+        None,
     );
 
     // Dial the exit, ask it for the echo server, and round-trip a payload through it.
@@ -184,6 +185,7 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
         keypair,
         SeedRng::from_seed(b"exit-deny-svc"),
         ExitPolicy::web(),
+        None,
     );
 
     let mut drng = SeedRng::from_seed(b"exit-deny-cli");
@@ -280,6 +282,7 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
         keypair,
         SeedRng::from_seed(b"exit-dialer-svc"),
         ExitPolicy::default(),
+        None,
     );
 
     // A `.fanos`-resolving dialer (empty resolver — we only test clearnet) that routes clearnet via the exit.
@@ -319,6 +322,7 @@ async fn the_proxy_dialer_relays_udp_through_the_exit() {
         keypair,
         SeedRng::from_seed(b"exit-udp-svc"),
         ExitPolicy::default(),
+        None,
     );
     let udp_echo = spawn_udp_echo().await;
 

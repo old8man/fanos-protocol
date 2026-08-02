@@ -21,8 +21,24 @@
 //! That fallback used to fire on any **zero**, which is a different and wrong rule: it discarded the true
 //! reading of a role that had legitimately gone idle, at exactly the moment the controller should have shrunk
 //! it, and it bound the two roles that *are* measured. `Notification::LoadReport` now carries
-//! `[Option<u16>; Role::COUNT]` so absence is a value rather than a guess, and a sibling engine fills the
-//! missing three through `OverlayNode::observe_load` — the seam `docs/design-observability.md` §7 describes.
+//! `[Option<u16>; Role::COUNT]` so absence is a value rather than a guess.
+//!
+//! **All five roles are sensed**, by three routes that differ only in what can see the work:
+//!
+//! | role | measured | reported by |
+//! |---|---|---|
+//! | relay | frames originated | the overlay's healer, first-hand |
+//! | storage | keys held | the overlay's healer, first-hand |
+//! | rendezvous | registrations + hosted services | `CellNode`, calling `observe_load` on a concrete inner engine |
+//! | service | intros being gathered | `ServiceNode`, addressing the same seam by `Control` through a `dyn Engine` |
+//! | exit | flows in flight | a driver-side [`LoadGauge`] — the work is async tasks, which no engine can count |
+//!
+//! Four of the five are **levels**, not rates: what the node is carrying *now*, which is the quantity the
+//! per-node capacity is defined against and which needs no observation window to be comparable. Only relay is a
+//! rate, because origination is what the sensor it reuses already counted.
+//!
+//! A role still reads unsensed where its driver is not running — a bare exit spawned outside a self-organizing
+//! node passes no gauge — and there the offer stands in, which is what a fallback is for.
 //!
 //! Composition with [`crate::capdir`]: a node runs *two* tasks — [`crate::capdir::spawn_capability_publisher`]
 //! keeps its own advertisement live, and [`spawn_role_loop`] reads the whole roster and computes its
@@ -85,11 +101,39 @@ impl LoadSensor {
         Self { latest: core::array::from_fn(|_| AtomicU32::new(0)) }
     }
 
-    /// Record a load report from the engine, latest-wins.
+    /// Record a load report from the engine: latest-wins for a role the engine **measured**, and no-op for one
+    /// it reports as absent.
+    ///
+    /// A `None` must not clear the slot, and that is not a convenience — it is what lets the two report paths
+    /// coexist. The engine reports `None` for every role it has no sensor for, which is exactly the set a
+    /// driver-side [`LoadGauge`] fills; storing the `None` would erase the gauge's reading on every observation
+    /// and the three roles would silently fall back to the offer forever, looking wired.
     fn record(&self, per_role: [Option<u16>; Role::COUNT]) {
         for (slot, reading) in self.latest.iter().zip(per_role) {
-            slot.store(reading.map_or(0, |v| u32::from(v) + 1), Ordering::Relaxed);
+            if let Some(v) = reading {
+                slot.store(u32::from(v) + 1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Open a **driver-side gauge** for `role` — for work an async task performs, which no engine can count.
+    ///
+    /// Opening it declares the role *sensed* at a load of zero, which is the truth at that moment: the task is
+    /// running and carrying nothing yet. From then on the role is measured, so the offer no longer stands in for
+    /// it, and a genuinely idle exit or service reaches the controller as the zero it is.
+    ///
+    /// The gauge counts work **in flight** rather than work completed. That is the quantity `capacity` is
+    /// defined against — "the load one node absorbs" — and it needs no observation window to be meaningful,
+    /// where a completion rate would have to be reconciled with whatever window the engine's own counters use.
+    pub(crate) fn gauge(self: &Arc<Self>, role: Role) -> LoadGauge {
+        // Some(0): sensed, carrying nothing. `fetch_add`/`fetch_sub` then work directly on the encoding.
+        self.slot(role).store(1, Ordering::Relaxed);
+        LoadGauge { sensor: Arc::clone(self), role }
+    }
+
+    /// This role's slot.
+    fn slot(&self, role: Role) -> &AtomicU32 {
+        &self.latest[role.index()]
     }
 
     /// The most recent reading, as the role vocabulary the setpoint is derived in.
@@ -112,6 +156,45 @@ impl LoadSensor {
     /// that reported nothing to do.
     pub(crate) fn load(&self, offered: RoleSet, capacity: Demand) -> Demand {
         self.reading().to_load(capacity, offered)
+    }
+}
+
+/// A driver-side load gauge for one role: the count of work units this node is **carrying right now**.
+///
+/// Held by the task that performs the role's work — the clearnet exit, the hosted service — for a role no engine
+/// can see. Cheap to clone; every clone addresses the same slot.
+#[derive(Clone)]
+pub struct LoadGauge {
+    sensor: Arc<LoadSensor>,
+    role: Role,
+}
+
+impl LoadGauge {
+    /// Count one unit of this role's work as in flight until the returned guard drops.
+    ///
+    /// A guard rather than a matched decrement call, because the flows this counts end in every way a Rust task
+    /// can end — a clean close, a policy rejection, an unreachable host, a cancelled task — and a decrement that
+    /// has to be *reached* would be skipped by most of them. A load that only ever rises reads as a permanently
+    /// saturated node, so the controller would keep provisioning for work that finished long ago.
+    #[must_use]
+    pub fn in_flight(&self) -> LoadGuard {
+        self.sensor.slot(self.role).fetch_add(1, Ordering::Relaxed);
+        LoadGuard { sensor: Arc::clone(&self.sensor), role: self.role }
+    }
+}
+
+/// One unit of in-flight work; the gauge falls when this drops. See [`LoadGauge::in_flight`].
+pub struct LoadGuard {
+    sensor: Arc<LoadSensor>,
+    role: Role,
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        // Saturating: the slot is `Some(n)` encoded as `n + 1`, so it must never fall below 1 — that would
+        // decode as "no sensor" and hand the role back to the offer fallback while the driver is still running.
+        let slot = self.sensor.slot(self.role);
+        let _ = slot.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1).max(1)));
     }
 }
 
@@ -703,9 +786,44 @@ mod tests {
         sensor.record(sent.into_array());
         assert_eq!(sensor.reading(), sent, "every reading survives the shared-atomic encoding");
 
-        // Latest wins, including a later report that drops a role back to absent.
+        // A later report that says nothing must change nothing: the engine reports `None` for every role it
+        // cannot see on *every* observation, and those are exactly the roles a driver gauge fills.
         sensor.record(RoleReading::blind().into_array());
-        assert_eq!(sensor.reading(), RoleReading::blind(), "a later blind report clears the register");
+        assert_eq!(sensor.reading(), sent, "an absent reading does not erase a present one");
+    }
+
+    #[test]
+    fn a_driver_gauge_measures_a_role_no_engine_can_see() {
+        // Exit and service work happens in async tasks, so no engine counts it and the report carries `None`.
+        // A gauge is how that role becomes measured — and opening one must survive the engine's next report,
+        // which will say `None` for it again.
+        let sensor = Arc::new(LoadSensor::new());
+        assert_eq!(sensor.reading().of(Role::Exit), None, "unsensed before the role's task starts");
+
+        let gauge = sensor.gauge(Role::Exit);
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(0),
+            "a running exit that is carrying nothing measured zero — it is not unsensed"
+        );
+
+        let first = gauge.in_flight();
+        let second = gauge.in_flight();
+        assert_eq!(sensor.reading().of(Role::Exit), Some(2), "two flows in flight");
+
+        // The engine's report says `None` for exit on every observation; it must not erase the gauge.
+        sensor.record(RoleReading::blind().measuring(Role::Relay, 4).into_array());
+        assert_eq!(sensor.reading().of(Role::Exit), Some(2), "an engine report does not clobber a gauge");
+        assert_eq!(sensor.reading().of(Role::Relay), Some(4), "and still lands its own readings");
+
+        drop(first);
+        assert_eq!(sensor.reading().of(Role::Exit), Some(1), "a finished flow stops being carried");
+        drop(second);
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(0),
+            "an idle exit reads zero — and stays sensed, so the offer does not stand back in for it"
+        );
     }
 
     #[test]

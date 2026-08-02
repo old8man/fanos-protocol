@@ -26,6 +26,7 @@
 //! coordinate itself (the live per-epoch reshuffle) is the remaining overlay-side half of #102; this
 //! engine is the substrate it builds on.
 
+use fanos_core::roles::Role;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_keygen::BeaconNode;
@@ -67,6 +68,12 @@ impl<F: Field> OverlayBeaconNode<F> {
     #[must_use]
     pub fn overlay_epoch(&self) -> Epoch {
         self.overlay.epoch()
+    }
+
+    /// Record what a sibling engine measured for `role`, forwarding to the overlay that assembles the load
+    /// report — the seam a composite fills the roles the overlay cannot see through.
+    pub fn observe_load(&mut self, role: Role, load: u16) {
+        self.overlay.observe_load(role, load);
     }
 
     /// Whether `frame` is a beacon control frame (routed to the beacon; everything else on the wire is

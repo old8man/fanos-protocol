@@ -31,7 +31,7 @@ use fanos_quic::NodeCredentials;
 
 use crate::config::{NodeConfig, RoleSet};
 use crate::role_loop::{
-    Assignment, SelfOrgConfig, SelfOrganization, role_capacity, spawn_load_sensor,
+    Assignment, LoadSensor, SelfOrgConfig, SelfOrganization, role_capacity, spawn_load_sensor,
     spawn_self_organization,
 };
 use crate::error::NodeError;
@@ -352,6 +352,7 @@ fn spawn_exit_role(
     handle: &NodeHandle,
     address: Triple,
     exit: Option<([u8; 32], Vec<u16>)>,
+    load: &Arc<LoadSensor>,
 ) -> Result<(), NodeError> {
     let Some((seed, allowed_ports)) = exit else {
         return Ok(());
@@ -369,6 +370,9 @@ fn spawn_exit_role(
         keypair,
         SeedRng::from_seed(&os_entropy_32()?),
         ExitPolicy::new(allowed_ports),
+        // Metering the role is what closes the controller's loop for it: an exit's work happens in async
+        // tasks, so no engine can count it, and without this the cell provisions exits by who volunteered.
+        Some(load.gauge(Role::Exit)),
     );
     // Advertise the exit through the overlay store so a proxy discovers it automatically (each epoch, so a
     // departed exit falls out of the live directory) — no hand-configured descriptor needed. The task runs
@@ -478,12 +482,10 @@ fn spawn_roles<F: Field + 'static>(
     credentials: &NodeCredentials,
     roles: RoleSet,
     directory: &Directory,
+    load: Arc<LoadSensor>,
 ) -> SelfOrganization {
     let offered = roles.offered();
     let peers = directory.clone();
-    // The engine measures per-role load once per observation and reports it; the sensor keeps the latest and
-    // converts it to the controller's setpoint, fallback policy included (`role_loop::LoadSensor`).
-    let load = spawn_load_sensor(&handle.client());
     spawn_self_organization::<F>(
         handle.client(),
         SelfOrgConfig {
@@ -500,9 +502,14 @@ fn spawn_roles<F: Field + 'static>(
             // else's (`crate::bound`). `None` only in a pinned cell, where the proof cannot exist.
             prover: handle.coordinate_prover(),
         },
-        // The measured load this node is carrying, as the controller's setpoint. Both the `⌈load / capacity⌉`
-        // conversion and the substitution for a role with **no** sensor live in `LoadSensor::setpoint`, so the
-        // fallback is stated once instead of inferred from a magic zero here.
+        // The measured load this node is carrying, in work units. The substitution for a role with **no**
+        // sensor lives in `RoleReading::to_load`, so the fallback is stated once rather than inferred from a
+        // magic zero here, and the `⌈load / capacity⌉` conversion happens once, cell-wide, in `cell_setpoint`.
+        //
+        // `load` is the sensor the caller also handed the role drivers, deliberately: it must be *the* one every
+        // reporter writes to. Building a second here — which an earlier edit of this function did, and the
+        // unused-parameter warning caught — leaves the exit gauge feeding a sensor nobody publishes from, so the
+        // role reads unsensed forever while looking fully wired.
         move || load.load(offered, role_capacity()),
         // The transport's own peer table, as a lower bound on live membership that owes nothing to the overlay store.
         // The role loop uses it to tell "I am alone" from "I have found no one yet" — see `ROSTER_REFRESH`.
@@ -707,11 +714,16 @@ impl Node {
 
         let recovery_trigger = spawn_recovery::<F>(handle.client(), &config, address, has_beacon); // audit §4 R-C1
 
+        // The measured per-role load, shared by every reporter: the engine's observations arrive on the
+        // notification stream, and a driver task that performs work no engine can see opens a gauge on it.
+        // Created before the roles that report into it.
+        let load = spawn_load_sensor(&handle.client());
+
         // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
-        spawn_exit_role(&handle, address, exit)?;
+        spawn_exit_role(&handle, address, exit, &load)?;
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
-        let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory);
+        let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory, load);
 
         let move_announcer = announce_node(&handle, &config);
 
