@@ -10,6 +10,11 @@
 > **theorem to prove**. Where a mechanism is, to the surveyed frontier, a genuine gap, that is said plainly — and
 > so is every precondition its security rests on, and every honest scope limit. The Tor vocabulary ("SURB",
 > "bridge", "rendezvous") is retired for the pantheon.
+>
+> **See also `docs/design-rendezvous.md`** for the layer *under* this one: what the projective plane actually
+> buys the meeting derivation (a membership-free address space — not, as was recorded, an optimal quorum
+> system), the candidate comparison that disqualifies HRW and the stratified designs on a stated rule, and the
+> two defects that audit found in `meeting_lines` and its caller.
 
 ## 0. The one theorem everything obeys — and why there must be two lanes
 
