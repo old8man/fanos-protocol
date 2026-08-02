@@ -21,23 +21,56 @@
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
-use fanos_wire::MAX_FRAME;
+use fanos_wire::{MAX_FRAME, varint};
 
-/// Bytes a `ShardMsg::Deliver` adds around one DA shard, plus the outer frame envelope.
+use crate::wire::{ShardMsg, shard_to_frame};
+
+/// The bytes an **App frame** adds around a payload that could fill a frame — measured, worst case.
 ///
-/// **Read off the encoding, not fitted to a measurement**: `wire.rs` writes `tag(1) ‖ block(32) ‖
-/// index(1) ‖ len(4)` ahead of the shard — 38 bytes — and the outer `encode_frame` prepends a type varint
-/// and a length varint, at most 8 bytes each for a body of this size. 54 is that sum, and it is rounded
-/// **up** deliberately: over-estimating the overhead costs a few bytes of block capacity, while
-/// under-estimating it puts the shard back over the ceiling, where it is dropped in silence. The two
-/// errors are not symmetric, so the constant leans the safe way.
-const SHARD_FRAME_OVERHEAD: usize = 38 + 8 + 8;
+/// Every TAXIS message reaches the wire through one `wire::app_frame`, so this is the shared part of both
+/// budgets below. It used to be hand-counted as `8 + 8`, a deliberate over-estimate of two varints because
+/// under-estimating puts a message back over the ceiling where it is dropped in silence. That asymmetry
+/// argument was right and the number was still a guess: the true envelope is a type varint, a length varint
+/// and the App kind byte, and only the encoder knows those widths. Measuring cannot drift from the wire
+/// when the codec changes; a hand count silently does.
+///
+/// The only part that grows with the payload is the length varint, so the worst case is added rather than
+/// assumed — [`varint::encoded_len`] at a frame-filling body, less what this small probe already charged.
+fn app_envelope() -> usize {
+    let probe = ShardMsg::NeedSkeleton { block: [0; 32] };
+    let framed = shard_to_frame(&probe).len();
+    // `framed = varint(type) ‖ varint(body) ‖ body`, and `body = kind(1) ‖ payload`.
+    let body = probe.to_bytes().len() + 1;
+    // Isolate the type varint by removing the body and the length varint that measured it. Written this way
+    // rather than as `framed − payload`: the length varint is the part that GROWS with the payload, so it has
+    // to be identified and replaced, not carried over from a probe that happens to be small. At these sizes
+    // both are one byte and either arithmetic gives the same answer — which is exactly why the wrong one
+    // would have survived until a probe crossed 127 bytes and the allowance silently went short.
+    let type_varint = framed - body - varint::encoded_len(body as u64);
+    type_varint + varint::encoded_len(MAX_FRAME as u64) + 1
+}
 
-/// Bytes a `ConsensusMsg::Body` adds around a whole block, plus the outer frame envelope — a variant tag
-/// and the same envelope as above. Rounded up for the same asymmetry.
-const CONSENSUS_MSG_OVERHEAD: usize = 8 + 8 + 8;
+/// Bytes a `ShardMsg::Deliver` adds around one DA shard, plus the App envelope — measured by encoding an
+/// empty `Deliver` through the same `to_bytes` the driver's `shard_to_frame` calls.
+fn shard_frame_overhead() -> usize {
+    let header = ShardMsg::Deliver { block: [0; 32], index: 0, data: Vec::new() }.to_bytes().len();
+    header + app_envelope()
+}
+
+/// Bytes a consensus message adds around a whole block, plus the App envelope.
+///
+/// `ConsensusMsg::to_bytes` is documented as "a 1-byte variant tag then the variant's body", and that one
+/// byte is the entire difference between a block and the message carrying it — there is no inner length
+/// prefix, because the frame layer already delimits the message. Stated here rather than measured to avoid
+/// encoding a whole block twice merely to learn the size of its wrapper; pinned by a test that encodes a
+/// real `ConsensusMsg` and checks the difference is exactly this.
+const CONSENSUS_VARIANT_TAG: usize = 1;
+
+fn consensus_msg_overhead() -> usize {
+    CONSENSUS_VARIANT_TAG + app_envelope()
+}
 use fanos_primitives::{Epoch, hash_labeled};
-use fanos_vrf::pqvrf::{MerkleProof, VrfOutput};
+use fanos_vrf::pqvrf::{self, MerkleProof, VrfOutput};
 use fanos_wire::Wire;
 use fanos_wire_derive::Wire;
 
@@ -320,8 +353,8 @@ impl Block {
     #[must_use]
     pub fn payload_budget(&self) -> usize {
         let overhead = self.to_bytes().len().saturating_sub(self.payload_bytes().len());
-        let whole_block = MAX_FRAME.saturating_sub(overhead + CONSENSUS_MSG_OVERHEAD);
-        let via_shards = MAX_FRAME.saturating_sub(SHARD_FRAME_OVERHEAD).saturating_mul(erasure::K);
+        let whole_block = MAX_FRAME.saturating_sub(overhead + consensus_msg_overhead());
+        let via_shards = MAX_FRAME.saturating_sub(shard_frame_overhead()).saturating_mul(erasure::K);
         whole_block.min(via_shards)
     }
 
@@ -443,12 +476,17 @@ pub fn budget_for(parent: [u8; 32], height: u64, epoch: Epoch, proposer: u8, las
 
 /// Bytes reserved for the SSLE sortition witness, which `maybe_propose` attaches *after* assembly.
 ///
-/// A [`LeaderWitness`] is `output(32) ‖ Merkle siblings`, so its size is `32 + 32·h` for a registration
-/// tree of height `h`. Reserving for `h = 32` — far above any registration tree this cell will hold — costs
-/// about a kilobyte of block capacity and removes the whole class of "grew after budgeting" failure. The
-/// asymmetry is the same one the overhead constants above lean on: a few bytes of lost capacity against a
-/// block that cannot be delivered or cannot be verified.
-const WITNESS_ALLOWANCE: usize = 32 + 32 * 32;
+/// A [`LeaderWitness`] is `output(32) ‖ Merkle siblings`, so its size is `32 + 32·h` for a Merkle-VRF tree
+/// of height `h`. The bound is therefore [`pqvrf::MAX_HEIGHT`] — not a comfortable-looking number, but the
+/// **enforced** ceiling: `MerkleVrfSecret::generate` refuses a larger height, so no witness above this size
+/// can exist to overflow the budget, and none below it is under-reserved.
+///
+/// This was `32 + 32 * 32`, reserving for a height of 32 — which reads as prudent and is in fact *unreachable*:
+/// it is eight levels above the maximum the VRF will produce. Over-reserving is the safe direction, so this
+/// never failed; it simply spent 256 bytes of every block's capacity on tree levels that cannot exist, and
+/// stated a bound nothing guaranteed. Deriving it from the guard that makes it true is both tighter and
+/// checkable — if `MAX_HEIGHT` moves, this moves with it.
+const WITNESS_ALLOWANCE: usize = 32 + 32 * pqvrf::MAX_HEIGHT as usize;
 
 /// The ordered transaction commitments of a sealed-tx list.
 fn commits_of(sealed: &[SealedTx]) -> Vec<TxCommit> {
@@ -517,6 +555,58 @@ mod tests {
         }).collect();
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
         SealedTx::seal(&Transaction::new(tag.to_vec()), epoch, 0, &pubs, 2, tag).unwrap()
+    }
+
+    #[test]
+    fn every_framing_allowance_matches_what_the_encoders_actually_produce() {
+        // These three were hand-counted constants. Each is now derived, and each derivation is pinned here
+        // against the real encoder — because a derivation nothing checks is a constant with a story.
+
+        // 1. The App envelope must cover the WORST case, not the probe's. Under-estimating is the dangerous
+        //    direction: a message a byte over the ceiling is dropped in silence.
+        let big = ShardMsg::Deliver { block: [7; 32], index: 3, data: alloc::vec![0u8; 60_000] };
+        let framed = shard_to_frame(&big).len();
+        assert!(
+            framed - big.to_bytes().len() <= app_envelope(),
+            "a 60 KB shard framed to {framed} bytes, over the allowance of {}",
+            app_envelope()
+        );
+
+        // 2. The shard overhead is the whole distance from payload to wire, and it must hold for a payload
+        //    at the size the budget actually packs to.
+        let data = alloc::vec![0u8; 200_000];
+        let msg = ShardMsg::Deliver { block: [1; 32], index: 0, data: data.clone() };
+        assert!(
+            shard_to_frame(&msg).len() <= data.len() + shard_frame_overhead(),
+            "the measured shard overhead under-covers a real 200 KB shard"
+        );
+
+        // 3. The consensus wrapper is exactly one variant tag around the block, which is what lets
+        //    `consensus_msg_overhead` state it instead of encoding a whole block to find out.
+        let block = Block::assemble([0; 32], 1, Epoch::new(1), 0, Vec::new());
+        let wrapped = crate::consensus::ConsensusMsg::Propose(block.clone()).to_bytes().len();
+        assert_eq!(
+            wrapped - block.to_bytes().len(),
+            CONSENSUS_VARIANT_TAG,
+            "a consensus message is a 1-byte tag around its payload; if that changed, the budget is wrong"
+        );
+
+        // 4. The witness allowance covers the largest witness the VRF will ever produce — and `MAX_HEIGHT`
+        //    is the reason it is a bound rather than a hope.
+        let widest = LeaderWitness {
+            output: [0; 32],
+            proof: MerkleProof::from_bytes(
+                &alloc::vec![0u8; 32 * pqvrf::MAX_HEIGHT as usize],
+                pqvrf::MAX_HEIGHT,
+            )
+            .expect("a max-height path decodes"),
+        };
+        assert_eq!(
+            widest.to_bytes().len(),
+            WITNESS_ALLOWANCE,
+            "the allowance must equal the widest witness exactly — larger wastes block capacity on levels \
+             the VRF refuses to build, smaller is a block that grew after it was budgeted"
+        );
     }
 
     #[test]
@@ -632,7 +722,7 @@ mod tests {
         assert_eq!(Block::from_bytes(&plain.to_bytes()).unwrap(), plain);
 
         // A secret-leader block carries a witness; it round-trips AND does not change the block identity.
-        let secret = fanos_vrf::pqvrf::MerkleVrfSecret::generate(&[7u8; 32], 6).unwrap();
+        let secret = pqvrf::MerkleVrfSecret::generate(&[7u8; 32], 6).unwrap();
         let (output, proof) = secret.prove(plain.header.height).unwrap();
         let witnessed = plain.clone().with_witness(LeaderWitness { output, proof });
         assert_eq!(witnessed.hash(), plain.hash(), "the witness rides outside the hashed header");
@@ -643,7 +733,7 @@ mod tests {
 
     #[test]
     fn the_leader_witness_codec_rejects_malformed_lengths() {
-        let secret = fanos_vrf::pqvrf::MerkleVrfSecret::generate(&[1u8; 32], 5).unwrap();
+        let secret = pqvrf::MerkleVrfSecret::generate(&[1u8; 32], 5).unwrap();
         let (output, proof) = secret.prove(3).unwrap();
         let w = LeaderWitness { output, proof };
         let bytes = w.to_bytes();
