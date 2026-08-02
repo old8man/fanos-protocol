@@ -38,6 +38,7 @@ use fanos_diaulos::{StaticKeypair, bundle_from_identity};
 use fanos_field::F2;
 use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
+use fanos_node::rendezvous_relay::RendezvousRelay;
 use fanos_node::spawn_mix_directory_feeder;
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, HostedService, OverlayBeaconNode, RendezvousRoute, StaticResolver,
@@ -92,7 +93,25 @@ async fn router(i: usize, dir: &Directory, t: usize) -> (NodeHandle, HybridKemPu
     let onion_public = OnionKeyRatchet::new(onion_seed, fanos_rendezvous::Epoch::ZERO)
         .public()
         .clone();
-    let engine = ThresholdRouter::<F2>::new(Point::<F2>::at(i), &secret, t, onion_seed);
+    // Wrapped in a `RendezvousRelay`, **as a deployed node is**: `CellNode::new` composes exactly this
+    // pairing, so a bare router here would be a fixture that cannot do what production does.
+    //
+    // It is not a detail. §3b off-combiner forwarding — a gathering member re-sealing a request to the
+    // host's registered dead-drop — lives only in the relay, and a bare `ThresholdRouter` has no `hosts` map
+    // at all. Since `a54d4aa` made the gathering member a per-onion salted draw, the member that peels a
+    // request is usually NOT the one hosting the service, so without the relay the request is peeled,
+    // surfaced locally on the wrong node, and silently dropped. Measured: the host at `[1,1,1]` while every
+    // request landed on `[0,1,1]`, `[1,0,0]` or `[1,1,0]` — 2 passes in 10 runs, the odds of the draw.
+    //
+    // The simulator-fidelity rule this restores: a test node must differ from a production node in its
+    // **transport** and nothing else. This one differed in its composition, which is the one difference
+    // that hides a whole subsystem.
+    let engine = RendezvousRelay::<F2>::new(ThresholdRouter::<F2>::new(
+        Point::<F2>::at(i),
+        &secret,
+        t,
+        onion_seed,
+    ));
     let handle = spawn(Box::new(engine), dir.clone())
         .await
         .expect("spawn router");
