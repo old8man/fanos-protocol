@@ -1,6 +1,6 @@
 //! # The data-path plane — where work stops, counted by structure
 //!
-//! The coherence plane ([`frame`](crate::frame)) answers **"is the organism healthy?"**. Nothing
+//! The coherence plane (`fanos_telemetry::frame`) answers **"is the organism healthy?"**. Nothing
 //! answered **"is the work getting done, and where does it stop?"** — and
 //! `docs/design-observability.md` §1 measures what that cost: defect #55 was localized by hand-inserting
 //! eight `eprintln!` probes and eliminating eleven candidate causes one at a time, while the coherence

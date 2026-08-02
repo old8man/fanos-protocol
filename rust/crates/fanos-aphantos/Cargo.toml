@@ -18,11 +18,12 @@ fanos-wire = { workspace = true, features = ["std"] }
 fanos-nyx = { workspace = true, features = ["std"] }
 # NyxNode / ThresholdRouter are sans-I/O engines that speak only the contract vocabulary — the light leaf,
 # not the whole OverlayNode engine crate (audit #73/#125).
+# It also carries the data-path plane's station counters (docs/design-observability.md): a threshold gather
+# is where work most often stops, #55 showed that stop was invisible, and recording is a field write on paths
+# already failing — so the engine stays sans-I/O. They live beside `GatherClock` here rather than in
+# fanos-telemetry, whose subject is the *coherence* self-model; this is instrumentation of the data path, needs
+# only the geometry's coordinate type, and belongs where every engine can already reach it.
 fanos-ports = { workspace = true, features = ["std"] }
-# The data-path plane's station counters (docs/design-observability.md): a threshold gather is where
-# work most often stops, and #55 showed that stop was invisible. Recording is a field write on paths
-# that are already failing — the engine stays sans-I/O.
-fanos-telemetry = { workspace = true, features = ["std"] }
 fanos-pqcrypto.workspace = true
 fanos-threshold = { workspace = true, features = [] }
 rand_core.workspace = true

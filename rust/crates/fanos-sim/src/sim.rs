@@ -66,6 +66,25 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        // The data-path plane: only the stations that actually fired, since a line printing every station at
+        // zero buries the two that moved — which is the failure mode the plane exists to end, not repeat.
+        Notification::DataPath { stations, gather } => {
+            let hit: Vec<String> = stations
+                .iter()
+                .filter(|o| o.count > 0)
+                .map(|o| match o.line {
+                    Some([x, y, z]) => format!("{}@{x}:{y}:{z}={}", o.station.name(), o.count),
+                    None => format!("{}={}", o.station.name(), o.count),
+                })
+                .collect();
+            let clock = gather.map_or_else(
+                || "gather=unmeasured".to_owned(),
+                |(srtt, var)| {
+                    format!("gather srtt={}ms var={}ms", srtt.as_nanos() / 1_000_000, var.as_nanos() / 1_000_000)
+                },
+            );
+            format!("DataPath [{}] {clock}", hit.join(" "))
+        }
         // Rendered as `-` for a role with no sensor and the number for one with a reading, because `Some(0)`
         // and `None` are the distinction the report exists to carry and `{:?}` buries it in six words of noise.
         Notification::LoadReport { per_role } => {

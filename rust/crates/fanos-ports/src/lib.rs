@@ -19,12 +19,14 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod gather;
+pub mod stations;
 
 // Re-export the coordinate + epoch vocabulary the contract is written in, so a driver or sibling engine
 // speaks them through the contract crate without depending on geometry/primitives directly.
 pub use fanos_geometry::Triple;
 pub use fanos_primitives::Epoch;
 pub use gather::GatherClock;
+pub use stations::{Observation, Station, Stations};
 
 /// A monotonic instant in nanoseconds since the run's origin. Virtual — never the wall clock.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]
@@ -295,6 +297,27 @@ pub enum Notification {
     /// capacity one node absorbs — `⌈load / capacity⌉` — which is the arithmetic the setpoint denominator has
     /// always described and never had a numerator for.
     ///
+    /// The **data-path plane's** readings, in answer to [`Command::Observe`] — where work stopped, and how
+    /// healthy the gather path is (`docs/design-observability.md` §4.1).
+    ///
+    /// These values were computed, used, and thrown away. The station counters recorded exactly the two facts
+    /// that solved defect #55 — every circuit through a point dead, gathers expiring at `1` of `t = 2` by the
+    /// hundreds — and nothing could read them outside a test. [`GatherClock`]'s smoothed estimate is the health
+    /// of the gather path in RFC 6298 form and was private to the engine that measures it. An instrument nobody
+    /// can read is not an instrument.
+    ///
+    /// Raised on `Observe` rather than continuously, because `Observe` is the contract's **sense-only** read:
+    /// it is the verb a passive monitor may issue, and it must not trigger the healing a full `Diagnose` does.
+    /// Counts are cumulative since the engine started, so a reader differences two observations rather than
+    /// trusting an engine to have chosen the same window it did.
+    DataPath {
+        /// Station counts keyed by `(station, line)` — bounded by the geometry, not by attacker-chosen labels.
+        stations: Vec<Observation>,
+        /// The measured gather deadline's `(srtt, var)`; `None` until a gather has completed. An engine still
+        /// reporting `None` after minutes of traffic is running on the initial estimate, which is the
+        /// difference between "the deadline is wrong" and "the deadline was never measured".
+        gather: Option<(Duration, Duration)>,
+    },
     /// **`None` means "this role has no sensor", which is not the same as a measured zero** — and the type
     /// says so, because the prose alone did not. This doc used to promise that an unmeasured role was
     /// "deliberately not disguised", while `[u16; 5]` made a fabricated count and a real one literally the

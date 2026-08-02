@@ -59,8 +59,8 @@ use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 use fanos_primitives::hash_labeled;
 use fanos_rendezvous::{BeaconSeed, Epoch, combiner_for, meeting_line};
 use fanos_runtime::ports::GatherClock;
-use fanos_telemetry::stations::{Observation, Station, Stations};
-use fanos_runtime::{Duration, Effect, Engine, Input, Instant, TimerToken};
+use fanos_runtime::ports::stations::{Observation, Station, Stations};
+use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
 use crate::config::Peer;
@@ -934,6 +934,12 @@ impl Engine for PorosHost {
             }
             Input::Timer(token) => self.on_timer(token),
             // A POROS host takes no application commands — it serves requests off the wire.
+            // The sense-only read: POROS owns its own gather clock and station counters, so it answers for
+            // them directly rather than a driver reaching into an engine (`docs/design-observability.md` §4.1).
+            Input::Command(Command::Observe) => vec![Effect::Notify(Notification::DataPath {
+                stations: self.stations.observations(),
+                gather: self.gather.srtt().map(|srtt| (srtt, self.gather.var())),
+            })],
             Input::Command(_) => Vec::new(),
         }
     }

@@ -208,6 +208,16 @@ impl<F: Field> Engine for CellNode<F> {
                 self.obn.observe_load(Role::Rendezvous, u16::try_from(carried).unwrap_or(u16::MAX));
                 self.step_obn(now, input)
             }
+            // The sense-only read reaches **both** halves. The overlay answers with the cell's coherence
+            // self-observation; the router answers with the data-path plane it alone owns — its station
+            // counters and its measured gather deadline. Sending it to only one of them would have exported
+            // "is the organism healthy?" while leaving "is the work getting done, and where does it stop?"
+            // unanswerable, which is the pair `docs/design-observability.md` §1 exists over.
+            Input::Command(Command::Observe) => {
+                let mut out = self.step_obn(now, Input::Command(Command::Observe));
+                out.extend(self.relay.router_mut().step(now, Input::Command(Command::Observe)));
+                out
+            }
             // Every other command drives the overlay+beacon composite: the epoch tick advances the beacon
             // (which `step_obn` then locks the router's onion key to) and arms the remapped overlay heartbeat;
             // Send/Put/Get/Join/Observe are the overlay's directly.
@@ -232,6 +242,7 @@ mod tests {
     use fanos_keygen::BeaconNode;
     use fanos_rendezvous::SessionId;
     use fanos_core::roles::RoleReading;
+    use fanos_runtime::ports::stations::{Observation, Station};
     use fanos_runtime::{Config as OverlayConfig, OverlayNode};
     use fanos_vrf::vss::{DeterministicRng, VssCommitment, VssShare, deal};
 
@@ -314,6 +325,48 @@ mod tests {
                 Effect::ArmTimer { token, .. } if *token == OVERLAY_HEARTBEAT
             )),
             "the heartbeat re-arms — the composite delivered the tick to the overlay"
+        );
+    }
+
+    #[test]
+    fn an_observation_exports_the_data_path_plane_the_overlay_cannot_answer_for() {
+        // §4.1: the station counters recorded exactly the two facts that solved #55 — every circuit through a
+        // point dead, gathers expiring at 1 of t = 2 by the hundreds — and nothing outside a test could read
+        // them. `Observe` is the right verb because it is the contract's *sense-only* read, the one a passive
+        // monitor may issue without triggering the healing a `Diagnose` does.
+        //
+        // The counts are asserted **live**, not merely present: a notification carrying a vector of zeros would
+        // pass a shape check while proving nothing about whether any site records into the map that is exported.
+        let (shares, commitment) = beacon_key();
+        let mut node = cell_node(0, &shares, &commitment);
+        let data_path = |node: &mut CellNode<F2>, at: u64| -> Vec<Observation> {
+            node.step(Instant(at), Input::Command(Command::Observe))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations.clone()),
+                    _ => None,
+                })
+                .expect("a sense-only read exports the data-path plane")
+        };
+
+        let quiet = data_path(&mut node, 0);
+        let decode_failures = |obs: &[Observation]| -> u64 {
+            obs.iter().filter(|o| o.station == Station::FrameDecodeFailed).map(|o| o.count).sum()
+        };
+        assert_eq!(decode_failures(&quiet), 0, "nothing has failed to decode yet");
+
+        // A frame that parses as no wire type is onion traffic by `is_relay_frame`, so it reaches the router
+        // and stops at its one `undecodable()` site.
+        for i in 0..3u8 {
+            node.step(
+                Instant(1),
+                Input::Message { from: Point::<F2>::at(1).coords(), frame: vec![0xEE, i] },
+            );
+        }
+        assert_eq!(
+            decode_failures(&data_path(&mut node, 2)),
+            3,
+            "the exported map is the one the discard sites write to"
         );
     }
 

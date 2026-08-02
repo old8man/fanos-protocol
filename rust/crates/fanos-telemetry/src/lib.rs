@@ -47,7 +47,6 @@ pub mod observer;
 #[cfg(feature = "std")]
 pub mod persist;
 pub mod snapshot;
-pub mod stations;
 pub mod sysmetrics;
 
 #[cfg(all(feature = "alloc", any(feature = "std", feature = "libm")))]
