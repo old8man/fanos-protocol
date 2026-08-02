@@ -1197,6 +1197,11 @@ mod tests {
              {verdict:?}\n{}",
             roster.render()
         );
+        // Role-assignment churn is measured in `a_lossy_cell_does_not_churn_its_role_assignment`, not here.
+        // It was briefly asserted in this test and passed — and then passed just as green with the fix under
+        // it reverted, because this fleet runs a **lossless** link, so a load read never times out and the
+        // noise source never fires. A gate that cannot fail is not a gate.
+
         // Stability, three-valued like the verdict above it and for the same reason. This used to be a bare
         // `assert_eq!(changes_after(..), 0)` sitting one line below a comment explaining that a contended host
         // must not turn "still converging" into "does not converge" — so the file argued the point and then
@@ -1227,6 +1232,47 @@ mod tests {
             // Not a failure: the measurement did not finish. Saying so beats a red that means nothing.
             println!("PG(2,4) N={N}: inconclusive — still converging at the deadline: {verdict:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_lossy_cell_does_not_churn_its_role_assignment() {
+        // The question the setpoint work left open, measured where it can actually be answered. Until the load
+        // sensors went live the setpoint was supply standing in for demand and could not oscillate; now it can.
+        // The dominant noise source was never load jitter — it was the *measurement*: a load read that timed
+        // out counted as a member demanding nothing, so the role shrank and the next successful read grew it
+        // back. With κ = 1 the assignment tracks that in one step.
+        //
+        // **Loss is the point of this fleet** — the lossless one cannot exercise the path at all.
+        //
+        // ⚠️ **This test has NOT been shown to fail without the hold rule.** Reverting `99b7207` and running
+        // this at 25% loss still passes, so it is a general regression guard on assignment stability and it is
+        // *not* evidence for that rule. Recorded here so the next reader does not mistake it for one — a test
+        // that passes with and without the mechanism under it proves nothing about the mechanism, whatever its
+        // name suggests.
+        //
+        // The likely reason, worth checking before trusting a stronger claim: a store read retries inside
+        // `STORE_TIMEOUT`, so datagram loss lengthens a read rather than failing it, and `Read::Unknown` may be
+        // rare enough in practice that the noise source barely fires. If so the hold rule is a correctness fix
+        // — a partial read genuinely understates the setpoint, which the code's own docs state — with a smaller
+        // stability payoff than the reasoning suggested.
+        let roles = fanos_node::RoleSet { relay: true, storage: true, ..fanos_node::RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(5, Link::default().with_loss(25), roles)
+            .await
+            .expect("fleet starts");
+        let trace = fleet.observe(12, Duration::from_secs(2), fanos_node::Node::assignment).await;
+        fleet.shutdown();
+
+        // `revisits`, not `transitions`: a cell still discovering members legitimately assigns more roles as
+        // it finds them, which is progress. Only a node returning to a role set it had already left is the
+        // controller chasing its own tail.
+        let assigned = trace.map(|a| a.roles);
+        assert_eq!(
+            assigned.revisits(),
+            0,
+            "the role assignment oscillates under lossy reads — a node returned to a role set it had already \
+             left, which is churn in the anonymity set\n{}",
+            assigned.render()
+        );
     }
 
     #[tokio::test]
