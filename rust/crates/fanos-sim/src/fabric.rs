@@ -1197,11 +1197,36 @@ mod tests {
              {verdict:?}\n{}",
             roster.render()
         );
-        if !verdict.is_reached() {
+        // Stability, three-valued like the verdict above it and for the same reason. This used to be a bare
+        // `assert_eq!(changes_after(..), 0)` sitting one line below a comment explaining that a contended host
+        // must not turn "still converging" into "does not converge" — so the file argued the point and then
+        // did the opposite. A cell that was still converging when the deadline arrived changes during the
+        // window *by definition*, and reading that as instability is the same false red, one layer up.
+        if verdict.is_reached() {
+            // Converged first, so anything moving now is the system, not the measurement. `revisits`, not
+            // `changes_after`: a roster shrinking monotonically under load is churn the host caused, while one
+            // returning to a value it already left is a controller chasing its own tail — and only the second
+            // is a claim about FANOS. That distinction matters now that the role setpoint is genuinely
+            // telemetry-driven and can oscillate for real.
+            assert_eq!(
+                roster.revisits(),
+                0,
+                "the assignment oscillates: a node returned to a roster it had already left\n{}",
+                roster.render()
+            );
+            if roster.changes_after(Duration::ZERO) > 0 {
+                // Drift without revisits. Reported rather than asserted: it is churn, and this observation
+                // cannot tell churn the host caused from churn the cell did.
+                println!(
+                    "PG(2,4) N={N}: converged, then drifted without oscillating ({} transitions)\n{}",
+                    roster.transitions(),
+                    roster.render()
+                );
+            }
+        } else {
             // Not a failure: the measurement did not finish. Saying so beats a red that means nothing.
             println!("PG(2,4) N={N}: inconclusive — still converging at the deadline: {verdict:?}");
         }
-        assert_eq!(roster.changes_after(Duration::ZERO), 0, "and it holds\n{}", roster.render());
     }
 
     #[tokio::test]

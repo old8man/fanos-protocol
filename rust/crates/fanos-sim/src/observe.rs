@@ -87,6 +87,52 @@ impl<T: Eq> Timeline<T> {
         self.samples.get(from).map(|(t, _)| *t)
     }
 
+    /// Per-node **revisits**: how many times a node returns to a value it had already left — the signature of
+    /// an *oscillation*, as distinct from drift.
+    ///
+    /// [`changes_after`](Self::changes_after) counts every transition, which conflates two different things. A
+    /// roster that goes `7 → 6 → 5` under a contended host is losing peers monotonically: churn caused by the
+    /// measurement, not by the system. A roster that goes `7 → 6 → 7 → 6` is a controller chasing its own tail,
+    /// and only that second one is a property of the system under test.
+    ///
+    /// The distinction is not academic here. A control loop whose setpoint is genuinely telemetry-driven can
+    /// oscillate for real, and an instrument that reports contention and oscillation with the same number
+    /// cannot answer the question it will be asked — which is exactly the failure `Settled` was made
+    /// three-valued to avoid, repeated one layer up.
+    ///
+    /// Counted per node and summed, so one flapping node in a settled fleet is visible rather than averaged
+    /// away.
+    #[must_use]
+    pub fn revisits(&self) -> usize {
+        let Some((_, first)) = self.samples.first() else {
+            return 0;
+        };
+        (0..first.len())
+            .map(|node| {
+                let series = self.samples.iter().filter_map(|(_, v)| v.get(node));
+                let mut left: Vec<&T> = Vec::new();
+                let mut revisits = 0usize;
+                let mut current: Option<&T> = None;
+                for value in series {
+                    match current {
+                        // Unchanged: not a transition, so nothing to judge.
+                        Some(c) if c == value => {}
+                        Some(c) => {
+                            // A transition. If we have stood on `value` before and left it, this is a revisit.
+                            if left.contains(&value) {
+                                revisits += 1;
+                            }
+                            left.push(c);
+                            current = Some(value);
+                        }
+                        None => current = Some(value),
+                    }
+                }
+                revisits
+            })
+            .sum()
+    }
+
     /// Per-node changes occurring at or after elapsed time `at` — the flap counter.
     ///
     /// Zero is the healthy value once the observable has settled. A positive count on a fleet whose membership never
@@ -154,6 +200,30 @@ mod tests {
         Timeline::new(
             rows.iter().enumerate().map(|(i, r)| (Duration::from_secs(i as u64), r.to_vec())).collect(),
         )
+    }
+
+    #[test]
+    fn drift_and_oscillation_are_told_apart_where_the_flap_counter_cannot() {
+        // Both of these move the same number of times, so `changes_after` reports them identically. Only one is
+        // a property of the system under test: a roster losing peers monotonically on a contended host is churn
+        // the *measurement* caused, while a roster returning to a value it already left is a controller chasing
+        // its own tail. An instrument that scores them the same cannot answer which one it is looking at.
+        let drift = at_1s(&[&[7u8], &[6], &[5], &[4]]);
+        let oscillation = at_1s(&[&[7u8], &[6], &[7], &[6]]);
+        assert_eq!(
+            drift.transitions(),
+            oscillation.transitions(),
+            "the premise: the flap counter cannot separate these"
+        );
+        assert_eq!(drift.revisits(), 0, "monotone drift never returns to a value it left");
+        assert_eq!(oscillation.revisits(), 2, "7→6→7→6 revisits 7 once and 6 once");
+
+        // A settled fleet has neither.
+        assert_eq!(at_1s(&[&[3u8], &[3], &[3]]).revisits(), 0, "an unchanging value is not a revisit");
+
+        // Per node and summed, so one flapping node among settled ones is visible rather than averaged away.
+        let one_flapper = at_1s(&[&[1u8, 9], &[1, 8], &[1, 9]]);
+        assert_eq!(one_flapper.revisits(), 1, "the flapping node is not hidden by its quiet neighbour");
     }
 
     #[test]
