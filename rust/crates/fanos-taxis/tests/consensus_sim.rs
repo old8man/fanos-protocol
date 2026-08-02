@@ -1197,6 +1197,14 @@ fn a_forged_or_mismatched_catch_up_response_is_refused() {
     assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), snapshot: wrong }), Vec::new());
     assert_eq!(c.engines[LAG].chain().next_height(), 0, "a snapshot that does not match the certified root is refused");
 
+    // **Both refusals are recorded, and recorded APART.** They are the same non-event to a lagging operator —
+    // the node simply never catches up — but they mean opposite things: an under-quorum certificate is a peer
+    // attacking, a mismatched snapshot is a peer that is broken or on another fork. T-H6 is the reason the
+    // distinction is worth a counter each: safety held there, and what was missing was any way to see it.
+    let vr = c.engines[LAG].probe().vote_rejects;
+    assert_eq!(vr.sync_head_disagreement, 1, "the under-quorum certificate is counted as a certificate fault");
+    assert_eq!(vr.sync_uncertified, 1, "the mismatched snapshot is counted separately, not folded into it");
+
     // (3) The GENUINE response IS adopted — the positive control: verified certificate + matching snapshot.
     let outs = c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), snapshot: good });
     assert!(matches!(outs.as_slice(), [Output::Committed { .. }]), "a valid response adopts (emits Committed)");
@@ -1309,6 +1317,17 @@ fn forged_votes_cannot_forge_a_certificate() {
     c.run();
     assert_eq!(c.honest_count_at(0), 0, "forged-signature votes cannot finalize anything");
     assert!(c.hashes_at(0).is_empty(), "no block was committed from forged votes");
+
+    // **Refusing them is half the job; being able to say so is the other half.** A peer forging votes and a
+    // peer sending nothing produce identical silence at every other observable an operator has — and an
+    // isolated validator inside the tolerated fault budget is exactly what T-H6 was. Safety held there too;
+    // what was missing was any way to know it was happening.
+    let forged: u64 = c.engines.iter().map(|e| e.probe().vote_rejects.forged).sum();
+    assert!(
+        forged > 0,
+        "the cell refused the forgeries but recorded none — a validator under attack is then \
+         indistinguishable from one nobody is talking to"
+    );
 }
 
 #[test]

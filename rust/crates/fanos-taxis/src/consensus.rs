@@ -113,6 +113,8 @@ pub struct ConsensusProbe {
     pub max_seen_height: u64,
     /// Why it has been refusing proposals.
     pub rejects: ProposalRejects,
+    /// Why votes and sync responses were discarded — see [`VoteRejects`].
+    pub vote_rejects: VoteRejects,
     /// Skeleton requests seen, and how many this validator could answer.
     pub skeleton_asks: (u64, u64),
     /// Shard requests seen, and how many this validator could answer.
@@ -245,8 +247,54 @@ impl core::fmt::Display for ConsensusProbe {
             }
             write!(f, "]")?;
         }
+        let v = &self.vote_rejects;
+        let vtotal =
+            v.forged + v.stale_height + v.future_height + v.sync_uncertified + v.sync_head_disagreement;
+        if vtotal > 0 {
+            write!(f, " vrej[")?;
+            for (name, n) in [
+                ("forged", v.forged),
+                ("stale", v.stale_height),
+                ("future", v.future_height),
+                ("syncunc", v.sync_uncertified),
+                ("synchead", v.sync_head_disagreement),
+            ] {
+                if n > 0 {
+                    write!(f, "{name}={n} ")?;
+                }
+            }
+            write!(f, "]")?;
+        }
         Ok(())
     }
+}
+
+/// Why a **vote** or a **sync response** was discarded — the counters proposals already had and votes did not.
+///
+/// `ProposalRejects` exists because "every one of those counters was added while a live cell was stuck and its
+/// state could not be read". The same argument applies with more force one layer down: a proposal that is
+/// refused is at least a proposal that arrived, whereas a validator whose *votes* are being discarded cannot
+/// reach quorum and looks, from every angle available to its operator, exactly like a validator nobody is
+/// talking to.
+///
+/// That is not hypothetical. T-H6 (`1fa8edc`) was precisely this: a Byzantine member pairing a genuine
+/// `ExecCertificate` with an arbitrary head to isolate an honest validator, taking effective participation to
+/// `4 < Q = 5` in a Fano cell. Safety held — the victim could never reach quorum, so no fork — but nothing in
+/// the engine could say it was happening.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VoteRejects {
+    /// The signature did not verify against the claimed voter's key. **The one that matters most**: a peer
+    /// actively forging votes and a peer sending nothing are otherwise the same observation.
+    pub forged: u64,
+    /// A vote for a height this validator has already passed.
+    pub stale_height: u64,
+    /// A vote for a height ahead of ours — we are behind, and `note_height` records how far.
+    pub future_height: u64,
+    /// A sync response that carried no usable certificate.
+    pub sync_uncertified: u64,
+    /// A sync response whose votes did not agree on the head (the T-H6 shape, now rejected by construction
+    /// since `ExecVote` signs the head — this counts the attempts).
+    pub sync_head_disagreement: u64,
 }
 
 /// Counters rather than log lines because this engine is `no_std` and sans-I/O: it has nowhere to write. A driver reads
@@ -752,6 +800,7 @@ pub struct ConsensusEngine<S: StateMachine> {
     round0_tickets: BTreeMap<u8, ([u8; 32], [u8; 32])>,
     // Why proposals were refused (`ProposalRejects`) — cumulative, never reset, so a driver or test can diff two reads.
     rejects: ProposalRejects,
+    vote_rejects: VoteRejects,
     // Peers' votes ingested, bucketed by the round they carried relative to ours *when they arrived*, plus the ones
     // that belonged to another height. Cumulative. See `ConsensusProbe::votes_seen` for why the vote path needs a
     // counter of its own rather than being reasoned about.
@@ -938,6 +987,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sortition: None,
             round0_tickets: BTreeMap::new(),
             rejects: ProposalRejects::default(),
+            vote_rejects: VoteRejects::default(),
             votes_seen: (0, 0, 0),
             votes_off_height: 0,
             skeleton_asks: (0, 0),
@@ -1244,6 +1294,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             parked: self.pending_finalize.keys().min().copied(),
             max_seen_height: self.max_seen_height,
             rejects: self.rejects,
+            vote_rejects: self.vote_rejects,
         }
     }
 
@@ -1519,12 +1570,21 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return Vec::new(); // (1) not ahead of us
         }
         if !cert.verify(self.params.quorum, &self.verifiers) {
+            // **The T-H6 site.** `verify` now requires every `ExecVote` to agree on the head as well as the
+            // root (`1fa8edc`), so a certificate stitched across two tips is refused here — but refusing it
+            // silently leaves the victim looking merely quiet. A validator that cannot catch up and a
+            // validator being fed forged certificates are the same observation without this counter, and the
+            // attack's whole effect was to isolate one honest node inside the tolerated fault budget.
+            self.vote_rejects.sync_head_disagreement =
+                self.vote_rejects.sync_head_disagreement.saturating_add(1);
             return Vec::new(); // (2) forged / under-quorum certificate
         }
         let Some(state) = S::restore(snapshot) else {
+            self.vote_rejects.sync_uncertified = self.vote_rejects.sync_uncertified.saturating_add(1);
             return Vec::new(); // malformed snapshot
         };
         if state.state_root() != cert.state_root {
+            self.vote_rejects.sync_uncertified = self.vote_rejects.sync_uncertified.saturating_add(1);
             return Vec::new(); // (3) the snapshot does not restore to the certified state
         }
         // Atomic adoption: install the certified state at `cert.height` on `head`, reset the round machinery,
@@ -2083,15 +2143,24 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return Vec::new();
         };
         if !sv.verify(verifier) {
+            // Counted, because this is the one rejection an operator cannot infer from anything else: a peer
+            // forging votes and a peer sending nothing produce the same silence at every other observable.
+            self.vote_rejects.forged = self.vote_rejects.forged.saturating_add(1);
             return Vec::new(); // bad / forged signature
         }
         if v.height != height {
             if v.height > height {
                 self.note_height(v.height); // a peer is voting a height we have not reached — we are behind
+                self.vote_rejects.future_height = self.vote_rejects.future_height.saturating_add(1);
+            } else {
+                self.vote_rejects.stale_height = self.vote_rejects.stale_height.saturating_add(1);
             }
             if v.voter != self.me {
                 self.votes_off_height = self.votes_off_height.saturating_add(1);
             }
+            // Split, where `votes_off_height` sums them: behind and ahead call for opposite actions — one
+            // waits for sync, the other means peers are lagging us — and a single total cannot tell an
+            // operator which.
             return Vec::new(); // stale or future height
         }
         // Counted after authentication and before storage, so the number is "votes a real validator cast that reached
