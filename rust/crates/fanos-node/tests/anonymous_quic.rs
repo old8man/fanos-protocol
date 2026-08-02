@@ -547,10 +547,10 @@ async fn await_every_meeting_member_binds(
 /// and four successive hypotheses died against it. Each half now has its own name and its own rate.
 struct OffCombiner {
     nodes: Vec<Option<NodeHandle>>,
-    /// Held so the host keeps serving for the fixture's lifetime.
-    _host_node: NodeHandle,
-    /// Held so the client keeps its transport for the fixture's lifetime; the dialer borrows from it.
-    _client_node: NodeHandle,
+    /// The host: kept serving for the fixture's lifetime, and shut down by `teardown`.
+    host_node: NodeHandle,
+    /// The client: its transport backs the dialer, and `teardown` shuts it down.
+    client_node: NodeHandle,
     dialer: FanosDialer<StaticResolver>,
     /// The canonical combiner of meeting point 0 — the node a censorship scenario silences.
     m_index: usize,
@@ -567,6 +567,10 @@ impl OffCombiner {
     }
 
     async fn build_with_host(force_host: Option<usize>) -> Self {
+        Self::build_with(force_host, None).await
+    }
+
+    async fn build_with(force_host: Option<usize>, force_client: Option<usize>) -> Self {
     // The §3b general case — no cheat: the service operator is NOT the node at its meeting combiner (it
     // cannot choose its VRF coordinate). It registers an anonymous forward route (its own dead-drop line)
     // with the combiner by onion; the combiner re-seals each client request to that dead-drop; the operator
@@ -642,7 +646,8 @@ impl OffCombiner {
     .await;
 
     // A third node dials by name — it neither is the combiner nor knows where the service is.
-    let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
+    let client_index = force_client
+        .unwrap_or_else(|| (0..7).find(|&i| i != m_index && i != host_index).unwrap());
     let client_node = nodes[client_index].take().unwrap();
     let params = AnonRouteParams {
         directory: mix.clone(),
@@ -659,13 +664,35 @@ impl OffCombiner {
 
         Self {
             nodes,
-            _host_node: host_node,
-            _client_node: client_node,
+            host_node,
+            client_node,
             dialer,
             m_index,
             drop_line_members: line_member_coords::<F2>(drop_line),
             silenced_coord: m_combiner,
         }
+    }
+
+    /// Shut every node down explicitly, then yield, so the next fixture starts on a clean cell.
+    ///
+    /// `drop` alone is not enough and the difference is measurable. The host sweep reported host 3
+    /// UNREACHABLE; the client sweep, which builds host 3 *first*, reaches it for every client. Same host,
+    /// same derived client, opposite verdicts — so the variable is neither of them, it is **what ran
+    /// before**. Seven whole-cell fixtures in sequence, each holding seven QUIC nodes on loopback, and the
+    /// later ones inherit sockets and peer state the earlier ones had not finished releasing.
+    ///
+    /// That makes any sequential sweep's later entries untrustworthy unless teardown is explicit, which is
+    /// what this is. It does not fix a product defect — it removes a measurement artefact that was being
+    /// read as one.
+    async fn teardown(mut self) {
+        for n in self.nodes.iter().flatten() {
+            n.shutdown();
+        }
+        self.nodes.clear();
+        self.host_node.shutdown();
+        self.client_node.shutdown();
+        // One scheduler turn for the shutdowns to take effect before the next fixture binds its ports.
+        tokio::task::yield_now().await;
     }
 
     /// One request/response over a fresh anonymous session. `None` if the dial or the exchange did not
@@ -688,6 +715,48 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
         cell.exchange().await.as_deref(),
         Some(b"anon-quic-200:GET /off".as_slice()),
         "a service hosted off its meeting combiner was reached end-to-end via combiner forwarding",
+    );
+}
+
+#[tokio::test]
+#[ignore = "diagnostic sweep: several fixtures, minutes — run explicitly with --ignored"]
+async fn reachability_does_not_depend_on_which_node_is_the_client() {
+    /// The pinned host: any non-combiner point, since the plane is point-transitive.
+    const HOST: usize = 3;
+    let _serial = serial();
+    let _serial = common::serial_cell().await;
+    // **Isolating the variable the host sweep could not.** That sweep reported one working placement out of
+    // six — but `client_index` is itself derived as `find(i != m_index && i != host_index)`, so it is 2 only
+    // when the host is 1 and 1 in every other case. The one "good" host placement is the only one with a
+    // different CLIENT, which makes the host the confounded variable and the client the suspect.
+    //
+    // Here the host is pinned and only the client moves. PG(2,2) is point-transitive — every point lies on 3
+    // lines and shares exactly one with the combiner — so no placement can be geometrically special, and a
+    // dependence on node index has to come from identity (spawn order, seed, beacon share), not the plane.
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for client in 0..7 {
+        if client == HOST {
+            continue;
+        }
+        let Ok(cell) = tokio::spawn(OffCombiner::build_with(Some(HOST), Some(client))).await else {
+            bad.push(client);
+            continue;
+        };
+        if client == cell.m_index {
+            continue; // the combiner is not a client candidate
+        }
+        if cell.exchange().await.as_deref() == Some(b"anon-quic-200:GET /off".as_slice()) {
+            ok.push(client);
+        } else {
+            bad.push(client);
+        }
+        cell.teardown().await;
+    }
+    assert!(
+        bad.is_empty(),
+        "with the host pinned at {HOST}, reachability still depends on which node dials: worked {ok:?}, \
+         failed {bad:?} — on a point-transitive plane that can only be node identity, not geometry",
     );
 }
 
@@ -724,7 +793,7 @@ async fn every_legitimate_host_placement_is_reachable() {
         }
         let ok = cell.exchange().await.as_deref() == Some(b"anon-quic-200:GET /off".as_slice());
         if ok { reachable.push(host) } else { unreachable.push(host) }
-        drop(cell);
+        cell.teardown().await;
     }
     assert!(
         unreachable.is_empty() && unbuildable.is_empty(),
