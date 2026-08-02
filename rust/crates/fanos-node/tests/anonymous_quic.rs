@@ -10,7 +10,13 @@
 //! mixnet's effective round trip (a hop is a multi-round threshold gather), rather than the Direct
 //! profile's base tick — otherwise the onion flood saturates the per-hop gathers.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::await_holding_lock)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::await_holding_lock,
+    clippy::format_push_string,
+)]
 
 mod common;
 
@@ -45,7 +51,7 @@ use fanos_node::{
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, HybridSigSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
-use fanos_quic::{Directory, NodeHandle, spawn};
+use fanos_quic::{Client, Directory, NodeHandle, spawn};
 use fanos_runtime::{Config as OverlayConfig, OverlayNode};
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, deal};
 use fanos_rendezvous::CONTROL_MIX_DIRECTORY;
@@ -742,6 +748,80 @@ impl OffCombiner {
         reached
     }
 
+    /// A dial + request + bounded read that reports a stall as `None` **instead of panicking**.
+    ///
+    /// `common::exchange` deliberately panics on a wedge (`REFUTED — … it is wedged`), which is right for a
+    /// verdict and useless for an autopsy: the process dies at exactly the moment its state is worth reading.
+    /// This is the same exchange with the verdict removed, so a diagnostic can go on to ask the cell where it
+    /// stopped. It is NOT a substitute for the budgeted form — it charges wall clock, so it cannot tell a
+    /// wedge from a starved host, and only the autopsy below uses it.
+    async fn probe(&self) -> Option<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = Target::Name("off.fanos".to_owned(), 80);
+        let dial = self.dialer.dial(&target);
+        let mut s = tokio::time::timeout(common::FROZEN_SPAN, dial).await.ok()?.ok()?;
+        s.write_all(b"GET /off").await.ok()?;
+        // **Half-close, not flush.** The RPC service reads its request to EOF before answering, so a probe
+        // that only flushes waits forever for a reply the service will never start writing — and reports its
+        // own omission as a wedge. Four autopsy runs were spent on that before `common::exchange` was read
+        // closely enough to notice it calls `shutdown`.
+        s.shutdown().await.ok()?;
+        let mut buf = vec![0u8; 512];
+        let n = tokio::time::timeout(common::FROZEN_SPAN, s.read(&mut buf)).await.ok()?.ok()?;
+        buf.truncate(n);
+        (n > 0).then_some(buf)
+    }
+
+    /// Ask every node still standing what its data path did, and render it.
+    ///
+    /// `Command::Observe` is the sense-only read: `ThresholdRouter` answers it with
+    /// `Notification::DataPath { stations, gather }` and `RendezvousRelay` delegates, so a wedged cell can be
+    /// interrogated rather than guessed at. Both endpoints are included — reading only the relays would be a
+    /// one-sided counter, which points at the wrong half.
+    async fn autopsy(&self) -> String {
+        let mut out = String::from("\n--- data-path stations after the wedge ---\n");
+        let mut probes: Vec<(String, Client)> = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let Some(node) = node {
+                probes.push((format!("relay[{i}]"), node.client()));
+            }
+        }
+        probes.push(("host".to_owned(), self.host_node.client()));
+        probes.push(("client".to_owned(), self.client_node.client()));
+        for (name, client) in probes {
+            // **Subscribe BEFORE asking.** `NodeHandle::next_notification` reads a receiver created at spawn
+            // and never drained, so the answer to a question asked now sits behind every notification the node
+            // has emitted since. Reading forward through that backlog is a race the busy nodes win and the
+            // quiet ones lose — exactly the pattern the first two runs showed, a different single node
+            // answering each time. A fresh subscription has no backlog, so the next `DataPath` on it is the
+            // reply to this `Observe`.
+            let mut events = client.subscribe();
+            client.command(Command::Observe);
+            let wait = std::time::Duration::from_secs(4);
+            let mut seen = String::from("(no DataPath answer)");
+            loop {
+                match tokio::time::timeout(wait, events.recv()).await {
+                    Ok(Ok(Notification::DataPath { stations, gather })) => {
+                        let counts: Vec<String> = stations
+                            .iter()
+                            .filter(|o| o.count > 0)
+                            .map(|o| match o.line {
+                                Some(l) => format!("{:?}@{l:?}={}", o.station, o.count),
+                                None => format!("{:?}={}", o.station, o.count),
+                            })
+                            .collect();
+                        seen = format!("gather={gather:?} {}", counts.join(" "));
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+            out.push_str(&format!("{name:>10}: {seen}\n"));
+        }
+        out
+    }
+
     /// One fresh dial and one request/response, bounded **as a whole**.
     ///
     /// The budget covers the dial too, and that became load-bearing when the client learned to hedge across
@@ -927,6 +1007,53 @@ async fn the_service_survives_one_meeting_point_going_silent() {
         reached > 0,
         "with one meeting point's combiner silent the service must still be reachable — 0 of 3 dials arrived, \
          which is what a service pinned to a single meeting point would give",
+    );
+}
+
+#[tokio::test]
+#[ignore = "autopsy: reproduces the wedge and interrogates the cell — run explicitly with --ignored"]
+async fn a_wedged_session_reports_where_it_stopped() {
+    let _serial = serial();
+    let _serial = common::serial_cell().await;
+    // With one cell member down, some established sessions stop moving bytes and never resume — verified as a
+    // WEDGE rather than slowness by giving each dial 4x the granted-time budget and watching the harness pick
+    // its `REFUTED` branch (the one that fires only when the runtime WAS being scheduled).
+    //
+    // Both reseals were then checked and neither is the cause: `RendezvousClient::seal_send` and
+    // `RendezvousService::seal_reply` each draw a fresh seed per call, so every retransmit produces a
+    // different onion, a different salt, and therefore a different member of the hop line (#55). Whatever is
+    // stuck is not a deterministic addressee.
+    //
+    // So this stops guessing and asks. It reproduces the wedge, then reads `Command::Observe` from every node
+    // still standing — including BOTH endpoints, since a one-sided counter points at the wrong half.
+    let mut cell = OffCombiner::build().await;
+    let (victim_index, victim) = cell
+        .unconfounded_victim()
+        .expect("no meeting point can be silenced without also removing a reply-line member or an endpoint");
+    // Printed because the whole diagnosis turns on WHICH lines the dead point sits on: an expiry on a line
+    // through it is a zero-margin gather (`t = ⌈2(q+1)/3⌉` is 2-of-3 at q=2, so one dead member spends the
+    // entire fault budget), while an expiry elsewhere would mean something else entirely.
+    let through: Vec<Triple> = (0..7)
+        .map(Line::<F2>::at)
+        .filter(|l| line_member_coords::<F2>(l.coords()).contains(&victim))
+        .map(|l| l.coords())
+        .collect();
+    println!("victim {victim:?} (index {victim_index}); lines through it: {through:?}");
+    cell.nodes[victim_index].take().expect("the victim combiner node is still held").shutdown();
+
+    for attempt in 0..12 {
+        if cell.probe().await.is_none() {
+            let report = cell.autopsy().await;
+            println!("wedged on dial {attempt}{report}");
+            cell.teardown().await;
+            return;
+        }
+    }
+    let report = cell.autopsy().await;
+    cell.teardown().await;
+    panic!(
+        "no wedge in 12 dials — either the defect is gone (check before deleting this) or the fixture no \
+         longer reproduces it{report}"
     );
 }
 
