@@ -249,14 +249,26 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-core", 15),
     ("fanos-diakrisis", 40),
     ("fanos-diaulos", 6),
-    ("fanos-dromos", 18),
+    // 19: `name_register_term` and `term_payload` (2026-07-31) build the name-registration term, and nothing
+    // in a running node builds a term at all — same gap as `fanos-ergon`'s codec below, tracked as the ERGON
+    // CLI verbs. Raised rather than wired because inventing a caller to satisfy the count is the one thing
+    // this ratchet must never reward. (`conflicts_with`, also here, is deliberate: it is the SPECIFICATION of
+    // the scheduler's conflict property, used by the test to verify the O(accesses) `schedule` that
+    // implements it. Wiring it onto the hot path would make block scheduling quadratic.)
+    ("fanos-dromos", 19),
     // 3 → 4, and the bump has a reason as the rule requires: `Expr::bin`, `exec::compare` and `Predicate::host_with`
     // are the expression layer's constructors. Nothing in production builds a computed argument or a compared gate yet
     // — `transfer_term` is the only term builder — and the callers are the Verum emitter and contract authors
     // (`docs/design-ergon.md` §11 step 6). This is the ratchet working as intended: the debt is named and bounded, not
     // hidden. `Journal::written` was the fifth and was deleted instead of budgeted — an accessor I added speculatively
     // with no caller anywhere, which is dead code rather than pending work.
-    ("fanos-ergon", 4),
+    // 5: `decode_value` (2026-07-31, one day after this ratchet was set — the guard working exactly as
+    // intended). The ERGON *value* layer IS wired: `ergon_host` converts ledger records to and from `Value`
+    // on the live read/write path. The **codec** is not, and its own test says why that matters — "a record
+    // that decodes to itself but re-encodes differently would give one ledger record two contract identities"
+    // — so canonicity is enforced in a function nothing in production calls. Wiring it means deciding where
+    // ledger records get serialized, which is a design question, not a count to satisfy.
+    ("fanos-ergon", 5),
     ("fanos-field", 1),
     ("fanos-geometry", 2),
     ("fanos-holarch", 1),
