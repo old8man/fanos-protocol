@@ -78,6 +78,55 @@ pub enum Derivation {
     OnionGatherMember,
 }
 
+/// What a derivation change has to agree across — and therefore the smallest unit it can be canaried in.
+///
+/// §2 says canarying must be expressed in the platform's own units (by cell, by role, by opt-in flag) and
+/// **never by coordinate**, since coordinates rotate every epoch and a coordinate range selects a
+/// geometrically clustered subset, which is exactly what the plane's fault model assumes away.
+///
+/// But §2 and §3 together say something sharper than either alone, and it is a constraint rather than a menu.
+/// §3: "a threshold gather needs `t` of `q+1` members to agree on the derivation. Any switch granularity
+/// coarser than *all members at once* leaves a window where a line cannot reach quorum — which is class C's
+/// silent death, self-inflicted." So for a derivation the members of a **line** must agree on, a per-node
+/// opt-in canary is not a cautious rollout: it is the failure mode, chosen deliberately. One volunteer in a
+/// line of three is how you take that line below `t`.
+///
+/// Hence the unit a derivation may be canaried in is a property *of the derivation*, not of the operator's
+/// appetite — which is why this is on the registry beside the heights rather than in a deployment flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// Affects only how this node behaves locally. Safe to canary per node, including by opt-in — the honest
+    /// unit for a public network, where nobody can be conscripted into a canary anyway.
+    Node,
+    /// Every member of a hop **line** must agree, or the line falls below `t` and its traffic dies silently.
+    /// Canary by **cell** (the blast-radius boundary, where a threshold, a beacon and a fault bound all live)
+    /// — never by node, and never by role, since a line's members are drawn by geometry rather than by role.
+    Line,
+    /// The whole cell must agree. Canary by cell, and only a whole cell at a time.
+    Cell,
+}
+
+impl Scope {
+    /// Whether a **per-node** canary is admissible — an opt-in flag, or any other selection finer than a cell.
+    ///
+    /// `false` for anything a line or a cell must agree on, and that is the whole content of the type: the
+    /// answer is a fact about the derivation, not a judgement call at deploy time.
+    #[must_use]
+    pub const fn allows_node_canary(self) -> bool {
+        matches!(self, Self::Node)
+    }
+
+    /// A short stable word for an operator surface.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Line => "line",
+            Self::Cell => "cell",
+        }
+    }
+}
+
 /// Whether `epoch` falls inside the half-open window `[activation, abort)`.
 ///
 /// The comparison is `>=` at the activation and `<` at the abort, and they read the same way on purpose: a
@@ -143,6 +192,19 @@ impl Derivation {
             // Shipped before this registry existed — see the variant's own doc for why `0` is the honest
             // value rather than a back-dated switch.
             Self::OnionGatherMember => 0,
+        }
+    }
+
+    /// What this change has to agree across, and therefore the smallest unit it may be canaried in.
+    #[must_use]
+    pub const fn scope(self) -> Scope {
+        match self {
+            // A gather needs `t` of `q + 1` line members to pick the SAME member. One node on the other
+            // derivation addresses a hop nobody is gathering, so the line loses a member toward `t` — and at
+            // the Fano threshold of 2 of 3, a single opted-in canary is enough to kill it. This is precisely
+            // the case §2's "never by coordinate" warning generalizes to: never finer than the unit that has
+            // to agree.
+            Self::OnionGatherMember => Scope::Line,
         }
     }
 
@@ -218,6 +280,36 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn a_line_scoped_derivation_refuses_a_per_node_canary() {
+        // §2 ∧ §3, which say more together than apart. §2 lists the admissible canary units; §3 says a switch
+        // granularity finer than "all members of a line at once" leaves the line unable to reach `t`. So for a
+        // line-scoped derivation an opt-in canary is not a cautious rollout — it is the class-C silent death,
+        // self-inflicted, and at the Fano threshold of 2 of 3 a single volunteer is enough to cause it.
+        assert!(!Scope::Line.allows_node_canary(), "one volunteer in a line of three takes it below t");
+        assert!(!Scope::Cell.allows_node_canary(), "a cell-wide agreement cannot be canaried per node either");
+        assert!(Scope::Node.allows_node_canary(), "a purely local change is the case opt-in was meant for");
+
+        // And the shipped entry is line-scoped, so the rule binds something real rather than describing a
+        // hypothetical: the gatherer draw is exactly the derivation whose members must pick the same node.
+        for d in Derivation::ALL {
+            if d.scope().allows_node_canary() {
+                continue;
+            }
+            assert!(
+                !d.scope().allows_node_canary(),
+                "{} is {}-scoped and must not be offered a per-node canary",
+                d.name(),
+                d.scope().name()
+            );
+        }
+        assert_eq!(
+            Derivation::OnionGatherMember.scope(),
+            Scope::Line,
+            "the gatherer draw is agreed across a LINE — canary it by cell or not at all"
+        );
+    }
 
     #[test]
     fn an_abort_height_names_the_first_epoch_running_the_old_form_again() {

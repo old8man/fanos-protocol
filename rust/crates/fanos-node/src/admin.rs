@@ -335,7 +335,17 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth, epoch: u
     // the second question immediately, and a hash cannot be diffed.
     for d in Derivation::ALL {
         let status = d.status_at(epoch);
-        let _ = write!(out, "  {:<22} {} at {}", d.name(), status.name(), d.activation_height());
+        // The scope is on this line because it is what an operator needs before planning a rollout: it says
+        // which canary units are admissible at all, and getting that wrong is not a slower rollout but a dead
+        // line (§2 ∧ §3).
+        let _ = write!(
+            out,
+            "  {:<22} {} at {} ({}-scoped)",
+            d.name(),
+            status.name(),
+            d.activation_height(),
+            d.scope().name()
+        );
         match d.abort_height() {
             // Named even when far off: a scheduled withdrawal is the single most important thing on this
             // line, and an operator should never learn of one by watching a derivation stop working.
