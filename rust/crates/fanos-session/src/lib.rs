@@ -24,6 +24,7 @@ use rand_core::CryptoRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
 
 /// The internal duplex buffer between the app and the driver.
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -76,8 +77,32 @@ pub fn stream_over_channels_paced(
     tick: Duration,
 ) -> DuplexStream {
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
-    tokio::spawn(drive(session, driver_side, transport, tick));
+    tokio::spawn(drive(session, driver_side, transport, tick, None));
     app_side
+}
+
+/// Like [`stream_over_channels_paced`], but also hands back a **liveness signal**: a receiver that resolves
+/// `Ok(())` the moment the DIAULOS handshake completes, and `Err(_)` if the driver gives up first.
+///
+/// A caller that can *choose another path* needs to know whether this one came up, and a bare
+/// [`DuplexStream`] cannot tell it: a session whose far end never answers looks exactly like one whose peer
+/// simply has nothing to say yet, until the give-up rule finally closes it minutes later. The anonymous dialer
+/// walks a service's meeting points precisely because any single one may be censored, and the walk is only as
+/// good as its ability to tell "this meeting point is dead" from "this meeting point is quiet".
+///
+/// Both outcomes come from the one channel with no extra state: the sender fires on establishment, and is
+/// dropped unfired when the driver exits any other way — so `Err` *is* the give-up, not a separate report that
+/// could disagree with it.
+#[must_use]
+pub fn stream_over_channels_confirmed(
+    session: ClientSession,
+    transport: ChannelTransport,
+    tick: Duration,
+) -> (DuplexStream, oneshot::Receiver<()>) {
+    let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    tokio::spawn(drive(session, driver_side, transport, tick, Some(ready_tx)));
+    (app_side, ready_rx)
 }
 
 /// Drive the **accepting** side of a DIAULOS session — a service answering one client — as an async
@@ -115,7 +140,7 @@ pub fn serve_over_channels_paced<R: CryptoRng + Send + 'static>(
         rng,
         stream_id: None,
     };
-    tokio::spawn(drive(server, driver_side, transport, tick));
+    tokio::spawn(drive(server, driver_side, transport, tick, None));
     app_side
 }
 
@@ -375,7 +400,7 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
 /// **This bounds only a peer that never acknowledges.** Every ack resets the count for what it covers, and
 /// a SACKed hole is excluded ([`StreamSender::stalled_attempts`](fanos_stream::StreamSender::stalled_attempts)),
 /// so a live-but-lossy peer is never abandoned — only an absent one.
-const GIVE_UP_ATTEMPTS: u32 = 15;
+pub const GIVE_UP_ATTEMPTS: u32 = 15;
 
 /// **How long an unanswered *handshake* is pursued** before the dial is abandoned — the second half of
 /// the give-up rule, and deliberately a different quantity from [`GIVE_UP_ATTEMPTS`].
@@ -425,6 +450,10 @@ async fn drive<S: SessionStream>(
     driver_side: DuplexStream,
     transport: ChannelTransport,
     tick: Duration,
+    // Fired once, the first time the session goes live; dropped unfired on every other exit, so a caller
+    // awaiting it learns "established" from `Ok` and "gave up" from `Err` without a second channel to
+    // contradict the first ([`stream_over_channels_confirmed`]).
+    mut ready: Option<oneshot::Sender<()>>,
 ) {
     let ChannelTransport {
         outbound,
@@ -461,6 +490,9 @@ async fn drive<S: SessionStream>(
     loop {
         // Once live, flush any buffered pre-handshake writes and propagate the app's close.
         if session.is_live() {
+            if let Some(tx) = ready.take() {
+                let _ = tx.send(()); // the caller may have stopped caring; that is not this driver's problem
+            }
             if !pending.is_empty() {
                 session.write(&pending);
                 session.flush(); // seal the buffered partial so it ships now, not only on close
