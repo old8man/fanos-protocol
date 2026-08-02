@@ -124,6 +124,35 @@ pub async fn publish_service(
 /// themselves by it, and a foreign caller has no other way to know that a store call returns.
 pub const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+mod timeout_ordering {
+    use super::STORE_TIMEOUT;
+
+    #[test]
+    fn the_outer_bound_must_fire_first_or_read_unknown_is_unreachable() {
+        // The invariant that makes [`Read`]'s third value exist, and it spans two crates with nothing but this
+        // test holding it. `Client::get` bounds itself by `REQUEST_TIMEOUT` and returns `None` when it elapses
+        // — and `None` is read as `Read::Absent`, a **definite** "nothing is published here" that `resolve.rs`
+        // says a caller may rely on. `Read::Unknown` exists only because this crate wraps that call in a
+        // *shorter* bound and treats its elapse as "did not conclude".
+        //
+        // Invert the two and the distinction vanishes silently: the inner bound always fires first, every
+        // failed read reports a definite absence, `Read::Unknown` becomes unreachable, and `Scan::complete()`
+        // returns `true` forever — so every consumer that checks it is checking a constant. An unreachable
+        // member would then be indistinguishable from one demanding nothing, which is exactly the conflation
+        // the three-valued read was introduced to end.
+        //
+        // Found while asking whether `Read::Unknown` ever fires at all. It does — but only because 5 < 10, and
+        // nothing said so.
+        assert!(
+            STORE_TIMEOUT < fanos_quic::REQUEST_TIMEOUT,
+            "STORE_TIMEOUT ({STORE_TIMEOUT:?}) must be strictly shorter than the store client's own \
+             REQUEST_TIMEOUT ({:?}), or a read that did not conclude is reported as a definite absence",
+            fanos_quic::REQUEST_TIMEOUT
+        );
+    }
+}
+
 /// A [`ServiceResolver`] over the overlay store: resolves a service's rendezvous descriptor (and mix
 /// keys) by looking them up at their coordinate-derived store slots, bounded by [`STORE_TIMEOUT`] so a
 /// missing service fails rather than hangs. This is the discovery side of the Direct profile.

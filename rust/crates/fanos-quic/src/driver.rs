@@ -322,7 +322,18 @@ struct Transport {
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
 /// responsible node is unreachable (down, or absent from a sparse cell) must fail, not hang the
 /// caller's task forever (audit C1).
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// **It must stay strictly longer than `fanos_node::resolve::STORE_TIMEOUT`, and that ordering carries a
+/// correctness property rather than a preference.** A `get` that gives up returns `None`, which callers read as
+/// a *definite* "nothing is published here" — `Read::Absent`, which `resolve.rs` says "a caller may rely on".
+/// A caller that wants to distinguish "did not conclude" from "definitely empty" therefore wraps this in its
+/// own, **shorter** bound and treats the elapse as `Read::Unknown`.
+///
+/// Invert the two and that distinction silently disappears: this timeout would always fire first, every read
+/// would return `None`, `Read::Unknown` would become unreachable, and an unreachable member would be reported
+/// as one demanding nothing — with `Scan::complete()` returning `true` the whole time, so every consumer that
+/// checks it would be checking a constant. Public so the ordering can be asserted rather than assumed.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long to wait for a dial to complete before abandoning it (#129). A peer that has gone away must
 /// fail fast so it cannot stall the send loop behind it — the erasure store fans reads to every cell

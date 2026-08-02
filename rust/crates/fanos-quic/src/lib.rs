@@ -38,7 +38,7 @@ mod tls;
 
 pub use directory::Directory;
 pub use reflexive::ReflexiveAddr;
-pub use driver::{CoordinateProver, 
+pub use driver::{CoordinateProver, REQUEST_TIMEOUT,
     Client, NodeHandle, ProteusConfig, QuicError, spawn, spawn_self_certifying,
     Fabric, spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,
     spawn_self_certifying_persistent_over,
