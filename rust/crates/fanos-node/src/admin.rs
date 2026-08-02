@@ -32,6 +32,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 use fanos_runtime::ports::stations::{GatherHealth, Observation};
+use fanos_wire::activation::Derivation;
 
 use crate::node::Health;
 
@@ -182,6 +183,39 @@ pub fn render_health(health: &Health) -> String {
     s
 }
 
+/// This build's **derivation vector**, as a digest: one hash over every registered derivation's
+/// `(name, activation_height)`, in `Derivation::ALL` order.
+///
+/// `docs/design-upgrade.md` §4 wants agreement to be *legible* rather than inferred. Two operators comparing
+/// this one value know their nodes agree on every registered height; different values mean the schedules
+/// differ, and that is knowable **before** an activation rather than after a line has gone quiet — which is the
+/// operational claim, since "the schedule *is* the build" and a node that disagrees about heights is a node
+/// running a different release.
+///
+/// A **digest, not the vector**, and the difference is a privacy one. Every node on a release yields the same
+/// digest, so it distinguishes releases without enumerating which features a particular node does and does not
+/// carry — §4 is explicit that a version vector is node-identifying metadata. It is still a build fingerprint,
+/// so like the station counters it stays **local**: read off an operator's own control socket, never exported
+/// across a node boundary until the DP sensitivity for it is derived the way `Δr = 1/21` was for the coherence
+/// frame.
+///
+/// The name is hashed alongside the height so that *renaming* a derivation — which changes what a height means
+/// — changes the digest; hashing heights alone would call two different schedules identical.
+///
+/// It lives here rather than beside the registry because `fanos-wire` has no hash to reach for:
+/// `fanos-primitives` depends **on** it, which is the same dependency fact that made `is_active_at` take a
+/// bare `u64` instead of an `Epoch`.
+#[must_use]
+pub fn derivation_digest() -> [u8; 32] {
+    let mut input = Vec::new();
+    for d in Derivation::ALL {
+        input.extend_from_slice(d.name().as_bytes());
+        input.push(0);
+        input.extend_from_slice(&d.activation_height().to_be_bytes());
+    }
+    fanos_primitives::hash::hash_labeled("FANOS-v1/derivation-vector", &input)
+}
+
 /// Render the data-path plane as the socket's response body.
 ///
 /// One station per line, **only where the count is non-zero**: a node reports `stations × lines` counters and
@@ -214,6 +248,18 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> Strin
     if moved == 0 {
         out.push_str("no station has fired: nothing has been discarded, expired or refused\n");
     }
+    // The derivation vector rides with the data-path plane rather than getting its own verb: an operator
+    // reading "where is work stopping" is one question away from "and is this node on the same schedule as the
+    // line that is stopping" — §4's two halves, which are only useful together.
+    let digest = derivation_digest();
+    let _ = writeln!(
+        out,
+        "derivation_vector        {}",
+        digest.iter().take(8).fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+    );
     match gather {
         // Milliseconds: the deadline lives in the 1 ms .. 10 s band its bounds define, and nanoseconds there
         // are six digits of noise in front of the one an operator reads.
@@ -396,6 +442,39 @@ mod tests {
             Request::all().split('|').count(),
             every.len(),
             "the help string and the variant list disagree on how many verbs there are"
+        );
+    }
+
+    #[test]
+    fn the_derivation_digest_changes_with_the_schedule_and_not_with_anything_else() {
+        // §4 wants agreement legible rather than inferred: two operators comparing this one value know their
+        // nodes agree on every registered height. That is only true if the digest actually depends on the
+        // schedule — a constant would compare equal between two genuinely different releases and report
+        // agreement that does not exist, which is worse than reporting nothing.
+        let digest = derivation_digest();
+        assert_eq!(digest, derivation_digest(), "same build, same value — or comparison means nothing");
+        assert_ne!(digest, [0u8; 32], "a digest that is all zeros is a constant wearing a hash's clothes");
+
+        // The name is hashed beside the height on purpose: renaming a derivation changes what its height
+        // *means*, and a digest over heights alone would call two different schedules identical. Recomputed
+        // here with one name perturbed — it must differ.
+        let mut perturbed = Vec::new();
+        for d in Derivation::ALL {
+            perturbed.extend_from_slice(d.name().as_bytes());
+            perturbed.push(b'!'); // a different name, same heights
+            perturbed.push(0);
+            perturbed.extend_from_slice(&d.activation_height().to_be_bytes());
+        }
+        assert_ne!(
+            fanos_primitives::hash::hash_labeled("FANOS-v1/derivation-vector", &perturbed),
+            digest,
+            "renaming a derivation must move the digest — otherwise the height it names is unanchored"
+        );
+
+        // And it reaches the operator, which is the point of computing it.
+        assert!(
+            render_data_path(&[], GatherHealth::NoGatherPath).contains("derivation_vector"),
+            "the schedule must be readable beside the plane it explains"
         );
     }
 
