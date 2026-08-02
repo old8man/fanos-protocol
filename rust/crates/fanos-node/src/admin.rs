@@ -198,12 +198,16 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> Strin
     let mut moved = 0usize;
     for o in stations.iter().filter(|o| o.count > 0) {
         moved += 1;
+        // The tag is printed only where a site recorded one, which is only the skew station — an operator
+        // reading `frame.type_unknown  line 1:0:1  tag 47  312` has the whole of §4's question in one line:
+        // what disagrees, where, and how much.
+        let tag = o.tag.map_or_else(String::new, |t| format!("  tag {t}"));
         match o.line {
             Some([x, y, z]) => {
-                let _ = writeln!(out, "{:<24} line {x}:{y}:{z}  {}", o.station.name(), o.count);
+                let _ = writeln!(out, "{:<24} line {x}:{y}:{z}{tag}  {}", o.station.name(), o.count);
             }
             None => {
-                let _ = writeln!(out, "{:<24} unattributed   {}", o.station.name(), o.count);
+                let _ = writeln!(out, "{:<24} unattributed{tag}   {}", o.station.name(), o.count);
             }
         }
     }
@@ -417,9 +421,15 @@ mod tests {
         );
 
         let obs = [
-            Observation { station: Station::GatherExpired, line: Some([1, 0, 1]), count: 412 },
-            Observation { station: Station::GatherCompleted, line: Some([1, 0, 1]), count: 0 },
-            Observation { station: Station::FrameDecodeFailed, line: None, count: 7 },
+            Observation { station: Station::GatherExpired, line: Some([1, 0, 1]), tag: None, count: 412 },
+            Observation { station: Station::GatherCompleted, line: Some([1, 0, 1]), tag: None, count: 0 },
+            Observation { station: Station::FrameDecodeFailed, line: None, tag: None, count: 7 },
+            Observation {
+                station: Station::FrameTypeUnknown,
+                line: Some([1, 0, 1]),
+                tag: Some(47),
+                count: 312,
+            },
         ];
         let body = render_data_path(
             &obs,

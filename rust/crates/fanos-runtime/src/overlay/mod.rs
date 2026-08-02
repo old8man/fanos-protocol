@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
-use crate::ports::stations::{GatherHealth, Stations};
+use crate::ports::stations::{GatherHealth, Station, Stations};
 use fanos_core::roles::{self, Role, RoleReading};
 use fanos_core::{AdaptivePowAdmission, AdmissionPolicy, LiveDifficulty, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
@@ -536,6 +536,8 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         }
         let Ok((frame, _)) = decode_frame(frame) else {
+            // Unattributed: nothing parsed, so there is no type code and no claim to make about who sent it.
+            self.stations.record(Station::FrameDecodeFailed, None);
             return Vec::new(); // canonical decode failure — drop (spec §7.5)
         };
         match frame.frame_type() {
@@ -637,7 +639,21 @@ impl<F: Field> OverlayNode<F> {
             // *adaptive* admission price safe to run at all: without it, a joiner priced out between minting its
             // proof and presenting it is refused forever with no way to learn the number that would work.
             Some(FrameType::Error) => self.on_error(frame.body),
-            _ => Vec::new(),
+            // **The reachable version-skew site.** A composite routes by frame type, so a type nobody claims
+            // arrives here — this is where a peer on a different release actually lands in a deployed node,
+            // not at a threshold engine whose composite filtered the frame away before it could see one.
+            //
+            // Counted with the type code *and* the sender, because `design-upgrade.md` §4's question is
+            // "does any hop line hold fewer than `t` members that agree", and neither dimension answers it
+            // alone: the code says which release, the sender says which line.
+            _ => {
+                // The **raw** `type_code`, not `frame_type()`. The enum cannot represent a code this build
+                // does not know — that is what makes it unknown — so resolving through it discards precisely
+                // the evidence the station exists to carry, and records a skew observation with nothing in it.
+                // Caught by the test, which asserted the code and got `None`.
+                self.stations.record_tagged(Station::FrameTypeUnknown, Some(from), Some(frame.type_code), 1);
+                Vec::new()
+            }
         }
     }
 
@@ -1381,6 +1397,54 @@ mod tests {
             admitter.members().any(|(c, _)| c == joiner_coord),
             "one peer's refusal must not travel — the joiner paid this peer's price and belongs in its view"
         );
+    }
+
+    #[test]
+    fn version_skew_is_counted_by_tag_and_line_where_corruption_is_neither() {
+        // `docs/design-upgrade.md` §4: the operational question is not "is anyone stale" — the network
+        // tolerates that until the activation height — but **"does any hop line hold fewer than `t` members
+        // that agree on the current derivation?"** A cell can be 90% upgraded and still have one line below
+        // quorum, and that line's traffic is what silently stops.
+        //
+        // Answering it needs both dimensions, and only one of the two failure kinds carries them. A malformed
+        // frame says nothing about who is on which release. A frame whose *type parsed* and names a handler
+        // nobody claims says both: the code is the evidence, the sender localizes it to a line.
+        //
+        // Tested on the OVERLAY because that is where an unclaimed type actually lands in a deployed node —
+        // a composite routes by frame type, so a threshold engine's own unknown-type arm never sees one. The
+        // first draft of this test asserted against `ServiceNode` and failed for exactly that reason.
+        let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        let mut node =
+            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+        let peer = Point::<F2>::at(1).coords();
+
+        node.step(Instant(0), Input::Message { from: peer, frame: alloc::vec![0xFF, 0xFF, 0xFF] });
+        let mut unclaimed = Vec::new();
+        // 0x7E is not a `FrameType` this build implements — exactly a peer on another release.
+        fanos_wire::encode_frame(0x7E, &[1, 2, 3], &mut unclaimed);
+        node.step(Instant(1), Input::Message { from: peer, frame: unclaimed });
+
+        let obs = node
+            .step(Instant(2), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations.clone()),
+                _ => None,
+            })
+            .expect("a sense-only read exports the data-path plane");
+        let at = |st: Station| -> Vec<crate::ports::stations::Observation> {
+            obs.iter().filter(|o| o.station == st && o.count > 0).copied().collect()
+        };
+
+        let corrupt = at(Station::FrameDecodeFailed);
+        assert_eq!(corrupt.len(), 1, "the malformed frame is counted once");
+        assert_eq!(corrupt[0].line, None, "and stays unattributed — it names no line and no release");
+        assert_eq!(corrupt[0].tag, None, "inventing a tag for it would be fabricated evidence");
+
+        let skew = at(Station::FrameTypeUnknown);
+        assert_eq!(skew.len(), 1, "the unclaimed type is counted once");
+        assert_eq!(skew[0].line, Some(peer), "localized to the sender, so a LINE can be judged against `t`");
+        assert_eq!(skew[0].tag, Some(0x7E), "carrying the code the peer used — the evidence of its release");
     }
 
     #[test]

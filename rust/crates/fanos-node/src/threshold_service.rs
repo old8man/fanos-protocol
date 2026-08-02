@@ -290,6 +290,16 @@ impl ThresholdService {
         Vec::new()
     }
 
+    /// Count a frame whose type parsed and names something this build has no handler for, and discard it.
+    ///
+    /// Attributed **both ways**: by `tag`, because the type code says which release the sender is on, and by
+    /// the sender's coordinate, because `design-upgrade.md` §4's question is whether any hop *line* has fallen
+    /// below `t` agreeing members — a count that cannot be localized to a line cannot answer it.
+    fn unknown_type(&mut self, tag: u64, from: Triple) -> Vec<Effect> {
+        self.stations.record_tagged(Station::FrameTypeUnknown, Some(from), Some(tag), 1);
+        Vec::new()
+    }
+
     fn on_timer(&mut self, token: TimerToken) -> Vec<Effect> {
         if let Some(&id) = self
             .pending
@@ -327,10 +337,15 @@ impl Engine for ThresholdService {
                         Some((id, share)) => self.on_partial(now, id, share),
                         None => self.undecodable(),
                     },
-                    // Includes the unknown-type arm, deliberately: a frame this build does not recognise is
-                    // the version-skew signal §6 is about, and leaving it uncounted is how a half-instrumented
-                    // plane happens — a later arm added without one.
-                    _ => self.undecodable(),
+                    // A type this build does not implement is **version skew**, not corruption, and it is
+                    // counted separately with the code the peer used — that code is the evidence. Folding it
+                    // into `undecodable` would answer "something broke" where the upgrade design needs
+                    // "which release disagrees, on which line".
+                    // A type this build KNOWS but this engine does not handle. Distinct from the overlay's
+                    // arm, which sees codes no `FrameType` claims at all — there the raw `type_code` is the
+                    // evidence, here the enum's own code is, because the frame resolved.
+                    Some(other) => self.unknown_type(other.code(), from),
+                    None => self.undecodable(),
                 }
             }
             Input::Timer(token) => self.on_timer(token),

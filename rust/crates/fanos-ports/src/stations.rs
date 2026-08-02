@@ -123,6 +123,19 @@ pub enum Station {
     /// genuine key/epoch disagreement inside a line produces it.
     FrameDecodeFailed,
 
+    /// A frame whose **type code parsed** and names a type this build does not implement.
+    ///
+    /// The version-skew detector `docs/design-upgrade.md` §4 asks for, and distinct from
+    /// [`FrameDecodeFailed`](Self::FrameDecodeFailed) in the one way that matters: a malformed frame tells you
+    /// nothing about *who* disagrees, while this one carries the type code the peer used. That code is the
+    /// evidence — "a member of this line sent type 47 and I have no type 47" is a statement about releases, not
+    /// about corruption.
+    ///
+    /// Counted **per tag**, because the operational question is not "is anyone stale" — the network tolerates
+    /// that until the activation height — but "does any hop line hold fewer than `t` members that agree". A
+    /// count without the tag cannot answer it, and a count without the line cannot localize it.
+    FrameTypeUnknown,
+
     // --- POROS admission (`fanos_node::PorosHost`) ---
     /// A request arrived from a coordinate other than the one it claims — the identity binding refusing a
     /// relayed or replayed proof.
@@ -156,6 +169,7 @@ impl Station {
         Self::AdmissionSybilCapped,
         Self::AdmissionNoCapacity,
         Self::GatherOpenFailed,
+        Self::FrameTypeUnknown,
     ];
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
@@ -174,6 +188,7 @@ impl Station {
             Self::ShareFloodCapped => "share.flood_capped",
             Self::HolonomyRejected => "holonomy.rejected",
             Self::FrameDecodeFailed => "frame.decode_failed",
+            Self::FrameTypeUnknown => "frame.type_unknown",
             Self::AdmissionIdentityUnbound => "admission.identity_unbound",
             Self::AdmissionPowFailed => "admission.pow_failed",
             Self::AdmissionSybilCapped => "admission.sybil_capped",
@@ -233,18 +248,21 @@ impl GatherHealth {
     }
 }
 
-/// Combine two engines' observation lists, summing counts that share a `(station, line)` key.
+/// Combine two engines' observation lists, summing counts that share a `(station, line, tag)` key.
 ///
 /// A composite node runs several data-path engines and must answer with **one** plane, not one per engine: a
 /// reader that takes the first notification it sees would silently drop the rest, and which one arrives first
 /// is an artifact of how the composite happens to order its delegation.
 #[must_use]
 pub fn merge_observations(parts: impl IntoIterator<Item = Observation>) -> Vec<Observation> {
-    let mut totals: BTreeMap<(Station, Option<Triple>), u64> = BTreeMap::new();
+    let mut totals: BTreeMap<(Station, Option<Triple>, Option<u64>), u64> = BTreeMap::new();
     for o in parts {
-        *totals.entry((o.station, o.line)).or_insert(0) += o.count;
+        *totals.entry((o.station, o.line, o.tag)).or_insert(0) += o.count;
     }
-    totals.into_iter().map(|((station, line), count)| Observation { station, line, count }).collect()
+    totals
+        .into_iter()
+        .map(|((station, line, tag), count)| Observation { station, line, tag, count })
+        .collect()
 }
 
 /// One `(station, line) → count` observation.
@@ -256,18 +274,26 @@ pub struct Observation {
     /// "this discard is not attributable to a line" (a frame that failed to decode before its line could
     /// be read, say), and keeping it distinct stops an unattributed count from being read as a line's.
     pub line: Option<Triple>,
+    /// The wire **type code** the frame carried, where the site read one — the second half of the skew
+    /// question (`design-upgrade.md` §4 asks for decode failures "counted per tag, per line").
+    ///
+    /// `None` where the site has no tag to report, which is most of them: a gather that expired stopped for
+    /// reasons that have nothing to do with a frame type. Kept `Option` rather than defaulted to `0` for the
+    /// same reason `line` is: a fabricated tag would put invented evidence about a peer's release into the
+    /// plane built to end diagnosis on thin evidence.
+    pub tag: Option<u64>,
     /// How many times, this window.
     pub count: u64,
 }
 
-/// A node's data-path counters for the current window: `(station, line) → count`.
+/// A node's data-path counters for the current window: `(station, line, tag) → count`.
 ///
 /// Deliberately a plain owned value (see the module docs on why never a process global). Cleared by
 /// [`take`](Self::take) at the window boundary, which is also how a reader gets the window's data — one
 /// operation, so a count can never be read twice or lost between a read and a clear.
 #[derive(Clone, Default, Debug)]
 pub struct Stations {
-    /// `(station, line) → count`, ordered.
+    /// `(station, line, tag) → count`, ordered.
     ///
     /// A `BTreeMap` rather than a linear `Vec` probe, and the reason is the *largest* plane rather than
     /// the shipped one. On Fano the key space is at most `14 × 7 = 98` and a scan would be free — but the
@@ -280,7 +306,7 @@ pub struct Stations {
     /// `BTreeMap` and not a hash map because the key space is closed and public (no attacker-chosen
     /// keys — module docs), so there is nothing for hashing to defend against, and ordered iteration
     /// gives `observations()` a stable output with no sort.
-    counts: BTreeMap<(Station, Option<Triple>), u64>,
+    counts: BTreeMap<(Station, Option<Triple>, Option<u64>), u64>,
 }
 
 impl Stations {
@@ -300,24 +326,30 @@ impl Stations {
 
     /// Record `n` occurrences at once — for a site that discards a batch.
     pub fn record_n(&mut self, station: Station, line: Option<Triple>, n: u64) {
-        let slot = self.counts.entry((station, line)).or_insert(0);
+        self.record_tagged(station, line, None, n);
+    }
+
+    /// Record one occurrence carrying the wire **type code** the frame used.
+    ///
+    /// The tagged form exists for one question — `design-upgrade.md` §4's "does any hop line hold fewer than
+    /// `t` members that agree on the current derivation?" — which needs the tag to say *what* disagrees and the
+    /// line to say *where*. Every other site passes `None`, because inventing a tag would put fabricated
+    /// evidence about a peer's release into the plane.
+    pub fn record_tagged(&mut self, station: Station, line: Option<Triple>, tag: Option<u64>, n: u64) {
+        let slot = self.counts.entry((station, line, tag)).or_insert(0);
         *slot = slot.saturating_add(n);
     }
 
-    /// This window's count at `(station, line)`.
+    /// This window's count at `(station, line)`, summed over tags.
     #[must_use]
     pub fn get(&self, station: Station, line: Option<Triple>) -> u64 {
-        self.counts.get(&(station, line)).copied().unwrap_or(0)
+        self.counts.iter().filter(|((s, l, _), _)| *s == station && *l == line).map(|(_, c)| *c).sum()
     }
 
-    /// This window's total at `station`, across every line.
+    /// This window's total at `station`, across every line and tag.
     #[must_use]
     pub fn total(&self, station: Station) -> u64 {
-        self.counts
-            .iter()
-            .filter(|((s, _), _)| *s == station)
-            .map(|(_, c)| *c)
-            .sum()
+        self.counts.iter().filter(|((s, _, _), _)| *s == station).map(|(_, c)| *c).sum()
     }
 
     /// Whether anything was recorded this window.
@@ -326,14 +358,14 @@ impl Stations {
         self.counts.is_empty()
     }
 
-    /// Every observation this window, ordered by station then line.
+    /// Every observation this window, ordered by station, then line, then tag.
     #[must_use]
     pub fn observations(&self) -> Vec<Observation> {
-        // Already ordered by `(station, line)` — the map's own iteration order — so no sort is needed
+        // Already ordered by `(station, line, tag)` — the map's own iteration order — so no sort is needed
         // and the output is stable across runs, which the simulator's determinism depends on.
         self.counts
             .iter()
-            .map(|(&(station, line), &count)| Observation { station, line, count })
+            .map(|(&(station, line, tag), &count)| Observation { station, line, tag, count })
             .collect()
     }
 
@@ -427,6 +459,7 @@ mod tests {
                 Station::ShareFloodCapped => listed(Station::ShareFloodCapped),
                 Station::HolonomyRejected => listed(Station::HolonomyRejected),
                 Station::FrameDecodeFailed => listed(Station::FrameDecodeFailed),
+                Station::FrameTypeUnknown => listed(Station::FrameTypeUnknown),
                 Station::AdmissionIdentityUnbound => listed(Station::AdmissionIdentityUnbound),
                 Station::AdmissionPowFailed => listed(Station::AdmissionPowFailed),
                 Station::AdmissionSybilCapped => listed(Station::AdmissionSybilCapped),
