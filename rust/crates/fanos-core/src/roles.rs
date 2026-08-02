@@ -378,6 +378,92 @@ impl Demand {
     }
 }
 
+/// Per-role **measured load**, where a role with no sensor is `None` — the raw observation a driver turns into
+/// a [`Demand`] setpoint.
+///
+/// This exists because the two are not the same kind of number and a single `[u16; Role::COUNT]` cannot say so.
+/// A [`Demand`] is a *decision* — every role has one, and zero means "want none". A reading is an *observation*,
+/// and a role this node cannot see has no observation at all, which is different from observing nothing. Folding
+/// the two into one array forced the driver to infer absence from the value, so it read every zero as "no
+/// sensor" and substituted a fallback: a role that genuinely fell idle had its true reading thrown away at
+/// exactly the moment the controller should have shrunk it.
+///
+/// So the sensor is total over roles and partial over readings, and the substitution happens once, where the
+/// fallback policy lives, instead of everywhere a zero appears.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RoleReading {
+    /// Measured load per role, indexed by [`Role::index`]; `None` where this node has no sensor.
+    readings: [Option<u16>; Role::COUNT],
+}
+
+// Every index below is `Role::index()`, proven `< Role::COUNT` and `ALL`-consistent by the const assertion above.
+#[allow(clippy::indexing_slicing)]
+impl RoleReading {
+    /// A reading with no sensor for any role — every role absent.
+    #[must_use]
+    pub const fn blind() -> Self {
+        Self { readings: [None; Role::COUNT] }
+    }
+
+    /// A reading built by evaluating `f` for each role.
+    #[must_use]
+    pub fn per_role(mut f: impl FnMut(Role) -> Option<u16>) -> Self {
+        let mut readings = [None; Role::COUNT];
+        for role in Role::ALL {
+            readings[role.index()] = f(role);
+        }
+        Self { readings }
+    }
+
+    /// This reading with `role` measured at `load`. Chainable, so a caller composes exactly the sensors it has.
+    #[must_use]
+    pub fn measuring(mut self, role: Role, load: u16) -> Self {
+        self.readings[role.index()] = Some(load);
+        self
+    }
+
+    /// This reading with `role` measured at `load`, saturating a `usize` count into the wire width.
+    ///
+    /// The saturation is deliberate and not a lossy shortcut: the reading feeds `⌈load / capacity⌉`, so any count
+    /// at or above `u16::MAX` already demands more nodes than a cell can hold, and the setpoint is clamped by
+    /// eligible supply downstream regardless. Wrapping, by contrast, would report a colossal load as a tiny one.
+    #[must_use]
+    pub fn counting(self, role: Role, count: usize) -> Self {
+        self.measuring(role, u16::try_from(count).unwrap_or(u16::MAX))
+    }
+
+    /// The measured load for one role, or `None` if this node has no sensor for it.
+    #[must_use]
+    pub fn of(self, role: Role) -> Option<u16> {
+        self.readings[role.index()]
+    }
+
+    /// The raw per-role array, in [`Role::ALL`] order — the form the sans-I/O contract carries.
+    #[must_use]
+    pub const fn into_array(self) -> [Option<u16>; Role::COUNT] {
+        self.readings
+    }
+
+    /// A reading from the contract's per-role array, in [`Role::ALL`] order.
+    #[must_use]
+    pub const fn from_array(readings: [Option<u16>; Role::COUNT]) -> Self {
+        Self { readings }
+    }
+
+    /// The [`Demand`] this reading implies, in **nodes**: `⌈load / capacity⌉` for a measured role, and
+    /// `fallback(role)` for one with no sensor.
+    ///
+    /// The conversion lives here, once, so the fallback policy is stated in a single place rather than inferred
+    /// from a magic zero at each call site. `capacity` is the per-node service capacity, floored at 1 so a
+    /// misconfigured zero cannot divide.
+    #[must_use]
+    pub fn to_demand(self, capacity: u16, mut fallback: impl FnMut(Role) -> u16) -> Demand {
+        Demand::per_role(|role| {
+            self.of(role).map_or_else(|| fallback(role), |load| load.div_ceil(capacity.max(1)))
+        })
+    }
+}
+
 impl Demand {
     /// Add `units` of load to one role (saturating).
     #[allow(clippy::indexing_slicing)] // `Role::index()`, bounded by the const assertion above

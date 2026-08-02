@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
+use fanos_core::roles::{Role, RoleReading};
 use fanos_core::{AdaptivePowAdmission, AdmissionPolicy, LiveDifficulty, ParentCell, PowAdmission};
 use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
@@ -323,6 +324,20 @@ pub struct OverlayNode<F: Field> {
     /// The current epoch, driven by the flooded beacon (adopt-max, spec §L3). Epoch-derived
     /// rendezvous/shapes rotate as it advances.
     epoch: Epoch,
+    /// Per-role load readings pushed in from **outside this engine** — the sensors for roles the overlay itself
+    /// cannot see (docs/design-observability.md §7).
+    ///
+    /// The overlay counts two of the five roles first-hand: storage (keys it holds) and relay (forwarding
+    /// activity, counted in the healer). Service, exit and rendezvous are carried by *sibling* engines a
+    /// composite owns — the service line, the clearnet exit, the rendezvous gatherer — and an engine that
+    /// depended on any of them to read a number would have inverted the layering. So the composite pushes its
+    /// readings in through [`observe_load`](Self::observe_load) and they leave on the next observation, in the
+    /// one report the role controller already consumes.
+    ///
+    /// [`RoleReading::blind`] until something reports: a role no one measures stays `None`, and the driver's
+    /// offer stands in for it. That is the *only* remaining fallback, and it now fires on absence rather than on
+    /// a zero, so a measured idle role is believed.
+    load_sensors: RoleReading,
 }
 
 /// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
@@ -424,7 +439,20 @@ impl<F: Field> OverlayNode<F> {
             grey_reported: None,
             store: Store::default(),
             epoch: Epoch::ZERO,
+            load_sensors: RoleReading::blind(),
         }
+    }
+
+    /// Record what a **sibling engine** measured for `role`, to be reported on the next observation.
+    ///
+    /// The composite that owns the mix router, the rendezvous gatherer and the service line calls this; the
+    /// overlay stores the latest reading and folds it into the load report the role controller reads. Latest
+    /// wins, and a role never reported stays absent — see [`load_sensors`](Self::load_sensors).
+    ///
+    /// This is the seam that keeps the layering right: the engine that *can* see a role's work reports it, and
+    /// the engine that assembles the report needs to know about none of them.
+    pub fn observe_load(&mut self, role: Role, load: u16) {
+        self.load_sensors = self.load_sensors.measuring(role, load);
     }
 
     /// The node's cell neighbour coordinates (its quorum members).
@@ -970,7 +998,9 @@ impl<F: Field> OverlayNode<F> {
         );
         // The load this node is carrying, reported every observation — it needs no coherence matrix, only the
         // counts the node already keeps, and the role controller's setpoint is its one real input.
-        effects.push(self.healer.load_effect(self.store.entries.len()));
+        effects.push(
+            self.healer.load_effect(self.load_sensors.counting(Role::Storage, self.store.entries.len())),
+        );
         // R-C2: the Healer raises the `Escalated` NOTIFICATION but has no router — the facade (which owns the
         // hierarchical address) transports the residue up to the parent cell's sibling members, where it folds
         // into their `ParentCell` reflex. Origination lives here so a driver on any transport gets it.
@@ -1337,32 +1367,69 @@ mod tests {
         let mut node =
             OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
 
-        let load_of = |node: &mut OverlayNode<F2>, at: u64| -> [u16; 5] {
+        let load_of = |node: &mut OverlayNode<F2>, at: u64| -> RoleReading {
             node.step(Instant(at), Input::Command(Command::Diagnose))
                 .iter()
                 .find_map(|e| match e {
-                    Effect::Notify(Notification::LoadReport { per_role }) => Some(*per_role),
+                    Effect::Notify(Notification::LoadReport { per_role }) => {
+                        Some(RoleReading::from_array(*per_role))
+                    }
                     _ => None,
                 })
                 .expect("an observation reports the load it measured")
         };
 
         let idle = load_of(&mut node, 0);
-        assert_eq!(idle[1], 0, "an empty node stores nothing — the offer-based figure said 1 regardless");
 
-        // Give it shards to hold, and the storage figure must follow.
+        // The property, first: **a measured zero and an unsensed role are different values.** They were the
+        // same `0u16`, so the driver could only tell them apart by guessing, and guessed by value — every zero
+        // became the node's offer, discarding the true reading of a role that had legitimately gone idle at
+        // exactly the moment the controller should have shrunk it.
+        assert_eq!(
+            idle.of(Role::Storage),
+            Some(0),
+            "an empty node measured no keys, and that is a reading — not the absence of one"
+        );
+        for role in [Role::Service, Role::Exit, Role::Rendezvous] {
+            assert_eq!(
+                idle.of(role),
+                None,
+                "{role:?} has no sensor in a bare overlay; reporting 0 would be a fabricated measurement"
+            );
+        }
+
+        // A sibling engine's reading reaches the report — the seam a composite fills the missing three through.
+        node.observe_load(Role::Service, 3);
+        assert_eq!(load_of(&mut node, 1).of(Role::Service), Some(3), "a pushed reading is reported");
+
+        // The relay reading must track originated traffic. Probed rather than assumed: this sensor reads
+        // `self_activity`, which the heartbeat's behavioural sample *clears*, so an unlucky interleaving could
+        // leave it reporting zero forever and no assertion here would have noticed.
+        assert_eq!(idle.of(Role::Relay), Some(0), "an idle node originated nothing");
+        for i in 0..3u8 {
+            node.step(
+                Instant(2),
+                Input::Command(Command::Send { to: Point::<F2>::at(3).coords(), payload: alloc::vec![i] }),
+            );
+        }
+        assert!(
+            load_of(&mut node, 2).of(Role::Relay) > Some(0),
+            "originated traffic must reach the relay sensor"
+        );
+
+        // And the mechanism: give it shards to hold, and the storage figure must follow.
         for i in 0..4u8 {
             node.step(
-                Instant(1),
+                Instant(2),
                 Input::Command(Command::Put { key: alloc::vec![i], value: alloc::vec![7u8; 64] }),
             );
         }
-        let busy = load_of(&mut node, 2);
+        let busy = load_of(&mut node, 3);
         assert!(
-            busy[1] > idle[1],
-            "storage load must track the keys held: idle {} vs busy {}",
-            idle[1],
-            busy[1]
+            busy.of(Role::Storage) > idle.of(Role::Storage),
+            "storage load must track the keys held: idle {:?} vs busy {:?}",
+            idle.of(Role::Storage),
+            busy.of(Role::Storage)
         );
     }
 

@@ -295,12 +295,18 @@ pub enum Notification {
     /// capacity one node absorbs — `⌈load / capacity⌉` — which is the arithmetic the setpoint denominator has
     /// always described and never had a numerator for.
     ///
-    /// Roles with no sensor yet report their offer, unchanged and deliberately not disguised: reporting a
-    /// measured relay count beside a fabricated service count in one vector would make the second look like
-    /// the first.
+    /// **`None` means "this role has no sensor", which is not the same as a measured zero** — and the type
+    /// says so, because the prose alone did not. This doc used to promise that an unmeasured role was
+    /// "deliberately not disguised", while `[u16; 5]` made a fabricated count and a real one literally the
+    /// same value; the driver then substituted the node's offer for any zero it saw, which is right for a
+    /// role with no sensor and **wrong for one that legitimately measured no demand** — its true reading was
+    /// discarded exactly when it should have shrunk the role. That bound the two roles that *are* measured
+    /// (relay, storage): a cell could not conclude "nobody here needs relays".
+    ///
+    /// So absence is now expressible. A driver substitutes on `None`, and believes a `Some(0)`.
     LoadReport {
-        /// Per-role counts in `Role::ALL` order.
-        per_role: [u16; 5],
+        /// Per-role counts in `Role::ALL` order; `None` where this node has no sensor for that role.
+        per_role: [Option<u16>; 5],
     },
     /// The shortest epoch period this cell's own measurements say it can sustain, **in seconds**.
     ///

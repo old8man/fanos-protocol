@@ -66,7 +66,13 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
-        Notification::LoadReport { per_role } => format!("LoadReport {per_role:?}"),
+        // Rendered as `-` for a role with no sensor and the number for one with a reading, because `Some(0)`
+        // and `None` are the distinction the report exists to carry and `{:?}` buries it in six words of noise.
+        Notification::LoadReport { per_role } => {
+            let cells: Vec<String> =
+                per_role.iter().map(|r| r.map_or_else(|| "-".to_owned(), |v| v.to_string())).collect();
+            format!("LoadReport [{}]", cells.join(" "))
+        }
         Notification::EpochFloor { millis } => match millis {
             Some(ms) => format!("EpochFloor {ms}ms"),
             None => "EpochFloor (no sustainable cadence)".to_owned(),

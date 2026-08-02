@@ -23,6 +23,7 @@ use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
 use fanos_core::LiveDifficulty;
+use fanos_core::roles::{Role, RoleReading};
 use fanos_diakrisis::regeneration;
 use fanos_diakrisis::stability::{self, AdmissionController, inferred_disturbance};
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
@@ -423,32 +424,40 @@ impl Healer {
         self.last_stress = stress;
     }
 
-    /// What this node is carrying, per role, in `Role::ALL` order.
+    /// What this node is carrying, per role, in `Role::ALL` order — `None` where it has no sensor.
     ///
-    /// Two roles have a real sensor and three do not, and the difference is kept visible rather than smoothed
-    /// over. **Relay** is the count of relays this node carried since the last behavioural sample — a rate, and
-    /// exactly the quantity the role exists to perform. **Storage** is the number of keys this node holds
-    /// shards for. The rest report **`0`** — this function has no sensor for them — and `Node::start` turns a
-    /// zero into the node's own *offer*, because reporting a demand of zero would retire a role the moment it
-    /// went quiet. So for service, exit and rendezvous the setpoint is fed by supply standing in for demand.
+    /// **Relay** is the count of frames this node **originated** since the last behavioural sample — read from
+    /// the coherence self-slot, which counts originations, not forwarding. This doc used to call it "relays
+    /// carried", which is the *other* counter (`activity`, keyed by peer) and would have sent the next
+    /// maintainer to swap in the wrong quantity. Originations are the right one and not by luck: the setpoint
+    /// asks how many relays the cell needs, so the load is the traffic that must be *carried*, summed once at
+    /// the origin. Summing frames forwarded would count each frame once per hop and make the demand a function
+    /// of the supply already deployed — a loop closed on itself.
     ///
-    /// (This paragraph used to say "the rest report `1` where the role is offered", which described the
-    /// *combined* behaviour while appearing to describe this function. The substitution happens one layer up,
-    /// and saying so here is the difference between a reader finding the fallback and assuming it away.)
+    /// **Storage** is the number of keys this node holds shards for. Both are `Some`, *including when they read
+    /// zero* — an idle relay measured no demand, and that is a reading. Service, exit and rendezvous are
+    /// `None`: this function has no sensor for them, and the driver substitutes the node's own offer, because a
+    /// fabricated demand of zero would retire a role on sight.
+    ///
+    /// The `Option` is the whole point and it is load-bearing. This returned a bare `[u16; 5]` and said in prose
+    /// that a measured count and an offered one "would be unsafe to present as the same kind of number" — while
+    /// making them the same `u16`, so the driver had to guess, and guessed *by value*: any zero became the
+    /// offer. That silently discarded the true reading of a role that legitimately fell idle, which is precisely
+    /// the moment the controller should shrink it, and it bound the two roles that **are** measured. A cell
+    /// could not conclude "nobody here needs relays". Making absence a distinct inhabitant of the type is what
+    /// lets the driver believe a `Some(0)` and substitute only on `None`.
+    ///
+    /// The width is [`Role::COUNT`], not a literal, so this fails to compile if a sixth role is added without
+    /// widening the contract — which also pins the `5` in `Notification::LoadReport`, a crate that cannot see
+    /// [`Role`] and so cannot state the relationship itself.
     ///
     /// Feeding the missing three is `docs/design-observability.md` §7: each is a station rate the data-path
     /// plane now records — service = sessions served, exit = flows carried, rendezvous = gathers armed and
     /// registrations bound — and they reach this function the same way `held_shards` does, from the caller
-    /// that can see them.
-    ///
-    /// Mixing a measured count with an offered one in a single vector is safe because the controller steps each
-    /// role toward *its own* setpoint independently — no cross-role comparison is made — but it would be unsafe
-    /// to present them as the same kind of number, which is why this says which is which.
-    fn load_report(&self, held_shards: usize) -> [u16; 5] {
-        let relays = u16::try_from(self.self_activity).unwrap_or(u16::MAX);
-        let stored = u16::try_from(held_shards).unwrap_or(u16::MAX);
-        // Role::ALL order: relay, storage, service, exit, rendezvous.
-        [relays, stored, 0, 0, 0]
+    /// that can see them, via [`load_effect`](Self::load_effect)'s reading argument.
+    fn load_report(&self, sensed: RoleReading) -> [Option<u16>; Role::COUNT] {
+        // The caller supplies every reading it can see; the healer fills in the one only it counts.
+        sensed.measuring(Role::Relay, u16::try_from(self.self_activity).unwrap_or(u16::MAX)).into_array()
     }
 
     /// The stress this cell last measured, for a law that must decide outside the observation loop.
@@ -478,8 +487,13 @@ impl Healer {
     }
 
     /// What this node is carrying, as an effect — emitted every observation, coherence or not.
-    pub(crate) fn load_effect(&self, held_shards: usize) -> Effect {
-        Effect::Notify(Notification::LoadReport { per_role: self.load_report(held_shards) })
+    ///
+    /// `sensed` carries the readings the *caller* can see; the healer adds the one it counts itself (relay
+    /// activity). Passing a reading rather than a bare shard count is what lets a composite engine — which owns
+    /// the mix router, the rendezvous gatherer and the service line — fill in the three roles the overlay alone
+    /// has no sensor for, without the healer growing a dependency on any of them.
+    pub(crate) fn load_effect(&self, sensed: RoleReading) -> Effect {
+        Effect::Notify(Notification::LoadReport { per_role: self.load_report(sensed) })
     }
 
     /// Run the per-observation control laws that need the cell's **coherence matrix**.

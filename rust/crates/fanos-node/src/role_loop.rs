@@ -12,11 +12,17 @@
 //! **This comment used to say "until that is wired the node holds a fixed target". It is wired** — and the
 //! stale sentence was read by a later reader as evidence the loop was open, and copied into a design document
 //! before anyone checked the code. The residual is narrower and worth stating exactly, so the next reader does
-//! not have to re-derive it: `HealerNode::load_report` measures **2 of the 5 roles** (relay from forwarding
-//! activity, storage from shards held) and returns `0` for service, exit and rendezvous. `Node::start` then
-//! falls back to *this node's own offer* for a role reporting zero — deliberately, since a demand of zero
-//! would retire a role the moment it went quiet — so for those three, supply stands in for demand. Feeding
-//! them is `docs/design-observability.md` §7.
+//! not have to re-derive it: `HealerNode::load_report` measures **2 of the 5 roles first-hand** (relay from
+//! forwarding activity, storage from shards held) and reports the other three as **absent** — `None`, not a
+//! fabricated zero. [`LoadSensor::setpoint`] substitutes this node's own offer for an absent role, deliberately,
+//! since a demand of zero would retire a role the moment nobody could see it; so for a role with no sensor,
+//! supply stands in for demand.
+//!
+//! That fallback used to fire on any **zero**, which is a different and wrong rule: it discarded the true
+//! reading of a role that had legitimately gone idle, at exactly the moment the controller should have shrunk
+//! it, and it bound the two roles that *are* measured. `Notification::LoadReport` now carries
+//! `[Option<u16>; Role::COUNT]` so absence is a value rather than a guess, and a sibling engine fills the
+//! missing three through `OverlayNode::observe_load` — the seam `docs/design-observability.md` §7 describes.
 //!
 //! Composition with [`crate::capdir`]: a node runs *two* tasks — [`crate::capdir::spawn_capability_publisher`]
 //! keeps its own advertisement live, and [`spawn_role_loop`] reads the whole roster and computes its
@@ -25,9 +31,11 @@
 //! coordination — the deterministic self-organization proven in `fanos-core/tests/self_organization.rs`, now
 //! over the live directory.
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
+use std::sync::Arc;
 
-use fanos_core::roles::{Capability, Demand, Reputation, RoleController, RoleSet};
+use fanos_core::roles::{Capability, Demand, Reputation, Role, RoleController, RoleReading, RoleSet};
 use fanos_field::Field;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
 use fanos_quic::{Client, CoordinateProver};
@@ -38,6 +46,87 @@ use tokio::task::JoinHandle;
 
 use crate::capdir::{build_capability_directory, spawn_capability_publisher};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
+
+/// The load one node is taken to absorb per role — the setpoint denominator (`⌈load / capacity⌉`). `1` makes the
+/// cell's setpoint equal the number of nodes offering the role, i.e. "everyone who offers it, serves it", which is
+/// the right default before telemetry can say otherwise.
+pub(crate) const ROLE_CAPACITY_PER_NODE: u16 = 1;
+
+/// The latest per-role load this node **measured**, shared between the engine's notification stream and the role
+/// loop's setpoint closure.
+///
+/// Shared atomics rather than a channel because the two run on different clocks — the engine samples once per
+/// observation window, the loop asks whenever an epoch turns — and only the most recent value matters. A channel
+/// would either buffer readings nobody will read or put back-pressure on the engine's notification fan-out.
+///
+/// One `AtomicU32` per role holds an `Option<u16>` as **`0` = no reading, `v + 1` = `Some(v)`**. That encoding is
+/// not a trick to save a word. The array's initial state *is* "nothing reported yet", which is genuinely absent,
+/// and an encoding whose zero meant `Some(0)` would have the loop read a node that has not yet observed as a node
+/// measuring no demand — the same conflation the `Option` in `Notification::LoadReport` exists to remove. Getting
+/// it backwards here would reintroduce the defect one layer down, where no type would catch it.
+pub(crate) struct LoadSensor {
+    /// Latest reading per role, indexed by `Role::index`, in the encoding above.
+    latest: [AtomicU32; Role::COUNT],
+}
+
+// Every index below is `Role::index()`, which `fanos_core::roles` proves `< Role::COUNT`.
+#[allow(clippy::indexing_slicing)]
+impl LoadSensor {
+    /// A sensor with nothing reported yet — every role absent.
+    fn new() -> Self {
+        Self { latest: core::array::from_fn(|_| AtomicU32::new(0)) }
+    }
+
+    /// Record a load report from the engine, latest-wins.
+    fn record(&self, per_role: [Option<u16>; Role::COUNT]) {
+        for (slot, reading) in self.latest.iter().zip(per_role) {
+            slot.store(reading.map_or(0, |v| u32::from(v) + 1), Ordering::Relaxed);
+        }
+    }
+
+    /// The most recent reading, as the role vocabulary the setpoint is derived in.
+    pub(crate) fn reading(&self) -> RoleReading {
+        RoleReading::per_role(|role| {
+            let raw = self.latest[role.index()].load(Ordering::Relaxed);
+            // `0` is absent; anything else decodes to `raw - 1`, which fits `u16` because `record` is the only
+            // writer and it only ever stores `u16 + 1`.
+            raw.checked_sub(1).map(|v| u16::try_from(v).unwrap_or(u16::MAX))
+        })
+    }
+
+    /// The **setpoint** this reading implies, in nodes: `⌈load / capacity⌉` for a role with a sensor, and this
+    /// node's own *offer* for one without.
+    ///
+    /// The fallback is stated once, here, and it fires on **absence** — not on a zero. That distinction is the
+    /// whole point of the change that introduced it: substituting the offer for every zero threw away the true
+    /// reading of a role that legitimately went idle, at exactly the moment the controller should have shrunk it,
+    /// and it bound the two roles that *are* measured. Standing supply in for demand is right for a role nobody
+    /// can see and wrong for one that reported nothing to do.
+    pub(crate) fn setpoint(&self, offered: RoleSet) -> Demand {
+        self.reading().to_demand(ROLE_CAPACITY_PER_NODE, |r| u16::from(offered.has(r)))
+    }
+}
+
+/// Subscribe to the engine's load reports and keep the latest, returning the shared sensor.
+///
+/// The task ends when the engine's notification stream closes, i.e. on node shutdown. A `Lagged` receiver is
+/// ignored rather than treated as an error: the sensor is a *latest-value* register, so dropped intermediate
+/// reports cost nothing — the next observation refreshes it in full.
+pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
+    let sensor = Arc::new(LoadSensor::new());
+    let sink = Arc::clone(&sensor);
+    let mut reports = client.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match reports.recv().await {
+                Ok(Notification::LoadReport { per_role }) => sink.record(per_role),
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    sensor
+}
 
 /// This node's assignment for an epoch, **with the roster it was computed over**.
 ///
@@ -482,6 +571,66 @@ mod tests {
 
     fn node(i: u8) -> NodeId {
         NodeId([i; 32])
+    }
+
+    #[test]
+    fn a_role_that_measured_no_demand_is_believed_and_one_with_no_sensor_falls_back() {
+        // The defect this pins. `Notification::LoadReport` carried a bare `[u16; 5]`, so "this role has no
+        // sensor" and "this role measured zero" were the same value, and the driver told them apart by
+        // guessing: **any** zero was replaced by the node's own offer. That is right for a role nobody can see
+        // and wrong for one that reported nothing to do — the controller could never learn demand had fallen to
+        // zero, precisely when it should be shrinking the role. It bound the two roles that *are* measured,
+        // relay and storage: a cell could not conclude "nobody here needs relays".
+        let offered = RoleSet::of(&[Role::Relay, Role::Storage, Role::Service]);
+        let sensor = LoadSensor::new();
+
+        // Nothing reported yet is genuinely absent — the array's initial state must not read as `Some(0)`.
+        assert_eq!(sensor.reading(), RoleReading::blind(), "an unreported sensor holds no reading");
+        let cold = sensor.setpoint(offered);
+        for role in Role::ALL {
+            assert_eq!(cold.of(role), u16::from(offered.has(role)), "{role:?} falls back before any report");
+        }
+
+        // Now a report: relay measured **zero**, storage measured work, service has no sensor at all.
+        sensor.record(
+            RoleReading::blind().measuring(Role::Relay, 0).measuring(Role::Storage, 5).into_array(),
+        );
+
+        let want = sensor.setpoint(offered);
+        assert_eq!(
+            want.of(Role::Relay),
+            0,
+            "a measured idle relay must reach the controller as zero demand; the offer-for-any-zero rule \
+             reported 1 here and the role could never shrink"
+        );
+        assert_eq!(
+            want.of(Role::Storage),
+            5u16.div_ceil(ROLE_CAPACITY_PER_NODE),
+            "a measured load converts by the setpoint denominator"
+        );
+        assert_eq!(
+            want.of(Role::Service),
+            1,
+            "service has no sensor, so supply stands in for demand — the one remaining fallback"
+        );
+        assert_eq!(want.of(Role::Exit), 0, "an unoffered, unsensed role is wanted by nobody");
+    }
+
+    #[test]
+    fn the_sensor_round_trips_every_reading_it_can_be_handed() {
+        // The `0 = absent, v + 1 = Some(v)` encoding is the one place a `Some(0)` could silently become a
+        // `None` again, one layer below where the type would catch it.
+        let sensor = LoadSensor::new();
+        let sent = RoleReading::blind()
+            .measuring(Role::Relay, 0)
+            .measuring(Role::Storage, 1)
+            .measuring(Role::Exit, u16::MAX);
+        sensor.record(sent.into_array());
+        assert_eq!(sensor.reading(), sent, "every reading survives the shared-atomic encoding");
+
+        // Latest wins, including a later report that drops a role back to absent.
+        sensor.record(RoleReading::blind().into_array());
+        assert_eq!(sensor.reading(), RoleReading::blind(), "a later blind report clears the register");
     }
 
     #[test]
