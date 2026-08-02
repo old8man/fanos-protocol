@@ -62,8 +62,40 @@ const MAX_RESHARE_GEN_ADVANCE: u64 = 8;
 /// new-holder coordinate). See the security note on [`BeaconNode::on_reshare_trigger`].
 const MIN_RESHARE_THRESHOLD: usize = 2;
 
+/// Why the beacon refused something — the counters this crate had none of.
+///
+/// `fanos-keygen` holds the DKG and the beacon reshare, where **four CRITICALs** were found (audit B1–B3:
+/// unauthenticated complaint/commit/justify frames, a discarded `ingest_share` result, a justification checked
+/// against the wrong commitment) plus the last live CRITICAL of all four passes (§2.1, the 2-anchor
+/// master-key exfiltration, closed 2026-07-24 by authenticating the reshare trigger).
+///
+/// All are fixed. None were **observable**. A node refusing a forged reshare trigger and a node with nothing
+/// to do are the same silence at every surface an operator has — and the beacon is the shared clock: the
+/// coordinate VRF, activation heights, mix-key rotation and rendezvous meeting lines all derive from it, so a
+/// beacon that stalls stalls everything and the cause has to be readable.
+///
+/// Counters, not logs: this crate is `no_std` and sans-I/O, with nowhere to write.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeaconRejects {
+    /// A reshare trigger arrived and this cell has **no recovery authority**, so no reshare can be
+    /// authenticated at all. Distinct from a forgery: this is a provisioning gap, not an attack.
+    pub reshare_no_authority: u64,
+    /// A reshare trigger whose signature did not verify against the recovery authority — **forged, foreign,
+    /// or tampered**. The §2.1 attack, counted. Nothing else an operator can see distinguishes it from quiet.
+    pub reshare_forged: u64,
+    /// A reshare trigger this build could not parse (the envelope decoded, the body did not).
+    pub reshare_malformed: u64,
+    /// A frame that did not decode at all, so its **type was never read** and no handler ran.
+    ///
+    /// Counted separately from the two above because it is upstream of them: a corrupted attack frame is
+    /// refused here without anything downstream ever learning an attack was attempted.
+    pub frame_undecodable: u64,
+}
+
 /// A node running the distributed randomness beacon over its cell.
 pub struct BeaconNode<F: Field> {
+    /// Why this beacon refused things — see [`BeaconRejects`].
+    rejects: BeaconRejects,
     coord: Point<F>,
     n: usize,
     threshold: usize,
@@ -117,6 +149,16 @@ struct ReshareRound {
 }
 
 impl<F: Field> BeaconNode<F> {
+    /// Why this beacon has refused things — the operator's read on whether it is quiet or under attack.
+    ///
+    /// Public because the distinction is invisible otherwise: a beacon that has stalled because someone is
+    /// feeding it forged reshare triggers and a beacon that is simply idle produce the same absence of
+    /// rounds, and the beacon is the clock every epoch-aligned mechanism reads.
+    #[must_use]
+    pub const fn rejects(&self) -> BeaconRejects {
+        self.rejects
+    }
+
     /// A beacon node at `coord`, verifying against the group `commitment` at `threshold`. `share` is
     /// this node's DKG beacon share if it is an anchor (it then contributes partials), else `None`.
     /// Starts at [`Epoch::ZERO`] with the genesis (all-zero) seed until the first round is adopted.
@@ -128,6 +170,7 @@ impl<F: Field> BeaconNode<F> {
         threshold: usize,
     ) -> Self {
         Self {
+            rejects: BeaconRejects::default(),
             coord,
             n: Plane::<F>::N as usize,
             threshold,
@@ -372,6 +415,7 @@ impl<F: Field> BeaconNode<F> {
     fn on_reshare_trigger(&mut self, body: &[u8]) -> Vec<Effect> {
         let Some((generation, new_threshold, contributors, new_indices, sig)) = parse_reshare_trigger(body)
         else {
+            self.rejects.reshare_malformed = self.rejects.reshare_malformed.saturating_add(1);
             return Vec::new();
         };
         // AUTHENTICATION (audit §2.1 — closes the master-key exfiltration oracle). A reshare CHANGES the
@@ -383,11 +427,18 @@ impl<F: Field> BeaconNode<F> {
         // authorizes re-genesis (`with_recovery_authority`) — so a node can never self-issue one. A cell with
         // no authority configured cannot reshare at all (consistent with re-genesis being disabled without a
         // trust root). A forged/foreign signature is rejected here, before any anchor deals a single sub-share.
-        let Some(authority) = &self.authority else {
+        let Some(authority) = self.authority.clone() else {
+            // A provisioning gap, not an attack — and counted apart from a forgery for exactly that reason:
+            // one is fixed by configuring an authority, the other by finding who is sending triggers.
+            self.rejects.reshare_no_authority = self.rejects.reshare_no_authority.saturating_add(1);
             return Vec::new(); // no trust root ⇒ no authenticated reshare is possible
         };
         let params = reshare_trigger_params(generation, new_threshold, &contributors, &new_indices);
         if !authority.verify(&reshare_trigger_signing_message(&params), &sig) {
+            // **The §2.1 attack, counted.** The 2-anchor coalition that could have reconstructed the beacon
+            // master key is refused here — and until now, refused in silence, so the attempt left no trace
+            // anywhere an operator could look.
+            self.rejects.reshare_forged = self.rejects.reshare_forged.saturating_add(1);
             return Vec::new(); // unauthenticated / forged / tampered trigger
         }
         // Defence-in-depth sanity (the authority signature is the real gate). `MIN_RESHARE_THRESHOLD` keeps a
@@ -662,18 +713,26 @@ impl<F: Field> Engine for BeaconNode<F> {
             Input::Command(Command::AdvanceEpoch) => self.advance(),
             // On join, pull the current beacon from the cell (spec §7.8 bootstrap).
             Input::Command(Command::StartHeartbeat) => self.request_sync(),
-            Input::Message { from, frame } => match decode_frame(&frame) {
-                Ok((f, _)) => match f.frame_type() {
+            Input::Message { from, frame } => {
+                let Ok((f, _)) = decode_frame(&frame) else {
+                    // **A frame that does not decode at all**, so its type was never read and no handler
+                    // ran. Found by a test that flipped a byte of a signed reshare trigger: the corruption
+                    // is caught upstream of every security check, and until this counter an attacker
+                    // probing the beacon with malformed frames left no trace of any kind.
+                    self.rejects.frame_undecodable = self.rejects.frame_undecodable.saturating_add(1);
+                    return Vec::new();
+                };
+                match f.frame_type() {
                     Some(FrameType::BeaconPartial) => self.on_partial(f.body),
                     Some(FrameType::Beacon) => self.on_round(f.body),
                     Some(FrameType::BeaconReq) => self.on_beacon_req(from),
                     Some(FrameType::BeaconReshareTrigger) => self.on_reshare_trigger(f.body),
                     Some(FrameType::BeaconReshareCommit) => self.on_reshare_commit(f.body),
                     Some(FrameType::BeaconReshareShare) => self.on_reshare_share(f.body),
+                    // A frame type this build does not handle — version skew, not corruption.
                     _ => Vec::new(),
-                },
-                Err(_) => Vec::new(),
-            },
+                }
+            }
             _ => Vec::new(),
         }
     }
@@ -1307,6 +1366,48 @@ mod tests {
             *b ^= 0xFF;
         }
         assert!(recv(&mut victim, tampered).is_empty(), "a tampered signature is refused");
+
+        // **Refusing it is half the job.** A beacon fed forged triggers and a beacon nobody is talking to
+        // produce the same absence of rounds, and the beacon is the clock every epoch-aligned mechanism reads
+        // — coordinate VRF, activation heights, mix-key rotation, rendezvous lines. Until this counter the
+        // §2.1 attack left no trace anywhere an operator could look.
+        // The two refusals take **different paths**, and finding that out is why this assertion exists.
+        // The impostor-signed trigger decodes and fails the signature check. The tampered one corrupts the
+        // frame envelope, so it never reaches the handler at all — it was refused with no record anywhere
+        // until `frame_undecodable` was added. An attacker probing the beacon with malformed triggers looked
+        // exactly like silence.
+        let r = victim.rejects();
+        // The two refusals take **different paths**, and measuring which is the point. The impostor-signed
+        // trigger parses and fails the authority check. The tampered one is rejected by
+        // `parse_reshare_trigger` before verification ever runs — corrupting a signature byte breaks the
+        // body's own length/shape check first. I assumed it would be a second forgery and it is not.
+        //
+        // That distinction is worth counting rather than folding: a malformed trigger is a peer that is
+        // broken or on another wire version, a forged one is a peer that holds a key it should not. They call
+        // for different responses and were previously the same silence.
+        assert_eq!(r.reshare_forged, 1, "the impostor-signed trigger fails the authority check");
+        assert_eq!(r.reshare_malformed, 1, "the tampered one fails the body parse, before verification");
+        assert_eq!(
+            r.reshare_forged + r.reshare_malformed,
+            2,
+            "and between them every attempt is accounted for — none is refused in silence"
+        );
+        assert_eq!(
+            victim.rejects().reshare_no_authority,
+            0,
+            "this cell HAS an authority — a provisioning gap must not be reported as an attack"
+        );
+
+        // And the two are kept apart, because they call for opposite responses: configure a trust root, or
+        // find who is sending triggers.
+        let mut rootless =
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+        assert!(
+            recv(&mut rootless, reshare_trigger_frame(&authority_sk, 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
+            "a cell with no recovery authority cannot reshare at all"
+        );
+        assert_eq!(rootless.rejects().reshare_no_authority, 1, "and says so as a provisioning gap");
+        assert_eq!(rootless.rejects().reshare_forged, 0, "not as a forgery");
 
         // Even correctly AUTHORITY-signed, the defence-in-depth guards still refuse: a degree-0 (threshold-1)
         // reshare, an out-of-range or duplicate new index, and a far-future generation.
