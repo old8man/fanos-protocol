@@ -76,6 +76,49 @@ impl Duration {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct TimerToken(pub u64);
 
+/// Fold every [`Notification::DataPath`] in `effects` into a single one, in place of the first.
+///
+/// **One node, one data-path plane.** A composite runs several engines that each own counters, and a reader
+/// takes the first notification it sees — so emitting one per engine means the rest are silently dropped, with
+/// which one survives decided by the order the composite happens to delegate in. Reported together, the counts
+/// sum and the gather health is the more informative of the two, so an engine with no gather cannot mask a
+/// sibling's measured clock.
+///
+/// Lives in the contract rather than in one composite because it is a property of the *answer*, not of any
+/// particular engine: every composite that forwards `Observe` to more than one place owes the same fold.
+#[must_use]
+pub fn fold_data_path(effects: Vec<Effect>) -> Vec<Effect> {
+    let planes =
+        effects.iter().filter(|e| matches!(e, Effect::Notify(Notification::DataPath { .. }))).count();
+    if planes < 2 {
+        return effects;
+    }
+    let mut observations = Vec::new();
+    let mut gather = GatherHealth::NoGatherPath;
+    for effect in &effects {
+        if let Effect::Notify(Notification::DataPath { stations, gather: g }) = effect {
+            observations.extend(stations.iter().copied());
+            gather = gather.or(*g);
+        }
+    }
+    let merged = Effect::Notify(Notification::DataPath {
+        stations: stations::merge_observations(observations),
+        gather,
+    });
+    let mut seen = false;
+    effects
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Notify(Notification::DataPath { .. }) if seen => None,
+            Effect::Notify(Notification::DataPath { .. }) => {
+                seen = true;
+                Some(merged.clone())
+            }
+            other => Some(other),
+        })
+        .collect()
+}
+
 /// An application-level command handed to a node (the app → engine direction).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {

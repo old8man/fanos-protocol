@@ -38,6 +38,7 @@
 
 use fanos_core::roles::{CONTROL_LOAD_READING, Role, encode_load_reading};
 use fanos_runtime::Command;
+use fanos_runtime::ports::fold_data_path;
 use fanos_geometry::Triple;
 use fanos_runtime::{Effect, Engine, Input, Instant, TimerToken};
 use fanos_wire::{FrameType, decode_frame};
@@ -101,6 +102,15 @@ impl Engine for ServiceNode {
             // Routed as a `Control` command because `inner` is a `dyn Engine`: the type that would let this
             // call `observe_load` directly is erased by the composition, so the reading is addressed by tag
             // instead. `Control` never arrives off the wire, so no peer can forge a load reading.
+            // The sense-only read reaches both halves, and the answers fold into one: this composite runs two
+            // engines that each own counters, and a reader takes the first notification it sees.
+            Input::Command(Command::Observe) => {
+                let mut out = self.inner.step(now, Input::Command(Command::Observe));
+                out.extend(Self::tag_service_effects(
+                    self.service.step(now, Input::Command(Command::Observe)),
+                ));
+                fold_data_path(out)
+            }
             Input::Command(Command::Diagnose) => {
                 let carried = u16::try_from(self.service.pending()).unwrap_or(u16::MAX);
                 let reading = encode_load_reading(Role::Service, carried).to_vec();
@@ -146,6 +156,7 @@ mod tests {
     use fanos_geometry::Point;
     use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
     use fanos_core::roles::RoleReading;
+    use fanos_runtime::ports::stations::{GatherHealth, Observation, Station};
     use fanos_runtime::{Command, Config as OverlayConfig, Notification, OverlayNode};
 
     use crate::intro_frame;
@@ -159,6 +170,71 @@ mod tests {
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
         let service = ThresholdService::new(coord, secret, vec![coord], 1);
         (ServiceNode::new(Box::new(overlay), service), public)
+    }
+
+    #[test]
+    fn a_hosted_service_exports_one_data_path_plane_carrying_its_own_gather_clock() {
+        // `ThresholdService` measured a gather deadline nothing could read and counted nothing at all, so a
+        // hosted service that had stopped serving looked identical whether its line disagreed on the key, its
+        // intros were being flooded, or its shares were arriving tampered.
+        //
+        // Both engines in this composite now own counters, so the fold matters here for the same reason it
+        // does in `CellNode`: a reader takes the first notification, and two planes means one dropped.
+        let (mut node, _public) = solo_service_node(9);
+        let observe = |node: &mut ServiceNode, at: u64| -> Vec<Effect> {
+            node.step(Instant(at), Input::Command(Command::Observe))
+        };
+
+        let planes = observe(&mut node, 0)
+            .iter()
+            .filter(|e| matches!(e, Effect::Notify(Notification::DataPath { .. })))
+            .count();
+        assert_eq!(planes, 1, "a node reports one data-path plane, not one per engine");
+
+        let plane = |node: &mut ServiceNode, at: u64| -> (Vec<Observation>, GatherHealth) {
+            observe(node, at)
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::DataPath { stations, gather }) => {
+                        Some((stations.clone(), *gather))
+                    }
+                    _ => None,
+                })
+                .expect("a sense-only read exports the data-path plane")
+        };
+
+        // The service's clock must win the fold: the inner overlay has no gather path, and its `NoGatherPath`
+        // must not mask the fact that this node *does* host one and has completed nothing on it.
+        let (quiet, health) = plane(&mut node, 1);
+        assert_eq!(
+            health,
+            GatherHealth::Unmeasured,
+            "the hosted service has a gather path; the overlay's NoGatherPath must not win the fold"
+        );
+        let decode_failures = |obs: &[Observation]| -> u64 {
+            obs.iter().filter(|o| o.station == Station::FrameDecodeFailed).map(|o| o.count).sum()
+        };
+        assert_eq!(decode_failures(&quiet), 0, "nothing has failed to decode yet");
+
+        // Live counts, not a vector of zeros: a frame carrying a hosting type with a body that is not one.
+        for _ in 0..2 {
+            node.step(
+                Instant(2),
+                Input::Message {
+                    from: Point::<F2>::at(1).coords(),
+                    frame: {
+                        let mut f = Vec::new();
+                        fanos_wire::encode_frame(FrameType::SvcPartial.code(), &[0xAB, 0xCD], &mut f);
+                        f
+                    },
+                },
+            );
+        }
+        assert_eq!(
+            decode_failures(&plane(&mut node, 3).0),
+            2,
+            "the exported map is the one the service's discard sites write to"
+        );
     }
 
     #[test]

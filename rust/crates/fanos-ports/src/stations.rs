@@ -78,6 +78,17 @@ pub enum Station {
     /// A pending gather evicted at the in-flight cap, not by its deadline — capacity pressure, which is a
     /// different world from a slow line and must not be summed with it.
     GatherEvicted,
+
+    /// A gather reached its threshold and the **open still failed** — the shares were tampered with, or came
+    /// from a line that does not agree on the key.
+    ///
+    /// Distinct from [`SharePartialFailed`](Self::SharePartialFailed), which is a member unable to compute its
+    /// *own* share, and the distinction is the diagnosis: that one localizes to the member, this one says the
+    /// threshold was met by shares that do not belong together. Folding them would report a combiner problem
+    /// as a member problem. It is also not [`GatherExpired`](Self::GatherExpired): nothing timed out, enough
+    /// arrived, and the result was still unusable — which looks identical from outside and is a different
+    /// fault entirely.
+    GatherOpenFailed,
     /// A share request arrived for a line this node is not on — why a gather never reaches quorum.
     ShareRequestNotAMember,
     /// This node could not compute its own share for a layer sealed to it — epoch/key skew between
@@ -144,6 +155,7 @@ impl Station {
         Self::AdmissionPowFailed,
         Self::AdmissionSybilCapped,
         Self::AdmissionNoCapacity,
+        Self::GatherOpenFailed,
     ];
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
@@ -154,6 +166,7 @@ impl Station {
             Self::GatherExpired => "gather.expired",
             Self::GatherCompleted => "gather.completed",
             Self::GatherEvicted => "gather.evicted",
+            Self::GatherOpenFailed => "gather.open_failed",
             Self::ShareRequestNotAMember => "share.not_a_member",
             Self::SharePartialFailed => "share.partial_failed",
             Self::ShareForUnknownRequest => "share.unknown_request",
@@ -406,6 +419,7 @@ mod tests {
                 Station::GatherExpired => listed(Station::GatherExpired),
                 Station::GatherCompleted => listed(Station::GatherCompleted),
                 Station::GatherEvicted => listed(Station::GatherEvicted),
+                Station::GatherOpenFailed => listed(Station::GatherOpenFailed),
                 Station::ShareRequestNotAMember => listed(Station::ShareRequestNotAMember),
                 Station::SharePartialFailed => listed(Station::SharePartialFailed),
                 Station::ShareForUnknownRequest => listed(Station::ShareForUnknownRequest),

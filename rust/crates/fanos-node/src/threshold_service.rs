@@ -36,7 +36,8 @@ use fanos_geometry::Triple;
 use fanos_pqcrypto::HybridKemSecret;
 use fanos_primitives::hash_labeled;
 use fanos_runtime::ports::GatherClock;
-use fanos_runtime::{Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_runtime::ports::stations::{GatherHealth, Station, Stations};
+use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, Wire, decode_frame, encode_frame};
 
 /// A 32-byte intro id — `H("…/intro-id" ‖ SealedIntro bytes)` — correlates a combiner's pending gather
@@ -87,6 +88,11 @@ pub struct ThresholdService {
     /// An explicit pin for scenarios that must assert a specific expiry; `None` — the default — uses the
     /// measured value.
     gather_override: Option<Duration>,
+    /// The data-path plane's counters (`docs/design-observability.md`). This engine measured a gather deadline
+    /// nothing could read and counted nothing at all, so a hosted service that had stopped serving looked
+    /// identical whether its line disagreed on the key, its intros were being flooded, or its shares were
+    /// arriving tampered — the exact "eleven candidate causes, one clock" position #55 was diagnosed from.
+    stations: Stations,
 }
 
 impl ThresholdService {
@@ -108,6 +114,7 @@ impl ThresholdService {
             max_pending: DEFAULT_MAX_PENDING,
             gather: GatherClock::new(),
             gather_override: None,
+            stations: Stations::new(),
         }
     }
 
@@ -169,6 +176,9 @@ impl ThresholdService {
             return Vec::new();
         }
         if self.pending.len() >= self.max_pending {
+            // Unattributed: the cap is on this member's own pending count, a property of *this* node under
+            // load, not of any one line.
+            self.stations.record(Station::ShareFloodCapped, None);
             return Vec::new(); // intro-flood bound (spec §12.5)
         }
         let mut shares: BTreeMap<u8, Share> = BTreeMap::new();
@@ -200,11 +210,18 @@ impl ThresholdService {
     }
 
     /// A combiner asked for our PartialDec of `intro`: compute and return it (if we are a line member).
-    fn on_share_req(&self, combiner: Triple, intro: &SealedIntro) -> Vec<Effect> {
+    fn on_share_req(&mut self, combiner: Triple, intro: &SealedIntro) -> Vec<Effect> {
         let Some(i) = self.my_index else {
+            // Asked for a share of a line this node is not on. Charged to the asker's coordinate, which is the
+            // only thing here that identifies who is confused.
+            self.stations.record(Station::ShareRequestNotAMember, Some(combiner));
             return Vec::new();
         };
         let Some(share) = intro.member_partial(i, &self.secret) else {
+            // The sharper of the two skew signals (§6): a member on the line that cannot compute its own share
+            // is key/epoch skew *inside* a line that is otherwise agreeing, and it presents as a hop that
+            // simply never peels.
+            self.stations.record(Station::SharePartialFailed, Some(self.coord));
             return Vec::new();
         };
         let id = Self::intro_id(intro);
@@ -217,6 +234,9 @@ impl ThresholdService {
     /// A member's PartialDec arrived: fold it into the matching pending gather and retry.
     fn on_partial(&mut self, now: Instant, id: IntroId, share: Share) -> Vec<Effect> {
         let Some(pending) = self.pending.get_mut(&id) else {
+            // A partial for a gather that is gone: served already, expired, or never started here. Common and
+            // benign one at a time; a rate says the deadline is short against the line's real latency.
+            self.stations.record(Station::ShareForUnknownRequest, None);
             return Vec::new(); // unknown/late intro id — nothing to gather it into
         };
         pending.shares.entry(share.x()).or_insert(share);
@@ -235,6 +255,10 @@ impl ThresholdService {
         }
         let shares: Vec<Share> = pending.shares.values().cloned().collect();
         let Ok(request) = pending.intro.open(&shares) else {
+            // Threshold met and the open still failed: the shares do not belong together. Not a member's own
+            // share failing and not a timeout — both of which look identical from outside and are different
+            // faults, which is why this has its own station.
+            self.stations.record(Station::GatherOpenFailed, Some(self.coord));
             return Vec::new();
         };
         let armed_at = pending.armed_at;
@@ -255,6 +279,17 @@ impl ThresholdService {
     /// A gather deadline fired: drop the (still-incomplete) intro it bounds, freeing its slot — and back
     /// off ([`GatherClock::expired`]): the deadline was demonstrably too short for the load this node is
     /// under, and an expiry yields no sample, so nothing else would ever widen it (RFC 6298 §5.5 + Karn).
+    /// Count a frame that stopped before it could be attributed, and discard it.
+    ///
+    /// One site for **every** decode-failure arm, including the unknown-type one, so the count cannot be
+    /// half-instrumented by a later arm being added without a call. Deliberately unattributed: a frame that
+    /// failed to parse has no readable line, and inventing one would put fabricated evidence against a line
+    /// into the plane built to end diagnosis on thin evidence.
+    fn undecodable(&mut self) -> Vec<Effect> {
+        self.stations.record(Station::FrameDecodeFailed, None);
+        Vec::new()
+    }
+
     fn on_timer(&mut self, token: TimerToken) -> Vec<Effect> {
         if let Some(&id) = self
             .pending
@@ -263,6 +298,7 @@ impl ThresholdService {
             .map(|(id, _)| id)
         {
             self.pending.remove(&id);
+            self.stations.record(Station::GatherExpired, Some(self.coord));
             self.gather.expired();
         }
         Vec::new()
@@ -274,20 +310,37 @@ impl Engine for ThresholdService {
         match input {
             Input::Message { from, frame } => {
                 let Ok((decoded, _)) = decode_frame(&frame) else {
-                    return Vec::new();
+                    return self.undecodable();
                 };
+                // Written as `match … { Ok(v) => …, Err(_) => self.undecodable() }` rather than `map_or_else`
+                // with two closures, which cannot both hold `&mut self`.
                 match decoded.frame_type() {
-                    Some(FrameType::RdvIntro) => SealedIntro::from_wire(decoded.body)
-                        .map_or_else(|_| Vec::new(), |intro| self.on_intro(now, intro)),
-                    Some(FrameType::SvcShareReq) => SealedIntro::from_wire(decoded.body)
-                        .map_or_else(|_| Vec::new(), |intro| self.on_share_req(from, &intro)),
-                    Some(FrameType::SvcPartial) => decode_partial(decoded.body)
-                        .map_or_else(Vec::new, |(id, share)| self.on_partial(now, id, share)),
-                    _ => Vec::new(),
+                    Some(FrameType::RdvIntro) => match SealedIntro::from_wire(decoded.body) {
+                        Ok(intro) => self.on_intro(now, intro),
+                        Err(_) => self.undecodable(),
+                    },
+                    Some(FrameType::SvcShareReq) => match SealedIntro::from_wire(decoded.body) {
+                        Ok(intro) => self.on_share_req(from, &intro),
+                        Err(_) => self.undecodable(),
+                    },
+                    Some(FrameType::SvcPartial) => match decode_partial(decoded.body) {
+                        Some((id, share)) => self.on_partial(now, id, share),
+                        None => self.undecodable(),
+                    },
+                    // Includes the unknown-type arm, deliberately: a frame this build does not recognise is
+                    // the version-skew signal §6 is about, and leaving it uncounted is how a half-instrumented
+                    // plane happens — a later arm added without one.
+                    _ => self.undecodable(),
                 }
             }
             Input::Timer(token) => self.on_timer(token),
-            // A threshold-service member takes no application commands (it serves intros off the wire).
+            // The sense-only read: this engine owns both a gather clock and a counter map, so it answers for
+            // them itself rather than a driver reaching in.
+            Input::Command(Command::Observe) => vec![Effect::Notify(Notification::DataPath {
+                stations: self.stations.observations(),
+                gather: GatherHealth::of(&self.gather),
+            })],
+            // A threshold-service member takes no other application commands (it serves intros off the wire).
             Input::Command(_) => Vec::new(),
         }
     }

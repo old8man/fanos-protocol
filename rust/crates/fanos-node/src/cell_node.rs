@@ -35,7 +35,7 @@
 //! back to `0`), every other token → the router.
 
 use fanos_core::roles::Role;
-use fanos_runtime::ports::stations::{GatherHealth, merge_observations};
+use fanos_runtime::ports::fold_data_path;
 use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_pqcrypto::kem::HybridKemPublic;
@@ -157,45 +157,6 @@ impl<F: Field> CellNode<F> {
     }
 }
 
-/// Fold every `DataPath` notification in `effects` into a single one, in place of the first.
-///
-/// **One node, one data-path plane.** Both halves of this composite own counters, so a bare concatenation emits
-/// two notifications and any reader that takes the first — the admin socket does — silently drops the other,
-/// with which one wins decided by the order this file happens to delegate in. Reported together, the counts sum
-/// and the gather health is the more informative of the two, so the overlay's "no gather here" cannot mask the
-/// router's measured deadline sitting beside it.
-fn fold_data_path(effects: Vec<Effect>) -> Vec<Effect> {
-    let planes = effects
-        .iter()
-        .filter(|e| matches!(e, Effect::Notify(Notification::DataPath { .. })))
-        .count();
-    if planes < 2 {
-        return effects;
-    }
-    let mut stations = Vec::new();
-    let mut gather = GatherHealth::NoGatherPath;
-    for effect in &effects {
-        if let Effect::Notify(Notification::DataPath { stations: s, gather: g }) = effect {
-            stations.extend(s.iter().copied());
-            gather = gather.or(*g);
-        }
-    }
-    let merged =
-        Effect::Notify(Notification::DataPath { stations: merge_observations(stations), gather });
-    let mut seen = false;
-    effects
-        .into_iter()
-        .filter_map(|e| match e {
-            Effect::Notify(Notification::DataPath { .. }) if seen => None,
-            Effect::Notify(Notification::DataPath { .. }) => {
-                seen = true;
-                Some(merged.clone())
-            }
-            other => Some(other),
-        })
-        .collect()
-}
-
 impl<F: Field> Engine for CellNode<F> {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
         match input {
@@ -282,7 +243,7 @@ mod tests {
     use fanos_keygen::BeaconNode;
     use fanos_rendezvous::SessionId;
     use fanos_core::roles::RoleReading;
-    use fanos_runtime::ports::stations::{Observation, Station};
+    use fanos_runtime::ports::stations::{GatherHealth, Observation, Station};
     use fanos_runtime::{Config as OverlayConfig, OverlayNode};
     use fanos_vrf::vss::{DeterministicRng, VssCommitment, VssShare, deal};
 
