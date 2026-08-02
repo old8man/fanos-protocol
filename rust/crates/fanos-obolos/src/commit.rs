@@ -20,7 +20,7 @@
 //!   short kernel vector `r − r'` of `A₁` (if `r ≠ r'`), else `v = v'`. Forging a second opening solves SIS.
 //! - **Homomorphic** by construction: the two components are linear in `(v, r)`, so commitments add.
 //!
-//! > **STATUS — [P]/[H], calibration + audit pending (as `fanos-vrf::rlwe`).** The *construction* is standard
+//! > **STATUS — \[P\]/\[H\], calibration + audit pending (as `fanos-vrf::rlwe`).** The *construction* is standard
 //! > and the *reductions* above are the security spec; the concrete parameters ([`Q`], [`N`], [`L`]) are
 //! > illustrative and **not yet calibrated to a bit-security target, nor externally cryptanalysed**. Ternary
 //! > sampling is not rejection-perfect and the modular reduction is `%` (not constant-time). This is a correct,

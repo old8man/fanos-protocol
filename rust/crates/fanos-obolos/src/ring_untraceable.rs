@@ -21,7 +21,7 @@
 //! tree slot is unique), so no note can ever lock another out — the ring form of [`crate::nullifier`]'s audit O-M1
 //! property. Ownership — that `cm` embeds an owner derived from `nsk` — is proven by [`crate::ring_note`].
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the sound membership path, the nullifier proof, and
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of the sound membership path, the nullifier proof, and
 //! > one linear relation; inherits their status and their `O(depth·ELL_H·LOG_BASE·REPETITIONS)` cost. Verified by an
 //! > `#[ignore]`d test (`--ignored`) at real `bits = LOG_BASE`: a genuine spend proves, a nullifier of a different
 //! > note is rejected, and a nullifier claiming a *different position* than the path proved is rejected.

@@ -9,17 +9,17 @@
 //! audit established this is **impossible from hash commitments alone**: proving a shadow re-commits the inputs
 //! forces opening them (leaking submitter↔value). Genuine unlinkability needs **re-randomization**, i.e. a
 //! *homomorphic* cryptosystem where a verifier can check `ct' = ReRand(ct, r)` from `r` **without** the
-//! plaintext — captured by the [`ReRandomizable`] trait.
+//! plaintext — captured by the `ReRandomizable` trait.
 //!
-//! The proof — a **Sako–Kilian cut-and-choose** — is fully generic over [`ReRandomizable`]. Two backends are
-//! provided: [`ElGamal`] (ristretto255, the group FANOS's VRF/DKG/VOPRF already use — **classical**, discrete
-//! log) and [`crate::rlwe`]'s `Rlwe` (**post-quantum**, Ring-LWE). The *same* [`prove`]/[`verify`] run over
+//! The proof — a **Sako–Kilian cut-and-choose** — is fully generic over `ReRandomizable`. Two backends are
+//! provided: `ElGamal` (ristretto255, the group FANOS's VRF/DKG/VOPRF already use — **classical**, discrete
+//! log) and [`crate::rlwe`]'s `Rlwe` (**post-quantum**, Ring-LWE). The *same* `prove`/`verify` run over
 //! either.
 //!
 //! **Security reduction.** *Soundness*: each shadow `M_j` is committed before the Fiat–Shamir challenge; if the
 //! output multiset ≠ the input multiset, `M_j` cannot be **both** a re-randomization of the inputs (`b=0`) and
 //! the outputs a re-randomization of `M_j` (`b=1`) — so one challenge branch fails, caught with probability
-//! `≥ 1/2` per shadow, `1 − 2^-k` over `k` shadows (`k ≥` [`MIN_ROUNDS`], enforced). The challenge is a single
+//! `≥ 1/2` per shadow, `1 − 2^-k` over `k` shadows (`k ≥` `MIN_ROUNDS`, enforced). The challenge is a single
 //! joint hash over the public key, `(n, k)`, and *all* shadow ciphertexts, so a shadow cannot be re-ground
 //! independently and a proof cannot be replayed across keys. *Hiding*: only re-randomization factors are ever
 //! revealed (checked homomorphically), one branch per shadow, so the composed permutation `π` is never
@@ -28,9 +28,9 @@
 //! reused `seed` de-anonymizes the batch — callers MUST pass a fresh CSPRNG draw).
 //!
 //! **Soundness scope — read before relying on the PQ backend.** The reduction above is exact **only when the
-//! backend's re-randomization is plaintext-preserving and [`verify_rerandomization`](ReRandomizable::verify_rerandomization)
+//! backend's re-randomization is plaintext-preserving and `verify_rerandomization`
 //! *enforces* that** (else a plaintext-changing factor satisfies whichever branch the challenge demands). The
-//! [`ElGamal`] backend meets this **unconditionally** — its factor is one scalar tying both ciphertext
+//! `ElGamal` backend meets this **unconditionally** — its factor is one scalar tying both ciphertext
 //! components, leaving no free translation — so the ElGamal shuffle is genuinely `1 − 2^-k` sound and is the
 //! backend to rely on. The lattice [`crate::rlwe`] backend enforces a **shortness** gate that closes the
 //! trivial free-translation forgery an independent audit found, but at `n = 512` a norm bound alone does *not*
@@ -52,13 +52,13 @@ const CHALLENGE_LABEL: &str = "FANOS-v1/shuffle-challenge";
 
 /// The minimum number of cut-and-choose rounds. Soundness is `2^-k`, so `k` is a security parameter and must
 /// not be caller-tunable below the standard `128`-bit floor — a low `k` (or a grindable `k` like 32) is
-/// otherwise a real forgery budget (audit fix). [`prove`]/[`verify`] reject any `k < MIN_ROUNDS`.
+/// otherwise a real forgery budget (audit fix). `prove`/`verify` reject any `k < MIN_ROUNDS`.
 pub const MIN_ROUNDS: usize = 128;
 
 /// A **re-randomizable public-key cryptosystem** — the homomorphic seam a verifiable shuffle needs. A
 /// re-randomization must (i) preserve the plaintext, (ii) compose additively
 /// (`ReRand(ReRand(ct, a), b) = ReRand(ct, a+b)`), and (iii) be **publicly checkable from the randomness
-/// alone**, without the plaintext. ristretto ElGamal ([`ElGamal`]) and Ring-LWE ([`crate::rlwe::Rlwe`]) both
+/// alone**, without the plaintext. ristretto ElGamal (`ElGamal`) and Ring-LWE ([`crate::rlwe::Rlwe`]) both
 /// satisfy this; the shuffle proof is generic over it.
 pub trait ReRandomizable {
     /// A ciphertext.

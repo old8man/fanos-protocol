@@ -54,11 +54,11 @@ const TICK_PERIOD: Duration = Duration::from_millis(150);
 const ROUND_TIMEOUT_BASE: Duration = Duration::from_millis(1_500);
 
 /// The **cap** on the adaptively-backed-off round timeout. A round that fails to finalize by its deadline
-/// doubles the next round's timeout (see [`next_round_timeout`]) up to this ceiling — so a genuinely slow round
+/// doubles the next round's timeout (see `next_round_timeout`) up to this ceiling — so a genuinely slow round
 /// (a CPU-loaded host whose multi-round threshold gathers take longer than the base timeout) is given more
 /// time rather than prematurely advanced, which under a fixed timeout **livelocks** the height (each premature
 /// advance reshuffles the leader before the in-flight round can commit). Bounded so a truly failed leader is
-/// still skipped in finite time. Reset to [`ROUND_TIMEOUT_BASE`] the moment the height advances (progress).
+/// still skipped in finite time. Reset to `ROUND_TIMEOUT_BASE` the moment the height advances (progress).
 ///
 /// Public because it is the **longest quiet period consensus can legitimately produce**, which is exactly what an
 /// integration harness needs to tell "still working" apart from "wedged": a driver merely between round attempts shows no
@@ -265,7 +265,7 @@ pub struct DriverProbe {
     /// The round timeout this driver is currently waiting out — the **measured** estimate, not the constant.
     ///
     /// Driver state, not engine state, which is why it is here: the engine has no clock. It is also the only way
-    /// to check that [`estimated_round_timeout`] is *wired* rather than merely correct — unit tests prove the
+    /// to check that `estimated_round_timeout` is *wired* rather than merely correct — unit tests prove the
     /// estimator follows its input, and only this says the driver is feeding it any. An estimate sitting exactly
     /// at `ROUND_TIMEOUT_BASE` on a cell that has been finalizing for minutes means no sample was ever admitted.
     pub round_timeout: Duration,

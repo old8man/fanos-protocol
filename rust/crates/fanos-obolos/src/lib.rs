@@ -19,7 +19,7 @@
 //! **Status discipline (`spec/platform.md` §9).** The *accounting* — the note-commitment tree, the nullifier
 //! set, the balance homomorphism — is fully implementable and **verified here**. The single frontier component,
 //! the post-quantum zero-knowledge shielded-transaction proof, is isolated behind a typed interface and tagged
-//! **[P]/[H]** (it needs cryptanalysis); it is never claimed as done. **No new cryptographic hardness is
+//! **\[P\]/\[H\]** (it needs cryptanalysis); it is never claimed as done. **No new cryptographic hardness is
 //! invented** — OBOLOS composes vetted post-quantum primitives (BLAKE3 for the tree/nullifiers, a Module-SIS
 //! lattice commitment for value, ML-KEM for stealth keys) exactly as the rest of the platform does.
 //!

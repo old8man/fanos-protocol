@@ -9,7 +9,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 
-/// A [`BTreeMap`](alloc::collections::BTreeMap) bounded to a fixed capacity with **FIFO eviction**: a new
+/// A [`BTreeMap`] bounded to a fixed capacity with **FIFO eviction**: a new
 /// key inserted beyond the capacity evicts the least-recently-**inserted** key (an insertion-order bound,
 /// not an access-order LRU). Re-inserting an existing key updates its value and leaves both the size and the
 /// eviction order unchanged — so a peer re-sending a known key cannot churn the order or grow the map. This

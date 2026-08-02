@@ -14,7 +14,7 @@
 //! chain from the announced identity and rejects any address that does not match, so a peer cannot
 //! announce an overlay address it did not earn in order to attract traffic it does not own (threat
 //! §79, hierarchical routing-table poisoning). This module is the single source of truth for the
-//! derivation; [`fanos_quic::identity`] and the overlay engine both call it.
+//! derivation; `fanos_quic::identity` and the overlay engine both call it.
 
 use alloc::vec::Vec;
 

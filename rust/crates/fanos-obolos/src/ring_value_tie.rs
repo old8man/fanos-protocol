@@ -19,7 +19,7 @@
 //! `Cv`'s components enter as zero-randomness commitments (`Cv` is public); `rv` is committed once and reused
 //! across all relations. Because these are linear (no shortness), the whole tie is **fast** — no `#[ignore]`.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Reduces to [`crate::ring_linear`]; inherits its status. Tests: a
+//! > **STATUS — \[P\]/\[H\], correctness-first.** Reduces to [`crate::ring_linear`]; inherits its status. Tests: a
 //! > matching `value_node`/`Cv` proves; a `value_node` encoding a different amount than `Cv` is rejected.
 
 use alloc::vec::Vec;

@@ -269,7 +269,7 @@ pub fn filler_slot(key: &[u8], line_size: usize) -> Vec<u8> {
 /// Pack `payload` into a constant-width block: `len(4) ‖ payload ‖ pad`.
 ///
 /// The pad is keystream from `seed`, not zeros, so a block is not distinguishable from ciphertext before its layers are
-/// applied. `TooLong` if the payload does not fit the block a header of [`MAX_DEPTH`] slots leaves.
+/// applied. `TooLong` if the payload does not fit the block a header of `MAX_DEPTH` slots leaves.
 pub fn pack_payload(payload: &[u8], line_size: usize, seed: &[u8]) -> Result<Vec<u8>, ThresholdError> {
     let width = payload_len(line_size).ok_or(ThresholdError::TooLong)?;
     if payload.len() + 4 > width {

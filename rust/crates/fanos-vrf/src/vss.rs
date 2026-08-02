@@ -204,7 +204,7 @@ impl VssCommitment {
     /// The coefficient-wise sum of several commitments — the public commitment of the sum of their
     /// polynomials. All must share the same degree (`threshold`); returns `None` if the slice is empty
     /// or the degrees differ. Aggregating a DKG's qualified dealers' commitments yields the joint
-    /// polynomial's commitment, whose [`public_share(i)`](Self::public_share) is holder `i`'s public key
+    /// polynomial's commitment, whose `public_share(i)` is holder `i`'s public key
     /// `Y_i = s_i·G` — exactly what a distributed-VRF beacon partial ([`crate::beacon`]) is verified
     /// against.
     #[must_use]

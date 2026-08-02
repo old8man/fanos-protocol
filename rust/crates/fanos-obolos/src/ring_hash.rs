@@ -28,7 +28,7 @@
 //!   `(l, r)`, so a path proof composes: at each level, an opening-style argument that the (secret) children map to
 //!   the (secret) parent, chained to the public root — with the shortness of each node a range/binary sub-proof.
 //!
-//! > **STATUS — [P]/[H], correctness-first (as the rest of the ring stack).** Construction and the SIS reduction
+//! > **STATUS — \[P\]/\[H\], correctness-first (as the rest of the ring stack).** Construction and the SIS reduction
 //! > are the security spec; the dimensions `(k, ℓ)`, base, and `q` are illustrative, not yet calibrated to a
 //! > bit-security target nor externally cryptanalysed; arithmetic is not constant-time. Tests verify the hash is
 //! > deterministic, that decomposition round-trips, that nodes stay short and re-hashable, and — the load-bearing

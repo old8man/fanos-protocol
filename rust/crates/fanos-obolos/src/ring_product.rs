@@ -32,7 +32,7 @@
 //! (`r_b1, r_b2, r_u`, bound `2²⁰ ≫ 1`) hides the short `r_x, r_y, r_z, r_t` in the revealed openings via
 //! rejection sampling — the accept region is witness-independent.
 //!
-//! > **STATUS — [P]/[H], correctness-first (as the rest of the ring stack).** Construction and the
+//! > **STATUS — \[P\]/\[H\], correctness-first (as the rest of the ring stack).** Construction and the
 //! > soundness/ZK arguments are the security spec; [`REPETITIONS`], the masking bound, and the monomial challenge
 //! > distribution are illustrative, not yet calibrated to a bit-security target nor externally cryptanalysed;
 //! > arithmetic is not constant-time. Tests verify completeness, soundness (a wrong product has no accepting

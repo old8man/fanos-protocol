@@ -15,7 +15,7 @@
 //! A whole shielded transaction is: a `prove_input` per input, a range proof per output, and one balance proof
 //! ([`crate::ring_confidential`]) — the full `ShieldedProof` the ledger integration will wire.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the built, tested primitives; inherits their status
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of the built, tested primitives; inherits their status
 //! > and their `O(depth·ELL_H·LOG_BASE·REPETITIONS)` cost. Verified by an `#[ignore]`d test (`--ignored`) at real
 //! > `bits = LOG_BASE`: a full input spend proves and verifies end to end.
 

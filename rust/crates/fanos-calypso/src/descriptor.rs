@@ -6,7 +6,7 @@
 //!
 //! 1. **encrypted** under `K = descriptor_key(addr, epoch)` — only holders of the address can
 //!    decrypt it, so a storage node sees an opaque blob (content unenumerability);
-//! 2. **stamped** with adaptive [`pow`](crate::pow) over the ciphertext — publishing at a lookup
+//! 2. **stamped** with adaptive [`pow`] over the ciphertext — publishing at a lookup
 //!    slot costs work, bounding squat/DoS floods;
 //! 3. **indexed** at the rotating coordinate [`publish_point`] `= MapToPoint(H(addr ‖ epoch))` —
 //!    without the address the slot is unguessable (service unenumerability).

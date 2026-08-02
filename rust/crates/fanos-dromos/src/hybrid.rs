@@ -1012,7 +1012,7 @@ impl StateMachine for HybridLedger {
     /// [`ExecOutcome::Malformed`]; a well-formed-but-invalid transaction (bad signature, double-spend, taken
     /// name, insufficient funds) is [`ExecOutcome::Rejected`]; success is [`ExecOutcome::Applied`]. The
     /// single-transaction entry point: it verifies inline (no pre-computed verdict). Block execution instead
-    /// verifies in parallel and drives [`apply_with_verdict`](HybridLedger::apply_with_verdict) directly.
+    /// verifies in parallel and drives ``apply_with_verdict`` directly.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome {
         self.apply_with_verdict(tx, None)
     }

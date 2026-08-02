@@ -1,6 +1,6 @@
 //! Differentially-private telemetry export (audit C7 · `docs/design-telemetry.md` §5).
 //!
-//! A [`CoherenceFrame`](crate::CoherenceFrame) folds a cell's health into a minimal record, but that
+//! A [`CoherenceFrame`] folds a cell's health into a minimal record, but that
 //! record is **data-minimized, not anonymized**: it names the exact faulted point (the 3-bit syndrome)
 //! and the cell's exact coherence scalars. An observer of an *exported* frame — a monitor feed, a
 //! cross-cell roll-up, any shareable telemetry — could therefore read *which node is down* and correlate

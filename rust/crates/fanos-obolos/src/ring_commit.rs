@@ -19,7 +19,7 @@
 //!   *constant coefficient* with `q ≫ MAX_VALUE`, the message terms add as **integers** — so a validator checks
 //!   `Σ v_in = Σ v_out + fee` on the commitments alone, exactly as the vector form did.
 //!
-//! > **STATUS — [P]/[H], calibration + audit pending (as [`crate::commit`] / [`crate::ring`]).** Construction and
+//! > **STATUS — \[P\]/\[H\], calibration + audit pending (as [`crate::commit`] / [`crate::ring`]).** Construction and
 //! > reductions are the security spec; the ranks `(K, ℓ)` and the ring `(D, q)` are illustrative, not yet
 //! > calibrated to a bit-security target nor externally cryptanalysed. The tests verify **correctness**
 //! > (homomorphism, opening, the balance identity), never security.

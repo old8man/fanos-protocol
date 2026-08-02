@@ -13,14 +13,14 @@
 //!
 //! ## One shared session driver, one shared bound
 //!
-//! Each cookie's session is driven by the *same* [`serve_over_channels`] engine the Direct loop uses, so the
+//! Each cookie's session is driven by the *same* `serve_over_channels` engine the Direct loop uses, so the
 //! RFC 6298 retransmit clock (and its anti-livelock pacing) is inherited, not re-implemented — the reference
 //! hand-rolled `poll_payloads`/`poll_new` split that a naive loop gets wrong lives inside that driver. The
 //! one structural difference is the reply path: a session's outbound cells cannot be sealed inside its own
 //! task, because sealing needs the single `RendezvousService` (its reply-route table and fresh per-onion
 //! seeds). So every session funnels its outbound cells — tagged by cookie — to the central loop, which owns
-//! the `RendezvousService` and does all sealing. The cookie→session map is [`MAX_SESSIONS`]-bounded and
-//! idle-swept exactly like the Direct loop (audit A4), reusing [`Session`]/[`evict_lru`], so a flood of
+//! the `RendezvousService` and does all sealing. The cookie→session map is `MAX_SESSIONS`-bounded and
+//! idle-swept exactly like the Direct loop (audit A4), reusing `Session`/`evict_lru`, so a flood of
 //! distinct cookies or a wedged handler cannot grow it without bound.
 
 use std::collections::HashMap;
@@ -137,7 +137,7 @@ fn sweep_idle_sessions(sessions: &mut HashMap<SessionId, Session>) {
 /// delivery with it before ingesting. Pass **empty** when the service *is* its own combiner (requests arrive
 /// as plaintext `Request`s — `open()` authenticates, so the empty ring just ingests raw). `epoch_updates`, if
 /// present, is the channel the `spawn_rendezvous_host` driver pushes each epoch's fresh [`HostEpoch`] on: the
-/// loop rings the new key (keeping the last [`MAX_REPLY_KEYS`], so a request forwarded across the boundary
+/// loop rings the new key (keeping the last `MAX_REPLY_KEYS`, so a request forwarded across the boundary
 /// still opens) and swaps the reply directory. Pass `None` for a fixed single-epoch host (tests, at-combiner).
 pub fn serve_anonymous<R, H, Fut>(
     client: Client,
@@ -277,7 +277,7 @@ pub struct HostedService {
     /// The service's static keypair — its anonymous identity, and what a client addresses it by.
     pub service: StaticKeypair,
     /// The service's **canonical published identity bundle** (`Ed25519 ‖ ML-DSA-65 ‖ X25519 ‖ ML-KEM-768`) — what
-    /// a `.fanos` resolution yields, and the preimage of [`service_tag`].
+    /// a `.fanos` resolution yields, and the preimage of `service_tag`.
     ///
     /// **Its KEM half must be `service`'s public key**, and [`spawn_rendezvous_host`] refuses to run otherwise.
     /// The two are used for different things by the client — the KEM key LOCATES the service (it derives the
@@ -297,7 +297,7 @@ pub struct HostedService {
     /// The rendezvous registration threshold: how many of the meeting line's points must hold a share.
     pub threshold: u8,
     /// Whether this cell's coordinates are **VRF-derived**, in which case each mix-key record must prove the slot's
-    /// coordinate lies on its publisher's probe walk (S1-M3, [`mixdir::parse_bound_record`]).
+    /// coordinate lies on its publisher's probe walk (S1-M3, `mixdir::parse_bound_record`).
     ///
     /// A deployment property of the cell, so it is stated by whoever configured it: [`crate::Node`] always sets
     /// `OverlayConfig::vrf_coordinates`, a pinned harness never does. It cannot be inferred from below — a pinned harness

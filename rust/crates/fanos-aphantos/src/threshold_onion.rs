@@ -35,7 +35,7 @@ const HOLOSEED_LABEL: &str = "FANOS-v1/threshold-holoseed";
 /// *line*, so the authenticator ratchets over the ordered hop-line coordinates (`fanos_nyx::Ratchet`,
 /// the same one-way cascade + length-binding finalization) and any inserted, substituted, reordered, or
 /// truncated hop moves the cascade and breaks the tag. The holoseed is the ratchet's secret prefix, so
-/// this is a keyed authenticator, not a public checksum — see [`HOLOSEED_LABEL`] (spec §5.4).
+/// this is a keyed authenticator, not a public checksum — see `HOLOSEED_LABEL` (spec §5.4).
 #[must_use]
 pub fn circuit_line_holonomy(hop_lines: &[fanos_geometry::Triple], holoseed: &[u8; HOLONOMY_LEN]) -> [u8; HOLONOMY_LEN] {
     let mut ratchet = fanos_nyx::ratchet::Ratchet::new(holoseed);

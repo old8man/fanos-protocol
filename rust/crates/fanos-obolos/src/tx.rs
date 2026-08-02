@@ -17,7 +17,7 @@
 //!    two constraints that together make modular-wraparound inflation impossible.
 //!
 //! [`ShieldedProof`] is the seam. The production backend is a lattice/STARK zero-knowledge proof of exactly
-//! this relation — the single frontier **[P]** component (`spec/platform.md` §4.3). The [`TransparentProof`]
+//! this relation — the single frontier **\[P\]** component (`spec/platform.md` §4.3). The [`TransparentProof`]
 //! here proves the *same relation in the clear* (revealing the witness), so the state machine
 //! ([`crate::state`]) is verified end-to-end now, and the exact statement the ZK proof must attest is pinned in
 //! code. It is not zero-knowledge — it is the accounting reference, the honest degraded-mode fallback, and the
@@ -112,7 +112,7 @@ impl ShieldedTx {
 }
 
 /// A proof that a [`ShieldedTx`] satisfies the shielded-transfer relation. The production implementation is a
-/// post-quantum zero-knowledge proof (**[P]**, `spec/platform.md` §4.3); [`TransparentProof`] is the
+/// post-quantum zero-knowledge proof (**\[P\]**, `spec/platform.md` §4.3); [`TransparentProof`] is the
 /// fully-verified transparent reference.
 pub trait ShieldedProof {
     /// Whether the transaction's relation holds (membership, ownership, nullifier correctness, value binding,

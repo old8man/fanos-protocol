@@ -17,7 +17,7 @@
 //!
 //! ## Atomicity is implemented, not assumed
 //!
-//! [`Term::Seq`](crate::Term::Seq) is documented as running its children "**atomically** — the invariant is checked at
+//! [`Term::Seq`] is documented as running its children "**atomically** — the invariant is checked at
 //! the composite boundary". A `Seq` that left half its writes behind on a fault would make that sentence false, so
 //! [`Journal`] records an undo entry per write and rolls back on any fault. The alternative — telling callers to snapshot
 //! the whole ledger — pushes an O(state) cost onto every transaction to avoid an O(writes) one here.
@@ -167,14 +167,14 @@ pub struct Receipt {
     pub predicates: usize,
     /// Claims verified.
     pub claims: usize,
-    /// Branches an [`Term::Alt`](crate::Term::Alt) declined before one matched, summed — the cost `Alt`'s
+    /// Branches an [`Term::Alt`] declined before one matched, summed — the cost `Alt`'s
     /// over-approximated footprint pays for, made visible rather than inferred.
     pub declined: usize,
 }
 
 /// Evaluate a well-typed term against `state`.
 ///
-/// `args` are the instantiation arguments [`Expr::Arg`](crate::value::Expr::Arg) indexes.
+/// `args` are the instantiation arguments [`Expr::Arg`] indexes.
 ///
 /// Takes a [`Checked`] rather than a `Term`, so "was this type-checked?" is not a question this function can be asked
 /// wrongly. Takes no `Limits`, deliberately. Every admission bound — proof size, footprint width, nesting — is checked once by

@@ -5,7 +5,7 @@
 //! - **Checkpoint directory** ([`publish_checkpoint`] / [`attest_children`]) — each cell publishes its latest
 //!   [`ExecCertificate`] for the epoch at a cell-and-epoch slot; a parent cell reads its children's
 //!   certificates and anchors their finality through a [`ChildRegistry`], giving *live* shared security.
-//! - **Cross-cell receipt inbox** ([`publish_receipt`] / [`drain_inbox`]) — a source cell publishes a
+//! - **Cross-cell receipt inbox** ([`publish_receipt`] / `drain_inbox`) — a source cell publishes a
 //!   [`CrossCellReceipt`] to the destination cell's inbox slot; the destination reads and (its state machine)
 //!   verifies + applies it, trusting no bridge.
 //!

@@ -31,6 +31,7 @@ use fanos_ports::{
     Command, Duration, Effect, Engine, GatherClock, Input, Instant, Notification, TimerToken,
 };
 use fanos_ports::stations::{GatherHealth, Observation, Station, Stations};
+use fanos_wire::activation::Derivation;
 
 use crate::threshold_onion::{self as threshold, ThresholdPeel};
 
@@ -218,27 +219,6 @@ impl<F: Field> ThresholdRouter<F> {
         Vec::new()
     }
 
-    /// **The gather path's measured health** — the smoothed latency and its deviation, or `None` before the
-    /// first gather completes.
-    ///
-    /// `docs/design-observability.md` §4.1 names this as the first thing the plane should export, for a
-    /// reason worth keeping: it is *already computed*. [`GatherClock`] maintains it to derive the deadline
-    /// ([`RFC 6298`](https://www.rfc-editor.org/rfc/rfc6298)'s `SRTT`/`RTTVAR`), so surfacing it costs one
-    /// method and no new state — and it is precisely the load signal the role controller's setpoint wants
-    /// for the rendezvous role, since a lengthening gather is what "this line is oversubscribed" looks like
-    /// before any hop actually fails.
-    ///
-    /// A *rate*-free reading, unlike the [`stations`](Self::stations) counters: it is a level, and it is the
-    /// engine's own estimate rather than a count of events. A caller mixing the two into one demand figure
-    /// must say which is which — see the design's note on rate-versus-level.
-    ///
-    /// **Local-only**, exactly like the station counters (`stations` R4): a per-node latency estimate is
-    /// node-identifying metadata, and nothing here crosses a boundary until the DP sensitivity for it is
-    /// derived the way `Δr = 1/21` was for the coherence frame.
-    #[must_use]
-    pub const fn gather_health(&self) -> (Option<Duration>, Duration) {
-        (self.gather.srtt(), self.gather.var())
-    }
 
     /// This router's data-path counters for the current window — **local-only** (`stations` R4: nothing
     /// crosses a node boundary until per-family DP sensitivities are derived the way `Δr = 1/21` was).
@@ -349,7 +329,7 @@ impl<F: Field> ThresholdRouter<F> {
             fanos_primitives::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
             // Salted like a real launch (#55): cover traffic must draw its gatherer the same way real
             // onions do, or the address pattern alone would tell cover and cargo apart.
-            if let Some(combiner) = Self::combiner_of_salted(line, &cell) {
+            if let Some(combiner) = self.gather_member(line, &cell) {
                 effects.push(Effect::Send {
                     to: combiner,
                     frame: encode_onion(line, &cell),
@@ -425,6 +405,27 @@ impl<F: Field> ThresholdRouter<F> {
     fn my_index(&self, line: Triple) -> Option<usize> {
         let me = self.coord.coords();
         Self::line_members(line).iter().position(|&m| m == me)
+    }
+
+    /// The member of `line` that gathers an onion whose body is `salt` — **through the activation registry**.
+    ///
+    /// This is the one place the gatherer is chosen, and it consults
+    /// [`Derivation::OnionGatherMember`](fanos_wire::activation::Derivation::OnionGatherMember) rather than
+    /// hard-coding the current form. At its registered height of `0` the answer is always the salted draw, so
+    /// nothing changes today — and that is the point: the registry was built for the *next* derivation change
+    /// and had no production caller, which is the shape that lets a mechanism rot until the release that needs
+    /// it discovers it was never wired. A derivation switch that no code consults is a schedule nobody keeps.
+    ///
+    /// The epoch is the router's own onion epoch, which the beacon drives — so every member of a line reads the
+    /// same height at the same time, which is what makes a scheduled switch a switch rather than a split.
+    fn gather_member(&self, line: Triple, salt: &[u8]) -> Option<Triple> {
+        if Derivation::OnionGatherMember.is_active_at(self.onion_epoch().get()) {
+            Self::combiner_of_salted(line, salt)
+        } else {
+            // The pre-#55 canonical pick: one member per line. Unreachable at height 0 and kept because a
+            // registry whose old form is deleted cannot serve a node that has not reached the height (§3.1).
+            Self::combiner_of(line)
+        }
     }
 
     /// The **canonical** combiner of a line — [`Self::combiner_of_salted`] with an empty salt. Use it where a
@@ -674,7 +675,7 @@ impl<F: Field> ThresholdRouter<F> {
                 // gatherer is then picked per onion (salted by the padded bytes, #55): any member
                 // can combine, and varying the pick keeps one dead member from killing the hop.
                 let padded = threshold::pad(&onion).unwrap_or(onion);
-                match Self::combiner_of_salted(next, &padded) {
+                match self.gather_member(next, &padded) {
                     Some(c) => self.forward_send(c, encode_onion(next, &padded)),
                     None => Vec::new(),
                 }
@@ -973,6 +974,19 @@ mod tests {
     /// plane and could censor every hidden service in the cell.
     ///
     /// A Fano-only test would have stayed green — 4 ≥ 3 — which is exactly why this enumerates a second plane.
+    /// The gather health this router reports on a sense-only read — the same path an operator's
+    /// `fanos status stations` takes, rather than a test-only accessor beside it.
+    fn reported_health<F: Field>(router: &mut ThresholdRouter<F>, at: u64) -> GatherHealth {
+        router
+            .step(Instant(at), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { gather, .. }) => Some(*gather),
+                _ => None,
+            })
+            .expect("a sense-only read exports the data-path plane")
+    }
+
     #[test]
     fn the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults() {
         use fanos_field::F7;
@@ -1706,8 +1720,8 @@ mod tests {
         );
 
         assert_eq!(
-            router.gather_health().0,
-            None,
+            reported_health(&mut router, 0),
+            GatherHealth::Unmeasured,
             "a router that has completed no gather reports NO measurement, not a plausible-looking zero"
         );
 
@@ -1729,8 +1743,9 @@ mod tests {
                 Input::Message { from: members[1], frame: encode_rep(req_id, &honest) },
             );
         }
-        let (srtt, _var) = router.gather_health();
-        let srtt = srtt.expect("after twelve completed gathers there IS a measurement");
+        let GatherHealth::Measured { srtt, .. } = reported_health(&mut router, now) else {
+            panic!("after twelve completed gathers there IS a measurement")
+        };
         assert!(
             srtt > Duration::from_millis(1) && srtt < Duration::from_millis(20),
             "the estimate tracks the observed 5 ms rather than drifting: {srtt:?}"

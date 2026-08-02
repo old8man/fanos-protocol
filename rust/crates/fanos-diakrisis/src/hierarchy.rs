@@ -4,10 +4,10 @@
 //! The base cell diagnoses `N = 7` **nodes** from their activity and loss signals. The recursion-of-cells
 //! (§L1) makes each node of a parent cell itself a **child cell**, so the *identical* diagnosis runs one level
 //! up with the child cells as its "nodes": the parent measures its own integration from its children's
-//! activity signals ([`parent_coherence`]) and localizes a failing child from the inter-child loss matrix
-//! ([`localize_failing_child`]) — the very §6.3 grey-endpoint that localizes a failing node inside a cell. A
+//! activity signals (`parent_coherence`) and localizes a failing child from the inter-child loss matrix
+//! (`localize_failing_child`) — the very §6.3 grey-endpoint that localizes a failing node inside a cell. A
 //! child a parent cannot heal escalates to the *grandparent*, and because a parent's own loss is itself a
-//! signal, the diagnosis composes to arbitrary depth ([`diagnose_level`], validated in [`recursion tests`]).
+//! signal, the diagnosis composes to arbitrary depth (`diagnose_level`, validated in [`recursion tests`]).
 //!
 //! **Scale-invariance is the point, and its honest caveat.** The projective structure is identical at every
 //! level (`S(2,3,7)` for `q = 2`), so the localization pyramid `21 → 7 → 3 → 1` and the leading-indicator
@@ -36,7 +36,7 @@ pub fn cell_loss(child_losses: &[f64]) -> f64 {
 /// Build the parent's inter-child **loss matrix** from each child's aggregate loss: a link `i↔j` is as lossy
 /// as its worse endpoint, `loss(i,j) = max(loss_i, loss_j)` (diagonal = the child's own loss). This is the
 /// parent-level analogue of the §6.3 per-neighbour loss matrix, and it is exactly what
-/// [`localize_failing_child`] reads: a failing child is lossy on *all* its links, an honest child keeps at
+/// `localize_failing_child` reads: a failing child is lossy on *all* its links, an honest child keeps at
 /// least one low-loss link (to another honest child).
 #[must_use]
 pub fn inter_child_loss(losses: &[f64; fano::N]) -> [[f64; fano::N]; fano::N] {
@@ -68,7 +68,7 @@ pub fn parent_coherence(child_activity: &[Vec<f64>]) -> Option<CoherenceMatrix> 
 /// The **federated verdict** over a parent's children — the Turyn covering applied to the degraded-axis masks the
 /// children already compute (`docs/design-federation.md`).
 ///
-/// This is a strictly finer instrument than [`localize_failing_child`], and the difference is worth stating rather than
+/// This is a strictly finer instrument than `localize_failing_child`, and the difference is worth stating rather than
 /// leaving to be discovered:
 ///
 /// | | `localize_failing_child` | the federated verdict |
@@ -99,7 +99,7 @@ pub fn parent_coherence(child_activity: &[Vec<f64>]) -> Option<CoherenceMatrix> 
 /// cannot move the blame anywhere. A liar can at most under-report its own genuine faults, which is the direction that
 /// harms only itself.
 ///
-/// `tol` is the same per-child jitter slack [`localize_failing_child`] uses, so the two localizers agree about what
+/// `tol` is the same per-child jitter slack `localize_failing_child` uses, so the two localizers agree about what
 /// "measurably lossy" means rather than drifting apart on two thresholds.
 #[must_use]
 pub fn corroborated_reports(

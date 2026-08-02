@@ -50,7 +50,7 @@
 //! Only the first describes a cell this platform would keep, and the reason is exact rather than stylistic:
 //! `R = 1/(N·P)`, so the self-model floor `R ≥ 1/3` **is** `P ≤ 3/N`. A cell at absolute purity `0.75` has
 //! `R = 0.19` on a Fano plane — over-coupled, no longer self-observing, and what the homeostat answers with
-//! `Decouple`. See [`tests::the_falling_ceiling_holds_inside_the_band_and_reverses_outside_it`].
+//! `Decouple`. See `tests::the_falling_ceiling_holds_inside_the_band_and_reverses_outside_it`.
 //!
 //! **4. There is an absolute floor at `N = 3`,** below which no cell is viable for reasons that have nothing to
 //! do with FANOS. The window in `r` is `(1/√(N−1), √(2/(N−1))]`, and at `N = 2` its lower edge is `1` — a

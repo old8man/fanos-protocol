@@ -101,7 +101,7 @@ pub fn ingress_line<F: Field>(community: &[u8], epoch: Epoch, beacon: &BeaconSee
 /// a degenerate plane offering no combiner.
 ///
 /// **This is the canonical case, not the address a requester should dial**: use [`ingress_walk`]. Every
-/// member of an ingress line can serve a request (see [`PorosHost::on_request`], which has no
+/// member of an ingress line can serve a request (see `PorosHost::on_request`, which has no
 /// is-canonical check), so sending every requester here would make one node the single point of failure
 /// for a whole community's admission — the same defect #55 removed from every mixnet hop. It is kept for
 /// derivations that need the line's canonical point, mirroring `combiner_for` against
@@ -129,7 +129,7 @@ pub fn ingress_combiner<F: Field>(
 /// property the Sybil gate is entitled to assume.
 ///
 /// **Why keyed by the requester.** There is no onion to salt with, but the requester's coordinate is
-/// already present and already non-transferable — [`admission_challenge`] binds the PoW to it — so
+/// already present and already non-transferable — `admission_challenge` binds the PoW to it — so
 /// keying the permutation with it costs nothing and spreads distinct requesters over distinct first
 /// choices. Folding `(community, epoch, beacon)` in too means the order rotates with the line itself, so
 /// no member is durably "the front door" for anyone.
@@ -671,7 +671,7 @@ impl PorosHost {
         self.pending.len()
     }
 
-    /// The epoch this host currently serves (advances when it [`adopt`](Self::adopt)s a rotation).
+    /// The epoch this host currently serves (advances when it ``adopt``s a rotation).
     #[must_use]
     pub fn epoch(&self) -> Epoch {
         self.epoch
@@ -722,7 +722,7 @@ impl PorosHost {
 
     /// **Prepare to rotate INTO** `new_line` for `target_epoch`, receiving from the outgoing `old_line`: sets
     /// the receive context so incoming `PorosReshare` sub-shares are authenticated to their old member, opened,
-    /// gathered, and combined into this host's rotated share (which it then [`adopt`](Self::adopt)s). A no-op if
+    /// gathered, and combined into this host's rotated share (which it then ``adopt``s). A no-op if
     /// this host is not a member of `new_line`. The driver computes both rosters from
     /// `ingress_line(community, epoch, beacon)` (no I/O) — `new_line` at `target_epoch`, `old_line` at the
     /// current epoch — and calls this before the contributions arrive. `old_line` is the roster whose position

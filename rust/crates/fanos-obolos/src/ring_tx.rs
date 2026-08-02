@@ -25,7 +25,7 @@
 //! knowledge. Wiring it as the ledger's `ShieldedProof` (migrating the value commitment and note model onto the
 //! ring) is the remaining integration step.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the built, tested pieces; inherits their status and
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of the built, tested pieces; inherits their status and
 //! > cost — a whole-transaction proof is minutes at real `bits` (aggregation / recursive-SNARK compaction is the
 //! > perf frontier). Verified by an `#[ignore]`d test (`--ignored`): a 1-in/1-out shielded transfer proves and
 //! > verifies end to end.
@@ -240,7 +240,7 @@ fn sub(base: &[u8], tag: &[u8], index: usize) -> Vec<u8> {
 /// (input/output note commitments, nullifiers) and the proof.
 ///
 /// The range width is deliberately **not** a parameter: it is the protocol constant
-/// [`RANGE_BITS`](crate::ring_commit::RANGE_BITS), so no call site — honest or otherwise — can widen the bound that
+/// [`RANGE_BITS`], so no call site — honest or otherwise — can widen the bound that
 /// keeps the balance law from wrapping modulo `q` (audit O-C1). Because the range proof is *aggregated*, its cost is
 /// independent of the width, so pinning it to the real ceiling is free.
 #[allow(clippy::too_many_arguments)]

@@ -8,7 +8,7 @@
 //! service's replies return as *anonymous* deliveries at the client's own reply rendezvous. The onion
 //! hides *where*; DIAULOS still encrypts *what*.
 //!
-//! The overlay coupling is injected into [`rendezvous_bridge`] (a send closure + the node's delivery
+//! The overlay coupling is injected into `rendezvous_bridge` (a send closure + the node's delivery
 //! stream), so the bridge's sealing/routing logic is unit-testable without a live node; [`dial_anonymous`]
 //! wires it to a real [`Client`].
 
@@ -97,7 +97,7 @@ async fn rendezvous_bridge<F, S>(
 ///
 /// The reply comes home via NOSTOS: `rclient`'s reply circuit must terminate at one of this node's own
 /// lines (a line through its coordinate), and `reply_keys` must be the matching
-/// [`session_reply_keypair`](fanos_rendezvous::session_reply_keypair) half, so the service's dead-drop
+/// [`session_reply_keypair`] half, so the service's dead-drop
 /// replies — anonymous deliveries this node receives as a line member — open here. [`anonymous_dial`]
 /// wires both. Must run inside a tokio runtime.
 #[must_use]

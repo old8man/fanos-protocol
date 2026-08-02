@@ -7,7 +7,7 @@
 //!
 //! * [`morph`] — the obfuscation modes and per-environment fallback policy (§13.3, §13.7).
 //! * [`shape`] — beacon-rotating shape `θ_epoch` (§13.4).
-//! * [`obfuscate`] — the `polymorph` codec (§13.2).
+//! * [`obfuscate`](mod@obfuscate) — the `polymorph` codec (§13.2).
 //! * [`profile`] — the traffic-shaper: per-morph size + timing targets (§13.3, §13.1).
 //! * [`shaper`] — the driver-facing [`ProteusShaper`]: morph-dispatched codec + shaping.
 //! * [`controller`] — morph auto-fallback ([`MorphController`], §13.7).

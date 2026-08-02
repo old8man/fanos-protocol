@@ -41,14 +41,14 @@
 //!   per seat**, not multiplicative over trials:
 //!
 //!   ```text
-//!       cost  =  E[T] hashes  +  (seats placed) · (admission cost)
+//!       cost  =  E\[T\] hashes  +  (seats placed) · (admission cost)
 //!   ```
 //!
 //!   The gap is not a rounding detail. For `q = 31` (`N = 993`) at PoW difficulty
 //!   `2²⁰`: seizing **one chosen point** costs `993 + 2²⁰ ≈ 1.05·10⁶`, where the
 //!   multiplicative reading claims `993 · 2²⁰ ≈ 1.04·10⁹` — an overstatement of
 //!   **992×**, i.e. by a factor of `N` exactly. Capturing a **whole line**
-//!   (`E[T] ≈ 4030` trials, 32 seats) costs `4030 + 32·2²⁰ ≈ 3.4·10⁷` against a
+//!   (`E\[T\] ≈ 4030` trials, 32 seats) costs `4030 + 32·2²⁰ ≈ 3.4·10⁷` against a
 //!   claimed `4.2·10⁹` — **126×**.
 //!
 //!   The security reading below is unaffected in *shape* — the cost is still
@@ -64,7 +64,7 @@
 //! number of trials `T` to the first hit is geometric:
 //!
 //! ```text
-//!     E[T]   = 1/ρ = N = q² + q + 1
+//!     E\[T\]   = 1/ρ = N = q² + q + 1
 //!     Var[T] = (1−ρ)/ρ² ≈ N²          P(T > k) = (1 − 1/N)^k ≈ e^{−k/N}.
 //! ```
 //!
@@ -72,7 +72,7 @@
 //! and only *linearly* in the cell size, not cryptographically: the
 //! self-certifying address bounds targeting resistance by `N`, nothing more.
 //! (`q=2`: `N=7`; `q=7`: `N=57`; `q=31`: `N=993`; `q=127`: `N=16257`.) The
-//! one-point test below measures `E[T]` for `q=7` and matches `N`.
+//! one-point test below measures `E\[T\]` for `q=7` and matches `N`.
 //!
 //! ## (b) Capturing a threshold — the coupon-collector law
 //!
@@ -267,7 +267,7 @@ fn mapping_is_uniform_over_prime_and_binary_cells() {
     assert_uniform(&binary, "GF(16)");
 }
 
-/// (a) One chosen coordinate is geometric with `ρ = 1/N`, so `E[T] = N`.
+/// (a) One chosen coordinate is geometric with `ρ = 1/N`, so `E\[T\] = N`.
 #[test]
 fn seizing_one_chosen_point_costs_n_hashes() {
     let n = Plane::<F7>::N; // 57

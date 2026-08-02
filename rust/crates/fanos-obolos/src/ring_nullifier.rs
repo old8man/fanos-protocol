@@ -33,7 +33,7 @@
 //! against the membership path's **already-committed direction bits** — one [`crate::ring_linear`] relation over
 //! commitments both halves share, so the slot the nullifier binds is exactly the slot the path proved.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of two hash steps + node-shortness; inherits their
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of two hash steps + node-shortness; inherits their
 //! > status. Real nodes are `LOG_BASE`-bit short (so `bits = LOG_BASE`); the proof test uses small artificial nodes
 //! > at `bits = 4` where it can — note that the intermediate `slot` is a *hash output*, so its bound is always the
 //! > gadget base `LOG_BASE`, whatever the caller's `bits`. Verifies a correct nullifier proves, a wrong one is

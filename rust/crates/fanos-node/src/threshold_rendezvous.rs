@@ -1,29 +1,29 @@
 //! `ThresholdRendezvous` — a **genuinely threshold-hosted rendezvous service** (spec §12.3–§12.6, the
 //! #99 follow-up wiring flagged in `fanos_calypso::hosting`).
 //!
-//! The single-host [`RendezvousService`](fanos_rendezvous::RendezvousService) has two seizure/deanonymization
+//! The single-host [`RendezvousService`] has two seizure/deanonymization
 //! weaknesses: whichever host runs it **reads every client request alone** (its cookie, reply circuit, and
 //! payload), and **alone holds the service identity** it was booted with. This composite removes both by
 //! hosting the service across the members of a **service-line**, composing the two engines that already
 //! exist rather than duplicating either:
 //!
 //! * **Request confidentiality (part b)** — the client seals its whole [`Request`] inside a
-//!   [`SealedIntro`](fanos_calypso::hosting::SealedIntro) to the line, and the per-member gather engine
+//!   [`SealedIntro`] to the line, and the per-member gather engine
 //!   [`ThresholdService`] threshold-decrypts it: a designated combiner collects `≥ threshold` members'
 //!   PartialDecs before the request surfaces, so **no single member ever reads a request alone** (0-knowledge
 //!   below threshold, the same guarantee NYX §5.2 gives onion hops). This adds a payload-confidentiality layer
 //!   *inside* the threshold onion transport, which only protected routing — so the delivering combiner can no
 //!   longer read what it delivers.
 //! * **Identity custody (part a)** — the service's identity secret is dealt as one
-//!   [`SealedShare`](fanos_calypso::hosting::SealedShare) per member ([`open_identity_share`] opens this
+//!   [`SealedShare`] per member (`open_identity_share` opens this
 //!   member's slot with its own KEM secret), reconstructed on demand from `≥ threshold` opened shares
-//!   ([`reconstruct_identity`]) only when the service must authenticate — e.g. re-signing an epoch cert
+//!   (`reconstruct_identity`) only when the service must authenticate — e.g. re-signing an epoch cert
 //!   (spec §12.6). So **no single host holds the service identity in the clear**; seizing `< threshold`
 //!   members can neither read requests nor impersonate the service.
 //!
 //! Once a request is threshold-decrypted, its reply travels back over the client's own reply circuit exactly
 //! as the single-host service already does — the combiner that decrypted it holds the route binding and
-//! [`seal_reply`](Self::seal_reply)s the response through it. Reply sealing is deliberately single-member
+//! ``seal_reply``s the response through it. Reply sealing is deliberately single-member
 //! (only the decrypting combiner learned the route), matching the existing NYX reply path; the threshold
 //! guarantee is on *reading the request*, not on emitting the reply onion.
 //!

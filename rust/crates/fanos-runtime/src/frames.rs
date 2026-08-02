@@ -123,7 +123,7 @@ pub(crate) fn parse_digest(slice: Option<&[u8]>) -> Option<[u8; DIGEST]> {
 
 /// The bytes a node's hybrid signing key signs to bind its **transport coordinate** to its identity's
 /// **overlay address**: `coord(12) ‖ hier ‖ id` (spec §80). A deployment signs this once and installs
-/// the signature via [`OverlayNode::with_signed_descriptor`]; a receiver reconstructs it from the parsed
+/// the signature via [`OverlayNode::with_signed_descriptor`](crate::OverlayNode::with_signed_descriptor); a receiver reconstructs it from the parsed
 /// announce and checks the signature — so an attacker cannot re-announce another identity's address at
 /// its own coordinate (it would have to forge that identity's signature over a *different* `coord`).
 #[must_use]
@@ -221,7 +221,7 @@ pub(crate) fn parse_announce<F: Field>(body: &[u8]) -> Option<ParsedAnnounce<F>>
 }
 
 /// The domain-separated Sybil-admission challenge for a joiner at `coord` in `epoch` (spec §L3):
-/// what an [`AdmissionPolicy`] proof is checked against ([`OverlayNode::with_admission_policy`]).
+/// what an [`AdmissionPolicy`](fanos_core::AdmissionPolicy) proof is checked against ([`OverlayNode::with_admission_policy`](crate::OverlayNode::with_admission_policy)).
 /// Binding the coordinate and epoch means a proof cannot be replayed at a different address or
 /// reused past an epoch roll. A live per-epoch beacon *seed* is not yet wired into
 /// `OverlayNode` (§L3.2 / A7 Level B is tracked separately, not by this task); once it is,

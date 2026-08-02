@@ -9,7 +9,7 @@
 //!   and numbers, never touch the OS, and are unit-tested with fixtures on every platform. Only a
 //!   thin I/O shim is platform-gated, so the load-bearing logic is always compiled and covered
 //!   (important here: CI runs on macOS + wasm, where the Linux I/O path is never built).
-//! * **Linux: direct `/proc`, cached handles, reused buffer.** [`linux::ProcProbe`] holds its `/proc`
+//! * **Linux: direct `/proc`, cached handles, reused buffer.** `linux::ProcProbe` holds its `/proc`
 //!   files open and re-reads them into one reused buffer each sample — the maximally efficient path
 //!   on the dominant server platform: no process spawning, no per-sample file opens, no allocation.
 //!   It is `#![forbid(unsafe_code)]`-clean (pure file I/O).
@@ -253,7 +253,7 @@ fn is_virtual_or_partition(name: &str) -> bool {
 }
 
 /// The best system probe for the platform this was compiled for: the optimized `/proc` [`linux::
-/// ProcProbe`] on Linux; the cross-platform [`portable::SysinfoProbe`] elsewhere when the `sysinfo`
+/// ProcProbe`] on Linux; the cross-platform `portable::SysinfoProbe` elsewhere when the `sysinfo`
 /// feature is on; otherwise a [`NullProbe`]. Boxed so callers stay platform-agnostic.
 #[cfg(feature = "std")]
 #[must_use]

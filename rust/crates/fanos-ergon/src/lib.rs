@@ -35,7 +35,7 @@
 //! ## Why there is no gas
 //!
 //! Gas is not a cost model — it is a bound on a computation whose termination could not be proven. ERGON terms are finite
-//! trees whose depth is bounded (see [`D_MAX`]), so [`Term::cost`] is a pure function of the term, computable without
+//! trees whose depth is bounded (see [`D_MAX`]), so `Term::cost` is a pure function of the term, computable without
 //! executing it. A transaction is therefore priced *at admission* and can never exhaust a budget mid-flight: there is no
 //! out-of-gas state, no refund rule, and no revert semantics to get wrong.
 //!
@@ -473,7 +473,7 @@ pub struct Claim {
     pub footprint: Footprint,
     /// The proof's size in bytes, which is what a verifier's cost is a function of.
     ///
-    /// Carried in the claim rather than measured from the proof so that [`Term::cost`] stays a pure function of the term,
+    /// Carried in the claim rather than measured from the proof so that `Term::cost` stays a pure function of the term,
     /// and so admission can cap it *before* touching the proof. Bounding the claim rather than the proof is the right
     /// place for the bound: a verification cost superlinear in a prover-chosen field is otherwise a griefing vector.
     pub proof_bytes: u32,
@@ -551,7 +551,7 @@ impl Term {
         }
     }
 
-    /// The number of nodes in the term — its size, and the linear factor in [`Self::cost`].
+    /// The number of nodes in the term — its size, and the linear factor in `Self::cost`.
     #[must_use]
     pub fn size(&self) -> usize {
         match self {

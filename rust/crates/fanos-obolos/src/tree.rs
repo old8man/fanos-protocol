@@ -51,7 +51,7 @@ fn empty_roots() -> [[u8; 32]; TREE_DEPTH + 1] {
 
 /// An **authentication path**: the `TREE_DEPTH` sibling hashes from a leaf up to the root, plus the leaf's
 /// index (whose bits say, at each level, whether the current node is the left or right child). A membership
-/// proof over the shielded pool carries (a commitment to) this path; [`verify`](Self::verify) recomputes the
+/// proof over the shielded pool carries (a commitment to) this path; `verify`(Self::verify) recomputes the
 /// root from a leaf and checks it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AuthPath {
@@ -157,7 +157,7 @@ impl CommitmentTree {
     }
 
     /// The authentication path for the leaf at `index`, or `None` if no note occupies that position yet. The
-    /// returned path [`verify`](AuthPath::verify)s against [`root`](Self::root) for exactly the appended leaf.
+    /// returned path `verify`(AuthPath::verify)s against [`root`](Self::root) for exactly the appended leaf.
     #[must_use]
     pub fn path(&self, index: u64) -> Option<AuthPath> {
         if index >= self.size() {

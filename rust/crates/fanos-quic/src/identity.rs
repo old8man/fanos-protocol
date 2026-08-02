@@ -127,7 +127,7 @@ pub(crate) fn verifiable_coordinate_ranked<F: Field>(
 }
 
 /// The coordinate-VRF public key embedded in a certificate, or `None` if the certificate is unparsable or
-/// carries no [`FANOS_VRF_OID`] extension. Read from a peer's *authenticated* certificate to check its
+/// carries no `FANOS_VRF_OID` extension. Read from a peer's *authenticated* certificate to check its
 /// coordinate proof.
 #[must_use]
 pub fn vrf_public_from_cert(cert_der: &[u8]) -> Option<VrfPublic> {
@@ -174,7 +174,7 @@ pub fn coordinate_at_level<F: Field>(cert_der: &[u8], level: usize) -> Point<F> 
 /// Resolve a node's **hierarchical address** by sub-cell descent (§L0/§L1): the shortest self-certifying
 /// path whose full address `occupied` reports free. A node that does not collide gets a depth-1 address
 /// equal to its ordinary coordinate; one that collides descends into a sub-cell it derives from its own
-/// certificate. `None` only under an astronomically improbable run of collisions ([`MAX_DEPTH`]).
+/// certificate. `None` only under an astronomically improbable run of collisions (`MAX_DEPTH`).
 #[must_use]
 pub fn hierarchical_coordinate<F: Field>(
     cert_der: &[u8],

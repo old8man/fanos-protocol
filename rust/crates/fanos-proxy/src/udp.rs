@@ -11,7 +11,7 @@
 //! +----+------+------+----------+----------+----------+
 //! ```
 //!
-//! The proxy strips the header, opens (or reuses) a [`UdpTunnel`] to that destination through the
+//! The proxy strips the header, opens (or reuses) a `UdpTunnel` to that destination through the
 //! [`UdpDialer`], and forwards the payload; each reply is wrapped in the same header form (naming the
 //! source) and sent back to the client's address. One association multiplexes many destinations — a tunnel
 //! per distinct `DST` — and lives exactly as long as the control connection: when it closes, every tunnel

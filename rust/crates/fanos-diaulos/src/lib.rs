@@ -14,12 +14,12 @@
 //! * [`frame`] — what a cell carries: `DATA` (a reliability [`Segment`](fanos_stream::Segment)),
 //!   `ACK` (a selective [`Ack`](fanos_stream::Ack) + receive credit), or `PADDING` (cover).
 //!   The real content length is inside the encrypted frame, so the constant cell hides it end-to-end.
-//! * [`endpoint`] — [`StreamEndpoint`](endpoint::StreamEndpoint): a bidirectional reliable stream over
+//! * [`endpoint`] — [`StreamEndpoint`]: a bidirectional reliable stream over
 //!   cells, driving the shipped selective-repeat + SACK core of `fanos_stream` end-to-end.
-//! * [`conn`] — [`Connection`](conn::Connection): many such streams multiplexed over one cell channel,
+//! * [`conn`] — [`Connection`]: many such streams multiplexed over one cell channel,
 //!   each with independent reliability (no cross-stream head-of-line blocking), stream ids by role.
-//! * [`handshake`] — the 1-RTT hybrid KEM key exchange ([`ClientHandshake`](handshake::ClientHandshake)
-//!   / [`ServerHandshake`](handshake::ServerHandshake)) that establishes a [`Connection`]'s two
+//! * [`handshake`] — the 1-RTT hybrid KEM key exchange ([`ClientHandshake`]
+//!   / [`ServerHandshake`]) that establishes a [`Connection`]'s two
 //!   direction keys: forward-secret, service-authenticated, client-anonymous.
 //!
 //! The threshold rendezvous-meeting reply path (carrying the `ClientHello` to a hidden service) and

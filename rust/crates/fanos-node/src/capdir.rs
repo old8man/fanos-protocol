@@ -4,7 +4,7 @@
 //! For the cell to assign roles deterministically, every node must run its `RoleController` over the *same*
 //! authenticated capability set. Each node publishes its signed [`CapabilityDescriptor`] for the current epoch
 //! at a coordinate-and-epoch-derived store slot ([`publish_capability`]); every node reads the whole cell's
-//! roster ([`build_capability_directory`]) into the `(NodeId, Capability)` list the assignment consumes — no
+//! roster (`build_capability_directory`) into the `(NodeId, Capability)` list the assignment consumes — no
 //! central registry, no hand-built map. This is the exact pattern the mix directory ([`crate::mixdir`]) uses
 //! for onion keys, applied to capabilities.
 //!
@@ -179,7 +179,7 @@ async fn read_capability<F: Field>(
 }
 
 /// Keep a node's capability advertisement **live**: spawn the task that (re)publishes its signed descriptor at
-/// each epoch, so [`build_capability_directory`] always reads a current, authenticated advertisement. It
+/// each epoch, so `build_capability_directory` always reads a current, authenticated advertisement. It
 /// publishes the genesis-epoch advertisement at once, then follows the node's [`Notification::BeaconReady`]
 /// stream, republishing the descriptor (re-signed for the new epoch) on every real advance. Mirrors
 /// [`crate::mixdir::spawn_mix_publisher`]. The task ends when the notification stream closes; must run inside a

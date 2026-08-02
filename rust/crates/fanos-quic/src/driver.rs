@@ -193,7 +193,7 @@ struct SelfCert {
     prove: CoordinateProver,
 }
 
-/// See [`SelfCert::prove`]: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
+/// See `SelfCert::prove`: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
 pub type CoordinateProver = Arc<dyn Fn(Epoch, &BeaconSeed) -> (Vec<u8>, VrfPublic, VrfProof) + Send + Sync>;
 
 /// The identity mode. `None` ⇒ HELLO + directory-trust (unauthenticated coordinate); `Some(_)` ⇒
@@ -405,7 +405,7 @@ impl NodeHandle {
     }
 
     /// This node's **public (reflexive) address** as learned from peers — the address remote peers
-    /// observe this node's connections arriving from, once at least [`REFLEXIVE_QUORUM`] of them agree
+    /// observe this node's connections arriving from, once at least `REFLEXIVE_QUORUM` of them agree
     /// (NAT traversal #119). `None` until enough peers have reported. Unlike [`local_addr`](Self::local_addr)
     /// (the possibly-private/wildcard bind), this is what the node should advertise to be reachable.
     #[must_use]

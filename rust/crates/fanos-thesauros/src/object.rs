@@ -1,7 +1,7 @@
 //! **Edge encryption** — sealing an object into stored, content-addressed ciphertext (`docs/design-storage.md`
 //! §4, §8). Content is sealed *at the edge*, before it enters the store, so a provider only ever holds opaque
 //! bytes: the E/privacy budget. Each plaintext chunk is AEAD-sealed under the object's fresh key with a
-//! per-chunk nonce, the **ciphertext** is what gets addressed (its [`Cid`] is the Merkle root a provider is
+//! per-chunk nonce, the **ciphertext** is what gets addressed (its `Cid` is the Merkle root a provider is
 //! audited against), and the [`Manifest`] lists the sealed chunks. Retrieval fetches each sealed chunk by CID,
 //! checks it against that CID (integrity), and opens it — so tampering or a wrong key is caught.
 //!

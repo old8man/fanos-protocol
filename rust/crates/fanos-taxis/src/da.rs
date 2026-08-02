@@ -253,7 +253,7 @@ impl Sampler {
     /// whole block (`ConsensusMsg::Body`), and a lagging validator can jump the height entirely by adopting a certified
     /// snapshot. Without this the pending entry outlives its purpose, and `pending` is capped — so entries nobody is
     /// waiting for compete for the space with the one block a validator actually is stuck on, which is exactly the
-    /// eviction that [`pin`](Self::pin) exists to prevent.
+    /// eviction that ``pin`` exists to prevent.
     pub fn forget(&mut self, block: &[u8; 32]) {
         self.pending.remove(block);
         self.relevant.retain(|h| h != block);
@@ -265,7 +265,7 @@ impl Sampler {
     /// a validator accumulates the sampling it abandoned on the way: measured as a validator at height 4 still holding a
     /// block from an earlier height, missing five of seven shards, which no future request would ever complete. `pending`
     /// is capped, and eviction is by insertion order — so abandoned entries compete for the space with the one block a
-    /// validator is actually stuck on, the very eviction [`pin`](Self::pin) exists to prevent.
+    /// validator is actually stuck on, the very eviction ``pin`` exists to prevent.
     pub fn prune_below(&mut self, height: u64) {
         let stale: Vec<[u8; 32]> = self
             .pending

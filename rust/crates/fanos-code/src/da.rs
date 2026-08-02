@@ -19,7 +19,7 @@
 //!   ([`false_available_bound`]) — one sample already gives `6/7` detection.
 //! * **`2` *distinct* samples ⇒ certainty:** with `≤ 1` external line you cannot draw two distinct all-present
 //!   lines, so any unavailable value fails a 2-distinct-line sample **deterministically**
-//!   ([`distinct_sampling_is_sound`] proves it over every unavailable mask).
+//!   (`distinct_sampling_is_sound` proves it over every unavailable mask).
 //!
 //! Sampling unpredictably (seed the line choice, [`sample_lines`]) denies an adversary the chance to
 //! pre-position that single external line, so the guarantee holds against a withholding adversary.
@@ -56,7 +56,7 @@ pub fn samples_pass(present: u8, sampled: &[usize]) -> bool {
 /// The soundness bound: the maximum probability that `k` **independent uniform** line-samples all pass when
 /// the value is actually unavailable — `(1/7)^k`, since an unavailable value has `≤ 1` of the `7` lines
 /// external (the theorem). `k = 0` is the vacuous `1.0`. Distinct sampling is strictly stronger (see
-/// [`distinct_sampling_is_sound`]); this bound covers the with-replacement case.
+/// `distinct_sampling_is_sound`); this bound covers the with-replacement case.
 #[must_use]
 pub fn false_available_bound(k: u32) -> f64 {
     // `(1/7)^k` by repeated multiplication — `f64::powi` is unavailable in `no_std`.

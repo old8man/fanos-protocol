@@ -46,7 +46,7 @@
 //! are `coupling(0↔1)`, `coupling(1↔2)`, and the tower's own parity attestation. So `3·7 + 2 = 23` natural units sit inside
 //! the same 24-coordinate word the horizontal federation uses, and **one decoder serves both readings**.
 //!
-//! ## Perfection has a cost, and FANOS pays the other way [D]
+//! ## Perfection has a cost, and FANOS pays the other way `D`
 //!
 //! The 24th coordinate is retained deliberately, and the reason is worth stating because it cuts against the elegance.
 //! Perfection means the radius-3 balls *tile* the cube: every raw profile has exactly one diagnosis, no profile is

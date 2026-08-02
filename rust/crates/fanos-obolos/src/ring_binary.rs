@@ -13,10 +13,10 @@
 //!
 //! `f ∘ (x−f) = x²·(p∘(1−p)) + x·(a∘(1−2p)) − a∘a`; the check forces the `x²` term `p∘(1−p) = 0`, i.e. `p` binary.
 //! A non-binary `p` survives only if `x` hits a root of a degree-2 identity (`≤ 2/2^{CHALLENGE_BITS}` per round →
-//! `≈2⁻¹²⁸` over [`SCALAR_ROUNDS`](crate::ring_range_agg::SCALAR_ROUNDS) rounds). Shares the challenge width, masking
+//! `≈2⁻¹²⁸` over `SCALAR_ROUNDS` rounds). Shares the challenge width, masking
 //! bound, and `scalar_mul` with [`crate::ring_range_agg`].
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Tests verify a binary polynomial proves, a non-binary one is
+//! > **STATUS — \[P\]/\[H\], correctness-first.** Tests verify a binary polynomial proves, a non-binary one is
 //! > rejected, commitment binding, and re-randomisation.
 
 use alloc::vec::Vec;

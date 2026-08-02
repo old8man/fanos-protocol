@@ -40,7 +40,7 @@ pub enum FrameType {
     Pong = 0x03,
     Error = 0x05,
     /// A peer reports the source address it **observes** this node's connection arriving from — the
-    /// reflexive/public address for NAT traversal (#119). Body: the observed [`SocketAddr`] encoded as
+    /// reflexive/public address for NAT traversal (#119). Body: the observed `SocketAddr` encoded as
     /// `family(1B: 4|6) ‖ ip(4|16) ‖ port(2B BE)`. A node aggregates these across peers
     /// (`fanos_quic::ReflexiveAddr`) to learn the address it should advertise / be reached at.
     ObservedAddr = 0x06,
@@ -140,7 +140,7 @@ pub enum FrameType {
     /// reports for the 3 channels it mediates (`fanos_diakrisis::polar::polar_class`), flooded on
     /// the heartbeat like [`DiagGossip`](Self::DiagGossip). Feeds the 14 free polar sum-rule
     /// alarms (§6.2) live — an equivocating mediator's own report disagrees with itself and is
-    /// localized by [`fanos_diakrisis::polar::violated_classes`].
+    /// localized by `fanos_diakrisis::polar::violated_classes`.
     DiagAttest = 0x63,
     /// A node's measured **per-neighbour loss vector** (spec §6.3 grey detection, #106): the fraction of its
     /// pings to each Fano point that went unanswered, one `u8` per point (`loss × 255`), flooded on the
@@ -152,7 +152,7 @@ pub enum FrameType {
     /// `Φ`-budget hands its irrecoverable residue up. Body: `child_index(1) ‖ residue(1) ‖ ttl(1)` — the
     /// child cell's point in the parent, its unrecoverable node-mask (a stopping set, or `0` on a coherence
     /// collapse), and a hop budget that bounds the recursion. A parent-cell member folds it into its
-    /// [`ParentCell`](fanos_core) reflex — the same reflexive Fano decoder one tier up — and coarse-reroutes
+    /// ``ParentCell`` reflex — the same reflexive Fano decoder one tier up — and coarse-reroutes
     /// around the failed child, or re-escalates the aggregate to the grandparent until absorbed or terminal.
     CellEscalate = 0x65,
     // 0x7* Application overlays (Kernel/Protocol split, design-platform.md §Kernel): a system Protocol

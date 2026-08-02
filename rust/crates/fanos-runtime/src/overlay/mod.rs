@@ -456,7 +456,7 @@ impl<F: Field> OverlayNode<F> {
     ///
     /// The composite that owns the mix router, the rendezvous gatherer and the service line calls this; the
     /// overlay stores the latest reading and folds it into the load report the role controller reads. Latest
-    /// wins, and a role never reported stays absent — see [`load_sensors`](Self::load_sensors).
+    /// wins, and a role never reported stays absent — see ``load_sensors``.
     ///
     /// This is the seam that keeps the layering right: the engine that *can* see a role's work reports it, and
     /// the engine that assembles the report needs to know about none of them.
@@ -753,7 +753,7 @@ impl<F: Field> OverlayNode<F> {
     /// Enable **PoW Sybil admission** at `difficulty` in one call (spec §L3): install a [`PowAdmission`]
     /// policy to verify *others*, `require` admission of peers, solve this node's OWN genesis proof for
     /// `(coordinate, epoch 0)`, and remember the difficulty so the proof is **re-solved on every reshuffle**
-    /// ([`on_reseat`](Self::on_reseat)) — keeping it valid for a peer's per-epoch check as the coordinate
+    /// (``on_reseat``) — keeping it valid for a peer's per-epoch check as the coordinate
     /// rotates, which is the "re-paid every epoch" cost that makes a grinded seat un-maintainable. This is
     /// the complete "join under a per-admission cost" setup; a deployment picks `difficulty` to price a join
     /// at ~`2^difficulty` hashes. Prefer this to wiring [`with_admission_policy`](Self::with_admission_policy)

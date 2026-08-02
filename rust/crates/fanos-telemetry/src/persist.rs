@@ -1,4 +1,4 @@
-//! Durable local history — atomically snapshot the [`MetricStore`](crate::history::MetricStore) to
+//! Durable local history — atomically snapshot the [`MetricStore`] to
 //! disk so a node's telemetry survives a restart. The snapshot format is the versioned, self-
 //! describing one from [`MetricStore::snapshot`](crate::history::MetricStore::snapshot); this module
 //! is just the (std-only) file plumbing, kept minimal and crash-safe.

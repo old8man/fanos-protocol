@@ -162,7 +162,7 @@ pub struct Block {
 impl Block {
     /// Assemble a block from an ordered `sealed_txs` list: derives `tx_root` and `da_commit` from the
     /// payload and links `parent`. The proposer builds this; a validator re-derives the two commitments to
-    /// check the header ([`verify_structure`](Self::verify_structure)). No sortition witness is attached —
+    /// check the header ([`Block::verify_structure`](Self::verify_structure)). No sortition witness is attached —
     /// this is the public-leader form; the secret-leader proposer chains [`with_witness`](Self::with_witness).
     #[must_use]
     pub fn assemble(
@@ -218,7 +218,7 @@ impl Block {
     /// the skeleton (small) and disperses the erasure shards separately; a validator samples shards from peers,
     /// reconstructs the payload, and rebuilds the identical block with [`with_sealed_txs`](Self::with_sealed_txs).
     /// The header still commits to the real payload via `tx_root`/`da_commit`, so the skeleton cannot misrepresent
-    /// it — a rebuilt block whose reconstructed payload disagrees with the header fails [`verify_structure`].
+    /// it — a rebuilt block whose reconstructed payload disagrees with the header fails [`Block::verify_structure`].
     #[must_use]
     pub fn skeleton(&self) -> Self {
         Self {
@@ -260,7 +260,7 @@ impl Block {
     }
 
     /// Decode a block from [`to_bytes`](Self::to_bytes), or `None` if malformed. The receiver still calls
-    /// [`verify_structure`](Self::verify_structure) — decoding trusts the bytes, verification checks them —
+    /// [`Block::verify_structure`](Self::verify_structure) — decoding trusts the bytes, verification checks them —
     /// and re-verifies any [`witness`](Self::witness) against the proposer's registered root.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
@@ -326,7 +326,7 @@ impl Block {
     }
 
     /// Whether this block's payload fits [`payload_budget`](Self::payload_budget) — the check
-    /// [`verify_structure`](Self::verify_structure) folds in, so an oversized block is **rejected on
+    /// [`Block::verify_structure`](Self::verify_structure) folds in, so an oversized block is **rejected on
     /// arrival** rather than accepted and then silently dropped by the transport.
     #[must_use]
     pub fn fits_frame(&self) -> bool {
@@ -357,7 +357,7 @@ impl Block {
     /// A proposer cannot record one finalizer set in the header and ship a different one. Its *validity* as a quorum
     /// certificate is checked by consensus, not here.
     ///
-    /// Split out of [`verify_structure`] because it is the one structural check a **skeleton** can still answer: the
+    /// Split out of [`Block::verify_structure`] because it is the one structural check a **skeleton** can still answer: the
     /// other two commit to a payload the skeleton does not carry, while `last_commit` rides along with it
     /// (`Block::skeleton`). The SSLE round-0 lottery ranks skeletons, so it needs exactly this much.
     #[must_use]

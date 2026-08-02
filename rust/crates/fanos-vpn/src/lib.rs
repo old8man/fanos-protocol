@@ -15,8 +15,8 @@
 //!   bridge, testable with an in-memory device (the stack-free option for embedders).
 //!
 //! With the **`device`** feature (a runnable `fanos vpn`):
-//! * [`device`] — the real OS TUN adapter over the `tun` crate.
-//! * [`fulltunnel`] — [`run_fulltunnel`], the complete **TCP + UDP** full-tunnel: a userspace TCP/IP stack
+//! * `device` — the real OS TUN adapter over the `tun` crate.
+//! * `fulltunnel` — `run_fulltunnel`, the complete **TCP + UDP** full-tunnel: a userspace TCP/IP stack
 //!   (`ipstack`) terminates each flow and bridges it to an exit via the shared `Dialer`/`UdpDialer` seams.
 
 #![forbid(unsafe_code)]

@@ -3,7 +3,7 @@
 //! The base overlay moves datagrams by coordinate (`Command::Send` / `Notification::Delivered`); this
 //! module rides a reliable, encrypted, hybrid-PQ [DIAULOS](fanos_diaulos) session on top, exposing it
 //! as an async byte stream. [`NodeTransport`] adapts a node [`Client`] to the
-//! [`OverlayTransport`](fanos_session::OverlayTransport) the async stream driver expects;
+//! [`OverlayTransport`] the async stream driver expects;
 //! [`dial_service`] / [`FanosDialer`] are the client side (what a SOCKS5 proxy calls); [`serve`] is
 //! the multi-client service accept loop. This is the **Direct** profile — the anonymous rendezvous is
 //! a different transport under the identical stream.
@@ -348,7 +348,7 @@ impl ServiceResolver for StaticResolver {
 /// secrecy holds per connection.
 ///
 /// A **clearnet** target (any non-`.fanos` name or IP) is reached through a configured **exit** node
-/// ([`with_exit`](Self::with_exit)): the dialer opens an exit session ([`dial_exit`]) and hands it the
+/// ([`with_exit`](Self::with_exit)): the dialer opens an exit session (`dial_exit`) and hands it the
 /// `host:port`, so the destination sees the exit rather than the client. Without an exit configured, a
 /// clearnet target is `Unsupported` (a `.fanos`-only proxy).
 pub struct FanosDialer<R: ServiceResolver> {
@@ -403,7 +403,7 @@ impl<R: ServiceResolver> FanosDialer<R> {
     }
 
     /// Route **clearnet** targets (non-`.fanos` names and IPs) through the exit node at `coord` with static
-    /// key `public` — the dialer opens a [`dial_exit`] session and hands it the destination. Without this,
+    /// key `public` — the dialer opens a `dial_exit` session and hands it the destination. Without this,
     /// clearnet targets are `Unsupported`.
     #[must_use]
     pub fn with_exit(mut self, coord: Coord, identity: Vec<u8>) -> Self {
@@ -556,7 +556,7 @@ const UDP_TUNNEL_BUFFER: usize = 64;
 impl<R: ServiceResolver> UdpDialer for FanosDialer<R> {
     /// Open a UDP tunnel to a **clearnet** `target` through the configured exit — the datagram counterpart
     /// of [`dial`](Self::dial). The exit session is established through the **anonymity profile** (via
-    /// [`establish`](Self::establish), same as the TCP path — audit S1-C1), then handed a `udp:host:port`
+    /// ``establish``, same as the TCP path — audit S1-C1), then handed a `udp:host:port`
     /// target; datagrams ride it as length framing on the DIAULOS stream, pumped both ways into the
     /// [`UdpTunnel`]'s channels. A `.fanos` target is [`Unsupported`](DialError::Unsupported) (services are
     /// byte streams, not datagram endpoints); without an exit, so is any clearnet UDP target.

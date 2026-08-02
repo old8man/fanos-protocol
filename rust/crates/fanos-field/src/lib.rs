@@ -46,7 +46,7 @@ pub enum FieldKind {
 
 /// The number of bytes needed to represent one `GF(q)` element: the smallest `w` with `256^w ≥ q`
 /// (equivalently, the byte width of the largest element `q − 1`). This is the one canonical width used
-/// by both the wire codec ([`fanos_wire`]) to serialize a coordinate and the `MapToPoint` sampler to
+/// by both the wire codec (`fanos_wire`) to serialize a coordinate and the `MapToPoint` sampler to
 /// draw one — a single definition, so the two can never disagree on how wide a field element is.
 #[must_use]
 pub const fn element_width(q: u32) -> usize {

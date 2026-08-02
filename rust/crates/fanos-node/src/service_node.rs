@@ -31,7 +31,7 @@
 //! overlay's heartbeat is `0`; the service's first gather deadline is `0`), so their spaces would collide
 //! on the shared wire clock. The service's tokens are therefore remapped into a range the inner engine
 //! provably never emits: bits 62 **and** 61 set with bit 63 clear (`SERVICE_FLAG`). That range is free of
-//! every inner token — the overlay/beacon use only small values; a wrapped [`CellNode`] uses gather ids
+//! every inner token — the overlay/beacon use only small values; a wrapped `CellNode` uses gather ids
 //! `< 2^62`, `COVER = 1<<62`, the remapped overlay heartbeat `(1<<62)|1`, and `MIX_FLAG | id` (bit 63 set)
 //! — none of which set bits 62 and 61 together with bit 63 clear. A fired token is dispatched by that tag:
 //! `(token >> 61) == 0b011` → the service (unmapped back), everything else → the inner engine.

@@ -8,7 +8,7 @@
 //! secrecy**. The AEAD tag authenticates each message, so a forged or tampered ciphertext fails to open and does
 //! not desync the chain.
 //!
-//! Delivery need not be in order: the receive chain is a [`crate::chain::RecvChain`], which opens a later message
+//! Delivery need not be in order: the receive chain is a `crate::chain::RecvChain`, which opens a later message
 //! ahead of the ones it skipped (banking their keys) and a delayed one from its banked key — bounded, so a
 //! replay or a forgery is still refused and neither advances the chain. This is the symmetric-ratchet half; the
 //! asymmetric KEM ratchet (post-compromise security) builds on it in [`crate::ratchet`].

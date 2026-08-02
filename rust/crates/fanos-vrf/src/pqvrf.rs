@@ -154,7 +154,7 @@ impl MerkleVrfSecret {
     }
 
     /// Prove the VRF at `index` (an epoch): returns `(output, proof)`, or `None` if `index` is outside the
-    /// domain. The output is deterministic in `(seed, index)`; the proof authenticates it against [`root`].
+    /// domain. The output is deterministic in `(seed, index)`; the proof authenticates it against `root`.
     #[must_use]
     pub fn prove(&self, index: u64) -> Option<(VrfOutput, MerkleProof)> {
         if index >= self.domain() {

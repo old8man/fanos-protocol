@@ -13,7 +13,7 @@
 //!   homomorphic **integer** sum the balance law needs never wraps.
 //! - **`D = 256`** (Kyber/Dilithium dimension) — the security/size sweet spot for a module lattice.
 //!
-//! > **STATUS — [P]/[H], correctness-first (as [`crate::commit`]).** The field and the negacyclic NTT are the
+//! > **STATUS — \[P\]/\[H\], correctness-first (as [`crate::commit`]).** The field and the negacyclic NTT are the
 //! > standard, textbook-correct constructions; the tests below verify the ring axioms and that NTT-multiplication
 //! > equals the schoolbook negacyclic convolution. What is deliberately *not yet* done, and lands as
 //! > **verified drop-in optimisations with no behavioural change**: the fast Goldilocks reduction (here a plain

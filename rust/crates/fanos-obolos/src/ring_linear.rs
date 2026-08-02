@@ -25,10 +25,10 @@
 //! For an honest witness `Σ cᵢ·zᵢ = γ·(Σ cᵢ·mᵢ) + Σ cᵢ·aᵢ = Σ cᵢ·aᵢ`, so the aggregate check holds. A cheater
 //! with `δ = Σ cᵢ·mᵢ ≠ 0` produces `Σ cᵢ·zᵢ = γ·δ + Σ cᵢ·aᵢ`, which matches the pre-committed `A_agg` only if `γ`
 //! hits one specific monomial — probability `≤ 1/2D` per round, driven to `≈ 2⁻¹²⁸` by
-//! [`REPETITIONS`](crate::ring_product::REPETITIONS) rounds under one Fiat–Shamir seed. Zero-knowledge: uniform
+//! [`REPETITIONS`] rounds under one Fiat–Shamir seed. Zero-knowledge: uniform
 //! `aᵢ` hide `mᵢ` in `zᵢ`; the transcript is simulatable from `γ` alone (choose `zᵢ`, derive `Aᵢ`/`A_agg`).
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Construction/soundness/ZK are the spec; parameters illustrative, not
+//! > **STATUS — \[P\]/\[H\], correctness-first.** Construction/soundness/ZK are the spec; parameters illustrative, not
 //! > constant-time. Tests verify completeness, soundness (a false relation has no accepting proof), coefficient/
 //! > commitment binding, and re-randomisation.
 

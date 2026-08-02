@@ -1,6 +1,6 @@
 //! The running node: composes the sans-I/O engine behind the QUIC driver.
 //!
-//! Phase 1 runs the [`OverlayNode`] engine (membership, liveness, L4 storage, DIAKRISIS healing)
+//! Phase 1 runs the `OverlayNode` engine (membership, liveness, L4 storage, DIAKRISIS healing)
 //! behind the production QUIC transport. Relay / service / exit engines compose in later phases; the
 //! node advertises its role set via JOIN so the cell learns what it offers. The heavy lifting —
 //! endpoint, connection pool, event loop — lives in the driver; this type is the supervisor that
@@ -39,7 +39,7 @@ use crate::identity;
 use crate::resolve::{ResolvedService, verify_descriptor};
 
 /// The mixnet's per-hop cooperation threshold: how many of a hop line's `q+1` members must combine to peel one
-/// onion layer. A relay's [`ThresholdRouter`] gathers this many partials; an anonymous client's `--threshold`
+/// onion layer. A relay's `ThresholdRouter` gathers this many partials; an anonymous client's `--threshold`
 /// MUST match, since it seals each layer for exactly this many members.
 ///
 /// **Derived from the plane, not fixed.** This was `const MIX_THRESHOLD: usize = 2` — correct for a Fano line's

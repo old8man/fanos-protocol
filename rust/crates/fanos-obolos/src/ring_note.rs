@@ -37,7 +37,7 @@
 //! Composed with membership + nullifier over the same `cm`, and balance/range over the value, it is a complete
 //! shielded spend.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the hash step + node-shortness; inherits their
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of the hash step + node-shortness; inherits their
 //! > status and cost. Verified by an `#[ignore]`d test (`--ignored`) at real `bits = LOG_BASE`: a well-formed note
 //! > proves, and a `cm` not derived from the committed `(value, nsk, rho)` is rejected — plus a fast test that two
 //! > notes differing only in `rho` yield **distinct** leaves (the uniqueness property above).

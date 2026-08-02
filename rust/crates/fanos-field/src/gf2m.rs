@@ -13,7 +13,7 @@ use crate::{Field, FieldKind};
 /// branch-predictable, `const`-evaluable, and — because the inner step is data-independent
 /// on the secret operand — a sound basis for a constant-time build. On targets with a
 /// carry-less multiply instruction (`PMULL` on AArch64, `PCLMULQDQ` on x86-64) this loop is
-/// the portable fallback; an accelerated path can replace [`Gf2m::clmul`] without changing
+/// the portable fallback; an accelerated path can replace `Gf2m::clmul` without changing
 /// any caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Gf2m<const M: u32>;

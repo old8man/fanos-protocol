@@ -1,4 +1,4 @@
-//! `#[derive(Wire)]` — generate a canonical [`fanos_wire::Wire`] codec from a struct definition.
+//! `#[derive(Wire)]` — generate a canonical `fanos_wire::Wire` codec from a struct definition.
 //!
 //! For a struct with named fields it emits `wire_encode`/`wire_decode` that process each field **in
 //! declaration order**, so the byte layout is exactly the field layout and every field type's own
@@ -10,7 +10,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Index, parse_macro_input};
 
-/// Derive [`fanos_wire::Wire`] for a struct — named-field, tuple, or unit. Fields are encoded and
+/// Derive `fanos_wire::Wire` for a struct — named-field, tuple, or unit. Fields are encoded and
 /// decoded in declaration order, so the byte layout is exactly the field layout.
 #[proc_macro_derive(Wire)]
 pub fn derive_wire(input: TokenStream) -> TokenStream {

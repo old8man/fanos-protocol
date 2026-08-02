@@ -99,7 +99,7 @@ impl GroupSession {
     /// fails authentication. Out-of-order posts are handled, not dropped (audit AT-M2): a post ahead of the
     /// expected number opens and the skipped keys are banked, and a late post opens from those banked keys — so a
     /// group riding the reordering Full mixnet does not silently lose messages. Each key opens at most once
-    /// (replay-safe), and the banked store is bounded (see [`crate::chain`]).
+    /// (replay-safe), and the banked store is bounded (see `crate::chain`).
     #[must_use]
     pub fn recv(&mut self, sender_id: u32, sealed: &[u8]) -> Option<Vec<u8>> {
         // Split the trailing signature, then verify it before anything else.

@@ -33,7 +33,7 @@ mod fleet;
 mod hierarchy;
 mod metrics;
 /// Cluster-scale stress experiments (`stress::Experiment`), namespaced to avoid clashing with the
-/// param-sweep [`Experiment`](experiment::Experiment) harness.
+/// param-sweep [`Experiment`] harness.
 pub mod fabric;
 pub mod observe;
 pub mod stress;
@@ -64,7 +64,7 @@ use fanos_node::composition::{CellComposition, compose_engine};
 use fanos_geometry::Plane;
 use fanos_runtime::{Config, Triple};
 
-/// Spawn a full cell `PG(2, q)`: an [`OverlayNode`] at every point. Returns the node
+/// Spawn a full cell `PG(2, q)`: an [`OverlayNode`](fanos_runtime::OverlayNode) at every point. Returns the node
 /// coordinates indexed by point index (so `cell[i]` is the node at point `i`).
 pub fn spawn_cell<F: Field + 'static>(sim: &mut Sim, config: Config) -> Vec<Triple> {
     spawn_partial_cell::<F>(sim, config, Plane::<F>::N as usize)
@@ -72,7 +72,7 @@ pub fn spawn_cell<F: Field + 'static>(sim: &mut Sim, config: Config) -> Vec<Trip
 
 /// Spawn the first `size` points of a cell `PG(2, q)` (clamped to the plane size) — a *partial* cell,
 /// for modelling a cell that is still filling (the "1 node, 2 nodes, 3 nodes …" progression) or a
-/// fractional last cell in a [`Cluster`](crate::Cluster). The absent points read as down to the members
+/// fractional last cell in a [`Cluster`]. The absent points read as down to the members
 /// present, exactly as a real under-provisioned cell would sense them.
 pub fn spawn_partial_cell<F: Field + 'static>(sim: &mut Sim, config: Config, size: usize) -> Vec<Triple> {
     spawn_composed_cell::<F>(sim, &CellComposition::overlay_only(config), size)

@@ -8,7 +8,7 @@
 //!
 //! A cross-cell message is emitted as an execution side-effect in the *source* cell and accumulated into an
 //! [`Outbox`], whose Merkle [`root`](Outbox::root) the source state machine folds into its `state_root`
-//! ([`compose_state_root`]). The source cell's [`ExecCertificate`](crate::checkpoint::ExecCertificate) — a
+//! ([`compose_state_root`]). The source cell's [`ExecCertificate`] — a
 //! `Q`-quorum attestation of that `state_root` at a height — therefore *also* certifies the outbox. A
 //! [`CrossCellReceipt`] bundles the message, its Merkle inclusion proof, the `state_root` opening, and that
 //! certificate; [`CrossCellReceipt::verify`] checks, against only the *source* cell's committee keys, that a

@@ -31,7 +31,7 @@
 //! well-defined. A sender who fixes it wrongly only makes its own output unspendable — never anyone else's, and
 //! never any extra value.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the built, tested primitives (hash step +
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of the built, tested primitives (hash step +
 //! > value-tie + node-shortness); inherits their status and cost — the shortness proofs dominate (`bits =
 //! > LOG_BASE` in production). A fast unit test exercises the whole relation at `bits = 4`.
 

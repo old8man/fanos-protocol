@@ -18,7 +18,7 @@
 //!
 //! Faithful on the equicorrelated stratum, a first-order reduction off it (see the honesty ledger in
 //! `docs/ddos-homeostasis.md`). It is a *validation instrument*, not production control — the shipping
-//! controller is [`homeostat::Homeostat`], which this simulator drives to confirm its guarantees.
+//! controller is `homeostat::Homeostat`, which this simulator drives to confirm its guarantees.
 
 use crate::coherence::p_crit;
 use crate::stability::{stability_radius, v_preservation_gate};

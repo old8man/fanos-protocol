@@ -77,7 +77,7 @@ pub fn verify_descriptor(
 
 /// Publish a **Direct-profile** service descriptor over the overlay store: seal the service's hybrid
 /// key `bundle` and overlay `coord` (with any `extra` metadata) into the address's rotating epoch slot
-/// `L = H(addr ‖ epoch)`, gated by a `difficulty`-bit proof of work. Clients then [`resolve`] the name
+/// `L = H(addr ‖ epoch)`, gated by a `difficulty`-bit proof of work. Clients then `resolve` the name
 /// to `(coord, key)` with no directory. `bundle` must be the canonical bundle the `.fanos` address
 /// certifies (`H(bundle) == address`).
 ///

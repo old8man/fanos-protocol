@@ -2,7 +2,7 @@
 //!
 //! The 50+ single-cell scenarios in `tests/` pin named adversarial *properties* (sybil, eclipse,
 //! byzantine, …) on one cell. This module is the complementary axis: parametric perturbations of a whole
-//! [`Cluster`](crate::Cluster) — crash a fraction of it, churn it continuously, cascade one cell to
+//! [`Cluster`] — crash a fraction of it, churn it continuously, cascade one cell to
 //! collapse — run for a horizon, with the fleet's homeostatic response captured as an
 //! [`ExperimentReport`]. Deterministic: every target is chosen by index, never a clock or RNG, so a run
 //! reproduces exactly (the determinism contract, lifted to the fleet). This is the substrate behind

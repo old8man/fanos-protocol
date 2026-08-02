@@ -10,7 +10,7 @@
 //!
 //! This crate is the sans-I/O core of that plane:
 //!
-//! * [`frame`] — the [`CoherenceFrame`](frame::CoherenceFrame): the minimal sufficient statistic for
+//! * [`frame`] — the [`CoherenceFrame`]: the minimal sufficient statistic for
 //!   a cell's health at a window (3-bit syndrome + coherence scalars), with a canonical KAT-pinned
 //!   encoding. The load-bearing signal is 3 bits. The fold *minimizes* data (per-node raw signals stay
 //!   local), but is **not** anonymization — the frame still names the faulted point and the cell's exact
@@ -23,7 +23,7 @@
 //!   the sensory input whose [`pressure`](sysmetrics::SystemSample::pressure) becomes each node's
 //!   scalar in the cell correlation. Pure, tested parsers plus a cached-handle Linux `/proc` probe.
 //!
-//! * [`stations`] — the **data-path plane**: where work stops, counted by structure. The coherence
+//! * `stations` — the **data-path plane**: where work stops, counted by structure. The coherence
 //!   plane above answers *"is the organism healthy?"*; this one answers *"is the work getting done, and
 //!   where does it stop?"* — the question defect #55 could only be answered by hand-inserted probes
 //!   (`docs/design-observability.md`). Its keys are `(station, line)` and nothing else, because a

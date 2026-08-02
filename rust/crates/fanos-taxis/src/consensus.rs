@@ -138,7 +138,7 @@ pub struct ConsensusProbe {
     ///
     /// The pair, not either alone, because it is their **relationship** that is diagnostic. A mempool that grows
     /// while the deferral count sits pinned at its cap is the signature of premature transactions whose give-up
-    /// horizon is not being reached — the failure mode [`Self::deferred_since`]'s eviction rule exists to prevent
+    /// horizon is not being reached — the failure mode `Self::deferred_since`'s eviction rule exists to prevent
     /// — whereas a mempool growing with the deferral count near zero is ordinary submission load.
     pub backlog: (usize, usize),
     /// Peers' votes ingested at this height, bucketed by the round they carried **relative to ours at the moment of
@@ -436,12 +436,12 @@ pub enum ConsensusMsg {
         /// installed it (T-H6). Deleting the field is the fix — a comparison against `cert.head` would have worked too,
         /// and would have been one refactor away from being dropped again.
         cert: ExecCertificate,
-        /// The full state at `cert.height`, per [`StateMachine::snapshot`](crate::state::StateMachine::snapshot).
+        /// The full state at `cert.height`, per [`StateMachine::snapshot`].
         snapshot: Vec<u8>,
     },
     /// A peer's **commit-certificate answer** to a `SyncReq`: the quorum COMMIT certificate that finalized the
     /// requester's *current* height. Serves the case [`SyncResp`](Self::SyncResp) structurally cannot — see
-    /// [`on_commit_cert`](ConsensusEngine::on_commit_cert).
+    /// ``on_commit_cert``.
     CommitCert(Certificate),
     /// **"I hold a quorum decision I cannot apply — send me the block itself."**
     ///
@@ -1055,7 +1055,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Submit a sealed transaction into this validator's mempool (a client's `SubmitTx`). A transaction that
     /// is not sealed to this epoch's beacon-chosen keyper line (wrong epoch, wrong line, or wrong committee
     /// size) is **rejected here**, so a malformed seal can never be ordered into a block (audit fix — see
-    /// [`valid_seal`](Self::valid_seal)).
+    /// ``valid_seal``).
     /// Submit a sealed transaction to the mempool. Returns `true` iff it was **valid and newly added** — the
     /// signal a networked driver uses to gossip a received transaction exactly once (an invalid seal, or a
     /// commitment already in the mempool, returns `false`, so re-broadcasts neither bloat the pool nor loop).
@@ -1091,7 +1091,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     ///
     /// A validator locks on a block hash, or gathers a commit certificate for one, from **votes alone** — votes are small
     /// and carry only the hash, so neither requires ever having seen the block. If the body then never arrives it cannot
-    /// make progress in either direction: [`reprepare_lock`](Self::reprepare_lock) rightly abstains rather than vote to
+    /// make progress in either direction: ``reprepare_lock`` rightly abstains rather than vote to
     /// prepare something it cannot execute, and the `locked_block` gate refuses every conflicting proposal. The height is
     /// stuck on a block it can never obtain.
     ///
@@ -2494,7 +2494,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     }
 
     /// The number of not-yet-finalized transactions with buffered reveals — observability, and a witness to the
-    /// bounded-buffer DoS defence (audit B1): this never exceeds [`MAX_PENDING_REVEAL_COMMITS`].
+    /// bounded-buffer DoS defence (audit B1): this never exceeds `MAX_PENDING_REVEAL_COMMITS`.
     #[must_use]
     pub fn pending_reveal_count(&self) -> usize {
         self.pending_reveals.len()

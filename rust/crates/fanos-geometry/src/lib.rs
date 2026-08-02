@@ -2,7 +2,7 @@
 //!
 //! FANOS addresses nodes as **points** of a finite projective plane and organises them into
 //! **lines** (quorums / multicast buses). This crate provides that plane, generic over the
-//! [`Field`](fanos_field::Field), and the three load-bearing operations of the specification
+//! [`Field`], and the three load-bearing operations of the specification
 //! (§2.2):
 //!
 //! * **Rendezvous** — the line through two points is their cross product `u × v`. A single

@@ -24,10 +24,10 @@
 //! block `state_root` is 32 bytes. So the *sets* are keyed on [`HashNode::digest`] — an injective encoding under the
 //! same BLAKE3 collision assumption the BLAKE3-side ledger already makes — while every **soundness** check is
 //! stated over the full node inside the proof. That lets the nullifier set and the anchor-window policy
-//! ([`MAX_ANCHORS`], audit O-M2) be *literally the same code* as [`crate::state`]'s, rather than a second
+//! (`MAX_ANCHORS`, audit O-M2) be *literally the same code* as [`crate::state`]'s, rather than a second
 //! divergent implementation of the same rules.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Inherits the proof stack's status: the gates and the state transitions
+//! > **STATUS — \[P\]/\[H\], correctness-first.** Inherits the proof stack's status: the gates and the state transitions
 //! > are exact and tested here, and the proof they gate on is the real zero-knowledge relation — but its parameters
 //! > are not yet calibrated to a bit-security target (`docs/design-obolos-zk.md` §5). The end-to-end test that mints,
 //! > proves, and applies a real shielded transfer is `#[ignore]`d (minutes at real `bits`); the state-machine
@@ -188,7 +188,7 @@ impl RingShieldedState {
     }
 
     /// Reconstruct a shielded state from [`to_bytes`](Self::to_bytes), or `None` if malformed, truncated, over-long,
-    /// or inconsistent (a leaf count exceeding the depth's capacity, or an anchor window over [`MAX_ANCHORS`]).
+    /// or inconsistent (a leaf count exceeding the depth's capacity, or an anchor window over `MAX_ANCHORS`).
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);

@@ -19,13 +19,13 @@
 //! product — and every opening `x·r + r_mask` stays short so binding holds. Expanding, `f∘(x−f) = x²·(b∘(1−b)) +
 //! x·(a∘(1−2b)) − a∘a`; the binarity check forces the `x²` term to vanish, i.e. `b∘(1−b)=0`. A non-binary `b`
 //! leaves a nonzero `x²` coefficient, so the degree-2 identity holds at a random `x` with probability `≤
-//! 2/2^{CHALLENGE_BITS}` per round — driven to `≈2⁻¹²⁸` by [`SCALAR_ROUNDS`] rounds
+//! 2/2^{CHALLENGE_BITS}` per round — driven to `≈2⁻¹²⁸` by `SCALAR_ROUNDS` rounds
 //! under one Fiat–Shamir seed. High coefficients of `b` (index `≥ bits`) are also forced binary but carry weight
 //! `0` in `⟨·,2^vec⟩`, so they cannot affect `v`.
 //!
 //! Size: `C_b` plus `SCALAR_ROUNDS` rounds of a handful of commitments and one polynomial — independent of `bits`.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Construction/soundness/ZK are the spec; `CHALLENGE_BITS`, the
+//! > **STATUS — \[P\]/\[H\], correctness-first.** Construction/soundness/ZK are the spec; `CHALLENGE_BITS`, the
 //! > repetition count, and the masking bound are illustrative (calibration pending), not constant-time. Tests
 //! > verify completeness, boundary values, out-of-range rejection, commitment binding, and re-randomisation.
 

@@ -22,7 +22,7 @@
 //! shielded-transaction relation as the confidentiality component of `ConfidentialProof`, alongside the
 //! untraceability proofs.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of the underlying primitives; it inherits their status
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of the underlying primitives; it inherits their status
 //! > (parameters illustrative, not constant-time). Tests verify a balanced in-range transfer proves and verifies;
 //! > that inflation, an out-of-range output, or a swapped commitment has no accepting proof; and that each of the
 //! > three wraparound paths above is refused — the range-width test constructs the actual forging transaction and
@@ -103,7 +103,7 @@ pub fn prove_amounts(
 }
 
 /// Verify a [`prove_amounts`] proof against the public input and output value commitments and the fee, demanding
-/// the range width `bits` (normally [`RANGE_BITS`] — consensus pins it; see below).
+/// the range width `bits` (normally `RANGE_BITS` — consensus pins it; see below).
 ///
 /// Three bounds together are what make the balance law sound over the integers rather than only modulo `q`
 /// (audit O-C1). Each closes a distinct wraparound path, and dropping any one forges value:

@@ -13,8 +13,8 @@
 //! are quinn's own, and the node composition is whatever `fanos-node` actually spawns.
 //!
 //! **This is a wall-clock tier, deliberately.** Delays are real `tokio` sleeps, so a scenario here is *not*
-//! bit-reproducible the way the deterministic simulator ([`crate::sim`]) is — that one buys determinism by abstracting
-//! the socket, which is precisely why it cannot see composition faults. The two are complements: [`crate::sim`] for
+//! bit-reproducible the way the deterministic simulator (`crate::sim`) is — that one buys determinism by abstracting
+//! the socket, which is precisely why it cannot see composition faults. The two are complements: `crate::sim` for
 //! reproducible protocol behaviour at scale, this for faithful wiring under adverse transport. Assertions here follow
 //! the T3/T4 discipline — poll until observed with a generous deadline, never a fixed tick.
 //!
@@ -113,7 +113,7 @@ pub struct Link {
 
 impl Default for Link {
     /// A plausible wide-area link: 20 ms one-way with 10 ms jitter and no loss — the same shape
-    /// [`crate::network`] uses for the deterministic tier, so a scenario reads the same in both.
+    /// `crate::network` uses for the deterministic tier, so a scenario reads the same in both.
     fn default() -> Self {
         Self { latency: Duration::from_millis(20), jitter: Duration::from_millis(10), loss_percent: 0 }
     }
@@ -343,12 +343,12 @@ impl UdpPoller for AlwaysWritable {
 /// A fleet of **real deployed nodes** on one modelled fabric — the composed-node facility a scenario drives.
 ///
 /// Every member is a genuine [`fanos_node::Node`]: the overlay engine *plus* every driver task it composes. That is
-/// what distinguishes this from [`crate::fleet`], which models node state directly, and from [`crate::sim`], which
+/// what distinguishes this from `crate::fleet`, which models node state directly, and from `crate::sim`, which
 /// steps engines — neither can observe wiring, and wiring is where composition faults live
 /// (`docs/design-testing.md` §5.1).
 ///
 /// Nodes bootstrap exactly as a deployment does: the first member's fabric address is handed to the rest as a
-/// [`Peer`], so discovery is the real path rather than a pre-populated table.
+/// `Peer`, so discovery is the real path rather than a pre-populated table.
 pub struct NodeFleet {
     /// The carrier every member shares — partition and inspect it here.
     pub fabric: Fabric,
@@ -362,7 +362,7 @@ pub struct NodeFleet {
 /// `P = q² + q + 1` points — so this is the classic occupancy-problem expectation:
 ///
 /// ```text
-/// E[distinct] = P · (1 − (1 − 1/P)ⁿ)
+/// E\[distinct\] = P · (1 − (1 − 1/P)ⁿ)
 /// ```
 #[must_use]
 pub fn expected_distinct(points: usize, n: u32) -> f64 {
@@ -384,8 +384,8 @@ pub fn expected_distinct(points: usize, n: u32) -> f64 {
 /// | plane | points | nodes | `injective_probability` | observed distinct |
 /// |---|---|---|---|---|
 /// | PG(2,2) | 7 | 3 | 0.612 | 3, sometimes 2 |
-/// | PG(2,2) | 7 | 7 | 0.0061 | **4** (one point held by three nodes; E[distinct] = 4.62) |
-/// | PG(2,4) | 21 | 7 | 0.325 | **7**, then **6** on the next run (E[distinct] = 6.08) |
+/// | PG(2,2) | 7 | 7 | 0.0061 | **4** (one point held by three nodes; E\[distinct\] = 4.62) |
+/// | PG(2,4) | 21 | 7 | 0.325 | **7**, then **6** on the next run (E\[distinct\] = 6.08) |
 ///
 /// Several cell-wide tests here were intermittent for exactly this reason: a collision splits the roster in a way that
 /// is indistinguishable from a resolution defect, and it was diagnosed as one until the plane was enlarged with

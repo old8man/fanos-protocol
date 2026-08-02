@@ -1,7 +1,7 @@
 //! The **bot SDK contract** — the language-agnostic, transport-agnostic model per-language messaging-bot SDKs
 //! implement. A bot is a *pure* handler: it maps an [`Event`] to the [`Outgoing`] messages it wants to send,
 //! with **no I/O**. That purity is deliberate — it makes bot logic portable across languages, testable entirely
-//! off-network, and trivial to bind through the C ABI ([`fanos-ffi`]): the SDK runtime does the encryption
+//! off-network, and trivial to bind through the C ABI (`fanos-ffi`): the SDK runtime does the encryption
 //! (`crate::session`/`crate::group`), the transport (over `fanos-node`), and the decryption, and hands the bot
 //! only decrypted events, collecting its replies.
 //!

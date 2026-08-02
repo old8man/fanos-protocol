@@ -11,7 +11,7 @@
 //!   contracts to the ball `‖h‖/κ` and, once the attack abates, decays as `(1−κ)` per step. The rate
 //!   `κ ≥ κ_bootstrap = 1/7 > 0` in *every* state (T-59), so the pull toward health never vanishes.
 //! * **Survival threshold.** A cell absorbs the flood and stays viable iff the aggregate noise obeys the
-//!   canonical `‖δΓ₂‖ < κ_bootstrap/2 = 1/14` ([`stability::NOISE_SURVIVAL_THRESHOLD`]).
+//!   canonical `‖δΓ₂‖ < κ_bootstrap/2 = 1/14` (`stability::NOISE_SURVIVAL_THRESHOLD`).
 //! * **Band-keeping control law.** Act only *outside* the collective-subject band, and only in the
 //!   direction that lowers `V`: [`BandControl::Decouple`] a common-mode over-coupling, [`BandControl::Bind`]
 //!   a differential disintegration, [`BandControl::Escalate`] a collapse the cell cannot self-heal

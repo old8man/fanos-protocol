@@ -18,7 +18,7 @@
 //! the message (there is no independent outer key), so the assumption is secret-prefix-BLAKE3-PRF (equivalently
 //! a ROM argument), which is standard for BLAKE3 but stronger than a plain native-keyed-PRF assumption. The
 //! full reduction and a deterministic attack experiment covering every tamper class are in
-//! `docs/design-holonomy-security.md` and [`tests`]/[`attack_experiment`](self::attack_experiment).
+//! `docs/design-holonomy-security.md` and `tests`/`attack_experiment`.
 //!
 //! **On forward secrecy (audit correction).** The ratchet is a path *authenticator*, not a source of forward
 //! secrecy, and neither is "the per-hop KEM" on its own: every layer key, KEM ephemeral, and this holonomy key

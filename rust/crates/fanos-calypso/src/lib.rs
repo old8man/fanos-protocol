@@ -5,7 +5,7 @@
 //! CALYPSO removes them: the meeting point is *computed, not published*, and a service may be
 //! hosted by a **threshold group with no single physical location**.
 //!
-//! * [`address`] — self-certifying `.fanos` addresses (§12.1).
+//! * `address` — self-certifying `.fanos` addresses (§12.1).
 //! * [`rendezvous`] — the computed, per-epoch-rotating rendezvous line (§12.2).
 //! * [`hosting`] — threshold hosting: no single host to raid (§12.3).
 //! * [`pow`] — introduction proof-of-work for DoS resistance (§12.5).

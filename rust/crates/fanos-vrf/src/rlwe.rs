@@ -11,7 +11,7 @@
 //! > only the syntactic relation `ct2 == ReRand(ct1, r)`: with `r' = 0` and `(e1', e2') = (ct2.u − ct1.u,
 //! > ct2.v − ct1.v)` the factor is a *free additive translation* carrying any `ct1` to any `ct2`, so it
 //! > verified for arbitrary plaintext-changing outputs — a total shuffle-soundness break. The fix here rejects
-//! > **non-short** factors ([`RlweRand::is_short`]), which closes that trivial forgery. **But it does not make
+//! > **non-short** factors (`RlweRand::is_short`), which closes that trivial forgery. **But it does not make
 //! > the RLWE shuffle worst-case sound at `n = 512`:** the decryption shift includes `s·e1'` with the *secret*
 //! > `s` unknown to the verifier, and the only bound it can enforce, `‖s·e1'‖∞ ≤ n·η·B`, exceeds `q/4` for any
 //! > `B` large enough to admit honest factors. A production-sound PQ shuffle needs a splitting-ring-aware NIZK
@@ -23,10 +23,10 @@
 //! binomial noise `η = 8` (stddev `σ = √(η/2) = 2`): the canonical single-ring RLWE set of NewHope
 //! (Alkim–Ducas–Pöppelmann–Schwabe), whose `NewHope-512` instance is estimated at **≈ 101-bit post-quantum**
 //! core-SVP security (NIST level 1). `q = 12289 ≡ 1 (mod 2n)` is NTT-friendly (`R_q` splits completely). The
-//! [`noise_experiment`] tests confirm the encrypt-then-re-randomize decryption noise is `~17σ_tot` below the
+//! `noise_experiment` tests confirm the encrypt-then-re-randomize decryption noise is `~17σ_tot` below the
 //! `q/4` failure bound, so the analytic decryption-failure rate `< 2^-100` holds even after a re-randomization.
 //!
-//! It implements [`ReRandomizable`](crate::shuffle::ReRandomizable) so the *same* Sako–Kilian shuffle proof
+//! It implements `ReRandomizable`(crate::shuffle::ReRandomizable) so the *same* Sako–Kilian shuffle proof
 //! runs post-quantum. Ciphertexts live in `R_q = Z_q[X]/(X^n + 1)`:
 //!
 //! ```text

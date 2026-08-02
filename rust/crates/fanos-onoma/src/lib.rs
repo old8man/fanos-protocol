@@ -14,7 +14,7 @@
 //! * **L-global** — [`registry`]: an optional interface for **purchasable, globally-unique**
 //!   readable names, with the settlement backend (the coherent chain, Phase 6) left pluggable.
 //!
-//! * [`derive`] — the per-epoch **lookup** and **encryption** derivations that make descriptors
+//! * [`derive`](mod@derive) — the per-epoch **lookup** and **encryption** derivations that make descriptors
 //!   unenumerable and address-gated.
 //! * [`mnemonic`] — a dictionary-free, pronounceable (proquint) rendering for human verification.
 //!

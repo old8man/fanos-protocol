@@ -6,7 +6,7 @@
 //! foundational FANOS crates, zero external dependencies) so it is `no_std`, auditable, and pinned
 //! against the BIP-350 known-answer vectors in the tests.
 //!
-//! Indices into [`CHARSET`] and the fixed generator/checksum arrays are all masked to their range,
+//! Indices into `CHARSET` and the fixed generator/checksum arrays are all masked to their range,
 //! so slice indexing here cannot go out of bounds.
 #![allow(clippy::indexing_slicing)]
 

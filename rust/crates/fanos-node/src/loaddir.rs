@@ -5,7 +5,7 @@
 //! cell wants, `⌈observed_load / per-node capacity⌉`. For the assignment to stay deterministic every node must
 //! use the *same* setpoint, so the setpoint is a **cell aggregate**: each node advertises its own observed
 //! per-role load for the epoch at its coordinate slot ([`publish_load`]), every node sums the roster's loads
-//! and applies [`cell_setpoint`](fanos_core::roles::cell_setpoint) ([`build_cell_setpoint`]) — the same total
+//! and applies [`cell_setpoint`] (`build_cell_setpoint`) — the same total
 //! on every node. This is the [`crate::capdir`] pattern applied to load telemetry.
 //!
 //! Trust: the load report is a self-observation, attributed by its slot (like [`crate::mixdir`]). A node can
@@ -51,7 +51,7 @@ fn encode_load(load: Demand) -> [u8; LOAD_BYTES] {
     b
 }
 
-/// Parse a load report (sans-I/O), or `None` if not exactly [`LOAD_BYTES`] long.
+/// Parse a load report (sans-I/O), or `None` if not exactly `LOAD_BYTES` long.
 ///
 /// A peer running a different role set therefore writes a wrong-width slot and is simply *not counted* toward the
 /// cell setpoint, rather than mis-parsed — the safe direction, since a missing report lowers the setpoint while a

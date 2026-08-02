@@ -11,7 +11,7 @@
 //! * [`params`] — the projective cell's PBFT quorum system `(n, f, Q)`, proved safe + live.
 //! * [`committee`] — beacon leader election and line-committee selection (cartel-proof by construction).
 //! * [`tx`] — transactions and the threshold-**sealed** transaction (the anti-MEV unit).
-//! * [`mempool`] — the encrypted mempool: seal-on-submit, order-over-commitments, open-on-commit.
+//! * `mempool` — the encrypted mempool: seal-on-submit, order-over-commitments, open-on-commit.
 //! * [`block`] — the block, its hash-linking, and the DA (data-availability) commitment.
 //! * [`vote`] — signed votes and the quorum certificate.
 //! * [`state`] — the pluggable [`state::StateMachine`] and a reference account instantiation.

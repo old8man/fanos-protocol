@@ -68,6 +68,18 @@ jobs:
         run: cargo run -p fanos-sim --example catastrophe
       - name: Benchmarks compile (hot paths)
         run: cargo bench -p fanos-bench --no-run
+      # The docs are where this codebase carries its reasoning, and an intra-doc link is the only part of a
+      # doc comment a compiler can check. Nothing checked them: 183 were broken across the workspace when this
+      # gate was first run, including links to items that had been renamed, moved to another crate, or made
+      # private — each one a reader sent to a page that does not exist. Several crates failed to document at
+      # ALL, which hid the errors in every crate downstream of them.
+      #
+      # `--no-deps` because a dependency's docs are not this repo's to fix, and no `--document-private-items`:
+      # the gate should see what a reader sees, and private items resolve differently.
+      - name: Docs — no broken intra-doc links
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   portability:
     name: no_std · wasm cross-build

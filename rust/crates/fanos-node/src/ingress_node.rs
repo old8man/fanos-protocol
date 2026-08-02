@@ -30,11 +30,11 @@
 //!
 //! Both the inner engine and the host are timer-driven and both number their tokens from zero (the host's
 //! first gather deadline is `0`), so their spaces would collide on the shared wire clock. The host's tokens
-//! are remapped into a range provably free of every inner token — **and** of the [`ServiceNode`] token range,
+//! are remapped into a range provably free of every inner token — **and** of the `ServiceNode` token range,
 //! so an ingress host may itself wrap a service node. The tag is bits 63 clear, 62 set, 61 clear, 60 set
-//! (`0b0101`, [`INGRESS_FLAG`]): a wrapped [`CellNode`] uses gather ids `< 2^62` (bit 62 clear), `COVER =
+//! (`0b0101`, `INGRESS_FLAG`): a wrapped `CellNode` uses gather ids `< 2^62` (bit 62 clear), `COVER =
 //! 1<<62` and the overlay heartbeat `(1<<62)|1` (both bit 60 clear), and `MIX_FLAG | id` (bit 63 set); a
-//! wrapped [`ServiceNode`] uses `0b011` (bit 61 set) — none match `0b0101`. A fired token is dispatched by
+//! wrapped `ServiceNode` uses `0b011` (bit 61 set) — none match `0b0101`. A fired token is dispatched by
 //! that tag: `(token >> 60) == 0b0101` → the host (unmapped back), everything else → the inner engine.
 
 use fanos_geometry::Triple;

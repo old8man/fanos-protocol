@@ -8,7 +8,7 @@
 //! without a separate relay chain* — the parent is the relay, using the same geometry.
 //!
 //! A child cell finalizes and executes its own TAXIS ledger and produces an
-//! [`ExecCertificate`](crate::checkpoint::ExecCertificate): a `Q`-quorum attestation of its canonical state
+//! [`ExecCertificate`]: a `Q`-quorum attestation of its canonical state
 //! root at a height. The parent, holding each child's committee keys, **verifies** that certificate (and,
 //! optionally, samples the child's data availability) before recording it. Consequences:
 //! - **Shared security.** Once the parent records a child's checkpoint, anyone who trusts the parent

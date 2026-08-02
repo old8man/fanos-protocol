@@ -27,7 +27,7 @@
 //!   slack `2(B−1)`, the standard lattice-ZK gap: binding must hold at that norm, not just at ternary — the
 //!   parameters must be calibrated for it, see the STATUS note.)
 //!
-//! > **STATUS — [P]/[H], calibration + audit pending (as [`crate::commit`]).** The *construction* is standard
+//! > **STATUS — \[P\]/\[H\], calibration + audit pending (as [`crate::commit`]).** The *construction* is standard
 //! > (Fiat–Shamir with aborts) and the completeness/soundness/ZK arguments above are the security spec; the
 //! > concrete `(κ, B)` here are illustrative and **not yet calibrated to a bit-security target**, the masking is
 //! > sampled with a negligible-but-nonzero modular bias, and arithmetic is not constant-time. This is a correct,
@@ -114,7 +114,7 @@ fn mask(seed: &[u8], attempt: u32, round: usize) -> Vec<i64> {
 
 /// Prove knowledge of the short randomness `r` opening `commitment` to `value`, without revealing `r`. `seed`
 /// seeds the (re-randomised, never-revealed) masking; distinct seeds give distinct proofs of the same statement.
-/// `None` only if the masking never lands in the safe region within [`MAX_ATTEMPTS`] — a parameter error, not a
+/// `None` only if the masking never lands in the safe region within `MAX_ATTEMPTS` — a parameter error, not a
 /// normal outcome (completeness needs ≈1 attempt).
 #[must_use]
 pub fn prove_opening(params: &Params, commitment: &Commitment, value: u64, r: &Randomness, seed: &[u8]) -> Option<OpeningProof> {

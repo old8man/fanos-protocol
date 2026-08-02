@@ -155,7 +155,7 @@ impl SpendingKey {
 
 /// A **full-viewing key**: scan + decrypt a wallet's incoming notes *and* detect when its notes are spent (it
 /// can compute their nullifiers via `nsk`), but with **no spend-auth secret**, so it can never sign a spend.
-/// Serializes to [`VIEWING_KEY_LEN`] bytes (`kem_seed ‖ nsk ‖ auth`). Downgrades to an [`IncomingViewingKey`].
+/// Serializes to `VIEWING_KEY_LEN` bytes (`kem_seed ‖ nsk ‖ auth`). Downgrades to an [`IncomingViewingKey`].
 #[derive(Clone)]
 pub struct FullViewingKey {
     kem_seed: [u8; 32],
@@ -231,7 +231,7 @@ impl FullViewingKey {
 
 /// An **incoming-viewing key**: the minimal delegatable capability — scan + decrypt the notes a wallet is
 /// *paid*, and nothing more (no `nsk`, so it cannot even compute a nullifier; no `ask`, so it cannot spend).
-/// Serializes to [`VIEWING_KEY_LEN`] bytes (`kem_seed ‖ owner ‖ auth`). Hand it to a watch-only wallet.
+/// Serializes to `VIEWING_KEY_LEN` bytes (`kem_seed ‖ owner ‖ auth`). Hand it to a watch-only wallet.
 #[derive(Clone)]
 pub struct IncomingViewingKey {
     kem_seed: [u8; 32],

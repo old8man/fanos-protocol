@@ -369,7 +369,7 @@ impl StreamSender {
 
     /// The segments to (re)send now — call on open/push and on each retransmit tick (one tick per call).
     /// Only segments within the effective window `[acked, acked + min(window, peer_rwnd))` that are
-    /// **actually due** are emitted; every call advances the logical [`clock`](Self::clock) one tick.
+    /// **actually due** are emitted; every call advances the logical ``clock`` one tick.
     ///
     /// A segment is due iff it is (a) being sent for the **first time** (never transmitted), (b) flagged
     /// by **fast retransmit** (RFC 5681 — three dup-acks confirmed the gap lost), or (c) past its **RTO**
@@ -442,7 +442,7 @@ impl StreamSender {
     /// per inbound delivery, for a prompt reaction) without disturbing [`outbound`](Self::outbound)'s
     /// RTO timing.
     ///
-    /// [`outbound`]'s `SRTT`/`RTO` estimate is calibrated in **calls to `outbound`**, one logical tick
+    /// `outbound`'s `SRTT`/`RTO` estimate is calibrated in **calls to `outbound`**, one logical tick
     /// per call, on the assumption that the driver calls it at a fixed cadence (see the module doc). A
     /// caller that also calls the clock-advancing sweep reactively — e.g. once per inbound datagram —
     /// races the clock ahead of real time in proportion to traffic volume: under a high-latency
@@ -450,7 +450,7 @@ impl StreamSender {
     /// reactive calls means a *faster* clock means a *shorter* effective RTO, exactly when backoff
     /// should be growing it — a retransmission-storm feedback loop, not a fixed-point. This sweep never
     /// ticks, so it cannot cause that: a segment it sends is scheduled (`due_at`) against the clock's
-    /// *current* value, and only [`outbound`]'s tick-paced sweep ever reconsiders it for retransmission.
+    /// *current* value, and only `outbound`'s tick-paced sweep ever reconsiders it for retransmission.
     #[must_use]
     pub fn poll_new(&mut self) -> Vec<Segment> {
         let total = self.total();
@@ -577,12 +577,12 @@ impl StreamSender {
     /// **How many times the most-retransmitted unacknowledged segment has been resent** — TCP's `R2`
     /// statistic (RFC 1122 §4.2.3.5), the input to deciding that a peer is gone rather than slow.
     ///
-    /// This reads bookkeeping the sender already keeps for retransmit jitter ([`jitter_ticks`]); it adds
+    /// This reads bookkeeping the sender already keeps for retransmit jitter (`jitter_ticks`); it adds
     /// no state. It is a *statistic*, not a policy: what counts as "too many" belongs to the layer that
     /// owns the connection, and lives in `fanos_session`.
     ///
     /// **Why attempts and not elapsed time.** The RTO backs off ×2 toward a ceiling expressed *relative*
-    /// to the measured base RTO ([`RTO_BACKOFF_MULT`]), so `n` attempts already denote a duration scaled
+    /// to the measured base RTO (`RTO_BACKOFF_MULT`), so `n` attempts already denote a duration scaled
     /// to this transport's own measured RTT. Counting attempts therefore adapts wherever the estimator
     /// adapts, while a wall-clock give-up constant would be right on one transport and wrong on the next
     /// — the same defect the measured gather deadline removed elsewhere in the platform.

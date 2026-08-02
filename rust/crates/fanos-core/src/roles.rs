@@ -431,7 +431,7 @@ impl Demand {
     }
 }
 
-/// The [`Command::Control`] tag carrying a **load reading** to the sub-engine that assembles the load report.
+/// The `Command::Control` tag carrying a **load reading** to the sub-engine that assembles the load report.
 ///
 /// A composite reaches that engine's `observe_load` seam directly when it holds it as a concrete type. When the
 /// inner engine is behind a `dyn Engine` the type system cannot reach it, and this is the route: the same seam,

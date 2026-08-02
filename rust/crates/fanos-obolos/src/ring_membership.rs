@@ -3,7 +3,7 @@
 //!
 //! - **hash step** ([`prove_hash_step`]) — committed `(left, right, parent)` satisfy `parent = hash(left, right)`.
 //!   The SIS hash relation is `R_q`-linear (`A₀·left + A₁·right − G(parent) = 0`), so a step is one
-//!   [`crate::ring_linear`] proof over `left ‖ right ‖ parent` with coefficients [`HashParams::step_coeffs`].
+//!   [`crate::ring_linear`] proof over `left ‖ right ‖ parent` with coefficients `HashParams::step_coeffs`.
 //! - **conditional swap** ([`prove_swap`]) — a hidden bit `d` selects `left = child + d·(sibling − child)`
 //!   (`right` derived), so the path leaks no position. Per limb a [`crate::ring_product`] proof, plus `d` binary.
 //! - **path** ([`prove_path`]) — *chains* swap + hash step up the tree (parent of level `j` = child of `j+1`),
@@ -16,7 +16,7 @@
 //! > per node; it is `O(depth·ELL_H·LOG_BASE)` binarity proofs — deferred as the known cost of lattice ZK
 //! > membership (recursive-SNARK compaction is future work).
 //!
-//! > **STATUS — [P]/[H], correctness-first.** Tests verify a genuine hash step, both swap directions, and a full
+//! > **STATUS — \[P\]/\[H\], correctness-first.** Tests verify a genuine hash step, both swap directions, and a full
 //! > leaf→root path; and that a wrong parent, a wrong swap, or a wrong root has no accepting proof.
 
 use alloc::vec::Vec;

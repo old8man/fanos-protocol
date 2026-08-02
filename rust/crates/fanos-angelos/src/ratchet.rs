@@ -22,10 +22,10 @@
 //! a tampered header fails to open (or fails a consistency check) even though the AEAD carries no separate
 //! associated data.
 //!
-//! **Out-of-order delivery.** Each chain is a [`crate::chain::RecvChain`], so a later message opens ahead of the
+//! **Out-of-order delivery.** Each chain is a `crate::chain::RecvChain`, so a later message opens ahead of the
 //! ones it skips. Across a ratchet, the header's `pn` lets the receiver **bank** the keys still owed on the chain
 //! it is leaving into a bounded per-epoch store, so a delayed message from a previous epoch still opens after the
-//! ratchet has moved on. All banking is bounded (see [`crate::chain`]); at most [`MAX_PAST_EPOCHS`] retired
+//! ratchet has moved on. All banking is bounded (see `crate::chain`); at most [`MAX_PAST_EPOCHS`] retired
 //! epochs are retained.
 
 use alloc::collections::BTreeMap;

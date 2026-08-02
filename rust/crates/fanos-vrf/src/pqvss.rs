@@ -32,7 +32,7 @@
 //! cross-epoch/cross-dealer replay fails. *Unpredictability*: below `t` shares reveal nothing (Shamir
 //! privacy) and the commitment is one-way (BLAKE3). *Detectable abort, not bias*: a malicious dealer can only
 //! get its own contribution *rejected* (its committed polynomial's `t` shares unavailable), never bias the
-//! honest sum — honest-majority-of-dealers model. [`beacon_seed`] de-duplicates by dealer so a replayed
+//! honest sum — honest-majority-of-dealers model. `beacon_seed` de-duplicates by dealer so a replayed
 //! contribution cannot be double-counted.
 
 use alloc::collections::{BTreeMap, BTreeSet};

@@ -24,7 +24,7 @@
 //! keeps a per-note incremental witness instead (as [`crate::tree`] does) — an optimisation of the *same* tree, with
 //! byte-identical roots and paths.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** The tree and its auth paths are exact; tests check that hashing a leaf
+//! > **STATUS — \[P\]/\[H\], correctness-first.** The tree and its auth paths are exact; tests check that hashing a leaf
 //! > up its auth path reproduces the root (so a membership proof against this tree/path is consistent), including at
 //! > a partially-filled level where the padding is load-bearing; that the frontier root agrees with a from-scratch
 //! > recomputation at every prefix length (the frontier's correctness proof, empirically); and that a realistic depth

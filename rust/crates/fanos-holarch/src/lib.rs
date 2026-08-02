@@ -21,7 +21,7 @@
 //! co-loaded on shared flows (`γ_ij = (1−ε)Σ_m λ_m ψ_mi ψ_mj`), and `ε` is the unstructured background
 //! (no real system is rank-3). See [`Gamma::from_modes`].
 //!
-//! ## The four release invariants (all [T])
+//! ## The four release invariants (all `T`)
 //!
 //! From `Γ` the calculator reads four scalars and checks each against a threshold. The thresholds are
 //! the *same* coherence family the runtime [`fanos_diakrisis`] plane uses, imported from it so they

@@ -44,7 +44,7 @@ pub fn content_address<F: Field>(key: &[u8]) -> Point<F> {
 /// The `q + 1` replica lines that erasure-code a target point's data (spec §L4 projective
 /// LRC): the lines through the target.
 ///
-/// These lines are the store's **Maekawa quorums** (spec §L4, line-364 "quorum consistency [T]"): any two
+/// These lines are the store's **Maekawa quorums** (spec §L4, line-364 "quorum consistency `T`"): any two
 /// distinct lines meet in exactly one point (the dual Steiner property, verified exhaustively by
 /// `fanos_geometry`'s `dual_any_two_lines_intersect`), so a write-line `W` and a read-line `R` always
 /// satisfy `W ∩ R ≠ ∅`. The overlay realizes the resulting linearisability *more strongly* than a bare

@@ -27,7 +27,7 @@
 //! Fano lines is a parity check of this code**: for any line `{p, q, r}` and any message,
 //! `shard[p] ⊕ shard[q] ⊕ shard[r] = 0`. That is *exactly* the equation
 //! [`crate::lrc::peel_fano`] already peels: this module reuses that closure's control flow
-//! verbatim ([`peel_group`]), so `reconstruct` inherits its exact recoverability boundary —
+//! verbatim (`peel_group`), so `reconstruct` inherits its exact recoverability boundary —
 //! any `≤3` simultaneous losses, and among `4`-losses precisely the non-hyperovals (spec
 //! §6.3 note, V20; [`crate::is_hyperoval_fano`]).
 //!
@@ -255,7 +255,7 @@ pub fn encode(data: &[u8]) -> [Vec<u8>; N] {
 
 /// Reconstruct the original payload from `N = 7` point-shards, any of which may be erased
 /// (`None`). Peel-decodes each stripe independently via the Fano line parities
-/// ([`peel_group`]); returns `None` if any stripe's erasure mask is not
+/// (`peel_group`); returns `None` if any stripe's erasure mask is not
 /// [`crate::lrc::is_recoverable_fano`] (spec §6.3, V20), or if the shards are malformed
 /// (inconsistent lengths, or padding that fails to validate).
 #[must_use]

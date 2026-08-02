@@ -1,5 +1,5 @@
 //! The **traffic-shaper** component of a morph (spec §13.3) — the *statistical* signature, distinct from
-//! the codec's *content* signature ([`crate::obfuscate`]). A censor's ML classifier keys on packet-**size**
+//! the codec's *content* signature ([`crate::obfuscate`](mod@crate::obfuscate)). A censor's ML classifier keys on packet-**size**
 //! and inter-packet-**timing** distributions even when the content carries no fixed bytes (§13.1, "flags
 //! flows by timing/volume/entropy"); the shaper moves both toward a per-morph target. Like the codec, the
 //! target is derived from `θ_epoch`, so it **rotates every epoch** (§13.4) and diversifies per packet by

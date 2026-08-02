@@ -38,7 +38,7 @@
 //! rate from the cell's own dissipative **spectral gap** `Δ = (G − max_k T_k)/6` (T-226(v), the exact
 //! gap `fanos_diakrisis::regeneration::spectral_gap` reads from the seven line rates), so admission
 //! relaxation and the DIAKRISIS reintegration time `τ = 1/Δ` are two observables of **one** spectral
-//! gap — the *derive-don't-tune* invariant, closed. [`Self::new`] with an explicit `Δ` remains for
+//! gap — the *derive-don't-tune* invariant, closed. `Self::new` with an explicit `Δ` remains for
 //! tests and analytic sizing.
 
 use fanos_diakrisis::regeneration::spectral_gap;
@@ -75,7 +75,7 @@ const DEFAULT_OVER_CEIL: f64 = 10.0;
 impl LindbladLoadController {
     /// A controller with dissipation (spectral gap) `dissipation ∈ (0, 1]`, a sustainable
     /// `target` intros per window, and difficulty bounds `[floor, ceil]`. Difficulty reaches the
-    /// ceiling once the excitation is [`DEFAULT_OVER_CEIL`]`× target`. Degenerate inputs are clamped.
+    /// ceiling once the excitation is `DEFAULT_OVER_CEIL``× target`. Degenerate inputs are clamped.
     #[must_use]
     pub fn new(dissipation: f64, target: f64, floor: u32, ceil: u32) -> Self {
         let ceil = ceil.max(floor);

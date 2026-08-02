@@ -39,7 +39,7 @@
 //! differences are *always* units; here it holds with overwhelming probability instead of certainty. That is the same
 //! relaxation [`crate::ring_balance`] already rests on, and it is part of what the pending calibration must confirm.
 //!
-//! > **STATUS — [P]/[H], correctness-first.** A composition of [`crate::ring_binary`] and [`crate::ring_zk`]; it
+//! > **STATUS — \[P\]/\[H\], correctness-first.** A composition of [`crate::ring_binary`] and [`crate::ring_zk`]; it
 //! > inherits their status. The untraceability hash step needs one of these per node limb, which makes it the stack's
 //! > dominant cost (`docs/design-obolos-zk.md` §6). Tests verify a short polynomial proves, a non-short one is
 //! > rejected, commitment binding, re-randomisation, and that the measured size matches the construction.

@@ -32,7 +32,7 @@
 //!   published function — so a counter keyed by it discloses nothing the plane's shape does not already.
 //! * **R3 — no per-session counters**, even with the id withheld: a count that varies with one session's
 //!   behaviour is a linkability channel by its variance alone.
-//! * **R4 — anything crossing a node boundary is privatized** through this crate's existing [`dp`](crate::dp)
+//! * **R4 — anything crossing a node boundary is privatized** through fanos-telemetry's `dp`
 //!   boundary. These counters are **local-only** until per-family sensitivities are derived the way
 //!   `Δr = 1/21` was for the coherence frame, so nothing here exports itself.
 //!

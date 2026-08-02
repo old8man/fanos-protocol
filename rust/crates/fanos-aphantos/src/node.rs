@@ -344,12 +344,12 @@ impl<F: Field> NyxNode<F> {
     }
 
     /// Build a fresh **reply** circuit `launch → … → self.coord` — the mirror image of
-    /// [`next_circuit`](Self::next_circuit): it ends AT this node rather than starting from it, so
+    /// ``next_circuit``: it ends AT this node rather than starting from it, so
     /// this node's own KEM secret is the one that peels the final `Deliver` layer. `launch` is a
     /// nominal entry label (folded into the holonomy chain like any other hop
     /// — see [`fanos_nyx::ratchet::circuit_holonomy`] — but never a real routing step *this* node
     /// takes: whoever seals a reply onto this circuit launches it at `circuit.relays()[1]`'s
-    /// combiner directly, the same way [`originate`](Self::originate) does for a forward circuit).
+    /// combiner directly, the same way ``originate`` does for a forward circuit).
     /// Retained (never sent) so the caller can hold `(circuit, seed)` and later verify a delivery's
     /// holonomy against it via [`verified_deliver`](Self::verified_deliver) (spec §5.4).
     ///

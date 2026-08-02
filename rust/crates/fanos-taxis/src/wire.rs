@@ -1,7 +1,7 @@
 //! TAXIS on the FANOS wire — the App-overlay framing (spec §7.2, `docs/design-taxis.md` §1).
 //!
 //! TAXIS is an application overlay, so its [`ConsensusMsg`]s ride inside the canonical
-//! [`FrameType::App`](fanos_wire::FrameType::App) (`0x70`) frame — the length-skippable outer type the wire
+//! [`FrameType::App`] (`0x70`) frame — the length-skippable outer type the wire
 //! protocol reserves for application overlays (the Kernel/Protocol split) — rather than claiming new
 //! top-level frame codes. A node that does not run TAXIS skips the frame by its length; a node that does
 //! hands the body to [`from_frame`]. This keeps `fanos-wire` the single frame-code authority (audit A1) with

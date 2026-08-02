@@ -59,7 +59,7 @@ impl<F: Field> OverlayNode<F> {
     }
 
     /// The next-hop transport coordinate toward `dst`, or `None` if this node delivers `dst` locally or
-    /// has no route to it. A thin accessor over [`Router::route`] for drivers and tests.
+    /// has no route to it. A thin accessor over `Router::route` for drivers and tests.
     #[must_use]
     pub fn hier_next_hop(&self, dst: &HierAddr<F>) -> Option<Triple> {
         match self.router.route(dst) {
@@ -70,7 +70,7 @@ impl<F: Field> OverlayNode<F> {
 
     /// Originate a hierarchical send to `dst`: deliver locally if we are its cell, else emit a
     /// `RouteHier` frame (`HierAddr(dst) ‖ payload`) toward the next hop — the driver entry a client
-    /// uses to reach a multi-level destination (the single-plane [`on_send`](Self::on_send) is unchanged).
+    /// uses to reach a multi-level destination (the single-plane ``on_send`` is unchanged).
     pub fn send_hier(&mut self, dst: &HierAddr<F>, payload: &[u8]) -> Vec<Effect> {
         self.healer.record_origination();
         match self.router.route(dst) {

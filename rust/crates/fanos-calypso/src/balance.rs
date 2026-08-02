@@ -142,7 +142,7 @@ pub fn delegation_message(
 /// The master's signed, load-balanced descriptor for an epoch — the published bulletin that maps a
 /// master `.fanos` address to its backend fleet, under the offline-root / epoch-signing-key hierarchy.
 /// `#[derive(Wire)]` emits the canonical storage form `root_pubkey ‖ signing_cert ‖ epoch(8B BE) ‖
-/// instances(varint-counted) ‖ descriptor_sig` (§7.1). The signed [`body_bytes`](Self::body_bytes) is
+/// instances(varint-counted) ‖ descriptor_sig` (§7.1). The signed ``body_bytes`` is
 /// exactly this minus the trailing `descriptor_sig`, built from the *same* `Wire` field codecs — so the
 /// stored bytes and the signed bytes can never drift.
 #[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]

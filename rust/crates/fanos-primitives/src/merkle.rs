@@ -20,18 +20,18 @@
 //! de-duplicates by `(source_cell, nonce)`. What was genuinely wrong is narrower and fixed here:
 //!
 //! * **The proof length was unbounded.** `merkle_verify` folded however many siblings it was handed — a `u16` count on
-//!   the wire, so 65 535 hashes per receipt from a ~2 MB message. [`verify`] instead *requires* exactly
-//!   [`height`]`(count)` siblings, so the work is bounded by the commitment itself and a wrong-shaped proof is rejected
+//!   the wire, so 65 535 hashes per receipt from a ~2 MB message. `verify` instead *requires* exactly
+//!   `height``(count)` siblings, so the work is bounded by the commitment itself and a wrong-shaped proof is rejected
 //!   before any hashing.
 //! * **The empty root was `[0u8; 32]`.** A certified empty outbox would have accepted any leaf whose hash was all-zeros —
 //!   safe only because that is a preimage problem, which is not the kind of thing a commitment scheme should be resting
-//!   on. [`empty_root`] is a domain-separated constant, and [`verify`] rejects `count == 0` outright: nothing is inside an
+//!   on. `empty_root` is a domain-separated constant, and `verify` rejects `count == 0` outright: nothing is inside an
 //!   empty tree, so there is no proof to check.
 //!
 //! ## Leaf hashing belongs to the caller
 //!
 //! This module hashes *already-hashed* leaves and owns only the internal-node and root labels. Each subsystem hashes its
-//! own leaves under its own label ([`leaf`] is the helper), which keeps two properties: a leaf can never collide with an
+//! own leaves under its own label (`leaf` is the helper), which keeps two properties: a leaf can never collide with an
 //! internal node (different label), and a leaf of one subsystem can never be replayed as a leaf of another (different
 //! label again). A single shared leaf label would silently give up the second.
 
@@ -83,7 +83,7 @@ fn node(left: &[u8; DIGEST_LEN], right: &[u8; DIGEST_LEN]) -> [u8; DIGEST_LEN] {
 /// The number of sibling hashes a proof carries for a tree of `count` leaves: `ceil(log2(count))`, and `0` for a single
 /// leaf (whose root is the leaf itself, wrapped).
 ///
-/// This is the *exact* proof length [`verify`] demands, not an upper bound. A fixed shape per count is what turns a
+/// This is the *exact* proof length `verify` demands, not an upper bound. A fixed shape per count is what turns a
 /// malformed proof into a cheap rejection instead of a fold over attacker-chosen work.
 #[must_use]
 pub const fn height(count: u64) -> u32 {
@@ -96,7 +96,7 @@ pub const fn height(count: u64) -> u32 {
 
 /// The Merkle root over `leaves`, binding the leaf count.
 ///
-/// `None` if there are more than [`MAX_LEAVES`]. An empty sequence gives [`empty_root`].
+/// `None` if there are more than [`MAX_LEAVES`]. An empty sequence gives `empty_root`.
 #[must_use]
 pub fn root(leaves: &[[u8; DIGEST_LEN]]) -> Option<[u8; DIGEST_LEN]> {
     let count = u64::try_from(leaves.len()).ok()?;
@@ -124,7 +124,7 @@ fn wrap(count: u64, bare: [u8; DIGEST_LEN]) -> [u8; DIGEST_LEN] {
 ///
 /// Duplication is safe here *because* the count is bound by [`wrap`]; on its own it is the CVE-2012-2459 shape. It is
 /// preferred over promoting the odd node because it keeps the height a function of the count alone, which is what lets
-/// [`verify`] demand an exact proof length.
+/// `verify` demand an exact proof length.
 #[must_use]
 fn fold(leaves: &[[u8; DIGEST_LEN]]) -> [u8; DIGEST_LEN] {
     let mut level: Vec<[u8; DIGEST_LEN]> = leaves.to_vec();
@@ -142,7 +142,7 @@ fn fold(leaves: &[[u8; DIGEST_LEN]]) -> [u8; DIGEST_LEN] {
     level.first().copied().unwrap_or_else(empty_root)
 }
 
-/// The authentication path for the leaf at `index`: sibling hashes bottom-up, exactly [`height`] of them.
+/// The authentication path for the leaf at `index`: sibling hashes bottom-up, exactly `height` of them.
 ///
 /// `None` if `index` is out of range or the tree is over-large.
 #[must_use]
@@ -179,7 +179,7 @@ pub fn prove(leaves: &[[u8; DIGEST_LEN]], index: usize) -> Option<Vec<[u8; DIGES
 /// Whether `leaf` sits at `index` of a tree of `count` leaves whose root is `root`, under `siblings`.
 ///
 /// Rejects, before hashing anything, every shape that cannot be a genuine opening: an empty tree (nothing is inside it),
-/// an index past the count, and a proof whose length is not exactly [`height`]`(count)`. That last check is what bounds
+/// an index past the count, and a proof whose length is not exactly `height``(count)`. That last check is what bounds
 /// the work an unauthenticated peer can ask for — the previous per-subsystem verifiers folded however many siblings they
 /// were handed.
 #[must_use]

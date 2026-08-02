@@ -273,7 +273,10 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-rendezvous", 2),
     ("fanos-runtime", 8),
     ("fanos-session", 1),
-    ("fanos-sim", 30),
+    // 31: `Timeline::revisits` — the oscillation detector added for the role-setpoint measurement. It is a
+    // scenario instrument, like most of this crate's entry: `until`, `until_settled`, `frozen`,
+    // `changes_after` and `is_reached` are all called only from scenarios, which is what fanos-sim is for.
+    ("fanos-sim", 31),
     ("fanos-stream", 2),
     ("fanos-taxis", 18),
     ("fanos-telemetry", 6),

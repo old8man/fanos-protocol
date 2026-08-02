@@ -1,7 +1,7 @@
 //! The **threshold-KEM-sealed** onion layer — a hop peeled by `t` of a line's `q+1` members, with
 //! real cryptographic zero-knowledge below threshold (spec §5.2, §5.7).
 //!
-//! [`fanos_nyx::sheaf`] introduced the threshold-sheaf idea — AEAD a layer under a key `K`, then
+//! `fanos_nyx::sheaf` introduced the threshold-sheaf idea — AEAD a layer under a key `K`, then
 //! Shamir-share `K` across the line — but transported the shares *in the clear*, so any holder of
 //! the packet had all `q+1` shares and the threshold was only nominal. This module closes that gap:
 //! each Shamir share is **hybrid-KEM-sealed to its line member's public key** (`X25519 ‖ ML-KEM-768`).
@@ -17,7 +17,7 @@
 //!
 //! **Forward secrecy & nonce hygiene (audit correction).** Do **not** read "each share rides a fresh KEM
 //! encapsulation" as forward secrecy against a *sender* compromise: the layer key `K`, the KEM ephemerals, and
-//! the AEAD nonce are all derived deterministically from the per-onion **`seed`** ([`seal_onion`]), so the seed
+//! the AEAD nonce are all derived deterministically from the per-onion **`seed`** (`seal_onion`), so the seed
 //! is a *universal trapdoor* while it lives — recovering `K` from it needs **no** member secret. Two operational
 //! requirements follow, and callers own them: (1) the per-onion `seed` MUST be a fresh CSPRNG draw and be
 //! **zeroized right after sealing** (forward secrecy is *seed-deletion* secrecy); and (2) a `seed` MUST NEVER
@@ -99,7 +99,7 @@ pub const THRESHOLD_ONION_LEN: usize = 20480;
 /// looks like ciphertext (the receiver's [`ThresholdSealed::from_bytes`] self-delimits and ignores
 /// it). Errors with [`ThresholdError::TooLong`] if the onion already exceeds the bucket.
 ///
-/// **Length-hiding is weaker here than in [`crate::sealed`] (audit Finding 4).** This padding is a
+/// **Length-hiding is weaker here than in `crate::sealed` (audit Finding 4).** This padding is a
 /// *public* deterministic function of the onion bytes (`hash_xof("…threshold-onion-pad", onion)`), and
 /// the header's `ct_len`/`members` are cleartext — so a party that sees the *decrypted* onion bytes (an
 /// on-path line member, or any observer of an un-encrypted hop) can read the exact layer length and even

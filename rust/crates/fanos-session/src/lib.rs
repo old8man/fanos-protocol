@@ -1,6 +1,6 @@
 //! # fanos-session — async DIAULOS byte streams
 //!
-//! Turns a sans-I/O [`ClientSession`](fanos_diaulos::ClientSession) into a tokio
+//! Turns a sans-I/O [`ClientSession`] into a tokio
 //! [`AsyncRead`](tokio::io::AsyncRead) + [`AsyncWrite`](tokio::io::AsyncWrite) stream — the object a
 //! SOCKS5 proxy hands to `copy_bidirectional`, or any async caller treats as a socket. A background
 //! task bridges the stream to a **datagram channel transport**: framed DIAULOS payloads flow out on
@@ -160,7 +160,7 @@ static DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 
 /// How many outbound payloads this process has discarded for a full transport channel.
 ///
-/// A diagnostic, not a control: [`offer`] cannot block (its caller also drives the inbound half, so waiting on a
+/// A diagnostic, not a control: `offer` cannot block (its caller also drives the inbound half, so waiting on a
 /// full outbound channel would deadlock the session), so it drops — and DIAULOS's selective repeat is what makes
 /// that survivable. The counter exists because "survivable in principle" and "recovered within the caller's
 /// patience" are different claims, and only one of them can be measured. A payload loss observed at the

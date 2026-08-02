@@ -29,7 +29,7 @@
 //!   — see the STATUS note. On the fully-splitting Goldilocks ring `c̄` is invertible with overwhelming
 //!   probability, giving an exact opening `r* = c̄⁻¹ z̄` where it is.)
 //!
-//! > **STATUS — [P]/[H], correctness-first (as [`crate::ring`]/[`crate::ring_commit`]).** Construction and the
+//! > **STATUS — \[P\]/\[H\], correctness-first (as [`crate::ring`]/[`crate::ring_commit`]).** Construction and the
 //! > completeness/soundness/ZK arguments are the security spec; the parameters `(B, β)`, the challenge
 //! > distribution, and the invertible-difference bound are illustrative, not yet calibrated to a bit-security
 //! > target nor externally cryptanalysed; arithmetic is not constant-time. The tests verify **completeness,
@@ -114,7 +114,7 @@ fn challenge(u: &[Poly], w: &[Poly]) -> Poly {
 /// Prove knowledge of the short randomness `r` opening `commitment` to `value`, in zero knowledge, in the norm
 /// `regime` (which both parties derive from context — [`OpeningParams::TERNARY`] for a note, or
 /// [`OpeningParams::for_randomness_bound`] for a balance). `seed` seeds the (re-randomised, never-revealed)
-/// masking. `None` only if the masking never lands short within [`MAX_ATTEMPTS`] — a parameter error, not a
+/// masking. `None` only if the masking never lands short within `MAX_ATTEMPTS` — a parameter error, not a
 /// normal outcome.
 #[must_use]
 pub fn prove_opening(

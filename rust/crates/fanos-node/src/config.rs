@@ -238,7 +238,7 @@ impl BeaconParams {
 /// [`HybridKemSecret::generate`](fanos_pqcrypto::HybridKemSecret::generate) — deterministically, so the
 /// member's published public key stays stable across restarts (unlike a relay's forward-secure onion key,
 /// which is fresh per run). Provisioned out-of-band, exactly like the beacon share: the operator generates
-/// each member's seed, collects the derived publics into the published [`ServiceLine`], and hands each
+/// each member's seed, collects the derived publics into the published `ServiceLine`, and hands each
 /// member its own seed. Set programmatically, not from the config file.
 #[derive(Clone)]
 pub struct ServiceParams {
@@ -398,7 +398,7 @@ fn parse_coord(s: &str) -> Result<Triple, NodeError> {
 }
 
 /// Decode exactly 64 hex characters into a 32-byte seed.
-/// Hex-encode bytes (lower-case) — the inverse of [`hex_decode`], for writing beacon provisioning files.
+/// Hex-encode bytes (lower-case) — the inverse of `hex_decode`, for writing beacon provisioning files.
 /// Lowercase hex. Public so the CLI's beacon dealer can write the recovery-authority seed in the same
 /// encoding the provisioning files use — one format for everything an operator handles by hand.
 pub fn hex_encode(bytes: &[u8]) -> String {

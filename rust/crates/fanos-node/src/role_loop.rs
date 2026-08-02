@@ -14,7 +14,7 @@
 //! before anyone checked the code. The residual is narrower and worth stating exactly, so the next reader does
 //! not have to re-derive it: `HealerNode::load_report` measures **2 of the 5 roles first-hand** (relay from
 //! forwarding activity, storage from shards held) and reports the other three as **absent** — `None`, not a
-//! fabricated zero. [`LoadSensor::setpoint`] substitutes this node's own offer for an absent role, deliberately,
+//! fabricated zero. `LoadSensor::setpoint` substitutes this node's own offer for an absent role, deliberately,
 //! since a demand of zero would retire a role the moment nobody could see it; so for a role with no sensor,
 //! supply stands in for demand.
 //!
@@ -108,10 +108,10 @@ impl LoadSensor {
     /// coexist. The engine reports `None` for every role it has no sensor for, which is exactly the set a
     /// driver-side [`LoadGauge`] fills; storing the `None` would erase the gauge's reading on every observation
     /// and the three roles would silently fall back to the offer forever, looking wired.
-    fn record(&self, per_role: [Option<u16>; Role::COUNT]) {
-        for (slot, reading) in self.latest.iter().zip(per_role) {
-            if let Some(v) = reading {
-                slot.store(u32::from(v) + 1, Ordering::Relaxed);
+    fn record(&self, reported: RoleReading) {
+        for role in Role::ALL {
+            if let Some(v) = reported.of(role) {
+                self.slot(role).store(u32::from(v) + 1, Ordering::Relaxed);
             }
         }
     }
@@ -210,7 +210,7 @@ pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
     tokio::spawn(async move {
         loop {
             match reports.recv().await {
-                Ok(Notification::LoadReport { per_role }) => sink.record(per_role),
+                Ok(Notification::LoadReport { per_role }) => sink.record(RoleReading::from_array(per_role)),
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -460,7 +460,7 @@ pub fn spawn_role_loop<F: Field>(
 /// its startup race produced.
 ///
 /// The period is **derived from the work it schedules**, not chosen: one assignment costs up to one
-/// [`STORE_TIMEOUT`] (the two directory scans run concurrently), so a 3× period bounds the refresh at a **1/3 duty
+/// `STORE_TIMEOUT` (the two directory scans run concurrently), so a 3× period bounds the refresh at a **1/3 duty
 /// cycle**. Anything near 1× and the scans overlap — the node is then permanently scanning the cell, which measurably
 /// destabilised timing-sensitive real-socket tests running alongside it and would be a traffic beacon in production.
 pub const ROSTER_REFRESH: Duration = Duration::from_secs(3 * crate::resolve::STORE_TIMEOUT.as_secs());
@@ -684,9 +684,7 @@ mod tests {
         assert_eq!(sensor.reading(), RoleReading::blind(), "an unreported sensor holds no reading");
 
         // Now a report: relay measured **zero**, storage measured work, service has no sensor at all.
-        sensor.record(
-            RoleReading::blind().measuring(Role::Relay, 0).measuring(Role::Storage, 5).into_array(),
-        );
+        sensor.record(RoleReading::blind().measuring(Role::Relay, 0).measuring(Role::Storage, 5));
         let published = sensor.load(offered, cap);
         assert_eq!(published.of(Role::Relay), 0, "a measured idle relay publishes zero work");
         assert_eq!(published.of(Role::Storage), 5, "a measured load publishes as work units");
@@ -718,7 +716,7 @@ mod tests {
         let cap = Demand::per_role(|_| 4);
         let offered = RoleSet::of(&[Role::Relay, Role::Service]);
         let sensor = LoadSensor::new();
-        sensor.record(RoleReading::blind().measuring(Role::Relay, 8).into_array());
+        sensor.record(RoleReading::blind().measuring(Role::Relay, 8));
 
         let published = sensor.load(offered, cap);
         assert_eq!(published.of(Role::Relay), 8, "a node publishes work units, not nodes");
@@ -783,12 +781,12 @@ mod tests {
             .measuring(Role::Relay, 0)
             .measuring(Role::Storage, 1)
             .measuring(Role::Exit, u16::MAX);
-        sensor.record(sent.into_array());
+        sensor.record(sent);
         assert_eq!(sensor.reading(), sent, "every reading survives the shared-atomic encoding");
 
         // A later report that says nothing must change nothing: the engine reports `None` for every role it
         // cannot see on *every* observation, and those are exactly the roles a driver gauge fills.
-        sensor.record(RoleReading::blind().into_array());
+        sensor.record(RoleReading::blind());
         assert_eq!(sensor.reading(), sent, "an absent reading does not erase a present one");
     }
 
@@ -812,7 +810,7 @@ mod tests {
         assert_eq!(sensor.reading().of(Role::Exit), Some(2), "two flows in flight");
 
         // The engine's report says `None` for exit on every observation; it must not erase the gauge.
-        sensor.record(RoleReading::blind().measuring(Role::Relay, 4).into_array());
+        sensor.record(RoleReading::blind().measuring(Role::Relay, 4));
         assert_eq!(sensor.reading().of(Role::Exit), Some(2), "an engine report does not clobber a gauge");
         assert_eq!(sensor.reading().of(Role::Relay), Some(4), "and still lands its own readings");
 

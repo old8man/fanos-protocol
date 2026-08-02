@@ -10,7 +10,7 @@
 //! The network runs the existing ristretto255 DKG ([`crate::dkg`]) once, yielding a joint public key
 //! `Y = x·G` whose secret `x` is held only as Shamir shares `s_i` (never assembled), with public share
 //! commitments `Y_i = s_i·G` recoverable from the aggregate VSS
-//! [`VssCommitment`](crate::vss::VssCommitment).
+//! [`VssCommitment`].
 //!
 //! For each epoch, let `M = M(epoch)` be a public hash-to-curve point. A holder of share `s_i` emits a
 //! **partial** `σ_i = s_i·M` together with a Chaum–Pedersen **DLEQ proof** that the same scalar `s_i`

@@ -58,7 +58,7 @@ pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &Beac
     fanos_calypso::rendezvous::rendezvous_line::<F>(service_pubkey, epoch, beacon)
 }
 
-/// The [`Command::Control`](fanos_ports::Command::Control) tag under which a combiner is handed the epoch's mix
+/// The ``Command::Control`` tag under which a combiner is handed the epoch's mix
 /// directory ([`MixDirectory::encode`]).
 ///
 /// A combiner needs those hop keys to seal a forward onion to a registered host's dead-drop, and it cannot get
@@ -128,7 +128,7 @@ pub struct MixDirectory {
 }
 
 impl MixDirectory {
-    /// Encode as a flat `Vec<MixEntry>` — the form a combiner is handed one in ([`Command::Control`]).
+    /// Encode as a flat `Vec<MixEntry>` — the form a combiner is handed one in (`Command::Control`).
     ///
     /// Deterministic (the map iterates in coordinate order), so two nodes that resolved the same cell produce
     /// byte-identical directories, which keeps a mismatch a real disagreement rather than an encoding artefact.
@@ -381,7 +381,7 @@ pub const HOST_REGISTER_TAG: &[u8; 4] = b"RHR1";
 /// path carries a real `forward_circuit` + `reply_pub`.
 /// `#[derive(Wire)]` emits `service_tag(32) ‖ reply_pub(varint-prefixed) ‖ forward_circuit(varint count ‖
 /// Triple×12) ‖ coordinate(12) ‖ identity(varint-prefixed) ‖ sig(varint-prefixed)`. The two authentication
-/// fields are appended rather than placed with the tag they bind, so [`Self::signing_preimage`] — the same
+/// fields are appended rather than placed with the tag they bind, so `Self::signing_preimage` — the same
 /// encoding with `sig` emptied — stays a prefix-stable function of the rest.
 #[derive(Clone, PartialEq, Eq, Debug, fanos_wire_derive::Wire)]
 pub struct HostRegister {
@@ -460,7 +460,7 @@ impl HostRegister {
     /// 2. the signing prefix must not be all-zero — `bundle_from_kem_public` builds exactly that for a KEM-only
     ///    service, and such a bundle is reconstructible by anyone holding the (public) KEM key, so accepting one
     ///    would authenticate nothing while looking like it did. Hosting requires a signing identity;
-    /// 3. the signature must verify over [`Self::signing_preimage`] under that prefix.
+    /// 3. the signature must verify over `Self::signing_preimage` under that prefix.
     #[must_use]
     pub fn verify(&self, epoch: Epoch) -> bool {
         if self.service_tag != service_tag(&self.identity, epoch) {

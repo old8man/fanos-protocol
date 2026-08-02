@@ -18,7 +18,7 @@
 //! - **Soundness.** The commitment is binding, so a short opening of `diff` to `0` exists iff `diff` commits to
 //!   `0`, i.e. iff `Σ v_in ≡ Σ v_out + fee (mod q)`. (Ruling out the modular *wrap* — an unbalanced transfer whose
 //!   amounts are congruent mod `q` — is the job of the range proof and the `≤ MAX_NOTES_PER_TX` bound, the frontier
-//!   [P] components, exactly as for the transparent proof.)
+//!   \[P\] components, exactly as for the transparent proof.)
 //! - **Zero-knowledge.** Inherited from the opening proof: the revealed `(challenge, z)` is simulatable from the
 //!   public `diff` alone, so `r_balance` — and thus the per-note randomness linkage — stays hidden.
 //!
@@ -26,7 +26,7 @@
 //! `‖r_balance‖∞ ≤ #notes`. Both prover and verifier derive the same
 //! [`OpeningParams::for_randomness_bound`]`(#notes)` from the public note count — no regime data rides on the wire.
 //!
-//! > **STATUS — [P]/[H], correctness-first (as the rest of the ring stack).** The construction is the security
+//! > **STATUS — \[P\]/\[H\], correctness-first (as the rest of the ring stack).** The construction is the security
 //! > spec; the tests verify completeness (a balanced transfer proves and verifies), soundness (an inflating
 //! > transfer has no accepting proof), fee/tamper rejection, and zero-knowledge re-randomisation — never
 //! > bit-security.
