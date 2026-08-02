@@ -392,12 +392,12 @@ async fn serve_control<N: Controllable>(
 /// Drains until a [`Notification::DataPath`] arrives, because `Observe` also raises the coherence observation
 /// and the two share the stream. `Lagged` is retried rather than treated as failure: the drop is of *other*
 /// notifications, and the one being waited for may still be ahead.
-async fn read_data_path(notes: &mut tokio::sync::broadcast::Receiver<Notification>) -> String {
+async fn read_data_path(notes: &mut tokio::sync::broadcast::Receiver<Notification>, epoch: u64) -> String {
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match tokio::time::timeout_at(deadline, notes.recv()).await {
             Ok(Ok(Notification::DataPath { stations, gather })) => {
-                return fanos_node::admin::render_data_path(&stations, gather);
+                return fanos_node::admin::render_data_path(&stations, gather, epoch);
             }
             Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -491,13 +491,16 @@ fn answer_control<N: Controllable>(
             // the node an operator asks this of, and an unbounded await would hang on it — turning the verb
             // that should report the wedge into another casualty of it. The timeout makes "the engine is not
             // answering" an answer.
-            let (client, _) = node.census_source();
+            // The node's own epoch, so the schedule is reported against the clock the heights are measured
+            // in. Reading it from the live beacon rather than a wall clock is the whole point of an
+            // epoch-aligned activation: an operator comparing two nodes must see the same ordinal.
+            let (client, epoch) = node.census_source();
             tokio::spawn(async move {
                 let mut notes = client.subscribe();
                 // Subscribe *before* issuing, or the answer can land in the gap between the two.
                 let asked = client.command(fanos_node::Command::Observe);
                 let body = if asked {
-                    read_data_path(&mut notes).await
+                    read_data_path(&mut notes, epoch.get()).await
                 } else {
                     "the engine is not accepting commands\n".to_owned()
                 };

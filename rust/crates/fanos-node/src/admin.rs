@@ -262,11 +262,27 @@ pub fn render_health(health: &Health) -> String {
 /// bare `u64` instead of an `Epoch`.
 #[must_use]
 pub fn derivation_digest() -> [u8; 32] {
+    digest_of(Derivation::ALL.iter().map(|d| (d.name(), d.activation_height(), d.abort_height())))
+}
+
+/// The digest of an arbitrary schedule — the body of [`derivation_digest`], taken as input.
+///
+/// Factored so a test can vary **one dimension at a time** against the real hashing. The first version of that
+/// test built a comparison vector by hand and asserted it differed; it passed with the abort height removed
+/// from the digest entirely, because the two inputs differed in *length* whatever the function did. Isolating a
+/// dimension means feeding the same function two schedules that differ only in it.
+fn digest_of<'a>(entries: impl Iterator<Item = (&'a str, u64, Option<u64>)>) -> [u8; 32] {
     let mut input = Vec::new();
-    for d in Derivation::ALL {
-        input.extend_from_slice(d.name().as_bytes());
+    for (name, activation, abort) in entries {
+        input.extend_from_slice(name.as_bytes());
         input.push(0);
-        input.extend_from_slice(&d.activation_height().to_be_bytes());
+        input.extend_from_slice(&activation.to_be_bytes());
+        // The **abort** height too. Arming one is a change to the schedule — a build that intends to withdraw
+        // a derivation is not on the same schedule as one that does not — and a digest that ignored it would
+        // report the two as agreeing. That is the silent derivation change §1 exists to make visible,
+        // reintroduced inside the instrument built to reveal it. `u64::MAX` stands for "no abort" so an absent
+        // height and a real one at 0 cannot hash alike.
+        input.extend_from_slice(&abort.unwrap_or(u64::MAX).to_be_bytes());
     }
     fanos_primitives::hash::hash_labeled("FANOS-v1/derivation-vector", &input)
 }
@@ -282,7 +298,7 @@ pub fn derivation_digest() -> [u8; 32] {
 /// folded into a bucket: a frame that failed to parse has no readable line, and inventing one would put
 /// fabricated evidence against a line into the plane built to end exactly that.
 #[must_use]
-pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> String {
+pub fn render_data_path(stations: &[Observation], gather: GatherHealth, epoch: u64) -> String {
     let mut out = String::new();
     let mut moved = 0usize;
     for o in stations.iter().filter(|o| o.count > 0) {
@@ -315,6 +331,22 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth) -> Strin
             acc
         })
     );
+    // The digest answers "do two nodes agree"; this answers "on what". An operator whose digests differ needs
+    // the second question immediately, and a hash cannot be diffed.
+    for d in Derivation::ALL {
+        let status = d.status_at(epoch);
+        let _ = write!(out, "  {:<22} {} at {}", d.name(), status.name(), d.activation_height());
+        match d.abort_height() {
+            // Named even when far off: a scheduled withdrawal is the single most important thing on this
+            // line, and an operator should never learn of one by watching a derivation stop working.
+            Some(h) => {
+                let _ = writeln!(out, ", withdrawn at {h}");
+            }
+            None => {
+                let _ = writeln!(out, ", permanent");
+            }
+        }
+    }
     match gather {
         // Milliseconds: the deadline lives in the 1 ms .. 10 s band its bounds define, and nanoseconds there
         // are six digits of noise in front of the one an operator reads.
@@ -595,26 +627,45 @@ mod tests {
         assert_eq!(digest, derivation_digest(), "same build, same value — or comparison means nothing");
         assert_ne!(digest, [0u8; 32], "a digest that is all zeros is a constant wearing a hash's clothes");
 
+        // Each dimension isolated against the REAL hashing: two schedules identical but for one field. The
+        // earlier version of this built a comparison vector by hand and passed even with the abort height
+        // dropped from the digest, because the two inputs differed in length whatever the function did.
+        let base = [("onion.gather_member", 4u64, None)];
+        let armed = [("onion.gather_member", 4u64, Some(9u64))];
+        let renamed = [("onion.gather_member!", 4u64, None)];
+        let moved = [("onion.gather_member", 5u64, None)];
+        assert_ne!(
+            digest_of(base.into_iter()),
+            digest_of(armed.into_iter()),
+            "arming an abort must move the digest, or a scheduled withdrawal is invisible to comparison"
+        );
+        assert_ne!(
+            digest_of(base.into_iter()),
+            digest_of(moved.into_iter()),
+            "moving an activation must move the digest"
+        );
+        // The name is hashed beside the heights so that RENAMING a derivation — which changes what its height
+        // means — changes the digest; hashing heights alone would call two different schedules identical.
+        assert_ne!(
+            digest_of(base.into_iter()),
+            digest_of(renamed.into_iter()),
+            "renaming a derivation must move the digest — the height it names would otherwise be unanchored"
+        );
+
         // The name is hashed beside the height on purpose: renaming a derivation changes what its height
         // *means*, and a digest over heights alone would call two different schedules identical. Recomputed
         // here with one name perturbed — it must differ.
-        let mut perturbed = Vec::new();
-        for d in Derivation::ALL {
-            perturbed.extend_from_slice(d.name().as_bytes());
-            perturbed.push(b'!'); // a different name, same heights
-            perturbed.push(0);
-            perturbed.extend_from_slice(&d.activation_height().to_be_bytes());
-        }
-        assert_ne!(
-            fanos_primitives::hash::hash_labeled("FANOS-v1/derivation-vector", &perturbed),
-            digest,
-            "renaming a derivation must move the digest — otherwise the height it names is unanchored"
-        );
-
         // And it reaches the operator, which is the point of computing it.
+        let plane = render_data_path(&[], GatherHealth::NoGatherPath, 0);
+        assert!(plane.contains("derivation_vector"), "the schedule must be readable beside the plane: {plane}");
+        // And the digest alone is not enough: it answers "do two nodes agree", and an operator whose digests
+        // differ needs "on what" immediately — a hash cannot be diffed.
+        for d in Derivation::ALL {
+            assert!(plane.contains(d.name()), "{} is missing from the listed schedule: {plane}", d.name());
+        }
         assert!(
-            render_data_path(&[], GatherHealth::NoGatherPath).contains("derivation_vector"),
-            "the schedule must be readable beside the plane it explains"
+            plane.contains("permanent") || plane.contains("withdrawn at"),
+            "every entry states whether it is provisional: {plane}"
         );
     }
 
@@ -623,7 +674,7 @@ mod tests {
         // A node reports `stations × lines` counters. Printing them all buries the two that moved, which is the
         // diagnosis-by-thin-evidence the plane exists to end rather than reproduce — so only non-zero counts
         // appear, and a quiet plane says so in words, because an empty body and a broken verb look identical.
-        let quiet = render_data_path(&[], GatherHealth::Unmeasured);
+        let quiet = render_data_path(&[], GatherHealth::Unmeasured, 0);
         assert!(quiet.contains("no station has fired"), "silence must be stated, not implied: {quiet}");
         assert!(
             quiet.contains("unmeasured"),
@@ -632,7 +683,7 @@ mod tests {
 
         // And the third state, which an `Option` could not carry: a node with no gather at all must not be told
         // its deadline is unmeasured, or every overlay-only node reports a finding it cannot act on.
-        let no_gather = render_data_path(&[], GatherHealth::NoGatherPath);
+        let no_gather = render_data_path(&[], GatherHealth::NoGatherPath, 0);
         assert!(no_gather.contains("n/a"), "no gather path is not an unmeasured one: {no_gather}");
         assert!(
             !no_gather.contains("unmeasured"),
@@ -653,6 +704,7 @@ mod tests {
         let body = render_data_path(
             &obs,
             GatherHealth::Measured { srtt: Duration::from_millis(180), var: Duration::from_millis(40) },
+            0,
         );
         assert!(body.contains("412") && body.contains("line 1:0:1"), "a hot station names its line: {body}");
         assert!(body.contains("unattributed"), "an unattributable count says so, not a fabricated line: {body}");

@@ -78,6 +78,56 @@ pub enum Derivation {
     OnionGatherMember,
 }
 
+/// Whether `epoch` falls inside the half-open window `[activation, abort)`.
+///
+/// The comparison is `>=` at the activation and `<` at the abort, and they read the same way on purpose: a
+/// height names the **first** epoch on which its side applies. Activation at `N` means `N` is the first epoch
+/// on the new form; abort at `M` means `M` is the first epoch back on the old one. Anything else and
+/// "activate at N, abort at M" means different things to different readers, which is the class of
+/// disagreement an activation registry exists to remove.
+///
+/// Taken as parameters rather than read off a [`Derivation`] so the boundaries can be exercised against
+/// schedules the shipped registry does not contain — its one entry is permanent and activates at 0, so it
+/// touches neither boundary. The first version of that test reimplemented this logic beside itself and
+/// therefore proved nothing about it: reverting the `<` to `<=` here left the test green.
+#[must_use]
+pub const fn active_in(epoch: u64, activation: u64, abort: Option<u64>) -> bool {
+    if epoch < activation {
+        return false;
+    }
+    match abort {
+        Some(withdrawn) => epoch < withdrawn,
+        None => true,
+    }
+}
+
+/// Where a [`Derivation`] stands at a given epoch.
+///
+/// Three states, not a boolean, because an operator diagnosing a quiet line needs to tell "this build has the
+/// change and is waiting for its height" from "this build withdrew it". Both answer `false` to
+/// [`is_active_at`](Derivation::is_active_at), and they call for opposite actions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Status {
+    /// Compiled in, activation height not yet reached — the old form is authoritative.
+    Scheduled,
+    /// Authoritative now.
+    Active,
+    /// Past its abort height: withdrawn, the old form authoritative again.
+    Withdrawn,
+}
+
+impl Status {
+    /// A short stable word for an operator surface.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Active => "active",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
 impl Derivation {
     /// Every registered derivation, for a reader that enumerates rather than guesses.
     pub const ALL: &'static [Self] = &[Self::OnionGatherMember];
@@ -96,6 +146,34 @@ impl Derivation {
         }
     }
 
+    /// The epoch at which this derivation's current form is **withdrawn again** — the pre-agreed abort height,
+    /// or `None` for a derivation shipped as permanent.
+    ///
+    /// §5's deliverable, and the reason it exists is that an epoch-aligned flip is also an epoch-aligned
+    /// *break*: if a defect only shows after activation, the whole network entered it together. Rolling a
+    /// derivation *back* is itself a derivation change and so needs its own height — there is no instant
+    /// revert. What an abort height shortens is the gap. Publishing both heights **with the feature** turns a
+    /// rollback from a new consensus decision, negotiated under pressure while a line is dying, into one the
+    /// network already agreed to before anything went wrong.
+    ///
+    /// It is a *release* decision, not a runtime one, for the same reason [`is_active_at`](Self::is_active_at)
+    /// consults no registry object: "the schedule **is** the build". Arming an abort means shipping a release
+    /// whose `abort_height` is set, and because that changes the schedule it also changes
+    /// `derivation_digest` — so two operators comparing digests can see that one of them is on a build that
+    /// intends to withdraw a derivation and the other is not. An abort nobody can observe would be the same
+    /// silent class-C change this whole document exists to make visible.
+    ///
+    /// Withdrawal restores the **old** form, which is why §3.1 requires both to stay linked into the binary: a
+    /// release that deleted the pre-activation code could not honour its own abort.
+    #[must_use]
+    pub const fn abort_height(self) -> Option<u64> {
+        match self {
+            // Shipped as permanent. It is the salted gatherer draw that fixed #55, and there is no old form to
+            // return to that would not reintroduce the single point of failure it removed.
+            Self::OnionGatherMember => None,
+        }
+    }
+
     /// Whether this derivation's current form is authoritative at epoch ordinal `epoch`.
     ///
     /// The comparison is `>=`, so the height names the **first** epoch on which the new form applies —
@@ -109,7 +187,19 @@ impl Derivation {
     /// re-creating the very class-C failure the design closes.
     #[must_use]
     pub const fn is_active_at(self, epoch: u64) -> bool {
-        epoch >= self.activation_height()
+        active_in(epoch, self.activation_height(), self.abort_height())
+    }
+
+    /// Where this derivation stands at `epoch`, for an operator surface that must distinguish three states.
+    #[must_use]
+    pub const fn status_at(self, epoch: u64) -> Status {
+        if epoch < self.activation_height() {
+            Status::Scheduled
+        } else if self.is_active_at(epoch) {
+            Status::Active
+        } else {
+            Status::Withdrawn
+        }
     }
 
     /// A short stable name for an operator surface and for logs. Stable because an operator's saved query
@@ -128,6 +218,55 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn an_abort_height_names_the_first_epoch_running_the_old_form_again() {
+        // Both boundaries must read the same way or "activate at N, abort at M" means different things to
+        // different readers — which is the class of disagreement an activation registry exists to remove.
+        // Activation is `>=`, so N is the first epoch on the NEW form; abort is `<`, so M is the first epoch
+        // back on the OLD one. The interval is `[N, M)`, half-open at both ends in the same direction.
+        let active = |a, b, e| active_in(e, a, b);
+        assert!(!active(10, Some(20), 9), "before activation: old form");
+        assert!(active(10, Some(20), 10), "N is the first epoch of the new form");
+        assert!(active(10, Some(20), 19), "still active on the last epoch before the abort");
+        assert!(!active(10, Some(20), 20), "M is the first epoch back on the old form, not the last new one");
+        assert!(!active(10, Some(20), 21), "and it stays withdrawn");
+
+        // A permanent derivation never withdraws, however far out the epoch runs.
+        assert!(active(10, None, u64::MAX), "no abort height means no withdrawal");
+
+        // An abort at or below the activation is a schedule that is never active — a release that shipped one
+        // would withdraw a feature before it ever applied. Stated so the arithmetic is not an accident.
+        assert!(!active(10, Some(10), 10), "abort == activation is never active");
+        assert!(!active(10, Some(5), 7), "abort below activation is never active");
+    }
+
+    #[test]
+    fn the_shipped_registry_has_a_coherent_schedule() {
+        // The property every entry must satisfy, checked over the real registry rather than a fixture: a
+        // derivation whose abort does not strictly follow its activation is one that can never be active, and
+        // that is a release mistake no test downstream would attribute correctly.
+        for d in Derivation::ALL {
+            if let Some(abort) = d.abort_height() {
+                assert!(
+                    abort > d.activation_height(),
+                    "{}: abort {abort} must strictly follow activation {}",
+                    d.name(),
+                    d.activation_height()
+                );
+            }
+            // And the three states agree with the boolean at every boundary they share.
+            let a = d.activation_height();
+            assert_eq!(d.status_at(a) == Status::Active, d.is_active_at(a));
+            // Only where a pre-activation epoch EXISTS. A derivation registered at height 0 has none —
+            // `saturating_sub` would hand back epoch 0 again, which is its first *active* epoch, and the
+            // assertion would demand `Scheduled` of a state that is `Active` by definition. The shipped entry
+            // is exactly that case, so this guard is load-bearing rather than defensive.
+            if let Some(before) = a.checked_sub(1) {
+                assert_eq!(d.status_at(before), Status::Scheduled, "{}", d.name());
+            }
+        }
+    }
 
     #[test]
     fn activation_is_monotone_in_the_epoch_and_never_flips_back() {
