@@ -24,13 +24,14 @@ use fanos_rendezvous::{
 };
 use fanos_runtime::{Command, Notification};
 
-use fanos_session::{ChannelTransport, stream_over_channels_paced};
+use fanos_session::{ChannelTransport, stream_over_channels_confirmed};
 use rand_core::{CryptoRng, Rng};
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
 
 /// Bridge a DIAULOS session's datagram channels to the base overlay through a threshold-onion
 /// rendezvous.
@@ -60,7 +61,16 @@ async fn rendezvous_bridge<F, S>(
     // concurrent halves on the one task instead: each progresses whenever its own input is ready.
     let inbound = async {
         loop {
-            match deliveries.recv().await {
+            // The session driver going away must end this half **without waiting for a delivery**. Its only
+            // other exit is `try_send` reporting `Closed`, which needs a reply to arrive and open — and an
+            // abandoned attempt is precisely one that gets no reply, so it would spin on the node's broadcast
+            // forever. That leaks a task per abandoned attempt, and the meeting-point walk creates one on
+            // every dial that skips a censored point.
+            let delivery = tokio::select! {
+                () = app_in.closed() => break,
+                d = deliveries.recv() => d,
+            };
+            match delivery {
                 Ok(Notification::Delivered { from, payload }) if from == ANONYMOUS => {
                     // NOSTOS: an anonymous delivery is a dead-drop landing on this session's own reply
                     // line — its body is end-to-end-sealed to our reply key. Open it; a body not for us
@@ -92,8 +102,14 @@ async fn rendezvous_bridge<F, S>(
 
 /// Dial a service **anonymously**: drive `session` (a DIAULOS [`ClientSession`] whose peer is the
 /// service's meeting-line coordinate) as an async byte stream whose cells ride threshold onions sealed
-/// by `rclient`. Returns the application side of the stream; a spawned task owns the session and the
-/// rendezvous bridge.
+/// by `rclient`. Returns the application side of the stream **and a liveness signal**; a spawned task owns
+/// the session and the rendezvous bridge.
+///
+/// The signal resolves `Ok(())` when the DIAULOS handshake completes through this meeting point and `Err(_)`
+/// when the driver gives up on it. A caller choosing among a service's several meeting points has no other
+/// way to tell a *censored* one from a merely *quiet* one — the stream itself stays open and silent either
+/// way until the give-up rule fires minutes later — and without that distinction the meeting points past the
+/// first are decorative (`docs/design-rendezvous.md §5`). A caller that will not walk may drop it.
 ///
 /// The reply comes home via NOSTOS: `rclient`'s reply circuit must terminate at one of this node's own
 /// lines (a line through its coordinate), and `reply_keys` must be the matching
@@ -106,7 +122,7 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
     session: ClientSession,
     rclient: RendezvousClient<F>,
     reply_keys: ReplyKeys,
-) -> DuplexStream {
+) -> (DuplexStream, oneshot::Receiver<()>) {
     let (out_tx, out_rx) = channel(ChannelTransport::CAP);
     let (in_tx, in_rx) = channel(ChannelTransport::CAP);
     let deliveries = client.subscribe();
@@ -127,7 +143,7 @@ pub fn dial_anonymous<F: Field + Send + 'static>(
         deliveries,
         reply_keys,
     ));
-    stream_over_channels_paced(
+    stream_over_channels_confirmed(
         session,
         ChannelTransport {
             outbound: out_tx,
@@ -263,7 +279,7 @@ pub fn anonymous_dial<R: CryptoRng>(
     meeting: Triple,
     secret: &[u8],
     rng: &mut R,
-) -> Option<DuplexStream> {
+) -> Option<(DuplexStream, oneshot::Receiver<()>)> {
     // Both derivations come from the one identity, so they cannot disagree: the KEM half LOCATES the service
     // (the meeting line, and the handshake encapsulates to it) while the whole bundle AUTHORISES its route
     // binding (`service_tag`, which the combiner recomputes from the registration's carried identity).

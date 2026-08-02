@@ -11,6 +11,7 @@
 use fanos_diaulos::service_public_from_bundle;
 use fanos_diaulos::{ClientSession, Coord, StaticKeypair};
 use fanos_field::F2;
+use fanos_geometry::Triple;
 use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
@@ -18,7 +19,9 @@ use fanos_proxy::{DialError, Dialer, Target, UdpDialer, UdpTunnel};
 use fanos_quic::Client;
 use fanos_rendezvous::{BeaconSeed, MixDirectory, meeting_lines};
 use fanos_runtime::{Command, Notification};
-use fanos_session::{ChannelTransport, OverlayTransport, dial_over_transport, serve_over_channels};
+use fanos_session::{
+    ChannelTransport, GIVE_UP_ATTEMPTS, OverlayTransport, dial_over_transport, serve_over_channels,
+};
 use rand_core::CryptoRng;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -26,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 use tokio::sync::mpsc::{Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -447,7 +451,7 @@ impl<R: ServiceResolver> FanosDialer<R> {
     /// Direct profile) via this dialer's anonymity profile. Shared by the TCP [`dial`](Self::dial) and UDP
     /// [`dial_udp`](Self::dial_udp) paths so **both** honour the profile — an anonymous profile never reaches a
     /// service (or the clearnet exit) by coordinate, which would leak the client's coordinate (audit S1-C1).
-    fn establish(
+    async fn establish(
         &self,
         coord: Coord,
         identity: &[u8],
@@ -459,50 +463,194 @@ impl<R: ServiceResolver> FanosDialer<R> {
                 dial_service(self.client.clone(), coord, &public, rng)
             }
             Profile::Fixed(route) => {
-                // A separate OS-entropy secret seeds this session's cookie + per-onion key material.
-                let secret = os_entropy_32()?;
-                // Pick one of the service's `f + 1` meeting points at random — random rather than derived from
-                // the client, since a derived pick makes two of one client's dials share a point, which is a
-                // linkable observation.
                 let public = service_public_from_bundle(identity).ok_or(DialError::Unreachable)?;
-                let meetings = meeting_lines::<F2>(&public.encode(), route.epoch, &route.beacon);
-                let mut pick = [0u8; 4];
-                rng.fill(&mut pick);
-                let meeting = *meetings
-                    .get(u32::from_be_bytes(pick) as usize % meetings.len().max(1))
-                    .ok_or(DialError::Unreachable)?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), identity, route, meeting, &secret, rng)
-                    .ok_or(DialError::Unreachable)?
+                // A FIXED route can only be walked to meeting points it does not already pass through.
+                // `RendezvousRoute::draw` lays forward hops that *avoid* their destination, so reusing one
+                // route for a different meeting point can put that point in the middle of its own circuit —
+                // a terminus the onion reaches and peels early, which is the "0 of 8 dials arriving" failure
+                // this profile already carries a warning about. Such a point is unreachable *by this route*,
+                // so it is not a candidate; the Fresh profile has no such restriction because it redraws.
+                let meetings: Vec<Triple> =
+                    meeting_lines::<F2>(&public.encode(), route.epoch, &route.beacon)
+                        .into_iter()
+                        .filter(|m| !route.forward_hops.contains(m) && !route.reply_circuit.contains(m))
+                        .collect();
+                self.walk_meeting_points(&meetings, rng, |meeting, rng| {
+                    // A separate OS-entropy secret seeds each attempt's cookie + per-onion key material, so two
+                    // attempts of one dial are no more linkable than two dials.
+                    let secret = os_entropy_32()?;
+                    crate::rendezvous::anonymous_dial(self.client.clone(), identity, route, meeting, &secret, rng)
+                        .ok_or(DialError::Unreachable)
+                })
+                .await?
             }
             Profile::Fresh(params) => {
-                // Derive the service's per-target meeting line, DRAW A FRESH route (new random forward/reply
+                // Derive the service's meeting points, DRAW A FRESH route per attempt (new random forward/reply
                 // hops so this connection is unlinkable to the client's others), then ride the session over it.
                 let public = service_public_from_bundle(identity).ok_or(DialError::Unreachable)?;
-                // ONE pick, used for BOTH the route draw and the dial. They must agree: `draw` lays hops that
-                // avoid the destination, so a route drawn toward one meeting point and sealed to another is a
-                // circuit built for somewhere it is not going — measured as 0 of 8 dials arriving.
                 let meetings = meeting_lines::<F2>(&public.encode(), params.epoch, &params.beacon);
-                let mut pick = [0u8; 4];
-                rng.fill(&mut pick);
-                let meeting = *meetings
-                    .get(u32::from_be_bytes(pick) as usize % meetings.len().max(1))
-                    .ok_or(DialError::Unreachable)?;
-                let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
-                    params.directory.clone(),
-                    params.threshold,
-                    params.epoch,
-                    params.beacon,
-                    meeting,
-                    params.depths,
-                    rng,
-                );
-                let secret = os_entropy_32()?;
-                crate::rendezvous::anonymous_dial(self.client.clone(), identity, &route, meeting, &secret, rng)
-                    .ok_or(DialError::Unreachable)?
+                self.walk_meeting_points(&meetings, rng, |meeting, rng| {
+                    // The route is drawn to the meeting point THIS attempt uses. They must agree: `draw` lays
+                    // hops that avoid the destination, so a route drawn toward one meeting point and sealed to
+                    // another is a circuit built for somewhere it is not going — measured as 0 of 8 dials
+                    // arriving. Redrawing per attempt is required, not merely tidy.
+                    let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
+                        params.directory.clone(),
+                        params.threshold,
+                        params.epoch,
+                        params.beacon,
+                        meeting,
+                        params.depths,
+                        rng,
+                    );
+                    let secret = os_entropy_32()?;
+                    crate::rendezvous::anonymous_dial(self.client.clone(), identity, &route, meeting, &secret, rng)
+                        .ok_or(DialError::Unreachable)
+                })
+                .await?
             }
         })
     }
+
+    /// Try a service's meeting points **from a random start** until one's DIAULOS handshake completes.
+    ///
+    /// `meeting_lines` derives its count so that at least one meeting point is uncensored — by pigeonhole on
+    /// the small planes, by the beacon's unpredictability on the large ones. Drawing *one* point and giving up
+    /// converts that guarantee into a per-dial success of `1 − f/n ≈ 2/3` and makes every point past the first
+    /// dead weight: the derivation proves a good element **exists**, and only a walk finds it
+    /// (`docs/design-rendezvous.md §5`). Failure here is observable — the confirmation signal resolves `Err`
+    /// when the session driver gives up — so this is a walk and not a re-draw.
+    ///
+    /// The **start is random**, which is the property the previous single pick was really protecting: two dials
+    /// by one client must not share a first contact, or a node sitting at a meeting point can link them. A
+    /// random start keeps each dial's first contact uniform while the walk supplies the coverage.
+    ///
+    /// **Hedged, not serial-with-a-deadline** — and that is a measured correction, not a preference. A serial
+    /// walk has to decide "is this meeting point censored, or merely slow?", and over this mixnet that
+    /// question has no cheap answer: twelve healthy handshakes through a live meeting point measured
+    /// `0.26 · 1.14 · 1.15 · 2.24 · 2.53 · 3.01 · 3.02 · 3.03 · 3.14 · 3.58 · 6.69 · 14.86` seconds — a median
+    /// near 3 s with a tail past 14. Any deadline short enough to be useful against a censor also abandons
+    /// live paths, which is *worse* than not walking at all; the first attempt at this measured **7 of 12**
+    /// arrivals against a single draw's 8.
+    ///
+    /// Hedging removes the question instead of answering it (Dean & Barroso, *The Tail at Scale*). Attempts
+    /// are **added** at [`HEDGE_DELAY`] and never withdrawn, so the dial completes at the *minimum* over the
+    /// points tried rather than at whichever one it happened to commit to. The asymmetry is what makes this
+    /// safe: hedging too early costs an extra onion, while timing out too early costs the dial.
+    ///
+    /// The anonymity price is that a hedged dial tells two meeting points a dial happened rather than one.
+    /// Neither learns who dialled or that the two are the same client, and the service key that selects them
+    /// is public anyway — so this buys tail latency with traffic, not with linkability.
+    async fn walk_meeting_points(
+        &self,
+        meetings: &[Triple],
+        rng: &mut SeedRng,
+        mut attempt: impl FnMut(Triple, &mut SeedRng) -> Result<(DuplexStream, oneshot::Receiver<()>), DialError>,
+    ) -> Result<DuplexStream, DialError> {
+        if meetings.is_empty() {
+            return Err(DialError::Unreachable);
+        }
+        let mut pick = [0u8; 4];
+        rng.fill(&mut pick);
+        let start = u32::from_be_bytes(pick) as usize % meetings.len();
+
+        // Each launched attempt reports its own outcome here: `Ok(idx)` established, `Err(idx)` gave up. A
+        // channel rather than a future combinator keeps the streams owned by this frame — the winner is handed
+        // back and the losers drop, and dropping a loser's stream is what tears its session driver down.
+        let (tx, mut rx) = channel(meetings.len());
+        let mut streams: Vec<Option<DuplexStream>> = Vec::with_capacity(meetings.len());
+        let mut last = DialError::Unreachable;
+        let mut in_flight = 0usize;
+
+        for i in 0..meetings.len() {
+            let Some(&meeting) = meetings.get((start + i) % meetings.len()) else { break };
+            match attempt(meeting, rng) {
+                Ok((stream, ready)) => {
+                    let (idx, tx) = (streams.len(), tx.clone());
+                    streams.push(Some(stream));
+                    in_flight += 1;
+                    tokio::spawn(async move {
+                        let _ = tx.send(ready.await.map(|()| idx).map_err(|_| idx)).await;
+                    });
+                }
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            }
+            // Wait for something to happen before adding another meeting point: an establishment ends the
+            // dial, a give-up frees a slot immediately, and the hedge delay adds a slot speculatively — but
+            // only while fewer than `MAX_IN_FLIGHT` attempts are outstanding.
+            //
+            // **The cap is the load brake, and it is not optional.** Hedging assumes slowness is *local* to a
+            // path. Under host starvation it is not — every path is slow at once, so an uncapped hedge fires
+            // on every dial and multiplies onion traffic by `m` precisely when the mixnet can least carry it.
+            // Measured: with the machine at load 16, an uncapped hedge took the silenced arm to **0 of 12**
+            // against a control of 10, a collapse an unhedged client would not have had. Capping at two keeps
+            // the worst case at 2× and leaves the coverage intact, because a *failed* attempt frees its slot
+            // at once — speculation is bounded, recovery is not.
+            while in_flight >= MAX_IN_FLIGHT {
+                match rx.recv().await {
+                    Some(Ok(idx)) => {
+                        return streams.get_mut(idx).and_then(Option::take).ok_or(DialError::Unreachable);
+                    }
+                    Some(Err(_)) => in_flight -= 1,
+                    None => return Err(last),
+                }
+            }
+            match tokio::time::timeout(HEDGE_DELAY, rx.recv()).await {
+                Ok(Some(Ok(idx))) => {
+                    return streams.get_mut(idx).and_then(Option::take).ok_or(DialError::Unreachable);
+                }
+                Ok(Some(Err(_))) => in_flight -= 1,
+                Ok(None) => return Err(last),
+                Err(_) => {} // the hedge delay elapsed: add the next meeting point
+            }
+        }
+
+        // Every meeting point has been offered. `recv` now ends only once the last attempt's task has dropped
+        // its sender — that is, once every session driver has given up — so the drivers' own give-up rule is
+        // the overall deadline and there is no second timer that could disagree with it.
+        drop(tx);
+        loop {
+            match rx.recv().await {
+                Some(Ok(idx)) => {
+                    return streams.get_mut(idx).and_then(Option::take).ok_or(DialError::Unreachable);
+                }
+                Some(Err(_)) => {} // that point gave up; the others are still trying
+                None => return Err(last),
+            }
+        }
+    }
 }
+
+/// How long the attempts already in flight are given before another meeting point is **added**.
+///
+/// Not a deadline: nothing is abandoned when it expires, so the cost of firing early is one extra onion and
+/// never a lost dial. That asymmetry is what lets the value be set from the measured distribution rather than
+/// argued from a worst case — the twelve healthy handshakes timed in [`FanosDialer::walk_meeting_points`] put
+/// the median near 3 s, so `GIVE_UP_ATTEMPTS × RENDEZVOUS_TICK` = 15 × 250 ms = 3.75 s sits around the third
+/// quartile: most dials never hedge, and the tail past 6 s gets a second path without waiting out the first.
+///
+/// It reuses the platform's existing "no answer by now is evidence" quantity ([`GIVE_UP_ATTEMPTS`], RFC 1122's
+/// `R2`) rather than introducing a constant of its own. Under a *timeout* that quantity was the wrong one —
+/// it abandoned live paths — but as a hedge trigger it is exactly the right shape: the point past which
+/// another sample is worth its bandwidth.
+const HEDGE_DELAY: Duration = crate::rendezvous::RENDEZVOUS_TICK.saturating_mul(GIVE_UP_ATTEMPTS);
+
+/// How many of a service's meeting points a single dial may have in flight at once.
+///
+/// **A hedge without a cap is a congestion amplifier.** Hedging is sound when slowness is a property of the
+/// *path* — then a second sample is cheap information. When slowness is a property of the *host*, every path
+/// is slow together, every dial hedges, and the mixnet receives `m` times the onions at the moment it is
+/// least able to peel them. That is not a hypothetical: measured at machine load 16, an uncapped hedge drove
+/// the censored arm of `anonymous_quic`'s experiment to **0 of 12** against a control of 10 — worse than not
+/// hedging at all, which is the signature of self-inflicted collapse.
+///
+/// Two is the smallest cap that keeps the mechanism: one live attempt plus one speculative alternative bounds
+/// the traffic multiplier at 2× while a *failed* attempt frees its slot immediately, so coverage of all `m`
+/// points is preserved — only the speculation is bounded, never the recovery.
+const MAX_IN_FLIGHT: usize = 2;
 
 /// 32 fresh bytes of OS entropy, mapped to a [`DialError`] on the (unexpected) failure of the OS source
 /// — the one place a dial draws randomness for its ephemeral session material.
@@ -538,7 +686,7 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
         let mut rng = SeedRng::from_seed(&os_entropy_32()?);
 
         // Establish the session per the anonymity profile (the exit is just a service, reached by its key).
-        let stream = self.establish(coord, &identity, &mut rng)?;
+        let stream = self.establish(coord, &identity, &mut rng).await?;
 
         // For a clearnet target, hand the exit its destination over the (Direct or anonymous) session it now
         // rides — the exit still learns only the target, never the client's coordinate.
@@ -577,7 +725,7 @@ impl<R: ServiceResolver> UdpDialer for FanosDialer<R> {
         // --profile anonymous` leaked the client's coordinate to the exit on every SOCKS5 UDP datagram (DNS,
         // QUIC/HTTP-3, WebRTC). Establishing via the profile and then handing the exit its `udp:host:port`
         // target means an anonymous profile rides threshold onions to the exit's meeting line, never by-coord.
-        let session = self.establish(*exit_coord, exit_public, &mut rng)?;
+        let session = self.establish(*exit_coord, exit_public, &mut rng).await?;
         let stream = crate::exit::exit_send_target(session, &format!("udp:{}:{}", target.host(), target.port()))
             .await
             .map_err(DialError::Io)?;
