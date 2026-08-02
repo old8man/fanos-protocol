@@ -300,12 +300,23 @@ where
                  it should have been), and this process has delivered {moved} bytes on other flows",
                 ran * 100.0
             );
+            // **`ran` decides, alone.** `moved` is the older proxy this heartbeat was introduced to replace —
+            // its doc above names the gap it leaves — and requiring *both* re-imported that gap in the other
+            // direction: `moved` counts bytes on OTHER flows, so a test run on its own has none by
+            // construction, and every solo failure was labelled INCONCLUSIVE even at 98% polling, where the
+            // runtime is demonstrably healthy and the honest verdict is a refutation.
+            //
+            // The message made that worse by advising "re-run it alone; if it passes, the host was the
+            // variable" — routing the reader into the single case the conjunction could not judge. Three real
+            // failures wore the inconclusive label for weeks because of it.
+            //
+            // `moved` stays in the evidence string, where it is informative, and out of the verdict, where it
+            // was only ever a weaker way of asking what `ran` answers directly.
             assert!(
-                moved > 0 && ran > 0.5,
+                ran > 0.5,
                 "INCONCLUSIVE — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes. {evidence}. \
-                 Either nothing in this process ever moved a byte, or this runtime was not scheduled enough to \
-                 judge — so the run says nothing about the system. Re-run it alone; if it passes, the host was the \
-                 variable."
+                 This runtime was not scheduled enough to judge — so the run says nothing about the system. \
+                 Re-run it on an idle host; if the poll ratio rises and it still moves nothing, it is wedged."
             );
             panic!(
                 "REFUTED — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes. {evidence} — so \
