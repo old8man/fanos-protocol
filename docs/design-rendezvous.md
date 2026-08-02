@@ -265,9 +265,24 @@ Recording these because they are now load-bearing and were not before:
    Today's tag is `H(RDV_HOST, signing_key ‖ epoch)`, which is exactly that, and folding in the beacon would
    change nothing — the beacon is public too.
 
-   The escape is to change *who may dial*: under **client authorization**, the tag folds in a secret held only
-   by authorized clients (`H(… ‖ authz)`), and the link becomes invisible to everyone else. So the two regimes
-   have genuinely different censorship guarantees, and the honest statement is:
+   **And in the shipped code the leak is blunter than that argument.** `HostRegister.identity` carries the
+   service's canonical published identity bundle *verbatim*, so the combiner can recompute the tag rather than
+   believe it — a sound anti-forgery check whose consequence had not been written down: a node at a meeting
+   point is simply **handed** the list of services registered there. Blinding the tag while the identity
+   travels beside it is a non-fix, which retires the "blinded, beacon-bound tag" of anonymity residual #49.
+
+   It also sharpens the adversary model above. An adaptive adversary does not have to *infer* which
+   registrations are the target's; holding any one combiner gives it the list. So the probabilistic bound
+   rests on the adversary being unable to *act* on that list within the epoch, which is a weaker footing than
+   "it cannot aim" — the honest reason `q ≥ 7` is a static-adversary claim.
+
+   The real escape is **key blinding** (Tor v3's mechanism): register under `blinded_vk = Blind(vk, epoch,
+   nonce)` and sign with the blinded key, so the combiner verifies the binding without ever seeing the
+   unblinded identity. Anyone holding `vk` can still link — correct for a public service — while an
+   **authorized-only** service folds the client-authorization secret into the blinding factor and becomes
+   unlinkable to everyone else. The obstacle is real rather than clerical: FANOS signs with a hybrid ML-DSA
+   construction and ML-DSA has no standard blinding, so this is research (task #39), not a patch. The two
+   regimes therefore have genuinely different censorship guarantees:
 
    | service | adaptive-within-epoch adversary | static adversary |
    |---|---|---|
@@ -338,11 +353,18 @@ rewrite:
 
 Recorded here rather than left implicit:
 
-- **~2 dials in 12 still fail when a cell member is down** (control 12/12, silenced 10/12 on an idle host).
-  Hedging recovers the *handshake*; an established session's replies still draw a gatherer per onion and a
-  dead draw costs a retransmit that does not always land in the window. Data path, not rendezvous path.
-- **The censorship test's falsification power is only ≈82%** at that tolerance (`P(Bin(12, 2/3) ≥ 10) ≈ 18%`).
-  Closing the residual above is what allows tightening it.
+- **An established session WEDGES when one cell member is down** — and that is stronger than the "2 dials in
+  12 look flaky" it first appeared as. Giving each dial **4× the window** (192 s of *granted* time) recovers
+  nothing: the failures land on the harness's `REFUTED` branch, which fires only when the poll ratio shows the
+  runtime *was* being scheduled and the session still moved zero bytes. Not slowness, not contention. The dial
+  and handshake succeed — hedging works — and the traffic afterwards stops forever, so some state bound *once
+  per session* points at the dead node and never redraws. Data path, not rendezvous path (task #38).
+- **The measurement that hid it.** The experiment wrapped the harness's own budgeted exchange in an outer 48 s
+  timeout, which usually fired *first* and turned a loud wedge into a silent non-arrival. The earlier "control
+  12/12, silenced 10/12" reading was therefore two **masked wedges**, not two slow dials — a reminder that an
+  outer timer placed over an instrument replaces its verdict with a weaker one.
+- **The censorship experiment's falsification power is only ≈82%** at its tolerance
+  (`P(Bin(12, 2/3) ≥ 10) ≈ 18%`). Closing the wedge is what allows tightening it.
 - **Mixing is not compared.** Stratified designs have provable mixing bounds a plane does not inherit, and
   nothing here measures FANOS's per-hop line quorum against them. That is a separate experiment, and this
   document does not settle it.
