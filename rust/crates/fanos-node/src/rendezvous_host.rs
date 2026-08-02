@@ -450,8 +450,10 @@ async fn rotate_host(
     // Register anonymously: seal the registration to the meeting line and raw-emit it at the combiner.
     // Register at EVERY meeting point, not one. A single meeting line put a whole epoch of this service's inbound
     // traffic behind one combiner, which cannot read it but can drop it — censorship by one node, and the beacon
-    // is public so the placement is predictable an epoch ahead. `meeting_lines` yields `f + 1` points with
-    // distinct combiners, so an adversary inside the tolerated fault budget cannot hold them all.
+    // is public so the placement is predictable an epoch ahead. `meeting_lines` yields `meeting_point_count(q)`
+    // points with distinct combiners, so an adversary inside the tolerated fault budget cannot hold them all —
+    // by pigeonhole on the small planes, and by the beacon's unpredictability on the large ones, where covering
+    // a third of the network is not a cost the host can pay (`docs/design-rendezvous.md §6`).
     //
     // Additive by construction: meeting point 0 IS the single-point derivation, so a client still computing
     // `meeting_line` keeps finding this service there while the extra points are pure gain.

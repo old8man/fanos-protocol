@@ -67,16 +67,75 @@ pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &Beac
 /// 7041-byte onion body, so it did not fit past Fano even before authentication added a bundle and a signature.
 pub const CONTROL_MIX_DIRECTORY: u16 = 1;
 
-/// **All** of a service's meeting lines for `epoch` — the `f + 1` points a client may reach it at.
+/// The horizon the probabilistic meeting-point count is solved for: the number of epochs over which a service
+/// expects **at most one** censored epoch. `2²⁰` epochs is ≈120 years at one epoch per hour.
 ///
-/// A single meeting point is a censorship single point of failure, and the count is forced rather than chosen.
-/// Model the censor as the fault model already does: an adversary holds a set `A` of points with `|A| = f`, where
-/// `f = ⌊(n − 1)/3⌋` and `n = q² + q + 1` is the plane's point count — the same tolerance every other bound here
-/// assumes. A service is censored exactly when every one of its meeting **combiners** lies in `A`. With `m ≤ f`
-/// distinct combiners the adversary picks `A` to cover them and censorship is deterministic, *within the tolerance
-/// the platform already grants it*; with `m = f + 1`, pigeonhole leaves at least one combiner outside `A` for
-/// every admissible `A`. So `m = f + 1` — on the Fano plane, 3, which is the number Tor picked by convention and
-/// here follows from the geometry.
+/// This is the single policy input to [`meeting_point_count`] — everything else there is derived. It is a
+/// horizon rather than a bare probability because that is the form an operator can reason about: "how long
+/// should this run before one epoch is expected to be censored", against which 120 years is a defensible
+/// answer for a network meant to outlive its authors. Raising it costs meeting points only logarithmically
+/// (`log₃`), so an extra factor of a thousand in horizon buys itself for about 6 more points.
+pub const CENSORSHIP_HORIZON_EPOCHS: u64 = 1 << 20;
+
+/// How many meeting points a service takes on a plane of order `q` — the **minimum of two bounds**, because
+/// they are cheapest in opposite regimes and neither dominates.
+///
+/// Model the censor as the fault model already does: an adversary holds `A` with `|A| = f = ⌊(n − 1)/3⌋`,
+/// where `n = q² + q + 1`. A service is censored in an epoch exactly when every one of its meeting
+/// **combiners** lies in `A`.
+///
+/// **The pigeonhole bound, `m = f + 1`.** With `m ≤ f` combiners an adversary that can *aim* `A` covers them
+/// all; with `m = f + 1` at least one combiner is outside every admissible `A`. Censorship becomes
+/// impossible rather than improbable. But `f + 1 ≈ n/3` is **linear in `n`** — the host registers at a third
+/// of the network, times `q + 1` members per line — so past the smallest planes it costs more than the
+/// network has (`tests/meeting_cost.rs` measures the growth).
+///
+/// **The unpredictability bound.** The adversary *cannot* aim `A`, and the reason is already an axiom here:
+/// `coord = MapToPoint(VRF(sk, node‖epoch‖beacon))` is identity-bound and HELLO-proven (§3.2 assumption 1,
+/// `design-coordinates.md`), so `A` is a uniformly random `f`-subset fixed before the epoch's beacon exists,
+/// while the combiners are `H(key‖i, epoch, beacon)`. Each combiner is then adversarial independently with
+/// probability `f/n`, and sampling the `m` distinct combiners *without* replacement only helps:
+///
+/// ```text
+/// Pr[censored in one epoch] = C(f,m)/C(n,m) < (f/n)^m
+/// ```
+///
+/// Solving `(f/n)^m ≤ 1/H` for the horizon `H` = [`CENSORSHIP_HORIZON_EPOCHS`] gives
+/// `m ≥ log(H) / log(n/f)`, and since `n/f → 3` that is `log₃ H` — **constant in `n`**. Censorship is also
+/// not permanent: the next beacon redraws every combiner, so the bound is one censored epoch per `H`, each
+/// self-healing at the next rotation.
+///
+/// Taking the minimum makes the two bounds a single rule: small planes keep the *strictly stronger*
+/// deterministic guarantee (on the Fano cell, `f + 1 = 3` — the number Tor picked by convention and here
+/// follows from the geometry), and large planes stop growing. The crossover falls at `q = 7` precisely
+/// because that is where the deterministic bound stops being affordable.
+///
+/// The arithmetic is **integer-only and division-truncating**. A client and a host must agree on this count
+/// with no channel to compare it on, so a `f64::ln` whose last bit differs between two platforms' libm would
+/// be a silent split; and truncation biases the ratio *down*, so `m` errs high — toward more meeting points
+/// than the bound needs, never fewer.
+#[must_use]
+pub fn meeting_point_count(q: usize) -> usize {
+    let n = q * q + q + 1;
+    let f = (n - 1) / 3;
+    let pigeonhole = f + 1;
+    if f == 0 {
+        return pigeonhole; // No adversary is tolerable on such a plane; one meeting point is the whole bound.
+    }
+    // Smallest `m` with `(n/f)^m ≥ H`, tracking the ratio in 32-bit fixed point so neither side of the
+    // comparison grows like `n^m`. `r` stays under `H·2³²·(n/f)` ≈ 2⁵⁴, well inside `u128`.
+    let (n, f) = (n as u128, f as u128);
+    let target = u128::from(CENSORSHIP_HORIZON_EPOCHS) << 32;
+    let (mut r, mut m) = (1u128 << 32, 0usize);
+    while r < target {
+        m += 1;
+        r = r * n / f;
+    }
+    m.min(pigeonhole)
+}
+
+/// **All** of a service's meeting lines for `epoch` — the [`meeting_point_count`] points a client may reach
+/// it at. A single meeting point would be a censorship single point of failure; the count is derived there.
 ///
 /// **Distinct COMBINERS, not distinct lines**, and that is part of the derivation rather than a detail: two lines
 /// can share a combiner, and `f + 1` lines with `f` distinct combiners is the censored case again. The index walks
@@ -93,7 +152,7 @@ pub const CONTROL_MIX_DIRECTORY: u16 = 1;
 pub fn meeting_lines<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &BeaconSeed) -> Vec<Triple> {
     let q = F::Q as usize;
     let n = q * q + q + 1;
-    let m = (n - 1) / 3 + 1; // f + 1
+    let m = meeting_point_count(q);
     let (mut lines, mut combiners) = (Vec::with_capacity(m), Vec::with_capacity(m));
     for i in 0..n as u32 {
         // Index 0 hashes the key ALONE, so `meeting_lines(..)[0] == meeting_line(..)` exactly. That identity is
@@ -688,23 +747,26 @@ mod tests {
     }
 
     #[test]
-    fn a_service_has_f_plus_one_meeting_points_with_distinct_combiners() {
+    fn a_service_has_its_derived_meeting_points_at_distinct_combiners() {
         use fanos_field::{F2, F7};
-        // THE PROPERTY: no adversary within the fault model can hold every meeting point of a service. `f` is the
-        // tolerance the platform already grants — `⌊(n − 1)/3⌋` — so `f + 1` distinct combiners leaves one honest
-        // by pigeonhole. Asserted on TWO planes, because the count must FOLLOW from the geometry rather than be a
-        // constant that happens to suit Fano — and that is not a hypothetical: enumerating a second plane is what
-        // exposed the combiner map covering only 14 of 57 points, which made `f + 1 = 19` unobtainable.
+        // THE PROPERTY: no adversary within the fault model can hold every meeting point of a service, and each
+        // point sits at a DIFFERENT combiner — two at one combiner puts two of them in a single pair of hands.
+        //
+        // The count follows from `meeting_point_count`, which takes the cheaper of two bounds: pigeonhole
+        // (`f + 1`, deterministic) on small planes, and the beacon's unpredictability (`log₃ H`, constant in `n`)
+        // once `f + 1 ≈ n/3` stops being affordable. Asserted on TWO planes because it must FOLLOW from the
+        // geometry rather than be a constant that happens to suit Fano — and that is not hypothetical:
+        // enumerating a second plane is what exposed the combiner map covering only 14 of 57 points, which made
+        // the requested count literally unobtainable. `PG(2,7)` is now on the *other* side of the crossover from
+        // `PG(2,2)`, so this pair also pins that both branches are reachable.
         for q in [2usize, 7] {
-            let n = q * q + q + 1;
-            let want = (n - 1) / 3 + 1;
+            let want = meeting_point_count(q);
             let lines = if q == 2 {
                 meeting_lines::<F2>(b"a-service-key", Epoch::new(4), &BeaconSeed::GENESIS)
             } else {
                 meeting_lines::<F7>(b"a-service-key", Epoch::new(4), &BeaconSeed::GENESIS)
             };
-            assert_eq!(lines.len(), want, "PG(2,{q}) tolerates f = {} faults, so a service needs {want} meeting \
-                 points", want - 1);
+            assert_eq!(lines.len(), want, "PG(2,{q}) must yield the {want} meeting points its derivation asks for");
             let combiners: std::collections::BTreeSet<Triple> = lines
                 .iter()
                 .filter_map(|&l| if q == 2 { combiner_for::<F2>(l) } else { combiner_for::<F7>(l) })
@@ -712,6 +774,10 @@ mod tests {
             assert_eq!(combiners.len(), want, "every meeting point must sit at a DIFFERENT combiner — two at one \
                  combiner puts two of them in a single adversary's hands");
         }
+        // The two planes must actually exercise the two branches, or the pair above is one test written twice.
+        let n7 = 7 * 7 + 7 + 1;
+        assert_eq!(meeting_point_count(2), (2 * 2 + 2 + 1 - 1) / 3 + 1, "Fano must take the pigeonhole bound");
+        assert!(meeting_point_count(7) < (n7 - 1) / 3 + 1, "PG(2,7) must take the unpredictability bound");
 
         // **Point 0 IS the single-point derivation**, which is what lets several meeting points be adopted
         // additively: anyone still computing `meeting_line` is computing meeting point 0, and every host
