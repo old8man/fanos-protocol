@@ -81,6 +81,55 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  reproducible:
+    name: reproducible release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      # `docs/design-upgrade.md` §6: "the release key is the power that does not dilute". Every other founding
+      # advantage decays as the network grows — bootstrap visibility, monitoring share, the beacon moving to
+      # DKG — but whoever publishes builds can change any derivation, any threshold, any bound in that
+      # document, and §1 established that derivation changes are silent on the wire. Signing binds an artefact
+      # to a key; only REPRODUCIBILITY lets anyone else check the artefact against the source, which is what
+      # makes the signature worth anything.
+      #
+      # Two builds from different source paths AND different target directories, compared byte for byte. The
+      # source path is the half that usually breaks first: rustc embeds absolute paths in panic locations and
+      # debug info, so a build that is reproducible in place can still differ between two checkouts.
+      #
+      # Verified locally before this job was written, on `fanos-verify`: identical across both axes with no
+      # `--remap-path-prefix` needed, and the comparison shown to be LIVE by perturbing a printed string and
+      # watching the hash move. A first probe added dead code instead and the hashes matched — correctly, since
+      # `opt-level = 3` deletes it. A reproducibility gate that compares two builds of nothing is the easiest
+      # green in CI.
+      - name: Build twice from different paths
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/build-a /tmp/build-b
+          tar -C rust --exclude=target -cf - . | tar -C /tmp/build-a -xf -
+          tar -C rust --exclude=target -cf - . | tar -C /tmp/build-b -xf -
+          ( cd /tmp/build-a && CARGO_TARGET_DIR=/tmp/target-a cargo build --release -p fanos-cli -p fanos-node )
+          ( cd /tmp/build-b && CARGO_TARGET_DIR=/tmp/target-b cargo build --release -p fanos-cli -p fanos-node )
+      - name: Compare the artefacts
+        run: |
+          set -euo pipefail
+          status=0
+          for bin in fanos-verify fanos; do
+            a=$(sha256sum "/tmp/target-a/release/$bin" | cut -d' ' -f1)
+            b=$(sha256sum "/tmp/target-b/release/$bin" | cut -d' ' -f1)
+            if [ "$a" = "$b" ]; then
+              echo "reproducible: $bin  $a"
+            else
+              echo "NOT REPRODUCIBLE: $bin"
+              echo "  build a: $a"
+              echo "  build b: $b"
+              status=1
+            fi
+          done
+          exit $status
+
   portability:
     name: no_std · wasm cross-build
     runs-on: ubuntu-latest
