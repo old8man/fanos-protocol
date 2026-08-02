@@ -309,6 +309,29 @@ pub struct Stations {
     counts: BTreeMap<(Station, Option<Triple>, Option<u64>), u64>,
 }
 
+/// The largest frame type code the plane will key a counter on.
+///
+/// **This bound is load-bearing, not tidiness.** A frame's type code is a `u64` this node decodes from bytes a
+/// *peer* chose, so keying a counter on it verbatim hands an attacker the key space: one map entry per distinct
+/// code, unbounded, inside the subsystem that exists to reveal such an attack rather than to be it — the same
+/// argument [`Stations`] already makes for preferring `O(log n)` on paths that fire under flood. It is also
+/// exactly the property `docs/design-observability.md` §5 claims ("no dynamic allocation and no attacker-chosen
+/// keys"), which adding the tag dimension broke until this was put back.
+///
+/// Derived from the **frame-type registry's allocation space**, one byte: codes are handed out densely from
+/// `0x00` and the highest allocated today is `0x70`, so a byte covers the registry with room for it to grow by
+/// more than twice over. A code above it is not one this protocol allocates — it is a peer inventing values.
+///
+/// It is deliberately *not* derived from the varint boundary, which was the first attempt and was wrong: these
+/// are QUIC varints, where the top two bits of the first byte select the length, so one byte holds only
+/// `0..=63` — below `0x70`, i.e. below codes the registry already uses. Tying the constant to the codec is what
+/// caught that; the test that checks the derivation lives where the registry is visible.
+///
+/// Codes above the ceiling are still **counted**, folded into the untagged bucket — so a flood of invented
+/// codes reads as a rising `frame.type_unknown` with no tag, which is the honest reading: something is sending
+/// nonsense, and nonsense names no release.
+pub const MAX_SKEW_TAG: u64 = 0xFF;
+
 impl Stations {
     /// An empty window.
     #[must_use]
@@ -336,6 +359,10 @@ impl Stations {
     /// line to say *where*. Every other site passes `None`, because inventing a tag would put fabricated
     /// evidence about a peer's release into the plane.
     pub fn record_tagged(&mut self, station: Station, line: Option<Triple>, tag: Option<u64>, n: u64) {
+        // Clamped **here**, at the one choke point every caller goes through, rather than at each site that
+        // happens to have a tag. A bound a caller has to remember is a bound the next caller forgets, and the
+        // cost of forgetting this one is an unbounded map keyed by bytes a peer chose — see [`MAX_SKEW_TAG`].
+        let tag = tag.filter(|t| *t <= MAX_SKEW_TAG);
         let slot = self.counts.entry((station, line, tag)).or_insert(0);
         *slot = slot.saturating_add(n);
     }
@@ -387,6 +414,45 @@ mod tests {
 
     const L1: Triple = [1, 0, 0];
     const L2: Triple = [0, 1, 0];
+
+    #[test]
+    fn an_invented_type_code_cannot_grow_the_key_space() {
+        // The plane's §5 guarantee is that its key space has **no attacker-chosen keys** — stations are a
+        // compile-time enumeration and lines a published set. A frame's type code is neither: it is a `u64`
+        // decoded from bytes a peer chose. Keying on it verbatim would let one sender mint a map entry per
+        // distinct code, in the subsystem that exists to reveal that attack rather than to be it.
+        let mut st = Stations::new();
+        let line = Some([1, 0, 1]);
+
+        // A flood of invented codes, each one different, each above the allocation space.
+        for i in 0..10_000u64 {
+            st.record_tagged(Station::FrameTypeUnknown, line, Some(MAX_SKEW_TAG + 1 + i), 1);
+        }
+        assert_eq!(
+            st.observations().len(),
+            1,
+            "10 000 invented codes must collapse to one bucket, not 10 000 map entries"
+        );
+        assert_eq!(st.observations()[0].tag, None, "and be reported untagged — nonsense names no release");
+        assert_eq!(st.total(Station::FrameTypeUnknown), 10_000, "while still being COUNTED in full");
+
+        // A real code is still recorded exactly, or the station stops being a skew detector.
+        st.record_tagged(Station::FrameTypeUnknown, line, Some(0x70), 3);
+        let tagged: Vec<_> = st.observations().into_iter().filter(|o| o.tag == Some(0x70)).collect();
+        assert_eq!(tagged.len(), 1, "an allocated code keeps its own bucket");
+        assert_eq!(tagged[0].count, 3);
+
+        // The whole reachable space, exercised: bounded by the constant, not by luck.
+        let mut full = Stations::new();
+        for code in 0..=MAX_SKEW_TAG {
+            full.record_tagged(Station::FrameTypeUnknown, line, Some(code), 1);
+        }
+        assert_eq!(
+            full.observations().len(),
+            usize::try_from(MAX_SKEW_TAG).unwrap() + 1,
+            "the tag space is exactly the single-byte varint space, per line and station"
+        );
+    }
 
     #[test]
     fn counts_are_kept_per_station_and_per_line() {

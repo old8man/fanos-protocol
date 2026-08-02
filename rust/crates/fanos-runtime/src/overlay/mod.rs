@@ -1400,6 +1400,28 @@ mod tests {
     }
 
     #[test]
+    fn no_allocated_frame_type_lies_above_the_skew_tag_ceiling() {
+        // `MAX_SKEW_TAG` lives in fanos-ports, which cannot see the frame-type registry that justifies it — so
+        // the derivation is checked here, where the registry is visible.
+        //
+        // The first version of this test asserted the ceiling was the single-byte *varint* space and failed:
+        // these are QUIC varints, where one byte holds `0..=63`, which is below codes the registry already
+        // allocates. The bound would have folded real evidence into the untagged bucket and the skew detector
+        // would have gone quiet about genuine release differences. Tying the constant to the thing that
+        // justifies it is what caught that.
+        use crate::ports::stations::MAX_SKEW_TAG;
+        // The property that makes the bound safe, checked exhaustively rather than by sampling the registry:
+        // **no allocated code lies outside the tag space.** If one did, the clamp would fold real evidence
+        // into the untagged bucket and the skew detector would go quiet about a genuine release difference.
+        for code in (MAX_SKEW_TAG + 1)..=0xFFFF {
+            assert!(
+                FrameType::from_code(code).is_none(),
+                "{code:#x} is an allocated frame type above the tag ceiling — the clamp would hide it"
+            );
+        }
+    }
+
+    #[test]
     fn version_skew_is_counted_by_tag_and_line_where_corruption_is_neither() {
         // `docs/design-upgrade.md` §4: the operational question is not "is anyone stale" — the network
         // tolerates that until the activation height — but **"does any hop line hold fewer than `t` members
