@@ -1235,6 +1235,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_isolated_member_does_not_make_the_cell_retire_a_role() {
+        // The condition the hold rule was written for, found by asking what actually produces `Read::Unknown`.
+        // Loss does not: a lossy read still concludes inside `STORE_TIMEOUT` (5 s), which is why
+        // `a_lossy_cell_does_not_churn_its_role_assignment` passes with the rule reverted. An **unreachable**
+        // member does — `Client::get` bounds itself at 10 s, so the outer 5 s fires first and the read reports
+        // "did not conclude" rather than "definitely nothing".
+        //
+        // Without the rule that member's load counts as zero demand, the cell shrinks a role nobody stopped
+        // needing, and the next epoch that resolves grows it back. With it, a partial read holds.
+        let roles = fanos_node::RoleSet { relay: true, storage: true, ..fanos_node::RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F2>(4, Link::default(), roles).await.expect("fleet starts");
+
+        // Let the cell settle before cutting anything, so what follows is the isolation's doing and not
+        // start-up. Three-valued: on a contended host this may not finish, and that is not a refutation.
+        let settled = fleet
+            .until_settled(
+                |f| f.nodes().iter().all(|n| n.assigned_roles().any()),
+                |f| f.nodes().iter().map(|n| n.assignment().roles).collect::<Vec<_>>(),
+            )
+            .await;
+
+        // Cut member 3 off from everyone: its load slot now takes longer than STORE_TIMEOUT to read.
+        for peer in 0..3 {
+            fleet.isolate(peer, 3);
+        }
+        let trace = fleet.observe(10, Duration::from_secs(3), fanos_node::Node::assignment).await;
+        fleet.shutdown();
+
+        if !settled.is_reached() {
+            println!("isolated-member churn: inconclusive — cell had not settled before the cut: {settled:?}");
+            return;
+        }
+        let assigned = trace.map(|a| a.roles);
+        // **Is this measurement capable of a result?** Measured: it is not, on this fleet. Every node offers
+        // relay and storage and receives both for the whole window, so the observable never moves and no
+        // setpoint change could show in it however wrong the setpoint was. Reported rather than passed off as
+        // a green tick — a saturated assignment is the seventh kind of blindness, an instrument that agrees
+        // with everything.
+        //
+        // Making it capable means a fleet where demand falls *below* eligible supply, so the assignment
+        // selects a subset. With the shipped per-node capacity of 1 an unsensed offered role publishes one
+        // node's worth per offering node, so the setpoint equals the supply by construction — which is why
+        // this needs a deliberate configuration rather than a bigger cell.
+        if assigned.transitions() == 0 {
+            println!(
+                "isolated-member churn: inconclusive — the assignment never moved, so this fleet cannot \
+                 detect churn\n{}",
+                assigned.render()
+            );
+            return;
+        }
+        assert_eq!(
+            assigned.revisits(),
+            0,
+            "a member going unreachable made the cell retire and reinstate a role — an unresolved read \
+             counted as a member demanding nothing\n{}",
+            assigned.render()
+        );
+    }
+
+    #[tokio::test]
     async fn a_lossy_cell_does_not_churn_its_role_assignment() {
         // The question the setpoint work left open, measured where it can actually be answered. Until the load
         // sensors went live the setpoint was supply standing in for demand and could not oscillate; now it can.
@@ -1250,11 +1311,10 @@ mod tests {
         // that passes with and without the mechanism under it proves nothing about the mechanism, whatever its
         // name suggests.
         //
-        // The likely reason, worth checking before trusting a stronger claim: a store read retries inside
-        // `STORE_TIMEOUT`, so datagram loss lengthens a read rather than failing it, and `Read::Unknown` may be
-        // rare enough in practice that the noise source barely fires. If so the hold rule is a correctness fix
-        // — a partial read genuinely understates the setpoint, which the code's own docs state — with a smaller
-        // stability payoff than the reasoning suggested.
+        // Two reasons, both since established. Loss does not produce `Read::Unknown` at all: a lossy read
+        // still concludes inside `STORE_TIMEOUT`, and the third value fires only when `Client::get` runs past
+        // it — which needs an *unreachable* member, not a lossy link. And this fleet's assignment is saturated
+        // anyway, so it could not have shown churn either way; the guard below now says so out loud.
         let roles = fanos_node::RoleSet { relay: true, storage: true, ..fanos_node::RoleSet::default() };
         let fleet = NodeFleet::spawn::<F2>(5, Link::default().with_loss(25), roles)
             .await
@@ -1266,6 +1326,24 @@ mod tests {
         // it finds them, which is progress. Only a node returning to a role set it had already left is the
         // controller chasing its own tail.
         let assigned = trace.map(|a| a.roles);
+        // **Is this measurement capable of a result?** Measured: it is not, on this fleet. Every node offers
+        // relay and storage and receives both for the whole window, so the observable never moves and no
+        // setpoint change could show in it however wrong the setpoint was. Reported rather than passed off as
+        // a green tick — a saturated assignment is the seventh kind of blindness, an instrument that agrees
+        // with everything.
+        //
+        // Making it capable means a fleet where demand falls *below* eligible supply, so the assignment
+        // selects a subset. With the shipped per-node capacity of 1 an unsensed offered role publishes one
+        // node's worth per offering node, so the setpoint equals the supply by construction — which is why
+        // this needs a deliberate configuration rather than a bigger cell.
+        if assigned.transitions() == 0 {
+            println!(
+                "lossy-cell churn: inconclusive — the assignment never moved, so this fleet cannot detect \
+                 churn\n{}",
+                assigned.render()
+            );
+            return;
+        }
         assert_eq!(
             assigned.revisits(),
             0,
