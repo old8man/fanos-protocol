@@ -32,6 +32,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::role_loop::LoadGauge;
 use crate::diaulos::{dial_service, serve};
 use crate::resolve::STORE_TIMEOUT;
@@ -304,7 +305,7 @@ pub async fn publish_exit_key(
     epoch: Epoch,
     public: &HybridKemPublic,
 ) -> bool {
-    client.put(exit_key_slot(coord, epoch), public.encode()).await
+    client.put_ephemeral(exit_key_slot(coord, epoch), public.encode(), DIRECTORY_SLOT_EPOCHS).await
 }
 
 /// Resolve the exit service key published by the node at `coord` for `epoch`, or `None` if none is

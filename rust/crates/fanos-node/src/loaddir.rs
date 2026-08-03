@@ -22,6 +22,7 @@ use fanos_runtime::Notification;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::capdir::cell_cap_coords;
 use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
 
@@ -66,7 +67,7 @@ pub fn parse_load(bytes: &[u8]) -> Option<Demand> {
 /// Publish this node's observed per-role `load` for `epoch` at its coordinate slot. `false` if the store
 /// rejected the write.
 pub async fn publish_load(client: &Client, coord: Coord, epoch: Epoch, load: Demand) -> bool {
-    client.put(load_slot(coord, epoch), encode_load(load).to_vec()).await
+    client.put_ephemeral(load_slot(coord, epoch), encode_load(load).to_vec(), DIRECTORY_SLOT_EPOCHS).await
 }
 
 /// Resolve the load the node at `coord` reported for `epoch`, or `None` if none/timeout/malformed.

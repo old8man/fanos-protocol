@@ -28,6 +28,7 @@ use fanos_runtime::{Command, Notification};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::EpochDriver;
 use fanos_primitives::BeaconSeed;
 use fanos_vrf::{VrfProof, VrfPublic};
@@ -67,7 +68,11 @@ pub async fn publish_bound_mix_key(
 ) -> bool {
     let (id, vrf_public, vrf_proof) = proof;
     client
-        .put(mix_key_slot(client.address(), epoch), Entitlement::encode(id, vrf_public, vrf_proof, &public.encode()))
+        .put_ephemeral(
+            mix_key_slot(client.address(), epoch),
+            Entitlement::encode(id, vrf_public, vrf_proof, &public.encode()),
+            DIRECTORY_SLOT_EPOCHS,
+        )
         .await
 }
 
@@ -94,7 +99,7 @@ pub async fn publish_mix_key(
     public: &HybridKemPublic,
 ) -> bool {
     client
-        .put(mix_key_slot(coord, epoch), public.encode())
+        .put_ephemeral(mix_key_slot(coord, epoch), public.encode(), DIRECTORY_SLOT_EPOCHS)
         .await
 }
 

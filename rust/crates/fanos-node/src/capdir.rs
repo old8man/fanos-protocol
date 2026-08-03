@@ -29,6 +29,7 @@ use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::bound::Entitlement;
 use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
 
@@ -117,7 +118,13 @@ pub async fn publish_capability(
     node_id: NodeId,
     capability: Capability,
 ) -> bool {
-    client.put(cap_slot(coord, epoch), advertisement(vrf_secret, node_id, epoch, capability)).await
+    client
+        .put_ephemeral(
+            cap_slot(coord, epoch),
+            advertisement(vrf_secret, node_id, epoch, capability),
+            DIRECTORY_SLOT_EPOCHS,
+        )
+        .await
 }
 
 /// Resolve and verify the capability the node at `coord` advertised for `epoch`, or `None` if none is
@@ -218,7 +225,7 @@ pub fn spawn_capability_publisher(
                     Some(prove) => bound_advertisement(&prove(epoch, &seed), &vrf_secret, node_id, epoch, capability),
                     None => advertisement(&vrf_secret, node_id, epoch, capability),
                 };
-                client.put(cap_slot(coord, epoch), bytes).await
+                client.put_ephemeral(cap_slot(coord, epoch), bytes, DIRECTORY_SLOT_EPOCHS).await
             }
         };
         publish(epoch, seed).await;

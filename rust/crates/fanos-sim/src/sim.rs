@@ -47,6 +47,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Control { .. } => "Control",
         Command::Observe => "Observe",
         Command::Put { .. } => "Put",
+        Command::PutEphemeral { .. } => "PutEphemeral",
         Command::Get { .. } => "Get",
         Command::SampleAvailability { .. } => "SampleAvailability",
         Command::Join { .. } => "Join",

@@ -28,6 +28,7 @@ use fanos_runtime::Notification;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::resolve::STORE_TIMEOUT;
 
 /// A cell's checkpoint slot: the store address its latest execution certificate for `epoch` lives at.
@@ -58,7 +59,7 @@ fn receipt_slot(dest_cell: u32, source_cell: u32, nonce: u64) -> Vec<u8> {
 
 /// Publish `cell`'s execution certificate for `epoch` so a parent can anchor its finality. `false` if rejected.
 pub async fn publish_checkpoint(client: &Client, cell: u32, epoch: Epoch, cert: &ExecCertificate) -> bool {
-    client.put(checkpoint_slot(cell, epoch), cert.to_bytes()).await
+    client.put_ephemeral(checkpoint_slot(cell, epoch), cert.to_bytes(), DIRECTORY_SLOT_EPOCHS).await
 }
 
 /// Resolve the execution certificate `cell` published for `epoch`, or `None` if none/timeout/malformed.
@@ -95,7 +96,7 @@ pub async fn attest_children(
 /// degraded-axis mask throughout DIAKRISIS (`polar::rho_vector_from_degraded`), which is exactly `golay::Report::axes`, so
 /// the wire format needed no invention. The bus occupies bit 7, which is where the code puts it too.
 pub async fn publish_health(client: &Client, cell: u32, epoch: Epoch, report: Report) -> bool {
-    client.put(health_slot(cell, epoch), alloc_vec(report.block())).await
+    client.put_ephemeral(health_slot(cell, epoch), alloc_vec(report.block()), DIRECTORY_SLOT_EPOCHS).await
 }
 
 /// One byte as a `Vec` — spelled out so the codec is visibly a single byte rather than a struct that might grow one.

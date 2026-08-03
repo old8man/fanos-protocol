@@ -596,6 +596,28 @@ impl Client {
         matches!(tokio::time::timeout(REQUEST_TIMEOUT, rx).await, Ok(Ok(())))
     }
 
+
+    /// Store `value` under `key` as **soft state that expires after `epochs` further epoch advances** —
+    /// what a directory slot is, as distinct from content ([`Command::PutEphemeral`]).
+    ///
+    /// Every `(coordinate, epoch)`-keyed directory publisher uses this: without it the store had no way to
+    /// know a slot was dead, kept every one ever written, and — being fail-closed on admission — stopped a
+    /// cell from publishing anything at all after about a day (`fanos-node/tests/store_lifetime.rs`).
+    pub async fn put_ephemeral(&self, key: Vec<u8>, value: Vec<u8>, epochs: u32) -> bool {
+        let digest = storage_digest(&key);
+        let (reply, rx) = oneshot::channel();
+        if self.ctrl_tx.send(Control::Put { digest, reply }).is_err() {
+            return false;
+        }
+        if self
+            .input_tx
+            .try_send(Input::Command(Command::PutEphemeral { key, value, epochs }))
+            .is_err()
+        {
+            return false;
+        }
+        matches!(tokio::time::timeout(REQUEST_TIMEOUT, rx).await, Ok(Ok(())))
+    }
     /// Subscribe to the full notification stream (Delivered, PeerDown, Verdict, healing events, …).
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Notification> {

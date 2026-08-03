@@ -29,6 +29,7 @@ use fanos_telemetry::dp::PrivacyBudget;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::resolve::{STORE_TIMEOUT, Read};
 
 /// The store slot a node's privatized coherence frame is published at, keyed by its coordinate **and** the epoch.
@@ -137,7 +138,9 @@ pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceF
         return false;
     };
     let bytes = frame.export(budget, &mut rng);
-    client.put(coherence_slot(client.address(), epoch), bytes.to_vec()).await
+    client
+        .put_ephemeral(coherence_slot(client.address(), epoch), bytes.to_vec(), DIRECTORY_SLOT_EPOCHS)
+        .await
 }
 
 /// Resolve the coherence frame the node at `coord` published for `epoch`.

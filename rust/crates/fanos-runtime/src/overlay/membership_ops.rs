@@ -159,6 +159,10 @@ impl<F: Field> OverlayNode<F> {
     /// and suppresses the flood (audit #102).
     pub(super) fn on_advance_epoch(&mut self) -> Vec<Effect> {
         self.epoch = self.epoch.next();
+        // Reclaim the directory slots the advance just killed. Here rather than on a timer, because the
+        // epoch IS the lifetime: a slot keyed `(coordinate, epoch)` is dead exactly when the epoch it names
+        // has passed, and this is the one place that fact becomes true.
+        self.store.sweep_expired(self.epoch);
         let mut effects = self.flood(&encode(FrameType::EpochAgree, &self.epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(self.epoch)));
         effects
@@ -175,6 +179,10 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new(); // not newer — drop (terminates the flood)
         }
         self.epoch = epoch;
+        // The gossip path advances the clock too, and a node that learns the epoch from a peer rather than
+        // from its own tick must reclaim exactly as much — otherwise whether a store fills depends on which
+        // node happened to drive the advance.
+        self.store.sweep_expired(self.epoch);
         let mut effects = self.flood(&encode(FrameType::EpochAgree, &epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(epoch)));
         effects

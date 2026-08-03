@@ -126,7 +126,14 @@ const GREY_TOL: f64 = 0.10;
 /// not to constrain honest use. When full, a *new* key is refused rather than an existing one evicted,
 /// so an attacker cannot displace already-stored replicas (LRC availability is preserved); overwriting
 /// an existing key is always allowed (it does not grow the map).
-pub(crate) const MAX_STORE_ENTRIES: usize = 4096;
+/// The most distinct keys one node's local store slice will hold.
+///
+/// **Public, because a caller cannot reason about its own key lifetime without it.** Six directories key
+/// their slots by `(coordinate, epoch)` and re-publish every epoch, so a cell generates new keys on a wall
+/// clock — and whether that is survivable is arithmetic over this number, the epoch period and the publisher
+/// count. Keeping it crate-private meant no publisher could do that arithmetic, and none did
+/// (`fanos-node/tests/store_lifetime.rs`).
+pub const MAX_STORE_ENTRIES: usize = 4096;
 /// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
 pub(crate) const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
@@ -1190,6 +1197,12 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Observe) => self.on_observe(now),
             Input::Command(Command::Put { key, value }) => self.on_put(now, &key, &value),
+            Input::Command(Command::PutEphemeral { key, value, epochs }) => {
+                // Record the lifetime BEFORE the write, so an entry can never be stored without one: a
+                // slot that reached the store as content would be immortal, which is the whole defect.
+                self.store.expires(storage_digest(&key), self.epoch.saturating_add(u64::from(epochs)));
+                self.on_put(now, &key, &value)
+            }
             Input::Command(Command::Get { key }) => self.on_get(now, &key),
             Input::Command(Command::SampleAvailability { key }) => self.on_sample(now, &key),
             Input::Command(Command::Join { info }) => self.on_join(info),
@@ -2643,6 +2656,52 @@ mod tests {
             node.members().count(),
             count_before,
             "an invalid coordinate is not accepted as a member"
+        );
+    }
+
+    #[test]
+    fn an_expiring_directory_slot_is_reclaimed_and_content_beside_it_is_not() {
+        // **The two kinds of write, and the store must tell them apart.** A directory slot is soft state
+        // with a lifetime its publisher knows; content has none, and only the application knows when it
+        // stops mattering. Before `PutEphemeral` the store could not distinguish them — a key arrives as an
+        // opaque digest — so it kept both for ever, and since admission is fail-closed a cell filled up on a
+        // wall clock and silently stopped publishing (`fanos-node/tests/store_lifetime.rs`).
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+
+        let slot = b"FANOS-v1/mix-key/some-coord/epoch-0".to_vec();
+        let content = b"an application value that must outlive every epoch".to_vec();
+        node.step(Instant(0), Input::Command(Command::PutEphemeral {
+            key: slot.clone(),
+            value: alloc::vec![0x11; 48],
+            epochs: 1,
+        }));
+        node.step(Instant(0), Input::Command(Command::Put {
+            key: content.clone(),
+            value: alloc::vec![0x22; 48],
+        }));
+        let (slot_digest, content_digest) = (storage_digest(&slot), storage_digest(&content));
+        assert!(node.store.entries.contains_key(&slot_digest), "the slot was stored");
+        assert!(node.store.entries.contains_key(&content_digest), "and so was the content");
+
+        // One advance: still inside the grace window the onion ratchet's own `retain` defines, so a reader
+        // one epoch behind can still use it.
+        node.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        assert!(
+            node.store.entries.contains_key(&slot_digest),
+            "a slot must survive its grace window — a client acting on the previous epoch's directory is \
+             exactly the case the onion ratchet retains a past secret for",
+        );
+
+        // A second advance takes it past the window: now no honest reader can use it, and it goes.
+        node.step(Instant(2), Input::Command(Command::AdvanceEpoch));
+        assert!(
+            !node.store.entries.contains_key(&slot_digest),
+            "past its grace window a directory slot is dead to every honest reader and must be reclaimed",
+        );
+        assert!(
+            node.store.entries.contains_key(&content_digest),
+            "content is not swept — it never declared a lifetime, and saying nothing means saying content. \
+             Reclaiming by AGE instead would have discarded this and kept the corpse beside it.",
         );
     }
 }

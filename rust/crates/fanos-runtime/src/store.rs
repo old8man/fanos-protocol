@@ -72,11 +72,59 @@ pub(crate) struct Store {
     /// accounted. Bounded by the store's own [`MAX_STORE_ENTRIES`] (it is a subset of held keys). Makes loss
     /// visible and auditable instead of silent; a production node persists it. Append-only (an audit trail).
     pub(crate) loss_ledger: BTreeMap<[u8; DIGEST], Epoch>,
+    /// Digests that **expire**, and the epoch after which each is dead — the soft-state half of the store.
+    ///
+    /// Six directories key their slots by `(coordinate, epoch)` and re-publish every epoch, so the cell
+    /// mints new keys on a wall clock. Nothing here could tell those apart from content, because a key
+    /// arrives as an opaque digest, so nothing ever removed one: the store filled at a rate fixed by the
+    /// epoch period, and its admission rule is fail-closed, so a cell ran normally and then silently stopped
+    /// being able to publish at all (`fanos-node/tests/store_lifetime.rs`).
+    ///
+    /// A digest absent from this map is content and is kept. The distinction is declared by the **publisher**
+    /// ([`Command::PutEphemeral`](fanos_ports::Command::PutEphemeral)) because the publisher is the only
+    /// party that knows a slot's lifetime — the store cannot read it out of a hash.
+    pub(crate) expiry: BTreeMap<[u8; DIGEST], Epoch>,
     /// Monotone per-request nonce source, so a stale/replayed `Value` cannot resolve a newer read (C4).
     pub(crate) seq: u64,
 }
 
 impl Store {
+    /// Record that `digest` is soft state that dies after `expires_after` — replacing any earlier expiry,
+    /// so a re-publish extends rather than accumulating.
+    pub(crate) fn expires(&mut self, digest: [u8; DIGEST], expires_after: Epoch) {
+        self.expiry.insert(digest, expires_after);
+    }
+
+    /// Drop every expired entry, now that the clock reads `now`.
+    ///
+    /// **Reclamation, not eviction, and the difference decides the rule.** Eviction answers "the store is
+    /// full, who goes" and must choose by age, which is why it cannot serve here: the entries that must go
+    /// are the ones that are *dead*, and a dead directory slot may be newer than live content sitting beside
+    /// it. Choosing by age would discard the content and keep the corpse.
+    ///
+    /// Content is never touched, because content never entered `expiry` — a caller has to say a write is
+    /// soft state, and saying nothing means saying content.
+    pub(crate) fn sweep_expired(&mut self, now: Epoch) -> usize {
+        let dead: Vec<[u8; DIGEST]> =
+            self.expiry.iter().filter(|&(_, until)| *until < now).map(|(d, _)| *d).collect();
+        for digest in &dead {
+            self.entries.remove(digest);
+            self.expiry.remove(digest);
+            // **The loss ledger goes with it, and leaving it would have been a leak of my own making.**
+            // `loss_ledger`'s own doc claims it is "bounded by `MAX_STORE_ENTRIES` (it is a subset of held
+            // keys)", and that is only true while nothing removes a held key — which is exactly what this
+            // function does. An orphaned record would have survived every sweep and grown without bound,
+            // reintroducing the shape this whole change exists to remove, one layer down.
+            //
+            // Dropping it is also right on the merits, not merely convenient: the ledger is an audit trail
+            // of data that became unrecoverable, and a directory slot nobody will ever ask for again cannot
+            // be lost in any sense an operator can act on. Content loss is untouched, because content is
+            // never swept.
+            self.loss_ledger.remove(digest);
+        }
+        dead.len()
+    }
+
     /// Whether the local slice admits a shard of `shard_len` for `digest` under the A4 DoS caps: within
     /// [`MAX_VALUE_LEN`], and either the key already exists (adding/overwriting a shard of a held key — no
     /// key growth) or the store is below [`MAX_STORE_ENTRIES`] — so a `Publish` flood of distinct digests

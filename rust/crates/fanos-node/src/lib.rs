@@ -16,6 +16,22 @@
 
 #![forbid(unsafe_code)]
 
+/// How many further epoch advances a published directory slot outlives before the store reclaims it.
+///
+/// **Derived from the grace window it has to cover, not chosen.** A slot keyed `(coordinate, epoch)` is dead
+/// to any honest reader the moment that epoch passes — a client derives the key from its own live epoch and
+/// will never compute the old one again. What is *not* dead is a reader that is one epoch behind: the onion
+/// ratchet retains `DEFAULT_RETAIN = 1` past epoch's secret precisely so an onion in flight across a rotation
+/// still peels (`fanos-pqcrypto::onion_ratchet`), and a client acting on the previous epoch's directory is the
+/// same situation on the lookup side. So the slot must outlive its epoch by exactly that window and no more:
+/// one.
+///
+/// Larger buys nothing — no honest party can use a slot older than the ratchet can peel — and costs linearly,
+/// since the live slot count is `publishers × (1 + this)`. Smaller reintroduces the failure the grace window
+/// exists to prevent. This is the same reasoning that fixes the ratchet's own `retain`, applied on the other
+/// side of the same rotation.
+pub(crate) const DIRECTORY_SLOT_EPOCHS: u32 = 1;
+
 pub mod bound;
 pub mod cell_node;
 pub mod config;

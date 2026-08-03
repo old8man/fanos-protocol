@@ -174,6 +174,30 @@ pub enum Command {
         /// The value to store.
         value: Vec<u8>,
     },
+    /// Store `value` under `key` as **soft state that expires** — a directory slot, not content.
+    ///
+    /// **A distinct command rather than a field on [`Put`](Self::Put), because the two are different kinds
+    /// of write and the type is where that belongs.** Content has no natural lifetime: it is kept until
+    /// somebody decides otherwise, and only the application knows when. A directory slot has one by
+    /// construction — `mixdir`, `capdir`, `loaddir`, `telemetry_dir`, `exit` and `crosscell_dir` all key
+    /// their slots by `(coordinate, epoch)` and re-publish on every epoch advance, so yesterday's slot is
+    /// dead the moment its successor lands and no honest reader will ever ask for it again.
+    ///
+    /// Without this the store had no way to tell them apart, because a key reaches it as an opaque digest —
+    /// so it kept both for ever, its admission rule is fail-closed, and a cell therefore ran normally for
+    /// about a day and then silently stopped being able to publish anything at all
+    /// (`fanos-node/tests/store_lifetime.rs` derives the exact figure from the shipped constants).
+    ///
+    /// `epochs` is how many further epoch advances the entry survives; `0` means it dies at the next one.
+    /// The **publisher** declares it because the publisher is the only party that knows it.
+    PutEphemeral {
+        /// The application key (hashed to its storage address).
+        key: Vec<u8>,
+        /// The value to store.
+        value: Vec<u8>,
+        /// How many epoch advances this entry outlives.
+        epochs: u32,
+    },
     /// Retrieve the value stored under `key` from the cell's DHT (spec §L4).
     Get {
         /// The application key.
