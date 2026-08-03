@@ -1056,6 +1056,14 @@ async fn a_wedged_session_reports_where_it_stopped() {
     println!("victim {victim:?} (index {victim_index}); lines through it: {through:?}");
     cell.nodes[victim_index].take().expect("the victim combiner node is still held").shutdown();
 
+    // **Refuse to conclude from a starved host.** Every reading in this investigation so far was taken on a
+    // box under a competing build at load 24-30, and the verdict has moved every time: FORWARD lost it, then
+    // REPLY lost it, then no wedge at all, across three consecutive runs of the same code. A failure that is
+    // not direction-specific and tracks machine load is the profile of capacity, not of a logic defect — and
+    // the counters below cannot tell those apart, however detailed they look.
+    let share = common::host_cpu_share();
+    println!("host cpu share {share:.2} (1.00 = idle; below ~0.5 this run measures the machine)");
+
     for attempt in 0..12 {
         let before = SERVED.load(Ordering::Relaxed);
         if cell.probe().await.is_none() {
@@ -1066,7 +1074,14 @@ async fn a_wedged_session_reports_where_it_stopped() {
                 "the request never reached the handler — the FORWARD path lost it"
             };
             let report = cell.autopsy().await;
-            println!("wedged on dial {attempt}: {half} (served {before} -> {after}){report}");
+            let verdict = if share < 0.5 {
+                "INCONCLUSIVE (starved host) —"
+            } else {
+                "wedged —"
+            };
+            println!(
+                "{verdict} dial {attempt}: {half} (served {before} -> {after}, cpu share {share:.2}){report}"
+            );
             cell.teardown().await;
             return;
         }

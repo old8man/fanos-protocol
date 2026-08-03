@@ -393,6 +393,17 @@ async fn within_span<F: Future>(work: F) -> Option<F::Output> {
 /// was still draining a previous experiment the one-minute average had not caught up with. The independent
 /// variable was never actually controlled. A shorter-horizon measure (run-queue depth sampled directly) would fix
 /// both, and is the obvious next step if this correction ever needs to be tighter.
+/// The fraction of a core this process can expect right now — `1.0` on an idle host, falling as the host is
+/// oversubscribed. Exported so a diagnostic can refuse to draw conclusions from a starved run.
+///
+/// A timing experiment on a loaded box measures the box. This harness already knows that, and encodes it in
+/// the `INCONCLUSIVE` branch of its budgeted exchange; a diagnostic that reads station counters by hand
+/// bypasses that machinery entirely and can spend hours attributing contention to the system under test.
+#[must_use]
+pub fn host_cpu_share() -> f64 {
+    cpu_share()
+}
+
 fn cpu_share() -> f64 {
     let cores = f64::from(u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1));
     share_at(read_load_average().unwrap_or(0.0), cores)
