@@ -242,7 +242,12 @@ fn the_two_exemptions_stay_distinct() {
 /// Some is not: `crosscell_dir`'s reading side means a cell publishes its checkpoint and no parent ever reads
 /// it. The direction is down; a bump needs a reason in the commit message.
 const UNWIRED_BUDGET: &[(&str, usize)] = &[
-    ("fanos-angelos", 7),
+    // 7 → 8 (2026-08-03), with the reason the rule requires: `reordered_past_window` counts frames refused
+    // for arriving further behind than `REPLAY_WINDOW` remembers — a signal that the window is too narrow for
+    // the path, which is a different fact from loss and the only evidence that would justify widening it. It
+    // has no door because ANGELOS has no call-stats surface yet. Raised rather than wired, because inventing a
+    // caller to satisfy the count is the one thing this ratchet must never reward.
+    ("fanos-angelos", 8),
     ("fanos-aphantos", 5),
     ("fanos-calypso", 11),
     ("fanos-code", 7),
@@ -292,7 +297,11 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-stream", 2),
     ("fanos-taxis", 18),
     ("fanos-telemetry", 6),
-    ("fanos-thesauros", 6),
+    // 6 → 7 (2026-08-03): `missed_audits` is the MEASUREMENT that audit AT-H2's missing early-termination
+    // policy needs — a consumer whose provider stopped proving still has its escrow locked for the full term
+    // precisely because misses were not countable. The count now exists and the policy does not, which is the
+    // right order; wiring it would mean inventing the policy inside a getter's caller.
+    ("fanos-thesauros", 7),
     ("fanos-threshold", 1),
     ("fanos-vpn", 1),
     ("fanos-vrf", 6),

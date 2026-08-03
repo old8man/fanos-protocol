@@ -174,20 +174,26 @@ struct ReshareRound {
 }
 
 impl<F: Field> BeaconNode<F> {
-    /// How many distinct future epochs currently hold buffered partials.
+    /// How many distinct future epochs currently hold buffered partials — **crate-private, and the demotion is
+    /// the point**.
     ///
-    /// Exposed because [`MAX_PENDING_EPOCHS`] is a bound an operator and a test both need to see held: the map
-    /// stays private, but "is this node buffering for eight epochs ahead?" is a real question about whether a
-    /// committee member is flooding.
+    /// This was `pub` on the argument that "is this node buffering for eight epochs ahead?" is a real operator
+    /// question. It is, and the operator already has its answer: [`BeaconRejects::partial_epoch_evicted`]
+    /// counts every time [`MAX_PENDING_EPOCHS`] actually bound, which is the *event*, while this is only the
+    /// gauge behind it. A public gauge with no reader is a door onto nothing, and the unwired-capability
+    /// ratchet in `fanos-cli/tests/architecture.rs` exists to stop exactly that accumulating — so the gauge
+    /// stays where its one caller is: the test that asserts the bound holds.
     #[must_use]
-    pub fn pending_epochs(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn pending_epochs(&self) -> usize {
         self.pending.len()
     }
 
     /// The smallest future epoch with buffered partials — the next one that can possibly assemble, since
-    /// adoption is in order.
+    /// adoption is in order. Crate-private for the same reason as [`pending_epochs`](Self::pending_epochs).
     #[must_use]
-    pub fn lowest_pending_epoch(&self) -> Option<Epoch> {
+    #[cfg(test)]
+    pub(crate) fn lowest_pending_epoch(&self) -> Option<Epoch> {
         self.pending.keys().next().copied()
     }
 
