@@ -706,6 +706,42 @@ pub fn spawn_self_organization<F: Field>(
 
 #[cfg(test)]
 mod tests {
+    /// **A tripwire on a defect that is deliberately unfixed, because fixing half of it is worse than
+    /// neither half.**
+    ///
+    /// `ROLE_CAPACITY_PER_NODE` is `1`, which reads an *event* count as a *node* count: a cell holding a
+    /// hundred keys asks for a hundred storage nodes. Demand therefore exceeds eligible supply on any active
+    /// cell, `assign_report` fills `min(demand, eligible)`, every offering node gets every role it offered,
+    /// and the controller expresses nothing — measured on a fleet as `transitions = 0` across a whole window.
+    ///
+    /// That saturation is **harmless only by accident**: `AssignReport::deficit` has no production caller, so
+    /// the escalation to the parent cell that `docs/design-roles.md` describes is not wired. Wire it today and
+    /// it escalates a fabricated shortfall every epoch.
+    ///
+    /// So the two must move together, and until now only a doc comment said so. This fails the moment capacity
+    /// stops being the placeholder — which is exactly when someone needs to be told about the other half.
+    #[test]
+    fn capacity_and_the_deficit_escalation_must_be_fixed_together() {
+        assert_eq!(
+            ROLE_CAPACITY_PER_NODE, 1,
+            "Capacity is no longer the placeholder — good, but read this before going further.\n\
+             \n\
+             It was `1` because nobody had measured how much load one node absorbs per observation window, and\n\
+             that placeholder saturated the assignment: every offering node got every role, so the controller\n\
+             could express nothing and role churn was undetectable.\n\
+             \n\
+             The saturation also MASKED a second defect. `AssignReport::deficit` is a fabricated shortfall\n\
+             under a placeholder capacity, and it has no production caller — the parent-cell escalation in\n\
+             `docs/design-roles.md` is unwired. With a real capacity the deficit becomes meaningful, so the\n\
+             escalation should now be wired; with a real capacity and the escalation still unwired, a genuine\n\
+             shortfall is silently ignored instead of harmlessly fabricated.\n\
+             \n\
+             Either wire the escalation, or state here why a real deficit may still go unread — then update\n\
+             this test to assert the new capacity's units rather than its value."
+        );
+    }
+
+
     use super::*;
     use fanos_core::roles::{Capability, Role, RoleSet, cell_setpoint};
 
