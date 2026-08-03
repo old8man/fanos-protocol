@@ -40,6 +40,17 @@ const COST_GATED: &[&str] = &[
     // Randomized no-fork searches: many seeds, so cost scales with the search rather than with one scenario.
     "randomized_scheduling_and_byzantine_faults_never_fork",
     "ssle_randomized_scheduling_and_byzantine_faults_never_fork",
+    // Anonymous-path properties over many real-QUIC fixtures (2026-08-03). Each of these is minutes of
+    // multi-node dialling, and each `#[ignore]` reason calls itself a "diagnostic sweep" — but their names
+    // are property claims and their bodies assert them, so they are assertions that happen to be expensive,
+    // not measurements. The distinction is not cosmetic: the first two exist BECAUSE the properties were
+    // found violated (a service was reachable or not depending on which node dialled it, and on where the
+    // host sat, on a plane whose point-transitivity says neither may matter), and the third is the
+    // censorship-survival claim §6 of `docs/design-rendezvous.md` rests on. Left unclassified they would
+    // have decayed unobserved, which is the exact failure this file was written to prevent.
+    "reachability_does_not_depend_on_which_node_is_the_client",
+    "every_legitimate_host_placement_is_reachable",
+    "hedging_holds_the_arrival_rate_when_a_meeting_point_is_silent",
 ];
 
 /// Every `#[ignore]`d test in a file, by the name of the function that follows the attribute.

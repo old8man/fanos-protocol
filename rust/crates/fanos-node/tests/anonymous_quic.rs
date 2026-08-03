@@ -1027,7 +1027,7 @@ async fn the_service_survives_one_meeting_point_going_silent() {
 
 #[tokio::test]
 #[ignore = "autopsy: reproduces the wedge and interrogates the cell — run explicitly with --ignored"]
-async fn a_wedged_session_reports_where_it_stopped() {
+async fn probe_a_wedged_session_reports_where_it_stopped() {
     let _serial = serial();
     let _serial = common::serial_cell().await;
     // With one cell member down, some established sessions stop moving bytes and never resume — verified as a
