@@ -54,7 +54,9 @@ It cannot run the DKG itself — that needs the founding nodes to be running and
 precisely why the dealt path must not be the one a public launch walks into by default.
 
 **Decision required before a public launch:** run the DKG across the founding set. The code is there; what is
-missing is only the operational choreography.
+missing is only the operational choreography. `docs/testnet.md` §7 spells out exactly what exists in
+`fanos-keygen` today, what a CLI ceremony for it would still need to be built, and — separately — what the
+dealt path costs in the meantime for anyone launching before that choreography exists.
 
 ### 2.1b The POROS ingress descriptor — a dealt secret with a *published* half
 

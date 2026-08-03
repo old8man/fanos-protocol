@@ -155,6 +155,11 @@ Beacon/epoch parameters (the DVRF group commitment that drives the live epoch cl
 material provisioned out-of-band, not set in this file — a node without them runs correctly, pinned
 at the genesis epoch.
 
+This section is written from one new operator's point of view, joining or extending a network that
+already exists. If instead you're one of several operators bringing a cell into existence together —
+dealing the epoch beacon, distributing it, agreeing role coverage, and starting the founding set at
+roughly the same time — that's a different document: `docs/testnet.md`.
+
 ---
 
 ## 7. Verify
