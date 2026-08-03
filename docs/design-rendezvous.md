@@ -211,16 +211,19 @@ Pr[service censored in one epoch] = Pr[all m combiners ∈ A]
 ```
 
 The target is stated as a **horizon** rather than a bare probability, because that is the form an operator can
-argue about: `CENSORSHIP_HORIZON_EPOCHS = 2²⁰` is the number of epochs over which *at most one* censored epoch
-is expected — ≈120 years at one epoch per hour. Solving `(f/n)^m ≤ 1/H`:
+argue about: `CENSORSHIP_HORIZON_EPOCHS = 2²³` is the number of epochs over which *at most one* censored epoch
+is expected — ≈159 years at the platform's default ten-minute epoch. (The first version said `2²⁰` and
+"≈120 years at one epoch per hour", computing the span against a clock this platform does not run: the real
+default is six times faster, so it bought ≈20 years. A policy number warranted by a span of time is worth
+nothing if the span uses the wrong clock; the arithmetic is now pinned by a test that sees both constants.) Solving `(f/n)^m ≤ 1/H`:
 
 > **m ≥ log H / log(n/f)**, and with `f = ⌊(n−1)/3⌋` that is `log₃ H` — **constant in `n`**.
 
 | horizon `H` | `m` |
 |---|---|
-| `2¹⁰` (≈6 weeks hourly) | 7 |
-| `2²⁰` (≈120 years hourly) | 13 |
-| `2³⁰` (≈120 000 years) | 19 |
+| `2¹⁰` (≈1 week) | 7 |
+| `2²³` (≈159 years) | 15 |
+| `2³⁰` (≈20 000 years) | 19 |
 
 The horizon is the *single* policy input; everything else is derived. It buys itself cheaply — a
 thousand-fold longer horizon costs about six more meeting points — which is why it can be set generously

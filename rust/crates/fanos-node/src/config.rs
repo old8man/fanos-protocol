@@ -902,6 +902,28 @@ impl NodeConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **The censorship horizon is stated in epochs and justified in years — pin the conversion.**
+    ///
+    /// `CENSORSHIP_HORIZON_EPOCHS` is a *policy* number whose entire warrant is a span of time: "at most one
+    /// censored epoch over this long". Its first version read "`2²⁰` epochs is ≈120 years at one epoch per
+    /// hour" — computed against a clock this platform does not run. The real default is **ten minutes**, six
+    /// times faster, so it bought ≈20 years and the justification was simply wrong.
+    ///
+    /// Neither crate can see the other's constant (`fanos-rendezvous` must not depend on the node's config),
+    /// so the invariant lives here, where both are visible, and fails if either moves. A comment hoping to
+    /// stay true is what produced the error; a test cannot hope.
+    #[test]
+    fn the_censorship_horizon_is_stated_against_the_real_epoch_period() {
+        let epochs = fanos_rendezvous::CENSORSHIP_HORIZON_EPOCHS;
+        let span = DEFAULT_EPOCH_PERIOD.saturating_mul(u32::try_from(epochs).unwrap_or(u32::MAX));
+        let years = span.as_secs_f64() / (365.25 * 24.0 * 3600.0);
+        assert!(
+            (100.0..500.0).contains(&years),
+            "the horizon must be a human lifetime and change, not a decade and not a geological age: \
+             {epochs} epochs x {DEFAULT_EPOCH_PERIOD:?} = {years:.0} years"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -68,14 +68,27 @@ pub fn meeting_line<F: Field>(service_pubkey: &[u8], epoch: Epoch, beacon: &Beac
 pub const CONTROL_MIX_DIRECTORY: u16 = 1;
 
 /// The horizon the probabilistic meeting-point count is solved for: the number of epochs over which a service
-/// expects **at most one** censored epoch. `2²⁰` epochs is ≈120 years at one epoch per hour.
+/// expects **at most one** censored epoch.
 ///
 /// This is the single policy input to [`meeting_point_count`] — everything else there is derived. It is a
-/// horizon rather than a bare probability because that is the form an operator can reason about: "how long
-/// should this run before one epoch is expected to be censored", against which 120 years is a defensible
-/// answer for a network meant to outlive its authors. Raising it costs meeting points only logarithmically
-/// (`log₃`), so an extra factor of a thousand in horizon buys itself for about 6 more points.
-pub const CENSORSHIP_HORIZON_EPOCHS: u64 = 1 << 20;
+/// horizon rather than a bare probability because that is the form an operator can reason about: *how long
+/// should this run before one epoch is expected to be censored*, and the intended answer is "longer than the
+/// network's authors". Raising it costs meeting points only logarithmically (`log₃`), so the horizon is cheap
+/// to be generous with.
+///
+/// **It is stated in epochs and justified in years, which is a unit conversion — and the first version of this
+/// constant got that conversion wrong.** It read "`2²⁰` epochs is ≈120 years at one epoch per hour", but this
+/// platform's default epoch is **ten minutes** (`fanos_node::config::DEFAULT_EPOCH_PERIOD`), six times faster,
+/// so `2²⁰` bought ≈20 years — not the lifetime the justification claimed. A policy number whose whole warrant
+/// is a span of time is worth nothing if the span is computed against the wrong clock.
+///
+/// So: `2²³ × 600 s ≈ 159 years`, at the platform's actual default. The arithmetic is pinned by
+/// `fanos-node`'s `the_censorship_horizon_is_stated_against_the_real_epoch_period`, which sees both constants
+/// and fails if either moves — a checkable invariant rather than a comment hoping to stay true.
+///
+/// The cost of the correction is two meeting points at large planes (`log₃ 2²³ = 15` against 13) and **none at
+/// all on the shipped Fano cell**, where the pigeonhole bound of 3 is cheaper and wins the `min` regardless.
+pub const CENSORSHIP_HORIZON_EPOCHS: u64 = 1 << 23;
 
 /// How many meeting points a service takes on a plane of order `q` — the **minimum of two bounds**, because
 /// they are cheapest in opposite regimes and neither dominates.

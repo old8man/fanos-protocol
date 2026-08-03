@@ -92,9 +92,28 @@ fn the_derived_bound_is_constant_in_the_plane_size() {
         assert_eq!(r.obtained, r.derived, "q={}: the distinct-combiner walk came up short{report}", r.q);
     }
 
-    // Flat past the crossover: every plane from q=7 up takes the same number of meeting points.
+    // **Bounded and converging, which is the true property — not flat.**
+    //
+    // An earlier version asserted flatness and passed only because the horizon then in use rounded every
+    // plane to the same integer. It does not hold in general and should not: `m ≥ log H / log(n/f)` and
+    // `n/f = n/⌊(n−1)/3⌋` approaches 3 **from above**, so a smaller plane has a slightly better ratio and can
+    // need one point fewer. `q = 7` takes 14 where `q ≥ 8` takes 15.
+    //
+    // What matters is that the count stops depending on the size of the network, and that is exactly
+    // "bounded by the limit, with the spread the convergence allows".
+    #[allow(clippy::cast_precision_loss)]
+    let limit = (CENSORSHIP_HORIZON_EPOCHS as f64).ln() / 3.0f64.ln();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let limit = limit.ceil() as usize;
     let past: Vec<usize> = rows.iter().filter(|r| r.q >= 7).map(|r| r.derived).collect();
-    assert!(past.windows(2).all(|w| w[0] == w[1]), "expected a flat count past q=7, got {past:?}{report}");
+    for &m in &past {
+        assert!(m <= limit, "the count must never exceed its `n/f → 3` limit of {limit}, got {m}{report}");
+    }
+    let (lo, hi) = (past.iter().min().copied(), past.iter().max().copied());
+    assert!(
+        hi.zip(lo).is_some_and(|(h, l)| h - l <= 1),
+        "the spread past the crossover must be at most the one point convergence allows, got {past:?}{report}"
+    );
 
     // And it is a real cut, not a rounding: the largest plane measured drops by more than an order of
     // magnitude against the bound it replaces.
