@@ -120,6 +120,29 @@ impl GatherClock {
         }
     }
 
+    /// Fold in a gather that answered **after its deadline had already fired** — the one sample the
+    /// estimator was structurally blind to.
+    ///
+    /// [`Self::observe`] only ever sees gathers that finished *inside* the current deadline, so its sample
+    /// set is truncated at exactly the quantity it is supposed to predict. That is self-reinforcing: anything
+    /// slower than the deadline expires, yields no sample under Karn, and so can never move the estimate that
+    /// would have admitted it. The deadline stays where it is because everything past it is invisible.
+    /// Measured: 158 shares in one run arrived for gathers already given up on, while `backoff` sat at zero.
+    ///
+    /// A late share is not a Karn violation. Karn's rule forbids attributing an **ambiguous** sample — one
+    /// that could belong to either of two transmissions. This share carries its gather's `req_id`, so it is
+    /// unambiguously the answer to that one gather, and `now − armed_at` is a duration that was genuinely
+    /// measured rather than fabricated. It is the tail of the real distribution, arriving late precisely
+    /// because the estimate was short.
+    ///
+    /// The backoff is **not** cleared, which is the difference from [`Self::observe`]: the gather did fail,
+    /// and only a gather that completes on time restores confidence in the estimate.
+    pub fn observe_late(&mut self, sample: Duration) {
+        let backoff = self.backoff;
+        self.observe(sample);
+        self.backoff = backoff;
+    }
+
     /// The deadline to arm the next gather with: `(SRTT + 4·RTTVAR) << backoff`, clamped to
     /// `[`[`MIN_GATHER_DEADLINE`]`, `[`MAX_GATHER_DEADLINE`]`]`.
     #[must_use]
@@ -160,6 +183,71 @@ impl GatherClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A deadline trained only on what beat it can never learn that it is short.**
+    ///
+    /// `observe` is fed by completions, and a completion is by construction a gather that finished inside
+    /// the current deadline — so the sample set is truncated at exactly the quantity being estimated. Feed a
+    /// clock a fast workload and then a slow one whose gathers all miss: under `observe` alone the estimate
+    /// cannot move, because the slow gathers produce no samples. `observe_late` is the missing evidence, and
+    /// it is a real measurement rather than a fabricated one — the share carries its own `req_id`, so there
+    /// is no ambiguity for Karn's rule to protect against.
+    #[test]
+    fn a_deadline_trained_only_on_what_beat_it_never_widens() {
+        let fast = Duration(1_000_000); // 1 ms
+        let slow = Duration(80_000_000); // 80 ms — past any deadline the fast samples can justify
+
+        // A clock that has only ever seen the fast workload.
+        let mut blind = GatherClock::new();
+        for _ in 0..64 {
+            blind.observe(fast);
+        }
+        let settled = blind.deadline();
+        assert!(settled < slow, "the premise: {settled:?} must be shorter than the slow gathers at {slow:?}");
+
+        // The workload slows down. Every gather now misses, so under `observe` alone the estimator sees
+        // NOTHING — expiries carry no sample, by Karn — and only the backoff moves.
+        let mut deaf = blind;
+        for _ in 0..8 {
+            deaf.expired();
+        }
+        assert_eq!(
+            deaf.srtt(),
+            blind.srtt(),
+            "expiries must not fabricate a sample — that is Karn, and it is why the estimate is stuck"
+        );
+
+        // The same eight gathers, with their late answers folded in. Now the estimate moves toward the
+        // truth, because a late share IS the measurement.
+        let mut learning = blind;
+        for _ in 0..8 {
+            learning.expired();
+            learning.observe_late(slow);
+        }
+        assert!(
+            learning.srtt() > blind.srtt(),
+            "a late share must move the estimate: {:?} vs {:?}",
+            learning.srtt(),
+            blind.srtt()
+        );
+        assert!(
+            learning.deadline() > deaf.deadline(),
+            "learning from late shares must widen the deadline further than backoff alone: {:?} vs {:?}",
+            learning.deadline(),
+            deaf.deadline()
+        );
+
+        // And it must not clear the backoff — the gathers still failed, so confidence is not restored.
+        let mut backed_off = GatherClock::new();
+        backed_off.observe(fast);
+        backed_off.expired();
+        let widened = backed_off.deadline();
+        backed_off.observe_late(slow);
+        assert!(
+            backed_off.deadline() >= widened,
+            "observe_late must keep the backoff it inherited, not reset it like a clean completion"
+        );
+    }
 
     #[test]
     fn the_gather_deadline_tracks_measured_latency_instead_of_a_constant() {

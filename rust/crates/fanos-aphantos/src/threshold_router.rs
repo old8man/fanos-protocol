@@ -109,9 +109,10 @@ struct Pending {
 enum Resolved {
     /// A subset peeled and the hop went on — later shares are the expected `q + 1 − t` remainder.
     Peeled,
-    /// The deadline fired first — a later share is evidence the deadline was too tight, not that the line
-    /// was silent.
-    Expired,
+    /// The deadline fired first, at the instant the gather was armed — a later share is evidence the
+    /// deadline was too tight, not that the line was silent, and `armed_at` is what turns that evidence
+    /// into a measurement the estimator can use ([`GatherClock::observe_late`]).
+    Expired { armed_at: Instant },
 }
 
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
@@ -620,7 +621,14 @@ impl<F: Field> ThresholdRouter<F> {
             // nothing in particular.
             let station = match self.resolved.iter().find(|(id, _)| *id == req_id).map(|(_, r)| *r) {
                 Some(Resolved::Peeled) => Station::ShareLateAfterPeel,
-                Some(Resolved::Expired) => Station::ShareAfterDeadline,
+                Some(Resolved::Expired { armed_at }) => {
+                    // The sample the estimator could not otherwise see. `observe` is fed only by gathers
+                    // that finished INSIDE the deadline, so its sample set is truncated at the very
+                    // quantity it predicts and can never learn that the deadline is short. This one is a
+                    // real, unambiguous measurement of a real round trip — it just arrived late.
+                    self.gather.observe_late(now.since(armed_at));
+                    Station::ShareAfterDeadline
+                }
                 None => Station::ShareForUnknownRequest,
             };
             self.stations.record(station, None);
@@ -885,7 +893,7 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                             Station::GatherUnpeelable
                         };
                         self.stations.record(station, Some(dead.line));
-                        self.remember_resolved(token, Resolved::Expired);
+                        self.remember_resolved(token, Resolved::Expired { armed_at: dead.armed_at });
                     }
                     Vec::new()
                 }
