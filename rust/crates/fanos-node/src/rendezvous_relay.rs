@@ -38,7 +38,7 @@ use fanos_field::Field;
 use fanos_geometry::Triple;
 use fanos_primitives::BoundedMap;
 use fanos_primitives::hash::{hash_labeled, label};
-use fanos_rendezvous::{HostRegister, MixDirectory, Request, SessionId, parse_host_register};
+use fanos_rendezvous::{Epoch, HostRegister, MixDirectory, Request, SessionId, parse_host_register};
 use fanos_runtime::ports::stations::{Station, Stations, merge_observations};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
@@ -64,7 +64,7 @@ pub struct RendezvousRelay<F: Field> {
     /// (`design-anonymity-substrate.md` §3b). A matching client request peeled here is re-sealed as a NOSTOS
     /// onion to the service's registered dead-drop line — reachable without any node learning its coordinate.
     /// A [`BoundedMap`], bounded like `registrations` at [`MAX_HOSTS`] against a registration flood.
-    hosts: BoundedMap<[u8; 32], HostRegister>,
+    hosts: BoundedMap<[u8; 32], (Epoch, HostRegister)>,
     /// This relay's **own** data-path readings, merged into the router's on `Command::Observe`.
     ///
     /// The relay had none, so its two forward-path discards — a host whose route it cannot seal to, and a
@@ -145,12 +145,15 @@ impl<F: Field> RendezvousRelay<F> {
         // beacon-led clock (`CellNode` documents the invariant: the beacon leads, the router follows). A
         // registration minted for another epoch carries another tag and would be filed under a key no client of
         // *this* epoch looks up, so refusing it costs nothing that was ever reachable.
-        if !reg.verify(self.router.onion_epoch()) {
+        let epoch = self.router.onion_epoch();
+        if !reg.verify(epoch) {
             return Vec::new();
         }
         let service_tag = reg.service_tag;
         // The `BoundedMap` bounds this against a registration flood (a re-registration refreshes the route).
-        self.hosts.insert(service_tag, reg);
+        // The epoch is stored WITH the registration, because a tag is a function of the epoch and therefore a
+        // service takes a fresh slot every epoch — see `retire_stale_hosts`, which is what frees the old one.
+        self.hosts.insert(service_tag, (epoch, reg));
         vec![Effect::Notify(Notification::HostRegistered { service_tag })]
     }
 
@@ -197,6 +200,31 @@ impl<F: Field> RendezvousRelay<F> {
     /// bind, and the next epoch's install makes them usable.
     pub fn set_directory(&mut self, directory: MixDirectory) {
         self.directory = directory;
+        self.retire_stale_hosts();
+    }
+
+    /// Drop every hidden-service registration minted for an epoch this relay has passed.
+    ///
+    /// **A retention rule that follows from the key, not from a policy.** `service_tag` is
+    /// `H(signing identity ‖ epoch)`, so a service occupies a *different* slot every epoch and the previous
+    /// one is never overwritten. Nothing removed it: the map's only eviction was FIFO under capacity
+    /// pressure, and its comment justified that with "it re-registers each epoch anyway" — which is precisely
+    /// what leaves the old entry behind.
+    ///
+    /// A past-epoch entry is unreachable by any honest client, because a client derives the tag from its own
+    /// live epoch and will never compute that one again. So retaining it can serve exactly one party: an
+    /// adversary that recorded the tag while it was current. It can then re-present that tag at any later
+    /// epoch and this relay will still re-seal its request to the service's old dead-drop line — which is to
+    /// say **rotation did not retire the path it rotated away from**, and the moving-target property the
+    /// design claims ("rotation caps a single enumeration's value to one epoch") held only for honest
+    /// lookups.
+    ///
+    /// Driven from `set_directory` because that is already the per-epoch hand-off: a combiner is a sans-I/O
+    /// engine and cannot notice a clock on its own, and the composite that rebuilds the directory each epoch
+    /// is the one party that knows the epoch turned.
+    fn retire_stale_hosts(&mut self) {
+        let now = self.router.onion_epoch();
+        self.hosts.retain(|_, (minted, _)| *minted >= now);
     }
 
     /// A mutable reference to the wrapped router (for a composite engine to drive its epoch rotation).
@@ -246,7 +274,7 @@ impl<F: Field> RendezvousRelay<F> {
         // 3. A client request naming a registered host → re-seal to that host's dead-drop and forward.
         if let Some(req) = Request::decode(&payload)
             && req.service_tag != [0u8; 32]
-            && let Some(reg) = self.hosts.get(&req.service_tag).cloned()
+            && let Some((_minted, reg)) = self.hosts.get(&req.service_tag).cloned()
         {
             let (e2e, onion) = self.next_forward_seeds();
             // A registered host whose route we cannot seal to: drop, don't surface locally (this node is not
@@ -756,6 +784,106 @@ mod tests {
                 Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS
             )),
             "a request for no registered host surfaces locally, as before",
+        );
+    }
+
+    #[test]
+    fn a_rotated_epoch_retires_the_path_it_rotated_away_from() {
+        use fanos_pqcrypto::HybridKemSecret;
+        use fanos_rendezvous::{HOST_REGISTER_TAG, MixDirectory, line_member_coords, service_tag};
+
+        // **What rotation was supposed to buy, and did not.** `service_tag = H(identity ‖ epoch)`, so a
+        // service takes a DIFFERENT slot in `hosts` every epoch and the previous one was never overwritten —
+        // nothing removed it. The map's only eviction was FIFO under capacity pressure, justified in its own
+        // comment with "it re-registers each epoch anyway", which is exactly what leaves the old entry behind.
+        //
+        // An honest client never notices: it derives the tag from its own live epoch and will never compute
+        // the old one again. The party that does notice is one that RECORDED the tag while it was current —
+        // it can re-present it at any later epoch and this relay would still re-seal the request to the
+        // service's old dead-drop line. So the design's "rotation caps a single enumeration's value to one
+        // epoch" held for honest lookups and not for the adversary it was written about.
+        let mut dir = MixDirectory::new();
+        for i in 0..7u8 {
+            let (_s, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xE0, i]));
+            dir.insert(Point::<F2>::at(usize::from(i)).coords(), public);
+        }
+        let l = Line::<F2>::at(0).coords();
+        let combiner = Point::<F2>::new(line_member_coords::<F2>(l)[0]).unwrap();
+        let onion_seed = [0xB7u8; 32];
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"retire-relay-id"));
+        let mut relay =
+            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+        let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB7, 1]));
+        let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB7, 2]));
+        let seal_to_relay = |body: &[u8], seed: &[u8], epoch: Epoch| {
+            let ratchet = OnionKeyRatchet::new(onion_seed, epoch);
+            let pubs = [ratchet.public(), &p1, &p2];
+            let onion = seal_onion(&[HopLine { line: l, members: &pubs }], 1, body, seed).unwrap();
+            launch_frame(l, &onion)
+        };
+
+        let epoch0 = relay.router().onion_epoch();
+        let mut srng = SeedRng::from_seed(b"a-rotating-hidden-service");
+        let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
+        let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
+        let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
+        let stale_tag = service_tag(&bundle, epoch0);
+        let drop_line = Line::<F2>::at(3).coords();
+        let (_svc_keys, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"retire-deaddrop");
+        relay.set_directory(dir.clone());
+        let reg =
+            HostRegister::onion(&bundle, &signer, epoch0, svc_reply_pub.encode(), vec![drop_line], 1)
+                .expect("the dead-drop line's members are in the directory");
+        let mut reg_body = HOST_REGISTER_TAG.to_vec();
+        reg_body.extend_from_slice(&reg.encode());
+        relay.step(
+            Instant(0),
+            Input::Message { from: [9, 9, 9], frame: seal_to_relay(&reg_body, b"reg", epoch0) },
+        );
+        assert_eq!(relay.hosts(), 1, "the registration bound at the epoch it was minted for");
+
+        // The adversary records the tag while it is current — a public value, so this costs it nothing.
+        let recorded = stale_tag;
+
+        // The cell's clock turns. The composite hands the relay the new epoch's directory, which is the one
+        // moment a sans-I/O combiner can learn that its epoch moved at all.
+        relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        let epoch1 = relay.router().onion_epoch();
+        assert!(epoch1 > epoch0, "the router's onion epoch advanced");
+        relay.set_directory(dir.clone());
+        assert_eq!(
+            relay.hosts(),
+            0,
+            "a registration minted for an epoch the relay has passed must be gone — it is unreachable by \
+             every honest client, so keeping it can serve only whoever recorded its tag",
+        );
+
+        // And the recorded tag is now dead: a request presenting it is not forwarded to the service's old
+        // dead-drop line, it falls through as an ordinary anonymous delivery like any unknown tag.
+        let replayed = Request {
+            cookie: *b"recorded-tag-001",
+            service_tag: recorded,
+            reply_circuit: vec![Line::<F2>::at(5).coords()],
+            payload: b"a request on a retired path".to_vec(),
+            reply_pub: b"adversary-reply".to_vec(),
+        }
+        .encode();
+        let effects = relay.step(
+            Instant(2),
+            Input::Message { from: [8, 8, 8], frame: seal_to_relay(&replayed, b"replay", epoch1) },
+        );
+        // The complement, and it must be asserted this way round. "No `Send` to a member of the drop line"
+        // would be unsound as a check: any two lines of a projective plane meet in exactly one point, so the
+        // relay's own line and the drop line share a member and a perfectly ordinary effect addressed there
+        // is indistinguishable from a forward. What IS unambiguous is the fall-through — an unknown tag
+        // surfaces locally as an anonymous delivery, which is exactly what the unknown-tag case asserts.
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS
+            )),
+            "a recorded tag from a passed epoch must fall through like any unknown tag, not be forwarded to \
+             the service's retired dead-drop line",
         );
     }
 }

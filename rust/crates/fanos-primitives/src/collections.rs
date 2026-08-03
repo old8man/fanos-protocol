@@ -96,6 +96,31 @@ impl<K: Ord + Copy, V> BoundedMap<K, V> {
         self.map.remove(&key).map(|v| (key, v))
     }
 
+    /// Keep only the entries `keep` accepts, dropping the rest — a **retention** rule, which is a different
+    /// thing from the eviction rule [`remove_oldest_where`](Self::remove_oldest_where) applies.
+    ///
+    /// Eviction answers "the map is full, who goes" and must therefore choose by *age*. Retention answers
+    /// "this entry can no longer be correct" and must choose by the entry's own content — the two are not
+    /// interchangeable, and using capacity pressure as a stand-in for expiry is how a map ends up holding
+    /// values that are unreachable to every honest reader and useful only to whoever recorded their key.
+    ///
+    /// The eviction order is repaired in the same pass, so a later insert cannot surface a key that is no
+    /// longer in the map and skip a live one.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        let map = &mut self.map;
+        self.order.retain(|k| match map.get(k) {
+            Some(v) => {
+                if keep(k, v) {
+                    true
+                } else {
+                    map.remove(k);
+                    false
+                }
+            }
+            None => false,
+        });
+    }
+
     /// Remove `key`, returning its value if present. Its slot in the eviction order is dropped too, so `order`
     /// keeps tracking exactly the live key set (an eviction never surfaces a stale key that would skip a real
     /// one and break the bound). Removing an absent key is a no-op.
