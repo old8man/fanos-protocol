@@ -92,8 +92,18 @@ async fn rendezvous_bridge<F, S>(
     };
     let outbound = async {
         while let Some(payload) = app_out.recv().await {
-            if let Some(fwd) = rclient.seal_send(&payload) {
-                send_frame(fwd.combiner, fwd.frame);
+            match rclient.seal_send(&payload) {
+                Some(fwd) => send_frame(fwd.combiner, fwd.frame),
+                // **A seal failure is fatal to this session, not a dropped packet.** `seal_forward` fails
+                // only for reasons fixed for the whole circuit — a hop line with a member absent from the
+                // directory — so the next payload will fail identically and so will every one after it.
+                // Dropping them silently is a session that moves zero bytes forever while looking healthy,
+                // which is precisely the wedge the harness reports as REFUTED.
+                //
+                // Ending the bridge closes the transport, the driver gives up, and the dial's confirmation
+                // signal resolves `Err` — so the hedged walk moves to another meeting point instead of
+                // riding a circuit that can never carry anything.
+                None => break,
             }
         }
     };
@@ -204,16 +214,12 @@ impl RendezvousRoute {
         // key present in the directory, because a reply onion seals to the whole line and its launch draws a
         // per-onion member (#55, `combiner_for_salted`), so no single member's liveness is the gate any more.
         // Falls back to the meeting line only on a degenerate plane that offers no such line.
-        let reply_rendezvous = draw_line::<F, R>(rng, |l| {
-            l != service_meeting
-                && fanos_rendezvous::line_member_coords::<F>(l)
-                    .iter()
-                    .all(|m| directory.get(m).is_some())
-        })
-        .unwrap_or(service_meeting);
-        let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting], rng);
+        let reply_rendezvous =
+            draw_line::<F, R>(rng, |l| l != service_meeting && line_is_sealable::<F>(l, &directory))
+                .unwrap_or(service_meeting);
+        let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting], &directory, rng);
         let mut reply_circuit =
-            random_hops::<F, R>(depths.1, &[service_meeting, reply_rendezvous], rng);
+            random_hops::<F, R>(depths.1, &[service_meeting, reply_rendezvous], &directory, rng);
         reply_circuit.push(reply_rendezvous);
         Self {
             forward_hops,
@@ -232,11 +238,37 @@ fn draw_budget<F: Field>() -> usize {
     (Plane::<F>::N as usize).saturating_mul(16).max(1)
 }
 
-/// Draw `count` distinct random hop lines, none in `avoid` and none repeated — a fresh set of hop lines
-/// for one circuit. Bounded retries, so it always terminates (returning fewer than `count` only if the
-/// plane cannot supply that many distinct non-avoided lines).
+/// Whether a line can carry a hop: **every** member's key is in `directory`, so an onion layer can be sealed
+/// to the whole line.
+///
+/// One predicate, because there were two. The reply-rendezvous draw has always required this and
+/// [`random_hops`], ten lines away, required nothing — the same decision under two rules. That is not a
+/// tidiness point: [`fanos_rendezvous::seal_forward`] returns `None` if *any* member of *any* hop line is
+/// missing, so a circuit laid through one unsealable line seals **nothing**, for the whole life of the
+/// session, and the bridge used to drop each payload silently. Zero bytes moving forever is exactly the
+/// wedge signature, and an unlucky draw was all it took.
 #[must_use]
-pub fn random_hops<F: Field, R: Rng>(count: usize, avoid: &[Coord], rng: &mut R) -> Vec<Coord> {
+pub fn line_is_sealable<F: Field>(line: Coord, directory: &MixDirectory) -> bool {
+    fanos_rendezvous::line_member_coords::<F>(line)
+        .iter()
+        .all(|m| directory.get(m).is_some())
+}
+
+/// Draw `count` distinct random hop lines — none in `avoid`, none repeated, and every one **sealable**
+/// against `directory` ([`line_is_sealable`]). Bounded retries, so it always terminates, returning fewer
+/// than `count` only if the plane cannot supply that many.
+///
+/// Returning short is the honest outcome and the caller must treat it as one: a circuit with fewer hops than
+/// asked for is shallower than the profile requested, which is a weaker anonymity set, not a failure to
+/// route. It is still strictly better than the previous behaviour, which returned the full count including
+/// lines nothing could be sealed to.
+#[must_use]
+pub fn random_hops<F: Field, R: Rng>(
+    count: usize,
+    avoid: &[Coord],
+    directory: &MixDirectory,
+    rng: &mut R,
+) -> Vec<Coord> {
     let n = Plane::<F>::N as usize;
     let mut chosen: Vec<Coord> = Vec::with_capacity(count);
     let mut attempts = 0usize;
@@ -244,7 +276,7 @@ pub fn random_hops<F: Field, R: Rng>(count: usize, avoid: &[Coord], rng: &mut R)
     while chosen.len() < count && attempts < budget {
         attempts += 1;
         let line = Line::<F>::at((rng.next_u32() as usize) % n.max(1)).coords();
-        if !avoid.contains(&line) && !chosen.contains(&line) {
+        if !avoid.contains(&line) && !chosen.contains(&line) && line_is_sealable::<F>(line, directory) {
             chosen.push(line);
         }
     }
@@ -345,6 +377,70 @@ mod tests {
             dir.insert(Point::<F2>::at(usize::from(i)).coords(), public);
         }
         dir
+    }
+
+    /// A directory missing exactly one member's key — every line through that point becomes unsealable.
+    fn fano_directory_without(missing: usize) -> MixDirectory {
+        let mut dir = MixDirectory::new();
+        for i in 0..7usize {
+            if i == missing {
+                continue;
+            }
+            let mut rng = SeedRng::from_seed(&[0x0E, u8::try_from(i).unwrap()]);
+            let (_secret, public) = HybridKemSecret::generate(&mut rng);
+            dir.insert(Point::<F2>::at(i).coords(), public);
+        }
+        dir
+    }
+
+    /// **A drawn circuit must be one the client can actually seal onto.**
+    ///
+    /// `seal_forward` needs every member of every hop line, and returns `None` if one is missing — for the
+    /// whole circuit, on every call, for the life of the session. So a single unsealable hop is not a lossy
+    /// hop, it is a session that sends nothing at all while looking established: the wedge signature.
+    ///
+    /// The draw used to permit exactly that. The reply rendezvous was checked for sealability and the
+    /// intermediate hops, drawn ten lines away, were not.
+    ///
+    /// Asserted on the end-to-end property — the route SEALS — rather than on the predicate, so this cannot
+    /// pass by agreeing with a reimplementation of the rule it is checking.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_drawn_circuit_can_always_be_sealed() {
+        for missing in 0..7usize {
+            let dir = fano_directory_without(missing);
+            let mut rng = TestRng(0xD1CE ^ missing as u64);
+            // A meeting line that is itself sealable, since the client does not choose that one and a route
+            // toward an unreachable service is a different question from a route laid through a dead hop.
+            let meeting = (0..7)
+                .map(|i| Line::<F2>::at(i).coords())
+                .find(|&l| line_is_sealable::<F2>(l, &dir))
+                .expect("a plane missing one point still has sealable lines");
+
+            let route = RendezvousRoute::draw::<F2, _>(
+                dir.clone(),
+                2,
+                Epoch::new(3),
+                BeaconSeed::GENESIS,
+                meeting,
+                (2, 2),
+                &mut rng,
+            );
+
+            let mut forward = route.forward_hops.clone();
+            forward.push(meeting);
+            assert!(
+                fanos_rendezvous::seal_forward::<F2>(&forward, &dir, 2, b"payload", b"seed").is_some(),
+                "missing point {missing}: the forward circuit {forward:?} cannot be sealed, so this session \
+                 would send nothing at all — forever, and silently"
+            );
+            assert!(
+                fanos_rendezvous::seal_forward::<F2>(&route.reply_circuit, &dir, 2, b"reply", b"seed")
+                    .is_some(),
+                "missing point {missing}: the reply circuit {:?} cannot be sealed",
+                route.reply_circuit
+            );
+        }
     }
 
     /// A tiny deterministic SplitMix64 standing in for a CSPRNG in the route-draw test. rand_core 0.10 is
