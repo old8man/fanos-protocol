@@ -269,3 +269,49 @@ fn a_cross_cell_transfer_is_trust_minimized_end_to_end() {
     // Both children are now anchored in the parent — anyone trusting the parent trusts both, without re-executing.
     assert!(parent.latest(1).is_some() && parent.latest(CELL_B).is_some());
 }
+
+/// **A validator's mempool must be bounded, and it must refuse rather than evict.**
+///
+/// `submit` gated only on `valid_seal` — that a transaction targets this epoch's beacon-chosen keyper line —
+/// and that line's public keys are *public*, so anyone can seal arbitrary payloads to it. Every seal carries a
+/// distinct commitment, so the de-duplication never fires and one peer could grow the pool without limit: the
+/// same shape as audit B1's `pending_reveals`, fixed there and not here. The de-duplication was also a linear
+/// scan of the whole pool per submission, so `N` admissions cost `O(N²)`.
+///
+/// Two properties, and the second is what makes the bound honest. The pool stops growing; and at the bound the
+/// **newcomer** is refused rather than an existing transaction evicted — because this is an *encrypted*
+/// mempool where fee and sender are invisible before reveal, so every available eviction key (arrival order,
+/// the commitment itself) is attacker-controlled, and refusing has no victim to choose wrongly.
+#[test]
+fn a_flood_of_valid_seals_cannot_grow_the_mempool_without_bound() {
+    let mut cell: Cell<CrossAccounts> = Cell::new(&CrossAccounts::default(), 0x5A);
+
+    let cap = fanos_taxis::consensus::MEMPOOL_CAP;
+    let overflow = 256usize;
+    let (mut admitted, mut refused) = (0usize, 0usize);
+    for i in 0..(cap + overflow) {
+        let tx = cell.seal(Transfer { from: ALICE, to: BRIDGE, amount: 1, nonce: i as u64 }, b"flood");
+        if cell.engines[0].submit(tx) {
+            admitted += 1;
+        } else {
+            refused += 1;
+        }
+    }
+
+    assert_eq!(admitted, cap, "the pool must stop admitting at its bound, not grow with the flood");
+    assert_eq!(refused, overflow, "everything past the bound must be refused");
+    assert_eq!(
+        cell.engines[0].rejects().mempool_full,
+        overflow as u64,
+        "every refusal must be counted — a silent one is indistinguishable from a lost packet to the sender"
+    );
+
+    // Fail-closed: the transaction admitted FIRST is still there. An evicting pool would have replaced the
+    // early entries with the flood's tail, which is exactly the targeting an attacker wants.
+    let first = cell.seal(Transfer { from: ALICE, to: BRIDGE, amount: 1, nonce: 0 }, b"flood");
+    assert!(
+        !cell.engines[0].submit(first),
+        "the first transaction must still be present, not evicted for the flood"
+    );
+}
+

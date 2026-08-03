@@ -311,6 +311,13 @@ pub struct ProposalRejects {
     pub last_commit: u64,
     /// A transaction was not sealed to this epoch's keyper line (anti-MEV admission).
     pub seal: u64,
+    /// A valid, novel transaction refused because the pool was at [`MEMPOOL_CAP`].
+    ///
+    /// The one counter that separates "the network is quiet" from "this validator is full and dropping work":
+    /// both look like an empty block, and only this tells them apart. A rising value is either genuine demand
+    /// past the configured capacity or a flood, and either way it is the operator's signal — where an
+    /// unbounded pool gave them a memory graph and then a dead process.
+    pub mempool_full: u64,
     /// The payload could not be reconstructed from the sampled shards, or failed `da_commit`.
     pub unavailable: u64,
     /// An SSLE round-0 proposal carried no verifiable sortition witness.
@@ -729,6 +736,30 @@ const COLLECT_WINDOW_TICKS: u32 = 1;
 /// all, so it is generous rather than tight.
 const RECENT_BODY_CAP: usize = 64;
 
+/// How many sealed transactions a validator holds awaiting ordering.
+///
+/// **The pool was unbounded**, and `valid_seal` cannot save it: the check is that a seal targets this epoch's
+/// beacon-chosen keyper line with the right committee size, and that line's public keys are *public*, so
+/// anyone can seal arbitrary payloads to it. Every seal carries a distinct commitment, so the de-duplication
+/// never fires and one peer could grow the pool without limit — the same shape as audit B1's
+/// `pending_reveals`, fixed there and not here.
+///
+/// **Fail-closed at the bound: refuse the newcomer, evict nobody.** That is not a shortcut, it is forced.
+/// This is an *encrypted* mempool — ordering happens over commitments and nothing about a transaction is
+/// visible before its reveal, not the fee and not the sender — so fee-priority eviction is unavailable by
+/// construction. What remains is arrival order or the commitment itself, and both are attacker-controlled: a
+/// FIFO victim can be evicted deterministically by out-waiting it, and any function of the commitment can be
+/// ground, since the submitter chose its preimage. Refusing admission has **no victim to choose wrongly**,
+/// which is precisely the argument [`DEFERRAL_CAP`] already makes for the same question one field away.
+///
+/// The consequence is honest and bounded: an attacker who fills the pool blocks new admissions until it
+/// drains, a liveness denial that is identical for every validator and visible in
+/// [`ProposalRejects::mempool_full`] — rather than a memory exhaustion that kills the process.
+///
+/// A **policy** number (`docs/design-constants.md` kind 4), in operator terms: how much memory a validator
+/// will spend holding transactions it cannot yet order.
+pub const MEMPOOL_CAP: usize = 4096;
+
 /// How many premature-transaction give-up clocks a validator tracks at once (see `deferred_since`).
 ///
 /// **What happens AT the bound is the whole design, and it is fail-closed.** A clock is what lets a deferred
@@ -782,7 +813,10 @@ pub struct ConsensusEngine<S: StateMachine> {
     epoch: Epoch,
     round: u32,
     chain: Chain<S>,
-    mempool: Vec<SealedTx>,
+    /// Sealed transactions awaiting ordering, keyed by commitment: de-duplication is a lookup rather than a
+    /// scan of the whole pool (which made admitting `N` transactions cost `O(N²)`), and `BTreeMap` iterates in
+    /// key order, so the proposer's blind commitment ordering comes for free instead of by sorting a clone.
+    mempool: BTreeMap<TxCommit, SealedTx>,
     // Per-height working state (reset on finalization).
     proposals: BTreeMap<[u8; 32], Block>,
     proposed_round: Option<u32>,
@@ -976,7 +1010,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             epoch,
             round: 0,
             chain: Chain::new(genesis_state),
-            mempool: Vec::new(),
+            mempool: BTreeMap::new(),
             proposals: BTreeMap::new(),
             proposed_round: None,
             prepares: Vec::new(),
@@ -1113,13 +1147,35 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if !self.valid_seal(&tx) {
             return false;
         }
-        // De-duplicate by commitment so a re-broadcast does not bloat the mempool.
+        // De-duplicate by commitment so a re-broadcast does not bloat the mempool — a lookup, not a scan.
         let commit = tx.commit();
-        if self.mempool.iter().all(|t| t.commit() != commit) {
-            self.mempool.push(tx);
-            return true;
+        if self.mempool.contains_key(&commit) {
+            return false;
         }
-        false
+        // Fail-closed at the bound (see `MEMPOOL_CAP`): refuse the newcomer rather than evict a victim this
+        // engine has no honest way to choose, and say so, because a silent refusal is indistinguishable from
+        // a lost packet to the sender and from nothing at all to an operator.
+        if self.mempool.len() >= MEMPOOL_CAP {
+            self.rejects.mempool_full = self.rejects.mempool_full.saturating_add(1);
+            return false;
+        }
+        self.mempool.insert(commit, tx);
+        true
+    }
+
+    /// Put a **deferred** transaction back in the pool, past [`MEMPOOL_CAP`].
+    ///
+    /// A re-submission from [`Self::note_deferrals`] is not new work asking for room — it is a transaction
+    /// this validator already admitted, already ordered into a block, and is retrying because execution said
+    /// *not yet*. Sending it through the fail-closed admission would let a pool full of spam silently discard
+    /// work the chain had already committed to retrying, which would be the fix causing a worse fault than
+    /// the one it closes.
+    ///
+    /// Safe to exempt because the exemption is **already bounded elsewhere**: a deferred transaction has a
+    /// give-up clock and no clock is issued past [`DEFERRAL_CAP`], so at most `DEFERRAL_CAP` entries can ever
+    /// enter this way. The pool's ceiling becomes `MEMPOOL_CAP + DEFERRAL_CAP`, which is still a constant.
+    fn readmit(&mut self, tx: SealedTx) {
+        self.mempool.entry(tx.commit()).or_insert(tx);
     }
 
     /// Whether a sealed transaction is bound to this epoch's **beacon-chosen keyper line** — the anti-MEV
@@ -1695,8 +1751,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Block { pol: Some(Box::new(cert)), witness: None, ..locked }
         } else {
             // Order the mempool blindly by commitment (the proposer never sees contents — anti-MEV).
-            let mut sealed = self.mempool.clone();
-            sealed.sort_by_key(SealedTx::commit);
+            // Already in commitment order: the pool is a `BTreeMap` keyed by commitment, so the blind
+            // anti-MEV ordering is the map's own iteration order rather than a sort of a clone.
+            let sealed: Vec<SealedTx> = self.mempool.values().cloned().collect();
             // Then take only what the transport can actually carry (#46). Without this the proposer packs
             // the whole pool, the block's DA shards exceed the frame ceiling, every shard is dropped in
             // SILENCE, no validator can reconstruct, nothing commits — and the pool never drains, so the
@@ -2480,7 +2537,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // transactions to the pool, and this retain is keyed on inclusion — run afterwards it would take them
         // straight back out, which is the whole defect in miniature. The retain reads no execution state, so
         // the order is free to be the correct one.
-        self.mempool.retain(|t| !included.contains(&t.commit()));
+        self.mempool.retain(|commit, _| !included.contains(commit));
         out.extend(self.try_execute());
         self.reset_round_state();
         out
@@ -2822,7 +2879,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             let Some(&first) = self.deferred_since.get(&commit) else {
                 if self.deferred_since.len() < DEFERRAL_CAP {
                     self.deferred_since.insert(commit, height);
-                    self.submit(sealed.clone());
+                    self.readmit(sealed.clone());
                 }
                 continue;
             };
@@ -2830,7 +2887,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 self.deferred_since.remove(&commit);
                 continue;
             }
-            self.submit(sealed.clone());
+            self.readmit(sealed.clone());
         }
     }
 
