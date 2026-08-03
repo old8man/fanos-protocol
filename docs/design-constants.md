@@ -168,7 +168,40 @@ Both are individually well derived. Together they are a trap: a reader who learn
 carry the wrong number, and neither name says which span it is. Same name, different quantity, no way to tell
 from the call site. Worth renaming to what each actually bounds.
 
-## 8. Applying it
+## 8. Pass C, 2026-08-03 — timing, and a shape that is not a wrong number
+
+Pass C found almost no wrong values. It found **relationships that were described rather than held**, which
+is the failure mode a timing tree is actually prone to: every constant correct today, and nothing keeping them
+correct together.
+
+| Was | Now |
+|---|---|
+| `ROUND_TIMEOUT_BASE = 1_500` ms, doc: "comfortably longer than a tick" | `TICK_PERIOD × ROUND_TIMEOUT_TICKS` — same value, and doubling the tick can no longer turn "comfortably" into "marginally" while the prose still says otherwise |
+| `ROUND_TIMEOUT_MAX = 24` s, doc: "doubles up to this ceiling" | `ROUND_TIMEOUT_BASE << ROUND_TIMEOUT_DOUBLINGS` — the ladder lands on its ceiling exactly, instead of a final step shorter than the one before it |
+| `ROUND_TIMEOUT_TICKS = 10`, chosen | `ROUND_PHASES + ROUND_TIMEOUT_SLACK` — the part the protocol requires, plus the part that is judgement, so a reader can tell which is which |
+| Backoff doc: "~22 attempts inside a 180 s give-up" | **27** at the anonymous tick, **286** at the Direct one, both measured by driving the real session |
+
+Three lessons, and they are the transferable part:
+
+1. **A relationship a doc describes is one that drifts; one it computes cannot.** Prose asserting "comfortably
+   longer" survives exactly until someone edits the other constant.
+2. **A number a comment works out by hand is a number nobody re-works out.** The "~22" was wrong, and the
+   spread between profiles — tenfold — was not merely unknown but unsuspected.
+3. **Assert the reason, not the value.** The ladder's test caught *me* demanding the ceiling clear
+   `ROUND_TIMEOUT_TICKS × 4 s` when a round's cost is proportional to `ROUND_PHASES`, not to the tick count
+   that already carries margin. The constant was right and my reasoning was not; only naming the two
+   quantities apart made the error visible.
+
+And one refinement to the taxonomy, from `STORE_TIMEOUT`: a **published contract** is policy that third
+parties depend on, so it must be *honoured* rather than merely justified, and it cannot adapt. It bounds the
+worst supported deployment where an estimator tracks the typical one — which makes it the right base for a
+duty-cycle derivation (`ROSTER_REFRESH = 3 × STORE_TIMEOUT`, correctly) and the wrong base for a
+latency-tracking one.
+
+**Still open in Pass C:** `TICK` (20 ms) and `TICK_PERIOD` (150 ms) remain roots with descriptions but no
+derivation, and `RENDEZVOUS_TICK` (250 ms) is the one the `GatherClock` could plausibly derive (#46).
+
+## 9. Applying it
 
 Highest risk first; do not sweep 811 entries blindly.
 
