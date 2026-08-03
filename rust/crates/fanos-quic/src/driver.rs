@@ -283,9 +283,31 @@ type Reflexive = Arc<Mutex<ReflexiveAddr>>;
 /// proven coordinate, lets this node later tell a third party where to reach that peer.
 type PeerAddrs = Arc<Mutex<HashMap<Triple, SocketAddr>>>;
 
-/// How many distinct peers must independently report the same observed address before this node trusts
-/// it as its public address (see [`ReflexiveAddr`]). Two, so one lying/misconfigured peer cannot move it.
-const REFLEXIVE_QUORUM: usize = 2;
+/// How many distinct peers must independently report the same observed address before this node trusts it
+/// as its public address (see [`ReflexiveAddr`]) — **derived from the plane's own fault budget.**
+///
+/// It used to be the constant `2`, "so one lying/misconfigured peer cannot move it". That defends against
+/// ONE liar while every other bound in FANOS is sized to `f = ⌊(n−1)/3⌋`, which is **2** at the Fano base
+/// cell. So two colluding peers sat *inside* the budget the platform explicitly promises to survive, and two
+/// agreeing reports was exactly the quorum: an adversary within tolerance could set a node's belief about its
+/// own public address — the address it advertises and a hub uses to broker a hole-punch (#119).
+///
+/// `f + 1` is the same pigeonhole every coalition bound here uses, so a tolerated adversary is one short of
+/// forging agreement whatever the plane.
+///
+/// **The layer matters and was the real defect.** A quorum sized against the fault model belongs where the
+/// fault model is known, and this crate is the transport: `Directory` holds *known peers*, not the cell's
+/// point count, so sizing from it would have been an attacker-influenceable guess. The self-certifying entry
+/// points are generic over `F`, so they compute this and hand it in; the field-less [`spawn`] keeps the base
+/// cell's value because a bare engine has no plane to ask.
+#[must_use]
+pub(crate) const fn reflexive_quorum(q: u32) -> usize {
+    let n = (q as usize) * (q as usize) + (q as usize) + 1;
+    (n - 1) / 3 + 1
+}
+
+/// The base cell's reflexive quorum — what [`spawn`] uses, having no `F` to derive from.
+const REFLEXIVE_QUORUM_FANO: usize = reflexive_quorum(2);
 
 /// An internal request from the engine actor to the transport loop.
 struct SendRequest {
@@ -724,6 +746,9 @@ pub async fn spawn(
         server,
         client,
         default_bind().into(),
+        // No `F` here: a bare engine carries no plane to ask, so the base cell's budget stands. A caller
+        // running a larger plane reaches the transport through `spawn_self_certifying*`, which derives it.
+        REFLEXIVE_QUORUM_FANO,
     )
 }
 
@@ -934,7 +959,17 @@ where
     // how the first attempt at this fix silently did nothing.
     let seeded_at_our_point = directory.resolve(coord.coords());
     let handle =
-        spawn_inner(engine, directory, shaper.clone(), controller, &identity, server, client, bind)?
+        spawn_inner(
+            engine,
+            directory,
+            shaper.clone(),
+            controller,
+            &identity,
+            server,
+            client,
+            bind,
+            reflexive_quorum(F::Q),
+        )?
             .with_claims(book.clone());
     // Re-bind our genesis point *with* its rank — unless someone else's address is already there.
     //
@@ -1239,6 +1274,9 @@ pub async fn spawn_shaped(
         server,
         client,
         default_bind().into(),
+        // No `F` here: a bare engine carries no plane to ask, so the base cell's budget stands. A caller
+        // running a larger plane reaches the transport through `spawn_self_certifying*`, which derives it.
+        REFLEXIVE_QUORUM_FANO,
     )
 }
 
@@ -1286,6 +1324,7 @@ fn spawn_inner(
     mut server_cfg: ServerConfig,
     mut client_cfg: ClientConfig,
     fabric: Fabric,
+    reflexive_quorum: usize,
 ) -> Result<NodeHandle, QuicError> {
     let addr = engine.address();
 
@@ -1315,7 +1354,7 @@ fn spawn_inner(
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Control>();
     let (events_tx, events_rx) = broadcast::channel::<Notification>(4096);
     let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
-    let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(REFLEXIVE_QUORUM)));
+    let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(reflexive_quorum)));
     let peer_addrs: PeerAddrs = Arc::new(Mutex::new(HashMap::new()));
     // Identity-keyed distrust, shared between the engine loop (which sees verdicts) and the accept path (which sees who
     // is seated where) — audit R-M1.

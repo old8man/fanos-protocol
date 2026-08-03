@@ -244,3 +244,48 @@ mod tests {
         assert_eq!(r.confirmed(), Some(addr(1000)));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod fault_budget {
+    use super::ReflexiveAddr;
+    use crate::driver::reflexive_quorum;
+    use std::net::SocketAddr;
+
+    /// **A coalition the platform promises to survive must not be able to move this node's address.**
+    ///
+    /// The quorum was the constant `2`, justified as "so one lying peer cannot move it". But FANOS sizes every
+    /// other coalition bound to `f = ⌊(n−1)/3⌋`, which is **2** at the Fano base cell — so two colluding peers
+    /// were *inside* the tolerated budget and two agreeing reports was exactly the quorum. An adversary within
+    /// what the platform explicitly promises to survive could set the address a node advertises and a hub uses
+    /// to broker a hole-punch.
+    ///
+    /// Asserted from both sides, since raising a quorum is only a fix if it still confirms: `f` liars fail,
+    /// `f + 1` honest peers succeed.
+    #[test]
+    fn a_tolerated_coalition_cannot_confirm_an_address_but_one_more_peer_can() {
+        for q in [2u32, 5, 8] {
+            let n = (q as usize) * (q as usize) + (q as usize) + 1;
+            let f = (n - 1) / 3;
+            let mut r = ReflexiveAddr::new(reflexive_quorum(q));
+
+            let lie: SocketAddr = "203.0.113.9:9".parse().expect("a literal address parses");
+            for i in 0..f {
+                let confirmed = r.observe([i as u32, 0, 0], lie);
+                assert!(
+                    confirmed.is_none(),
+                    "q={q}: {} of the tolerated {f} liars must not confirm — the budget says they exist",
+                    i + 1
+                );
+            }
+            // One more agreeing peer is one more than the adversary can field, so it confirms.
+            assert_eq!(
+                r.observe([f as u32, 0, 0], lie),
+                Some(lie),
+                "q={q}: f+1 = {} agreeing peers must confirm, or the quorum is unreachable rather than safe",
+                f + 1
+            );
+        }
+    }
+}
+
