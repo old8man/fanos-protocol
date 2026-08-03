@@ -7,6 +7,36 @@
 
 > **Resolution status — refreshed 2026-07-24: every finding in this document is RESOLVED.** Each was re-verified against the current source in a full per-finding closure re-audit; the last open items (D2, D4, A4/A4b, A6, C4, G1) were closed on 2026-07-24, and the rest were confirmed already fixed. The workspace has since grown to 41 crates and passes `cargo clippy --workspace --all-targets -D warnings` and `cargo test --workspace` green (the mid-change `cargo fmt` failure noted above is long gone). Resolutions are annotated inline (`— **RESOLVED**`) and summarised in the §2 table. This document is deliberately **retained** as the project's internal defect-audit record and external-audit deliverable (`crypto-audit-readiness.md` §6.5), not deleted.
 
+> ## Verification sweep — 2026-08-03
+>
+> Every `[CRITICAL]` and `[HIGH]` in Audits II–IV re-checked **against the current source**, not against commit
+> messages. Prompted by finding one entry (POROS identity-binding) still reading OPEN long after it was fixed:
+> this file is what a reviewer reads to decide what is unsafe, so a stale OPEN spends attention on settled work
+> and, worse, teaches the reader to discount the entries that are real.
+>
+> | Finding | Verdict | Evidence in the tree |
+> |---|---|---|
+> | **O-C1** modular-wraparound inflation | **RESOLVED** | `tx.rs:183` caps `n_in + outputs ≤ MAX_NOTES_PER_TX` and bounds `fee`/`public_value`; `:230`/`:243` range-check **inputs** as well as outputs — all four fixes the finding asked for |
+> | **O-C2** untraceability defeated | **RESOLVED** | `build.rs:96-108` commits each `input_values[i]` under **fresh** randomness derived from `(nsk, rho, i)`, not the note's creation randomness — the Orchard pattern the finding prescribed, so the byte-for-byte match to the creating commitment is gone |
+> | **O-H1** shielded fee never collected | **RESOLVED** | `hybrid.rs:321` moves the fee `POOL_SINK → TREASURY`, and `:795` declares TREASURY as a write so the footprint is honest |
+> | **O-H2** note-cipher key+nonce from the KEM session | **PARTIAL** | `seal` now takes a `CryptoRng` rather than an `rng_seed`, and key/nonce are domain-separated (`note_cipher.rs:64-68`) — so reuse takes an RNG-contract violation. But the nonce is still `H(label, session)` and **not** bound to `kem_ct`, so the defence rests entirely on the RNG instead of being belt-and-braces. Cheap hardening, still worth doing |
+> | **AT-C1** storage escrow drained by proof-replay | **RESOLVED** | `hybrid.rs:461-464` settles at the block height and the deal **rejects a second settlement at the same height**; `por.rs:126` requires the response to be exactly the challenged indices in canonical ascending order, killing the order-malleable duplicates |
+> | **AT-C2** media (key, nonce) reused across directions | **RESOLVED** | `media.rs` now has `MediaRole` with `CALLER_EPOCH0_LABEL`/`CALLEE_EPOCH0_LABEL`, so each direction keys separately — the module doc names the two-time pad it exists to prevent |
+> | **AT-C3** group sender-keys unauthenticated | **RESOLVED** | `group.rs:41-51` gives each member a `HybridSigSecret`; every post is signed over `sender_id ‖ number ‖ ciphertext` and verified against the roster's public half **before** the chain is touched |
+> | **AT-H1** PoR not provider-bound | **RESOLVED** | `hybrid.rs:446-452` requires a **fresh per-audit** signature over `deal_id ‖ H(response)` verified against `params.provider`, so a replica holder cannot be paid for data the provider deleted |
+> | **AT-H2** reputation decay + miss path unwired | **STILL OPEN** | no caller of `settle_epoch(.., false, ..)`, no `Settlement::Miss`, no `Reputation::observe` anywhere in `fanos-dromos`. Two of the three forces the no-staking incentive model rests on are still absent from the running system |
+> | **AT-H3** media plane has no replay protection | **STILL OPEN** | `media.rs:161` `open_frame(&self, ..)` is still `&self` and stateless — any captured frame re-opens while its epoch is current. SRTP mandates a window |
+> | **B1** unauthenticated, uncapped `pending_reveals` | **RESOLVED** | `consensus.rs:53-57` — reveals are buffered only after a signature check binds them to a real committee member, and `MAX_PENDING_REVEAL_COMMITS` bounds what a Byzantine member can force |
+> | **POROS** identity binding `from == req.requester` | **RESOLVED** | `poros.rs:803` Gate 0, ahead of the PoW and Sybil gates, recording `AdmissionIdentityUnbound` (struck inline below) |
+>
+> **So: eight of the twelve severe findings re-checked here were already fixed and still read OPEN; two are
+> genuinely open (AT-H2, AT-H3) and one is partial (O-H2).** The two open ones are tracked as tasks. Nothing was
+> deleted — each original entry stands, so the record still shows what was true and when.
+>
+> Not yet swept: the architectural `[HIGH]`s of Audit IV (three Merkle implementations, wire bifurcation,
+> `fanos-runtime` as one file, the shipped-binary chain, round-timeout livelock). Those are design-shape
+> findings rather than exploitable defects, and need reading rather than a grep.
+
 > **Consolidation status — this file is now the single FANOS audit record (consolidated 2026-07-24).** It gathers **four chronological audit passes** into one document (the separate `docs/audit-2026-07-2*.md` files were merged in and removed). Read it as a timeline — each later pass independently re-verified and **supersedes** the earlier one:
 >
 > | Pass | Date | Scope | Status of its own findings |
