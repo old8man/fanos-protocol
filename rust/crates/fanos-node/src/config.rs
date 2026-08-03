@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fanos_calypso::hosting::Share;
 use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
 use fanos_geometry::Triple;
 use fanos_quic::{Environment, Morph};
@@ -12,6 +13,7 @@ use fanos_pqcrypto::sig::HybridVerifier;
 use fanos_vrf::vss::{VssCommitment, VssShare};
 
 use crate::error::NodeError;
+use crate::poros::DescriptorBinding;
 
 /// The default beacon epoch period (§7.6). Ten minutes is a conservative moving-target cadence: long
 /// enough that per-epoch coordinate reshuffle + re-handshake churn is modest, short enough that a
@@ -258,6 +260,149 @@ impl fmt::Debug for ServiceParams {
             .field("seed", &"<redacted>")
             .field("line", &self.line)
             .field("threshold", &self.threshold)
+            .finish()
+    }
+}
+
+/// The **POROS ingress** parameters a node needs to run the `ingress` role (`docs/design-anonymity-substrate.md`
+/// §6): the community it serves, its own dealt descriptor share, and the dealing's public bindings.
+///
+/// Provisioned out-of-band by a **ceremony**, exactly like the beacon share and the service line: an operator
+/// runs `fanos ingress deal` once over the community's entry peers, which threshold-shards the descriptor across
+/// the line and emits one file per member plus the public binding every member and every combiner is configured
+/// with. The share is secret; the binding is not.
+///
+/// **The binding is not optional and is not separable from the share.** A POROS line reconstructs a *plaintext*,
+/// so unlike every other threshold secret in the platform it has no AEAD tag to fail on a wrong reconstruction —
+/// and Lagrange is linear, so one member could otherwise choose the entry peers the whole community bootstraps
+/// from ([`fanos_node::DescriptorBinding`](crate::DescriptorBinding)). The two travel together for that reason.
+#[derive(Clone)]
+pub struct IngressParams {
+    /// The community secret whose ingress line this node sits on — the enumeration-resistance input of the §6
+    /// derivation. Secret material.
+    pub community: Vec<u8>,
+    /// This node's dealt descriptor share.
+    pub share: Share,
+    /// The dealing's public bindings (the descriptor commitment + the per-share commitments).
+    pub binding: DescriptorBinding,
+    /// The ingress line's member coordinates, in the order the shares were dealt (position = share index).
+    pub line: Vec<Triple>,
+    /// The reconstruction threshold `t` — how many members must cooperate to serve a bucket of entry peers.
+    pub threshold: usize,
+    /// The admission proof-of-work difficulty this line demands of a requester (the rate-limiter half of the
+    /// Sybil gate; the cap half is the coherence layer's admitted set).
+    pub difficulty: u32,
+    /// The seed this node regenerates its hybrid-KEM keypair from, so it can OPEN sealed reshare sub-shares
+    /// when the ingress line rotates. Secret material; the matching public is published in the line's roster.
+    pub kem_seed: [u8; 32],
+}
+
+impl IngressParams {
+    /// Render as the `key = value` provisioning file `fanos ingress deal` writes and `fanos node` reads.
+    ///
+    /// Everything but `community`, `share` and `kem_seed` is public; those three are why the file is secret.
+    /// The binding travels **in the same file as the share** on purpose: they are only correct as a pair (a
+    /// share with no binding is a descriptor anyone on the line can rewrite), and a format that let an
+    /// operator copy one without the other would be an invitation to do exactly that.
+    #[must_use]
+    pub fn to_config_string(&self) -> String {
+        use core::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "threshold = {}", self.threshold);
+        let _ = writeln!(s, "difficulty = {}", self.difficulty);
+        let _ = writeln!(s, "community = {}", hex_encode(&self.community));
+        let _ = writeln!(s, "share = {}{}", hex_encode(&[self.share.x()]), hex_encode(self.share.y()));
+        let _ = writeln!(s, "binding = {}", hex_encode(&self.binding.to_bytes()));
+        let _ = writeln!(s, "kem_seed = {}", hex_encode(&self.kem_seed));
+        for coord in &self.line {
+            let _ = writeln!(s, "member = {}:{}:{}", coord[0], coord[1], coord[2]);
+        }
+        s
+    }
+
+    /// Parse the file [`to_config_string`](Self::to_config_string) writes.
+    ///
+    /// # Errors
+    /// [`NodeError::Config`] on a malformed line, a bad hex field, or a missing required key.
+    pub fn from_config_str(text: &str) -> Result<Self, NodeError> {
+        let mut threshold: Option<usize> = None;
+        let mut difficulty: Option<u32> = None;
+        let mut community: Option<Vec<u8>> = None;
+        let mut share: Option<Share> = None;
+        let mut binding: Option<DescriptorBinding> = None;
+        let mut kem_seed: Option<[u8; 32]> = None;
+        let mut line: Vec<Triple> = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let l = raw.split('#').next().unwrap_or("").trim();
+            if l.is_empty() {
+                continue;
+            }
+            let (key, value) = l.split_once('=').ok_or_else(|| {
+                NodeError::Config(format!("ingress config line {}: expected `key = value`", n + 1))
+            })?;
+            let value = value.trim();
+            match key.trim() {
+                "threshold" => {
+                    threshold = Some(value.parse().map_err(|_| {
+                        NodeError::Config(format!("bad ingress threshold '{value}'"))
+                    })?);
+                }
+                "difficulty" => {
+                    difficulty = Some(value.parse().map_err(|_| {
+                        NodeError::Config(format!("bad ingress difficulty '{value}'"))
+                    })?);
+                }
+                "community" => community = Some(hex_decode(value)?),
+                "share" => {
+                    let bytes = hex_decode(value)?;
+                    let (&x, y) = bytes.split_first().ok_or_else(|| {
+                        NodeError::Config("bad ingress share (empty)".to_owned())
+                    })?;
+                    share = Some(Share::new(x, y.to_vec()));
+                }
+                "binding" => {
+                    binding = Some(DescriptorBinding::from_bytes(&hex_decode(value)?).ok_or_else(|| {
+                        NodeError::Config("bad ingress binding (not a valid DescriptorBinding)".to_owned())
+                    })?);
+                }
+                "kem_seed" => {
+                    kem_seed = Some(hex_decode(value)?.try_into().map_err(|_| {
+                        NodeError::Config("bad ingress kem_seed (want 32 bytes)".to_owned())
+                    })?);
+                }
+                "member" => line.push(parse_coord(value)?),
+                other => return Err(NodeError::Config(format!("unknown ingress config key '{other}'"))),
+            }
+        }
+        Ok(Self {
+            community: community
+                .ok_or_else(|| NodeError::Config("ingress config missing `community`".to_owned()))?,
+            share: share.ok_or_else(|| NodeError::Config("ingress config missing `share`".to_owned()))?,
+            binding: binding
+                .ok_or_else(|| NodeError::Config("ingress config missing `binding`".to_owned()))?,
+            line,
+            threshold: threshold
+                .ok_or_else(|| NodeError::Config("ingress config missing `threshold`".to_owned()))?,
+            difficulty: difficulty
+                .ok_or_else(|| NodeError::Config("ingress config missing `difficulty`".to_owned()))?,
+            kem_seed: kem_seed
+                .ok_or_else(|| NodeError::Config("ingress config missing `kem_seed`".to_owned()))?,
+        })
+    }
+}
+
+// `community`, `share` and `kem_seed` are all key material, and `NodeConfig` derives `Debug` — so a config can
+// be logged without leaking a community's ingress hosting secrets.
+impl fmt::Debug for IngressParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IngressParams")
+            .field("community", &"<redacted>")
+            .field("share", &"<redacted>")
+            .field("binding", &self.binding)
+            .field("line", &self.line)
+            .field("threshold", &self.threshold)
+            .field("difficulty", &self.difficulty)
+            .field("kem_seed", &"<redacted>")
             .finish()
     }
 }
@@ -552,6 +697,11 @@ pub struct RoleSet {
     /// a line; the service's anonymity set is that line's membership, so coverage is provisioned cell-wide rather
     /// than configured per host.
     pub rendezvous: bool,
+    /// Serves as a member of a community's **POROS ingress line** — the censorship-resistant bootstrap entry
+    /// (`docs/design-anonymity-substrate.md` §6). Offering it lets the cell seat this node on an ingress line;
+    /// the seize-`< t`-reveals-nothing guarantee is a property of how much of that line is occupied, so
+    /// coverage is provisioned cell-wide rather than configured per host.
+    pub ingress: bool,
 }
 
 /// The inverse of [`RoleSet::parse`] — the comma list a config file carries.
@@ -567,6 +717,7 @@ impl fmt::Display for RoleSet {
             ("service", self.service),
             ("exit", self.exit),
             ("rendezvous", self.rendezvous),
+            ("ingress", self.ingress),
         ];
         let mut first = true;
         for (name, on) in names {
@@ -588,7 +739,7 @@ impl RoleSet {
     /// Whether any role is advertised.
     #[must_use]
     pub fn any(self) -> bool {
-        self.relay || self.storage || self.service || self.exit || self.rendezvous
+        self.relay || self.storage || self.service || self.exit || self.rendezvous || self.ingress
     }
 
     /// The offered set as the **core** [`fanos_core::roles::RoleSet`] the self-organizing controller assigns from —
@@ -602,6 +753,7 @@ impl RoleSet {
             (self.service, Role::Service),
             (self.exit, Role::Exit),
             (self.rendezvous, Role::Rendezvous),
+            (self.ingress, Role::Ingress),
         ] {
             if offered {
                 set.insert(role);
@@ -616,7 +768,7 @@ impl RoleSet {
         self.offered().bits()
     }
 
-    /// Parse a comma-separated role list (`relay,storage,service,exit,rendezvous`).
+    /// Parse a comma-separated role list (`relay,storage,service,exit,rendezvous,ingress`).
     ///
     /// # Errors
     /// [`NodeError::Config`] on an unknown role name.
@@ -632,6 +784,7 @@ impl RoleSet {
                 "service" => roles.service = true,
                 "exit" => roles.exit = true,
                 "rendezvous" => roles.rendezvous = true,
+                "ingress" => roles.ingress = true,
                 other => return Err(NodeError::Config(format!("unknown role '{other}'"))),
             }
         }
@@ -648,6 +801,7 @@ const _: () = {
     assert!(CoreRoleSet::BIT_SERVICE == 1 << 2, "JOIN bit 2 is service");
     assert!(CoreRoleSet::BIT_EXIT == 1 << 3, "JOIN bit 3 is exit");
     assert!(CoreRoleSet::BIT_RENDEZVOUS == 1 << 4, "JOIN bit 4 is rendezvous");
+    assert!(CoreRoleSet::BIT_INGRESS == 1 << 5, "JOIN bit 5 is ingress");
 };
 
 /// A node's runtime configuration.
@@ -735,6 +889,10 @@ pub struct NodeConfig {
     /// [`serve_exit`](crate::serve_exit) relay under a stable service identity — see [`ExitParams`]. `None`
     /// (the default) runs no exit.
     pub exit: Option<ExitParams>,
+    /// The POROS ingress parameters. Required by (and only used with) the `ingress` role: `Some(..)` composes
+    /// an [`IngressNode`](crate::IngressNode) hosting one member of a community's ingress line — see
+    /// [`IngressParams`]. `None` (the default) hosts no ingress.
+    pub ingress: Option<IngressParams>,
     /// PROTEUS censorship-resistance (§13.4). `Some(secret)` shapes every wire frame with the shared
     /// community secret so the transport carries no static FANOS signature, and the shape **rotates each
     /// epoch** (the moving-target defence); `None` (the default) is plaintext QUIC. All peers that must
@@ -769,6 +927,7 @@ impl Default for NodeConfig {
             admission_difficulty: None,
             service: None,
             exit: None,
+            ingress: None,
             proteus_secret: None,
             proteus_morph: Morph::Polymorph,
             proteus_environment: None,
@@ -1160,5 +1319,68 @@ mod tests {
         let cfg = NodeConfig::from_config_str("proteus_environment = deep-censorship").unwrap();
         assert_eq!(cfg.proteus_environment, Some(Environment::DeepCensorship));
         assert!(NodeConfig::from_config_str("proteus_environment = nowhere").is_err());
+    }
+
+    #[test]
+    fn an_ingress_provisioning_file_round_trips_and_still_serves() {
+        use fanos_calypso::hosting::Share;
+        use fanos_geometry::Point;
+        use fanos_field::F2;
+        use crate::poros::{IngressDescriptor, Recovery, recover, shard_descriptor};
+
+        // **The ceremony's whole point, asserted as one property**: what `fanos ingress-deal` writes must,
+        // after a trip through the file format, still reconstruct the descriptor it dealt. A codec that loses
+        // a byte of the share or of the binding produces a line that starts cleanly and admits nobody — and
+        // the binding is what makes that failure *loud* rather than a wrong ingress set, so it has to survive
+        // the round trip too.
+        let peers: Vec<Peer> = (0..4)
+            .map(|i| Peer {
+                coord: Point::<F2>::at(i % 7).coords(),
+                addr: SocketAddr::from(([203, 0, 113, i as u8], 9000 + i as u16)),
+            })
+            .collect();
+        let descriptor = IngressDescriptor { peers };
+        let (threshold, line_size) = (2usize, 3u8);
+        let randomness = vec![0x4Du8; descriptor.to_bytes().len() * threshold + 32];
+        let dealt = shard_descriptor(&descriptor, threshold as u8, line_size, &randomness).unwrap();
+        let line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+
+        let written: Vec<IngressParams> = dealt
+            .shares
+            .iter()
+            .map(|share| IngressParams {
+                community: b"a-community-secret".to_vec(),
+                share: share.clone(),
+                binding: dealt.binding.clone(),
+                line: line.clone(),
+                threshold,
+                difficulty: 12,
+                kem_seed: [0x9Cu8; 32],
+            })
+            .collect();
+
+        let read: Vec<IngressParams> = written
+            .iter()
+            .map(|p| IngressParams::from_config_str(&p.to_config_string()).expect("round trip"))
+            .collect();
+
+        for (a, b) in written.iter().zip(&read) {
+            assert_eq!(a.community, b.community);
+            assert_eq!(a.share.x(), b.share.x(), "the share index survives");
+            assert_eq!(a.share.y(), b.share.y(), "and every byte of its value");
+            assert_eq!(a.binding, b.binding, "the binding is not separable from the share");
+            assert_eq!((a.line.clone(), a.threshold, a.difficulty), (b.line.clone(), b.threshold, b.difficulty));
+            assert_eq!(a.kem_seed, b.kem_seed);
+        }
+
+        // The property, not the fields: a threshold of the shares as they came back OFF DISK recovers the
+        // dealt descriptor, verified against the binding that travelled with them.
+        let recovered: Vec<Share> = read.iter().take(threshold).map(|p| p.share.clone()).collect();
+        let commitment = read.first().expect("a dealt line has members").binding.commitment();
+        assert_eq!(
+            recover(&recovered, threshold, &commitment),
+            Recovery::Recovered(descriptor, None),
+            "a threshold of provisioned members reconstructs the committed descriptor",
+        );
     }
 }

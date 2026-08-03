@@ -434,7 +434,7 @@ pub const BEACON_FILE: &str = "beacon.params";
 /// legal weight and must be typed, never defaulted into.
 #[must_use]
 pub fn default_roles() -> RoleSet {
-    RoleSet { relay: true, storage: true, service: false, exit: false, rendezvous: false }
+    RoleSet { relay: true, storage: true, service: false, exit: false, rendezvous: false, ingress: false }
 }
 
 #[cfg(test)]
@@ -449,7 +449,7 @@ mod tests {
         let c = NodeConfig {
             listen: "0.0.0.0:9931".parse().expect("a valid listen address"),
             plane_order: 7,
-            roles: RoleSet { relay: true, storage: true, service: true, exit: false, rendezvous: true },
+            roles: RoleSet { relay: true, storage: true, service: true, exit: false, rendezvous: true, ingress: true },
             telemetry_epsilon: Some(0.75),
             admission_difficulty: Some(18),
             epoch_period: std::time::Duration::from_secs(120),

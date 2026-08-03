@@ -28,9 +28,13 @@ use fanos_pqcrypto::kem::HybridKemSecret;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_runtime::{Config as OverlayConfig, Duration, Engine, OverlayNode};
 
+use fanos_rendezvous::{BeaconSeed, Epoch};
+
 use crate::cell_node::CellNode;
-use crate::config::BeaconParams;
+use crate::config::{BeaconParams, IngressParams};
+use crate::ingress_node::IngressNode;
 use crate::overlay_beacon::OverlayBeaconNode;
+use crate::poros::PorosHost;
 use crate::service_node::ServiceNode;
 use crate::threshold_service::ThresholdService;
 
@@ -62,6 +66,11 @@ pub struct CellComposition {
     pub cover_interval: Duration,
     /// Threshold-service hosting: `(member seed, the line's coordinates, reconstruction threshold)`.
     pub service: Option<([u8; 32], Vec<Triple>, usize)>,
+    /// **POROS ingress hosting** — this node is one member of a community's ingress line
+    /// (`docs/design-anonymity-substrate.md` §6), holding one threshold share of its entry-peer descriptor.
+    /// Composed *over* everything below, exactly as `service` is: an ingress frame is dispatched to the host,
+    /// everything else to the cell engine, so one coordinate both admits new nodes and stays a full member.
+    pub ingress: Option<IngressParams>,
     /// This node's **hierarchical descent path**, when it sits in a sub-cell rather than at the root (§L1).
     ///
     /// Carried as coordinates rather than a `HierAddr<F>` so this type stays free of the field parameter — the
@@ -93,6 +102,7 @@ impl CellComposition {
             mix_mean_delay: Duration(0),
             cover_interval: Duration(0),
             service: None,
+            ingress: None,
             hier_path: None,
             cell_members: None,
         }
@@ -113,6 +123,10 @@ impl CellComposition {
 /// 5. **service** — a threshold-CALYPSO member composed *over* whatever the roles below produced, so one
 ///    coordinate both serves its line and remains a full cell member: an intro is dispatched to the service,
 ///    everything else to the cell engine.
+/// 6. **ingress** — a POROS ingress-line member, composed the same way and outermost, so a node that admits
+///    newcomers to the network is otherwise an ordinary cell node. Outermost because the ingress frames are a
+///    disjoint set that must reach the host whatever the layers below are; the composite's timer namespacing
+///    is built for exactly that nesting ([`IngressNode`]).
 #[must_use]
 pub fn compose_engine<F: Field + 'static>(
     coord: Point<F>,
@@ -167,7 +181,7 @@ pub fn compose_engine<F: Field + 'static>(
         }
         None => Box::new(overlay),
     };
-    match &what.service {
+    let base = match &what.service {
         Some((seed, line, threshold)) => {
             // Regenerated in memory from the seed and never serialized (audit #124); the matching public is
             // the one the operator collected into the published line.
@@ -176,6 +190,29 @@ pub fn compose_engine<F: Field + 'static>(
                 base,
                 ThresholdService::new(coord.coords(), secret, line.clone(), *threshold),
             ))
+        }
+        None => base,
+    };
+    match &what.ingress {
+        Some(ip) => {
+            // The KEM secret is regenerated in memory from its seed and never serialized (audit #124); its
+            // public is what the ceremony published in the line's roster, so a rotating line can seal this
+            // member's sub-shares to it.
+            let (kem_secret, _public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&ip.kem_seed));
+            let host = PorosHost::new(
+                coord.coords(),
+                ip.share.clone(),
+                ip.binding.clone(),
+                ip.line.clone(),
+                ip.threshold,
+                ip.community.clone(),
+                // The host serves the epoch its dealing was made for; the rotation driver advances it.
+                Epoch::new(0),
+                BeaconSeed::GENESIS,
+                ip.difficulty,
+            )
+            .with_kem_secret(kem_secret);
+            Box::new(IngressNode::new(base, host))
         }
         None => base,
     }

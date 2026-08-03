@@ -29,7 +29,7 @@ use fanos_core::roles::{Capability, Demand, Role, RoleController, RoleSet as Cor
 use fanos_primitives::NodeId;
 use fanos_quic::NodeCredentials;
 
-use crate::config::{NodeConfig, RoleSet};
+use crate::config::{IngressParams, NodeConfig, RoleSet};
 use crate::role_loop::{
     Assignment, LoadSensor, SelfOrgConfig, SelfOrganization, role_capacity, spawn_load_sensor,
     spawn_self_organization,
@@ -37,6 +37,48 @@ use crate::role_loop::{
 use crate::error::NodeError;
 use crate::identity;
 use crate::resolve::{ResolvedService, verify_descriptor};
+
+/// Validate the **POROS ingress** role's parameters (`docs/design-anonymity-substrate.md` §6), so bad
+/// provisioning fails `start` here rather than producing a line that silently cannot serve.
+///
+/// The threshold is checked against the roster the same way the service role's is, and the floor is **2**, not
+/// 1: a `1`-of-`n` sharing hands every member the descriptor whole, which is exactly the "seize `< t` reveals
+/// nothing" property POROS is built on, and `emit_reshare` already refuses to propagate one. Rejecting it at
+/// startup is better than rejecting it at the first rotation.
+///
+/// This node's own coordinate is **not** checked against the roster here, because a deployed node's coordinate
+/// is drawn by its VRF at spawn and is not known yet at this point. A host that finds itself off the line
+/// simply never holds a share position the line asks for.
+fn ingress_params(config: &NodeConfig) -> Result<Option<IngressParams>, NodeError> {
+    if !config.roles.ingress {
+        return Ok(None);
+    }
+    let params = config.ingress.as_ref().ok_or_else(|| {
+        NodeError::Config(
+            "the ingress role hosts a member of a POROS ingress line and needs ingress parameters (the \
+             community secret, this node's dealt descriptor share, the dealing's public binding, the line \
+             roster and its threshold) — run `fanos ingress deal` to produce them"
+                .to_owned(),
+        )
+    })?;
+    if params.threshold < 2 || params.threshold > params.line.len() {
+        return Err(NodeError::Config(format!(
+            "the ingress threshold {} must be in 2..={} (the line has {} members); a threshold of 1 would \
+             hand every member the whole descriptor",
+            params.threshold,
+            params.line.len(),
+            params.line.len(),
+        )));
+    }
+    if params.community.is_empty() {
+        return Err(NodeError::Config(
+            "the ingress role needs a non-empty community secret — it is the enumeration-resistance input \
+             of the §6 derivation, and an empty one makes the line computable by anyone holding the beacon"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(params.clone()))
+}
 
 /// The mixnet's per-hop cooperation threshold: how many of a hop line's `q+1` members must combine to peel one
 /// onion layer. A relay's `ThresholdRouter` gathers this many partials; an anonymous client's `--threshold`
@@ -682,6 +724,8 @@ impl Node {
         let service = service_params(&config)?;
         // Validate the exit role's parameters up front too (it spawns its relay after the node is up).
         let exit = exit_params(&config)?;
+        // And the ingress role's, for the same reason.
+        let ingress = ingress_params(&config)?;
         let handle = spawn_self_certifying_persistent_over::<F>(
             fabric,
             &credentials,
@@ -701,6 +745,7 @@ impl Node {
                     mix_mean_delay,
                     cover_interval,
                     service: service.clone(),
+                    ingress: ingress.clone(),
                     // A deployed node sits at its cell root and discovers its roster by announcement; both are
                     // scenario parameters, and their absence here is what a deployment means.
                     hier_path: None,

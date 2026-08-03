@@ -456,6 +456,13 @@ impl Healer {
     /// driver gauge reports exit flows in flight. This function stays deliberately ignorant of all three — it
     /// knows what it counts and passes the rest through, so a new sensor needs no change here.
     fn load_report(&self, sensed: RoleReading) -> [Option<u16>; Role::COUNT] {
+        // The contract crate cannot see `fanos-core`, so `Notification::LoadReport`'s width is a literal
+        // there. This is where the two meet, so this is where they are proven equal — a sixth role that
+        // updated one and not the other would otherwise truncate every reading in silence.
+        const _: () = assert!(
+            fanos_ports::ROLE_COUNT == Role::COUNT,
+            "the load-report width and the role count must agree",
+        );
         // The caller supplies every reading it can see; the healer fills in the one only it counts.
         sensed.measuring(Role::Relay, u16::try_from(self.self_activity).unwrap_or(u16::MAX)).into_array()
     }

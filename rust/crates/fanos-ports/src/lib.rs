@@ -268,6 +268,15 @@ pub enum Effect {
     Notify(Notification),
 }
 
+/// The number of functional roles a cell provides — the width of a per-role reading.
+///
+/// **A literal mirroring `fanos_core::Role::COUNT` across a crate boundary, and the mirror is proven.**
+/// `fanos-ports` is the sans-I/O contract crate and deliberately does not depend on `fanos-core`, so the
+/// count cannot be imported; `fanos-runtime`, which sees both, carries a compile-time assertion that the two
+/// agree. Without it a sixth role would silently truncate every load reading — the reading of whichever role
+/// fell off the end, which is exactly the reading a controller needs to retire it.
+pub const ROLE_COUNT: usize = 6;
+
 /// An application-level notification (the engine → app direction).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Notification {
@@ -390,7 +399,7 @@ pub enum Notification {
     /// So absence is now expressible. A driver substitutes on `None`, and believes a `Some(0)`.
     LoadReport {
         /// Per-role counts in `Role::ALL` order; `None` where this node has no sensor for that role.
-        per_role: [Option<u16>; 5],
+        per_role: [Option<u16>; ROLE_COUNT],
     },
     /// The shortest epoch period this cell's own measurements say it can sustain, **in seconds**.
     ///

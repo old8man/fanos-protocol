@@ -56,6 +56,25 @@ precisely why the dealt path must not be the one a public launch walks into by d
 **Decision required before a public launch:** run the DKG across the founding set. The code is there; what is
 missing is only the operational choreography.
 
+### 2.1b The POROS ingress descriptor — a dealt secret with a *published* half
+
+A community's ingress descriptor names the entry peers a censored newcomer bootstraps from. It is dealt
+(`fanos ingress-deal`) rather than distributed, and unlike the beacon that is defensible: the descriptor is a
+*community's* list of its own entry points, so the party that compiles it necessarily knows it, and the
+threshold sharing exists to stop a **seizure** of `< t` members from disclosing it, not to stop the dealer from
+knowing what they themselves wrote down.
+
+What the ceremony must not get wrong is the other half. Every member's file carries the dealing's public
+**binding** alongside its secret share, and a host refuses to start without one. That is not belt-and-braces:
+a POROS line reconstructs a *plaintext*, so it has no AEAD tag to fail on a wrong reconstruction the way every
+other threshold secret in the platform does, and Lagrange interpolation is linear — a single member could
+otherwise contribute an offset share and make every other combiner serve a descriptor of its choosing, which is
+to say choose the entry peers the whole community bootstraps from. Confidentiality below threshold and
+integrity at any threshold are different properties, and only the first one comes free from Shamir.
+
+**Operationally:** hand each member exactly one file and no more. A second file gives its holder a second
+share, and two of three is the threshold.
+
 ### 2.2 The validator committee
 
 TAXIS verifies against a fixed committee established at genesis (`fanos taxis-deal`). Share *resharing* exists

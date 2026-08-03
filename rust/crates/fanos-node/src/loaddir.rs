@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn a_load_report_round_trips() {
-        let load = Demand::from_counts([25, 3, 0, 7, 0]);
+        let load = Demand::from_counts([25, 3, 0, 7, 0, 0]);
         assert_eq!(parse_load(&encode_load(load)), Some(load));
         assert_eq!(parse_load(b"short"), None, "a wrong-length report is rejected");
     }

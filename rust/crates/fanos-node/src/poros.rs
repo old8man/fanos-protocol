@@ -139,6 +139,28 @@ pub struct DescriptorBinding {
 }
 
 impl DescriptorBinding {
+    /// Canonical wire bytes: `dealing(32) ‖ count(u32 BE) ‖ per-share commitments(32 each)`.
+    ///
+    /// Public data only, so this is a *provisioning* codec — the ceremony writes it into every member's file
+    /// and into the roster a combiner reads. It carries no secret and needs no protection.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 4 + self.shares.len() * 32);
+        out.extend_from_slice(&self.dealing);
+        put_seq(&mut out, self.shares.len(), &self.shares, |o, c| o.extend_from_slice(c));
+        out
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        let dealing = r.array::<32>()?;
+        let shares = r.seq(32, Reader::array::<32>)?;
+        r.finish()?;
+        Some(Self { dealing, shares })
+    }
+
     /// The descriptor commitment `H(descriptor)` — what a reconstruction must equal.
     #[must_use]
     pub fn commitment(&self) -> [u8; 32] {

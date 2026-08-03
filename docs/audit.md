@@ -63,7 +63,7 @@
 >
 > | Item | Snapshot said | Verified 2026-07-26 |
 > |---|---|---|
-> | **Holonomy verification** | "function exists, live peel path never compares, `HolonomyFail` never produced" | **stale — RESOLVED.** Produced on the live path at `fanos-aphantos/src/sealed.rs:255`, pinned by `sealed.rs:519` and `threshold_router.rs:1023` |
+> | **Holonomy verification** | "function exists, live peel path never compares, `HolonomyFail` never produced" | **the original finding was closer to right than this row. Corrected 2026-08-03.** The comparison exists on the peel path and `HolonomyFail` is produced — but only behind `ThresholdRouter::with_delivery_check`, which **no shipped composition calls**. Structural, not a missing wire: NOSTOS removed the party that could verify (see S1-M1 below), so delivery integrity is the end-to-end AEAD, now asserted directly |
 > | **S1-H1** cover + mixing off | "the shipping node builds the router with neither" | **stale — RESOLVED.** `fanos-node/src/node.rs:555-556` applies both, non-zero by default (`DEFAULT_MIX_DELAY = 50 ms`) |
 > | **C7** telemetry DP | "`.privatize(` has no live caller — the observer still emits the exact syndrome un-privatized" | **mis-stated, now RESOLVED.** No *export path for frames exists at all*, so nothing was leaking; the engine is sans-I/O and cannot privatize. Closed at the seam: `CoherenceFrame::export` is the sanctioned outward path and `encode` is documented cell-local |
 > | **R-M1** quarantine keyed by coordinate | "coordinates reshuffle, so the tag aliases" | was **REAL and sharper than written**; **RESOLVED 2026-07-26** — distrust split along the authentication seam: engine keeps the mechanism, driver keeps the identity. See the finding below |

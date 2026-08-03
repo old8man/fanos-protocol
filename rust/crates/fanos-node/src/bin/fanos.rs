@@ -62,6 +62,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("status") => cmd_status(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
+        Some("ingress-deal") => cmd_ingress_deal(args.get(2..).unwrap_or(&[])),
         Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
@@ -202,6 +203,13 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         // its DKG output — group commitment, threshold, and (if an anchor) its share. Generate with
         // `fanos beacon-deal`.
         config.beacon = Some(BeaconParams::from_config_str(&std::fs::read_to_string(path)?)?);
+    }
+    if let Some(path) = flag(args, "--ingress-params") {
+        // Provision this node as one member of a community's POROS ingress line (§6): its dealt descriptor
+        // share, the dealing's public binding, the line roster and the community secret. Generate the whole
+        // set with `fanos ingress-deal`, and hand each member exactly one file.
+        config.ingress =
+            Some(fanos_node::config::IngressParams::from_config_str(&std::fs::read_to_string(path)?)?);
     }
     Ok(config)
 }
@@ -1730,6 +1738,151 @@ fn cmd_id(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// `fanos ingress-deal <community> <peer>... [--out DIR] [--threshold T] [--difficulty D] [--line C:C:C,...]`:
+/// the **POROS provisioning ceremony** (`docs/design-anonymity-substrate.md` §6).
+///
+/// Threshold-shards a community's ingress descriptor — the entry peers a censored newcomer bootstraps from —
+/// across the `q+1` members of its ingress line, and writes one provisioning file per member. Run it once per
+/// community; hand each member its own file and nothing else.
+///
+/// **Why this exists as a ceremony at all.** Every part of POROS was built and tested and none of it could be
+/// reached, because the descriptor has to come from somewhere and nothing produced one: `shard_descriptor` had
+/// no caller outside its own tests. A line with no dealing is a line that admits nobody.
+///
+/// **The binding travels with every share.** A POROS line reconstructs a *plaintext*, so unlike every other
+/// threshold secret in the platform it has no AEAD tag to fail on a wrong reconstruction, and Lagrange is
+/// linear — one member could otherwise choose the entry peers the whole community bootstraps from. Each file
+/// therefore carries the dealing's public binding alongside the secret share, and a host refuses to start
+/// without it.
+///
+/// The community secret is the enumeration-resistance input: a censor holding only the public beacon cannot
+/// compute a community's ingress line without it. Pass it as a passphrase; it is hashed into the file.
+fn cmd_ingress_deal(args: &[String]) -> Result<(), NodeError> {
+    use fanos_field::F2;
+    use fanos_geometry::{Point, Triple};
+    use fanos_node::config::IngressParams;
+    use fanos_node::node::mix_threshold;
+    use fanos_node::{IngressDescriptor, shard_descriptor};
+
+    let usage = || {
+        NodeError::Config(
+            "usage: fanos ingress-deal <community> <coord@host:port>... \
+             [--out DIR] [--threshold T] [--difficulty D] [--line C:C:C,...]"
+                .to_owned(),
+        )
+    };
+    let community = args.first().filter(|s| !s.starts_with("--")).ok_or_else(usage)?.clone();
+    let peers: Vec<Peer> = args
+        .iter()
+        .skip(1)
+        .take_while(|a| !a.starts_with("--"))
+        .map(|a| Peer::parse(a))
+        .collect::<Result<_, _>>()?;
+    if peers.is_empty() {
+        return Err(usage());
+    }
+    let out = flag(args, "--out").unwrap_or(".");
+    let difficulty: u32 = match flag(args, "--difficulty") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --difficulty '{s}'")))?,
+        None => DEFAULT_INGRESS_DIFFICULTY,
+    };
+    // The line: either an explicit roster, or the Fano cell's points 0..q — the same default the rest of the
+    // single-operator tooling uses, so a first deployment needs one flag fewer.
+    let line: Vec<Triple> = match flag(args, "--line") {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(parse_line_coord)
+            .collect::<Result<_, _>>()?,
+        None => (0..3).map(|i| Point::<F2>::at(i).coords()).collect(),
+    };
+    // The threshold defaults to the plane's own mix threshold ⌈2(q+1)/3⌉ rather than a chosen number: an
+    // ingress line is a line, and the reason a hop's threshold is that value — two corrupt members must not
+    // own it however wide the line grows — applies here unchanged.
+    let threshold: usize = match flag(args, "--threshold") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
+        None => mix_threshold(line.len()),
+    };
+    if threshold < 2 || threshold > line.len() {
+        return Err(NodeError::Config(format!(
+            "the ingress threshold {threshold} must be in 2..={} (the line has {} members); a threshold of \
+             1 would hand every member the whole descriptor",
+            line.len(),
+            line.len(),
+        )));
+    }
+
+    let descriptor = IngressDescriptor { peers };
+    // The sharing polynomial is OS entropy: this tool holds the whole descriptor for the moment of dealing,
+    // exactly as `beacon-deal` holds the beacon secret, and exists to bootstrap a single-operator community.
+    let mut randomness = vec![0u8; descriptor.to_bytes().len() * threshold + 32];
+    getrandom::fill(&mut randomness).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let line_size = u8::try_from(line.len())
+        .map_err(|_| NodeError::Config("an ingress line cannot exceed 255 members".to_owned()))?;
+    let dealt = shard_descriptor(
+        &descriptor,
+        u8::try_from(threshold).unwrap_or(u8::MAX),
+        line_size,
+        &randomness,
+    )
+    .ok_or_else(|| NodeError::Config(format!("cannot deal {threshold}-of-{line_size}")))?;
+
+    let community_bytes = fanos_primitives::hash_labeled("FANOS-v1/poros-community", community.as_bytes());
+    for (i, share) in dealt.shares.iter().enumerate() {
+        // One KEM seed per member, from OS entropy: it regenerates the secret that OPENS sealed reshare
+        // sub-shares when the line rotates, so it must be that member's alone.
+        let mut kem_seed = [0u8; 32];
+        getrandom::fill(&mut kem_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+        let params = IngressParams {
+            community: community_bytes.to_vec(),
+            share: share.clone(),
+            binding: dealt.binding.clone(),
+            line: line.clone(),
+            threshold,
+            difficulty,
+            kem_seed,
+        };
+        let path = format!("{out}/ingress-{}.poros", i + 1);
+        std::fs::write(&path, params.to_config_string())?;
+        println!("wrote {path}");
+    }
+    println!(
+        "dealt a {threshold}-of-{line_size} POROS ingress line for community '{community}' over {} entry \
+         peers; run each member with `fanos node --role ingress --ingress-params ingress-<i>.poros`",
+        descriptor.peers.len(),
+    );
+    println!(
+        "each file holds that member's SECRET share and the community secret — hand out one file per member, \
+         and no more"
+    );
+    Ok(())
+}
+
+/// Parse a `x:y:z` coordinate from a `--line` roster entry.
+fn parse_line_coord(s: &str) -> Result<fanos_geometry::Triple, NodeError> {
+    let mut it = s.split(':').map(str::trim);
+    let mut next = || -> Result<u32, NodeError> {
+        it.next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| NodeError::Config(format!("bad line coordinate '{s}' (want x:y:z)")))
+    };
+    let (x, y, z) = (next()?, next()?, next()?);
+    if it.next().is_some() {
+        return Err(NodeError::Config(format!("bad line coordinate '{s}' (want x:y:z)")));
+    }
+    Ok([x, y, z])
+}
+
+/// The admission proof-of-work difficulty a freshly-dealt ingress line demands, in leading zero bits.
+///
+/// A **policy** constant (`docs/design-constants.md` §2): it prices one admission attempt, and the right price
+/// is a deployment's trade between join latency and the rate a censor can enumerate at — no derivation fixes
+/// it, because it depends on the hardware the community's newcomers actually have. Matched to the platform's
+/// other join price (`--admission-difficulty`) so a first deployment has one number to reason about, and
+/// overridable with `--difficulty`.
+const DEFAULT_INGRESS_DIFFICULTY: u32 = 12;
+
 /// `fanos beacon-deal <n> <t> [--out DIR]`: deal a `t`-of-`n` threshold-DVRF beacon key from OS entropy and
 /// write each anchor's provisioning file (`anchor-<i>.beacon`, `i = 1..=n`) plus a share-less
 /// `consumer.beacon` into `DIR` (default `.`). Provision a node with `fanos node --beacon-params
@@ -2337,7 +2490,7 @@ fn print_help() {
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
          \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
          \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N] \\\n\
-         \x20             [--plane-order 2|4|7|31] [--beacon-params FILE]\n\
+         \x20             [--plane-order 2|4|7|31] [--beacon-params FILE] [--ingress-params FILE]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
          \x20             [--profile direct|anonymous] [--threshold T] [--fwd-depth D] [--reply-depth D] \\\n\
          \x20             [--beacon HEX64] [--exit-via FILE] [--config FILE] [--identity PATH] \\\n\
@@ -2351,6 +2504,8 @@ fn print_help() {
          \x20 fanos id    [--identity PATH]\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
+         \x20 fanos ingress-deal COMMUNITY PEER... [--out DIR] [--threshold T] [--difficulty D] [--line C:C:C,...]\n\
+         \x20                                     (deal a community's POROS ingress line; writes *.poros files)\n\
          \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64] [--supply N]\n\
          \x20             (deal a 7-validator TAXIS blockchain cell + a genesis-funded founder; writes\n\
          \x20             validator-<i>.taxis + founder.key; --features validator)\n\
