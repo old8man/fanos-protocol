@@ -726,6 +726,7 @@ impl Node {
         let exit = exit_params(&config)?;
         // And the ingress role's, for the same reason.
         let ingress = ingress_params(&config)?;
+        let rotation_params = ingress.as_ref().map(|p| (p.community.clone(), p.kem_seed));
         let handle = spawn_self_certifying_persistent_over::<F>(
             fabric,
             &credentials,
@@ -783,6 +784,14 @@ impl Node {
 
         // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
         spawn_exit_role(&handle, address, exit, &load)?;
+
+        // The POROS ingress line's rotation. Spawned here rather than left to a caller for the reason this
+        // whole subsystem keeps demonstrating: a driver nobody starts is a mechanism that does not exist,
+        // and an ingress line that does not rotate forfeits the moving-target property §6 rests on — its
+        // blocklist stops going stale. `None` for a node not hosting ingress, which is most of them.
+        let _ingress_rotation = rotation_params.map(|(community, kem_seed)| {
+            crate::ingressdir::spawn_ingress_rotation::<F>(handle.client(), community, kem_seed)
+        });
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
         let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory, load);
@@ -1473,5 +1482,69 @@ mod tests {
 
         a.shutdown();
         b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_node_hosting_ingress_publishes_the_key_its_line_needs_to_rotate_to_it() {
+        // **The observable that says the rotation driver is actually running.** `emit_reshares` needs every
+        // INCOMING member's KEM public, and until this driver existed nothing published one — so a dealt
+        // ingress line served the epoch it was provisioned for and stayed there, which forfeits the whole
+        // moving-target property §6 rests on. The driver is spawned by `Node::start`, not by a caller,
+        // because a driver nobody starts is a mechanism that does not exist.
+        //
+        // Asserted through the STORE rather than by inspecting the task: what matters is that another node
+        // could resolve this key, and that is exactly what a successful lookup proves.
+        use std::time::Duration;
+
+        use fanos_calypso::hosting::Share;
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        use crate::config::IngressParams;
+        use crate::poros::{IngressDescriptor, shard_descriptor};
+
+        let (_shares, commitment) = deal(&[0xD2; 32], 2, 3, &mut DeterministicRng::new(b"ingress-wire")).unwrap();
+        let desc = IngressDescriptor { peers: Vec::new() };
+        let dealt = shard_descriptor(&desc, 2, 3, &vec![0x3Au8; 256]).expect("a valid dealing");
+        let my_share = dealt.shares.first().expect("a dealing has shares").clone();
+        let line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+        let kem_seed = [0x8Bu8; 32];
+
+        let node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams { commitment, threshold: 2, share: None, authority: None }),
+            roles: RoleSet { ingress: true, ..RoleSet::default() },
+            ingress: Some(IngressParams {
+                community: b"a-testnet-community".to_vec(),
+                share: Share::new(1, my_share.y().to_vec()),
+                binding: dealt.binding.clone(),
+                line,
+                threshold: 2,
+                difficulty: 4,
+                kem_seed,
+            }),
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("node starts");
+
+        // The driver publishes at genesis before waiting on any beacon, so a line rotating out of epoch 0
+        // can already resolve this member — otherwise the very first rotation would find nothing.
+        let expected = crate::ingressdir::ingress_keypair(&kem_seed).1;
+        let mut resolved = None;
+        for _ in 0..200 {
+            resolved =
+                crate::ingressdir::resolve_ingress_key(&node.client(), node.address(), Epoch::new(0)).await;
+            if resolved.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            resolved.map(|k| k.encode()),
+            Some(expected.encode()),
+            "an ingress-hosting node must publish the stable KEM public its line's outgoing members seal \
+             reshare sub-shares to — without it the line cannot rotate, and a line that cannot rotate is a \
+             line whose blocklist stops going stale",
+        );
     }
 }
