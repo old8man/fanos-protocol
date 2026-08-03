@@ -855,6 +855,30 @@ impl PorosHost {
         self.epoch
     }
 
+    /// The epoch this host is armed to rotate INTO, or `None` outside a rotation — the observable that says
+    /// the receive side is ready for the incoming line's sub-shares.
+    #[must_use]
+    pub fn rotating_into(&self) -> Option<Epoch> {
+        self.rotation.as_ref().map(|r| r.target_epoch)
+    }
+
+    /// The rosters of the **outgoing** and **incoming** ingress lines for a rotation to `target_epoch`, under
+    /// this host's community and the beacon seed the cell has adopted.
+    ///
+    /// Both are computed from `(community, epoch, beacon)` alone — a pure function of the plane and the
+    /// beacon, with no lookup — which is why the *receive* side of a rotation needs no I/O at all. The emit
+    /// side does, because sealing a sub-share needs each new member's KEM public, and that is the asymmetry
+    /// that decides where each half can live.
+    #[must_use]
+    pub fn rotation_rosters(&self, target_epoch: Epoch, beacon: &BeaconSeed) -> (Vec<Triple>, Vec<Triple>) {
+        let members = |e: Epoch| {
+            fanos_rendezvous::line_member_coords::<F2>(
+                ingress_line::<F2>(&self.community, e, beacon).coords(),
+            )
+        };
+        (members(self.epoch), members(target_epoch))
+    }
+
     /// This host's `x`-coordinate (1-based position) in `line`, or `None` if it is not a member.
     fn my_x_in(&self, line: &[Triple]) -> Option<u8> {
         line.iter().position(|c| *c == self.coord).and_then(|i| u8::try_from(i + 1).ok())

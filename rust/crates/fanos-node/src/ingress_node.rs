@@ -39,8 +39,8 @@
 
 use fanos_geometry::Triple;
 use fanos_pqcrypto::HybridKemPublic;
-use fanos_rendezvous::Epoch;
-use fanos_runtime::{Effect, Engine, Input, Instant, TimerToken};
+use fanos_rendezvous::{BeaconSeed, Epoch};
+use fanos_runtime::{Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, decode_frame};
 
 use crate::poros::PorosHost;
@@ -106,6 +106,29 @@ impl IngressNode {
         self.host.begin_rotation(target_epoch, new_line, old_line);
     }
 
+    /// **Arm the receive side of a rotation from the cell's own epoch clock.**
+    ///
+    /// Watches the inner engine's effects for a `BeaconReady`, exactly as `OverlayBeaconNode` watches the
+    /// beacon to drive the overlay's epoch, and arms the host for the incoming line. This half needs **no
+    /// I/O**: both rosters are a pure function of `(community, epoch, beacon)`, so a node that will be on the
+    /// next epoch's line can prepare to receive its rotated share without asking anyone anything.
+    ///
+    /// The *emit* half is not here and cannot be: sealing a sub-share needs each new member's KEM public,
+    /// which lives in the directory. That asymmetry is the whole of why an ingress line does not yet rotate
+    /// on its own — a driver has to supply those keys.
+    fn arm_from_beacon(&mut self, effects: &[Effect]) {
+        let ready = effects.iter().find_map(|e| match e {
+            Effect::Notify(Notification::BeaconReady { epoch, seed }) => Some((*epoch, *seed)),
+            _ => None,
+        });
+        let Some((epoch, seed)) = ready else { return };
+        if epoch <= self.host.epoch() {
+            return; // not a rotation: the clock has not moved past the epoch this host serves
+        }
+        let (old_line, new_line) = self.host.rotation_rosters(epoch, &BeaconSeed::new(seed));
+        self.host.begin_rotation(epoch, new_line, old_line);
+    }
+
     /// Whether `frame` is one of the POROS host wire types the [`PorosHost`] owns (the combiner/member frames,
     /// not the client-bound [`PorosResponse`](FrameType::PorosResponse)).
     fn is_ingress_frame(frame: &[u8]) -> bool {
@@ -146,7 +169,9 @@ impl Engine for IngressNode {
                 if to_host {
                     Self::tag_host_effects(self.host.step(now, input))
                 } else {
-                    self.inner.step(now, input)
+                    let effects = self.inner.step(now, input);
+                    self.arm_from_beacon(&effects);
+                    effects
                 }
             }
             // An ingress-tagged timer fires: hand the host its own (unmapped) token.
@@ -156,7 +181,11 @@ impl Engine for IngressNode {
             }
             // Every other timer is the inner engine's; and the host is purely frame/timer-driven, so every
             // command drives the inner cell engine too.
-            Input::Timer(_) | Input::Command(_) => self.inner.step(now, input),
+            Input::Timer(_) | Input::Command(_) => {
+                let effects = self.inner.step(now, input);
+                self.arm_from_beacon(&effects);
+                effects
+            }
         }
     }
 
@@ -173,6 +202,7 @@ mod tests {
     use fanos_field::F2;
     use fanos_geometry::Point;
     use fanos_rendezvous::{BeaconSeed, Epoch};
+    use fanos_calypso::hosting::Share;
     use fanos_runtime::{Command, Config as OverlayConfig, OverlayNode};
     use fanos_wire::decode_frame;
 
@@ -305,7 +335,6 @@ mod tests {
 
     #[test]
     fn a_cell_rotates_its_ingress_line_and_the_new_line_serves_requests() {
-        use fanos_calypso::hosting::Share;
         use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
 
         use crate::poros::{IngressResponse, PorosHost};
@@ -410,5 +439,102 @@ mod tests {
         for p in &bucket.peers {
             assert!(desc.peers.iter().any(|d| d.coord == p.coord), "served peers come from the original descriptor");
         }
+    }
+
+    #[test]
+    fn the_cells_own_beacon_arms_the_ingress_rotation_with_no_lookup() {
+        use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+        use fanos_runtime::Notification;
+        // An inner engine that emits a BeaconReady when told to advance — the shape `OverlayBeaconNode`
+        // produces on the real path, reduced to the one effect this composite reacts to.
+        struct Clock {
+            coord: Triple,
+            epoch: u64,
+        }
+        impl Engine for Clock {
+            fn step(&mut self, _now: Instant, input: Input) -> Vec<Effect> {
+                match input {
+                    Input::Command(Command::AdvanceEpoch) => {
+                        self.epoch += 1;
+                        vec![Effect::Notify(Notification::BeaconReady {
+                            epoch: Epoch::new(self.epoch),
+                            seed: [0x31; 32],
+                        })]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            fn address(&self) -> Triple {
+                self.coord
+            }
+        }
+
+
+        use crate::poros::{PorosHost, shard_descriptor};
+
+        // **Half of a rotation needs nothing from anyone.** Both rosters are a pure function of
+        // `(community, epoch, beacon)`, so a host that will sit on next epoch's line can arm itself to
+        // receive its rotated share the moment the cell's clock moves — no directory, no round trip. This
+        // pins that the composite actually does it, because `arm_rotation` had no caller at all and a line
+        // that never rotates forfeits the moving-target property the whole §6 derivation rests on.
+        let coord = Point::<F2>::at(0).coords();
+        let desc = descriptor(4);
+        let (t, n) = (2u8, 3u8);
+        let randomness = vec![0x6Bu8; desc.to_bytes().len() * usize::from(t) + 32];
+        let dealt = shard_descriptor(&desc, t, n, &randomness).unwrap();
+        let line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+        let (secret, _public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x5A; 2]));
+        let host = PorosHost::new(
+            coord,
+            dealt.shares[0].clone(),
+            dealt.binding.clone(),
+            line.clone(),
+            usize::from(t),
+            COMMUNITY.to_vec(),
+            EPOCH,
+            BeaconSeed::new([0x31; 32]),
+            DIFFICULTY,
+        )
+        .with_kem_secret(secret);
+
+        let mut node = IngressNode::new(Box::new(Clock { coord, epoch: EPOCH.get() }), host);
+        assert_eq!(node.host.rotating_into(), None, "no rotation before the clock moves");
+
+        // Arming is CONDITIONAL, and that condition is the property worth pinning: a host prepares to receive
+        // a rotated share exactly when the incoming line passes through its own point, and stays inert
+        // otherwise. Anything else would have every node in the cell gathering sub-shares for lines it is not
+        // on. So walk the clock and check the composite's decision against the geometry directly.
+        let beacon = BeaconSeed::new([0x31; 32]);
+        let mut armed_at = Vec::new();
+        let mut on_line_at = Vec::new();
+        // The clock's epoch, not the host's: a host only advances its own when a rotation COMPLETES, and
+        // nothing here delivers sub-shares, so reading `host.epoch()` would test the same target twelve times
+        // — which is exactly what the first version of this test did, and why it reported no eligible epoch.
+        let mut clock = EPOCH;
+        for _ in 0..12 {
+            node.step(Instant(0), Input::Command(Command::AdvanceEpoch));
+            clock = clock.next();
+            let target = clock;
+            let members = fanos_rendezvous::line_member_coords::<F2>(
+                crate::poros::ingress_line::<F2>(COMMUNITY, target, &beacon).coords(),
+            );
+            if members.contains(&coord) {
+                on_line_at.push(target);
+            }
+            if node.host.rotating_into() == Some(target) {
+                armed_at.push(target);
+            }
+        }
+        assert!(
+            !on_line_at.is_empty(),
+            "the fixture must reach at least one epoch whose ingress line passes through this host, or the \
+             test proves nothing",
+        );
+        assert_eq!(
+            armed_at, on_line_at,
+            "the composite must arm exactly on the epochs whose incoming line contains this host — the cell's \
+             own beacon is the only thing that was ever going to call `arm_rotation`, and it must not arm a \
+             node for a line it is not on",
+        );
     }
 }
