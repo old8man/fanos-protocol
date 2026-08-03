@@ -184,6 +184,11 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
   are unit-tested with mocks; the real `tun` syscalls are verified on a host, not in the gate.
 - **Real-NAT socket-filter test harness** — the NAT-traversal logic (#119) is complete and tested against
   simulated NATs; a harness exercising real OS NAT/firewall filters is the only residual.
+  *(Corrected 2026-08-03: "complete" had been true of the mechanism and false of the wiring — `hole_punch`
+  had no caller outside its own test, so a running node never initiated one and every NAT-to-NAT pair
+  relayed through a hub permanently. Now initiated automatically from the send path. The loopback tests
+  cannot model a punch that FAILS, which is the case the relay fallback exists for, so the real-NAT harness
+  is still the residual — and it is the only thing that can tell the two paths apart in the field.)*
 
 > **Two former "frontier" items were phantom gaps — already realized + tested, kept here as the record:**
 > **Maekawa W∩R quorum** is the erasure store's versioned full-fan-out read (a superset of any line-quorum →

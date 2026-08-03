@@ -130,9 +130,13 @@ RUST_LOG=info fanos node --config /etc/fanos/node.conf
 * **NAT / port-forward.** Behind NAT, forward the same UDP port to the host and advertise the
   *public* `host:port` in your bootstrap seed. A node now **auto-discovers** the public address its
   peers observe it at (reflexive / STUN-like: peers report it, and a node trusts it once a quorum
-  agree — `fanos_quic::ReflexiveAddr`, NAT traversal #119). Direct **hole-punching** for
-  non-forwarded nodes is the remaining piece; until it lands a server still needs a reachable UDP
-  port (forwarded or firewall-opened).
+  agree — `fanos_quic::ReflexiveAddr`, NAT traversal #119). Direct **hole-punching** is now
+  attempted automatically: when a node has no route to a peer but shares a hub with it, the send path
+  asks that hub to broker a punch before falling back to relaying through it, so a NAT-to-NAT pair
+  ends up connected directly instead of paying a third node to carry its traffic for ever. Behind a
+  symmetric NAT the punch can still fail, and the relay fallback carries the pair — working, but
+  slower, and it tells the hub who is talking to whom. **A publicly reachable port remains strictly
+  better**, so forward it for anything serving traffic.
 * **Pin the port.** Set `listen` to a fixed port (not `:0`) so the seed you hand out stays valid.
 
 ---

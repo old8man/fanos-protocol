@@ -6,7 +6,7 @@
 
 use std::time::Duration as StdDuration;
 
-use fanos_field::F2;
+use fanos_field::{F2, Field};
 use fanos_geometry::Point;
 use fanos_quic::{Directory, NodeHandle, spawn};
 use fanos_runtime::{Command, Config, Notification, OverlayNode, Triple};
@@ -85,29 +85,50 @@ async fn delivery_is_bidirectional_and_reuses_the_connection() {
 }
 
 #[tokio::test]
-async fn a_node_learns_its_public_address_from_a_quorum_of_peers() {
+async fn a_node_learns_its_public_address_only_once_the_fault_budget_agrees() {
     // NAT traversal #119, reflexive discovery: a node does not know the address remote peers reach it at.
-    // Here A dials B and C; each, on accepting, reports back the source address it observes A arriving from
-    // (an `ObservedAddr` frame). Once a quorum (2) of peers agree, A confirms its public address. Over
-    // loopback there is no NAT, so that observed address is A's own endpoint — the mechanism is identical
-    // under a real NAT, where it would instead be the NAT-mapped public endpoint.
+    // A dials its peers; each, on accepting, reports back the source address it observes A arriving from (an
+    // `ObservedAddr` frame), and A confirms its public address once a quorum agree. Over loopback there is no
+    // NAT, so that observed address is A's own endpoint — the mechanism is identical under a real NAT, where
+    // it would instead be the NAT-mapped public endpoint.
+    //
+    // **The quorum is the cell's fault budget, and the count is asserted rather than assumed.** A node's
+    // public address is what it advertises and what a hub hands out to broker a hole-punch, so a coalition
+    // that could carry the vote could move a node's address — which is why the quorum is `⌊(n−1)/3⌋ + 1`
+    // (`fanos_quic::reflexive_quorum`) and not the 2 it once was. This test used to supply exactly two
+    // observers and confirm; raising the quorum broke it, and the break went unseen because the change was
+    // gated with `-p fanos-node` and this file is `-p fanos-quic`'s. So it now supplies one observer FEWER
+    // than the quorum first, proves the address stays unconfirmed, and only then adds the last one.
+    let quorum = fanos_quic::reflexive_quorum(F2::Q);
     let dir = Directory::new();
     let a = node(0, &dir, Config::default()).await;
-    let b = node(1, &dir, Config::default()).await;
-    let c = node(2, &dir, Config::default()).await;
+    // One peer per observer, plus the last one held back — `quorum + 1` nodes in all, which the Fano cell's
+    // seven points accommodate for any `q = 2` budget.
+    let mut peers = Vec::new();
+    for i in 1..=quorum {
+        peers.push(node(i, &dir, Config::default()).await);
+    }
 
     assert_eq!(a.public_addr(), None, "A knows no public address before any peer reports one");
 
-    // A dials both peers (triggering the connections whose accept-side sends the ObservedAddr back).
-    a.command(Command::Send {
-        to: b.address(),
-        payload: b"hi-b".to_vec(),
-    });
-    a.command(Command::Send {
-        to: c.address(),
-        payload: b"hi-c".to_vec(),
-    });
+    // Dial every peer but the last: one vote short of the quorum.
+    for peer in peers.iter().take(quorum - 1) {
+        a.command(Command::Send { to: peer.address(), payload: b"hi".to_vec() });
+    }
+    // Long enough for those reports to have landed — the next assertion is only meaningful if they did, so
+    // it is checked against the *last* peer's arrival below rather than trusted to a sleep alone.
+    tokio::time::sleep(StdDuration::from_millis(600)).await;
+    assert_eq!(
+        a.public_addr(),
+        None,
+        "{} observers is one short of the quorum of {quorum} — a sub-budget coalition must not set an \
+         address the network will dial and a hub will hand out",
+        quorum - 1,
+    );
 
+    // The last observer completes the quorum.
+    let last = peers.last().expect("at least one peer");
+    a.command(Command::Send { to: last.address(), payload: b"hi".to_vec() });
     let confirmed = tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             if let Some(addr) = a.public_addr() {
@@ -117,14 +138,14 @@ async fn a_node_learns_its_public_address_from_a_quorum_of_peers() {
         }
     })
     .await
-    .expect("A never confirmed a public address from a quorum of peers");
+    .expect("A never confirmed a public address once a quorum of peers had reported one");
 
     assert_eq!(
         confirmed,
         a.local_addr(),
         "A's reflexive address is where its peers observe it (its own endpoint, over loopback)"
     );
-    drop((b, c));
+    drop(peers);
 }
 
 #[tokio::test]

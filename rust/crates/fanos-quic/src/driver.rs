@@ -14,6 +14,7 @@
 //! The clock is the one real-time seam: a driver *may* read the wall clock (the engine never can),
 //! so virtual [`Instant`]s here are elapsed nanoseconds since the node started.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -301,7 +302,7 @@ type PeerAddrs = Arc<Mutex<HashMap<Triple, SocketAddr>>>;
 /// points are generic over `F`, so they compute this and hand it in; the field-less [`spawn`] keeps the base
 /// cell's value because a bare engine has no plane to ask.
 #[must_use]
-pub(crate) const fn reflexive_quorum(q: u32) -> usize {
+pub const fn reflexive_quorum(q: u32) -> usize {
     let n = (q as usize) * (q as usize) + (q as usize) + 1;
     (n - 1) / 3 + 1
 }
@@ -459,9 +460,7 @@ impl NodeHandle {
     /// subsequent overlay traffic routes to it directly without the hub. Returns `false` if the engine
     /// actor has stopped. Best-effort: reachability then depends on the NATs actually admitting the punch.
     pub fn hole_punch(&self, via: Triple, target: Triple) -> bool {
-        let mut frame = Vec::new();
-        encode_frame(FrameType::ConnectReq.code(), &encode_triple(target), &mut frame);
-        self.command(Command::Emit { to: via, frame })
+        self.command(Command::Emit { to: via, frame: connect_req_frame(target) })
     }
 
     /// Await the next application notification the engine emits, or `None` once it stops. Backed by a
@@ -1547,6 +1546,9 @@ async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendR
 /// connection), then write each queued frame as its own QUIC uni-stream, in order. Scoped to one peer so a
 /// slow dial or a broken connection cannot delay any other peer's traffic (#129).
 async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    // Hubs already asked to broker a punch to `to` — see the relay branch below. Local to this worker, so
+    // it needs no lock, and bounded by the plane's point count because a hub is a peer coordinate.
+    let mut asked: BTreeSet<Triple> = BTreeSet::new();
     while let Some(frame) = rx.recv().await {
         // Resolve `to` to a live connection. If the directory knows an address, reuse-or-dial it; otherwise
         // fall back to a connection the peer already dialed IN on — a live cached connection *is*
@@ -1558,13 +1560,29 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedRecei
         };
         if let Some(conn) = direct {
             send_uni(&conn, &t.shaper, &frame).await;
-        } else if let Some(hub) = pick_relay_hub(&t.conns, to) {
+        } else if let Some((hub_coord, hub)) = pick_relay_hub(&t.conns, to) {
+            // **Try to stop relaying before settling into it.** The relay below is the fallback for the case
+            // a hole-punch cannot fix, but nothing in a running node ever *asked* for a punch — `hole_punch`
+            // had no caller outside its own test — so every NAT-to-NAT pair relayed all of its traffic
+            // through a third node, permanently. That is a bandwidth amplifier on the hub, and on an
+            // anonymity network it also hands that hub a volume vantage on the pair: a `Relay` names its
+            // `target` and `origin` in the clear to the forwarder, where a punched connection names nothing.
+            //
+            // **Once per hub, and the bound is derived rather than a retry interval.** Whether a punch
+            // succeeds is a function of the two NATs and the broker that describes them; re-asking the same
+            // broker about the same pair cannot yield a different answer while the mappings hold. A
+            // *different* hub is genuinely new information — it observed a different mapping — so it gets its
+            // own attempt. That needs no timer and no chosen period, and it is bounded by the peer count.
+            if asked.insert(hub_coord) {
+                send_uni(&hub, &t.shaper, &connect_req_frame(to)).await;
+            }
             // Symmetric-NAT relay fallback (#119): `to` is unreachable directly (no address, no cached
             // connection — the case a symmetric NAT leaves after even a hole-punch fails). Wrap the frame
             // (with ourselves as origin, so `to`'s reply routes back the same way) and ask a hub we CAN
             // reach to forward it, so any pair behind NAT still communicates. The hub forwards only to a
             // peer it already holds a connection to, so this reaches `to` iff some common node connects both
-            // ends — exactly the topology the overlay's cell membership creates.
+            // ends — exactly the topology the overlay's cell membership creates. This frame relays either
+            // way: a punch is asynchronous, and the traffic must not wait on it.
             send_uni(&hub, &t.shaper, &encode_relay(to, t.me, &frame)).await;
         } else {
             // Genuinely unroutable (no direct path and no hub): drop, counted + logged so it is observable.
@@ -1589,15 +1607,25 @@ async fn send_uni(conn: &Connection, shaper: &Shaper, frame: &[u8]) {
 }
 
 /// A live cached connection to any peer other than `exclude` — a hub to relay through when `exclude` is
-/// not directly reachable (#119). `None` if this node has no other live connection to relay via.
-fn pick_relay_hub(conns: &ConnMap, exclude: Triple) -> Option<Connection> {
+/// not directly reachable (#119) — **with its coordinate**, which the caller needs to remember which hubs it
+/// has already asked to broker a punch. `None` if this node has no other live connection to relay via.
+fn pick_relay_hub(conns: &ConnMap, exclude: Triple) -> Option<(Triple, Connection)> {
     let map = conns.lock().ok()?;
     for (&peer, conn) in map.iter() {
         if peer != exclude && conn.close_reason().is_none() {
-            return Some(conn.clone());
+            return Some((peer, conn.clone()));
         }
     }
     None
+}
+
+/// A [`ConnectReq`](FrameType::ConnectReq) frame asking a hub to broker a hole-punch to `target`. One
+/// builder, so the manual [`hole_punch`](Driver::hole_punch) call and the send path's automatic attempt can
+/// never drift onto different encodings.
+fn connect_req_frame(target: Triple) -> Vec<u8> {
+    let mut frame = Vec::new();
+    encode_frame(FrameType::ConnectReq.code(), &encode_triple(target), &mut frame);
+    frame
 }
 
 /// Encode a [`Relay`](FrameType::Relay) frame asking a hub to forward `inner` to `target` on behalf of

@@ -130,11 +130,19 @@ async fn a_hub_brokers_a_direct_hole_punched_connection() {
 }
 
 #[tokio::test]
-async fn a_hub_relays_between_peers_that_cannot_reach_each_other() {
+async fn a_hub_relays_between_peers_it_cannot_broker_a_punch_for() {
     let _serial = serial();
-    // Symmetric-NAT fallback: A and B can each reach a hub H but NOT each other (separate directories, no
-    // cross-address, no hole-punch here). A's traffic to B is relayed transparently through H — and B's
-    // reply routes back the same way, because the relay carries the origin (a bidirectional relay).
+    // Symmetric-NAT fallback: A and B can each reach a hub H but NOT each other. A's traffic to B is relayed
+    // transparently through H — and B's reply routes back the same way, because the relay carries the origin
+    // (a bidirectional relay).
+    //
+    // **The hub must be unable to broker, or this stops testing the relay.** Since the send path now asks for
+    // a hole-punch before settling into relaying, a hub that *could* broker would punch the pair through and
+    // the relay would carry only the first frame — leaving the reverse leg proven over a direct connection
+    // while the test still claimed the relay. So B never dials H: the hub *dials out* to B instead. It then
+    // holds a live connection to B (relayable) but no entry in its hole-punch table, which is populated only
+    // on the accept path — a real condition, not a contrivance, and exactly the "hub cannot describe this
+    // peer's mapping to a third party" case the relay exists for.
     let dir_a = Directory::new();
     let dir_b = Directory::new();
     let dir_h = Directory::new();
@@ -142,16 +150,14 @@ async fn a_hub_relays_between_peers_that_cannot_reach_each_other() {
     let mut b = node(1, &dir_b).await;
     let h = node(2, &dir_h).await;
 
-    // A and B each know only the hub, and each opens a connection to it (a Send warms it): the hub then
-    // holds a connection to both, and A/B each hold one to the hub to relay through.
     dir_a.insert(h.address(), h.local_addr());
-    dir_b.insert(h.address(), h.local_addr());
+    dir_h.insert(b.address(), b.local_addr());
     a.command(Command::Send {
         to: h.address(),
         payload: vec![0xAA],
     });
-    b.command(Command::Send {
-        to: h.address(),
+    h.command(Command::Send {
+        to: b.address(),
         payload: vec![0xBB],
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -184,6 +190,68 @@ async fn a_hub_relays_between_peers_that_cannot_reach_each_other() {
         await_delivery(&mut a, b.address(), 5).await,
         rev,
         "A received B's reply via the relay, attributed to B"
+    );
+
+    a.shutdown();
+    b.shutdown();
+    h.shutdown();
+}
+
+#[tokio::test]
+async fn a_relaying_peer_asks_its_hub_to_punch_instead_of_relaying_for_ever() {
+    let _serial = serial();
+    // **The wiring this file's first test never exercised.** `hole_punch` is a manual call, and until now it
+    // had no caller anywhere but that test: the send path fell straight from "no direct route" to "relay
+    // through a hub", so a NAT-to-NAT pair relayed *all* of its traffic through a third node for the life of
+    // the session. The hub paid the bandwidth, and — this being an anonymity network — the hub also saw the
+    // volume of the pair's traffic, since a `Relay` names its target and origin in the clear to the
+    // forwarder while a punched connection names nothing.
+    //
+    // Here nobody calls `hole_punch`. A simply sends to B, and the punch must happen on its own.
+    let dir_a = Directory::new();
+    let dir_b = Directory::new();
+    let dir_h = Directory::new();
+    let a = node(0, &dir_a).await;
+    let mut b = node(1, &dir_b).await;
+    let mut h = node(2, &dir_h).await;
+
+    dir_a.insert(h.address(), h.local_addr());
+    dir_b.insert(h.address(), h.local_addr());
+
+    // Both ends dial the hub, so it holds each one's observed address — the material it brokers with.
+    b.command(Command::Send { to: h.address(), payload: b"b-warms-the-hub".to_vec() });
+    assert_eq!(await_delivery(&mut h, b.address(), 5).await, b"b-warms-the-hub");
+    a.command(Command::Send { to: h.address(), payload: b"a-warms-the-hub".to_vec() });
+    assert_eq!(await_delivery(&mut h, a.address(), 5).await, b"a-warms-the-hub");
+
+    assert!(
+        dir_a.resolve(b.address()).is_none(),
+        "A must have no address for B — the relay branch is the one under test",
+    );
+
+    // One ordinary application send. Its own frame rides the relay (a punch is asynchronous and traffic must
+    // not wait on it), so B receives it either way — but the send ALSO asks the hub to broker.
+    let payload = b"A to B, relayed now and punched next".to_vec();
+    a.command(Command::Send { to: b.address(), payload: payload.clone() });
+    assert_eq!(
+        await_delivery(&mut b, a.address(), 5).await,
+        payload,
+        "the frame itself is relayed — the punch must not delay traffic",
+    );
+
+    // The property: without anyone calling `hole_punch`, A ends up holding B's address, so every subsequent
+    // frame leaves the hub out of the path entirely.
+    assert!(
+        await_resolved(&dir_a, b.address(), 5).await,
+        "an ordinary send over the relay must ask the hub to punch — otherwise the pair relays for ever",
+    );
+
+    let direct = b"and this one goes direct".to_vec();
+    a.command(Command::Send { to: b.address(), payload: direct.clone() });
+    assert_eq!(
+        await_delivery(&mut b, a.address(), 5).await,
+        direct,
+        "traffic continues over the punched connection",
     );
 
     a.shutdown();
