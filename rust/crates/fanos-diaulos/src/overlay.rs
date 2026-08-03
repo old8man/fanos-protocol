@@ -45,6 +45,16 @@ fn unframe(payload: &[u8]) -> Option<(u8, &[u8])> {
     payload.split_first().map(|(&tag, rest)| (tag, rest))
 }
 
+/// Ceiling on the `ClientHello` resend gap, in polls.
+///
+/// The backoff must not outrun the give-up rule that ends an unanswered handshake: `fanos_session`'s
+/// `HANDSHAKE_GIVE_UP` is a **duration**, so at some gap the session would be abandoned having sent only a
+/// handful of hellos, and a path that was merely slow would read as absent. Capping the gap keeps the resend
+/// rate bounded below *and* above — backing off to a floor of one attempt per 32 polls (8 s at the anonymous
+/// profile's 250 ms) still yields ~22 attempts inside a 180 s give-up, which is ample evidence of absence
+/// while being 32x quieter than the unpaced original.
+const MAX_HELLO_RESEND_GAP: u32 = 32;
+
 /// The client half of a DIAULOS session over the overlay: dial a service by coordinate, complete the
 /// 1-RTT handshake over datagrams, then carry a byte stream on the primary stream.
 pub struct ClientSession {
@@ -53,10 +63,28 @@ pub struct ClientSession {
 }
 
 enum ClientState {
-    /// Awaiting the `ServerHello`; `hello` is retransmitted each poll until it arrives.
+    /// Awaiting the `ServerHello`.
+    ///
+    /// `hello` used to be retransmitted on **every** poll, unpaced — the one retry path in an otherwise
+    /// carefully RTO-governed system, and the one that runs when the path is least established. Over the
+    /// anonymous profile a poll is `RENDEZVOUS_TICK` (250 ms) while a hop is a threshold gather whose
+    /// measured round trip reaches **4 s under load**, so a single dial emitted ~16 `ClientHello` onions per
+    /// actual round trip, each arming a fresh gather at every hop line of its circuit. That is a multiplying
+    /// flood at exactly the moment the mixnet cannot absorb one, and with the hedged walk two attempts run at
+    /// once.
+    ///
+    /// So the resend backs off: `polls_until_resend` counts down, and doubles after each send
+    /// (RFC 6298 §5.5, the same rule `GatherClock::expired` follows). There is no RTT sample to derive from
+    /// during a handshake — that is what a handshake is for — so exponential backoff from one poll is the
+    /// standard answer, as TCP's SYN retry and QUIC's Initial PTO both do.
     Handshaking {
         pending: PendingDial,
         hello: Vec<u8>,
+        /// Polls remaining before the next `ClientHello` resend; `0` means send on this poll.
+        polls_until_resend: u32,
+        /// The gap that will be used after the next send, doubling each time (capped so the count stays
+        /// meaningful against [`fanos_session`]'s handshake give-up, which is a duration).
+        resend_gap: u32,
     },
     /// Established: a live connection with its primary stream.
     Live { dialed: Dialed },
@@ -76,7 +104,7 @@ impl ClientSession {
         let (pending, hello) = session::dial(service_public, rng);
         Self {
             service,
-            state: ClientState::Handshaking { pending, hello },
+            state: ClientState::Handshaking { pending, hello, polls_until_resend: 0, resend_gap: 1 },
         }
     }
 
@@ -87,7 +115,7 @@ impl ClientSession {
         let (pending, hello) = session::dial_bundle(bundle, rng)?;
         Some(Self {
             service,
-            state: ClientState::Handshaking { pending, hello },
+            state: ClientState::Handshaking { pending, hello, polls_until_resend: 0, resend_gap: 1 },
         })
     }
 
@@ -101,7 +129,15 @@ impl ClientSession {
     /// reactive counterpart (new inbound data / app writes), which does not.
     pub fn poll_payloads(&mut self) -> Vec<Vec<u8>> {
         match &mut self.state {
-            ClientState::Handshaking { hello, .. } => vec![framed(TAG_HELLO, hello)],
+            ClientState::Handshaking { hello, polls_until_resend, resend_gap, .. } => {
+                if *polls_until_resend > 0 {
+                    *polls_until_resend -= 1;
+                    return Vec::new();
+                }
+                *polls_until_resend = *resend_gap;
+                *resend_gap = resend_gap.saturating_mul(2).min(MAX_HELLO_RESEND_GAP);
+                vec![framed(TAG_HELLO, hello)]
+            }
             ClientState::Live { dialed } => dialed
                 .conn
                 .outbound()
@@ -456,6 +492,48 @@ impl ServerSession {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    /// **An unanswered `ClientHello` must back off, not repeat every poll.**
+    ///
+    /// This was the one unpaced retry in an otherwise RTO-governed system, and it ran in the phase where the
+    /// path is least established. Over the anonymous profile a poll is 250 ms while a hop is a threshold
+    /// gather measured at up to 4 s under load, so an unpaced resend put ~16 hello onions into the mixnet per
+    /// actual round trip, each arming a fresh gather at every hop line — and the hedged dialer runs two
+    /// attempts at once.
+    ///
+    /// Asserted on the *shape* of the sequence, not on a count of sends at some horizon: the gaps must be
+    /// non-decreasing and must actually grow, while the first poll still sends immediately (a dial must not
+    /// be slower to start than it was).
+    #[test]
+    fn an_unanswered_client_hello_backs_off_instead_of_flooding() {
+        let mut rng = SeedRng::from_seed(b"hello-backoff");
+        let keypair = StaticKeypair::generate(&mut rng);
+        let mut session = ClientSession::dial([1, 0, 0], keypair.public(), &mut rng);
+
+        // Poll many times with no ServerHello, recording which polls produced a hello.
+        let mut at: Vec<usize> = Vec::new();
+        for poll in 0..512usize {
+            if !session.poll_payloads().is_empty() {
+                at.push(poll);
+            }
+        }
+
+        assert_eq!(at.first().copied(), Some(0), "the first poll must still send at once");
+        assert!(at.len() >= 3, "there must be several attempts to compare, got {}", at.len());
+        let gaps: Vec<usize> =
+            at.windows(2).filter_map(|w| w.get(1)?.checked_sub(*w.first()?)).collect();
+        assert!(
+            gaps.windows(2).all(|w| w.get(1) >= w.first()),
+            "gaps must never shrink: {gaps:?}"
+        );
+        assert!(
+            gaps.last().copied().unwrap_or(0) > gaps.first().copied().unwrap_or(0),
+            "the gap must actually grow — an unpaced resend has every gap equal to 1: {gaps:?}"
+        );
+        // Bounded above as well: the give-up rule is a duration, so the backoff must not starve the evidence
+        // of absence. 512 polls is 128 s at the anonymous cadence, well inside the 180 s give-up.
+        assert!(at.len() >= 8, "the cap must keep attempts coming inside a give-up window, got {}", at.len());
+    }
     use super::*;
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_ports::Command;
