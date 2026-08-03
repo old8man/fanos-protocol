@@ -44,6 +44,25 @@ const LINEAGE_LABEL: &str = "FANOS-recovery-v1/lineage";
 /// still fails its DLEQ, so none is ever adopted — this only bounds the buffer).
 const MAX_PARTIALS: usize = 256;
 
+/// Cap on the number of **future epochs** partials are buffered for at once.
+///
+/// `MAX_PARTIALS` bounds each bucket and nothing bounded the number of buckets: `buffer` refuses only
+/// `epoch <= self.epoch`, so every epoch above the adopted one opened a fresh entry. Partials are DLEQ-verified
+/// against the group commitment before buffering, which means a forged one is refused — but a **committee
+/// member** can evaluate its share at any target, so a Byzantine member could open unboundedly many buckets
+/// with entirely valid partials. Authenticated-but-unbounded, the same shape as audit B1's `pending_reveals`
+/// and TAXIS's `exec_votes`.
+///
+/// **Evict the HIGHEST epoch**, and that direction is derived rather than chosen. Beacon epochs are adopted in
+/// order — `try_assemble` adopts, then `pending.retain(|&e, _| e > epoch)` clears everything at or below — so
+/// the next epoch that can possibly assemble is the *smallest* pending one. Far-future buckets cannot become
+/// current until every epoch below them has, which makes them exactly what an attacker fills memory with and
+/// exactly what an honest cell does not need. (Contrast TAXIS's `exec_votes`, where the checkpoint is monotone
+/// upward and the *highest* is the one worth keeping, and the sealed mempool, where nothing is visible before
+/// reveal so there is no honest ordering at all and admission is refused instead. Three retentions, three
+/// eviction rules, each read off the ordering its data actually has.)
+const MAX_PENDING_EPOCHS: usize = 8;
+
 /// Cap on concurrently-tracked resharing generations. Honest operation runs one at a time; this bounds
 /// memory against a peer flooding triggers/commits for many bogus generations (each commit still fails its
 /// binding check, so none is ever adopted — this only bounds the buffer). Oldest generations are evicted.
@@ -85,6 +104,12 @@ pub struct BeaconRejects {
     pub reshare_forged: u64,
     /// A reshare trigger this build could not parse (the envelope decoded, the body did not).
     pub reshare_malformed: u64,
+    /// A buffered future-epoch partial set discarded at [`MAX_PENDING_EPOCHS`].
+    ///
+    /// Zero in honest operation: a cell runs one epoch ahead, not eight. A nonzero value means partials are
+    /// arriving for epochs far beyond the adopted one — which a committee member can produce validly, so this
+    /// is the only signal that one is doing it, and the difference between a bounded buffer and a silent one.
+    pub partial_epoch_evicted: u64,
     /// A frame that did not decode at all, so its **type was never read** and no handler ran.
     ///
     /// Counted separately from the two above because it is upstream of them: a corrupted attack frame is
@@ -149,6 +174,23 @@ struct ReshareRound {
 }
 
 impl<F: Field> BeaconNode<F> {
+    /// How many distinct future epochs currently hold buffered partials.
+    ///
+    /// Exposed because [`MAX_PENDING_EPOCHS`] is a bound an operator and a test both need to see held: the map
+    /// stays private, but "is this node buffering for eight epochs ahead?" is a real question about whether a
+    /// committee member is flooding.
+    #[must_use]
+    pub fn pending_epochs(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The smallest future epoch with buffered partials — the next one that can possibly assemble, since
+    /// adoption is in order.
+    #[must_use]
+    pub fn lowest_pending_epoch(&self) -> Option<Epoch> {
+        self.pending.keys().next().copied()
+    }
+
     /// Why this beacon has refused things — the operator's read on whether it is quiet or under attack.
     ///
     /// Public because the distinction is invisible otherwise: a beacon that has stalled because someone is
@@ -302,6 +344,13 @@ impl<F: Field> BeaconNode<F> {
             return;
         }
         bucket.push(partial);
+        // Bound the number of buckets, not only their contents (see `MAX_PENDING_EPOCHS`). The highest epoch
+        // goes: adoption is in order, so a far-future bucket cannot assemble until every epoch below it has.
+        while self.pending.len() > MAX_PENDING_EPOCHS {
+            let Some(&highest) = self.pending.keys().next_back() else { break };
+            self.pending.remove(&highest);
+            self.rejects.partial_epoch_evicted = self.rejects.partial_epoch_evicted.saturating_add(1);
+        }
     }
 
     /// If `epoch`'s pending partials reach the threshold, assemble + verify the round, adopt its seed,
@@ -1421,5 +1470,48 @@ mod tests {
         // A well-formed reshare correctly signed by the authority is honored.
         assert!(!recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
             "a legitimate authority-signed reshare is still dealt");
+    }
+
+    /// **A committee member must not be able to open unboundedly many future-epoch buffers.**
+    ///
+    /// `MAX_PARTIALS` bounded each bucket and nothing bounded the number of buckets: `buffer` refused only
+    /// `epoch <= self.epoch`, so every epoch above the adopted one opened a fresh entry. Partials are
+    /// DLEQ-verified before buffering, which stops a *forgery* — but a share holder can evaluate at any
+    /// target, so a Byzantine member floods with entirely **valid** partials. Authenticated-but-unbounded,
+    /// the same shape as audit B1.
+    ///
+    /// Asserted on both halves: the map stays bounded, and the buckets kept are the LOW epochs — because
+    /// adoption is in order, so a far-future bucket cannot assemble until every epoch beneath it has, and
+    /// evicting the nearest ones would starve exactly the epoch about to run.
+    #[test]
+    fn a_member_cannot_open_unbounded_future_epoch_buffers() {
+        let t = 2usize;
+        let (shares, commitment) =
+            deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"beacon-flood")).unwrap();
+        let mut node: BeaconNode<F2> =
+            BeaconNode::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+
+        // A member evaluates its share at many far-future epochs — every partial genuinely verifies.
+        let far = 4 * MAX_PENDING_EPOCHS as u64;
+        for e in 1..=far {
+            let epoch = Epoch::new(e);
+            let partial = partial_eval(&shares[1], epoch);
+            node.step(Instant(0), Input::Message { from: [0, 0, 0], frame: partial_frame(epoch, &partial) });
+        }
+
+        assert!(
+            node.pending_epochs() <= MAX_PENDING_EPOCHS,
+            "the buffer must bound the number of epochs, not only each bucket: {} > {MAX_PENDING_EPOCHS}",
+            node.pending_epochs()
+        );
+        assert!(
+            node.rejects().partial_epoch_evicted > 0,
+            "and must say so — a silent discard is indistinguishable from a partial that never arrived"
+        );
+        assert!(
+            node.lowest_pending_epoch().is_some_and(|e| e.get() <= MAX_PENDING_EPOCHS as u64),
+            "the epochs KEPT must be the low ones: adoption is in order, so the nearest are the only ones \
+             that can assemble next"
+        );
     }
 }
