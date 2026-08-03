@@ -48,11 +48,16 @@ fn unframe(payload: &[u8]) -> Option<(u8, &[u8])> {
 /// Ceiling on the `ClientHello` resend gap, in polls.
 ///
 /// The backoff must not outrun the give-up rule that ends an unanswered handshake: `fanos_session`'s
-/// `HANDSHAKE_GIVE_UP` is a **duration**, so at some gap the session would be abandoned having sent only a
-/// handful of hellos, and a path that was merely slow would read as absent. Capping the gap keeps the resend
-/// rate bounded below *and* above — backing off to a floor of one attempt per 32 polls (8 s at the anonymous
-/// profile's 250 ms) still yields ~22 attempts inside a 180 s give-up, which is ample evidence of absence
-/// while being 32x quieter than the unpaced original.
+/// `HANDSHAKE_GIVE_UP` is a **duration** while this backs off in *polls*, so at some gap the session would be
+/// abandoned having sent only a handful of hellos, and a path that was merely slow would read as absent.
+/// Capping the gap bounds the resend rate below *and* above.
+///
+/// **How much evidence that actually buys depends on the caller's tick, and this crate cannot see it** — which
+/// is how the first version of this comment came to claim "~22 attempts inside a 180 s give-up", hand-computed
+/// and wrong. Driving the real session says **27** at the anonymous profile's 250 ms poll and **286** at the
+/// Direct profile's 20 ms one: both ample, and a tenfold spread nobody had measured. Pinned by
+/// `fanos_session`'s `the_handshake_give_up_admits_enough_attempts_at_every_profile_tick`, which sees both
+/// sides and counts what the session really sends rather than what either doc believes.
 const MAX_HELLO_RESEND_GAP: u32 = 32;
 
 /// The client half of a DIAULOS session over the overlay: dial a service by coordinate, complete the

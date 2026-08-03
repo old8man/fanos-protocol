@@ -592,6 +592,44 @@ async fn drive<S: SessionStream>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **The give-up window must admit enough attempts to be evidence of absence — measured, not claimed.**
+    ///
+    /// `HANDSHAKE_GIVE_UP` is a *duration*, while the `ClientHello` resend backs off in *polls*
+    /// (`fanos_diaulos`). So how much evidence the window actually buys depends on the caller's tick, and the
+    /// two crates cannot see each other's number — which is exactly how a claim about their product drifts.
+    ///
+    /// It already had: the backoff's own doc said "~22 attempts inside a 180 s give-up", hand-computed and
+    /// wrong. Driving the real session says **27** at the anonymous profile's 250 ms poll, and **286** at the
+    /// Direct profile's 20 ms one. Both are ample — the point is that neither was known, and a tenfold spread
+    /// between two live profiles is not something a reader should have to rediscover.
+    #[test]
+    fn the_handshake_give_up_admits_enough_attempts_at_every_profile_tick() {
+        fn hellos_within(tick: Duration) -> usize {
+            let mut rng = SeedRng::from_seed(b"give-up-evidence");
+            let keypair = StaticKeypair::generate(&mut rng);
+            let mut session = ClientSession::dial([1, 0, 0], keypair.public(), &mut rng);
+            let polls = HANDSHAKE_GIVE_UP.as_millis() / tick.as_millis().max(1);
+            (0..polls).filter(|_| !session.poll_payloads().is_empty()).count()
+        }
+
+        // The anonymous profile's cadence (`fanos_node::rendezvous::RENDEZVOUS_TICK`), and the Direct one.
+        let anonymous = hellos_within(Duration::from_millis(250));
+        let direct = hellos_within(TICK);
+
+        // Enough to be evidence: a handful of unanswered attempts is a lost packet, dozens is an absence.
+        assert!(anonymous >= 16, "the anonymous profile must get real evidence of absence, got {anonymous}");
+        assert!(direct >= anonymous, "a faster tick cannot buy less evidence: {direct} vs {anonymous}");
+
+        // And bounded: the backoff exists so an unanswered handshake is not a flood, so the fastest profile
+        // must still be far below one attempt per poll.
+        let polls_direct = HANDSHAKE_GIVE_UP.as_millis() / TICK.as_millis();
+        assert!(
+            (direct as u128) * 8 < polls_direct,
+            "the backoff must keep attempts far under one per poll: {direct} sends in {polls_direct} polls"
+        );
+    }
+
+
     use super::*;
     use fanos_diaulos::{ServerSession, StaticKeypair};
     use fanos_pqcrypto::rng::SeedRng;
