@@ -888,6 +888,46 @@ impl Node {
 mod tests {
     use super::*;
 
+    /// **The plane order should be chosen for its liveness SPARE, and the spare is `⌊(q+1)/3⌋`.**
+    ///
+    /// `t = ⌈2(q+1)/3⌉` comes from the BFT safety ratio, and safety is what it is for. But the same number
+    /// fixes *liveness*: a gather completes when `t` of `q+1` members answer in time, so the members it can
+    /// afford to lose is `(q+1) − t = ⌊(q+1)/3⌋`. The ceiling's **rounding** is therefore a liveness tax, and
+    /// it is not paid evenly — `q = 3` and `q = 4` carry more members than Fano while tolerating the same
+    /// single absence, which is strictly worse: more ways to lose, no more slack.
+    ///
+    /// The tax vanishes exactly when `3 | (q+1)`, i.e. **`q ≡ 2 (mod 3)`**, where the ceiling is exact. That
+    /// family is `q = 2, 5, 8, 11, 14, …`, and the shipped Fano cell is its smallest member — so the base
+    /// cell is defensible on liveness grounds and not only on tradition, while the sensible step *up* is
+    /// `q = 5` or `q = 8`, never `q = 3` or `q = 4`.
+    ///
+    /// Asserted rather than argued, because the ordering is the surprising part: Fano beats the two orders
+    /// above it, and a naive "bigger plane is more robust" reading of the geometry gets it backwards.
+    #[test]
+    fn a_planes_liveness_spare_is_floor_of_q_plus_one_over_three() {
+        let spare = |q: usize| (q + 1) - mix_threshold(q + 1);
+        for q in [2usize, 3, 4, 5, 7, 8, 9, 11, 13, 16, 31] {
+            assert_eq!(spare(q), (q + 1) / 3, "q={q}: the spare must be ⌊(q+1)/3⌋");
+        }
+        // The rounding tax: three orders in a row tolerate exactly one absence, on lines of 3, 4 and 5.
+        assert_eq!((spare(2), spare(3), spare(4)), (1, 1, 1), "q = 2, 3, 4 all tolerate one absence");
+        // So more members buys nothing there — and a gather's failure probability is monotone in the member
+        // count at fixed spare, which is what makes q = 3 and q = 4 strictly worse than Fano.
+        assert!(spare(5) > spare(4), "q=5 is where the spare finally grows");
+
+        // The tax is exactly the rounding, so it is zero iff 3 divides the line size.
+        for q in [2usize, 5, 8, 11, 14] {
+            assert_eq!(
+                mix_threshold(q + 1) * 3,
+                2 * (q + 1),
+                "q={q} ≡ 2 (mod 3): the threshold is exact, so no capacity is lost to rounding"
+            );
+        }
+        for q in [3usize, 4, 7, 9] {
+            assert_ne!(mix_threshold(q + 1) * 3, 2 * (q + 1), "q={q}: the ceiling rounds up, and that costs");
+        }
+    }
+
     /// The default plane must be **bit-for-bit unchanged** by the generalization.
     ///
     /// `MIX_THRESHOLD` was `2`, correct for a Fano line's three points, and `mix_threshold(3)` must still be

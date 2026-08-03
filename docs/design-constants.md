@@ -64,7 +64,35 @@ mixnet's effective round trip" — and that round trip is no longer unknown, bec
 gather completes, and every retransmit arms a fresh gather. That is a multiplying flood at exactly the moment
 the mixnet cannot absorb it, and it fits every symptom of the wedge in #38.
 
-## 5. Applying it
+## 5. What the rule found, applied to `t`
+
+`t = ⌈2(q+1)/3⌉` is a **derived** constant and its derivation is written down: the BFT safety ratio. Applying
+the rule properly means asking *what else that number decides* — and it decides liveness too, silently.
+
+A gather completes when `t` of `q+1` members answer in time, so what it can afford to lose is
+`(q+1) − t = ⌊(q+1)/3⌋`. The ceiling's **rounding** is a liveness tax, and it falls unevenly. Per-gather
+success with each member answering in time with probability `r = 0.90`:
+
+```
+ q=2   3 members, spare 1   0.9720
+ q=3   4 members, spare 1   0.9477   ← worse than Fano
+ q=4   5 members, spare 1   0.9185   ← worse still
+ q=5   6 members, spare 2   0.9842
+ q=8   9 members, spare 3   0.9917
+ q=31 32 members, spare 10  0.9998
+```
+
+More members with the same spare is strictly worse: more ways to lose, no more slack. The tax is zero exactly
+when `3 | (q+1)`, i.e. **`q ≡ 2 (mod 3)`** — the family `2, 5, 8, 11, 14, …`. The shipped Fano cell is its
+smallest member, so the base cell is defensible on liveness grounds and not only on tradition, and the
+sensible step up is `q = 5` or `q = 8`, never `q = 3` or `q = 4`.
+
+That inverts the naive reading of the geometry ("a bigger plane is more robust"), which is why it is an
+asserted test (`node.rs`) and not a paragraph. It is also the clearest example of what this rule is *for*: the
+constant was already derived, already documented, already correct — and still had an unexamined consequence
+that changes which planes we would deploy.
+
+## 6. Applying it
 
 Highest risk first; do not sweep 811 entries blindly.
 
