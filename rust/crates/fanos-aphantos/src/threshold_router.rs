@@ -76,6 +76,16 @@ const COVER_TOKEN: u64 = 1 << 62;
 /// below) against an attacker flooding forged `TAG_REP` replies.
 const MAX_CANDIDATES: usize = 64;
 
+/// How many recently-resolved gathers are remembered, purely so a late share can be attributed.
+///
+/// A share that arrives for a gather no longer pending is one of three things — the gather **peeled** and
+/// this is the expected remainder, it **expired** and the deadline was too tight, or it is foreign — and
+/// those call for opposite responses. Without this ring they are one number, which is why the largest
+/// counter on every node was arithmetic. `q + 1 − t` late shares follow each completion, so remembering a
+/// few hundred outcomes covers the window in which they can still arrive; older ones fall out and are
+/// attributed as unknown, which is the honest answer once the evidence is gone.
+const MAX_RESOLVED: usize = 512;
+
 /// Cap on the number of `t`-subsets tried while searching for a set of shares that peels. Honest
 /// operation succeeds on the first (all-honest) subset; this bounds the CPU cost when up to `t − 1`
 /// forged shares are mixed in and several subsets must be tried.
@@ -92,6 +102,16 @@ struct Pending {
     /// When the share requests went out. A gather that completes yields `now − armed_at` as one latency
     /// sample, which is what makes the deadline measured rather than chosen ([`GatherClock`]).
     armed_at: Instant,
+}
+
+/// How a gather ended, remembered just long enough to attribute the shares still in flight behind it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    /// A subset peeled and the hop went on — later shares are the expected `q + 1 − t` remainder.
+    Peeled,
+    /// The deadline fired first — a later share is evidence the deadline was too tight, not that the line
+    /// was silent.
+    Expired,
 }
 
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
@@ -117,6 +137,8 @@ pub struct ThresholdRouter<F: Field> {
     /// specific expiry). `None` — the default — uses the measured value.
     gather_override: Option<Duration>,
     pending: BTreeMap<u64, Pending>,
+    /// Recently-resolved request ids and how they ended, oldest first ([`MAX_RESOLVED`]).
+    resolved: VecDeque<(u64, Resolved)>,
     seq: u64,
     /// Mean Poisson mixing delay before forwarding a peeled hop (0 ⇒ forward immediately). Holding
     /// each forward for an independent exponential delay reorders a batch, breaking the timing
@@ -184,6 +206,7 @@ impl<F: Field> ThresholdRouter<F> {
             gather: GatherClock::new(),
             gather_override: None,
             stations: Stations::new(),
+            resolved: VecDeque::new(),
             pending: BTreeMap::new(),
             seq: 0,
             mean_delay: Duration(0),
@@ -589,9 +612,18 @@ impl<F: Field> ThresholdRouter<F> {
     /// peel. A reply is only a *candidate* — it is not trusted until a subset of shares actually peels.
     fn on_reply(&mut self, now: Instant, req_id: u64, share: Share) -> Vec<Effect> {
         let Some(pending) = self.pending.get_mut(&req_id) else {
-            // Already peeled, foreign, or **past its deadline** — the last of which says the deadline
-            // was too tight rather than the line too slow, and only a count can tell them apart.
-            self.stations.record(Station::ShareForUnknownRequest, None);
+            // Already peeled, past its deadline, or foreign — three worlds this used to sum into one, which
+            // is how the largest counter on every node came to be arithmetic. `Peeled` is the expected
+            // `q + 1 − t` remainder behind every completion; `Expired` says the line DID answer and the
+            // deadline was too tight, which is the opposite reading of a gather expiry taken alone; unknown
+            // is what is left once the ring has forgotten, and it is the only one that is evidence of
+            // nothing in particular.
+            let station = match self.resolved.iter().find(|(id, _)| *id == req_id).map(|(_, r)| *r) {
+                Some(Resolved::Peeled) => Station::ShareLateAfterPeel,
+                Some(Resolved::Expired) => Station::ShareAfterDeadline,
+                None => Station::ShareForUnknownRequest,
+            };
+            self.stations.record(station, None);
             return Vec::new();
         };
         // Reject any share whose index is not a real member of this line (valid Shamir x is
@@ -626,6 +658,17 @@ impl<F: Field> ThresholdRouter<F> {
         self.try_peel(now, req_id).unwrap_or_default()
     }
 
+    /// Remember how a gather ended, evicting the oldest past [`MAX_RESOLVED`].
+    ///
+    /// Bounded by COUNT and not by time, for the same reason `pending` is: memory must not depend on a
+    /// deadline that is measured and free to grow.
+    fn remember_resolved(&mut self, req_id: u64, how: Resolved) {
+        if self.resolved.len() >= MAX_RESOLVED {
+            self.resolved.pop_front();
+        }
+        self.resolved.push_back((req_id, how));
+    }
+
     /// If a pending peel can be satisfied, peel it and act on the outcome. The pending state is removed
     /// **only** when a subset of shares actually peels (or when its gather deadline fires) — a single
     /// poisoned share can therefore neither reconstruct a wrong key that discards the peel nor destroy
@@ -640,6 +683,7 @@ impl<F: Field> ThresholdRouter<F> {
         let armed_at = pending.armed_at;
         let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
         self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
+        self.remember_resolved(req_id, Resolved::Peeled);
         // One completed gather is one latency sample, and it contains `RTT + C_partial + Q` together —
         // measured under exactly the load the next gather will meet. This is what replaces the constant.
         self.gather.observe(now.since(armed_at));
@@ -841,6 +885,7 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                             Station::GatherUnpeelable
                         };
                         self.stations.record(station, Some(dead.line));
+                        self.remember_resolved(token, Resolved::Expired);
                     }
                     Vec::new()
                 }

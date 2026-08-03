@@ -86,6 +86,20 @@ pub enum Station {
     /// spare member is failing because a member is absent or because a peel had exactly one candidate subset
     /// and it did not work.
     GatherUnpeelable,
+    /// A share arrived for a gather that had already **peeled** — the expected remainder.
+    ///
+    /// A `t`-of-`(q+1)` gather completes on the `t`-th share, so `q + 1 − t` more are already in flight and
+    /// must land somewhere. Recording them as a discard made this the largest counter on every node — 613 to
+    /// 2283 per run against comparable completion totals — so the plane's most prominent number was
+    /// arithmetic, and the signals that actually found defects sat underneath it. Counted, because the ratio
+    /// against `GatherCompleted` is a real check on the design, but counted **apart** from failure.
+    ShareLateAfterPeel,
+    /// A share arrived for a gather that had already **expired** — so the line did answer and the deadline
+    /// was too tight, which is the opposite conclusion from [`Station::GatherExpired`] taken alone.
+    ///
+    /// This is the actionable one: it is direct evidence for widening the gather deadline (RFC 6298 §5.5),
+    /// and it is invisible if late shares are all summed together.
+    ShareAfterDeadline,
     /// The gatherer could **not compute its own share** of a line it is a member of, so the gather started
     /// one short of where it should.
     ///
@@ -176,6 +190,8 @@ impl Station {
     pub const ALL: &'static [Self] = &[
         Self::GatherExpired,
         Self::GatherCompleted,
+        Self::ShareLateAfterPeel,
+        Self::ShareAfterDeadline,
         Self::GatherUnpeelable,
         Self::GatherSelfShareMissing,
         Self::GatherEvicted,
@@ -201,6 +217,8 @@ impl Station {
         match self {
             Self::GatherExpired => "gather.expired",
             Self::GatherCompleted => "gather.completed",
+            Self::ShareLateAfterPeel => "share.late_after_peel",
+            Self::ShareAfterDeadline => "share.after_deadline",
             Self::GatherUnpeelable => "gather.unpeelable",
             Self::GatherSelfShareMissing => "gather.self_share_missing",
             Self::GatherEvicted => "gather.evicted",
@@ -540,6 +558,8 @@ mod tests {
             match *station {
                 Station::GatherExpired => listed(Station::GatherExpired),
                 Station::GatherCompleted => listed(Station::GatherCompleted),
+                Station::ShareLateAfterPeel => listed(Station::ShareLateAfterPeel),
+                Station::ShareAfterDeadline => listed(Station::ShareAfterDeadline),
                 Station::GatherUnpeelable => listed(Station::GatherUnpeelable),
                 Station::GatherSelfShareMissing => listed(Station::GatherSelfShareMissing),
                 Station::GatherEvicted => listed(Station::GatherEvicted),
