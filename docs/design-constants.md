@@ -58,11 +58,17 @@ form a tidy tree — `ROSTER_REFRESH = 3 × STORE_TIMEOUT`, `FROZEN_SPAN = 2 × 
 **Fix roots, not leaves.** A derived leaf inherits its root's error and hides it behind arithmetic that looks
 principled.
 
-The sharpest instance is tracked as task #46. `RENDEZVOUS_TICK = 250 ms` is documented as "paced to the
-mixnet's effective round trip" — and that round trip is no longer unknown, because `GatherClock` measures it:
-25 ms on an idle host, **4.0 s under load**. Under load the client therefore retransmits ~16× faster than a
-gather completes, and every retransmit arms a fresh gather. That is a multiplying flood at exactly the moment
-the mixnet cannot absorb it, and it fits every symptom of the wedge in #38.
+The sharpest instance is #46, and it is worth reading for how it turned out rather than only for the finding.
+`RENDEZVOUS_TICK = 250 ms` is documented as "paced to the mixnet's effective round trip" — a round trip
+`GatherClock` now measures at 25 ms idle and **4.0 s under load**. Chasing that turned up a real defect one
+layer down: `ClientSession::poll_payloads` resent the `ClientHello` on *every* poll with no backoff, so a dial
+put ~16 hello onions into the mixnet per actual round trip, each arming a fresh gather. Fixed, with an
+exponential backoff.
+
+**But I predicted it would explain the wedge in #38, and it did not** — the autopsy still wedges with the
+backoff in. Recorded here because the roots problem is real *and* a plausible chain from a plucked root to an
+observed symptom is not evidence: the flood existed, was worth fixing, and was a different defect. Deriving
+`RENDEZVOUS_TICK` from the clock remains right, but as a tuning improvement to be measured, not as a suspect.
 
 ## 5. What the rule found, applied to `t`
 
