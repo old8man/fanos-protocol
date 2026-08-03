@@ -25,12 +25,12 @@
 > | **AT-C3** group sender-keys unauthenticated | **RESOLVED** | `group.rs:41-51` gives each member a `HybridSigSecret`; every post is signed over `sender_id ‖ number ‖ ciphertext` and verified against the roster's public half **before** the chain is touched |
 > | **AT-H1** PoR not provider-bound | **RESOLVED** | `hybrid.rs:446-452` requires a **fresh per-audit** signature over `deal_id ‖ H(response)` verified against `params.provider`, so a replica holder cannot be paid for data the provider deleted |
 > | **AT-H2** reputation decay + miss path unwired | **STILL OPEN** | no caller of `settle_epoch(.., false, ..)`, no `Settlement::Miss`, no `Reputation::observe` anywhere in `fanos-dromos`. Two of the three forces the no-staking incentive model rests on are still absent from the running system |
-> | **AT-H3** media plane has no replay protection | **STILL OPEN** | `media.rs:161` `open_frame(&self, ..)` is still `&self` and stateless — any captured frame re-opens while its epoch is current. SRTP mandates a window |
+> | **AT-H3** media plane has no replay protection | **RESOLVED 2026-08-03** | was: `open_frame(&self, ..)` stateless, so any captured frame re-opened while its epoch was current. Now a per-epoch sliding window (`highest_seen` + a `u64` bitmap); `open_frame` takes `&mut self`, authenticates *before* recording so a forgery cannot burn a slot, and a frame past the window is refused **and counted** (`reordered_past_window`) rather than dropped as if it were loss |
 > | **B1** unauthenticated, uncapped `pending_reveals` | **RESOLVED** | `consensus.rs:53-57` — reveals are buffered only after a signature check binds them to a real committee member, and `MAX_PENDING_REVEAL_COMMITS` bounds what a Byzantine member can force |
 > | **POROS** identity binding `from == req.requester` | **RESOLVED** | `poros.rs:803` Gate 0, ahead of the PoW and Sybil gates, recording `AdmissionIdentityUnbound` (struck inline below) |
 >
 > **So: eight of the twelve severe findings re-checked here were already fixed and still read OPEN; two are
-> genuinely open (AT-H2, AT-H3) and one is partial (O-H2).** The two open ones are tracked as tasks. Nothing was
+> genuinely open when swept (AT-H2, AT-H3 — the latter closed the same day, see its row) and one is partial (O-H2).** The two open ones are tracked as tasks. Nothing was
 > deleted — each original entry stands, so the record still shows what was true and when.
 >
 > Not yet swept: the architectural `[HIGH]`s of Audit IV (three Merkle implementations, wire bifurcation,

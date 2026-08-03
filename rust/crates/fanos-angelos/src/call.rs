@@ -169,7 +169,7 @@ mod tests {
         let (invite, mut caller_media) = CallSignal::invite(CALL, SECRET, media_flags::AUDIO | media_flags::VIDEO);
         // The invite travels sealed over the session; the callee decodes it and accepts.
         let received = CallSignal::from_bytes(&invite.to_bytes()).expect("decode");
-        let (accept, callee_media) = received.accept().expect("accept an invite");
+        let (accept, mut callee_media) = received.accept().expect("accept an invite");
         assert_eq!(accept, CallSignal::Accept { call: CALL });
         // Both media sessions match: a frame sealed by the caller opens for the callee.
         let frame = caller_media.seal_frame(MediaKind::Audio, b"hello call");

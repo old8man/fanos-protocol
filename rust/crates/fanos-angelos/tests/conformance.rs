@@ -110,7 +110,7 @@ fn call_signal_kat_matches_angelos_json() {
     assert_eq!(CallSignal::from_bytes(&invite.to_bytes()), Some(invite), "invite round-trips");
     // Invite → accept seeds interoperable media sessions.
     let (offer, mut caller) = CallSignal::invite(CallId::new([1; 16]), [2; 32], media_flags::AUDIO);
-    let (_accept, callee) = CallSignal::from_bytes(&offer.to_bytes()).unwrap().accept().expect("accept");
+    let (_accept, mut callee) = CallSignal::from_bytes(&offer.to_bytes()).unwrap().accept().expect("accept");
     let frame = caller.seal_frame(MediaKind::Audio, b"hi");
     assert_eq!(callee.open_frame(&frame), Some((0, MediaKind::Audio, b"hi".to_vec())), "media interoperates");
 }
@@ -163,7 +163,7 @@ fn media_frame_kat_matches_angelos_json() {
 
     // The callee opens the caller's frame (cross-direction, loss-tolerant, order-independent).
     let mut caller = MediaSession::new(&[0x33; 32], MediaRole::Caller);
-    let callee = MediaSession::new(&[0x33; 32], MediaRole::Callee);
+    let mut callee = MediaSession::new(&[0x33; 32], MediaRole::Callee);
     let a = caller.seal_frame(MediaKind::Audio, b"audio0");
     assert_eq!(callee.open_frame(&a), Some((0, MediaKind::Audio, b"audio0".to_vec())));
 }
