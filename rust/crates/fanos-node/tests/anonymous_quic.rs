@@ -21,6 +21,7 @@
 mod common;
 
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 // Real-QUIC integration tests each bring up several loopback nodes; running them at once overloads the
@@ -31,6 +32,15 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 // failed together, every one of them reporting that its runtime "was polled 0 times ... against 521 expected
 // (0%)" — a starved host, not a broken system. The workflow has never once been green.
 static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// How many requests the off-combiner service's handler has actually been called with.
+///
+/// **The one bit that halves the search for a wedge.** A wedged dial establishes and then moves nothing, and
+/// station counters are aggregates over a whole fixture — they cannot say whether THIS session's request
+/// reached the far end. Comparing this count across the failing dial does: unchanged means the request never
+/// arrived (forward path), incremented means it arrived and the answer did not come home (reply path).
+/// Instrument both directions, or a one-sided counter points at the wrong half.
+static SERVED: AtomicUsize = AtomicUsize::new(0);
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
@@ -649,6 +659,7 @@ impl OffCombiner {
         vec![host_reply_keys], // the off-combiner host opens forwarded dead-drops with this key
         None,                  // fixed genesis epoch — no rotation driver
         |req| {
+            SERVED.fetch_add(1, Ordering::Relaxed);
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
             resp
@@ -1046,9 +1057,16 @@ async fn a_wedged_session_reports_where_it_stopped() {
     cell.nodes[victim_index].take().expect("the victim combiner node is still held").shutdown();
 
     for attempt in 0..12 {
+        let before = SERVED.load(Ordering::Relaxed);
         if cell.probe().await.is_none() {
+            let after = SERVED.load(Ordering::Relaxed);
+            let half = if after > before {
+                "the request ARRIVED and was answered — the REPLY path lost it"
+            } else {
+                "the request never reached the handler — the FORWARD path lost it"
+            };
             let report = cell.autopsy().await;
-            println!("wedged on dial {attempt}{report}");
+            println!("wedged on dial {attempt}: {half} (served {before} -> {after}){report}");
             cell.teardown().await;
             return;
         }

@@ -262,11 +262,21 @@ where
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut request = Vec::new();
-    if stream.read_to_end(&mut request).await.is_ok() {
-        let response = handler(&request);
-        let _ = stream.write_all(&response).await;
-        let _ = stream.shutdown().await;
+    if stream.read_to_end(&mut request).await.is_err() {
+        return;
     }
+    // **An empty request is an abandoned session, not a request.** A client that hedges across meeting points
+    // drops the attempts that lose the race, which closes their transports — so the service reads EOF with
+    // nothing in hand. Calling the handler there invents a request the client never sent: measured as one
+    // dial incrementing a handler's count by three. Harmless for an echo, not harmless for application code
+    // that counts, bills, rate-limits, or has any side effect at all, and the hedge means EVERY dial can
+    // produce them rather than only failing ones.
+    if request.is_empty() {
+        return;
+    }
+    let response = handler(&request);
+    let _ = stream.write_all(&response).await;
+    let _ = stream.shutdown().await;
 }
 
 /// One hidden service's hosting parameters: **what** is hosted, and **under which coordinate regime**.

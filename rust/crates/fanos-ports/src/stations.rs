@@ -109,6 +109,21 @@ pub enum Station {
     /// the onion's layer was sealed to an epoch key this relay has already ratcheted past — the responder's
     /// side of the same failure is [`Station::SharePartialFailed`], and the gatherer's had no counter at all.
     GatherSelfShareMissing,
+    /// A meeting combiner held a registration for the named service but **could not seal the forward onion**
+    /// to its dead-drop line, so the client's request was discarded there.
+    ///
+    /// Silent until now, and on the forward path — which is the half a wedged session was measured to lose.
+    /// `seal_forward_to_host` reads the relay's OWN mix directory, so this fires when that directory is stale
+    /// or short of a member of the host's route, and it fires **per combiner**: a launch draws a salted member
+    /// per onion (#55), so one member with a bad directory drops the requests that happen to land on it while
+    /// its siblings serve theirs. That is a session which handshakes and then stops, intermittently.
+    HostForwardUnsealable,
+    /// A client request named a `service_tag` this combiner holds no registration for, so it fell through to a
+    /// local delivery at a node that is not the service, and died there.
+    ///
+    /// Distinguished from [`Station::HostForwardUnsealable`] because the responses differ: this one says the
+    /// registration never arrived or has been evicted, the other says it arrived and the route cannot be used.
+    RequestForUnknownHost,
     /// A pending gather evicted at the in-flight cap, not by its deadline — capacity pressure, which is a
     /// different world from a slow line and must not be summed with it.
     GatherEvicted,
@@ -190,6 +205,8 @@ impl Station {
     pub const ALL: &'static [Self] = &[
         Self::GatherExpired,
         Self::GatherCompleted,
+        Self::HostForwardUnsealable,
+        Self::RequestForUnknownHost,
         Self::ShareLateAfterPeel,
         Self::ShareAfterDeadline,
         Self::GatherUnpeelable,
@@ -217,6 +234,8 @@ impl Station {
         match self {
             Self::GatherExpired => "gather.expired",
             Self::GatherCompleted => "gather.completed",
+            Self::HostForwardUnsealable => "host.forward_unsealable",
+            Self::RequestForUnknownHost => "request.unknown_host",
             Self::ShareLateAfterPeel => "share.late_after_peel",
             Self::ShareAfterDeadline => "share.after_deadline",
             Self::GatherUnpeelable => "gather.unpeelable",
@@ -558,6 +577,8 @@ mod tests {
             match *station {
                 Station::GatherExpired => listed(Station::GatherExpired),
                 Station::GatherCompleted => listed(Station::GatherCompleted),
+                Station::HostForwardUnsealable => listed(Station::HostForwardUnsealable),
+                Station::RequestForUnknownHost => listed(Station::RequestForUnknownHost),
                 Station::ShareLateAfterPeel => listed(Station::ShareLateAfterPeel),
                 Station::ShareAfterDeadline => listed(Station::ShareAfterDeadline),
                 Station::GatherUnpeelable => listed(Station::GatherUnpeelable),

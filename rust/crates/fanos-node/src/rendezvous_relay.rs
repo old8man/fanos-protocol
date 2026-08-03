@@ -39,7 +39,8 @@ use fanos_geometry::Triple;
 use fanos_primitives::BoundedMap;
 use fanos_primitives::hash::{hash_labeled, label};
 use fanos_rendezvous::{HostRegister, MixDirectory, Request, SessionId, parse_host_register};
-use fanos_runtime::{Effect, Engine, Input, Instant, Notification};
+use fanos_runtime::ports::stations::{Station, Stations, merge_observations};
+use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
 /// A rendezvous relay: a [`ThresholdRouter`] plus a table of the clients whose anonymous replies it
@@ -64,6 +65,13 @@ pub struct RendezvousRelay<F: Field> {
     /// onion to the service's registered dead-drop line — reachable without any node learning its coordinate.
     /// A [`BoundedMap`], bounded like `registrations` at [`MAX_HOSTS`] against a registration flood.
     hosts: BoundedMap<[u8; 32], HostRegister>,
+    /// This relay's **own** data-path readings, merged into the router's on `Command::Observe`.
+    ///
+    /// The relay had none, so its two forward-path discards — a host whose route it cannot seal to, and a
+    /// request naming a service it does not hold — were invisible while the router's plane reported in
+    /// detail beside them. A wedged session was measured to lose the FORWARD half, which is exactly the half
+    /// these two cover.
+    stations: Stations,
     /// The mix directory the forward seal reads its hop keys from, refreshed each epoch by the composite that
     /// owns this relay (the same place that drives the router's rotation).
     ///
@@ -102,6 +110,7 @@ impl<F: Field> RendezvousRelay<F> {
             router,
             registrations: BoundedMap::new(MAX_REGISTRATIONS),
             hosts: BoundedMap::new(MAX_HOSTS),
+            stations: Stations::new(),
             directory: MixDirectory::new(),
             forward_seed,
             forward_counter: 0,
@@ -240,14 +249,26 @@ impl<F: Field> RendezvousRelay<F> {
             && let Some(reg) = self.hosts.get(&req.service_tag).cloned()
         {
             let (e2e, onion) = self.next_forward_seeds();
-            return match reg.seal_forward_to_host::<F>(&self.directory, &payload, &e2e, &onion) {
-                Some(fwd) => vec![Effect::Send { to: fwd.combiner, frame: fwd.frame }],
-                // A registered host whose route we cannot seal to: drop, don't surface locally (this node
-                // is not the service — a local delivery would be answered by the wrong party).
-                None => Vec::new(),
+            // A registered host whose route we cannot seal to: drop, don't surface locally (this node is not
+            // the service — a local delivery would be answered by the wrong party). Dropping is right;
+            // dropping SILENTLY was not, since this is the forward path and it fires per combiner.
+            let Some(fwd) = reg.seal_forward_to_host::<F>(&self.directory, &payload, &e2e, &onion) else {
+                self.stations.record(Station::HostForwardUnsealable, None);
+                return Vec::new();
             };
+            return vec![Effect::Send { to: fwd.combiner, frame: fwd.frame }];
         }
         // 4. Otherwise a local anonymous delivery (the service is its own combiner, or an unrelated onion).
+        //
+        // A request that names a service tag and reaches here named one this relay does not hold, so it is
+        // about to be answered by the wrong party or by nobody. Surfacing it locally stays the right
+        // behaviour — this node may BE the service — but the case is now counted, because a client whose
+        // requests land on a member that never bound the registration sees exactly a forward-path wedge.
+        if let Some(req) = Request::decode(&payload)
+            && req.service_tag != [0u8; 32]
+        {
+            self.stations.record(Station::RequestForUnknownHost, None);
+        }
         vec![Effect::Notify(Notification::Delivered { from: ANONYMOUS, payload })]
     }
 
@@ -279,6 +300,20 @@ fn encode_coord(coord: Triple) -> Vec<u8> {
 
 impl<F: Field> Engine for RendezvousRelay<F> {
     fn step(&mut self, now: Instant, input: Input) -> Vec<Effect> {
+        // The sense-only read: answer with the router's plane AND this relay's own, merged. Without this the
+        // relay's forward-path discards are invisible next to a router plane that reports in detail — and the
+        // forward half is where a wedged session was measured to lose its request.
+        if matches!(input, Input::Command(Command::Observe)) {
+            let mut out = self.router.step(now, input);
+            for effect in &mut out {
+                if let Effect::Notify(Notification::DataPath { stations, .. }) = effect {
+                    *stations = merge_observations(
+                        stations.iter().copied().chain(self.stations.observations()),
+                    );
+                }
+            }
+            return out;
+        }
         if let Input::Message { from, frame } = &input
             && let Ok((decoded, _)) = decode_frame(frame)
         {
