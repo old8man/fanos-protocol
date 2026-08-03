@@ -421,6 +421,27 @@ mod tests {
             None,
             "the delivering line and every non-receiver see only ciphertext",
         );
+
+        // **And this is what carries delivery INTEGRITY on the shipped path, so it is asserted here rather
+        // than assumed.** Spec §5.4's path authenticator is verified by "a verifier that already knows the
+        // circuit" — in §5.6's rendezvous that is both endpoints, because the meeting line is derived from a
+        // shared secret. NOSTOS deliberately does not derive the circuit: the return hops are drawn freshly,
+        // because a predictable circuit is a targetable one. So no party at delivery holds the circuit, the
+        // holonomy check has no verifier on this path, and the guarantee that a delivered body is the one the
+        // sender sealed rests entirely on this AEAD.
+        //
+        // A stronger guarantee than the holonomy, incidentally: the path authenticator says "it came the
+        // agreed way", this says "it came from the party holding the agreed key".
+        for i in [0usize, e2e_ciphertext.len() / 2, e2e_ciphertext.len() - 1] {
+            let mut tampered = e2e_ciphertext.to_vec();
+            tampered[i] ^= 0x01;
+            assert_eq!(
+                reply_keys.open(&tampered),
+                None,
+                "a dead-drop body altered at byte {i} must not open — this is the delivery integrity the \
+                 shipped reply path actually has",
+            );
+        }
     }
 
     /// Below threshold, a return hop's members cannot peel — the reply's routing is ZK to any

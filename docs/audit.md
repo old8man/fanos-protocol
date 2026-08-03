@@ -1780,8 +1780,30 @@ rendezvous**. The Direct profile works but reveals the client coordinate (the CL
   `build_proxy_dialer` (`fanos.rs:401-403`).
 - **S1-H3 cookie correlator — SUPERSEDED by NOSTOS:** production dial uses a dead-drop reply (`reply_keys.open` +
   `select_drop_line`), no relay registration, no SURB; the client coordinate never leaves the node.
-- **S1-M1 holonomy on the peel path — FIXED:** `circuit_line_holonomy` keyed MAC verified on `Deliver`
-  (`threshold.rs:295,322-325`).
+- **S1-M1 holonomy on the peel path — MECHANISM PRESENT, VERIFIER ABSENT.** *(This entry read "FIXED"; corrected
+  2026-08-03 by measurement.)* `circuit_line_holonomy` is a correct keyed MAC and `ThresholdRouter` does verify it
+  on `Deliver` — but only when `with_delivery_check` was called, and **that method has no caller outside its own
+  module's tests**: not `composition.rs` (which builds the production router with `.with_mixing().with_cover()` and
+  nothing else), not any other crate, not the simulator. No shipped node has ever verified a delivery's path.
+
+  It is not a missing wire. The check needs a verifier that already holds the circuit, and NOSTOS removed that
+  party: return hops are drawn freshly rather than derived from a shared secret (§5.6's derived-meeting model is
+  what §5.4's "both endpoints, knowing the algebraic description of the path" assumes, and a predictable circuit is
+  a targetable one); a service host never agreed the client's forward circuit; a client's reply arrives as a
+  geometric dead-drop opened by its end-to-end key, not through a router at all. So the seam is **structurally
+  unreachable in the shipped architecture**.
+
+  Delivery integrity on the shipped path is the end-to-end AEAD — a *stronger* statement than the path
+  authenticator for authenticity ("it came from the party holding the agreed key" versus "it came the agreed way"),
+  though it says nothing about the route. That property is now asserted directly rather than assumed
+  (`nostos.rs`, tampered dead-drop bodies at three byte positions), and `with_delivery_check` documents why it is
+  unwired. The code is kept, not deleted: an authenticated-rendezvous mode where both parties derive the circuit
+  would have exactly the verifier it wants.
+
+  **The residual §5.4 gives up, stated plainly:** nothing on the shipped path detects that a payload traversed a
+  *different route* than intended. Per-hop AEAD and below-threshold ZK still hold, so this is a traffic-analysis
+  surface, not a forgery one. Reconciling spec §5.4 — scope its path-authenticator claim to a circuit-deriving
+  mode, or accept the AEAD-only guarantee in writing — is the open item.
 
 **[CRITICAL — anonymity] No production node completes an anonymous session end-to-end.** The client-side stack is
 correct and fully wired (§5.C good-news above) — `FanosDialer::anonymous_dial` computes `meeting = meeting_line(exit_public)`

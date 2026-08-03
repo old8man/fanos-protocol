@@ -278,6 +278,19 @@ impl<F: Field> ThresholdRouter<F> {
     /// payload whose holonomy does not match — the live wiring of [`threshold::verify_delivery`] onto the
     /// peel path (spec §5.4, S1-M1). A transit relay leaves this unset and delivers unverified, exactly as
     /// [`crate::sealed`]'s relay path does — only the circuit owner can (and does) verify.
+    ///
+    /// **No shipped composition calls this, and the reason is architectural rather than an oversight.** The
+    /// check needs a verifier that already holds the circuit, and in NOSTOS no such party is present at
+    /// delivery: return hops are drawn freshly rather than derived from a shared secret (a predictable
+    /// circuit is a targetable one), a service host never agreed the client's forward circuit, and a client's
+    /// reply arrives as a geometric dead-drop opened by its end-to-end key — not through a router at all.
+    /// Spec §5.4's "both endpoints, knowing the algebraic description of the path" is §5.6's derived-meeting
+    /// model, which NOSTOS replaced. Delivery integrity on the shipped path is therefore the end-to-end AEAD,
+    /// asserted directly in `nostos::a_reply_comes_home_and_only_the_receiver_opens_it`.
+    ///
+    /// Kept, not deleted: it is correct and proven, and an authenticated-rendezvous mode where both parties
+    /// derive the circuit from a shared secret would have exactly the verifier it wants. Left unwired and
+    /// **said so here**, because a security check that reads as enforced and is not is worse than none.
     #[must_use]
     pub fn with_delivery_check(mut self, hop_lines: Vec<Triple>, seed: Vec<u8>) -> Self {
         self.delivery_check = Some((hop_lines, seed));
