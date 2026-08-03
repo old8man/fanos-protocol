@@ -40,7 +40,7 @@
 use fanos_geometry::Triple;
 use fanos_pqcrypto::HybridKemPublic;
 use fanos_rendezvous::{BeaconSeed, Epoch};
-use fanos_runtime::{Effect, Engine, Input, Instant, Notification, TimerToken};
+use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, decode_frame};
 
 use crate::poros::PorosHost;
@@ -181,6 +181,21 @@ impl Engine for IngressNode {
             }
             // Every other timer is the inner engine's; and the host is purely frame/timer-driven, so every
             // command drives the inner cell engine too.
+            // **The rotation instruction** — the driver hands the host the incoming line's KEM publics and
+            // the entropy to seal with, both of which a sans-I/O engine cannot obtain, and the host emits
+            // its sealed sub-shares. Intercepted before the inner engine, because it names this composite's
+            // own host and nothing below it would recognise the tag.
+            Input::Command(Command::Control { tag, ref body })
+                if tag == crate::ingressdir::CONTROL_INGRESS_ROTATION =>
+            {
+                let Some(r) = crate::ingressdir::decode_rotation(body) else {
+                    return Vec::new();
+                };
+                let refs: Vec<&HybridKemPublic> = r.keys.iter().collect();
+                Self::tag_host_effects(self.host.emit_reshare(
+                    r.target_epoch, &r.new_line, &refs, &r.key_randomness, &r.kem_seed,
+                ))
+            }
             Input::Timer(_) | Input::Command(_) => {
                 let effects = self.inner.step(now, input);
                 self.arm_from_beacon(&effects);
@@ -536,5 +551,85 @@ mod tests {
              own beacon is the only thing that was ever going to call `arm_rotation`, and it must not arm a \
              node for a line it is not on",
         );
+    }
+
+    #[test]
+    fn a_driver_supplied_rotation_makes_the_line_emit_its_sealed_reshares() {
+        use fanos_pqcrypto::HybridKemPublic;
+
+        use crate::ingressdir::{CONTROL_INGRESS_ROTATION, encode_rotation, ingress_keypair};
+        use crate::poros::{PorosHost, shard_descriptor};
+
+        // **The half a sans-I/O engine cannot do alone, and could not do at all until now.** Emitting a
+        // reshare needs every INCOMING member's KEM public — those live at other nodes, the engine cannot
+        // look anything up, and no slot published them, so `emit_reshares` had no caller and a dealt ingress
+        // line served the epoch it was provisioned for and stayed there. `ingressdir` publishes the keys and
+        // the driver hands them in over `Control`, which is local by construction: a peer cannot inject a
+        // rotation and talk a line into resharing a community's descriptor to a roster of its choosing.
+        let coord = Point::<F2>::at(0).coords();
+        let desc = descriptor(4);
+        let (t, n) = (2u8, 3u8);
+        let secret_len = desc.to_bytes().len();
+        let randomness = vec![0x7Cu8; secret_len * usize::from(t) + 32];
+        let dealt = shard_descriptor(&desc, t, n, &randomness).unwrap();
+        let old_line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+        let new_line: Vec<Triple> = (3..6).map(|i| Point::<F2>::at(i).coords()).collect();
+
+        let host = PorosHost::new(
+            coord,
+            dealt.shares[0].clone(),
+            dealt.binding.clone(),
+            old_line.clone(),
+            usize::from(t),
+            COMMUNITY.to_vec(),
+            EPOCH,
+            BeaconSeed::new([0x2A; 32]),
+            DIFFICULTY,
+        );
+        let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
+        let mut node = IngressNode::new(Box::new(overlay), host);
+
+        // The incoming line's members publish stable KEM publics; the driver would resolve these from the
+        // store. Stable, not ratcheting: a rotation seals for a FUTURE epoch and its recipient must still be
+        // able to open it after the turn, which a forward-secure mix key could not.
+        let keys: Vec<HybridKemPublic> =
+            (0..3).map(|j| ingress_keypair(&[0x3B + j as u8; 32]).1).collect();
+        let body = encode_rotation(
+            EPOCH.next(),
+            &new_line,
+            &keys,
+            &vec![0x5Fu8; secret_len * usize::from(t) + 32],
+            &[0x6E; 32],
+        );
+
+        let effects = node.step(Instant(0), Input::Command(Command::Control {
+            tag: CONTROL_INGRESS_ROTATION,
+            body,
+        }));
+        let sends: Vec<Triple> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send { to, .. } => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sends, new_line,
+            "an outgoing member must emit one sealed sub-share per INCOMING member, in roster order — one \
+             short and the new line is below threshold, which is a line that looks provisioned and admits \
+             nobody",
+        );
+
+        // A malformed instruction is refused rather than half-applied: it arrives over a local channel, so
+        // this is a programming-error guard, but a partial rotation is worse than none.
+        assert!(
+            node.step(Instant(1), Input::Command(Command::Control {
+                tag: CONTROL_INGRESS_ROTATION,
+                body: vec![0xFF; 3],
+            }))
+            .is_empty(),
+            "a malformed rotation emits nothing",
+        );
+
     }
 }

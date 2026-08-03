@@ -49,6 +49,7 @@ pub mod taxis_driver;
 pub mod taxis_config;
 pub mod identity;
 pub mod ingress_node;
+pub mod ingressdir;
 pub mod mix_relay;
 pub mod mixdir;
 pub mod node;
@@ -94,6 +95,7 @@ pub use mixdir::{
     resolve_mix_key, spawn_mix_directory_feeder, spawn_mix_publisher,
 };
 pub use ingress_node::IngressNode;
+pub use ingressdir::{ingress_keypair, publish_ingress_key, resolve_ingress_key, resolve_ingress_line};
 pub use node::{Health, Node};
 pub use poros::{
     DealtDescriptor, DescriptorBinding, IngressDescriptor, IngressRequest, IngressResponse, PorosHost,

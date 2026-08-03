@@ -619,6 +619,53 @@ A follow-up spec-vs-implementation audit (driving toward #97) re-swept the spec 
 
 None of these is a regression — each is a tracked frontier item, several already in progress. This addendum records where the "drive to 100%" effort stands; it does not supersede the Tier-0/1 resolutions above.
 
+## Verification sweep — 2026-08-04: two failures that a running network reaches on a clock
+
+Both were found by asking a mechanical question rather than by reading: *what does this system accumulate,
+and what removes it?* Neither is an attack. Both are what an honest cell does to itself given enough uptime,
+which is why no adversarial scenario had ever produced them.
+
+**S-C1 — a cell stops publishing after 1.01 days. CRITICAL, fixed (`218ab5c`).** Six directories key their
+slots by `(coordinate, epoch)` — `mixdir`, `capdir`, `loaddir`, `telemetry_dir`, `exit`, `crosscell_dir` —
+and every one re-publishes on each epoch advance, so every node mints a distinct key every epoch. The store
+had **no deletion path at all**: no `Delete` command, no prune, no TTL. Its admission rule is fail-closed, so
+past `MAX_STORE_ENTRIES = 4096` a new digest is refused while keys already held keep accepting writes.
+
+The arithmetic: 4 slots × 7 nodes = 28 per epoch; 4096/28 = 146 epochs; × 600 s = **1.01 days**. After that
+the cell answers every existing lookup and can no longer rotate a mix key, advertise a capability or report a
+load — and nothing reports it, because refusing a `Publish` is a store-local decision. It does not degrade;
+it works, and then it is finished.
+
+Raising the cap only moves the date. What was missing is the ability to say that a directory slot is **soft
+state**: a key reaches the store as an opaque digest, so the store cannot know, but the publisher can and now
+declares it (`Command::PutEphemeral`). Reclamation is by expiry and never by age — eviction-by-age would
+discard live content and keep a dead slot beside it. `DIRECTORY_SLOT_EPOCHS = 1` is derived from the grace
+window it must cover: the onion ratchet keeps one past epoch's secret so an in-flight onion still peels, and a
+client acting on the previous epoch's directory is that same case on the lookup side. Live slots are now
+`publishers × 2 = 56`, constant in uptime. `fanos-node/tests/store_lifetime.rs` is the arithmetic, computed
+from the shipped constants so it stays true when they move.
+
+**S-H1 — rotation did not retire the path it rotated away from. HIGH, fixed (`9d8e611`).**
+`service_tag = H(identity ‖ epoch)`, so a hidden service occupies a different slot in a relay's `hosts` map
+every epoch and the previous one was never overwritten. Nothing removed it: the map's only eviction was FIFO
+under capacity pressure, justified in its own comment with "it re-registers each epoch anyway" — which is
+exactly what leaves the old entry behind. An honest client never notices, deriving the tag from its live
+epoch; a party that **recorded** the tag while it was current can re-present it at any later epoch, and the
+relay would still re-seal its request to the service's retired dead-drop line. So
+`design-anonymity-substrate.md`'s "rotation caps a single enumeration's value to one epoch" held for honest
+lookups and not for the adversary it was written about.
+
+Fixed with a **retention** rule (`BoundedMap::retain`), which is a different thing from the eviction rule the
+map already had: eviction answers "the map is full, who goes" and must choose by age; retention answers "this
+entry can no longer be correct" and must choose by content. Using capacity pressure as a stand-in for expiry
+is how a map ends up holding values unreachable to every honest reader and useful only to whoever recorded
+their key.
+
+**The shape to look for**, since it produced both: *a key that is a function of the epoch, in a map whose only
+removal rule is capacity.* A sweep of every `BoundedMap` and every growable collection field in the tree found
+these two and no others — `ClaimBook` clears on epoch move, the stream's per-segment maps `split_off` at the
+cumulative ack, and the rest are bounded by the plane's point count.
+
 **Update — 2026-07-24: all nine addendum items are now resolved.** A per-item re-audit against the current tree confirmed each is implemented: §6.4 live diagnose→heal (`on_diagnose` runs every heartbeat), §12.3 threshold-hosted CALYPSO (`ServiceNode`+`ThresholdService` wired into `Node::start`), §7.4 capability negotiation (`fanos-wire::capability`, folded into HELLO), §7.9 wire-KAT harness (`fanos-wire/tests/wire_kat.rs` loads + verifies `conformance/vectors/wire.json`), L3.2 per-epoch reshuffle (`reshuffle_loop` on `BeaconReady`), L3.3 Sybil admission (`PowAdmission` wired into JOIN via `with_admission_pow`), L4.1 erasure coding (`fanos-code::{erasure,lrc}` replaces full replication), §5.4 holonomy verification (`verify_delivery` produces `WireError::HolonomyFail` on the live peel path), and PROTEUS enablement (config/CLI surface + auto-fallback + capability advertisement). The deeper residuals surfaced afterwards — cross-cell erasure placement, full hidden-service reachability, censored-bootstrap bridges — are carried forward and tracked in the consolidated later-audit sections that follow (Audits II–IV).
 
 
