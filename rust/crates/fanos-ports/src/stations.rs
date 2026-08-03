@@ -109,6 +109,23 @@ pub enum Station {
     /// the onion's layer was sealed to an epoch key this relay has already ratcheted past — the responder's
     /// side of the same failure is [`Station::SharePartialFailed`], and the gatherer's had no counter at all.
     GatherSelfShareMissing,
+    /// A frame discarded because its sender is **locally quarantined** (spec §6.2/§6.4).
+    ///
+    /// The one discard that is unambiguously *this node's own decision*, and it was the quietest. Every other
+    /// silence on the wire is ambiguous between the peer, the path, and us; a quarantine drop is us, and it
+    /// looked exactly like the peer having gone away — to an operator, to the peer, and to any diagnosis
+    /// downstream.
+    ///
+    /// That matters most when the quarantine is **wrong**. The window is bounded so a transient fault is not a
+    /// permanent exile (audit C5), but a node that keeps re-quarantining a healthy peer keeps dropping it, and
+    /// the only visible symptom is a link that does not work.
+    ///
+    /// **Aggregate, not per-peer, and deliberately so.** `Observation::line` is a *line*, and the sender here
+    /// is a *point* — in `PG(2,q)` both are `Triple`s, so attributing this drop by putting the sender in that
+    /// field would type-check and be a lie, which is precisely the category confusion this plane exists to
+    /// stop. So the count answers "is this node refusing traffic at all", which is the question that was
+    /// unanswerable; "which peer" needs a field the plane does not have and should not fake.
+    QuarantineDropped,
     /// A meeting combiner held a registration for the named service but **could not seal the forward onion**
     /// to its dead-drop line, so the client's request was discarded there.
     ///
@@ -205,6 +222,7 @@ impl Station {
     pub const ALL: &'static [Self] = &[
         Self::GatherExpired,
         Self::GatherCompleted,
+        Self::QuarantineDropped,
         Self::HostForwardUnsealable,
         Self::RequestForUnknownHost,
         Self::ShareLateAfterPeel,
@@ -234,6 +252,7 @@ impl Station {
         match self {
             Self::GatherExpired => "gather.expired",
             Self::GatherCompleted => "gather.completed",
+            Self::QuarantineDropped => "quarantine.dropped",
             Self::HostForwardUnsealable => "host.forward_unsealable",
             Self::RequestForUnknownHost => "request.unknown_host",
             Self::ShareLateAfterPeel => "share.late_after_peel",
@@ -577,6 +596,7 @@ mod tests {
             match *station {
                 Station::GatherExpired => listed(Station::GatherExpired),
                 Station::GatherCompleted => listed(Station::GatherCompleted),
+                Station::QuarantineDropped => listed(Station::QuarantineDropped),
                 Station::HostForwardUnsealable => listed(Station::HostForwardUnsealable),
                 Station::RequestForUnknownHost => listed(Station::RequestForUnknownHost),
                 Station::ShareLateAfterPeel => listed(Station::ShareLateAfterPeel),

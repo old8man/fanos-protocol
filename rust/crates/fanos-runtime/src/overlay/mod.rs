@@ -533,6 +533,9 @@ impl<F: Field> OverlayNode<F> {
         // the bounded quarantine window; once it elapses the [`Healer`] re-admits the member for
         // re-evaluation, so a transient fault is not a permanent exile (audit C5).
         if self.healer.is_quarantined(from, now) {
+            // Counted, because this drop is OURS. Every other silence is ambiguous between the peer, the path
+            // and us; this one is a decision this node made, and it looked identical to the peer vanishing.
+            self.stations.record(Station::QuarantineDropped, None);
             return Vec::new();
         }
         let Ok((frame, _)) = decode_frame(frame) else {
@@ -2508,6 +2511,16 @@ mod tests {
         assert!(
             within.is_empty(),
             "a quarantined member's frames are dropped within the window"
+        );
+        // **And the drop is audible.** This is the one discard that is unambiguously this node's own
+        // decision — every other silence on the wire is ambiguous between the peer, the path and us — and it
+        // used to look exactly like the member having gone away. An operator could not tell "that node is
+        // down" from "we are refusing it", and a wrongly-quarantined healthy peer presented as a link that
+        // simply does not work.
+        assert_eq!(
+            node.stations.total(Station::QuarantineDropped),
+            1,
+            "a quarantine drop must be counted, or refusing a peer is indistinguishable from losing one"
         );
         assert!(
             node.healer.quarantined.contains_key(&member),
