@@ -212,6 +212,62 @@ The coordinate authority (§4) is the same at every level and every `q`: `MapToP
 epoch‖beacon))`. Nothing here forecloses a future large-`q` self-observation story; it records that the
 shipped model is `q = 2` + hierarchy, so the capability is not mistaken for one that runs.
 
+### 5.1 A challenge to this decision, on an axis it did not consider (2026-08-03)
+
+The decision above is argued on **state and depth** — `O(log n)` like Kademlia — and on **proprioception**.
+It is silent on **liveness**, and liveness is where the base cell is weakest.
+
+A gather completes when `t = ⌈2(q+1)/3⌉` of `q+1` members answer in time, so a line can afford to lose
+`⌊(q+1)/3⌋`. At `q = 2` that is **1** — the minimum for any non-trivial threshold. With each member answering
+in time with probability `r = 0.9`, a gather succeeds with probability 0.972, and a session needing `N`
+gathers survives with about `0.972^N`: **0.24 at `N = 50`**, 0.058 at `N = 100`. The measured wedge rate in
+`anonymous_quic` (~1 dial in 8–10) sits comfortably inside that model.
+
+**And the hierarchy makes it worse, not better.** `k` levels of Fano cells means a path crosses more lines,
+every one of them with a spare of exactly 1, so `N` grows with depth while the per-gather margin does not.
+The scaling model that fixes state and depth also multiplies the number of minimum-margin hops.
+
+The natural remedy is `q = 5`: 31 points, spare **2**, per-gather 0.984 — still a small fixed cell, still
+recursive, so every argument §5 actually makes survives. It is also in the `q ≡ 2 (mod 3)` family where the
+threshold's ceiling is exact and no capacity is lost to rounding (`docs/design-constants.md` §5).
+
+**What it would cost, stated honestly, because this is the load-bearing objection.** DIAKRISIS's `N = 7`
+proprioception is not merely sized to the base cell — it *is* the Fano plane: the 7 non-zero vectors of `F₂³`
+are simultaneously the points of `PG(2,2)` and the syndrome space of Hamming(7,4), which is why the 3-bit
+syndrome localizes a fault at all. That coincidence does **not** reproduce at 31: `PG(2,5)`'s 31 points are a
+plane over `F₅`, while the 31 non-zero vectors of `F₂⁵` are the points of `PG(4,2)` — a different object, so
+`[31,26,3]` Hamming buys nothing here. Moving the base cell to `q = 5` costs self-diagnosis its algebra.
+
+So the real decision is a **trade the original text does not name**: `q = 2` buys Hamming(7,4) proprioception
+at the price of the minimum possible liveness margin, at every hop, at every level. That may still be the
+right trade — the point is that it should be made knowingly, and it was not.
+
+Tracked as #47. What would settle it is an experiment rather than more argument: run the rendezvous fixture at
+`q = 5` and see whether the wedge thins as the model predicts.
+
+### 5.2 Why the experiment cannot be run today, and the shape that would allow it
+
+The plane order is a **type parameter**: `Field::Q` is an associated `const`, so `q` is fixed at compile time.
+The engines are already generic — `ThresholdRouter<F>`, `RendezvousRelay<F>`, `RendezvousClient<F>`,
+`RendezvousService<F>` — and it is only the **composition** that pins, `F2` appearing ~176 times in
+`fanos-node`'s sources alone. The familiar shape: libraries ahead, wiring behind.
+
+Three ways out, and the third is the one to build:
+
+1. **Keep one order per binary** (today). Zero cost, and a node cannot join a cell of a different order
+   without a rebuild — which also forecloses a hierarchy whose levels differ in order.
+2. **Make `q` a runtime value.** Every field operation loses its compile-time modulus, const-generic
+   specialization goes, and it touches everything. The arithmetic is the hot path of every onion; paying
+   there to gain deployment flexibility is the wrong direction.
+3. **Monomorphize a small enumerated set and dispatch once, at construction.** `Field` stays exactly as it
+   is; the node composite becomes an enum over supported orders and picks from the cell's advertised order.
+   Zero cost in the hot path, one branch at startup.
+
+Option 3 needs a set of supported orders, and it should not be a taste. `docs/design-constants.md` §5 derives
+one: the liveness tax is zero exactly when `3 | (q+1)`, so the supported set is `q ≡ 2 (mod 3)` — **`{2, 5, 8,
+11}`** — smallest first. The enumeration is then a consequence of the threshold's algebra rather than a list
+someone picked, which is the property that keeps it from rotting.
+
 ## 6. Impact
 
 - **Wire/KAT.** Adding `VrfPublic` to the bundle changes `HybridPublicKey::encode()` length and every
