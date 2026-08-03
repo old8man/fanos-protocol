@@ -98,7 +98,51 @@ asserted test (`node.rs`) and not a paragraph. It is also the clearest example o
 constant was already derived, already documented, already correct — and still had an unexamined consequence
 that changes which planes we would deploy.
 
-## 6. Applying it
+## 6. Pass A, completed 2026-08-03 — the unbounded-collection sweep
+
+Pass A asks which constants are consensus-critical. Following one that **admitted it could not be derived**
+turned it into a different and more productive question. `DEFERRAL_CAP`'s doc says: *"the natural derivation is
+'as many transactions as can be pending at once', and that quantity is currently unbounded because the mempool
+has no cap of its own."* So the question became: **which collections fed by remote input have no bound?**
+
+Three found, each a remote memory exhaustion by an *authenticated* peer — audit B1's shape, which had been
+fixed in one place and not looked for elsewhere:
+
+| Collection | Defect | Rule adopted |
+|---|---|---|
+| TAXIS `mempool` | No cap at all; dedup was a linear scan, so `N` admissions cost `O(N²)`. `valid_seal` cannot help — the keyper line's keys are public, so anyone can mint distinct valid seals. | **Refuse** at the bound |
+| TAXIS `exec_votes` | Never pruned — a leak with **no adversary**, growing with chain height forever; and `on_exec_vote` applies no height bound, so a Byzantine member forges heights. | Evict the **lowest** height |
+| Beacon `pending` | Each bucket capped, the **number of buckets** unbounded; a share holder can evaluate at any epoch, so a member floods with valid partials. | Evict the **highest** epoch |
+
+**The three eviction rules are different, and that is the finding.** A single house policy would have been wrong
+twice:
+
+- the mempool is *encrypted* — fee and sender are invisible before reveal, so every candidate ordering
+  (arrival, the commitment) is attacker-controlled and there is **no honest ordering to evict by**. Refusing
+  has no victim to choose wrongly.
+- `exec_votes` is ordered by a **monotone** checkpoint, so low heights stop mattering first and a far-ahead
+  certificate is exactly what a lagging validator needs.
+- beacon epochs are adopted **in order**, so the *nearest* future epoch is the only one that can assemble next
+  and far-future buckets are precisely what an attacker fills memory with.
+
+**The rule follows from the ordering the data actually has.** That is the reusable lesson, not the caps.
+
+### What the sweep found already correct
+
+Recorded so the pass is re-runnable and its coverage is legible, not just its findings:
+
+- **`fanos-runtime`** — every map (`peers`, `attested`, `witnessed`, `reroute`, `activity`, `loss_reports`) is
+  keyed by *coordinate*, so the plane's `q²+q+1` points bound them structurally. The nicest kind of bound:
+  nothing to enforce.
+- **`fanos-angelos`** — the double ratchet is properly capped in all three places a skipped-key DoS lives:
+  `MAX_SKIP_PER_MESSAGE`, `MAX_SKIPPED_STORED`, `MAX_PAST_EPOCHS`, and the doc cites Signal's `MAX_SKIP`.
+- **`fanos-aphantos`** — `MAX_PENDING`, `MAX_CANDIDATES`, `MAX_RESOLVED`.
+- **`fanos-keygen`** reshare generations — `MAX_RESHARE_GENS`, oldest evicted.
+- **`fanos-node`** relay — `registrations` and `hosts` are `BoundedMap`.
+- **Not attack surfaces** — `fanos-onoma`'s registries are operator-populated, `fanos-thesauros`'s chunk
+  vectors are per-object.
+
+## 7. Applying it
 
 Highest risk first; do not sweep 811 entries blindly.
 
