@@ -129,6 +129,37 @@ pub struct Deal {
 }
 
 impl Deal {
+    /// How many audit periods have elapsed without a passing proof, at block `height`.
+    ///
+    /// **The signal a consumer has no other way to get.** `epoch` advances only when `settle_epoch` runs, and
+    /// that runs only on a *passing* proof — so a provider that simply stops proving leaves every field on
+    /// this deal frozen, and the deal looks identical to one whose provider is proving perfectly but whose
+    /// audits have not come due. The consumer learns nothing until `finalize_if_lapsed` fires at
+    /// `open_height + duration · audit_period`, which for a long deal is a great deal of locked capital after
+    /// the fact.
+    ///
+    /// Derived, not chosen: the periods that *should* have settled by now are `(height − open_height) /
+    /// audit_period`, and `passed` is how many did. The difference is arithmetic on state the deal already
+    /// holds — it needed exposing, not inventing.
+    ///
+    /// **This deliberately stops short of acting on it**, because acting is a policy question with no
+    /// derivation behind it. Payment is linear in `passed`, so a provider can still earn every remaining
+    /// period right up to the deadline: there is no height at which continuing becomes *impossible*, only one
+    /// at which a consumer stops being willing to wait. That threshold belongs in the incentive design
+    /// (`docs/design-incentive-equilibrium.md`), and it cannot be set at all until misses are countable —
+    /// which is what this is for.
+    ///
+    /// `None` for a clock-less deal (engine use / tests), which has no anchor to measure from.
+    #[must_use]
+    pub fn missed_audits(&self, height: u64, audit_period: u64) -> Option<u64> {
+        let open = self.open_height?;
+        if audit_period == 0 {
+            return None;
+        }
+        let elapsed = height.saturating_sub(open) / audit_period;
+        Some(elapsed.min(self.params.duration).saturating_sub(self.passed))
+    }
+
     /// Open a deal without a clock (engine use / tests). `None` if the duration is zero (a deal must run at least
     /// one epoch). Such a deal never auto-lapses; see [`open_at`](Self::open_at) for the ledger path.
     #[must_use]
@@ -499,5 +530,46 @@ mod tests {
         assert_eq!(deal.state(), DealState::Closed);
         assert_eq!(deal.close(), 0, "closing again refunds nothing");
         assert!(deal.settle_epoch(3, true, 0).is_none(), "a closed deal settles no further");
+    }
+
+    /// **A silent provider must be countable before the deadline, not only at it.**
+    ///
+    /// Every field on a deal advances only when `settle_epoch` runs, and that runs only on a *passing* proof.
+    /// So a provider that stops proving leaves the deal frozen and indistinguishable from one whose audits have
+    /// simply not come due — and the consumer learns nothing until `finalize_if_lapsed` fires at the full
+    /// deadline, which for a long deal is a lot of locked capital discovered late.
+    ///
+    /// Asserts the arithmetic in all three regimes, because a counter that is wrong in one of them is worse
+    /// than none: a provider proving on cadence must show zero, a silent one must accumulate, and the count
+    /// must never exceed the deal's own duration however long the chain runs past the deadline.
+    #[test]
+    fn a_silent_provider_accumulates_countable_missed_audits() {
+        const PERIOD: u64 = 64;
+        let mut deal = Deal::open_at(params(1_000, 10), 100).expect("a ten-epoch deal opens");
+
+        // Nothing due yet.
+        assert_eq!(deal.missed_audits(100, PERIOD), Some(0), "no audit is due at the open height");
+        assert_eq!(deal.missed_audits(100 + PERIOD - 1, PERIOD), Some(0), "nor just before the first is");
+
+        // Silent from the start: one missed audit per elapsed period.
+        assert_eq!(deal.missed_audits(100 + PERIOD, PERIOD), Some(1), "one period elapsed, none proven");
+        assert_eq!(deal.missed_audits(100 + 5 * PERIOD, PERIOD), Some(5), "five elapsed, none proven");
+
+        // A provider proving on cadence shows nothing missed — the counter must not fire on a good deal.
+        for k in 1..=5u64 {
+            assert!(deal.settle_epoch(100 + k * PERIOD, true, PERIOD).is_some(), "audit {k} settles");
+        }
+        assert_eq!(deal.missed_audits(100 + 5 * PERIOD, PERIOD), Some(0), "five elapsed, five proven");
+
+        // Then it goes quiet: the misses resume from where the proofs stopped.
+        assert_eq!(deal.missed_audits(100 + 8 * PERIOD, PERIOD), Some(3), "three unproven periods since");
+
+        // And the count is capped by the deal's own duration — past the deadline it cannot keep growing, or a
+        // long-running chain would report a debt the deal never owed.
+        assert_eq!(
+            deal.missed_audits(100 + 10_000 * PERIOD, PERIOD),
+            Some(5),
+            "a ten-epoch deal with five proven can never have missed more than five"
+        );
     }
 }
