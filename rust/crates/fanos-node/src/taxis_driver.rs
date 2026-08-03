@@ -48,10 +48,36 @@ use crate::crosscell_dir::publish_checkpoint;
 /// How often the driver ticks the engine — the leader proposes on a tick, so this bounds block time.
 const TICK_PERIOD: Duration = Duration::from_millis(150);
 
+/// Message delays in one consensus round: propose, prepare, commit — and the proposal's DA shards must be
+/// sampled before a validator can prepare, which is a fourth.
+///
+/// The quantity a round's cost is actually proportional to, and worth naming because it is easy to confuse
+/// with the tick count below. It is not the same number: the tick count is this plus margin.
+const ROUND_PHASES: u32 = 4;
+
+/// Ticks of slack above the phase count, before the driver decides a proposer never proposed.
+///
+/// Deliberately generous, and the asymmetry is why: waiting too long merely slows a height, while advancing
+/// too early reshuffles the leader before the in-flight round can commit — which **livelocks** it. When one
+/// direction costs latency and the other costs progress, the slack goes to the cheap side.
+const ROUND_TIMEOUT_SLACK: u32 = 6;
+
+/// How many ticks a healthy round is given before the driver decides its proposer never proposed.
+///
+/// **Composed rather than chosen**: the phases a round actually needs, plus slack. Written this way so the
+/// floor cannot be violated by editing one number — `ROUND_PHASES` is the part that follows from the protocol
+/// and `ROUND_TIMEOUT_SLACK` is the part that is judgement, and a reader can tell which is which.
+const ROUND_TIMEOUT_TICKS: u32 = ROUND_PHASES + ROUND_TIMEOUT_SLACK;
+
 /// The **base** round-timeout: how long the driver waits before injecting a `Timeout` (advancing a round whose
-/// proposer never proposed) at a fresh height. Comfortably longer than a tick so the happy path finalizes well
-/// before a round ever times out.
-const ROUND_TIMEOUT_BASE: Duration = Duration::from_millis(1_500);
+/// proposer never proposed) at a fresh height.
+///
+/// **Expressed as a multiple of [`TICK_PERIOD`], because the relationship is the point.** This used to be the
+/// literal `1_500` ms with the prose "comfortably longer than a tick" — a claim nothing enforced. Doubling
+/// `TICK_PERIOD` to 300 ms would have left this at ten ticks' worth of milliseconds but only five ticks, and
+/// "comfortably" would have quietly become "marginally" with no test and no reader the wiser. A relationship a
+/// doc *describes* is a relationship that drifts; one it *computes* cannot.
+const ROUND_TIMEOUT_BASE: Duration = TICK_PERIOD.saturating_mul(ROUND_TIMEOUT_TICKS);
 
 /// The **cap** on the adaptively-backed-off round timeout. A round that fails to finalize by its deadline
 /// doubles the next round's timeout (see `next_round_timeout`) up to this ceiling — so a genuinely slow round
@@ -64,7 +90,22 @@ const ROUND_TIMEOUT_BASE: Duration = Duration::from_millis(1_500);
 /// integration harness needs to tell "still working" apart from "wedged": a driver merely between round attempts shows no
 /// state change for just under this, so the harness's frozen threshold is derived as twice it
 /// (`tests/common::FROZEN_SPAN`) rather than picked. Changing this changes that, which is the point.
-pub const ROUND_TIMEOUT_MAX: Duration = Duration::from_secs(24);
+pub const ROUND_TIMEOUT_MAX: Duration = ROUND_TIMEOUT_BASE.saturating_mul(1 << ROUND_TIMEOUT_DOUBLINGS);
+
+/// How many times the round timeout may double before it stops.
+///
+/// The ceiling must clear the slowest round a **healthy but loaded** cell can produce, or the backoff that
+/// exists to stop premature advances starts causing them again at the top of the ladder. Measured on this
+/// codebase, a threshold gather's smoothed round trip reaches ~4 s under host contention
+/// (`GatherClock::srtt`, observed in `anonymous_quic`'s autopsy), and a round needs the propose/prepare/commit
+/// sequence plus DA sampling on top of that — so the ceiling wants to be tens of seconds, not seconds.
+///
+/// Four doublings takes the base's ten ticks to a hundred and sixty, which is 24 s at the shipped tick — clear
+/// of the `ROUND_PHASES × 4 s ≈ 16 s` a loaded round costs, with room left over.
+/// **Written as doublings rather than as `24` because the ladder must land on it exactly:** a literal ceiling
+/// that is not a whole number of doublings gives the backoff a ragged final step, shorter than the one before
+/// it, which is the opposite of what a ceiling is for.
+const ROUND_TIMEOUT_DOUBLINGS: u32 = 4;
 
 /// Cap on the tx-gossip dedup set (commitments of transactions this node has already ingested + flooded). A
 /// remote-chosen value (a sealed transaction's commitment) keys it, so it is bounded against a flood; a
@@ -910,6 +951,55 @@ pub fn spawn_checkpoint_publisher<S>(
 
 #[cfg(test)]
 mod tests {
+    /// **The consensus timing ladder must hold its own claims, not describe them.**
+    ///
+    /// `ROUND_TIMEOUT_BASE` used to be the literal `1_500` ms with the prose "comfortably longer than a tick",
+    /// and `ROUND_TIMEOUT_MAX` the literal `24` s with the prose "doubles up to this ceiling". Both claims
+    /// happened to hold at the shipped tick and nothing enforced either: doubling `TICK_PERIOD` would have
+    /// halved the base's tick count while the prose still said "comfortably", and left the ceiling on a ragged
+    /// final step shorter than the one before it.
+    ///
+    /// They are computed now, so this asserts what the computation is *for* — the reasons, which are the part
+    /// a future edit can still get wrong.
+    #[test]
+    fn the_round_timeout_ladder_holds_the_relationships_its_docs_claim() {
+        // A round is propose → prepare → commit, and DA shards must be sampled before a validator can
+        // prepare: four message delays minimum. Below that the timeout fires on rounds merely in flight, and
+        // a premature advance reshuffles the leader mid-round — which livelocks the height rather than
+        // slowing it, so this floor is the expensive one to get wrong.
+        // The phase floor needs no assertion any more: `ROUND_TIMEOUT_TICKS = ROUND_PHASES + SLACK` cannot
+        // fall below it, which is the point of composing it rather than choosing it.
+        assert_eq!(
+            ROUND_TIMEOUT_BASE,
+            TICK_PERIOD.saturating_mul(ROUND_TIMEOUT_TICKS),
+            "the base must stay a whole number of ticks, or 'comfortably longer than a tick' is prose only"
+        );
+
+        // The ladder must land on its ceiling exactly: every step is a doubling, so the ceiling is a power of
+        // two multiple of the base or the final step is shorter than the one before it.
+        assert_eq!(
+            ROUND_TIMEOUT_MAX,
+            ROUND_TIMEOUT_BASE.saturating_mul(1 << ROUND_TIMEOUT_DOUBLINGS),
+            "the ceiling must be a whole number of doublings above the base"
+        );
+
+        // And the ceiling must clear the slowest round a healthy-but-loaded cell produces, or the backoff that
+        // exists to prevent premature advances starts causing them at the top of the ladder. Measured: a
+        // threshold gather's smoothed round trip reaches ~4 s under host contention, and a round needs the
+        // full phase sequence on top of that.
+        // A round's cost is proportional to its PHASES, not to the tick count — the tick count already
+        // carries margin, and multiplying by it would demand the ceiling clear a round that never happens.
+        // (This assertion was written the wrong way first and the test caught it, which is the argument for
+        // asserting reasons rather than values.)
+        let slowest_gather = Duration::from_secs(4);
+        assert!(
+            ROUND_TIMEOUT_MAX >= slowest_gather.saturating_mul(ROUND_PHASES),
+            "the ceiling {ROUND_TIMEOUT_MAX:?} must clear a loaded round's measured cost of \
+             {ROUND_PHASES} x {slowest_gather:?}"
+        );
+    }
+
+
     use super::*;
 
     #[test]
