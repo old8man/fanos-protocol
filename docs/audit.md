@@ -1783,6 +1783,13 @@ beacon). **Fix:** port `tests/anonymous_quic.rs::anonymous_service` (169-229) in
 + an anonymous `serve_exit`, wire into `spawn_exit_role` (`node.rs:301`), and add a hidden-service CLI verb
 (`bin/fanos.rs` has only node/proxy/vpn/id/beacon-deal/resolve).
 
+**[HIGH] ~~POROS ingress: identity-binding `from == req.requester` unenforced.~~ RESOLVED** — verified against
+the tree 2026-08-03. `PorosHost::on_request` now opens with **Gate 0**: `if from != req.requester { record
+(Station::AdmissionIdentityUnbound); return }`, ahead of the PoW and Sybil gates, and the counter makes the
+refusal audible rather than silent. The fix landed in-engine rather than in `ingress_node.rs` as suggested
+below, which is the better place — the binding is then enforced for *every* caller of the host, not only for
+the one composite that happens to route to it. Original finding follows.
+
 **[HIGH] POROS ingress: identity-binding `from == req.requester` unenforced.** `on_request` (`poros.rs:625`) checks
 PoW+Sybil on `req.requester` (a frame-body field) but never against the arriving transport `from`; `IngressNode::step`
 (`ingress_node.rs:104-111`) routes by frame-type only and drops `from` (the host's own doc at `poros.rs:161-163` says the
