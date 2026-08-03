@@ -315,3 +315,34 @@ fn a_flood_of_valid_seals_cannot_grow_the_mempool_without_bound() {
     );
 }
 
+/// **Execution attestations must be bounded in both directions.**
+///
+/// `exec_votes` had exactly three sites: created empty, inserted on every attestation, and cleared only on a
+/// full state-sync adoption. `prune_recovery_retention` — whose own doc opens "one rule, one place, because
+/// there is only one horizon" — did not list it. So the map grew with chain height for the process's whole
+/// life even with no adversary, and a Byzantine committee member (authenticated: `on_exec_vote` verifies the
+/// voter and the signature, and applies no height bound) could sign attestations for arbitrarily many heights,
+/// each costing an entry holding an ML-DSA signature.
+///
+/// Both directions asserted, because closing one alone leaves the other open: the horizon prunes at and below
+/// the floor, and forged heights sit *above* it.
+#[test]
+fn execution_attestations_are_bounded_above_and_below() {
+    let cap = fanos_taxis::consensus::EXEC_VOTE_HEIGHTS;
+    let mut cell: Cell<CrossAccounts> = Cell::new(&CrossAccounts::default(), 0x5B);
+    let keys = gen_keys(0x5B);
+
+    // A committee member streams AUTHENTIC attestations for heights the chain will never reach. Authentic is
+    // the point: `on_exec_vote` verifies the voter and the signature, so this is not a forgery being caught —
+    // it is a real member the map had no bound against.
+    for h in 0..(cap as u64 + 512) {
+        let vote = ExecVote::sign(h, [0xAB; 32], [0xCD; 32], 1, &keys[1].sig);
+        cell.engines[0].step(Input::ExecVote(vote));
+    }
+    let held = cell.engines[0].probe().exec_vote_heights;
+    assert!(
+        held <= cap,
+        "a member signing attestations for arbitrary heights must not grow the map without bound: {held} > {cap}"
+    );
+}
+

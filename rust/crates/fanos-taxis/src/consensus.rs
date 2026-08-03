@@ -136,6 +136,15 @@ pub struct ConsensusProbe {
     pub cc_rejects: (u64, u64, u64),
     /// Round-synchronization jumps and the total rounds they skipped.
     pub round_jumps: (u64, u64),
+    /// Distinct heights holding execution attestations — the third bounded retention, and the one that used to
+    /// have no bound at all.
+    ///
+    /// Reported beside the other two because it fails differently: the mempool and the deferral clocks grow
+    /// with *load*, while this grew with **chain height**, forever, adversary or not. A value pinned at
+    /// [`EXEC_VOTE_HEIGHTS`] is a validator being fed attestations for heights the chain has not reached —
+    /// which is either a badly lagging peer or a member forging them, and both are worth an operator's
+    /// attention where an unbounded map gave them only a memory graph.
+    pub exec_vote_heights: usize,
     /// `(mempool depth, live deferral clocks)` — the backlog pressure an operator otherwise cannot see.
     ///
     /// The pair, not either alone, because it is their **relationship** that is diagnostic. A mempool that grows
@@ -760,6 +769,18 @@ const RECENT_BODY_CAP: usize = 64;
 /// will spend holding transactions it cannot yet order.
 pub const MEMPOOL_CAP: usize = 4096;
 
+/// How many distinct heights of execution attestations a validator retains above its checkpoint.
+///
+/// The checkpoint horizon prunes everything at or below the floor, which closes the honest leak; this bounds
+/// what sits *above* it, where a Byzantine committee member can place attestations for heights the chain has
+/// not reached. Kept in units of heights rather than bytes because that is what the attack multiplies.
+///
+/// A **policy** number (`docs/design-constants.md` kind 4): how many not-yet-certified heights a validator
+/// will hold attestations for while catching up. It is generous relative to any real gap between a quorum's
+/// executions — a certificate forms from votes at ONE height, so the working set is a handful, and the rest of
+/// the budget exists so a genuinely lagging peer's catch-up is not the thing that gets evicted.
+pub const EXEC_VOTE_HEIGHTS: usize = 1024;
+
 /// How many premature-transaction give-up clocks a validator tracks at once (see `deferred_since`).
 ///
 /// **What happens AT the bound is the whole design, and it is fail-closed.** A clock is what lets a deferred
@@ -1334,6 +1355,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             votes_off_height: self.votes_off_height,
             round_jumps: self.round_jumps,
             backlog: (self.mempool.len(), self.deferred_since.len()),
+            exec_vote_heights: self.exec_votes.len(),
             voters_above: {
                 let h = self.height();
                 let mut seen = BTreeSet::new();
@@ -2824,9 +2846,25 @@ impl<S: StateMachine> ConsensusEngine<S> {
     }
 
     /// Store an execution vote and, if a quorum now agrees on a root at that height, advance the checkpoint.
+    ///
+    /// Bounded above as well as below. `on_exec_vote` authenticates the voter and verifies the signature, and
+    /// then applies **no height bound** — so a Byzantine committee member could sign attestations for
+    /// arbitrarily many heights, each costing an entry holding an ML-DSA signature. Authenticated-but-unbounded
+    /// is audit B1's shape, and the checkpoint horizon alone does not close it, since forged heights sit
+    /// *above* the floor where the prune cannot reach.
+    ///
+    /// **Evicting the lowest is not a choice here.** The checkpoint is monotone, so among heights not yet
+    /// certified it is the low ones that stop mattering first, and a far-ahead certificate is precisely what a
+    /// lagging validator needs. That is the opposite of the mempool ([`MEMPOOL_CAP`]), where nothing about a
+    /// sealed transaction is visible before reveal and so there is no honest ordering to evict by — the rule
+    /// differs because the information does.
     fn record_exec_vote(&mut self, vote: ExecVote) {
         let height = vote.height;
         self.exec_votes.entry(height).or_default().entry(vote.voter).or_insert(vote);
+        while self.exec_votes.len() > EXEC_VOTE_HEIGHTS {
+            let Some(&lowest) = self.exec_votes.keys().next() else { break };
+            self.exec_votes.remove(&lowest);
+        }
         self.try_form_checkpoint(height);
     }
 
@@ -2919,6 +2957,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let Some(floor) = self.checkpoint.as_ref().map(|c| c.height) else { return };
         self.sync_heads.retain(|&h, _| h >= floor);
         self.certified.retain(|&h, _| h >= floor);
+        // Execution attestations belong to the same horizon and were missing from it — a retention this rule
+        // claims to cover ("one rule, one place, because there is only one horizon") while `exec_votes` grew
+        // for the process's whole life. `try_form_checkpoint` returns early once `checkpoint.height >= height`,
+        // so a vote at or below the floor can never form a NEWER certificate: it is dead weight by
+        // construction, not merely old.
+        self.exec_votes.retain(|&h, _| h > floor);
         let live: BTreeSet<[u8; 32]> = self.sync_heads.values().map(|(r, _)| *r).collect();
         self.sync_states.retain(|r, _| live.contains(r));
         let stale: Vec<[u8; 32]> =
