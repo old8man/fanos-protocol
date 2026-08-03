@@ -30,6 +30,20 @@ So the rule is not "derive everything". It is: **declare the kind, and meet that
 | **Measured** | Its correct value depends on the environment it runs in. | **It must not be a constant.** It must be an estimator over observation; a constant may survive only as a *bound* on that estimator, and the bound needs its own derivation. |
 | **Policy** | A genuine operator input — a target, a horizon, a budget. | Named as policy, documented in the form an operator can reason about, and **few**. If there are many, most are misclassified. |
 
+Policy splits once more, and the split has teeth. A **published contract** — policy that third parties have
+been told and now depend on — carries an obligation the others do not: it must be *honoured*, not merely
+justified, and it therefore **cannot adapt**. `STORE_TIMEOUT` is one: its own doc says "public because it is a
+contract an embedder needs; the C ABI's `fanos_lookup`/`fanos_publish` bound themselves by it, and a foreign
+caller has no other way to know that a store call returns." A measured estimator in its place would be a
+better *number* and a broken *promise*.
+
+The consequence worth knowing before deriving anything from one: **a contract bounds the worst supported
+deployment, an estimator tracks the typical one.** So a contract is the right base for a *duty-cycle* bound and
+the wrong base for a *latency-tracking* one. `ROSTER_REFRESH = 3 × STORE_TIMEOUT` is the right use, and says
+so — "one assignment costs up to one `STORE_TIMEOUT`, so a 3× period bounds the refresh at a 1/3 duty cycle."
+Reading that as "three times how long a store read takes" would be the category error, and would make the
+constant look absurdly conservative rather than exactly right.
+
 **A constant that cannot be classified is itself the finding.** That is the useful output of applying this
 rule: not the reclassification, but the ones that resist it.
 
@@ -142,7 +156,19 @@ Recorded so the pass is re-runnable and its coverage is legible, not just its fi
 - **Not attack surfaces** — `fanos-onoma`'s registries are operator-populated, `fanos-thesauros`'s chunk
   vectors are per-object.
 
-## 7. Applying it
+## 7. Pass C's first slice — and a naming hazard
+
+Two constants named **`FROZEN_SPAN`** exist, in two harnesses, derived from different roots and meaning
+different things:
+
+- `fanos-node/tests/common` — `2 × ROUND_TIMEOUT_MAX` (48 s), the patience for a *consensus*-driven wait;
+- `fanos-sim/fabric` — `2 × ROSTER_REFRESH` (30 s), the patience for a *role-assignment* wait.
+
+Both are individually well derived. Together they are a trap: a reader who learns one and meets the other will
+carry the wrong number, and neither name says which span it is. Same name, different quantity, no way to tell
+from the call site. Worth renaming to what each actually bounds.
+
+## 8. Applying it
 
 Highest risk first; do not sweep 811 entries blindly.
 
