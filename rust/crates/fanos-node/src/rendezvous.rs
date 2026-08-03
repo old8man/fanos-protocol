@@ -330,8 +330,14 @@ pub fn anonymous_dial<R: CryptoRng>(
     // drawn intermediate reply hops are kept; only the terminus becomes the own line.
     let mut reply_circuit = route.reply_circuit.clone();
     if let Some(point) = Point::<F2>::new(client.address()) {
-        let drop_line =
-            select_drop_line(point, secret, route.epoch.get(), route.beacon.as_bytes()).coords();
+        // Sealable, because this line REPLACES the `reply_rendezvous` the route draw already checked — an
+        // unchecked overwrite of a checked choice, which is the sharpest form of the same defect
+        // `random_hops` had. The service seals every reply along this circuit and this line is its last hop,
+        // so a member missing from the directory is a reply path that carries nothing, forever, in silence.
+        let drop_line = select_drop_line(point, secret, route.epoch.get(), route.beacon.as_bytes(), |l| {
+            line_is_sealable::<F2>(l.coords(), &route.directory)
+        })
+        .coords();
         match reply_circuit.last_mut() {
             Some(last) => *last = drop_line,
             None => reply_circuit.push(drop_line),

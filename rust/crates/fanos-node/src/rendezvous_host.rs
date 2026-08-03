@@ -438,7 +438,16 @@ async fn rotate_host(
     }
     let Some(point) = Point::<F2>::new(coord) else { return };
     // The dead-drop line: beacon-blinded, through this node's own point — forwarded requests come home here.
-    let drop_line = select_drop_line(point, host_secret, epoch.get(), &seed).coords();
+    // Sealable against the epoch's directory, or `HostRegister::onion` below returns `None` and this
+    // function silently returns — leaving the service unregistered for the whole epoch because one member of
+    // one line happened to be absent. Choosing a usable line is the difference between a service that is
+    // reachable and one that is quietly not there.
+    let drop_line = select_drop_line(point, host_secret, epoch.get(), &seed, |l| {
+        line_member_coords::<F2>(l.coords())
+            .iter()
+            .all(|m| dir.get(m).is_some())
+    })
+    .coords();
     // A fresh per-epoch dead-drop reply keypair (deterministic in secret+epoch), advertised in the
     // registration and handed to the accept loop to open forwarded requests.
     let (reply_keys, reply_pub) = ReplyKeys::generate(&epoch_seed(host_secret, epoch, b"reply"));
