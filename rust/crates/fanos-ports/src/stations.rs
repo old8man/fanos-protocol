@@ -214,6 +214,22 @@ pub enum Station {
     AdmissionSybilCapped,
     /// Admission refused for want of a gather slot — capacity, not policy.
     AdmissionNoCapacity,
+    /// A descriptor share arrived that does **not** open its dealt per-share commitment: not a decode error
+    /// and not a stale epoch, but a value provably different from the one the dealer handed that member.
+    ///
+    /// This is the only station in the table that is *evidence of forgery* rather than of failure. Lagrange
+    /// interpolation is linear, so a single line member can add a chosen offset to the reconstructed secret;
+    /// the per-share commitment is what turns that from an undetected substitution into a rejected frame,
+    /// and this counter is what turns a rejected frame into something an operator can see.
+    ShareOffCommitment,
+    /// A threshold of shares reconstructed, but no admissible subset of them produced the **committed**
+    /// descriptor — so nothing was served.
+    ///
+    /// Distinct from a gather that merely did not fill: this one *had* its threshold and still could not
+    /// produce the dealt secret, which means a share it cannot individually attribute is wrong. A rotated
+    /// line is the case that reaches it, because resharing invalidates the dealt per-share commitments and
+    /// leaves only the descriptor commitment to check against.
+    DescriptorUnrecoverable,
 }
 
 impl Station {
@@ -241,6 +257,8 @@ impl Station {
         Self::AdmissionPowFailed,
         Self::AdmissionSybilCapped,
         Self::AdmissionNoCapacity,
+        Self::ShareOffCommitment,
+        Self::DescriptorUnrecoverable,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
     ];
@@ -273,6 +291,8 @@ impl Station {
             Self::AdmissionPowFailed => "admission.pow_failed",
             Self::AdmissionSybilCapped => "admission.sybil_capped",
             Self::AdmissionNoCapacity => "admission.no_capacity",
+            Self::ShareOffCommitment => "share.off_commitment",
+            Self::DescriptorUnrecoverable => "descriptor.unrecoverable",
         }
     }
 }
@@ -617,6 +637,8 @@ mod tests {
                 Station::AdmissionPowFailed => listed(Station::AdmissionPowFailed),
                 Station::AdmissionSybilCapped => listed(Station::AdmissionSybilCapped),
                 Station::AdmissionNoCapacity => listed(Station::AdmissionNoCapacity),
+                Station::ShareOffCommitment => listed(Station::ShareOffCommitment),
+                Station::DescriptorUnrecoverable => listed(Station::DescriptorUnrecoverable),
             }
         }
         // And no variant is listed twice, which would double-count it in any enumeration.

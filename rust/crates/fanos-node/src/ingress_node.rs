@@ -202,10 +202,11 @@ mod tests {
         let beacon = BeaconSeed::new([seed; 32]);
         let desc = descriptor(6);
         let randomness = vec![0x33u8; desc.to_bytes().len() + 8];
-        let shares = shard_descriptor(&desc, 1, 1, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, 1, 1, &randomness).unwrap();
         let host = PorosHost::new(
             coord,
-            shares[0].clone(),
+            dealt.shares[0].clone(),
+            dealt.binding.clone(),
             vec![coord],
             1,
             COMMUNITY.to_vec(),
@@ -260,10 +261,11 @@ mod tests {
         let beacon = BeaconSeed::new([0x44; 32]);
         let desc = descriptor(6);
         let randomness = vec![0x9u8; desc.to_bytes().len() + 8];
-        let shares = shard_descriptor(&desc, 2, 2, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, 2, 2, &randomness).unwrap();
         let host = PorosHost::new(
             coord,
-            shares[0].clone(),
+            dealt.shares[0].clone(),
+            dealt.binding.clone(),
             vec![coord, other],
             2,
             COMMUNITY.to_vec(),
@@ -321,13 +323,14 @@ mod tests {
         let old_coords: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
         let new_idx = [3usize, 4, 5];
         let new_coords: Vec<Triple> = new_idx.iter().map(|&i| Point::<F2>::at(i).coords()).collect();
-        let shares =
+        let dealt =
             shard_descriptor(&desc, t as u8, 3, &vec![0x5Au8; secret_len * (t - 1) + 8]).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
 
         // Old-line IngressNodes (host + overlay), each holding its real descriptor share.
         let old_node = |i: usize| {
             let host = PorosHost::new(
-                old_coords[i], shares[i].clone(), old_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
+                old_coords[i], shares[i].clone(), binding.clone(), old_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
             );
             let overlay = OverlayNode::<F2>::new(Point::<F2>::at(i), OverlayConfig::default());
             IngressNode::new(Box::new(overlay), host)
@@ -340,7 +343,7 @@ mod tests {
             .map(|j| {
                 let placeholder = Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]);
                 let host = PorosHost::new(
-                    new_coords[j], placeholder, new_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
+                    new_coords[j], placeholder, binding.clone(), new_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
                 )
                 .with_kem_secret(HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB1, j as u8])).0);
                 let overlay = OverlayNode::<F2>::new(Point::<F2>::at(new_idx[j]), OverlayConfig::default());

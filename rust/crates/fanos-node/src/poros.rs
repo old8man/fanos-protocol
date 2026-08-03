@@ -22,10 +22,20 @@
 //! **Threshold-hosted, so seizing the entry reveals nothing.** The ingress descriptor (the reachable
 //! entry peers) is not held by any single node: it is Shamir-**sharded across the ingress line's
 //! `q+1` members** ([`shard_descriptor`]), reconstructable only by a threshold `t` of them
-//! ([`recover_descriptor`]). Seizing `< t` members discloses neither the descriptor nor the ability
+//! ([`recover`]). Seizing `< t` members discloses neither the descriptor nor the ability
 //! to serve it — the property no prior censorship-bootstrap system provides (the audit's flagged
 //! novelty). This is the CALYPSO threshold-hosting primitive ([`fanos_calypso::hosting`]) applied to
 //! a *rotating network entry-point* rather than a ledger secret.
+//!
+//! **And committed, because confidentiality is not integrity.** Threshold hosting says a minority cannot
+//! *read* the descriptor. It says nothing about whether a minority can *change* it — and Lagrange
+//! interpolation is linear, so one member of the line could add a chosen offset to the reconstruction and
+//! make every combiner serve a descriptor of its choosing: the entry peers a whole community bootstraps
+//! from. Every other Shamir site in the platform is saved from this by accident, because it reconstructs a
+//! *key* and the AEAD tag fails on a wrong one; POROS reconstructs a *plaintext* and has no tag. So a
+//! dealing here publishes a [`DescriptorBinding`] — per-share commitments that reject a forged share at
+//! arrival, and a descriptor commitment that refuses to serve any reconstruction that is not the dealt one —
+//! and the binding is a constructor argument, never a builder method a caller can forget.
 //!
 //! **The Sybil admission is honest about what it is.** The per-request proof of work
 //! ([`solve_ingress_request`]) is a **rate-limiter, not a Sybil cap** (Boneh et al. CRYPTO'18: a
@@ -74,18 +84,163 @@ pub const INGRESS_BUCKET: usize = 3;
 const POW_LABEL: &str = "FANOS-v1/poros-admission-pow";
 /// Domain separation for the per-request bucket ranking.
 const BUCKET_LABEL: &str = "FANOS-v1/poros-bucket";
-/// Domain separation for the **descriptor commitment** — the public binding a rotated line verifies its
-/// reconstructed descriptor against, so a corrupted reshare can never serve a silently-wrong descriptor.
+/// Domain separation for the **descriptor commitment** — the public binding every line verifies its
+/// reconstructed descriptor against, so a forged or corrupted share can never serve a wrong descriptor.
 const DESCRIPTOR_COMMIT_LABEL: &str = "FANOS-v1/poros-descriptor-commit";
+/// Domain separation for a **per-share commitment**, bound to the dealing it belongs to.
+const SHARE_COMMIT_LABEL: &str = "FANOS-v1/poros-share-commit";
 
 /// The public **commitment** to an ingress descriptor: `H(descriptor bytes)`. Preimage-resistant, so it
-/// discloses nothing about the (semi-secret, per-requester-bucketed) descriptor, yet binds it — the old line
-/// publishes it, and a rotated line checks its reconstruction against it (see
-/// [`PorosHost::with_descriptor_commitment`]). Rotation preserves the descriptor, so the commitment is
-/// epoch-invariant.
+/// discloses nothing about the (semi-secret, per-requester-bucketed) descriptor, yet binds it. Rotation
+/// preserves the descriptor, so the commitment is epoch-invariant and a rotated line carries the same one.
 #[must_use]
 pub fn descriptor_commitment(descriptor: &IngressDescriptor) -> [u8; 32] {
     hash_labeled(DESCRIPTOR_COMMIT_LABEL, &descriptor.to_bytes())
+}
+
+/// The commitment to one dealt share: `H(dealing ‖ x ‖ y)`, where `dealing` is the descriptor commitment —
+/// so a share commitment belongs to exactly one dealing and cannot be spliced across epochs or communities.
+///
+/// **Unblinded, deliberately.** `pqvss` blinds its per-share commitments with a nonce so they are not a
+/// confirm-a-guess oracle for a low-entropy share. Here the share `y` is `|descriptor|` bytes of uniform
+/// `GF(256)` polynomial evaluation (for `t ≥ 2`), so there is nothing to guess; and the value an adversary
+/// would want to confirm — the descriptor — is already confirmable against the *public* descriptor
+/// commitment. A nonce would buy nothing and would have to travel with every share.
+#[must_use]
+fn share_commitment(dealing: &[u8; 32], share: &Share) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(32 + 1 + share.y().len());
+    buf.extend_from_slice(dealing);
+    buf.push(share.x());
+    buf.extend_from_slice(share.y());
+    hash_labeled(SHARE_COMMIT_LABEL, &buf)
+}
+
+/// The **public half of a descriptor dealing** — everything a line member and a combiner need to verify, and
+/// no secret at all. Published with the line's roster; safe to hand to anyone.
+///
+/// ## Why a threshold *plaintext* must carry this, and a threshold *key* need not
+///
+/// Every other Shamir reconstruction in the platform recovers a **key** and immediately AEAD-opens with it
+/// (`fanos_nyx::sheaf`, `fanos_nyx::tessera`, `fanos_calypso::hosting::SealedIntro::open`), so the AEAD tag
+/// *is* the integrity check: a wrong reconstruction cannot authenticate. POROS is the one site that
+/// reconstructs a **plaintext** — the descriptor is the shared secret, not a key — so it has no tag, and
+/// nothing detects a wrong reconstruction unless a commitment is checked.
+///
+/// That gap was not theoretical. Lagrange interpolation is linear, so a member holding one share can add a
+/// chosen offset to the reconstructed secret: knowing the true descriptor `S` (which any member learns by
+/// acting as combiner once — `on_request` lets every member serve) it sends `y' = λ⁻¹·(T ⊕ S) ⊕ y` and every
+/// other combiner reconstructs exactly `T`. One member of an ingress line therefore chose the entry peers
+/// every bootstrapping node in the community dialled. The binding is **not optional** for that reason: it is
+/// a constructor argument of [`PorosHost`], not a builder method that a caller can forget.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DescriptorBinding {
+    dealing: [u8; 32],
+    shares: Vec<[u8; 32]>,
+}
+
+impl DescriptorBinding {
+    /// The descriptor commitment `H(descriptor)` — what a reconstruction must equal.
+    #[must_use]
+    pub fn commitment(&self) -> [u8; 32] {
+        self.dealing
+    }
+
+    /// The commitment to the share at `x` (1-based line position), or `None` once the per-share commitments
+    /// are stale — see [`rotated`](Self::rotated).
+    #[must_use]
+    fn share(&self, x: u8) -> Option<[u8; 32]> {
+        self.shares.get(usize::from(x).checked_sub(1)?).copied()
+    }
+
+    /// Whether an arriving `share` opens its dealt commitment. Vacuously `true` for a
+    /// [`rotated`](Self::rotated) binding, which has no per-share commitments left to check.
+    #[must_use]
+    fn admits(&self, share: &Share) -> bool {
+        self.share(share.x()).is_none_or(|c| share_commitment(&self.dealing, share) == c)
+    }
+
+    /// The binding a **rotated** line carries: the descriptor commitment survives (resharing preserves the
+    /// secret) but the per-share commitments do not, because the new shares lie on a fresh polynomial. So a
+    /// rotated line detects a wrong reconstruction and cannot attribute it — which is precisely why
+    /// [`recover`] keeps a one-fault fallback, and why verified resharing is the follow-on.
+    #[must_use]
+    fn rotated(&self) -> Self {
+        Self { dealing: self.dealing, shares: Vec::new() }
+    }
+}
+
+/// A dealt descriptor: one secret share per line member, plus the public [`DescriptorBinding`] every member
+/// and combiner is configured with. Produced by [`shard_descriptor`].
+pub struct DealtDescriptor {
+    /// One share per line member, in line order (position = `x − 1`), each handed privately to its member.
+    pub shares: Vec<Share>,
+    /// The public bindings — published, not secret.
+    pub binding: DescriptorBinding,
+}
+
+/// What a committed reconstruction concluded.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Recovery {
+    /// Fewer than `threshold` distinct shares are in hand — nothing to decide yet.
+    BelowThreshold,
+    /// The dealt descriptor, with the `x` of the single share that had to be excluded to obtain it (`None`
+    /// when every held share lay on the committed polynomial).
+    Recovered(IngressDescriptor, Option<u8>),
+    /// A threshold was in hand and no admissible subset produced the committed descriptor.
+    Unrecoverable,
+}
+
+/// Reconstruct the ingress descriptor from held member `shares` and **verify it against `commitment`**,
+/// recovering from a single off-polynomial share.
+///
+/// A subset whose interpolation hashes to `commitment` is *the* dealt descriptor: BLAKE3 collision
+/// resistance means no other subset can match, so acceptance needs no further evidence.
+///
+/// ## Why the search stops at one exclusion
+///
+/// It is not a chosen depth. Enumerating exclusion sets of size `k` costs `C(n, k)` interpolations, so a
+/// Byzantine member that corrupts `k` shares would amplify **every** request into `Θ(n^k)` combiner work —
+/// recovery would itself become the cheapest denial-of-service against the line it protects. Depth one is
+/// `n + 1` interpolations, linear in the line, and therefore the deepest search that is not an amplifier.
+///
+/// It is also exactly enough where the platform ships: the Fano ingress line has `n = q + 1 = 3` members at
+/// `t = 2`, so its serving fault budget is `n − t = 1` and drop-one covers the whole of it. On a larger
+/// plane the budget is `⌊(q+1)/3⌋ > 1`, and the answer there is **not** a deeper search but the per-share
+/// commitments in [`DescriptorBinding`], which reject a forged share at arrival in `O(1)` each and never
+/// interpolate at all. The residual is a line that has already *rotated* (per-share commitments are stale
+/// after resharing) and holds more than one corrupt share: it fails safe as [`Recovery::Unrecoverable`],
+/// and verified resharing is the follow-on that closes it.
+#[must_use]
+pub fn recover(shares: &[Share], threshold: usize, commitment: &[u8; 32]) -> Recovery {
+    let held: Vec<&Share> = {
+        let mut seen = BTreeSet::new();
+        shares.iter().filter(|s| seen.insert(s.x())).collect()
+    };
+    if held.len() < threshold {
+        return Recovery::BelowThreshold;
+    }
+    let attempt = |subset: Vec<Share>| -> Option<IngressDescriptor> {
+        let bytes = recover_service_key(&subset).ok()?;
+        let descriptor = IngressDescriptor::from_bytes(&bytes)?;
+        (descriptor_commitment(&descriptor) == *commitment).then_some(descriptor)
+    };
+    let all: Vec<Share> = held.iter().map(|s| (*s).clone()).collect();
+    if let Some(descriptor) = attempt(all) {
+        return Recovery::Recovered(descriptor, None);
+    }
+    // One exclusion. Only reachable when dropping still leaves a threshold, which is exactly the line's own
+    // spare capacity — below that there is nothing to try and the gather is simply short.
+    if held.len() > threshold {
+        for skip in 0..held.len() {
+            let subset: Vec<Share> =
+                held.iter().enumerate().filter(|(i, _)| *i != skip).map(|(_, s)| (*s).clone()).collect();
+            if let Some(descriptor) = attempt(subset) {
+                let excluded = held.get(skip).map(|s| s.x());
+                return Recovery::Recovered(descriptor, excluded);
+            }
+        }
+    }
+    Recovery::Unrecoverable
 }
 
 /// The moving-target **ingress line** for a community sharing `community`, at `epoch` folded with the
@@ -258,7 +413,7 @@ pub fn verify_ingress_request(
 
 /// The **ingress descriptor** — the reachable entry peers a new node bootstraps from. It is never held
 /// whole by any single node: it is threshold-sharded across the ingress line's members
-/// ([`shard_descriptor`]) and reconstructed only by a threshold of them ([`recover_descriptor`]).
+/// ([`shard_descriptor`]) and reconstructed only by a threshold of them ([`recover`]).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct IngressDescriptor {
     /// The reachable entry peers (a community's ingress set).
@@ -306,6 +461,10 @@ impl IngressDescriptor {
 /// is handed to one line member; seizing `< threshold` members reveals nothing about the entry peers.
 /// `randomness` supplies the sharing polynomial (a CSPRNG draw in production).
 ///
+/// Returns the shares **and** the public [`DescriptorBinding`] — together, because a dealing that hands out
+/// shares without publishing what they must open to has no integrity at all, and the two are only ever
+/// correct as a pair.
+///
 /// # Errors
 /// Returns `None` if the Shamir parameters are invalid (`threshold` zero or exceeding `line_size`).
 #[must_use]
@@ -314,17 +473,11 @@ pub fn shard_descriptor(
     threshold: u8,
     line_size: u8,
     randomness: &[u8],
-) -> Option<Vec<Share>> {
-    shard_service_key(&descriptor.to_bytes(), threshold, line_size, randomness).ok()
-}
-
-/// Reconstruct the ingress descriptor from `threshold` (or more) member shares — the combiner's step
-/// once it has gathered a threshold of partials. `None` if fewer than the threshold are supplied, the
-/// shares are inconsistent, or the reconstructed bytes are not a valid descriptor.
-#[must_use]
-pub fn recover_descriptor(shares: &[Share]) -> Option<IngressDescriptor> {
-    let bytes = recover_service_key(shares).ok()?;
-    IngressDescriptor::from_bytes(&bytes)
+) -> Option<DealtDescriptor> {
+    let shares = shard_service_key(&descriptor.to_bytes(), threshold, line_size, randomness).ok()?;
+    let dealing = descriptor_commitment(descriptor);
+    let commitments = shares.iter().map(|s| share_commitment(&dealing, s)).collect();
+    Some(DealtDescriptor { shares, binding: DescriptorBinding { dealing, shares: commitments } })
 }
 
 /// **One old line member's resharing contribution** when the ingress line rotates for a new epoch: a fresh
@@ -474,6 +627,13 @@ struct PendingServe {
     /// When the share requests went out — a completed gather yields `now − armed_at` as one latency
     /// sample for the measured deadline ([`GatherClock`]).
     armed_at: Instant,
+    /// Set once this gather has reached a threshold and failed to produce the committed descriptor.
+    ///
+    /// Its expiry must **not** widen the measured deadline. `GatherClock::expired` reads a timeout as "the
+    /// line was too slow for the load this node is under" and backs off; a corrupted gather was not slow, and
+    /// letting it feed the estimator would let one Byzantine member push every honest gather's deadline to
+    /// its ceiling — an attack on the clock, disguised as congestion.
+    unrecoverable: bool,
 }
 
 /// One member of a **threshold-hosted POROS ingress line**, as a sans-I/O engine. It holds only *one*
@@ -485,7 +645,7 @@ struct PendingServe {
 ///    [`IngressRequest`]) to the [`ingress_combiner`]. The combiner verifies the PoW, seeds its own
 ///    share, and fans a [`PorosShareReq`](FrameType::PorosShareReq) (the requester tag) to the line.
 /// 2. Each member replies with its descriptor share in a [`PorosShare`](FrameType::PorosShare).
-/// 3. Once the combiner holds `≥ t` shares it reconstructs the descriptor ([`recover_descriptor`]),
+/// 3. Once the combiner holds `≥ t` shares it reconstructs the descriptor ([`recover`]),
 ///    buckets it for the requester, and sends the [`PorosResponse`](FrameType::PorosResponse). It then
 ///    discards the reconstructed descriptor — the at-rest "seize `< t` reveals nothing" property is
 ///    unchanged; only a transient serve-time reconstruction ever lives at the combiner.
@@ -523,11 +683,11 @@ pub struct PorosHost {
     // `PorosReshare` sub-shares are opened + gathered here, and a threshold of them combines into this host's
     // rotated share (then adopted). `None` outside a rotation.
     rotation: Option<RotationCtx>,
-    // The public commitment `H(descriptor)` this host verifies every reconstruction against
-    // ([`with_descriptor_commitment`](Self::with_descriptor_commitment)): a reconstructed descriptor that does
-    // not match is NEVER served, so a corrupted reshare (or a tampered share set) fails safe. `None` ⇒ no
-    // verification (the pre-commitment default, for a host whose descriptor is not yet committed).
-    descriptor_commitment: Option<[u8; 32]>,
+    // The dealing's public bindings — MANDATORY, because a threshold plaintext has no AEAD tag to fail on a
+    // wrong reconstruction and Lagrange is linear (see [`DescriptorBinding`]). Per-share commitments reject a
+    // forged share at arrival; the descriptor commitment refuses to serve any reconstruction that is not the
+    // dealt one. Rotation keeps the second and drops the first.
+    binding: DescriptorBinding,
 }
 
 /// The receive-side state of a POROS line rotation: this host is a member of the incoming `new_line` for
@@ -544,14 +704,21 @@ struct RotationCtx {
 }
 
 impl PorosHost {
-    /// A line member at `coord` holding its dealt descriptor `share`, hosting the ingress
-    /// `threshold`-of-`line.len()` for `(community, epoch, beacon)` at PoW `difficulty`. `line` is every
-    /// member's coordinate in the order [`shard_descriptor`] dealt shares (position = share index).
+    /// A line member at `coord` holding its dealt descriptor `share` and the dealing's public `binding`,
+    /// hosting the ingress `threshold`-of-`line.len()` for `(community, epoch, beacon)` at PoW `difficulty`.
+    /// `line` is every member's coordinate in the order [`shard_descriptor`] dealt shares (position = share
+    /// index).
+    ///
+    /// The `binding` is an argument rather than a builder method on purpose: it is the only thing standing
+    /// between this line and one of its own members choosing the entry peers the community bootstraps from
+    /// ([`DescriptorBinding`]), and a security property a caller can forget to opt into is one that will be
+    /// absent in production.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         coord: Triple,
         share: Share,
+        binding: DescriptorBinding,
         line: Vec<Triple>,
         threshold: usize,
         community: Vec<u8>,
@@ -577,7 +744,7 @@ impl PorosHost {
             admitted: None,
             kem_secret: None,
             rotation: None,
-            descriptor_commitment: None,
+            binding,
         }
     }
 
@@ -586,17 +753,6 @@ impl PorosHost {
     #[must_use]
     pub fn with_kem_secret(mut self, kem_secret: HybridKemSecret) -> Self {
         self.kem_secret = Some(kem_secret);
-        self
-    }
-
-    /// Bind this host to the public **descriptor commitment** `H(descriptor)`
-    /// ([`descriptor_commitment`]): every reconstruction it serves is checked against it, so a corrupted
-    /// reshare (a Byzantine old member's poisoned sub-share) or a tampered share set can never yield a
-    /// silently-wrong served descriptor — the serve fails safe instead. The commitment is epoch-invariant
-    /// (rotation preserves the descriptor), so a rotated host carries the same one.
-    #[must_use]
-    pub fn with_descriptor_commitment(mut self, commitment: [u8; 32]) -> Self {
-        self.descriptor_commitment = Some(commitment);
         self
     }
 
@@ -743,7 +899,7 @@ impl PorosHost {
     /// Sender authentication closes the spoof hole: a `PorosReshare` from any coordinate other than the old
     /// member it claims (`old_x`) is dropped, so an outsider cannot inject a sub-share. A *genuine but
     /// Byzantine* old member's corrupt sub-share still combines here, but a rotated line NEVER serves a
-    /// descriptor that fails its [`with_descriptor_commitment`](Self::with_descriptor_commitment) check — so
+    /// descriptor that fails its [`DescriptorBinding`] check — so
     /// corruption is fail-safe (detected at serve, never a wrong descriptor). Robust recovery from such a
     /// Byzantine contributor (attribute + retry a different old-member subset) is the VSS follow-on.
     fn on_reshare(&mut self, from: Triple, target_epoch: Epoch, old_x: u8, sealed: &SealedShare) -> Vec<Effect> {
@@ -789,6 +945,10 @@ impl PorosHost {
         self.share = share;
         self.rotation = None;
         self.pending.clear();
+        // The per-share commitments described the OLD polynomial; the rotated shares lie on a fresh one, so
+        // they no longer bind anything and keeping them would reject every honest share. The descriptor
+        // commitment survives, because resharing preserves the secret it commits to.
+        self.binding = self.binding.rotated();
     }
 
     /// A request arrived at us as the combiner: verify its PoW, seed our own share, fan share-requests to
@@ -833,7 +993,7 @@ impl PorosHost {
         self.seq = self.seq.wrapping_add(1);
         effects.push(Effect::ArmTimer { token: timer, after: self.gather_deadline() });
         let requester = req.requester;
-        self.pending.insert(requester, PendingServe { req, shares, timer, armed_at: now });
+        self.pending.insert(requester, PendingServe { req, shares, timer, armed_at: now, unrecoverable: false });
         effects.extend(self.try_serve(now, requester));
         effects
     }
@@ -847,36 +1007,56 @@ impl PorosHost {
         }]
     }
 
-    /// A member's descriptor share arrived: fold it into the matching gather and retry.
+    /// A member's descriptor share arrived: **check it against its dealt commitment**, fold it into the
+    /// matching gather, and retry.
+    ///
+    /// The check is at arrival rather than at reconstruction because that is what preserves liveness: a
+    /// forged share never enters the gather, so the gather can still fill from the line's honest members and
+    /// serve normally. Rejecting it later would mean the gather holds a threshold it cannot use.
     fn on_share(&mut self, now: Instant, requester: Triple, share: Share) -> Vec<Effect> {
+        if !self.binding.admits(&share) {
+            // Provably not the value the dealer handed that member — evidence of forgery, not of failure.
+            self.stations.record(Station::ShareOffCommitment, None);
+            return Vec::new();
+        }
         let Some(pending) = self.pending.get_mut(&requester) else {
+            self.stations.record(Station::ShareForUnknownRequest, None);
             return Vec::new();
         };
         pending.shares.entry(share.x()).or_insert(share);
         self.try_serve(now, requester)
     }
 
-    /// If the gather for `requester` holds a threshold of shares, reconstruct the descriptor, bucket it,
-    /// and send the response; else leave it pending. A failed reconstruction awaits more shares.
+    /// If the gather for `requester` holds a threshold of shares, reconstruct the **committed** descriptor,
+    /// bucket it, and send the response; else leave it pending.
     fn try_serve(&mut self, now: Instant, requester: Triple) -> Vec<Effect> {
         let Some(pending) = self.pending.get(&requester) else {
             return Vec::new();
         };
-        if pending.shares.len() < self.threshold {
-            return Vec::new();
-        }
         let shares: Vec<Share> = pending.shares.values().cloned().collect();
-        let Some(descriptor) = recover_descriptor(&shares) else {
+        let descriptor = match recover(&shares, self.threshold, &self.binding.commitment()) {
+            Recovery::BelowThreshold => return Vec::new(),
+            Recovery::Recovered(descriptor, excluded) => {
+                if excluded.is_some() {
+                    // Recovered by dropping one share, so a share this host could not reject at arrival was
+                    // wrong — the post-rotation case, where the per-share commitments are stale.
+                    self.stations.record(Station::ShareOffCommitment, None);
+                }
+                descriptor
+            }
+            Recovery::Unrecoverable => {
+                self.stations.record(Station::DescriptorUnrecoverable, None);
+                // Keep gathering — a later share may complete an admissible subset — but mark the gather so
+                // its expiry does not back off the measured deadline. It was corrupted, not slow.
+                if let Some(p) = self.pending.get_mut(&requester) {
+                    p.unrecoverable = true;
+                }
+                return Vec::new();
+            }
+        };
+        let Some(pending) = self.pending.get(&requester) else {
             return Vec::new();
         };
-        // Fail-safe verification: if this host is bound to a descriptor commitment, a reconstruction that does
-        // not match it (a corrupted reshare, or a tampered/inconsistent share set) is NEVER served — the serve
-        // silently drops instead of handing back a wrong ingress set.
-        if let Some(commit) = self.descriptor_commitment
-            && descriptor_commitment(&descriptor) != commit
-        {
-            return Vec::new();
-        }
         let response = IngressResponse { peers: descriptor.bucket(&pending.req) };
         let armed_at = pending.armed_at;
         self.pending.remove(&requester);
@@ -901,10 +1081,17 @@ impl PorosHost {
             .find(|(_, p)| p.timer == token)
             .map(|(r, _)| r)
         {
-            self.pending.remove(&requester);
-            self.gather.expired();
+            let corrupted = self.pending.remove(&requester).is_some_and(|p| p.unrecoverable);
             let line = self.line_coords();
-            self.stations.record(Station::GatherExpired, Some(line));
+            if corrupted {
+                // The line answered and its answers were wrong. Backing off here would let one Byzantine
+                // member drive every honest gather's deadline to its ceiling by feeding the estimator a
+                // timeout per request — congestion control taking dictation from an adversary.
+                self.stations.record(Station::GatherUnpeelable, Some(line));
+            } else {
+                self.gather.expired();
+                self.stations.record(Station::GatherExpired, Some(line));
+            }
         }
         Vec::new()
     }
@@ -1046,11 +1233,13 @@ mod tests {
         let beacon = BeaconSeed::new([0x5c; 32]);
         let line: Vec<Triple> = (0..3).map(coord).collect();
         let randomness = vec![0x2Bu8; desc.to_bytes().len() * (threshold - 1) + 8];
-        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
         let admitted = coord(4);
         let mut host = PorosHost::new(
             line[0],
             shares[0].clone(),
+            binding.clone(),
             line.clone(),
             threshold,
             community.clone(),
@@ -1174,17 +1363,23 @@ mod tests {
         // Byte-wise Shamir needs (threshold-1) random bytes per secret byte; size the polynomial
         // randomness to the descriptor length (a CSPRNG draw in production).
         let randomness = vec![0x5Au8; desc.to_bytes().len() * usize::from(threshold - 1) + 8];
-        let shares = shard_descriptor(&desc, threshold, line_size, &randomness).expect("valid sharing");
+        let dealt = shard_descriptor(&desc, threshold, line_size, &randomness).expect("valid sharing");
+        let (shares, binding) = (dealt.shares, dealt.binding);
         assert_eq!(shares.len(), usize::from(line_size), "one share per line member");
 
         // Any threshold of members reconstructs the exact descriptor.
-        assert_eq!(recover_descriptor(&shares[0..2]), Some(desc.clone()), "members 0,1 reconstruct");
-        assert_eq!(recover_descriptor(&shares[1..3]), Some(desc.clone()), "members 1,2 reconstruct");
+        let commit = binding.commitment();
+        let got = |sub: &[Share]| recover(sub, usize::from(threshold), &commit);
+        assert_eq!(got(&shares[0..2]), Recovery::Recovered(desc.clone(), None), "members 0,1 reconstruct");
+        assert_eq!(got(&shares[1..3]), Recovery::Recovered(desc.clone(), None), "members 1,2 reconstruct");
 
         // A single seized share cannot reconstruct — recovery of a 1-subset does not yield the descriptor.
         // (Shamir needs `threshold` distinct shares; one is below threshold.)
-        let one = recover_descriptor(&shares[0..1]);
-        assert_ne!(one, Some(desc.clone()), "one seized share does not disclose the entry peers");
+        assert_eq!(
+            got(&shares[0..1]),
+            Recovery::BelowThreshold,
+            "one seized share does not disclose the entry peers",
+        );
     }
 
     #[test]
@@ -1216,11 +1411,13 @@ mod tests {
         let beacon = BeaconSeed::new([0x33; 32]);
         let line: Vec<Triple> = (0..3).map(coord).collect();
         let randomness = vec![0x21u8; desc.to_bytes().len() * (threshold - 1) + 8];
-        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
         let host = |i: usize| {
             PorosHost::new(
                 line[i],
                 shares[i].clone(),
+                binding.clone(),
                 line.clone(),
                 threshold,
                 community.clone(),
@@ -1297,10 +1494,12 @@ mod tests {
         let beacon = BeaconSeed::GENESIS;
         let line: Vec<Triple> = (0..3).map(coord).collect();
         let randomness = vec![0x9u8; desc.to_bytes().len() * (threshold - 1) + 8];
-        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
         let mut combiner = PorosHost::new(
             line[0],
             shares[0].clone(),
+            binding.clone(),
             line.clone(),
             threshold,
             community.clone(),
@@ -1347,7 +1546,8 @@ mod tests {
         let beacon = BeaconSeed::new([0x44; 32]);
         let line: Vec<Triple> = (0..3).map(coord).collect();
         let randomness = vec![0x11u8; desc.to_bytes().len() * (threshold - 1) + 8];
-        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
 
         // A distinct identity coordinate per trust node (the Fano `coord` helper only has 7 points; a real
         // requester's VRF-identity coordinate lives in a large space — an opaque [u32;3] key for the gate).
@@ -1383,6 +1583,7 @@ mod tests {
         let mut combiner = PorosHost::new(
             line[0],
             shares[0].clone(),
+            binding.clone(),
             line.clone(),
             threshold,
             community.clone(),
@@ -1423,10 +1624,12 @@ mod tests {
         let beacon = BeaconSeed::new([0x2C; 32]);
         let line: Vec<Triple> = (0..3).map(coord).collect();
         let randomness = vec![0x3Du8; desc.to_bytes().len() * (threshold - 1) + 8];
-        let shares = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
         let mut combiner = PorosHost::new(
             line[0],
             shares[0].clone(),
+            binding.clone(),
             line.clone(),
             threshold,
             community.clone(),
@@ -1509,8 +1712,9 @@ mod tests {
         let (old_t, old_n) = (2u8, 3u8);
         let (new_t, new_n) = (2u8, 3u8);
         let secret_len = desc.to_bytes().len();
-        let old_shares =
+        let dealt =
             shard_descriptor(&desc, old_t, old_n, &vec![0x5Au8; secret_len * usize::from(old_t - 1) + 8]).unwrap();
+        let (old_shares, commit) = (dealt.shares, dealt.binding.commitment());
 
         // A threshold subset of the OLD line (members at x = 1, 2) each reshare their own share to the new line.
         let old_xs = [old_shares[0].x(), old_shares[1].x()];
@@ -1535,13 +1739,17 @@ mod tests {
 
         // The NEW line recovers the SAME descriptor from any threshold of its rotated shares.
         assert_eq!(
-            recover_descriptor(&[new_shares[0].clone(), new_shares[2].clone()]).as_ref(),
-            Some(&desc),
+            recover(&[new_shares[0].clone(), new_shares[2].clone()], usize::from(new_t), &commit),
+            Recovery::Recovered(desc.clone(), None),
             "the new epoch line reconstructs the identical descriptor after resharing",
         );
         // Seizing < t of the new line still reveals nothing (a real threshold committee), and a stale old
         // share is not a valid point of the fresh polynomial (proactive refresh).
-        assert_ne!(recover_descriptor(&[new_shares[0].clone()]).as_ref(), Some(&desc), "one new share reveals nothing");
+        assert_eq!(
+            recover(&[new_shares[0].clone()], usize::from(new_t), &commit),
+            Recovery::BelowThreshold,
+            "one new share reveals nothing",
+        );
         assert_ne!(new_shares[0].y(), old_shares[0].y(), "the rotated share is on a fresh polynomial, not a copy");
     }
 
@@ -1556,8 +1764,9 @@ mod tests {
         let (old_t, old_n) = (2u8, 3u8);
         let (new_t, new_n) = (2u8, 3usize);
         let secret_len = desc.to_bytes().len();
-        let old_shares =
+        let dealt =
             shard_descriptor(&desc, old_t, old_n, &vec![0x5Au8; secret_len * usize::from(old_t - 1) + 8]).unwrap();
+        let (old_shares, commit) = (dealt.shares, dealt.binding.commitment());
 
         // The new line's KEM keypairs (in new-line position order).
         let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> = (0..new_n)
@@ -1589,8 +1798,8 @@ mod tests {
 
         // The new line recovers the identical descriptor from a threshold of its rotated shares.
         assert_eq!(
-            recover_descriptor(&[new_shares[0].clone(), new_shares[1].clone()]).as_ref(),
-            Some(&desc),
+            recover(&[new_shares[0].clone(), new_shares[1].clone()], usize::from(new_t), &commit),
+            Recovery::Recovered(desc.clone(), None),
             "the new line recovers the descriptor from sealed, never-in-clear sub-shares",
         );
         // The seal is real: new member 0's sub-shares cannot be opened with new member 1's secret.
@@ -1618,11 +1827,12 @@ mod tests {
         let beacon = BeaconSeed::new([0x55; 32]);
         let old_line: Vec<Triple> = (0..3).map(coord).collect();
         let new_line: Vec<Triple> = (3..6).map(coord).collect();
-        let shares = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let dealt = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
 
         // Old-line hosts, each holding its real descriptor share.
         let old_host = |i: usize| {
-            PorosHost::new(old_line[i], shares[i].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+            PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
         };
         // New-line hosts: a placeholder share (adopt replaces it), a KEM secret (to open sealed sub-shares), and
         // the rotation context set to the new line.
@@ -1633,7 +1843,7 @@ mod tests {
             .map(|j| {
                 let placeholder = Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]);
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, j as u8])).0; // same seed ⇒ same secret
-                let mut h = PorosHost::new(new_line[j], placeholder, new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                let mut h = PorosHost::new(new_line[j], placeholder, binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
                     .with_kem_secret(secret);
                 h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
@@ -1661,13 +1871,13 @@ mod tests {
         }
         // The adopted shares reconstruct the ORIGINAL descriptor — rotation preserved the hosted secret.
         assert_eq!(
-            recover_descriptor(&[new_hosts[0].share.clone(), new_hosts[1].share.clone()]).as_ref(),
-            Some(&desc),
+            recover(&[new_hosts[0].share.clone(), new_hosts[1].share.clone()], usize::from(t), &binding.commitment()),
+            Recovery::Recovered(desc.clone(), None),
             "the rotated new line hosts the identical descriptor",
         );
         // A stale sub-share for a DIFFERENT epoch is ignored (no spurious adoption / gather pollution).
         let fresh_secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, 0])).0; // new_host[0]'s secret
-        let mut fresh = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+        let mut fresh = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
             .with_kem_secret(fresh_secret);
         fresh.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
         let stale = old_host(0).emit_reshare(Epoch::new(99), &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xC0]);
@@ -1690,15 +1900,16 @@ mod tests {
         let beacon = BeaconSeed::new([0x66; 32]);
         let old_line: Vec<Triple> = (0..3).map(coord).collect();
         let new_line: Vec<Triple> = (3..6).map(coord).collect();
-        let shares = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let dealt = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
         let old_host = |i: usize| {
-            PorosHost::new(old_line[i], shares[i].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+            PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
         };
         let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x77, 0])).0;
         let new_pubs: Vec<HybridKemPublic> =
             (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x77, j as u8])).1).collect();
         let new_keys: Vec<&HybridKemPublic> = new_pubs.iter().collect();
-        let mut victim = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+        let mut victim = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
             .with_kem_secret(secret);
         victim.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
 
@@ -1717,26 +1928,25 @@ mod tests {
     fn a_corrupted_reshare_never_serves_a_wrong_descriptor_commitment_fail_safe() {
         use fanos_pqcrypto::SeedRng;
         // A Byzantine old member sends a CORRUPT sub-share (valid source, wrong value): it authenticates and
-        // combines, so the new line's rotated shares are poisoned. But every new host is bound to the descriptor
-        // commitment, so a serve that reconstructs a descriptor != H(commitment) returns NOTHING — the wrong
-        // ingress set is never handed out (fail-safe over GF(256), where per-share Feldman verification cannot
-        // apply).
+        // combines, so the new line's rotated shares are poisoned. Resharing invalidates the dealt per-share
+        // commitments — the new shares lie on a fresh polynomial — so this is the case that reaches the
+        // descriptor commitment, and it must serve NOTHING rather than a wrong ingress set.
         let desc = descriptor(6);
         let (t, n) = (2u8, 3u8);
         let secret_len = desc.to_bytes().len();
-        let commit = descriptor_commitment(&desc);
         let (old_epoch, new_epoch) = (Epoch::new(1), Epoch::new(2));
         let beacon = BeaconSeed::new([0x88; 32]);
         let old_line: Vec<Triple> = (0..3).map(coord).collect();
         let new_line: Vec<Triple> = (3..6).map(coord).collect();
-        let shares = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let dealt = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
 
         // Old member 0 is honest; old member 1 is Byzantine — it holds a CORRUPTED share (flipped bytes), so its
         // reshare contribution poisons the combination.
-        let honest0 = PorosHost::new(old_line[0], shares[0].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let honest0 = PorosHost::new(old_line[0], shares[0].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
         let mut bad_y = shares[1].y().to_vec();
         bad_y[0] ^= 0xFF;
-        let byz1 = PorosHost::new(old_line[1], Share::new(shares[1].x(), bad_y), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let byz1 = PorosHost::new(old_line[1], Share::new(shares[1].x(), bad_y), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
 
         let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> =
             (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8]))).collect();
@@ -1745,9 +1955,8 @@ mod tests {
         let mut new_hosts: Vec<PorosHost> = (0..3)
             .map(|j| {
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
-                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
-                    .with_kem_secret(secret)
-                    .with_descriptor_commitment(commit);
+                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                    .with_kem_secret(secret);
                 h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
             })
@@ -1772,15 +1981,24 @@ mod tests {
             !probe_serve(&mut new_hosts, &new_line, b"c", new_epoch, &beacon),
             "a corrupted rotation fails the commitment and serves nothing — never a wrong descriptor",
         );
+        // And it says so. Resharing poisoned *every* new share, so no subset of them is the dealt polynomial
+        // and drop-one has nothing to find — the gather names itself unrecoverable rather than presenting as
+        // a line that was merely slow. Counted once per arriving share, because each arrival is a fresh
+        // attempt that failed and the operator's question is "how much of this line's traffic is failing",
+        // not "how many requests noticed".
+        assert_eq!(
+            new_hosts[0].stations().total(Station::DescriptorUnrecoverable),
+            2,
+            "a reconstruction that cannot produce the committed descriptor must name itself, per attempt",
+        );
 
         // Control: an UNcorrupted rotation of the same committed line DOES serve (the guard is not over-eager).
-        let honest1 = PorosHost::new(old_line[1], shares[1].clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let honest1 = PorosHost::new(old_line[1], shares[1].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
         let mut good_hosts: Vec<PorosHost> = (0..3)
             .map(|j| {
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
-                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
-                    .with_kem_secret(secret)
-                    .with_descriptor_commitment(commit);
+                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                    .with_kem_secret(secret);
                 h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
             })
@@ -1797,6 +2015,229 @@ mod tests {
         assert!(
             probe_serve(&mut good_hosts, &new_line, b"c", new_epoch, &beacon),
             "an uncorrupted committed rotation still serves — the commitment guard is not over-eager",
+        );
+    }
+
+    #[test]
+    fn one_line_member_cannot_choose_the_entry_peers_a_bootstrapping_node_dials() {
+        use fanos_field::F256;
+        // **The attack this module is built against, run end to end.**
+        //
+        // Lagrange interpolation is LINEAR, so a member holding one share can add a chosen offset to the
+        // reconstructed secret:
+        //
+        //     S = λ_a·y_a ⊕ λ_b·y_b   ⇒   y_b' = λ_b⁻¹·(T ⊕ S) ⊕ y_b   makes every combiner recover T
+        //
+        // It needs only `S` — which any member learns by acting as combiner once, since `on_request` has no
+        // is-canonical check and every member can serve — and its own `y_b`. That is not corruption-as-denial:
+        // the attacker *picks* `T`, and `T` is the set of entry peers every new node in the community dials.
+        //
+        // When the descriptor binding was a builder method that defaulted to `None`, this test passed with
+        // `response.peers == evil.bucket(&req)`. It is kept in that shape — forge, deliver, then demand the
+        // committed peers — so that removing either guard makes it fail loudly rather than silently weaken.
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let community = b"steer".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 4);
+        let beacon = BeaconSeed::new([0xA5; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x3Cu8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
+
+        // The attacker's descriptor: the same shape (so the encoding is the same length), entirely its peers.
+        let evil = IngressDescriptor {
+            peers: (0..6)
+                .map(|i| Peer { coord: coord(i), addr: SocketAddr::from(([203, 0, 113, i as u8], 6666)) })
+                .collect(),
+        };
+        let (s_bytes, t_bytes) = (desc.to_bytes(), evil.to_bytes());
+        assert_eq!(s_bytes.len(), t_bytes.len(), "the forgery is length-preserving");
+
+        // The combiner is line[0] (x = 1); the Byzantine member is line[2] (x = 3). `try_serve` fires as soon
+        // as a threshold is in hand, so the subset it interpolates over is exactly {1, 3} — which the attacker,
+        // knowing the public x-coordinates, computes without asking anyone.
+        let (xa, xb) = (shares[0].x(), shares[2].x());
+        let inv = |v: u8| F256::inv(u32::from(v)) as u8;
+        let mul = |a: u8, b: u8| F256::mul(u32::from(a), u32::from(b)) as u8;
+        let lambda_b = mul(xa, inv(xa ^ xb)); // L_b(0) = x_a/(x_a − x_b), subtraction == XOR in GF(2⁸)
+        let forged = Share::new(
+            xb,
+            shares[2]
+                .y()
+                .iter()
+                .zip(s_bytes.iter().zip(&t_bytes))
+                .map(|(&yb, (&s, &t))| mul(inv(lambda_b), s ^ t) ^ yb)
+                .collect(),
+        );
+        // The forgery is arithmetically sound: interpolating {honest x=1, forged x=3} yields exactly `T`.
+        assert_eq!(
+            recover(&[shares[0].clone(), forged.clone()], threshold, &descriptor_commitment(&evil)),
+            Recovery::Recovered(evil.clone(), None),
+            "the forged share really does steer an unguarded reconstruction to the attacker's descriptor",
+        );
+
+        let host = |i: usize| {
+            PorosHost::new(
+                line[i],
+                shares[i].clone(),
+                binding.clone(),
+                line.clone(),
+                threshold,
+                community.clone(),
+                epoch,
+                beacon,
+                difficulty,
+            )
+        };
+        let mut combiner = host(0);
+        let requester = coord(5);
+        let req = solve_ingress_request(requester, &community, epoch, &beacon, difficulty);
+        let fanned = combiner.step(Instant(0), Input::Message { from: requester, frame: request_frame(&req) });
+
+        // The Byzantine member answers the share-request with its forged share.
+        let poison = encode(FrameType::PorosShare, &encode_share_reply(requester, &forged));
+        let served = combiner.step(Instant(1), Input::Message { from: line[2], frame: poison });
+        assert!(
+            served.is_empty(),
+            "a forged share must not produce a response — it does not open its dealt commitment",
+        );
+        assert_eq!(
+            combiner.stations().total(Station::ShareOffCommitment),
+            1,
+            "and the forgery is counted as forgery, not as a share that merely arrived late",
+        );
+
+        // **Liveness is preserved, which is the whole reason the check is at arrival.** The forged share never
+        // entered the gather, so the honest member's share still completes it — and the peers served are the
+        // dealt ones, not the attacker's.
+        let share_req = fanned
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == line[1] => Some(frame.clone()),
+                _ => None,
+            })
+            .expect("the combiner fanned a share-request to member 1");
+        let reply = host(1).step(Instant(2), Input::Message { from: line[0], frame: share_req });
+        let honest = reply
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if to == line[0] => Some(frame),
+                _ => None,
+            })
+            .expect("member 1 returned its descriptor share");
+        let response = combiner
+            .step(Instant(3), Input::Message { from: line[1], frame: honest })
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == requester => {
+                    let (decoded, _) = decode_frame(frame).ok()?;
+                    (decoded.frame_type() == Some(FrameType::PorosResponse))
+                        .then(|| IngressResponse::from_bytes(decoded.body))?
+                }
+                _ => None,
+            })
+            .expect("the line still serves after refusing the forgery");
+        assert_eq!(
+            response.peers,
+            desc.bucket(&req),
+            "the served peers are the DEALT ones — the Byzantine member neither steered nor denied",
+        );
+        assert_ne!(response.peers, evil.bucket(&req), "and are not the attacker's");
+    }
+
+    #[test]
+    fn a_rotated_line_still_refuses_a_steered_descriptor_with_only_the_commitment_left() {
+        use fanos_field::F256;
+        // The residual case, stated as a test. Resharing puts the new shares on a fresh polynomial, so the
+        // dealt per-share commitments no longer bind anything and `adopt` drops them — a rotated line has only
+        // the descriptor commitment left. That is weaker (it detects rather than attributes), and this pins
+        // exactly how much weaker: the steer is still refused, the line simply cannot say by whom.
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let community = b"rotated".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 4);
+        let beacon = BeaconSeed::new([0xC3; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x2Eu8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
+        let rotated = binding.rotated();
+        assert_eq!(rotated.commitment(), binding.commitment(), "rotation preserves the descriptor commitment");
+        assert!(rotated.share(1).is_none(), "and drops the per-share commitments, which no longer bind");
+
+        let evil = IngressDescriptor {
+            peers: (0..6)
+                .map(|i| Peer { coord: coord(i), addr: SocketAddr::from(([198, 51, 100, i as u8], 4444)) })
+                .collect(),
+        };
+        let (s_bytes, t_bytes) = (desc.to_bytes(), evil.to_bytes());
+        let (xa, xb) = (shares[0].x(), shares[2].x());
+        let inv = |v: u8| F256::inv(u32::from(v)) as u8;
+        let mul = |a: u8, b: u8| F256::mul(u32::from(a), u32::from(b)) as u8;
+        let lambda_b = mul(xa, inv(xa ^ xb));
+        let forged = Share::new(
+            xb,
+            shares[2]
+                .y()
+                .iter()
+                .zip(s_bytes.iter().zip(&t_bytes))
+                .map(|(&yb, (&s, &t))| mul(inv(lambda_b), s ^ t) ^ yb)
+                .collect(),
+        );
+
+        let mut combiner = PorosHost::new(
+            line[0],
+            shares[0].clone(),
+            rotated,
+            line.clone(),
+            threshold,
+            community.clone(),
+            epoch,
+            beacon,
+            difficulty,
+        );
+        let requester = coord(5);
+        let req = solve_ingress_request(requester, &community, epoch, &beacon, difficulty);
+        combiner.step(Instant(0), Input::Message { from: requester, frame: request_frame(&req) });
+        let poison = encode(FrameType::PorosShare, &encode_share_reply(requester, &forged));
+        assert!(
+            combiner.step(Instant(1), Input::Message { from: line[2], frame: poison }).is_empty(),
+            "the descriptor commitment alone still refuses a steered reconstruction",
+        );
+        assert_eq!(
+            combiner.stations().total(Station::ShareOffCommitment),
+            0,
+            "but it cannot attribute — the share passed arrival, because there was nothing to check it against",
+        );
+        assert_eq!(
+            combiner.stations().total(Station::DescriptorUnrecoverable),
+            1,
+            "so the failure surfaces as an unrecoverable gather instead",
+        );
+
+        // **And drop-one recovers where the line has spare capacity.** Once the honest third member answers,
+        // the combiner holds 3 shares of which 1 is forged, and `n − t = 1` is exactly the fault budget: the
+        // one-exclusion search finds the honest pair and serves the dealt peers.
+        let honest = encode(FrameType::PorosShare, &encode_share_reply(requester, &shares[1]));
+        let response = combiner
+            .step(Instant(2), Input::Message { from: line[1], frame: honest })
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == requester => {
+                    let (decoded, _) = decode_frame(frame).ok()?;
+                    (decoded.frame_type() == Some(FrameType::PorosResponse))
+                        .then(|| IngressResponse::from_bytes(decoded.body))?
+                }
+                _ => None,
+            })
+            .expect("drop-one recovered the committed descriptor from the honest pair");
+        assert_eq!(response.peers, desc.bucket(&req), "and served the DEALT peers");
+        assert_eq!(
+            combiner.stations().total(Station::ShareOffCommitment),
+            1,
+            "the excluded share is finally attributed — by exclusion, which is the only evidence a rotated \
+             line has",
         );
     }
 

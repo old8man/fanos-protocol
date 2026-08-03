@@ -460,6 +460,34 @@ measurable axes**: (i) seizure (`< t` reveals nothing vs one bridge = total comp
 enumeration (rotation caps a single enumeration's value to one epoch); (iii) availability under partial blocking
 (LRC recovery from any of `q+1` lines); (iv) unbiasable rotation (DVRF strictly dominates commit-reveal SRV).
 
+**Threshold hosting is a confidentiality property, and this design needs an integrity one too.** "Seize `< t`
+⇒ learn nothing" says a minority cannot *read* the descriptor. It says nothing about whether a minority can
+*change* it — and Lagrange interpolation is linear, so a **single** line member can add a chosen offset to the
+reconstruction: knowing the true descriptor `S` (which any member learns by acting as combiner once — every
+member may serve) it contributes `y' = λ⁻¹·(T ⊕ S) ⊕ y`, and every other combiner recovers exactly `T`. The
+attacker does not corrupt the ingress set; it *chooses* it, for every node in the community that bootstraps
+that epoch. That is strictly worse than the fixed-bridge baseline this construction is measured against, and
+it survived review because the axis was never listed.
+
+Every other threshold reconstruction in the platform is protected from this by accident: NYX's sheaf and
+tessera and CALYPSO's sealed intro all reconstruct a **key** and immediately AEAD-open with it, so the AEAD tag
+*is* the integrity check and a wrong reconstruction cannot authenticate. POROS is the one site that
+reconstructs a **plaintext** — the descriptor is the shared secret, not a key — so nothing fails when the
+reconstruction is wrong. **Design decision:** a POROS dealing publishes a *binding* alongside the shares —
+per-share commitments `H(dealing ‖ x ‖ y)` that let a combiner reject a forged share at arrival in `O(1)` and
+name the member responsible, plus the descriptor commitment `H(descriptor)` that refuses to serve any
+reconstruction that is not the dealt one. Both are hash-based, hence post-quantum, and neither is optional:
+the binding is a constructor argument of the host engine, because a security property a caller can forget to
+enable is one that will be absent in production. Checking at *arrival* rather than at reconstruction is what
+preserves liveness — the forged share never enters the gather, so the line's honest members still complete it.
+
+The residual is a line that has already **rotated**: resharing puts the new shares on a fresh polynomial, so
+the dealt per-share commitments no longer bind and only the descriptor commitment survives. A rotated line
+therefore *detects* a steer but cannot attribute it, and recovers only from a single corrupt share — the
+one-exclusion search costs `n + 1` interpolations, while any deeper search costs `Θ(n^k)` and would make
+recovery itself the cheapest denial-of-service against the line it protects. Verified resharing (establishing
+per-share commitments for the fresh polynomial without a dealer) is the follow-on that closes it.
+
 **The Sybil gate is load-bearing, and must be anchored correctly.** Mahdian's `Ω(t)` floor binds POROS too:
 anyone admitted who can *compute* coordinates can block them at the same `t·log` rate — so **keeping `t` small is
 the whole game**, which makes the admission gate not optional. But the FANOS holonic *coherence* signal has the
