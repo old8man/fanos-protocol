@@ -186,6 +186,17 @@ pub type F32b = Gf2m<5>;
 /// `GF(256)` — a byte-aligned binary cell for the embedded profile (spec §11.5).
 pub type F256 = Gf2m<8>;
 
+/// `GF(5)` — the **second** member of the liveness family `q ≡ 2 (mod 3)`.
+///
+/// The family matters and is not a taste: a line affords to lose `(q+1) − ⌈2(q+1)/3⌉ = ⌊(q+1)/3⌋` members,
+/// and the threshold's ceiling wastes nothing exactly when `3 | (q+1)`. So `q ∈ {2, 5, 8, 11, …}` are the
+/// orders where no capacity is lost to rounding, and `q = 5` is the first step up from Fano that actually
+/// buys liveness — spare 2 rather than 1, per-gather 0.984 against 0.972 — where `q = 3` and `q = 4` are
+/// strictly *worse* than Fano (`docs/design-constants.md` §5, `docs/design-coordinates.md` §5.1).
+pub type F5 = GfP<5>;
+/// `GF(11)` — the fourth member of the liveness family (`q ≡ 2 (mod 3)`); spare 4.
+pub type F11 = GfP<11>;
+
 /// `GF(7)` — the primary illustrative prime cell of the test vectors (spec Appendix C).
 pub type F7 = GfP<7>;
 /// `GF(13)`.
@@ -197,6 +208,7 @@ pub type F127 = GfP<127>;
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// Exercise the full field axioms exhaustively for a small field `F`.

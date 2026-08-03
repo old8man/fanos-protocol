@@ -301,6 +301,39 @@ pub fn pgl3_order(q: u32) -> u128 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// **The liveness family of plane orders is constructible, and its planes behave.**
+    ///
+    /// `docs/design-coordinates.md` §5.2 proposes monomorphizing the node composite over `q ≡ 2 (mod 3)` —
+    /// `{2, 5, 8, 11}` — so a deployment picks its plane order instead of inheriting whichever one the binary
+    /// happened to be built with. The family is not a taste: a line affords to lose `⌊(q+1)/3⌋` members, and
+    /// the threshold's ceiling wastes nothing exactly when `3 | (q+1)`. These are the orders where no
+    /// capacity is lost to rounding — and `q = 3`, `q = 4` are strictly *worse* than Fano.
+    ///
+    /// Checks the premise before anything is built on it: `q² + q + 1` points, lines of `q + 1`, `λ = 1` (the
+    /// axiom the onion transport rests on — consecutive hops always share a relay), and `q + 1` lines through
+    /// every point.
+    #[test]
+    fn the_liveness_family_of_plane_orders_is_constructible() {
+        use fanos_field::{F2, F5, F8, F11, Field};
+
+        fn check<F: Field>() {
+            let q = F::Q as usize;
+            assert_eq!(Plane::<F>::N as usize, q * q + q + 1, "q={q}: q²+q+1 points");
+            assert_eq!(Plane::<F>::LINE_SIZE as usize, q + 1, "q={q}: q+1 points on a line");
+            let (a, b) = (Line::<F>::at(0), Line::<F>::at(1));
+            assert!(a.meet(&b).is_some(), "q={q}: any two distinct lines must meet — that is λ = 1");
+            assert_eq!(
+                Plane::<F>::lines_through(Point::<F>::at(0)).count(),
+                q + 1,
+                "q={q}: q+1 lines through a point — the spare's denominator"
+            );
+        }
+        check::<F2>();
+        check::<F5>();
+        check::<F8>();
+        check::<F11>();
+    }
+
     extern crate alloc;
     use alloc::vec::Vec;
 
