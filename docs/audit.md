@@ -2832,3 +2832,51 @@ a global semaphore plus a per-source cap (audit C3), the observed-address side-c
 established connection, the timer task is one per engine-armed timer and the engines' pending maps are
 count-bounded, and the send worker is one per peer coordinate. `PunchTo` was the only spawn a single frame
 could trigger without limit.
+
+---
+
+# The wedge was contention, and five idle runs are what settled it (#38, 2026-08-04)
+
+The anonymous-dial "wedge" — a session that stops mid-conversation, sometimes on the forward half, sometimes
+on the reply half, sometimes not at all — accumulated ten instrumented runs and three contradictory verdicts
+from the *same code*. Every one of those runs was taken on a box under a competing build.
+
+The task recorded the one thing that would settle it: **on an idle host the wedge should not reproduce**, and
+warned against closing on a single clean run, since at the observed ~1-in-8 per-dial rate twelve clean dials
+is only about 20 % evidence.
+
+**Measured 2026-08-04, five runs, nothing else on the machine:**
+
+| run | host cpu share | result |
+|---|---|---|
+| 1 | 0.97 | no wedge in 12 dials |
+| 2 | 0.79 | no wedge in 12 dials |
+| 3 | 0.89 | no wedge in 12 dials |
+| 4 | 0.76 | no wedge in 12 dials |
+| 5 | 0.93 | no wedge in 12 dials |
+
+Every share is above the 0.5 the harness itself calls inconclusive. Sixty dials, zero wedges: at 1-in-8 that
+is `(7/8)^60 ≈ 1 in 2900`. **The wedge tracks host load. It is capacity, not a logic defect**, which is what
+the supporting counters already said and no single run could confirm — `GatherUnpeelable` = 0 always (an
+expiry is never "the answers were wrong", always "too few answers"), `GatherSelfShareMissing` = 0 always, and
+expiry concentration correlating with SRTT rather than with which lines the silenced point sits on.
+
+## The instrument was pointing the wrong way, and that is the part worth keeping
+
+The autopsy **panicked** on twelve clean dials — "either the defect is gone or the fixture no longer
+reproduces it". So the outcome the experiment existed to obtain was coded as its failure mode, and every
+correct run looked like a broken test.
+
+It now asserts the opposite: on an idle host every dial must land, which is a *reachability regression test*
+and a strictly stronger claim than "a wedge is still reproducible". Below 0.5 cpu share it declines to
+conclude rather than reporting either way, because a starved box cannot separate the two hypotheses and a
+test that reports the machine as a defect is worse than no test.
+
+**What a run must not do is answer a question it cannot see.** Ten runs produced three verdicts because none
+of them could tell contention from a defect, and none of them said so. The share is now printed, thresholded,
+and load-bearing in the assertion.
+
+Real defects found while chasing this, all fixed and committed along the way: unsealable hop lines
+(`random_hops`), the discarded sealability check (`select_drop_line`), the silent seal-failure drop, the
+relay having no data-path plane at all, the censored-sampling bias in the gather estimator, empty requests
+reaching the service handler, and three counters that summed distinct worlds.

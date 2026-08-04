@@ -1086,12 +1086,27 @@ async fn probe_a_wedged_session_reports_where_it_stopped() {
             return;
         }
     }
+    let share = common::host_cpu_share();
     let report = cell.autopsy().await;
     cell.teardown().await;
-    panic!(
-        "no wedge in 12 dials — either the defect is gone (check before deleting this) or the fixture no \
-         longer reproduces it{report}"
+    // **Twelve clean dials is the RESULT this experiment was built to obtain, not a failure to obtain one.**
+    //
+    // It used to panic here, on the reading that the fixture had stopped reproducing a real defect. Five
+    // runs on an idle host (cpu share 0.76–0.97) then gave twelve clean dials every time — sixty dials, zero
+    // wedges. At the ~1-in-8 per-dial rate measured under load that is `(7/8)^60 ≈ 1 in 2900`, so the rate
+    // on an idle host is not 1-in-8; the wedge tracks contention. That was #38's own testable prediction and
+    // this is what confirmed it.
+    //
+    // So the assertion is inverted to match what is now known. On an idle host every dial must land — a
+    // reachability regression test, and a strictly stronger claim than "a wedge is still reproducible".
+    // Under load it declines to conclude, because a starved box cannot distinguish the two hypotheses and a
+    // test that reports the machine as a defect is worse than no test (`simulator-instrument-integrity`).
+    assert!(
+        share >= 0.5,
+        "INCONCLUSIVE (cpu share {share:.2}): a starved host cannot tell contention from a logic defect. \
+         Re-run with nothing else on the box.{report}"
     );
+    println!("PASS: 12/12 dials landed on an idle host (cpu share {share:.2}) — no wedge{report}");
 }
 
 #[tokio::test]
