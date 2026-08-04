@@ -3252,3 +3252,117 @@ A run that goes red because it could not measure teaches everyone to ignore red,
 `fanos-quic` and `fanos-node` in their own steps with the runner to themselves and excludes them from the
 parallel workspace step. The guard stays exactly as it is: it is telling the truth, and the truth is about
 how the suite is run.
+
+---
+
+# Audit pass 2026-08-05 — the last testnet blocker, and what a scan is worth
+
+## §1. [Closed, #57] The chain survives a whole-cell restart
+
+The final item on the testnet blocker list. A validator persists the
+`(ExecCertificate, snapshot)` pair it could serve a peer and, at startup, feeds it back through the **same
+`Input::SyncResp` a peer's answer takes**. The quorum certificate is verified, the head it binds is checked
+(the T-H6 site), and the snapshot must restore to the certified root — by code that already existed to refuse
+a forgery on the wire.
+
+**The disk is a peer that happens to be local**, and that is the whole design: persistence adds *no trust in
+the filesystem*. A tampered file is refused by the same check that refuses a forged one, and the validator
+starts clean and says so — because "started at genesis with a file present" and "started at genesis with no
+file" are the same silence otherwise, and only one of them is an attack. The cadence needs no timer: a
+checkpoint is the only moment there is anything certified to write.
+
+Three tests split by what each can catch — the engine's adoption, the adversarial refusals, and the codec,
+where a crafted length must be **refused rather than panicked on** (measured: `split_at` in place of
+`split_at_checked` turns that assertion into an abort).
+
+Also closed with it: `fanos service-deal` (every other role had a dealer and this one had instructions; the
+failure it prevents is a *roster* that differs by one coordinate, which cannot reconstruct and says nothing),
+per-verb `--help` as a projection of the single listing, and the three role provisioning files becoming
+config keys (#90 — they had been exempt from the render/parse round-trip assertion by not being expressible
+at all).
+
+## §2. [#45, tier 1 closed] A count is a claim about the scan first
+
+Measuring "named numeric constants with no recorded derivation" gave four different answers, and three were
+artefacts of the scanner not knowing this tree's conventions:
+
+| what the scan understood | count |
+|---|---|
+| only `///` counts | 63 |
+| …a doc above a *group* documents the group | 48 |
+| …plain `//` counts too, which private items use here | 30 |
+| …a group may be led by a **non-numeric** constant | **0** |
+
+The real figure was 30, and **all 30 were definitional** — RFC 1928's SOCKS5 codes, Tessera command bytes,
+ChaCha20-Poly1305's nonce and tag widths, a field's own order and characteristic. Not one was a tuning
+number, which inverts the task's premise: the risky class was already documented, and the headline
+"~690 with no recorded derivation" had counted numeric *literals*.
+
+All 30 now say what fixes them and a ratchet holds it at zero, asserting `total > 400` first so a broken scan
+fails rather than passing vacuously.
+
+**What is left is the tier no scan can see.** A comment saying what a constant *does* is not one saying why
+it has that *value*. `DECOUPLE_STEP = 0.25` carries a fine paragraph about the homeostatic shed loop and
+nothing about 0.25 — and it governs a mechanism the platform proves a theorem about (§2.7: `Decouple` must
+actually lower `Φ`). That is #45's real content, and it is now the *only* content, which is what the mechanical
+tier was worth closing for.
+
+## §3. Two process failures worth recording, because both are repeats
+
+A `git commit` chained after a clippy gate ran on the *grep's* exit status and shipped a lint. A scripted
+`str.replace` matched the wrong occurrence, produced a syntax error, and — while a full suite was in flight —
+made that suite's `101` a verdict about neither tree; repairing it then silently turned a `pub const` private,
+which compiled. The project already has a written rule against the first (verify in a separate step) and
+this is its second instance in one session. The third lesson is new and belongs beside it: **a scripted edit
+is a tool, and a tool that silently matches the wrong thing is worse than a manual edit that fails loudly** —
+anchor the replacement or assert the match count, and read the diff, because compiling is not the same as
+being what you meant.
+
+## §4. [HIGH, FIXED, #91] The homeostat's control law was computed every round and thrown away
+
+Found by working #45's tier 2 on the first target it named, which is the argument for closing the mechanical
+tier: with every constant carrying *a* comment, the ones whose comment does not explain their *value* become
+findable.
+
+`Homeostat::control` returns `BandControl::Decouple { effort }` with `effort = κ(r − hi)/hi` — proportional
+to the over-excursion, and documented as gradient descent on `V = ‖Γ − ρ*‖²`, which is what makes the closed
+loop inherit the T-104 contraction. **Its only production consumer matched `{ .. }` and discarded it.**
+Actuation ran on a different path entirely (`plan_healing` → `HealingAction::Decouple`) and added a fixed
+`DECOUPLE_STEP = 0.25`; `effort` was read nowhere outside the homeostat's own unit test.
+
+**The arithmetic, for the shipped Fano cell.** The shed scales the configured baseline
+`healthy_correlation = 0.45`, and the collective-subject band at `N = 7` is `(0.4082, 0.5774]`, so the entire
+budget is `1 − 0.4082/0.45 ≈ 0.093`:
+
+| state | modelled `r` | classification |
+|---|---|---|
+| baseline | 0.4500 | CollectiveSubject |
+| after **one** step of 0.25 | 0.3375 | **Aggregate** |
+| at `DECOUPLE_MAX = 0.6` | 0.1800 | Aggregate, `Φ = 0.19` |
+
+So a single over-coupling response flipped the cell's self-model into the *under*-coupled band, whose
+homeostatic answer is `Bind` — the opposite action. The proportional law cannot do that, and says so at its
+own definition; at a modest excursion it yields `≈ 0.034`, comfortably inside the budget. **The law was
+correctly scaled and the constant that replaced it was not.**
+
+All three constants retire into derivations: the step *is* the effort; the cap is
+`(1 − 1/(healthy·√(n−1)))/2`, taken from DIAKRISIS's own floor so the band and the ceiling cannot drift, and
+**plane-dependent**, which is why one number could not serve (the same shape as `MIX_THRESHOLD` pinned at 2,
+E7); the decay is `2^(−1/DWELL)`, a half-life of one detection dwell rather than of one round.
+
+The halving in the cap is a **stated policy and says so** — `d_max` is a supremum, `r ≤ lo` classifies as
+`Aggregate`, so spending the whole budget lands on the boundary and is read as the failure it was avoiding.
+That is the discipline #45 asks for where no tighter derivation exists: name the kind rather than let a
+reader infer one.
+
+## §5. The deeper question this opened, and did not close
+
+`effective_correlation` sheds the **configured baseline**, while the over-coupling is detected in the
+**measured** `Γ_net`. Those are different quantities: the baseline is in-band by construction (0.45 sits
+inside `(0.4082, 0.5774]`), so a shed can only ever move the model *down out of* the band, never "back into"
+it. Every cap therefore looks arbitrary, because the mechanism is scaling something that was never
+over-coupled.
+
+Stated rather than fixed. It is a question about what `Φ`'s estimate should be computed from, it touches the
+healing budget and the published coherence frame, and it deserves its own analysis rather than a change made
+at the end of a long session.
