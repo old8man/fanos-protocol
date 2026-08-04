@@ -404,6 +404,41 @@ pub fn host_cpu_share() -> f64 {
     cpu_share()
 }
 
+/// The share below which a real-QUIC **liveness** assertion cannot tell a starved machine from a defect.
+///
+/// Derived from what the number means rather than chosen: `share_at` returns `cores / load`, so 0.5 is the
+/// point at which this process can expect half a core — i.e. every deadline in the test is competing with an
+/// equal amount of foreign work, and a missed one is at least as likely to be the box as the system.
+pub const QUIET_ENOUGH: f64 = 0.5;
+
+/// Refuse to conclude from a starved run, for an assertion whose subject is **liveness within a deadline**.
+///
+/// Call it immediately before such an assertion. On a quiet host it does nothing; on a loaded one it fails
+/// with a message naming the machine, so the run is reported as unmeasurable rather than as a defect.
+///
+/// **Why this fails rather than skips.** A skip is silent, and a test that quietly skips under load is a test
+/// that stops running exactly when the suite is busiest — which is most of the time. Failing converts a
+/// *false defect report* into a *true environment report*: the run still goes red, but it goes red for the
+/// reason it actually had.
+///
+/// **Why only liveness assertions.** A structural property — a forgery refused, a codec round-tripping, a
+/// quorum arithmetic — does not depend on how fast the box is, and guarding it would weaken a test for no
+/// reason. This is for the ones that count arrivals or wait on a deadline.
+///
+/// The cost of not having this is measured: #38 and #41 each sat open for weeks as suspected defects and
+/// both were contention; three more real-QUIC tests produced false failures in a single day
+/// (`handshake_negotiation`, `self_certifying`, `the_service_survives_one_meeting_point_going_silent`), each
+/// passing 3/3 in isolation on a quiet box.
+pub fn require_quiet_host(what: &str) {
+    let share = host_cpu_share();
+    assert!(
+        share >= QUIET_ENOUGH,
+        "INCONCLUSIVE (cpu share {share:.2} < {QUIET_ENOUGH}): this run cannot measure {what} — a starved \
+         host and a defect look the same here. Re-run with nothing else on the box; do not read this as a \
+         failure of the property."
+    );
+}
+
 fn cpu_share() -> f64 {
     let cores = f64::from(u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1));
     share_at(read_load_average().unwrap_or(0.0), cores)

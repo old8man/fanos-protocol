@@ -1018,6 +1018,9 @@ async fn the_service_survives_one_meeting_point_going_silent() {
     // and this file already keeps its multi-minute measurements out of the default suite.
     cell.nodes[victim_index].take().expect("the victim combiner node is still held").shutdown();
     let reached = cell.arrivals(3).await;
+    // Liveness within a deadline: a starved box and a censored service are indistinguishable here, and this
+    // assertion has produced a false 0-of-3 under load while passing 3/3 in isolation.
+    common::require_quiet_host("whether a service survives one silenced meeting point");
     assert!(
         reached > 0,
         "with one meeting point's combiner silent the service must still be reachable — 0 of 3 dials arrived, \
