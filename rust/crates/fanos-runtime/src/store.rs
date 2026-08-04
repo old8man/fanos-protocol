@@ -67,10 +67,17 @@ pub(crate) struct Store {
     pub(crate) pending: BTreeMap<[u8; DIGEST], PendingGet>,
     /// In-flight DA samples ([`Command::SampleAvailability`]), keyed by digest (spec §L4.3).
     pub(crate) pending_samples: BTreeMap<[u8; DIGEST], PendingSample>,
-    /// The **durable loss ledger** (audit R-C3): digests this node held a shard of that became permanently
+    /// The loss ledger (audit R-C3): digests this node held a shard of that became permanently
     /// unrecoverable — more shard-homes gone than the `[7,3,4]` code tolerates — and the epoch each loss was
     /// accounted. Bounded by the store's own [`MAX_STORE_ENTRIES`] (it is a subset of held keys). Makes loss
-    /// visible and auditable instead of silent; a production node persists it. Append-only (an audit trail).
+    /// visible and auditable instead of silent, within one process lifetime.
+    ///
+    /// **It was called "durable" and said "a production node persists it", and neither is true.** Nothing in
+    /// this tree writes the store to disk — the whole of it is these `BTreeMap`s, and a restart drops them.
+    /// The claim mattered because it is an audit trail: a record of permanent data loss that itself does not
+    /// survive a restart is a record of nothing. Corrected here rather than left as an aspiration in the
+    /// present tense; the gap is tracked as a task, with the severity split out (a *single* node restarting
+    /// is survivable by construction — the erasure code re-heals — while a whole-cell restart is not).
     pub(crate) loss_ledger: BTreeMap<[u8; DIGEST], Epoch>,
     /// Digests that **expire**, and the epoch after which each is dead — the soft-state half of the store.
     ///

@@ -570,6 +570,25 @@ meeting line from `(epoch, beacon)` independently, so the grace window is the th
 between them — and the window is now derived and unit-tested, but the composition of host + client + relay
 across a live `BeaconReady` is not.
 
+**Nothing a node stores survives a restart of the cell.** Measured, not inferred: six files in the shipped
+tree touch the filesystem at all — the config, the identity key, the setup wizard, the admin socket, the CLI,
+and a telemetry snapshot module that has no caller. The L4 erasure store is three in-memory maps with no
+serialization; `fanos-taxis` touches no filesystem, so the ledger is in memory too; and `--data DIR` is used
+only to place the control socket.
+
+The severity splits in two, and the distinction is the whole of it:
+
+* **One node restarting is fine, by construction.** The `[7,3,4]` erasure code tolerates the loss and the
+  cell re-heals; a restarted validator re-syncs from a cert-verified snapshot. This is the case the design
+  anticipates and it works.
+* **The whole cell restarting is total, permanent loss** — every stored object and the entire chain. There is
+  no other copy. For a testnet whose purpose is connectivity and consensus that may be acceptable; for
+  anything storing content people want back, or holding balances, it is not.
+
+One interaction is unanalyzed and worth knowing before you plan an upgrade: `docs/design-upgrade.md` describes
+cell-wide activation with canaries, and a rolling restart that moves faster than the store re-heals loses data
+the erasure code would otherwise have recovered. Nothing measures that window.
+
 **A POROS ingress host runs with no Sybil cap.** The per-request proof of work is a *rate*-limiter — it
 bounds how fast identities can be created, never how many exist (Boneh et al., CRYPTO 2018), and
 `fanos-node/src/sybil.rs` says so in its own module doc. The *cap* is the fast-mixing trust graph in that
