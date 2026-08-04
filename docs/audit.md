@@ -2707,3 +2707,70 @@ for 3 h 45 m and 6 h 02 m holding the build lock — after killing them a suite 
 
 **The lesson is not the rules, all of which were already written down. It is that a plausible causal story survives
 round after round when none of the evidence is aimed at the mechanism itself.**
+
+---
+
+# The real-NAT harness found a live defect on its first run (2026-08-04)
+
+`fanos-quic/tests/real_nat.rs` closes `docs/tasks.md`'s "real-NAT harness" residual: a `quinn::AsyncUdpSocket`
+that models both RFC 4787 axes, plugged into the existing `Fabric::Abstract` seam, so real QUIC/TLS/driver
+run above a carrier that can *refuse* a punch. The loopback tests structurally cannot do that — no NAT is
+present, so the punched dial always lands and the relay fallback, which exists precisely for the punch that
+cannot work, had never once run.
+
+## §1. [HIGH, FIXED] A symmetric-NAT pair paid a full dial timeout on every frame
+
+Once a hole-punch failed, the hub's brokered address — permanently unreachable, that being what a symmetric
+NAT means — stayed in the directory. So `peer_send_worker` called `get_or_connect` on it for **every frame**:
+a fresh QUIC handshake awaited to `DIAL_TIMEOUT` (3 s) before falling back to the relay that was always going
+to carry the frame. Measured: four frames, four dials, thirty NAT-rejected datagrams, with the data path
+blocked for the timeout each time.
+
+Two consequences beyond throughput:
+
+* each failure calls `apply_outcome(&t.shaper, &t.controller, false)`, which feeds the **morph auto-fallback
+  breaker** (§13.7) — so an unreachable peer was continuously reported as a censored transport;
+* the pair keeps relaying through a hub, and a `Relay` names its `target` and `origin` in the clear to the
+  forwarder where a direct connection names nothing. Sustained hub exposure is an anonymity cost, not only a
+  bandwidth one.
+
+**Fixed** by the same derivation the neighbouring `asked` guard already used: re-trying the same thing cannot
+yield a different answer while the mappings hold, and a *different* address is genuinely new information. The
+first dial to an address is awaited exactly as before — so the common path, including a first frame going
+direct rather than being disclosed to a hub, is unchanged — and a repeat of a failed address is skipped.
+
+**What recovers, with no timer anywhere.** A different address retries (the guard is on the address, not on
+"have we failed"). An inbound connection is found by the connection cache, so reverse reachability needs no
+dial. And the epoch reshuffle ends the state by construction: coordinates are redrawn per epoch, so the peer
+becomes a new point and the dispatcher starts a new worker — the cache's lifetime is exactly one epoch
+without a constant being chosen for it. A background retry loop was written first and deleted: at one dial
+per `DIAL_TIMEOUT` for as long as traffic flows, it is a retry timer wearing a derivation's clothes.
+
+## §2. [Instrument] The test that was supposed to catch this had three separate reasons it could not
+
+Worth recording in full, because each is a distinct class and all three were invisible while it passed.
+
+1. **It passed for an unrelated reason.** The harness generated fresh identities, so three nodes drew random
+   VRF coordinates on a 7-point plane and collided with probability `1 − (6/7)(5/7) ≈ 39 %`. On a collision
+   `Send { to: b.address() }` addressed the sender itself, no punch path ran at all, and the assertion held.
+   Measured after pinning was removed as an experiment: three consecutive runs gave 1, 2 and 2 failures out
+   of 3. Nodes are now ground to distinct points, which is what the coordinate harness exists for.
+2. **Its settle window was shorter than what it was waiting for.** It declared the punch finished after
+   700 ms of quiet, but QUIC retransmits an Initial on a growing backoff, so 700 ms lands *between* retries
+   and the remainder was counted as if later frames had provoked it. One attempt read as 32 events. The
+   window is now derived from `DIAL_TIMEOUT`, which bounds an attempt's life; verified by re-measuring with
+   an 11 s window and getting identical counts.
+3. **It measured packets and asserted about decisions.** `rejected()` cannot tell a re-asked hub from a
+   re-dialled address, and after the first two problems were fixed it still failed — at 14 against 8 — where
+   the six extra were *correct*: the punch had taught the sender an address it did not have, and an address
+   never tried is tried once. The assertion had been demanding that a node never try an address it has just
+   learned. It is now a batch-to-batch comparison — four frames, then eight — because the claim is that the
+   cost does not scale with the traffic, not that it is zero.
+
+Both guards are falsified independently: making `asked.insert(hub_coord)` unconditional gives 140 against
+52, and dropping the `dead_addr` condition gives 72 against 30.
+
+**The transferable part is (1).** A test can pass for a reason that has nothing to do with its subject, and
+the reason can be a *property of the platform* — here, that a 7-point plane cannot hold three randomly-drawn
+nodes without collisions ([[coordinate-collision-capacity-bound]]). Any test that asserts two nodes are
+distinct must pin them, or it is asserting something about the birthday problem instead.

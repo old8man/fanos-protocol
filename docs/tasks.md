@@ -182,13 +182,26 @@ every level, verified against the UHM coherence/viability/holarchy theory. Seque
 ### C · Runtime-only verification — built + compiles/lints clean, but the OS-syscall shell can't run in CI
 - **TUN device I/O** (`fanos-vpn`, feature `device`; `fulltunnel.rs` + `device.rs`) — the datapath/engine/mux
   are unit-tested with mocks; the real `tun` syscalls are verified on a host, not in the gate.
-- **Real-NAT socket-filter test harness** — the NAT-traversal logic (#119) is complete and tested against
-  simulated NATs; a harness exercising real OS NAT/firewall filters is the only residual.
+- **Real-NAT socket-filter test harness** — **DONE 2026-08-04** (`fanos-quic/tests/real_nat.rs`). A
+  `quinn::AsyncUdpSocket` modelling both RFC 4787 axes — mapping (cone vs symmetric) and filtering — plugged
+  into the existing `Fabric::Abstract` seam, so real QUIC/TLS/driver run above a carrier that can actually
+  *refuse* a punch. Three cases: filtering alone does not defeat a punch; a symmetric NAT does, and the
+  relay carries the pair anyway (the path that had never once run); and the per-frame cost of an
+  unreachable peer is bounded.
+  *(Residual, stated honestly: still an in-memory model, not real OS NAT/firewall filters — the same choice
+  `fanos_sim::fabric::Fabric` makes, for the same reason. It is worth what it cost: it immediately found a
+  live defect the loopback tests structurally could not, below.)*
   *(Corrected 2026-08-03: "complete" had been true of the mechanism and false of the wiring — `hole_punch`
   had no caller outside its own test, so a running node never initiated one and every NAT-to-NAT pair
-  relayed through a hub permanently. Now initiated automatically from the send path. The loopback tests
-  cannot model a punch that FAILS, which is the case the relay fallback exists for, so the real-NAT harness
-  is still the residual — and it is the only thing that can tell the two paths apart in the field.)*
+  relayed through a hub permanently. Now initiated automatically from the send path.)*
+  *(Found 2026-08-04 by the new harness, fixed: once a punch failed, the hub's brokered — permanently
+  unreachable — address stayed in the directory, so every subsequent frame paid a full `DIAL_TIMEOUT` QUIC
+  handshake to it before falling back to the relay that was always going to carry it. Measured at four
+  dials for four frames. It also fed `apply_outcome(false)` on each failure, so an unreachable peer was
+  reported to the morph auto-fallback breaker as a censored transport. `peer_send_worker` now declines to
+  re-dial an address whose dial failed, by the same derivation the `asked` guard already used — a
+  *different* address is new information, the same one is not — with the epoch reshuffle bounding the
+  cache's lifetime by construction rather than by a timer.)*
 
 > **Two former "frontier" items were phantom gaps — already realized + tested, kept here as the record:**
 > **Maekawa W∩R quorum** is the erasure store's versioned full-fan-out read (a superset of any line-quorum →

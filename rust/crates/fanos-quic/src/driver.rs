@@ -1614,14 +1614,46 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedRecei
     // Hubs already asked to broker a punch to `to` — see the relay branch below. Local to this worker, so
     // it needs no lock, and bounded by the plane's point count because a hub is a peer coordinate.
     let mut asked: BTreeSet<Triple> = BTreeSet::new();
+    // The address whose dial already failed — see the reachability decision below. Per-peer, because this
+    // worker is.
+    let mut dead_addr: Option<SocketAddr> = None;
     while let Some(frame) = rx.recv().await {
-        // Resolve `to` to a live connection. If the directory knows an address, reuse-or-dial it; otherwise
-        // fall back to a connection the peer already dialed IN on — a live cached connection *is*
-        // reachability, so a peer we never learned an address for is still routable in reverse (#119).
-        let direct = if let Some(addr) = t.directory.resolve(to) {
-            get_or_connect(&t, to, addr).await
-        } else {
-            cached(&t.conns, to)
+        // Resolve `to` to a live connection. A live cached connection *is* reachability, so it is checked
+        // first and a peer we never learned an address for is still routable in reverse (#119).
+        //
+        // **A dial that already failed is not waited for a second time.** After a hole-punch fails, the
+        // hub's brokered address stays in the directory, so this used to call `get_or_connect` on every
+        // frame — a fresh QUIC handshake awaited to `DIAL_TIMEOUT` before falling back to the relay that
+        // was always going to carry it. Measured on the modelled-NAT harness: four frames to one
+        // symmetric-NAT peer cost four full dials and 30 NAT-rejected datagrams, with the frame path
+        // blocked for the timeout each time. The failures also feed `apply_outcome(false)` and so the
+        // morph auto-fallback breaker (§13.7), which means an unreachable peer reads as a censored morph.
+        //
+        // The rule is the same one the `asked` guard below already derives: re-trying the same thing
+        // cannot yield a different answer while the mappings hold, and a *different* address is genuinely
+        // new information. So the first dial to an address is awaited exactly as before — the common path
+        // is unchanged, and in particular a first frame to a reachable peer still goes direct rather than
+        // being disclosed to a hub — and a repeat of a *failed* address is skipped rather than retried.
+        //
+        // **What recovers, with no timer anywhere.** A different address in the directory retries (the
+        // condition below is on the address, not on "have we ever failed"). An inbound connection from the
+        // peer is found by `cached` above, so reverse reachability needs no dial at all. And the epoch
+        // reshuffle ends this state by construction: coordinates are redrawn per epoch, so `to` becomes a
+        // new point, the dispatcher starts a new worker for it, and this cache is gone — its lifetime is
+        // exactly one epoch without a constant being chosen for it. A background retry loop was written
+        // first and deleted: at one dial per `DIAL_TIMEOUT` for as long as traffic flows it is a retry
+        // timer wearing a derivation's clothes, and it re-creates a smaller copy of the amplification this
+        // change exists to remove.
+        let direct = match t.directory.resolve(to) {
+            Some(addr) if dead_addr != Some(addr) => {
+                let conn = get_or_connect(&t, to, addr).await;
+                if conn.is_none() {
+                    dead_addr = Some(addr);
+                }
+                conn
+            }
+            // Known-dead address, or none at all: whatever is already live, and no waiting.
+            _ => cached(&t.conns, to),
         };
         if let Some(conn) = direct {
             send_uni(&conn, &t.shaper, &frame).await;
