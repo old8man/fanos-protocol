@@ -540,3 +540,50 @@ fn the_unwired_budget_is_not_slack() {
         loose.join("\n  ")
     );
 }
+
+/// **A crate directory that is not a workspace member is gated by nothing at all.**
+///
+/// Not clippy, not the test suite, not the doc build, not the reachability checks above — `cargo` simply does
+/// not know it exists. It compiles the day someone adds it as a dependency, having never been linted or
+/// tested, which is a worse position than an orphan: an orphan is *watched* and unreachable, this is
+/// unwatched and about to be reached.
+///
+/// The checks above count and classify the members; nothing compared that list to the filesystem. Currently
+/// they agree exactly (44 each), which is the moment to lock it in rather than after the first divergence.
+#[test]
+fn every_crate_directory_is_a_workspace_member() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("the workspace manifest");
+    // The `members` array only — `[workspace.dependencies]` names the same crates by path and would make
+    // this pass for a crate that is depended on but never built as a member.
+    let members_block = manifest
+        .split("members = [")
+        .nth(1)
+        .expect("a members array")
+        .split(']')
+        .next()
+        .expect("the members array ends");
+    let members: BTreeSet<String> = members_block
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("\"crates/"))
+        .filter_map(|l| l.split('"').next())
+        .map(str::to_owned)
+        .collect();
+
+    let dirs: BTreeSet<String> = std::fs::read_dir(root.join("crates"))
+        .expect("the crates directory")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join("Cargo.toml").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    assert!(dirs.len() > 30, "only {} crate directories found — the scan is broken", dirs.len());
+    let unlisted: Vec<&String> = dirs.difference(&members).collect();
+    assert!(
+        unlisted.is_empty(),
+        "these crate directories are not workspace members, so nothing builds, lints or tests them: \
+         {unlisted:?}"
+    );
+    let phantom: Vec<&String> = members.difference(&dirs).collect();
+    assert!(phantom.is_empty(), "these members have no crate directory: {phantom:?}");
+}
