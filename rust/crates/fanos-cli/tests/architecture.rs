@@ -654,7 +654,7 @@ fn every_numeric_constant_carries_a_comment() {
 }
 
 /// Every `.rs` under a crate's `src/`.
-fn rust_sources(crates: &std::path::Path) -> Vec<PathBuf> {
+fn rust_sources(crates: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![crates.to_path_buf()];
     while let Some(dir) = stack.pop() {
