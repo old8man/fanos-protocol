@@ -714,11 +714,26 @@ impl<F: Field> BeaconNode<F> {
     ///    commitment), never forked;
     /// 3. `auth.anchor == lineage_anchor()` — the authorization was issued for THIS cell at THIS generation;
     /// 4. `auth.epoch_fence > epoch` — the resumed clock only moves forward;
-    /// 5. `new_commitment.threshold() == auth.threshold` — the DKG produced exactly the authorized threshold.
+    /// 5. `new_commitment.threshold() == auth.threshold` — the DKG produced exactly the authorized threshold;
+    /// 6. `auth.survivors` is **below this cell's threshold** — the certificate must describe a cell that
+    ///    genuinely cannot reshare, which is the only situation re-genesis is the right answer to.
     ///
     /// The fresh key has no continuity with the lost one (it is information-theoretically gone); the `RGC` plus
     /// this commitment ARE the new lineage. `new_share` is this node's share from the survivor DKG — `None` for a
     /// pure consumer, which then adopts the resumed rounds without contributing partials.
+    ///
+    /// # The obligation this engine cannot discharge
+    ///
+    /// Guard 6 is what the *certificate* claims about the cell. Whether the cell is **actually** frozen is a
+    /// liveness question, and liveness is not visible to a sans-I/O engine — it lives in the node's
+    /// [`StallDetector`](crate::recovery::StallDetector) and its
+    /// [`recovery_decision`](crate::recovery::recovery_decision) ladder.
+    ///
+    /// **So a driver that carries an RGC into a running node MUST additionally require its own confirmed
+    /// stall before calling this.** Stated here rather than left to be rediscovered: this function has no
+    /// production caller yet, and the neighbouring POROS reshare path was once wired by a driver that omitted
+    /// the guard the engine was relying on it to apply. The cheapest moment to write the rule down is while
+    /// there is still no caller to break.
     pub fn rebootstrap(
         &mut self,
         auth: &RecoveryAuthorization,
@@ -728,6 +743,27 @@ impl<F: Field> BeaconNode<F> {
         let Some(authority) = &self.authority else {
             return false; // re-genesis disabled — no configured trust root
         };
+        // **The certificate must describe a cell that cannot reshare.** Re-genesis abandons a live key and
+        // installs one with no continuity to it, which is the right answer to `< t` surviving shares and the
+        // wrong answer to anything else — a reshare preserves the key and is available whenever `≥ t` remain.
+        // Without this, an authorization naming a *healthy* survivor set replaced the beacon of a working
+        // cell, and since coordinates derive from the beacon that is control over where every node lands.
+        //
+        // Checked through `recovery_decision`, not by re-deriving `len < t` here, so the acceptance rule and
+        // the ladder that decides when to *ask* for re-genesis cannot drift apart — they are the same
+        // predicate read from two sides.
+        //
+        // This is a claim the certificate makes about itself, and it is deliberately the weaker of the two
+        // guards: a node's own view of liveness lives above this sans-I/O engine (`StallDetector`), so the
+        // driver that eventually carries an RGC must ALSO require its own confirmed stall. That obligation is
+        // stated on `rebootstrap`'s doc comment rather than left to be rediscovered, because the neighbouring
+        // POROS reshare path shipped a driver without its guard once already.
+        if !matches!(
+            crate::recovery::recovery_decision(&auth.survivors, self.threshold),
+            crate::recovery::RecoveryAction::RequestRegenesis { .. }
+        ) {
+            return false;
+        }
         if !auth.verify(authority)
             || auth.generation <= self.reshare_gen
             || auth.anchor != self.lineage_anchor()
@@ -1087,6 +1123,60 @@ mod tests {
         ));
         let stale = RecoveryAuthorization::issue(&authority_sk, 1, Epoch::new(9), &survivors, t2, n.lineage_anchor());
         assert!(!n.rebootstrap(&stale, new_commitment, Some(new_shares[4].clone())), "a stale generation is refused");
+    }
+
+    /// **A re-genesis certificate for a cell that is not below threshold is refused.**
+    ///
+    /// Re-genesis exists for one situation: `< t` shares survive, so the key is information-theoretically
+    /// gone and no reshare can recover it. Every other case has a *reshare*, which preserves the key. Before
+    /// this guard, `rebootstrap` checked the authority, the fence, the anchor and the generation — and not
+    /// whether there was anything to recover. An authorization naming a healthy survivor set therefore
+    /// replaced a working cell's beacon, and since coordinates derive from the beacon
+    /// (`docs/design-governance.md` §2.1) that is control over where every node in the cell lands.
+    ///
+    /// It matters more than it looks because `rebootstrap` has **no production caller**: the R-C1 freeze exit
+    /// is engine-complete and unwired, so this guard is being written while there is still nothing to break —
+    /// which is the opposite of how the neighbouring POROS reshare path acquired its driver.
+    #[test]
+    fn re_genesis_is_refused_while_the_cell_can_still_reshare() {
+        use crate::RecoveryAuthorization;
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+
+        let t = 4usize;
+        let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"healthy-genesis")).unwrap();
+        let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"authority"));
+        let mut node = BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t)
+            .with_recovery_authority(authority_vk);
+
+        let t2 = 2u8;
+        let (new_shares, new_commitment) =
+            deal(&[0x5E; 32], usize::from(t2), N, &mut DeterministicRng::new(b"healthy-fresh")).unwrap();
+        let fence = Epoch::new(3);
+
+        // THE PROPERTY. Every other guard passes — genuine authority, this cell's anchor, an advancing fence,
+        // a fresh generation, a matching threshold — so nothing but the survivor count can refuse this.
+        for healthy in [N, t + 1, t] {
+            let survivors: Vec<u8> = (1..=healthy as u8).collect();
+            let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, node.lineage_anchor());
+            assert!(
+                !node.rebootstrap(&rgc, new_commitment.clone(), Some(new_shares[4].clone())),
+                "{healthy} survivors at threshold {t} can still RESHARE, so re-genesis — which abandons the \
+                 key — must be refused; accepting it lets an authority re-key a working cell and thereby \
+                 choose where every node lands"
+            );
+            assert_eq!(node.threshold(), t, "and nothing was installed");
+            assert_eq!(node.reshare_gen(), 0, "and the generation did not advance");
+        }
+
+        // THE MECHANISM, so the test cannot pass by refusing everything: one fewer survivor than the
+        // threshold is exactly the case re-genesis is for, and it is accepted.
+        let survivors: Vec<u8> = (1..=(t - 1) as u8).collect();
+        let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, node.lineage_anchor());
+        assert!(
+            node.rebootstrap(&rgc, new_commitment, Some(new_shares[4].clone())),
+            "{} survivors at threshold {t} cannot reshare — this is the case re-genesis exists for",
+            t - 1
+        );
     }
 
     /// Step `AdvanceEpoch` on only the nodes at `which` (the survivors), returning their flooded-partial bus —
