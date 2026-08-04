@@ -394,4 +394,73 @@ mod tests {
             "sustained pre-sample expiries saturate at the ceiling, never past it"
         );
     }
+
+    /// **Does the estimator actually converge, and in how many gathers?** — measured, because the defect that
+    /// produced `observe_late` was measured: 158 shares arrived *after* the deadline had already fired in one
+    /// run, which says the deadline was too tight and says nothing about whether the fix reaches the right
+    /// value or merely moves.
+    ///
+    /// The trap this rules out is specific. `expired` backs off and `observe` clears the backoff, so a clock
+    /// that only ever saw completions and expiries could oscillate: widen on expiry, snap back on the first
+    /// completion, expire again. `observe_late` exists to break that by folding the *real* elapsed time of a
+    /// share that arrived late — a genuine latency sample, which an expiry alone never yields (RFC 6298 §5.5
+    /// and Karn: a timeout is not a measurement).
+    ///
+    /// Reported as a table rather than asserted to a constant, because "how many rounds" is a property of the
+    /// smoothing constants (⅞ / ¼) and would silently become a different claim if they moved.
+    #[test]
+    fn the_gather_deadline_converges_onto_a_latency_it_starts_far_below() {
+        // A cell whose true gather latency is well past the bootstrap guess: every early gather expires, and
+        // the only information available is the late arrivals.
+        // The value is bracketed, not picked: it must exceed `INITIAL_GATHER_DEADLINE` (2 s) or the
+        // bootstrap already covers it and there is nothing to converge, and `srtt + 4·var = 3·truth` must
+        // stay under `MAX_GATHER_DEADLINE` (10 s) or every value clamps and the widening and narrowing this
+        // test is about become invisible behind the ceiling. That leaves `2 s < truth < 3.33 s`.
+        let truth = Duration::from_millis(2500);
+        let mut clock = GatherClock::new();
+        assert!(clock.deadline() < truth, "the bootstrap guess starts below the truth, which is the case");
+
+        let mut rounds = 0usize;
+        let mut report = String::from("\n  round   deadline(ms)   covers truth\n");
+        while clock.deadline() < truth && rounds < 64 {
+            // The gather expires, and a share then lands at the true latency: exactly what the instrumented
+            // run saw hundreds of times.
+            clock.expired();
+            clock.observe_late(truth);
+            rounds += 1;
+            if rounds <= 8 || clock.deadline() >= truth {
+                report.push_str(&format!(
+                    "  {rounds:5}   {:12}   {}\n",
+                    clock.deadline().as_nanos() / 1_000_000,
+                    clock.deadline() >= truth,
+                ));
+            }
+        }
+        println!("{report}");
+
+        assert!(
+            clock.deadline() >= truth,
+            "the deadline must reach a latency the cell actually has, or every gather expires for ever{report}"
+        );
+        assert!(
+            rounds <= 8,
+            "convergence must be quick enough to matter: a cell that needs dozens of failed gathers to learn \
+             its own latency has already dropped the traffic that mattered{report}"
+        );
+
+        // **And it must not stay wide once the cell is healthy.** A completion clears the backoff, so the
+        // deadline falls back to what the samples justify rather than staying at its widened value — which is
+        // the half `observe_late` deliberately does NOT do, and the reason it exists as a separate call.
+        let widened = clock.deadline();
+        clock.observe(truth);
+        assert!(
+            clock.deadline() < widened,
+            "a completed gather must narrow the deadline again — otherwise one bad patch widens a node for \
+             the rest of its life{report}"
+        );
+        assert!(
+            clock.deadline() >= truth,
+            "but not below the latency it just measured{report}"
+        );
+    }
 }
