@@ -3366,3 +3366,42 @@ over-coupled.
 Stated rather than fixed. It is a question about what `Φ`'s estimate should be computed from, it touches the
 healing budget and the published coherence frame, and it deserves its own analysis rather than a change made
 at the end of a long session.
+
+## §6. [HIGH, FIXED, #94] "By construction", three times, checked nowhere
+
+DROMOS holds value in three shared system accounts and each asserted its invariant in prose —
+`storage_escrow()` "the sum of unreleased deal escrow **by construction**", `htlc_escrow()` "the sum of
+unresolved locked contracts **by construction**", `total_bonded()` "equal to `STAKE_SINK`'s balance **by
+construction**". Nothing checked any of them, while `Tokens::move_system` returns `false` on a short system
+account and **all twelve production call sites discard it**.
+
+The composition is the finding. A settlement records `released += amount` *before* moving the tokens, so a
+move that silently does not happen leaves the deal saying the provider was paid and the token ledger saying
+it was not — deterministically, so every validator computes the same wrong `state_root` and consensus
+ratifies it. A discarded `false` here is not a lost log line; it is a disagreement between two halves of one
+state that nothing can observe.
+
+No reachable break was found — per-deal arithmetic is exact. The defect is that soundness rested on an
+unstated invariant over a *shared* account with its only violation signal thrown away everywhere.
+
+`conservation()` returns three `(held, owed)` pairs and `apply_block` checks them. Equality, not `≥`: the
+accounts are shared, so a **surplus** is as much a defect as a shortfall — it is value credited to a sink no
+owner's accounting claims, which can never be released. **Counted, not aborted**: a `panic!` would stop the
+whole cell together (every validator computes the same state), converting a value bug into a liveness bug an
+attacker could trigger on purpose; the count is deterministic so it cannot fork the chain either.
+
+## §7. A finding I filed and then had to withdraw, recorded because the method matters
+
+I filed a HIGH claiming the storage market never detects a provider that stops proving — no penalty, the deal
+`Active` for ever, the consumer's refund never accruing. **All three were false.** `Deal::finalize_if_lapsed`
+runs in a per-block lapse sweep, auto-completes the deal at its audit deadline, refunds the unproven escrow
+without a manual close, and prunes it. It sits *twenty lines below* the function I had been reading.
+
+The call-site grep that started it was correct — `Settlement::Miss` genuinely has no producer — but the
+consequence I attributed to that fact is handled somewhere else entirely. The narrower true finding is that
+`Miss` and `missed_audits` are **reputation inputs with no consumer** (#93), which is #44's content, plus a
+test that drives a call production cannot make.
+
+The rule this earns: **before writing "nothing handles X", read the file around the function, not only its
+callers.** The remedy is routinely present under a different name — the same lesson `canonical-addressee-family`
+records from the other direction.
