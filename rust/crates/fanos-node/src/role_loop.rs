@@ -95,11 +95,42 @@ use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 /// `fanos-bench` can produce. Setting it by taste would replace one wrong number with another.
 pub(crate) const ROLE_CAPACITY_PER_NODE: u16 = 1;
 
+/// **How many keys one node absorbs — and the one role whose capacity is a derivation rather than a
+/// placeholder.**
+///
+/// The storage load a node reports is `store.entries.len()` (`overlay/mod.rs`), so capacity in those units is
+/// "how many entries one node will hold", and the node itself already answers that: `MAX_STORE_ENTRIES` is
+/// the bound its own admission rule enforces, past which it refuses a new digest outright. Reading capacity
+/// off anything else would be reading a number the node does not obey.
+///
+/// It became a *usable* figure only once the store started reclaiming. While six directories minted a slot
+/// per epoch and nothing removed one, `entries.len()` climbed on a wall clock toward the cap regardless of
+/// how much content the cell actually held — so this ratio measured uptime, not demand
+/// (`fanos-node/tests/store_lifetime.rs`). With soft state reclaimed, what is left in `entries` is content
+/// plus a constant directory footprint, which is the thing worth provisioning against.
+///
+/// Saturated `u16` because `Demand` is `u16`-valued and `MAX_STORE_ENTRIES` fits; if the cap ever grew past
+/// `u16::MAX` the clamp would understate capacity, which errs toward over-provisioning storage — the safe
+/// direction, and one the deficit escalation would surface rather than hide.
+#[allow(clippy::cast_possible_truncation)]
+const STORAGE_CAPACITY_PER_NODE: u16 =
+    if fanos_runtime::MAX_STORE_ENTRIES > u16::MAX as usize { u16::MAX } else { fanos_runtime::MAX_STORE_ENTRIES as u16 };
+
 /// The per-role capacity vector, built once so the load publisher and the setpoint aggregation cannot disagree
 /// about the denominator — the divergence that would reintroduce a double division without any type noticing.
+///
+/// **Per role, because capacity is not one number.** Each role's load is measured in its own units, so its
+/// capacity has to be too: storage counts held keys and has the derivation above; relay counts originated
+/// frames per observation window, which is a throughput figure only `fanos-bench` can produce; the remaining
+/// four have no sensor at all yet, so a capacity for them would be a denominator over a fabricated numerator.
+/// Those keep [`ROLE_CAPACITY_PER_NODE`] and its stated defect until each gets a measurement — replacing one
+/// wrong number with another by taste is the thing this whole subsystem is trying not to do.
 #[must_use]
 pub(crate) fn role_capacity() -> Demand {
-    Demand::per_role(|_| ROLE_CAPACITY_PER_NODE)
+    Demand::per_role(|role| match role {
+        Role::Storage => STORAGE_CAPACITY_PER_NODE,
+        _ => ROLE_CAPACITY_PER_NODE,
+    })
 }
 
 /// The latest per-role load this node **measured**, shared between the engine's notification stream and the role
@@ -709,8 +740,10 @@ mod tests {
     /// **A tripwire on a defect that is deliberately unfixed, because fixing half of it is worse than
     /// neither half.**
     ///
-    /// `ROLE_CAPACITY_PER_NODE` is `1`, which reads an *event* count as a *node* count: a cell holding a
-    /// hundred keys asks for a hundred storage nodes. Demand therefore exceeds eligible supply on any active
+    /// `ROLE_CAPACITY_PER_NODE` is `1`, which reads an *event* count as a *node* count. **Storage is out of
+    /// its scope as of 2026-08-04** — its capacity is now derived from `MAX_STORE_ENTRIES`, the bound the
+    /// node's own admission rule enforces on the very number it reports — but the other five roles still
+    /// carry it, and for four of them there is not even a sensor to divide. Demand therefore exceeds eligible supply on any active
     /// cell, `assign_report` fills `min(demand, eligible)`, every offering node gets every role it offered,
     /// and the controller expresses nothing — measured on a fleet as `transitions = 0` across a whole window.
     ///
@@ -720,6 +753,24 @@ mod tests {
     ///
     /// So the two must move together, and until now only a doc comment said so. This fails the moment capacity
     /// stops being the placeholder — which is exactly when someone needs to be told about the other half.
+    #[test]
+    fn storage_capacity_is_the_bound_the_node_actually_enforces() {
+        // The one role whose capacity is derived rather than placed. Its load is `store.entries.len()`, so
+        // its capacity is the bound the node's own admission rule enforces on that number — read from
+        // `MAX_STORE_ENTRIES` rather than restated, because a copy would drift the moment the cap moved and
+        // nothing would notice: the assignment would simply provision the wrong number of storage nodes.
+        assert_eq!(
+            usize::from(role_capacity().of(Role::Storage)),
+            fanos_runtime::MAX_STORE_ENTRIES,
+            "storage capacity must equal the store's own admission bound",
+        );
+        assert!(
+            role_capacity().of(Role::Storage) > role_capacity().of(Role::Relay),
+            "and it must actually differ from the placeholder the unmeasured roles still carry — if these \
+             ever coincide, capacity has silently become one number again",
+        );
+    }
+
     #[test]
     fn capacity_and_the_deficit_escalation_must_be_fixed_together() {
         assert_eq!(
@@ -821,7 +872,19 @@ mod tests {
             "a cell where every node measured no relay demand must want no relays; the offer-for-any-zero rule \
              reported 7 here and the role could never shrink"
         );
-        assert_eq!(want.of(Role::Storage), 35, "measured storage work aggregates");
+        // **Seven nodes holding five keys each need one storage node, not thirty-five, and that is the fix
+        // working.** This read `35` while capacity was the placeholder `1` — a cell of seven asking for
+        // thirty-five storage nodes because it holds thirty-five keys, an *event* count read as a *node*
+        // count, and the saturation that made every assignment unanimous. Divided by the bound the node
+        // actually enforces on that number, the same load is one node's worth of work, which is a figure a
+        // controller can act on.
+        assert_eq!(
+            want.of(Role::Storage),
+            1,
+            "thirty-five keys against a per-node capacity of {} is ONE storage node's worth of work — \
+             asking for thirty-five was reading held keys as needed nodes",
+            cap.of(Role::Storage),
+        );
         assert_eq!(want.of(Role::Service), 7, "everyone who offers an unsensed role serves it");
     }
 
