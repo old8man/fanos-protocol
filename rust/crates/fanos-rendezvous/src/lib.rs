@@ -904,6 +904,57 @@ mod tests {
     }
 
     #[test]
+    fn the_epoch_rotating_tag_is_defeated_by_the_preimage_travelling_beside_it() {
+        // **What the rotation buys, and what carrying the identity gives straight back.**
+        //
+        // `service_tag` rotates every epoch precisely so a combiner cannot follow one hidden service through
+        // time: `service_tag_is_one_way_epoch_rotating_and_service_specific` proves the tags themselves are
+        // unlinkable. But a registration also carries `identity` — the bundle the tag is a hash of — because
+        // the combiner must *recompute* the tag rather than believe it, or one unsigned message per epoch
+        // would seize a service's route.
+        //
+        // So the combiner holds the preimage. Two registrations from different epochs, whose tags share
+        // nothing, are trivially the same service: their `identity` fields are byte-identical. Every meeting
+        // combiner therefore keeps a linkable, timestamped record of which services exist and when they are
+        // up — by construction, with no attack, from data the protocol hands it.
+        //
+        // This test exists to make that measured rather than argued, because the design's "proven
+        // non-linkable across epochs" is a claim about the NOSTOS receiver's dead-drop line and does not
+        // extend to a hidden service's registration. Closing it needs per-epoch **key blinding** — a public
+        // derivation of an epoch verification key from a stable one — which ML-DSA does not offer as a
+        // standard operation. Until then the leak stands, and the number below is the honest size of it.
+        let (bundle, signer) = identity(b"a-service-across-time");
+
+        let across: Vec<HostRegister> = (1..=8u64)
+            .map(|e| HostRegister::bare(&bundle, &signer, Epoch::new(e), [1, 0, 1]))
+            .collect();
+
+        // The rotation works, on its own terms: no two epochs share a tag.
+        let tags: std::collections::BTreeSet<[u8; 32]> =
+            across.iter().map(|r| r.service_tag).collect();
+        assert_eq!(tags.len(), across.len(), "the tag genuinely rotates — this half is sound");
+
+        // And it is defeated: the SAME registrations are linkable by a field sitting beside the tag, so the
+        // combiner needs no cryptanalysis and no correlation window.
+        let identities: std::collections::BTreeSet<&[u8]> =
+            across.iter().map(|r| r.identity.as_slice()).collect();
+        assert_eq!(
+            identities.len(),
+            1,
+            "eight epochs of registrations carry ONE identity — the epoch-rotating tag hides nothing from \
+             the party that receives its preimage, which is every meeting combiner the service registers at",
+        );
+
+        // The precise leak, so a fix can be checked against it rather than against a feeling: the tag commits
+        // to the signing half only, so that is exactly what travels.
+        assert!(
+            across.first().is_some_and(|r| r.identity == bundle),
+            "the registration carries the service's published bundle verbatim, whose prefix is the stable \
+             signing verification key the tag commits to",
+        );
+    }
+
+    #[test]
     fn service_tag_is_one_way_epoch_rotating_and_service_specific() {
         let a = service_tag(b"svc-A", Epoch::new(5));
         // Deterministic in its inputs.

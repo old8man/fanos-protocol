@@ -488,6 +488,30 @@ one-exclusion search costs `n + 1` interpolations, while any deeper search costs
 recovery itself the cheapest denial-of-service against the line it protects. Verified resharing (establishing
 per-share commitments for the fresh polynomial without a dealer) is the follow-on that closes it.
 
+**The epoch-rotating service tag is defeated by its own preimage, and the honest scope is narrower than §3b
+reads.** `service_tag = H(identity ‖ epoch)` rotates so a meeting combiner cannot follow one hidden service
+through time, and the tags themselves genuinely are unlinkable. But a registration also carries `identity` —
+the bundle the tag hashes from — because the combiner must *recompute* the tag rather than believe it: without
+that, one unsigned message per epoch seizes a service's route (the seizure `HostRegister::verify` refuses).
+
+So every meeting combiner receives the preimage. Two registrations from different epochs whose tags share
+nothing are the same service by byte comparison of one field, and a combiner therefore keeps a linkable,
+timestamped record of which services exist and when they are up — by construction, with no attack and no
+correlation window. `fanos-rendezvous`'s
+`the_epoch_rotating_tag_is_defeated_by_the_preimage_travelling_beside_it` measures it over eight epochs.
+
+The claim elsewhere in this document that the substrate is "proven non-linkable across epochs" is about the
+**NOSTOS receiver's dead-drop line**, and does not extend to a hidden service's registration. The two are
+different parties with different exposures, and conflating them overstates what §3b delivers.
+
+Closing it needs per-epoch **key blinding**: a public derivation of an epoch verification key from a stable
+one, so the combiner verifies a signature under a key it can check against the tag while learning nothing that
+persists. Tor v3 does exactly this with ed25519. **ML-DSA offers no standard blinding operation**, which is
+the research gate — not an implementation gap — and inventing one unaudited would be worse than the leak. The
+alternative shapes worth evaluating are a committed chain of per-epoch verification keys with a
+membership proof, and an anonymous-credential presentation; both cost a proof per registration, which is a
+real budget question against a fixed-width onion.
+
 **The Sybil gate is load-bearing, and must be anchored correctly.** Mahdian's `Ω(t)` floor binds POROS too:
 anyone admitted who can *compute* coordinates can block them at the same `t·log` rate — so **keeping `t` small is
 the whole game**, which makes the admission gate not optional. But the FANOS holonic *coherence* signal has the
