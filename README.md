@@ -35,6 +35,34 @@ analysis is [`docs/comparison.md`](docs/comparison.md).
 
 ---
 
+## What it is for
+
+FANOS is built for the situations where the ordinary internet's assumption — that who talks to whom is
+nobody's secret — is the thing that gets someone hurt. Journalists and their sources. Human-rights workers in
+places where an association graph is evidence. People under network censorship, for whom "which service did
+you reach" is the question that matters. Researchers who need a substrate they can measure rather than trust.
+And, plainly, ordinary users who would rather not have their traffic profiled by anyone at all.
+
+It is post-quantum from day one for one reason: **traffic recorded today is decrypted later.** An anonymity
+network whose protection expires when a cryptographically relevant quantum computer arrives is not protecting
+the people whose exposure has a long tail — which is most of the people above. That is a design constraint,
+not a marketing line, and it is why every primitive here is a hybrid of a classical and a lattice scheme
+rather than the faster classical one alone.
+
+**What this project does not do.** It does not target individuals, it does not help anyone attack a network,
+and it is not a tool for evading accountability to the people one has harmed. Anonymity systems are
+dual-use — that is a property of the mathematics, and no design choice removes it — so the honest posture is
+to say what the work is *for*, to build the thing that serves that purpose well, and not to pretend the
+dual-use edge is absent. Where a mechanism here has a misuse surface, the design documents say so rather than
+routing around the sentence.
+
+**And it is not finished.** It has no users, no deployment, and no external cryptographic audit; several
+subsystems are marked `[P]` — a direction of work with an honest gap, not a shipped guarantee — and
+`docs/audit.md` lists what is open in more detail than most projects publish about themselves. Treat every
+claim here as a claim under test until an audit says otherwise. That, too, is part of what the project is for.
+
+---
+
 ## What you can do with it
 
 FANOS is not a single app; it is a foundation that already carries five product surfaces, each a real,
