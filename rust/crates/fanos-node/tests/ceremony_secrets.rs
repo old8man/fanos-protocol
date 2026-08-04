@@ -10,7 +10,7 @@
 //! classified set**: a ceremony that grows a new output fails here until someone decides which kind it is.
 //! That is the property — the classification is total — and it is the only form that survives the next file.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt as _;
@@ -315,7 +315,7 @@ fn the_service_ceremony_deals_one_roster_and_keeps_every_seed_apart() {
 
     // And the seeds are independent, which is the other half: this dealer holds no secret after it exits,
     // because there is no split secret for it to hold.
-    let seeds: std::collections::BTreeSet<&str> = files
+    let seeds: BTreeSet<&str> = files
         .iter()
         .filter_map(|t| t.lines().find(|l| l.starts_with("seed =")))
         .collect();

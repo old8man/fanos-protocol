@@ -702,8 +702,11 @@ here only because earlier notes described ingress as non-rotating, and that's no
 
 **One CLI sharp edge left, and two that were fixed:**
 
-* Still true: `fanos <verb> --help` prints the **top-level** help, not that verb's own usage. There is no
-  per-verb usage text; the flags for each verb are in the one listing.
+* Fixed (2026-08-04): `fanos <verb> --help` prints **that verb's** usage. It is a projection of the one
+  listing rather than a second set of strings — twenty usage blocks would drift the first time a flag was
+  added to one and not the other — and a test asserts every dispatched verb has a block, so a new verb
+  cannot ship undocumented. It found three on its first run (`message`, `stop`, `restart`), which is the
+  whole reason it exists.
 * Fixed (2026-08-04): `--help` or `-h` anywhere in the argument list now prints help and exits
   (`bin/fanos.rs`). Before that the dispatch table checked only the *first* argument, so `fanos node
   --help` silently started a real node with `--help` treated as an unrecognized, ignored argument — found

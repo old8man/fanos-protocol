@@ -58,7 +58,12 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
     // having to remember. It runs before any argument is parsed, so a malformed command still explains itself
     // rather than failing on the first bad flag.
     if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
-        print_help();
+        // A named verb gets **its own** usage rather than the full listing — the block is projected out of the
+        // one help text, so there is no second copy to drift (see `print_verb_help`).
+        match args.get(1).map(String::as_str) {
+            Some(v) if !v.starts_with('-') => print_verb_help(v),
+            _ => print_help(),
+        }
         return Ok(());
     }
     match args.get(1).map(String::as_str) {
@@ -3072,8 +3077,8 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-fn print_help() {
-    eprintln!(
+fn help_text() -> String {
+    let mut s = String::from(
         "fanos — the FANOS node\n\
          \n\
          USAGE:\n\
@@ -3087,21 +3092,24 @@ fn print_help() {
            \x20                                 VERB asks a running node directly: health (default), roles,\n\
            \x20                                 coherence (is the cell healthy), stations (where work is\n\
            \x20                                 stopping), census, consensus\n\
-           fanos start | stop | restart     — drive the installed service\n\
+           fanos start                      — start the installed service\n\
+           fanos stop                       — stop it\n\
+           fanos restart                    — stop and start it (after editing the config)\n\
            fanos uninstall [--purge] [--yes]\n\
                        (remove the service; --purge also deletes config, identity and state — the\n\
                         coordinate is derived from the identity, so a purged node returns as a stranger)\n\
-         "
+         ",
     );
-    print_help_advanced();
+    s.push_str(&help_advanced());
+    s
 }
 
 /// The rest of the help: the verbs an operator reaches for after the first day.
 ///
 /// Split from [`print_help`] because it is one string and it grew past what one function may hold — the
 /// boundary is where the text itself already put one.
-fn print_help_advanced() {
-    eprintln!(
+fn help_advanced() -> String {
+    String::from(
         "ADVANCED:\n\
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--data DIR] \\\n\
          \x20             [--bootstrap x:y:z@host:port,...] \\\n\
@@ -3131,6 +3139,9 @@ fn print_help_advanced() {
          \x20 fanos authority-key [--out FILE]\n\
          \x20             (generate THIS founder's recovery-authority key locally: the seed stays here, the\n\
          \x20              printed verifier goes to whoever deals the beacon)\n\
+         \x20 fanos message serve --host-key FILE [--config FILE] [--bootstrap x:y:z@host:port,...]\n\
+         \x20             (host an ANGELOS messenger on the anonymous rendezvous: clients reach it by\n\
+         \x20              service tag, and neither side learns the other's coordinate)\n\
          \x20 fanos service-deal x:y:z... [--out DIR] [--threshold T]\n\
          \x20             (assemble a threshold-hosted service line: one file per member, all carrying the\n\
          \x20              SAME roster — a line whose members disagree by one coordinate cannot reconstruct)\n\
@@ -3186,8 +3197,57 @@ fn print_help_advanced() {
          \x20 fanos proxy --profile anonymous --threshold 2 --bootstrap 1:0:0@seed.example:9000\n\
          \x20            # unlinkable per-dial routes over the cell mixnet\n\
          \n\
-         Set RUST_LOG=debug for verbose logs."
-    );
+         Set RUST_LOG=debug for verbose logs.",
+    )
+}
+
+/// Print the whole help.
+fn print_help() {
+    eprint!("{}", help_text());
+}
+
+/// Print the usage block for **one verb**, projected out of the single help text — or the whole thing when the
+/// verb has no block.
+///
+/// **A projection rather than a second set of strings, and that is the point.** `fanos <verb> --help` used to
+/// print the top-level listing, and the obvious fix — a usage string per verb — is twenty copies of text that
+/// already exists, which drift the first time a flag is added to one and not the other. Here there is one
+/// source and the per-verb view is derived from it, so a flag documented once is documented everywhere.
+///
+/// A block is the line beginning `fanos <verb>` plus every following line indented under it, which is exactly
+/// how the listing is already written. `every_verb_has_a_help_block` asserts the projection finds one for each
+/// verb the dispatcher accepts, so a new verb cannot ship undocumented.
+fn print_verb_help(verb: &str) {
+    let text = help_text();
+    let Some(block) = verb_block(&text, verb) else {
+        eprint!("{text}");
+        return;
+    };
+    eprintln!("usage:\n{block}");
+    eprintln!("(`fanos help` lists every verb.)");
+}
+
+/// The lines of `text` documenting `verb`: the `fanos <verb>` line and the indented lines under it.
+fn verb_block(text: &str, verb: &str) -> Option<String> {
+    let head = format!("fanos {verb} ");
+    let exact = format!("fanos {verb}");
+    let mut lines = text.lines().skip_while(|l| {
+        let t = l.trim_start();
+        !(t.starts_with(&head) || t == exact)
+    });
+    let first = lines.next()?;
+    // The continuation is every following line indented *past* the verb line's own indent — the shape the
+    // listing already uses for a verb's flags and its parenthetical description.
+    let indent = first.len() - first.trim_start().len();
+    let mut out = vec![first.trim_end().to_owned()];
+    for l in lines {
+        let t = l.trim_start();
+        if t.is_empty() || l.len() - t.len() <= indent {
+            break;
+        }
+        out.push(l.trim_end().to_owned());
+    }
+    Some(out.join("\n"))
 }
 
 #[cfg(test)]
@@ -3299,5 +3359,45 @@ mod tests {
             "and the role it implies is set — otherwise the node stores the parameters and hosts nothing, \
              which is exactly what `--service` and `--exit` avoid by implying theirs",
         );
+    }
+
+    /// **Every verb the dispatcher accepts must have a help block**, and this is the check that makes the
+    /// projection honest.
+    ///
+    /// Per-verb help is derived from the one listing rather than written twice (`print_verb_help`), which
+    /// removes drift — but it introduces a different failure: a verb with no block silently falls back to the
+    /// whole listing, which is exactly the behaviour the change was made to remove. So the verb list is stated
+    /// here and asserted against the text, and a new verb fails this test on the commit that adds it.
+    #[test]
+    fn every_verb_has_a_help_block() {
+        // The dispatcher's own arms, in order. Kept by hand because the alternative — parsing the match — is
+        // a worse test than a list someone has to update when they add an arm.
+        const VERBS: &[&str] = &[
+            "node", "proxy", "host", "message", "validator", "pay", "term", "vpn", "init", "start",
+            "stop", "restart", "uninstall", "status", "id", "beacon-deal", "authority-key",
+            "ingress-deal", "service-deal", "taxis-deal", "resolve",
+        ];
+        let text = help_text();
+        let missing: Vec<&str> = VERBS.iter().copied().filter(|v| verb_block(&text, v).is_none()).collect();
+        assert!(
+            missing.is_empty(),
+            "these verbs are dispatched but documented nowhere, so `fanos <verb> --help` falls back to the \
+             whole listing — which is the behaviour per-verb help exists to remove: {missing:?}"
+        );
+    }
+
+    /// The projection must return **that verb's** block, not the first thing that happens to match.
+    #[test]
+    fn a_verb_block_is_the_verb_and_its_own_continuation() {
+        let text = help_text();
+        let block = verb_block(&text, "beacon-deal").expect("beacon-deal is documented");
+        assert!(block.contains("beacon-deal"), "the block names its verb");
+        assert!(block.contains("--authority-verifiers"), "and carries its own flags");
+        assert!(
+            !block.contains("fanos ingress-deal"),
+            "and stops before the next verb — a block that ran on would make every projection the listing"
+        );
+
+        assert!(verb_block(&text, "not-a-verb").is_none(), "an unknown verb has no block");
     }
 }
