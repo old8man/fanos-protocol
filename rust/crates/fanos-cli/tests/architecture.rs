@@ -48,9 +48,26 @@ const ORPHANS: &[(&str, &str)] = &[
     // capability lands without a door.
 ];
 
-/// Every crate that is allowed to be unlinked, for either reason.
+/// Crates that exist to be linked by **test harnesses only**, and are therefore correctly absent from every
+/// shipped binary's dependency closure.
+///
+/// A third category, kept apart for the reason the other two are: an embedding surface is finished and waiting
+/// for a foreign caller, an orphan is capability with no door, and this is neither. `fanos-testkit` holds the
+/// host-load instrument that decides when a timing test must decline to conclude; shipping it inside a node
+/// would be the defect, not the absence.
+///
+/// It follows that its public functions have no *production* caller by construction, so it is exempt from the
+/// unwired-capability scan below. That exemption is safe precisely because the category is narrow: a crate
+/// here must be a `dev-dependency` of something and a dependency of nothing.
+const TEST_SUPPORT: &[(&str, &str)] = &[(
+    "fanos-testkit",
+    "the shared test instrument (host load, the quiet-host guard) — a dev-dependency of fanos-node and \
+     fanos-quic, and deliberately reachable from no shipped binary",
+)];
+
+/// Every crate that is allowed to be unlinked, for any of the three reasons.
 fn unlinked() -> Vec<(&'static str, &'static str)> {
-    EMBEDDING_SURFACE.iter().chain(ORPHANS).copied().collect()
+    EMBEDDING_SURFACE.iter().chain(ORPHANS).chain(TEST_SUPPORT).copied().collect()
 }
 
 /// Parse one manifest's *normal* workspace dependencies (dev- and build-dependencies are not shipping
@@ -137,7 +154,8 @@ fn every_crate_is_reachable_from_a_shipped_binary_or_declared_unlinked() {
         unexpected.is_empty(),
         "these crates are linked by nothing the project ships: {unexpected:?}\n\
          Either wire them into a binary, or add each to EMBEDDING_SURFACE (if it exists to be called from \
-         outside) or ORPHANS (if it is capability with no door) with the reason."
+         outside), ORPHANS (if it is capability with no door), or TEST_SUPPORT (if it exists only for test \
+         harnesses) with the reason."
     );
     let wired: Vec<&String> = declared.difference(&unreachable).collect();
     assert!(
@@ -164,7 +182,8 @@ fn the_reachability_figures_are_what_the_audit_states() {
     let from_node = closure(&deps, &BTreeSet::from(["fanos-node".to_owned()]));
     let from_any = closure(&deps, &binaries);
 
-    assert_eq!(total, 43, "the workspace crate count changed");
+    // 43 → 44: `fanos-testkit`, the shared test instrument — see `TEST_SUPPORT`.
+    assert_eq!(total, 44, "the workspace crate count changed");
     // 35 → 36: `fanos-ergon` joined the node's closure when `fanos-dromos` took a dependency on it (`ergon_host`).
     assert_eq!(from_node.len(), 36, "reachable from fanos-node (itself included): {from_node:?}");
     // 39 → 40, same cause. And the remainder is now the embedding surface alone, since `ORPHANS` is empty.
@@ -483,6 +502,12 @@ fn no_new_public_capability_arrives_unwired() {
     let budget: BTreeMap<&str, usize> = UNWIRED_BUDGET.iter().copied().collect();
     let mut grew = Vec::new();
     for (krate, names) in &actual {
+        // A test-support crate's callers are tests **by construction**, so counting its unwired functions
+        // measures the wrong thing — see `TEST_SUPPORT`. Exempted by category rather than by budget, so it
+        // cannot silently become a place to park real capability.
+        if TEST_SUPPORT.iter().any(|(c, _)| c == krate) {
+            continue;
+        }
         let allowed = budget.get(krate.as_str()).copied().unwrap_or(0);
         if names.len() > allowed {
             grew.push(format!("{krate}: {} > {allowed} — {names:?}", names.len()));
