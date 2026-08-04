@@ -31,6 +31,8 @@ use crate::session::{self, Dialed, PendingDial};
 /// literally one type, so they cannot silently diverge.
 pub use fanos_ports::Triple as Coord;
 
+// The two frame tags this overlay binding speaks, distinguishing a session HELLO from a data cell. Wire
+// values: fixed by the format and read by the peer, so they may never change without a version bump.
 const TAG_HELLO: u8 = 0x01;
 const TAG_CELL: u8 = 0x02;
 

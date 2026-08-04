@@ -18,6 +18,9 @@ use crate::slots;
 pub use fanos_threshold::THRESHOLD_ONION_LEN;
 pub use fanos_threshold::pad_onion as pad;
 
+// The peeled command byte, fixed by the canonical Tessera layout (`fanos_wire::tessera::command`):
+// `DELIVER` ends the circuit here, `NEXT` names another hop. Definitional — the values are the wire's,
+// not a choice made here, and a threshold onion peels into the same two commands a plain one does.
 const CMD_DELIVER: u8 = 0;
 const CMD_NEXT: u8 = 1;
 

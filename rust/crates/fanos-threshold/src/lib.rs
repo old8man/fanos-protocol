@@ -38,7 +38,9 @@ use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, SeedRng
 use fanos_primitives::hash_labeled;
 use fanos_primitives::shamir::{self, Share};
 
-pub const NONCE_LEN: usize = 12;
+pub /// AEAD geometry, fixed by the cipher rather than chosen: ChaCha20-Poly1305 takes a 96-bit nonce and
+/// produces a 128-bit tag (RFC 8439 §2.8). Definitional — any other value would not be this construction.
+const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 /// A Shamir share of a 32-byte key: `x(1) ‖ y(32)`.
 pub const SHARE_LEN: usize = 1 + 32;

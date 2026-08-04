@@ -31,6 +31,8 @@ use crate::pow;
 const NONCE_LABEL: &str = "FANOS-v1/onoma-desc-nonce";
 const NONCE_SALT_LABEL: &str = "FANOS-v1/onoma-desc-nonce-salt";
 const SIGN_LABEL: &str = "FANOS-v1/onoma-desc-sign";
+/// The AEAD nonce width, fixed by the cipher: ChaCha20-Poly1305 takes a 96-bit nonce (RFC 8439 §2.8).
+/// Definitional, not a tuning choice — any other value would not be a nonce for this construction.
 const NONCE_LEN: usize = 12;
 /// The per-publish nonce salt length, carried in the wire form.
 const SALT_LEN: usize = 16;

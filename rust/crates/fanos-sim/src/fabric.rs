@@ -610,6 +610,10 @@ impl NodeFleet {
         O: FnMut(&Self) -> T,
         T: PartialEq + core::fmt::Debug,
     {
+        // The polling granularity of this wait. Not a deadline — the deadline is the caller's — but the
+        // resolution at which it is checked, so it only has to be fine enough that `FROZEN_SPAN` spans
+        // several samples (the quiet-run count below divides by it). 100 ms gives tens of samples across
+        // any span this harness uses, at a cost of ten wakeups a second on an idle wait.
         const STEP: Duration = Duration::from_millis(100);
         let polls = (deadline.as_millis() / STEP.as_millis().max(1)).max(1) as u32;
         // How many unchanged samples span `FROZEN_SPAN`; at least one, whatever the step.

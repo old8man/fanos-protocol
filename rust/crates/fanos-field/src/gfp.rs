@@ -36,6 +36,9 @@ impl<const MODULUS: u32> GfP<MODULUS> {
 }
 
 impl<const MODULUS: u32> Field for GfP<MODULUS> {
+    // The field's own arithmetic, not settings: a prime field `GF(p)` has order `q = p`, characteristic
+    // `p`, and extension degree `m = 1`. Forced by the construction — a different value would name a
+    // different field — which is why these carry the definition rather than a derivation.
     const Q: u32 = MODULUS;
     const P: u32 = MODULUS;
     const M: u32 = 1;

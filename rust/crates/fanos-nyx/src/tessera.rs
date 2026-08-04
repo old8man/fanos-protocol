@@ -21,6 +21,8 @@ use crate::path::Circuit;
 use crate::ratchet::circuit_holonomy;
 use crate::error::NyxError;
 
+// The peeled command byte, fixed by the canonical Tessera layout: `DELIVER` ends the circuit here,
+// `NEXT` names another hop. Definitional — the wire fixes these, they are not a choice made here.
 const CMD_DELIVER: u8 = 0;
 const CMD_NEXT: u8 = 1;
 const NONCE_LABEL: &str = "FANOS-v1/nyx-nonce";

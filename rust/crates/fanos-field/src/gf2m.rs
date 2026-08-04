@@ -86,6 +86,9 @@ impl<const M: u32> Gf2m<M> {
 }
 
 impl<const M: u32> Field for Gf2m<M> {
+    // The field's own arithmetic, not settings: `GF(2^m)` has order `q = 2^m`, characteristic `p = 2`, and
+    // extension degree `m`. Every one is forced by the construction — a different value would name a
+    // different field — which is why they carry the definition rather than a derivation.
     const Q: u32 = 1u32 << M;
     const P: u32 = 2;
     const M: u32 = M;

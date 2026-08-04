@@ -18,6 +18,8 @@ use crate::shape::ShapeParams;
 
 const JUNK_LABEL: &str = "FANOS-v1/proteus-junk";
 const PAD_LABEL: &str = "FANOS-v1/proteus-pad";
+/// The obfuscated length prefix's width in bytes — a `u32`, so it can describe any packet the transport
+/// will carry. Definitional (the field *is* a `u32`), and read by the peer, so it is wire-fixed.
 const LENGTH_FIELD: usize = 4;
 
 /// The per-packet nonce carried in cleartext at the front of the wire. It looks random (the shaper

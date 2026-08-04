@@ -13,6 +13,10 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::dialer::{Dialer, UdpDialer};
 use crate::target::Target;
 
+// **Every value below is RFC 1928's, not ours.** The protocol version, the command and address-type
+// codes, the reply codes and the no-authentication method are fixed by the SOCKS5 specification (§3–§6);
+// a client written against the RFC is on the other end of this socket, so none of them is a choice this
+// crate could make differently. Named rather than inlined so the parser reads as the RFC does.
 pub(crate) const VER: u8 = 5;
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;

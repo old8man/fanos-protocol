@@ -276,6 +276,7 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     /// 1 s × 1 h, 1 min × 1 day, 1 h × 30 days — ~5760 buckets/metric, a few hundred KB.
     fn default() -> Self {
+        /// One second in nanoseconds — the unit every tier below is expressed in.
         const S: u64 = 1_000_000_000;
         Self {
             tiers: alloc::vec![(S, 3600), (60 * S, 1440), (3600 * S, 720)],
@@ -287,6 +288,7 @@ impl HistoryConfig {
     /// A compact policy for memory-constrained nodes: 1 s × 5 min, 1 min × 2 h.
     #[must_use]
     pub fn compact() -> Self {
+        /// One second in nanoseconds — the unit every tier below is expressed in.
         const S: u64 = 1_000_000_000;
         Self {
             tiers: alloc::vec![(S, 300), (60 * S, 120)],

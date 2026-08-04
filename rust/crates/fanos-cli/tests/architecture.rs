@@ -587,3 +587,112 @@ fn every_crate_directory_is_a_workspace_member() {
     let phantom: Vec<&String> = members.difference(&dirs).collect();
     assert!(phantom.is_empty(), "these members have no crate directory: {phantom:?}");
 }
+
+/// **Every named numeric constant says something about itself, and this is the floor of #45.**
+///
+/// The task's ambition is larger — each constant should declare *which kind* it is (derived, measured,
+/// protocol-fixed, or a stated policy) — and no scan can judge prose. What a scan can judge is the tier
+/// below: a constant with **no comment at all**, which is the state in which nobody can even begin the
+/// argument. That was 30 across the tree and is now zero, so this locks the ground rather than aspiring to
+/// it.
+///
+/// Groups are honoured — one comment above a run of related constants documents the run, which is the
+/// convention the tree already uses and the reason the first three measurements of this were wrong (63,
+/// then 48, then 30, as the scan learned what a comment looks like here). Test modules are excluded: a
+/// fixture's `const N: usize = 7` is not a platform constant.
+///
+/// **What this deliberately does not claim.** A comment saying what a constant *does* is not a comment
+/// saying why it has that *value* — `DECOUPLE_STEP: f64 = 0.25` has a fine paragraph about the control loop
+/// and nothing about 0.25. Those are #45's real content and they need judgement, one at a time.
+#[test]
+fn every_numeric_constant_carries_a_comment() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let mut undocumented = Vec::new();
+    let mut total = 0usize;
+    for file in rust_sources(&root.join("crates")) {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let stop = lines.iter().position(|l| l.contains("#[cfg(test)]")).unwrap_or(lines.len());
+        let mut run = false;
+        for (i, line) in lines.iter().take(stop).enumerate() {
+            let Some(name) = const_name(line) else {
+                if line.trim().is_empty() {
+                    run = false;
+                }
+                continue;
+            };
+            let numeric = is_numeric_const(line);
+            if numeric {
+                total += 1;
+            }
+            let mut j = i;
+            let mut commented = false;
+            while j > 0 {
+                let above = lines[j - 1].trim();
+                if above.starts_with("//") {
+                    commented = true;
+                } else if !above.starts_with("#[") {
+                    break;
+                }
+                j -= 1;
+            }
+            if commented || run {
+                run = true;
+            } else if numeric {
+                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
+                undocumented.push(format!("{rel}:{} {name}", i + 1));
+            }
+        }
+    }
+    assert!(total > 400, "only {total} numeric constants found — the scan is broken, not the tree");
+    assert!(
+        undocumented.is_empty(),
+        "these numeric constants carry no comment at all, so nothing says where the value comes from — \
+         which is the state in which the question cannot even be asked (#45):\n  {}",
+        undocumented.join("\n  ")
+    );
+}
+
+/// Every `.rs` under a crate's `src/`.
+fn rust_sources(crates: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![crates.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.filter_map(Result::ok) {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && p.components().any(|c| c.as_os_str() == "src")
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The name of the constant this line declares, if it declares one.
+fn const_name(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("pub ").unwrap_or(line.trim());
+    let rest = rest.split_once(')').map_or(rest, |(head, tail)| {
+        if head.starts_with("pub(") { tail.trim_start() } else { rest }
+    });
+    let rest = rest.strip_prefix("const ")?;
+    let (name, _) = rest.split_once(':')?;
+    let name = name.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))
+        .then_some(name)
+}
+
+/// Whether the constant this line declares has a numeric type — the ones #45 is about.
+fn is_numeric_const(line: &str) -> bool {
+    const NUMERIC: &[&str] =
+        &["usize", "u8", "u16", "u32", "u64", "f64", "i32", "i64", "Duration"];
+    line.split_once(':').is_some_and(|(_, ty)| {
+        let ty = ty.split('=').next().unwrap_or("").trim().trim_end_matches("::Duration");
+        NUMERIC.iter().any(|n| ty == *n || ty.ends_with(&format!("::{n}")))
+    })
+}
