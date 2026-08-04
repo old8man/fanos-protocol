@@ -365,6 +365,17 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     let _ = writeln!(s);
     let _ = writeln!(s, "listen = {}", config.listen);
     let _ = writeln!(s, "identity = {}", identity.display());
+    // The durable store (#77). Written when the caller named one — the wizard always does, so an installed
+    // node keeps its shards across a restart; a config assembled in a test or by a client that wants an
+    // ephemeral node leaves it unset and keeps nothing, which is what ephemeral means.
+    match &config.state_path {
+        Some(dir) => {
+            let _ = writeln!(s, "state = {}", dir.display());
+        }
+        None => {
+            let _ = writeln!(s, "# state = /var/lib/fanos   (unset: this node keeps nothing across a restart)");
+        }
+    }
     let _ = writeln!(s, "role = {}", config.roles);
     if let Some(dir) = identity.parent() {
         let beacon = dir.join(BEACON_FILE);
@@ -456,6 +467,7 @@ mod tests {
             mix_mean_delay: std::time::Duration::from_millis(45),
             cover_interval: std::time::Duration::from_millis(900),
             start_heartbeat: false,
+            state_path: Some(PathBuf::from("/var/lib/fanos")),
             ..NodeConfig::default()
         };
 
@@ -472,6 +484,7 @@ mod tests {
         assert_eq!(back.cover_interval, c.cover_interval, "cover_interval");
         assert_eq!(back.start_heartbeat, c.start_heartbeat, "heartbeat");
         assert_eq!(back.identity_path.as_deref(), Some(Path::new("/etc/fanos/identity.key")), "identity");
+        assert_eq!(back.state_path, c.state_path, "state");
     }
 
     #[test]
@@ -485,6 +498,7 @@ mod tests {
         assert_eq!(back.telemetry_epsilon, None, "an omitted ε must stay omitted, not become a number");
         assert_eq!(back.admission_difficulty, None, "an omitted PoW must stay omitted");
         assert!(back.bootstrap.is_empty(), "the bootstrap comment must not parse as a peer");
+        assert!(back.state_path.is_none(), "the state comment must not parse as a directory");
     }
 
     #[test]

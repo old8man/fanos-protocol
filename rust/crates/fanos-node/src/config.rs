@@ -598,7 +598,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 
 /// Decode an even-length hex string to bytes — for the variable-length crypto objects (`VssCommitment`,
 /// `VssShare`) a beacon provisioning file carries (audit S1-H2).
-fn hex_decode(s: &str) -> Result<Vec<u8>, NodeError> {
+pub fn hex_decode(s: &str) -> Result<Vec<u8>, NodeError> {
     let nibble = |c: u8| -> Result<u8, NodeError> {
         match c {
             b'0'..=b'9' => Ok(c - b'0'),
@@ -894,6 +894,18 @@ pub struct NodeConfig {
     pub telemetry_epsilon: Option<f64>,
     /// Where to persist the self-certifying identity; `None` = ephemeral (new identity each run).
     pub identity_path: Option<PathBuf>,
+    /// Where to keep this node's **durable store** — the erasure shards it is custodian of, the expiry
+    /// schedule, and the loss ledger. `None` = keep nothing, and lose it all on restart.
+    ///
+    /// **`None` was the only behaviour, and it is what task #77 named.** A node persisted its identity and
+    /// nothing else, so a restart returned a member that had forgotten every shard it was holding for the
+    /// cell. One node doing that is survivable by construction — the `[7,3,4]` code re-heals from three of
+    /// seven homes — but the survival is a repair budget being spent, not a property, and a rolling restart
+    /// of a whole cell spends all of it at once.
+    ///
+    /// Written by `fanos init` to the platform's state directory, so a deployed node has it; `None` stays
+    /// the default because an ephemeral node (a test, a proxy-only client) should not litter a disk.
+    pub state_path: Option<PathBuf>,
     /// Bootstrap peers seeded into the address book.
     pub bootstrap: Vec<Peer>,
     /// The advertised role set.
@@ -958,6 +970,7 @@ impl Default for NodeConfig {
             plane_order: 2,
             telemetry_epsilon: None, // silence by default: publishing a cell's coherence readings is an operator's decision
             identity_path: None,
+            state_path: None,
             bootstrap: Vec::new(),
             roles: RoleSet::default(),
             mix_mean_delay: DEFAULT_MIX_DELAY,
@@ -1035,6 +1048,7 @@ impl NodeConfig {
                         .map_err(|_| NodeError::Config(format!("bad listen '{value}'")))?;
                 }
                 "identity" => config.identity_path = Some(PathBuf::from(value)),
+                "state" => config.state_path = Some(PathBuf::from(value)),
                 "bootstrap" => {
                     for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                         config.bootstrap.push(Peer::parse(part)?);

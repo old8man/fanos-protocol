@@ -1,0 +1,269 @@
+//! Every file a dealing ceremony writes is classified, and the secret ones are unreadable by anyone else.
+//!
+//! `fanos` has one writer that sets `0600` **before** the bytes land ([`write_file`]), and a comment on it
+//! saying why the order matters. Five secret-bearing dealer outputs went around it and landed at the process
+//! umask — 0644 on the usual host — so a beacon share, a POROS share, a validator's config and the genesis
+//! founder's spending seed were readable by every account on the dealing machine (task #82). The guard was
+//! never missing; it was written, documented, and simply not called on the paths that hold the most.
+//!
+//! So this test does not check that some files are 0600. It checks that **the produced set is exactly the
+//! classified set**: a ceremony that grows a new output fails here until someone decides which kind it is.
+//! That is the property — the classification is total — and it is the only form that survives the next file.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// A directory of this test's own, removed when it drops.
+///
+/// Named per test rather than per process: these run in parallel in one binary, and a shared directory would
+/// make each ceremony's file list the union of all of them — which is exactly the assertion under test.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("fanos-ceremony-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the ceremony's output directory");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Best-effort: a leaked directory holds dealt SECRETS, so a failure here is worth the noise, but
+        // panicking in a Drop during an unwind would abort and hide the assertion that actually failed.
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// Run `fanos <args…>` in a fresh directory and return the names of the files it wrote.
+fn deal(dir: &Path, args: &[&str]) -> BTreeSet<String> {
+    let out = Command::new(env!("CARGO_BIN_EXE_fanos"))
+        .args(args)
+        .output()
+        .expect("the fanos binary is built by the test harness");
+    assert!(
+        out.status.success(),
+        "`fanos {}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_dir(dir)
+        .expect("the ceremony's output directory")
+        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Assert `dir` holds exactly `secret ∪ public`, that every secret file is owner-only, and — the half that
+/// keeps this honest — that every public one is NOT, so a blanket `0600` cannot satisfy the test vacuously.
+///
+/// The **modes are checked first**, deliberately. Both halves can fail at once — an unprotected new output
+/// is unclassified AND world-readable — and a set-equality assertion reports only "the lists differ", which
+/// is the ratchet talking, not the exposure. First failure wins in Rust, so the order of these two blocks
+/// decides which one an operator reads.
+fn assert_classified(dir: &Path, produced: &BTreeSet<String>, secret: &[&str], public: &[&str]) {
+    for name in secret {
+        let meta = std::fs::metadata(dir.join(name))
+            .unwrap_or_else(|e| panic!("the ceremony must deal {name}, and did not: {e}"));
+        let mode = meta.permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{name} carries key material and is mode {mode:o} — readable off-owner. Deal it through \
+             write_file(.., secret = true), which sets the mode at creation rather than after."
+        );
+    }
+    for name in public {
+        let meta = std::fs::metadata(dir.join(name))
+            .unwrap_or_else(|e| panic!("the ceremony must deal {name}, and did not: {e}"));
+        let mode = meta.permissions().mode();
+        assert_ne!(
+            mode & 0o077,
+            0,
+            "{name} is public material dealt as a secret. Not itself an exposure, but it makes the secret \
+             half of this test unfalsifiable — every file 0600 passes whatever the ceremony does."
+        );
+    }
+    let classified: BTreeSet<String> =
+        secret.iter().chain(public).map(|s| (*s).to_owned()).collect();
+    assert_eq!(
+        *produced, classified,
+        "a ceremony output is unclassified: this test is the only thing that forces a new dealt file to be \
+         declared secret or public, so it fails until someone decides"
+    );
+}
+
+#[test]
+fn the_beacon_ceremony_deals_every_share_owner_only() {
+    const SCRATCH: &str = "beacon";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+    let produced = deal(dir.path(), &["beacon-deal", "7", "3", "--out", &path]);
+    assert_classified(
+        dir.path(),
+        &produced,
+        &[
+            "anchor-1.beacon",
+            "anchor-2.beacon",
+            "anchor-3.beacon",
+            "anchor-4.beacon",
+            "anchor-5.beacon",
+            "anchor-6.beacon",
+            "anchor-7.beacon",
+            "recovery-authority-1.key",
+            "recovery-authority-2.key",
+            "recovery-authority-3.key",
+            "recovery-authority-4.key",
+            "recovery-authority-5.key",
+            "recovery-authority-6.key",
+            "recovery-authority-7.key",
+        ],
+        // The consumer's copy carries the commitment and the threshold and no share at all — it is what a
+        // client is *given*, so dealing it 0600 would be a category error, not caution.
+        &["consumer.beacon"],
+    );
+}
+
+/// Gated on the feature that builds the chain into the binary: without it `taxis-deal` refuses by design,
+/// and CI runs the suite both ways, so this is covered rather than skipped.
+#[cfg(feature = "validator")]
+#[test]
+fn the_taxis_ceremony_deals_every_validator_owner_only() {
+    const SCRATCH: &str = "taxis";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+    let produced = deal(dir.path(), &["taxis-deal", "--out", &path]);
+    // 0-based, unlike `anchor-<i>.beacon`: the number in a validator's filename is the member index that
+    // config carries, and divorcing the two to make the tooling look uniform would be the worse trade.
+    let validators: Vec<String> = (0..7).map(|i| format!("validator-{i}.taxis")).collect();
+    let mut secret: Vec<&str> = validators.iter().map(String::as_str).collect();
+    secret.push("founder.key");
+    assert_classified(dir.path(), &produced, &secret, &["chain-info.taxis"]);
+}
+
+#[test]
+fn the_ingress_ceremony_deals_every_share_owner_only() {
+    const SCRATCH: &str = "ingress";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+    let produced =
+        deal(dir.path(), &["ingress-deal", "acme", "1:0:0@127.0.0.1:9001", "--out", &path]);
+    assert_classified(
+        dir.path(),
+        &produced,
+        &["ingress-1.poros", "ingress-2.poros", "ingress-3.poros"],
+        &[],
+    );
+}
+
+#[test]
+fn a_founder_generates_their_own_authority_key_and_it_never_leaves_owner_only() {
+    const SCRATCH: &str = "authkey";
+    let dir = Scratch::new(SCRATCH);
+    let key = dir.path().join("mine.key");
+    let produced = deal(dir.path(), &["authority-key", "--out", &key.to_string_lossy()]);
+    assert_classified(dir.path(), &produced, &["mine.key"], &[]);
+}
+
+/// The trust-minimized founding (#74): each founder generates locally, the dealer assembles verifiers and
+/// **never holds an authority secret**.
+///
+/// The property is the absence: with `--authority-verifiers` the ceremony must write no authority key at
+/// all — the same file list minus the secrets it did not create. If the dealer kept generating them "as a
+/// backup" the ceremony would still work and the whole point would be gone, so the assertion is on the set.
+#[test]
+fn founders_can_supply_their_own_verifiers_and_the_dealer_deals_no_authority_secret() {
+    const SCRATCH: &str = "byfounders";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+
+    // Three founders, each on their own machine, each keeping their seed.
+    let mut verifiers = Vec::new();
+    for i in 0..3 {
+        let home = Scratch::new(&format!("{SCRATCH}-founder-{i}"));
+        let key = home.path().join("mine.key");
+        let out = Command::new(env!("CARGO_BIN_EXE_fanos"))
+            .args(["authority-key", "--out", &key.to_string_lossy()])
+            .output()
+            .expect("the fanos binary");
+        assert!(out.status.success(), "founder {i} could not generate a key");
+        let text = String::from_utf8(out.stdout).expect("utf-8");
+        // The verifier is the one long hex line the founder is told to send back.
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.len() > 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
+            .expect("`fanos authority-key` prints the verifier to hand to the dealer");
+        verifiers.push(line.to_owned());
+        assert!(key.exists(), "the seed stays on the founder's own machine");
+    }
+    let list = dir.path().join("verifiers.txt");
+    std::fs::write(&list, format!("# collected in agreed order\n{}\n", verifiers.join("\n")))
+        .expect("write the collected verifiers");
+
+    let produced = deal(
+        dir.path(),
+        &["beacon-deal", "3", "2", "--out", &path, "--authority-verifiers", &list.to_string_lossy()],
+    );
+    assert_classified(
+        dir.path(),
+        &produced,
+        &["anchor-1.beacon", "anchor-2.beacon", "anchor-3.beacon"],
+        &["consumer.beacon", "verifiers.txt"],
+    );
+}
+
+/// A verifier list whose length disagrees with the cell is refused, because the order and the count are
+/// genesis material: a signature names its member by INDEX, so a list one short does not shrink the
+/// committee — it renames every member after the gap.
+#[test]
+fn a_verifier_list_that_does_not_match_the_cell_is_refused() {
+    const SCRATCH: &str = "mismatch";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+    let list = dir.path().join("verifiers.txt");
+
+    let key = dir.path().join("mine.key");
+    let out = Command::new(env!("CARGO_BIN_EXE_fanos"))
+        .args(["authority-key", "--out", &key.to_string_lossy()])
+        .output()
+        .expect("the fanos binary");
+    let text = String::from_utf8(out.stdout).expect("utf-8");
+    let one = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.len() > 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("the verifier line");
+    std::fs::write(&list, format!("{one}\n")).expect("write");
+
+    // One verifier, seven anchors.
+    let out = Command::new(env!("CARGO_BIN_EXE_fanos"))
+        .args([
+            "beacon-deal",
+            "7",
+            "3",
+            "--out",
+            &path,
+            "--authority-verifiers",
+            &list.to_string_lossy(),
+        ])
+        .output()
+        .expect("the fanos binary");
+    assert!(!out.status.success(), "a 1-member committee for a 7-anchor cell was dealt");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("verifiers"),
+        "the refusal must name the mismatch it is about; got: {err}"
+    );
+}

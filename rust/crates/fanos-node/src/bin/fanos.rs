@@ -20,7 +20,7 @@ use fanos_field::F2;
 use fanos_onoma::Address;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
-use fanos_pqcrypto::sig::HybridSigSecret;
+use fanos_pqcrypto::sig::{HybridSigSecret, HybridVerifier};
 use fanos_node::{
     AnonRouteParams, BeaconParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
     NodeConfig,
@@ -76,6 +76,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("status") => cmd_status(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
+        Some("authority-key") => cmd_authority_key(args.get(2..).unwrap_or(&[])),
         Some("ingress-deal") => cmd_ingress_deal(args.get(2..).unwrap_or(&[])),
         Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
@@ -146,6 +147,12 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     }
     if let Some(p) = flag(args, "--identity") {
         config.identity_path = Some(PathBuf::from(p));
+    }
+    // `--data DIR` names where this node's state lives, so it names where the **store** lives too (#77).
+    // Without this the flag moved only the control socket and the store silently kept nothing — the operator
+    // would have said exactly the thing that asks for persistence and not got it.
+    if let Some(p) = flag(args, "--data") {
+        config.state_path = Some(PathBuf::from(p));
     }
     // The cell's projective plane order. Exposed because it is the parameter that BOUNDS anonymity — an adversary's
     // flow-matching floor is `1/K` for `K` concurrent circuits, and `K` comes from the plane, not the mix schedule
@@ -1098,7 +1105,11 @@ fn ask_line(question: &str, default: &str) -> String {
 ///
 /// The permission is set **before** the bytes land, not after: a key written world-readable and chmod-ed a
 /// microsecond later was world-readable, and on a shared host that is the whole of the exposure.
-fn write_file(path: &Path, contents: &str, secret: bool) -> Result<(), NodeError> {
+///
+/// Bytes, not text, because the material that most needs the guard is not text: a founder's seed and a
+/// validator's config are raw. The guard existed and the ceremonies that deal shares went around it (#82),
+/// which is the reason this takes whatever the caller has rather than what the first caller happened to have.
+fn write_file(path: &Path, contents: impl AsRef<[u8]>, secret: bool) -> Result<(), NodeError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1110,9 +1121,24 @@ fn write_file(path: &Path, contents: &str, secret: bool) -> Result<(), NodeError
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        std::io::Write::write_all(&mut f, contents.as_bytes())?;
+        std::io::Write::write_all(&mut f, contents.as_ref())?;
     } else {
-        std::fs::write(path, contents)?;
+        std::fs::write(path, contents.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Write a dealt file and say so, in the one shape every ceremony in this tool uses.
+///
+/// `secret` is the caller's declaration that the bytes are key material — it selects 0600 AND the marking in
+/// the operator's transcript, so a file cannot be quietly protected without being announced, or announced
+/// without being protected.
+fn write_dealt(path: &str, contents: impl AsRef<[u8]>, secret: bool) -> Result<(), NodeError> {
+    write_file(Path::new(path), contents, secret)?;
+    if secret {
+        println!("wrote {path}  (SECRET — mode 0600; keep it off any node that does not need it)");
+    } else {
+        println!("wrote {path}");
     }
     Ok(())
 }
@@ -1239,6 +1265,10 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     std::fs::create_dir_all(&paths.data)?;
     let credentials = identity::load_or_generate(Some(&paths.identity))?;
     config.identity_path = Some(paths.identity.clone());
+    // An installed node keeps its store (#77). Not asked about: a node that forgets every shard the cell gave
+    // it on each restart is spending the erasure code's repair budget on ordinary reboots, and no operator
+    // benefits from being offered that.
+    config.state_path = Some(paths.data.clone());
 
     ensure_beacon(&mut config, &paths, assume_yes, has_flag(args, "--private-cell"))?;
 
@@ -1370,7 +1400,7 @@ fn deal_own_beacon(path: &Path) -> Result<(), NodeError> {
     let share = shares.first().cloned();
     let params = BeaconParams { commitment, threshold: 1, share, authority: None };
     // Secret: it carries this cell's beacon share.
-    write_file(path, &params.to_config_string(), true)
+    write_file(path, params.to_config_string(), true)
 }
 
 /// Install and (with consent) start the platform's service unit.
@@ -1615,6 +1645,10 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
         "telemetry     : {}",
         config.telemetry_epsilon.map_or_else(|| "not published".to_owned(), |e| format!("published, ε = {e}"))
     );
+    // **Whether this node keeps what the cell gave it, and how much (#77).** The size is the fact an operator
+    // needs and cannot get anywhere else: "persistence is configured" and "persistence is working" are
+    // different claims, and a `store.snapshot` that exists but is 45 bytes says the second one is false.
+    println!("store         : {}", store_status(config.state_path.as_deref()));
 
     // Ask the node itself if it is there. A held port says *something* is running; only the node can say what it
     // sees — how many peers it has, whose claims it verified, which point it actually sits on. Falling back to
@@ -1914,8 +1948,7 @@ fn cmd_ingress_deal(args: &[String]) -> Result<(), NodeError> {
             kem_seed,
         };
         let path = format!("{out}/ingress-{}.poros", i + 1);
-        std::fs::write(&path, params.to_config_string())?;
-        println!("wrote {path}");
+        write_dealt(&path, params.to_config_string(), true)?;
     }
     println!(
         "dealt a {threshold}-of-{line_size} POROS ingress line for community '{community}' over {} entry \
@@ -1981,19 +2014,7 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     //
     // **One authority key per founder, not one for the ceremony.** The beacon is `t`-of-`n` so that no single
     // party holds it; an authority that can order that key REPLACED must not be weaker, and a single key was.
-    // Coordinates derive from the beacon, so one file on one disk was the placement of every node in the
-    // cell. The committee's quorum is a strict majority of `n`, derived rather than written into any file.
-    let mut authority_seeds = Vec::with_capacity(n);
-    let mut authority_members = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-        let (_secret, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
-        authority_seeds.push(seed);
-        authority_members.push(verifier);
-    }
-    let authority = fanos_keygen::recovery::RecoveryAuthoritySet::new(authority_members)
-        .ok_or_else(|| NodeError::Config("cannot deal a beacon for n = 0".to_owned()))?;
+    let (authority_seeds, authority) = resolve_authority(args, n)?;
 
     for (i, share) in shares.iter().enumerate() {
         let params = BeaconParams {
@@ -2003,14 +2024,12 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
             authority: Some(authority.clone()),
         };
         let path = format!("{out}/anchor-{}.beacon", i + 1);
-        std::fs::write(&path, params.to_config_string())?;
-        println!("wrote {path}");
+        write_dealt(&path, params.to_config_string(), true)?;
     }
     let consumer =
         BeaconParams { commitment, threshold: t, share: None, authority: Some(authority.clone()) };
     let cpath = format!("{out}/consumer.beacon");
-    std::fs::write(&cpath, consumer.to_config_string())?;
-    println!("wrote {cpath}");
+    write_dealt(&cpath, consumer.to_config_string(), false)?;
     // The SEEDS, not the derived secrets: `HybridSigSecret::generate` is deterministic in one, so a member
     // regenerates the same authority key whenever one is needed — the convention the rest of the tree uses
     // for secret material (a service member's KEM key is carried the same way). Member `i` signs at INDEX
@@ -2018,16 +2037,151 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     // material and reordering it invalidates every signature.
     for (i, seed) in authority_seeds.iter().enumerate() {
         let apath = format!("{out}/recovery-authority-{}.key", i + 1);
-        std::fs::write(&apath, fanos_node::config::hex_encode(seed))?;
-        println!("wrote {apath}  (SECRET SEED for authority member index {i} — keep offline)");
+        write_file(Path::new(&apath), fanos_node::config::hex_encode(seed), true)?;
+        println!("wrote {apath}  (SECRET SEED for authority member index {i} — mode 0600, keep offline)");
     }
     println!("dealt a {t}-of-{n} beacon; run each anchor with `fanos node --beacon-params anchor-<i>.beacon`");
+    if authority_seeds.is_empty() {
+        println!(
+            "recovery authority: {}-of-{n}, from verifiers you supplied — this dealer never saw an authority \
+             secret. Each founder keeps the seed `fanos authority-key` wrote on their own machine.",
+            authority.quorum()
+        );
+    } else {
+        println!(
+            "recovery authority: {}-of-{n} — hand recovery-authority-<i>.key to founder <i> and keep it OFF \
+             the node. No single holder can order a reshare or a re-genesis.",
+            authority.quorum()
+        );
+        println!(
+            "  ! this machine generated every authority secret, so for the moment of dealing it held the \
+             whole committee. Correct for a private cell; for a public one have each founder run \
+             `fanos authority-key` and pass the collected verifiers with --authority-verifiers."
+        );
+    }
+    Ok(())
+}
+
+/// The recovery committee this ceremony deals against, and the seeds it had to generate to get it.
+///
+/// Two paths, and which one an operator takes is the difference between a founding that needs a trusted
+/// dealer and one that does not.
+///
+/// **`--authority-verifiers FILE` is the trust-minimized path, and it is the one a public network takes.**
+/// Generating the members here means this machine holds every authority secret for the instant of dealing —
+/// the same concentration the beacon shares have, and the residual #74 recorded when the committee landed.
+/// With the flag, each founder runs `fanos authority-key` on their OWN machine, keeps the seed, and sends
+/// back only the verifier; the dealer assembles the list and never sees a secret. It needs no cryptography
+/// that does not already exist — only a ceremony step and this flag. The returned seed vector is then empty,
+/// which is the caller's signal that there is nothing to write and nothing to hand over.
+///
+/// Without it the dealer generates them, which stays correct for a private or test cell and is what the
+/// single-operator wizard needs. The difference is stated at the end of the run rather than left for an
+/// operator to infer.
+fn resolve_authority(
+    args: &[String],
+    n: usize,
+) -> Result<(Vec<[u8; 32]>, fanos_keygen::recovery::RecoveryAuthoritySet), NodeError> {
+    let members = if let Some(path) = flag(args, "--authority-verifiers") {
+        let text = std::fs::read_to_string(path)?;
+        let members = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                HybridVerifier::decode(&fanos_node::config::hex_decode(l)?)
+                    .ok_or_else(|| NodeError::Config(format!("{path}: '{l}' is not a HybridVerifier")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // The order is genesis material: a signature names its member by index into this list, so a list one
+        // short does not deal a smaller committee — it renames every member after the gap, and every
+        // signature they produce would verify against the wrong key.
+        if members.len() != n {
+            return Err(NodeError::Config(format!(
+                "{path} lists {} verifiers but this ceremony deals {n} anchors — the recovery committee is \
+                 one key per founder, and its order is genesis material",
+                members.len()
+            )));
+        }
+        return Ok((Vec::new(), set_of(members)?));
+    } else {
+        let mut seeds = Vec::with_capacity(n);
+        let mut members = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+            let (_secret, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
+            seeds.push(seed);
+            members.push(verifier);
+        }
+        (seeds, members)
+    };
+    Ok((members.0, set_of(members.1)?))
+}
+
+/// A committee from its members, refusing the empty one — a 0-member authority has a quorum of 1 and would
+/// accept an authorization signed by nobody.
+fn set_of(
+    members: Vec<HybridVerifier>,
+) -> Result<fanos_keygen::recovery::RecoveryAuthoritySet, NodeError> {
+    fanos_keygen::recovery::RecoveryAuthoritySet::new(members)
+        .ok_or_else(|| NodeError::Config("cannot deal a beacon for n = 0".to_owned()))
+}
+
+/// `fanos authority-key [--out FILE]`: generate **one recovery-authority member's** keypair on this
+/// operator's own machine, keep the secret seed here, and print the verifier to hand to the dealer.
+///
+/// The trust-minimized half of the founding ceremony (#74). `fanos beacon-deal` can generate the whole
+/// committee itself, and then this machine holds every authority secret for the instant of dealing — the
+/// same concentration the beacon shares have, and the reason a public network should not do it that way.
+/// With this verb each founder generates locally and sends back only the public half; the dealer assembles
+/// them with `--authority-verifiers` and never sees a secret.
+///
+/// The seed, not the derived key: `HybridSigSecret::generate` is deterministic in it, so the holder
+/// regenerates the same authority key whenever one is needed — the convention the rest of the tree uses for
+/// secret material.
+fn cmd_authority_key(args: &[String]) -> Result<(), NodeError> {
+    let out = flag(args, "--out").unwrap_or("recovery-authority.key");
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let (_secret, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
+    // Secret: mode 0600 at creation, like the identity key — a key created world-readable and chmod-ed a
+    // microsecond later WAS world-readable, and on a shared host that window is the whole exposure.
+    write_file(Path::new(out), fanos_node::config::hex_encode(&seed), true)?;
+    println!("wrote {out}  (SECRET SEED — keep it offline and never on a node)");
+    println!();
+    println!("Send this line to whoever runs `fanos beacon-deal`; it is public:");
+    println!("{}", fanos_node::config::hex_encode(&verifier.encode()));
+    println!();
     println!(
-        "recovery authority: {}-of-{n} — hand recovery-authority-<i>.key to founder <i> and keep it OFF the \
-         node. No single holder can order a reshare or a re-genesis.",
-        authority.quorum()
+        "They collect one line per founder, in an agreed ORDER, into a file and pass it as \
+         `--authority-verifiers`. The order is genesis material: a signature names its member by index."
     );
     Ok(())
+}
+
+/// One line describing this node's durable store, for `fanos status`.
+///
+/// Three states an operator has to be able to tell apart: not configured (keeps nothing, by choice), configured
+/// but never written (a first boot, or a persister that is failing), and holding N bytes as of a moment. Only
+/// the third is the working system, and the first two used to be indistinguishable from it.
+fn store_status(state_dir: Option<&Path>) -> String {
+    let Some(dir) = state_dir else {
+        return "not kept (no `state` directory configured — this node forgets its shards on restart)"
+            .to_owned();
+    };
+    let path = dir.join(fanos_node::durable::STORE_FILE);
+    match std::fs::metadata(&path) {
+        Ok(m) => {
+            let age = m
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map_or_else(String::new, |d| format!(", written {}s ago", d.as_secs()));
+            format!("{} ({} bytes{age})", path.display(), m.len())
+        }
+        Err(_) => format!("{} (not yet written — a first boot, or the persister is failing)", path.display()),
+    }
 }
 
 /// `fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64]`: deal a fresh 7-validator TAXIS cell (the base
@@ -2039,7 +2193,6 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
 fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
     use fanos_dromos::token::account_id;
     use fanos_node::{ChainInfo, ValidatorConfig, deal_validators};
-    use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_taxis::params::CellParams;
 
@@ -2074,17 +2227,16 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
 
     for c in &configs {
         let path = format!("{out}/validator-{}.taxis", c.me);
-        std::fs::write(&path, ValidatorConfig::to_bytes(c))?;
-        println!("wrote {path}");
+        write_dealt(&path, ValidatorConfig::to_bytes(c), true)?;
     }
     // The public chain info a client needs to build, seal, and submit a transaction (`fanos pay`).
     let info = ChainInfo { cell, epoch, beacon, keyper: registry };
     let ipath = format!("{out}/chain-info.taxis");
-    std::fs::write(&ipath, info.to_bytes())?;
+    write_file(Path::new(&ipath), info.to_bytes(), false)?;
     println!("wrote {ipath} (public chain info for `fanos pay`)");
     let fpath = format!("{out}/founder.key");
-    std::fs::write(&fpath, founder_seed)?;
-    println!("wrote {fpath} (the genesis founder's secret seed — keep it safe)");
+    write_file(Path::new(&fpath), founder_seed, true)?;
+    println!("wrote {fpath}  (the genesis founder's SECRET seed — mode 0600, keep it safe)");
     println!(
         "dealt a {}-validator TAXIS cell (epoch {}); genesis-funded a founder with {supply} (key in founder.key)\n\
          run each validator with `fanos validator --config validator-<i>.taxis`",
@@ -2848,9 +3000,20 @@ fn print_help() {
            fanos uninstall [--purge] [--yes]\n\
                        (remove the service; --purge also deletes config, identity and state — the\n\
                         coordinate is derived from the identity, so a purged node returns as a stranger)\n\
-         \n\
-         ADVANCED:\n\
-         \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--bootstrap x:y:z@host:port,...] \\\n\
+         "
+    );
+    print_help_advanced();
+}
+
+/// The rest of the help: the verbs an operator reaches for after the first day.
+///
+/// Split from [`print_help`] because it is one string and it grew past what one function may hold — the
+/// boundary is where the text itself already put one.
+fn print_help_advanced() {
+    eprintln!(
+        "ADVANCED:\n\
+         \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--data DIR] \\\n\
+         \x20             [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
          \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
          \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N] \\\n\
@@ -2869,7 +3032,14 @@ fn print_help() {
          \x20             (the coordinate depends on the NETWORK too: the config names the beacon it is\n\
          \x20              drawn against. Without one it prints the beacon-less coordinate and says so)\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
-         \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
+         \x20 fanos beacon-deal N T [--out DIR] [--authority-verifiers FILE]\n\
+         \x20             (deal a T-of-N epoch-clock beacon; writes *.beacon files. Without the flag this\n\
+         \x20              machine also generates the recovery committee, holding every authority secret for\n\
+         \x20              the moment of dealing — fine for a private cell. For a public one, each founder\n\
+         \x20              runs `fanos authority-key` and you pass their collected verifiers here)\n\
+         \x20 fanos authority-key [--out FILE]\n\
+         \x20             (generate THIS founder's recovery-authority key locally: the seed stays here, the\n\
+         \x20              printed verifier goes to whoever deals the beacon)\n\
          \x20 fanos ingress-deal COMMUNITY PEER... [--out DIR] [--threshold T] [--difficulty D] [--line C:C:C,...]\n\
          \x20                                     (deal a community's POROS ingress line; writes *.poros files)\n\
          \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64] [--supply N]\n\
