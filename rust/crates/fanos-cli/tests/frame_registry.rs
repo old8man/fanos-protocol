@@ -25,6 +25,38 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap()
 }
 
+/// **One wire type, one codec.** The `ERROR` frame had two: `fanos-wire`'s `encode_error` (spec §7.5, a
+/// varint code then the reason — the one the conformance vector pins and `fanos-quic`'s handshake sends) and
+/// a local `ErrorBody` in `fanos-runtime` deriving `Wire`, whose `u64` is a fixed 8-byte big-endian integer
+/// and whose `Vec<u8>` is length-prefixed. They are not the same bytes. A handshake `ERROR` reaching the
+/// overlay's receive arm therefore failed to parse and was dropped in silence — the same defect class as the
+/// receive arm that was missing entirely, one layer along.
+///
+/// It survived because only one of the two was verified: `wire_kat.rs` checks the wire codec, nothing
+/// checked the runtime one, and the divergence is invisible to a gate that only sees the tested half. Both
+/// the encoder and the decoder now live in `fanos-wire`; this fails if a second definition appears.
+#[test]
+fn the_error_frame_has_exactly_one_codec() {
+    let runtime = std::fs::read_to_string(repo_root().join("rust/crates/fanos-runtime/src/frames.rs")).unwrap();
+    assert!(
+        !runtime.contains("struct ErrorBody"),
+        "`fanos-runtime` defines its own ERROR body again. Spec §7.5's encoding is `varint(code) || reason` \
+         and `fanos_wire::error::{{encode_error, decode_error}}` implement it; a second definition means two \
+         encodings for one frame type, and only the wire one is in `conformance/vectors/wire.json`."
+    );
+    for (rel, what) in [
+        ("rust/crates/fanos-runtime/src/frames.rs", "the overlay's producer and parser"),
+        ("rust/crates/fanos-sim/tests/sybil_admission.rs", "the simulator's SYBIL_REJECT recogniser"),
+    ] {
+        let text = std::fs::read_to_string(repo_root().join(rel)).unwrap();
+        assert!(
+            text.contains("fanos_wire::error::"),
+            "{rel} ({what}) must go through `fanos_wire::error`, not hand-decode the ERROR body — a \
+             hand-rolled reader is a third encoding, and the one that drifts is the one nobody tests."
+        );
+    }
+}
+
 /// The type names the spec's §7.2 table lists, with `*`-suffixed families expanded away.
 ///
 /// The table writes families as `DKG_*`, `BEACON_RESHARE_*`, `POROS_*` — one cell for a group of codes that

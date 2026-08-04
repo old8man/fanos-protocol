@@ -70,11 +70,12 @@ impl<F: Field> Engine for AdmissionObserver<F> {
     }
 }
 
-/// Whether `frame` is an `Error` frame carrying exactly the `SYBIL_REJECT` code: a frame-type
-/// check, then the body's leading 8 bytes, big-endian, are the `ProtocolError` code
-/// (`fanos-runtime/src/overlay.rs`'s `ErrorBody`/`encode_error` — `code(8B BE) ‖ reason`; a
-/// `#[derive(Wire)]` `u64` field is a fixed-width big-endian integer, not a varint — see that
-/// struct's doc comment).
+/// Whether `frame` is an `Error` frame carrying exactly the `SYBIL_REJECT` code.
+///
+/// **Decoded with the shipped codec, not re-implemented here.** This used to read "the body's leading 8
+/// bytes, big-endian", which was true of a local `ErrorBody` that no longer exists — one frame type had two
+/// incompatible encodings in one tree, and a test that hand-decodes one of them is a third. `decode_error`
+/// is the spec's (§7.5: a varint code, then the reason) and the one the conformance vector pins.
 fn is_sybil_reject(frame: &[u8]) -> bool {
     let Ok((f, _)) = decode_frame(frame) else {
         return false;
@@ -82,10 +83,7 @@ fn is_sybil_reject(frame: &[u8]) -> bool {
     if f.frame_type() != Some(FrameType::Error) {
         return false;
     }
-    let Some(code_bytes) = f.body.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()) else {
-        return false;
-    };
-    u64::from_be_bytes(code_bytes) == ProtocolError::SybilReject.code()
+    fanos_wire::error::decode_error(f.body).is_ok_and(|(code, _)| code == ProtocolError::SybilReject.code())
 }
 
 /// Spawn an admission-observed receiver at [`RECEIVER_POINT`] and `joiner` at [`JOINER_POINT`],

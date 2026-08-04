@@ -105,7 +105,7 @@ impl<F: Field> OverlayNode<F> {
                     to: coord,
                     frame: encode_error_with(
                         ProtocolError::SybilReject,
-                        required.map(|bits| bits.to_le_bytes().to_vec()).unwrap_or_default(),
+                        &required.map(|bits| bits.to_le_bytes().to_vec()).unwrap_or_default(),
                     ),
                 }];
             }

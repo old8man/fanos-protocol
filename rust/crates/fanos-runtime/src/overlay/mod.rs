@@ -673,11 +673,11 @@ impl<F: Field> OverlayNode<F> {
     /// and the proof re-minted, exactly as [`on_reseat`](Self::reseat) already does when the coordinate moves.
     /// Above [`MAX_INLINE_ADMISSION_BITS`] it is only reported, because the work would block the engine.
     fn on_error(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some(err) = crate::frames::parse_error(body) else { return Vec::new() };
-        if err.code != fanos_wire::ProtocolError::SybilReject.code() {
+        let Some((code, reason)) = crate::frames::parse_error(body) else { return Vec::new() };
+        if code != fanos_wire::ProtocolError::SybilReject.code() {
             return Vec::new();
         }
-        let required = crate::frames::decode_required_difficulty(&err.reason);
+        let required = crate::frames::decode_required_difficulty(reason);
         if let Some(bits) = required {
             self.repay_admission(bits);
         }
@@ -1296,7 +1296,7 @@ mod tests {
         let before = node.admission_proof_for_test().to_vec();
         let refusal = crate::frames::encode_error_with(
             fanos_wire::ProtocolError::SybilReject,
-            9u32.to_le_bytes().to_vec(),
+            &9u32.to_le_bytes(),
         );
         node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
         assert_ne!(node.admission_proof_for_test(), &before[..], "the proof was not re-minted at the new price");
@@ -1311,7 +1311,7 @@ mod tests {
             .with_admission_pow(12);
         let refusal = crate::frames::encode_error_with(
             fanos_wire::ProtocolError::SybilReject,
-            2u32.to_le_bytes().to_vec(),
+            &2u32.to_le_bytes(),
         );
         node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
         assert_eq!(node.paid_difficulty_for_test(), Some(12), "the node lowered its own admission cost");
@@ -1327,7 +1327,7 @@ mod tests {
             .with_admission_pow(4);
         let refusal = crate::frames::encode_error_with(
             fanos_wire::ProtocolError::SybilReject,
-            (MAX_INLINE_ADMISSION_BITS + 1).to_le_bytes().to_vec(),
+            &(MAX_INLINE_ADMISSION_BITS + 1).to_le_bytes(),
         );
         let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
         assert_eq!(node.paid_difficulty_for_test(), Some(4), "the engine paid an extortionate demand");
@@ -1613,7 +1613,7 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let refusal = crate::frames::encode_error_with(
             fanos_wire::ProtocolError::SybilReject,
-            17u32.to_le_bytes().to_vec(),
+            &17u32.to_le_bytes(),
         );
         let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
         let told = effects.iter().find_map(|e| match e {
@@ -1629,7 +1629,7 @@ mod tests {
         // `0` would re-solve at zero against a gate demanding work — an infinite loop.
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let refusal =
-            crate::frames::encode_error_with(fanos_wire::ProtocolError::SybilReject, alloc::vec![]);
+            crate::frames::encode_error_with(fanos_wire::ProtocolError::SybilReject, &[]);
         let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
         let told = effects.iter().find_map(|e| match e {
             Effect::Notify(Notification::AdmissionRefused { required }) => Some(*required),
@@ -1644,7 +1644,7 @@ mod tests {
         // write a log and no business waking a driver for something it cannot act on.
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         let other =
-            crate::frames::encode_error_with(fanos_wire::ProtocolError::Malformed, alloc::vec![]);
+            crate::frames::encode_error_with(fanos_wire::ProtocolError::Malformed, &[]);
         let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: other });
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::AdmissionRefused { .. }))),

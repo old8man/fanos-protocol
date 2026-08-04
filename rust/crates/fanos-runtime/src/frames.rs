@@ -252,21 +252,6 @@ pub fn admission_challenge(id: &[u8], coord: Triple, epoch: Epoch) -> Vec<u8> {
     challenge
 }
 
-/// An `Error` frame body: `code(8B BE) ‖ reason` — the numeric [`ProtocolError`] code and an
-/// optional UTF-8 reason (empty here; a human-readable reason is left to the wire-handshake
-/// follow-up, task #100). Canonical derived codec (audit A1) — one definition, one encoding,
-/// the same `#[derive(Wire)]` pattern [`LookupBody`] uses above: a `u64` field's canonical
-/// encoding is a fixed 8-byte big-endian integer (`fanos_wire::wire::impl_wire_int!`), not a
-/// true LEB128 varint. Spec §7.5 describes the ERROR frame prose-level as "a varint code" —
-/// this preliminary body is a real, working `SYBIL_REJECT` producer ahead of that, not the
-/// formalization; reconciling the exact on-wire integer width against the spec text (or
-/// widening the derive's integer convention itself) is task #100's, not this one's, to settle.
-#[derive(fanos_wire_derive::Wire)]
-pub(crate) struct ErrorBody {
-    pub(crate) code: u64,
-    pub(crate) reason: Vec<u8>,
-}
-
 /// An `Error` frame carrying `err`'s numeric code **and a machine-readable reason**.
 ///
 /// Used for `SYBIL_REJECT` to carry the difficulty the joiner must actually meet. An adaptive admission price
@@ -274,15 +259,25 @@ pub(crate) struct ErrorBody {
 /// protect: their proof was minted at yesterday's price, it is refused, and nothing tells them the number that
 /// would work. The reason field already existed and was always empty; this is what it is for.
 ///
-/// Backward compatible in both directions — a peer that does not read the reason sees the same rejection it
-/// always did, and a peer that does gets a retry it can actually satisfy.
-pub(crate) fn encode_error_with(err: ProtocolError, reason: Vec<u8>) -> Vec<u8> {
-    encode(FrameType::Error, &ErrorBody { code: err.code(), reason }.to_wire())
+/// **The codec is [`fanos_wire::error::encode_error`] — the spec's, and the only one.** This used to be a
+/// local `ErrorBody` deriving `Wire`, whose `u64` encodes as a fixed 8-byte big-endian integer and whose
+/// `Vec<u8>` encodes length-prefixed: `code(8B BE) ‖ len ‖ reason`. Spec §7.5 says a *varint* code followed by
+/// the reason, which is what `fanos-wire` implements, what the conformance vector pins, and what
+/// `fanos-quic`'s handshake `send_error` has always sent. So one frame type had **two incompatible
+/// encodings** in one tree, and the one production's overlay used was the one nothing verified — a handshake
+/// ERROR arriving at [`OverlayNode::on_error`](crate::OverlayNode) failed to parse and was dropped in
+/// silence, which is the same defect class as the receive arm that was missing entirely (`6415f26`).
+///
+/// The local type's own doc deferred the reconciliation to task #100. #100 shipped (`f77233f`) with the
+/// wire-side codec and its KAT, and the deferral was never collected.
+pub(crate) fn encode_error_with(err: ProtocolError, reason: &[u8]) -> Vec<u8> {
+    encode(FrameType::Error, &fanos_wire::error::encode_error(err, reason))
 }
 
-/// Parse an `Error` frame body.
-pub(crate) fn parse_error(body: &[u8]) -> Option<ErrorBody> {
-    ErrorBody::from_wire(body).ok()
+/// Parse an `Error` frame body with the same single codec, returning `(code, reason)` unresolved — a future
+/// error class this build does not name is still readable rather than discarded.
+pub(crate) fn parse_error(body: &[u8]) -> Option<(u64, &[u8])> {
+    fanos_wire::error::decode_error(body).ok()
 }
 
 /// The required admission difficulty carried by a `SYBIL_REJECT`, if it carries one.
