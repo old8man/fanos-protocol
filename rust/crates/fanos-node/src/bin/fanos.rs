@@ -175,11 +175,13 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         // Provision the threshold-hosting line (seed, roster, threshold) from an out-of-band file, and
         // imply the `service` role — providing service parameters is the operator asking to host it.
         config.service = Some(ServiceParams::from_config_str(&std::fs::read_to_string(path)?)?);
+        config.service_path = Some(PathBuf::from(path));
         config.roles.service = true;
     }
     if let Some(path) = flag(args, "--exit") {
         // Provision the clearnet exit (service-key seed + optional port policy) and imply the `exit` role.
         config.exit = Some(ExitParams::from_config_str(&std::fs::read_to_string(path)?)?);
+        config.exit_path = Some(PathBuf::from(path));
         config.roles.exit = true;
     }
     if has_flag(args, "--no-heartbeat") {
@@ -231,6 +233,7 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         // set with `fanos ingress-deal`, and hand each member exactly one file.
         config.ingress =
             Some(fanos_node::config::IngressParams::from_config_str(&std::fs::read_to_string(path)?)?);
+        config.ingress_path = Some(PathBuf::from(path));
         // **And imply the role, as `--service` and `--exit` do.** Without this the flag was accepted, the
         // file parsed, and the node then composed no ingress host — a silent no-op unless the operator also
         // passed `--role ingress`. Handing a node a community's dealt descriptor share IS the operator

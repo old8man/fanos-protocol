@@ -377,6 +377,22 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
         }
     }
     let _ = writeln!(s, "role = {}", config.roles);
+    // The three role provisioning files (#90). Written when configured, so a supervised unit no longer needs
+    // them on its `ExecStart=` line and the round-trip assertion below can see them at all.
+    for (key, path) in [
+        ("service", config.service_path.as_ref()),
+        ("exit", config.exit_path.as_ref()),
+        ("ingress_params", config.ingress_path.as_ref()),
+    ] {
+        match path {
+            Some(p) => {
+                let _ = writeln!(s, "{key} = {}", p.display());
+            }
+            None => {
+                let _ = writeln!(s, "# {key} = /etc/fanos/{key}.conf   (unset: this node does not serve it)");
+            }
+        }
+    }
     if let Some(dir) = identity.parent() {
         let beacon = dir.join(BEACON_FILE);
         if beacon.exists() {
@@ -485,6 +501,9 @@ mod tests {
         assert_eq!(back.start_heartbeat, c.start_heartbeat, "heartbeat");
         assert_eq!(back.identity_path.as_deref(), Some(Path::new("/etc/fanos/identity.key")), "identity");
         assert_eq!(back.state_path, c.state_path, "state");
+        assert_eq!(back.service_path, c.service_path, "service");
+        assert_eq!(back.exit_path, c.exit_path, "exit");
+        assert_eq!(back.ingress_path, c.ingress_path, "ingress_params");
     }
 
     #[test]
@@ -499,6 +518,9 @@ mod tests {
         assert_eq!(back.admission_difficulty, None, "an omitted PoW must stay omitted");
         assert!(back.bootstrap.is_empty(), "the bootstrap comment must not parse as a peer");
         assert!(back.state_path.is_none(), "the state comment must not parse as a directory");
+        assert!(back.service_path.is_none(), "the service comment must not parse as a path");
+        assert!(back.exit_path.is_none(), "the exit comment must not parse as a path");
+        assert!(back.ingress_path.is_none(), "the ingress comment must not parse as a path");
     }
 
     #[test]
@@ -662,5 +684,41 @@ mod tests {
                 assert!(cmd.contains(&"--user".to_owned()), "user-manager command without --user: {cmd:?}");
             }
         }
+    }
+
+    /// **The three role files survive the round trip, with real files on disk.**
+    ///
+    /// The round-trip test above compares `None` to `None` for these, which is no test at all: the parser has
+    /// to *read* each file to accept the key, so the only honest fixture is real provisioning. Written because
+    /// the whole reason these keys exist (#90) is that a configured role used to vanish between restarts, and
+    /// an assertion that cannot fail would have shipped the same defect with a green tick over it.
+    #[test]
+    fn a_configured_service_and_exit_survive_the_round_trip() {
+        let dir = std::env::temp_dir().join(format!("fanos-roles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let (svc, exit) = (dir.join("service.conf"), dir.join("exit.conf"));
+        std::fs::write(&svc, format!("seed = {}\nline = 1:0:0, 0:1:0\nthreshold = 1\n", "ab".repeat(32)))
+            .expect("write service params");
+        std::fs::write(&exit, format!("seed = {}\nports = 80, 443\n", "cd".repeat(32)))
+            .expect("write exit params");
+
+        let c = NodeConfig {
+            service_path: Some(svc.clone()),
+            exit_path: Some(exit.clone()),
+            ..NodeConfig::default()
+        };
+        let text = render_config(&c, Path::new("/etc/fanos/identity.key"));
+        let back = NodeConfig::from_config_str(&text).expect("the wizard's own output must parse");
+
+        assert_eq!(back.service_path.as_deref(), Some(svc.as_path()), "the service path survives");
+        assert_eq!(back.exit_path.as_deref(), Some(exit.as_path()), "the exit path survives");
+        // And the *effect* of the setting, not only its text: reading the file is what makes the key mean
+        // something, and implying the role is what makes it usable without a second setting.
+        assert!(back.roles.service, "a configured service file implies the service role");
+        assert!(back.roles.exit, "a configured exit file implies the exit role");
+        assert_eq!(back.service.expect("service params were read").threshold, 1);
+        assert_eq!(back.exit.expect("exit params were read").allowed_ports, vec![80, 443]);
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

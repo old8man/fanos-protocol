@@ -705,8 +705,11 @@ here only because earlier notes described ingress as non-rotating, and that's no
   already implied theirs. Handing a node a community's dealt descriptor share *is* the operator asking it
   to serve that community; a flag whose effect depends on a second flag being remembered is a flag that
   will be absent in production. It used to parse the file and then compose no ingress host at all.
-* Still true: `--service`, `--exit` and `--ingress-params` have no config-file key — see §3.4's callout —
-  so a supervised unit needs them on its `ExecStart=` line.
+* Fixed (2026-08-04): `service = PATH`, `exit = PATH` and `ingress_params = PATH` are config keys, parsed
+  and rendered like `beacon_params`, each implying its role exactly as the matching flag does. A supervised
+  unit no longer needs them on its `ExecStart=` line, and — the part that mattered more — they are now
+  visible to the render/parse round-trip assertion they had been exempt from, which is the check that exists
+  to catch a setting silently reverting at the next restart.
 
 ---
 

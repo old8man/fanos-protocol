@@ -894,6 +894,16 @@ pub struct NodeConfig {
     pub telemetry_epsilon: Option<f64>,
     /// Where to persist the self-certifying identity; `None` = ephemeral (new identity each run).
     pub identity_path: Option<PathBuf>,
+    /// Where the `service` role's provisioning file lives, when one was configured (#90).
+    ///
+    /// The *path*, kept beside the parsed [`service`](Self::service), so the renderer can write the setting
+    /// back. Without it the round trip would silently drop a configured role — the class the round-trip test
+    /// exists to catch, and which these three were exempt from by not being expressible at all.
+    pub service_path: Option<PathBuf>,
+    /// Where the `exit` role's provisioning file lives — see [`service_path`](Self::service_path).
+    pub exit_path: Option<PathBuf>,
+    /// Where the `ingress` role's provisioning file lives — see [`service_path`](Self::service_path).
+    pub ingress_path: Option<PathBuf>,
     /// Where to keep this node's **durable store** — the erasure shards it is custodian of, the expiry
     /// schedule, and the loss ledger. `None` = keep nothing, and lose it all on restart.
     ///
@@ -971,6 +981,9 @@ impl Default for NodeConfig {
             telemetry_epsilon: None, // silence by default: publishing a cell's coherence readings is an operator's decision
             identity_path: None,
             state_path: None,
+            service_path: None,
+            exit_path: None,
+            ingress_path: None,
             bootstrap: Vec::new(),
             roles: RoleSet::default(),
             mix_mean_delay: DEFAULT_MIX_DELAY,
@@ -987,6 +1000,43 @@ impl Default for NodeConfig {
             proteus_environment: None,
         }
     }
+}
+
+
+/// Apply one of the three **role provisioning** keys — `service`, `exit`, `ingress_params` (#90).
+///
+/// Paths, never the material, for the same reason `beacon_params` is: each file carries a secret seed or
+/// share, and inlining one would put a key into the file an operator copies between hosts.
+///
+/// Each **implies its role**, exactly as the matching flag does. Handing a node a dealt file *is* the operator
+/// asking it to serve that role — there is no other reason to provision one — and a setting whose effect
+/// depends on a second setting being remembered is a setting that will be absent in production.
+///
+/// Without these keys a supervised unit had to carry them on its `ExecStart=` line, so the config was not a
+/// complete description of the node; and, worse, they were invisible to the render/parse round-trip assertion
+/// that exists to catch exactly that class.
+fn role_key(config: &mut NodeConfig, key: &str, value: &str) -> Result<(), NodeError> {
+    let text = std::fs::read_to_string(value)
+        .map_err(|e| NodeError::Config(format!("{key} '{value}': {e}")))?;
+    let path = PathBuf::from(value);
+    match key {
+        "service" => {
+            config.service = Some(ServiceParams::from_config_str(&text)?);
+            config.service_path = Some(path);
+            config.roles.service = true;
+        }
+        "exit" => {
+            config.exit = Some(ExitParams::from_config_str(&text)?);
+            config.exit_path = Some(path);
+            config.roles.exit = true;
+        }
+        _ => {
+            config.ingress = Some(IngressParams::from_config_str(&text)?);
+            config.ingress_path = Some(path);
+            config.roles.ingress = true;
+        }
+    }
+    Ok(())
 }
 
 impl NodeConfig {
@@ -1123,6 +1173,9 @@ impl NodeConfig {
                     })?;
                     config.beacon = Some(BeaconParams::from_config_str(&text)?);
                 }
+                // The three role provisioning files (#90) — see [`role_key`] for why they are paths and
+                // why each implies its role.
+                "service" | "exit" | "ingress_params" => role_key(&mut config, key, value)?,
                 "proteus_environment" => {
                     config.proteus_environment = Some(Environment::from_name(value).ok_or_else(|| {
                         NodeError::Config(format!(
