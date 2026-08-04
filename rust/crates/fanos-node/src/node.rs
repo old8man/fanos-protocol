@@ -440,9 +440,18 @@ fn service_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<Triple>, 
                 .to_owned(),
         )
     })?;
-    if params.threshold == 0 || params.threshold > params.line.len() {
+    // **The floor is 2, not 1, and the difference is the whole property.** Three places state that "no single
+    // host holds the service identity in the clear" and that "seizing `< threshold` reveals nothing"
+    // (`threshold_service`, `threshold_rendezvous`). At `t = 1` both are vacuous: `< 1` is zero members, so
+    // the guarantee says seizing *nobody* learns nothing, while every member holds the identity whole.
+    //
+    // A threshold-hosted service provisioned 1-of-n is therefore not a weaker version of the design — it is
+    // the design's claim inverted, and it starts and serves without complaint. The sibling ingress line got
+    // this floor when the same shape was found in `emit_reshare`; this is the half that was left.
+    if params.threshold < 2 || params.threshold > params.line.len() {
         return Err(NodeError::Config(format!(
-            "the service threshold {} must be in 1..={} (the line has {} members)",
+            "the service threshold {} must be in 2..={} (the line has {} members); a threshold of 1 hands \
+             every member the service identity whole, which is what threshold hosting exists to prevent",
             params.threshold,
             params.line.len(),
             params.line.len(),
@@ -1545,6 +1554,47 @@ mod tests {
             "an ingress-hosting node must publish the stable KEM public its line's outgoing members seal \
              reshare sub-shares to — without it the line cannot rotate, and a line that cannot rotate is a \
              line whose blocklist stops going stale",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_of_n_service_line_is_refused_because_it_inverts_the_claim_it_makes() {
+        // **The property, not the parameter.** `threshold_service` and `threshold_rendezvous` both state that
+        // "no single host holds the service identity in the clear" and that "seizing `< threshold` reveals
+        // nothing". At `t = 1` those are vacuous — `< 1` is zero members, so the guarantee says seizing
+        // NOBODY learns nothing — while every member of the line holds the identity whole.
+        //
+        // So a 1-of-n service line is not a weaker configuration of the design; it is the design's own claim
+        // inverted, and before this it started and served without a word. The sibling POROS ingress line got
+        // this floor when the same shape was found in `emit_reshare`; the CALYPSO half was left behind.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        use crate::config::ServiceParams;
+
+        let (_shares, commitment) = deal(&[0xE3; 32], 2, 3, &mut DeterministicRng::new(b"svc-floor")).unwrap();
+        let line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+        let start = |threshold: usize| NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams {
+                commitment: commitment.clone(),
+                threshold: 2,
+                share: None,
+                authority: None,
+            }),
+            roles: RoleSet { service: true, ..RoleSet::default() },
+            service: Some(ServiceParams { seed: [0x7A; 32], line: line.clone(), threshold }),
+            ..NodeConfig::default()
+        };
+
+        assert!(
+            Node::start::<F2>(start(1)).await.is_err(),
+            "a 1-of-n service line must be refused at startup — it hands every member the identity whole \
+             while three doc comments promise no single host holds it",
+        );
+        // And the floor is not over-eager: the smallest threshold that keeps the promise still starts.
+        assert!(
+            Node::start::<F2>(start(2)).await.is_ok(),
+            "2-of-3 is the smallest line that means what the design says, and it must still run",
         );
     }
 }
