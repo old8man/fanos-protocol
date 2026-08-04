@@ -260,7 +260,14 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // this ratchet must never reward. (`conflicts_with`, also here, is deliberate: it is the SPECIFICATION of
     // the scheduler's conflict property, used by the test to verify the O(accesses) `schedule` that
     // implements it. Wiring it onto the hot path would make block scheduling quadratic.)
-    ("fanos-dromos", 19),
+    // 19 → 20 (2026-08-04): `parallel_blocks` joins `waves_last_block`, which is already here for the same
+    // reason. Both exist so that a claim with no other observable can be checked — the conflict schedule is
+    // serial-equivalent by construction, so no OUTCOME distinguishes parallel from serial execution, and
+    // without a counter the vertical-parallelism claim is unfalsifiable. Their only legitimate caller is
+    // therefore the test that falsifies it, which is exactly the "accessors a test asserts on" debt this
+    // table's own preamble names as legitimate. Wiring a production reader to satisfy the count would be
+    // inventing a caller, which the ratchet must never reward.
+    ("fanos-dromos", 20),
     // 3 → 4, and the bump has a reason as the rule requires: `Expr::bin`, `exec::compare` and `Predicate::host_with`
     // are the expression layer's constructors. Nothing in production builds a computed argument or a compared gate yet
     // — `transfer_term` is the only term builder — and the callers are the Verum emitter and contract authors
