@@ -36,6 +36,7 @@ pub mod bound;
 pub mod cell_node;
 pub mod config;
 pub mod diaulos;
+pub mod durable;
 pub mod epoch_driver;
 pub mod error;
 pub mod exit;

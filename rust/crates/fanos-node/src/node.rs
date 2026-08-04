@@ -7,6 +7,7 @@
 //! wires identity, bootstrap, and the engine together and exposes control.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -577,6 +578,43 @@ const ROLE_CAPACITY_WEIGHT: u16 = 4;
 const ROLE_GAIN_SEVENTH: u8 = 7;
 
 
+/// Keep this node's durable store on disk, and say at startup whether the previous run's came back.
+///
+/// `None` when the config named no state directory — an ephemeral node (a test, a proxy-only client) has
+/// nothing worth a file and should not make one.
+///
+/// The report is not decoration. Whether a restart recovered its shards or came up empty is the one fact
+/// about this mechanism an operator cannot observe any other way, and a silent empty start is precisely the
+/// failure #77 exists to remove; leaving it silent would reintroduce it one layer up.
+fn spawn_store_role(
+    handle: &NodeHandle,
+    state_dir: Option<PathBuf>,
+    restored_len: Option<usize>,
+) -> Option<JoinHandle<()>> {
+    let Some(dir) = state_dir else {
+        // Said once, rather than left to be discovered after a restart. A node with no state directory is a
+        // legitimate configuration — a test, a proxy-only client — but "keeps nothing" must be a sentence the
+        // operator read, not a behaviour they infer from missing shards.
+        eprintln!("fanos: no state directory configured — this node keeps nothing across a restart");
+        return None;
+    };
+    match restored_len {
+        Some(len) => eprintln!(
+            "fanos: restored {len} bytes of store state from {}",
+            dir.join(crate::durable::STORE_FILE).display()
+        ),
+        None => eprintln!("fanos: no store snapshot in {} — starting empty", dir.display()),
+    }
+    Some(crate::durable::spawn_store_persister(
+        handle.client(),
+        dir,
+        crate::durable::snapshot_interval(
+            crate::durable::ASSUMED_RESTARTS_PER_DAY,
+            crate::durable::DURABILITY_TARGET,
+        ),
+    ))
+}
+
 /// Spawn the **self-organizing role subsystem** (`crate::role_loop`): advertise what this node offers, report its
 /// observed load, and run the cell's deterministic assignment each epoch.
 ///
@@ -677,6 +715,9 @@ pub struct Node {
     _recovery_trigger: Option<JoinHandle<()>>,
     /// Re-announces this node to the cell on every coordinate move — see [`spawn_move_announcer`].
     _move_announcer: Option<JoinHandle<()>>,
+    /// Keeps this node's durable store on disk (#77) — present only when the config named a state
+    /// directory. Held for the node's lifetime; it ends when the engine stops.
+    _store_persister: Option<JoinHandle<()>>,
     /// The **self-organizing role subsystem** — the capability/load publishers and the per-epoch assignment loop.
     /// Held for the node's lifetime; [`assigned_roles`](Self::assigned_roles) reads the current assignment.
     self_org: SelfOrganization,
@@ -816,6 +857,14 @@ impl Node {
         beacon_params_checked(&config)?;
         let ingress = ingress_params(&config)?;
         let rotation_params = ingress.as_ref().map(|p| (p.community.clone(), p.kem_seed));
+        // The previous run's durable store, read before the engine exists — adopting one is only correct
+        // before anything has been served (#77). Absent on a first boot, and absent for good on a node that
+        // configured no state directory, which is what an ephemeral node means.
+        let state_dir = config.state_path.clone();
+        let restore = state_dir.as_deref().and_then(crate::durable::read_snapshot);
+        // What the engine builder consumes; `restored_len` is what the startup report needs, kept because the
+        // builder is a `move` closure and the bytes go with it.
+        let restored_len = restore.as_ref().map(Vec::len);
         let handle = spawn_self_certifying_persistent_over::<F>(
             fabric,
             &credentials,
@@ -836,6 +885,7 @@ impl Node {
                     cover_interval,
                     service: service.clone(),
                     ingress: ingress.clone(),
+                    restore: restore.clone(),
                     // A deployed node sits at its cell root and discovers its roster by announcement; both are
                     // scenario parameters, and their absence here is what a deployment means.
                     hier_path: None,
@@ -885,6 +935,12 @@ impl Node {
         // The self-organizing role subsystem (see [`spawn_roles`]).
         let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory, load);
 
+        // Keep the durable store current (#77). Present only when the config named a state directory — an
+        // ephemeral node (a test, a proxy-only client) has nothing worth a file and should not make one.
+        // Reported at startup rather than inferred: whether the previous run's store came back is exactly the
+        // fact an operator cannot see any other way, and a silent empty start is the failure this closes.
+        let store_persister = spawn_store_role(&handle, state_dir, restored_len);
+
         let move_announcer = announce_node(&handle, &config);
 
         Ok(Self {
@@ -897,6 +953,7 @@ impl Node {
             _beacon_tracker: beacon_tracker,
             _recovery_trigger: recovery_trigger,
             _move_announcer: move_announcer,
+            _store_persister: store_persister,
             self_org,
             live_beacon,
         })

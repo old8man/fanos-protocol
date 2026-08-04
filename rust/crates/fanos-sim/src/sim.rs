@@ -46,6 +46,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Diagnose => "Diagnose",
         Command::Control { .. } => "Control",
         Command::Observe => "Observe",
+        Command::Snapshot => "Snapshot",
         Command::Put { .. } => "Put",
         Command::PutEphemeral { .. } => "PutEphemeral",
         Command::Get { .. } => "Get",
@@ -68,6 +69,9 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        // The length, not the bytes: a durable snapshot is the whole store and a trace that inlined it would
+        // be unreadable, while the size is the quantity a scenario about persistence actually watches.
+        Notification::Snapshot(bytes) => format!("Snapshot {} bytes", bytes.len()),
         // The footprint as points, not as a number: `degraded=20` makes a reader do binary in their head,
         // and the whole reason this rides beside the syndrome is that a reader needs the SET.
         Notification::Liveness { degraded, alive } => {

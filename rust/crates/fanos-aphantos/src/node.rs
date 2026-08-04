@@ -506,6 +506,10 @@ impl<F: Field> Engine for NyxNode<F> {
                 Command::Diagnose
                 | Command::Control { .. }
                 | Command::Observe
+                // Nothing durable: a NYX relay's whole state is in-flight onions and cover timers, which a
+                // restart is *supposed* to drop — resurrecting them would replay traffic the network has
+                // already forgotten.
+                | Command::Snapshot
                 | Command::Put { .. }
                 | Command::PutEphemeral { .. }
                 | Command::Get { .. }

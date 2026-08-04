@@ -914,6 +914,39 @@ impl<F: Field> OverlayNode<F> {
         self.store.loss_ledger.iter().map(|(k, e)| (*k, *e)).collect()
     }
 
+    /// This node's **durable state** as canonical bytes, for a host that can write a file.
+    ///
+    /// The store is the only thing in a node worth keeping across a restart that the network cannot hand
+    /// back for free, and `fanos-runtime` is sans-I/O and `no_std` — it cannot open a file and should not
+    /// learn how. So the split is: the engine says *what* is durable and in what bytes, and the host says
+    /// *where* and *when* ([`crate::store::Store::snapshot`] states what is in it and what is deliberately
+    /// left out).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.store.snapshot()
+    }
+
+    /// Adopt a [`snapshot`](Self::snapshot) taken by a previous run of this node, returning whether it was
+    /// accepted. A rejected snapshot leaves the store untouched and **empty is the correct fallback** — the
+    /// cell's `[7,3,4]` code re-heals one node's missing shards, which is precisely the case this whole
+    /// mechanism exists to make rarer rather than impossible.
+    ///
+    /// Adopt it **before** the node starts serving. Restoring over a store that has already accepted writes
+    /// would discard them, so this refuses once anything is held: the caller's mistake is then visible at
+    /// startup rather than as data that quietly disappeared.
+    pub fn restore(&mut self, bytes: &[u8]) -> bool {
+        if !self.store.entries.is_empty() {
+            return false;
+        }
+        match Store::restore(bytes) {
+            Some(store) => {
+                self.store = store;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// This node's cell-liveness view (base Fano cell only): `(self_index, degraded_mask,
     /// alive_count)`. Bit `i` of the mask is set when point `i` is not corroborated-alive. `None`
     /// off the base `N = 7` cell, where the index-addressed syndrome geometry does not apply.
@@ -1196,6 +1229,10 @@ impl<F: Field> Engine for OverlayNode<F> {
             Input::Command(Command::Emit { to, frame }) => alloc::vec![Effect::Send { to, frame }],
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Observe) => self.on_observe(now),
+            // Sense-only, like `Observe` beside it: the store is read, nothing is armed, nothing moves.
+            Input::Command(Command::Snapshot) => {
+                alloc::vec![Effect::Notify(Notification::Snapshot(self.store.snapshot()))]
+            }
             Input::Command(Command::Put { key, value }) => self.on_put(now, &key, &value),
             Input::Command(Command::PutEphemeral { key, value, epochs }) => {
                 // Record the lifetime BEFORE the write, so an entry can never be stored without one: a

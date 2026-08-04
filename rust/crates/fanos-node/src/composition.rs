@@ -76,6 +76,13 @@ pub struct CellComposition {
     /// Carried as coordinates rather than a `HierAddr<F>` so this type stays free of the field parameter — the
     /// path is the same numbers either way, and `compose_engine` knows `F`.
     pub hier_path: Option<Vec<Triple>>,
+    /// This node's **durable store**, as written by a previous run of it ([`Command::Snapshot`]).
+    ///
+    /// Adopted at construction because that is the only correct moment: restoring over an engine that has
+    /// already accepted a write would discard it. A snapshot this build cannot read is refused and the node
+    /// starts empty, which the cell's `[7,3,4]` erasure code is designed to survive for one member — the
+    /// point of persistence is to make that rarer, not to make an unreadable file fatal.
+    pub restore: Option<Vec<u8>>,
     /// A **pinned** cell roster, for a scenario that seats a cell directly instead of letting it discover
     /// itself by announcement.
     ///
@@ -111,6 +118,7 @@ impl CellComposition {
             cover_interval: Duration(0),
             service: None,
             ingress: None,
+            restore: None,
             hier_path: None,
             cell_members: None,
         }
@@ -141,6 +149,12 @@ pub fn compose_engine<F: Field + 'static>(
     what: &CellComposition,
 ) -> Box<dyn Engine + Send> {
     let mut overlay = OverlayNode::<F>::new(coord, what.overlay);
+    if let Some(bytes) = &what.restore {
+        // Ignored on failure by design — see the field's doc. The *host* reports whether it took, because
+        // the host is what knows there was a file to read at all; a silent empty start is the failure mode
+        // this whole task exists to remove, so it must not be reintroduced here.
+        overlay.restore(bytes);
+    }
     if let Some(members) = what.cell_members {
         overlay = overlay.with_cell_members(members);
     }

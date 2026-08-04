@@ -8,7 +8,8 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use fanos_primitives::Epoch;
+use fanos_primitives::codec::{Reader, put_seq, put_u64, put_var_bytes};
+use fanos_primitives::{Epoch, hash::hash_labeled};
 
 use crate::overlay::{DIGEST, HeldShards, MAX_STORE_ENTRIES, MAX_VALUE_LEN, VersionedShards};
 use crate::ports::Instant;
@@ -72,12 +73,11 @@ pub(crate) struct Store {
     /// accounted. Bounded by the store's own [`MAX_STORE_ENTRIES`] (it is a subset of held keys). Makes loss
     /// visible and auditable instead of silent, within one process lifetime.
     ///
-    /// **It was called "durable" and said "a production node persists it", and neither is true.** Nothing in
-    /// this tree writes the store to disk — the whole of it is these `BTreeMap`s, and a restart drops them.
-    /// The claim mattered because it is an audit trail: a record of permanent data loss that itself does not
-    /// survive a restart is a record of nothing. Corrected here rather than left as an aspiration in the
-    /// present tense; the gap is tracked as a task, with the severity split out (a *single* node restarting
-    /// is survivable by construction — the erasure code re-heals — while a whole-cell restart is not).
+    /// **Durable in the literal sense now, and it was not for a long time.** The word was here before the
+    /// mechanism was: nothing in this tree wrote the store to disk, so a record of permanent data loss did
+    /// not itself survive a restart, which makes it a record of nothing. It is carried in
+    /// [`Store::snapshot`] and comes back through [`Store::restore`] (#77); a node whose configuration names
+    /// no state directory still keeps nothing, and for that node the old caveat stands unchanged.
     pub(crate) loss_ledger: BTreeMap<[u8; DIGEST], Epoch>,
     /// Digests that **expire**, and the epoch after which each is dead — the soft-state half of the store.
     ///
@@ -164,5 +164,129 @@ impl Store {
                 }
             }
         }
+    }
+}
+
+/// The snapshot format's domain separator and version. Bumping the version invalidates older files by
+/// construction — a decode that does not recognise the header refuses, rather than reading a v1 layout as v2.
+const SNAPSHOT_LABEL: &str = "FANOS-v1/store-snapshot";
+
+/// The format revision, encoded in the header so a future layout change is a refusal and not a silent
+/// misread. There is no migration path and there does not need to be: an unreadable snapshot costs this node
+/// its local shards, which the `[7,3,4]` erasure code across the cell is *designed* to re-heal.
+const SNAPSHOT_VERSION: u32 = 1;
+
+impl Store {
+    /// This node's **durable** state as canonical bytes: the held shards, the expiry schedule, the loss
+    /// ledger, and the read-nonce counter.
+    ///
+    /// # What is in it, and what deliberately is not
+    ///
+    /// `pending` and `pending_samples` are **in-flight**, not durable. A `Get` is a conversation with peers
+    /// that a restart has already ended: the reply nonce is gone with the socket, the peers have forgotten
+    /// the request, and restoring the accumulator would resurrect a read that can only time out. The caller
+    /// re-issues; that is what a caller of a distributed store must be able to do anyway.
+    ///
+    /// `seq` **is** persisted, at a cost of eight bytes, so the read nonce is monotone across the process
+    /// boundary. Not strictly required — a restored node has no `pending`, so a replayed `Value` resolves
+    /// nothing regardless (audit C4) — but making the counter monotone means the C4 argument does not have to
+    /// rest on that, and an argument that rests on one fewer thing is worth eight bytes.
+    ///
+    /// # Integrity, and what the checksum is not for
+    ///
+    /// The body is followed by a `BLAKE3` tag over itself, so a truncated or bit-rotted file is refused
+    /// instead of half-loaded. It is a **checksum, not authentication**: anyone who can write this file can
+    /// also write the identity key next to it, so a MAC keyed by anything on this disk would prove nothing an
+    /// attacker could not forge. The threat it addresses is a machine that lost power mid-write, which is the
+    /// one that actually happens.
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        put_u64(&mut body, self.seq);
+        // Each map streams in its own sorted order, so the encoding is canonical: two nodes with equal state
+        // produce equal bytes, which is what makes a snapshot comparable in a test at all.
+        put_seq(&mut body, self.entries.len(), &self.entries, |out, (digest, held)| {
+            out.extend_from_slice(digest);
+            put_seq(out, held.len(), held, |out, (index, (version, shard))| {
+                out.push(*index);
+                put_u64(out, *version);
+                put_var_bytes(out, shard);
+            });
+        });
+        put_seq(&mut body, self.expiry.len(), &self.expiry, |out, (digest, until)| {
+            out.extend_from_slice(digest);
+            put_u64(out, until.get());
+        });
+        put_seq(&mut body, self.loss_ledger.len(), &self.loss_ledger, |out, (digest, at)| {
+            out.extend_from_slice(digest);
+            put_u64(out, at.get());
+        });
+        let tag = hash_labeled(SNAPSHOT_LABEL, &body);
+        body.extend_from_slice(&tag);
+        body
+    }
+
+    /// Restore from [`snapshot`](Self::snapshot) bytes, or `None` if they are not a snapshot this build
+    /// wrote — wrong version, wrong length, failed checksum, trailing garbage, or **over this store's own
+    /// caps**.
+    ///
+    /// **The caps are re-applied on the way in, and that is the whole security content of this function.**
+    /// A snapshot is a file on disk, so it is provisioning, and provisioning is the surface that gets audited
+    /// last: `MAX_STORE_ENTRIES` and `MAX_VALUE_LEN` bound what the *network* can make this node hold, and a
+    /// restore path that did not re-check them would let a crafted file do what no peer can — allocate
+    /// without limit before any of the runtime's admission logic has run. `admits` is not reachable from
+    /// here (it consults the half-built store), so the bounds are checked directly, and a file that exceeds
+    /// either is refused **whole** rather than truncated: a partially-loaded store silently claims custody of
+    /// shards it does not have, and a node that lies about custody is worse for the cell than one that
+    /// starts empty.
+    pub(crate) fn restore(bytes: &[u8]) -> Option<Self> {
+        let (body, tag) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+        if hash_labeled(SNAPSHOT_LABEL, body) != *tag {
+            return None;
+        }
+        let mut r = Reader::new(body);
+        if u32::from_le_bytes(r.array()?) != SNAPSHOT_VERSION {
+            return None;
+        }
+        let seq = r.u64()?;
+        // `min_elem`: a digest plus a zero-length inner sequence is 32 + 4 bytes, so the count cannot claim
+        // more entries than the remaining bytes could hold — the same bound `Reader::seq` exists to impose.
+        let entries = r.seq(DIGEST + 4, |r| {
+            let digest: [u8; DIGEST] = r.array()?;
+            let held = r.seq(1 + 8 + 4, |r| {
+                let index = r.u8()?;
+                let version = r.u64()?;
+                let shard = r.var_bytes()?;
+                (shard.len() <= MAX_VALUE_LEN).then(|| (index, (version, shard.to_vec())))
+            })?;
+            Some((digest, held.into_iter().collect::<HeldShards>()))
+        })?;
+        let expiry = r.seq(DIGEST + 8, |r| Some((r.array::<DIGEST>()?, Epoch::new(r.u64()?))))?;
+        let loss_ledger = r.seq(DIGEST + 8, |r| Some((r.array::<DIGEST>()?, Epoch::new(r.u64()?))))?;
+        r.finish()?;
+
+        let entries: BTreeMap<[u8; DIGEST], HeldShards> = entries.into_iter().collect();
+        let loss_ledger: BTreeMap<[u8; DIGEST], Epoch> = loss_ledger.into_iter().collect();
+        let expiry: BTreeMap<[u8; DIGEST], Epoch> = expiry.into_iter().collect();
+        // **Every map, not just `entries`.** Capping the held shards alone would leave two side maps whose
+        // only bound was the file's own length — a snapshot with no entries at all and forty million bytes of
+        // expiry records is a memory amplification a peer has no way to perform, which is exactly the shape
+        // this second door exists to refuse. Both are *documented* as subsets of the held keys, but that is
+        // an invariant of the code that produced the file, and the whole premise here is that the file may
+        // not have come from that code.
+        if entries.len() > MAX_STORE_ENTRIES
+            || loss_ledger.len() > MAX_STORE_ENTRIES
+            || expiry.len() > MAX_STORE_ENTRIES
+        {
+            return None;
+        }
+        Some(Self {
+            entries,
+            pending: BTreeMap::new(),
+            pending_samples: BTreeMap::new(),
+            loss_ledger,
+            expiry,
+            seq,
+        })
     }
 }

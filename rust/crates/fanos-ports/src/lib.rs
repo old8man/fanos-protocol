@@ -166,6 +166,18 @@ pub enum Command {
     /// a passive monitor (`fanos_telemetry`), which must not trigger the healing side-effects a full
     /// `Diagnose` does. Produces a `Notification::Observed` (docs/design-telemetry.md §4).
     Observe,
+    /// Emit this engine's **durable state** as canonical bytes, for a host that can write a file. Produces a
+    /// [`Notification::Snapshot`].
+    ///
+    /// A command rather than a trait method because the engine runs inside its own task: the state has to
+    /// cross the same boundary every other reading crosses, and inventing a second path for it would give the
+    /// persister a view no other observer has. Sense-only, exactly like [`Observe`](Self::Observe) — nothing
+    /// in the engine changes because someone asked what it holds.
+    ///
+    /// The *restore* direction has no command, and the asymmetry is deliberate: adopting a snapshot is only
+    /// correct before the engine has served anything, so it belongs to construction, not to the running
+    /// node's vocabulary (`CellComposition::restore`).
+    Snapshot,
     /// Store `value` in the cell's DHT under `key` (spec §L4). The responsible node is
     /// `MapToPoint(H(key))`; the value is replicated across the cell for LRC availability.
     Put {
@@ -355,6 +367,12 @@ pub enum Notification {
     },
     /// A local diagnosis verdict (spec §6.9).
     Verdict(fanos_diakrisis::Verdict),
+    /// This engine's durable state, in answer to [`Command::Snapshot`] — opaque canonical bytes to be
+    /// written somewhere they survive a restart, and handed back at construction.
+    ///
+    /// Empty from an engine with nothing durable, which is most of them: only the overlay's content store
+    /// holds state the network cannot cheaply reproduce.
+    Snapshot(Vec<u8>),
     /// A mandatory self-observation: the node's encoded `CoherenceFrame` for this window
     /// (`fanos_telemetry`), carrying the 3-bit Fano/Hamming syndrome and the cell's coherence
     /// scalars. Emitted every diagnosis; decode with `fanos_telemetry::CoherenceFrame::decode`. The
