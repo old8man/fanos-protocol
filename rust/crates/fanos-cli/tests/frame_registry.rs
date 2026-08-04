@@ -151,3 +151,48 @@ fn the_spec_frame_table_and_the_wire_registry_name_the_same_types() {
          carries something the specification does not describe."
     );
 }
+
+/// **The operator-facing verb list is a second record of the dispatch table, so it is checked against it.**
+///
+/// `docs/testnet.md`'s quick-command reference and `bin/fanos.rs`'s `match` are two descriptions of the same
+/// thing, and only one of them is compiled. The same shape as the frame registry above: a reader of the doc
+/// reasonably concludes a verb exists, or does not, and nothing said otherwise.
+///
+/// It is a **one-way** check, deliberately. Every verb the doc names must dispatch — a documented command
+/// that does not exist is a lie an operator finds by running it. The converse is not asserted, because the
+/// reference is a *quick* one and is allowed to omit verbs (`fanos --help` is the complete listing, and the
+/// binary's own `every_verb_has_a_help_block` test is what keeps that honest).
+#[test]
+fn every_verb_the_testnet_guide_names_is_one_the_binary_dispatches() {
+    let doc = std::fs::read_to_string(repo_root().join("docs/testnet.md")).expect("docs/testnet.md");
+    let dispatch =
+        std::fs::read_to_string(repo_root().join("rust/crates/fanos-node/src/bin/fanos.rs"))
+            .expect("bin/fanos.rs");
+
+    // The reference table's rows are ``| … | `fanos <verb> …` |``.
+    let table = doc
+        .split("## Quick command reference")
+        .nth(1)
+        .expect("the quick command reference")
+        .split("See also:")
+        .next()
+        .expect("the table ends before the see-also");
+
+    let named: BTreeSet<String> = table
+        .lines()
+        .filter_map(|l| l.split("`fanos ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(|v| v.trim_end_matches('`').to_owned())
+        // `<verb>` is the placeholder in the "what does one verb do" row, not a verb.
+        .filter(|v| !v.starts_with('<') && !v.starts_with('-'))
+        .collect();
+    assert!(named.len() >= 8, "the reference table parsed to {} rows, which cannot be right", named.len());
+
+    let missing: Vec<&String> =
+        named.iter().filter(|v| !dispatch.contains(&format!("Some(\"{v}\")"))).collect();
+    assert!(
+        missing.is_empty(),
+        "docs/testnet.md's quick reference names commands the binary does not dispatch: {missing:?}\n\
+         An operator finds this by typing it. Either add the verb or correct the table."
+    );
+}

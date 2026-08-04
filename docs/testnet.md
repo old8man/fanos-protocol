@@ -734,7 +734,10 @@ here only because earlier notes described ingress as non-rotating, and that's no
 | check setup + ask a running node | `fanos status [health\|roles\|coherence\|census\|stations\|consensus]` |
 | host a hidden service | `fanos host --forward HOST:PORT --host-key FILE --threshold T` |
 | dial anonymously | `fanos proxy --profile anonymous --threshold T --bootstrap SEED,…` |
+| generate YOUR recovery-authority key | `fanos authority-key --out FILE` (on your own machine; send back only the printed verifier) |
 | deal a community's ingress line | `fanos ingress-deal COMMUNITY PEER… --out DIR` |
+| deal a threshold service line | `fanos service-deal x:y:z… --out DIR [--threshold T]` |
+| what does one verb do | `fanos <verb> --help` |
 | deal a TAXIS validator cell | `fanos taxis-deal --out DIR` (needs `--features validator`) |
 | run a validator | `fanos validator --config validator-<i>.taxis --listen ADDR --bootstrap COORD@HOST:PORT,…` |
 
