@@ -115,6 +115,33 @@ that key earns this epoch?*". The unification binds them:
    existing `beacon_alpha` with the beacon term the spec's `VRF_beacon` names). At genesis (`epoch 0`,
    `beacon = BeaconSeed::GENESIS`) this is computable with no live beacon, so cold-start and tests need no
    beacon round.
+
+   **That convenience is also a window, and the two halves of this document had never been put together.**
+   §Reshuffle above states that on `q = 2`, where grind-cost is nil, *"this unpredictable reshuffle is the
+   entire defense"*. At genesis there is no reshuffle yet — so on the base cell there is, for that window, no
+   placement defence at all. `BeaconSeed::GENESIS` is a public constant, so an adversary computes credentials
+   for every point of the plane offline (`fanos-quic::harness` measures the cost as ~7 mints per point, which
+   is why it exists as a *test* facility) and joins wherever it chose. The window closes when the first beacon
+   round assembles — `epoch_period`, 600 s by default.
+
+   **Confirmed against the code, 2026-08-04**, because the conjunction alone would not have settled it:
+   `on_join` and `on_announce` (`overlay/membership_ops.rs`) do not require an adopted beacon, and the only
+   gate on the path is `require_admission` — which is **`false` in `Config::default()`**, with
+   `admission_difficulty: None`. So on a default cell the genesis window is not merely undefended by the
+   reshuffle; it is ungated entirely.
+
+   This is the same primitive the announce path already documents defending against — its comment records
+   *"grind ~20 identities until one collides with a chosen victim at a lower rank … reuse the victim's proof"*,
+   and that attack was closed by binding the admission challenge to the identity. What was closed there is
+   proof **replay**; what remains here is placement **choice** during the one window that has no reshuffle to
+   undo it.
+
+   **Not fixed here, because the fix is a deployment decision with a real cost.** Three shapes: refuse joins
+   until the first beacon round (costs the cold-start ergonomics this bullet exists to provide, and the
+   founding runbook would have to sequence the beacon first); price the join (`admission_difficulty` makes
+   occupying seven points cost seven proofs — cheap to state, weak against a funded adversary); or accept it
+   and require that a cell be founded privately and then opened, which is what a multi-operator ceremony does
+   anyway. Picking one belongs with the founding choreography, not with this derivation.
 3. **`HELLO` carries a proof-of-coordinate.** The handshake sends `(epoch, coord, vrf_output,
    vrf_proof)`; the peer runs `verify_coordinate(vrf_public, node_id, epoch, beacon, coord, proof)` and
    rejects a mismatch (`BAD_COORD`) or a stale epoch (`EPOCH_STALE` → `BEACON` sync). Zero extra round
