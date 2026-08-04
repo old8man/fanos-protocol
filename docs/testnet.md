@@ -103,10 +103,22 @@ This draws a fresh secret from OS entropy, Shamir-splits it 5-of-7 (illustrative
 * `anchor-1.beacon` … `anchor-7.beacon` — one per founding node, each carrying that node's secret share
 * `consumer.beacon` — the public commitment and threshold only, for a node that should track the live
   epoch without being an anchor (a joining node later, §4)
-* `recovery-authority.key` — **the most sensitive file in the ceremony.** It authorizes a future reshare
-  or re-genesis of the beacon (the way out of an anchor-loss freeze). It is *not* split — the founder keeps
-  this one file, offline, and never puts it on a running node. Its public half travels automatically inside
-  every `.beacon` file above (`authority = …`), so nothing further needs distributing for it.
+* `recovery-authority-1.key` … `recovery-authority-7.key` — **one per founder, and this is the point.**
+  Together they authorize a future reshare or re-genesis of the beacon (the way out of an anchor-loss
+  freeze), and **a strict majority must sign**: 4 of 7 here, derived from the count rather than written into
+  any file. Hand member `i` to founding operator `i` along with their anchor file, keep it *offline*, and
+  never put it on a running node.
+
+  It used to be one unsplit key, and that was the sharpest asymmetry in the ceremony: the beacon secret is
+  5-of-7 precisely so no single party holds it, while the authority that can order that key *replaced* was a
+  single file on the founder's disk. Coordinates derive from the beacon, so whoever held it chose where every
+  node in the cell lands — the DKG's whole guarantee, undone by the file next to it. A committee closes it,
+  and the strict majority is what keeps re-genesis single-writer: any two quorums share a member, so two
+  partitioned groups cannot each sign a different authorization at the same generation.
+
+  The public halves travel automatically inside every `.beacon` file above (`authority = hex,hex,…`), **in
+  order** — a signature names its member by index into that list, so the order is genesis material and
+  reordering it invalidates every signature.
 
 Hand `anchor-<i>.beacon` to founding operator `i` over a channel you trust (SSH, an encrypted messenger —
 the tool doesn't specify one, and that gap is real; see §6). Each file carries that operator's secret
@@ -415,12 +427,14 @@ was split a moment later:
   later — lands on the plane.
 * The channel used to hand out `anchor-<i>.beacon` in §3.1 is unspecified by the tooling. Whoever
   transmits a share insecurely is the actual leak, and the code has no opinion on how you do that part.
-* `recovery-authority.key` is a standing, ongoing trust root, not a one-time cost: whoever holds it can
-  authorize a reshare or re-genesis for the life of the cell, by design (it's what recovers a cell that
-  loses too many anchors). Keeping it "offline" is a promise the tooling cannot enforce.
+* The recovery-authority keys are a standing, ongoing trust root, not a one-time cost: a strict majority of
+  their holders can authorize a reshare or re-genesis for the life of the cell, by design (it's what
+  recovers a cell that loses too many anchors). Keeping them "offline" is a promise the tooling cannot
+  enforce. What the committee *does* buy is that this is now a promise from four people rather than one, and
+  that no single compromised laptop is sufficient.
 
 None of this is a reason not to launch. It is a reason to say, in whatever the testnet's own operator
-documentation is, who dealt it and what they promise to do with `recovery-authority.key` — the same
+documentation is, who dealt it and what the authority holders promise to do with their keys — the same
 reasoning `docs/design-governance.md` §2.1 already applies to a public launch, at smaller scale.
 
 ---
@@ -474,10 +488,15 @@ ever holding the whole secret.
   `DkgNode`'s `final_share()` / `aggregate_commitment()`.
 * **The recovery authority is untouched by the DKG entirely**, and this is worth stating precisely because
   it's easy to assume the DKG closes the whole governance gap in §2.1 and it does not: `DkgNode` has no
-  concept of a recovery-authority keypair. Even a fully-wired `fanos keygen` would still need the exact
-  manual step `beacon-deal` uses today — one party generates a `HybridSigSecret`, keeps the seed offline,
-  and distributes only the public verifier. The DKG removes single-party trust from the *beacon secret*; it
-  does nothing for the *recovery authority* unless a second ceremony is designed for that too.
+  concept of a recovery-authority keypair. Even a fully-wired `fanos keygen` would still need the step
+  `beacon-deal` performs today.
+  *(Narrowed 2026-08-04: that step is no longer "one party generates a key". `beacon-deal` now generates one
+  authority keypair per founder and a strict majority must sign, so the single-party trust the DKG removes
+  from the beacon secret is no longer sitting undisturbed next to it. What remains genuinely open is that
+  the authority keys are still generated **in one place** by the dealing tool, exactly as the beacon shares
+  are — a trust-minimized founding would have each operator generate their own authority key locally and
+  publish only the verifier, which needs no cryptography that does not already exist, only a ceremony
+  step.)*
 * **No discovery/transport step** for "these `n` operators, each on their own machine, are all in the same
   run." `fanos-sim`'s test wires every `DkgNode` directly in one process over a hand-rolled bus; a real
   multi-operator run needs the participants reachable by network address first.

@@ -25,7 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
 use fanos_ports::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
-use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
+use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
+use fanos_pqcrypto::{HybridSigSecret, HybridSignature};
 use fanos_primitives::hash_labeled;
 use fanos_vrf::beacon::{BeaconPartial, BeaconRound, PARTIAL_LEN, partial_eval, verify_partial};
 use fanos_vrf::vss::{
@@ -34,7 +35,7 @@ use fanos_vrf::vss::{
 };
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
-use crate::recovery::RecoveryAuthorization;
+use crate::recovery::{MAX_AUTHORITY_MEMBERS, RecoveryAuthoritySet, RecoveryAuthorization};
 
 /// Domain-separation label for the cell lineage fingerprint an `RGC` binds to (audit §4).
 const LINEAGE_LABEL: &str = "FANOS-recovery-v1/lineage";
@@ -149,7 +150,7 @@ pub struct BeaconNode<F: Field> {
     /// ([`rebootstrap`](Self::rebootstrap)). The parent cell's key, or (for the root cell) a founder/constitution
     /// key. `None` disables re-genesis: a cell with no configured authority freezes rather than re-key on an
     /// unauthenticated say-so (audit §4, `docs/design-recovery.md`).
-    authority: Option<HybridVerifier>,
+    authority: Option<RecoveryAuthoritySet>,
 }
 
 /// An in-progress resharing generation (audit R-C1). A coordinator's trigger fixes the target set; each
@@ -238,7 +239,7 @@ impl<F: Field> BeaconNode<F> {
     /// ([`rebootstrap`](Self::rebootstrap)). Without it, a cell that falls below threshold freezes permanently
     /// rather than re-key on an unauthenticated request (audit §4).
     #[must_use]
-    pub fn with_recovery_authority(mut self, authority: HybridVerifier) -> Self {
+    pub fn with_recovery_authority(mut self, authority: RecoveryAuthoritySet) -> Self {
         self.authority = Some(authority);
         self
     }
@@ -281,10 +282,15 @@ impl<F: Field> BeaconNode<F> {
     /// recovery-authority **secret** — a parent cell or an operator, the same trust root that issues a
     /// re-genesis certificate — can trigger a reshare; a node cannot self-issue one (an unauthenticated
     /// trigger was the §2.1 2-coalition key-exfiltration oracle). The trigger self-floods (monotone) with its
-    /// signature, so it need only reach one live anchor.
+    /// signatures, so it need only reach one live anchor.
+    ///
+    /// `authority` is `(member index, secret)` for each signing member of the committee, and a **quorum**
+    /// must be present or every anchor refuses the frame. Duplicate indices are dropped rather than counted,
+    /// which is the same rule [`RecoveryAuthorization::sign`] enforces and for the same reason: a quorum
+    /// filled by one key is not a quorum.
     #[must_use]
     pub fn reshare_trigger(
-        authority: &HybridSigSecret,
+        authority: &[(u8, &HybridSigSecret)],
         generation: u64,
         new_threshold: usize,
         contributors: &[u8],
@@ -468,7 +474,7 @@ impl<F: Field> BeaconNode<F> {
     /// Handle a resharing trigger: record the target parameters for `generation`, re-flood it once (monotone, so it
     /// terminates), and — if this node is a named contributor — deal its verifiable contribution.
     fn on_reshare_trigger(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((generation, new_threshold, contributors, new_indices, sig)) = parse_reshare_trigger(body)
+        let Some((generation, new_threshold, contributors, new_indices, sigs)) = parse_reshare_trigger(body)
         else {
             self.rejects.reshare_malformed = self.rejects.reshare_malformed.saturating_add(1);
             return Vec::new();
@@ -489,7 +495,7 @@ impl<F: Field> BeaconNode<F> {
             return Vec::new(); // no trust root ⇒ no authenticated reshare is possible
         };
         let params = reshare_trigger_params(generation, new_threshold, &contributors, &new_indices);
-        if !authority.verify(&reshare_trigger_signing_message(&params), &sig) {
+        if !authority_quorum_verifies(&authority, &reshare_trigger_signing_message(&params), &sigs) {
             // **The §2.1 attack, counted.** The 2-anchor coalition that could have reconstructed the beacon
             // master key is refused here — and until now, refused in silence, so the attempt left no trace
             // anywhere an operator could look.
@@ -899,17 +905,46 @@ fn reshare_trigger_signing_message(params: &[u8]) -> Vec<u8> {
 /// `authority` over `LABEL ‖ params` — so an unauthenticated (forged) trigger is rejected before any anchor
 /// deals a sub-share (audit §2.1). The frame self-floods with its signature, so every downstream anchor
 /// re-verifies the same authorization.
-fn reshare_trigger_frame(authority: &HybridSigSecret, generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
+fn reshare_trigger_frame(authority: &[(u8, &HybridSigSecret)], generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
     let params = reshare_trigger_params(generation, new_threshold, contributors, new_indices);
-    let sig = authority.sign(&reshare_trigger_signing_message(&params));
+    let message = reshare_trigger_signing_message(&params);
+    let mut signed: Vec<(u8, HybridSignature)> = Vec::new();
+    for (index, sk) in authority {
+        if !signed.iter().any(|(i, _)| i == index) {
+            signed.push((*index, sk.sign(&message)));
+        }
+    }
+    signed.sort_by_key(|(i, _)| *i);
     let mut body = params;
-    body.extend_from_slice(&sig.to_bytes());
+    body.push(signed.len() as u8);
+    for (index, sig) in &signed {
+        body.push(*index);
+        body.extend_from_slice(&sig.to_bytes());
+    }
     encode(FrameType::BeaconReshareTrigger, &body)
+}
+
+/// Whether `sigs` is a **quorum of distinct authority members** each signing `message`.
+///
+/// The same rule `RecoveryAuthorization::verify` applies to a re-genesis certificate, applied to the reshare
+/// trigger — because they are the same authorization: audit §2.1 established that a reshare CHANGES the
+/// sharing threshold and so must come from the trust root, and a trust root that is one key is one key
+/// whichever of the two it signs.
+fn authority_quorum_verifies(
+    authority: &RecoveryAuthoritySet,
+    message: &[u8],
+    sigs: &[(u8, HybridSignature)],
+) -> bool {
+    sigs.len() >= authority.quorum()
+        && sigs.is_sorted_by(|(a, _), (b, _)| a < b)
+        && sigs.iter().all(|(index, sig)| {
+            authority.members().get(usize::from(*index)).is_some_and(|vk| vk.verify(message, sig))
+        })
 }
 
 /// The parsed fields of an authenticated reshare trigger: `(generation, new_threshold, contributors,
 /// new_indices, authority_signature)`.
-type ParsedReshareTrigger = (u64, usize, Vec<u8>, Vec<u8>, HybridSignature);
+type ParsedReshareTrigger = (u64, usize, Vec<u8>, Vec<u8>, Vec<(u8, HybridSignature)>);
 
 fn parse_reshare_trigger(body: &[u8]) -> Option<ParsedReshareTrigger> {
     let generation = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
@@ -920,10 +955,23 @@ fn parse_reshare_trigger(body: &[u8]) -> Option<ParsedReshareTrigger> {
     let n_new = usize::from(*body.get(n_new_pos)?);
     let new_indices_end = n_new_pos + 1 + n_new;
     let new_indices = body.get(n_new_pos + 1..new_indices_end)?.to_vec();
-    // The trailing bytes are the authority signature — `from_bytes` requires exactly `HYBRID_SIG_LEN`, so a
-    // truncated/oversized tail (or a missing signature on a legacy frame) is rejected here.
-    let sig = HybridSignature::from_bytes(body.get(new_indices_end..)?)?;
-    Some((generation, new_threshold, contributors, new_indices, sig))
+    // The tail is the authority quorum: `count(1) ‖ [index(1) ‖ HybridSignature]…`. The count is bounded
+    // by the frame itself — each entry has a fixed width, so an oversized count simply fails to slice — and
+    // `from_bytes` requires exactly `HYBRID_SIG_LEN`, so a truncated or padded tail is rejected here rather
+    // than producing a short quorum that the caller would then have to notice.
+    let n_sigs = usize::from(*body.get(new_indices_end)?);
+    let mut sigs = Vec::with_capacity(n_sigs.min(MAX_AUTHORITY_MEMBERS));
+    let mut at = new_indices_end + 1;
+    for _ in 0..n_sigs {
+        let index = *body.get(at)?;
+        let sig_end = at + 1 + HYBRID_SIG_LEN;
+        sigs.push((index, HybridSignature::from_bytes(body.get(at + 1..sig_end)?)?));
+        at = sig_end;
+    }
+    if at != body.len() {
+        return None; // trailing garbage
+    }
+    Some((generation, new_threshold, contributors, new_indices, sigs))
 }
 
 /// `BeaconReshareCommit` body: `generation(8) ‖ old_index(1) ‖ new_threshold(1) ‖ VssCommitment(Dᵢ)`.
@@ -1075,7 +1123,7 @@ mod tests {
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"parent-authority"));
         let survivor = || {
             BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t)
-                .with_recovery_authority(authority_vk.clone())
+                .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap())
         };
 
         // A fresh survivor DKG — a single trusted deal stands for it, exactly as genesis stands for the DKG: a
@@ -1089,7 +1137,7 @@ mod tests {
         // (1) An authorized RGC re-genesises: the fresh key installs, the generation fences forward, the clock is
         // set to resume at the fence, and the anchor produces a partial again (the freeze is lifted).
         let mut node = survivor();
-        let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, node.lineage_anchor());
+        let rgc = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, fence, &survivors, t2, node.lineage_anchor());
         assert!(node.rebootstrap(&rgc, new_commitment.clone(), Some(new_shares[4].clone())), "authorized re-genesis adopts");
         assert_eq!(node.reshare_gen(), 1, "generation fenced forward");
         assert_eq!(node.threshold(), 2, "the fresh threshold is installed");
@@ -1103,25 +1151,25 @@ mod tests {
         // (2) A foreign authority is refused (no fork on an unauthorized say-so).
         let mut n = survivor();
         let (impostor_sk, _) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"impostor"));
-        let forged = RecoveryAuthorization::issue(&impostor_sk, 1, fence, &survivors, t2, n.lineage_anchor());
+        let forged = RecoveryAuthorization::issue(&[(0, &impostor_sk)], 1, fence, &survivors, t2, n.lineage_anchor());
         assert!(!n.rebootstrap(&forged, new_commitment.clone(), Some(new_shares[4].clone())), "a foreign authority is refused");
 
         // (3) An authorization anchored to a different cell/generation is refused (no cross-cell replay).
-        let wrong_anchor = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, [0xAA; 32]);
+        let wrong_anchor = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, fence, &survivors, t2, [0xAA; 32]);
         assert!(!n.rebootstrap(&wrong_anchor, new_commitment.clone(), Some(new_shares[4].clone())), "a foreign anchor is refused");
 
         // (4) A non-advancing fence is refused (the clock never runs backward).
-        let backward = RecoveryAuthorization::issue(&authority_sk, 1, n.epoch(), &survivors, t2, n.lineage_anchor());
+        let backward = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, n.epoch(), &survivors, t2, n.lineage_anchor());
         assert!(!n.rebootstrap(&backward, new_commitment.clone(), Some(new_shares[4].clone())), "a non-advancing fence is refused");
 
         // (5) After a valid adoption, a stale (≤ current) generation is refused — the monotonic fence that makes
         // a returning partition subordinate, not forking.
         assert!(n.rebootstrap(
-            &RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, n.lineage_anchor()),
+            &RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, fence, &survivors, t2, n.lineage_anchor()),
             new_commitment.clone(),
             Some(new_shares[4].clone()),
         ));
-        let stale = RecoveryAuthorization::issue(&authority_sk, 1, Epoch::new(9), &survivors, t2, n.lineage_anchor());
+        let stale = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, Epoch::new(9), &survivors, t2, n.lineage_anchor());
         assert!(!n.rebootstrap(&stale, new_commitment, Some(new_shares[4].clone())), "a stale generation is refused");
     }
 
@@ -1146,7 +1194,7 @@ mod tests {
         let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"healthy-genesis")).unwrap();
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"authority"));
         let mut node = BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t)
-            .with_recovery_authority(authority_vk);
+            .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk]).unwrap());
 
         let t2 = 2u8;
         let (new_shares, new_commitment) =
@@ -1157,7 +1205,7 @@ mod tests {
         // a fresh generation, a matching threshold — so nothing but the survivor count can refuse this.
         for healthy in [N, t + 1, t] {
             let survivors: Vec<u8> = (1..=healthy as u8).collect();
-            let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, node.lineage_anchor());
+            let rgc = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, fence, &survivors, t2, node.lineage_anchor());
             assert!(
                 !node.rebootstrap(&rgc, new_commitment.clone(), Some(new_shares[4].clone())),
                 "{healthy} survivors at threshold {t} can still RESHARE, so re-genesis — which abandons the \
@@ -1171,7 +1219,7 @@ mod tests {
         // THE MECHANISM, so the test cannot pass by refusing everything: one fewer survivor than the
         // threshold is exactly the case re-genesis is for, and it is accepted.
         let survivors: Vec<u8> = (1..=(t - 1) as u8).collect();
-        let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &survivors, t2, node.lineage_anchor());
+        let rgc = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, fence, &survivors, t2, node.lineage_anchor());
         assert!(
             node.rebootstrap(&rgc, new_commitment, Some(new_shares[4].clone())),
             "{} survivors at threshold {t} cannot reshare — this is the case re-genesis exists for",
@@ -1206,7 +1254,7 @@ mod tests {
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
             .map(|i| {
                 BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t)
-                    .with_recovery_authority(authority_vk.clone())
+                    .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap())
             })
             .collect();
         let survivors_pts = [4usize, 5, 6];
@@ -1221,7 +1269,7 @@ mod tests {
         let (new_shares, new_commitment) =
             deal(&[0x5E; 32], usize::from(t2), N, &mut DeterministicRng::new(b"resume-fresh")).unwrap();
         let fence = Epoch::new(3);
-        let rgc = RecoveryAuthorization::issue(&authority_sk, 1, fence, &[5, 6, 7], t2, nodes[4].lineage_anchor());
+        let rgc = RecoveryAuthorization::issue(&[(0, &authority_sk)], 1, fence, &[5, 6, 7], t2, nodes[4].lineage_anchor());
         for &p in &survivors_pts {
             assert!(nodes[p].rebootstrap(&rgc, new_commitment.clone(), Some(new_shares[p].clone())), "survivor re-genesises");
         }
@@ -1426,7 +1474,7 @@ mod tests {
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
             .map(|i| {
                 BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t)
-                    .with_recovery_authority(authority_vk.clone())
+                    .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap())
             })
             .collect();
 
@@ -1447,7 +1495,7 @@ mod tests {
         // 3..6); new threshold t'=3. A coordinator broadcasts the trigger to the whole cell.
         let contributors = [4u8, 5, 6, 7];
         let new_indices = [4u8, 5, 6, 7];
-        let trigger = reshare_trigger_frame(&authority_sk, 1, 3, &contributors, &new_indices);
+        let trigger = reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &contributors, &new_indices);
         let initial: Vec<(usize, Vec<u8>)> = (0..N).map(|k| (k, trigger.clone())).collect();
         route(&mut nodes, initial, &[]);
 
@@ -1497,16 +1545,16 @@ mod tests {
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"exfil-authority"));
         let (impostor_sk, _) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"exfil-impostor"));
         let mut victim = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t)
-            .with_recovery_authority(authority_vk);
+            .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk]).unwrap());
         let recv = |v: &mut BeaconNode<F2>, frame: Vec<u8>| v.step(Instant(0), Input::Message { from: [0, 0, 0], frame });
 
         // The §2.1 exploit — a 2-coalition names new_threshold=2 at its own indices {5,6} — but SIGNED BY THE
         // ATTACKER, not the authority. It is refused, so no honest anchor deals a sub-share. This is the fix.
-        assert!(recv(&mut victim, reshare_trigger_frame(&impostor_sk, 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &impostor_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
             "a foreign-signed (unauthenticated) reshare trigger is refused — the 2-coalition exfil is closed");
         assert_eq!(victim.reshare_gen(), 0, "and does not adopt it");
         // Tampering a validly-signed trigger (corrupt a trailing signature byte) also fails verification.
-        let mut tampered = reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7]);
+        let mut tampered = reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7]);
         if let Some(b) = tampered.last_mut() {
             *b ^= 0xFF;
         }
@@ -1548,7 +1596,7 @@ mod tests {
         let mut rootless =
             BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
         assert!(
-            recv(&mut rootless, reshare_trigger_frame(&authority_sk, 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
+            recv(&mut rootless, reshare_trigger_frame(&[(0, &authority_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
             "a cell with no recovery authority cannot reshare at all"
         );
         assert_eq!(rootless.rejects().reshare_no_authority, 1, "and says so as a provisioning gap");
@@ -1556,15 +1604,15 @@ mod tests {
 
         // Even correctly AUTHORITY-signed, the defence-in-depth guards still refuse: a degree-0 (threshold-1)
         // reshare, an out-of-range or duplicate new index, and a far-future generation.
-        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 1, &[1, 2, 3, 4], &[5])).is_empty(),
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 1, &[1, 2, 3, 4], &[5])).is_empty(),
             "the MIN_RESHARE_THRESHOLD floor refuses a degree-0 reshare even from the authority");
-        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[5, 6, 99])).is_empty());
-        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[5, 5, 6])).is_empty());
-        assert!(recv(&mut victim, reshare_trigger_frame(&authority_sk, 1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[5, 6, 99])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[5, 5, 6])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6])).is_empty());
         assert_eq!(victim.reshare_gen(), 0, "no refused trigger advanced any state");
 
         // A well-formed reshare correctly signed by the authority is honored.
-        assert!(!recv(&mut victim, reshare_trigger_frame(&authority_sk, 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
+        assert!(!recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
             "a legitimate authority-signed reshare is still dealt");
     }
 

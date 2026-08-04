@@ -3,6 +3,7 @@
 
 #![allow(dead_code, unreachable_pub, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use fanos_keygen::recovery::RecoveryAuthoritySet;
 use fanos_field::Field;
 use fanos_geometry::Plane;
 use fanos_keygen::BeaconNode;
@@ -44,7 +45,7 @@ pub fn spawn_beacon_cell<F: Field + 'static>(
         let overlay = OverlayNode::<F>::new(point, config);
         let share = (i < anchors).then(|| shares[i].clone());
         let beacon = BeaconNode::<F>::new(point, share, commitment.clone(), threshold)
-            .with_recovery_authority(authority_vk.clone());
+            .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap());
         coords.push(sim.add(Box::new(OverlayBeaconNode::new(overlay, beacon))));
     }
     coords
@@ -86,7 +87,7 @@ pub fn spawn_composed_beacon_cell<F: Field + 'static>(
                 commitment: commitment.clone(),
                 threshold,
                 share: (i < anchors).then(|| shares[i].clone()),
-                authority: with_authority.then(|| authority_vk.clone()),
+                authority: with_authority.then(|| RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap()),
             }),
             ..CellComposition::overlay_only(config)
         };

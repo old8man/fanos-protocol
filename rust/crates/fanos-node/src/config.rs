@@ -8,6 +8,7 @@ use std::time::Duration;
 use fanos_calypso::hosting::Share;
 use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
 use fanos_geometry::Triple;
+use fanos_keygen::recovery::RecoveryAuthoritySet;
 use fanos_quic::{Environment, Morph};
 use fanos_pqcrypto::sig::HybridVerifier;
 use fanos_vrf::vss::{VssCommitment, VssShare};
@@ -118,7 +119,15 @@ pub struct BeaconParams {
     pub threshold: usize,
     /// This node's beacon share if it is an anchor; `None` for a pure consumer.
     pub share: Option<VssShare>,
-    /// The **recovery authority's verifier** — the trust root that may order a threshold change.
+    /// The **recovery authority committee** — the trust root that may order a threshold change.
+    ///
+    /// A *committee*, not a key, and the asymmetry that forced it is worth stating where an operator
+    /// provisions it: the beacon secret is `t`-of-`n` so no single party holds it, and until this became a
+    /// set, the authority that could order that key REPLACED was one verifier — one file on one founder's
+    /// disk. Coordinates derive from the beacon (`docs/design-governance.md` §2.1), so that file was the
+    /// placement of every node in the cell. The quorum is a strict majority and is **derived from the member
+    /// count, never configured** ([`fanos_keygen::recovery::authority_quorum`]) — a quorum field one value
+    /// too loose is the `CellParams` fork all over again.
     ///
     /// Without it a beacon refuses every reshare trigger and every re-genesis
     /// (`BeaconNode::on_reshare_trigger` and `rebootstrap` both return early on `authority: None`), which is
@@ -128,10 +137,11 @@ pub struct BeaconParams {
     /// 2026 with no wire between them: there was no field here, no config key, and `with_recovery_authority`
     /// had no caller outside the simulator.
     ///
-    /// It is deliberately the *verifier*, never the secret. A node holds no authority key and cannot
-    /// self-issue a trigger; it detects the stall, elects a coordinator and escalates, and an operator or
-    /// parent cell signs. This is the public half every member needs to check that signature.
-    pub authority: Option<HybridVerifier>,
+    /// It is deliberately the *verifiers*, never the secrets. A node holds no authority key and cannot
+    /// self-issue a trigger; it detects the stall, elects a coordinator and escalates, and a quorum of
+    /// operators (or the parent cell) signs. This is the public half every member needs to check those
+    /// signatures.
+    pub authority: Option<RecoveryAuthoritySet>,
 }
 
 impl fmt::Debug for BeaconParams {
@@ -168,8 +178,11 @@ impl BeaconParams {
     /// - `threshold = <t>` — the DVRF reconstruction threshold;
     /// - `commitment = <hex>` — the group's public [`VssCommitment`] (network-wide genesis material);
     /// - `share = <hex>` — THIS node's anchor [`VssShare`]; omit for a pure consumer (verifies + adopts only);
-    /// - `authority = <hex>` — the recovery authority's [`HybridVerifier`]; omit and the cell can never
-    ///   reshape its beacon, so a freeze is permanent (see [`BeaconParams::authority`]).
+    /// - `authority = <hex>[,<hex>…]` — the recovery authority committee's [`HybridVerifier`]s, in the order
+    ///   the founding ceremony fixed (a signature names its member by index into that order). Omit and the
+    ///   cell can never reshape its beacon, so a freeze is permanent (see [`BeaconParams::authority`]). The
+    ///   quorum is not written here: it is a strict majority of however many are listed, derived rather than
+    ///   configured, so a file cannot quietly lower it.
     ///
     /// The share is this node's secret — protect the file. The commitment/threshold are public and identical
     /// network-wide. Generate a set with `fanos beacon-deal` (or an external DKG).
@@ -177,7 +190,7 @@ impl BeaconParams {
         let mut threshold: Option<usize> = None;
         let mut commitment: Option<VssCommitment> = None;
         let mut share: Option<VssShare> = None;
-        let mut authority: Option<HybridVerifier> = None;
+        let mut authority: Option<RecoveryAuthoritySet> = None;
         for (n, raw) in text.lines().enumerate() {
             let l = raw.split('#').next().unwrap_or("").trim();
             if l.is_empty() {
@@ -204,8 +217,23 @@ impl BeaconParams {
                     })?);
                 }
                 "authority" => {
-                    authority = Some(HybridVerifier::decode(&hex_decode(value)?).ok_or_else(|| {
-                        NodeError::Config("bad beacon authority (not a valid HybridVerifier)".to_owned())
+                    let members = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .map(|m| {
+                            HybridVerifier::decode(&hex_decode(m)?).ok_or_else(|| {
+                                NodeError::Config("bad beacon authority (not a valid HybridVerifier)".to_owned())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // An empty list is a provisioning mistake, not "no authority": writing `authority =` and
+                    // silently getting a cell that can never recover is exactly the class of quiet no-op the
+                    // provisioning ratchet exists for. Omit the key to mean none.
+                    authority = Some(RecoveryAuthoritySet::new(members).ok_or_else(|| {
+                        NodeError::Config(
+                            "beacon authority is empty — omit the key entirely to disable recovery".to_owned(),
+                        )
                     })?);
                 }
                 other => return Err(NodeError::Config(format!("unknown beacon config key '{other}'"))),
@@ -234,7 +262,9 @@ impl BeaconParams {
             let _ = writeln!(s, "share = {}", hex_encode(&share.to_bytes()));
         }
         if let Some(authority) = &self.authority {
-            let _ = writeln!(s, "authority = {}", hex_encode(&authority.encode()));
+            let members: Vec<String> =
+                authority.members().iter().map(|vk| hex_encode(&vk.encode())).collect();
+            let _ = writeln!(s, "authority = {}", members.join(","));
         }
         s
     }
@@ -1175,12 +1205,12 @@ mod tests {
             commitment: commitment.clone(),
             threshold: 4,
             share: None,
-            authority: Some(verifier.clone()),
+            authority: Some(RecoveryAuthoritySet::new(vec![verifier.clone()]).unwrap()),
         };
         let back = BeaconParams::from_config_str(&params.to_config_string()).expect("round trip");
         let recovered = back.authority.expect("the authority must survive the file");
         assert_eq!(
-            recovered.encode(),
+            recovered.members().first().expect("one member").encode(),
             verifier.encode(),
             "the verifier must come back byte-identical — a different key rejects the operator's own trigger"
         );

@@ -111,7 +111,7 @@ fn proactive_resharing_survives_the_r_c1_cliff() {
     // A reshare changes the threshold, so it must be authorized by the beacon's recovery authority (§2.1);
     // the operator/parent signs the trigger. spawn_beacon_cell configured the cell with this authority.
     let (authority_sk, _) = common::recovery_authority();
-    let trigger = BeaconNode::<F2>::reshare_trigger(&authority_sk, 1, 3, &contributors, &new_holders);
+    let trigger = BeaconNode::<F2>::reshare_trigger(&[(0, &authority_sk)], 1, 3, &contributors, &new_holders);
     sim.inject_frame(cell[6], cell[6], trigger);
     sim.run_for(Duration::from_millis(3000)); // the reshare deals, floods, and is adopted cell-wide
 
@@ -146,7 +146,7 @@ fn a_composed_cell_carries_the_recovery_authority_through_to_its_beacon() {
     assert_eq!(sim.tick_epoch(), Some(Epoch::new(2)), "and advances");
 
     let (authority_sk, _) = common::recovery_authority();
-    let trigger = BeaconNode::<F2>::reshare_trigger(&authority_sk, 1, 3, &[4u8, 5, 6, 7], &[4u8, 5, 6, 7]);
+    let trigger = BeaconNode::<F2>::reshare_trigger(&[(0, &authority_sk)], 1, 3, &[4u8, 5, 6, 7], &[4u8, 5, 6, 7]);
     sim.inject_frame(cell[6], cell[6], trigger);
     sim.run_for(Duration::from_millis(3000));
 
@@ -177,7 +177,7 @@ fn a_composed_cell_without_an_authority_refuses_the_trigger_and_stays_frozen() {
     assert_eq!(sim.tick_epoch(), Some(Epoch::new(1)), "healthy: the clock starts");
 
     let (authority_sk, _) = common::recovery_authority();
-    let trigger = BeaconNode::<F2>::reshare_trigger(&authority_sk, 1, 3, &[4u8, 5, 6, 7], &[4u8, 5, 6, 7]);
+    let trigger = BeaconNode::<F2>::reshare_trigger(&[(0, &authority_sk)], 1, 3, &[4u8, 5, 6, 7], &[4u8, 5, 6, 7]);
     sim.inject_frame(cell[6], cell[6], trigger);
     sim.run_for(Duration::from_millis(3000));
 

@@ -1976,11 +1976,24 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     // The **recovery authority**, without which the dealt beacon can never be reshaped. A beacon with no
     // configured trust root refuses every reshare trigger and every re-genesis, so losing `n − t + 1` anchors
     // freezes its epoch clock permanently — the R-C1 cliff. Every provisioning file therefore carries the
-    // authority's VERIFIER, and its secret is written once, separately, for the operator to keep offline: a
-    // node holds no authority key and cannot self-issue a threshold change.
-    let mut authority_seed = [0u8; 32];
-    getrandom::fill(&mut authority_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let (_authority_secret, authority) = HybridSigSecret::generate(&mut SeedRng::from_seed(&authority_seed));
+    // authority's VERIFIERS, and each member's secret is written separately for that operator to keep
+    // offline: a node holds no authority key and cannot self-issue a threshold change.
+    //
+    // **One authority key per founder, not one for the ceremony.** The beacon is `t`-of-`n` so that no single
+    // party holds it; an authority that can order that key REPLACED must not be weaker, and a single key was.
+    // Coordinates derive from the beacon, so one file on one disk was the placement of every node in the
+    // cell. The committee's quorum is a strict majority of `n`, derived rather than written into any file.
+    let mut authority_seeds = Vec::with_capacity(n);
+    let mut authority_members = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+        let (_secret, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
+        authority_seeds.push(seed);
+        authority_members.push(verifier);
+    }
+    let authority = fanos_keygen::recovery::RecoveryAuthoritySet::new(authority_members)
+        .ok_or_else(|| NodeError::Config("cannot deal a beacon for n = 0".to_owned()))?;
 
     for (i, share) in shares.iter().enumerate() {
         let params = BeaconParams {
@@ -1994,17 +2007,26 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
         println!("wrote {path}");
     }
     let consumer =
-        BeaconParams { commitment, threshold: t, share: None, authority: Some(authority) };
+        BeaconParams { commitment, threshold: t, share: None, authority: Some(authority.clone()) };
     let cpath = format!("{out}/consumer.beacon");
     std::fs::write(&cpath, consumer.to_config_string())?;
     println!("wrote {cpath}");
-    let apath = format!("{out}/recovery-authority.key");
-    // The SEED, not the derived secret: `HybridSigSecret::generate` is deterministic in it, so the operator
-    // regenerates the same authority whenever one is needed — the convention the rest of the tree uses for
-    // secret material (a service member's KEM key is carried the same way).
-    std::fs::write(&apath, fanos_node::config::hex_encode(&authority_seed))?;
-    println!("wrote {apath}  (SECRET SEED — keep offline; it is what authorizes a reshare or re-genesis)");
+    // The SEEDS, not the derived secrets: `HybridSigSecret::generate` is deterministic in one, so a member
+    // regenerates the same authority key whenever one is needed — the convention the rest of the tree uses
+    // for secret material (a service member's KEM key is carried the same way). Member `i` signs at INDEX
+    // `i - 1`, which is the position its verifier occupies in every `.beacon` file; the order is genesis
+    // material and reordering it invalidates every signature.
+    for (i, seed) in authority_seeds.iter().enumerate() {
+        let apath = format!("{out}/recovery-authority-{}.key", i + 1);
+        std::fs::write(&apath, fanos_node::config::hex_encode(seed))?;
+        println!("wrote {apath}  (SECRET SEED for authority member index {i} — keep offline)");
+    }
     println!("dealt a {t}-of-{n} beacon; run each anchor with `fanos node --beacon-params anchor-<i>.beacon`");
+    println!(
+        "recovery authority: {}-of-{n} — hand recovery-authority-<i>.key to founder <i> and keep it OFF the \
+         node. No single holder can order a reshare or a re-genesis.",
+        authority.quorum()
+    );
     Ok(())
 }
 

@@ -21,12 +21,102 @@ const RGC_DOMAIN: &[u8] = b"FANOS-recovery-v1/rgc";
 /// (audit §3.1): `t' = 1` would let a single new holder reconstruct the fresh key alone.
 pub const MIN_REGENESIS_THRESHOLD: u8 = 2;
 
-/// A **re-genesis certificate** (`RGC`): a single-writer authority's authorization for a below-threshold cell to
+/// The largest recovery-authority committee a decoder will allocate for.
+///
+/// Not a policy on how many founders a network may have — it is a **decode bound**, and it exists because
+/// the signature count on the wire is attacker-supplied: without it, `from_bytes` would reserve capacity
+/// from a `u64` a peer chose. Sized at the largest cell this platform's addressing supports, `PG(2, 31)`'s
+/// `q² + q + 1 = 993` points, since the authority committee is a founder set and a founder holds a seat.
+/// Derived from the plane, not picked.
+pub const MAX_AUTHORITY_MEMBERS: usize = 31 * 31 + 31 + 1;
+
+/// The **recovery authority**: the trust root that may order a beacon reshape, as a *committee* rather than
+/// one key.
+///
+/// A cell's DVRF secret is `t`-of-`n` precisely so no single party holds it. The authority that can order that
+/// key replaced was, until this type existed, a **single** `HybridVerifier` — one `recovery-authority.key` on
+/// one founder's disk, able to authorize a re-genesis of a key it takes a threshold to use. That asymmetry
+/// undid the DKG: whoever held the file could replace the beacon, and since coordinates derive from the
+/// beacon (`docs/design-governance.md` §2.1) that is the placement of every node in the cell.
+///
+/// The quorum is **derived, never configured** — see [`authority_quorum`]. A configurable quorum is the
+/// `CellParams` defect again (`fanos-cli/tests/provisioning.rs`): a provisioning file one value too loose
+/// would silently restore single-party control, and no node could tell.
+#[derive(Clone)]
+pub struct RecoveryAuthoritySet {
+    /// The founders' verifiers, in the order the ceremony fixed. A signature names its member by index into
+    /// this vector, so the set's *order* is part of the cell's genesis material.
+    members: Vec<HybridVerifier>,
+}
+
+/// By encoded bytes: `HybridVerifier` is a key pair of two schemes and implements neither `PartialEq` nor
+/// `Debug`, deliberately — a key is compared by its canonical encoding or not at all.
+impl PartialEq for RecoveryAuthoritySet {
+    fn eq(&self, other: &Self) -> bool {
+        self.members.len() == other.members.len()
+            && self.members.iter().zip(&other.members).all(|(a, b)| a.encode() == b.encode())
+    }
+}
+
+/// Size and quorum, never key material — the same posture as `BeaconParams`'s own `Debug`.
+impl core::fmt::Debug for RecoveryAuthoritySet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecoveryAuthoritySet")
+            .field("members", &self.members.len())
+            .field("quorum", &self.quorum())
+            .finish()
+    }
+}
+
+impl RecoveryAuthoritySet {
+    /// A committee of `members`. `None` if empty — an authority nobody can be is not an authority, and the
+    /// honest way to disable recovery is `authority: None` on the beacon, which fails closed and is already
+    /// what an unprovisioned cell does.
+    #[must_use]
+    pub fn new(members: Vec<HybridVerifier>) -> Option<Self> {
+        (!members.is_empty()).then_some(Self { members })
+    }
+
+    /// The committee's members.
+    #[must_use]
+    pub fn members(&self) -> &[HybridVerifier] {
+        &self.members
+    }
+
+    /// How many members must sign — [`authority_quorum`] of the set size.
+    #[must_use]
+    pub fn quorum(&self) -> usize {
+        authority_quorum(self.members.len())
+    }
+}
+
+/// The number of authority members that must sign, for a committee of `m`: a **strict majority**, `m/2 + 1`.
+///
+/// Derived from the property the whole recovery design rests on. `docs/design-recovery.md` §2 makes
+/// re-genesis safe by being *single-writer*: "at most one authorization is ever validly signed per
+/// generation", so a returning partitioned group is subordinated rather than forking. A committee preserves
+/// that exactly when **any two quorums intersect**, which for a set of size `m` is exactly `2k > m`, i.e.
+/// `k ≥ m/2 + 1`. Any smaller `k` lets two disjoint subsets each sign a *different* authorization at the same
+/// generation — two fresh keys, two lineages, one cell: the fork the fencing exists to prevent.
+///
+/// It is the same intersection argument as the cell's own `2Q > n + f`, applied to a committee whose failure
+/// mode is equivocation rather than crash.
+///
+/// `m = 1` gives `k = 1`, which is correct rather than a special case: a single-operator cell has one
+/// founder, that founder *is* the constitution, and the runbook says so
+/// (`docs/testnet.md` §3.1, `docs/design-governance.md` §2.1). The committee buys nothing there and the type
+/// does not pretend otherwise.
+#[must_use]
+pub const fn authority_quorum(m: usize) -> usize {
+    m / 2 + 1
+}
+
+/// A **re-genesis certificate** (`RGC`): the recovery authority's authorization for a below-threshold cell to
 /// re-key from scratch among `survivors`, resuming the epoch clock at `epoch_fence`, generation `generation`.
 ///
-/// Every semantic field is bound by [`sig`](Self::sig), so none can be altered without invalidating it, and the
-/// `generation` fences the whole cell: a node rejects any beacon artifact from an older generation
-/// (`docs/design-recovery.md` §2).
+/// Every semantic field is bound by each of [`sigs`](Self::sigs), so none can be altered without invalidating
+/// them, and the `generation` fences the whole cell: a node rejects any beacon artifact from an older
+/// generation (`docs/design-recovery.md` §2).
 #[derive(Clone, PartialEq, Debug)]
 pub struct RecoveryAuthorization {
     /// The re-genesis generation — must be strictly greater than the cell's current `reshare_gen`. The fencing
@@ -44,8 +134,10 @@ pub struct RecoveryAuthorization {
     /// cell's lineage fingerprint for a pure-beacon cell — binding the re-genesis to a specific cell + state, so
     /// an authorization cannot be replayed onto a different cell (`docs/design-recovery.md` §2).
     pub anchor: [u8; 32],
-    /// The authority's hybrid PQ signature (`Ed25519 ‖ ML-DSA-65`) over [`signable`](Self::signable).
-    pub sig: HybridSignature,
+    /// The authorizing signatures, as `(member index into the authority set, hybrid PQ signature over
+    /// [`signable`](Self::signable))`, **sorted by index and distinct** — so one member cannot fill a quorum
+    /// by signing repeatedly, and the canonical encoding is unambiguous.
+    pub sigs: Vec<(u8, HybridSignature)>,
 }
 
 impl RecoveryAuthorization {
@@ -62,11 +154,14 @@ impl RecoveryAuthorization {
         m
     }
 
-    /// Issue an authorization: the authority signs `(generation, epoch_fence, survivors, threshold, anchor)` with
-    /// its recovery key. `survivors` is canonicalized (sorted, deduplicated) so the signed set is unambiguous.
+    /// Begin an authorization, with no signatures yet. `survivors` is canonicalized (sorted, deduplicated) so
+    /// the signed set is unambiguous.
+    ///
+    /// Separate from signing because the founders are on **separate machines** — that is the entire point of
+    /// a committee. Each independently reconstructs this same value from the agreed parameters, calls
+    /// [`sign`](Self::sign), and their signatures are collected; nothing has to travel but the signature.
     #[must_use]
-    pub fn issue(
-        authority: &HybridSigSecret,
+    pub fn unsigned(
         generation: u64,
         epoch_fence: Epoch,
         survivors: &[u8],
@@ -76,22 +171,63 @@ impl RecoveryAuthorization {
         let mut survivors = survivors.to_vec();
         survivors.sort_unstable();
         survivors.dedup();
-        let sig = authority.sign(&Self::signable(generation, epoch_fence, &survivors, threshold, &anchor));
-        Self { generation, epoch_fence, survivors, threshold, anchor, sig }
+        Self { generation, epoch_fence, survivors, threshold, anchor, sigs: Vec::new() }
     }
 
-    /// Verify the authorization against the cell's `authority` key and its internal well-formedness: the
-    /// signature covers every field, the survivor set is sorted+distinct+non-empty, and
-    /// `MIN_REGENESIS_THRESHOLD ≤ threshold ≤ |survivors|`. Does **not** check the anchor or the generation
-    /// monotonicity — those are the adopting node's responsibility ([`crate::beacon::BeaconNode::rebootstrap`]),
-    /// since they depend on that node's local state.
+    /// Add authority member `index`'s signature over every semantic field. `false` — and no change — if that
+    /// member has already signed, which is what stops one key from filling a quorum by itself.
+    pub fn sign(&mut self, index: u8, member: &HybridSigSecret) -> bool {
+        if self.sigs.iter().any(|(i, _)| *i == index) {
+            return false;
+        }
+        let sig = member
+            .sign(&Self::signable(self.generation, self.epoch_fence, &self.survivors, self.threshold, &self.anchor));
+        self.sigs.push((index, sig));
+        self.sigs.sort_by_key(|(i, _)| *i);
+        true
+    }
+
+    /// Issue a fully-signed authorization in one call — the single-machine ceremony, and the shape every test
+    /// wants. `members` are `(index, secret)` pairs.
     #[must_use]
-    pub fn verify(&self, authority: &HybridVerifier) -> bool {
-        self.well_formed()
-            && authority.verify(
-                &Self::signable(self.generation, self.epoch_fence, &self.survivors, self.threshold, &self.anchor),
-                &self.sig,
-            )
+    pub fn issue(
+        members: &[(u8, &HybridSigSecret)],
+        generation: u64,
+        epoch_fence: Epoch,
+        survivors: &[u8],
+        threshold: u8,
+        anchor: [u8; 32],
+    ) -> Self {
+        let mut rgc = Self::unsigned(generation, epoch_fence, survivors, threshold, anchor);
+        for (index, sk) in members {
+            rgc.sign(*index, sk);
+        }
+        rgc
+    }
+
+    /// Verify the authorization against the cell's recovery `authority` committee and its internal
+    /// well-formedness: a **quorum** of distinct members have each signed every field, the survivor set is
+    /// sorted+distinct+non-empty, and `MIN_REGENESIS_THRESHOLD ≤ threshold ≤ |survivors|`.
+    ///
+    /// Does **not** check the anchor or the generation monotonicity — those are the adopting node's
+    /// responsibility ([`crate::beacon::BeaconNode::rebootstrap`]), since they depend on that node's local
+    /// state — nor whether the cell is genuinely below threshold, which is guard 6 there.
+    #[must_use]
+    pub fn verify(&self, authority: &RecoveryAuthoritySet) -> bool {
+        if !self.well_formed() || self.sigs.len() < authority.quorum() {
+            return false;
+        }
+        // Distinct and ordered: a repeated index would let one member count twice toward the quorum, and an
+        // unordered list would make the canonical encoding ambiguous. Checked rather than assumed, because
+        // this value arrives from the wire.
+        if !self.sigs.is_sorted_by(|(a, _), (b, _)| a < b) {
+            return false;
+        }
+        let message =
+            Self::signable(self.generation, self.epoch_fence, &self.survivors, self.threshold, &self.anchor);
+        self.sigs.iter().all(|(index, sig)| {
+            authority.members().get(usize::from(*index)).is_some_and(|vk| vk.verify(&message, sig))
+        })
     }
 
     /// Structural validity independent of any key: a non-empty, sorted, distinct survivor set and a threshold in
@@ -113,11 +249,18 @@ impl RecoveryAuthorization {
         out.push(self.threshold);
         put_var_bytes(&mut out, &self.survivors);
         out.extend_from_slice(&self.anchor);
-        put_var_bytes(&mut out, &self.sig.to_bytes());
+        put_u64(&mut out, self.sigs.len() as u64);
+        for (index, sig) in &self.sigs {
+            out.push(*index);
+            put_var_bytes(&mut out, &sig.to_bytes());
+        }
         out
     }
 
     /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / trailing garbage.
+    ///
+    /// The signature count is bounded by [`MAX_AUTHORITY_MEMBERS`] before anything is allocated: the length
+    /// arrives from the wire, and a `u64` of them would otherwise be a reservation request from an attacker.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
@@ -126,9 +269,17 @@ impl RecoveryAuthorization {
         let threshold = r.u8()?;
         let survivors = r.var_bytes()?.to_vec();
         let anchor = r.array::<32>()?;
-        let sig = HybridSignature::from_bytes(r.var_bytes()?)?;
+        let count = usize::try_from(r.u64()?).ok()?;
+        if count > MAX_AUTHORITY_MEMBERS {
+            return None;
+        }
+        let mut sigs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let index = r.u8()?;
+            sigs.push((index, HybridSignature::from_bytes(r.var_bytes()?)?));
+        }
         r.finish()?;
-        Some(Self { generation, epoch_fence, survivors, threshold, anchor, sig })
+        Some(Self { generation, epoch_fence, survivors, threshold, anchor, sigs })
     }
 }
 
@@ -243,14 +394,15 @@ mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
 
-    fn authority() -> (HybridSigSecret, HybridVerifier) {
-        HybridSigSecret::generate(&mut SeedRng::from_seed(b"recovery-authority"))
+    fn authority() -> (HybridSigSecret, RecoveryAuthoritySet) {
+        let (sk, vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"recovery-authority"));
+        (sk, RecoveryAuthoritySet::new(vec![vk]).unwrap())
     }
 
     #[test]
     fn an_issued_authorization_verifies_and_round_trips() {
         let (sk, vk) = authority();
-        let rgc = RecoveryAuthorization::issue(&sk, 1, Epoch::new(9), &[5, 6, 7], 2, [0x11; 32]);
+        let rgc = RecoveryAuthorization::issue(&[(0, &sk)], 1, Epoch::new(9), &[5, 6, 7], 2, [0x11; 32]);
         assert!(rgc.verify(&vk), "the issued authorization verifies against its authority");
         assert_eq!(rgc.survivors, vec![5, 6, 7], "the survivor set is canonicalized");
         let round = RecoveryAuthorization::from_bytes(&rgc.to_bytes()).expect("re-decodes");
@@ -261,8 +413,9 @@ mod tests {
     #[test]
     fn tampering_or_a_foreign_authority_is_rejected() {
         let (sk, vk) = authority();
-        let (_other_sk, other_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"impostor"));
-        let rgc = RecoveryAuthorization::issue(&sk, 3, Epoch::new(12), &[1, 2, 3, 4], 3, [0x22; 32]);
+        let (_other_sk, other_key) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"impostor"));
+        let other_vk = RecoveryAuthoritySet::new(vec![other_key]).unwrap();
+        let rgc = RecoveryAuthorization::issue(&[(0, &sk)], 3, Epoch::new(12), &[1, 2, 3, 4], 3, [0x22; 32]);
         assert!(rgc.verify(&vk));
         assert!(!rgc.verify(&other_vk), "a different authority's key does not verify it");
         // Flip a field: the signature no longer covers the message.
@@ -272,6 +425,79 @@ mod tests {
         let mut widened = rgc.clone();
         widened.survivors.push(5);
         assert!(!widened.verify(&vk), "adding a survivor invalidates the signature");
+    }
+
+    /// **One member of the recovery committee cannot order a re-genesis, and cannot fake a quorum.**
+    ///
+    /// This is the property the committee exists for. A cell's DVRF key is `t`-of-`n` so no single party
+    /// holds it; the authority that can order that key REPLACED used to be one `HybridVerifier` — one file on
+    /// one founder's disk. Whoever held it could re-key the cell, and coordinates derive from the beacon, so
+    /// that is the placement of every node. The DKG's whole guarantee, undone by the key next to it.
+    #[test]
+    fn a_minority_of_the_recovery_committee_cannot_authorize() {
+        let founders: Vec<(HybridSigSecret, HybridVerifier)> = (0u8..5)
+            .map(|i| HybridSigSecret::generate(&mut SeedRng::from_seed(&[b'f', i])))
+            .collect();
+        let set = RecoveryAuthoritySet::new(founders.iter().map(|(_, vk)| vk.clone()).collect()).unwrap();
+        assert_eq!(set.quorum(), 3, "5 members ⇒ a strict majority is 3");
+
+        let issue = |signers: &[u8]| {
+            let members: Vec<(u8, &HybridSigSecret)> =
+                signers.iter().filter_map(|&i| founders.get(usize::from(i)).map(|(sk, _)| (i, sk))).collect();
+            RecoveryAuthorization::issue(&members, 1, Epoch::new(9), &[1, 2], 2, [0x33; 32])
+        };
+
+        // THE PROPERTY: every sub-quorum is refused, whoever it is.
+        for signers in [&[0u8][..], &[4][..], &[0, 1][..], &[2, 3][..], &[0, 4][..]] {
+            assert!(
+                !issue(signers).verify(&set),
+                "{} of 5 authority members signed — below the strict majority that keeps re-genesis \
+                 single-writer, so it must not authorize anything",
+                signers.len()
+            );
+        }
+
+        // A member cannot fill the gap by signing twice: `sign` refuses a repeat, so the certificate stays
+        // one signature short rather than silently counting the same key toward the quorum.
+        let mut doubled = issue(&[0, 1]);
+        let (one_sk, _) = founders.get(1).expect("member 1");
+        assert!(!doubled.sign(1, one_sk), "a member that has signed cannot sign again");
+        assert_eq!(doubled.sigs.len(), 2, "and no signature was added");
+        assert!(!doubled.verify(&set));
+
+        // Nor by forging an index it does not hold: the signature is checked against the verifier AT that
+        // index, so member 0 claiming to be member 2 fails on the key, not on the count.
+        let mut impersonating = issue(&[0, 1]);
+        let message = RecoveryAuthorization::signable(1, Epoch::new(9), &[1, 2], 2, &[0x33; 32]);
+        let (zero_sk, _) = founders.first().expect("member 0");
+        impersonating.sigs.push((2, zero_sk.sign(&message)));
+        impersonating.sigs.sort_by_key(|(i, _)| *i);
+        assert_eq!(impersonating.sigs.len(), 3, "a quorum by count");
+        assert!(!impersonating.verify(&set), "but member 0's signature does not verify under member 2's key");
+
+        // THE MECHANISM, so the test cannot pass by refusing everything: a genuine quorum authorizes, and
+        // round-trips through the wire encoding unchanged.
+        let good = issue(&[1, 2, 4]);
+        assert!(good.verify(&set), "a strict majority of distinct members authorizes");
+        let back = RecoveryAuthorization::from_bytes(&good.to_bytes()).expect("round-trips");
+        assert_eq!(back, good);
+        assert!(back.verify(&set), "and still verifies after a wire round-trip");
+    }
+
+    /// The quorum is a strict majority at every size, and that is what keeps two authorizations from being
+    /// validly signed at one generation — the single-writer property the fencing rests on.
+    #[test]
+    fn the_authority_quorum_is_a_strict_majority_so_two_quorums_always_intersect() {
+        for m in 1..=64usize {
+            let k = authority_quorum(m);
+            assert!(2 * k > m, "m={m}: quorum {k} must be a strict majority, or two disjoint quorums exist");
+            assert!(k <= m, "m={m}: quorum {k} must be reachable");
+            // The intersection statement itself, stated as the pigeonhole it is: two k-subsets of an
+            // m-set share at least `2k − m ≥ 1` members, so they cannot sign different certificates.
+            assert!(2 * k - m >= 1, "m={m}: any two quorums must share a member");
+        }
+        assert_eq!(authority_quorum(1), 1, "a single-founder cell is its own constitution");
+        assert_eq!(authority_quorum(7), 4);
     }
 
     #[test]
@@ -316,10 +542,10 @@ mod tests {
     fn a_below_floor_threshold_is_refused() {
         let (sk, vk) = authority();
         // t' = 1 would let one new holder reconstruct the fresh key alone — refused structurally.
-        let rgc = RecoveryAuthorization::issue(&sk, 1, Epoch::new(9), &[6, 7], 1, [0; 32]);
+        let rgc = RecoveryAuthorization::issue(&[(0, &sk)], 1, Epoch::new(9), &[6, 7], 1, [0; 32]);
         assert!(!rgc.verify(&vk), "threshold below MIN_REGENESIS_THRESHOLD is not well-formed");
         // t' > |survivors| is impossible to satisfy — refused.
-        let rgc = RecoveryAuthorization::issue(&sk, 1, Epoch::new(9), &[6, 7], 3, [0; 32]);
+        let rgc = RecoveryAuthorization::issue(&[(0, &sk)], 1, Epoch::new(9), &[6, 7], 3, [0; 32]);
         assert!(!rgc.verify(&vk), "threshold above the survivor count is not well-formed");
     }
 
