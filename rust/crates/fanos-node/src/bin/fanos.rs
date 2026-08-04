@@ -2837,7 +2837,9 @@ fn print_help() {
          \x20             anonymous session to a local port; --host-key is your stable .fanos identity)\n\
          \x20 fanos vpn   [--tun NAME] [--exit-via FILE] [--epoch N] [--config FILE] [--bootstrap ...]\n\
          \x20             (full-tunnel: routes all TCP+UDP through an exit; needs --features vpn + root)\n\
-         \x20 fanos id    [--identity PATH]\n\
+         \x20 fanos id    [--identity PATH] [--config FILE]\n\
+         \x20             (the coordinate depends on the NETWORK too: the config names the beacon it is\n\
+         \x20              drawn against. Without one it prints the beacon-less coordinate and says so)\n\
          \x20 fanos resolve NAME.fanos [--epoch N] [--min-pow BITS] [--bootstrap ...]\n\
          \x20 fanos beacon-deal N T [--out DIR]  (deal a T-of-N epoch-clock beacon; writes *.beacon files)\n\
          \x20 fanos ingress-deal COMMUNITY PEER... [--out DIR] [--threshold T] [--difficulty D] [--line C:C:C,...]\n\
@@ -2884,7 +2886,7 @@ fn print_help() {
          \x20 If no exit is discovered and none is pinned, clearnet targets are refused (.fanos-only).\n\
          \n\
          EXAMPLES:\n\
-         \x20 fanos id --identity ~/.fanos/id.bin      # show this node's coordinate\n\
+         \x20 fanos id --identity ~/.fanos/id.bin --config /etc/fanos/node.conf  # coordinate on THIS network\n\
          \x20 fanos node --listen 0.0.0.0:9000 --identity ~/.fanos/id.bin \\\n\
          \x20            --bootstrap 1:0:0@seed.example:9000 --role relay,storage\n\
          \x20 fanos proxy --socks-listen 127.0.0.1:1080 --bootstrap 1:0:0@seed.example:9000\n\

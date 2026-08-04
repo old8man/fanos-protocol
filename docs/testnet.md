@@ -114,19 +114,44 @@ share: treat it like a private key, because a `VssShare` is exactly that.
 
 ### 3.2 Each founding operator generates a persistent identity
 
-Independently, and in any order — a node's coordinate is VRF-derived from its identity key at *start*
-time, not from which beacon share it holds, so there's no sequencing constraint between §3.1 and this step.
+**This step follows §3.1, and the ordering is load-bearing.** The identity *key* can be generated whenever
+you like, but the **coordinate cannot be known without the network's beacon commitment**: epoch-0 coordinates
+are drawn against `genesis_seed = H("FANOS-v1/genesis-beacon" ‖ commitment)`, not against a constant
+(`docs/design-genesis.md`). At genesis there is no reshuffle yet, so on the base cell that seed *is* the
+placement defence — with a constant, one offline grinding effort would buy a chosen placement on every FANOS
+network anyone ever founds.
+
+The practical consequence is the reason this is stated so plainly: **a coordinate printed without the beacon
+is an address no node will match.** The last line below is a bootstrap seed, §3.3 has every operator publish
+it, and bootstrap pins are coordinate-checked. So hand `fanos id` the beacon file (or a config that names
+one):
 
 ```sh
 mkdir -p ~/.config/fanos            # see the path table below for your platform
-fanos id --identity ~/.config/fanos/identity.key
+cp ~/ceremony/anchor-3.beacon ~/.config/fanos/          # from §3.1, over the channel you trust
+printf 'beacon_params = %s/.config/fanos/anchor-3.beacon\n' "$HOME" > ~/.config/fanos/node.conf
+fanos id --identity ~/.config/fanos/identity.key --config ~/.config/fanos/node.conf
 ```
 
 ```
 coordinate: 4:1:0
 identity file: /home/op/.config/fanos/identity.key
+network: 9f3ac7b2 (from /home/op/.config/fanos/node.conf)
 bootstrap seed (add host:port): 4:1:0@HOST:PORT
 ```
+
+Without `--config` (and with no configuration at the default path) the command says so and prints the
+beacon-less coordinate instead:
+
+```
+network: none configured — this is the coordinate on a beacon-less cell only. A network with a
+beacon seats this identity elsewhere; pass --config <file> (or run `fanos init`) before publishing
+the address below.
+```
+
+**Compare the `network:` fingerprint with the other operators before going further.** It is the first four
+bytes of the genesis seed, so identical fingerprints mean identical genesis material — and nothing else
+printed can tell you that, because coordinates differ between identities *and* between networks.
 
 Replace `HOST:PORT` with your real, publicly reachable address and a port you intend to keep stable (this
 runbook uses `9931`, the wizard's own default — `fanos-node/src/setup.rs::DEFAULT_PORT`). Open it in your
@@ -145,6 +170,29 @@ rather not use the platform default.)
 
 All 7 operators post their `x:y:z@host:port` line from the previous step to each other — a shared
 document, a group chat, whatever's convenient. These are **public**; nothing here is secret.
+
+An address published before §3.2's `network:` line was checked is worth nothing: the coordinate half is
+network-specific, so a seed computed against the wrong genesis material (or none) names a point its node
+will never occupy, and every peer that pins it fails to connect. If a founder's fingerprint differs from the
+rest, they are holding different beacon material — go back to §3.1's distribution rather than debugging the
+network.
+
+### 3.3a Reach the first beacon round before opening joins
+
+**The founding set only. Do this before publishing anything to a wider audience** — the second half of the
+genesis defence (`docs/design-genesis.md` §4), and operational rather than in the code.
+
+The derived genesis seed converts "grindable by anyone, for every network, before any network exists" into
+"grindable only by someone holding this network's beacon material, and only until its first beacon round".
+The founding operators already hold that material, so the residual window is against *them* — and it closes
+the moment the anchors assemble their first round. There is no circularity to worry about: the founding set
+is provisioned with its own coordinates and does not need to join, so the cell reaches its first
+`BeaconReady` with no joiner present.
+
+Concretely: complete §3.4, confirm the epoch clock has advanced past 0 (§5 shows how to read it), and only
+then hand out `consumer.beacon` and the bootstrap seeds to anyone outside the founding set. A public testnet
+that publishes `consumer.beacon` openly on day zero reopens the original window against everyone who reads
+it — which is a legitimate choice for a throwaway testnet, but it should be a choice.
 
 ### 3.4 Start the founding nodes
 
@@ -511,7 +559,7 @@ here only because earlier notes described ingress as non-rotating, and that's no
 | do this | run this |
 |---|---|
 | deal the cell's epoch beacon | `fanos beacon-deal <n> <t> --out DIR` |
-| generate/show an identity | `fanos id --identity PATH` |
+| generate/show an identity | `fanos id --identity PATH --config FILE` (the config names the beacon; without it the coordinate is the beacon-less one) |
 | run a node, foreground | `fanos node --listen ADDR --identity PATH --beacon-params FILE --role LIST --bootstrap SEED,…` |
 | single-operator setup wizard | `fanos init [--yes] [--role LIST] [--bootstrap SEED,…]` |
 | check setup + ask a running node | `fanos status [health\|roles\|coherence\|census\|stations\|consensus]` |

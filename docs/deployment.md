@@ -46,19 +46,31 @@ persists the identity in the `/var/lib/fanos` volume.
 
 ## 2. Generate a persistent identity
 
-A node's identity file is its overlay coordinate — self-certifying, so it needs no registration.
-Generate it once and keep it:
+A node's identity file is self-certifying, so it needs no registration. Generate it once and keep it:
 
 ```sh
-fanos id --identity /var/lib/fanos/id.bin
+fanos id --identity /var/lib/fanos/id.bin --config /etc/fanos/node.conf
 # coordinate: 3:1:0
 # identity file: /var/lib/fanos/id.bin
+# network: 9f3ac7b2 (from /etc/fanos/node.conf)
 # bootstrap seed (add host:port): 3:1:0@HOST:PORT
 ```
 
 The last line is the **bootstrap seed** other operators add to reach you — replace `HOST:PORT` with
 your public address (see §5). Keep `id.bin` at mode `0600` and back it up: losing it means a new
 coordinate; leaking it lets someone impersonate the node.
+
+**The coordinate is a function of the identity *and the network*, so the config matters here.** Epoch-0
+coordinates are drawn against that network's genesis seed (`docs/design-genesis.md`), which comes from its
+beacon commitment — so `fanos id` reads the same configuration the daemon reads, from the same default path,
+and `--config` only needs naming if you keep it somewhere else. Run it before the network's beacon is
+configured and it will say `network: none configured` and print the beacon-less coordinate, which is correct
+for a cell that has no beacon and **wrong to publish** for one that does: bootstrap seeds are
+coordinate-pinned, so peers would fail to match an address computed against the wrong network.
+
+The `network:` fingerprint is the first four bytes of the genesis seed. Comparing it with another operator
+answers "are we on the same network?", which nothing else printed can — coordinates differ between
+identities *and* between networks, so comparing those separates neither case.
 
 > An identity is optional. Omit `identity` and the node runs ephemerally with a fresh coordinate each
 > start — useful for a throwaway client, wrong for a server you want peers to keep reaching.
