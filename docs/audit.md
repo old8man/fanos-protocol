@@ -75,6 +75,140 @@
 >
 > Inter-audit references in the archived sections (e.g. "`docs/audit-2026-07-23.md`", "pass 1") now point to the correspondingly-dated section **within this file**.
 
+> ## Verification sweep — 2026-08-04 (RESOLVED-verdict audit)
+>
+> This file's own verdicts had gone stale twice in one day (a holonomy entry claiming a live check that only runs
+> behind an uncalled builder method; a `#119` NAT-traversal entry claiming COMPLETE while the punch-through path had
+> no caller at all — the second is tracked outside this file). Both were written from *a function existing*, not
+> from *a caller existing*. So every entry in this document carrying **RESOLVED / FIXED / DONE / CLOSED / CONFIRMED**
+> and naming a concrete symbol, file, or line was re-checked against the current tree — `grep`, not commit messages,
+> and for every "wired" claim, a check that a production caller exists outside `#[cfg(test)]` and `tests/`. No
+> `cargo build`/`test`/`clippy` was run (the machine is loaded; the team's own guidance this cycle is greps over
+> builds) — so this sweep confirms **existence and wiring**, not that the workspace currently compiles or passes.
+>
+> **Headline: the table below has 52 rows, each covering one or more named findings (≈65 individually, several
+> share a row where one fix closed a cluster) — 50 rows CONFIRMED, 2 STALE.** The mechanisms genuinely exist and
+> are genuinely called from production code, matching their descriptions, for every claim checked except the two
+> struck below (both the same underlying overclaim, in two places). This is the reverse ratio from what prompted
+> the sweep — most of this document's closure record is accurate — but a false RESOLVED is worse than an open
+> finding precisely because nobody looks again, so the two are struck and dated rather than left standing.
+>
+> | # | Part / finding(s) | Verdict | Evidence |
+> |---|---|---|---|
+> | 1 | A1 wire codec | **CONFIRMED** | `SessionFrameType` (`fanos-wire/src/frame.rs:237`), `FrameType::App = 0x70` (`:160`), `Tessera::TOTAL_LEN = 8192` with no cleartext holonomy field (`tessera.rs`); the 12 crates named all depend on `fanos-wire` per `Cargo.toml` |
+> | 2 | A2 large-`q` decision | **CONFIRMED** | `docs/design-coordinates.md:190` — "## 5. A2 — the large-`q` scaling decision (recorded)" |
+> | 3 | A3 `Epoch` newtype | **CONFIRMED** | `fanos_primitives::Epoch(u64)` (`epoch.rs:23`); the beacon-agreed epoch is threaded into observation (moved to `fanos-runtime/src/healer.rs:354`, `emit_observation(..., epoch: Epoch, ...)`, doc-commented "audit A3") |
+> | 4 | A4 / A4b bounded maps | **CONFIRMED** | `MAX_ROUTES=4096` `BoundedMap` (`fanos-rendezvous/src/transport.rs:182,195`); `MAX_SESSIONS=1024` + LRU + `SESSION_IDLE_TIMEOUT=120s` (`fanos-node/src/diaulos.rs:41,55`); `rendezvous_relay.rs` `registrations`/`hosts` both `BoundedMap`; `fanos-session::CAP=1024` (`lib.rs:56`) |
+> | 5 | A5 anonymous path wired | **CONFIRMED** | `fanos-node/Cargo.toml:39` depends on `fanos-rendezvous`; `anonymous_dial` (`rendezvous.rs:307`) |
+> | 6 | A6 zeroize/subtle | **CONFIRMED** | direct workspace deps (`Cargo.toml:151,161`); `VrfSecret` hand-written redacted `Debug` |
+> | 7 | A7 VRF coordinate authority | **CONFIRMED** | `coordinate_for` (moved to `fanos-primitives/src/vrf.rs:55`) is doc-demoted: "not the coordinate authority: real node placement uses the verifiable VRF `fanos_vrf::prove_coordinate`" |
+> | 8 | B1–B3 DKG authentication | **CONFIRMED** | `dealer_of`/`on_commit`/`on_complaint`/`on_justify` (`fanos-keygen/src/lib.rs`) + all three named adversary tests present (`a_forged_complaint_cannot_evict_an_honest_dealer`, `a_commitment_is_only_accepted_from_its_own_dealer`, `a_justification_is_checked_against_the_qualified_commitment`) |
+> | 9 | B4 synthetic DLEQ nonce | **CONFIRMED** | `synthetic_dleq_nonce` + `the_dleq_proof_is_deterministic_so_a_bad_rng_cannot_leak_the_key` (`fanos-incentives/src/lib.rs:89,494`) |
+> | 10 | B5 KEM transcript binding + contributory check | **CONFIRMED** | `combine()` hashes the full transcript; `x_ss.was_contributory()` guards in both `encapsulate`/`decapsulate` (`fanos-pqcrypto/src/kem.rs`) |
+> | 11 | B6 DKG session nonce | **CONFIRMED** | `session_nonce: [u8; 32]` folded into the polynomial seed (`fanos-keygen/src/lib.rs:122+`) |
+> | 12 | B7 branchless `clmul` | **CONFIRMED** | mask-based (`0u32.wrapping_sub(...)`), zero `if` in the hot loop (`fanos-field/src/gf2m.rs:60-85`) |
+> | 13 | B8 context-bound redemption | **CONFIRMED** | `RedeemProof`/`redeem_authenticator` + `subtle::ConstantTimeEq` (`fanos-incentives/src/lib.rs`) |
+> | 14 | C1 request timeouts | **CONFIRMED** (symbol renamed) | `REQUEST_TIMEOUT=10s` + `evict_stale` (`fanos-quic/src/driver.rs`); `MAX_PENDING_GETS=1024` (`fanos-runtime/src/overlay/mod.rs:140`); node-side timeout is now named `STORE_TIMEOUT` (was `RESOLVE_TIMEOUT`), still 5 s, still wired into 6 directory modules (`fanos-node/src/resolve.rs:125`) |
+> | 15 | C2 bounded channels + back-pressure | **CONFIRMED** | `INPUT_CAP=1024`, `MAX_INBOUND_CONNECTIONS=512`, `MAX_INBOUND_PER_SOURCE=32`, `peer_send_worker` (`fanos-quic/src/driver.rs`) |
+> | 16 | C3/F1 admission anchored on `delivered` | **CONFIRMED** | `on_segment`: `seq >= delivered && seq < delivered + recv_window` (`fanos-stream/src/lib.rs:664-665`) |
+> | 17 | C4 nonce-scoped digest correlation | **CONFIRMED** | `encode_lookup(digest, nonce)` (`fanos-runtime/src/frames.rs:69`) |
+> | 18 | C5 quarantine TTL + identity-keyed distrust (the 2026-07-26 R-M1 fix) | **CONFIRMED** | `QUARANTINE_TTL=60_000ms` (`overlay/mod.rs:157`); `Distrust` struct + `Command::Quarantine`/`Command::Readmit` (`fanos-quic/src/driver.rs:1479,1476-1521`) |
+> | 19 | C6 `Decouple` genuinely sheds correlation | **CONFIRMED** | mutable `decoupling` factor, `effective_correlation` (`overlay/mod.rs:2085-2157`) |
+> | 20 | C7 telemetry DP mechanism | **CONFIRMED** (see also finding below) | `privatize`/`export` (`fanos-telemetry/src/dp.rs:142,175`) |
+> | 21 | D1–D4 math-core guards | **CONFIRMED** | non-finite/PSD guards exactly as described, unchanged in shape (`fanos-diakrisis/src/{healing,coherence,polar,eig}.rs`) |
+> | 22 | E1/E2/E6 threshold cover + secret mix delay + constant-rate displacement | **CONFIRMED** | `with_cover`/`arm_cover`/`start_cover`/`emit_cover`; `mix_seed = kem_secret.derive_subkey(...)` (`:202`); `forward_send` displaces cover (`:395-405`) — all `fanos-aphantos/src/threshold_router.rs` |
+> | 23 | E3 SIV descriptor nonce + boot nonce | **CONFIRMED** | `nonce_salt`/`NONCE_SALT_LABEL` (`fanos-calypso/src/descriptor.rs`); `boot_nonce` (`fanos-aphantos/src/node.rs` — `NyxNode` is defined in the `aphantos` crate, not `fanos-nyx`; not a citation error, just a naming quirk) |
+> | 24 | E4 forward-secure onion ratchet | **CONFIRMED** | `OnionKeyRatchet` (`fanos-pqcrypto/src/onion_ratchet.rs:47`) |
+> | 25 | E5 DVRF beacon + `EpochDriver` | **CONFIRMED** | `BeaconRound::assemble` (`fanos-vrf/src/beacon.rs`), `BeaconNode` (`fanos-keygen/src/beacon.rs`), `EpochDriver` (`fanos-node/src/epoch_driver.rs`) |
+> | 26 | E7 `mix_threshold` derivation | **CONFIRMED** | `pub const fn mix_threshold(line_size)` (`fanos-node/src/node.rs:112`) |
+> | 27 | F2–F4 stream lifecycle + RTO | **CONFIRMED** | `MAX_CONCURRENT_STREAMS=256`, `retire_stream`, `Frame::Reset` (`fanos-diaulos/src/conn.rs`); `StreamSender.segments: VecDeque` (`fanos-stream/src/lib.rs:243`); `RttEstimator` (RFC 6298) |
+> | 28 | G1/G2 docs | **CONFIRMED** | `rust/README.md` states "41 crates"; `fanos-wire-derive` exists and is used across ~18 files |
+> | 29 | 2026-07 gap-map addendum, 8 of 9 items (§6.4, §12.3, §7.4, §7.9, L3.2, L3.3, L4.1, PROTEUS) | **CONFIRMED** (spot-checked, not each at full depth) | `on_diagnose`; `ServiceNode`+`ThresholdService` in `Node::start`; `fanos-wire::capability`; `fanos-wire/tests/wire_kat.rs` loading `wire.json`; `reshuffle_loop` taking a `BeaconWindow` (moved to `fanos-quic/src/driver.rs:1168`); `PowAdmission`/`with_admission_pow` (`composition.rs:148`) |
+> | 30 | 2026-07 gap-map addendum, item 9 (§5.4 holonomy) | **STALE — corrected in place** | see below |
+> | 31 | Audit II §5.4 "Holonomy verification — RESOLVED (stale finding)" | **STALE — corrected in place** | see below |
+> | 32 | R-M1 (Audit II, 2026-07-26 resolution) identity-keyed distrust | **CONFIRMED** | same evidence as #18 |
+> | 33 | T-H2 round-lock liveness (`unlocks_us`/`reprepare_lock`/`valid_value`/`Block::pol`) | **CONFIRMED** | all four present in `fanos-taxis/src/{consensus,block}.rs`; test `a_sub_quorum_lock_split_heals` present (`tests/consensus_sim.rs:2615`) |
+> | 34 | T-H4 DA sampled from peers, not the proposer | **CONFIRMED** | `on_skeleton` exists and is the inbound-`Propose` path (`fanos-node/src/taxis_driver.rs:791`) |
+> | 35 | T-M5 lag-signal authenticate-first fix (`5f1c343`) | **CONFIRMED** | `accept_vote` verifies the signature before touching the height/lag signal, comment: "Authenticate first... this is the deviation, not the rule" (`consensus.rs:2215-2230`) |
+> | 36 | SSLE safety (min-ticket, Merkle-VRF, bounded collection window) | **CONFIRMED** | `sent_prepare` idempotence, `COLLECT_WINDOW_TICKS=1` (`consensus.rs:739,1919`) |
+> | 37 | §2.1 beacon reshare trigger authentication (the platform's former #1 open CRITICAL) | **CONFIRMED, thoroughly** | `on_reshare_trigger` requires `authority.verify(...)` before any anchor deals a sub-share (`fanos-keygen/src/beacon.rs:470-495`); `node.rs::actuate_recovery` escalates rather than self-issuing (`:199-214`); both named tests present (`a_key_exfiltration_reshare_trigger_is_rejected`, `a_reshare_moves_the_beacon_to_a_survivor_set_with_a_continuous_seed`) |
+> | 38 | §3.4 non-zero escrow/HTLC floors | **CONFIRMED** | `terms.amount == 0` / `params.price == 0` rejected (`fanos-dromos/src/hybrid.rs:181-184,418-422`) |
+> | 39 | §3.7 `TREASURY` declared in the shielded-fee access list | **CONFIRMED** | `hybrid.rs:826`, comment cites "audit §3.7" |
+> | 40 | §5.C client-side anonymity fixes (UDP-profile leak, cover-from-startup, epoch-pinning) | **CONFIRMED** | `dial_udp` routes through `establish()` consulting the profile (`diaulos.rs:711-728`); `StartHeartbeat` forwarded to the relay router (`cell_node.rs:193-195`); `Node::live_beacon()` exists (`node.rs:849`) |
+> | 41 | §5.C S1-M1 holonomy ("MECHANISM PRESENT, VERIFIER ABSENT") | **CONFIRMED already-correct** | `with_delivery_check`'s only reference besides its own definition is inside `#[cfg(test)]` (`threshold_router.rs`); `composition.rs` never calls it — this entry already reads correctly and needed no change |
+> | 42 | POROS Gate 0 (`from == req.requester`) | **CONFIRMED** | `poros.rs:1009-1010`, `Station::AdmissionIdentityUnbound` counter, tests at `:1314,1572` |
+> | 43 | Bounded-capacity re-audit §1 `recent_bodies` (checkpoint horizon, not bare capacity) | **CONFIRMED** | `prune_recovery_retention` prunes `recent_bodies` to the certified-checkpoint floor, not just `RECENT_BODY_CAP` (`consensus.rs:2956-2973`) |
+> | 44 | Bounded-capacity re-audit §2 `deferred_since` (admission policy, not eviction policy) | **CONFIRMED** | `note_deferrals` (`consensus.rs:2910+`) |
+> | 45 | Bounded-capacity re-audit §3 `ClaimBook` (prefer-unreferenced eviction) | **CONFIRMED** | `fanos-quic/src/claims.rs:113-123` |
+> | 46 | Hidden-service audit §1 route-binding signature (`9e34d4c`) | **CONFIRMED** | `HostRegister` carries `identity: Vec<u8>` (the full bundle) + a signature field (`fanos-rendezvous/src/lib.rs:459-479`) |
+> | 47 | Hidden-service audit §2 combiner map salted draw (`a7c7699`, closed further 2026-08-01) | **CONFIRMED** | `combiner_for_salted` (`fanos-aphantos/src/threshold_router.rs:967`) |
+> | 48 | Hidden-service audit §3 `m = f+1` wiring + measured `GatherClock` deadline | **CONFIRMED** | `GatherClock` struct present (`threshold_router.rs`); `fanos-aphantos/tests/gather_cost.rs` exists (per `git status`, newly added) |
+> | 49 | Hidden-service audit §4a no_std `mathfns` fix | **CONFIRMED** | `ceil`/`round` dispatch `std`/`libm`/`compile_error!` (`fanos-diakrisis/src/mathfns.rs:74-103`) |
+> | 50 | Hidden-service audit §4b ghost-session `R2=15` give-up rule | **CONFIRMED** | comment citing `R2 = 15` (`fanos-session/src/lib.rs:1063`) |
+> | 51 | Hidden-service audit §4c mempool/block size budget | **CONFIRMED** | `fits_frame`/`pack_to_budget` (`fanos-taxis/src/block.rs:365,437`) |
+> | 52 | S-C1/S-H1 (2026-08-04 directory-slot sweep, above) | **CONFIRMED** | `Command::PutEphemeral` wired (`overlay/mod.rs:1200`, `capdir.rs`, `crosscell_dir.rs`); `rendezvous_relay.rs:227` `.retain(\|_, (minted, _)\| *minted >= now)` |
+>
+> **Corrections made in place (2, both the same underlying overclaim):**
+>
+> 1. **Audit II §5.4**, the line "`HolonomyFail` *is* produced on the live peel path (`sealed.rs:255`)" — true only of
+>    the sim-only Lite `NyxNode` engine. The Full/threshold engine's own check (`threshold_onion.rs::verify_delivery`)
+>    is real code, gated by `ThresholdRouter::with_delivery_check`, and **no shipped composition calls it**
+>    (`with_delivery_check`'s only non-definition reference is inside a `#[cfg(test)]` module; `fanos-node/src/composition.rs`,
+>    the production router constructor, never calls it). Struck and corrected in place, pointing at the already-correct
+>    account in the "Verification sweep — 2026-08-03" table above and Audit IV §5.C (S1-M1).
+> 2. **The 2026-07 gap-map addendum**'s "all nine items resolved" line carried the identical overclaim for its
+>    §5.4 entry. Corrected the same way; the other eight items in that line were spot-checked this pass (row 29
+>    above) and hold.
+>
+> Both stale entries were copies of one claim written before NOSTOS replaced the party that could verify a circuit
+> (documented correctly, once, in the 2026-08-03 sweep and in Audit IV) — the correction never propagated to the
+> two earlier, more confident-sounding mentions. That is the propagation failure mode to watch for: a correction
+> written once in the newest section does not retroactively fix the older sections a reader may stop at first.
+>
+> **Found while checking — outside this task's scope (verifying RESOLVED claims), offered with evidence rather than
+> corrected in place, because each is cited as OPEN in multiple scattered locations and a full multi-site correction
+> is a separate pass:**
+>
+> - **C7 telemetry-DP export is no longer unwired.** `spawn_telemetry_export` (`fanos-node/src/node.rs:512`) calls
+>   `telemetry_dir::spawn_coherence_publisher`, and is itself called from `Node::start` (`node.rs:772`), gated on
+>   `config.telemetry_epsilon` (operator opt-in, `None` by default — a privacy-export default, not a security one).
+>   This closes the "`.privatize(`/`CoherenceFrame::export` has no production caller" finding repeated as open in
+>   Audit III §7, Audit IV §7 item 3, and both remediation queues.
+> - **T-H5 slashing/rewards now apply to real state.** `fanos-dromos::stake` is a real bonded-stake ledger
+>   (`STAKE_SINK`, `StakeLedger`, `StakeTx`, `SlashTx`); `apply_stake`/`apply_slash` move balances
+>   (`hybrid.rs:347-397`); `taxis_driver.rs:763` converts a consensus `Output::Slash` into a real `SlashTx` sealed
+>   to the ledger. Closes "there is no bonded-stake state anywhere... slashing detected but never applied," open in
+>   §5.B, §7 item 5, and the remediation queue (Audit IV).
+> - **§5.D-2 `public_recipient` is now bound into the spend-authorization sighash** (`fanos-obolos/src/tx.rs:79-90,197`,
+>   comment cites "audit §5.D-2") — closes the fund-redirection landmine. §5.D-2 currently has no resolution note at
+>   all in its own section.
+> - **§5.D-1 POROS reshare — partially addressed, not fully confirmed.** Sender-authentication (`from == old_line_coord_for(old_x)`,
+>   `poros.rs:962-966`) and the `new_threshold ≥ 2` floor (`poros.rs:904,911`) are both present and match the fix's
+>   items (a) and (c). Item (b) — a commitment check on each opened sub-share before combining — was **not confirmed**
+>   this pass: `on_reshare`'s combine path (`poros.rs:970-982`) still reads as a blind Lagrange combine, and while a
+>   `commitment` parameter exists on the unrelated `poros::recover` function, this sweep did not trace whether it
+>   reaches the reshare-adopt path. §5.D-1 is still marked open in its own section, so this is not a stale-RESOLVED
+>   case — flagged for whoever picks up §5.D-1 next.
+>
+> **A systemic note, not a verdict problem.** `fanos-runtime/src/overlay.rs` — the single 3,870-line file Audit IV
+> §3.2/§5.A criticized and recommended splitting — **has since been split** into
+> `fanos-runtime/src/{overlay/{mod,storage,membership_ops,hier,liveness}.rs, store.rs, router.rs, membership.rs,
+> healer.rs, frames.rs}`, exactly the recommended shape. Every mechanism cited above that used to live in
+> `overlay.rs` (`QUARANTINE_TTL`, `MAX_PENDING_GETS`, `Decouple`'s shed factor, `encode_lookup`, `observe_liveness`)
+> is still present and still does what its entry says — just relocated, with a drifted line number. The same
+> applies to `fanos-crypto` (folded into `fanos-primitives`/`fanos-pqcrypto`) and to `fanos-node`'s `RESOLVE_TIMEOUT`
+> (renamed `STORE_TIMEOUT`, same 5 s, same role, now used by six directory modules). None of this changed any
+> verdict, but a reader following one of the ~23 `overlay.rs:NNN` citations in this document, or the handful of
+> `fanos-crypto`/`RESOLVE_TIMEOUT` ones, will find the file gone or the name wrong. Not corrected site-by-site here
+> (the volume is large and the mechanism, not the pointer, is what a verdict certifies) — noted as a pattern.
+>
+> **Not checked this pass:** the doc's own CI/build-health claims (`cargo test`/`clippy` "PASS" in the various §0
+> baselines) were not re-run — greps only, per this cycle's guidance. Findings that are pure architecture/prose
+> without a concrete symbol (e.g. the Γ-gate's overall framing, most MEDIUM/LOW coherence items) were left as
+> written; they carry no falsifiable claim to check. The Audit II/III original-finding text (R-C1, S1-C1, O-C1, etc.)
+> is preserved verbatim as a historical snapshot and was not re-verified as a "current" claim — its resolution status
+> lives in the Audit III §2 and Audit IV §2 scorecards, which this sweep did check (rows 33-51 above).
+
 ---
 
 ## 1. Executive summary
@@ -666,7 +800,7 @@ removal rule is capacity.* A sweep of every `BoundedMap` and every growable coll
 these two and no others — `ClaimBook` clears on epoch move, the stream's per-segment maps `split_off` at the
 cumulative ack, and the rest are bounded by the plane's point count.
 
-**Update — 2026-07-24: all nine addendum items are now resolved.** A per-item re-audit against the current tree confirmed each is implemented: §6.4 live diagnose→heal (`on_diagnose` runs every heartbeat), §12.3 threshold-hosted CALYPSO (`ServiceNode`+`ThresholdService` wired into `Node::start`), §7.4 capability negotiation (`fanos-wire::capability`, folded into HELLO), §7.9 wire-KAT harness (`fanos-wire/tests/wire_kat.rs` loads + verifies `conformance/vectors/wire.json`), L3.2 per-epoch reshuffle (`reshuffle_loop` on `BeaconReady`), L3.3 Sybil admission (`PowAdmission` wired into JOIN via `with_admission_pow`), L4.1 erasure coding (`fanos-code::{erasure,lrc}` replaces full replication), §5.4 holonomy verification (`verify_delivery` produces `WireError::HolonomyFail` on the live peel path), and PROTEUS enablement (config/CLI surface + auto-fallback + capability advertisement). The deeper residuals surfaced afterwards — cross-cell erasure placement, full hidden-service reachability, censored-bootstrap bridges — are carried forward and tracked in the consolidated later-audit sections that follow (Audits II–IV).
+**Update — 2026-07-24: eight of nine addendum items are resolved; the ninth was overclaimed.** A per-item re-audit against the current tree confirmed: §6.4 live diagnose→heal (`on_diagnose` runs every heartbeat), §12.3 threshold-hosted CALYPSO (`ServiceNode`+`ThresholdService` wired into `Node::start`), §7.4 capability negotiation (`fanos-wire::capability`, folded into HELLO), §7.9 wire-KAT harness (`fanos-wire/tests/wire_kat.rs` loads + verifies `conformance/vectors/wire.json`), L3.2 per-epoch reshuffle (`reshuffle_loop` on `BeaconReady`), L3.3 Sybil admission (`PowAdmission` wired into JOIN via `with_admission_pow`), L4.1 erasure coding (`fanos-code::{erasure,lrc}` replaces full replication), and PROTEUS enablement (config/CLI surface + auto-fallback + capability advertisement) — all **re-confirmed in the 2026-08-04 verification sweep** below. ~~§5.4 holonomy verification (`verify_delivery` produces `WireError::HolonomyFail` on the live peel path)~~ **corrected 2026-08-04:** true only of the sim-only Lite `NyxNode` path (`sealed.rs`); the Full/threshold engine's `verify_delivery` (`threshold_onion.rs`) is gated by `ThresholdRouter::with_delivery_check`, which no shipped composition calls — see the "Verification sweep — 2026-08-03" table near the top of this file and Audit IV §5.C (S1-M1) for the full account. The deeper residuals surfaced afterwards — cross-cell erasure placement, full hidden-service reachability, censored-bootstrap bridges — are carried forward and tracked in the consolidated later-audit sections that follow (Audits II–IV).
 
 
 ---
@@ -989,7 +1123,7 @@ anonymity for latency/bandwidth. The snapshot below is retained for the record.
 
 ### 5.4 Systemic robustness — prior cluster fixed; bug-class migrated to new wiring
 
-**Prior-audit robustness cluster (re-verified against current code): C1, C2, C3/F1, F2, F3, F4 — all FIXED** (largely via the `fanos-stream` extraction and the per-peer driver rework: `REQUEST_TIMEOUT=10s` + waiter eviction; bounded `INPUT_CAP=1024` with back-pressure + per-peer workers + `MAX_INBOUND_CONNECTIONS=512`/`_PER_SOURCE=32`; admission anchored on `delivered`; `MAX_CONCURRENT_STREAMS=256` + retire/reset; `VecDeque`+`base` reclaim; RFC-6298 RTO). **C5 (quarantine expiry), C6 (Decouple made real), #100 (version/capability negotiation), #101 (wire-KAT harness loads+verifies `wire.json`), #103 (PoW admission) — all FIXED.** **C7 (telemetry DP) — RESOLVED 2026-07-26, and the finding was mis-stated.** `.privatize(` indeed had no caller, but not from neglect: the engine that produces frames is **sans-I/O and has no RNG**, so privatization can only happen at an *export* boundary in a driver — and re-verification shows **no live export path for frames exists at all**. `Notification::Observed` is consumed only by `fanos-sim`'s local bookkeeping and the observatory's *synthetic* source; nothing ships a frame beyond the cell. So the exact frame was never leaking; it was being kept where the reflexive loop genuinely needs it (localizing a fault requires the exact syndrome). The real risk was that a future export path would ship `encode()` by habit, since the exact bytes are already there and shipping them is one line shorter. Closed at the seam rather than by ceremony: `CoherenceFrame::export(budget, rng)` is now the single sanctioned outward path (privatize-then-encode, so the two cannot drift), `encode` is documented cell-local with the consequence spelled out, and a test asserts they differ and that the syndrome/gap/forecast/heal-counter are *withheld* rather than merely noised. **Holonomy verification — RESOLVED (stale finding).** `HolonomyFail` *is* produced on the live peel path (`fanos-aphantos/src/sealed.rs:255`) and pinned by tests at `sealed.rs:519` and `threshold_router.rs:1023` ("a delivery whose path does not match the agreed circuit is dropped").
+**Prior-audit robustness cluster (re-verified against current code): C1, C2, C3/F1, F2, F3, F4 — all FIXED** (largely via the `fanos-stream` extraction and the per-peer driver rework: `REQUEST_TIMEOUT=10s` + waiter eviction; bounded `INPUT_CAP=1024` with back-pressure + per-peer workers + `MAX_INBOUND_CONNECTIONS=512`/`_PER_SOURCE=32`; admission anchored on `delivered`; `MAX_CONCURRENT_STREAMS=256` + retire/reset; `VecDeque`+`base` reclaim; RFC-6298 RTO). **C5 (quarantine expiry), C6 (Decouple made real), #100 (version/capability negotiation), #101 (wire-KAT harness loads+verifies `wire.json`), #103 (PoW admission) — all FIXED.** **C7 (telemetry DP) — RESOLVED 2026-07-26, and the finding was mis-stated.** `.privatize(` indeed had no caller, but not from neglect: the engine that produces frames is **sans-I/O and has no RNG**, so privatization can only happen at an *export* boundary in a driver — and re-verification shows **no live export path for frames exists at all**. `Notification::Observed` is consumed only by `fanos-sim`'s local bookkeeping and the observatory's *synthetic* source; nothing ships a frame beyond the cell. So the exact frame was never leaking; it was being kept where the reflexive loop genuinely needs it (localizing a fault requires the exact syndrome). The real risk was that a future export path would ship `encode()` by habit, since the exact bytes are already there and shipping them is one line shorter. Closed at the seam rather than by ceremony: `CoherenceFrame::export(budget, rng)` is now the single sanctioned outward path (privatize-then-encode, so the two cannot drift), `encode` is documented cell-local with the consequence spelled out, and a test asserts they differ and that the syndrome/gap/forecast/heal-counter are *withheld* rather than merely noised. ~~**Holonomy verification — RESOLVED (stale finding).** `HolonomyFail` *is* produced on the live peel path (`fanos-aphantos/src/sealed.rs:255`) and pinned by tests at `sealed.rs:519` and `threshold_router.rs:1023` ("a delivery whose path does not match the agreed circuit is dropped").~~ **Corrected 2026-08-04 (verification sweep): overclaimed.** `HolonomyFail` is genuinely produced at `sealed.rs:255`, but that is the sim-only Lite `NyxNode` path — the Full/threshold engine's own check (`threshold_onion.rs::verify_delivery`, gated by `ThresholdRouter::with_delivery_check`) has no caller outside its own test module (verified: `with_delivery_check`'s only reference besides its definition is inside `#[cfg(test)]` in `threshold_router.rs`, and `fanos-node/src/composition.rs` — the production router constructor — never calls it). See the corrected, fuller account in the "Verification sweep — 2026-08-03" table near the top of this file and in Audit IV §5.C (S1-M1).
 
 **New findings (bug-class = unbounded attacker-keyed map + missing validation, migrated to the newest live wiring):**
 - **[HIGH] B1 — unauthenticated, uncapped `pending_reveals` in TAXIS consensus → single-peer remote OOM.** `consensus.rs:777-784` (`on_reveal`): the `else` branch buffers a raw `RevealMsg` whose `commit` is not a known finalized tx **without `validate_and_record`, so the signature is never verified**, keyed by the attacker-chosen 32-byte `r.commit`; `drain_pending_reveals` only evicts commits that become finalized txs → garbage is never evicted. A single connected peer streams reveals with distinct random commits (each carrying a `share`+`sig` Vec) and grows the map without bound. **Fix:** verify `r.verify(verifiers[r.member])` eagerly before buffering (the verifier is already available) + bound `pending_reveals` with LRU/TTL.
