@@ -234,6 +234,13 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
 async fn a_validator_joining_late_reaches_the_cells_executed_state() {
     const LATE: usize = 6;
 
+    // **Declined up front rather than after 250 s.** This is the longest liveness test in the tree and its
+    // own budgeted-exchange ceiling already reports INCONCLUSIVE correctly — but only after burning the full
+    // window to get there. Measured: 6 s on an idle box, 250 s under contention, both times a correct
+    // verdict and one of them forty times more expensive. The guard re-measures for two minutes before
+    // declining, so a transient spike still lets the test run (#87).
+    common::require_quiet_host("whether a validator joining late catches up to the cell's executed state");
+
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
 
