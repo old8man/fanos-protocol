@@ -466,7 +466,15 @@ async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notificatio
         match tokio::time::timeout_at(deadline, notes.recv()).await {
             Ok(Ok(Notification::Liveness { degraded, alive })) => seen = Some((degraded, alive)),
             Ok(Ok(Notification::Observed(bytes))) => {
-                let (degraded, alive) = seen.unwrap_or((0, 0));
+                // **`(0, 0)` would read as "nothing degraded, nobody alive", which is a claim rather than
+                // an absence.** The footprint arrives on the same lossy broadcast as the frame, immediately
+                // before it, so a `Lagged` between the two used to make `fanos status coherence` print a
+                // confident report of a cell it had not seen. Reported as unknown instead (#88).
+                let Some((degraded, alive)) = seen else {
+                    return "the coherence frame arrived without its liveness footprint (the notification \
+                            stream dropped it under load) — re-run `fanos status coherence`\n"
+                        .to_owned();
+                };
                 return fanos_telemetry::CoherenceFrame::decode(&bytes).map_or_else(
                     || "the node emitted a frame this build cannot decode\n".to_owned(),
                     |f| fanos_node::admin::render_coherence(&f, degraded, alive),

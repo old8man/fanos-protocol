@@ -3149,3 +3149,41 @@ One test surfaced and was triaged rather than accepted: `a_validator_joining_lat
 reported INCONCLUSIVE at its 240 s ceiling in a parallel run and completes in **6 s** alone — a 40× spread, so
 contention, not a regression. Its own harness said so ("still changing at the ceiling, so this is latency
 rather than a wedge"), which is the budgeted-exchange machinery working as designed.
+
+## §7. [HIGH, FIXED, #88] The trigger that unfreezes a cell could elect an anchor that cannot act
+
+Found by asking the #86 question one layer up: **what else is state, reconstructed from an event stream that
+is allowed to lose events?**
+
+`RecoveryWatcher` is the auto-trigger for a beacon freeze — the mechanism the whole §4 recovery design rests
+on. To emit one trigger per generation rather than one per node, only the **deterministic coordinator** fired:
+the lowest-index anchor not in a down-set built by accumulating `Notification::PeerDown` off the lossy
+broadcast, with `Err(Lagged(_)) => {}`.
+
+So a dropped `PeerDown` left a dead anchor believed live. If it was the lowest-index one, **every node elected
+it, it could not act, and nobody else fired.** The cell stayed frozen — the one state this trigger exists to
+escape.
+
+The exposure was worst exactly where it mattered. The down-set is cleared on every advance, so it only
+accumulates while the beacon has *already* stalled: an emergency, during which the node is doing recovery work
+and is most likely to be behind on a lossy channel. And the design's own comment assumed the problem away —
+"every node computes the same coordinator as their down-views converge" — which is true only if nobody lost
+an event.
+
+**Fixed by removing the need for a shared view, not by making the view better.** A node now fires once its
+**rank** among the anchors *it* believes live falls below the number of stall confirmations: rank 0 goes
+first, rank 1 one patience window later, and so on. Firing twice is harmless — the trigger is
+generation-fenced and both regimes only escalate — so the design now fails toward *more* triggers, which is
+the safe direction for a mechanism whose purpose is to unfreeze. This is the give-up rule the election never
+had. Progress is read from the epoch watch (§ above), so the watcher can no longer sleep through the round
+that proves its anchors live.
+
+**The first test I wrote for it could not fail.** It asserted on `confirmations`, which increments before the
+rank check — the detector's bookkeeping, not the property. Injecting `if rank != 0 { return }` left it green.
+`on_tick` now returns whether it actuated, which is the election's only observable, and the same injection
+turns the test red.
+
+A second, smaller instance of the family, fixed in the same pass: `read_coherence` held the `Liveness`
+footprint that arrives immediately before the `Observed` frame and fell back to `(0, 0)` — "nothing degraded,
+nobody alive" — if a `Lagged` fell between them, so `fanos status coherence` could print a confident report of
+a cell it had not seen. It now says the footprint was dropped.

@@ -205,6 +205,9 @@ struct RecoveryWatcher {
     down: std::collections::BTreeSet<Triple>,
     threshold: usize,
     generation: u64,
+    /// Consecutive stall confirmations since the last epoch advance — the **failover clock** for the
+    /// coordinator election (see [`on_tick`](Self::on_tick)).
+    confirmations: u32,
 }
 
 impl RecoveryWatcher {
@@ -215,21 +218,19 @@ impl RecoveryWatcher {
             down: std::collections::BTreeSet::new(),
             threshold,
             generation: 0,
+            confirmations: 0,
         }
     }
 
-    /// Fold one notification into the watched state: an epoch advance proves the anchors that produced its round
-    /// are live (clearing the down set); a `PeerDown` marks an anchor unreachable.
+    /// Fold one notification into the watched state: a `PeerDown` marks an anchor unreachable.
+    ///
+    /// **Progress is no longer read from here.** The epoch used to arrive as `BeaconReady` on the same lossy
+    /// broadcast, so this watcher could sleep through the round that proves its anchors live; it comes from
+    /// the router's latest-state watch in [`on_tick`](Self::on_tick) instead (#86). A dropped `PeerDown` is
+    /// survivable in a way a dropped advance was not — see the failover in `on_tick`.
     fn on_note(&mut self, note: &Notification) {
-        match note {
-            Notification::BeaconReady { epoch, .. } if *epoch > self.last_epoch => {
-                self.last_epoch = *epoch;
-                self.down.clear();
-            }
-            Notification::PeerDown(coord) => {
-                self.down.insert(*coord);
-            }
-            _ => {}
+        if let Notification::PeerDown(coord) = note {
+            self.down.insert(*coord);
         }
     }
 
@@ -245,16 +246,46 @@ impl RecoveryWatcher {
 
     /// One epoch-driver tick: if a stall is confirmed and THIS node is the deterministic coordinator (the
     /// lowest-index live anchor), actuate the recovery decision, so the cell emits one action, not one per node.
-    fn on_tick(&mut self, me: Triple, anchors: &[Triple]) {
+    /// Returns whether this node **actuated** on this tick — the only observable the election has, and
+    /// therefore the only thing a test of it can assert on.
+    fn on_tick(&mut self, me: Triple, anchors: &[Triple], live_epoch: Epoch) -> bool {
+        // Progress, taken from latest-state: an advancing round proves the anchors that produced it are live.
+        if live_epoch > self.last_epoch {
+            self.last_epoch = live_epoch;
+            self.down.clear();
+            self.confirmations = 0;
+        }
         if !self.detector.observe(self.last_epoch) {
-            return;
+            return false;
         }
+        self.confirmations = self.confirmations.saturating_add(1);
+
+        // **Rank-delayed election, because "elect the lowest-index live anchor" had no way to fail.**
+        // Every node fired only if it computed *itself* as the coordinator, which assumed every node's
+        // down-view agreed. Views are built from `PeerDown` events on a lossy channel, and they diverge
+        // exactly when it matters — the down set only accumulates while the beacon has already stalled,
+        // which is when this node is busiest and most likely to be behind. One node wrongly believed live
+        // was therefore elected by everybody, could not act, and **nobody else fired**: the cell stayed
+        // frozen, in the one state this trigger exists to escape.
+        //
+        // A node now fires when its **rank** among the anchors it believes live is below the number of
+        // stall confirmations. Rank 0 fires on the first, rank 1 one confirmation later, and so on — no
+        // shared view is required, only that a live anchor eventually reaches its turn. Firing twice is
+        // harmless (the trigger is generation-fenced and both regimes only escalate), so the design fails
+        // toward *more* triggers, which is the safe direction for a mechanism that exists to unfreeze.
         let live = self.live_anchors(anchors);
-        let coordinator = live.first().and_then(|&idx| anchors.get(usize::from(idx.saturating_sub(1))));
-        if coordinator == Some(&me) {
-            (self.generation, self.threshold) =
-                actuate_recovery(&live, self.threshold, self.generation, self.last_epoch);
+        let Some(rank) = live
+            .iter()
+            .position(|&idx| anchors.get(usize::from(idx.saturating_sub(1))) == Some(&me))
+        else {
+            return false; // this node is not an anchor, or believes itself down
+        };
+        if u32::try_from(rank).unwrap_or(u32::MAX) >= self.confirmations {
+            return false; // not yet this node's turn
         }
+        (self.generation, self.threshold) =
+            actuate_recovery(&live, self.threshold, self.generation, self.last_epoch);
+        true
     }
 }
 
@@ -328,6 +359,7 @@ fn spawn_recovery_trigger(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = client.subscribe();
+        let beacons = client.beacons();
         let mut ticker = tokio::time::interval(period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate tick, matching the epoch driver's connect/sync grace period
@@ -339,7 +371,10 @@ fn spawn_recovery_trigger(
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
-                _ = ticker.tick() => watcher.on_tick(me, &anchors),
+                _ = ticker.tick() => {
+                    let live_epoch = beacons.borrow().map_or(Epoch::ZERO, |(e, _)| e);
+                    let _actuated = watcher.on_tick(me, &anchors, live_epoch);
+                }
             }
         }
     })
@@ -1140,6 +1175,12 @@ mod tests {
     use crate::config::{BeaconParams, ExitParams, NodeConfig, ServiceParams};
     use fanos_field::F2;
 
+    /// One anchor by index, without indexing — the lint that forbids `[i]` in this tree is right that a
+    /// panicking subscript in a test is still a panicking subscript.
+    fn anchor(anchors: &[Triple], i: usize) -> Triple {
+        *anchors.get(i).expect("the base cell has seven anchors")
+    }
+
     #[test]
     fn the_recovery_watcher_tracks_live_anchors_and_clears_them_on_a_round() {
         let anchors: Vec<Triple> = (0..Plane::<F2>::N as usize).map(|i| Point::<F2>::at(i).coords()).collect();
@@ -1149,13 +1190,65 @@ mod tests {
         w.on_note(&Notification::PeerDown(Point::<F2>::at(0).coords()));
         w.on_note(&Notification::PeerDown(Point::<F2>::at(3).coords()));
         assert_eq!(w.live_anchors(&anchors), vec![2, 3, 5, 6, 7], "down anchors 1 and 4 are excluded");
-        // A fresh (strictly-newer) beacon round proves its producers live — the down set clears.
-        w.on_note(&Notification::BeaconReady { epoch: Epoch::new(1), seed: [0u8; 32] });
-        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 3, 4, 5, 6, 7], "an advancing round clears the down set");
-        // A replayed, non-advancing round does NOT clear — progress is monotone.
+        // A fresh (strictly-newer) epoch proves its producers live — the down set clears. Read from
+        // latest-state on the tick, not from a `BeaconReady` event this watcher could have slept through.
+        w.on_tick(anchor(&anchors, 6), &anchors, Epoch::new(1));
+        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 3, 4, 5, 6, 7], "an advancing epoch clears the down set");
+        // A replayed, non-advancing epoch does NOT clear — progress is monotone.
         w.on_note(&Notification::PeerDown(Point::<F2>::at(2).coords()));
-        w.on_note(&Notification::BeaconReady { epoch: Epoch::new(1), seed: [0u8; 32] });
-        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 4, 5, 6, 7], "a stale round keeps the down set");
+        w.on_tick(anchor(&anchors, 6), &anchors, Epoch::new(1));
+        assert_eq!(w.live_anchors(&anchors), vec![1, 2, 4, 5, 6, 7], "a stale epoch keeps the down set");
+    }
+
+    /// **A dead coordinator must not freeze the cell, and it used to.**
+    ///
+    /// The election was "fire iff I am the lowest-index anchor I believe live", which is correct only while
+    /// every node's down-view agrees. Those views are built from `PeerDown` events on a lossy channel and
+    /// diverge exactly when it matters — the down set only accumulates while the beacon has *already*
+    /// stalled. One anchor wrongly believed live was then elected by everybody, could not act, and nobody
+    /// else fired.
+    ///
+    /// The property now: a node fires once its **rank** among the anchors it believes live falls below the
+    /// number of stall confirmations. So rank 0 goes first, and if rank 0 never does, rank 1 follows.
+    #[test]
+    fn a_node_that_is_not_the_first_choice_still_takes_its_turn() {
+        let anchors: Vec<Triple> = (0..Plane::<F2>::N as usize).map(|i| Point::<F2>::at(i).coords()).collect();
+        // This node is anchor index 1 (rank 1), and believes every anchor live — so anchor 0 is the first
+        // choice and this node must wait exactly one confirmation longer.
+        let me = anchor(&anchors, 1);
+        let mut w = RecoveryWatcher::new(4);
+
+        // Confirmations arrive every `RECOVERY_PATIENCE` non-advancing ticks; drive them by ticking at a
+        // frozen epoch and counting how many ticks it takes this node to fire.
+        let mut fired_at = None;
+        for tick in 1..=(RECOVERY_PATIENCE * 4) {
+            if w.on_tick(me, &anchors, Epoch::ZERO) && fired_at.is_none() {
+                fired_at = Some(tick);
+            }
+        }
+        // `1 + (rank + 1) × patience`: the detector's first observation is a baseline rather than a stall,
+        // then each confirmation costs a full patience window. Written as the formula, not the number, so a
+        // change to `RECOVERY_PATIENCE` moves the expectation with it instead of breaking the test.
+        assert_eq!(
+            fired_at,
+            Some(1 + 2 * RECOVERY_PATIENCE),
+            "a rank-1 node takes its turn on the SECOND confirmation — one patience window after the first \
+             choice had theirs, and without needing to know whether the first choice acted"
+        );
+
+        // A rank-0 node fires on the first confirmation, so the ordering is a delay and not a deadlock.
+        let mut first = RecoveryWatcher::new(4);
+        let mut first_fired_at = None;
+        for tick in 1..=(RECOVERY_PATIENCE * 4) {
+            if first.on_tick(anchor(&anchors, 0), &anchors, Epoch::ZERO) && first_fired_at.is_none() {
+                first_fired_at = Some(tick);
+            }
+        }
+        assert_eq!(
+            first_fired_at,
+            Some(1 + RECOVERY_PATIENCE),
+            "the first choice acts on the first confirmation, so the ordering is a delay and not a deadlock"
+        );
     }
 
     #[tokio::test]
