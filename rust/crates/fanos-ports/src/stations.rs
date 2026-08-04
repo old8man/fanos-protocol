@@ -214,6 +214,16 @@ pub enum Station {
     AdmissionSybilCapped,
     /// Admission refused for want of a gather slot — capacity, not policy.
     AdmissionNoCapacity,
+    /// A store write refused because this node is at its content cap — capacity, not policy, and the same
+    /// distinction [`AdmissionNoCapacity`](Self::AdmissionNoCapacity) draws one layer over.
+    ///
+    /// **The only discard site in the overlay that used to record nothing.** A storage node fills with
+    /// content by design — content has no lifetime, so it is never swept — and past `MAX_STORE_ENTRIES` a
+    /// new digest is refused with no `Ack`. That refusal is correct: fail-closed admission is what stops a
+    /// flood of distinct digests displacing stored shards. What was wrong is that nobody else could tell.
+    /// The writer learns only from a `put` timing out, which is indistinguishable from an unreachable peer —
+    /// the two failures an operator most needs to separate — and the node itself reported nothing at all.
+    StoreAtCapacity,
     /// A descriptor share arrived that does **not** open its dealt per-share commitment: not a decode error
     /// and not a stale epoch, but a value provably different from the one the dealer handed that member.
     ///
@@ -261,6 +271,7 @@ impl Station {
         Self::DescriptorUnrecoverable,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
+        Self::StoreAtCapacity,
     ];
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
@@ -287,6 +298,7 @@ impl Station {
             Self::HolonomyRejected => "holonomy.rejected",
             Self::FrameDecodeFailed => "frame.decode_failed",
             Self::FrameTypeUnknown => "frame.type_unknown",
+            Self::StoreAtCapacity => "store.at_capacity",
             Self::AdmissionIdentityUnbound => "admission.identity_unbound",
             Self::AdmissionPowFailed => "admission.pow_failed",
             Self::AdmissionSybilCapped => "admission.sybil_capped",
@@ -631,6 +643,7 @@ mod tests {
                 Station::ShareIndexOutOfRange => listed(Station::ShareIndexOutOfRange),
                 Station::ShareFloodCapped => listed(Station::ShareFloodCapped),
                 Station::HolonomyRejected => listed(Station::HolonomyRejected),
+                Station::StoreAtCapacity => listed(Station::StoreAtCapacity),
                 Station::FrameDecodeFailed => listed(Station::FrameDecodeFailed),
                 Station::FrameTypeUnknown => listed(Station::FrameTypeUnknown),
                 Station::AdmissionIdentityUnbound => listed(Station::AdmissionIdentityUnbound),

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use fanos_code::{da, erasure, lrc};
 use fanos_field::Field;
 use fanos_geometry::{Point, Triple, fano};
+use fanos_ports::Station;
 use fanos_wire::{FrameType, Wire};
 
 use crate::frames::{
@@ -402,7 +403,14 @@ impl<F: Field> OverlayNode<F> {
         let payload = body.get(10 + DIGEST..).unwrap_or(&[]);
         // A4 DoS caps: a refused publish (over-size, or a new key over the store cap) is dropped without an
         // Ack or distribution — a relayed flood of distinct digests cannot exhaust this node's memory.
+        //
+        // **Counted, because a full node used to be indistinguishable from a healthy one.** Content is never
+        // swept (it has no lifetime), so a storage node fills by design and then refuses every new key
+        // silently; the writer saw only a `put` time out, which reads the same as an unreachable peer.
+        // Tagged with the sender so `fanos status stations` shows *whose* writes are being refused as well
+        // as how many.
         if !self.store.admits(&digest, payload.len()) {
+            self.stations.record(Station::StoreAtCapacity, Some(from));
             return Vec::new();
         }
         match flag {

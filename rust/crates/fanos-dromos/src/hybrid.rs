@@ -226,6 +226,19 @@ impl HybridLedger {
     /// a defect as a shortfall: it means value was credited to the sink and no owner's accounting claims it,
     /// which is money that can never be released. Equality is the invariant; anything else is a bug that has
     /// already happened.
+    ///
+    /// # Why `POOL_SINK` is not here
+    ///
+    /// The shielded pool is the fourth system account and its absence is a **decision, not an omission**.
+    /// Its invariant is `POOL_SINK == Σ unspent notes`, and note values are hidden by design — there is no
+    /// sum in public state to compare the balance against, so a fourth row would either be vacuous or would
+    /// need a supply counter duplicating a number the token ledger already holds.
+    ///
+    /// The protection is elsewhere and is stronger than a check would be: `apply_shielded` refuses an
+    /// unshield whose `public_value + fee` exceeds `pool_backing()`, **before** anything mutates. That is the
+    /// turnstile every shielded system converges on — it bounds a break in the ZK balance argument to the
+    /// value actually deposited in the pool, rather than to the money supply — and the sink balance is
+    /// itself the supply counter, held where it can be spent from rather than beside it.
     #[must_use]
     pub fn conservation(&self) -> Conservation {
         let deals: u64 = self
