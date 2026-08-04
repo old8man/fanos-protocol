@@ -2880,3 +2880,46 @@ Real defects found while chasing this, all fixed and committed along the way: un
 (`random_hops`), the discarded sealability check (`select_drop_line`), the silent seal-failure drop, the
 relay having no data-path plane at all, the censored-sampling bias in the gather estimator, empty requests
 reaching the service handler, and three counters that summed distinct worlds.
+
+---
+
+# The gather deadline was measured on a loaded box too (#41, 2026-08-04)
+
+Same root cause as #38, found by re-running the same experiment under the same discipline. The task recorded
+**158 shares arriving after the deadline had already fired** and read it as "the deadline is measurably too
+tight". That measurement was taken under contention.
+
+**On a fully idle host (`host_cpu_share` = 1.00), one 12-dial run across six live engines:**
+
+| | count |
+|---|---|
+| `GatherCompleted` | 1860 |
+| `GatherExpired` | 12 — a **0.64 %** expiry rate |
+| `ShareAfterDeadline` | **22** (1.18 % of gathers) — against 158 under load |
+| `ShareLateAfterPeel` | 1589 |
+
+`ShareAfterDeadline` falls **7×** when the box is quiet. The residual 1.18 % is the expected tail of an
+RFC 6298 estimator, not a defect: the deadline is armed at `SRTT + 4·RTTVAR`, measured here at
+`SRTT ≈ 1.4–3.0 ms` with `var ≈ 0.6–1.5 ms` (so ≈ 4–9 ms), and a small fraction of round trips beyond the
+RTO is what that estimator is *defined* to allow. Every one of those 22 feeds `observe_late`, which exists
+precisely so the estimator can learn it is short — the corrective loop is closed and running.
+
+`ShareLateAfterPeel = 1589` is likewise the expected remainder, not waste: a mix hop needs `t = 2` of a
+`q + 1 = 3` member line, so one share per completed gather arrives after the peel. 1860 completions predict
+~1860; 1589 observed.
+
+## The hypothesis I had, and why it was wrong
+
+I expected `ShareAfterDeadline` to be conflating "a share arrived after we already succeeded" with "a share
+arrived after we gave up" — the "one predicate, two decisions" shape. **It does not**, and the code says why
+in its own comment: `Peeled` is "the expected `q + 1 − t` remainder behind every completion"; `Expired` says
+"the line DID answer and the deadline was too tight"; unknown "is the only one that is evidence of nothing in
+particular". Those three worlds were summed into one counter once, and that was already fixed. Recording the
+refuted hypothesis because the counter's correctness is what makes the 22 readable at all.
+
+## Two open findings, one root cause
+
+#38 and #41 were both artefacts of measuring on a loaded box, and neither could be settled while the box
+stayed loaded. The platform now has the discipline that prevents a third: `host_cpu_share()` is printed,
+thresholded at 0.5, and load-bearing in the autopsy's assertion, so a starved run declines to conclude
+instead of reporting the machine as a defect.
