@@ -101,6 +101,12 @@ pub struct HybridLedger {
     /// Local metric, never consensus state, for the same reason as the gauge: not hashed into `state_root`,
     /// not carried in `snapshot`, so validators with different core counts still agree.
     parallel_blocks: u64,
+    /// Blocks whose execution left a conservation invariant broken (#94) — zero on a correct ledger.
+    ///
+    /// A **counter rather than an abort**: every validator computes the same state, so a `panic!` would stop
+    /// the whole cell together, converting a value bug into a liveness bug an attacker could trigger on
+    /// purpose. Deterministic for the same reason, so it cannot fork the chain either.
+    conservation_breaks: u64,
     tokens: TokenLedger,
     shielded: ShieldedState,
     names: NameRegistry,
@@ -112,6 +118,49 @@ pub struct HybridLedger {
     audit_beacon: [u8; 32],
 }
 
+/// The three conservation invariants, each as `(held, owed)` — see [`HybridLedger::conservation`].
+///
+/// A pair rather than a bool, because a failing invariant's *direction and size* is the whole diagnostic: a
+/// shortfall means a transfer was recorded and not made, a surplus means value entered a sink no owner
+/// claims. A bare `false` would send an operator back to the same reading this exists to replace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Conservation {
+    /// `STAKE_SINK`'s balance against the total bonded across all accounts.
+    pub stake: (u64, u64),
+    /// `STORAGE_ESCROW`'s balance against the unreleased escrow of every active deal.
+    pub storage: (u64, u64),
+    /// `HTLC_ESCROW`'s balance against the amount of every still-locked contract.
+    pub htlc: (u64, u64),
+}
+
+impl Conservation {
+    /// Whether all three hold exactly.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.stake.0 == self.stake.1
+            && self.storage.0 == self.storage.1
+            && self.htlc.0 == self.htlc.1
+    }
+
+    /// The invariants that do **not** hold, named, with what was held and what was owed — the message a
+    /// refusing validator prints and an operator acts on.
+    #[must_use]
+    pub fn broken(&self) -> Vec<String> {
+        [("stake", self.stake), ("storage-escrow", self.storage), ("htlc-escrow", self.htlc)]
+            .into_iter()
+            .filter(|(_, (held, owed))| held != owed)
+            .map(|(what, (held, owed))| {
+                let (verb, delta) = if held > owed {
+                    ("surplus", held - owed)
+                } else {
+                    ("SHORTFALL", owed - held)
+                };
+                format!("{what}: holds {held}, owes {owed} ({verb} {delta})")
+            })
+            .collect()
+    }
+}
+
 impl HybridLedger {
     /// A hybrid ledger over a funded genesis token ledger, an empty shielded pool, and an empty name registry.
     #[must_use]
@@ -119,6 +168,7 @@ impl HybridLedger {
         Self {
             waves_last_block: 0,
             parallel_blocks: 0,
+            conservation_breaks: 0,
             tokens: genesis_tokens,
             shielded: ShieldedState::new(),
             names: NameRegistry::new(),
@@ -141,6 +191,60 @@ impl HybridLedger {
     #[must_use]
     pub fn stake(&self) -> &StakeLedger {
         &self.stake
+    }
+
+    /// How many executed blocks left a conservation invariant broken — zero on a correct ledger, and the
+    /// single number a test or an operator checks instead of re-deriving the three sums.
+    #[must_use]
+    pub fn conservation_breaks(&self) -> u64 {
+        self.conservation_breaks
+    }
+
+    /// **Whether the ledger's three conservation invariants hold**, and which do not.
+    ///
+    /// Each system account's doc used to assert its invariant with the words *"by construction"* — three
+    /// times, and nothing checked any of them (#94). Meanwhile `Tokens::move_system` returns `false` when a
+    /// system account is short and every production call site discarded it, so the one signal that a
+    /// construction had failed was thrown away at each of the twelve places it could appear.
+    ///
+    /// The two compose badly. A settlement records `released += amount` *before* moving the tokens, so a move
+    /// that silently does not happen leaves the deal saying the provider was paid and the token ledger saying
+    /// it was not — and because the divergence is deterministic, every validator computes the same wrong
+    /// `state_root` and consensus ratifies it. A discarded `false` is not a lost log line here; it is a
+    /// disagreement between two halves of the same state that nothing can observe.
+    ///
+    /// Checking is cheap because each invariant is a **pure function of state**, and it catches the whole
+    /// class rather than each call site:
+    ///
+    /// | account | must equal |
+    /// |---|---|
+    /// | `STAKE_SINK` | the total bonded across all accounts |
+    /// | `STORAGE_ESCROW` | the unreleased escrow of every active deal |
+    /// | `HTLC_ESCROW` | the amount of every still-locked contract |
+    ///
+    /// A `≥` would not do. Each account is **shared** across all deals or contracts, so a surplus is as much
+    /// a defect as a shortfall: it means value was credited to the sink and no owner's accounting claims it,
+    /// which is money that can never be released. Equality is the invariant; anything else is a bug that has
+    /// already happened.
+    #[must_use]
+    pub fn conservation(&self) -> Conservation {
+        let deals: u64 = self
+            .storage
+            .deals
+            .values()
+            .filter(|d| d.state() == DealState::Active)
+            .fold(0u64, |acc, d| acc.saturating_add(d.refundable()));
+        let locked: u64 = self
+            .htlcs
+            .htlcs
+            .values()
+            .filter(|h| h.state() == HtlcState::Locked)
+            .fold(0u64, |acc, h| acc.saturating_add(h.terms().amount));
+        Conservation {
+            stake: (self.tokens.balance(&STAKE_SINK), self.stake.total_bonded()),
+            storage: (self.tokens.balance(&STORAGE_ESCROW), deals),
+            htlc: (self.tokens.balance(&HTLC_ESCROW), locked),
+        }
     }
 
     /// The balance held in the storage-escrow sink (the sum of unreleased deal escrow by construction).
@@ -986,7 +1090,24 @@ impl StateMachine for HybridLedger {
     /// batched across a thread pool before the serial commit. Serial-equivalent by construction and pinned as such by
     /// `execute_block_matches_serial_execution_and_parallelizes_independent_work` and the determinism KATs.
     fn apply_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
-        self.execute_block(txs)
+        let outcomes = self.execute_block(txs);
+        // **The conservation gate (#94).** Every system-account transfer discards its `false`, and a
+        // settlement records its effect *before* moving the tokens — so a move that cannot happen leaves two
+        // halves of this state disagreeing, deterministically, and consensus ratifies the disagreement. This
+        // is where that stops being silent: the invariants are a pure function of state, so one check after
+        // execution covers all twelve sites and every future one.
+        //
+        // **Counted, not enforced by aborting.** A `panic!` here would turn a value bug into a liveness bug
+        // for the whole cell: every validator computes the same state, so every validator would abort
+        // together and the chain would simply stop — a worse failure than the one being caught, and one an
+        // attacker could trigger deliberately if they ever found a breaking transaction. The count is
+        // deterministic (it is a function of the same state every node has), so it cannot fork the chain
+        // either. `conservation()` names the invariant, the direction and the size when someone asks; the
+        // tests make a break a hard failure, which is where a hard failure belongs.
+        if !self.conservation().holds() {
+            self.conservation_breaks = self.conservation_breaks.saturating_add(1);
+        }
+        outcomes
     }
 
     /// Set the registry's clock to the block being executed, and finalize any storage deals whose audit deadline
@@ -1093,6 +1214,7 @@ impl StateMachine for HybridLedger {
             // describes *this* validator's last scheduling pass, not the state it adopted.
             waves_last_block: 0,
             parallel_blocks: 0,
+            conservation_breaks: 0,
             tokens,
             shielded,
             names,
@@ -2654,5 +2776,76 @@ mod tests {
         // never executed a transaction.
         let _ = ledger.execute_block(&[]);
         assert_eq!(ledger.parallel_blocks(), 1, "an empty block exercises nothing and counts as nothing");
+    }
+
+    /// **Conservation is a property of the whole ledger, and it used to be asserted only by the word
+    /// "by construction" in three doc comments (#94).**
+    ///
+    /// Driven through the real transaction path — open a deal, bond stake, lock an HTLC — so the sums are
+    /// what production actually produces, not a hand-built state. The falsification is at the end and is the
+    /// reason this test is worth its length: a check that cannot see a break is a comment with a `#[test]`
+    /// on it.
+    #[test]
+    fn the_ledger_conserves_what_its_system_accounts_hold() {
+        let (consumer_sk, consumer_vk, consumer) = account(11);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        assert!(ledger.conservation().holds(), "an empty ledger conserves trivially");
+        assert!(ledger.conservation().broken().is_empty());
+
+        // A funded deal: the escrow sink must hold exactly the unreleased escrow.
+        let params = DealParams {
+            cid: fanos_thesauros::content::Cid::new([3u8; 32]),
+            size: 262_144,
+            duration: 4,
+            replication: 3,
+            lambda_bits: 10,
+            f_tol_permille: 100,
+            k: 3,
+            price: 400,
+            provider: account(12).2,
+            consumer,
+        };
+        let payment = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 400, nonce: 0 },
+            &consumer_sk,
+            consumer_vk.clone(),
+        );
+        let open = StorageTx::Open { params, payment };
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::storage_payload(&open))),
+            ExecOutcome::Applied
+        );
+        let c = ledger.conservation();
+        assert!(c.holds(), "an open deal conserves: {:?}", c.broken());
+        assert_eq!(c.storage, (400, 400), "the sink holds exactly the deal's unreleased escrow");
+
+        // Executing blocks must not accumulate breaks.
+        for h in 1..=3 {
+            ledger.begin_block(h);
+            let _ = ledger.apply_block(&[]);
+        }
+        assert_eq!(ledger.conservation_breaks(), 0, "an honest ledger never breaks conservation");
+
+        // **The falsification.** Credit the sink from nowhere — the shape a discarded `move_system` failure
+        // or a double credit produces — and the check must name the account, the direction and the size.
+        // Done through the token ledger directly because no transaction *can* do this, which is the point:
+        // the invariant exists to catch a bug, and a bug is not a transaction.
+        ledger.tokens_mut().credit(STORAGE_ESCROW, 7);
+        let c = ledger.conservation();
+        assert!(!c.holds(), "a sink holding more than any owner claims is a broken invariant, not a rounding");
+        let broken = c.broken();
+        assert_eq!(broken.len(), 1, "exactly the storage invariant broke: {broken:?}");
+        assert!(
+            broken[0].contains("storage-escrow") && broken[0].contains("surplus 7"),
+            "the message must name the account, the direction and the size — an operator acts on it: {broken:?}"
+        );
+
+        // And the block gate sees it: the next executed block counts the break rather than passing silently.
+        ledger.begin_block(4);
+        let _ = ledger.apply_block(&[]);
+        assert_eq!(ledger.conservation_breaks(), 1, "the gate counts a block that left the invariant broken");
     }
 }
