@@ -70,6 +70,24 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     let mut b = spawn_distinct(&dir, &[a.address()]).await;
     let c = spawn_distinct(&dir, &[a.address(), b.address()]).await;
 
+    // **Wait for B's binding to be PROVEN before testing that a proof cannot be overwritten.** `spawn_inner`
+    // seeds an unranked entry and the reshuffle loop replaces it with the ranked one on a spawned task, so
+    // "B has a proven claim" is not true the instant `spawn_distinct` returns — it is true a moment later.
+    // Asserting through that window passed whenever the task happened to win the race and failed under load,
+    // which is a property of the machine rather than of the rank rule.
+    //
+    // `claim_at` is the oracle that already answers this — `None` covers "free" and "occupied but unranked"
+    // alike, which is exactly the distinction being waited on. A second accessor was written for it and
+    // deleted: the architecture ratchet flagged it as public-and-uncalled, and it was right, because the
+    // question already had an answer with a production caller (`Node::health`'s `probe_index`).
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while dir.claim_at(b.address()).is_none() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("B's own coordinate claim must be seated before the arbitration rule can be tested");
+
     // A naive overwrite no longer poisons anything, and that is the rank rule working: B's binding was made *with* its
     // verified rank when B spawned, and an unranked write carries no evidence, so it cannot evict a proven claim
     // (`Directory::supersedes`). This assertion is the reason the test below has to reach for a realistic stale entry.

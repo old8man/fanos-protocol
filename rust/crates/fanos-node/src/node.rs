@@ -422,7 +422,7 @@ fn spawn_exit_role(
     // Advertise the exit through the overlay store so a proxy discovers it automatically (each epoch, so a
     // departed exit falls out of the live directory) — no hand-configured descriptor needed. The task runs
     // until the node stops; its handle is not retained (like the mix publisher's).
-    let _publisher = spawn_exit_publisher(handle.client(), public);
+    let _publisher = spawn_exit_publisher(handle.client(), public, handle.coordinate_prover());
     Ok(())
 }
 

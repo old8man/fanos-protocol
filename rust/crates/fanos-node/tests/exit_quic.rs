@@ -252,7 +252,7 @@ async fn an_exit_advertises_itself_and_is_discovered() {
     let coord = node.address();
     let found = tokio::time::timeout(common::HANG_CEILING, async {
         loop {
-            if let Some(public) = resolve_exit_key(&client, coord, Epoch::ZERO).await {
+            if let Some(public) = resolve_exit_key::<F2>(&client, coord, Epoch::ZERO, Some(client.genesis())).await {
                 return public;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

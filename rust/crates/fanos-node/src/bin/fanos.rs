@@ -2690,7 +2690,13 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
 /// proxy restart spreads load across the available exits. `None` if none is currently published (clearnet
 /// targets are then refused).
 async fn discover_exit(node: &Node, epoch: Epoch) -> Option<([u32; 3], HybridKemPublic)> {
-    let mut exits = build_cell_exit_directory::<F2>(&node.client(), epoch).await;
+    // The seed the directory's records are bound against: the live beacon once one is adopted, else this
+    // network's genesis seed. A deployed node always proves coordinates, so a record that is not bound to
+    // the point it sits at is not an exit — it is someone else writing at that point.
+    let beacon = node
+        .live_beacon()
+        .map_or_else(|| node.client().genesis(), |(_, seed)| BeaconSeed::new(seed));
+    let mut exits = build_cell_exit_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
     let n = exits.len();
     if n == 0 {
         return None;

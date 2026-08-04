@@ -21,9 +21,12 @@ use fanos_diaulos::{Coord, StaticKeypair};
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point};
 use fanos_pqcrypto::kem::HybridKemPublic;
-use fanos_quic::Client;
-use fanos_rendezvous::Epoch;
+use fanos_quic::{Client, CoordinateProver};
+use fanos_rendezvous::{BeaconSeed, Epoch};
 use fanos_runtime::Notification;
+use fanos_vrf::{VrfProof, VrfPublic};
+
+use crate::bound::Entitlement;
 use rand_core::CryptoRng;
 use std::net::Ipv4Addr;
 
@@ -297,41 +300,94 @@ fn exit_key_slot(coord: Coord, epoch: Epoch) -> Vec<u8> {
     key
 }
 
+/// The bytes an exit key is stored as: the bare key, or the key inside the coordinate-bound
+/// [`Entitlement`] envelope when this deployment can prove coordinates.
+///
+/// **A key directory that nobody signs is a key directory anyone can rewrite.** The store is
+/// content-addressed, so this slot's key embeds a coordinate but nothing made the publisher own it: any
+/// admitted member could overwrite another exit's published key. Traffic then seals to a key the honest node
+/// at that coordinate cannot open — the transport is still coordinate-authenticated by HELLO, so it is
+/// denial rather than interception, and total: with no exit discovered and none pinned, a proxy refuses
+/// every clearnet target. One member takes down the cell's whole clearnet path, attributable to nobody.
+///
+/// The three sibling directories ([`crate::mixdir`], [`crate::capdir`], [`crate::loaddir`]) all carry this
+/// envelope; this one did not. One encode, one decode, both on the production path, so a test that drives
+/// them is testing what ships.
+#[must_use]
+fn exit_record(public: &HybridKemPublic, credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>) -> Vec<u8> {
+    let payload = public.encode();
+    match credential {
+        Some((id, vrf_public, proof)) => Entitlement::encode(id, vrf_public, proof, &payload),
+        None => payload,
+    }
+}
+
+/// The inverse of [`exit_record`]: the published key, or `None` if malformed or — when `beacon` is `Some` —
+/// not bound to `coord` for `epoch`.
+#[must_use]
+fn open_exit_record<F: Field>(
+    bytes: &[u8],
+    coord: Coord,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Option<HybridKemPublic> {
+    match beacon {
+        Some(seed) => {
+            let (_, payload) = Entitlement::open::<F>(bytes, coord, epoch, &seed)?;
+            HybridKemPublic::decode(payload)
+        }
+        None => HybridKemPublic::decode(bytes),
+    }
+}
+
 /// Publish this exit's stable service public key for `epoch` at its coordinate slot, so a proxy resolving
 /// exits for that epoch discovers it. `false` if the store rejected the write.
+///
+/// `credential` is this node's coordinate proof for `epoch` — `Some` on any cell with VRF coordinates, and
+/// the record is then bound so no other member can replace this exit's key. `None` emits the bare key a
+/// pinned cell can produce, where no coordinate is provable.
 pub async fn publish_exit_key(
     client: &Client,
     coord: Coord,
     epoch: Epoch,
     public: &HybridKemPublic,
+    credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>,
 ) -> bool {
-    client.put_ephemeral(exit_key_slot(coord, epoch), public.encode(), DIRECTORY_SLOT_EPOCHS).await
+    client
+        .put_ephemeral(exit_key_slot(coord, epoch), exit_record(public, credential), DIRECTORY_SLOT_EPOCHS)
+        .await
 }
 
 /// Resolve the exit service key published by the node at `coord` for `epoch`, or `None` if none is
-/// published, the lookup times out, or the stored bytes are not a valid key.
-pub async fn resolve_exit_key(
+/// published, the lookup times out, the stored bytes are not a valid key, or — when `beacon` is `Some` —
+/// the record is not bound to that coordinate.
+pub async fn resolve_exit_key<F: Field>(
     client: &Client,
     coord: Coord,
     epoch: Epoch,
+    beacon: Option<BeaconSeed>,
 ) -> Option<HybridKemPublic> {
     let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(exit_key_slot(coord, epoch)))
         .await
         .ok()??;
-    HybridKemPublic::decode(&bytes)
+    open_exit_record::<F>(&bytes, coord, epoch, beacon)
 }
 
 /// Assemble the **live** exit directory of the base cell of plane `F` for `epoch`: resolve every cell
 /// point's published exit key and keep those currently answering — a best-effort roster of exits the proxy
 /// can route clearnet traffic through (no central directory; the cell advertises itself through the store).
+/// `beacon` states whether this deployment can prove coordinates — `Some` on any cell with VRF
+/// coordinates, and a record that is not bound to the point it sits at is then skipped rather than routed
+/// through. Symmetric with the publisher's `credential`, and with the three sibling directories.
 pub async fn build_cell_exit_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
+    beacon: Option<BeaconSeed>,
 ) -> Vec<(Coord, HybridKemPublic)> {
     let mut exits = Vec::new();
     for i in 0..Plane::<F>::N as usize {
         let coord = Point::<F>::at(i).coords();
-        if let Some(public) = resolve_exit_key(client, coord, epoch).await {
+        if let Some(public) = resolve_exit_key::<F>(client, coord, epoch, beacon).await {
             exits.push((coord, public));
         }
     }
@@ -349,16 +405,31 @@ pub async fn build_cell_exit_directory<F: Field>(
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
 #[must_use]
-pub fn spawn_exit_publisher(client: Client, public: HybridKemPublic) -> JoinHandle<()> {
+pub fn spawn_exit_publisher(
+    client: Client,
+    public: HybridKemPublic,
+    prover: Option<CoordinateProver>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
-        publish_exit_key(&client, client.address(), epoch, &public).await;
+        // This network's epoch-0 seed, not the constant (`docs/design-genesis.md`) — a record bound against
+        // the wrong seed proves a coordinate this node does not occupy, so no reader can verify it.
+        let mut seed = client.genesis();
+        let publish = |epoch: Epoch, seed: BeaconSeed, public: &HybridKemPublic| {
+            // Proven per write: the credential names an epoch, so one captured at spawn would verify only
+            // in the epoch it was made.
+            let credential = prover.as_ref().map(|prove| prove(epoch, &seed));
+            let (client, public) = (client.clone(), public.clone());
+            async move { publish_exit_key(&client, client.address(), epoch, &public, credential.as_ref()).await }
+        };
+        publish(epoch, seed, &public).await;
         loop {
             match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: reached, .. }) if reached > epoch => {
+                Ok(Notification::BeaconReady { epoch: reached, seed: s }) if reached > epoch => {
                     epoch = reached;
-                    publish_exit_key(&client, client.address(), epoch, &public).await;
+                    seed = BeaconSeed::new(s);
+                    publish(epoch, seed, &public).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -371,6 +442,52 @@ pub fn spawn_exit_publisher(client: Client, public: HybridKemPublic) -> JoinHand
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// **An exit key verifies only at a coordinate its publisher can prove.**
+    ///
+    /// A key directory nobody signs is a key directory anyone rewrites. Any admitted member could overwrite
+    /// another exit's published key; traffic then seals to something the honest node at that coordinate
+    /// cannot open, and since a proxy refuses every clearnet target when no exit is discovered, one member
+    /// takes the cell's whole clearnet path down and nothing attributes it.
+    ///
+    /// Stated over the plane rather than at one forged point — a credential verifies exactly on the
+    /// coordinates its VRF walk reaches — and driven through the same `exit_record` / `open_exit_record`
+    /// the publisher and the directory use, so deleting the binding from either end fails this.
+    #[test]
+    fn an_exit_key_verifies_only_at_a_coordinate_its_publisher_can_prove() {
+        use fanos_field::F7;
+        use fanos_pqcrypto::kem::HybridKemSecret;
+        use fanos_pqcrypto::rng::SeedRng;
+        use fanos_vrf::VrfSecret;
+
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let sk = VrfSecret::from_seed([7u8; 32]);
+        let id = b"exit-7".to_vec();
+        let (_, proof) = fanos_vrf::prove_coordinate::<F7>(&sk, &id, epoch, &beacon);
+        let (_, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"exit-key"));
+        let record = exit_record(&public, Some(&(id.clone(), sk.public(), proof)));
+        let output = fanos_vrf::coordinate_output(&sk.public(), &id, epoch, &beacon, &proof)
+            .expect("the publisher's own credential yields its walk");
+
+        let mut refused = 0;
+        for i in 0..Plane::<F7>::N as usize {
+            let p = Point::<F7>::at(i);
+            let got = open_exit_record::<F7>(&record, p.coords(), epoch, Some(beacon));
+            if fanos_vrf::probe_index_of::<F7>(&output, &p).is_some() {
+                assert_eq!(
+                    got.map(|k| k.encode()),
+                    Some(public.encode()),
+                    "a point on the publisher's own walk yields its key"
+                );
+            } else {
+                assert!(got.is_none(), "a coordinate the publisher cannot prove is refused");
+                refused += 1;
+            }
+        }
+        // PG(2,7) holds 57 points and a line q + 1 = 8, so 49 are unreachable for this publisher — the same
+        // arithmetic the capability and load directories state for their own bindings.
+        assert_eq!(refused, 49, "the substitution is refused at 49 of the plane's 57 points");
+    }
 
     #[test]
     fn policy_gates_on_port() {
