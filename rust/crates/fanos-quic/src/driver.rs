@@ -268,9 +268,39 @@ const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// **await** when it is full, so a peer flooding frames is back-pressured through QUIC's own flow control
 /// rather than growing this queue without limit (audit C2). The timer/command producers share it; commands
 /// use a non-blocking `try_send` (dropped under a sustained flood, the caller sees `false`), timers await.
-/// The outbound/notification channels stay unbounded — they are bounded *transitively*, since the engine
-/// can only produce effects as fast as it drains this now-bounded input.
+/// The notification channel stays unbounded and is bounded *transitively*: the router drains it at memory
+/// speed, so the engine cannot outrun it for long.
+///
+/// **The same argument was made for the per-peer send queues and it does not hold there** — see
+/// [`MAX_PEER_SEND_QUEUE`]. It bounds the engine's production *rate*, not the queue's *depth*, and a queue
+/// whose consumer runs at zero grows without limit however slowly it is filled.
 const INPUT_CAP: usize = 1024;
+
+/// The most frames one peer's send queue may hold before this node stops making more (#89).
+///
+/// # Why it was unbounded, and why the reasoning failed
+///
+/// `INPUT_CAP`'s own comment used to cover this: "the outbound channels stay unbounded — they are bounded
+/// transitively, since the engine can only produce effects as fast as it drains this now-bounded input."
+/// That bounds the **rate**. The depth is `∫(rate − drain)`, and the drain here is *the peer's*, which can be
+/// zero: `send_uni` awaits `open_uni` and `write_all`, so a peer that completes the handshake and simply
+/// never reads — or advertises a minimal stream window — stalls the worker while this node keeps queueing.
+/// No forged frame and no protocol violation; a socket that does not drain is enough. The traffic shaper is
+/// the second, non-adversarial path to the same place: it *deliberately* paces sends, so even a healthy peer
+/// has a bounded drain rate by design.
+///
+/// # The bound
+///
+/// `INPUT_CAP`, because that is exactly the depth the transitive argument was right about. Each input the
+/// engine has accepted but not yet processed owes at most one frame per peer, so a legitimate backlog to one
+/// peer cannot exceed the inbound queue's own capacity. Anything past it is not work this node was asked to
+/// do — it is a peer that is not draining, and the answer to that is to stop making frames for it rather
+/// than to buffer them.
+///
+/// Stated honestly: this converts an *unbounded* leak into a *bounded* one, and the bound is generous — a
+/// queue full of maximum-size shard publishes is tens of megabytes. It is the engine's own accepted-work
+/// limit rather than a comfortable number, which is the right trade for a cap whose job is to exist.
+const MAX_PEER_SEND_QUEUE: usize = INPUT_CAP;
 
 /// A coordinate → live connection cache. A `Connection` is a cheap handle (an `Arc` inside).
 type ConnMap = Arc<Mutex<HashMap<Triple, Connection>>>;
@@ -340,6 +370,12 @@ struct Transport {
     directory: Directory,
     /// Identity-keyed distrust, so a quarantine follows the peer rather than the point (audit R-M1).
     distrust: Arc<Distrust>,
+    /// Frames not made because a peer's send queue was at [`MAX_PEER_SEND_QUEUE`] (#89).
+    ///
+    /// Zero on a healthy node, and a non-zero value has exactly one meaning: some peer stopped draining and
+    /// this node stopped making frames for it. Counted rather than logged-and-forgotten because that is the
+    /// difference between an operator being able to test the hypothesis and having to guess.
+    send_drops: Arc<std::sync::atomic::AtomicU64>,
     /// Coordinates with a hole-punch dial already in flight — the bound on what an unsolicited `PunchTo`
     /// can cost (see [`accept_holepunch`]). A *set of coordinates*, so the ceiling is the plane's own point
     /// count and no constant has to assert one.
@@ -407,6 +443,8 @@ pub struct NodeHandle {
     events_rx: broadcast::Receiver<Notification>,
     /// The live epoch, as latest-state — see [`Beacons`].
     beacons: Beacons,
+    /// Frames not made because a peer's send queue was full (#89) — shared with the transport.
+    send_drops: Arc<std::sync::atomic::AtomicU64>,
     endpoint: Endpoint,
     reflexive: Reflexive,
     /// The **network's genesis seed** — the value epoch-0 coordinates on this network are drawn against
@@ -441,6 +479,17 @@ impl NodeHandle {
     #[must_use]
     pub fn coordinate_prover(&self) -> Option<CoordinateProver> {
         self.identity.as_ref().map(|id| id.prove.clone())
+    }
+
+    /// Frames this node **did not make** because a peer's send queue was at [`MAX_PEER_SEND_QUEUE`].
+    ///
+    /// Zero on a healthy node. A non-zero value has one meaning and it is actionable: some peer stopped
+    /// draining its connection, so this node stopped queueing for it rather than growing without limit
+    /// (#89). Reported by `fanos status health`, because the alternative — a silent drop — is the property
+    /// that makes a defect unfalsifiable.
+    #[must_use]
+    pub fn send_drops(&self) -> u64 {
+        self.send_drops.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many peers' coordinate claims this node has verified this epoch, or `None` without a self-certifying identity.
@@ -1558,6 +1607,8 @@ fn spawn_inner(
     // Identity-keyed distrust, shared between the engine loop (which sees verdicts) and the accept path (which sees who
     // is seated where) — audit R-M1.
     let distrust: Arc<Distrust> = Arc::new(Distrust::default());
+    // Shared with the handle, so `fanos status health` can report it (#89).
+    let send_drops: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The one live coordinate cell every handle and client above shares. A copy per layer is what let the reported
     // coordinate go stale at the first reshuffle.
     let seat = Arc::new(Mutex::new(addr));
@@ -1576,6 +1627,7 @@ fn spawn_inner(
         peer_addrs,
         directory,
         distrust: distrust.clone(),
+        send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
     };
     tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe()));
@@ -1600,6 +1652,7 @@ fn spawn_inner(
         events_tx,
         events_rx,
         beacons: beacon_rx,
+        send_drops,
         endpoint,
         reflexive,
         claims: None,
@@ -1732,24 +1785,35 @@ async fn fire_timer(tx: mpsc::Sender<Input>, token: TimerToken, delay: std::time
 /// exactly one worker per coordinate, there is also exactly one in-flight dial per coordinate — the
 /// duplicate-dial race a naive per-frame spawn would suffer cannot arise.
 async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendRequest>) {
-    let mut workers: HashMap<Triple, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+    let mut workers: HashMap<Triple, mpsc::Sender<Vec<u8>>> = HashMap::new();
     while let Some(SendRequest { to, frame }) = send_rx.recv().await {
         // Reuse the peer's worker, or start one. Workers live for the dispatcher's lifetime (bounded by the
         // node's peer set, exactly like the connection cache), so no per-peer teardown race exists: the
         // channel a frame is handed to always has a live receiver draining it.
         let worker = workers.entry(to).or_insert_with(|| {
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(MAX_PEER_SEND_QUEUE);
             tokio::spawn(peer_send_worker(t.clone(), to, rx));
             tx
         });
-        let _ = worker.send(frame);
+        // **`try_send`, never `send`.** Awaiting here would let one stalled peer stop this dispatcher and
+        // therefore every *other* peer's traffic — reintroducing the head-of-line blocking the per-peer
+        // workers exist to remove (#129), and turning a memory leak into a total send outage. Over budget,
+        // the frame is not made.
+        //
+        // Dropping is safe because every layer above recovers on its own: DIAULOS retransmits, a store read
+        // re-fans to the shard homes, a directory slot is rewritten next epoch. It is **counted**, because a
+        // silent drop is the property that makes a defect unfalsifiable — `fanos status health` reports it,
+        // and a non-zero count is the operator's evidence that a peer is not draining.
+        if worker.try_send(frame).is_err() {
+            t.send_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
 /// A single peer's send worker: resolve the destination to a connection (dial once, then reuse the cached
 /// connection), then write each queued frame as its own QUIC uni-stream, in order. Scoped to one peer so a
 /// slow dial or a broken connection cannot delay any other peer's traffic (#129).
-async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u8>>) {
     // Hubs already asked to broker a punch to `to` — see the relay branch below. Local to this worker, so
     // it needs no lock, and bounded by the plane's point count because a hub is a peer coordinate.
     let mut asked: BTreeSet<Triple> = BTreeSet::new();

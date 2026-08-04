@@ -3213,3 +3213,42 @@ The rest were checked and are correct as they stand, which is the more useful ha
 
 A comment claiming the next event covers it deserves suspicion rather than trust: `mixdir` said "the next
 BeaconReady's catch-up advance covers it", and it covered the ratchet state, not the directory hole.
+
+## §8. [HIGH, FIXED, #89] A peer that stops reading grew this node's send queue without limit
+
+The per-peer send queues were `mpsc::unbounded_channel`, and `INPUT_CAP`'s own comment justified it: "the
+outbound channels stay unbounded — they are bounded *transitively*, since the engine can only produce effects
+as fast as it drains this now-bounded input."
+
+**That bounds the rate. Depth is the integral of rate minus drain, and the drain here is the peer's.**
+`send_uni` awaits `open_uni` and `write_all`, so a peer that completes the handshake and simply never reads —
+or advertises a minimal stream window — stalls the worker while this node keeps queueing. No forged frame and
+no protocol violation: a socket that does not drain is the whole attack. The traffic shaper is the second,
+non-adversarial path to the same place, since it *deliberately* paces sends, so even a healthy peer has a
+bounded drain rate by design.
+
+Bounded at `INPUT_CAP`, which is the depth the transitive argument was right about: each input the engine has
+accepted but not yet processed owes at most one frame per peer, so a legitimate backlog to one peer cannot
+exceed the inbound queue's capacity. Past it, the frame is not made. `try_send` rather than `send`, because
+awaiting would let one stalled peer stop the dispatcher and therefore *every other peer's* traffic —
+reintroducing the head-of-line blocking the per-peer workers exist to remove, and turning a memory leak into
+a total send outage.
+
+Dropping is safe because every layer above recovers on its own — DIAULOS retransmits, a store read re-fans, a
+directory slot is rewritten next epoch — and it is **counted**: `fanos status health` reports `send_drops`,
+zero on a healthy node, with exactly one meaning when it is not. Stated honestly, this converts an unbounded
+leak into a bounded one and the bound is generous; it is the engine's own accepted-work limit rather than a
+comfortable number.
+
+## §9. Two of this pass's own changes fought, and the resolution is operational
+
+Installing the quiet-host guard on every real-QUIC liveness test (#87) and moving the suite to
+multi-threaded runtimes (#84) are each right and together make a full parallel `cargo test --workspace`
+unmeasurable: fifteen test binaries with four workers apiece oversubscribe the machine, and the guard then
+correctly reports INCONCLUSIVE. Measured on the full run: **221 targets green and 9 INCONCLUSIVE, not one of
+them a defect**, at cpu share 0.18 — while the same targets pass 9 of 9 in 13 s with the box to themselves.
+
+A run that goes red because it could not measure teaches everyone to ignore red, so CI now runs
+`fanos-quic` and `fanos-node` in their own steps with the runner to themselves and excludes them from the
+parallel workspace step. The guard stays exactly as it is: it is telling the truth, and the truth is about
+how the suite is run.

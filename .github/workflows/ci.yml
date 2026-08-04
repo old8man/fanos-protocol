@@ -59,10 +59,23 @@ jobs:
       # a red result. Measured 2026-08-04: `fanos-wire`'s conformance KAT had been failing for six days
       # behind a live-QUIC flake that happened to run earlier, and nobody could have seen it. A run that
       # hides its own coverage is worth less than a slower one that does not.
-      - name: Tests — default features
-        run: cargo test --workspace --no-fail-fast
+      # The real-QUIC integration targets are **excluded here and run alone below**, and that is a
+      # measurement property rather than a preference. Since 2026-08-04 every one of them runs on a
+      # multi-threaded runtime (4 workers), because a current-thread harness cannot observe a parallelism
+      # defect at all (#84) — so fifteen test binaries in parallel oversubscribe the runner several times
+      # over. Their own `require_quiet_host` guard then correctly reports INCONCLUSIVE (measured: cpu share
+      # 0.18 in a full parallel run, against 9 of 9 passing in 13 s when the target runs alone), and a run
+      # that goes red because it could not measure teaches everyone to ignore red.
+      - name: Tests — default features (excluding the real-QUIC targets)
+        run: cargo test --workspace --no-fail-fast --exclude fanos-node --exclude fanos-quic
+      - name: Tests — fanos-quic and fanos-node, with the runner to themselves
+        run: |
+          cargo test -p fanos-quic --no-fail-fast
+          cargo test -p fanos-node --no-fail-fast
       - name: Tests — validator features (ledger · consensus · TAXIS)
-        run: cargo test --workspace --features validator --no-fail-fast
+        run: cargo test --workspace --features validator --no-fail-fast --exclude fanos-node
+      - name: Tests — fanos-node with validator features, alone
+        run: cargo test -p fanos-node --features validator --no-fail-fast
       - name: Reference verifier (V1–V22)
         run: cargo run -p fanos-cli
       - name: Simulator demo (real engines, substituted transport)

@@ -757,6 +757,13 @@ pub struct Health {
     pub local_addr: SocketAddr,
     /// The number of peers currently in the address book.
     pub known_peers: usize,
+    /// Frames this node did **not** make because a peer's send queue was full (#89).
+    ///
+    /// Zero on a healthy node, and one meaning when it is not: some peer stopped draining its connection, so
+    /// this node stopped queueing for it instead of growing without limit. A peer that completes a handshake
+    /// and never reads is enough to cause it, which makes this a health signal about the *cell*, not only
+    /// about this node.
+    pub send_drops: u64,
     /// Peers whose **coordinate claim** this node has verified this epoch, or `None` without a self-certifying identity.
     ///
     /// Distinct from `known_peers`, and the distinction is the point: the address book says who this node can *dial*, while
@@ -1054,6 +1061,7 @@ impl Node {
             probe_index: self.directory.claim_at(address).map(|(index, _)| index),
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
+            send_drops: self.handle.send_drops(),
             roles: self.roles,
         }
     }

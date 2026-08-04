@@ -218,6 +218,10 @@ pub fn render_health(health: &Health) -> String {
     let _ = writeln!(s, "coordinate: {x}:{y}:{z}");
     let _ = writeln!(s, "listen: {}", health.local_addr);
     let _ = writeln!(s, "known_peers: {}", health.known_peers);
+    // Reported unconditionally, including the zero. A counter that appears only when non-zero teaches an
+    // operator that its absence means "not measured" — and this is a health signal about the *cell*, since a
+    // peer that stops draining is what makes it move (#89).
+    let _ = writeln!(s, "send_drops: {}", health.send_drops);
     match health.verified_claims {
         Some(n) => {
             let _ = writeln!(s, "verified_claims: {n}");
