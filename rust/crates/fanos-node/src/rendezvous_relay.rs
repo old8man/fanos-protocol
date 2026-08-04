@@ -93,6 +93,28 @@ pub struct RendezvousRelay<F: Field> {
 /// bound. Generous enough for any real relay's concurrent fallback clients.
 const MAX_REGISTRATIONS: usize = 4096;
 
+/// How many further epoch advances a hidden-service registration outlives before the relay retires it.
+///
+/// **Derived from the skew the rest of the system already tolerates, not chosen — and getting it wrong once
+/// is why it is written down.** Retiring at the epoch boundary (`minted >= now`) looks obviously right and is
+/// not: client and host derive the meeting line from `(epoch, beacon)` INDEPENDENTLY, so they turn at
+/// different moments, and a client that has not yet adopted the new beacon computes last epoch's tag while
+/// being an entirely honest client.
+///
+/// Every other component already grants that client its window. The host's accept loop keeps
+/// `MAX_REPLY_KEYS = 3` epochs of dead-drop keys precisely because "a request forwarded just before a
+/// rotation is sealed to the *previous* epoch's key". The onion ratchet retains one past epoch's secret so an
+/// in-flight onion still peels. A relay retiring at the boundary would be the one component with no grace at
+/// all — and the symptom is not a clean failure but a hidden service that goes unreachable once per
+/// `epoch_period`, reported as "randomly down".
+///
+/// One, matching the ratchet rather than the key ring, because the ratchet is the binding constraint: past
+/// its retain window the onion carrying the request cannot be peeled at all, so a longer host grace would
+/// keep a route nothing can reach. Larger also re-widens the leak that retirement exists to close — a
+/// recorded tag buys an adversary exactly this window, and it should buy no more than every other component
+/// already concedes.
+const HOST_GRACE_EPOCHS: u64 = 1;
+
 /// The cap on concurrently-registered hidden-service hosts (§3b). A `HostRegister` peels out as an
 /// anonymous delivery, so — like the client registrations — an unbounded map would be a remote OOM; beyond
 /// the cap the oldest host is evicted FIFO (it re-registers each epoch anyway). Generous for any real cell.
@@ -223,8 +245,8 @@ impl<F: Field> RendezvousRelay<F> {
     /// engine and cannot notice a clock on its own, and the composite that rebuilds the directory each epoch
     /// is the one party that knows the epoch turned.
     fn retire_stale_hosts(&mut self) {
-        let now = self.router.onion_epoch();
-        self.hosts.retain(|_, (minted, _)| *minted >= now);
+        let now = self.router.onion_epoch().get();
+        self.hosts.retain(|_, (minted, _)| minted.get().saturating_add(HOST_GRACE_EPOCHS) >= now);
     }
 
     /// A mutable reference to the wrapped router (for a composite engine to drive its epoch rotation).
@@ -842,12 +864,20 @@ mod tests {
         );
         assert_eq!(relay.hosts(), 1, "the registration bound at the epoch it was minted for");
 
-        // The adversary records the tag while it is current — a public value, so this costs it nothing.
-        let recorded = stale_tag;
+        // The adversary records the tag while it is current — a public value, so this costs it nothing. Kept
+        // as an assertion rather than a binding: what it can do with the record is measured in the grace
+        // test, for the reason given below.
+        assert_eq!(stale_tag, service_tag(&bundle, epoch0), "the tag is public and recordable");
 
         // The cell's clock turns. The composite hands the relay the new epoch's directory, which is the one
         // moment a sans-I/O combiner can learn that its epoch moved at all.
+        // Two advances, not one: the registration outlives its epoch by `HOST_GRACE_EPOCHS`, because a
+        // client that has not yet adopted the new beacon is an honest client computing last epoch's tag —
+        // see `a_client_one_epoch_behind_still_reaches_a_host_across_the_turn`, which is the test that found
+        // the boundary rule this one originally asserted made every service unreachable once per epoch.
         relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        relay.set_directory(dir.clone());
+        relay.step(Instant(2), Input::Command(Command::AdvanceEpoch));
         let epoch1 = relay.router().onion_epoch();
         assert!(epoch1 > epoch0, "the router's onion epoch advanced");
         relay.set_directory(dir.clone());
@@ -858,32 +888,115 @@ mod tests {
              every honest client, so keeping it can serve only whoever recorded its tag",
         );
 
-        // And the recorded tag is now dead: a request presenting it is not forwarded to the service's old
-        // dead-drop line, it falls through as an ordinary anonymous delivery like any unknown tag.
-        let replayed = Request {
-            cookie: *b"recorded-tag-001",
-            service_tag: recorded,
-            reply_circuit: vec![Line::<F2>::at(5).coords()],
-            payload: b"a request on a retired path".to_vec(),
-            reply_pub: b"adversary-reply".to_vec(),
+        // **The request-level check lives in the grace test, not here, and the reason is a real limit rather
+        // than convenience.** Past two turns the relay's onion ratchet no longer holds the key an onion
+        // sealed at the registration epoch was built with (`retain = 1`), so a request from that far back
+        // cannot be *peeled* at all — there is no reachable state in which a two-epoch-old tag is presented
+        // and answered, which is exactly the property, and it makes the effect unobservable at this layer.
+        //
+        // What is observable is the map, and it is asserted above: the registration is gone. The reachable
+        // half — a tag one epoch old, whose onion still peels — is measured in
+        // `a_client_one_epoch_behind_still_reaches_a_host_across_the_turn`, which is where the grace window
+        // and its bound both belong.
+    }
+
+    #[test]
+    fn a_client_one_epoch_behind_still_reaches_a_host_across_the_turn() {
+        use fanos_pqcrypto::HybridKemSecret;
+        use fanos_rendezvous::{HOST_REGISTER_TAG, MixDirectory, line_member_coords, service_tag};
+
+        // **The window my own retirement fix opened, measured.** `a_rotated_epoch_retires_the_path_it_rotated
+        // _away_from` closes a real leak — a recorded tag reached a service's retired dead-drop for ever —
+        // and it retired at `minted >= now`: strictly the current epoch, nothing older.
+        //
+        // But client and host derive the meeting line from `(epoch, beacon)` INDEPENDENTLY, so they turn at
+        // different moments. A client that has not yet seen the new `BeaconReady` computes last epoch's tag
+        // and is, for that window, an ordinary honest client — which is precisely why the host's accept loop
+        // keeps `MAX_REPLY_KEYS = 3` epochs of dead-drop keys, and why the onion ratchet retains one past
+        // epoch's secret so an in-flight onion still peels. Retiring at the boundary made the relay the one
+        // component with no grace at all: every hidden service would go unreachable once per `epoch_period`,
+        // and it would be reported as "the service is randomly down".
+        //
+        // So the retention window is derived, not chosen — the same derivation as `DIRECTORY_SLOT_EPOCHS`:
+        // outlive the epoch by exactly the grace the rest of the system already extends, and no more.
+        let mut dir = MixDirectory::new();
+        for i in 0..7u8 {
+            let (_s, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF1, i]));
+            dir.insert(Point::<F2>::at(usize::from(i)).coords(), public);
         }
-        .encode();
-        let effects = relay.step(
-            Instant(2),
-            Input::Message { from: [8, 8, 8], frame: seal_to_relay(&replayed, b"replay", epoch1) },
+        let l = Line::<F2>::at(0).coords();
+        let combiner = Point::<F2>::new(line_member_coords::<F2>(l)[0]).unwrap();
+        let onion_seed = [0xD3u8; 32];
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"grace-relay-id"));
+        let mut relay =
+            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+        let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD3, 1]));
+        let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD3, 2]));
+        let seal = |body: &[u8], seed: &[u8], epoch: Epoch| {
+            let ratchet = OnionKeyRatchet::new(onion_seed, epoch);
+            let pubs = [ratchet.public(), &p1, &p2];
+            launch_frame(l, &seal_onion(&[HopLine { line: l, members: &pubs }], 1, body, seed).unwrap())
+        };
+
+        let epoch0 = relay.router().onion_epoch();
+        let mut srng = SeedRng::from_seed(b"a-service-across-a-turn");
+        let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
+        let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
+        let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
+        let lagging_tag = service_tag(&bundle, epoch0);
+        let drop_line = Line::<F2>::at(3).coords();
+        let (_svc, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"grace-deaddrop");
+        relay.set_directory(dir.clone());
+        let reg = HostRegister::onion(&bundle, &signer, epoch0, svc_reply_pub.encode(), vec![drop_line], 1)
+            .expect("the dead-drop line's members are in the directory");
+        let mut body = HOST_REGISTER_TAG.to_vec();
+        body.extend_from_slice(&reg.encode());
+        relay.step(Instant(0), Input::Message { from: [9, 9, 9], frame: seal(&body, b"reg", epoch0) });
+        assert_eq!(relay.hosts(), 1, "the service registered for its epoch");
+
+        // The cell's clock turns. The host will re-register at the new epoch, but a client that has not yet
+        // adopted the new beacon is still computing `lagging_tag`.
+        relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        relay.set_directory(dir.clone());
+        assert_eq!(
+            relay.hosts(),
+            1,
+            "one epoch of grace: a client that has not yet seen the new beacon is an honest client, and the \
+             host's own accept loop keeps three epochs of keys for exactly this skew",
         );
-        // The complement, and it must be asserted this way round. "No `Send` to a member of the drop line"
-        // would be unsound as a check: any two lines of a projective plane meet in exactly one point, so the
-        // relay's own line and the drop line share a member and a perfectly ordinary effect addressed there
-        // is indistinguishable from a forward. What IS unambiguous is the fall-through — an unknown tag
-        // surfaces locally as an anonymous delivery, which is exactly what the unknown-tag case asserts.
+
+        let request = |tag: [u8; 32]| {
+            Request {
+                cookie: *b"lagging-client01",
+                service_tag: tag,
+                reply_circuit: vec![Line::<F2>::at(5).coords()],
+                payload: b"a request from one epoch behind".to_vec(),
+                reply_pub: b"client-reply-key".to_vec(),
+            }
+            .encode()
+        };
+        let epoch1 = relay.router().onion_epoch();
+        let effects =
+            relay.step(Instant(2), Input::Message { from: [8, 8, 8], frame: seal(&request(lagging_tag), b"lag", epoch1) });
         assert!(
-            effects.iter().any(|e| matches!(
+            !effects.iter().any(|e| matches!(
                 e,
                 Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS
             )),
-            "a recorded tag from a passed epoch must fall through like any unknown tag, not be forwarded to \
-             the service's retired dead-drop line",
+            "the lagging client's request must still be FORWARDED to the service, not fall through as an \
+             unknown tag — falling through is what makes a service look randomly down once per epoch",
+        );
+
+        // And the grace is exactly one epoch, not indefinite: a second turn retires it, so the leak the
+        // previous test closes stays closed. A recorded tag buys an adversary one epoch, which is the same
+        // window every other component already grants.
+        relay.step(Instant(3), Input::Command(Command::AdvanceEpoch));
+        relay.set_directory(dir.clone());
+        assert_eq!(
+            relay.hosts(),
+            0,
+            "past the grace window the registration is gone — the retirement property still holds, it is \
+             just measured against the skew the rest of the system already tolerates",
         );
     }
 }
